@@ -1795,16 +1795,19 @@ impl Document {
         } else {
             source
         };
+        // WARNING: fragments move into the page node by node, so their list may be oversized, unlike a document's.
+        let mut nodes = Vec::with_capacity(context.map_or(1, |_| source.len() / 32 + 1));
+        nodes.push(Node {
+            tag: if context.is_some() {
+                "#fragment"
+            } else {
+                "#document"
+            }
+            .into(),
+            ..Node::default()
+        });
         let mut builder = Builder {
-            nodes: vec![Node {
-                tag: if context.is_some() {
-                    "#fragment"
-                } else {
-                    "#document"
-                }
-                .into(),
-                ..Node::default()
-            }],
+            nodes,
             stack: Vec::new(),
             active: Vec::new(),
             opened: Vec::new(),

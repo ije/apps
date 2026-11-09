@@ -503,6 +503,10 @@ fn round_corners(mask: &ContentMask<ScaledPixels>) -> [Bounds<ScaledPixels>; 4] 
     .map(|(x, y, width, height)| Bounds::new(point(x, y), size(width, height)))
 }
 
+// WARNING: by promoted layer, its first sample's time, the seconds between samples, the times they play and the
+// transforms, so hit tests can follow it.
+type Track = (u64, std::time::Instant, f32, f32, Vec<[f32; 16]>);
+
 pub struct Window {
     pub(crate) id: WindowId,
     pub(crate) platform: platform::Window,
@@ -548,7 +552,7 @@ pub struct Window {
     cursor: Option<CursorStyle>,
     drawn_at: std::time::Instant,
     frames_drawn: u64,
-    tracks: Vec<(u64, std::time::Instant, f32, Vec<[f32; 16]>)>,
+    tracks: Vec<Track>,
     pub(crate) rails: ([f32; 2], std::time::Instant),
     pub(crate) scroll_chain: Option<Vec<ScrollHandle>>,
     pub(crate) gesture: ScrollGesture,
@@ -691,10 +695,14 @@ impl Window {
         self.tracks.clear();
     }
 
+    // WARNING: the samples start at `start`, `step` seconds apart, and play `repeat` times, so the last sample
+    // must equal the first when `repeat` is not 1.
     pub fn promote(
         &mut self,
         key: u64,
+        start: std::time::Instant,
         step: f32,
+        repeat: f32,
         opacities: &[f32],
         transforms: Option<&[[f32; 16]]>,
     ) -> bool {
@@ -734,6 +742,13 @@ impl Window {
         let region = crate::frame::region(content);
         // WARNING: the compositor draws the layer over the window without its clip, so it must stay
         // inside the clip and nothing may paint over it there. Web views stay above it, as above the frame.
+        // The window clips its layers itself, so only the part in the window counts, and a layer that never
+        // shows in it needs nothing.
+        let window = Bounds::new(Point::default(), self.viewport_size.scale(scale));
+        let reach = reach.map(|reach| reach.intersect(&window));
+        if reach.is_some_and(|reach| reach.is_empty()) {
+            return true;
+        }
         let mask = &effect.content_mask;
         if reach.is_none_or(|reach| {
             mask.bounds.intersect(&reach) != reach
@@ -763,18 +778,25 @@ impl Window {
                     matrix
                 })
                 .collect();
-            self.platform
-                .promote(key, index, region, f64::from(step), opacities, &points);
+            let begin = start.elapsed().as_secs_f64();
+            self.platform.promote(
+                key,
+                index,
+                region,
+                [f64::from(step), f64::from(repeat), begin],
+                opacities,
+                &points,
+            );
             self.tracks.retain(|track| track.0 != key);
             if let Some(transforms) = transforms {
                 self.tracks
-                    .push((key, std::time::Instant::now(), step, transforms.to_vec()));
+                    .push((key, start, step, repeat, transforms.to_vec()));
             }
             true
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (step, opacities);
+            let _ = (start, step, repeat, opacities);
             false
         }
     }
@@ -965,7 +987,6 @@ impl Window {
             {
                 self.caret = None;
             }
-            self.next_hitbox = 0;
             if self.redraw[1] {
                 // WARNING: the first pass moved its states out of `states`, so they go back for this one.
                 let states = mem::take(&mut self.next_states);
@@ -1031,6 +1052,9 @@ impl Window {
         self.platform
             .set_drawable_size(self.native.0, self.native.1);
         let mut frame = self.platform.draw(&self.scene, !captures.is_empty());
+        if let Some(tree) = &mut self.tree {
+            tree.bury();
+        }
         self.text_system.finish_frame();
         self.platform.atlas().finish_frame();
         let last = captures.len().wrapping_sub(1);
@@ -1079,7 +1103,6 @@ impl Window {
         let mut again = false;
         for _ in 0..2 {
             self.next.clear();
-            self.next_hitbox = 0;
             let mut tree = self.tree.take().unwrap_or_default();
             if let Some(root) = self.build(&mut tree, cx, &mut render) {
                 tree.layout(root, self.viewport_size, self);
@@ -1195,9 +1218,15 @@ impl Window {
         if mouse {
             // WARNING: the compositor turns promoted layers without frames, so hit testing takes their
             // transform of now.
-            for (key, start, step, transforms) in &self.tracks {
-                let at = (start.elapsed().as_secs_f32() / step).round() as usize;
-                if let Some(matrix) = transforms.get(at).or(transforms.last()) {
+            for (key, start, step, repeat, transforms) in &self.tracks {
+                let count = transforms.len().saturating_sub(1).max(1);
+                let end = repeat * count as f32;
+                let at = (start.elapsed().as_secs_f32() / step).min(end).round();
+                let index = match at >= end {
+                    true => (end.round() as usize).saturating_sub(1) % count + 1,
+                    false => at as usize % count,
+                };
+                if let Some(matrix) = transforms.get(index).or(transforms.last()) {
                     self.rendered.turn(*key, matrix);
                 }
             }
@@ -1313,6 +1342,41 @@ impl Window {
         };
         self.next.hitboxes.push(hitbox.clone());
         hitbox
+    }
+
+    // WARNING: ids grow across passes, so a hitbox kept from the last pass keeps its id, and hover with it, also when
+    // its box moved.
+    pub fn place_hitbox(&mut self, hitbox: &Hitbox, bounds: Bounds<Pixels>) -> Hitbox {
+        let hitbox = Hitbox {
+            bounds,
+            content_mask: self.content_mask(),
+            transform: self.hit_transform.clone(),
+            ..hitbox.clone()
+        };
+        self.next.hitboxes.push(hitbox.clone());
+        hitbox
+    }
+
+    // WARNING: what places a box besides its layout: the offset, clip and hit transform it prepaints in.
+    pub(crate) fn placement(&self) -> (Point<Pixels>, ContentMask<Pixels>, usize) {
+        let transform = self.hit_transform.as_ref().map_or(0, |transform| Rc::as_ptr(transform) as usize);
+        (self.element_offset(), self.content_mask(), transform)
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn hitbox_places(&self) -> Vec<(Bounds<Pixels>, ContentMask<Pixels>, HitboxBehavior, bool)> {
+        let place = |hitbox: &Hitbox| (hitbox.bounds, hitbox.content_mask, hitbox.behavior, hitbox.transform.is_some());
+        self.next.hitboxes.iter().map(place).collect()
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn redraws(&self) -> bool {
+        self.redraw[0]
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn truncate_hitboxes(&mut self, len: usize) {
+        self.next.hitboxes.truncate(len);
     }
 
     pub fn insert_window_drag_hitbox(&mut self, hitbox: &Hitbox) {

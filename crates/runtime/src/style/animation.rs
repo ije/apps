@@ -3,12 +3,8 @@ use super::{
     resolve_keywords, resolve_style,
 };
 use crate::dom::Document;
-use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet},
-    rc::Rc,
-    time::Instant,
-};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::{borrow::Cow, collections::HashMap, rc::Rc, time::Instant};
 
 const PAINT: &[Prop] = &[
     Prop::COLOR,
@@ -284,11 +280,14 @@ impl Animation {
                 wake = Some(0.);
             }
         }
+        let mut keys: Vec<(f64, Cow<str>, &str)> = Vec::new();
         for (property, frames) in &self.tracks {
-            let mut keys: Vec<(f64, Cow<str>, &str)> = frames
-                .iter()
-                .map(|(at, value, timing)| (*at, Cow::Borrowed(value.as_str()), timing.as_str()))
-                .collect();
+            keys.clear();
+            keys.extend(
+                frames.iter().map(|(at, value, timing)| {
+                    (*at, Cow::Borrowed(value.as_str()), timing.as_str())
+                }),
+            );
             let replace = self.composite == "replace";
             if !replace || keys[0].0 > 0. || keys[keys.len() - 1].0 < 1. {
                 let under = out
@@ -389,8 +388,7 @@ impl Animation {
                     None => 0.,
                 });
             }
-            let value =
-                value.unwrap_or_else(|| if eased < 0.5 { &*from.1 } else { &*to.1 }.to_owned());
+            let value = value.unwrap_or_else(|| if eased < 0.5 { &*from.1 } else { &*to.1 }.into());
             out.insert(*property, value);
         }
         (wake, ended)
@@ -454,16 +452,17 @@ impl Transition {
         (time < self.duration).then(|| easing(&self.timing, (time / self.duration).max(0.)))
     }
 
-    fn value(&self, progress: f64) -> String {
+    fn value(&self, progress: f64) -> Rc<str> {
+        let near = if progress < 0.5 { &self.from } else { &self.to };
         interpolate(self.property.name(), &self.from, &self.to, progress)
-            .unwrap_or_else(|| if progress < 0.5 { &self.from } else { &self.to }.clone())
+            .unwrap_or_else(|| near.as_str().into())
     }
 
     fn shows(&self, now: Instant) -> bool {
         self.property == Prop::DISPLAY
             && self
                 .progress(now)
-                .is_some_and(|progress| self.value(progress) != "none")
+                .is_some_and(|progress| &*self.value(progress) != "none")
     }
 }
 
@@ -558,7 +557,7 @@ fn retarget(
             }
             Some(old) => {
                 let progress = old.progress(now);
-                let current = progress.map_or_else(|| old.to.clone(), |p| old.value(p));
+                let current = progress.map_or_else(|| old.to.clone(), |p| old.value(p).to_string());
                 if old.reverse == after {
                     let factor = (progress.unwrap_or(1.) * old.shortening + 1. - old.shortening)
                         .abs()
@@ -791,9 +790,13 @@ impl Scripted {
 #[derive(Default)]
 pub(crate) struct Motion {
     previous: Vec<Rc<Style>>,
-    clocks: HashMap<usize, Vec<Clock>>,
-    transitions: HashMap<usize, Vec<Transition>>,
-    styled: HashMap<usize, (Rc<Style>, Style, Rc<Style>)>,
+    // WARNING: `previous` equals `seen` after each update, except at `touched`, so an update visits only the chunks
+    // that a pass wrote since and the nodes read or forgotten since, not every node of the arena.
+    seen: super::Chunked<Rc<Style>>,
+    touched: Vec<usize>,
+    clocks: FxHashMap<usize, Vec<Clock>>,
+    transitions: FxHashMap<usize, Vec<Transition>>,
+    styled: FxHashMap<usize, (Rc<Style>, Style, Rc<Style>)>,
     pub custom: HashMap<usize, Style>,
     pub wake: Option<(Instant, renderer::Timer)>,
     pub parked: Vec<usize>,
@@ -808,6 +811,9 @@ pub(crate) struct Motion {
     backdrop: HashMap<usize, (Rc<Style>, Vec<Transition>)>,
     // WARNING: the `::backdrop` styles that the last `update` animated, for render to paint.
     pub backdrops: Vec<(usize, Rc<Style>)>,
+    // WARNING: whether the page listens for `animationiteration`. Iterations are no events without listeners, as in
+    // Chromium, so a compositor plays endless animations without waking the page.
+    pub iterations: bool,
 }
 
 impl Motion {
@@ -824,7 +830,14 @@ impl Motion {
             .filter(|(effect, clock)| effect.name == clock.name)
     }
 
-    pub fn timeline(&self, id: usize, styles: &ComputedStyles, times: &[Instant]) -> Vec<Style> {
+    // WARNING: with `props`, the styles hold only those of the base, besides the animated values.
+    pub fn timeline(
+        &self,
+        id: usize,
+        styles: &ComputedStyles,
+        times: &[Instant],
+        props: &[Prop],
+    ) -> Vec<Style> {
         let registry = &*styles.registry;
         let base = &*styles.values[id];
         times
@@ -851,11 +864,81 @@ impl Motion {
                         out.insert(transition.property, transition.value(progress));
                     }
                 }
-                let mut style = base.clone();
+                let mut style = match props {
+                    [] => base.clone(),
+                    props => props
+                        .iter()
+                        .filter_map(|&prop| Some((prop, base.value(prop)?.clone())))
+                        .collect(),
+                };
                 style.extend(out.iter().map(|(key, value)| (key, value.clone())));
                 style
             })
             .collect()
+    }
+
+    // WARNING: a box whose values come from one running effect at rate 1, while the others are held or done, repeats
+    // them every period. Returns the period and how far into it the box is, in seconds, how many periods are left
+    // from now, and for a box with no other effect, the effect without its delay, which with the box's base values
+    // and units gives the same period to every box that has it.
+    pub fn period(
+        &self,
+        id: usize,
+        styles: &ComputedStyles,
+        now: Instant,
+    ) -> Option<(f64, f64, f64, Option<String>)> {
+        if self
+            .transitions
+            .get(&id)
+            .is_some_and(|list| !list.is_empty())
+        {
+            return None;
+        }
+        let scripted = self.scripted.get(&id).into_iter().flatten();
+        let (mut running, mut effects) = (None, 0);
+        for (effect, playback) in self
+            .pairs(id, styles)
+            .filter(|(_, clock)| !clock.canceled)
+            .map(|(effect, clock)| (effect, &clock.playback))
+            .chain(scripted.map(|animation| (&animation.effect, &animation.playback)))
+        {
+            effects += 1;
+            let local = playback.at(now);
+            let stop =
+                effect.delay + effect.duration * effect.iterations + effect.end_delay.min(0.);
+            if effect.pseudo != 0 || playback.rate == 0. || local >= stop {
+                continue;
+            }
+            if running.is_some()
+                || playback.rate != 1.
+                || effect.duration <= 0.
+                || local < effect.delay
+            {
+                return None;
+            }
+            let period = effect.duration
+                * if effect.direction.contains("alternate") {
+                    2.
+                } else {
+                    1.
+                };
+            let phase = (local - effect.delay + effect.iteration_start * effect.duration)
+                .rem_euclid(period);
+            running = Some((period, phase, (stop - local) / period, effect));
+        }
+        running.map(|(period, phase, left, effect)| {
+            let shape = (effects == 1).then(|| {
+                format!(
+                    "{:?}",
+                    Animation {
+                        name: String::new(),
+                        delay: 0.,
+                        ..effect.clone()
+                    }
+                )
+            });
+            (period, phase, left, shape)
+        })
     }
 
     pub fn next_event(&self, id: usize, styles: &ComputedStyles, now: Instant) -> Option<Instant> {
@@ -868,7 +951,7 @@ impl Motion {
             let end = effect.duration * effect.iterations;
             let at = if active < 0. {
                 0.
-            } else if effect.duration > 0. {
+            } else if effect.duration > 0. && self.iterations {
                 (((active / effect.duration).floor() + 1.) * effect.duration).min(end)
             } else {
                 end
@@ -899,6 +982,8 @@ impl Motion {
     pub fn trim(&mut self, len: usize) {
         self.previous.truncate(len);
         self.previous.shrink_to_fit();
+        self.seen.clear();
+        self.touched = Vec::new();
     }
 
     pub fn read(&mut self, id: usize, style: &Rc<Style>) {
@@ -907,12 +992,14 @@ impl Motion {
         }
         if self.previous[id].is_empty() {
             self.previous[id] = style.clone();
+            self.touched.push(id);
         }
     }
 
     pub fn forget(&mut self, id: usize) {
         if let Some(previous) = self.previous.get_mut(id) {
             *previous = super::empty().0;
+            self.touched.push(id);
         }
         // WARNING: this runs for every freed node, and these maps are empty on most pages.
         if !self.clocks.is_empty() {
@@ -1236,7 +1323,7 @@ impl Motion {
         }
         // WARNING: `visible` follows the cascade, where a box in an exit transition already has `display: none`.
         // `painted` follows the animated `display`, and exits restyle first, so the boxes inside them see it.
-        let shows = |transitions: &HashMap<usize, Vec<Transition>>, id: usize| {
+        let shows = |transitions: &FxHashMap<usize, Vec<Transition>>, id: usize| {
             revealed.contains(&id)
                 || transitions
                     .get(&id)
@@ -1261,7 +1348,14 @@ impl Motion {
         self.previous
             .resize_with(styles.values.len(), Default::default);
         let (mut exits, mut changed) = (Vec::new(), Vec::new());
-        for (id, new) in styles.values.iter().enumerate() {
+        let mut visit: Vec<usize> = std::mem::take(&mut self.touched);
+        visit.retain(|&id| id < styles.values.len());
+        visit.extend(styles.values.differing(&self.seen).flatten());
+        visit.sort_unstable();
+        visit.dedup();
+        self.seen = styles.values.clone();
+        for id in visit {
+            let new = &styles.values[id];
             if Rc::ptr_eq(&self.previous[id], new) {
                 continue;
             }
@@ -1415,8 +1509,9 @@ impl Motion {
             }
             kept
         });
-        let mut animated: HashMap<usize, Style> = HashMap::new();
-        let mut pseudo: HashMap<(usize, u8), Style> = HashMap::new();
+        let mut animated: FxHashMap<usize, Style> = FxHashMap::default();
+        animated.reserve(self.styled.len());
+        let mut pseudo: FxHashMap<(usize, u8), Style> = FxHashMap::default();
         let mut wakes: Vec<Wake> = Vec::new();
         for (&id, effects) in &styles.animations {
             if painted.get(id) != Some(&true) {
@@ -1506,7 +1601,7 @@ impl Motion {
                     ));
                 }
                 if clock.started && effect.duration > 0. && !ended {
-                    if iteration > clock.iteration {
+                    if iteration > clock.iteration && self.iterations {
                         events.push((
                             id,
                             "animationiteration",
@@ -1634,7 +1729,10 @@ impl Motion {
                 || values.contains(Prop::FONT_SIZE)
                 || values.contains(Prop::LINE_HEIGHT)
         }) {
-            self.custom.clone_from(&animated);
+            self.custom = animated
+                .iter()
+                .map(|(&id, values)| (id, values.clone()))
+                .collect();
         }
         let mut inherited = Vec::new();
         for (&id, values) in &animated {
@@ -1666,7 +1764,7 @@ impl Motion {
             animated.entry(id).or_default().insert(key, value);
         }
         // WARNING: the inline text of a paragraph holds the paint of its inline boxes, so render rebuilds it only for a new color.
-        let layout: HashSet<usize> = animated
+        let layout: FxHashSet<usize> = animated
             .iter()
             .filter(|(id, values)| {
                 values.iter().any(|(key, _)| {
@@ -1738,8 +1836,23 @@ impl Motion {
             .into_iter()
             .map(|(id, values)| {
                 let base = &styles.values[id];
-                let style = match self.styled.get(&id) {
-                    Some((old, sampled, style)) if Rc::ptr_eq(old, base) && *sampled == values => {
+                // WARNING: a box that animates the same properties over the same base writes the new values into
+                // the last frame's style, in place when render dropped it, so no frame merges the whole style again.
+                let style = match self.styled.get_mut(&id) {
+                    Some((old, sampled, style))
+                        if Rc::ptr_eq(old, base)
+                            && sampled
+                                .iter()
+                                .map(|(key, _)| key)
+                                .eq(values.iter().map(|(key, _)| key)) =>
+                    {
+                        if *sampled != values {
+                            let next = Rc::make_mut(style);
+                            for (key, value) in values.iter() {
+                                next.insert(key, value.clone());
+                            }
+                            *sampled = values;
+                        }
                         style.clone()
                     }
                     _ => {
@@ -2003,12 +2116,12 @@ fn transitions(style: &Style) -> Vec<(String, f64, f64, String, bool)> {
         .collect()
 }
 
-pub(crate) fn interpolate(property: &str, from: &str, to: &str, t: f64) -> Option<String> {
+pub(crate) fn interpolate(property: &str, from: &str, to: &str, t: f64) -> Option<Rc<str>> {
     if from == to || t == 0. {
-        return Some(from.to_owned());
+        return Some(from.into());
     }
     if t == 1. {
-        return Some(to.to_owned());
+        return Some(to.into());
     }
     // WARNING: Tailwind writes `opacity: 0%` and `scale: 98% 98%`, and they mix as the numbers they stand for.
     if matches!(property, "opacity" | "scale") && (from.contains('%') || to.contains('%')) {
@@ -2031,10 +2144,10 @@ pub(crate) fn interpolate(property: &str, from: &str, to: &str, t: f64) -> Optio
     // WARNING: animations mix the same values every frame, so their parsed pairs are kept by a hash
     // of the property and values, checked against them.
     thread_local! {
-        static LERPS: std::cell::RefCell<Lerps> = Default::default();
+        static LERPS: std::cell::RefCell<(Lerps, String)> = Default::default();
     }
     let key = std::hash::BuildHasher::hash_one(&rustc_hash::FxBuildHasher, (property, from, to));
-    LERPS.with_borrow_mut(|lerps| {
+    LERPS.with_borrow_mut(|(lerps, text)| {
         if !lerps
             .get(&key)
             .is_some_and(|(p, a, b, _)| p == property && a == from && b == to)
@@ -2045,7 +2158,10 @@ pub(crate) fn interpolate(property: &str, from: &str, to: &str, t: f64) -> Optio
             let lerp = Lerp::new(property, from, to);
             lerps.insert(key, (property.into(), from.into(), to.into(), lerp));
         }
-        lerps[&key].3.as_ref().map(|lerp| lerp.at(t))
+        let lerp = lerps[&key].3.as_ref()?;
+        text.clear();
+        lerp.write(t, text);
+        Some(Rc::from(&**text))
     })
 }
 
@@ -2498,19 +2614,13 @@ impl Lerp {
         }
     }
 
-    pub(crate) fn at(&self, t: f64) -> String {
-        let mut out = String::new();
-        self.write(t, &mut out);
-        out
-    }
-
     fn write(&self, t: f64, out: &mut String) {
         use std::fmt::Write;
-        let round = |value: f64, integer: bool| {
+        let round = |value: f64, integer: bool, out: &mut String| {
             if integer {
-                value.round().to_string()
+                let _ = write!(out, "{}", value.round());
             } else {
-                super::value::number(value)
+                super::value::write_number(value, out);
             }
         };
         match self {
@@ -2551,19 +2661,19 @@ impl Lerp {
                     *cell *= value[3 + index / 4];
                 }
                 m[12..15].copy_from_slice(&value[..3]);
-                let list: Vec<String> = if *flat {
-                    [0, 1, 4, 5, 12, 13]
-                        .map(|index| round(m[index], false))
-                        .into()
+                out.push_str(if *flat { "matrix(" } else { "matrix3d(" });
+                let indices: &[usize] = if *flat {
+                    &[0, 1, 4, 5, 12, 13]
                 } else {
-                    m.iter().map(|value| round(*value, false)).collect()
+                    &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
                 };
-                let _ = write!(
-                    out,
-                    "{}({})",
-                    if *flat { "matrix" } else { "matrix3d" },
-                    list.join(", ")
-                );
+                for (position, &index) in indices.iter().enumerate() {
+                    if position > 0 {
+                        out.push_str(", ");
+                    }
+                    round(m[index], false, out);
+                }
+                out.push(')');
             }
             Self::List(items, separator) => {
                 for (index, item) in items.iter().enumerate() {
@@ -2594,18 +2704,27 @@ impl Lerp {
                             0
                         };
                 }
-                let _ = write!(out, "#{rgb:06x}{:02x}", alpha.round().clamp(0., 255.) as u8);
+                let value = rgb << 8 | alpha.round().clamp(0., 255.) as u32;
+                out.push('#');
+                for shift in (0..32).step_by(4).rev() {
+                    let digit = (value >> shift & 15) as usize;
+                    out.push(char::from(b"0123456789abcdef"[digit]));
+                }
             }
             Self::Number(a, b, unit, integer) => {
-                let _ = write!(out, "{}{unit}", round(a + (b - a) * t, *integer));
+                round(a + (b - a) * t, *integer, out);
+                out.push_str(unit);
             }
             Self::Calc(from, to, integer) => {
-                let _ = write!(
-                    out,
-                    "calc({from} * {} + {to} * {})",
-                    round(1. - t, *integer),
-                    round(t, *integer)
-                );
+                out.push_str("calc(");
+                out.push_str(from);
+                out.push_str(" * ");
+                round(1. - t, *integer, out);
+                out.push_str(" + ");
+                out.push_str(to);
+                out.push_str(" * ");
+                round(t, *integer, out);
+                out.push(')');
             }
         }
     }
@@ -2892,7 +3011,9 @@ mod tests {
 
     #[test]
     fn values_interpolate_by_type() {
-        let mix = |property: &str, from: &str, to: &str, t: f64| interpolate(property, from, to, t);
+        let mix = |property: &str, from: &str, to: &str, t: f64| {
+            interpolate(property, from, to, t).map(|value| value.to_string())
+        };
         assert_eq!(mix("color", "red", "blue", 0.5).unwrap(), "#800080ff");
         assert_eq!(
             mix("color", "transparent", "red", 0.5).unwrap(),
@@ -2990,6 +3111,35 @@ mod tests {
             units.resolve(&mix("left", "calc(100% - 10px)", "0px", 0.5).unwrap(), 200.),
             Some(95.)
         );
+    }
+
+    #[test]
+    fn animated_styles_drop_values_that_stop_animating() {
+        let doc = Document::parse(
+            "<style>@keyframes w{from{width:0px}to{width:100px}}@keyframes h{from{height:0px}to{height:10px}}div{height:3px;animation:w 1s linear,h 0.5s linear}</style><div></div>",
+        );
+        let id = doc.nodes.iter().position(|node| node.tag == "div").unwrap();
+        let styles = computed_styles(&doc);
+        let visible = vec![true; doc.nodes.len()];
+        let start = Instant::now();
+        let mut motion = Motion::default();
+        let mut style = |seconds: f64| {
+            let (animated, _) = motion.update(
+                &doc,
+                &styles,
+                &visible,
+                &|_| true,
+                start + Duration::from_secs_f64(seconds),
+                false,
+                &mut Vec::new(),
+            );
+            let style = animated.into_iter().find(|entry| entry.0 == id).unwrap().1;
+            [Prop::WIDTH, Prop::HEIGHT].map(|prop| style.get(prop).map(str::to_owned))
+        };
+        style(0.);
+        assert_eq!(style(0.25), [Some("25px".into()), Some("5px".into())]);
+        assert_eq!(style(0.3), [Some("30px".into()), Some("6px".into())]);
+        assert_eq!(style(0.75), [Some("75px".into()), Some("3px".into())]);
     }
 
     #[test]
@@ -3199,7 +3349,10 @@ mod tests {
         let div = doc.nodes.iter().position(|node| node.tag == "div").unwrap();
         let visible = vec![true; doc.nodes.len()];
         let start = Instant::now();
-        let mut motion = Motion::default();
+        let mut motion = Motion {
+            iterations: true,
+            ..Default::default()
+        };
         let mut events = Vec::new();
         let mut run = |motion: &mut Motion, doc: &Document, time: f64| {
             events.clear();
@@ -3769,7 +3922,7 @@ mod tests {
             step(&mut motion, &doc, &styles, at);
             for id in nodes.iter().copied() {
                 motion.next_event(id, &styles, at);
-                motion.timeline(id, &styles, &[at]);
+                motion.timeline(id, &styles, &[at], &[]);
             }
         }
         assert_eq!(after(start, 1e19), None);
@@ -3801,6 +3954,46 @@ mod tests {
     }
 
     #[test]
+    fn iterations_wake_only_listening_pages_and_single_effects_loop() {
+        let doc = Document::parse(
+            "<style>@keyframes pulse{to{opacity:0}}div{animation:pulse 1s infinite}p{animation:pulse .5s 3 alternate}i{animation:pulse 1s 2s}b{animation:pulse 1s,pulse 2s}</style><div></div><p></p><i></i><b></b>",
+        );
+        let [div, p, i, b] = ["div", "p", "i", "b"].map(|tag| node(&doc, tag));
+        let styles = computed_styles(&doc);
+        let start = Instant::now();
+        let at = |seconds: f64| start + Duration::from_secs_f64(seconds);
+        let mut motion = Motion::default();
+        let kinds = |motion: &mut Motion, seconds: f64| {
+            let (.., events) = step(motion, &doc, &styles, at(seconds));
+            events
+                .into_iter()
+                .filter(|event| event.0 == div)
+                .map(|event| event.1)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(&mut motion, 0.), ["animationstart"]);
+        assert_eq!(kinds(&mut motion, 1.1), [""; 0]);
+        assert_eq!(motion.next_event(div, &styles, at(1.1)), None);
+        let period = |id: usize, seconds: f64| {
+            motion
+                .period(id, &styles, at(seconds))
+                .map(|(period, phase, left, shape)| {
+                    let round = |value: f64| (value * 1e6).round() / 1e6;
+                    (period, round(phase), left, shape.is_some())
+                })
+        };
+        assert_eq!(period(div, 1.1), Some((1., 0.1, f64::INFINITY, true)));
+        assert_eq!(period(p, 0.25), Some((1., 0.25, 1.25, true)));
+        assert_eq!(period(i, 1.), None);
+        assert_eq!(period(b, 0.5), None);
+        assert_eq!(period(b, 1.5), Some((2., 1.5, 0.25, false)));
+        motion.iterations = true;
+        assert_eq!(kinds(&mut motion, 2.2), ["animationiteration"]);
+        let next = motion.next_event(div, &styles, at(2.2)).unwrap();
+        assert!((next.duration_since(start).as_secs_f64() - 3.).abs() < 1e-6);
+    }
+
+    #[test]
     fn late_starts_fire_no_iteration_events() {
         let doc = Document::parse(
             "<style>@keyframes pulse{to{opacity:0}}div{animation:pulse 1s -2.5s 5}p{animation:pulse 1s 1s 5}</style><div></div><p></p>",
@@ -3808,7 +4001,10 @@ mod tests {
         let (div, p) = (node(&doc, "div"), node(&doc, "p"));
         let styles = computed_styles(&doc);
         let start = Instant::now();
-        let mut motion = Motion::default();
+        let mut motion = Motion {
+            iterations: true,
+            ..Default::default()
+        };
         let mut events = |seconds: f64| {
             let at = start + Duration::from_secs_f64(seconds);
             let (.., events) = step(&mut motion, &doc, &styles, at);
@@ -4155,11 +4351,16 @@ mod tests {
             "skewY(1deg)",
         )
         .unwrap();
+        let at = |t: f64| {
+            let mut out = String::new();
+            lerp.write(t, &mut out);
+            out
+        };
         assert_eq!(
-            lerp.at(0.),
+            at(0.),
             "matrix(1.73205, 1, -1.04189, 2.86257, 2.40892, 22.1754)"
         );
-        assert_eq!(lerp.at(1.), "matrix(1, 0.0174551, 0, 1, 0, 0)");
+        assert_eq!(at(1.), "matrix(1, 0.0174551, 0, 1, 0, 0)");
     }
 
     #[test]

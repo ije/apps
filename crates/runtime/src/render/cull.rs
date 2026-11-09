@@ -1,7 +1,7 @@
 use crate::style::Prop;
 use crate::{dom::Document, style};
 use renderer::{Child, px};
-use std::{cell::Cell, collections::HashMap, rc::Rc};
+use std::{cell::Cell, rc::Rc};
 
 pub(crate) const UNCULLABLE: u16 = 1;
 pub(crate) const CHANGED: u16 = 2;
@@ -59,14 +59,21 @@ pub(crate) struct Cull {
     pub(crate) enabled: bool,
     pub(crate) frame: [f32; 4],
     pub(crate) resized: bool,
-    pub(crate) offsets: HashMap<usize, renderer::Point<renderer::Pixels>>,
+    pub(crate) offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
     pub(crate) visible: Vec<bool>,
     pub(crate) walk: crate::dom::Walk,
     /// The parent of each node in `walk`, or `u32::MAX`.
     pub(crate) parents: Vec<u32>,
     /// Nodes whose info holds paint animation flags from a frame since the last info pass.
     pub(crate) painted: Vec<usize>,
+    // WARNING: only these nodes can hold per-frame flags, or any node while it is `None`, so a frame clears just these.
+    pub(crate) fresh: Option<Vec<usize>>,
+    pub(crate) marked: Vec<bool>,
+    // WARNING: whether `visible` follows the cascade, not the painted `display` of exit transitions.
+    pub(crate) cascaded: bool,
     pub(crate) cells: Vec<usize>,
+    pub(crate) canvases: Vec<usize>,
+    pub(crate) iframes: Vec<usize>,
     pub(crate) seen: Option<(u64, Option<usize>, Rc<crate::style::ComputedStyles>)>,
     pub(crate) subtrees: Subtrees,
     // WARNING: how far each scroll handle moved since the last frame. Culling reads last frame's rects, which lie that
@@ -83,6 +90,7 @@ impl Cull {
         self.walk = Default::default();
         self.parents = Vec::new();
         self.cells = Vec::new();
+        self.marked = Vec::new();
         if self.info.len() > len {
             self.info.truncate(len);
             self.info.shrink_to_fit();
@@ -214,10 +222,14 @@ pub(super) fn content(node: &crate::dom::Node) -> (u64, u64) {
     }
     (node.state & (crate::dom::CHECKED | crate::dom::DIRTY | crate::dom::BROKEN)).hash(&mut shape);
     let mut own = shape.finish();
+    // WARNING: `class` and `style` act only through the computed style, which renews a node by itself, so a class
+    // that changes only paint keeps the node's revision, see `render_page`.
     let mut attrs = rustc_hash::FxHasher::default();
     for pair in node.attrs.iter() {
-        pair.hash(&mut attrs);
         let name = pair.0.as_str();
+        if !matches!(name, "class" | "style") {
+            pair.hash(&mut attrs);
+        }
         if !(matches!(name, "class" | "style" | "id" | "title")
             || name.starts_with("data-")
             || name.starts_with("aria-"))
@@ -483,9 +495,9 @@ pub(super) fn shift(
     roots: &[usize],
     [x, y]: [f32; 2],
 ) {
-    // WARNING: a scroll moves every culled subtree, so their nodes are listed once per document revision.
-    if subtrees.0 != doc.nodes.latest() {
-        subtrees.0 = doc.nodes.latest();
+    // WARNING: a scroll moves every culled subtree, so their nodes are listed once per tree revision.
+    if subtrees.0 != doc.nodes.tree() {
+        subtrees.0 = doc.nodes.tree();
         subtrees.1.clear();
     }
     for &root in roots {
@@ -662,6 +674,7 @@ pub(super) fn anchor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn page(html: &str) -> (Document, Rc<style::ComputedStyles>, impl Fn(&str) -> usize) {
         let mut doc = Document::parse(html);

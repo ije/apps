@@ -234,6 +234,9 @@ impl Hash for RenderGlyphParams {
 pub struct Fonts {
     pub(crate) platform: platform::TextSystem,
     fonts: RefCell<FxHashMap<Font, Option<FontId>>>,
+    // WARNING: the last fonts resolved, found by the pointers of their family and features, since runs share those
+    // and hashing a whole font for every run costs more than its shaping cache lookups.
+    recent: RefCell<Vec<(Font, FontId)>>,
     metrics: RefCell<FxHashMap<FontId, FontMetrics>>,
     generation: Cell<usize>,
 }
@@ -269,12 +272,41 @@ impl Default for TextSystem {
     }
 }
 
+// WARNING: CoreText takes milliseconds to find an installed family, and the platform keeps faces for the process, so
+// a thread finds the first installed family of each list before a page's first style pass asks for it.
+pub fn warm(lists: Vec<Vec<String>>) {
+    #[cfg(target_os = "macos")]
+    if !lists.is_empty() {
+        let _ = std::thread::Builder::new()
+            .name("apps-fonts".into())
+            .spawn(move || {
+                let text = TextSystem::new();
+                let names: FxHashMap<String, String> = text
+                    .all_font_names()
+                    .into_iter()
+                    .map(|name| (name.to_lowercase(), name))
+                    .collect();
+                for list in lists {
+                    if let Some(name) = list
+                        .iter()
+                        .find_map(|family| names.get(&family.to_lowercase()))
+                    {
+                        text.resolve_font(&font(name.clone()));
+                    }
+                }
+            });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = lists;
+}
+
 impl TextSystem {
     pub fn new() -> Self {
         Self {
             shared: Rc::new(Fonts {
                 platform: platform::TextSystem::new(),
                 fonts: RefCell::default(),
+                recent: RefCell::default(),
                 metrics: RefCell::default(),
                 generation: Cell::new(0),
             }),
@@ -315,12 +347,28 @@ impl TextSystem {
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.platform.add_fonts(fonts)?;
         self.fonts.borrow_mut().clear();
+        self.recent.borrow_mut().clear();
         self.shared.generation.set(self.shared.generation.get() + 1);
         Ok(())
     }
 
     pub fn resolve_font(&self, font: &Font) -> FontId {
+        let same = |kept: &Font| {
+            Rc::ptr_eq(&kept.family, &font.family)
+                && Rc::ptr_eq(&kept.features.0, &font.features.0)
+                && kept.fallbacks.as_ref().map(|list| Rc::as_ptr(&list.0))
+                    == font.fallbacks.as_ref().map(|list| Rc::as_ptr(&list.0))
+                && (kept.weight, kept.style) == (font.weight, font.style)
+        };
+        if let Some(&(_, id)) = self.recent.borrow().iter().find(|(kept, _)| same(kept)) {
+            return id;
+        }
         if let Some(Some(id)) = self.fonts.borrow().get(font) {
+            let mut recent = self.recent.borrow_mut();
+            if recent.len() == 8 {
+                recent.remove(0);
+            }
+            recent.push((font.clone(), *id));
             return *id;
         }
         let lookup = |candidate: &Font| {
@@ -582,7 +630,7 @@ impl TextSystem {
         force_width: Option<Pixels>,
     ) -> Rc<LineLayout> {
         let font_runs = self.font_runs(runs.iter().map(|run| (run.len, run)), font_size, true);
-        let layout =
+        let (_, layout) =
             self.lines()
                 .layout_line(&self.platform, text, font_size, &font_runs, force_width);
         self.font_runs.set(font_runs);

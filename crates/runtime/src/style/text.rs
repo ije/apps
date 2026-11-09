@@ -3,7 +3,7 @@ use crate::dom::Document;
 use crate::style::Prop;
 use std::rc::Rc;
 
-pub(crate) fn selection_colors(style: &Style, selection: Option<&Style>) -> (Option<u32>, u32) {
+pub(crate) fn selection_colors(style: &Style, selection: Option<&Rc<Style>>) -> (Option<u32>, u32) {
     let normal = style.get(Prop::COLOR).and_then(color).unwrap_or((0, 255));
     let foreground = selection
         .and_then(|style| style.get(Prop::COLOR))
@@ -47,14 +47,14 @@ pub(crate) fn selection_colors(style: &Style, selection: Option<&Style>) -> (Opt
 #[derive(Clone)]
 pub(crate) struct InlineText {
     pub text: Rc<str>,
-    pub runs: Box<[renderer::TextRun]>,
-    pub ranges: Box<[(usize, std::ops::Range<usize>)]>,
-    pub boxes: Box<[InlineBox]>,
-    pub atoms: Box<[Atom]>,
-    pub cursors: Box<[(usize, renderer::CursorStyle)]>,
-    pub shadows: Box<[(f32, f32, f32, u32)]>,
+    pub runs: Vec<renderer::TextRun>,
+    pub ranges: Vec<(usize, std::ops::Range<usize>)>,
+    pub boxes: Vec<InlineBox>,
+    pub atoms: Vec<Atom>,
+    pub cursors: Vec<(usize, renderer::CursorStyle)>,
+    pub shadows: Vec<(f32, f32, f32, u32)>,
     pub first_line: Option<Box<(renderer::TextRun, renderer::TextRun, Option<String>)>>,
-    pub line_heights: Box<[(usize, LineHeight)]>,
+    pub line_heights: Vec<(usize, LineHeight)>,
 }
 
 #[derive(Clone, Copy)]
@@ -196,6 +196,49 @@ pub(crate) fn cursor(value: &str) -> Option<renderer::CursorStyle> {
         "none" => None,
         _ => return Option::None,
     })
+}
+
+// WARNING: by style pointer, the runs of its text, one for each units it was built with. An entry holds its style, so
+// the pointer is not reused while it lives, and a run is used only while the font names still give its family, which
+// new fonts renew.
+fn styled_run(style: &Rc<Style>, units: &Lengths, len: usize) -> renderer::TextRun {
+    type Runs = rustc_hash::FxHashMap<*const Style, (Rc<Style>, Vec<(Lengths, renderer::TextRun)>)>;
+    thread_local!(static RUNS: std::cell::RefCell<Runs> = Default::default());
+    let key = style
+        .value(Prop::FONT_FAMILY)
+        .map_or(std::ptr::null(), |value| value.as_ptr());
+    let named = FONT_NAMES.with_borrow(|names| names.1.get(&key).map(|(_, family)| family.clone()));
+    let found = named.and_then(|named| {
+        RUNS.with_borrow(|runs| {
+            runs.get(&Rc::as_ptr(style))?
+                .1
+                .iter()
+                .find(|(kept, run)| kept == units && Rc::ptr_eq(&run.font.family, &named))
+                .map(|(_, run)| run.clone())
+        })
+    });
+    let mut run = found.unwrap_or_else(|| {
+        let run = text_run(style, units, 0);
+        RUNS.with_borrow_mut(|runs| {
+            if runs.len() >= 1024 {
+                runs.retain(|_, (style, _)| Rc::strong_count(style) > 1);
+                if runs.len() >= 1024 {
+                    runs.clear();
+                }
+            }
+            let list = &mut runs
+                .entry(Rc::as_ptr(style))
+                .or_insert_with(|| (style.clone(), Vec::new()))
+                .1;
+            if list.len() == 4 {
+                list.remove(0);
+            }
+            list.push((*units, run.clone()));
+        });
+        run
+    });
+    run.len = len;
+    run
 }
 
 pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::TextRun {
@@ -353,8 +396,16 @@ pub(crate) fn holds_block_box(doc: &Document, styles: &ComputedStyles, id: usize
     if !inline(id) {
         return false;
     }
-    let mut pending: Vec<usize> = doc.nodes[id].children.clone();
-    while let Some(child) = pending.pop() {
+    // WARNING: the stack allocates only when an inline child holds more children to walk.
+    let (mut children, mut stack) = (doc.nodes[id].children.iter(), Vec::new());
+    loop {
+        let Some(&child) = children.next() else {
+            match stack.pop() {
+                Some(next) => children = next,
+                None => return false,
+            }
+            continue;
+        };
         let style = &styles.values[child];
         if doc.nodes[child].tag.starts_with('#')
             || doc.nodes[child].tag == "br"
@@ -367,13 +418,178 @@ pub(crate) fn holds_block_box(doc: &Document, styles: &ComputedStyles, id: usize
         }
         match style.get(Prop::DISPLAY) {
             Some("none") => {}
-            Some("contents") => pending.extend(&doc.nodes[child].children),
-            _ if inline(child) => pending.extend(&doc.nodes[child].children),
+            value if value == Some("contents") || inline(child) => stack.push(std::mem::replace(
+                &mut children,
+                doc.nodes[child].children.iter(),
+            )),
             Some(value) if !value.starts_with("inline") => return true,
             _ => {}
         }
     }
-    false
+}
+
+// WARNING: whether a node with `style` must be its own box in a paragraph whose box has `parent`, by their values
+// alone. Nodes that cascade alike share one style, so each pair is compared once. An entry holds both styles, so their
+// pointers are not reused while it lives, and entries whose styles only it holds go when the map fills.
+fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
+    type Pairs = rustc_hash::FxHashMap<(*const Style, *const Style), (Rc<Style>, Rc<Style>, bool)>;
+    thread_local!(static PAIRS: std::cell::RefCell<Pairs> = Default::default());
+    if Rc::ptr_eq(style, parent) {
+        return false;
+    }
+    let key = (Rc::as_ptr(style), Rc::as_ptr(parent));
+    if let Some(split) = PAIRS.with_borrow(|pairs| pairs.get(&key).map(|entry| entry.2)) {
+        return split;
+    }
+    let split = style.get(Prop::WHITE_SPACE) != parent.get(Prop::WHITE_SPACE)
+        && style.get(Prop::WHITE_SPACE) != Some("nowrap")
+        || [Prop::VISIBILITY, Prop::POINTER_EVENTS, Prop::TEXT_SHADOW]
+            .into_iter()
+            .any(|prop| style.get(prop) != parent.get(prop))
+        || style.iter().any(|(key, value)| {
+            key.is_known()
+                && parent.value(key) != Some(value)
+                && !(key == Prop::POSITION
+                    && &**value == "relative"
+                    && [
+                        Prop::TOP,
+                        Prop::RIGHT,
+                        Prop::BOTTOM,
+                        Prop::LEFT,
+                        Prop::Z_INDEX,
+                    ]
+                    .into_iter()
+                    .all(|prop| {
+                        style
+                            .get(prop)
+                            .is_none_or(|value| matches!(value, "auto" | "0" | "0px"))
+                    }))
+                && !matches!(
+                    &**value,
+                    "" | "0"
+                        | "0px"
+                        | "none"
+                        | "normal"
+                        | "auto"
+                        | "inline"
+                        | "baseline"
+                        | "static"
+                        | "visible"
+                        | "border-box"
+                        | "content-box"
+                        | "transparent"
+                        | "currentcolor"
+                        | "solid"
+                        | "0% 0%"
+                        | "repeat"
+                        | "scroll"
+                        | "padding-box"
+                        | "auto auto"
+                )
+                && !matches!(
+                    key,
+                    Prop::WHITE_SPACE
+                        | Prop::PADDING
+                        | Prop::PADDING_TOP
+                        | Prop::PADDING_RIGHT
+                        | Prop::PADDING_BOTTOM
+                        | Prop::PADDING_LEFT
+                        | Prop::MARGIN_LEFT
+                        | Prop::MARGIN_RIGHT
+                        | Prop::BORDER_TOP_WIDTH
+                        | Prop::BORDER_RIGHT_WIDTH
+                        | Prop::BORDER_BOTTOM_WIDTH
+                        | Prop::BORDER_LEFT_WIDTH
+                        | Prop::BORDER_TOP_STYLE
+                        | Prop::BORDER_RIGHT_STYLE
+                        | Prop::BORDER_BOTTOM_STYLE
+                        | Prop::BORDER_LEFT_STYLE
+                        | Prop::COLOR
+                        | Prop::FONT_FAMILY
+                        | Prop::FONT_WEIGHT
+                        | Prop::FONT_STYLE
+                        | Prop::TEXT_DECORATION_LINE
+                        | Prop::TEXT_DECORATION_COLOR
+                        | Prop::TEXT_DECORATION_STYLE
+                        | Prop::TEXT_DECORATION_THICKNESS
+                        | Prop::TEXT_UNDERLINE_OFFSET
+                        | Prop::TEXT_TRANSFORM
+                        | Prop::COLOR_SCHEME
+                        | Prop::CARET_COLOR
+                        | Prop::CURSOR
+                        | Prop::FILL
+                        | Prop::TEXT_ALIGN
+                        | Prop::BACKGROUND_COLOR
+                        | Prop::BORDER_TOP_LEFT_RADIUS
+                        | Prop::BORDER_TOP_RIGHT_RADIUS
+                        | Prop::BORDER_BOTTOM_RIGHT_RADIUS
+                        | Prop::BORDER_BOTTOM_LEFT_RADIUS
+                        | Prop::BOX_DECORATION_BREAK
+                        | Prop::USER_SELECT
+                        | Prop::WEBKIT_USER_SELECT
+                        | Prop::FONT_SIZE
+                        | Prop::BORDER_TOP_COLOR
+                        | Prop::BORDER_RIGHT_COLOR
+                        | Prop::BORDER_BOTTOM_COLOR
+                        | Prop::BORDER_LEFT_COLOR
+                        | Prop::LINE_HEIGHT
+                        | Prop::LETTER_SPACING
+                        | Prop::WORD_SPACING
+                        | Prop::TRANSITION_PROPERTY
+                        | Prop::TRANSITION_DURATION
+                        | Prop::TRANSITION_TIMING_FUNCTION
+                        | Prop::TRANSITION_DELAY
+                        | Prop::TRANSITION_BEHAVIOR
+                        | Prop::WILL_CHANGE
+                        | Prop::FONT_FEATURE_SETTINGS
+                        | Prop::FONT_VARIATION_SETTINGS
+                        | Prop::WEBKIT_FONT_SMOOTHING
+                        | Prop::MOZ_OSX_FONT_SMOOTHING
+                        | Prop::OUTLINE_COLOR
+                        | Prop::OUTLINE_STYLE
+                        | Prop::OUTLINE_WIDTH
+                        | Prop::OUTLINE_OFFSET
+                        | Prop::WIDTH
+                        | Prop::HEIGHT
+                        | Prop::MIN_WIDTH
+                        | Prop::MIN_HEIGHT
+                        | Prop::MAX_WIDTH
+                        | Prop::MAX_HEIGHT
+                        | Prop::ASPECT_RATIO
+                        | Prop::MARGIN_TOP
+                        | Prop::MARGIN_BOTTOM
+                        | Prop::JUSTIFY_SELF
+                        | Prop::ALIGN_SELF
+                        | Prop::FLEX_GROW
+                        | Prop::FLEX_SHRINK
+                        | Prop::FLEX_BASIS
+                        | Prop::ORDER
+                        | Prop::GRID_ROW_START
+                        | Prop::GRID_ROW_END
+                        | Prop::GRID_COLUMN_START
+                        | Prop::GRID_COLUMN_END
+                        | Prop::JUSTIFY_ITEMS
+                        | Prop::ALIGN_ITEMS
+                        | Prop::JUSTIFY_CONTENT
+                        | Prop::ALIGN_CONTENT
+                        | Prop::FLEX_DIRECTION
+                        | Prop::FLEX_WRAP
+                        | Prop::ROW_GAP
+                        | Prop::COLUMN_GAP
+                )
+        });
+    PAIRS.with_borrow_mut(|pairs| {
+        if pairs.len() >= 1024 {
+            pairs.retain(|_, (style, parent, _)| {
+                Rc::strong_count(style) > 1 && Rc::strong_count(parent) > 1
+            });
+            if pairs.len() >= 1024 {
+                pairs.clear();
+            }
+        }
+        pairs.insert(key, (style.clone(), parent.clone(), split));
+    });
+    split
 }
 
 pub(crate) fn inline_text(
@@ -420,7 +636,8 @@ pub(crate) fn inline_text(
             .find(|&&sibling| !makes_no_line(doc, styles, sibling))
     }));
     let mut text = String::new();
-    let mut runs: Vec<renderer::TextRun> = Vec::new();
+    // WARNING: two runs fit a small block of the runtime's allocator, four don't.
+    let mut runs: Vec<renderer::TextRun> = Vec::with_capacity(2);
     let mut line_heights = Vec::new();
     let mut ranges = Vec::new();
     let mut boxes: Vec<InlineBox> = Vec::new();
@@ -582,143 +799,7 @@ pub(crate) fn inline_text(
                 ))
             || styles.pseudos.contains_key(&child)
             || styles.animations.contains_key(&child)
-            || style.get(Prop::WHITE_SPACE) != parent.get(Prop::WHITE_SPACE)
-                && style.get(Prop::WHITE_SPACE) != Some("nowrap")
-            || [Prop::VISIBILITY, Prop::POINTER_EVENTS, Prop::TEXT_SHADOW]
-                .into_iter()
-                .any(|prop| style.get(prop) != parent.get(prop))
-            || style.iter().any(|(key, value)| {
-                key.is_known()
-                    && parent.value(key) != Some(value)
-                    && !(key == Prop::POSITION
-                        && &**value == "relative"
-                        && [
-                            Prop::TOP,
-                            Prop::RIGHT,
-                            Prop::BOTTOM,
-                            Prop::LEFT,
-                            Prop::Z_INDEX,
-                        ]
-                        .into_iter()
-                        .all(|prop| {
-                            style
-                                .get(prop)
-                                .is_none_or(|value| matches!(value, "auto" | "0" | "0px"))
-                        }))
-                    && !matches!(
-                        &**value,
-                        "" | "0"
-                            | "0px"
-                            | "none"
-                            | "normal"
-                            | "auto"
-                            | "inline"
-                            | "baseline"
-                            | "static"
-                            | "visible"
-                            | "border-box"
-                            | "content-box"
-                            | "transparent"
-                            | "currentcolor"
-                            | "solid"
-                            | "0% 0%"
-                            | "repeat"
-                            | "scroll"
-                            | "padding-box"
-                            | "auto auto"
-                    )
-                    && !matches!(
-                        key,
-                        Prop::WHITE_SPACE
-                            | Prop::PADDING
-                            | Prop::PADDING_TOP
-                            | Prop::PADDING_RIGHT
-                            | Prop::PADDING_BOTTOM
-                            | Prop::PADDING_LEFT
-                            | Prop::MARGIN_LEFT
-                            | Prop::MARGIN_RIGHT
-                            | Prop::BORDER_TOP_WIDTH
-                            | Prop::BORDER_RIGHT_WIDTH
-                            | Prop::BORDER_BOTTOM_WIDTH
-                            | Prop::BORDER_LEFT_WIDTH
-                            | Prop::BORDER_TOP_STYLE
-                            | Prop::BORDER_RIGHT_STYLE
-                            | Prop::BORDER_BOTTOM_STYLE
-                            | Prop::BORDER_LEFT_STYLE
-                            | Prop::COLOR
-                            | Prop::FONT_FAMILY
-                            | Prop::FONT_WEIGHT
-                            | Prop::FONT_STYLE
-                            | Prop::TEXT_DECORATION_LINE
-                            | Prop::TEXT_DECORATION_COLOR
-                            | Prop::TEXT_DECORATION_STYLE
-                            | Prop::TEXT_DECORATION_THICKNESS
-                            | Prop::TEXT_UNDERLINE_OFFSET
-                            | Prop::TEXT_TRANSFORM
-                            | Prop::COLOR_SCHEME
-                            | Prop::CARET_COLOR
-                            | Prop::CURSOR
-                            | Prop::FILL
-                            | Prop::TEXT_ALIGN
-                            | Prop::BACKGROUND_COLOR
-                            | Prop::BORDER_TOP_LEFT_RADIUS
-                            | Prop::BORDER_TOP_RIGHT_RADIUS
-                            | Prop::BORDER_BOTTOM_RIGHT_RADIUS
-                            | Prop::BORDER_BOTTOM_LEFT_RADIUS
-                            | Prop::BOX_DECORATION_BREAK
-                            | Prop::USER_SELECT
-                            | Prop::WEBKIT_USER_SELECT
-                            | Prop::FONT_SIZE
-                            | Prop::BORDER_TOP_COLOR
-                            | Prop::BORDER_RIGHT_COLOR
-                            | Prop::BORDER_BOTTOM_COLOR
-                            | Prop::BORDER_LEFT_COLOR
-                            | Prop::LINE_HEIGHT
-                            | Prop::LETTER_SPACING
-                            | Prop::WORD_SPACING
-                            | Prop::TRANSITION_PROPERTY
-                            | Prop::TRANSITION_DURATION
-                            | Prop::TRANSITION_TIMING_FUNCTION
-                            | Prop::TRANSITION_DELAY
-                            | Prop::TRANSITION_BEHAVIOR
-                            | Prop::WILL_CHANGE
-                            | Prop::FONT_FEATURE_SETTINGS
-                            | Prop::FONT_VARIATION_SETTINGS
-                            | Prop::WEBKIT_FONT_SMOOTHING
-                            | Prop::MOZ_OSX_FONT_SMOOTHING
-                            | Prop::OUTLINE_COLOR
-                            | Prop::OUTLINE_STYLE
-                            | Prop::OUTLINE_WIDTH
-                            | Prop::OUTLINE_OFFSET
-                            | Prop::WIDTH
-                            | Prop::HEIGHT
-                            | Prop::MIN_WIDTH
-                            | Prop::MIN_HEIGHT
-                            | Prop::MAX_WIDTH
-                            | Prop::MAX_HEIGHT
-                            | Prop::ASPECT_RATIO
-                            | Prop::MARGIN_TOP
-                            | Prop::MARGIN_BOTTOM
-                            | Prop::JUSTIFY_SELF
-                            | Prop::ALIGN_SELF
-                            | Prop::FLEX_GROW
-                            | Prop::FLEX_SHRINK
-                            | Prop::FLEX_BASIS
-                            | Prop::ORDER
-                            | Prop::GRID_ROW_START
-                            | Prop::GRID_ROW_END
-                            | Prop::GRID_COLUMN_START
-                            | Prop::GRID_COLUMN_END
-                            | Prop::JUSTIFY_ITEMS
-                            | Prop::ALIGN_ITEMS
-                            | Prop::JUSTIFY_CONTENT
-                            | Prop::ALIGN_CONTENT
-                            | Prop::FLEX_DIRECTION
-                            | Prop::FLEX_WRAP
-                            | Prop::ROW_GAP
-                            | Prop::COLUMN_GAP
-                    )
-            })
+            || splits(style, parent)
         {
             return None;
         }
@@ -794,6 +875,7 @@ pub(crate) fn inline_text(
             let preserve = matches!(mode, "pre" | "pre-wrap" | "break-spaces");
             let transform = style.get(Prop::TEXT_TRANSFORM);
             let mut word = true;
+            text.reserve(node.text.len());
             for c in node.text.chars() {
                 if c.is_ascii_whitespace() && !preserve && !(c == '\n' && mode == "pre-line") {
                     if !space {
@@ -824,7 +906,7 @@ pub(crate) fn inline_text(
                 word = !c.is_alphanumeric();
             }
             if text.len() > start {
-                let mut run = text_run(style, &styles.lengths[child], text.len() - start);
+                let mut run = styled_run(style, &styles.lengths[child], text.len() - start);
                 let size = styles.lengths[child].font.em;
                 if (size - styles.lengths[id].font.em).abs() > 0.01 {
                     run.font_size = Some(renderer::px(size));
@@ -946,13 +1028,13 @@ pub(crate) fn inline_text(
     }
     Some(InlineText {
         text: text.into(),
-        runs: runs.into(),
-        ranges: ranges.into(),
-        boxes: boxes.into(),
-        atoms: atoms.into(),
-        cursors: cursors.into(),
-        shadows: shadows.into(),
-        line_heights: line_heights.into(),
+        runs,
+        ranges,
+        boxes,
+        atoms,
+        cursors,
+        shadows,
+        line_heights,
         first_line: pseudos.and_then(|pseudos| pseudos[2].as_ref()).map(|line| {
             Box::new((
                 text_run(parent, &styles.lengths[id], 0),
@@ -975,12 +1057,14 @@ pub(crate) fn word_break(style: &Style) -> renderer::WordBreak {
 }
 
 pub(crate) fn font(style: &Style) -> renderer::Font {
-    let families = style.get(Prop::FONT_FAMILY).unwrap_or("system-ui");
+    let value = style.value(Prop::FONT_FAMILY);
+    let key = value.map_or(std::ptr::null(), |value| value.as_ptr());
     let family = FONT_NAMES.with(|names| {
         let mut names = names.borrow_mut();
-        if let Some(family) = names.1.get(families) {
+        if let Some((_, family)) = names.1.get(&key) {
             return family.clone();
         }
+        let families = value.map_or("system-ui", |value| &**value);
         let family: renderer::SharedString = components(families, ',')
             .into_iter()
             .find_map(|family| {
@@ -1031,7 +1115,10 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
             .unwrap_or_else(|| ".SystemUIFont".into())
             .into();
         if !names.0.is_empty() {
-            names.1.insert(families.to_owned(), family.clone());
+            if names.1.len() > 4096 {
+                names.1.clear();
+            }
+            names.1.insert(key, (value.cloned(), family.clone()));
         }
         family
     });

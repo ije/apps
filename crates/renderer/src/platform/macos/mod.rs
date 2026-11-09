@@ -583,7 +583,8 @@ pub(crate) fn native_after(delay: Duration, f: impl FnOnce() + 'static) {
             fire,
             &mut context,
         );
-        CFRunLoopTimerSetTolerance(timer, 0.001);
+        // WARNING: a tenth of the delay, at most 1 ms, so a due task doesn't wait for timer coalescing.
+        CFRunLoopTimerSetTolerance(timer, (delay.as_secs_f64() / 10.).min(0.001));
         CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
         CFRelease(timer as _);
     }
@@ -620,6 +621,7 @@ extern "C-unwind" fn did_finish_launching(_: &AnyObject, _: Sel, _: *mut AnyObje
     // WARNING: the policy is set here and not before the run loop, or the menu bar of an
     // unbundled app started from a terminal can't be clicked.
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    window::measure_screens();
     if let Some(launch) = LAUNCH.with_borrow_mut(Option::take) {
         launch();
     }

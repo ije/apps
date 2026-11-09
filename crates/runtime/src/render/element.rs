@@ -53,7 +53,7 @@ pub(super) struct Build<'a> {
 // gives what it gave then. A build reads other boxes, the host and the frame only through `Build::log`, or the box is
 // never kept, see `element`. The queries up to `Shrunk` replay at the box whose record holds them, the rest name
 // what they read.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum Query {
     Margins,
     Parent(Prop),
@@ -67,6 +67,7 @@ pub(super) enum Query {
     Backdrop,
     Scroller,
     Editable,
+    Cell,
     Shrunk,
     Uses(u32),
     Block(u32),
@@ -78,12 +79,33 @@ pub(super) enum Query {
     Image(u32),
     Look(u32),
     Boxless(u32),
+    RowFill,
+    Collapse,
     Value(u32),
     Viewport,
     Theme,
 }
 
 impl Query {
+    // WARNING: shared styles keep the reads of their box with its node as `from`, so they name no other node.
+    fn moved(self, from: u32, to: u32) -> Option<Self> {
+        let at = |node: u32| (node == from).then_some(to);
+        Some(match self {
+            Query::Uses(node) => Query::Uses(at(node)?),
+            Query::Block(node) => Query::Block(at(node)?),
+            Query::Scroll(node) => Query::Scroll(at(node)?),
+            Query::Width(node) => Query::Width(at(node)?),
+            Query::Track(node, axis) => Query::Track(at(node)?, axis),
+            Query::Baselines(node) => Query::Baselines(at(node)?),
+            Query::Atom(node) => Query::Atom(at(node)?),
+            Query::Image(node) => Query::Image(at(node)?),
+            Query::Look(node) => Query::Look(at(node)?),
+            Query::Boxless(node) => Query::Boxless(at(node)?),
+            Query::Value(node) => Query::Value(at(node)?),
+            query => query,
+        })
+    }
+
     // WARNING: the last layout, scroll handles and the system theme change without a new node or style, so these are
     // checked in every frame, the others only in a new epoch.
     fn host(self) -> bool {
@@ -99,6 +121,7 @@ impl Query {
                 | Query::Image(_)
                 | Query::Viewport
                 | Query::Theme
+                | Query::Cell
         )
     }
 }
@@ -126,9 +149,19 @@ pub(super) struct Patch {
     pub(super) value: u64,
 }
 
+// WARNING: a box style that boxes with the same key and own reads share, see `create`. Its reads are kept like
+// those of a record, with `scope` counted up from the box.
+pub(super) struct Shared {
+    plan: Rc<super::plan::Plan>,
+    reads: Box<[Read]>,
+    style: Rc<renderer::Style>,
+}
+
 pub(super) struct Kept {
     pub(super) call: Call,
     pub(super) reads: Box<[Read]>,
+    // WARNING: the boxes the box was built in, so it can build again in place, see `repaint`.
+    ancestors: Rc<[usize]>,
     epoch: std::cell::Cell<u64>,
     pub(super) culled: bool,
     #[cfg(debug_assertions)]
@@ -138,13 +171,21 @@ pub(super) struct Kept {
     plan: Rc<[usize]>,
 }
 
+impl Kept {
+    // WARNING: a box can build again in place from its record unless it culled or sits in a grid or table cell, whose
+    // call the record doesn't hold.
+    pub(super) fn in_place(&self) -> Option<&Rc<[usize]>> {
+        (!self.culled && self.call.cell.is_none()).then_some(&self.ancestors)
+    }
+}
+
 #[derive(PartialEq)]
 pub(super) struct Call {
     subtree: u64,
     containing: [f32; 2],
     container: [f32; 2],
     flex_parent: bool,
-    cell: Option<([f32; 2], bool, bool, u64)>,
+    cell: Option<(bool, bool, u64)>,
 }
 
 #[derive(PartialEq)]
@@ -168,6 +209,29 @@ fn parent_style<'b>(
     doc.nodes[id]
         .parent
         .and_then(|parent| styles.values[parent].get(prop))
+}
+
+// WARNING: a table cell without a background of its own shows the first one of its rows and row groups.
+fn row_fill(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<(u32, u8)> {
+    std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent)
+        .take_while(|&row| {
+            matches!(
+                doc.nodes[row].tag.as_str(),
+                "tr" | "thead" | "tbody" | "tfoot"
+            )
+        })
+        .find_map(|row| {
+            styles.values[row]
+                .get(Prop::BACKGROUND_COLOR)
+                .and_then(style::color)
+                .filter(|(_, alpha)| *alpha > 0)
+        })
+}
+
+fn collapses(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
+    std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent)
+        .find(|&parent| doc.nodes[parent].tag == "table")
+        .is_some_and(|table| styles.values[table].get(Prop::BORDER_COLLAPSE) == Some("collapse"))
 }
 
 fn parent_font(
@@ -450,7 +514,7 @@ impl<'a> Build<'a> {
         id: usize,
         [width, _]: [f32; 2],
         container: [f32; 2],
-        slot: bool,
+        cell: Option<[f32; 2]>,
         dom: Option<&crate::dom::State>,
         read: &Read,
     ) -> Replay {
@@ -460,7 +524,10 @@ impl<'a> Build<'a> {
             Query::Margins => {
                 let mut units = styles.lengths[id];
                 units.container = Some(container);
-                hashed(margins(self, id, &units, width, self.flex_parent, slot).map(f32::to_bits))
+                hashed(
+                    margins(self, id, &units, width, self.flex_parent, cell.is_some())
+                        .map(f32::to_bits),
+                )
             }
             Query::Parent(prop) => hashed(parent_style(doc, styles, id, prop)),
             Query::ParentFont => hashed(parent_font(doc, styles, id)),
@@ -506,6 +573,7 @@ impl<'a> Build<'a> {
                 ))
             }
             Query::Editable => hashed(content_editable(doc, id).is_some()),
+            Query::Cell => hashed(cell.map(|size| size.map(f32::to_bits))),
             Query::Shrunk => hashed(shrinks(doc, styles, id, !below).0),
             Query::Uses(svg) => hashed(uses(doc, styles, self.ids, svg as usize)),
             Query::Block(block) => hashed(
@@ -546,6 +614,8 @@ impl<'a> Build<'a> {
             }
             Query::Look(node) => hashed(doc.nodes[node as usize].state & LOOK),
             Query::Boxless(node) => hashed(boxless(doc, node as usize).map(|select| select.1)),
+            Query::RowFill => hashed(row_fill(doc, styles, id)),
+            Query::Collapse => hashed(collapses(doc, styles, id)),
             Query::Value(node) => hashed(&doc.nodes[node as usize].value),
             Query::Viewport => hashed(styles.lengths[id].viewport.map(f32::to_bits)),
             Query::Theme => hashed(crate::desktop::native::theme_state() & 1),
@@ -909,24 +979,30 @@ pub(super) fn element(
         },
         container,
         flex_parent: build.flex_parent,
-        cell: slot.as_ref().map(|(bounds, grid)| {
+        cell: slot.as_ref().map(|(_, grid)| {
             use std::hash::{Hash, Hasher};
             let mut tracks = rustc_hash::FxHasher::default();
             for value in grid.columns.iter().chain(&grid.rows).chain(&grid.gap) {
                 value.to_bits().hash(&mut tracks);
             }
-            (
-                [bounds[2], bounds[3]],
-                grid.baseline,
-                grid.first_item.is_some(),
-                tracks.finish(),
-            )
+            (grid.baseline, grid.first_item.is_some(), tracks.finish())
         }),
     };
     // WARNING: `Some` when the box's record still holds, with `true` when a read held only within prepaint's
     // tolerance. The record goes into the log, so the boxes around a kept box keep its reads too.
+    // WARNING: a box whose style changed only in paint builds again, also inside a box built again around it. Debug
+    // checks build it too, but leave it to the build that the renderer takes.
+    #[cfg(debug_assertions)]
+    let repainted = if build.checking {
+        build.view.repaint.borrow().contains(&id)
+    } else {
+        build.view.repaint.borrow_mut().remove(&id)
+    };
+    #[cfg(not(debug_assertions))]
+    let repainted = build.view.repaint.borrow_mut().remove(&id);
     let keep = 'keep: {
         if !storable
+            || repainted
             || build.resized && info.flags & cull::READS_VIEWPORT != 0
             || !build.settled && info.flags & cull::READS_LAST_FRAME != 0
             || !build.tree.contains(id)
@@ -937,7 +1013,7 @@ pub(super) fn element(
         let Some(record) = kept.get(&id) else {
             break 'keep None;
         };
-        let slotted = slot.is_some();
+        let cell = slot.as_ref().map(|(bounds, _)| [bounds[2], bounds[3]]);
         // WARNING: a kept subtree culls only what its build culled. One that culled keeps its spacers, which build
         // it again when they come near the visible range. Others are kept only while no box below them that a parent
         // could cull lies wholly outside the culling margin, also inside scroll boxes and in subtrees built without
@@ -960,7 +1036,7 @@ pub(super) fn element(
             let dom = host.dom.get(&build.view.id);
             record.reads.iter().all(|read| {
                 fresh && !read.query.host()
-                    || match build.replay(id, containing, container, slotted, dom, read) {
+                    || match build.replay(id, containing, container, cell, dom, read) {
                         Replay::Same => true,
                         Replay::Close => {
                             close = true;
@@ -984,7 +1060,7 @@ pub(super) fn element(
                         .reads
                         .iter()
                         .filter(
-                            |read| build.replay(id, containing, container, slotted, dom, read)
+                            |read| build.replay(id, containing, container, cell, dom, read)
                                 == Replay::Changed
                         )
                         .map(|read| read.query)
@@ -1019,13 +1095,23 @@ pub(super) fn element(
         Some(close)
     };
     if let Some(_close) = keep {
+        // WARNING: the record of a box with boxes below it that build in place holds their old paint, which the debug
+        // build after them renews, see `same_in_place`.
         #[cfg(debug_assertions)]
-        if !_close {
+        if !_close && !build.view.around.borrow().contains(&id) {
             check(build, id, containing, container, slot, mark, printed);
         }
         return Child::Kept(id.into());
     }
     let culls = build.culls.get();
+    // WARNING: a box that builds holds the ones below it that build in place, or culls them, see `render_page`.
+    #[cfg(debug_assertions)]
+    let checking = build.checking;
+    #[cfg(not(debug_assertions))]
+    let checking = false;
+    if !checking && !build.view.repaint.borrow().is_empty() {
+        build.view.built.borrow_mut().insert(id);
+    }
     let patch = text_field(&build.doc.nodes[id]).then(|| Patch {
         ancestors: build.ancestors.clone(),
         containing,
@@ -1083,10 +1169,6 @@ pub(super) fn element(
     };
     #[cfg(debug_assertions)]
     let print = print(build, printed, &mut child);
-    #[cfg(debug_assertions)]
-    let checking = build.checking;
-    #[cfg(not(debug_assertions))]
-    let checking = false;
     if let Some(patch) = patch.filter(|_| !checking) {
         build.view.patches.borrow_mut().insert(id, patch);
     }
@@ -1099,6 +1181,7 @@ pub(super) fn element(
                     Kept {
                         call,
                         reads,
+                        ancestors: build.ancestors.clone(),
                         epoch: build.epoch.into(),
                         culled: build.culls.get() != culls,
                         #[cfg(debug_assertions)]
@@ -1114,6 +1197,95 @@ pub(super) fn element(
         }
     }
     child
+}
+
+// WARNING: a box whose style changed only in paint keeps its revision, so the boxes around it stay kept, and it
+// builds again from its record's call in place, see `render_page`. Its reads must stay those its record holds, which
+// the records around it hold too, or those records go, so the boxes around build again next time.
+pub(super) fn repaint(build: &Build<'_>, id: usize) -> Option<renderer::Node> {
+    let old = build.view.kept.borrow_mut().remove(&id)?;
+    let (ancestors, containing, container, flex_parent) = (
+        old.ancestors.clone(),
+        old.call.containing,
+        old.call.container,
+        old.call.flex_parent,
+    );
+    let mark = build.reads.borrow().len();
+    let place = Build {
+        ancestors: ancestors.clone(),
+        flex_parent,
+        perspective: None,
+        zone: None,
+        #[cfg(debug_assertions)]
+        extra: Default::default(),
+        #[cfg(debug_assertions)]
+        plan: Default::default(),
+        ..*build
+    };
+    #[cfg(debug_assertions)]
+    let printed = place.prints.borrow().len();
+    let child = element(&place, id, containing, container, None);
+    #[cfg(debug_assertions)]
+    place.prints.borrow_mut().truncate(printed);
+    build.reads.borrow_mut().truncate(mark);
+    let mut kept = build.view.kept.borrow_mut();
+    if kept.get(&id).is_none_or(|record| record.reads != old.reads) {
+        for ancestor in ancestors.iter() {
+            kept.remove(ancestor);
+        }
+    }
+    match child {
+        Child::Node(node) => Some(*node),
+        Child::Kept(_) | Child::Placed(..) => None,
+    }
+}
+
+// WARNING: debug builds build the page again without records after boxes built in place, and each such box must
+// build the same as there, and its kept children must be what their slots hold.
+#[cfg(debug_assertions)]
+pub(super) fn same_in_place(fresh: &Child, placed: &[renderer::Node], tree: &renderer::Tree) {
+    fn find(child: &Child, id: renderer::ElementId) -> Option<&renderer::Node> {
+        let Child::Node(node) = child else {
+            return None;
+        };
+        if node.element_id() == Some(id) {
+            return Some(node);
+        }
+        node.kids().iter().find_map(|kid| find(kid, id))
+    }
+    fn same(fresh: &renderer::Node, placed: &renderer::Node, tree: &renderer::Tree) {
+        let id = fresh.element_id();
+        assert!(
+            fresh.style_ref() == placed.style_ref(),
+            "box {id:?} built in place has another style than a full build gives"
+        );
+        assert!(
+            fresh.text_content() == placed.text_content(),
+            "box {id:?} built in place has other text than a full build gives"
+        );
+        assert_eq!(
+            fresh.kids().len(),
+            placed.kids().len(),
+            "box {id:?} built in place has other children than a full build gives"
+        );
+        for (fresh, placed) in fresh.kids().iter().zip(placed.kids()) {
+            match (fresh, placed) {
+                (Child::Node(fresh), Child::Node(placed)) => same(fresh, placed, tree),
+                (Child::Node(fresh), Child::Kept(kept) | Child::Placed(kept, _)) => assert!(
+                    tree.style_of(*kept) == Some(fresh.style_ref()),
+                    "box {kept:?} kept in a box built in place has another style than a full build gives"
+                ),
+                _ => {}
+            }
+        }
+    }
+    for node in placed {
+        if let Some(id) = node.element_id()
+            && let Some(fresh) = find(fresh, id)
+        {
+            same(fresh, node, tree);
+        }
+    }
 }
 
 // WARNING: with `APPS_TRACE_BUILDS` set, debug builds print the `id` attribute of each box they build, so tests see
@@ -1210,7 +1382,7 @@ fn print(build: &Build<'_>, from: usize, child: &mut Child) -> u64 {
     }
     let mut hasher = Hashed(Default::default());
     if let Child::Node(node) = child {
-        let _ = std::fmt::Write::write_fmt(&mut hasher, format_args!("{:?}", node.style()));
+        let _ = std::fmt::Write::write_fmt(&mut hasher, format_args!("{:?}", node.style_ref()));
     }
     hasher.0.write_u64(build.extra.take());
     let mut prints = build.prints.borrow_mut();
@@ -1238,6 +1410,7 @@ impl std::fmt::Debug for Query {
             Query::Backdrop => write!(f, "Backdrop"),
             Query::Scroller => write!(f, "Scroller"),
             Query::Editable => write!(f, "Editable"),
+            Query::Cell => write!(f, "Cell"),
             Query::Shrunk => write!(f, "Shrunk"),
             Query::Uses(node) => write!(f, "Uses({node})"),
             Query::Block(node) => write!(f, "Block({node})"),
@@ -1249,6 +1422,8 @@ impl std::fmt::Debug for Query {
             Query::Image(node) => write!(f, "Image({node})"),
             Query::Look(node) => write!(f, "Look({node})"),
             Query::Boxless(node) => write!(f, "Boxless({node})"),
+            Query::RowFill => write!(f, "RowFill"),
+            Query::Collapse => write!(f, "Collapse"),
             Query::Value(node) => write!(f, "Value({node})"),
             Query::Viewport => write!(f, "Viewport"),
             Query::Theme => write!(f, "Theme"),
@@ -1290,6 +1465,7 @@ fn create(
         ..
     } = *build;
     let depth = ancestors.len();
+    let mark = reads.borrow().len();
     let node = &doc.nodes[id];
     let symbol = node.sf_symbol();
     let style = &styles.values[id];
@@ -1317,9 +1493,10 @@ fn create(
     } else {
         display
     };
-    let order = style
-        .get(Prop::Z_INDEX)
-        .and_then(|value| value.parse::<i32>().ok());
+    let mut units = styles.lengths[id];
+    units.container = Some(container);
+    let parsed = view.plans.borrow_mut().get(style, &units, pixel_ratio);
+    let order = parsed.order;
     let positioned = style
         .get(Prop::POSITION)
         .is_some_and(|value| value != "static");
@@ -1333,7 +1510,7 @@ fn create(
     // WARNING: a box whose opacity animates keeps one stacking context and effect layer at every
     // value, so animation frames only patch the layer's opacity.
     let composited = info[id].flags & cull::COMPOSITED != 0;
-    let made = super::effects::establishes(style);
+    let made = parsed.made;
     // WARNING: the renderer paints a z-indexed box in its nearest stacking ancestor, so every box that paints
     // through a layer must be one, or such boxes escape its transform, opacity or clip.
     let stacking = id == 0 || composited || made.stacking || layered;
@@ -1404,8 +1581,6 @@ fn create(
             }),
     };
     let build = &child_build;
-    let mut units = styles.lengths[id];
-    units.container = Some(container);
     let position = style.get(Prop::POSITION).unwrap_or("static");
     let parent = box_parent(doc, styles, id);
     let positioner = positioner(position, ancestors.iter().rev().copied(), |ancestor| {
@@ -1456,22 +1631,21 @@ fn create(
     if chain.len() > 256 || style.get(Prop::DISPLAY).is_some_and(|s| s == "none") {
         return renderer::node().hidden().into();
     }
-    let opacity = super::effects::opacity(style);
+    let opacity = parsed.opacity;
     // WARNING: a box at opacity 0 draws nothing, so it takes the element opacity, which skips its primitives, and
     // not a layer: hidden truncation copies in a file tree cost two render passes each. It still lays out and takes
     // events.
     let effect_layer = (made.layer || opacity > 0. && opacity < 1. && !node.children.is_empty() || composited)
         .then_some(opacity);
-    let selection_colors = style::selection_colors(style, styles.selections.get(&id));
-    let face = style::font(style);
-    let line_height = match style::line_height(style) {
-        style::LineHeight::Fixed(_) => (units.font.lh * pixel_ratio * 64.).round(),
-        _ => (units.font.lh * pixel_ratio * 64.).floor(),
-    } / 64.
-        / pixel_ratio;
+    let selection_colors = match styles.selections.get(&id) {
+        Some(selection) => style::selection_colors(style, Some(selection)),
+        None => parsed.selection,
+    };
+    let face = &parsed.face;
+    let line_height = parsed.line_height;
     let above = || {
         f32::from(text.baseline(
-            text.resolve_font(&style::font(style)),
+            text.resolve_font(face),
             px(units.font.em),
             px(line_height),
             pixel_ratio,
@@ -1487,8 +1661,8 @@ fn create(
             .baseline(renderer::Baseline::Bottom)
     };
     let align_of = |element: &mut renderer::Child| match element {
-        renderer::Child::Node(node) => node.style().align_self,
-        renderer::Child::Kept(id) => build.tree.align_self(*id),
+        renderer::Child::Node(node) => node.style_ref().align_self,
+        renderer::Child::Kept(id) | renderer::Child::Placed(id, _) => build.tree.align_self(*id),
     };
     // WARNING: taffy moves an item that doesn't fit its line to a new line when any item is before it, even the
     // zero-width strut, so the strut and the first item are one item, aligned like the item. Like browsers, a first
@@ -1509,42 +1683,6 @@ fn create(
     };
     let mut strut_due = false;
     let mut strut_next = false;
-    let mut el = renderer::node()
-        .id(id)
-        .flex()
-        .flex_col()
-        .text_size(px(units.font.em))
-        .font_family(face.family)
-        .font_weight(face.weight)
-        .line_height(px(line_height));
-    el.style().flex_shrink = if flex_parent { 1. } else { 0. };
-    el.style().baseline = match display {
-        "inline-block" if !flex_parent && slot.is_none() => renderer::Baseline::Last,
-        "flex" | "inline-flex" | "grid" | "inline-grid" => renderer::Baseline::First,
-        "table" | "inline-table" => renderer::Baseline::FirstOnly,
-        _ => renderer::Baseline::Auto,
-    };
-    {
-        let text = el.text_style();
-        text.letter_spacing = Some(style::spacing(style, &units, Prop::LETTER_SPACING));
-        text.word_spacing = Some(style::spacing(style, &units, Prop::WORD_SPACING));
-        text.font_smoothing = Some(
-            ![Prop::WEBKIT_FONT_SMOOTHING, Prop::MOZ_OSX_FONT_SMOOTHING]
-                .into_iter()
-                .any(|name| {
-                    style
-                        .get(name)
-                        .is_some_and(|v| v == "antialiased" || v == "grayscale")
-                }),
-        );
-        text.text_indent = Some(px(style
-            .get(Prop::TEXT_INDENT)
-            .and_then(|value| units.resolve(value, containing[0]))
-            .unwrap_or(0.)));
-    }
-    if face.style != renderer::FontStyle::Normal {
-        el.text_style().font_style = Some(face.style);
-    }
     if node.tag == "br" {
         let empty = starts_line(doc, id);
         reader.log(Query::Break, depth, hashed(empty));
@@ -1597,9 +1735,6 @@ fn create(
         .baseline(renderer::Baseline::Bottom);
         br = if empty { br.w_full() } else { br.w(px(0.)) };
         return br.into();
-    }
-    if stacking {
-        el = el.stacking().child(renderer::layers(true));
     }
     let flow = !matches!(display, "flex" | "inline-flex" | "grid" | "inline-grid");
     let mut flat = Vec::new();
@@ -1663,11 +1798,134 @@ fn create(
         _ => None,
     };
     let line_align = Some(renderer::AlignItems::Baseline);
+    // WARNING: like browsers, a canvas takes its natural size and ratio from its attributes, whatever it shows.
+    // An auto height comes from the in-flow picture, which keeps that ratio in the content box, also in a flex
+    // row, where taffy drops the box's own ratio for a percentage width. The drawing covers that picture, so it
+    // stays in the content box too. Pictures paint from the node, so a drawing or a frame changes no box.
+    let (mut natural, mut natural_ratio) = match node.tag.as_str() {
+        "img" | "video" => (None, None),
+        _ => natural_size(doc, id, None).map_or((None, None), |(size, ratio)| (Some(size), ratio)),
+    };
+    #[cfg(debug_assertions)]
+    let checking = reader.checking;
+    #[cfg(not(debug_assertions))]
+    let checking = false;
+    // WARNING: boxes of common tags with a shareable plan build their style only from the plan, the call, their own
+    // reads and the facts of their children in `share`, never from what their children built. So a box whose key finds
+    // a style whose reads still give the same takes it and skips the code that builds it, all of which tests `hit`.
+    // Code that sets their style from anything else must add it to the key. Debug builds build each such box again
+    // through that code, and check the style and the reads.
+    let share = (parsed.shareable
+        && !checking
+        && slot.is_none()
+        && parent_perspective.is_none()
+        && natural.is_none()
+        && id != 0
+        && !broken
+        && symbol.is_none()
+        && node.native_control().is_none()
+        && !styles.pseudos.contains_key(&id)
+        && !top_layer.contains(&id)
+        && matches!(
+            node.tag.as_str(),
+            "div" | "span" | "a" | "p" | "section" | "article" | "header" | "footer" | "nav" | "main"
+                | "aside" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "b" | "i" | "strong" | "em"
+                | "small" | "label" | "ul" | "ol" | "li" | "code" | "form"
+        ))
+    .then(|| {
+        use std::hash::{Hash, Hasher};
+        let texted = measured
+            .borrow_mut()
+            .texts
+            .entry(id)
+            .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
+            .as_ref()
+            .map(|data| data.text.is_empty());
+        let mut hasher = rustc_hash::FxHasher::default();
+        (
+            Rc::as_ptr(&parsed),
+            containing.map(f32::to_bits),
+            container.map(f32::to_bits),
+            block_size.is_some(),
+            flex_parent,
+            info[id].flags & !(cull::CHANGED | cull::CHILDREN_CHANGED | cull::GEOMETRY_CHANGED),
+            (all_inline, node.children.is_empty(), texted),
+        )
+            .hash(&mut hasher);
+        hasher.finish()
+    });
+    let hit = share.and_then(|key| {
+        let shared = view.shared.borrow();
+        let host = view.host.borrow();
+        let dom = host.dom.get(&view.id);
+        let here = |read: &Read| Read {
+            query: read.query.moved(u32::MAX, id as u32).unwrap_or(read.query),
+            ..*read
+        };
+        let found = shared.get(&key)?.iter().rev().find(|entry| {
+            Rc::ptr_eq(&entry.plan, &parsed)
+                && entry.reads.iter().all(|read| {
+                    reader.replay(id, containing, container, None, dom, &here(read)) == Replay::Same
+                })
+        })?;
+        reads.borrow_mut().extend(found.reads.iter().map(|read| Read {
+            scope: if read.scope == 0 {
+                0
+            } else {
+                (depth + 1).saturating_sub(usize::from(read.scope)).max(1) as u16
+            },
+            reader: depth as u16,
+            ..here(read)
+        }));
+        Some(found.style.clone())
+    });
+    let mut el = match &hit {
+        Some(style) => renderer::shared(style.clone()).id(id),
+        None => {
+            let mut el = renderer::node()
+                .id(id)
+                .flex()
+                .flex_col()
+                .text_size(px(units.font.em))
+                .font_family(face.family.clone())
+                .font_weight(face.weight)
+                .line_height(px(line_height));
+            el.style().flex_shrink = if flex_parent { 1. } else { 0. };
+            el.style().baseline = match display {
+                "inline-block" if !flex_parent && slot.is_none() => renderer::Baseline::Last,
+                "flex" | "inline-flex" | "grid" | "inline-grid" => renderer::Baseline::First,
+                "table" | "inline-table" => renderer::Baseline::FirstOnly,
+                _ => renderer::Baseline::Auto,
+            };
+            {
+                let text = el.text_style();
+                text.letter_spacing = Some(parsed.spacing[0]);
+                text.word_spacing = Some(parsed.spacing[1]);
+                text.font_smoothing = Some(!parsed.smoothing);
+                text.text_indent = Some(px(style
+                    .get(Prop::TEXT_INDENT)
+                    .and_then(|value| units.resolve(value, containing[0]))
+                    .unwrap_or(0.)));
+            }
+            if face.style != renderer::FontStyle::Normal {
+                el.text_style().font_style = Some(face.style);
+            }
+            el
+        }
+    };
+    if stacking {
+        if hit.is_none() {
+            el = el.stacking();
+        }
+        el = el.child(renderer::layers(true));
+    }
     if all_inline || display == "inline" {
-        el = el.flex_row().flex_wrap();
-        el.style().justify_content = line_justify;
-        el.style().align_items = line_align;
-        el.style().inline = renderer::Inline::Lines;
+        if hit.is_none() {
+            el = el.flex_row().flex_wrap();
+            el.style().justify_content = line_justify;
+            el.style().align_items = line_align;
+            el.style().inline = renderer::Inline::Lines;
+        }
         let merged = !text_field(node)
             && symbol.is_none()
             && !matches!(node.tag.as_str(), "svg" | "canvas" | "iframe")
@@ -1690,14 +1948,6 @@ fn create(
             strut_due = true;
         }
     }
-    // WARNING: like browsers, a canvas takes its natural size and ratio from its attributes, whatever it shows.
-    // An auto height comes from the in-flow picture, which keeps that ratio in the content box, also in a flex
-    // row, where taffy drops the box's own ratio for a percentage width. The drawing covers that picture, so it
-    // stays in the content box too. Pictures paint from the node, so a drawing or a frame changes no box.
-    let (mut natural, mut natural_ratio) = match node.tag.as_str() {
-        "img" | "video" => (None, None),
-        _ => natural_size(doc, id, None).map_or((None, None), |(size, ratio)| (Some(size), ratio)),
-    };
     if node.tag == "canvas" {
         let picture = |source| {
             renderer::node().size_full().hooks(super::paint::Picture {
@@ -2129,12 +2379,12 @@ fn create(
             .child(button)
             .child(renderer::node().whitespace_nowrap().child("No file chosen"));
         if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
-            let face = text.resolve_font(&style::font(style));
+            let face = text.resolve_font(&parsed.face);
             let em = px(units.font.em);
             let width = |label: &str| {
                 let run = renderer::TextRun {
                     len: label.len(),
-                    font: style::font(style),
+                    font: parsed.face.clone(),
                     color: renderer::black(),
                     background_color: None,
                     underline: None,
@@ -2190,7 +2440,7 @@ fn create(
     }
     if editable && node.tag != "textarea" {
         let above = f32::from(text.baseline(
-            text.resolve_font(&style::font(style)),
+            text.resolve_font(&parsed.face),
             px(units.font.em),
             px(units.font.lh),
             pixel_ratio,
@@ -2215,7 +2465,7 @@ fn create(
                 .map_or_else(|| doc.text(id), str::to_owned),
         );
         let placeholder = node.attrs.get("placeholder").cloned().unwrap_or_default();
-        let face = style::font(style);
+        let face = parsed.face.clone();
         let font_size = units.font.em;
         let line_height = units.font.lh;
         let text_color = style
@@ -2325,15 +2575,11 @@ fn create(
                     .child(field)
             });
     }
-    if let Some((ink, alpha)) = style.get(Prop::COLOR).and_then(style::color) {
+    if hit.is_none()
+        && let Some((ink, alpha)) = parsed.ink
+    {
         el = el.text_color(rgba((ink << 8) | alpha as u32));
     }
-    let background = |style: &style::Style| {
-        style
-            .get(Prop::BACKGROUND_COLOR)
-            .and_then(style::color)
-            .filter(|(_, alpha)| *alpha > 0)
-    };
     let inline_box = display == "inline"
         && symbol.is_none()
         && !node.tag.starts_with('#')
@@ -2347,21 +2593,22 @@ fn create(
             .get(Prop::POSITION)
             .is_some_and(|value| matches!(value, "absolute" | "fixed"));
     let mut inline_fill = renderer::transparent_black();
-    let mut cell_background = background(style);
+    let mut cell_background = parsed.background;
     if cell_background.is_none() && matches!(node.tag.as_str(), "td" | "th") {
-        let mut parent = node.parent;
-        while let Some(row) = parent.filter(|&row| {
-            matches!(
-                doc.nodes[row].tag.as_str(),
-                "tr" | "thead" | "tbody" | "tfoot"
-            )
-        }) {
-            cell_background = background(&styles.values[row]);
-            if cell_background.is_some() {
-                break;
-            }
-            parent = doc.nodes[row].parent;
-        }
+        cell_background = row_fill(doc, styles, id);
+        let table = std::iter::successors(node.parent, |&parent| doc.nodes[parent].parent).find(
+            |&parent| {
+                !matches!(
+                    doc.nodes[parent].tag.as_str(),
+                    "tr" | "thead" | "tbody" | "tfoot"
+                )
+            },
+        );
+        reader.log(
+            Query::RowFill,
+            table.map_or(0, |table| reader.scope_of(id, table)),
+            hashed(cell_background),
+        );
     }
     if let Some(color) = cell_background {
         let color = rgba((color.0 << 8) | color.1 as u32);
@@ -2374,7 +2621,7 @@ fn create(
         if blended {
         } else if inline_box {
             inline_fill = color;
-        } else {
+        } else if hit.is_none() {
             el = el.bg(color);
         }
     }
@@ -2399,7 +2646,7 @@ fn create(
         _ => renderer::Overflow::Visible,
     });
     // WARNING: a form field's text clips and scrolls in its own box, so the field keeps its outline unclipped.
-    if overflow != [renderer::Overflow::Visible; 2] && !editable {
+    if hit.is_none() && overflow != [renderer::Overflow::Visible; 2] && !editable {
         el.style().overflow.x = overflow[0];
         el.style().overflow.y = overflow[1];
     }
@@ -2440,9 +2687,11 @@ fn create(
             .unwrap_or_default();
         look.space(look.shown(scrolls, max))
     });
-    let mut padding = units
-        .edges(style, style::PADDING, containing[0])
-        .map(|value| value.max(0.));
+    let mut padding = parsed.padding.unwrap_or_else(|| {
+        units
+            .edges(style, style::PADDING, containing[0])
+            .map(|value| value.max(0.))
+    });
     padding[1] += reserved[1];
     padding[2] += reserved[0];
     let opposite = if style
@@ -2454,11 +2703,13 @@ fn create(
         0.
     };
     padding[3] += opposite;
-    el = el
-        .pt(px(padding[0]))
-        .pr(px(padding[1]))
-        .pb(px(padding[2]))
-        .pl(px(padding[3]));
+    if hit.is_none() {
+        el = el
+            .pt(px(padding[0]))
+            .pr(px(padding[1]))
+            .pb(px(padding[2]))
+            .pl(px(padding[3]));
+    }
     let mut margin = margins(
         build,
         id,
@@ -2467,12 +2718,17 @@ fn create(
         flex_parent,
         slot.is_some(),
     );
-    reader.log(Query::Margins, depth, hashed(margin.map(f32::to_bits)));
-    el = el
-        .mt(px(margin[0]))
-        .mr(px(margin[1]))
-        .mb(px(margin[2]))
-        .ml(px(margin[3]));
+    // WARNING: a grid item's margins come only from its style and call, so it has no read of them to replay.
+    if slot.is_none() {
+        reader.log(Query::Margins, depth, hashed(margin.map(f32::to_bits)));
+    }
+    if hit.is_none() {
+        el = el
+            .mt(px(margin[0]))
+            .mr(px(margin[1]))
+            .mb(px(margin[2]))
+            .ml(px(margin[3]));
+    }
     if let Some(fieldset) = node.parent
         && let Some((legend, height, _)) = legend(doc, styles, fieldset)
         && legend == id
@@ -2483,7 +2739,7 @@ fn create(
         el = el.absolute().top(px(-height)).left(px(left));
     }
     for (side, prop) in style::MARGIN[1..].iter().enumerate() {
-        if style.get(*prop).is_some_and(|s| s == "auto") {
+        if hit.is_none() && style.get(*prop).is_some_and(|s| s == "auto") {
             el = match side {
                 0 => el.mt_auto(),
                 1 => el.mr_auto(),
@@ -2493,7 +2749,8 @@ fn create(
         }
     }
     // WARNING: right-to-left blocks put an over-constrained child at the right, so its left margin gives way.
-    if !flex_parent
+    if hit.is_none()
+        && !flex_parent
         && slot.is_none()
         && reader.parent(id, Prop::DIRECTION) == Some("rtl")
         && style.get(Prop::DISPLAY).is_some_and(|value| {
@@ -2513,39 +2770,35 @@ fn create(
     {
         el = el.ml_auto();
     }
-    let ink = style
-        .get(Prop::COLOR)
-        .and_then(style::color)
-        .map_or(rgba(0x000000ff), |(ink, alpha)| {
-            rgba(ink << 8 | alpha as u32)
-        });
+    let ink = parsed
+        .ink
+        .map_or(rgba(0x000000ff), |(ink, alpha)| rgba(ink << 8 | alpha as u32));
+    let mut borders = parsed.borders.unwrap_or_else(|| {
+        style::BORDERS.map(|[width, kind, _]| {
+            if style
+                .get(kind)
+                .is_none_or(|kind| matches!(kind, "none" | "hidden"))
+            {
+                return 0.;
+            }
+            style
+                .get(width)
+                .map_or(Some(3.), |width| units.resolve(width, containing[0]))
+                .unwrap_or(0.)
+                .max(0.)
+        })
+    });
     let sides = style::BORDERS.map(|[width, kind, color]| (width, kind, color));
-    let mut borders = sides.map(|(width, kind, _)| {
-        if style
-            .get(kind)
-            .is_none_or(|kind| matches!(kind, "none" | "hidden"))
-        {
-            return 0.;
-        }
-        style
-            .get(width)
-            .map_or(Some(3.), |width| units.resolve(width, containing[0]))
-            .unwrap_or(0.)
-            .max(0.)
-    });
-    let mut border_colors = sides.map(|(_, _, name)| {
-        style
-            .get(name)
-            .and_then(style::color)
-            .map_or(ink, |(ink, alpha)| rgba(ink << 8 | alpha as u32))
-    });
+    let mut border_colors = parsed.border_colors;
     let mut border_kinds = sides.map(|(_, kind, _)| style.get(kind).unwrap_or("none"));
     if inline_box {
         let [above, below] = [padding[0] + borders[0], padding[2] + borders[2]];
         // WARNING: like browsers, padding and borders of an inline box hang outside its line.
         margin[0] = -above;
         margin[2] = -below;
-        el = el.mt(px(margin[0])).mb(px(margin[2]));
+        if hit.is_none() {
+            el = el.mt(px(margin[0])).mb(px(margin[2]));
+        }
         let same = border_colors.iter().all(|color| *color == border_colors[0]);
         let border = if same && borders.iter().any(|width| *width > 0.) {
             border_colors[0]
@@ -2553,7 +2806,7 @@ fn create(
             renderer::transparent_black()
         };
         if border.a > 0. || inline_fill.a > 0. {
-            let font = text.resolve_font(&style::font(style));
+            let font = text.resolve_font(&parsed.face);
             let size_px = px(units.font.em);
             let height = f32::from(text.ascent(font, size_px) - text.descent(font, size_px));
             let line_height = units.font.lh;
@@ -2758,7 +3011,7 @@ fn create(
             padding[1] += 16.;
             padding[3] += 4.;
             if list.is_none() && style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
-                let (font, size) = (style::font(style), px(units.font.em));
+                let (font, size) = (parsed.face.clone(), px(units.font.em));
                 let mut widest = 0f32;
                 let mut stack = node.children.clone();
                 while let Some(child) = stack.pop() {
@@ -2802,7 +3055,7 @@ fn create(
                     .is_none_or(|size| size.trim().parse::<u32>().is_ok_and(|size| size <= 1))
                 && style.get(Prop::HEIGHT).is_none_or(|value| value == "auto")
             {
-                let face = text.resolve_font(&style::font(style));
+                let face = text.resolve_font(&parsed.face);
                 let [ascent, descent, _] = text
                     .line_metrics(face, px(units.font.em * pixel_ratio))
                     .map(f32::from);
@@ -2844,18 +3097,22 @@ fn create(
         border_colors = [renderer::transparent_black(); 4];
         border_kinds = ["solid"; 4];
     }
-    el = el
-        .border_t(px(borders[0]))
-        .border_r(px(borders[1]))
-        .border_b(px(borders[2]))
-        .border_l(px(borders[3]));
+    if hit.is_none() {
+        el = el
+            .border_t(px(borders[0]))
+            .border_r(px(borders[1]))
+            .border_b(px(borders[2]))
+            .border_l(px(borders[3]));
+    }
     let visible = (0..4)
         .filter(|&side| borders[side] > 0.)
         .collect::<Vec<_>>();
     let shaded = visible
         .iter()
         .any(|&side| matches!(border_kinds[side], "groove" | "ridge" | "inset" | "outset"));
-    if let Some(&first) = visible.first() {
+    if hit.is_none()
+        && let Some(&first) = visible.first()
+    {
         if !shaded
             && visible
                 .iter()
@@ -2961,8 +3218,12 @@ fn create(
                 .unwrap_or(base)
         })
     };
-    let radius = super::effects::radii(style, &units, basis);
-    el.style().corner_radii = radius;
+    let radius = parsed
+        .radii
+        .unwrap_or_else(|| super::effects::radii(style, &units, basis));
+    if hit.is_none() {
+        el.style().corner_radii = radius;
+    }
     if native.as_ref().is_some_and(|look| look.boxed) {
         el.style().corner_radii = renderer::Corners::all(px(2.).into()).into();
     }
@@ -2979,7 +3240,12 @@ fn create(
                 .or_else(|| reader.parent(id, Prop::ALIGN_ITEMS))
                 .is_none_or(|value| matches!(value, "normal" | "stretch"))
     };
-    for (prop, value) in style.iter() {
+    if hit.is_some()
+        && let Some(value) = style.get(Prop::BOX_SHADOW)
+    {
+        inner_shadows = units.shadows(value, true);
+    }
+    for (prop, value) in style.iter().filter(|_| hit.is_none()) {
         let value: &str = value;
         let vertical = matches!(
             prop,
@@ -3386,7 +3652,8 @@ fn create(
         );
     let auto = [Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT]
         .map(|prop| style.get(prop).is_some_and(|value| value == "auto"));
-    if auto.contains(&true)
+    if hit.is_none()
+        && auto.contains(&true)
         && !flex_parent
         && slot.is_none()
         && matches!(
@@ -3426,7 +3693,8 @@ fn create(
         el.style().flex_basis = width;
         el.style().size.width = renderer::Length::Auto;
     }
-    if !flex_parent
+    if hit.is_none()
+        && !flex_parent
         && slot.is_none()
         && !matches!(position, "absolute" | "fixed")
         && display.starts_with("inline")
@@ -3655,14 +3923,16 @@ fn create(
         .get(Prop::WEBKIT_LINE_CLAMP)
         .or_else(|| style.get(Prop::LINE_CLAMP))
         .and_then(|value| value.parse::<usize>().ok())
+        .filter(|_| hit.is_none())
     {
         let text = el.text_style();
         text.white_space = Some(renderer::WhiteSpace::Normal);
         text.line_clamp = Some(lines.max(1));
         text.text_overflow = Some("…".into());
-    } else if style.get(Prop::TEXT_OVERFLOW) == Some("ellipsis")
+    } else if hit.is_none()
+        && style.get(Prop::TEXT_OVERFLOW) == Some("ellipsis")
         && matches!(style.get(Prop::WHITE_SPACE), Some("nowrap" | "pre"))
-        && el.style().overflow.x != renderer::Overflow::Visible
+        && el.style_ref().overflow.x != renderer::Overflow::Visible
     {
         el.text_style().text_overflow = Some("…".into());
     }
@@ -3687,17 +3957,16 @@ fn create(
             el = el.h(px((viewport[1] - top - bottom).max(0.)));
         }
     }
-    if let Some(width) = units
-        .resolve(
-            style.get(Prop::OUTLINE_WIDTH).unwrap_or("3px"),
-            containing[0],
-        )
-        .filter(|width| {
-            *width > 0.
-                && style
-                    .get(Prop::OUTLINE_STYLE)
-                    .is_some_and(|kind| !matches!(kind, "none" | "hidden"))
+    if let Some(width) = style
+        .get(Prop::OUTLINE_STYLE)
+        .filter(|kind| !matches!(*kind, "none" | "hidden"))
+        .and_then(|_| {
+            units.resolve(
+                style.get(Prop::OUTLINE_WIDTH).unwrap_or("3px"),
+                containing[0],
+            )
         })
+        .filter(|width| *width > 0.)
     {
         let grow = width
             + style
@@ -3864,8 +4133,10 @@ fn create(
     if let Some(handle) = handle {
         if !editable {
             el = el.track_scroll(&handle);
-            el.style().restrict_scroll_to_axis = true;
-            el.style().overscroll = overscroll;
+            if hit.is_none() {
+                el.style().restrict_scroll_to_axis = true;
+                el.style().overscroll = overscroll;
+            }
         }
         bars = Some(scrollbar::Scrollbar {
             id,
@@ -3975,7 +4246,7 @@ fn create(
         };
         let mut top = padding[0];
         if !inside && marker_style.is_some() {
-            let own = text.resolve_font(&style::font(style));
+            let own = text.resolve_font(&parsed.face);
             let rise = f32::from(text.baseline(face, px(size), px(line), pixel_ratio))
                 - f32::from(text.baseline(own, px(units.font.em), px(units.font.lh), pixel_ratio));
             if rise > 0. {
@@ -4114,6 +4385,11 @@ fn create(
                 .max(0.);
         }
         if let Some((bounds, _)) = &slot {
+            reader.log(
+                Query::Cell,
+                depth,
+                hashed(Some([bounds[2], bounds[3]].map(f32::to_bits))),
+            );
             content[0] = (bounds[2]
                 - padding[1]
                 - padding[3]
@@ -4505,7 +4781,8 @@ fn create(
     let drag = style
         .get(Prop::APP_REGION)
         .is_some_and(|value| value == "drag");
-    if (hit_test || node.tag == "#text")
+    if hit.is_none()
+        && (hit_test || node.tag == "#text")
         && !drag
         && {
             // WARNING: an inherited mode is the same in all boxes from the one that sets it down, so a box above
@@ -4595,7 +4872,7 @@ fn create(
         let (mut trim_top, mut trim_bottom) = (0., 0.);
         if over || under {
             let system = build.text;
-            let font = system.resolve_font(&style::font(style));
+            let font = system.resolve_font(&parsed.face);
             let (size, height) = (px(units.font.em), px(units.font.lh));
             let baseline = f32::from(system.baseline(font, size, height, build.pixel_ratio));
             let [ascent, descent, _] = system.line_metrics(font, size).map(f32::from);
@@ -4619,29 +4896,54 @@ fn create(
                     };
             }
         }
-        el = el.child(
-            renderer::node()
-                .min_w(px(0.))
-                .max_w(relative(1.))
-                .flex_shrink(1.)
-                .mt(px(-trim_top))
-                .mb(px(-trim_bottom))
-                .child(InlineText {
-                    data: data.clone(),
-                    atoms: atom_slots.clone(),
-                    view: view.clone(),
-                    shaped: Default::default(),
-                    prepainted: Default::default(),
-                    justify: style
-                        .get(Prop::TEXT_ALIGN)
+        let paragraph = renderer::Node::from(InlineText {
+            data: data.clone(),
+            atoms: atom_slots.clone(),
+            view: view.clone(),
+            shaped: Default::default(),
+            prepainted: Default::default(),
+            justify: style
+                .get(Prop::TEXT_ALIGN)
+                .is_some_and(|value| value == "justify")
+                .then(|| {
+                    style
+                        .get(Prop::TEXT_ALIGN_LAST)
                         .is_some_and(|value| value == "justify")
-                        .then(|| {
-                            style
-                                .get(Prop::TEXT_ALIGN_LAST)
-                                .is_some_and(|value| value == "justify")
-                        }),
                 }),
-        );
+        });
+        // WARNING: a block that holds only its paragraph, set at the start of its lines, is the paragraph's box itself,
+        // while nothing clips, scrolls, moves or paints around the text in it.
+        let alone = !el.has_children()
+            && data.atoms.is_empty()
+            && trim_top == 0.
+            && trim_bottom == 0.
+            && after.is_none()
+            && !stacking
+            && slot.is_none()
+            && (flex_parent || display != "inline")
+            && !rtl
+            && line_justify.is_none()
+            && matches!(position, "static" | "relative")
+            && el.style_ref().overflow.x == renderer::Overflow::Visible
+            && el.style_ref().overflow.y == renderer::Overflow::Visible
+            && [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE]
+                .iter()
+                .all(|&prop| style.get(prop).is_none_or(|value| value == "none"))
+            && style
+                .get(Prop::WRITING_MODE)
+                .is_none_or(|mode| mode.starts_with("horizontal"));
+        el = if alone {
+            el.adopt(paragraph)
+        } else {
+            el.child(
+                paragraph
+                    .min_w(px(0.))
+                    .max_w(relative(1.))
+                    .flex_shrink(1.)
+                    .mt(px(-trim_top))
+                    .mb(px(-trim_bottom)),
+            )
+        };
         for (index, (atom, child)) in data.atoms.iter().zip(atom_elements).enumerate() {
             let mut wrapper = renderer::node()
                 .absolute()
@@ -5240,6 +5542,8 @@ fn create(
                 .get(Prop::TEXT_WRAP)
                 .is_none_or(|value| !value.contains("nowrap"));
         el.reserve(children.len());
+        // WARNING: the margins of grid items by style, as items with one style have the same lengths in a pass.
+        let mut item_margins = rustc_hash::FxHashMap::<*const style::Style, [f32; 4]>::default();
         for (index, &child) in children.iter().enumerate() {
             if index != joined && shown(index) {
                 if let Some((slots, runs, then, zone)) = plan.as_mut()
@@ -5286,11 +5590,29 @@ fn create(
                         *grid.cells.get(index)?;
                     bounds[0] += padding[3];
                     bounds[1] += padding[0];
+                    // WARNING: only a subgrid reads the tracks of its area, so other items get none, which spares two
+                    // lists per item in each frame that builds the grid.
+                    let [columns, rows] = [
+                        (
+                            Prop::GRID_TEMPLATE_COLUMNS,
+                            &grid.columns,
+                            column..column + columns,
+                        ),
+                        (Prop::GRID_TEMPLATE_ROWS, &grid.rows, row..row + rows),
+                    ]
+                    .map(|(prop, tracks, range)| {
+                        let subgrid = styles.values[child]
+                            .get(prop)
+                            .is_some_and(|v| v.starts_with("subgrid"));
+                        tracks
+                            .get(range)
+                            .map(|tracks| if subgrid { tracks.to_vec() } else { Vec::new() })
+                    });
                     Some((
                         bounds,
                         super::grid::Grid {
-                            columns: grid.columns.get(column..column + columns)?.to_vec(),
-                            rows: grid.rows.get(row..row + rows)?.to_vec(),
+                            columns: columns?,
+                            rows: rows?,
                             gap: grid.gap,
                             baseline,
                             first_item: grid.first_item.filter(|&first| first == item),
@@ -5298,20 +5620,28 @@ fn create(
                         },
                     ))
                 });
-                let cell = placement
+                let bounds = placement.as_ref().map(|(bounds, _)| *bounds);
+                // WARNING: a kept text field builds again from its patch, which must hold its new place.
+                let field = placement
                     .as_ref()
-                    .map(|(bounds, grid)| (*bounds, grid.first_item.is_some()));
+                    .filter(|_| view.patches.borrow().contains_key(&child))
+                    .cloned();
                 let child_element = element(build, child, content, container, placement);
-                let child_element: renderer::Child = match cell {
-                    Some((bounds, first)) => {
-                        let mut cell = renderer::node()
-                            .absolute()
-                            .left(px(bounds[0]))
-                            .top(px(bounds[1]))
-                            .w(px(bounds[2]))
-                            .h(px(bounds[3]));
-                        cell.style().baseline_source = first;
-                        cell.child(child_element).into()
+                if bounds.is_some()
+                    && let Child::Kept(_) = child_element
+                    && let Some(patch) = view.patches.borrow_mut().get_mut(&child)
+                {
+                    patch.slot = field;
+                }
+                let child_element = match bounds {
+                    Some(bounds) => {
+                        let style = &styles.values[child];
+                        let margin = *item_margins.entry(Rc::as_ptr(style)).or_insert_with(|| {
+                            let mut units = styles.lengths[child];
+                            units.container = Some(container);
+                            units.edges(style, style::MARGIN, content[0])
+                        });
+                        place(child_element, margin, pixel_ratio, bounds)
                     }
                     None => child_element,
                 };
@@ -5598,21 +5928,14 @@ fn create(
             el.style().justify_content = align;
         }
     }
-    if let Some((bounds, grid)) = &slot {
+    if let Some((_, grid)) = &slot {
         el.style().baseline_source = grid.first_item.is_some();
         el = el
             .absolute()
-            .left(px(0.))
-            .top(px(0.))
             .mt(px(margin[0]))
             .mr(px(margin[1]))
             .mb(px(margin[2]))
-            .ml(px(margin[3]))
-            .w(px(layout_ceil(
-                (bounds[2] - margin[1] - margin[3]).max(0.),
-                pixel_ratio,
-            )))
-            .h(px((bounds[3] - margin[0] - margin[2]).max(0.)));
+            .ml(px(margin[3]));
     }
     // WARNING: Windows moves the window in the native hit test (`window_drag_area`), macOS and Linux on the first drag.
     if drag {
@@ -5718,19 +6041,20 @@ fn create(
                 depth,
                 hashed(block.map(|(parent, insets)| (parent, insets.map(f32::to_bits)))),
             );
-            Some(super::paint::Sticky {
+            Some(Box::new(super::paint::Sticky {
                 scroll: scrolls.get(&parent)?.clone(),
                 border,
                 block,
-            })
+            }))
         })
         .flatten();
     // WARNING: blocks lay out as a stretched flex column, so a replaced element or a control, and a block whose width
     // comes from its ratio and a set height, must not stretch, and they start at the right in right-to-left blocks.
-    if !flex_parent
+    if hit.is_none()
+        && !flex_parent
         && slot.is_none()
         && !display.starts_with("inline")
-        && el.style().align_self.is_none()
+        && el.style_ref().align_self.is_none()
         && (replaced
             || el.style().aspect_ratio.is_some()
                 && matches!(el.style().size.width, renderer::Length::Auto)
@@ -5789,6 +6113,8 @@ fn create(
     };
     let hooks = DomBox {
         placed: Default::default(),
+        offset: Default::default(),
+        frame: node.tag == "iframe",
         anchor,
         block: made.absolute.then_some(borders),
         container: positioner.filter(|&block| position == "fixed" || Some(block) != parent),
@@ -5799,7 +6125,7 @@ fn create(
         effects: effect_layer,
         composited,
         transformed: info[id].flags & cull::TRANSFORMED != 0,
-        perspective: parent_perspective.clone().zip(parent),
+        perspective: parent_perspective.clone().zip(parent).map(Box::new),
         units,
         revision: info[id].revision,
         sides: [
@@ -5807,17 +6133,22 @@ fn create(
             padding[0] + padding[2] + borders[0] + borders[2],
         ],
         margin,
-        cell: slot.as_ref().map(|(bounds, _)| [bounds[2], bounds[3]]),
+        cell: slot.as_ref().and(parent),
         grid: slot
             .as_ref()
             .filter(|(_, grid)| grid.baseline || grid.first_item.is_some())
             .and_then(|(_, grid)| Some((node.parent?, grid.baseline))),
-        shared: (matches!(node.tag.as_str(), "td" | "th")
-            && std::iter::successors(node.parent, |&parent| doc.nodes[parent].parent)
-                .find(|&parent| doc.nodes[parent].tag == "table")
-                .is_some_and(|table| {
-                    styles.values[table].get(Prop::BORDER_COLLAPSE) == Some("collapse")
-                }))
+        shared: (matches!(node.tag.as_str(), "td" | "th") && {
+            let table = std::iter::successors(node.parent, |&parent| doc.nodes[parent].parent)
+                .find(|&parent| doc.nodes[parent].tag == "table");
+            let collapsed = collapses(doc, styles, id);
+            reader.log(
+                Query::Collapse,
+                table.map_or(0, |table| reader.scope_of(id, table)),
+                hashed(collapsed),
+            );
+            collapsed
+        })
         .then(|| borders.map(|width| width / 2.)),
         boxless: node.tag == "option" && {
             let found = boxless(doc, id);
@@ -5842,7 +6173,7 @@ fn create(
             })
             .flatten(),
         leading: (display == "inline" && !node.tag.starts_with('#')).then(|| {
-            let face = text.resolve_font(&style::font(style));
+            let face = text.resolve_font(&parsed.face);
             let [ascent, descent, _] = text
                 .line_metrics(face, px(units.font.em * pixel_ratio))
                 .map(f32::from);
@@ -5926,16 +6257,105 @@ fn create(
             ),
         )
     )));
-    let element = el.hooks(hooks);
+    let mut element = el.hooks(hooks);
     // WARNING: `z-index` does nothing in the top layer, whose boxes paint in their own order.
-    if layered
+    if hit.is_none()
+        && layered
         && let Some(order) = order.filter(|order| *order != 0)
         && !top_layer.contains(&id)
     {
-        element.z_index(order).into()
-    } else {
-        element.into()
+        element = element.z_index(order);
     }
+    match (share, &hit) {
+        (Some(key), None) => 'store: {
+            let own: Option<Box<[Read]>> = reads.borrow()[mark..]
+                .iter()
+                .filter(|read| usize::from(read.reader) == depth)
+                .map(|read| {
+                    Some(Read {
+                        query: read.query.moved(id as u32, u32::MAX)?,
+                        scope: if read.scope == 0 {
+                            0
+                        } else {
+                            (depth + 1 - usize::from(read.scope)) as u16
+                        },
+                        reader: 0,
+                        ..*read
+                    })
+                })
+                .collect();
+            let Some(own) = own else {
+                break 'store;
+            };
+            let mut shared = view.shared.borrow_mut();
+            if shared.len() >= 4096 {
+                shared.clear();
+            }
+            let list = shared.entry(key).or_default();
+            if list.len() == 4 {
+                list.remove(0);
+            }
+            list.push(Shared {
+                plan: parsed.clone(),
+                reads: own,
+                style: element.shared_style(),
+            });
+        }
+        #[cfg(debug_assertions)]
+        (Some(_), Some(style)) => {
+            assert!(
+                element.shares(style),
+                "box {id} <{}> sets its style after it took a shared one",
+                node.tag
+            );
+            // WARNING: built again without the memo, the box must build the style it took and read what it read.
+            let start = reads.borrow().len();
+            let printed = reader.prints.borrow().len();
+            let culls = std::cell::Cell::new(0);
+            let shadow = Build {
+                ancestors: ancestors.clone(),
+                perspective: None,
+                zone: zone.clone(),
+                culls: &culls,
+                checking: true,
+                extra: Default::default(),
+                plan: Default::default(),
+                ..*reader
+            };
+            let fresh = create(&shadow, id, containing, container, None);
+            reader.prints.borrow_mut().truncate(printed);
+            let own = |reads: &[Read]| {
+                let mut own: Vec<_> = reads
+                    .iter()
+                    .filter(|read| usize::from(read.reader) == depth)
+                    .map(|read| (read.query, read.value))
+                    .collect();
+                own.sort_unstable_by_key(|&(query, _)| query);
+                own.dedup_by_key(|&mut (query, _)| query);
+                own
+            };
+            let mut log = reads.borrow_mut();
+            let (took, built) = (own(&log[mark..start]), own(&log[start..]));
+            log.truncate(start);
+            assert!(
+                took == built,
+                "box {id} <{}> reads otherwise than the box whose style it took: {:?} instead of {:?}",
+                node.tag,
+                took.iter().map(|read| read.0).collect::<Vec<_>>(),
+                built.iter().map(|read| read.0).collect::<Vec<_>>()
+            );
+            let renderer::Child::Node(fresh) = fresh else {
+                unreachable!()
+            };
+            assert!(
+                *fresh.style_ref() == **style,
+                "box {id} <{}> builds a style that differs from the one it took",
+                node.tag
+            );
+        }
+        _ => {}
+    }
+    element.into()
 }
 
 pub(super) fn pseudo_content(
@@ -6312,6 +6732,36 @@ pub(super) fn field_size(
 // WARNING: rounds a size up to layout units, so the content it was measured from doesn't wrap.
 fn layout_ceil(size: f32, pixel_ratio: f32) -> f32 {
     (size * pixel_ratio * 64.).ceil() / 64. / pixel_ratio
+}
+
+// WARNING: a grid item's place, the left and top of its margin box in the grid's padding box and the size of its
+// border box, is set on the item by its grid, so the item's build and record hold neither.
+pub(super) fn place(
+    child: Child,
+    [top, right, bottom, left]: [f32; 4],
+    pixel_ratio: f32,
+    [x, y, cell_width, cell_height]: [f32; 4],
+) -> Child {
+    let place = Bounds {
+        origin: point(px(x), px(y)),
+        size: size(
+            px(layout_ceil(
+                (cell_width - right - left).max(0.),
+                pixel_ratio,
+            )),
+            px((cell_height - top - bottom).max(0.)),
+        ),
+    };
+    match child {
+        Child::Node(mut node) => {
+            let style = node.style();
+            style.inset.left = place.origin.x.into();
+            style.inset.top = place.origin.y.into();
+            style.size = place.size.map(Into::into);
+            Child::Node(node)
+        }
+        Child::Kept(id) | Child::Placed(id, _) => Child::Placed(id, place),
+    }
 }
 
 fn in_flow(doc: &Document, info: &[cull::Info], id: usize) -> bool {

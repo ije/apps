@@ -1,6 +1,5 @@
-globalThis.__appsNet = (call, EventEmitter, streams, Buffer) => {
-  const sockets = new Map(), servers = new Map(), { encode, decode } = globalThis.__appsBytes;
-  delete globalThis.__appsBytes;
+globalThis.__appsNet = (call, EventEmitter, streams, Buffer, { encode, decode }) => {
+  const sockets = new Map(), servers = new Map();
   const fail = (code, message, Type = TypeError) => Object.assign(new Type(message), { code });
   const port = (value, name = 'Port') => {
     const number = typeof value === 'string' && value.trim() ? Number(value) : value;

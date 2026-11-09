@@ -901,10 +901,15 @@ mod tests {
             ];
             m
         };
-        let scene = |degrees: f32| {
+        let shift = |x: f32, y: f32| {
+            let mut m = super::IDENTITY;
+            [m[12], m[13]] = [x, y];
+            m
+        };
+        let scene = |matrix: [f32; 16]| {
             let mut scene = Scene::default();
             let state = EffectState {
-                transform: Some(turn(degrees)),
+                transform: Some(matrix),
                 opacity: 1.,
                 color_matrix: None,
                 blur: 0.,
@@ -949,9 +954,11 @@ mod tests {
                 super::bytes(&frame.composites).to_vec(),
             )
         };
-        let mut patched = scene(0.);
-        assert!(patched.patch(9, 1., Some(turn(30.))));
-        assert_eq!(draw(&patched), draw(&scene(30.)));
+        for matrix in [turn(30.), shift(100., 40.), shift(-90., 0.)] {
+            let mut patched = scene(turn(0.));
+            assert!(patched.patch(9, 1., Some(matrix)));
+            assert_eq!(draw(&patched), draw(&scene(matrix)));
+        }
     }
 
     #[test]

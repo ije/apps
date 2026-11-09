@@ -55,10 +55,12 @@ unsafe extern "C" fn start(
 
 const SMALL: usize = 512;
 const CLASSES: usize = SMALL / 16 + 1;
-const KEPT: u32 = 64 * 1024;
+const KEPT: u32 = 1024 * 1024;
 
 // WARNING: `MallocSpaceEfficient` makes malloc and free slower, and frames build and drop thousands of small
-// blocks. A thread takes back what it freed without calling them, and big blocks still go back to the system.
+// blocks. A thread takes back what it freed without calling them, and big blocks still go back to the system. A frame
+// that drops a thousand rows frees thousands of blocks of one size, so each size keeps up to 1 MB until the thread is
+// quiet.
 struct Bins {
     heads: [*mut u8; CLASSES],
     bytes: [u32; CLASSES],

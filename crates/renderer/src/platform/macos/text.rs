@@ -48,7 +48,7 @@ use pathfinder_geometry::{
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use std::cell::RefCell;
-use std::{borrow::Cow, char, convert::TryFrom, sync::Arc};
+use std::{borrow::Cow, char, convert::TryFrom, mem, rc::Rc, sync::Arc};
 
 use core_foundation::base::CFType;
 use std::sync::OnceLock;
@@ -109,14 +109,62 @@ struct State {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
+    // WARNING: the fonts from memory, which the process caches leave out.
+    local: HashSet<FontId>,
     sized: HashMap<(FontId, u32), CTFont>,
     // WARNING: the font of each shaped run's face, kept alive so its address stays unique.
     natives: HashMap<usize, (CTFont, FontId)>,
     // WARNING: code repeats its words and indents across lines, so lines in a monospace font shape by runs of
     // spaces and non-spaces, each once per font and size. Monospace fonts don't kern, so the line is the same.
-    segments: HashMap<(FontId, u32, Box<str>), std::rc::Rc<LineLayout>>,
+    segments: HashMap<(FontId, u32), HashMap<Box<str>, Rc<LineLayout>>>,
     monospace: HashMap<FontId, bool>,
+    // WARNING: other lines of simple scripts shape by words and runs of spaces too, each once per font, size and
+    // whether a space comes before and after it, shaped next to those spaces. That holds while no character after a
+    // space kerns with it, which `Face::spaced` learns per character. Words keep each x in f64, so a line of them
+    // rounds like the whole line.
+    faces: HashMap<(FontId, u32), Face>,
+    words: usize,
+    parts: Vec<Part>,
+    metrics: HashMap<FontId, Metrics>,
 }
+
+#[derive(Default)]
+struct Face {
+    words: HashMap<Box<str>, [Option<Rc<Word>>; 4]>,
+    spaced: HashMap<char, bool>,
+    misses: u32,
+    numbers: Option<Box<Numbers>>,
+}
+
+// WARNING: after some missing words of digits, a font and size learn each digit's glyph and its advance before every
+// digit or space, from one line that holds each three of them in a row once. A digit word then shapes without
+// CoreText while the triples in it, and the pairs at its ends, which shape alone once, match those advances.
+struct Numbers {
+    font: FontId,
+    glyphs: [GlyphId; 11],
+    ends: [f64; 11],
+    advances: [[f64; 11]; 11],
+    triples: Box<[bool]>,
+    edges: [[u8; 11]; 11],
+}
+
+// WARNING: a word or a run of spaces: its run, shaped size, range in the line, which sides have a space, and shape.
+type Part = (
+    usize,
+    Pixels,
+    std::ops::Range<usize>,
+    usize,
+    Option<Rc<Word>>,
+);
+
+// WARNING: each glyph's x in f64, as CoreText places it, then the width, and where each CoreText run starts in the
+// text and on the line.
+type Exact = (Vec<f64>, Vec<(usize, f64)>);
+
+// WARNING: each glyph's x, font, id, y and byte offset in the word, then the word's width.
+type Glyphs = Box<[(f64, FontId, GlyphId, f32, usize)]>;
+
+struct Word(Glyphs, f64);
 
 static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
     unsafe extern "C" {
@@ -132,6 +180,33 @@ static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| 
         .chain(["Times".into(), "Courier".into()])
         .collect()
 });
+
+// WARNING: finding a system family's faces, a weight of a variable face, or its axes (which CoreText copies with
+// their localized names) takes milliseconds, the same in every window, so system faces by family, features and
+// fallbacks, their weights and default weights, and the names that have none, are kept for the process. Their
+// fonts stay alive here, so a face's address names it. Fonts from memory belong to their text system.
+// WARNING: each entry is found once, outside the map's lock, so threads that look up other entries meanwhile don't wait.
+type Shared<K, V> = std::sync::LazyLock<std::sync::Mutex<HashMap<K, Arc<OnceLock<V>>>>>;
+type Faces = Option<Vec<(FontKitFont, String)>>;
+type SystemKey = (String, Vec<(String, u32)>, Option<Vec<String>>);
+static SYSTEM_FAMILIES: Shared<SystemKey, Faces> = std::sync::LazyLock::new(Default::default);
+static AXES: Shared<usize, Option<f32>> = std::sync::LazyLock::new(Default::default);
+static WEIGHTS: Shared<(usize, u32), Option<(FontKitFont, String)>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn shared<K: std::hash::Hash + Eq, V: Clone>(
+    map: &Shared<K, V>,
+    key: K,
+    find: impl FnOnce() -> V,
+) -> V {
+    let entry = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key)
+        .or_default()
+        .clone();
+    entry.get_or_init(find).clone()
+}
 
 impl TextSystem {
     pub fn new() -> Self {
@@ -150,10 +225,15 @@ impl TextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            local: HashSet::default(),
             sized: HashMap::default(),
             natives: HashMap::default(),
             segments: HashMap::default(),
             monospace: HashMap::default(),
+            faces: HashMap::default(),
+            words: 0,
+            parts: Vec::new(),
+            metrics: HashMap::default(),
         }))
     }
 
@@ -229,16 +309,24 @@ impl TextSystem {
         // in its variation, so the axis default stands in.
         // WARNING: old Apple fonts like Skia use a 0.5 to 3.2 `wght` scale, so they keep their faces.
         let native = state.fonts[font_id.0].native_font();
-        let default = native
-            .get_variation_axes()
-            .and_then(|axes| {
-                axes.iter().find_map(|axis| {
-                    let number = |key| axis.find(key)?.downcast::<CFNumber>();
-                    (number(unsafe { kCTFontVariationAxisIdentifierKey })?.to_i64()? == WGHT)
-                        .then(|| number(unsafe { kCTFontVariationAxisDefaultValueKey })?.to_f32())?
+        let axis = || {
+            native
+                .get_variation_axes()
+                .and_then(|axes| {
+                    axes.iter().find_map(|axis| {
+                        let number = |key| axis.find(key)?.downcast::<CFNumber>();
+                        (number(unsafe { kCTFontVariationAxisIdentifierKey })?.to_i64()? == WGHT)
+                            .then(|| {
+                                number(unsafe { kCTFontVariationAxisDefaultValueKey })?.to_f32()
+                            })?
+                    })
                 })
-            })
-            .filter(|weight| *weight >= 100.);
+                .filter(|weight| *weight >= 100.)
+        };
+        let default = match state.local.contains(&font_id) {
+            true => axis(),
+            false => shared(&AXES, native.as_concrete_TypeRef() as usize, axis),
+        };
         if default.is_some() && variation_weight(&native).or(default) != Some(font.weight.0) {
             font_id = state.weighted(font_id, font.weight.0);
         }
@@ -379,48 +467,70 @@ impl State {
         };
 
         let mut font_ids = SmallVec::new();
-        let mut postscript_names_seen = HashSet::default();
-        let family = self
-            .memory_source
-            .select_family_by_name(name)
-            .or_else(|_| self.system_source.select_family_by_name(name))?;
-        for font in family.fonts() {
-            let mut font = font.load()?;
+        let load = |family: font_kit::family_handle::FamilyHandle| {
+            let mut faces = Vec::new();
+            let mut postscript_names_seen = HashSet::default();
+            for font in family.fonts() {
+                let mut font = font.load()?;
 
-            apply_features_and_fallbacks(&mut font, features, fallbacks)?;
+                apply_features_and_fallbacks(&mut font, features, fallbacks)?;
 
-            // WARNING: `font.properties()` panics on fonts whose traits are not CFNumbers.
-            let traits = font.native_font().all_traits();
-            if unsafe {
-                !(traits
-                    .get(kCTFontSymbolicTrait)
-                    .downcast::<CFNumber>()
-                    .is_some()
-                    && traits
-                        .get(kCTFontWidthTrait)
+                // WARNING: `font.properties()` panics on fonts whose traits are not CFNumbers.
+                let traits = font.native_font().all_traits();
+                if unsafe {
+                    !(traits
+                        .get(kCTFontSymbolicTrait)
                         .downcast::<CFNumber>()
                         .is_some()
-                    && traits
-                        .get(kCTFontWeightTrait)
-                        .downcast::<CFNumber>()
-                        .is_some()
-                    && traits
-                        .get(kCTFontSlantTrait)
-                        .downcast::<CFNumber>()
-                        .is_some())
-            } {
-                continue;
-            }
+                        && traits
+                            .get(kCTFontWidthTrait)
+                            .downcast::<CFNumber>()
+                            .is_some()
+                        && traits
+                            .get(kCTFontWeightTrait)
+                            .downcast::<CFNumber>()
+                            .is_some()
+                        && traits
+                            .get(kCTFontSlantTrait)
+                            .downcast::<CFNumber>()
+                            .is_some())
+                } {
+                    continue;
+                }
 
-            let Some(postscript_name) = font.postscript_name() else {
-                continue;
-            };
-            // WARNING: dedup only within this call: a family can load again under another `FontKey`, and
-            // a check against `font_ids_by_postscript_name` would leave that call empty.
-            if !postscript_names_seen.insert(postscript_name.clone()) {
-                continue;
+                let Some(postscript_name) = font.postscript_name() else {
+                    continue;
+                };
+                // WARNING: dedup only within this call: a family can load again under another `FontKey`, and
+                // a check against `font_ids_by_postscript_name` would leave that call empty.
+                if postscript_names_seen.insert(postscript_name.clone()) {
+                    faces.push((font, postscript_name));
+                }
             }
+            anyhow::Ok(faces)
+        };
+        let (faces, local) = match self.memory_source.select_family_by_name(name) {
+            Ok(family) => (load(family)?, true),
+            Err(_) => {
+                let key = (
+                    name.to_owned(),
+                    features.0.to_vec(),
+                    fallbacks.map(|fallbacks| fallbacks.fallback_list().to_vec()),
+                );
+                let faces = shared(&SYSTEM_FAMILIES, key, || {
+                    load(self.system_source.select_family_by_name(name).ok()?).ok()
+                });
+                (
+                    faces.ok_or_else(|| anyhow!("no font family {name}"))?,
+                    false,
+                )
+            }
+        };
+        for (font, postscript_name) in faces {
             let font_id = FontId(self.fonts.len());
+            if local {
+                self.local.insert(font_id);
+            }
             font_ids.push(font_id);
             self.font_ids_by_postscript_name
                 .insert(postscript_name.clone(), font_id);
@@ -460,36 +570,52 @@ impl State {
 
     fn weighted(&mut self, font_id: FontId, weight: f32) -> FontId {
         let base = self.fonts[font_id.0].native_font();
-        let variations = CFDictionary::from_CFType_pairs(&[(
-            CFNumber::from(WGHT).as_CFType(),
-            CFNumber::from(f64::from(weight)).as_CFType(),
-        )]);
-        let attributes = CFDictionary::from_CFType_pairs(&[(
-            unsafe { CFString::wrap_under_get_rule(kCTFontVariationAttribute) },
-            variations.as_CFType(),
-        )]);
-        let descriptor = core_text::font_descriptor::new_from_attributes(&attributes);
-        let font = unsafe {
-            CTFont::wrap_under_create_rule(CTFontCreateCopyWithAttributes(
-                base.as_concrete_TypeRef(),
-                base.pt_size(),
-                std::ptr::null(),
-                descriptor.as_concrete_TypeRef(),
+        let make = || {
+            let variations = CFDictionary::from_CFType_pairs(&[(
+                CFNumber::from(WGHT).as_CFType(),
+                CFNumber::from(f64::from(weight)).as_CFType(),
+            )]);
+            let attributes = CFDictionary::from_CFType_pairs(&[(
+                unsafe { CFString::wrap_under_get_rule(kCTFontVariationAttribute) },
+                variations.as_CFType(),
+            )]);
+            let descriptor = core_text::font_descriptor::new_from_attributes(&attributes);
+            let font = unsafe {
+                CTFont::wrap_under_create_rule(CTFontCreateCopyWithAttributes(
+                    base.as_concrete_TypeRef(),
+                    base.pt_size(),
+                    std::ptr::null(),
+                    descriptor.as_concrete_TypeRef(),
+                ))
+            };
+            let name = variation_weight(&font)
+                .map(|weight| format!("{}#wght{weight}", font.postscript_name()))?;
+            Some((
+                unsafe { font_kit::font::Font::from_native_font(&font) },
+                name,
             ))
         };
-        let Some(name) = variation_weight(&font)
-            .map(|weight| format!("{}#wght{weight}", font.postscript_name()))
-        else {
+        let weighted = match self.local.contains(&font_id) {
+            true => make(),
+            false => shared(
+                &WEIGHTS,
+                (base.as_concrete_TypeRef() as usize, weight.to_bits()),
+                make,
+            ),
+        };
+        let Some((font, name)) = weighted else {
             return font_id;
         };
         if let Some(&id) = self.font_ids_by_postscript_name.get(&name) {
             return id;
         }
         let id = FontId(self.fonts.len());
+        if self.local.contains(&font_id) {
+            self.local.insert(id);
+        }
         self.font_ids_by_postscript_name.insert(name.clone(), id);
         self.postscript_names_by_font_id.insert(id, name);
-        self.fonts
-            .push(unsafe { font_kit::font::Font::from_native_font(&font) });
+        self.fonts.push(font);
         id
     }
 
@@ -688,18 +814,504 @@ impl State {
                 return self.layout_segments(text, font_size, font_runs);
             }
         }
-        self.layout_whole(text, font_size, font_runs)
+        let simple = |ch: char| {
+            matches!(ch, ' '..='~' | '\u{a0}'..='\u{58f}' | '\u{1e00}'..='\u{1fff}' | '\u{2010}'..='\u{2027}'
+                | '\u{2030}'..='\u{205e}' | '\u{20a0}'..='\u{20cf}')
+        };
+        if !font_runs.is_empty()
+            && text.chars().all(simple)
+            && let Some(layout) = self.layout_words(text, font_size, font_runs)
+        {
+            #[cfg(debug_assertions)]
+            assert!(
+                same_lines(
+                    &self.layout_whole(text, font_size, font_runs, None),
+                    &layout
+                ),
+                "words of {text:?} shape unlike the whole line"
+            );
+            return layout;
+        }
+        self.layout_whole(text, font_size, font_runs, None)
     }
 
-    fn layout_segments(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
-        if self.segments.len() > 32768 {
+    fn layout_words(
+        &mut self,
+        text: &str,
+        font_size: Pixels,
+        font_runs: &[FontRun],
+    ) -> Option<LineLayout> {
+        if self.words > 16384 {
+            self.faces.clear();
+            self.words = 0;
+        }
+        let mut parts = mem::take(&mut self.parts);
+        parts.clear();
+        let (mut start, mut nudged, mut missing) = (0, false, 0);
+        for (index, run) in font_runs.iter().enumerate() {
+            // WARNING: like `layout_whole`, every other run shapes a hair larger.
+            let size = if nudged {
+                px(f32::from(run.font_size).next_up())
+            } else {
+                run.font_size
+            };
+            let part = &text[start..start + run.len];
+            let key = (run.font_id, f32::from(size).to_bits());
+            let mut offset = 0;
+            while offset < part.len() {
+                let space = part.as_bytes()[offset] == b' ';
+                let end = part[offset..]
+                    .bytes()
+                    .position(|byte| (byte == b' ') != space)
+                    .map_or(part.len(), |length| offset + length);
+                let around = (offset > 0) as usize | ((end < part.len()) as usize) << 1;
+                parts.push((index, size, start + offset..start + end, around, None));
+                offset = end;
+            }
+            let first = parts.len()
+                - parts
+                    .iter()
+                    .rev()
+                    .take_while(|part| part.0 == index)
+                    .count();
+            let mut face = self.faces.get(&key);
+            for at in first..parts.len() {
+                let (range, around) = (parts[at].2.clone(), parts[at].3);
+                if text.as_bytes()[range.start] == b' '
+                    && let Some(next) = text[range.end..].chars().next().filter(|_| around & 2 != 0)
+                {
+                    let spaced = match face.and_then(|face| face.spaced.get(&next)) {
+                        Some(&spaced) => spaced,
+                        None => {
+                            let spaced = self.spaced(run.font_id, size, next);
+                            face = self.faces.get(&key);
+                            spaced
+                        }
+                    };
+                    if !spaced {
+                        self.parts = parts;
+                        return None;
+                    }
+                }
+                parts[at].4 = face.and_then(|face| face.words.get(&text[range])?[around].clone());
+                missing += parts[at].4.is_none() as usize;
+            }
+            nudged ^= run.len > 0;
+            start += run.len;
+        }
+        if missing > 2 {
+            let mut exact = Exact::default();
+            let whole = self.layout_whole(text, font_size, font_runs, Some(&mut exact));
+            self.harvest(text, 0, &whole, &exact, font_runs, &mut parts);
+            self.parts = parts;
+            return Some(whole);
+        }
+        for at in 0..parts.len() {
+            let (index, size, range, around, None) = parts[at].clone() else {
+                continue;
+            };
+            let before = text[..range.start]
+                .chars()
+                .next_back()
+                .filter(|_| around & 1 != 0);
+            let after = text[range.end..].chars().next().filter(|_| around & 2 != 0);
+            let context = range.start - before.map_or(0, char::len_utf8)
+                ..range.end + after.map_or(0, char::len_utf8);
+            let word = range.start - context.start..range.end - context.start;
+            if let Some(word) =
+                self.numbers(font_runs[index].font_id, size, &text[context.clone()], word)
+            {
+                parts[at].4 = Some(Rc::new(word));
+                continue;
+            }
+            let single = FontRun {
+                len: context.len(),
+                font_size: size,
+                ..font_runs[index]
+            };
+            let mut exact = Exact::default();
+            let shaped =
+                self.layout_whole(&text[context.clone()], size, &[single], Some(&mut exact));
+            self.harvest(
+                text,
+                context.start,
+                &shaped,
+                &exact,
+                font_runs,
+                &mut parts[at..at + 1],
+            );
+            if parts[at].4.is_none() {
+                self.parts = parts;
+                return None;
+            }
+        }
+        let mut runs: Vec<ShapedRun> = Vec::with_capacity(1);
+        let mut count: usize = parts
+            .iter()
+            .filter_map(|part| Some(part.4.as_ref()?.0.len()))
+            .sum();
+        let (mut x, mut last) = (0f64, (usize::MAX, font_size));
+        for (index, size, range, _, word) in &parts {
+            let Some(Word(glyphs, width)) = word.as_deref() else {
+                continue;
+            };
+            // WARNING: like `layout_whole`, a run takes the size of the line's run closest to its shaped size.
+            if *index != last.0 {
+                let shaped = f32::from(*size);
+                let run_size = font_runs
+                    .iter()
+                    .map(|run| run.font_size)
+                    .min_by(|a, b| {
+                        (f32::from(*a) - shaped)
+                            .abs()
+                            .total_cmp(&(f32::from(*b) - shaped).abs())
+                    })
+                    .unwrap_or(font_size);
+                last = (*index, run_size);
+            }
+            for &(at, font_id, id, y, offset) in glyphs {
+                let glyph = ShapedGlyph {
+                    id,
+                    position: point(px((x + at) as f32), px(y)),
+                    index: range.start + offset,
+                    is_emoji: false,
+                };
+                match runs.last_mut() {
+                    Some(run) if run.font_id == font_id && run.font_size == last.1 => {
+                        run.glyphs.push(glyph)
+                    }
+                    _ => {
+                        let mut glyphs = Vec::with_capacity(count);
+                        glyphs.push(glyph);
+                        runs.push(ShapedRun {
+                            font_id,
+                            font_size: last.1,
+                            glyphs,
+                        })
+                    }
+                }
+                count -= 1;
+            }
+            x += width;
+        }
+        self.parts = parts;
+        let (mut ascent, mut descent) = (0f32, 0f32);
+        for run in font_runs {
+            let fonts = &self.fonts;
+            let metrics = self
+                .metrics
+                .entry(run.font_id)
+                .or_insert_with(|| fonts[run.font_id.0].metrics());
+            let scale = f32::from(run.font_size) / metrics.units_per_em as f32;
+            ascent = ascent.max(metrics.ascent * scale);
+            descent = descent.max(-metrics.descent * scale);
+        }
+        Some(LineLayout {
+            runs,
+            font_size,
+            width: px(x as f32),
+            ascent: px(ascent),
+            descent: px(descent),
+            len: text.len(),
+        })
+    }
+
+    // WARNING: keeps the parts that `layout`, shaped from `text` at `at`, holds whole and in one font.
+    fn harvest(
+        &mut self,
+        text: &str,
+        at: usize,
+        layout: &LineLayout,
+        (xs, starts): &Exact,
+        font_runs: &[FontRun],
+        parts: &mut [Part],
+    ) {
+        let glyphs: Vec<_> = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(move |glyph| (run.font_id, glyph)))
+            .collect();
+        if glyphs.iter().any(|(_, glyph)| glyph.is_emoji) {
+            return;
+        }
+        for (index, size, range, around, word) in parts {
+            let first = glyphs.partition_point(|(_, glyph)| glyph.index + at < range.start);
+            let count = glyphs[first..].partition_point(|(_, glyph)| glyph.index + at < range.end);
+            let own = &glyphs[first..first + count];
+            if word.is_some()
+                || own
+                    .first()
+                    .is_none_or(|(font, _)| own.iter().any(|(other, _)| other != font))
+            {
+                continue;
+            }
+            // WARNING: CoreText moves some glyphs, like an opening quote, at the start of a run, so a part without a
+            // space before it starts where its run starts, and one without a space after it ends where its run ends.
+            let edge = |index: usize| match index - at {
+                end if end == layout.len => Some(xs[glyphs.len()]),
+                index => starts
+                    .iter()
+                    .find(|start| start.0 == index)
+                    .map(|start| start.1),
+            };
+            let (Some(left), Some(right)) = (
+                if *around & 1 == 0 {
+                    edge(range.start)
+                } else {
+                    Some(xs[first])
+                },
+                if *around & 2 == 0 {
+                    edge(range.end)
+                } else {
+                    Some(xs[first + count])
+                },
+            ) else {
+                continue;
+            };
+            let shaped = Rc::new(Word(
+                own.iter()
+                    .zip(&xs[first..])
+                    .map(|((font, glyph), x)| {
+                        (
+                            x - left,
+                            *font,
+                            glyph.id,
+                            f32::from(glyph.position.y),
+                            glyph.index + at - range.start,
+                        )
+                    })
+                    .collect(),
+                right - left,
+            ));
+            self.words += 1;
+            self.faces
+                .entry((font_runs[*index].font_id, f32::from(*size).to_bits()))
+                .or_default()
+                .words
+                .entry(text[range.clone()].into())
+                .or_default()[*around] = Some(shaped.clone());
+            *word = Some(shaped);
+        }
+    }
+
+    fn numbers(
+        &mut self,
+        font_id: FontId,
+        size: Pixels,
+        text: &str,
+        word: std::ops::Range<usize>,
+    ) -> Option<Word> {
+        const CHARS: &[u8; 11] = b"0123456789 ";
+        let bytes = text.as_bytes();
+        if !bytes.iter().all(|byte| CHARS.contains(byte)) {
+            return None;
+        }
+        let digit = |byte: u8| {
+            if byte == b' ' {
+                10
+            } else {
+                (byte - b'0') as usize
+            }
+        };
+        let key = (font_id, f32::from(size).to_bits());
+        let face = self.faces.entry(key).or_default();
+        face.misses = face.misses.saturating_add(1);
+        let (misses, numbers) = (face.misses, face.numbers.take());
+        let shape = |state: &mut State, chars: &[usize]| {
+            let text: String = chars.iter().map(|&at| CHARS[at] as char).collect();
+            let run = FontRun {
+                len: text.len(),
+                font_id,
+                font_size: size,
+                letter_spacing: px(0.),
+                word_spacing: px(0.),
+                inset: [px(0.); 2],
+                nowrap: false,
+            };
+            let mut exact = Exact::default();
+            let layout = state.layout_whole(&text, size, &[run], Some(&mut exact));
+            let glyphs: Vec<_> = layout
+                .runs
+                .iter()
+                .flat_map(|run| {
+                    run.glyphs.iter().map(move |glyph| {
+                        let plain = glyph.position.y == px(0.) && !glyph.is_emoji;
+                        (run.font_id, glyph.id, glyph.index, plain)
+                    })
+                })
+                .collect();
+            (glyphs, exact.0)
+        };
+        let mut numbers = match numbers {
+            Some(numbers) => numbers,
+            None if misses == 32 => {
+                let mut numbers = Box::new(Numbers {
+                    font: FontId(usize::MAX),
+                    glyphs: [GlyphId(0); 11],
+                    ends: [0.; 11],
+                    advances: [[f64::NAN; 11]; 11],
+                    triples: vec![false; 1331].into(),
+                    edges: [[0; 11]; 11],
+                });
+                for at in 0..11 {
+                    let (glyphs, xs) = shape(self, &[at]);
+                    let [(font, id, 0, true)] = glyphs[..] else {
+                        return None;
+                    };
+                    if xs[0] != 0. || at > 0 && font != numbers.font {
+                        return None;
+                    }
+                    (numbers.font, numbers.glyphs[at], numbers.ends[at]) = (font, id, xs[1]);
+                }
+                // WARNING: a de Bruijn sequence holds each three of the characters in a row once.
+                let (mut lyndon, mut order) = (vec![-1isize], Vec::new());
+                while let Some(last) = lyndon.last_mut() {
+                    *last += 1;
+                    let length = lyndon.len();
+                    if 3 % length == 0 {
+                        order.extend(lyndon.iter().map(|&at| at as usize));
+                    }
+                    while lyndon.len() < 3 {
+                        lyndon.push(lyndon[lyndon.len() - length]);
+                    }
+                    while lyndon.last() == Some(&10) {
+                        lyndon.pop();
+                    }
+                }
+                order.extend([order[0], order[1]]);
+                let (glyphs, xs) = shape(self, &order);
+                if glyphs.len() != order.len() {
+                    return None;
+                }
+                let mut moved = vec![false; order.len()];
+                for (at, &(font, id, index, plain)) in glyphs.iter().enumerate() {
+                    moved[at] |= !plain
+                        || font != numbers.font
+                        || id != numbers.glyphs[order[at]]
+                        || index != at;
+                    if let Some(&next) = order.get(at + 1) {
+                        let advance = &mut numbers.advances[order[at]][next];
+                        if advance.is_nan() {
+                            *advance = xs[at + 1] - xs[at];
+                        } else if (*advance - (xs[at + 1] - xs[at])).abs() > 1e-9 {
+                            moved[at] = true;
+                            moved[at + 1] = true;
+                        }
+                    }
+                }
+                for at in 0..order.len() - 2 {
+                    numbers.triples[order[at] * 121 + order[at + 1] * 11 + order[at + 2]] =
+                        !moved[at..at + 3].contains(&true);
+                }
+                numbers
+            }
+            None => return None,
+        };
+        let n = bytes.len();
+        let word = 'stitch: {
+            if bytes.windows(3).any(|three| {
+                !numbers.triples[digit(three[0]) * 121 + digit(three[1]) * 11 + digit(three[2])]
+            }) {
+                break 'stitch None;
+            }
+            for (a, b) in [(0, 1), (n.wrapping_sub(2), n.wrapping_sub(1))] {
+                let Some((a, b)) = bytes.get(a).zip(bytes.get(b)) else {
+                    break;
+                };
+                let (a, b) = (digit(*a), digit(*b));
+                if numbers.edges[a][b] == 0 {
+                    let (glyphs, xs) = shape(self, &[a, b]);
+                    let advance = numbers.advances[a][b];
+                    let same = matches!(glyphs[..], [(first, x, 0, true), (second, y, 1, true)]
+                        if first == numbers.font && second == numbers.font
+                            && x == numbers.glyphs[a] && y == numbers.glyphs[b])
+                        && xs[0] == 0.
+                        && (xs[1] - advance).abs() < 1e-9
+                        && (xs[2] - advance - numbers.ends[b]).abs() < 1e-9;
+                    numbers.edges[a][b] = if same { 1 } else { 2 };
+                }
+                if numbers.edges[a][b] != 1 {
+                    break 'stitch None;
+                }
+            }
+            let (mut x, mut left) = (0., 0.);
+            let mut glyphs = Vec::with_capacity(word.len());
+            for (at, &byte) in bytes.iter().enumerate().take(word.end) {
+                if at == word.start {
+                    left = x;
+                }
+                if at >= word.start {
+                    glyphs.push((
+                        x - left,
+                        numbers.font,
+                        numbers.glyphs[digit(byte)],
+                        0.,
+                        at - word.start,
+                    ));
+                }
+                x += match bytes.get(at + 1) {
+                    Some(&next) => numbers.advances[digit(byte)][digit(next)],
+                    None => numbers.ends[digit(byte)],
+                };
+            }
+            Some(Word(glyphs.into(), x - left))
+        };
+        self.faces.get_mut(&key)?.numbers = Some(numbers);
+        word
+    }
+
+    fn spaced(&mut self, font_id: FontId, size: Pixels, ch: char) -> bool {
+        let key = (font_id, f32::from(size).to_bits());
+        if let Some(&spaced) = self.faces.get(&key).and_then(|face| face.spaced.get(&ch)) {
+            return spaced;
+        }
+        let pair = format!(" {ch}");
+        let run = FontRun {
+            len: 1,
+            font_id,
+            font_size: size,
+            letter_spacing: px(0.),
+            word_spacing: px(0.),
+            inset: [px(0.); 2],
+            nowrap: false,
+        };
+        let space = self.layout_whole(" ", size, &[run], None).width;
+        let both = self.layout_whole(
+            &pair,
+            size,
+            &[FontRun {
+                len: pair.len(),
+                ..run
+            }],
+            None,
+        );
+        let spaced = both
+            .runs
+            .iter()
+            .flat_map(|run| &run.glyphs)
+            .find(|glyph| glyph.index > 0)
+            .is_some_and(|glyph| (glyph.position.x - space).abs() < px(1e-4));
+        self.faces.entry(key).or_default().spaced.insert(ch, spaced);
+        spaced
+    }
+
+    fn layout_segments(
+        &mut self,
+        text: &str,
+        font_size: Pixels,
+        font_runs: &[FontRun],
+    ) -> LineLayout {
+        if self.words > 16384 {
+            self.faces.clear();
             self.segments.clear();
+            self.words = 0;
         }
         let mut runs: Vec<ShapedRun> = Vec::new();
         let (mut x, mut ascent, mut descent) = (0f32, px(0.), px(0.));
         let mut start = 0;
         for run in font_runs {
             let part = &text[start..start + run.len];
+            let key = (run.font_id, f32::from(run.font_size).to_bits());
             let mut offset = 0;
             while offset < part.len() {
                 let space = part.as_bytes()[offset] == b' ';
@@ -708,14 +1320,65 @@ impl State {
                     .position(|byte| (byte == b' ') != space)
                     .map_or(part.len(), |length| offset + length);
                 let segment = &part[offset..end];
-                let key = (run.font_id, f32::from(run.font_size).to_bits(), Box::<str>::from(segment));
-                let shaped = match self.segments.get(&key) {
-                    Some(shaped) => shaped.clone(),
+                let found = self
+                    .segments
+                    .get(&key)
+                    .and_then(|map| map.get(segment))
+                    .cloned();
+                let shaped = match found {
+                    Some(shaped) => shaped,
                     None => {
-                        let single = FontRun { len: segment.len(), ..run.clone() };
-                        let shaped =
-                            std::rc::Rc::new(self.layout_whole(segment, run.font_size, &[single]));
-                        self.segments.insert(key, shaped.clone());
+                        let single = FontRun {
+                            len: segment.len(),
+                            ..*run
+                        };
+                        let numbers =
+                            self.numbers(run.font_id, run.font_size, segment, 0..segment.len());
+                        let shaped = Rc::new(match numbers {
+                            Some(Word(glyphs, width)) => {
+                                let fonts = &self.fonts;
+                                let metrics = self
+                                    .metrics
+                                    .entry(run.font_id)
+                                    .or_insert_with(|| fonts[run.font_id.0].metrics());
+                                let scale = f32::from(run.font_size) / metrics.units_per_em as f32;
+                                let layout = LineLayout {
+                                    runs: vec![ShapedRun {
+                                        font_id: glyphs[0].1,
+                                        font_size: run.font_size,
+                                        glyphs: glyphs
+                                            .iter()
+                                            .map(|&(x, _, id, y, index)| ShapedGlyph {
+                                                id,
+                                                position: point(px(x as f32), px(y)),
+                                                index,
+                                                is_emoji: false,
+                                            })
+                                            .collect(),
+                                    }],
+                                    font_size: run.font_size,
+                                    width: px(width as f32),
+                                    ascent: px(0f32.max(metrics.ascent * scale)),
+                                    descent: px(0f32.max(-metrics.descent * scale)),
+                                    len: segment.len(),
+                                };
+                                #[cfg(debug_assertions)]
+                                assert!(
+                                    same_lines(
+                                        &layout,
+                                        &self.layout_whole(segment, run.font_size, &[single], None)
+                                    ),
+                                    "digits of {segment:?} shape unlike the whole segment"
+                                );
+                                layout
+                            }
+                            None => self.layout_whole(segment, run.font_size, &[single], None),
+                        });
+                        self.words += 1;
+                        self.segments
+                            .entry(key)
+                            .or_default()
+                            .insert(segment.into(), shaped.clone());
                         shaped
                     }
                 };
@@ -731,7 +1394,7 @@ impl State {
                             runs.push(ShapedRun {
                                 font_id: shaped_run.font_id,
                                 font_size: shaped_run.font_size,
-                                glyphs: Vec::with_capacity(shaped_run.glyphs.len()),
+                                glyphs: Vec::with_capacity(text.len() - start - offset),
                             });
                             &mut runs.last_mut().unwrap().glyphs
                         }
@@ -759,7 +1422,13 @@ impl State {
         }
     }
 
-    fn layout_whole(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
+    fn layout_whole(
+        &mut self,
+        text: &str,
+        font_size: Pixels,
+        font_runs: &[FontRun],
+        mut exact: Option<&mut Exact>,
+    ) -> LineLayout {
         let mut string = CFMutableAttributedString::new();
         let mut max_ascent = 0.0f32;
         let mut max_descent = 0.0f32;
@@ -783,7 +1452,11 @@ impl State {
 
                 let length = utf16_end - utf16_start;
                 let cf_range = CFRange::init(utf16_start, length);
-                let font_metrics = self.fonts[run.font_id.0].metrics();
+                let fonts = &self.fonts;
+                let font_metrics = *self
+                    .metrics
+                    .entry(run.font_id)
+                    .or_insert_with(|| fonts[run.font_id.0].metrics());
                 let font_scale = f32::from(run.font_size) / font_metrics.units_per_em as f32;
                 max_ascent = max_ascent.max(font_metrics.ascent * font_scale);
                 max_descent = max_descent.max(-font_metrics.descent * font_scale);
@@ -808,7 +1481,9 @@ impl State {
         let mut index_converter = StringIndexConverter::new(text);
         let mut shift = 0f32;
         let mut emoji_end = None;
+        let mut pen = 0f64;
         for run in glyph_runs.into_iter() {
+            let mut first = exact.is_some();
             let attributes = run.attributes().unwrap();
             let font = unsafe {
                 attributes
@@ -873,6 +1548,12 @@ impl State {
                     shift = end - position.x as f32;
                 }
                 let x = position.x as f32 + shift;
+                if let Some((xs, starts)) = &mut exact {
+                    if mem::take(&mut first) {
+                        starts.push((index_converter.utf8_index, pen));
+                    }
+                    xs.push(position.x + f64::from(shift));
+                }
                 glyphs.push(ShapedGlyph {
                     id: GlyphId(glyph_id as u32),
                     position: point(x, position.y as f32).map(px),
@@ -898,8 +1579,14 @@ impl State {
                     emoji_end = Some(x + drawn / 2.);
                 }
             }
+            if exact.is_some() {
+                pen += run.get_typographic_bounds().width;
+            }
         }
         let typographic_bounds = line.get_typographic_bounds();
+        if let Some((xs, _)) = exact {
+            xs.push(typographic_bounds.width + f64::from(shift));
+        }
         LineLayout {
             runs,
             font_size,
@@ -909,6 +1596,34 @@ impl State {
             len: text.len(),
         }
     }
+}
+
+#[cfg(debug_assertions)]
+fn same_lines(a: &LineLayout, b: &LineLayout) -> bool {
+    let glyphs = |layout: &LineLayout| {
+        layout
+            .runs
+            .iter()
+            .flat_map(|run| {
+                run.glyphs
+                    .iter()
+                    .map(move |glyph| (run.font_id, run.font_size, glyph.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+    let (a_glyphs, b_glyphs) = (glyphs(a), glyphs(b));
+    a.runs.len() == b.runs.len()
+        && (a.width - b.width).abs() < px(1e-3)
+        && (a.ascent, a.descent) == (b.ascent, b.descent)
+        && a_glyphs.len() == b_glyphs.len()
+        && a_glyphs
+            .iter()
+            .zip(&b_glyphs)
+            .all(|((a_font, a_size, a), (b_font, b_size, b))| {
+                (a_font, a_size, a.id, a.index, a.is_emoji, a.position.y)
+                    == (b_font, b_size, b.id, b.index, b.is_emoji, b.position.y)
+                    && (a.position.x - b.position.x).abs() < px(1e-3)
+            })
 }
 
 #[derive(Debug, Clone)]
@@ -986,5 +1701,60 @@ fn font_kit_style(style: FontStyle) -> FontkitStyle {
         FontStyle::Normal => FontkitStyle::Normal,
         FontStyle::Italic => FontkitStyle::Italic,
         FontStyle::Oblique => FontkitStyle::Oblique,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_fonts_load_once_per_process() {
+        let names = |text: &TextSystem, weight: f32| {
+            let font = Font {
+                weight: crate::FontWeight(weight),
+                ..crate::text::font(".SystemUIFont")
+            };
+            let id = text.font_id(&font).unwrap();
+            text.0.borrow().postscript_names_by_font_id[&id].clone()
+        };
+        let [first, second] = [TextSystem::new(), TextSystem::new()];
+        let bold = names(&first, 600.);
+        assert!(bold.ends_with("#wght600"), "{bold}");
+        assert_eq!(
+            [names(&second, 400.), names(&second, 600.)],
+            [names(&first, 400.), bold]
+        );
+        let missing = crate::text::font("No Such Family h2o");
+        assert!(first.font_id(&missing).is_err() && second.font_id(&missing).is_err());
+        let families = SYSTEM_FAMILIES.lock().unwrap();
+        assert!(families.iter().any(|(key, faces)| {
+            key.0 == "No Such Family h2o" && faces.get().is_some_and(Option::is_none)
+        }));
+        let system = families
+            .iter()
+            .find(|(key, _)| key.0 == ".AppleSystemUIFont")
+            .unwrap();
+        let face = &system.1.get().unwrap().as_ref().unwrap()[0].0;
+        let shared = second.0.borrow().fonts.iter().any(|font| {
+            font.native_font().as_concrete_TypeRef() == face.native_font().as_concrete_TypeRef()
+        });
+        assert!(shared, "the second text system uses the process's faces");
+    }
+
+    #[test]
+    fn fonts_from_memory_stay_with_their_text_system() {
+        let bytes = std::fs::read("/System/Library/Fonts/Supplemental/Chalkduster.ttf").unwrap();
+        let text = TextSystem::new();
+        text.add_fonts(vec![Cow::Owned(bytes)]).unwrap();
+        let id = text.font_id(&crate::text::font("Chalkduster")).unwrap();
+        assert!(text.0.borrow().local.contains(&id));
+        assert!(
+            !SYSTEM_FAMILIES
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|key| key.0 == "Chalkduster")
+        );
     }
 }

@@ -564,11 +564,26 @@ pub(super) struct InlineText {
     pub(super) atoms: Rc<[AtomSlot]>,
     pub(super) justify: Option<bool>,
     pub(super) shaped: std::cell::RefCell<Option<(renderer::TextLayout, Vec<renderer::TextRun>)>>,
-    pub(super) prepainted: std::cell::RefCell<(
-        Vec<(renderer::Hitbox, renderer::CursorStyle)>,
-        crate::dom::Rows,
-    )>,
+    pub(super) prepainted: std::cell::RefCell<Prepainted>,
 }
+
+// WARNING: what the last prepaint gave, so a kept paragraph gives it again, moved where its box moved.
+#[derive(Default)]
+pub(super) struct Prepainted {
+    hitboxes: Vec<(renderer::Hitbox, renderer::CursorStyle)>,
+    rows: crate::dom::Rows,
+    layouts: Vec<(usize, TextLayoutEntry)>,
+    rects: Vec<(usize, [f32; 4])>,
+    origin: Point<Pixels>,
+}
+
+type TextLayoutEntry = (
+    renderer::TextLayout,
+    Rc<str>,
+    std::ops::Range<usize>,
+    crate::dom::Rows,
+    [Pixels; 2],
+);
 
 pub(super) struct AtomSlot {
     pub(super) size: [f32; 3],
@@ -645,7 +660,7 @@ impl PartialEq for Measured {
     }
 }
 
-impl From<InlineText> for renderer::Child {
+impl From<InlineText> for renderer::Node {
     fn from(text: InlineText) -> Self {
         let data = &text.data;
         let sized = data.runs.iter().any(|run| run.font_size.is_some())
@@ -654,9 +669,7 @@ impl From<InlineText> for renderer::Child {
                 .as_deref()
                 .is_some_and(|(_, pseudo, _)| pseudo.font_size.is_some());
         if data.first_line.is_none() && !sized {
-            return renderer::text(data.text.to_string(), Some(data.runs.to_vec()))
-                .hooks(text)
-                .into();
+            return renderer::text(data.text.clone(), Some(data.runs.to_vec())).hooks(text);
         }
         renderer::node()
             .measure(
@@ -758,14 +771,50 @@ impl From<InlineText> for renderer::Child {
                 },
             )
             .hooks(text)
-            .into()
+    }
+}
+
+impl InlineText {
+    // WARNING: the areas of the paragraph's links that show a cursor: their text, or the rows between their ends.
+    fn cursors<'a>(
+        &'a self,
+        layout: &'a renderer::TextLayout,
+        rows: &'a crate::dom::Rows,
+        bounds: Bounds<Pixels>,
+    ) -> impl Iterator<Item = (Bounds<Pixels>, renderer::CursorStyle)> + 'a {
+        self.data.cursors.iter().filter_map(move |&(index, cursor)| {
+            let range = &self.data.ranges.get(index)?.1;
+            let (a, b) = text_position(layout, &self.data.text, rows, range.start)
+                .zip(text_position(layout, &self.data.text, rows, range.end))?;
+            let rect = if a.y == b.y {
+                Bounds::new(a, size(b.x - a.x, layout.line_height()))
+            } else {
+                Bounds::new(
+                    point(bounds.left(), a.y),
+                    size(bounds.size.width, b.y - a.y + layout.line_height()),
+                )
+            };
+            Some((rect, cursor))
+        })
     }
 }
 
 impl renderer::Hooks for InlineText {
+    fn bounded(&self) -> bool {
+        true
+    }
+
     fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window);
-        let (bounds, exact, style) = (cx.bounds, cx.exact, cx.text.clone());
+        // WARNING: a block that holds its paragraph itself sets its text inside its padding and border.
+        let [top, right, bottom, left] = cx.inset;
+        let inside = |bounds: Bounds<Pixels>| {
+            Bounds::new(
+                bounds.origin + point(left, top),
+                size(bounds.size.width - left - right, bounds.size.height - top - bottom),
+            )
+        };
+        let (bounds, exact, style) = (inside(cx.bounds), inside(cx.exact), cx.text.clone());
         let measured = cx.state::<Measured>().map(|kept| kept.measured.clone());
         let node_layout = cx.text_layout().cloned();
         let window = &mut *cx.window;
@@ -939,26 +988,8 @@ impl renderer::Hooks for InlineText {
             }
         }
         let hitboxes = self
-            .data
-            .cursors
-            .iter()
-            .filter_map(|&(index, cursor)| {
-                let range = &self.data.ranges.get(index)?.1;
-                let (a, b) = text_position(layout, &self.data.text, &rows, range.start)
-                    .zip(text_position(layout, &self.data.text, &rows, range.end))?;
-                let rect = if a.y == b.y {
-                    Bounds::new(a, size(b.x - a.x, layout.line_height()))
-                } else {
-                    Bounds::new(
-                        point(bounds.left(), a.y),
-                        size(bounds.size.width, b.y - a.y + layout.line_height()),
-                    )
-                };
-                Some((
-                    window.insert_hitbox(rect, renderer::HitboxBehavior::Normal),
-                    cursor,
-                ))
-            })
+            .cursors(layout, &rows, bounds)
+            .map(|(rect, cursor)| (window.insert_hitbox(rect, renderer::HitboxBehavior::Normal), cursor))
             .collect();
         let shift = exact.origin - bounds.origin;
         let view = &*self.view;
@@ -966,6 +997,12 @@ impl renderer::Hooks for InlineText {
         let dom = host.dom.entry(view.id).or_default();
         let computed = dom.computed.clone();
         let mut spans: Option<Vec<(usize, Pixels)>> = None;
+        let (mut layouts, mut rects) = {
+            let mut prepainted = self.prepainted.borrow_mut();
+            (std::mem::take(&mut prepainted.layouts), std::mem::take(&mut prepainted.rects))
+        };
+        layouts.clear();
+        rects.clear();
         for (at, (id, range)) in self.data.ranges.iter().enumerate() {
             let boxed = self.data.boxes.iter().find(|inline| inline.index == at);
             if let Some((mut a, mut b, mut top, mut height)) = inline_box(
@@ -1053,34 +1090,90 @@ impl renderer::Hooks for InlineText {
                     }
                     (origin + low, high - low)
                 };
-                dom.bounds.insert(
-                    *id,
-                    [
-                        (left + shift.x).into(),
-                        (a.y + top + shift.y).into(),
-                        width.into(),
-                        (b.y - a.y + height).into(),
-                    ],
+                let rect = [
+                    (left + shift.x).into(),
+                    (a.y + top + shift.y).into(),
+                    width.into(),
+                    (b.y - a.y + height).into(),
+                ];
+                dom.bounds.insert(*id, rect);
+                rects.push((*id, rect));
+                let entry = (
+                    layout.clone(),
+                    self.data.text.clone(),
+                    range.clone(),
+                    rows.clone(),
+                    font,
                 );
-                dom.text_layouts.insert(
-                    *id,
-                    (
-                        layout.clone(),
-                        self.data.text.clone(),
-                        range.clone(),
-                        rows.clone(),
-                        font,
-                    ),
-                );
+                dom.text_layouts.insert(*id, entry.clone());
+                layouts.push((*id, entry));
             }
         }
         std::mem::drop(host);
         std::mem::drop(shaped);
-        *self.prepainted.borrow_mut() = (hitboxes, rows);
+        *self.prepainted.borrow_mut() = Prepainted {
+            hitboxes,
+            rows,
+            layouts,
+            rects,
+            origin: exact.origin,
+        };
+    }
+
+    // WARNING: a paragraph with atoms or one it shapes itself places them in each pass.
+    fn volatile(&self) -> bool {
+        !self.atoms.is_empty()
+            || self.data.first_line.is_some()
+            || self.data.runs.iter().any(|run| run.font_size.is_some())
+    }
+
+    // WARNING: the page drops its text layouts in each build, so a kept paragraph gives them again. One that moved with
+    // its box moves its rects and cursor areas along.
+    fn kept(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        inner(cx.window);
+        let [top, right, bottom, left] = cx.inset;
+        let bounds = Bounds::new(
+            cx.bounds.origin + point(left, top),
+            size(cx.bounds.size.width - left - right, cx.bounds.size.height - top - bottom),
+        );
+        let origin = cx.exact.origin + point(left, top);
+        let layout = cx.text_layout().cloned();
+        let mut prepainted = self.prepainted.borrow_mut();
+        let Prepainted {
+            hitboxes,
+            rows,
+            layouts,
+            rects,
+            origin: at,
+        } = &mut *prepainted;
+        let moved = origin != *at;
+        let window = &mut *cx.window;
+        let places: Vec<_> = match &layout {
+            Some(layout) if moved => self.cursors(layout, rows, bounds).map(|(rect, _)| rect).collect(),
+            _ => hitboxes.iter().map(|(hitbox, _)| hitbox.bounds).collect(),
+        };
+        for ((hitbox, _), place) in hitboxes.iter_mut().zip(places) {
+            *hitbox = window.place_hitbox(hitbox, place);
+        }
+        let view = &*self.view;
+        let mut host = view.host.borrow_mut();
+        let dom = host.dom.entry(view.id).or_default();
+        if moved {
+            let [x, y] = [origin.x - at.x, origin.y - at.y].map(f32::from);
+            *at = origin;
+            for (id, rect) in rects.iter_mut() {
+                rect[0] += x;
+                rect[1] += y;
+                dom.bounds.insert(*id, *rect);
+            }
+        }
+        for (id, entry) in layouts.iter() {
+            dom.text_layouts.insert(*id, entry.clone());
+        }
     }
 
     // WARNING: the paragraph paints its own rows, so the text node's lines are not painted.
-    fn paint(&self, cx: &mut renderer::NodeCx<'_>, _: &mut dyn FnMut(&mut Window)) {
+    fn paint_content(&self, cx: &mut renderer::NodeCx<'_>) -> bool {
         let node_layout = cx.text_layout().cloned();
         let text_style = cx.text.clone();
         let window = &mut *cx.window;
@@ -1088,10 +1181,10 @@ impl renderer::Hooks for InlineText {
         let (layout, runs) = match (&*shaped, &node_layout) {
             (Some((layout, runs)), _) => (layout, &runs[..]),
             (None, Some(layout)) => (layout, &self.data.runs[..]),
-            (None, None) => return,
+            (None, None) => return true,
         };
         let prepainted = self.prepainted.borrow();
-        let (hitboxes, rows) = &*prepainted;
+        let Prepainted { hitboxes, rows, .. } = &*prepainted;
         for (hitbox, cursor) in hitboxes.iter() {
             window.set_cursor_style(*cursor, hitbox);
         }
@@ -1296,5 +1389,6 @@ impl renderer::Hooks for InlineText {
                 paint(window);
             }
         }
+        true
     }
 }

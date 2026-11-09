@@ -3437,6 +3437,36 @@ globalThis.result = [nextId, early, viaGetter, viaMethod].join();",
 }
 
 #[test]
+fn production_reads_only_the_builtin_exports_that_imports_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let named = dir.path().join("named.js");
+    fs::write(&named, "import { existsSync } from 'node:fs'; import { join } from 'node:path'; globalThis.result = [existsSync(join('/', 'missing-file')), typeof join].join(':');").unwrap();
+    let whole = dir.path().join("whole.js");
+    fs::write(&whole, "import * as all from 'node:fs'; globalThis.result = [typeof all.ReadStream, Object.keys(all).includes('createReadStream')].join(':');").unwrap();
+    for production in [false, true] {
+        for (entry, reads, expected) in [
+            (&named, !production, "false:function"),
+            (&whole, true, "function:true"),
+        ] {
+            let files = compile(entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+            assert_eq!(
+                files["app.js"].contains("ReadStream"),
+                reads,
+                "{entry:?} production={production}"
+            );
+            let engine = apps_runtime::jsc::JsContext::new(
+                apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+                Rc::default(),
+                apps_runtime::host::Role::Main,
+            )
+            .unwrap();
+            engine.load_bundle(&files, "app.js").unwrap();
+            assert_eq!(engine.eval("result", "test").unwrap(), expected);
+        }
+    }
+}
+
+#[test]
 fn production_drops_unused_modules_of_side_effect_free_packages() {
     let dir = tempfile::tempdir().unwrap();
     let icons = dir.path().join("node_modules/icons");

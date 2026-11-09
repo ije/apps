@@ -9,12 +9,16 @@ use std::{
     rc::Rc,
 };
 
+macro_rules! same {
+    ($a:expr, $b:expr; $($field:ident),*) => { $($a.$field == $b.$field)&&* };
+}
+
 #[derive(Default, Clone)]
 pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
 
 struct TextLayoutInner {
     shaped_width: Option<Pixels>,
-    lines: Vec<WrappedLine>,
+    lines: Rc<[WrappedLine]>,
     line_height: Pixels,
     top: Pixels,
     wrap_width: Option<Pixels>,
@@ -26,23 +30,19 @@ struct TextLayoutInner {
 
 pub(crate) struct TextState {
     text: SharedString,
-    runs: Vec<TextRun>,
-    style: TextStyle,
+    runs: RefCell<Vec<TextRun>>,
+    style: RefCell<TextStyle>,
     scale: f32,
     pub(crate) layout: TextLayout,
     probes: Cell<[Option<Probe>; 2]>,
+    repaint: Cell<bool>,
+    base: RefCell<Option<Base>>,
 }
 
 type Probe = (Size<Pixels>, [Pixels; 2]);
 
-impl PartialEq for TextState {
-    fn eq(&self, other: &Self) -> bool {
-        self.text == other.text
-            && self.runs == other.runs
-            && self.style == other.style
-            && self.scale == other.scale
-    }
-}
+// WARNING: the unwrapped lines, which every width wraps, and how far the first and the other lines reach.
+type Base = (Rc<[WrappedLine]>, [Pixels; 2]);
 
 impl TextState {
     pub(crate) fn new(
@@ -52,22 +52,65 @@ impl TextState {
         scale: f32,
     ) -> Self {
         Self {
-            runs: runs.unwrap_or_else(|| vec![style.to_run(text.len())]),
+            runs: RefCell::new(runs.unwrap_or_else(|| vec![style.to_run(text.len())])),
             text,
-            style: style.clone(),
+            style: RefCell::new(style.clone()),
             scale,
             layout: TextLayout::default(),
             probes: Cell::default(),
+            repaint: Cell::new(false),
+            base: RefCell::default(),
         }
     }
 
     pub(crate) fn restyled(&self, own: bool, style: &TextStyle, scale: f32) -> Self {
         Self::new(
             self.text.clone(),
-            own.then(|| self.runs.clone()),
+            own.then(|| self.runs.borrow().clone()),
             style,
             scale,
         )
+    }
+
+    // WARNING: true when `new` measures like this state. Then the two swap their paint, and this state shapes again
+    // when it next paints, so its box keeps its layout.
+    pub(crate) fn keep(&self, new: &TextState) -> bool {
+        if self.text != new.text
+            || self.scale != new.scale
+            || !same_shaping(&self.style.borrow(), &new.style.borrow())
+        {
+            return false;
+        }
+        let (old, runs) = (self.runs.borrow(), new.runs.borrow());
+        let mut last: Option<(&TextRun, &TextRun)> = None;
+        // WARNING: runs split where their decoration changes, which breaks ligatures, so those places must stay.
+        let same = old.len() == runs.len()
+            && old
+                .iter()
+                .zip(runs.iter())
+                .filter(|(a, b)| a.len > 0 || b.len > 0)
+                .all(|(a, b)| {
+                    let joined = last.is_none_or(|(x, y)| {
+                        same!(x, a; color, background_color, underline, strikethrough)
+                            == same!(y, b; color, background_color, underline, strikethrough)
+                    });
+                    last = Some((a, b));
+                    joined
+                        && same!(a, b; len, font, letter_spacing, word_spacing, font_size, inset, nowrap)
+                });
+        if !same {
+            return false;
+        }
+        if *old != *runs || *self.style.borrow() != *new.style.borrow() {
+            drop((old, runs));
+            self.runs.swap(&new.runs);
+            self.style.swap(&new.style);
+            self.base.take();
+            if self.layout.0.borrow_mut().take().is_some() {
+                self.repaint.set(true);
+            }
+        }
+        true
     }
 
     pub(crate) fn measure(
@@ -78,12 +121,12 @@ impl TextState {
     ) -> (Size<Pixels>, Option<[Pixels; 2]>) {
         let Self {
             text,
-            runs,
-            style,
             layout,
             probes,
             ..
         } = self;
+        let (runs, style) = (self.runs.borrow(), self.style.borrow());
+        let (runs, style) = (&*runs, &*style);
         let line_height = style.line_height;
         let definite = |space: AvailableSpace| match space {
             AvailableSpace::Definite(width) => Some(width),
@@ -111,58 +154,166 @@ impl TextState {
         }
         let min_content = probe == Some(0);
         let system = window.text_system().clone();
-        let (text, runs, truncated) = match truncate {
-            Some((affix, width)) => {
-                let (text, runs, truncated) =
-                    truncate_text(&system, style, text, runs, &affix, width, wrap_width);
-                (text, Cow::Owned(runs), truncated)
-            }
-            None => (text.clone(), Cow::Borrowed(runs), false),
-        };
         // WARNING: like CSS, `BreakWord` does not break inside words for the min-content size.
-        let shape = |runs: &[TextRun]| {
-            system
+        let word_break = match style.word_break {
+            WordBreak::BreakWord if min_content => WordBreak::Normal,
+            word_break => word_break,
+        };
+        let float = style.float;
+        let base = || {
+            let lines: Rc<[WrappedLine]> = system
                 .shape_text_indented(
                     text.clone(),
                     style.font_size,
                     runs,
-                    if min_content && wraps {
-                        Some(px(0.))
-                    } else {
-                        wrap_width
-                    },
-                    style.line_clamp.filter(|_| !min_content),
-                    style.text_indent,
-                    if min_content {
-                        TextWrap::Wrap
-                    } else {
-                        style.text_wrap
-                    },
-                    match style.word_break {
-                        WordBreak::BreakWord if min_content => WordBreak::Normal,
-                        word_break => word_break,
-                    },
+                    None,
+                    None,
+                    px(0.),
+                    TextWrap::Wrap,
+                    WordBreak::Normal,
                 )
                 .unwrap_or_default()
+                .into();
+            let mut reach = [px(0.); 2];
+            for (index, line) in lines.iter().enumerate() {
+                let layout = &line.unwrapped_layout;
+                let end = layout
+                    .runs
+                    .iter()
+                    .flat_map(|run| &run.glyphs)
+                    .fold(layout.width, |end, glyph| end.max(glyph.position.x));
+                reach[(index > 0) as usize] = reach[(index > 0) as usize].max(end);
+            }
+            (lines, reach)
         };
-        // WARNING: like a CSS float, the float moves the first line, and the text goes below it when the first
-        // word doesn't fit beside it, as at the min-content size of text that wraps. The float doesn't widen the
-        // min-content size of the text, which is at least as wide as the float.
-        let float = style.float;
-        let beside = (float > px(0.) && !(min_content && wraps))
-            .then(|| {
-                let mut runs = runs.to_vec();
-                runs.first_mut()?.inset[0] += float;
-                Some(shape(&runs))
-            })
-            .flatten()
-            .filter(|lines| {
-                wrap_width
-                    .zip(lines.first())
-                    .is_none_or(|(width, line)| line.first_row_end() <= width + px(0.01))
-            });
-        let top = if beside.is_none() { float } else { px(0.) };
-        let lines = beside.unwrap_or_else(|| shape(&runs));
+        // WARNING: one line of text that doesn't wrap and fits needs no ellipsis, so it shapes once, like other text,
+        // where `truncate_text` would shape it to find no cut and then the text would shape again.
+        let fits = truncate.as_ref().is_some_and(|(_, width)| {
+            float == px(0.)
+                && wrap_width.is_none()
+                && style.line_clamp.is_none()
+                && style.text_indent == px(0.)
+                && {
+                    let mut kept = self.base.borrow_mut();
+                    let (lines, _) = kept.get_or_insert_with(base);
+                    lines.len() == 1 && lines[0].unwrapped_layout.width <= *width
+                }
+        });
+        let (lines, top, truncated) = if (truncate.is_none() || fits) && float == px(0.) {
+            let mut kept = self.base.borrow_mut();
+            let (lines, [first, rest]) = kept.get_or_insert_with(base);
+            let wrap = match min_content {
+                true => Some((px(0.), None, TextWrap::Wrap)),
+                false => wrap_width.map(|width| (width, style.line_clamp, style.text_wrap)),
+            };
+            let lines = match wrap {
+                // WARNING: lines that reach no further than the width don't wrap and keep their size.
+                Some((width, ..))
+                    if *first <= width.min(width - style.text_indent) && *rest <= width =>
+                {
+                    lines.clone()
+                }
+                None => lines.clone(),
+                Some((width, clamp, wrap)) => {
+                    let nowrap = runs.iter().any(|run| run.nowrap);
+                    let (mut start, mut wrapped) = (0, 0);
+                    lines
+                        .iter()
+                        .enumerate()
+                        .map(|(index, line)| {
+                            let end = start + line.len();
+                            let mut ranges = Vec::new();
+                            if nowrap {
+                                let mut at = 0;
+                                for run in runs {
+                                    let range = at.max(start)..(at + run.len).min(end);
+                                    if run.nowrap && range.start < range.end {
+                                        ranges.push(range.start - start..range.end - start);
+                                    }
+                                    at += run.len;
+                                }
+                            }
+                            let boundaries = line.unwrapped_layout.compute_wrap_boundaries(
+                                &line.text,
+                                width,
+                                clamp.map(|max: usize| max.saturating_sub(wrapped)),
+                                if index == 0 {
+                                    style.text_indent
+                                } else {
+                                    px(0.)
+                                },
+                                wrap,
+                                word_break,
+                                &ranges,
+                            );
+                            (start, wrapped) = (end + 1, wrapped + boundaries.len());
+                            WrappedLine {
+                                layout: Rc::new(WrappedLineLayout {
+                                    unwrapped_layout: line.unwrapped_layout.clone(),
+                                    wrap_boundaries: boundaries,
+                                    wrap_width: Some(width),
+                                }),
+                                text: line.text.clone(),
+                                decoration_runs: line.decoration_runs.clone(),
+                            }
+                        })
+                        .collect()
+                }
+            };
+            (lines, px(0.), false)
+        } else {
+            let (text, runs, truncated) = match truncate {
+                Some((affix, width)) => {
+                    let (text, runs, truncated) =
+                        truncate_text(&system, style, text, runs, &affix, width, wrap_width);
+                    (text, Cow::Owned(runs), truncated)
+                }
+                None => (text.clone(), Cow::Borrowed(runs), false),
+            };
+            let shape = |runs: &[TextRun]| {
+                system
+                    .shape_text_indented(
+                        text.clone(),
+                        style.font_size,
+                        runs,
+                        if min_content && wraps {
+                            Some(px(0.))
+                        } else {
+                            wrap_width
+                        },
+                        style.line_clamp.filter(|_| !min_content),
+                        style.text_indent,
+                        if min_content {
+                            TextWrap::Wrap
+                        } else {
+                            style.text_wrap
+                        },
+                        word_break,
+                    )
+                    .unwrap_or_default()
+            };
+            // WARNING: like a CSS float, the float moves the first line, and the text goes below it when the first
+            // word doesn't fit beside it, as at the min-content size of text that wraps. The float doesn't widen the
+            // min-content size of the text, which is at least as wide as the float.
+            let beside = (float > px(0.) && !(min_content && wraps))
+                .then(|| {
+                    let mut runs = runs.to_vec();
+                    runs.first_mut()?.inset[0] += float;
+                    Some(shape(&runs))
+                })
+                .flatten()
+                .filter(|lines| {
+                    wrap_width
+                        .zip(lines.first())
+                        .is_none_or(|(width, line)| line.first_row_end() <= width + px(0.01))
+                });
+            let top = if beside.is_none() { float } else { px(0.) };
+            (
+                beside.unwrap_or_else(|| shape(&runs)).into(),
+                top,
+                truncated,
+            )
+        };
         let mut size = Size::<Pixels>::default();
         for (index, line) in lines.iter().enumerate() {
             let mut line_size = line.size(line_height);
@@ -176,7 +327,7 @@ impl TextState {
         if min_content {
             size.width = px(0.);
             let mut start = float - top - style.text_indent;
-            for line in &lines {
+            for line in lines.iter() {
                 let unwrapped = &line.unwrapped_layout;
                 let mut breaks = line.wrap_boundaries.iter().peekable();
                 let mut glyphs = unwrapped
@@ -228,6 +379,7 @@ impl TextState {
         }
         // WARNING: taffy can take the final size from its cache, so a probe keeps the painted layout.
         if probe.is_none() || layout.0.borrow().is_none() {
+            self.repaint.set(false);
             *layout.0.borrow_mut() = Some(TextLayoutInner {
                 shaped_width: if min_content { Some(px(0.)) } else { width },
                 lines,
@@ -247,18 +399,18 @@ impl TextState {
 impl TextState {
     /// WARNING: taffy can answer the final width from its cache across frames, while the text was last shaped for another width.
     pub(crate) fn fit(&self, width: Pixels, window: &mut Window) {
-        if self.style.white_space != WhiteSpace::Normal && self.style.text_overflow.is_none() {
-            return;
-        }
-        let stale = self
-            .layout
-            .0
-            .borrow()
-            .as_ref()
-            .is_some_and(|inner| match inner.shaped_width {
-                Some(shaped) => (shaped - width).abs() > px(0.01),
-                None => inner.size.width > width + px(0.01),
-            });
+        let style = self.style.borrow();
+        let wraps = style.white_space == WhiteSpace::Normal || style.text_overflow.is_some();
+        drop(style);
+        let stale =
+            self.repaint.take()
+                || wraps
+                    && self.layout.0.borrow().as_ref().is_some_and(|inner| {
+                        match inner.shaped_width {
+                            Some(shaped) => (shaped - width).abs() > px(0.01),
+                            None => inner.size.width > width + px(0.01),
+                        }
+                    });
         if stale {
             self.measure(
                 Size::new(Some(width), None),
@@ -279,7 +431,7 @@ impl TextLayout {
             return;
         };
         let mut origin = bounds.origin + Point::new(px(0.), inner.top);
-        for line in &inner.lines {
+        for line in inner.lines.iter() {
             line.paint_background(origin, inner.line_height, align, Some(bounds), window);
             line.paint(origin, inner.line_height, align, Some(bounds), window);
             origin.y += line.size(inner.line_height).height;
@@ -299,7 +451,7 @@ impl TextLayout {
         }
         let mut origin = bounds.origin + Point::new(px(0.), inner.top);
         let mut start = 0;
-        for line in &inner.lines {
+        for line in inner.lines.iter() {
             let bottom = origin.y + line.size(inner.line_height).height;
             if position.y > bottom {
                 origin.y = bottom;
@@ -319,7 +471,7 @@ impl TextLayout {
         let inner = inner.as_ref()?;
         let mut origin = inner.bounds?.origin + Point::new(px(0.), inner.top);
         let mut start = 0;
-        for line in &inner.lines {
+        for line in inner.lines.iter() {
             let end = start + line.len();
             if index < start {
                 break;
@@ -379,6 +531,11 @@ impl TextLayout {
             .as_ref()
             .map_or(px(0.), |inner| inner.line_height)
     }
+}
+
+pub(crate) fn same_shaping(a: &TextStyle, b: &TextStyle) -> bool {
+    same!(a, b; font_family, font_features, font_fallbacks, font_size, line_height, font_weight, font_style,
+        white_space, text_overflow, line_clamp, letter_spacing, word_spacing, text_indent, float, text_wrap, word_break)
 }
 
 fn truncate_text(
@@ -487,4 +644,52 @@ fn truncate_text(
         None => new_runs.push(style.to_run(affix.len())),
     }
     (kept.into(), new_runs, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rgba;
+
+    #[test]
+    fn paint_changes_keep_the_measure() {
+        let style = TextStyle::default();
+        let run = |len: usize, color: u32| TextRun {
+            color: rgba(color),
+            ..style.to_run(len)
+        };
+        let state = |runs: Vec<TextRun>| TextState::new("ab cd".into(), Some(runs), &style, 1.);
+        let old = state(vec![run(2, 0xff0000ff), run(3, 0x0000ffff)]);
+        *old.layout.0.borrow_mut() = Some(TextLayoutInner {
+            shaped_width: None,
+            lines: Rc::new([]),
+            line_height: px(0.),
+            top: px(0.),
+            wrap_width: None,
+            truncated: false,
+            size: Size::default(),
+            baselines: [px(0.); 2],
+            bounds: None,
+        });
+        assert!(old.keep(&state(vec![run(2, 0xff0000ff), run(3, 0x0000ffff)])));
+        assert!(old.layout.0.borrow().is_some() && !old.repaint.get());
+        assert!(old.keep(&state(vec![run(2, 0x00ff00ff), run(3, 0x0000ffff)])));
+        assert_eq!(old.runs.borrow()[0].color, rgba(0x00ff00ff));
+        assert!(old.layout.0.borrow().is_none() && old.repaint.get());
+        assert!(!old.keep(&state(vec![run(2, 0x0000ffff), run(3, 0x0000ffff)])));
+        assert!(!old.keep(&state(vec![run(3, 0x00ff00ff), run(2, 0x0000ffff)])));
+        let wide = TextStyle {
+            letter_spacing: px(1.),
+            color: rgba(0xff0000ff),
+            ..style.clone()
+        };
+        assert!(same_shaping(
+            &style,
+            &TextStyle {
+                color: rgba(0xff0000ff),
+                ..style.clone()
+            }
+        ));
+        assert!(!same_shaping(&style, &wide));
+    }
 }

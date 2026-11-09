@@ -299,11 +299,20 @@ impl LayoutMirror {
         }
     }
 
-    pub(crate) fn hide(&mut self, visible: &[bool], old: &[bool]) {
+    // WARNING: `nodes` must hold every node shown in either list and every node past the end of `old`.
+    pub(crate) fn hide(
+        &mut self,
+        visible: &[bool],
+        old: &[bool],
+        nodes: impl Iterator<Item = usize>,
+    ) {
         if let Some(last) = visible.len().checked_sub(1) {
             self.reserve(last);
         }
-        for (id, &shown) in visible.iter().enumerate() {
+        for id in nodes {
+            let Some(&shown) = visible.get(id) else {
+                continue;
+            };
             if old.get(id).copied().unwrap_or(true) != shown {
                 unsafe {
                     let flags = self.flags(id);
@@ -432,7 +441,7 @@ pub struct State {
     frames: Frames,
     pub(crate) placeholders: rustc_hash::FxHashMap<usize, Placeholder>,
     decoding: rustc_hash::FxHashMap<usize, u64>,
-    pub(crate) reserved: HashSet<usize>,
+    pub(crate) reserved: rustc_hash::FxHashSet<usize>,
     pub(crate) svg_sources: rustc_hash::FxHashMap<usize, String>,
     pub(crate) svg_boxes: rustc_hash::FxHashMap<usize, SvgBoxes>,
     pub(crate) svg_trees: rustc_hash::FxHashMap<usize, usvg::Tree>,
@@ -575,15 +584,20 @@ impl State {
     }
 
     pub(crate) fn allocate(&mut self, doc: &mut Document, node: Node) -> usize {
-        let id = self.free.pop().map_or_else(
+        let id = self.slot(doc);
+        self.place(doc, id, node);
+        id
+    }
+
+    // An unused node id, freed or new, whose node is empty until `place` fills it.
+    fn slot(&mut self, doc: &mut Document) -> usize {
+        self.free.pop().map_or_else(
             || {
                 doc.nodes.push(Node::default());
                 doc.nodes.len() - 1
             },
             |id| id.0,
-        );
-        self.place(doc, id, node);
-        id
+        )
     }
 
     pub(crate) fn place(&mut self, doc: &mut Document, id: usize, node: Node) {
@@ -908,6 +922,7 @@ pub fn call(
             | "dom.client"
             | "dom.innerText"
             | "dom.wheel"
+            | "dom.iterations"
     ) {
         return None;
     }
@@ -996,6 +1011,10 @@ pub fn call(
         }
         if op == "dom.wheel" {
             state.wheel = true;
+            return Ok(Value::Null);
+        }
+        if op == "dom.iterations" {
+            state.motion.iterations = true;
             return Ok(Value::Null);
         }
         if op == "dom.cssControl" {
@@ -1624,22 +1643,26 @@ pub fn call(
                     state.removed.push(child);
                 }
                 doc.nodes[id].text.clear();
-                let mut ids = vec![id];
+                let mut ids = Vec::with_capacity(parsed.nodes.len());
+                ids.push(id);
                 for _ in 1..parsed.nodes.len() {
-                    ids.push(state.allocate(doc, Node::default()));
+                    ids.push(state.slot(doc));
                 }
                 doc.nodes[id].children = parsed.nodes[0]
                     .children
                     .iter()
                     .map(|&child| ids[child])
                     .collect();
+                // WARNING: the new nodes hang below `id`, so they are not detached roots.
+                let detached = state.detached.len();
                 for (index, mut node) in parsed.nodes.into_iter().enumerate().skip(1) {
                     node.parent = node.parent.map(|parent| ids[parent]);
                     for child in &mut node.children {
                         *child = ids[*child];
                     }
-                    doc.nodes[ids[index]] = node;
+                    state.place(doc, ids[index], node);
                 }
+                state.detached.truncate(detached);
                 state.dirty = true;
                 Ok(tree(doc, id, false))
             }
@@ -1710,7 +1733,7 @@ pub fn call(
                     .contains_key(&id)
                     .then(|| {
                         let now = std::time::Instant::now();
-                        state.motion.timeline(id, &styles, &[now]).pop()
+                        state.motion.timeline(id, &styles, &[now], &[]).pop()
                     })
                     .flatten();
                 let mut sampled = None;
@@ -1767,24 +1790,26 @@ pub fn call(
                 let size = (pseudo.is_empty())
                     .then(|| state.bounds.get(&id).map(|rect| [rect[2], rect[3]]))
                     .flatten();
-                let container = doc.nodes[id]
-                    .parent
-                    .and_then(|parent| {
-                        let rect = state.bounds.get(&parent)?;
-                        let (style, units) = (&styles.values[parent], styles.lengths[parent]);
-                        let padding = units.edges(style, style::PADDING, rect[2]);
-                        Some([
-                            rect[2] - padding[1] - padding[3],
-                            rect[3] - padding[0] - padding[2],
-                        ])
-                    })
-                    .unwrap_or(viewport);
+                let container = || {
+                    doc.nodes[id]
+                        .parent
+                        .and_then(|parent| {
+                            let rect = state.bounds.get(&parent)?;
+                            let (style, units) = (&styles.values[parent], styles.lengths[parent]);
+                            let padding = units.edges(style, style::PADDING, rect[2]);
+                            Some([
+                                rect[2] - padding[1] - padding[3],
+                                rect[3] - padding[0] - padding[2],
+                            ])
+                        })
+                        .unwrap_or(viewport)
+                };
                 let registry = state.style_cache.registry();
                 let parent = doc.nodes[id].parent.map(|parent| &*styles.values[parent]);
                 Ok(match args[1].as_str() {
                     Some(name) => {
                         let value =
-                            style::resolved(style, &units, name, size, container, &registry);
+                            style::resolved(style, &units, name, size, &container, &registry);
                         let tag = doc.nodes[id].tag.as_str();
                         json!(match (name, value.as_str()) {
                             ("display", "grid") if tag == "table" => "table".to_owned(),
@@ -2693,8 +2718,9 @@ pub fn call(
     })())
 }
 
+// WARNING: pages parse this JSON text, which costs a fraction of building and serializing JSON values for every node.
 fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
-    let mut list = Vec::new();
+    let mut list = Vec::with_capacity(1024);
     let mut pending: Vec<_> = if inclusive {
         vec![root]
     } else {
@@ -2708,19 +2734,28 @@ fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
                 && node.parent.is_some_and(|parent| {
                     matches!(doc.nodes[parent].tag.as_str(), "script" | "style")
                 });
-        list.extend([
-            json!(id),
-            json!(node.parent),
-            json!(node.tag),
-            if lazy { Value::Null } else { json!(node.text) },
-            json!(node.attrs.iter().count()),
-        ]);
-        for (key, value) in &node.attrs {
-            list.extend([json!(key), json!(value)]);
+        let text = (!lazy).then_some(&node.text);
+        let count = node.attrs.iter().count();
+        // WARNING: each part is written as a JSON array, whose brackets become the commas of one flat list.
+        let at = list.len();
+        let _ = serde_json::to_writer(&mut list, &(id, node.parent, &node.tag, text, count));
+        if at > 0 {
+            list[at] = b',';
+        }
+        list.pop();
+        for pair in &node.attrs {
+            let at = list.len();
+            let _ = serde_json::to_writer(&mut list, &pair);
+            list[at] = b',';
+            list.pop();
         }
         pending.extend(node.children.iter().rev());
     }
-    Value::Array(list)
+    if list.is_empty() {
+        list.push(b'[');
+    }
+    list.push(b']');
+    Value::String(String::from_utf8(list).unwrap_or_default())
 }
 
 fn scroll_offset(
@@ -3275,10 +3310,11 @@ pub(crate) fn styles(
         };
         result.user_select[id] = (mode, if mode == inherited.0 { inherited.1 } else { id });
     }
-    if result
-        .flags
+    if state
+        .style_walk
+        .nodes
         .iter()
-        .any(|flags| flags & style::DISPLAY_CONTENTS != 0)
+        .any(|&(id, _)| result.flags[id as usize] & style::DISPLAY_CONTENTS != 0)
     {
         let contents = |child: usize| result.flags[child] & style::DISPLAY_CONTENTS != 0;
         let mut parents = vec![false; doc.nodes.len()];
@@ -3859,6 +3895,174 @@ mod tests {
     }
 
     #[test]
+    fn incremental_styles_follow_class_changes() {
+        use crate::{
+            host::{Host, Page, Role},
+            jsc::{JavaScriptCore, JsContext},
+        };
+        use std::cell::RefCell;
+
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            Page {
+                doc: Document::parse(
+                    "<html><head><style>
+                    .on{color:red} .dark .leaf{color:blue} .a+.b{color:green} .box:has(.hit){background-color:yellow}
+                    li:nth-child(1 of .pick){color:purple} .wrap:not(.off) .inner{color:teal} .nest{& .deep{color:navy}}
+                    .row.sel{color:olive} .row b{padding-left:1px}
+                    </style></head><body><div id=root class=box><div id=wrap class=wrap><span id=inner class=inner>i</span></div>
+                    <span id=leaf class=leaf>x</span><i id=a></i><i class=b></i><ul><li id=l1>1</li><li id=l2>2</li></ul>
+                    <div id=nest><b class=deep>d</b></div>
+                    <div id=row class=row><b>r</b></div><em id=hit>h</em></div></body></html>",
+                ),
+                dirty: false,
+            },
+        );
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
+        let read = "for(const e of document.querySelectorAll('*'))getComputedStyle(e).color;";
+        engine
+            .eval(&format!("for(const id of ['root','wrap','leaf','a','l1','l2','nest','row','hit'])globalThis[id]=document.getElementById(id);{read}"), "test")
+            .unwrap();
+        for step in [
+            "row.classList.add('sel')",
+            "row.classList.add('zz')",
+            "row.classList.remove('sel')",
+            "root.classList.add('dark')",
+            "a.classList.add('a')",
+            "hit.classList.add('hit')",
+            "l2.classList.add('pick')",
+            "l1.classList.add('pick')",
+            "wrap.classList.add('off')",
+            "nest.classList.add('nest')",
+            "row.className='other'",
+            "root.classList.remove('dark')",
+            "wrap.classList.remove('off')",
+            "l1.classList.remove('pick')",
+            "hit.classList.remove('hit')",
+            "leaf.classList.add('on')",
+        ] {
+            engine.eval(&format!("{step};{read}"), "test").unwrap();
+        }
+        assert!(host.borrow().dom[&1].style_cache.incremental >= 15);
+    }
+
+    #[test]
+    fn cousins_that_share_matches_restyle_with_their_own_ancestors() {
+        use crate::{
+            host::{Host, Page, Role},
+            jsc::{JavaScriptCore, JsContext},
+        };
+        use std::cell::RefCell;
+
+        let rows = "<div class=row><span class=x>1</span></div><div class=row><span class=x>2</span></div>".repeat(2);
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            Page {
+                doc: Document::parse(&format!(
+                    "<html><head><style>.a .x{{color:red}} .g[data-k=v] .x{{padding-left:1px}} .row.on .x{{color:blue}}
+                    .g:hover .x{{color:green}}</style></head><body><div id=list><div id=g1 class=g>{rows}</div>
+                    <div id=g2 class=g>{rows}</div><div id=g3 class=g>{rows}</div></div></body></html>"
+                )),
+                dirty: false,
+            },
+        );
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
+        let read = "for(const e of document.querySelectorAll('*'))getComputedStyle(e).color;";
+        engine
+            .eval(&format!("for(const id of ['g1','g2','g3'])globalThis[id]=document.getElementById(id);{read}"), "test")
+            .unwrap();
+        for step in [
+            "g2.classList.add('a')",
+            "g3.children[3].classList.add('on')",
+            "g1.dataset.k='v'",
+            "g2.children[1].classList.add('on')",
+            "g2.classList.remove('a')",
+            "g3.append(g1.children[0])",
+            "g1.dataset.k='w'",
+        ] {
+            engine.eval(&format!("{step};{read}"), "test").unwrap();
+        }
+        let g3 = host.borrow().pages[&1]
+            .doc
+            .nodes
+            .iter()
+            .position(|node| node.attrs.get("id").is_some_and(|id| id == "g3"))
+            .unwrap();
+        host.borrow_mut()
+            .call(Role::Renderer(1), "dom.hover", json!([[g3]]))
+            .unwrap();
+        engine.eval(read, "test").unwrap();
+        assert!(host.borrow().dom[&1].style_cache.incremental >= 8);
+    }
+
+    #[test]
+    fn incremental_styles_adjust_collapsed_tables_again() {
+        use crate::{
+            host::{Host, Page, Role},
+            jsc::{JavaScriptCore, JsContext},
+        };
+        use std::cell::RefCell;
+
+        let rows = "<tr><td>a</td><td>b</td></tr>".repeat(4);
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            Page {
+                doc: Document::parse(&format!(
+                    "<html><head><style>table{{border-collapse:collapse}} td{{border:1px solid #ccc}}
+                    tr.danger td{{background-color:#fdd}} tr.thick td{{border-bottom:3px solid red}} tr.wide{{border-top:4px solid blue}}
+                    .x{{border-left:5px double green}} .blocky{{display:block}}</style></head><body><table id=t><thead><tr><th>h</th><th>i</th></tr></thead>
+                    <tbody id=b>{rows}</tbody></table><table id=u style='border:2px solid'><tr><td>c</td></tr></table></body></html>"
+                )),
+                dirty: false,
+            },
+        );
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
+        let read = "for(const e of document.querySelectorAll('*'))getComputedStyle(e).color;";
+        engine
+            .eval(&format!("for(const id of ['t','b','u'])globalThis[id]=document.getElementById(id);{read}"), "test")
+            .unwrap();
+        for step in [
+            "b.rows[1].className='danger'",
+            "b.rows[1].className='thick'",
+            "b.rows[2].className='wide'",
+            "b.rows[0].cells[1].className='x'",
+            "b.rows[3].cells[0].colSpan=2",
+            "b.rows[3].deleteCell(1)",
+            "b.insertRow().insertCell().textContent='n'",
+            "b.rows[0].remove()",
+            "t.style.border='6px solid'",
+            "u.rows[0].insertCell().style.border='7px dashed'",
+            "b.rows[1].className=''",
+            "t.style.borderCollapse='separate'",
+            "t.style.borderCollapse=''",
+            "t.classList.add('blocky')",
+            "t.classList.remove('blocky')",
+            "b.rows[0].className='danger'",
+        ] {
+            engine.eval(&format!("{step};{read}"), "test").unwrap();
+        }
+        assert!(host.borrow().dom[&1].style_cache.incremental >= 12);
+    }
+
+    #[test]
     fn incremental_styles_match_full_passes_in_shadow_trees() {
         use crate::{
             host::{Host, Page, Role},
@@ -4062,7 +4266,9 @@ mod tests {
         for node in 0..doc.nodes.len() {
             assert!(cached.lengths[node] == fresh.lengths[node], "{node}");
         }
-        let p = (0..doc.nodes.len()).find(|&node| doc.nodes[node].tag == "p").unwrap();
+        let p = (0..doc.nodes.len())
+            .find(|&node| doc.nodes[node].tag == "p")
+            .unwrap();
         doc.nodes[p].attrs.insert("class".into(), "x".into());
         state.invalidate();
         styles(&mut doc, &mut state, viewport, None);

@@ -10,7 +10,9 @@ use oxc_allocator::{Allocator, ArenaVec, TakeIn};
 use oxc_ast::{ast::*, builder::AstBuilder};
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
 use oxc_codegen::{Codegen, CodegenOptions, CommentOptions};
-use oxc_minifier::{Minifier, MinifierOptions};
+use oxc_minifier::{
+    CompressOptions, Minifier, MinifierOptions, PropertyReadSideEffects, TreeShakeOptions,
+};
 use oxc_parser::Parser;
 use oxc_react_compiler::{CompileResult, PluginOptions};
 use oxc_semantic::SemanticBuilder;
@@ -190,6 +192,7 @@ struct Module {
     linked: bool,
     preload: bool,
     pure: bool,
+    builtin: bool,
     asynchronous: u8,
 }
 
@@ -2304,6 +2307,12 @@ impl Builder {
             commonjs,
             linked,
             asynchronous,
+            builtin: path
+                .to_str()
+                .and_then(|path| path.strip_prefix("apps:"))
+                .is_some_and(|specifier| {
+                    specifier.starts_with("node:") || PACKAGES.contains(&specifier)
+                }),
             ..Module::default()
         };
         if commonjs {
@@ -2870,6 +2879,22 @@ fn bundle(
         };
         let origin = |dep: usize, name: &str| walk(dep, name, &mut Vec::new());
         let mut uses_of: Vec<Vec<(usize, Option<String>)>> = vec![Vec::new(); modules.len()];
+        // WARNING: a built-in module reads its exports from an object of the runtime, whose getters make node modules
+        // on first use, so its reads of exports that no importer uses are dropped.
+        let minifier = |module: &Module| MinifierOptions {
+            compress: Some(CompressOptions {
+                treeshake: TreeShakeOptions {
+                    property_read_side_effects: if module.builtin {
+                        PropertyReadSideEffects::None
+                    } else {
+                        PropertyReadSideEffects::All
+                    },
+                    ..TreeShakeOptions::default()
+                },
+                ..CompressOptions::default()
+            }),
+            ..MinifierOptions::default()
+        };
         let mut needed = vec![BTreeSet::new(); modules.len()];
         for &id in entries.iter().chain(&builder.dynamic) {
             needed[id] = available[id].clone();
@@ -2953,8 +2978,7 @@ fn bundle(
                 module.url,
                 parsed.diagnostics
             );
-            let result =
-                Minifier::new(MinifierOptions::default()).minify(&allocator, &mut parsed.program);
+            let result = Minifier::new(minifier(module)).minify(&allocator, &mut parsed.program);
             let scoping = result.scoping.as_ref().unwrap();
             let references = scoping.root_unresolved_references();
             let eval = references.contains_key("eval");
@@ -3154,7 +3178,7 @@ fn bundle(
                 .as_mut()
                 .context("Missing module factory body")?
                 .statements = parsed.program.body;
-            let result = Minifier::new(MinifierOptions::default()).minify(&allocator, &mut program);
+            let result = Minifier::new(minifier(module)).minify(&allocator, &mut program);
             // WARNING: the linker also saw reads in dead code, of modules that may be pruned, so only what the
             // minifier kept gets an argument. Parameters stay in place, so the others get nothing.
             let mut kept = Uses(Vec::new());

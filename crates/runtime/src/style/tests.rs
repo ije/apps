@@ -2760,7 +2760,7 @@ fn inline_logical_properties_follow_the_direction() {
             &computed.lengths[r],
             "margin-inline-start",
             None,
-            [200., 100.],
+            &|| [200., 100.],
             &Registry::default()
         ),
         "50px"
@@ -2872,7 +2872,7 @@ fn computed_values_serialize_shorthands_and_color_spaces_like_webkit() {
             &computed.lengths[id],
             name,
             None,
-            [800., 600.],
+            &|| [800., 600.],
             &Registry::default(),
         )
     };
@@ -3529,6 +3529,162 @@ fn incremental(
     cache.finish();
     *last = Some(out.clone());
     out
+}
+
+#[test]
+fn ancestor_filter_rejections_restyle_when_ancestors_change() {
+    let mut doc = Document::parse(
+        "<style>.a .x{color:red}[data-k]>.x{width:1px}#i .x{height:2px}div.b .x{top:3px}.c>.d .x{left:4px}</style>
+        <section id=s><div id=d><p id=p><span class=x>x</span></p></div></section>",
+    );
+    let [s, d, p, x] = ["#s", "#d", "#p", ".x"].map(|selector| element(&doc, selector));
+    let (mut cache, mut last) = (StyleCache::default(), None);
+    let mut matched = |doc: &Document| {
+        let out = incremental(doc, &mut cache, &mut last, [800., 600.]);
+        [
+            (Prop::COLOR, "red"),
+            (Prop::WIDTH, "1px"),
+            (Prop::HEIGHT, "2px"),
+            (Prop::TOP, "3px"),
+            (Prop::LEFT, "4px"),
+        ]
+        .map(|(prop, value)| u8::from(out.values[x].get(prop) == Some(value)))
+    };
+    assert_eq!(matched(&doc), [0, 0, 0, 0, 0]);
+    doc.nodes[s].attrs.set("class", "a");
+    assert_eq!(matched(&doc), [1, 0, 0, 0, 0]);
+    doc.nodes[d].attrs.set("data-k", "");
+    assert_eq!(matched(&doc), [1, 0, 0, 0, 0]);
+    doc.nodes[p].attrs.set("data-k", "");
+    assert_eq!(matched(&doc), [1, 1, 0, 0, 0]);
+    doc.nodes[d].attrs.set("id", "i");
+    assert_eq!(matched(&doc), [1, 1, 1, 0, 0]);
+    doc.nodes[s].attrs.set("class", "a b");
+    assert_eq!(matched(&doc), [1, 1, 1, 0, 0]);
+    doc.nodes[d].attrs.set("class", "b d");
+    assert_eq!(matched(&doc), [1, 1, 1, 1, 0]);
+    doc.nodes[s].attrs.set("class", "c");
+    assert_eq!(matched(&doc), [0, 1, 1, 1, 1]);
+    let mut doc = Document::parse(
+        "<style>[data-k]>.x{width:1px}</style><div><p><span class=x>x</span></p></div>",
+    );
+    let [div, p, x] = ["div", "p", ".x"].map(|selector| element(&doc, selector));
+    let (mut cache, mut last) = (StyleCache::default(), None);
+    let mut width = |doc: &Document| {
+        let out = incremental(doc, &mut cache, &mut last, [800., 600.]);
+        out.values[x].get(Prop::WIDTH) == Some("1px")
+    };
+    assert!(!width(&doc));
+    doc.nodes[div].attrs.set("data-k", "");
+    assert!(!width(&doc));
+    doc.nodes[p].attrs.set("data-k", "");
+    assert!(width(&doc));
+}
+
+#[test]
+fn animated_passes_start_from_the_stored_pass() {
+    let mut doc = Document::parse(
+        "<style>@property --w{syntax:'<length>';inherits:false;initial-value:1px}
+        @keyframes k{to{height:calc(var(--w) * 2)}}.a{width:var(--w);--c:red;animation:k 1s}.a p{color:var(--c)}</style>
+        <div class=a><p>x</p></div><div class=b><p>y</p></div><i>z</i>",
+    );
+    let [a, b, p, i] = [".a", ".b", ".a p", "i"].map(|selector| element(&doc, selector));
+    let (mut cache, mut last) = (StyleCache::default(), None);
+    let base = incremental(&doc, &mut cache, &mut last, [800., 600.]);
+    doc.nodes[b].attrs.set("class", "b a");
+    let context = StyleContext {
+        animated: HashMap::from([(
+            a,
+            Style::from_iter([
+                (Prop::new("--w"), "5px".into()),
+                (Prop::new("--c"), "blue".into()),
+            ]),
+        )]),
+        previous: Some(base.clone()),
+        ..Default::default()
+    };
+    let passes = cache.incremental;
+    let out = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut cache,
+        Some(&context),
+    );
+    cache.finish();
+    assert_eq!(cache.incremental, passes + 1);
+    assert_eq!(out.values[a].get(Prop::WIDTH), Some("5px"));
+    assert_eq!(out.values[p].get(Prop::COLOR), Some("blue"));
+    assert!(Rc::ptr_eq(&out.values[i], &base.values[i]));
+    assert_eq!(
+        format!("{:?}", out.animations.get(&a)),
+        format!("{:?}", base.animations.get(&a))
+    );
+    let after = incremental(&doc, &mut cache, &mut last, [800., 600.]);
+    assert_eq!(after.values[b].get(Prop::WIDTH), Some("1px"));
+    assert_eq!(after.values[a].get(Prop::WIDTH), Some("1px"));
+    assert!(after.animations.contains_key(&b));
+}
+
+#[test]
+fn bundled_sheets_name_their_font_lists() {
+    let mut doc = Document::parse(
+        "<style>@media (min-width:1px){p{font-family:'Geist', system-ui}}:root{--font-mono:Menlo,monospace;--x:1px}b{font:12px Arial}</style><style>@layer a{i{font-family:\"Inter\"}}</style>",
+    );
+    for id in 0..doc.nodes.len() {
+        if doc.nodes[id].tag == "#text" {
+            let sheet = Stylesheet::parse(&doc.nodes[id].text);
+            doc.nodes.get_mut(id).unwrap().stylesheet = Some(Rc::new(sheet));
+        }
+    }
+    let mut lists = font_lists(&doc);
+    lists.sort();
+    assert_eq!(
+        lists,
+        [
+            vec!["Geist", "system-ui"],
+            vec!["Inter"],
+            vec!["Menlo", "monospace"]
+        ]
+    );
+}
+
+#[test]
+fn text_nodes_follow_their_parent_units() {
+    let doc = Document::parse(
+        "<style>.a{font-size:2em}</style><div style=font-size:10px><p class=a>x</p><p class=a>x</p><p class=a>x</p></div><div style=font-size:20px><p class=a>y</p><p class=a>y</p><p class=a>y</p><!--z--><!--z--></div><b style=color:red>r</b><b style=color:red>r</b><b style=color:blue>u</b><b style=color:blue>u</b>",
+    );
+    let (mut cache, mut last) = (StyleCache::default(), None);
+    let out = incremental(&doc, &mut cache, &mut last, [800., 600.]);
+    let mut fresh = StyleCache {
+        unshared: true,
+        ..Default::default()
+    };
+    let reference = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut fresh,
+        None,
+    );
+    for id in 0..doc.nodes.len() {
+        assert!(*out.values[id] == *reference.values[id], "node {id}");
+        assert_eq!(out.lengths[id], reference.lengths[id], "node {id}");
+    }
+    let em = |data: &str| {
+        (0..doc.nodes.len())
+            .filter(|&id| doc.nodes[id].tag.starts_with('#') && doc.nodes[id].text == data)
+            .map(|id| out.lengths[id].font.em)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        [em("x"), em("y"), em("z")],
+        [[20.; 3].to_vec(), [40.; 3].to_vec(), [20.; 2].to_vec()]
+    );
 }
 
 #[test]
@@ -4206,4 +4362,229 @@ fn siblings_share_matches_only_when_they_read_no_position_or_neighbor() {
     ] {
         assert_eq!(get(parent, index, name).as_deref(), value, "{parent} {index} {name}");
     }
+}
+
+#[test]
+fn cousins_share_matches_only_with_the_same_ancestors() {
+    let rows =
+        "<div class=row><span class=x>1</span></div><div class=row><span class=x>2</span></div>";
+    for (css, groups) in [
+        (
+            ".a .x{color:red}",
+            "<div class=g>R</div><div class='g a'>R</div>",
+        ),
+        (
+            "[data-k=v] .x{color:red}",
+            "<div class=g data-k=w>R</div><div class=g data-k=v>R</div>",
+        ),
+        (
+            ".g[title] .x{color:red}",
+            "<div class=g>R</div><div class=g title=t>R</div>",
+        ),
+        (
+            ".g:hover .x{color:red}",
+            "<div class=g>R</div><div class=g id=hovered>R</div>",
+        ),
+        (
+            ".g:nth-child(2) .x{color:red}",
+            "<div class=g>R</div><div class=g>R</div>",
+        ),
+        (".row:nth-child(odd) .x{color:red}", "<div class=g>R</div>"),
+        (
+            ".row:first-child .x{color:red}",
+            "<div class=g>R</div><div class=g>R</div>",
+        ),
+        (
+            ":not(.b)>.row .x{color:red}",
+            "<div class=g>R</div><div class='g b'>R</div>",
+        ),
+        (
+            ".g:is(.c) .x{color:red}",
+            "<div class=g>R</div><div class='g c'>R</div>",
+        ),
+        (
+            ".g:has(.y) .x{color:red}",
+            "<div class=g>R</div><div class=g>R<i class=y></i></div>",
+        ),
+        (
+            ".g+.g .x{color:red}",
+            "<div class=g>R</div><div class=g>R</div>",
+        ),
+        (".row~.row .x{color:red}", "<div class=g>R</div>"),
+        (
+            ".g:empty~.g .x{color:red}",
+            "<div class=g>R</div><div class=g></div><div class=g>R</div>",
+        ),
+    ] {
+        let mut doc = Document::parse(&format!(
+            "<style>{css}</style><div id=list>{}</div>",
+            groups.replace('R', rows)
+        ));
+        if let Some(hovered) = (0..doc.nodes.len()).find(|&id| doc.matches(id, "#hovered")) {
+            doc.nodes[hovered].state = crate::dom::HOVER;
+        }
+        let pass = |unshared: bool| {
+            compute_styles(
+                &doc,
+                800.,
+                600.,
+                None,
+                &mut HashMap::new(),
+                &mut StyleCache {
+                    unshared,
+                    ..Default::default()
+                },
+                None,
+            )
+            .values
+        };
+        assert_eq!(pass(false), pass(true), "{css}");
+    }
+}
+
+#[test]
+fn children_share_values_by_what_their_parents_pass_on() {
+    let doc = Document::parse(
+        "<style>.c{padding-left:2em} .k{border-top-style:solid;border-top-width:inherit} .v{width:var(--w,1px)}</style>
+        <div style='transform:translateX(1px)'><span class=c></span></div><div style='transform:translateX(2px)'><span class=c></span></div>
+        <div style='border-top:3px solid'><span class='c k'></span></div><div style='border-top:4px solid'><span class='c k'></span></div>
+        <div style='--w:5px'><span class='c v'></span></div><div style='font-size:10px'><span class=c></span></div>
+        <div style='display:flex'><span class=c></span></div><div style='display:inline-grid'><span class=c></span></div>
+        <div><span class=c></span></div><div><span class='c v'></span></div><div style='color:red'><span class=c></span></div>",
+    );
+    let values = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    )
+    .values;
+    let spans: Vec<&Rc<Style>> = (0..doc.nodes.len())
+        .filter(|&id| doc.nodes[id].tag == "span")
+        .map(|id| &values[id])
+        .collect();
+    assert!(Rc::ptr_eq(spans[0], spans[1]));
+    assert!(Rc::ptr_eq(spans[0], spans[8]));
+    for (span, prop, value) in [
+        (2, Prop::BORDER_TOP_WIDTH, Some("3px")),
+        (3, Prop::BORDER_TOP_WIDTH, Some("4px")),
+        (0, Prop::BORDER_TOP_STYLE, None),
+        (4, Prop::WIDTH, Some("5px")),
+        (9, Prop::WIDTH, Some("1px")),
+        (10, Prop::COLOR, Some("red")),
+        (5, Prop::FONT_SIZE, Some("10px")),
+        (6, Prop::DISPLAY, Some("block")),
+        (7, Prop::DISPLAY, Some("block")),
+        (8, Prop::DISPLAY, None),
+    ] {
+        assert_eq!(spans[span].get(prop), value, "span {span} {prop:?}");
+    }
+}
+
+#[test]
+fn collapsed_cells_share_adjusted_styles_and_keep_them_when_other_rows_change() {
+    let mut doc = Document::parse(&format!(
+        "<style>table{{border-collapse:collapse}} td{{border:1px solid #ccc}} tr.blue{{border-top:4px solid blue}}
+        tr.green{{border-top:4px solid green}} tr.on td{{background-color:red}}</style><table>{}</table>",
+        "<tr><td></td><td></td></tr>".repeat(8)
+    ));
+    let rows: Vec<usize> = (0..doc.nodes.len())
+        .filter(|&id| doc.nodes[id].tag == "tr")
+        .collect();
+    let cells = |row: usize, doc: &Document| -> Vec<usize> {
+        doc.nodes[row]
+            .children
+            .iter()
+            .copied()
+            .filter(|&id| doc.nodes[id].tag == "td")
+            .collect()
+    };
+    doc.nodes[rows[1]].attrs.set("class", "blue");
+    doc.nodes[rows[3]].attrs.set("class", "green");
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    let first = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    cache.finish();
+    let [blue, green] = [1, 3].map(|row| first.values[cells(rows[row], &doc)[0]].clone());
+    assert_eq!(blue.get(Prop::BORDER_TOP_COLOR), Some("blue"));
+    assert_eq!(green.get(Prop::BORDER_TOP_COLOR), Some("green"));
+    let [middle, other] = [5, 6].map(|row| first.values[cells(rows[row], &doc)[0]].clone());
+    assert!(Rc::ptr_eq(&middle, &other));
+    doc.nodes[rows[4]].attrs.set("class", "on");
+    let second = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    for row in [0, 1, 2, 3, 5, 6, 7] {
+        for cell in cells(rows[row], &doc) {
+            assert!(
+                Rc::ptr_eq(&first.values[cell], &second.values[cell]),
+                "row {row}"
+            );
+        }
+    }
+    let changed = &second.values[cells(rows[4], &doc)[0]];
+    assert_eq!(changed.get(Prop::BACKGROUND_COLOR), Some("red"));
+    assert_eq!(changed.get(Prop::MARGIN_TOP), middle.get(Prop::MARGIN_TOP));
+}
+
+#[test]
+fn collapsed_groups_give_their_first_and_last_rows_their_borders() {
+    let doc = Document::parse(
+        "<style>table{border-collapse:collapse} td{border:1px solid #ccc} tbody{border-top:5px solid red;border-bottom:2px solid blue}</style>
+        <table><thead><tr><td id=h></td></tr></thead><tbody><tr><td id=a></td></tr><tr><td id=b></td></tr><tr><td id=c></td></tr></tbody></table>",
+    );
+    let values = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    )
+    .values;
+    let [h, a, b, c] = ["#h", "#a", "#b", "#c"].map(|selector| &values[element(&doc, selector)]);
+    for (style, prop, value) in [
+        (h, Prop::BORDER_BOTTOM_WIDTH, "5px"),
+        (a, Prop::BORDER_TOP_WIDTH, "5px"),
+        (a, Prop::BORDER_TOP_COLOR, "red"),
+        (a, Prop::BORDER_BOTTOM_WIDTH, "1px"),
+        (b, Prop::BORDER_TOP_WIDTH, "1px"),
+        (c, Prop::BORDER_BOTTOM_WIDTH, "2px"),
+        (c, Prop::BORDER_BOTTOM_COLOR, "blue"),
+    ] {
+        assert_eq!(style.get(prop), Some(value), "{prop:?}");
+    }
+}
+
+#[test]
+fn values_keep_a_style_per_inline_source_selection_and_custom_properties() {
+    let doc = Document::parse(
+        "<style>div::selection{color:red} .s::selection{color:blue} .c{width:var(--w,1px)}</style>
+        <div id=d><span id=a></span><span id=b></span><span id=s class=s></span></div>
+        <p style='--w:5px'><b class=c id=five></b></p><p style='--w:7px'><b class=c id=seven></b></p>
+        <p style='--w:5px'><b class=c id=again></b></p>
+        <i style='color:green' id=g1></i><i style='color:green' id=g2></i><i style='color:navy' id=n></i>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let id = |selector: &str| element(&doc, selector);
+    let selection = |selector: &str| computed.selections[&id(selector)].clone();
+    assert!(Rc::ptr_eq(&selection("#d"), &selection("#a")));
+    assert_eq!(selection("#a").get(Prop::COLOR), Some("red"));
+    assert_eq!(selection("#s").get(Prop::COLOR), Some("blue"));
+    let style = |selector: &str| computed.values[id(selector)].clone();
+    assert_eq!(style("#five").get(Prop::WIDTH), Some("5px"));
+    assert_eq!(style("#seven").get(Prop::WIDTH), Some("7px"));
+    assert!(Rc::ptr_eq(&style("#five"), &style("#again")));
+    assert!(Rc::ptr_eq(&style("#g1"), &style("#g2")));
+    assert_eq!(style("#n").get(Prop::COLOR), Some("navy"));
 }

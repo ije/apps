@@ -1,5 +1,5 @@
 (() => {
-  const host = globalThis.__appsDOM, eventState = globalThis.__appsEventState, droppedFiles = globalThis.__appsFiles, microtask = queueMicrotask;
+  const host = globalThis.__appsDOM, eventState = globalThis.__appsEventState, droppedFiles = globalThis.__appsFiles, microtask = queueMicrotask, json = JSON.parse;
   delete globalThis.__appsDOM; delete globalThis.__appsEventState; delete globalThis.__appsFiles;
   // WARNING: records mirror the Rust tree for reads. Writes queue as `code, a, b, c` integers, with strings in `texts` and their lengths in place, and reach Rust in one `dom.batch` before any other host call and at the microtask checkpoint that ends the turn, so Rust never reads a stale page.
   // WARNING: a Map per element costs hundreds of bytes and these lists are short, so attributes are a flat list in source order. Elements without attributes share `noAttrs`, and text and comments share `noKids`, so `setAttribute` must replace it and nothing may add to it.
@@ -79,20 +79,25 @@
     const id = pool.pop();
     records[id] = new Record(id, tag, text); op(0, id, tag, text); if (tag === 'base' || tag === 'title') rare[tag]++; return id;
   };
+  // WARNING: returns whether the list has media elements, so callers skip looking for them otherwise.
   const load = list => {
     version++;
+    let media = false;
     for (let i = 0; i < list.length;) {
       const rec = records[list[i]] = new Record(list[i], list[i + 2], list[i + 3]), up = records[list[i + 1]], end = i + 5 + 2 * list[i + 4];
       if (end > i + 5) { rec.attrs = new Attrs(list.slice(i + 5, end)); const id = rec.attrs.get('id'); if (id) idAdd(id, rec); }
-      if (rec.tag === 'base' || rec.tag === 'title') rare[rec.tag]++;
+      const tag = rec.tag;
+      if (tag === 'base' || tag === 'title') rare[tag]++;
+      media ||= tag === 'img' || tag === 'video' || tag === 'audio';
       i = end;
       if (up) { rec.up = up; rec.i = up.kids.push(rec) - 1; }
     }
+    return media;
   };
   // WARNING: Rust skips a write that fails its checks, so after a failed batch the mirror reloads each tree it holds from Rust. Records stay the same objects, because wrappers point to them.
   const resync = () => {
     const lists = [], seen = new Set();
-    for (const rec of records) if (rec && !rec.up) try { lists.push(host('dom.tree', rec.id)); } catch {}
+    for (const rec of records) if (rec && !rec.up) try { lists.push(json(host('dom.tree', rec.id))); } catch {}
     if (!lists.length) return;
     version++;
     for (const rec of records) if (rec?.kids.length) rec.kids = [];
@@ -130,7 +135,7 @@
   const definitions = new Map(), defined = new WeakMap(), definitionsWaiting = new Map();
   let constructing = null;
   const wrapped = [], names = new Map(), types = { __proto__: null, '#document': 9, '#text': 3, '#comment': 8, '#fragment': 11, '#doctype': 10 }, events = new WeakMap(), registered = [], pointers = new Set(), captures = new Map(), observers = new Set();
-  let readyState = 'loading', currentScript = null, active = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null, quiet = 0, shadows = 0, moving = false, wheeling = false, native = 0;
+  let readyState = 'loading', currentScript = null, active = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null, quiet = 0, shadows = 0, moving = false, wheeling = false, iterating = false, native = 0;
   const selectionPending = new Set();
   const topLayer = [], modals = [], dialogs = [], autos = [], hints = [], fullscreens = [], watchers = [];
   const selectionChanged = (target = document) => {
@@ -418,14 +423,14 @@
   const parseFragment = scoped((source, context) => {
     const fragment = document.createDocumentFragment(), tag = contextTag(context);
     if (tag === 'svg') fragment._svg = true;
-    load(call('dom.html', fragment._id, String(source), tag)); __appsImages(fragment);
+    if (load(json(call('dom.html', fragment._id, String(source), tag)))) __appsImages(fragment);
     if (definitions.size) reactions(fragment._m);
     return fragment;
   });
   const setHTML = (node, value, inert = false) => replaceAll(node, removed => {
-    const list = node.nodeType === 1 ? call('dom.html', node._id, String(value), contextTag(node)) : call('dom.html', node._id, String(value));
-    release(node); detach(node._m); load(list); removed();
-    if (!inert) { __appsImages(node); if (definitions.size) for (const kid of node._m.kids) reactions(kid); }
+    const list = json(node.nodeType === 1 ? call('dom.html', node._id, String(value), contextTag(node)) : call('dom.html', node._id, String(value)));
+    release(node); detach(node._m); const media = load(list); removed();
+    if (!inert) { if (media) __appsImages(node); if (definitions.size) for (const kid of node._m.kids) reactions(kid); }
   });
   class List extends Array { static get [Symbol.species]() { return Array; } item(index) { return this[index] ?? null; } }
   class NodeList extends List {}
@@ -571,7 +576,7 @@
     isEqualNode(other) { return other?.nodeType === this.nodeType && serialize(this._m) === serialize(other._m); }
     compareDocumentPosition(other) { if (this === other) return 0; const [a, b] = [this._m, other._m].map(rec => { const chain = []; for (; rec; rec = rec.up) chain.push(rec); return chain.reverse(); }); if (a[0] !== b[0]) return 1 | 32; let i = 0; while (a[i] && a[i] === b[i]) i++; if (i === a.length) return 4 | 16; if (i === b.length) return 2 | 8; return index(a[i]) < index(b[i]) ? 4 : 2; }
     normalize() { for (const child of this.childNodes) { if (child.nodeType === 3) { while (child.nextSibling?.nodeType === 3) { child.data += child.nextSibling.data; child.nextSibling.remove(); } if (!child.length) child.remove(); } else child.normalize(); } }
-    addEventListener(name, fn, options = false) { if (!fn || options?.signal?.aborted) return; name = String(name); const capture = typeof options === 'boolean' ? options : !!options?.capture; let listeners = events.get(this); if (!listeners) events.set(this, listeners = new Map()); const list = listeners.get(name) ?? []; if (list.some(item => item.fn === fn && item.capture === capture)) return; const scroll = name === 'wheel' || name === 'mousewheel' || name === 'touchstart' || name === 'touchmove'; if (name === 'wheel' && !wheeling) { wheeling = true; call('dom.wheel'); } list.push({ fn, capture, once: !!options?.once, passive: !!(options?.passive ?? (scroll && (this === globalThis || this === document || this === document.documentElement || this === document.body))) }); listeners.set(name, list); options?.signal?.addEventListener('abort', () => this.removeEventListener(name, fn, capture), { once: true }); }
+    addEventListener(name, fn, options = false) { if (!fn || options?.signal?.aborted) return; name = String(name); const capture = typeof options === 'boolean' ? options : !!options?.capture; let listeners = events.get(this); if (!listeners) events.set(this, listeners = new Map()); const list = listeners.get(name) ?? []; if (list.some(item => item.fn === fn && item.capture === capture)) return; const scroll = name === 'wheel' || name === 'mousewheel' || name === 'touchstart' || name === 'touchmove'; if (name === 'wheel' && !wheeling) { wheeling = true; call('dom.wheel'); } if (name === 'animationiteration' && !iterating) { iterating = true; call('dom.iterations'); } list.push({ fn, capture, once: !!options?.once, passive: !!(options?.passive ?? (scroll && (this === globalThis || this === document || this === document.documentElement || this === document.body))) }); listeners.set(name, list); options?.signal?.addEventListener('abort', () => this.removeEventListener(name, fn, capture), { once: true }); }
     removeEventListener(name, fn, options = false) { const capture = typeof options === 'boolean' ? options : !!options?.capture, listeners = events.get(this); listeners?.set(String(name), (listeners.get(String(name)) ?? []).filter(item => item.fn !== fn || item.capture !== capture)); }
     dispatchEvent(event) { if (!(event instanceof Event)) throw new TypeError('Expected an Event'); return event.type === 'click' && event instanceof MouseEvent ? activateClick(this, event) : dispatch(this, event); }
   }
@@ -1787,7 +1792,7 @@
   for (const Type of [Element, Document, DocumentFragment]) Object.defineProperties(Type.prototype, parentNode);
   class XMLSerializer { serializeToString(node) { if (!(node instanceof Node)) throw new TypeError('Expected a Node'); const source = serialize(node._m); return node.nodeType === 1 && node.namespaceURI && !node.hasAttribute('xmlns') ? source.replace(/^<[^\s>]+/, tag => tag + ' xmlns=' + quote(node.namespaceURI)) : source; } }
   class DOMParser {
-    parseFromString(source,type){if(type!=='text/html')throw new DOMException('Only HTML parsing is supported','NotSupportedError');const doc=wrap(create('#document'));load(call('dom.html',doc._id,String(source)));return doc;}
+    parseFromString(source,type){if(type!=='text/html')throw new DOMException('Only HTML parsing is supported','NotSupportedError');const doc=wrap(create('#document'));load(json(call('dom.html',doc._id,String(source))));return doc;}
   }
   // WARNING: compares boundary points through records, so it costs the depth of the tree and builds no child lists.
   const comparePoints = (a, start, b, end) => {
@@ -2293,7 +2298,7 @@
     }));
     Object.defineProperty(HTMLTableCellElement.prototype, 'cellIndex', { get() { return this.parentNode ? kids(this.parentNode, 'td', 'th').indexOf(this) : -1; }, configurable: true });
   }
-  load(call('dom.tree', 0));
+  load(json(call('dom.tree', 0)));
   const document = globalThis.document = wrap(0);
   globalThis.window = globalThis; globalThis.self = globalThis;
   selection = new Selection();

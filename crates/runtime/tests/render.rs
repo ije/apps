@@ -865,6 +865,77 @@ fn native_content_keeps_the_boxes_around_it() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn table_cells_keep_their_boxes_and_follow_their_rows() {
+    let text = run_hidden(
+        &format!(
+            r#"{STEPS}
+            await load('table.html');
+            console.log('PLAIN ' + await inside('c2'));
+            await step('row', () => run("document.getElementById('r2').className = 'on'"));
+            console.log('ROW ' + await inside('c2') + ' ' + await inside('c5'));
+            await step('collapse', () => run("document.getElementById('t').style.borderCollapse = 'separate'"));
+            await step('block', () => run("document.getElementById('b').style.borderCollapse = 'separate'"));
+            const boxes = () => run("JSON.stringify(['c2', 'c3', 'c4'].map(id => document.getElementById(id).getBoundingClientRect()).map(r => [r.x, r.width]))");
+            await step('fixed', () => run("document.getElementById('t').style.width = '300px'; document.getElementById('c4').style.width = 'auto'"));
+            const narrow = await boxes();
+            await step('wide', () => run("const c1 = document.getElementById('c1'); c1.style.width = 'auto'; c1.textContent = 'wide'.repeat(4)"));
+            console.log('WIDE ' + narrow + ' ' + await boxes());
+            "#
+        ),
+        &[(
+            "table.html",
+            "<body style='margin:0'><table id=t style='border-collapse:collapse'><style>td{border:4px solid #000;width:40px;height:20px} \
+             tr.on{background-color:rgb(0,255,0)} .own{border-collapse:separate}</style>\
+             <tr id=r1><td id=c1></td><td id=c4></td></tr><tr id=r2><td id=c2 class=own></td><td id=c3></td></tr>\
+             <tr id=r3><td id=c5></td><td id=c6></td></tr></table>\
+             <table id=b style='display:block;border-collapse:collapse'><tr><td id=c7 class=own></td></tr></table></body>",
+        )],
+    );
+    let line = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap_or_else(|| panic!("{text}"))
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(line("PLAIN"), "255,255,255", "{text}");
+    assert_eq!(
+        line("ROW"),
+        "0,255,0 255,255,255",
+        "a cell shows its row's new background: {text}"
+    );
+    let row = built(&text, "row");
+    assert!(
+        row.contains(&"c2") && !row.contains(&"c5") && !row.contains(&"c1"),
+        "only the cells of the row build again: {row:?}"
+    );
+    assert!(built(&text, "collapse").contains(&"c2"), "{text}");
+    assert!(
+        built(&text, "block").contains(&"c7"),
+        "a cell follows its table's border-collapse: {text}"
+    );
+    let wide = built(&text, "wide");
+    assert!(
+        wide.contains(&"c1")
+            && !["c2", "c3", "c4", "c5", "c6"]
+                .iter()
+                .any(|id| wide.contains(id)),
+        "in a table of a set width, cells that only take a new place keep their boxes: {wide:?}"
+    );
+    let boxes: Vec<Vec<[f32; 2]>> = line("WIDE")
+        .split(' ')
+        .map(|boxes| serde_json::from_str(boxes).unwrap())
+        .collect();
+    let [[first, next, fill], [first_after, next_after, fill_after]] =
+        [0, 1].map(|at| [0, 1, 2].map(|cell| boxes[at][cell]));
+    assert!(
+        first == first_after && next_after[0] > next[0] + 20. && fill_after[1] < fill[1] - 20.,
+        "the cells of the next column move, and its cell of no set width narrows: {boxes:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn video_frames_keep_the_boxes_around_them() {
     let runtime = std::path::Path::new(env!("CARGO_BIN_EXE_apps-runtime"))
         .parent()
@@ -948,6 +1019,45 @@ fn rects(text: &str) -> std::collections::HashMap<String, String> {
         .find_map(|line| line.strip_prefix("RECTS "))
         .unwrap_or_else(|| panic!("{text}"));
     serde_json::from_str(line).unwrap()
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn grid_tracks_take_content_only_where_their_sizing_reads_it() {
+    let text = run_hidden(
+        &format!(
+            r#"{RECTS}
+            await load('grid.html');
+            console.log('RECTS ' + await rects());
+            "#
+        ),
+        &[(
+            "grid.html",
+            "<body style='margin:0;font:16px sans-serif'><style>.w{display:grid;width:200px}</style>\
+             <div class=w style='grid-template-columns:repeat(2,minmax(0,1fr))'><span id=a>Wwwwwwwwwwwwwwwwwwwwwww</span><span id=b>x</span></div>\
+             <div class=w style='grid-template-columns:repeat(2,1fr)'><span id=c>Wwwwwwwwwwwwwwwwwwwwwww</span><span id=d>x</span></div>\
+             <div class=w style='grid-template-columns:30px 70px;column-gap:10px'>\
+             <div style='grid-column:1/3;display:grid;grid-template-columns:subgrid'><i id=e>e</i><i id=f>f</i></div></div>\
+             <div class=w style='grid-template-columns:100px 100px'><i id=g style='margin:5px'>g</i><b id=h style='margin:0 10px'>h</b></div>\
+             </body>",
+        )],
+    );
+    let rects = rects(&text);
+    let field = |id: &str, index: usize| -> f32 {
+        rects[id].split(',').nth(index).unwrap().parse().unwrap()
+    };
+    assert_eq!([field("a", 2), field("b", 0)], [100., 100.], "{rects:?}");
+    assert!(field("c", 2) > 150. && field("d", 0) > 150., "{rects:?}");
+    assert_eq!(
+        [field("e", 2), field("f", 0), field("f", 2)],
+        [30., 40., 70.],
+        "{rects:?}"
+    );
+    assert_eq!(
+        [field("g", 0), field("g", 2), field("h", 0), field("h", 2)],
+        [5., 90., 110., 80.],
+        "each item takes its own margins: {rects:?}"
+    );
 }
 
 #[test]

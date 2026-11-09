@@ -901,7 +901,7 @@ mod tests {
         let tree = host
             .call(Role::Renderer(1), "dom.tree", json!([card]))
             .unwrap();
-        let tree = tree.as_array().unwrap();
+        let tree: Vec<serde_json::Value> = serde_json::from_str(tree.as_str().unwrap()).unwrap();
         let style = tree.iter().position(|value| value == "style").unwrap();
         assert!(
             tree[style + 1]

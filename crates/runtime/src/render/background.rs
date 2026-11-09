@@ -93,7 +93,7 @@ pub(super) fn css_background(
                 });
                 let view = view.clone();
                 layers.push(
-                    renderer::canvas(
+                    renderer::canvas_within(
                         |_, _| (),
                         move |bounds, _, window| {
                             let [width, height] =
@@ -412,7 +412,7 @@ pub(super) fn css_background(
         let strip = super::effects::gradient_axis(&kind, &body);
         let view = view.clone();
         layers.push(
-            renderer::canvas(
+            renderer::canvas_within(
                 |_, _| (),
                 move |bounds, _, window| {
                     let [width, height] =

@@ -521,6 +521,11 @@ impl Main {
                     // WARNING: A window that closed on its way here must not stay retained.
                     if self.opened.borrow().contains(&id) {
                         self.windows.borrow_mut().insert(id, (window, control));
+                        // WARNING: main sends a window's first state, and reading it on main opens the window.
+                        let mut changed = self.changed.borrow_mut();
+                        if !changed.contains(&id) {
+                            changed.push(id);
+                        }
                     }
                     let waiting = std::mem::take(&mut *self.waiting.borrow_mut());
                     for command in waiting {
@@ -983,7 +988,8 @@ impl Main {
         if self.link.main_pending() {
             delay = delay.min(0);
         }
-        Ok((delay != i64::MAX).then(|| delay.clamp(1, 1 << 31) as u64))
+        // WARNING: a due task wakes main at once, as in Node, so setImmediate and MessageChannel don't wait a timer tick.
+        Ok((delay != i64::MAX).then(|| delay.clamp(0, 1 << 31) as u64))
     }
 
     fn shrink_when_quiet(self: &Rc<Self>) {

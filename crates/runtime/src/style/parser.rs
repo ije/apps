@@ -896,9 +896,10 @@ pub(crate) struct Lengths {
     pub container: Option<[f32; 2]>,
 }
 
+// WARNING: `ids` is as long as the node arena, so copies share its chunks.
 #[derive(Clone, Default)]
 pub(crate) struct NodeLengths {
-    ids: Vec<u32>,
+    ids: super::Chunked<u32>,
     list: Vec<Lengths>,
     last: u32,
 }

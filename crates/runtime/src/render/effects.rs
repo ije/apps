@@ -59,7 +59,7 @@ pub(crate) fn multiply(a: &Matrix, b: &Matrix) -> Matrix {
     })
 }
 
-fn translate(x: f32, y: f32, z: f32) -> Matrix {
+pub(crate) fn translate(x: f32, y: f32, z: f32) -> Matrix {
     let mut m = IDENTITY;
     m[12] = x;
     m[13] = y;
@@ -1430,6 +1430,40 @@ mod tests {
 
     fn close(a: [f32; 2], b: [f32; 2]) -> bool {
         (a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3
+    }
+
+    #[test]
+    fn transforms_move_with_their_box() {
+        let units = Lengths::new(16., 800., 600.);
+        let at =
+            |x: f32, y: f32| Bounds::new(renderer::point(px(x), px(y)), size(px(120.), px(40.)));
+        for pairs in [
+            &[("transform", "rotate(30deg) translate(10%, 2em) scale(1.5)")][..],
+            &[
+                ("translate", "-40px 25%"),
+                ("rotate", "12deg"),
+                ("transform-origin", "0 100%"),
+            ],
+            &[
+                (
+                    "transform",
+                    "perspective(200px) rotateY(40deg) skewX(10deg)",
+                ),
+                ("transform-origin", "20px 5px"),
+            ],
+        ] {
+            let style = style(pairs);
+            let local = transform(&style, &units, at(0., 0.), None).unwrap();
+            let moved = multiply(
+                &translate(300., 70., 0.),
+                &multiply(&local, &translate(-300., -70., 0.)),
+            );
+            let placed = transform(&style, &units, at(300., 70.), None).unwrap();
+            for corner in [[300., 70.], [420., 110.], [350., 90.]] {
+                let (a, b) = (map(&moved, corner).unwrap(), map(&placed, corner).unwrap());
+                assert!(close(a, b), "{pairs:?} {a:?} {b:?}");
+            }
+        }
     }
 
     #[test]

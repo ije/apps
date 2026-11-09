@@ -15,7 +15,7 @@ use crate::{
     app::{Callbacks, dispatch, send_ime_key},
     point, px, size,
 };
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use core_foundation::base::{CFRelease, CFTypeRef};
 use core_foundation_sys::{
     base::CFEqual,
@@ -55,7 +55,7 @@ use std::{
     rc::{Rc, Weak},
     sync::{
         Arc, Mutex, OnceLock, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicPtr, Ordering},
     },
     time::Duration,
 };
@@ -635,11 +635,90 @@ impl State {
 
 type Shared = Rc<RefCell<State>>;
 
-struct Opened {
-    window: *mut AnyObject,
-    view: NonNull<AnyObject>,
-    mirror: Arc<Mutex<Mirror>>,
-    frames: Arc<Mutex<Frames>>,
+// What `estimate` reads about the screen that windows open on.
+#[derive(Clone, Copy)]
+struct Screens {
+    titlebar: f32,
+    scale: f32,
+    frame: Bounds<Pixels>,
+    work_area: Bounds<Pixels>,
+}
+
+static SCREENS: Mutex<Option<Screens>> = Mutex::new(None);
+
+// Runs on the main thread, at launch and after each window opens.
+pub(crate) fn measure_screens() {
+    let marker = MainThreadMarker::new().unwrap();
+    let screens = NSScreen::screens(marker);
+    let Some(screen) = screens
+        .iter()
+        .next()
+        .or_else(|| NSScreen::mainScreen(marker))
+    else {
+        return;
+    };
+    let top = primary_screen_top(marker);
+    let flip = |rect: NSRect| {
+        Bounds::new(
+            point(
+                px(rect.origin.x as f32),
+                px((top - rect.origin.y - rect.size.height) as f32),
+            ),
+            size(px(rect.size.width as f32), px(rect.size.height as f32)),
+        )
+    };
+    let content = NSRect::new(NSPoint::new(0., 0.), NSSize::new(100., 100.));
+    let frame = NSWindow::frameRectForContentRect_styleMask(
+        content,
+        NSWindowStyleMask::Closable | NSWindowStyleMask::Titled,
+        marker,
+    );
+    let scale = screen.backingScaleFactor() as f32;
+    *SCREENS.lock().unwrap_or_else(PoisonError::into_inner) = Some(Screens {
+        titlebar: (frame.size.height - content.size.height) as f32,
+        scale: if scale == 0. { 2. } else { scale },
+        frame: flip(screen.frame()),
+        work_area: flip(screen.visibleFrame()),
+    });
+}
+
+// WARNING: the window opens on the main thread after `Window::open` returns, so until then its mirror holds what
+// `open_native` will make of the options on the first screen. An open that finds another size reports a resize.
+fn estimate(options: &WindowOptions) -> Mirror {
+    let mut screens = *SCREENS.lock().unwrap_or_else(PoisonError::into_inner);
+    if screens.is_none() {
+        native_sync(measure_screens);
+        screens = *SCREENS.lock().unwrap_or_else(PoisonError::into_inner);
+    }
+    let Some(screens) = screens else {
+        return Mirror::default();
+    };
+    let titlebar = if options.titlebar_hidden || options.frameless {
+        px(0.)
+    } else {
+        px(screens.titlebar)
+    };
+    let mut frame = options.bounds;
+    frame.origin += screens.frame.origin;
+    if !options.outer_size {
+        frame.size.height += titlebar;
+    }
+    let mut content = frame;
+    content.origin.y += titlebar;
+    content.size.height -= titlebar;
+    Mirror {
+        scale: screens.scale,
+        content: content.size,
+        active: false,
+        state: WindowState {
+            frame,
+            content,
+            visible: options.show,
+            display: screens.frame,
+            work_area: screens.work_area,
+            ..WindowState::default()
+        },
+    }
 }
 
 fn open_native(
@@ -647,7 +726,9 @@ fn open_native(
     callbacks: Callbacks,
     layer: Retained<CAMetalLayer>,
     overlay: Retained<CALayer>,
-) -> Result<Sendable<Opened>> {
+    frames: Arc<Mutex<Frames>>,
+    mirror: Arc<Mutex<Mirror>>,
+) -> Result<(*mut AnyObject, NonNull<AnyObject>)> {
     let marker = MainThreadMarker::new().unwrap();
     let (window_class, view_class, overlay_class) = classes();
     autoreleasepool(|_| unsafe {
@@ -714,26 +795,13 @@ fn open_native(
             let color = NSColor::colorWithSRGBRed_green_blue_alpha(0., 0., 0., 0.0001);
             let () = msg_send![native_window, setBackgroundColor: &*color];
         }
-        let frames = Arc::new(Mutex::new(Frames {
-            source: {
-                let tick = Arc::new(Tick {
-                    callbacks,
-                    pending: AtomicBool::new(false),
-                });
-                WindowFrameSource::new(Arc::into_raw(tick) as *mut c_void, self::tick, free_tick)
-            },
-            wants: false,
-            visible: false,
-            display: None,
-            closed: false,
-        }));
         let state = Rc::new(RefCell::new(State {
             callbacks,
             native_window,
             native_view: NonNull::new_unchecked(native_view),
             layer,
-            mirror: Arc::default(),
-            frames: frames.clone(),
+            mirror,
+            frames,
             glass: Vec::new(),
             controls: Default::default(),
             motion: None,
@@ -813,22 +881,19 @@ fn open_native(
         let lock = state.borrow();
         lock.update_mirror();
         lock.locate_frames();
-        let mirror = lock.mirror.clone();
         drop(lock);
         state.borrow_mut().move_traffic_light();
         // WARNING: the two strong references live in the ivars of the window and the view.
         drop(state);
-        Ok(Sendable::new(Opened {
-            window: native_window,
-            view: NonNull::new_unchecked(native_view),
-            mirror,
-            frames,
-        }))
+        Ok((native_window, NonNull::new_unchecked(native_view)))
     })
 }
 
 fn on_main(native: &NativeRef, f: impl FnOnce(&NSWindow, &Shared)) {
-    let window = native.0;
+    let window = native.window();
+    if window.is_null() {
+        return;
+    }
     // SAFETY: `native` keeps the window, and so its state, alive.
     let Some(state) = (unsafe { get_state(&*window) }) else {
         return;
@@ -861,15 +926,55 @@ fn set_button_visibility(state: &Shared, visible: bool) {
     }
 }
 
-// WARNING: the strong reference to a native window. AppKit must release it on the main thread.
-struct NativeRef(*mut AnyObject);
-// SAFETY: only the main thread sends the window messages.
-unsafe impl Send for NativeRef {}
-unsafe impl Sync for NativeRef {}
+type Open = Box<dyn FnOnce(&NativeRef) + Send>;
+
+// WARNING: the strong reference to a native window, which the main thread opens after `Window::open` returns, so
+// the render thread runs page scripts meanwhile. The main thread opens it at once if it needs it first, and the
+// render thread waits for it before it draws or hands out the view. AppKit must release it on the main thread.
+#[derive(Default)]
+struct NativeRef {
+    window: AtomicPtr<AnyObject>,
+    view: AtomicPtr<AnyObject>,
+    open: Mutex<Option<Open>>,
+}
+
+impl NativeRef {
+    // On the main thread: the window, opened now if it isn't yet, or null if AppKit didn't make it.
+    fn window(&self) -> *mut AnyObject {
+        let open = self
+            .open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(open) = open {
+            open(self);
+        }
+        self.window.load(Ordering::Acquire)
+    }
+
+    // Waits until the main thread opened the window, or on main opens it now.
+    fn wait(self: &Arc<Self>) {
+        if self
+            .open
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+        {
+            let native = self.clone();
+            native_sync(move || {
+                native.window();
+            });
+        }
+    }
+}
 
 impl Drop for NativeRef {
     fn drop(&mut self) {
-        let window = Sendable::new(self.0);
+        let window = *self.window.get_mut();
+        if window.is_null() {
+            return;
+        }
+        let window = Sendable::new(window);
         // SAFETY: this balances the `alloc` of `open_native`.
         native_post(Box::new(move || unsafe {
             let () = msg_send![window.take(), release];
@@ -880,12 +985,8 @@ impl Drop for NativeRef {
 #[derive(Clone)]
 pub struct WindowControl {
     native: Arc<NativeRef>,
-    view: NonNull<AnyObject>,
     mirror: Arc<Mutex<Mirror>>,
 }
-// SAFETY: the view pointer is only handed out, and the rest is locked or thread safe.
-unsafe impl Send for WindowControl {}
-unsafe impl Sync for WindowControl {}
 
 // WARNING: a frame that the main thread has to show keeps its drawables. Only the newest one waits, and a newer
 // frame drops it unseen, so a busy main thread never makes the render thread wait for a drawable.
@@ -931,27 +1032,58 @@ impl Window {
             renderer.update_transparency(true);
         }
         let atlas = renderer.atlas().clone();
-        let layers = Sendable::new((renderer.layer().clone(), renderer.overlay().clone()));
-        let opened = native_sync(move || {
-            let (layer, overlay) = layers.take();
-            autoreleasepool(|_| open_native(options, callbacks, layer, overlay)).map(Sendable::new)
-        })?
-        .take()
-        .take();
-        Ok(Self {
-            control: WindowControl {
-                native: Arc::new(NativeRef(opened.window)),
-                view: opened.view,
-                mirror: opened.mirror,
+        let frames = Arc::new(Mutex::new(Frames {
+            source: {
+                let tick = Arc::new(Tick {
+                    callbacks,
+                    pending: AtomicBool::new(false),
+                });
+                WindowFrameSource::new(Arc::into_raw(tick) as *mut c_void, self::tick, free_tick)
             },
+            wants: false,
+            visible: false,
+            display: None,
+            closed: false,
+        }));
+        let mirror = Arc::new(Mutex::new(estimate(options)));
+        let layers = Sendable::new((renderer.layer().clone(), renderer.overlay().clone()));
+        let transparent = options.transparent;
+        let (options, shared) = (options.clone(), (frames.clone(), mirror.clone()));
+        let open: Open = Box::new(move |native| {
+            let (layer, overlay) = layers.take();
+            let (frames, mirror) = shared;
+            let opened = autoreleasepool(|_| {
+                open_native(&options, callbacks, layer, overlay, frames, mirror)
+            });
+            let (window, view) = match opened {
+                Ok(opened) => opened,
+                Err(error) => return eprintln!("apps: {error:#}"),
+            };
+            native.view.store(view.as_ptr(), Ordering::Release);
+            native.window.store(window, Ordering::Release);
+            measure_screens();
+            // SAFETY: the window was just made. WARNING: the render thread laid out with the guess, and main waits for
+            // a change to send the first state, so both hear of the real size.
+            if let Some(state) = unsafe { get_state(&*window) } {
+                update_size(&state);
+            }
+        });
+        let native = Arc::new(NativeRef::default());
+        *native.open.lock().unwrap_or_else(PoisonError::into_inner) = Some(open);
+        let posted = native.clone();
+        native_post(Box::new(move || {
+            posted.window();
+        }));
+        Ok(Self {
+            control: WindowControl { native, mirror },
             callbacks,
             renderer: RefCell::new(renderer),
             atlas,
-            frames: opened.frames,
+            frames,
             quiet: std::cell::Cell::new(None),
             waiting: Arc::default(),
             controls: Controls::default(),
-            transparent: options.transparent,
+            transparent,
         })
     }
 
@@ -1015,6 +1147,7 @@ impl Window {
     }
 
     pub fn draw(&self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
+        self.control.native.wait();
         self.quiet.take();
         let mut renderer = self.renderer.borrow_mut();
         let waiting = &self.waiting;
@@ -1064,13 +1197,13 @@ impl Window {
         key: u64,
         index: usize,
         region: [i32; 4],
-        step: f64,
+        timing: [f64; 3],
         opacities: &[f32],
         transforms: &[[f64; 16]],
     ) -> bool {
         self.renderer
             .borrow_mut()
-            .promote(key, index, region, step, opacities, transforms)
+            .promote(key, index, region, timing, opacities, transforms)
     }
 
     pub fn demote(&self) {
@@ -1150,7 +1283,11 @@ impl WindowControl {
         });
     }
 
+    // WARNING: until the window opened, its mirror holds a guess, so on main the window opens first.
     pub fn state(&self) -> Option<WindowState> {
+        if MainThreadMarker::new().is_some() {
+            self.native.window();
+        }
         Some(self.mirror().state)
     }
 
@@ -1439,8 +1576,11 @@ impl WindowControl {
     }
 
     pub fn raw_window_handle(&self) -> Result<rwh::RawWindowHandle> {
+        self.native.wait();
+        let view = NonNull::new(self.native.view.load(Ordering::Acquire).cast())
+            .context("The window did not open")?;
         Ok(rwh::RawWindowHandle::AppKit(rwh::AppKitWindowHandle::new(
-            self.view.cast(),
+            view,
         )))
     }
 }
@@ -1454,7 +1594,19 @@ impl Drop for Window {
         }
         let control = self.control.clone();
         native_post(Box::new(move || {
-            let native = control.native.0;
+            // WARNING: a window that closes before it opened never opens.
+            drop(
+                control
+                    .native
+                    .open
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take(),
+            );
+            let native = control.native.window.load(Ordering::Acquire);
+            if native.is_null() {
+                return;
+            }
             // SAFETY: the window stays retained until the posted close.
             unsafe {
                 if let Some(state) = get_state(&*native)
@@ -1468,7 +1620,7 @@ impl Drop for Window {
                 detach(&*native.cast::<NSWindow>());
             }
             post_local(move || unsafe {
-                let () = msg_send![control.native.0, close];
+                let () = msg_send![control.native.window.load(Ordering::Acquire), close];
             });
         }));
     }
@@ -2359,9 +2511,19 @@ extern "C" fn display_layer(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     // transaction it shows the old layers displaced by the resize, so a frame that takes long moves
     // the whole window, even with its frame in sync. A late frame shows after the commit instead,
     // and only the bottom edge can tell. While one is on its way, more would only queue up.
+    // A window that is not ordered in, like one created hidden, shows nothing, so its frame skips the
+    // transaction and its wait. Ordering it in asks for a display again, which then presents in it.
+    // SAFETY: plain view and window properties.
+    let visible = unsafe {
+        let window: *mut AnyObject = msg_send![this, window];
+        !window.is_null() && {
+            let visible: Bool = msg_send![window, isVisible];
+            visible.as_bool()
+        }
+    };
     if callbacks.thread.late.load(Ordering::Acquire) == 0 {
         drop(ask_within(callbacks.thread, RESIZE_WAIT, move || {
-            callbacks.with(|window, _| window.platform.set_presents_with_transaction(true));
+            callbacks.with(move |window, _| window.platform.set_presents_with_transaction(visible));
             step(callbacks);
             callbacks.with(|window, _| {
                 window.platform.set_presents_with_transaction(false);

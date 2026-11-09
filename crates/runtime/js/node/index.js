@@ -1091,69 +1091,74 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   };
   querystring.decode = querystring.parse; querystring.encode = querystring.stringify;
 
-  let resultOrder = 'verbatim';
-  const family = value => ({ IPv4: 4, IPv6: 6 })[value] ?? Number(value ?? 0);
-  const resolve = async (hostname, o) => {
-    let list;
-    try { list = await asyncCall('lookup', String(hostname), family(o.family)); } catch (error) { throw Object.assign(error, { message: `getaddrinfo ENOTFOUND ${hostname}`, code: 'ENOTFOUND', errno: undefined, syscall: 'getaddrinfo', hostname }); }
-    const order = o.order ?? (o.verbatim === false ? 'ipv4first' : resultOrder);
-    return order === 'verbatim' ? list : list.sort((a, b) => order === 'ipv4first' ? a.family - b.family : b.family - a.family);
-  };
-  const rrtypes = { A: 1, AAAA: 28, ANY: 255, CAA: 257, CNAME: 5, MX: 15, NAPTR: 35, NS: 2, PTR: 12, SOA: 6, SRV: 33, TLSA: 52, TXT: 16 };
-  const fields = { A: ['address', 'ttl'], AAAA: ['address', 'ttl'], CNAME: ['value'], NS: ['value'], PTR: ['value'], MX: ['exchange', 'priority'], TXT: ['entries'], SRV: ['name', 'port', 'priority', 'weight'], SOA: ['nsname', 'hostmaster', 'serial', 'refresh', 'retry', 'expire', 'minttl'], NAPTR: ['flags', 'service', 'regexp', 'replacement', 'order', 'preference'], TLSA: ['certUsage', 'selector', 'match', 'data'] };
-  const shape = (type, records, o) => {
-    const list = records.map(([kind, ...values]) => {
-      const record = kind === 'CAA' ? { critical: values[0], [values[1]]: values[2] } : Object.fromEntries(fields[kind].map((key, i) => [key, values[i]]));
-      if (kind === 'TLSA') record.data = record.data.buffer.slice(record.data.byteOffset, record.data.byteOffset + record.data.byteLength);
-      return type === 'ANY' ? Object.assign(record, { type: kind }) : record;
-    });
-    if (type === 'A' || type === 'AAAA') return o?.ttl ? list : list.map(record => record.address);
-    if (type === 'CNAME' || type === 'NS' || type === 'PTR' || type === 'TXT') return list.map(record => record.value ?? record.entries);
-    return type === 'SOA' ? list[0] : list;
-  };
-  const systemServers = () => { try { return [...files.readFileSync('/etc/resolv.conf', 'utf8').matchAll(/^\s*nameserver\s+([^\s%]+)/gm)].map(match => match[1]); } catch { return []; } };
-  // WARNING: queries go through the system resolver library, which takes only IPv4 servers from setServers().
-  const PromiseResolver = class Resolver {
-    #servers = null; #seconds; #tries; #generation = 0;
-    constructor(o = {}) { this.#seconds = o.timeout > 0 ? Math.ceil(o.timeout / 1000) : null; this.#tries = o.tries ?? null; }
-    getServers() { return this.#servers ? [...this.#servers] : systemServers(); }
-    setServers(list) {
-      if (!Array.isArray(list)) throw typeError('servers', 'an instance of Array', list);
-      this.#servers = list.map(server => {
-        const text = String(server), [, ip, port] = /^\[(.+)\](?::(\d+))?$/.exec(text) ?? /^([^:]+)(?::(\d+))?$/.exec(text) ?? [, text], kind = call('web.tcp.ip', ip);
-        if (!kind) throw error(TypeError, 'ERR_INVALID_IP_ADDRESS', `Invalid IP address: ${text}`);
-        if (kind === 6) throw error(Error, 'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM', 'IPv6 DNS servers are not supported');
-        return port && port !== '53' ? `${ip}:${port}` : ip;
+  // WARNING: dns is made on first use, so the first engine runs less code at startup.
+  let dnsMade;
+  const dnsModule = () => dnsMade ??= (() => {
+    let resultOrder = 'verbatim';
+    const family = value => ({ IPv4: 4, IPv6: 6 })[value] ?? Number(value ?? 0);
+    const resolve = async (hostname, o) => {
+      let list;
+      try { list = await asyncCall('lookup', String(hostname), family(o.family)); } catch (error) { throw Object.assign(error, { message: `getaddrinfo ENOTFOUND ${hostname}`, code: 'ENOTFOUND', errno: undefined, syscall: 'getaddrinfo', hostname }); }
+      const order = o.order ?? (o.verbatim === false ? 'ipv4first' : resultOrder);
+      return order === 'verbatim' ? list : list.sort((a, b) => order === 'ipv4first' ? a.family - b.family : b.family - a.family);
+    };
+    const rrtypes = { A: 1, AAAA: 28, ANY: 255, CAA: 257, CNAME: 5, MX: 15, NAPTR: 35, NS: 2, PTR: 12, SOA: 6, SRV: 33, TLSA: 52, TXT: 16 };
+    const fields = { A: ['address', 'ttl'], AAAA: ['address', 'ttl'], CNAME: ['value'], NS: ['value'], PTR: ['value'], MX: ['exchange', 'priority'], TXT: ['entries'], SRV: ['name', 'port', 'priority', 'weight'], SOA: ['nsname', 'hostmaster', 'serial', 'refresh', 'retry', 'expire', 'minttl'], NAPTR: ['flags', 'service', 'regexp', 'replacement', 'order', 'preference'], TLSA: ['certUsage', 'selector', 'match', 'data'] };
+    const shape = (type, records, o) => {
+      const list = records.map(([kind, ...values]) => {
+        const record = kind === 'CAA' ? { critical: values[0], [values[1]]: values[2] } : Object.fromEntries(fields[kind].map((key, i) => [key, values[i]]));
+        if (kind === 'TLSA') record.data = record.data.buffer.slice(record.data.byteOffset, record.data.byteOffset + record.data.byteLength);
+        return type === 'ANY' ? Object.assign(record, { type: kind }) : record;
       });
-    }
-    cancel() { this.#generation++; }
-    #query(hostname, type, reverse) {
-      if (typeof hostname !== 'string') throw typeError(reverse ? 'ip' : 'name', 'of type string', hostname);
-      const syscall = reverse ? 'getHostByAddr' : 'query' + type[0] + type.slice(1).toLowerCase(), generation = this.#generation;
-      const fail = code => Object.assign(new Error(`${syscall} ${code} ${hostname}`), { errno: undefined, code, syscall, hostname });
-      return asyncCall('resolve', hostname, rrtypes[type], this.#servers?.map(server => server.includes(':') ? server : server + ':53') ?? null, this.#seconds, this.#tries, !!reverse)
-        .then(list => { if (generation !== this.#generation) throw fail('ECANCELLED'); return list; }, failure => { throw fail(generation !== this.#generation ? 'ECANCELLED' : /^E[A-Z]+$/.test(failure.message) ? failure.message : 'EBADRESP'); });
-    }
-    resolve(hostname, rrtype = 'A') { if (!Object.hasOwn(rrtypes, rrtype)) throw error(TypeError, 'ERR_INVALID_ARG_VALUE', `The argument 'rrtype' is invalid. Received '${rrtype}'`); return this.#query(hostname, rrtype).then(list => shape(rrtype, list)); }
-    async reverse(ip) { return shape('PTR', await this.#query(ip, 'PTR', true)); }
-    static { for (const type of Object.keys(rrtypes)) this.prototype['resolve' + (type === 'A' ? '4' : type === 'AAAA' ? '6' : type[0] + type.slice(1).toLowerCase())] = async function(hostname, o) { return shape(type, await this.#query(hostname, type), o); }; }
-  };
-  class Resolver extends PromiseResolver {}
-  const methods = ['resolve', 'reverse', ...Object.keys(rrtypes).map(type => 'resolve' + (type === 'A' ? '4' : type === 'AAAA' ? '6' : type[0] + type.slice(1).toLowerCase()))];
-  for (const method of methods) Resolver.prototype[method] = function(...args) { const callback = args.pop(); if (typeof callback !== 'function') throw typeError('callback', 'of type function', callback); PromiseResolver.prototype[method].apply(this, args).then(value => callback(null, value), callback); };
-  const resolver = new Resolver(), order = {
-    getDefaultResultOrder: () => resultOrder,
-    setDefaultResultOrder(value) { if (!['ipv4first', 'ipv6first', 'verbatim'].includes(value)) throw error(TypeError, 'ERR_INVALID_ARG_VALUE', `The argument 'order' must be one of: 'verbatim', 'ipv4first', 'ipv6first'. Received '${value}'`); resultOrder = value; },
-    getServers: () => resolver.getServers(), setServers: list => resolver.setServers(list),
-    ...Object.fromEntries('NODATA FORMERR SERVFAIL NOTFOUND NOTIMP REFUSED BADQUERY BADNAME BADFAMILY BADRESP CONNREFUSED TIMEOUT EOF FILE NOMEM DESTRUCTION BADSTR BADFLAGS NONAME BADHINTS NOTINITIALIZED LOADIPHLPAPI ADDRGETNETWORKPARAMS CANCELLED'.split(' ').map(code => [code, 'E' + code])),
-  };
-  const dns = {
-    ...order, Resolver, ADDRCONFIG: 1024, V4MAPPED: 2048, ALL: 256,
-    ...Object.fromEntries(methods.map(method => [method, Resolver.prototype[method].bind(resolver)])),
-    lookup(hostname, o, callback) { if (typeof o === 'function') { callback = o; o = {}; } o = typeof o === 'object' && o !== null ? o : { family: o }; resolve(hostname, o).then(list => o.all ? callback(null, list) : callback(null, list[0].address, list[0].family), callback); },
-    promises: { ...order, Resolver: PromiseResolver, ...Object.fromEntries(methods.map(method => [method, PromiseResolver.prototype[method].bind(resolver)])), lookup: async (hostname, o = {}) => { o = typeof o === 'object' && o !== null ? o : { family: o }; const list = await resolve(hostname, o); return o.all ? list : list[0]; } },
-  };
-  dns.lookup[promisify.custom] = dns.promises.lookup;
+      if (type === 'A' || type === 'AAAA') return o?.ttl ? list : list.map(record => record.address);
+      if (type === 'CNAME' || type === 'NS' || type === 'PTR' || type === 'TXT') return list.map(record => record.value ?? record.entries);
+      return type === 'SOA' ? list[0] : list;
+    };
+    const systemServers = () => { try { return [...files.readFileSync('/etc/resolv.conf', 'utf8').matchAll(/^\s*nameserver\s+([^\s%]+)/gm)].map(match => match[1]); } catch { return []; } };
+    // WARNING: queries go through the system resolver library, which takes only IPv4 servers from setServers().
+    const PromiseResolver = class Resolver {
+      #servers = null; #seconds; #tries; #generation = 0;
+      constructor(o = {}) { this.#seconds = o.timeout > 0 ? Math.ceil(o.timeout / 1000) : null; this.#tries = o.tries ?? null; }
+      getServers() { return this.#servers ? [...this.#servers] : systemServers(); }
+      setServers(list) {
+        if (!Array.isArray(list)) throw typeError('servers', 'an instance of Array', list);
+        this.#servers = list.map(server => {
+          const text = String(server), [, ip, port] = /^\[(.+)\](?::(\d+))?$/.exec(text) ?? /^([^:]+)(?::(\d+))?$/.exec(text) ?? [, text], kind = call('web.tcp.ip', ip);
+          if (!kind) throw error(TypeError, 'ERR_INVALID_IP_ADDRESS', `Invalid IP address: ${text}`);
+          if (kind === 6) throw error(Error, 'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM', 'IPv6 DNS servers are not supported');
+          return port && port !== '53' ? `${ip}:${port}` : ip;
+        });
+      }
+      cancel() { this.#generation++; }
+      #query(hostname, type, reverse) {
+        if (typeof hostname !== 'string') throw typeError(reverse ? 'ip' : 'name', 'of type string', hostname);
+        const syscall = reverse ? 'getHostByAddr' : 'query' + type[0] + type.slice(1).toLowerCase(), generation = this.#generation;
+        const fail = code => Object.assign(new Error(`${syscall} ${code} ${hostname}`), { errno: undefined, code, syscall, hostname });
+        return asyncCall('resolve', hostname, rrtypes[type], this.#servers?.map(server => server.includes(':') ? server : server + ':53') ?? null, this.#seconds, this.#tries, !!reverse)
+          .then(list => { if (generation !== this.#generation) throw fail('ECANCELLED'); return list; }, failure => { throw fail(generation !== this.#generation ? 'ECANCELLED' : /^E[A-Z]+$/.test(failure.message) ? failure.message : 'EBADRESP'); });
+      }
+      resolve(hostname, rrtype = 'A') { if (!Object.hasOwn(rrtypes, rrtype)) throw error(TypeError, 'ERR_INVALID_ARG_VALUE', `The argument 'rrtype' is invalid. Received '${rrtype}'`); return this.#query(hostname, rrtype).then(list => shape(rrtype, list)); }
+      async reverse(ip) { return shape('PTR', await this.#query(ip, 'PTR', true)); }
+      static { for (const type of Object.keys(rrtypes)) this.prototype['resolve' + (type === 'A' ? '4' : type === 'AAAA' ? '6' : type[0] + type.slice(1).toLowerCase())] = async function(hostname, o) { return shape(type, await this.#query(hostname, type), o); }; }
+    };
+    class Resolver extends PromiseResolver {}
+    const methods = ['resolve', 'reverse', ...Object.keys(rrtypes).map(type => 'resolve' + (type === 'A' ? '4' : type === 'AAAA' ? '6' : type[0] + type.slice(1).toLowerCase()))];
+    for (const method of methods) Resolver.prototype[method] = function(...args) { const callback = args.pop(); if (typeof callback !== 'function') throw typeError('callback', 'of type function', callback); PromiseResolver.prototype[method].apply(this, args).then(value => callback(null, value), callback); };
+    const resolver = new Resolver(), order = {
+      getDefaultResultOrder: () => resultOrder,
+      setDefaultResultOrder(value) { if (!['ipv4first', 'ipv6first', 'verbatim'].includes(value)) throw error(TypeError, 'ERR_INVALID_ARG_VALUE', `The argument 'order' must be one of: 'verbatim', 'ipv4first', 'ipv6first'. Received '${value}'`); resultOrder = value; },
+      getServers: () => resolver.getServers(), setServers: list => resolver.setServers(list),
+      ...Object.fromEntries('NODATA FORMERR SERVFAIL NOTFOUND NOTIMP REFUSED BADQUERY BADNAME BADFAMILY BADRESP CONNREFUSED TIMEOUT EOF FILE NOMEM DESTRUCTION BADSTR BADFLAGS NONAME BADHINTS NOTINITIALIZED LOADIPHLPAPI ADDRGETNETWORKPARAMS CANCELLED'.split(' ').map(code => [code, 'E' + code])),
+    };
+    const dns = {
+      ...order, Resolver, ADDRCONFIG: 1024, V4MAPPED: 2048, ALL: 256,
+      ...Object.fromEntries(methods.map(method => [method, Resolver.prototype[method].bind(resolver)])),
+      lookup(hostname, o, callback) { if (typeof o === 'function') { callback = o; o = {}; } o = typeof o === 'object' && o !== null ? o : { family: o }; resolve(hostname, o).then(list => o.all ? callback(null, list) : callback(null, list[0].address, list[0].family), callback); },
+      promises: { ...order, Resolver: PromiseResolver, ...Object.fromEntries(methods.map(method => [method, PromiseResolver.prototype[method].bind(resolver)])), lookup: async (hostname, o = {}) => { o = typeof o === 'object' && o !== null ? o : { family: o }; const list = await resolve(hostname, o); return o.all ? list : list[0]; } },
+    };
+    dns.lookup[promisify.custom] = dns.promises.lookup;
+    return dns;
+  })();
 
   const colorDepth = (env = globalThis.process.env) => {
     if (env.FORCE_COLOR !== undefined) return ['', '1', 'true'].includes(env.FORCE_COLOR) ? 4 : env.FORCE_COLOR === '2' ? 8 : env.FORCE_COLOR === '3' ? 24 : 1;
@@ -1197,5 +1202,5 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   let streams;
   // WARNING: makes process.stdout and stderr terminal streams. They are created before `__apps.stream` exists.
   const terminal = (stream, modules) => { streams = modules; return resizable(Object.setPrototypeOf(stream, tty.WriteStream.prototype)); };
-  return { Buffer, buffer, fs: files, path, os, util, url, string_decoder: { StringDecoder }, assert, querystring, dns, tty, details, sync, asyncCall, poll, terminal };
+  return { Buffer, buffer, fs: files, path, os, util, url, string_decoder: { StringDecoder }, assert, querystring, get dns() { return dnsModule(); }, tty, details, sync, asyncCall, poll, terminal };
 };

@@ -298,11 +298,11 @@
   }
   globalThis.setImmediate = (fn, ...args) => { callable(fn, 'callback'); const immediate = new Immediate(); immediates.set(immediate, [fn, args]); return immediate; };
   globalThis.clearImmediate = immediate => { immediates.delete(immediate); };
-  const ffi = globalThis.__appsFFI(globalThis.__appsFFINative, codec);
-  delete globalThis.__appsFFI;
-  delete globalThis.__appsFFINative;
-  const sqlite = globalThis.__appsSQLite(call);
-  delete globalThis.__appsSQLite;
+  // WARNING: node modules that an app may never use are made on first use, so the first engine runs less code at startup.
+  const once = make => { let made; return () => made ??= make(); };
+  const { __appsFFI: installFFI, __appsFFINative: ffiNative, __appsSQLite: installSQLite, __appsNodeStreams: installStreams, __appsChildProcess: installChildren, __appsNodeIO: installIO, __appsNet: installNet, __appsHTTP: installHTTP, __appsPty: installPty, __appsNodeCompat: installCompat } = globalThis;
+  for (const name of ['__appsFFI', '__appsFFINative', '__appsSQLite', '__appsNodeStreams', '__appsChildProcess', '__appsNodeIO', '__appsNet', '__appsHTTP', '__appsPty', '__appsNodeCompat']) delete globalThis[name];
+  const ffi = once(() => installFFI(ffiNative, codec)), sqlite = once(() => installSQLite(call));
   const events = globalThis.__appsEvents;
   delete globalThis.__appsEvents;
   globalThis.__appsEventTargets(pollWeb.listeners);
@@ -311,18 +311,17 @@
   delete globalThis.__appsServe;
   node = globalThis.__appsNode(call, events.EventEmitter, inspector, info, codec);
   delete globalThis.__appsNode;
-  const stream = globalThis.__appsNodeStreams(events.EventEmitter, node.Buffer, node.string_decoder.StringDecoder);
-  delete globalThis.__appsNodeStreams;
-  children = globalThis.__appsChildProcess(call, events.EventEmitter, stream);
-  delete globalThis.__appsChildProcess;
-  const io = globalThis.__appsNodeIO({ call, sync: node.sync, asyncCall: node.asyncCall, Buffer: node.Buffer, stream, EventEmitter: events.EventEmitter, StringDecoder: node.string_decoder.StringDecoder, webcrypto: globalThis.__appsNodeCrypto.webcrypto, inspect, codec });
-  delete globalThis.__appsNodeIO;
-  node.util.types.isKeyObject = value => value instanceof io.crypto.KeyObject;
-  net = globalThis.__appsNet(call, events.EventEmitter, stream, node.Buffer);
-  delete globalThis.__appsNet;
-  const http = globalThis.__appsHTTP(servers.serve, stream, events.EventEmitter, net);
-  delete globalThis.__appsHTTP;
-  class ClientRequest extends http.http.ClientRequest {
+  const stream = once(() => installStreams(events.EventEmitter, node.Buffer, node.string_decoder.StringDecoder));
+  const childProcess = once(() => children = installChildren(call, events.EventEmitter, stream()));
+  let ioMade;
+  const io = once(() => ioMade = installIO({ call, sync: node.sync, asyncCall: node.asyncCall, Buffer: node.Buffer, stream: stream(), EventEmitter: events.EventEmitter, StringDecoder: node.string_decoder.StringDecoder, webcrypto: globalThis.__appsNodeCrypto.webcrypto, inspect, codec }));
+  // WARNING: a KeyObject exists only after `crypto` was made, so this doesn't make it.
+  node.util.types.isKeyObject = value => ioMade !== undefined && value instanceof ioMade.crypto.KeyObject;
+  const bytes = globalThis.__appsBytes;
+  delete globalThis.__appsBytes;
+  const netModule = once(() => net = installNet(call, events.EventEmitter, stream(), node.Buffer, bytes));
+  const http = once(() => installHTTP(servers.serve, stream(), events.EventEmitter, netModule()));
+  const clientRequest = once(() => class ClientRequest extends http().http.ClientRequest {
     constructor(options) {
       options = typeof options === 'string' ? { url: options } : { ...options };
       if (!['follow', 'error'].includes(options.redirect ??= 'follow')) throw new TypeError(`Unsupported redirect mode: ${options.redirect}`);
@@ -331,13 +330,12 @@
     }
     followRedirect() {}
     getUploadProgress() { const total = this._chunks.reduce((size, chunk) => size + chunk.length, 0); return { active: this.headersSent && !this.res, started: this.headersSent, current: this.res ? total : 0, total }; }
-  }
+  });
   const isOnline = () => info.platform === 'win32' || Object.values(node.os.networkInterfaces()).flat().some(item => !item.internal && !/^(169\.254\.|fe80:)/i.test(item.address));
   const electron = globalThis.__appsElectron(call, events.EventEmitter, () => ready);
   delete globalThis.__appsElectron;
-  const electronNet = Object.freeze({ fetch: async (input, init) => { const handler = electron.handled(input); return handler ? handler(new Request(input, init)) : fetch(input, init); }, request: options => new ClientRequest(options), isOnline, get online() { return isOnline(); } });
-  pty = globalThis.__appsPty(call);
-  delete globalThis.__appsPty;
+  const electronNet = Object.freeze({ fetch: async (input, init) => { const handler = electron.handled(input); return handler ? handler(new Request(input, init)) : fetch(input, init); }, request: options => new (clientRequest())(options), isOnline, get online() { return isOnline(); } });
+  const ptyModule = once(() => pty = installPty(call));
   // WARNING: like Node.js, main has `fetch` but no `XMLHttpRequest`, and libraries look for it to detect a browser.
   for (const name of ['FileReader', 'ProgressEvent', 'XMLHttpRequest', 'XMLHttpRequestEventTarget', 'XMLHttpRequestUpload']) delete globalThis[name];
   browsers = globalThis.__appsBrowser(call, events.EventEmitter, () => ready, contents => app.emit('web-contents-created', event(), contents), electron.nativeImage);
@@ -414,14 +412,15 @@
   hooks.report = error => { if (!uncaught(error)) console.error(error); };
   addEventListener('unhandledrejection', event => { if (!process.listenerCount('unhandledRejection')) return; event.preventDefault(); process.emit('unhandledRejection', event.reason, event.promise); });
   const output = fd => {
-    const tty = node.tty.isatty(fd), writable = new stream.Writable({ write(data, _encoding, done) { call('process.write', fd, data); done(); } });
+    const tty = node.tty.isatty(fd), writable = new (stream().Writable)({ write(data, _encoding, done) { call('process.write', fd, data); done(); } });
     // WARNING: Writes stay synchronous so they keep their order with console output.
     writable.write = (data, encoding, callback) => { if (typeof encoding === 'function') { callback = encoding; encoding = undefined; } call('process.write', fd, typeof data === 'string' && !encoding ? data : Buffer.from(data, encoding)); if (callback) queueMicrotask(callback); return true; };
     Object.defineProperties(writable, { fd: { value: fd, enumerable: true }, isTTY: { value: tty || undefined, enumerable: true } });
-    return tty ? node.terminal(writable, stream) : writable;
+    return tty ? node.terminal(writable, stream()) : writable;
   };
-  process.stdout = output(1);
-  process.stderr = output(2);
+  // WARNING: like Node, the standard output streams are made when first read.
+  const outputs = [];
+  for (const [fd, name] of [[1, 'stdout'], [2, 'stderr']]) Object.defineProperty(process, name, { enumerable: true, configurable: true, get: () => outputs[fd] ??= output(fd), set: value => { outputs[fd] = value; } });
   const fs = node.fs;
   // WARNING: reading it holds a thread of the file pool until input comes, so it opens on first use.
   let stdin;
@@ -438,54 +437,58 @@
     if (self.fd === null) self.opening.then(fd => { self.fd = fd; self.emit('open', fd); self.emit('ready'); }, error => self.destroy(error));
     self._destroy = (error, done) => self.opening.then(fd => self.autoClose && new Promise(resolve => { self.fd = null; if (handle) handle.close().then(resolve, resolve); else fs.close(fd, resolve); }), () => {}).then(() => done(error));
   };
-  class ReadStream extends stream.Readable {
-    get pending() { return this.fd === null; }
-    constructor(file, o) {
-      o = typeof o === 'string' ? { encoding: o } : o ?? {};
-      super({ highWaterMark: o.highWaterMark ?? 65536, encoding: o.encoding, emitClose: o.emitClose, signal: o.signal });
-      this.bytesRead = 0; this.end = o.end ?? Infinity;
-      fileStream(this, file, { ...o, start: o.start ?? (o.end === undefined ? undefined : 0) }, 'r');
+  const fileStreams = once(() => {
+    class ReadStream extends stream().Readable {
+      get pending() { return this.fd === null; }
+      constructor(file, o) {
+        o = typeof o === 'string' ? { encoding: o } : o ?? {};
+        super({ highWaterMark: o.highWaterMark ?? 65536, encoding: o.encoding, emitClose: o.emitClose, signal: o.signal });
+        this.bytesRead = 0; this.end = o.end ?? Infinity;
+        fileStream(this, file, { ...o, start: o.start ?? (o.end === undefined ? undefined : 0) }, 'r');
+      }
+      _read(size) {
+        this.opening.then(fd => {
+          const length = Math.min(size, this.end - (this.pos ?? 0) + 1);
+          if (length <= 0) return this.push(null);
+          fs.read(fd, Buffer.allocUnsafe(length), 0, length, this.pos ?? null, (error, bytesRead, buffer) => {
+            if (error) return this.destroy(error);
+            if (this.pos !== undefined) this.pos += bytesRead;
+            this.bytesRead += bytesRead;
+            this.push(bytesRead ? buffer.subarray(0, bytesRead) : null);
+          });
+        }, () => {});
+      }
+      close(callback) { if (callback) { if (this.closed) queueMicrotask(callback); else this.once('close', callback); } this.destroy(); }
     }
-    _read(size) {
-      this.opening.then(fd => {
-        const length = Math.min(size, this.end - (this.pos ?? 0) + 1);
-        if (length <= 0) return this.push(null);
-        fs.read(fd, Buffer.allocUnsafe(length), 0, length, this.pos ?? null, (error, bytesRead, buffer) => {
-          if (error) return this.destroy(error);
-          if (this.pos !== undefined) this.pos += bytesRead;
-          this.bytesRead += bytesRead;
-          this.push(bytesRead ? buffer.subarray(0, bytesRead) : null);
-        });
-      }, () => {});
+    class WriteStream extends stream().Writable {
+      get pending() { return this.fd === null; }
+      constructor(file, o) {
+        o = typeof o === 'string' ? { encoding: o } : o ?? {};
+        super({ highWaterMark: o.highWaterMark, defaultEncoding: o.encoding, emitClose: o.emitClose, signal: o.signal });
+        this.bytesWritten = 0; this.flush = !!o.flush;
+        fileStream(this, file, o, 'w');
+      }
+      _write(data, _encoding, done) {
+        this.opening.then(fd => {
+          const step = at => fs.write(fd, data, at, data.length - at, this.pos ?? null, (error, written) => {
+            if (error) return done(error);
+            this.bytesWritten += written;
+            if (this.pos !== undefined) this.pos += written;
+            if (at + written < data.length) step(at + written); else done();
+          });
+          step(0);
+        }, done);
+      }
+      // WARNING: like Node, chunks that queue while a write runs go out in one write, so each small write() costs no thread round trip.
+      _writev(chunks, done) { this._write(Buffer.concat(chunks.map(entry => entry.chunk)), null, done); }
+      _final(done) { this.opening.then(fd => this.flush ? fs.fsync(fd, done) : done(), done); }
+      close(callback) { if (callback) { if (this.closed) queueMicrotask(callback); else this.once('close', callback); } if (this.writable) this.end(); else this.destroy(); }
+      destroySoon() { this.end(); }
     }
-    close(callback) { if (callback) { if (this.closed) queueMicrotask(callback); else this.once('close', callback); } this.destroy(); }
-  }
-  class WriteStream extends stream.Writable {
-    get pending() { return this.fd === null; }
-    constructor(file, o) {
-      o = typeof o === 'string' ? { encoding: o } : o ?? {};
-      super({ highWaterMark: o.highWaterMark, defaultEncoding: o.encoding, emitClose: o.emitClose, signal: o.signal });
-      this.bytesWritten = 0; this.flush = !!o.flush;
-      fileStream(this, file, o, 'w');
-    }
-    _write(data, _encoding, done) {
-      this.opening.then(fd => {
-        const step = at => fs.write(fd, data, at, data.length - at, this.pos ?? null, (error, written) => {
-          if (error) return done(error);
-          this.bytesWritten += written;
-          if (this.pos !== undefined) this.pos += written;
-          if (at + written < data.length) step(at + written); else done();
-        });
-        step(0);
-      }, done);
-    }
-    // WARNING: like Node, chunks that queue while a write runs go out in one write, so each small write() costs no thread round trip.
-    _writev(chunks, done) { this._write(Buffer.concat(chunks.map(entry => entry.chunk)), null, done); }
-    _final(done) { this.opening.then(fd => this.flush ? fs.fsync(fd, done) : done(), done); }
-    close(callback) { if (callback) { if (this.closed) queueMicrotask(callback); else this.once('close', callback); } if (this.writable) this.end(); else this.destroy(); }
-    destroySoon() { this.end(); }
-  }
-  Object.assign(fs, { ReadStream, WriteStream, createReadStream: (file, o) => new ReadStream(file, o), createWriteStream: (file, o) => new WriteStream(file, o) });
+    return { ReadStream, WriteStream };
+  });
+  Object.defineProperties(fs, { ReadStream: { get: () => fileStreams().ReadStream, enumerable: true, configurable: true }, WriteStream: { get: () => fileStreams().WriteStream, enumerable: true, configurable: true } });
+  Object.assign(fs, { createReadStream: (file, o) => new (fileStreams().ReadStream)(file, o), createWriteStream: (file, o) => new (fileStreams().WriteStream)(file, o) });
   const { path, os } = node;
   let ready = false, nextWindow = 0, resolveReady;
   const readyPromise = new Promise(resolve => { resolveReady = resolve; });
@@ -1146,17 +1149,35 @@
     });
   };
   const perf_hooks = { performance, PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList, createHistogram: () => new RecordableHistogram(), monitorEventLoopDelay };
-  const compat = globalThis.__appsNodeCompat(events.EventEmitter, stream, net.api);
-  delete globalThis.__appsNodeCompat;
-  const modules = { ...compat, fs, path, os, process, events, stream, util: node.util, url: node.url, buffer: node.buffer, string_decoder: node.string_decoder, assert: node.assert, querystring: node.querystring, dns: node.dns, tty: node.tty, zlib: io.zlib, readline: io.readline, crypto: { ...globalThis.__appsNodeCrypto, ...io.crypto }, child_process: children.api, net: net.api, http: http.http, https: http.https, worker_threads: workers.api, perf_hooks, timers: timerModule, sqlite, ffi };
-  modules.constants = Object.assign({}, os.constants.errno, os.constants.priority, os.constants.signals, fs.constants, modules.crypto.constants);
-  const builtins = { ...modules, module: null, sys: node.util, 'fs/promises': fs.promises, 'stream/promises': stream.promises, 'stream/consumers': stream.consumers, 'stream/web': { ReadableStream, WritableStream, TransformStream, ByteLengthQueuingStrategy, CountQueuingStrategy, TextEncoderStream, TextDecoderStream, CompressionStream, DecompressionStream, ReadableStreamDefaultReader, ReadableStreamBYOBReader, ReadableStreamBYOBRequest, ReadableStreamDefaultController, ReadableByteStreamController, WritableStreamDefaultWriter, WritableStreamDefaultController, TransformStreamDefaultController }, 'timers/promises': timerModule.promises, 'util/types': node.util.types, 'path/posix': path.posix, 'path/win32': path.win32, 'assert/strict': node.assert.strict, 'readline/promises': io.readline.promises, 'dns/promises': node.dns.promises };
+  const compat = once(() => installCompat(events.EventEmitter, stream(), netModule().api));
+  const crypto = once(() => ({ ...globalThis.__appsNodeCrypto, ...io().crypto }));
+  const lazy = (target, key, get) => Object.defineProperty(target, key, { get, enumerable: true, configurable: true });
+  // WARNING: the keys keep their order, which `builtinModules` lists.
+  const modules = {};
+  for (const key of ['async_hooks', 'diagnostics_channel', 'sea', 'tls', 'undici', 'v8']) lazy(modules, key, () => compat()[key]);
+  Object.assign(modules, { fs, path, os, process, events });
+  lazy(modules, 'stream', stream);
+  Object.assign(modules, { util: node.util, url: node.url, buffer: node.buffer, string_decoder: node.string_decoder, assert: node.assert, querystring: node.querystring });
+  lazy(modules, 'dns', () => node.dns);
+  modules.tty = node.tty;
+  for (const [key, get] of [['zlib', () => io().zlib], ['readline', () => io().readline], ['crypto', crypto], ['child_process', () => childProcess().api], ['net', () => netModule().api], ['http', () => http().http], ['https', () => http().https]]) lazy(modules, key, get);
+  Object.assign(modules, { worker_threads: workers.api, perf_hooks, timers: timerModule });
+  lazy(modules, 'sqlite', sqlite);
+  lazy(modules, 'ffi', ffi);
+  lazy(modules, 'constants', once(() => Object.assign({}, os.constants.errno, os.constants.priority, os.constants.signals, fs.constants, crypto().constants)));
+  const builtins = Object.defineProperties({}, Object.getOwnPropertyDescriptors(modules));
+  Object.assign(builtins, { module: null, sys: node.util, 'fs/promises': fs.promises });
+  lazy(builtins, 'stream/promises', () => stream().promises);
+  lazy(builtins, 'stream/consumers', () => stream().consumers);
+  Object.assign(builtins, { 'stream/web': { ReadableStream, WritableStream, TransformStream, ByteLengthQueuingStrategy, CountQueuingStrategy, TextEncoderStream, TextDecoderStream, CompressionStream, DecompressionStream, ReadableStreamDefaultReader, ReadableStreamBYOBReader, ReadableStreamBYOBRequest, ReadableStreamDefaultController, ReadableByteStreamController, WritableStreamDefaultWriter, WritableStreamDefaultController, TransformStreamDefaultController }, 'timers/promises': timerModule.promises, 'util/types': node.util.types, 'path/posix': path.posix, 'path/win32': path.win32, 'assert/strict': node.assert.strict });
+  lazy(builtins, 'readline/promises', () => io().readline.promises);
+  lazy(builtins, 'dns/promises', () => node.dns.promises);
   // WARNING: like Node, prefixed modules are built in only with `node:`.
   const prefixed = new Set(['sqlite', 'ffi', 'sea']), isBuiltin = name => { name = String(name); const key = name.replace(/^node:/, ''); return Object.hasOwn(builtins, key) && (key !== name || !prefixed.has(key)); };
   const missingModule = name => Object.assign(new Error(`Cannot find module '${name}'`), { code: 'MODULE_NOT_FOUND' });
   builtins.module = { builtinModules: Object.keys(builtins).map(name => prefixed.has(name) ? 'node:' + name : name), isBuiltin, createRequire: () => Object.assign(name => {
     const key = String(name).replace(/^node:/, '');
-    const value = key === 'electron' || key === '@pierre/apps' ? globalThis.__apps : key === 'node-pty' ? pty.api : key === 'ws' ? http.ws : isBuiltin(name) ? builtins[key] : undefined;
+    const value = key === 'electron' || key === '@pierre/apps' ? globalThis.__apps : key === 'node-pty' ? ptyModule().api : key === 'ws' ? http().ws : isBuiltin(name) ? builtins[key] : undefined;
     if (value === undefined) throw missingModule(name);
     return value;
   }, { resolve: name => { if (isBuiltin(name) || /^(node-pty|ws|undici|electron)(\/|$)/.test(String(name))) return String(name); throw missingModule(name); } }) };
@@ -1166,5 +1187,10 @@
   if (info.node) globalThis.__appsFinish = () => { process.emit('beforeExit', Number(process.exitCode ?? 0) | 0); return __appsAlive() ? -1 : finish(); };
   // WARNING: like Electron, preloads don't get the main process modules: windows, app and native state belong to main.
   const main = role === 'main' ? { app, BrowserWindow, View: browsers.View, WebContentsView: browsers.WebContentsView, session: browsers.session, webContents, protocol: electron.protocol, autoUpdater: electron.autoUpdater, desktopCapturer: electron.desktopCapturer } : {};
-  globalThis.__apps = Object.freeze({ ...main, nativeImage: electron.nativeImage, ClipboardItem: electron.ClipboardItem, webFrame, ...nativeShell, ...bridge, ipcMain: role === 'main' ? bridge.ipcMain : undefined, ipcRenderer: role === 'main' ? undefined : bridge.ipcRenderer, serve: servers.serve, ...modules, net: electronNet, module: builtins.module, pty: pty.api, ws: http.ws });
+  const apps = Object.defineProperties({ ...main, nativeImage: electron.nativeImage, ClipboardItem: electron.ClipboardItem, webFrame, ...nativeShell, ...bridge, ipcMain: role === 'main' ? bridge.ipcMain : undefined, ipcRenderer: role === 'main' ? undefined : bridge.ipcRenderer, serve: servers.serve }, Object.getOwnPropertyDescriptors(modules));
+  Object.defineProperty(apps, 'net', { value: electronNet, enumerable: true, writable: true, configurable: true });
+  apps.module = builtins.module;
+  lazy(apps, 'pty', () => ptyModule().api);
+  lazy(apps, 'ws', () => http().ws);
+  globalThis.__apps = Object.freeze(apps);
 })();

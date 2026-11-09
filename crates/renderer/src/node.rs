@@ -74,23 +74,61 @@ pub type MeasureFn = dyn FnMut(
 #[derive(Default)]
 pub struct Node {
     pub(crate) id: Option<ElementId>,
-    pub(crate) style: Style,
+    pub(crate) style: NodeStyle,
     pub(crate) children: Vec<Child>,
     pub(crate) events: Option<Box<Events>>,
     pub(crate) hooks: Option<Rc<dyn Hooks>>,
     pub(crate) content: Content,
 }
 
-// WARNING: boxing the description would allocate for every box built, so children move it instead.
-#[allow(clippy::large_enum_variant)]
+// WARNING: boxed, so the builder chains in the runtime move a pointer instead of a 736-byte style per call. A shared
+// style is one the runtime built before from the same inputs, so commit finds it by pointer, and a change copies it.
+pub(crate) enum NodeStyle {
+    Own(Box<Style>),
+    Shared(Rc<Style>),
+}
+
+impl Default for NodeStyle {
+    fn default() -> Self {
+        Self::Own(Box::default())
+    }
+}
+
+impl std::ops::Deref for NodeStyle {
+    type Target = Style;
+
+    fn deref(&self) -> &Style {
+        match self {
+            Self::Own(style) => style,
+            Self::Shared(style) => style,
+        }
+    }
+}
+
+impl NodeStyle {
+    pub(crate) fn make_mut(&mut self) -> &mut Style {
+        if let Self::Shared(style) = self {
+            *self = Self::Own(Box::new((**style).clone()));
+        }
+        match self {
+            Self::Own(style) => style,
+            Self::Shared(_) => unreachable!(),
+        }
+    }
+}
+
+// WARNING: a node is about 100 bytes plus its boxed style, so lists hold it boxed: a box with one child no longer allocates room for four
+// nodes, and moving children moves pointers.
 pub enum Child {
-    Node(Node),
+    Node(Box<Node>),
     Kept(ElementId),
+    // WARNING: a kept box that its parent places again: its left and top insets, width and height.
+    Placed(ElementId, Bounds<Pixels>),
 }
 
 impl From<Node> for Child {
     fn from(node: Node) -> Self {
-        Self::Node(node)
+        Self::Node(Box::new(node))
     }
 }
 
@@ -166,15 +204,35 @@ pub trait Hooks: 'static {
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window)
     }
+    // WARNING: a box whose subtree didn't change and lies where it lay keeps its last prepaint, and its hooks only
+    // `kept`, which gives again what a pass collects anew. A hook whose prepaint reads more than its box, or leaves
+    // state that its paint takes, is volatile and prepaints in every pass.
+    fn volatile(&self) -> bool {
+        true
+    }
+    // WARNING: true when the hook paints its box only within its bounds and its children where they lie. A
+    // transform, a filter or a drawing can paint anywhere.
+    fn bounded(&self) -> bool {
+        false
+    }
+    fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        inner(cx.window)
+    }
+    // WARNING: paints the box's text or measured content in place of the box's own lines, inside its clip and under
+    // its children and border, and returns whether it did.
+    fn paint_content(&self, _cx: &mut NodeCx<'_>) -> bool {
+        false
+    }
 }
 
 struct Chain(Rc<dyn Hooks>, Rc<dyn Hooks>);
 
 impl Hooks for Chain {
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        let (bounds, exact, baselines, text, style, state) = (
+        let (bounds, exact, inset, baselines, text, style, state) = (
             cx.bounds,
             cx.exact,
+            cx.inset,
             cx.baselines,
             cx.text,
             cx.style,
@@ -185,6 +243,7 @@ impl Hooks for Chain {
                 window,
                 bounds,
                 exact,
+                inset,
                 baselines,
                 text,
                 style,
@@ -194,10 +253,48 @@ impl Hooks for Chain {
         })
     }
 
-    fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        let (bounds, exact, baselines, text, style, state) = (
+    fn volatile(&self) -> bool {
+        self.0.volatile() || self.1.volatile()
+    }
+
+    fn bounded(&self) -> bool {
+        self.0.bounded() && self.1.bounded()
+    }
+
+    fn paint_content(&self, cx: &mut NodeCx<'_>) -> bool {
+        self.0.paint_content(cx) || self.1.paint_content(cx)
+    }
+
+    fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let (bounds, exact, inset, baselines, text, style, state) = (
             cx.bounds,
             cx.exact,
+            cx.inset,
+            cx.baselines,
+            cx.text,
+            cx.style,
+            cx.state,
+        );
+        self.0.kept(cx, &mut |window| {
+            let mut cx = NodeCx {
+                window,
+                bounds,
+                exact,
+                inset,
+                baselines,
+                text,
+                style,
+                state,
+            };
+            self.1.kept(&mut cx, inner)
+        })
+    }
+
+    fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let (bounds, exact, inset, baselines, text, style, state) = (
+            cx.bounds,
+            cx.exact,
+            cx.inset,
             cx.baselines,
             cx.text,
             cx.style,
@@ -208,6 +305,7 @@ impl Hooks for Chain {
                 window,
                 bounds,
                 exact,
+                inset,
                 baselines,
                 text,
                 style,
@@ -222,6 +320,8 @@ pub struct NodeCx<'a> {
     pub window: &'a mut Window,
     pub bounds: Bounds<Pixels>,
     pub exact: Bounds<Pixels>,
+    // WARNING: the padding and border of the box, top, right, bottom and left, which hold its text in.
+    pub inset: [Pixels; 4],
     pub baselines: [Option<Pixels>; 2],
     pub text: &'a TextStyle,
     pub style: &'a Style,
@@ -238,8 +338,23 @@ impl NodeCx<'_> {
     }
 }
 
+// WARNING: nodes start with one shared default style, so a node whose style is never set, like a paragraph that its
+// box adopts, allocates none.
 pub fn node() -> Node {
-    Node::default()
+    thread_local!(static STYLE: Rc<Style> = Rc::default());
+    shared(STYLE.with(Rc::clone))
+}
+
+// WARNING: a node with a style the runtime built before, see `Node::share_style`.
+pub fn shared(style: Rc<Style>) -> Node {
+    Node {
+        id: None,
+        style: NodeStyle::Shared(style),
+        children: Vec::new(),
+        events: None,
+        hooks: None,
+        content: Content::None,
+    }
 }
 
 impl Node {
@@ -249,11 +364,68 @@ impl Node {
     }
 
     pub fn style(&mut self) -> &mut Style {
-        &mut self.style
+        self.style.make_mut()
+    }
+
+    pub fn style_ref(&self) -> &Style {
+        &self.style
+    }
+
+    // WARNING: makes the node's style one that other nodes can take with `share_style`, which only nodes whose inputs
+    // fully determine the same style may do.
+    pub fn shared_style(&mut self) -> Rc<Style> {
+        if let NodeStyle::Own(style) = &mut self.style {
+            self.style = NodeStyle::Shared(Rc::new(std::mem::take(&mut **style)));
+        }
+        match &self.style {
+            NodeStyle::Shared(style) => style.clone(),
+            NodeStyle::Own(_) => unreachable!(),
+        }
+    }
+
+    pub fn share_style(&mut self, style: Rc<Style>) {
+        self.style = NodeStyle::Shared(style);
+    }
+
+    pub fn element_id(&self) -> Option<ElementId> {
+        self.id
+    }
+
+    pub fn kids(&self) -> &[Child] {
+        &self.children
+    }
+
+    pub fn text_content(&self) -> Option<(&str, Option<&[TextRun]>)> {
+        match &self.content {
+            Content::Text(text, runs) => Some((text, runs.as_deref())),
+            _ => None,
+        }
+    }
+
+    pub fn shares(&self, style: &Rc<Style>) -> bool {
+        matches!(&self.style, NodeStyle::Shared(own) if Rc::ptr_eq(own, style))
     }
 
     pub fn child(mut self, child: impl Into<Child>) -> Self {
         self.children.push(child.into());
+        self
+    }
+
+    pub fn has_children(&self) -> bool {
+        !self.children.is_empty()
+    }
+
+    // WARNING: a box with no children takes the content and hooks of a text node, and lays out and paints the text
+    // itself in its content box, so the text needs no box of its own.
+    pub fn adopt(mut self, text: Node) -> Self {
+        debug_assert!(self.children.is_empty() && matches!(self.content, Content::None));
+        self.content = text.content;
+        if let Some(hooks) = text.hooks {
+            self.hooks = Some(match self.hooks.take() {
+                Some(inner) => Rc::new(Chain(hooks, inner)),
+                None => hooks,
+            });
+        }
         self
     }
 
@@ -282,12 +454,12 @@ impl Node {
     }
 
     pub fn z_index(mut self, order: i32) -> Self {
-        self.style.z_index = Some(order);
+        self.style().z_index = Some(order);
         self
     }
 
     pub fn stacking(mut self) -> Self {
-        self.style.stacking = true;
+        self.style().stacking = true;
         self
     }
 
@@ -631,8 +803,10 @@ impl Node {
     }
 }
 
+// WARNING: every stacking context holds two of these, so they share one style.
 pub fn layers(negative: bool) -> Node {
-    let mut node = node().absolute().w(px(0.)).h(px(0.));
+    thread_local!(static STYLE: Rc<Style> = node().absolute().w(px(0.)).h(px(0.)).shared_style());
+    let mut node = shared(STYLE.with(Rc::clone));
     node.content = Content::Layers(negative);
     node
 }
@@ -641,7 +815,7 @@ pub fn img(image: Arc<RenderImage>) -> Node {
     let size = image.size();
     let mut node = node();
     if size.height.0 > 0 {
-        node.style.aspect_ratio = Some(size.width.0 as f32 / size.height.0 as f32);
+        node.style().aspect_ratio = Some(size.width.0 as f32 / size.height.0 as f32);
     }
     node.content = Content::Image(image, ObjectFit::Fill);
     node
@@ -667,6 +841,20 @@ pub fn canvas<T: 'static>(
         prepaint,
         paint,
         state: Cell::new(None),
+        within: false,
+    })
+}
+
+// WARNING: a canvas whose drawing stays within its bounds, so paint can skip it with its box, see `Hooks::bounded`.
+pub fn canvas_within<T: 'static>(
+    prepaint: impl Fn(Bounds<Pixels>, &mut Window) -> T + 'static,
+    paint: impl Fn(Bounds<Pixels>, T, &mut Window) + 'static,
+) -> Node {
+    node().hooks(Canvas {
+        prepaint,
+        paint,
+        state: Cell::new(None),
+        within: true,
     })
 }
 
@@ -674,6 +862,7 @@ struct Canvas<P, F, T> {
     prepaint: P,
     paint: F,
     state: Cell<Option<T>>,
+    within: bool,
 }
 
 impl<T: 'static, P, F> Hooks for Canvas<P, F, T>
@@ -684,6 +873,10 @@ where
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window);
         self.state.set(Some((self.prepaint)(cx.exact, cx.window)));
+    }
+
+    fn bounded(&self) -> bool {
+        self.within
     }
 
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {

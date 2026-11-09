@@ -557,6 +557,42 @@ fn grid_area_rows_split_dots_from_names() {
 }
 
 #[test]
+fn numbers_print_like_the_exact_formatter() {
+    let exact = |value: f64| {
+        let value = if value.abs() < 1e-9 { 0. } else { value };
+        let digits = if value == 0. || !value.is_finite() {
+            0
+        } else {
+            (5 - value.abs().log10().floor() as i32).max(0) as usize
+        };
+        let text = format!("{value:.digits$}");
+        let text = if text.contains('.') {
+            text.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            &text
+        };
+        if text == "-0" { "0" } else { text }.to_owned()
+    };
+    let mut values = vec![0., -0., 1., 2.5, 0.3, 1e-9, -1e-9, 2e-9, 9.999995];
+    values.extend([9.9999949, 0.0000125, 123456.5, 99999.95, 1e300]);
+    values.extend([12.000004, 0.00999999, f64::NAN]);
+    values.extend([0.1 + 0.2, 1. / 3., -2. / 3., 1. / 0.]);
+    values.extend((1..60).flat_map(|power| [2f64.powi(-power), -3. * 2f64.powi(-power)]));
+    let mut seed = 7u64;
+    for _ in 0..200_000 {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mantissa = (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+        values.push(mantissa * 10f64.powi((seed % 19) as i32 - 10));
+        values.push(((seed >> 20) % 2_000_000) as f64 / 10f64.powi((seed % 9) as i32));
+    }
+    for value in values {
+        assert_eq!(number(value), exact(value), "{value:e}");
+    }
+}
+
+#[test]
 fn split_values_like_the_tokenizer() {
     let values = [
         "0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1)",
@@ -614,17 +650,46 @@ fn split_values_like_the_tokenizer() {
 }
 
 pub(crate) fn number(value: f64) -> String {
+    let mut out = String::new();
+    write_number(value, &mut out);
+    out
+}
+
+pub(crate) fn write_number(value: f64, out: &mut String) {
+    use std::fmt::Write;
     let value = if value.abs() < 1e-9 { 0. } else { value };
     let digits = if value == 0. || !value.is_finite() {
         0
     } else {
         (5 - value.abs().log10().floor() as i32).max(0) as usize
     };
-    let text = format!("{value:.digits$}");
-    let text = if text.contains('.') {
-        text.trim_end_matches('0').trim_end_matches('.')
-    } else {
-        &text
-    };
-    if text == "-0" { "0" } else { text }.to_owned()
+    // WARNING: the scaled value is below 2^21, so the product is off by less than 1e-9 and only near ties can it
+    // round unlike the exact formatter below.
+    let scaled = value.abs() * 10f64.powi(digits as i32);
+    if (1..=15).contains(&digits) && (scaled.fract() - 0.5).abs() > 1e-6 {
+        let (whole, power) = (scaled.round() as u64, 10u64.pow(digits as u32));
+        if value < 0. {
+            out.push('-');
+        }
+        let _ = write!(out, "{}", whole / power);
+        let (mut fraction, mut width) = (whole % power, digits);
+        if fraction != 0 {
+            while fraction % 10 == 0 {
+                fraction /= 10;
+                width -= 1;
+            }
+            let _ = write!(out, ".{fraction:0width$}");
+        }
+        return;
+    }
+    let start = out.len();
+    let _ = write!(out, "{value:.digits$}");
+    if out[start..].contains('.') {
+        let end = out.trim_end_matches('0').trim_end_matches('.').len();
+        out.truncate(end);
+    }
+    if &out[start..] == "-0" {
+        out.truncate(start);
+        out.push('0');
+    }
 }

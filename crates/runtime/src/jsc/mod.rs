@@ -492,6 +492,30 @@ fn create_bytecode(
     })
 }
 
+// WARNING: the first window's engines start some 60 ms after the main side, while AppKit launches, so a thread builds
+// the bytecode of the runtime scripts from the start, those of pages first.
+pub(crate) fn prebuild(api: &JavaScriptCore, webgpu: bool, node: bool) {
+    if api.aot.is_some() || api.evaluate_latin1.is_none() || api.create_bytecode.is_none() {
+        return;
+    }
+    let mut scripts = SCRIPTS.lock().unwrap();
+    let count = scripts.0.len();
+    let node = NODE_SCRIPTS.into_iter().filter(|_| node);
+    for (url, source) in WEB_SCRIPTS.into_iter().chain(PAGE_SCRIPTS).chain(node) {
+        if (webgpu || url != "apps:gpu") && !scripts.0.iter().any(|script| script.0 == url) {
+            scripts.0.push((url, source(), None));
+        }
+    }
+    if scripts.1 || scripts.0.len() == count {
+        return;
+    }
+    scripts.1 = true;
+    drop(scripts);
+    let _ = std::thread::Builder::new()
+        .name("apps-bytecode".into())
+        .spawn(build_bytecode);
+}
+
 // Builds the bytecode of the runtime scripts that have none yet, in a VM of its own.
 fn build_bytecode() -> Result<()> {
     let api = JavaScriptCore::load()?;

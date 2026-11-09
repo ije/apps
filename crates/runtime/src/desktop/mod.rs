@@ -89,15 +89,14 @@ impl Desktop {
             bundle.files.contains_key("app.js"),
             "Start a Rust app with its Cargo executable"
         );
-        let mut desktop = Self::create(
+        Self::create(
             &bundle.files,
+            bundle.pages,
             bundle.scripts,
             bundle.packaged,
             bundle.root,
             false,
-        )?;
-        desktop.pages = bundle.pages;
-        Ok(desktop)
+        )
     }
 
     // WARNING: the main side keeps running, so a bundle from `input` must change only pages and the chunks they load.
@@ -181,6 +180,7 @@ impl Desktop {
     pub fn new(files: &BBTreeMap<String, String>) -> Result<Self> {
         Self::create(
             files,
+            BBTreeMap::new(),
             HashMap::new(),
             false,
             std::path::PathBuf::new(),
@@ -190,12 +190,64 @@ impl Desktop {
 
     fn create(
         files: &BBTreeMap<String, String>,
+        pages: BBTreeMap<String, Document>,
         scripts: HashMap<String, bytes::Bytes>,
         packaged: bool,
         root: std::path::PathBuf,
         rust: bool,
     ) -> Result<Self> {
         let api = JavaScriptCore::load()?;
+        // WARNING: after `new BrowserWindow()`, no thread could build the bytecode of the window's engines in time, so
+        // apps with pages build it, and load what windows need, from the start. Apps without pages do both with their
+        // first window, if any.
+        let windows = !pages.is_empty() || files.keys().any(|name| name.ends_with(".html"));
+        // WARNING: AppKit's launch, the first window and the first frame wait for the window server connection, the
+        // Metal driver and CoreText's font metadata, so a thread loads them while the main side starts.
+        #[cfg(target_os = "macos")]
+        if windows {
+            let _ = std::thread::Builder::new()
+                .name("apps-warm".into())
+                .spawn(|| {
+                    use renderer::text::{TextRun, TextSystem, font};
+                    #[link(name = "CoreGraphics", kind = "framework")]
+                    unsafe extern "C" {
+                        fn CGMainDisplayID() -> u32;
+                    }
+                    #[link(name = "Metal", kind = "framework")]
+                    unsafe extern "C" {
+                        fn MTLCopyAllDevices() -> *const std::ffi::c_void;
+                    }
+                    #[link(name = "CoreFoundation", kind = "framework")]
+                    unsafe extern "C" {
+                        fn CFRelease(value: *const std::ffi::c_void);
+                    }
+                    unsafe { CGMainDisplayID() };
+                    let text = TextSystem::new();
+                    let run = TextRun {
+                        len: 2,
+                        font: font(".SystemUIFont"),
+                        ..Default::default()
+                    };
+                    let line = text.layout_line("Ag", renderer::px(13.), &[run], None);
+                    if let Some(run) = line.runs.first()
+                        && let Some(glyph) = run.glyphs.first()
+                    {
+                        text.glyph_pixels(run.font_id, glyph.id, run.font_size, 2., 0, false);
+                    }
+                    // WARNING: the text system keeps fonts for the process, so pages find the bold system font and the
+                    // monospace and sans-serif fallbacks loaded.
+                    text.resolve_font(&renderer::Font {
+                        weight: renderer::FontWeight(600.),
+                        ..font(".SystemUIFont")
+                    });
+                    text.resolve_font(&font("Menlo"));
+                    text.resolve_font(&font("Helvetica"));
+                    let devices = unsafe { MTLCopyAllDevices() };
+                    if !devices.is_null() {
+                        unsafe { CFRelease(devices) };
+                    }
+                });
+        }
         let link = Link::new();
         // WARNING: native producers of this thread capture this waker before the app runs.
         crate::host::Waker::install({
@@ -212,6 +264,13 @@ impl Desktop {
         let package = files.get("package.json").map(String::as_str);
         let (_, name, version, _) = crate::bundle::package_metadata(package)?;
         let disabled = crate::bundle::disabled_features(package)?;
+        if windows {
+            crate::jsc::prebuild(
+                &api,
+                disabled & crate::bundle::feature_bit("webgpu") == 0,
+                !rust,
+            );
+        }
         crate::web::LOCAL_NETWORK.store(
             disabled & crate::bundle::feature_bit("localNetwork") == 0,
             Ordering::Relaxed,
@@ -254,7 +313,7 @@ impl Desktop {
             Some(engine)
         };
         Ok(Self {
-            pages: BBTreeMap::new(),
+            pages,
             main: Some(Main::new(engine, main_host, link.clone(), api.clone())),
             api,
             host,
@@ -380,7 +439,6 @@ impl Desktop {
                                 (0xffffff, 255)
                             });
                         self.host.borrow_mut().backgrounds.insert(id, background);
-                        let mut baseline = None;
                         let mut data = Weak::new();
                         let handle = if let Some(cx) = cx.as_deref_mut() {
                             let runtime = runtime.unwrap().clone();
@@ -475,12 +533,13 @@ impl Desktop {
                                 if options["fullscreen"] == true {
                                     window.toggle_fullscreen();
                                 }
+                                // WARNING: the native window opens later on main, so this size is its guess, and main
+                                // sends the first state once it opened.
                                 let size = window.viewport_size();
                                 self.host
                                     .borrow_mut()
                                     .viewports
                                     .insert(id, [f32::from(size.width), f32::from(size.height)]);
-                                baseline = Some(window_state(window));
                             });
                             Some(handle)
                         } else {
@@ -498,10 +557,6 @@ impl Desktop {
                                 focused: true,
                             },
                         );
-                        if let Some(state) = baseline {
-                            self.link
-                                .event(format!("__appsEvent('state',{id},{state})"), "apps:state");
-                        }
                     }
                     "load" | "loadFile" => {
                         if let Some((files, scripts)) = RELOADED
@@ -594,6 +649,7 @@ impl Desktop {
                                 continue;
                             }
                         };
+                        renderer::text::warm(crate::style::font_lists(&doc));
                         // WARNING: only pages that ship with the app run `<script type="preload">` with Node; user files and HTML strings never do.
                         let trusted = location.starts_with("apps:///")
                             || !page
@@ -1302,10 +1358,13 @@ impl Desktop {
                     cx.refresh_window(handle);
                 }
             }
+            // WARNING: a due task wakes the loop at once, as in browsers, so a MessageChannel task doesn't wait a timer
+            // tick. The render thread runs a posted task (frames, input) between its timers, so a page that posts
+            // tasks without end still draws.
             Ok(if delay == i64::MAX || app.quit {
                 None
             } else {
-                Some(delay.clamp(1, 1 << 31) as u64)
+                Some(delay.clamp(0, 1 << 31) as u64)
             })
         })();
         if runtime.try_borrow().is_ok_and(|app| app.ended) {
@@ -1619,6 +1678,11 @@ impl Desktop {
                 return;
             }
         };
+        crate::jsc::prebuild(
+            &api,
+            template.disabled & crate::bundle::feature_bit("webgpu") == 0,
+            !template.rust_main,
+        );
         let waker = cx.waker();
         queue.set_wake(move || waker.wake());
         // WARNING: without a thread per window this one also runs the main side, which must wake too.
@@ -1942,7 +2006,8 @@ mod tests {
         for (name, source) in extra {
             files.insert((*name).into(), (*source).into());
         }
-        let mut desktop = Desktop::create(&files, HashMap::new(), false, root, false).unwrap();
+        let mut desktop =
+            Desktop::create(&files, BBTreeMap::new(), HashMap::new(), false, root, false).unwrap();
         desktop.js().eval("__appsEvent('ready')", "test").unwrap();
         desktop.pump(None, None).unwrap();
         desktop

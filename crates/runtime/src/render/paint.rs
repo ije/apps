@@ -92,6 +92,10 @@ pub(super) struct Effected {
 }
 
 impl Hooks for Effected {
+    fn volatile(&self) -> bool {
+        false
+    }
+
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let mut effect = self.effect.clone();
         if let Some(backdrop) = effect.backdrop.as_mut()
@@ -122,6 +126,14 @@ pub(super) struct Picture {
 }
 
 impl Hooks for Picture {
+    fn volatile(&self) -> bool {
+        false
+    }
+
+    fn bounded(&self) -> bool {
+        true
+    }
+
     // WARNING: the image paints under the box's children, like an image box's content.
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let view = &*self.view;
@@ -171,7 +183,8 @@ pub(super) struct DomBox {
     pub(super) plans: u8,
     pub(super) ids: Rc<super::effects::Ids>,
     pub(super) view: Rc<super::PageState>,
-    pub(super) sticky: Option<Sticky>,
+    // WARNING: rare fields are boxed, so the box stays a small block of the runtime's allocator, see `malloc.rs`.
+    pub(super) sticky: Option<Box<Sticky>>,
     pub(super) fixed: bool,
     pub(super) block: Option<[f32; 4]>,
     pub(super) container: Option<usize>,
@@ -181,12 +194,13 @@ pub(super) struct DomBox {
     pub(super) effects: Option<f32>,
     pub(super) composited: bool,
     pub(super) transformed: bool,
-    pub(super) perspective: Option<((f32, String), usize)>,
+    pub(super) perspective: Option<Box<((f32, String), usize)>>,
     pub(super) units: style::Lengths,
     pub(super) revision: u64,
     pub(super) sides: [f32; 2],
     pub(super) margin: [f32; 4],
-    pub(super) cell: Option<[f32; 2]>,
+    // WARNING: the grid that places the box.
+    pub(super) cell: Option<usize>,
     pub(super) grid: Option<(usize, bool)>,
     pub(super) parts: Rc<[(usize, Vec<usize>)]>,
     pub(super) shared: Option<[f32; 4]>,
@@ -194,9 +208,130 @@ pub(super) struct DomBox {
     pub(super) boxless: bool,
     pub(super) text: Option<([usize; 2], [f32; 2])>,
     pub(super) placed: Cell<(Bounds<Pixels>, Option<super::effects::Matrix>)>,
+    pub(super) offset: Cell<Point<Pixels>>,
+    pub(super) frame: bool,
+}
+
+// WARNING: with its counts, a box's `Rc` must stay within the small blocks of the runtime's allocator.
+const _: () = assert!(size_of::<DomBox>() + 16 <= 512);
+
+impl DomBox {
+    // WARNING: a box that positions absolute boxes records its padding box for them, translated with the box.
+    fn block(&self, bounds: Bounds<Pixels>, translation: Point<Pixels>) {
+        if let Some([top, right, bottom, left]) = self.block {
+            let view = &*self.view;
+            let mut host = view.host.borrow_mut();
+            let mut padding = Bounds::new(
+                bounds.origin + point(px(left), px(top)),
+                renderer::size(
+                    bounds.size.width - px(left + right),
+                    bounds.size.height - px(top + bottom),
+                ),
+            );
+            padding.origin += translation;
+            host.dom
+                .entry(view.id)
+                .or_default()
+                .blocks
+                .insert(self.id, padding);
+        }
+    }
+
+    fn mirror(&self, mirror: &mut crate::dom::LayoutMirror, window_bounds: Bounds<Pixels>) {
+        let [mut top, right, mut bottom, left] = self.shared.unwrap_or_default();
+        if let Some([line, above, below]) = self.leading
+            && (f32::from(window_bounds.size.height) - line).abs() < 0.5
+        {
+            (top, bottom) = (above, below);
+        }
+        mirror.insert(
+            self.id,
+            if self.boxless {
+                [0.; 4]
+            } else {
+                [
+                    f32::from(window_bounds.origin.x) + left,
+                    f32::from(window_bounds.origin.y) + top,
+                    f32::from(window_bounds.size.width) - left - right,
+                    f32::from(window_bounds.size.height) - top - bottom,
+                ]
+            },
+        );
+    }
+
+    // WARNING: an inline box spans the lines of its text, and a table part the cells in it.
+    fn unions(&self) {
+        let view = &*self.view;
+        if let Some(([first, last], [above, below])) = self.text {
+            let mut host = view.host.borrow_mut();
+            let bounds = &mut host.dom.entry(view.id).or_default().bounds;
+            if let (Some(&[x, _, width, _]), Some(&[_, top, ..]), Some(&[_, y, _, height])) =
+                (bounds.get(&self.id), bounds.get(&first), bounds.get(&last))
+                && width > 0.
+            {
+                bounds.insert(
+                    self.id,
+                    [x, top - above, width, y + height - top + above + below],
+                );
+            }
+        }
+        if !self.parts.is_empty() {
+            let mut host = view.host.borrow_mut();
+            let bounds = &mut host.dom.entry(view.id).or_default().bounds;
+            for (part, members) in self.parts.iter() {
+                let union = members
+                    .iter()
+                    .filter_map(|member| bounds.get(member).copied())
+                    .reduce(|[x, y, w, h], [a, b, c, d]| {
+                        let [left, top] = [x.min(a), y.min(b)];
+                        [
+                            left,
+                            top,
+                            (x + w).max(a + c) - left,
+                            (y + h).max(b + d) - top,
+                        ]
+                    });
+                if let Some(union) = union {
+                    bounds.insert(*part, union);
+                }
+            }
+        }
+    }
+
+    // WARNING: where the boxes below this one lie that a parent could cull: plain blocks in boxes that cull their
+    // children, see `element::element`.
+    fn reached(&self, window_bounds: Bounds<Pixels>, flags: u16) {
+        let view = &*self.view;
+        let mut reaching = view.reaching.borrow_mut();
+        let none = [f32::INFINITY, f32::NEG_INFINITY];
+        let found = reaching.pop().map_or(none, |(reach, _)| reach);
+        let reach = if self.plans == u8::MAX { none } else { found };
+        let mut reached = view.reach.borrow_mut();
+        if reached.len() <= self.id {
+            reached.resize(self.id + 1, [f32::NAN; 2]);
+        }
+        reached[self.id] = reach;
+        if let Some(([bottom, top], plans)) = reaching.last_mut() {
+            *bottom = bottom.min(reach[0]);
+            *top = top.max(reach[1]);
+            if matches!(*plans, 1 | 2)
+                && flags & (super::cull::PLAIN_BLOCK | super::cull::UNCULLABLE)
+                    == super::cull::PLAIN_BLOCK
+                && (*plans == 1 || flags & super::cull::DEFINITE_SIZE == 0)
+            {
+                *bottom = bottom.min(f32::from(window_bounds.bottom()));
+                *top = top.max(f32::from(window_bounds.top()));
+            }
+        }
+    }
 }
 
 impl Hooks for DomBox {
+    // WARNING: a box with a transform or an effect paints through a layer that can reach past its bounds.
+    fn bounded(&self) -> bool {
+        self.placed.get().1.is_none() && self.effects.is_none()
+    }
+
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let (exact, baselines) = (cx.exact, cx.baselines);
         let window = &mut *cx.window;
@@ -220,12 +355,12 @@ impl Hooks for DomBox {
             }
             bounds.origin += offset;
         }
-        if let Some(Sticky {
-            scroll,
-            border,
-            block,
-        }) = &self.sticky
-        {
+        if let Some(sticky) = &self.sticky {
+            let Sticky {
+                scroll,
+                border,
+                block,
+            } = &**sticky;
             let mut viewport = scroll.bounds();
             viewport.origin += point(px(border[3]), px(border[0]));
             viewport.size.width -= px(border[1] + border[3]);
@@ -362,25 +497,10 @@ impl Hooks for DomBox {
             }
             bounds.origin += offset;
         }
-        if let Some([top, right, bottom, left]) = self.block {
-            let view = &*self.view;
-            let mut host = view.host.borrow_mut();
-            let padding = Bounds::new(
-                bounds.origin + point(px(left), px(top)),
-                renderer::size(
-                    bounds.size.width - px(left + right),
-                    bounds.size.height - px(top + bottom),
-                ),
-            );
-            host.dom
-                .entry(view.id)
-                .or_default()
-                .blocks
-                .insert(self.id, padding);
-        }
+        self.block(bounds, point(px(0.), px(0.)));
         let perspective = self
             .perspective
-            .as_ref()
+            .as_deref()
             .and_then(|((distance, origin), parent)| {
                 let view = &*self.view;
                 let host = view.host.borrow();
@@ -390,11 +510,11 @@ impl Hooks for DomBox {
             });
         let mut matrix = super::effects::transform(&self.style, &self.units, bounds, perspective);
         if self.transformed {
-            let matrix = *matrix.get_or_insert(super::effects::IDENTITY);
+            matrix.get_or_insert(super::effects::IDENTITY);
             self.view
                 .composited_transforms
                 .borrow_mut()
-                .insert(self.id, (bounds, perspective, matrix));
+                .insert(self.id, (bounds, perspective));
         }
         if !self.transformed
             && let Some([x, y]) = matrix.as_ref().and_then(super::effects::translation)
@@ -436,39 +556,27 @@ impl Hooks for DomBox {
                 {
                     window.redraw();
                 }
-                let [mut top, right, mut bottom, left] = self.shared.unwrap_or_default();
-                if let Some([line, above, below]) = self.leading
-                    && (f32::from(window_bounds.size.height) - line).abs() < 0.5
-                {
-                    (top, bottom) = (above, below);
-                }
-                dom.bounds.insert(
-                    self.id,
-                    if self.boxless {
-                        [0.; 4]
-                    } else {
-                        [
-                            f32::from(window_bounds.origin.x) + left,
-                            f32::from(window_bounds.origin.y) + top,
-                            f32::from(window_bounds.size.width) - left - right,
-                            f32::from(window_bounds.size.height) - top - bottom,
-                        ]
-                    },
-                );
-                let cull = &mut dom.cull;
+                self.mirror(&mut dom.bounds, window_bounds);
                 let width = f32::from(bounds.size.width);
+                let [top, right, bottom, left] = self.margin;
+                // WARNING: a grid item takes the unsnapped size of its cell in the grid it was last placed by.
+                let cell = self
+                    .cell
+                    .and_then(|grid| {
+                        let cells = &dom.grids.get(&grid)?.3.cells;
+                        let index = cells.binary_search_by_key(&self.id, |cell| cell.0).ok()?;
+                        let [_, _, width, height] = cells[index].2;
+                        Some([width, height])
+                    })
+                    .unwrap_or([
+                        (width + right + left).max(0.),
+                        f32::from(bounds.size.height) + top + bottom,
+                    ]);
+                let cull = &mut dom.cull;
                 if cull.placed.len() <= self.id {
                     cull.placed.resize(self.id + 1, Default::default());
                 }
-                let [top, right, bottom, left] = self.margin;
-                cull.placed[self.id] = (
-                    self.revision,
-                    self.cell.unwrap_or([
-                        (width + right + left).max(0.),
-                        f32::from(bounds.size.height) + top + bottom,
-                    ]),
-                    self.margin,
-                );
+                cull.placed[self.id] = (self.revision, cell, self.margin);
                 let inner = [
                     width - self.sides[0],
                     f32::from(bounds.size.height) - self.sides[1],
@@ -518,65 +626,8 @@ impl Hooks for DomBox {
                 }
             }
             window.with_element_offset(offset, |window| inner(window));
-            {
-                // WARNING: where the boxes below this one lie that a parent could cull: plain blocks in boxes that
-                // cull their children, see `element::element`.
-                let mut reaching = view.reaching.borrow_mut();
-                let none = [f32::INFINITY, f32::NEG_INFINITY];
-                let found = reaching.pop().map_or(none, |(reach, _)| reach);
-                let reach = if self.plans == u8::MAX { none } else { found };
-                let mut reached = view.reach.borrow_mut();
-                if reached.len() <= self.id {
-                    reached.resize(self.id + 1, [f32::NAN; 2]);
-                }
-                reached[self.id] = reach;
-                if let Some(([bottom, top], plans)) = reaching.last_mut() {
-                    *bottom = bottom.min(reach[0]);
-                    *top = top.max(reach[1]);
-                    if matches!(*plans, 1 | 2)
-                        && flags & (super::cull::PLAIN_BLOCK | super::cull::UNCULLABLE)
-                            == super::cull::PLAIN_BLOCK
-                        && (*plans == 1 || flags & super::cull::DEFINITE_SIZE == 0)
-                    {
-                        *bottom = bottom.min(f32::from(window_bounds.bottom()));
-                        *top = top.max(f32::from(window_bounds.top()));
-                    }
-                }
-            }
-            if let Some(([first, last], [above, below])) = self.text {
-                let mut host = view.host.borrow_mut();
-                let bounds = &mut host.dom.entry(view.id).or_default().bounds;
-                if let (Some(&[x, _, width, _]), Some(&[_, top, ..]), Some(&[_, y, _, height])) =
-                    (bounds.get(&self.id), bounds.get(&first), bounds.get(&last))
-                    && width > 0.
-                {
-                    bounds.insert(
-                        self.id,
-                        [x, top - above, width, y + height - top + above + below],
-                    );
-                }
-            }
-            if !self.parts.is_empty() {
-                let mut host = view.host.borrow_mut();
-                let bounds = &mut host.dom.entry(view.id).or_default().bounds;
-                for (part, members) in self.parts.iter() {
-                    let union = members
-                        .iter()
-                        .filter_map(|member| bounds.get(member).copied())
-                        .reduce(|[x, y, w, h], [a, b, c, d]| {
-                            let [left, top] = [x.min(a), y.min(b)];
-                            [
-                                left,
-                                top,
-                                (x + w).max(a + c) - left,
-                                (y + h).max(b + d) - top,
-                            ]
-                        });
-                    if let Some(union) = union {
-                        bounds.insert(*part, union);
-                    }
-                }
-            }
+            self.reached(window_bounds, flags);
+            self.unions();
         };
         match matrix {
             Some(matrix) => window.with_keyed_hit_transform(
@@ -587,7 +638,60 @@ impl Hooks for DomBox {
             None => prepaint(window),
         }
         self.placed.set((bounds, matrix));
+        self.offset.set(offset);
     }
+    // WARNING: boxes placed from other boxes, the scroll, the viewport or the frame prepaint in every pass.
+    fn volatile(&self) -> bool {
+        self.anchor.is_some()
+            || self.sticky.is_some()
+            || self.fixed
+            || self.container.is_some()
+            || self.sized.is_some()
+            || self.perspective.is_some()
+            || self.transformed
+            || self.frame
+    }
+
+    // WARNING: a box that moved, with its parent or the scroll, writes its place again; one with a transform that
+    // isn't a translation prepaints again, as its matrix holds its place.
+    fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let (placed, matrix) = self.placed.get();
+        let offset = self.offset.get();
+        let bounds = Bounds::new(cx.exact.origin + offset, cx.exact.size);
+        let moved = bounds != placed;
+        if moved && matrix.is_some() {
+            return self.prepaint(cx, inner);
+        }
+        if moved {
+            self.block(cx.exact, offset);
+            self.placed.set((bounds, matrix));
+        }
+        let mut kept = |window: &mut Window| {
+            let window_bounds = window.transformed_bounds(bounds);
+            let view = &*self.view;
+            let flags = {
+                let mut host = view.host.borrow_mut();
+                let dom = host.dom.entry(view.id).or_default();
+                if moved {
+                    self.mirror(&mut dom.bounds, window_bounds);
+                }
+                dom.cull.info.get(self.id).map_or(0, |info| info.flags)
+            };
+            view.reaching
+                .borrow_mut()
+                .push(([f32::INFINITY, f32::NEG_INFINITY], self.plans));
+            window.with_element_offset(offset, |window| inner(window));
+            self.reached(window_bounds, flags);
+            if moved {
+                self.unions();
+            }
+        };
+        match matrix {
+            Some(matrix) => cx.window.with_keyed_hit_transform(matrix, None, &mut kept),
+            None => kept(cx.window),
+        }
+    }
+
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let window = &mut *cx.window;
         let (bounds, matrix) = self.placed.get();

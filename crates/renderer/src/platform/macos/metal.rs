@@ -311,6 +311,8 @@ impl Renderer {
         // promoted layers and the caret are placed from the top left, like the frame during a resize.
         let overlay = CALayer::new();
         overlay.setGeometryFlipped(true);
+        // WARNING: promoted layers can move past the window's content, which must not show them over the title bar.
+        overlay.setMasksToBounds(true);
         let unified = device.hasUnifiedMemory();
         let shared = device.supportsFamily(MTLGPUFamily::Apple1);
         let queue = device.newCommandQueue().context("creating command queue")?;
@@ -346,13 +348,13 @@ impl Renderer {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    // WARNING: `timing` is the seconds between samples, the times they play and the seconds since the first sample.
     pub fn promote(
         &mut self,
         key: u64,
         index: usize,
         region: [i32; 4],
-        step: f64,
+        [step, repeat, since]: [f64; 3],
         opacities: &[f32],
         transforms: &[[f64; 16]],
     ) -> bool {
@@ -409,13 +411,14 @@ impl Renderer {
             .map(|k| NSNumber::new_f64(k as f64 / (count - 1).max(1) as f64))
             .collect();
         let times = NSArray::from_retained_slice(&times);
-        let begin = CACurrentMediaTime();
+        let begin = CACurrentMediaTime() - since;
         let play = |path: &NSString, values: &NSArray| {
             let animation = CAKeyframeAnimation::animationWithKeyPath(Some(path));
             // SAFETY: the values are what the key path animates: numbers or transform values.
             unsafe { animation.setValues(Some(values)) };
             animation.setKeyTimes(Some(&times));
             animation.setDuration(step * (count - 1) as f64);
+            animation.setRepeatCount(repeat as f32);
             animation.setBeginTime(begin);
             // SAFETY: a constant of Core Animation.
             animation.setFillMode(unsafe { kCAFillModeBoth });
@@ -1450,7 +1453,7 @@ impl AtlasBackend for AtlasTextures {
 mod tests {
     use crate::{Bounds, Rgba, ScaledPixels, point, size};
     use objc2::rc::Retained;
-    use objc2_quartz_core::CALayer;
+    use objc2_quartz_core::{CALayer, CAMediaTiming};
 
     #[test]
     fn page_sublayers_stay_in_the_overlay_below_the_caret() {
@@ -1465,7 +1468,15 @@ mod tests {
         let turn = [
             0., 1., 0., 0., -1., 0., 0., 0., 0., 0., 1., 0., 65., -15., 0., 1.,
         ];
-        renderer.promote(1, 3, [20, 10, 40, 30], 1. / 120., &[1., 0.5], &[turn, turn]);
+        let since = objc2_quartz_core::CACurrentMediaTime();
+        renderer.promote(
+            1,
+            3,
+            [20, 10, 40, 30],
+            [0.5, f64::INFINITY, 0.25],
+            &[1., 0.5],
+            &[turn, turn],
+        );
         let caret = Bounds {
             origin: point(ScaledPixels(4.), ScaledPixels(6.)),
             size: size(ScaledPixels(2.), ScaledPixels(16.)),
@@ -1477,7 +1488,14 @@ mod tests {
             a: 1.,
         };
         renderer.set_caret(Some((caret, black, std::time::Instant::now())));
-        renderer.promote(2, 4, [100, 10, 40, 30], 1. / 120., &[1., 0.5], &[]);
+        renderer.promote(
+            2,
+            4,
+            [100, 10, 40, 30],
+            [1. / 120., 1., 0.],
+            &[1., 0.5],
+            &[],
+        );
         let caret = Retained::as_ptr(&renderer.caret.as_ref().unwrap().0);
         let promoted: Vec<_> = renderer
             .promoted
@@ -1502,6 +1520,18 @@ mod tests {
             [0., 1., -1., 0., 35., -5.],
             "a turn about the center of the sublayer, from its top left corner"
         );
+        // SAFETY: a plain layer property.
+        let looped =
+            unsafe { first.animationForKey(objc2_foundation::ns_string!("transform")) }.unwrap();
+        assert_eq!(
+            (looped.repeatCount(), looped.duration()),
+            (f32::INFINITY, 0.5)
+        );
+        assert!(
+            (since - 0.25 - looped.beginTime()).abs() < 0.05,
+            "it starts at the first sample"
+        );
+        assert!(renderer.overlay.masksToBounds());
         let position = renderer.caret.as_ref().unwrap().0.position();
         assert_eq!((position.x, position.y), (4., 6.));
         renderer.demote();

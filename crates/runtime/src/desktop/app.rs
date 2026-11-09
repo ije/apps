@@ -174,14 +174,14 @@ fn bootstrap(bundle: Bundle, setup: impl FnOnce(&App) -> Result<()>) -> Result<D
         .chain(bundle.files.keys().filter(|name| name.ends_with(".html")))
         .cloned()
         .collect();
-    let mut desktop = Desktop::create(
+    let desktop = Desktop::create(
         &bundle.files,
+        bundle.pages,
         bundle.scripts,
         bundle.packaged,
         bundle.root,
         true,
     )?;
-    desktop.pages = bundle.pages;
     let main = desktop.main.as_ref().context("Missing the main side")?;
     setup(&App(Rc::new(State {
         main: Rc::downgrade(main),

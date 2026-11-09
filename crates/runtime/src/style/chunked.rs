@@ -31,6 +31,24 @@ impl<T: Clone> Chunked<T> {
         (index < self.len).then(|| &self.chunks[index >> BITS][index & MASK])
     }
 
+    // The ranges of entries whose chunk is not `other`'s. A write copies its chunk, so a shared chunk holds the
+    // same entries.
+    pub(crate) fn differing<'a>(
+        &'a self,
+        other: &'a Self,
+    ) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+        self.chunks
+            .iter()
+            .enumerate()
+            .filter(|(index, chunk)| {
+                other
+                    .chunks
+                    .get(*index)
+                    .is_none_or(|old| !Rc::ptr_eq(old, chunk))
+            })
+            .map(|(index, _)| index * SIZE..((index + 1) * SIZE).min(self.len))
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
         self.chunks.iter().flat_map(|chunk| chunk.iter()).take(self.len)
     }

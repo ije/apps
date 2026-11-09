@@ -2,9 +2,9 @@ use crate::{
     AlignContent, AlignItems, AvailableSpace, Baseline, Bounds, ContentMask, Display, ElementId,
     Hitbox, HitboxBehavior, Hooks, Inline, Pixels, Point, Size, Style, TextStyle, Visibility, Window,
     geometry::round_half_up,
-    node::{Child, Content, Events, MeasureFn, Measurement, Node, NodeCx},
+    node::{Child, Content, Events, MeasureFn, Measurement, Node, NodeCx, NodeStyle},
     point, px, quad, size,
-    text::TextState,
+    text::{TextState, same_shaping},
 };
 use rustc_hash::{FxHashMap, FxHasher};
 use std::{
@@ -36,8 +36,9 @@ struct Slot {
     live: bool,
     parent: u32,
     children: Vec<NodeId>,
-    style: Rc<Style>,
-    taffy: taffy::Style,
+    style: Rc<Styled>,
+    // WARNING: only the root, which takes the viewport size, has a taffy style of its own.
+    stretched: Option<Box<taffy::Style>>,
     events: Option<Box<Events>>,
     hooks: Option<Rc<dyn Hooks>>,
     kind: Kind,
@@ -52,17 +53,38 @@ struct Slot {
     bounds: [Bounds<Pixels>; 3],
     hitbox: u32,
     listed: bool,
+    // WARNING: whether the box's width can't depend on its height (no grid, wrapping column flex or aspect ratio in
+    // its subtree), and whether its height can't depend on the available height (no column flex either). Layout then
+    // caches these sizes for any height, see `cache_input`.
+    free: [bool; 2],
+    // WARNING: the pass, origin and placement of the box's last prepaint, or None once the box changed. Prepaint keeps
+    // a box and its subtree that lie where they lay, while nothing below changed and no box below is volatile.
+    #[allow(clippy::type_complexity)]
+    placed: Option<(u32, Point<f32>, (Point<Pixels>, ContentMask<Pixels>, usize))>,
+    below: bool,
+    volatile: bool,
+    // WARNING: where the box and the boxes below it can paint, from the last prepaint, or None when a hook can paint
+    // farther, so paint skips a subtree only when its reach misses the clip.
+    reach: Option<Bounds<Pixels>>,
 }
 
+type Remains = (
+    Option<Box<Events>>,
+    Option<Rc<dyn Hooks>>,
+    Kind,
+    Option<Box<MeasureFn>>,
+    Option<Rc<dyn Any>>,
+);
+
 impl Slot {
-    fn new(key: (u64, u32), inherited: Rc<TextStyle>, style: Rc<Style>) -> Self {
+    fn new(key: (u64, u32), inherited: Rc<TextStyle>, style: Rc<Styled>) -> Self {
         Self {
             key,
             live: true,
             parent: NONE,
             children: Vec::new(),
             style,
-            taffy: taffy::Style::default(),
+            stretched: None,
             events: None,
             hooks: None,
             kind: Kind::Box,
@@ -77,9 +99,77 @@ impl Slot {
             bounds: Default::default(),
             hitbox: NONE,
             listed: false,
+            free: [true; 2],
+            placed: None,
+            below: false,
+            volatile: false,
+            reach: None,
         }
     }
 }
+
+impl Slot {
+    // WARNING: a freed slot is cleared in place, so reusing it keeps its children's capacity and moves no 1 KB value.
+    // Its heavy parts, hooks, text state, measure and events, wait in the graveyard and drop after the frame draws, so
+    // a pass that drops thousands of culled boxes doesn't free them on the way.
+    fn release(&mut self, blank: &Rc<Styled>, graveyard: &mut Vec<Remains>) {
+        self.live = false;
+        self.children.clear();
+        self.style = blank.clone();
+        self.stretched = None;
+        graveyard.push((
+            self.events.take(),
+            self.hooks.take(),
+            mem::replace(&mut self.kind, Kind::Box),
+            self.measure.take(),
+            self.state.take(),
+        ));
+        self.cache.clear();
+    }
+
+    fn reuse(&mut self, key: (u64, u32), inherited: &Rc<TextStyle>) {
+        self.key = key;
+        self.live = true;
+        self.parent = NONE;
+        self.inherited = inherited.clone();
+        self.text = inherited.clone();
+        self.layout = Layout::new();
+        self.baselines = Baselines::NONE;
+        self.origin = Point::default();
+        self.bounds = Default::default();
+        self.hitbox = NONE;
+        self.listed = false;
+        self.free = [true; 2];
+        self.placed = None;
+        self.below = false;
+        self.volatile = false;
+    }
+
+    fn taffy(&self) -> &taffy::Style {
+        self.stretched.as_deref().unwrap_or(&self.style.taffy)
+    }
+}
+
+// WARNING: boxes with equal styles share one `Styled`, so taffy's style is made once per distinct style and scale,
+// not once per box.
+#[derive(Default)]
+pub(crate) struct Styled {
+    style: Style,
+    taffy: taffy::Style,
+    // WARNING: whether the box's own sizes, padding, border or margins are percentages or calc(), the only things
+    // that read the parent size it's laid out in. Other boxes cache their layout for any parent size.
+    relative: bool,
+}
+
+impl std::ops::Deref for Styled {
+    type Target = Style;
+
+    fn deref(&self) -> &Style {
+        &self.style
+    }
+}
+
+type Refined = (Rc<TextStyle>, Vec<(crate::style::TextStyleRefinement, Rc<TextStyle>)>);
 
 #[derive(Default)]
 pub struct Tree {
@@ -98,11 +188,20 @@ pub struct Tree {
     layers: FxHashMap<u32, Vec<(i32, u32, ContentMask<Pixels>)>>,
     kids: Vec<NodeId>,
     initial: Rc<TextStyle>,
-    blank: Rc<Style>,
-    styles: Interned<Style>,
+    blank: Rc<Styled>,
+    styles: Interned<Styled>,
+    // WARNING: by the pointer of a style the runtime shares, its `Styled`. An entry holds the style, so the pointer is
+    // not reused while it lives, and entries that only this map holds go when it grows.
+    shared: FxHashMap<*const Style, (Rc<Style>, Rc<Styled>)>,
     texts: Interned<TextStyle>,
     stacks: Vec<Vec<(i32, u32, ContentMask<Pixels>)>>,
     painting: Vec<u32>,
+    unbounded: u32,
+    previous: Vec<Hitbox>,
+    prepaints: u32,
+    full: bool,
+    graveyard: Vec<Remains>,
+    refined: FxHashMap<usize, Refined>,
 }
 
 fn identity(id: Option<ElementId>, scope: u64) -> u64 {
@@ -120,6 +219,8 @@ impl Tree {
             self.keys.clear();
             self.orphans.clear();
             self.root = None;
+            self.styles = Interned::default();
+            self.shared.clear();
         }
         self.pass = self.pass.wrapping_add(1);
         self.occurrences.clear();
@@ -128,6 +229,11 @@ impl Tree {
 
     pub fn contains(&self, id: impl Into<ElementId>) -> bool {
         self.keys.contains_key(&(identity(Some(id.into()), 0), 0))
+    }
+
+    pub fn style_of(&self, id: impl Into<ElementId>) -> Option<&Style> {
+        let &index = self.keys.get(&(identity(Some(id.into()), 0), 0))?;
+        Some(&self.slots[index as usize].style)
     }
 
     pub fn align_self(&self, id: ElementId) -> Option<crate::AlignSelf> {
@@ -167,21 +273,41 @@ impl Tree {
         };
         let inherited = self.slots[index as usize].inherited.clone();
         self.commit_node(node, &inherited, scale);
+        changed(&mut self.slots, index as usize);
+        let mut parent = self.slots[index as usize].parent;
+        while parent != NONE && self.slots[index as usize].free != [true; 2] {
+            let [wide, tall] = self.slots[index as usize].free;
+            let free = &mut self.slots[parent as usize].free;
+            *free = [free[0] && wide, free[1] && tall];
+            parent = self.slots[parent as usize].parent;
+        }
         self.free_orphans();
     }
 
     fn commit(&mut self, child: Child, inherited: &Rc<TextStyle>, scale: f32) -> Option<NodeId> {
-        match child {
-            Child::Kept(id) => {
-                let index = self.keys.get(&(identity(Some(id), 0), 0)).copied();
-                debug_assert!(index.is_some(), "kept box {id:?} is not in the tree");
-                let index = index?;
-                self.seen[index as usize] = self.pass;
-                self.inherit(index, inherited, scale);
-                Some(NodeId::from(index as usize))
-            }
-            Child::Node(node) => Some(self.commit_node(node, inherited, scale)),
+        let (id, place) = match child {
+            Child::Node(node) => return Some(self.commit_node(*node, inherited, scale)),
+            Child::Kept(id) => (id, None),
+            Child::Placed(id, place) => (id, Some(place)),
+        };
+        let index = self.keys.get(&(identity(Some(id), 0), 0)).copied();
+        debug_assert!(index.is_some(), "kept box {id:?} is not in the tree");
+        let index = index?;
+        self.seen[index as usize] = self.pass;
+        self.inherit(index, inherited, scale);
+        let style = &self.slots[index as usize].style.style;
+        let length = crate::Length::Px;
+        if let Some(placed) =
+            place.map(|place| (length(place.origin.x), length(place.origin.y), place.size.map(length)))
+            && (style.inset.left, style.inset.top, style.size) != placed
+        {
+            let mut style = style.clone();
+            (style.inset.left, style.inset.top, style.size) = placed;
+            self.slots[index as usize].style = self.styles.styled(style, scale);
+            changed(&mut self.slots, index as usize);
+            self.dirty(index);
         }
+        Some(NodeId::from(index as usize))
     }
 
     fn inherit(&mut self, index: u32, inherited: &Rc<TextStyle>, scale: f32) {
@@ -197,25 +323,30 @@ impl Tree {
         let text = if slot.style.text.is_empty() {
             inherited.clone()
         } else {
-            let mut text = (**inherited).clone();
-            text.refine(&slot.style.text);
-            self.texts.get(text)
+            let own = slot.style.clone();
+            self.refine(inherited, &own.text)
         };
         let slot = &mut self.slots[index as usize];
         if *text != *slot.text {
+            let mut kept = same_shaping(&text, &slot.text);
             if let Kind::Text(own) = slot.kind
                 && let Some(state) = slot
                     .state
                     .as_ref()
                     .and_then(|state| state.downcast_ref::<TextState>())
             {
-                let (state, measure) = text_measurement(state.restyled(own, &text, scale));
-                slot.state = Some(state);
-                slot.measure = Some(measure);
+                let new = state.restyled(own, &text, scale);
+                kept = state.keep(&new);
+                if !kept {
+                    let (state, measure) = text_measurement(new);
+                    slot.state = Some(state);
+                    slot.measure = Some(measure);
+                }
             }
-            if slot.measure.is_some() {
+            if slot.measure.is_some() && !kept {
                 self.dirty(index);
             }
+            changed(&mut self.slots, index as usize);
         }
         let slot = &mut self.slots[index as usize];
         slot.text = text.clone();
@@ -247,11 +378,7 @@ impl Tree {
             {
                 slot.text.clone()
             }
-            _ => {
-                let mut text = (**inherited).clone();
-                text.refine(&style.text);
-                self.texts.get(text)
-            }
+            _ => self.refine(inherited, &style.text),
         };
         if id.is_some() {
             self.scopes.push(identity);
@@ -279,17 +406,36 @@ impl Tree {
             Content::Measured(measurement) => (Kind::Measured, Some(measurement)),
             Content::Layers(negative) => (Kind::Layers(negative), None),
         };
-        if style.display == Display::None {
-            style.z_index = None;
+        if style.display == Display::None && style.z_index.is_some() {
+            style.make_mut().z_index = None;
         }
-        let restyled = kept.is_none_or(|index| *self.slots[index as usize].style != style);
-        let mut taffy = match kept {
-            Some(_) if !restyled && stretch.is_none() => None,
-            _ => Some(style.to_taffy(scale)),
+        let (styled, restyled) = match style {
+            NodeStyle::Shared(style) => {
+                let styled = match self.shared.get(&Rc::as_ptr(&style)) {
+                    Some((_, styled)) => styled.clone(),
+                    None => {
+                        let styled = self.styles.styled((*style).clone(), scale);
+                        if self.shared.len() >= 1024 && self.shared.len().is_power_of_two() {
+                            self.shared.retain(|_, (style, _)| Rc::strong_count(style) > 1);
+                        }
+                        self.shared.insert(Rc::as_ptr(&style), (style, styled.clone()));
+                        styled
+                    }
+                };
+                let restyled = kept.is_none_or(|index| !Rc::ptr_eq(&self.slots[index as usize].style, &styled));
+                (styled, restyled)
+            }
+            NodeStyle::Own(style) => {
+                let restyled = kept.is_none_or(|index| self.slots[index as usize].style.style != *style);
+                let styled = match kept {
+                    Some(index) if !restyled => self.slots[index as usize].style.clone(),
+                    _ => self.styles.styled(*style, scale),
+                };
+                (styled, restyled)
+            }
         };
-        if let Some(viewport) = stretch
-            && let Some(taffy) = &mut taffy
-        {
+        let stretched = stretch.map(|viewport| {
+            let mut taffy = styled.taffy.clone();
             let length = |value: Pixels| {
                 taffy::Dimension::length(crate::geometry::to_layout_unit(value.0, scale))
             };
@@ -299,18 +445,18 @@ impl Tree {
             if taffy.size.height.is_auto() {
                 taffy.size.height = length(viewport.height);
             }
-        }
+            Box::new(taffy)
+        });
         let index = match kept {
             Some(index) => index,
             None => {
-                let slot = Slot::new(key, inherited.clone(), self.blank.clone());
                 let index = match self.free.pop() {
                     Some(index) => {
-                        self.slots[index as usize] = slot;
+                        self.slots[index as usize].reuse(key, inherited);
                         index
                     }
                     None => {
-                        self.slots.push(slot);
+                        self.slots.push(Slot::new(key, inherited.clone(), self.blank.clone()));
                         self.seen.push(0);
                         (self.slots.len() - 1) as u32
                     }
@@ -324,7 +470,7 @@ impl Tree {
         let same_measure = match &measurement {
             Some(measurement) => {
                 measurement.same(slot.state.as_ref())
-                    && *slot.text == *text
+                    && same_shaping(&slot.text, &text)
                     && slot.measure.is_some()
             }
             None => slot.measure.is_none(),
@@ -334,11 +480,12 @@ impl Tree {
         let relaid = kept.is_none()
             || !same_measure
             || relisted
-            || taffy.as_ref().is_some_and(|taffy| slot.taffy != *taffy)
+            || (restyled || stretched.is_some())
+                && *slot.taffy() != *stretched.as_deref().unwrap_or(&styled.taffy)
             || restyled
-                && (slot.style.baseline != style.baseline
-                    || slot.style.baseline_source != style.baseline_source
-                    || slot.style.inline != style.inline);
+                && (slot.style.baseline != styled.baseline
+                    || slot.style.baseline_source != styled.baseline_source
+                    || slot.style.inline != styled.inline);
         if !same_measure {
             match measurement {
                 Some(measurement) => {
@@ -353,12 +500,11 @@ impl Tree {
             }
         }
         slot.kind = kind;
-        if restyled {
-            slot.style = self.styles.get(style);
-        }
-        if let Some(taffy) = taffy {
-            slot.taffy = taffy;
-        }
+        slot.style = styled;
+        slot.stretched = stretched;
+        slot.volatile = hooks.as_ref().is_some_and(|hooks| hooks.volatile())
+            || events.as_ref().is_some_and(|events| events.scroll.is_some());
+        slot.placed = None;
         slot.events = events;
         slot.hooks = hooks;
         slot.inherited = inherited.clone();
@@ -372,10 +518,51 @@ impl Tree {
             }
         }
         self.kids.truncate(start);
+        let slot = &self.slots[index as usize];
+        let row = matches!(slot.taffy().flex_direction, FlexDirection::Row | FlexDirection::RowReverse);
+        let (wide, tall) = match slot.taffy().display {
+            _ if slot.taffy().aspect_ratio.is_some() => (false, false),
+            taffy::Display::Grid => (false, false),
+            taffy::Display::Flex => (row || slot.taffy().flex_wrap == taffy::FlexWrap::NoWrap, row),
+            _ => (true, true),
+        };
+        let free = slot.children.iter().fold([wide, tall], |[wide, tall], &child| {
+            let child = self.slots[index_of(child) as usize].free;
+            [wide && child[0], tall && child[1]]
+        });
+        let below = self.slots[index as usize].children.iter().any(|&child| {
+            let child = &self.slots[index_of(child) as usize];
+            child.placed.is_none() || child.below || child.volatile
+        });
+        let slot = &mut self.slots[index as usize];
+        (slot.free, slot.below) = (free, below);
         if relaid {
             self.dirty(index);
         }
         NodeId::from(index as usize)
+    }
+
+    // WARNING: the boxes under a parent mostly refine its text style the same few ways, so each parent style keeps its
+    // last refinements and their results.
+    fn refine(&mut self, inherited: &Rc<TextStyle>, own: &crate::style::TextStyleRefinement) -> Rc<TextStyle> {
+        let key = Rc::as_ptr(inherited) as usize;
+        if let Some((_, list)) = self.refined.get(&key)
+            && let Some((_, text)) = list.iter().find(|(kept, _)| kept == own)
+        {
+            return text.clone();
+        }
+        let mut text = (**inherited).clone();
+        text.refine(own);
+        let text = self.texts.get(text);
+        if self.refined.len() > 1024 {
+            self.refined.clear();
+        }
+        let (_, list) = self.refined.entry(key).or_insert_with(|| (inherited.clone(), Vec::new()));
+        if list.len() == 8 {
+            list.remove(0);
+        }
+        list.push((own.clone(), text.clone()));
+        text
     }
 
     fn scope(&self) -> u64 {
@@ -406,14 +593,19 @@ impl Tree {
                 continue;
             }
             self.keys.remove(&slot.key);
-            pending.extend(slot.children.drain(..).map(index_of));
-            *slot = Slot {
-                live: false,
-                ..Slot::new((0, 0), self.initial.clone(), self.blank.clone())
-            };
+            pending.extend(slot.children.iter().copied().map(index_of));
+            slot.release(&self.blank, &mut self.graveyard);
             self.free.push(index);
         }
         self.orphans = pending;
+        if self.graveyard.len() > 1 << 15 {
+            self.bury();
+        }
+    }
+
+    // WARNING: runs after a frame draws: drops the freed boxes, and compacts a mostly free arena.
+    pub(crate) fn bury(&mut self) {
+        self.graveyard.clear();
         if self.free.len() > 1024 && self.free.len() * 2 > self.slots.len() {
             self.compact();
         }
@@ -421,7 +613,8 @@ impl Tree {
 
     fn compact(&mut self) {
         let mut moved = vec![NONE; self.slots.len()];
-        let mut slots = Vec::with_capacity(self.slots.len() - self.free.len());
+        // WARNING: room for half again as many, so the next frame that builds rows doesn't grow and move the arena.
+        let mut slots = Vec::with_capacity((self.slots.len() - self.free.len()) * 3 / 2);
         let mut seen = Vec::with_capacity(slots.capacity());
         for (index, slot) in mem::take(&mut self.slots).into_iter().enumerate() {
             if slot.live {
@@ -432,6 +625,7 @@ impl Tree {
         }
         let map = |node: &mut NodeId| *node = NodeId::from(moved[usize::from(*node)] as usize);
         for slot in &mut slots {
+            slot.placed = None;
             slot.children.iter_mut().for_each(map);
             if slot.parent != NONE {
                 slot.parent = moved[slot.parent as usize];
@@ -450,18 +644,48 @@ impl Tree {
 
     pub(crate) fn layout(&mut self, root: NodeId, viewport: Size<Pixels>, window: &mut Window) {
         let scale = window.scale_factor();
-        taffy::compute_root_layout(
-            &mut LayoutTree {
-                slots: &mut self.slots,
-                window,
-                scale,
-            },
-            root,
-            taffy::Size {
-                width: taffy::AvailableSpace::Definite(viewport.width.0 * scale),
-                height: taffy::AvailableSpace::Definite(viewport.height.0 * scale),
-            },
-        );
+        let space = taffy::Size {
+            width: taffy::AvailableSpace::Definite(viewport.width.0 * scale),
+            height: taffy::AvailableSpace::Definite(viewport.height.0 * scale),
+        };
+        let mut tree = LayoutTree {
+            slots: &mut self.slots,
+            window,
+            scale,
+            exact: false,
+        };
+        taffy::compute_root_layout(&mut tree, root, space);
+        // WARNING: debug builds lay the tree out again with taffy alone from empty caches, and check that every box
+        // lands on the same values, so fast paths and shared cache entries can't drift.
+        #[cfg(debug_assertions)]
+        {
+            let kept: Vec<_> = tree
+                .slots
+                .iter_mut()
+                .map(|slot| (mem::take(&mut slot.cache), slot.layout, slot.baselines))
+                .collect();
+            tree.exact = true;
+            taffy::compute_root_layout(&mut tree, root, space);
+            let mut pending = vec![index_of(root)];
+            while let Some(index) = pending.pop() {
+                let slot = &tree.slots[index as usize];
+                let (_, layout, baselines) = &kept[index as usize];
+                let exact = (slot.layout.location, slot.layout.size, slot.baselines);
+                assert!(
+                    (layout.location, layout.size, *baselines) == exact,
+                    "box {index} was laid out at {:?} {:?} {baselines:?}, taffy places it at {:?} {:?} {:?}",
+                    layout.location,
+                    layout.size,
+                    slot.layout.location,
+                    slot.layout.size,
+                    slot.baselines,
+                );
+                pending.extend(slot.children.iter().map(|&child| index_of(child)));
+            }
+            for (slot, (cache, layout, baselines)) in tree.slots.iter_mut().zip(kept) {
+                (slot.cache, slot.layout, slot.baselines) = (cache, layout, baselines);
+            }
+        }
     }
 
     fn bounds(&self, index: u32, origin: Point<f32>, window: &Window) -> [Bounds<Pixels>; 2] {
@@ -481,15 +705,64 @@ impl Tree {
     }
 
     pub(crate) fn prepaint(&mut self, root: NodeId, window: &mut Window) {
-        self.stacks.clear();
+        self.prepaints = self.prepaints.wrapping_add(1);
+        mem::swap(&mut self.previous, &mut self.hitboxes);
         self.hitboxes.clear();
+        self.stacks.clear();
+        #[cfg(debug_assertions)]
+        let start = window.hitbox_places().len();
         self.prepaint_node(index_of(root), Point::default(), window);
+        // WARNING: debug builds prepaint again in full, and check that the kept boxes, hitboxes and layers match. A
+        // pass that asks to draw again changed what it read, like a field that scrolls to its caret, and isn't checked.
+        #[cfg(debug_assertions)]
+        if !window.redraws() {
+            let boxes = |tree: &Tree| {
+                let (mut pending, mut boxes) = (vec![index_of(root)], Vec::new());
+                while let Some(index) = pending.pop() {
+                    let slot = &tree.slots[index as usize];
+                    boxes.push((index, slot.origin, slot.bounds, slot.listed));
+                    pending.extend(slot.children.iter().map(|&child| index_of(child)));
+                }
+                boxes
+            };
+            let places = |tree: &Tree| {
+                let place = |hitbox: &Hitbox| (hitbox.bounds, hitbox.content_mask, hitbox.behavior);
+                tree.hitboxes.iter().map(place).collect::<Vec<_>>()
+            };
+            let kept = (boxes(self), places(self), window.hitbox_places()[start..].to_vec(), self.layers.clone());
+            window.truncate_hitboxes(start);
+            self.hitboxes.clear();
+            self.stacks.clear();
+            self.full = true;
+            self.prepaint_node(index_of(root), Point::default(), window);
+            self.full = false;
+            let full = (boxes(self), places(self), window.hitbox_places()[start..].to_vec(), self.layers.clone());
+            let first = |kept: &[_], full: &[_]| kept.iter().zip(full).position(|(kept, full)| kept != full);
+            let at = first(&kept.0, &full.0).map(|at| (kept.0[at], full.0[at]));
+            assert!(kept.0 == full.0, "kept box differs: {at:?}");
+            assert!(kept.1 == full.1, "kept hitboxes differ: {:?} {:?}", kept.1, full.1);
+            assert!(kept.2 == full.2, "kept window hitboxes differ: {:?} {:?}", kept.2, full.2);
+            assert!(kept.3 == full.3, "kept layers differ: {:?} {:?}", kept.3, full.3);
+        }
     }
 
     fn prepaint_node(&mut self, index: u32, parent: Point<f32>, window: &mut Window) {
+        let prepaints = self.prepaints;
         let slot = &mut self.slots[index as usize];
         let location = slot.layout.location;
         let origin = point(parent.x + location.x, parent.y + location.y);
+        let placement = window.placement();
+        if !self.full
+            && !slot.below
+            && !slot.volatile
+            && slot.placed.is_some_and(|(pass, _, (_, mask, transform))| {
+                pass == prepaints.wrapping_sub(1) && (mask, transform) == (placement.1, placement.2)
+            })
+        {
+            self.keep(index, parent, window);
+            return;
+        }
+        slot.placed = Some((prepaints, origin, placement));
         slot.origin = origin;
         slot.listed = false;
         let [bounds, exact] = self.bounds(index, origin, window);
@@ -500,10 +773,12 @@ impl Tree {
                 let (text, state) = (slot.text.clone(), slot.state.clone());
                 let baselines = self.baselines(index, window.scale_factor());
                 let style = self.slots[index as usize].style.clone();
+                let inset = inset(&self.slots[index as usize].layout, window.scale_factor());
                 let mut cx = NodeCx {
                     window,
                     bounds,
                     exact,
+                    inset,
                     baselines,
                     text: &text,
                     style: &style,
@@ -517,6 +792,7 @@ impl Tree {
                 self.prepaint_box(index, &style, window);
             }
         }
+        self.reach(index);
         if let Some(order) = self.slots[index as usize].style.z_index
             && let Some(list) = self.stacks.last_mut()
         {
@@ -527,19 +803,9 @@ impl Tree {
 
     fn prepaint_box(&mut self, index: u32, style: &Style, window: &mut Window) {
         let origin = self.slots[index as usize].origin;
-        let [bounds, exact] = self.bounds(index, origin, window);
+        let [bounds, _] = self.place(index, origin, window);
         let scale = window.scale_factor();
-        self.slots[index as usize].bounds[1] = bounds;
         let slot = &self.slots[index as usize];
-        if let Some(state) = slot
-            .state
-            .as_ref()
-            .and_then(|state| state.downcast_ref::<TextState>())
-        {
-            state.fit(px(slot.layout.size.width / scale), window);
-            // WARNING: like Chromium, text starts at its exact place, and only each row's baseline snaps to a device pixel.
-            state.layout.place(Bounds::new(exact.origin, bounds.size));
-        }
         let scroll = slot
             .events
             .as_ref()
@@ -596,6 +862,139 @@ impl Tree {
                 }
             }
         });
+        let below = self.slots[index as usize].children.iter().any(|&child| {
+            let child = &self.slots[index_of(child) as usize];
+            child.below || child.volatile
+        });
+        self.slots[index as usize].below = below;
+    }
+
+    // WARNING: like Chromium, text starts at its exact place, inside the box's padding and border, and only each row's
+    // baseline snaps to a device pixel.
+    fn place(&mut self, index: u32, origin: Point<f32>, window: &mut Window) -> [Bounds<Pixels>; 2] {
+        let [bounds, exact] = self.bounds(index, origin, window);
+        let scale = window.scale_factor();
+        let slot = &mut self.slots[index as usize];
+        slot.bounds[1] = bounds;
+        if let Some(state) = slot.state.as_ref().and_then(|state| state.downcast_ref::<TextState>()) {
+            let [top, right, bottom, left] = inset(&slot.layout, scale);
+            let sides = slot.layout.padding + slot.layout.border;
+            state.fit(px((slot.layout.size.width - sides.left - sides.right) / scale), window);
+            state.layout.place(Bounds::new(
+                exact.origin + point(left, top),
+                size(bounds.size.width - left - right, bounds.size.height - top - bottom),
+            ));
+        }
+        [bounds, exact]
+    }
+
+    // WARNING: a kept box gives again what each pass collects: its hitbox, the hooks' share, and its place in the
+    // layers of its stacking context.
+    // A box that moved with its parent or the scroll takes new bounds, and its hooks see them in `kept`.
+    fn keep(&mut self, index: u32, parent: Point<f32>, window: &mut Window) {
+        let slot = &mut self.slots[index as usize];
+        let location = slot.layout.location;
+        let origin = point(parent.x + location.x, parent.y + location.y);
+        let placement = window.placement();
+        let moved = slot.placed.is_none_or(|(_, at, (offset, ..))| (at, offset) != (origin, placement.0));
+        slot.placed = Some((self.prepaints, origin, placement));
+        if moved {
+            slot.origin = origin;
+            let [bounds, exact] = self.bounds(index, origin, window);
+            let slot = &mut self.slots[index as usize];
+            [slot.bounds[0], slot.bounds[2]] = [bounds, exact];
+        }
+        let slot = &self.slots[index as usize];
+        match slot.hooks.clone() {
+            Some(hooks) => {
+                let (text, state) = (slot.text.clone(), slot.state.clone());
+                let [bounds, _, exact] = slot.bounds;
+                let baselines = self.baselines(index, window.scale_factor());
+                let style = self.slots[index as usize].style.clone();
+                let inset = inset(&self.slots[index as usize].layout, window.scale_factor());
+                let mut cx = NodeCx {
+                    window,
+                    bounds,
+                    exact,
+                    inset,
+                    baselines,
+                    text: &text,
+                    style: &style,
+                    state: state.as_ref(),
+                };
+                let mut inner = |window: &mut Window| self.keep_box(index, &style, moved, window);
+                hooks.kept(&mut cx, &mut inner);
+            }
+            None => {
+                let style = slot.style.clone();
+                self.keep_box(index, &style, moved, window);
+            }
+        }
+        if moved {
+            self.reach(index);
+        }
+        if let Some(order) = self.slots[index as usize].style.z_index
+            && let Some(list) = self.stacks.last_mut()
+        {
+            list.push((order, index, window.content_mask()));
+        }
+    }
+
+    fn keep_box(&mut self, index: u32, style: &Style, moved: bool, window: &mut Window) {
+        let origin = self.slots[index as usize].origin;
+        let [bounds, _] = match moved {
+            true => self.place(index, origin, window),
+            false => [self.slots[index as usize].bounds[1]; 2],
+        };
+        window.with_content_mask(style.overflow_mask(bounds), |window| {
+            let slot = &mut self.slots[index as usize];
+            if let Some(hitbox) = self.previous.get(slot.hitbox as usize) {
+                self.hitboxes.push(window.place_hitbox(hitbox, bounds));
+                slot.hitbox = (self.hitboxes.len() - 1) as u32;
+            }
+            if style.display != Display::None {
+                if style.stacking {
+                    let mut list = self.layers.remove(&index).unwrap_or_default();
+                    list.clear();
+                    self.stacks.push(list);
+                }
+                for child in 0..self.slots[index as usize].children.len() {
+                    let child = index_of(self.slots[index as usize].children[child]);
+                    self.keep(child, origin, window);
+                }
+                if style.stacking {
+                    let mut list = self.stacks.pop().unwrap_or_default();
+                    list.sort_by_key(|(order, ..)| *order);
+                    self.layers.insert(index, list);
+                }
+            }
+        });
+    }
+
+    // WARNING: text can run past its box across, and its glyphs a line past it down, so text reaches across the window.
+    fn reach(&mut self, index: u32) {
+        let slot = &self.slots[index as usize];
+        let reach = slot.hooks.as_ref().is_none_or(|hooks| hooks.bounded()).then(|| {
+            let style = &slot.style;
+            let grow = style.box_shadow.iter().fold(px(0.), |grow, shadow| {
+                grow.max(shadow.offset.x.abs() + shadow.offset.y.abs() + shadow.blur_radius * 2. + shadow.spread_radius)
+            });
+            let mut reach = slot.bounds[1].dilate(grow);
+            if matches!(slot.kind, Kind::Text(..) | Kind::Measured) {
+                let line = slot.text.line_height_in_pixels() * 2.;
+                reach = Bounds::new(
+                    point(px(-1e9), reach.origin.y - line),
+                    size(px(2e9), reach.size.height + line * 2.),
+                );
+            }
+            reach
+        });
+        let reach = reach.and_then(|reach| {
+            slot.children.iter().try_fold(reach, |reach, &child| {
+                Some(reach.union(&self.slots[index_of(child) as usize].reach?))
+            })
+        });
+        self.slots[index as usize].reach = reach;
     }
 
     fn baselines(&self, index: u32, scale: f32) -> [Option<Pixels>; 2] {
@@ -605,14 +1004,25 @@ impl Tree {
 
     pub(crate) fn paint(&mut self, root: NodeId, window: &mut Window) {
         self.painting.clear();
+        self.unbounded = 0;
         self.paint_node(index_of(root), false, window);
     }
 
     fn paint_node(&mut self, index: u32, listed: bool, window: &mut Window) {
         let slot = &self.slots[index as usize];
-        if slot.listed != listed {
+        // WARNING: a layers node paints the z-indexed boxes of its stacking context, whose reach holds them.
+        if slot.listed != listed
+            || self.unbounded == 0
+                && !matches!(slot.kind, Kind::Layers(_))
+                && slot
+                    .reach
+                    .is_some_and(|reach| !reach.intersects(&window.content_mask().bounds))
+        {
             return;
         }
+        // WARNING: below a transform or an effect, boxes paint elsewhere than their bounds, so none is skipped.
+        let unbounded = slot.hooks.as_ref().is_some_and(|hooks| !hooks.bounded());
+        self.unbounded += u32::from(unbounded);
         let smoothing = mem::replace(&mut window.font_smoothing, slot.text.font_smoothing);
         match slot.hooks.clone() {
             Some(hooks) => {
@@ -620,10 +1030,12 @@ impl Tree {
                 let [bounds, _, exact] = slot.bounds;
                 let baselines = self.baselines(index, window.scale_factor());
                 let style = self.slots[index as usize].style.clone();
+                let inset = inset(&self.slots[index as usize].layout, window.scale_factor());
                 let mut cx = NodeCx {
                     window,
                     bounds,
                     exact,
+                    inset,
                     baselines,
                     text: &text,
                     style: &style,
@@ -637,6 +1049,7 @@ impl Tree {
                 self.paint_box(index, &style, window);
             }
         }
+        self.unbounded -= u32::from(unbounded);
         window.font_smoothing = smoothing;
     }
 
@@ -678,7 +1091,26 @@ impl Tree {
                         events.paint(style, slot.text.line_height_in_pixels(), hitbox, window);
                     }
                 }
+                let painted = matches!(slot.kind, Kind::Text(..) | Kind::Measured)
+                    && slot.hooks.clone().is_some_and(|hooks| {
+                        let (text, state) = (slot.text.clone(), slot.state.clone());
+                        let [bounds, _, exact] = slot.bounds;
+                        let scale = window.scale_factor();
+                        let mut cx = NodeCx {
+                            window,
+                            bounds,
+                            exact,
+                            inset: inset(&slot.layout, scale),
+                            baselines: self.baselines(index, scale),
+                            text: &text,
+                            style,
+                            state: state.as_ref(),
+                        };
+                        hooks.paint_content(&mut cx)
+                    });
+                let slot = &self.slots[index as usize];
                 match &slot.kind {
+                    _ if painted => {}
                     Kind::Image(image, fit) => {
                         let shown = fit.get_bounds(bounds, image.size());
                         window.paint_image(shown, bounds, radii, image.clone(), false);
@@ -734,6 +1166,22 @@ impl Tree {
     }
 }
 
+// WARNING: a box that changed drops its last prepaint, and the boxes above learn that one below them changed.
+fn changed(slots: &mut [Slot], index: usize) {
+    slots[index].placed = None;
+    let mut parent = slots[index].parent;
+    while parent != NONE && !slots[parent as usize].below {
+        slots[parent as usize].below = true;
+        parent = slots[parent as usize].parent;
+    }
+}
+
+// WARNING: the box's padding and border in pixels, top, right, bottom and left: what its text sits inside.
+fn inset(layout: &Layout, scale: f32) -> [Pixels; 4] {
+    let sides = layout.padding + layout.border;
+    [sides.top, sides.right, sides.bottom, sides.left].map(|side| Pixels(side / scale))
+}
+
 fn index_of(node: NodeId) -> u32 {
     usize::from(node) as u32
 }
@@ -780,6 +1228,7 @@ impl Fingerprint for Style {
         ]
         .into_iter()
         .chain([self.margin.top, self.margin.left, self.margin.bottom])
+        .chain([self.inset.top, self.inset.left])
         {
             length(hasher, value);
         }
@@ -820,11 +1269,50 @@ impl<T: Fingerprint + PartialEq> Interned<T> {
     fn get(&mut self, value: T) -> Rc<T> {
         let mut hasher = FxHasher::default();
         value.fingerprint(&mut hasher);
-        let list = self.values.entry(hasher.finish()).or_default();
-        if let Some(kept) = list.iter().find(|kept| ***kept == value) {
+        self.find(hasher.finish(), value, |kept, value| kept == value, |value| value)
+    }
+}
+
+impl Interned<Styled> {
+    fn styled(&mut self, style: Style, scale: f32) -> Rc<Styled> {
+        let mut hasher = FxHasher::default();
+        style.fingerprint(&mut hasher);
+        self.find(hasher.finish(), style, |kept, style| kept.style == *style, |style| {
+            let taffy = style.to_taffy(scale);
+            let fixed = |raw: taffy::CompactLength| {
+                matches!(raw.tag(), taffy::CompactLength::LENGTH_TAG | taffy::CompactLength::AUTO_TAG)
+            };
+            let sides = |rect: taffy::Rect<taffy::CompactLength>| [rect.top, rect.right, rect.bottom, rect.left];
+            let relative = ![taffy.size.width.into_raw(), taffy.size.height.into_raw()]
+                .into_iter()
+                .chain([taffy.min_size.width.into_raw(), taffy.min_size.height.into_raw()])
+                .chain([taffy.max_size.width.into_raw(), taffy.max_size.height.into_raw()])
+                .chain(sides(taffy.padding.map(|value| value.into_raw())))
+                .chain(sides(taffy.border.map(|value| value.into_raw())))
+                .chain(sides(taffy.margin.map(|value| value.into_raw())))
+                .all(fixed);
+            Styled {
+                taffy,
+                style,
+                relative,
+            }
+        })
+    }
+}
+
+impl<T> Interned<T> {
+    fn find<V>(
+        &mut self,
+        fingerprint: u64,
+        value: V,
+        same: impl Fn(&T, &V) -> bool,
+        make: impl FnOnce(V) -> T,
+    ) -> Rc<T> {
+        let list = self.values.entry(fingerprint).or_default();
+        if let Some(kept) = list.iter().find(|kept| same(kept, &value)) {
             return kept.clone();
         }
-        let value = Rc::new(value);
+        let value = Rc::new(make(value));
         list.push(value.clone());
         if self.values.len() > self.limit {
             self.values.retain(|_, list| {
@@ -842,7 +1330,7 @@ struct TextMeasurement(TextState);
 impl Measurement for TextMeasurement {
     fn same(&self, old: Option<&Rc<dyn Any>>) -> bool {
         old.and_then(|old| old.downcast_ref::<TextState>())
-            .is_some_and(|old| *old == self.0)
+            .is_some_and(|old| old.keep(&self.0))
     }
 
     fn build(self: Box<Self>) -> (Rc<dyn Any>, Box<MeasureFn>) {
@@ -863,6 +1351,8 @@ struct LayoutTree<'a> {
     slots: &'a mut [Slot],
     window: &'a mut Window,
     scale: f32,
+    // WARNING: lays out with taffy only, with no fast paths or shared cache entries, to check them in debug builds.
+    exact: bool,
 }
 
 impl LayoutTree<'_> {
@@ -875,7 +1365,58 @@ impl LayoutTree<'_> {
         if inputs.run_mode == RunMode::PerformHiddenLayout {
             return taffy::compute_hidden_layout(self, node);
         }
-        let style = &self.slots[usize::from(node)].taffy;
+        let slot = &self.slots[usize::from(node)];
+        let style = slot.taffy();
+        // WARNING: taffy measures the cross size of each item of a single-line flex container, but a stretched item
+        // takes the line's size, which a container with a definite cross size knows already. Such an item answers
+        // with that size and isn't measured.
+        if !self.exact
+            && inputs.run_mode == RunMode::ComputeSize
+            && inputs.sizing_mode == taffy::SizingMode::ContentSize
+            && slot.parent != NONE
+            && style.position != taffy::Position::Absolute
+        {
+            let parent = self.slots[slot.parent as usize].taffy();
+            let row = matches!(parent.flex_direction, FlexDirection::Row | FlexDirection::RowReverse);
+            let (axis, main, cross, size, line) = match row {
+                true => (
+                    taffy::RequestedAxis::Vertical,
+                    inputs.known_dimensions.width,
+                    inputs.known_dimensions.height,
+                    style.size.height,
+                    inputs.parent_size.height,
+                ),
+                false => (
+                    taffy::RequestedAxis::Horizontal,
+                    inputs.known_dimensions.height,
+                    inputs.known_dimensions.width,
+                    style.size.width,
+                    inputs.parent_size.width,
+                ),
+            };
+            let margins = match row {
+                true => [style.margin.top, style.margin.bottom],
+                false => [style.margin.left, style.margin.right],
+            };
+            if parent.display == taffy::Display::Flex
+                && parent.flex_wrap == taffy::FlexWrap::NoWrap
+                && inputs.axis == axis
+                && cross.is_none()
+                && size.is_auto()
+                && margins.iter().all(|margin| !margin.is_auto())
+                && matches!(
+                    style.align_self.unwrap_or(parent.align_items).keyword,
+                    AlignItemsKeyword::Normal | AlignItemsKeyword::Stretch
+                )
+                && let (Some(main), Some(line)) = (main, line)
+            {
+                let size = match row {
+                    true => taffy::Size { width: main, height: line },
+                    false => taffy::Size { width: line, height: main },
+                };
+                return LayoutOutput::from_outer_size(size);
+            }
+        }
         // WARNING: taffy calls the measured height of an absolute box definite. With `height: auto` and without
         // both insets it comes from the content, so percentage heights inside must act as `auto`.
         if style.position == taffy::Position::Absolute
@@ -888,10 +1429,13 @@ impl LayoutTree<'_> {
         let output = taffy::compute_cached_layout(self, node, inputs, |tree, node, inputs| {
             let slot = &tree.slots[usize::from(node)];
             let leaf = slot.children.is_empty();
-            let mut output = match slot.taffy.display {
+            let mut output = match slot.taffy().display {
                 taffy::Display::None => taffy::compute_hidden_layout(tree, node),
                 _ if leaf => tree.measure(usize::from(node), inputs),
-                taffy::Display::Flex => tree.flexbox(node, inputs),
+                taffy::Display::Flex => tree
+                    .stack(node, inputs)
+                    .or_else(|| tree.row(node, inputs))
+                    .unwrap_or_else(|| tree.flexbox(node, inputs)),
                 taffy::Display::Grid => taffy::compute_grid_layout(tree, node, inputs),
                 _ => taffy::compute_block_layout(tree, node, inputs, block),
             };
@@ -901,16 +1445,703 @@ impl LayoutTree<'_> {
             }
             output
         });
-        if inputs.run_mode == RunMode::PerformLayout {
+        if inputs.run_mode == RunMode::PerformLayout
+            && self.slots[usize::from(node)].baselines != output.baselines
+        {
             self.slots[usize::from(node)].baselines = output.baselines;
+            if !self.exact {
+                changed(self.slots, usize::from(node));
+            }
         }
         output
+    }
+
+    // WARNING: a single-line row with its final width, where nothing shrinks, stretches to an unknown line or aligns by
+    // baselines: items are sized as taffy sizes them, then each is laid out once at its width and placed by its
+    // height, without taffy's separate cross size measures. The sums follow taffy's order, so boxes land on the same
+    // values, and anything else goes to taffy.
+    fn row(&mut self, node: NodeId, inputs: LayoutInput) -> Option<LayoutOutput> {
+        use taffy::{AlignContentKeyword, CompactLength, MaybeMath, MaybeResolve, ResolveOrZero};
+        let LayoutInput {
+            known_dimensions: known,
+            parent_size,
+            available_space,
+            run_mode,
+            sizing_mode,
+            ..
+        } = inputs;
+        let width = known.width?;
+        let index = usize::from(node);
+        let style = self.slots[index].taffy();
+        let calc = |value, basis| crate::style::resolve_calc(value, basis);
+        let aligns = |align: taffy::AlignItems| {
+            align.safety == taffy::AlignmentSafety::Default
+                && matches!(
+                    align.keyword,
+                    AlignItemsKeyword::Normal
+                        | AlignItemsKeyword::Stretch
+                        | AlignItemsKeyword::Center
+                        | AlignItemsKeyword::FlexStart
+                        | AlignItemsKeyword::Start
+                )
+        };
+        if self.exact
+            || run_mode != RunMode::PerformLayout
+            || !inputs.known_dimensions_are_definite.width
+            || style.flex_direction != FlexDirection::Row
+            || style.flex_wrap != taffy::FlexWrap::NoWrap
+            || style.direction != taffy::Direction::Ltr
+            || style.box_sizing != taffy::BoxSizing::BorderBox
+            || style.aspect_ratio.is_some()
+            || !aligns(style.align_items)
+            || !matches!(
+                style.justify_content.keyword(),
+                AlignContentKeyword::Normal | AlignContentKeyword::Start | AlignContentKeyword::FlexStart
+            )
+            || !matches!(
+                style.align_content.keyword,
+                AlignContentKeyword::Normal
+                    | AlignContentKeyword::Stretch
+                    | AlignContentKeyword::Start
+                    | AlignContentKeyword::FlexStart
+            )
+            || style.gap.width.into_raw().tag() != CompactLength::LENGTH_TAG
+            || self.slots[index].style.inline == Inline::Lines
+        {
+            return None;
+        }
+        let simple = self.slots[index].children.iter().all(|&child| {
+            let child = self.slots[usize::from(child)].taffy();
+            child.display == taffy::Display::None
+                || child.position != taffy::Position::Absolute
+                    && aligns(child.align_self.unwrap_or(style.align_items))
+                    && child.box_sizing == taffy::BoxSizing::BorderBox
+                    && child.aspect_ratio.is_none()
+                    && !child.flex_basis.is_sizing_keyword()
+                    && !child.flex_basis.is_content()
+                    && !child.size.width.is_sizing_keyword()
+                    && matches!(
+                        child.size.height.into_raw().tag(),
+                        CompactLength::AUTO_TAG | CompactLength::LENGTH_TAG
+                    )
+                    && child.min_size.height.is_auto()
+                    && child.max_size.height.is_auto()
+                    && [child.margin.top, child.margin.right, child.margin.bottom, child.margin.left]
+                        .iter()
+                        .all(|margin| !margin.is_auto())
+                    && [child.inset.top, child.inset.right, child.inset.bottom, child.inset.left]
+                        .iter()
+                        .all(|inset| inset.is_auto())
+        });
+        if !simple {
+            return None;
+        }
+        let padding = style.padding.resolve_or_zero(parent_size.width, calc);
+        let border = style.border.resolve_or_zero(parent_size.width, calc);
+        let inset = padding + border;
+        let min = style.min_size.maybe_resolve(parent_size, calc);
+        let max = style.max_size.maybe_resolve(parent_size, calc);
+        let definite = match (min.height, max.height) {
+            (Some(min), Some(max)) if max <= min => Some(min),
+            _ => None,
+        };
+        let styled = match sizing_mode {
+            taffy::SizingMode::InherentSize => style
+                .size
+                .height
+                .maybe_resolve(parent_size.height, calc)
+                .maybe_clamp(min.height, max.height),
+            taffy::SizingMode::ContentSize => None,
+        };
+        let pb = padding.sum_axes() + border.sum_axes();
+        let fixed = known.height.or(definite.or(styled).maybe_max(pb.height));
+        let (main, cross) = (inset.left + inset.right, inset.top + inset.bottom);
+        let inner = (width - main, fixed.map(|height| height - cross));
+        let gap = style.gap.width.into_raw().value();
+        let (align_items, contain) = (style.align_items, style.contain);
+        let space = match fixed {
+            Some(height) => taffy::AvailableSpace::Definite((height - cross).max(0.)),
+            None => available_space.height.maybe_sub(cross).maybe_max(0.),
+        };
+        struct Item {
+            node: NodeId,
+            order: u32,
+            margin: taffy::Rect<f32>,
+            padding: taffy::Rect<f32>,
+            border: taffy::Rect<f32>,
+            stretch: bool,
+            center: bool,
+            cross: Option<f32>,
+            sides: f32,
+            scrolls: bool,
+            grow: f32,
+            basis: f32,
+            floor: f32,
+            limit: Option<f32>,
+            hypothetical: f32,
+            target: f32,
+            frozen: bool,
+            violation: f32,
+        }
+        let mut items = Vec::with_capacity(self.slots[index].children.len());
+        for order in 0..self.slots[index].children.len() {
+            let child = self.slots[index].children[order];
+            let style = self.slots[usize::from(child)].taffy();
+            if style.display == taffy::Display::None {
+                continue;
+            }
+            let margin = style.margin.resolve_or_zero(Some(inner.0), calc);
+            let padding = style.padding.resolve_or_zero(Some(inner.0), calc);
+            let border = style.border.resolve_or_zero(Some(inner.0), calc);
+            let percents = taffy::Size {
+                width: Some(inner.0),
+                height: inner.1,
+            };
+            let size = style.size.maybe_resolve(percents, calc);
+            let [min, max] = [style.min_size, style.max_size].map(|size| size.maybe_resolve(percents, calc));
+            let align = style.align_self.unwrap_or(align_items).keyword;
+            let stretch = matches!(align, AlignItemsKeyword::Normal | AlignItemsKeyword::Stretch)
+                && style.size.height.is_auto();
+            if stretch && inner.1.is_none() {
+                return None;
+            }
+            let automatic = min.width.or(style.overflow.x.is_scroll_container().then_some(0.));
+            let basis = style.flex_basis.maybe_resolve(Some(inner.0), calc);
+            let (grow, shrink, auto) = (style.flex_grow, style.flex_shrink, style.flex_basis.is_auto());
+            let scrolls = style.overflow.y.is_scroll_container();
+            let edges = padding + border;
+            let lines = taffy::Size {
+                width: (padding.left + padding.right) + (border.left + border.right),
+                height: edges.top + edges.bottom,
+            };
+            let spaced = match space {
+                taffy::AvailableSpace::Definite(value) => taffy::AvailableSpace::Definite(
+                    (inner.1.unwrap_or(value) - (margin.top + margin.bottom)).max(0.),
+                ),
+                other => other,
+            };
+            let known = taffy::Size {
+                width: None,
+                height: size.height.or(stretch.then(|| spaced.into_option()).flatten()),
+            };
+            let measure = |tree: &mut Self, width: taffy::AvailableSpace| {
+                tree.compute(
+                    child,
+                    LayoutInput {
+                        run_mode: RunMode::ComputeSize,
+                        sizing_mode: taffy::SizingMode::ContentSize,
+                        axis: taffy::RequestedAxis::Horizontal,
+                        known_dimensions: known,
+                        known_dimensions_are_definite: taffy::Size { width: true, height: true },
+                        parent_size: taffy::Size {
+                            width: None,
+                            height: inner.1,
+                        },
+                        available_space: taffy::Size { width, height: spaced },
+                        vertical_margins_are_collapsible: taffy::Line::FALSE,
+                    },
+                    None,
+                )
+                .size
+                .width
+            };
+            let (basis, set) = match (basis, size.width) {
+                (Some(basis), _) => (basis, true),
+                (None, Some(width)) if auto => (width, false),
+                _ => (measure(self, taffy::AvailableSpace::MaxContent), false),
+            };
+            let basis = basis.max(lines.width);
+            // WARNING: an item's automatic minimum is its min-content width, no more than its width, which a basis
+            // from its width or its content already holds while the line grows, so only a set basis measures it.
+            let floor = match automatic {
+                Some(floor) => floor,
+                None if set => measure(self, taffy::AvailableSpace::MinContent)
+                    .maybe_min(size.width)
+                    .maybe_min(max.width)
+                    .maybe_max(Some(edges.left + edges.right)),
+                None => 0.,
+            };
+            let lowest = floor.maybe_max(min.width).maybe_max(Some(edges.left + edges.right));
+            let hypothetical = basis.maybe_clamp(Some(lowest), max.width);
+            items.push(Item {
+                node: child,
+                order: order as u32,
+                margin,
+                padding,
+                border,
+                stretch,
+                center: align == AlignItemsKeyword::Center,
+                cross: size.height.map(|height| height.max(lines.height)),
+                sides: lines.height,
+                scrolls,
+                grow,
+                basis,
+                floor,
+                limit: max.width,
+                hypothetical,
+                target: hypothetical,
+                frozen: grow == 0. && shrink == 0.,
+                violation: 0.,
+            });
+        }
+        let gaps = if items.len() <= 1 { 0. } else { gap * (items.len() - 1) as f32 };
+        let used = gaps
+            + items
+                .iter()
+                .map(|item| item.hypothetical + (item.margin.left + item.margin.right))
+                .sum::<f32>();
+        if used > inner.0 {
+            return None;
+        }
+        if used < inner.0 {
+            for item in &mut items {
+                item.frozen |= item.basis > item.hypothetical;
+            }
+            let taken = |items: &[Item]| {
+                gaps + items
+                    .iter()
+                    .map(|item| match item.frozen {
+                        true => item.target + (item.margin.left + item.margin.right),
+                        false => item.basis + (item.margin.left + item.margin.right),
+                    })
+                    .sum::<f32>()
+            };
+            let initial = inner.0 - taken(&items);
+            while !items.iter().all(|item| item.frozen) {
+                let used = taken(&items);
+                let grows = items
+                    .iter()
+                    .filter(|item| !item.frozen)
+                    .fold(0., |sum, item| sum + item.grow);
+                let free = match grows < 1. {
+                    true => (initial * grows - gaps).min(inner.0 - used),
+                    false => inner.0 - used,
+                };
+                if free.is_normal() && grows > 0. {
+                    for item in items.iter_mut().filter(|item| !item.frozen) {
+                        item.target = item.basis + free * (item.grow / grows);
+                    }
+                }
+                let mut total = 0.;
+                for item in items.iter_mut().filter(|item| !item.frozen) {
+                    let clamped = item.target.maybe_clamp(Some(item.floor), item.limit).max(0.);
+                    item.violation = clamped - item.target;
+                    item.target = clamped;
+                    total += item.violation;
+                }
+                for item in items.iter_mut().filter(|item| !item.frozen) {
+                    item.frozen = match total {
+                        total if total > 0. => item.violation > 0.,
+                        total if total < 0. => item.violation < 0.,
+                        _ => true,
+                    };
+                }
+            }
+        }
+        let outer = inner.0 + main;
+        let parent = taffy::Size {
+            width: Some(inner.0),
+            height: inner.1,
+        };
+        let stretched = fixed.map(|height| (height.maybe_clamp(min.height, max.height) - cross).max(0.));
+        let mut outputs = Vec::with_capacity(items.len());
+        for item in &items {
+            let margins = item.margin.top + item.margin.bottom;
+            let available = space
+                .map_definite_value(|value| (value - margins).max(0.))
+                .maybe_max(item.sides);
+            let height = match (item.stretch, item.cross) {
+                (true, _) => stretched.map(|line| (line - margins).max(0.)),
+                (false, height) => height,
+            };
+            let output = self.compute(
+                item.node,
+                LayoutInput {
+                    run_mode: RunMode::PerformLayout,
+                    sizing_mode: taffy::SizingMode::ContentSize,
+                    axis: taffy::RequestedAxis::Both,
+                    known_dimensions: taffy::Size {
+                        width: Some(item.target),
+                        height,
+                    },
+                    known_dimensions_are_definite: taffy::Size {
+                        width: true,
+                        height: height.is_some(),
+                    },
+                    parent_size: parent,
+                    available_space: taffy::Size {
+                        width: taffy::AvailableSpace::Definite(
+                            (outer - (item.margin.left + item.margin.right)).max(0.),
+                        ),
+                        height: available,
+                    },
+                    vertical_margins_are_collapsible: taffy::Line::FALSE,
+                },
+                None,
+            );
+            if output.size.height.max(item.sides) != output.size.height {
+                return None;
+            }
+            outputs.push(output);
+        }
+        let line = match stretched {
+            Some(line) => line,
+            None => items
+                .iter()
+                .zip(&outputs)
+                .map(|(item, output)| output.size.height + (item.margin.top + item.margin.bottom))
+                .fold(0., f32::max)
+                .maybe_clamp(min.height.maybe_sub(cross), max.height.maybe_sub(cross)),
+        };
+        let height = fixed
+            .unwrap_or(line + 0. + cross)
+            .maybe_clamp(min.height, max.height)
+            .max(cross);
+        let (mut total, mut first) = (inset.left, None);
+        for (number, (item, output)) in items.iter().zip(&outputs).enumerate() {
+            let offset = if number == 0 { 0. } else { gap };
+            let free = line - (output.size.height + (item.margin.top + item.margin.bottom));
+            let top = inset.top + if item.center { free / 2. } else { 0. } + item.margin.top;
+            let mut layout = Layout::with_order(item.order);
+            layout.size = output.size;
+            layout.location = taffy::Point {
+                x: total + offset + item.margin.left,
+                y: top,
+            };
+            layout.padding = item.padding;
+            layout.border = item.border;
+            layout.margin = item.margin;
+            self.set_unrounded_layout(item.node, &layout);
+            if number == 0 {
+                let baseline = output.baselines.first.unwrap_or(output.size.height);
+                first = Some(top + if item.scrolls { baseline.min(output.size.height).max(0.) } else { baseline });
+            }
+            total += offset + (item.margin.left + item.margin.right) + output.size.width;
+        }
+        let size = taffy::Size { width: outer, height };
+        for order in 0..self.slots[index].children.len() {
+            let child = self.slots[index].children[order];
+            if self.slots[usize::from(child)].taffy().display == taffy::Display::None {
+                self.set_unrounded_layout(child, &Layout::with_order(order as u32));
+                self.compute(
+                    child,
+                    LayoutInput {
+                        run_mode: RunMode::PerformLayout,
+                        sizing_mode: taffy::SizingMode::ContentSize,
+                        axis: taffy::RequestedAxis::Both,
+                        known_dimensions: taffy::Size::NONE,
+                        known_dimensions_are_definite: taffy::Size { width: true, height: true },
+                        parent_size: taffy::Size::NONE,
+                        available_space: taffy::Size {
+                            width: taffy::AvailableSpace::MaxContent,
+                            height: taffy::AvailableSpace::MaxContent,
+                        },
+                        vertical_margins_are_collapsible: taffy::Line::FALSE,
+                    },
+                    None,
+                );
+            }
+        }
+        let mut output = LayoutOutput::from_sizes_and_baselines(
+            size,
+            taffy::Rect::ZERO,
+            if contain.suppresses_baseline() { Baselines::NONE } else { Baselines::from_first(first) },
+        );
+        output.oof_positioning_area = Some(taffy::OofPositioningArea {
+            size: size - border.sum_axes(),
+            offset: taffy::Point { x: border.left, y: border.top },
+        });
+        Some(output)
+    }
+
+    // WARNING: like Blink's block layout, a column whose items only stack is laid out in one pass, each item once at
+    // its stretched width, without taffy's flex base size, minimum size and cross size measures. The sums follow
+    // taffy's order, so boxes land on the same values, and a column whose items could flex, shrink or move goes to
+    // taffy.
+    fn stack(&mut self, node: NodeId, inputs: LayoutInput) -> Option<LayoutOutput> {
+        use taffy::{
+            AlignContentKeyword, CompactLength, MaybeMath, MaybeResolve, ResolveOrZero,
+            prelude::TaffyMaxContent,
+        };
+        let LayoutInput {
+            known_dimensions: known,
+            parent_size,
+            available_space,
+            run_mode,
+            sizing_mode,
+            axis,
+            ..
+        } = inputs;
+        let width = known.width?;
+        let index = usize::from(node);
+        let style = self.slots[index].taffy();
+        let calc = |value, basis| crate::style::resolve_calc(value, basis);
+        let starts = |align: Option<taffy::AlignItems>| {
+            align.is_none_or(|align| {
+                matches!(align.keyword, AlignItemsKeyword::Normal | AlignItemsKeyword::Stretch)
+            })
+        };
+        if self.exact
+            || style.flex_direction != FlexDirection::Column
+            || style.flex_wrap != taffy::FlexWrap::NoWrap
+            || style.direction != taffy::Direction::Ltr
+            || style.box_sizing != taffy::BoxSizing::BorderBox
+            || style.aspect_ratio.is_some()
+            || !starts(Some(style.align_items))
+            || style.gap.height.into_raw().tag() != CompactLength::LENGTH_TAG
+            || self.slots[index].style.inline == Inline::Lines
+        {
+            return None;
+        }
+        let flow = |child: &taffy::Style| {
+            child.position != taffy::Position::Absolute && child.display != taffy::Display::None
+        };
+        let simple = self.slots[index].children.iter().all(|&child| {
+            let child = self.slots[usize::from(child)].taffy();
+            match child.position {
+                _ if child.display == taffy::Display::None => true,
+                taffy::Position::Absolute => {
+                    let align = child.align_self.unwrap_or(style.align_items);
+                    align.safety == taffy::AlignmentSafety::Default
+                        && matches!(
+                            align.keyword,
+                            AlignItemsKeyword::Normal
+                                | AlignItemsKeyword::Stretch
+                                | AlignItemsKeyword::FlexStart
+                                | AlignItemsKeyword::Start
+                        )
+                        && matches!(
+                            style.justify_content.keyword(),
+                            AlignContentKeyword::Normal
+                                | AlignContentKeyword::Start
+                                | AlignContentKeyword::FlexStart
+                                | AlignContentKeyword::Stretch
+                                | AlignContentKeyword::SpaceBetween
+                        )
+                }
+                _ => {
+                    starts(child.align_self)
+                        && child.box_sizing == taffy::BoxSizing::BorderBox
+                        && child.aspect_ratio.is_none()
+                        && child.flex_basis.is_auto()
+                        && !child.size.width.is_sizing_keyword()
+                        && matches!(
+                            child.size.height.into_raw().tag(),
+                            CompactLength::AUTO_TAG | CompactLength::LENGTH_TAG
+                        )
+                        && child.min_size.height.is_auto()
+                        && child.max_size.height.is_auto()
+                        && [child.margin.top, child.margin.right, child.margin.bottom, child.margin.left]
+                            .iter()
+                            .all(|margin| !margin.is_auto())
+                        && [child.inset.top, child.inset.right, child.inset.bottom, child.inset.left]
+                            .iter()
+                            .all(|inset| inset.is_auto())
+                }
+            }
+        });
+        if !simple {
+            return None;
+        }
+        let padding = style.padding.resolve_or_zero(parent_size.width, calc);
+        let border = style.border.resolve_or_zero(parent_size.width, calc);
+        let inset = padding + border;
+        let min = style.min_size.maybe_resolve(parent_size, calc);
+        let max = style.max_size.maybe_resolve(parent_size, calc);
+        let pb = padding.top + padding.bottom + (border.top + border.bottom);
+        let definite = match (min.height, max.height) {
+            (Some(min), Some(max)) if max <= min => Some(min),
+            _ => None,
+        };
+        let styled = match sizing_mode {
+            taffy::SizingMode::InherentSize => style
+                .size
+                .height
+                .maybe_resolve(parent_size.height, calc)
+                .maybe_clamp(min.height, max.height),
+            taffy::SizingMode::ContentSize => None,
+        };
+        let fixed = known.height.or(definite.or(styled).maybe_max(pb));
+        let main = inset.top + inset.bottom;
+        let cross = inset.left + inset.right;
+        if run_mode == RunMode::ComputeSize && (fixed.is_some() || axis == taffy::RequestedAxis::Horizontal)
+            || width.maybe_clamp(min.width, max.width) != width
+        {
+            return None;
+        }
+        let inner = width - cross;
+        let line = (width - cross).max(0.);
+        let gap = style.gap.height.into_raw().value();
+        let (justify, contain) = (style.justify_content.keyword(), style.contain);
+        let perform = run_mode == RunMode::PerformLayout;
+        let mut total = inset.top;
+        let (mut items, mut hypothetical, mut contents, mut grows, mut shrinks) = (0, 0., 0., false, false);
+        let mut first = None;
+        for order in 0..self.slots[index].children.len() {
+            let child = self.slots[index].children[order];
+            let style = self.slots[usize::from(child)].taffy();
+            if !flow(style) {
+                continue;
+            }
+            let margin = style.margin.resolve_or_zero(Some(inner), calc);
+            let padding = style.padding.resolve_or_zero(Some(inner), calc);
+            let border = style.border.resolve_or_zero(Some(inner), calc);
+            let sides = (padding + border).sum_axes();
+            let [min, max] = [style.min_size, style.max_size].map(|size| size.width.maybe_resolve(Some(inner), calc));
+            let width = match style.size.width.maybe_resolve(Some(inner), calc) {
+                None => (line - (margin.left + margin.right)).max(0.).maybe_clamp(min, max),
+                Some(width) => width.maybe_clamp(min, max).max(sides.width),
+            };
+            let (grow, shrink, styled) = (style.flex_grow, style.flex_shrink, style.size.height.into_raw());
+            let output = self.compute(
+                child,
+                LayoutInput {
+                    run_mode: if perform { RunMode::PerformLayout } else { RunMode::ComputeSize },
+                    sizing_mode: taffy::SizingMode::InherentSize,
+                    axis: if perform { taffy::RequestedAxis::Both } else { taffy::RequestedAxis::Vertical },
+                    known_dimensions: taffy::Size { width: Some(width), height: None },
+                    known_dimensions_are_definite: taffy::Size { width: true, height: true },
+                    parent_size: taffy::Size { width: Some(inner), height: None },
+                    available_space: taffy::Size {
+                        width: taffy::AvailableSpace::Definite(width),
+                        height: taffy::AvailableSpace::MaxContent,
+                    },
+                    vertical_margins_are_collapsible: taffy::Line::FALSE,
+                },
+                None,
+            );
+            let height = output.size.height;
+            // WARNING: taffy's content sizes take a fixed height even below the padding, which the box itself doesn't.
+            if styled.tag() == CompactLength::LENGTH_TAG && styled.value() != height {
+                return None;
+            }
+            let margins = margin.top + margin.bottom;
+            let offset = if items == 0 { 0. } else { gap };
+            let top = total + offset + margin.top;
+            if perform {
+                let mut layout = Layout::with_order(order as u32);
+                layout.size = taffy::Size { width, height };
+                layout.location = taffy::Point { x: inset.left + margin.left, y: top };
+                layout.padding = padding;
+                layout.border = border;
+                layout.margin = margin;
+                self.set_unrounded_layout(child, &layout);
+                if items == 0 {
+                    first = Some(top + output.baselines.first.unwrap_or(height));
+                }
+            }
+            total += offset + margins + height;
+            hypothetical += height + margins;
+            contents += match available_space.height {
+                taffy::AvailableSpace::Definite(_) => (height + margins).max(sides.height),
+                _ => {
+                    let difference = (height + margins) - height;
+                    let basis = height - (padding.top + padding.bottom) - (border.top + border.bottom);
+                    let fraction = if difference > 0. {
+                        difference / grow.max(1.)
+                    } else if difference < 0. {
+                        difference / (shrink.max(1.) * basis)
+                    } else {
+                        0.
+                    };
+                    height
+                        + if fraction > 0. {
+                            grow.max(1.) * fraction
+                        } else if fraction < 0. && shrink.max(1.) * basis != 0. {
+                            shrink.max(1.) * basis * fraction
+                        } else {
+                            0.
+                        }
+                }
+            };
+            grows |= grow > 0.;
+            shrinks |= shrink > 0.;
+            items += 1;
+        }
+        let gaps = if items <= 1 { 0. } else { gap * (items - 1) as f32 };
+        let (outer, inner_main) = match fixed {
+            Some(height) => {
+                let inner = height - main;
+                (inner + main, inner)
+            }
+            None => {
+                let content = match available_space.height {
+                    taffy::AvailableSpace::Definite(_) => contents + gaps + main,
+                    _ => 0f32.max(contents + gaps) + main,
+                };
+                let outer = content.maybe_clamp(min.height, max.height).max(main);
+                (outer, (outer - main).max(0.))
+            }
+        };
+        let free = inner_main - (gaps + hypothetical);
+        let packed = matches!(
+            justify,
+            AlignContentKeyword::Normal
+                | AlignContentKeyword::Start
+                | AlignContentKeyword::FlexStart
+                | AlignContentKeyword::Stretch
+        );
+        if free != 0. && (!packed || free > 0. && grows || free < 0. && shrinks) {
+            return None;
+        }
+        if !perform {
+            let width = if axis == taffy::RequestedAxis::Vertical { 0. } else { width.max(cross) };
+            return Some(LayoutOutput::from_outer_size(taffy::Size { width, height: outer }));
+        }
+        let size = taffy::Size { width: width.max(cross), height: outer };
+        let mut candidates = taffy::OofCandidates::new();
+        for order in 0..self.slots[index].children.len() {
+            let child = self.slots[index].children[order];
+            let style = self.slots[usize::from(child)].taffy();
+            if style.display == taffy::Display::None {
+                self.set_unrounded_layout(child, &Layout::with_order(order as u32));
+                self.compute(
+                    child,
+                    LayoutInput {
+                        run_mode: RunMode::PerformLayout,
+                        sizing_mode: taffy::SizingMode::ContentSize,
+                        axis: taffy::RequestedAxis::Both,
+                        known_dimensions: taffy::Size::NONE,
+                        known_dimensions_are_definite: taffy::Size { width: true, height: true },
+                        parent_size: taffy::Size::NONE,
+                        available_space: taffy::Size::MAX_CONTENT,
+                        vertical_margins_are_collapsible: taffy::Line::FALSE,
+                    },
+                    None,
+                );
+            } else if style.position == taffy::Position::Absolute {
+                let area = |start, end| taffy::AxisStaticPosition {
+                    area: taffy::Line { start, end },
+                    align: taffy::AxisStaticAlign::from_keyword(taffy::AxisStaticEdge::Start),
+                };
+                candidates.push(taffy::OofCandidate {
+                    node: child,
+                    order: order as u32,
+                    position: style.position,
+                    static_position: taffy::Point {
+                        x: area(inset.left, size.width - inset.right),
+                        y: area(inset.top, size.height - inset.bottom),
+                    },
+                });
+            }
+        }
+        let mut output = LayoutOutput::from_sizes_and_baselines(
+            size,
+            taffy::Rect::ZERO,
+            if contain.suppresses_baseline() { Baselines::NONE } else { Baselines::from_first(first) },
+        );
+        output.oof_candidates = candidates;
+        output.oof_positioning_area = Some(taffy::OofPositioningArea {
+            size: size - border.sum_axes(),
+            offset: taffy::Point { x: border.left, y: border.top },
+        });
+        Some(output)
     }
 
     fn flexbox(&mut self, node: NodeId, inputs: LayoutInput) -> LayoutOutput {
         let mut output = taffy::compute_flexbox_layout(self, node, inputs);
         let index = usize::from(node);
-        let style = &self.slots[index].taffy;
+        let style = self.slots[index].taffy();
         if inputs.known_dimensions.width.is_none()
             && matches!(
                 style.flex_direction,
@@ -962,8 +2193,8 @@ impl LayoutTree<'_> {
             _ => 0.,
         };
         let flows = |slot: &Slot| {
-            slot.taffy.position != taffy::Position::Absolute
-                && slot.taffy.display != taffy::Display::None
+            slot.taffy().position != taffy::Position::Absolute
+                && slot.taffy().display != taffy::Display::None
         };
         let align = |slot: &Slot| slot.style.align_self.or(style.align_items);
         let children = mem::take(&mut self.slots[index].children);
@@ -1020,7 +2251,7 @@ impl LayoutTree<'_> {
             // WARNING: a `Lines` row that doesn't wrap holds the strut and the first item, so it ends with that item.
             let mut end = last(line);
             while let Some(slot) = end.filter(|slot| {
-                slot.style.inline == Inline::Lines && slot.taffy.flex_wrap == taffy::FlexWrap::NoWrap
+                slot.style.inline == Inline::Lines && slot.taffy().flex_wrap == taffy::FlexWrap::NoWrap
             }) {
                 end = last(&slot.children);
             }
@@ -1055,16 +2286,17 @@ impl LayoutTree<'_> {
         let scale = self.scale;
         let window = &mut *self.window;
         let Slot {
-            taffy,
+            stretched,
             measure,
             style,
             text,
             ..
         } = &mut self.slots[index];
+        let taffy = stretched.as_deref().unwrap_or(&style.taffy);
         let mut baselines = None;
         let mut output = taffy::compute_leaf_layout(
             inputs,
-            &*taffy,
+            taffy,
             |_, _| 0.,
             |known, available| {
                 let Some(measure) = measure else {
@@ -1087,9 +2319,13 @@ impl LayoutTree<'_> {
             },
         );
         if let Some([first, last]) = baselines.filter(|_| style.baseline != Baseline::None) {
+            use taffy::ResolveOrZero;
+            let width = inputs.parent_size.width;
+            let calc = |value, basis| crate::style::resolve_calc(value, basis);
+            let top = taffy.padding.top.resolve_or_zero(width, calc) + taffy.border.top.resolve_or_zero(width, calc);
             output.baselines = Baselines {
-                first: Some(first.0 * scale),
-                last: Some(last.0 * scale),
+                first: Some(first.0 * scale + top),
+                last: Some(last.0 * scale + top),
             };
         }
         output
@@ -1097,7 +2333,7 @@ impl LayoutTree<'_> {
 
     fn baselines(&self, index: usize, output: &LayoutOutput) -> Baselines {
         let slot = &self.slots[index];
-        let style = &slot.taffy;
+        let style = slot.taffy();
         let baseline = slot.style.baseline;
         let first = output.baselines.first;
         if baseline == Baseline::Bottom {
@@ -1108,15 +2344,19 @@ impl LayoutTree<'_> {
             };
         }
         if slot.children.is_empty() {
-            return output.baselines;
+            let Baselines { first, last } = output.baselines;
+            return Baselines {
+                first: if baseline == Baseline::Last { last } else { first },
+                last,
+            };
         }
         let children = slot
             .children
             .iter()
             .map(|&child| &self.slots[usize::from(child)])
             .filter(|child| {
-                child.taffy.position != taffy::Position::Absolute
-                    && child.taffy.display != taffy::Display::None
+                child.taffy().position != taffy::Position::Absolute
+                    && child.taffy().display != taffy::Display::None
             });
         let at = |child: &Slot, value: f32| child.layout.location.y + value;
         let source = slot
@@ -1144,7 +2384,7 @@ impl LayoutTree<'_> {
                 let last = children
                     .rev()
                     .find(|child| {
-                        child.taffy.align_self.unwrap_or(style.align_items).keyword
+                        child.taffy().align_self.unwrap_or(style.align_items).keyword
                             == AlignItemsKeyword::Baseline
                     })
                     .map(|child| {
@@ -1207,15 +2447,20 @@ impl LayoutPartialTree for LayoutTree<'_> {
     type CustomIdent = String;
 
     fn get_core_container_style(&self, node: NodeId) -> &taffy::Style {
-        &self.slots[usize::from(node)].taffy
+        self.slots[usize::from(node)].taffy()
     }
 
     fn resolve_calc_value(&self, handle: *const (), basis: f32) -> f32 {
         crate::style::resolve_calc(handle, basis)
     }
 
+    // WARNING: a box that only moved keeps its prepaint, which follows it, see `Tree::keep`.
     fn set_unrounded_layout(&mut self, node: NodeId, layout: &Layout) {
-        self.slots[usize::from(node)].layout = *layout;
+        let index = usize::from(node);
+        let old = mem::replace(&mut self.slots[index].layout, *layout);
+        if !self.exact && (Layout { location: old.location, ..*layout }) != old {
+            changed(self.slots, index);
+        }
     }
 
     fn compute_child_layout(&mut self, node: NodeId, inputs: LayoutInput) -> LayoutOutput {
@@ -1232,7 +2477,7 @@ impl LayoutContainingBlock for LayoutTree<'_> {
         Self: 'a;
 
     fn get_oof_item_style(&self, node: NodeId) -> &taffy::Style {
-        &self.slots[usize::from(node)].taffy
+        self.slots[usize::from(node)].taffy()
     }
 
     fn clear_hoisted_children(&mut self, _: NodeId) {}
@@ -1240,13 +2485,40 @@ impl LayoutContainingBlock for LayoutTree<'_> {
     fn add_hoisted_children(&mut self, _: NodeId, _: &[NodeId]) {}
 }
 
+// WARNING: like Blink's intrinsic sizes that don't depend on block constraints, a free box asked only for one size
+// gets one cache entry for any available height, so a span in a flex row isn't measured again for each height its
+// parents try. Such entries are only read for that size, as taffy keeps them per requested axis.
+fn cache_input(free: [bool; 2], relative: bool, input: &LayoutInput) -> LayoutInput {
+    let mut input = *input;
+    if !relative {
+        input.parent_size = taffy::Size::NONE;
+    }
+    if input.run_mode == RunMode::ComputeSize {
+        match input.axis {
+            taffy::RequestedAxis::Horizontal if free[0] && input.known_dimensions.width.is_none() => {
+                input.known_dimensions.height = None;
+                input.available_space.height = taffy::AvailableSpace::MaxContent;
+            }
+            taffy::RequestedAxis::Vertical if free[1] && input.known_dimensions.height.is_none() => {
+                input.available_space.height = taffy::AvailableSpace::MaxContent;
+            }
+            _ => {}
+        }
+    }
+    input
+}
+
 impl CacheTree for LayoutTree<'_> {
     fn cache_get(&mut self, node: NodeId, input: &LayoutInput) -> Option<LayoutOutput> {
-        self.slots[usize::from(node)].cache.get(input)
+        let slot = &mut self.slots[usize::from(node)];
+        let relative = self.exact || slot.style.relative;
+        slot.cache.get(&cache_input(slot.free, relative, input))
     }
 
     fn cache_store(&mut self, node: NodeId, input: &LayoutInput, output: LayoutOutput) {
-        self.slots[usize::from(node)].cache.store(input, output);
+        let slot = &mut self.slots[usize::from(node)];
+        let relative = self.exact || slot.style.relative;
+        slot.cache.store(&cache_input(slot.free, relative, input), output);
     }
 
     fn cache_clear(&mut self, node: NodeId) {
@@ -1265,11 +2537,11 @@ impl LayoutBlockContainer for LayoutTree<'_> {
         Self: 'a;
 
     fn get_block_container_style(&self, node: NodeId) -> &taffy::Style {
-        &self.slots[usize::from(node)].taffy
+        self.slots[usize::from(node)].taffy()
     }
 
     fn get_block_child_style(&self, node: NodeId) -> &taffy::Style {
-        &self.slots[usize::from(node)].taffy
+        self.slots[usize::from(node)].taffy()
     }
 
     fn compute_block_child_layout(
@@ -1293,11 +2565,11 @@ impl LayoutFlexboxContainer for LayoutTree<'_> {
         Self: 'a;
 
     fn get_flexbox_container_style(&self, node: NodeId) -> &taffy::Style {
-        &self.slots[usize::from(node)].taffy
+        self.slots[usize::from(node)].taffy()
     }
 
     fn get_flexbox_child_style(&self, node: NodeId) -> &taffy::Style {
-        &self.slots[usize::from(node)].taffy
+        self.slots[usize::from(node)].taffy()
     }
 }
 
@@ -1312,11 +2584,11 @@ impl LayoutGridContainer for LayoutTree<'_> {
         Self: 'a;
 
     fn get_grid_container_style(&self, node: NodeId) -> &taffy::Style {
-        &self.slots[usize::from(node)].taffy
+        self.slots[usize::from(node)].taffy()
     }
 
     fn get_grid_child_style(&self, node: NodeId) -> &taffy::Style {
-        &self.slots[usize::from(node)].taffy
+        self.slots[usize::from(node)].taffy()
     }
 }
 
@@ -1382,16 +2654,17 @@ mod tests {
         tree.commit_root(page(2000, false), viewport, 1.);
         let kept = slot(&tree, 3).children.clone();
         tree.begin(1., 0);
-        let root = tree.commit_root(page(3, true), viewport, 1.).unwrap();
+        tree.commit_root(page(3, true), viewport, 1.).unwrap();
+        tree.bury();
+        let root = tree.root.unwrap();
         assert_eq!(tree.slots.len(), 1 + 3 * 2);
-        assert_eq!(tree.root, Some(index_of(root)));
         assert_eq!(slot(&tree, 3).children.len(), kept.len());
         let child = index_of(slot(&tree, 3).children[0]);
         assert_eq!(
             tree.slots[child as usize].parent,
             tree.keys[&(identity(Some(ElementId::from(3usize)), 0), 0)]
         );
-        assert_eq!(slot(&tree, 3).parent, index_of(root));
+        assert_eq!(slot(&tree, 3).parent, root);
     }
 
     #[test]
@@ -1410,6 +2683,30 @@ mod tests {
         let text = index_of(slot(&tree, 1).children[0]);
         assert_eq!(tree.slots[text as usize].text.font_size, px(20.));
         assert!(tree.slots[text as usize].cache.is_empty());
+    }
+
+    #[test]
+    fn paint_only_text_changes_keep_the_measured_state() {
+        let mut tree = Tree::default();
+        let viewport = size(px(100.), px(100.));
+        let page = |color: u32, child: Child| {
+            let mut page = node().id(0usize).child(child);
+            page.style().text.color = Some(crate::rgba(color));
+            page.into()
+        };
+        let text = |tree: &Tree| index_of(slot(tree, 1).children[0]) as usize;
+        let state = |tree: &Tree| tree.slots[text(tree)].state.clone().unwrap();
+        tree.begin(1., 0);
+        tree.commit_root(page(0xff0000ff, node().id(1usize).child("a").into()), viewport, 1.);
+        let first = state(&tree);
+        tree.begin(1., 0);
+        tree.commit_root(page(0x0000ffff, Child::Kept(1usize.into())), viewport, 1.);
+        assert_eq!(tree.slots[text(&tree)].text.color, crate::rgba(0x0000ffff));
+        assert!(std::rc::Rc::ptr_eq(&first, &state(&tree)));
+        tree.begin(1., 0);
+        tree.commit_root(page(0x00ff00ff, node().id(1usize).child("a").into()), viewport, 1.);
+        assert_eq!(tree.slots[text(&tree)].text.color, crate::rgba(0x00ff00ff));
+        assert!(std::rc::Rc::ptr_eq(&first, &state(&tree)));
     }
 
     #[test]
@@ -1448,5 +2745,52 @@ mod tests {
             px(30.).into(),
             "a box built in this pass keeps its build"
         );
+    }
+
+    #[test]
+    fn placed_boxes_keep_their_subtree_at_a_new_place() {
+        let mut tree = Tree::default();
+        let viewport = size(px(100.), px(100.));
+        let page = |child: Child| node().id(0usize).child(child).into();
+        let place = |x: f32, width: f32| {
+            Child::Placed(
+                1usize.into(),
+                crate::Bounds {
+                    origin: crate::point(px(x), px(2.)),
+                    size: size(px(width), px(8.)),
+                },
+            )
+        };
+        tree.begin(1., 0);
+        let cell = node()
+            .id(1usize)
+            .absolute()
+            .left(px(1.))
+            .top(px(2.))
+            .w(px(4.))
+            .h(px(8.));
+        tree.commit_root(page(cell.child("a").into()), viewport, 1.);
+        let (inner, built) = (
+            slot(&tree, 1).children.clone(),
+            slot(&tree, 1).style.clone(),
+        );
+        tree.begin(1., 0);
+        tree.commit_root(page(place(1., 4.)), viewport, 1.);
+        assert!(
+            std::rc::Rc::ptr_eq(&built, &slot(&tree, 1).style),
+            "the same place keeps the style"
+        );
+        tree.begin(1., 0);
+        tree.commit_root(page(place(10., 30.)), viewport, 1.);
+        let cell = slot(&tree, 1);
+        assert_eq!(
+            [
+                cell.style.inset.left,
+                cell.style.inset.top,
+                cell.style.size.width
+            ],
+            [px(10.).into(), px(2.).into(), px(30.).into()]
+        );
+        assert_eq!(cell.children, inner);
     }
 }

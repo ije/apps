@@ -75,61 +75,79 @@ const DARK_SYSTEM_COLORS: [(&str, &str); 19] = [
 ];
 
 pub(crate) fn serialize(value: &str) -> Option<String> {
-    let lower = value.trim().to_ascii_lowercase();
-    let (mut space, mut channels, alpha) = parse(&lower, 0)?;
-    let function = lower.split_once('(').map_or("", |(name, _)| name);
-    let own = matches!(
-        function,
-        "color" | "color-mix" | "lab" | "lch" | "oklab" | "oklch"
-    ) || lower.contains("(from ");
-    if matches!(space, Space::Hsl | Space::Hwb) {
-        channels = convert(space, channels, Space::Srgb);
-        space = Space::Srgb;
+    // WARNING: computed style reads serialize the same few colors again and again, so the text is kept by value
+    // like `COLORS`, and starts over when full.
+    thread_local! {
+        static SERIALIZED: std::cell::RefCell<rustc_hash::FxHashMap<Box<str>, Option<String>>> =
+            Default::default();
     }
-    let number = |value: f64| {
-        if value.is_nan() {
-            "none".to_owned()
-        } else {
-            super::value::number(value)
+    if let Some(text) = SERIALIZED.with_borrow(|memo| memo.get(value).cloned()) {
+        return text;
+    }
+    let text = (|| {
+        let lower = value.trim().to_ascii_lowercase();
+        let (mut space, mut channels, alpha) = parse(&lower, 0)?;
+        let function = lower.split_once('(').map_or("", |(name, _)| name);
+        let own = matches!(
+            function,
+            "color" | "color-mix" | "lab" | "lch" | "oklab" | "oklch"
+        ) || lower.contains("(from ");
+        if matches!(space, Space::Hsl | Space::Hwb) {
+            channels = convert(space, channels, Space::Srgb);
+            space = Space::Srgb;
         }
-    };
-    let name = match space {
-        Space::Srgb => "color(srgb ",
-        Space::SrgbLinear => "color(srgb-linear ",
-        Space::DisplayP3 => "color(display-p3 ",
-        Space::XyzD50 => "color(xyz-d50 ",
-        Space::XyzD65 => "color(xyz-d65 ",
-        Space::Lab => "lab(",
-        Space::Lch => "lch(",
-        Space::Oklab => "oklab(",
-        Space::Oklch => "oklch(",
-        Space::Hsl | Space::Hwb => "",
-    };
-    if !own {
-        let (rgb, alpha) = color(value)?;
-        let fraction = f32::from(alpha) / 255.;
-        let short = (fraction * 100.).round() / 100.;
-        return Some(match alpha {
-            255 => format!("rgb({}, {}, {})", rgb >> 16, rgb >> 8 & 255, rgb & 255),
-            _ => format!(
-                "rgba({}, {}, {}, {})",
-                rgb >> 16,
-                rgb >> 8 & 255,
-                rgb & 255,
-                if (short * 255.).round() as u8 == alpha {
-                    short
-                } else {
-                    (fraction * 1000.).round() / 1000.
-                }
-            ),
-        });
-    }
-    let channels = channels.map(number).join(" ");
-    Some(if alpha < 1. {
-        format!("{name}{channels} / {})", number(alpha.max(0.)))
-    } else {
-        format!("{name}{channels})")
-    })
+        let number = |value: f64| {
+            if value.is_nan() {
+                "none".to_owned()
+            } else {
+                super::value::number(value)
+            }
+        };
+        let name = match space {
+            Space::Srgb => "color(srgb ",
+            Space::SrgbLinear => "color(srgb-linear ",
+            Space::DisplayP3 => "color(display-p3 ",
+            Space::XyzD50 => "color(xyz-d50 ",
+            Space::XyzD65 => "color(xyz-d65 ",
+            Space::Lab => "lab(",
+            Space::Lch => "lch(",
+            Space::Oklab => "oklab(",
+            Space::Oklch => "oklch(",
+            Space::Hsl | Space::Hwb => "",
+        };
+        if !own {
+            let (rgb, alpha) = color(value)?;
+            let fraction = f32::from(alpha) / 255.;
+            let short = (fraction * 100.).round() / 100.;
+            return Some(match alpha {
+                255 => format!("rgb({}, {}, {})", rgb >> 16, rgb >> 8 & 255, rgb & 255),
+                _ => format!(
+                    "rgba({}, {}, {}, {})",
+                    rgb >> 16,
+                    rgb >> 8 & 255,
+                    rgb & 255,
+                    if (short * 255.).round() as u8 == alpha {
+                        short
+                    } else {
+                        (fraction * 1000.).round() / 1000.
+                    }
+                ),
+            });
+        }
+        let channels = channels.map(number).join(" ");
+        Some(if alpha < 1. {
+            format!("{name}{channels} / {})", number(alpha.max(0.)))
+        } else {
+            format!("{name}{channels})")
+        })
+    })();
+    SERIALIZED.with_borrow_mut(|memo| {
+        if memo.len() >= 1024 {
+            memo.clear();
+        }
+        memo.insert(value.into(), text.clone());
+    });
+    text
 }
 
 pub(crate) fn system(name: &str, dark: bool) -> Option<String> {

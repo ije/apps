@@ -13,6 +13,10 @@ pub(crate) struct Measurements {
     pub(crate) naturals: rustc_hash::FxHashMap<usize, [f32; 2]>,
     // WARNING: by node, its inline text: measuring and building both read it, and a changed node drops it.
     pub(crate) texts: rustc_hash::FxHashMap<usize, Option<std::rc::Rc<style::InlineText>>>,
+    // WARNING: only while a grid lays out, the padding, margin and border of a style by its address and base. Nodes
+    // with one style have the same lengths within a pass, and the grid's styles outlive it.
+    #[allow(clippy::type_complexity)]
+    pub(crate) edges: Option<rustc_hash::FxHashMap<(*const style::Style, u32), [[f32; 4]; 3]>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -288,6 +292,10 @@ fn size(
         .collect();
     items.sort_by_key(group);
     let mut growable = vec![false; count];
+    // WARNING: grids have thousands of items, so the lists of each item's distribution are reused.
+    let mut planned = vec![None::<f32>; count];
+    let (mut targets, mut weights, mut caps, mut incurred, mut open) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for items in items.chunk_by(|a, b| group(a) == group(b)) {
         let flexible = group(&items[0]) == usize::MAX;
         for step in 0..6 {
@@ -309,22 +317,33 @@ fn size(
                     base[i]
                 }
             };
-            let mut planned = vec![None::<f32>; count];
+            let cap = |i: usize| match (growing, max(i)) {
+                (true, _) if limit[i].is_finite() && !growable[i] => 0.,
+                (true, FitContent(size)) => (size - current(i)).max(0.),
+                (true, _) => f32::INFINITY,
+                (false, FitContent(size)) => (limit[i].min(size) - base[i]).max(0.),
+                (false, _) => (limit[i] - base[i]).max(0.),
+            };
+            let beyond = |i: usize| match (growing, step) {
+                (true, _) => !matches!(max(i), FitContent(_)),
+                (false, 2) => matches!(max(i), MaxContent | Auto | FitContent(_)),
+                _ => matches!(max(i), MinContent | MaxContent | Auto | FitContent(_)),
+            };
+            planned.fill(None);
             for &&(start, span, contribution) in items {
-                let targets: Vec<_> = (start..start + span)
-                    .filter(|&i| {
-                        (!flexible || factor(i).is_some())
-                            && match step {
-                                0 => matches!(min(i), MinContent | MaxContent | Auto),
-                                1 => matches!(min(i), MinContent | MaxContent),
-                                2 => min(i) == MaxContent || available.is_none() && min(i) == Auto,
-                                4 => {
-                                    matches!(max(i), MinContent | MaxContent | Auto | FitContent(_))
-                                }
-                                _ => matches!(max(i), MaxContent | Auto | FitContent(_)),
+                targets.clear();
+                targets.extend((start..start + span).filter(|&i| {
+                    (!flexible || factor(i).is_some())
+                        && match step {
+                            0 => matches!(min(i), MinContent | MaxContent | Auto),
+                            1 => matches!(min(i), MinContent | MaxContent),
+                            2 => min(i) == MaxContent || available.is_none() && min(i) == Auto,
+                            4 => {
+                                matches!(max(i), MinContent | MaxContent | Auto | FitContent(_))
                             }
-                    })
-                    .collect();
+                            _ => matches!(max(i), MaxContent | Auto | FitContent(_)),
+                        }
+                }));
                 if targets.is_empty() {
                     continue;
                 }
@@ -346,26 +365,30 @@ fn size(
                 };
                 let mut space =
                     value - (start..start + span).map(current).sum::<f32>() - gaps(span);
-                let weights: Vec<f32> = targets.iter().map(|&i| factor(i).unwrap_or(1.)).collect();
+                // WARNING: grids have thousands of items with one track to grow, which take what the loops below
+                // give them: the space up to the track's cap, then the rest where the track may grow beyond it.
+                if let [i] = targets[..]
+                    && !flexible
+                {
+                    let first = if space > 1e-3 { space.min(cap(i)) } else { 0. };
+                    let rest = space - first;
+                    let incurred = if (beyond(i) || !growing) && rest > 1e-3 {
+                        first + rest
+                    } else {
+                        first
+                    };
+                    planned[i] = Some(planned[i].unwrap_or(0.).max(incurred));
+                    continue;
+                }
+                weights.clear();
+                weights.extend(targets.iter().map(|&i| factor(i).unwrap_or(1.)));
                 let uniform = weights.iter().sum::<f32>() <= 0.;
-                let mut caps: Vec<f32> = targets
-                    .iter()
-                    .map(|&i| match (growing, max(i)) {
-                        (true, _) if limit[i].is_finite() && !growable[i] => 0.,
-                        (true, FitContent(size)) => (size - current(i)).max(0.),
-                        (true, _) => f32::INFINITY,
-                        (false, FitContent(size)) => (limit[i].min(size) - base[i]).max(0.),
-                        (false, _) => (limit[i] - base[i]).max(0.),
-                    })
-                    .collect();
-                let mut incurred = vec![0f32; targets.len()];
+                caps.clear();
+                caps.extend(targets.iter().map(|&i| cap(i)));
+                incurred.clear();
+                incurred.resize(targets.len(), 0f32);
                 for pass in 0..2 {
                     if pass == 1 {
-                        let beyond = |i: usize| match (growing, step) {
-                            (true, _) => !matches!(max(i), FitContent(_)),
-                            (false, 2) => matches!(max(i), MaxContent | Auto | FitContent(_)),
-                            _ => matches!(max(i), MinContent | MaxContent | Auto | FitContent(_)),
-                        };
                         let any = targets.iter().any(|&i| beyond(i));
                         for ((cap, &i), incurred) in caps.iter_mut().zip(&targets).zip(&incurred) {
                             *cap = if beyond(i) || !any && !growing {
@@ -377,26 +400,25 @@ fn size(
                     }
                     let weight = |k: usize| if uniform { 1. } else { weights[k] };
                     for _ in 0..=targets.len() {
-                        let open: Vec<_> = (0..targets.len())
-                            .filter(|&k| incurred[k] < caps[k])
-                            .collect();
+                        open.clear();
+                        open.extend((0..targets.len()).filter(|&k| incurred[k] < caps[k]));
                         let total: f32 = open.iter().map(|&k| weight(k)).sum();
                         if space <= 1e-3 || total <= 0. {
                             break;
                         }
                         let share = space / total;
-                        for k in open {
+                        for &k in &open {
                             let add = (share * weight(k)).min(caps[k] - incurred[k]);
                             incurred[k] += add;
                             space -= add;
                         }
                     }
                 }
-                for (&i, incurred) in targets.iter().zip(incurred) {
+                for (&i, &incurred) in targets.iter().zip(&incurred) {
                     planned[i] = Some(planned[i].unwrap_or(0.).max(incurred));
                 }
             }
-            for (i, planned) in planned.into_iter().enumerate() {
+            for (i, &planned) in planned.iter().enumerate() {
                 let Some(planned) = planned else { continue };
                 if !growing {
                     base[i] += planned;
@@ -531,21 +553,31 @@ pub(crate) fn intrinsic(
         return [0.; 4];
     }
     let base = width.unwrap_or(0.);
-    let padding = units.edges(style, style::PADDING, base);
-    let margin = units.edges(style, style::MARGIN, base);
-    let border = style::BORDERS.map(|[width, kind, _]| {
-        if style
-            .get(kind)
-            .is_none_or(|kind| matches!(kind, "none" | "hidden"))
-        {
-            return 0.;
-        }
-        style
-            .get(width)
-            .map_or(Some(3.), |v| units.resolve(v, base))
-            .unwrap_or(0.)
-            .max(0.)
-    });
+    let edges = || {
+        [
+            units.edges(style, style::PADDING, base),
+            units.edges(style, style::MARGIN, base),
+            style::BORDERS.map(|[width, kind, _]| {
+                if style
+                    .get(kind)
+                    .is_none_or(|kind| matches!(kind, "none" | "hidden"))
+                {
+                    return 0.;
+                }
+                style
+                    .get(width)
+                    .map_or(Some(3.), |v| units.resolve(v, base))
+                    .unwrap_or(0.)
+                    .max(0.)
+            }),
+        ]
+    };
+    let [padding, margin, border] = match &mut measured.edges {
+        Some(memo) => *memo
+            .entry((std::rc::Rc::as_ptr(style), base.to_bits()))
+            .or_insert_with(edges),
+        None => edges(),
+    };
     let inner = [
         padding[1] + padding[3] + border[1] + border[3],
         padding[0] + padding[2] + border[0] + border[2],
@@ -684,14 +716,14 @@ pub(crate) fn intrinsic(
         Some(alt) => Some((
             renderer::SharedString::from(alt.clone()),
             vec![style::text_run(style, units, alt.len())],
-            Box::default(),
+            Vec::new(),
         )),
         None => measured
             .texts
             .entry(id)
             .or_insert_with(|| style::inline_text(doc, styles, id).map(std::rc::Rc::new))
             .clone()
-            .map(|inline| (inline.text.to_string().into(), inline.runs.to_vec(), inline.atoms.clone())),
+            .map(|inline| (inline.text.clone(), inline.runs.to_vec(), inline.atoms.clone())),
     } {
         for atom in &atoms {
             let [_, max, ..] = intrinsic(doc, atom.node, styles, available, None, text, measured);
@@ -1091,6 +1123,10 @@ pub(crate) fn layout(
     let units = &styles.lengths[id];
     let available = [width, height];
     let get = |prop| style.get(prop);
+    let outermost = measured.edges.is_none();
+    if outermost {
+        measured.edges = Some(Default::default());
+    }
     let mut template = [
         get(Prop::GRID_TEMPLATE_COLUMNS),
         get(Prop::GRID_TEMPLATE_ROWS),
@@ -1703,10 +1739,26 @@ pub(crate) fn layout(
                 }
             }
         }
+        // WARNING: tracks sized without content, like the `minmax(0, 1fr)` columns of a container with a definite size,
+        // take no contributions, so their items are measured only for the other axis.
+        let sized = |cell: &[usize; 4]| {
+            available[axis].is_some()
+                && definitions[axis]
+                    .get(cell[axis]..cell[axis] + cell[axis + 2])
+                    .is_some_and(|tracks| {
+                        tracks.iter().all(|&(min, max)| {
+                            !matches!(min, MinContent | MaxContent | Auto)
+                                && !matches!(max, MinContent | MaxContent | Auto | FitContent(_))
+                        })
+                    })
+        };
         let mut contributions = Vec::new();
         for (index, (&child, cell)) in children.iter().zip(&cells).enumerate() {
             if shared[axis].is_some() {
                 break;
+            }
+            if sized(cell) {
+                continue;
             }
             if !derived[index].subgrid[axis] {
                 let [min, max] = if axis == 0 {
@@ -1852,12 +1904,65 @@ pub(crate) fn layout(
         }
     }
     grid.cells.sort_unstable_by_key(|(child, ..)| *child);
+    if outermost {
+        measured.edges = None;
+    }
     grid
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Sizing::*, *};
+
+    #[test]
+    fn items_of_one_track_size_tracks_of_every_kind() {
+        let tracks = [
+            (Auto, Auto),
+            (MinContent, MaxContent),
+            (Fixed(10.), Auto),
+            (Auto, FitContent(30.)),
+            (MaxContent, MaxContent),
+            (Auto, Fixed(20.)),
+            (MinContent, Auto),
+        ];
+        let items = [
+            (0, 1, [5., 5., 50.]),
+            (0, 1, [12., 12., 20.]),
+            (1, 1, [8., 8., 40.]),
+            (2, 1, [3., 3., 25.]),
+            (3, 1, [6., 6., 45.]),
+            (4, 1, [7., 9., 33.]),
+            (5, 1, [15., 15., 60.]),
+            (6, 1, [4., 4., 70.]),
+            (2, 2, [30., 30., 90.]),
+        ];
+        let sized = |available, stretch, table| -> Vec<f32> {
+            size(&tracks, &items, 2., available, stretch, table)
+                .into_iter()
+                .map(|v| (v * 1000.).round() / 1000.)
+                .collect()
+        };
+        assert_eq!(
+            sized(None, true, false),
+            [50., 40., 25., 78., 33., 60., 70.]
+        );
+        assert_eq!(
+            sized(Some(150.), false, false),
+            [18.6, 14.6, 16.6, 24.6, 33., 20., 10.6]
+        );
+        assert_eq!(
+            sized(Some(150.), true, true),
+            [19.184, 14.05, 19.075, 20.269, 33., 15.945, 16.478]
+        );
+        assert_eq!(
+            sized(Some(400.), false, false),
+            [50., 40., 58., 30., 33., 20., 70.]
+        );
+        assert_eq!(
+            sized(Some(400.), true, false),
+            [79., 40., 87., 30., 33., 20., 99.]
+        );
+    }
 
     fn sized(
         template: &str,
@@ -2038,6 +2143,35 @@ mod tests {
         assert_eq!(grid.rows, [26., 26.]);
         let cells: Vec<_> = grid.cells.iter().map(|(_, cell, ..)| *cell).collect();
         assert_eq!(cells[2..], [[1, 1, 1, 1], [2, 1, 1, 1]]);
+    }
+
+    #[test]
+    fn items_of_one_style_resolve_percentages_against_each_width() {
+        let text = renderer::TextSystem::new();
+        let mut doc = Document::parse(
+            "<style>main{display:grid;grid-template-columns:100px 300px}i{display:block;padding:10% 0 0;height:0}</style><main><i></i><i></i></main>",
+        );
+        let mut state = crate::dom::State::default();
+        let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.], None);
+        let main = doc
+            .nodes
+            .iter()
+            .position(|node| node.tag == "main")
+            .unwrap();
+        let grid = layout(
+            &doc,
+            main,
+            &styles,
+            Some(800.),
+            None,
+            None,
+            None,
+            &text,
+            &mut Default::default(),
+        );
+        let heights: Vec<_> = grid.cells.iter().map(|(.., bounds, _)| bounds[3]).collect();
+        assert_eq!(heights, [10., 30.]);
+        assert_eq!(grid.rows, [30.]);
     }
 
     #[test]

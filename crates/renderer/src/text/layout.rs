@@ -1,8 +1,7 @@
 use super::{FontId, FontRun, GlyphId, SharedString, TextWrap, WordBreak};
 use crate::{Pixels, Point, Size, platform, point, px};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 use std::{
-    borrow::Borrow,
     cell::{Cell, RefCell},
     hash::{Hash, Hasher},
     mem,
@@ -94,7 +93,7 @@ impl LineLayout {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn compute_wrap_boundaries(
+    pub(crate) fn compute_wrap_boundaries(
         &self,
         text: &str,
         wrap_width: Pixels,
@@ -452,7 +451,8 @@ pub(crate) struct LineLayoutCache {
 const MAX_AGE: u32 = 60;
 const MAX_BYTES: usize = 4 << 20;
 
-type Entries<T> = FxHashMap<Rc<CacheKey>, (Rc<T>, Cell<u32>, usize)>;
+// WARNING: entries are found by the hash of their key, which they keep to compare, so a key hashes once.
+type Entries<T> = FxHashMap<u64, (CacheKey, Rc<T>, Cell<u32>, usize)>;
 
 #[derive(Default)]
 struct Lines {
@@ -473,7 +473,7 @@ fn size_of_line(text: &str, layout: &LineLayout) -> usize {
 }
 
 fn evict<T>(entries: &mut Entries<T>, bytes: &mut usize, keep: impl Fn(u32) -> bool) {
-    entries.retain(|_, (_, used, size)| {
+    entries.retain(|_, (_, _, used, size)| {
         keep(used.get()) || {
             *bytes -= *size;
             false
@@ -513,7 +513,18 @@ impl LineLayoutCache {
         wrap: TextWrap,
         word_break: WordBreak,
     ) -> (SharedString, Rc<WrappedLineLayout>) {
-        let key = &CacheKeyRef {
+        let Some(width) = wrap_width else {
+            let (text, unwrapped_layout) = self.layout_line(platform, text, font_size, runs, None);
+            return (
+                text,
+                Rc::new(WrappedLineLayout {
+                    unwrapped_layout,
+                    wrap_boundaries: Vec::new(),
+                    wrap_width,
+                }),
+            );
+        };
+        let key = CacheKeyRef {
             text,
             font_size,
             runs,
@@ -523,56 +534,43 @@ impl LineLayoutCache {
             indent,
             wrap,
             word_break,
-        } as &dyn AsCacheKeyRef;
+        };
+        let hash = key.hashed();
         {
             let state = self.state.borrow();
-            if let Some((key, (layout, used, _))) = state.wrapped.get_key_value(key) {
+            if let Some((found, layout, used, _)) = state.wrapped.get(&hash)
+                && found.as_ref() == key
+            {
                 used.set(state.frame);
-                return (key.text.clone(), layout.clone());
+                return (found.text.clone(), layout.clone());
             }
         }
-        let unwrapped_layout = self.layout_line(platform, text, font_size, runs, None);
-        let wrap_boundaries = match wrap_width {
-            Some(width) => {
-                let mut end = 0;
-                let nowrap: Vec<_> = runs
-                    .iter()
-                    .filter_map(|run| {
-                        let start = end;
-                        end += run.len;
-                        run.nowrap.then_some(start..end)
-                    })
-                    .collect();
-                unwrapped_layout.compute_wrap_boundaries(
-                    text, width, max_lines, indent, wrap, word_break, &nowrap,
-                )
-            }
-            None => Vec::new(),
-        };
-        let size = size_of_line(text, &unwrapped_layout)
+        let (text, unwrapped_layout) = self.layout_line(platform, text, font_size, runs, None);
+        let mut end = 0;
+        let nowrap: Vec<_> = runs
+            .iter()
+            .filter_map(|run| {
+                let start = end;
+                end += run.len;
+                run.nowrap.then_some(start..end)
+            })
+            .collect();
+        let wrap_boundaries = unwrapped_layout
+            .compute_wrap_boundaries(&text, width, max_lines, indent, wrap, word_break, &nowrap);
+        let size = size_of_line(&text, &unwrapped_layout)
             + wrap_boundaries.len() * mem::size_of::<WrapBoundary>();
         let layout = Rc::new(WrappedLineLayout {
             unwrapped_layout,
             wrap_boundaries,
             wrap_width,
         });
-        let text: SharedString = text.into();
-        let key = Rc::new(CacheKey {
-            text: text.clone(),
-            font_size,
-            runs: runs.into(),
-            wrap_width,
-            force_width: None,
-            max_lines,
-            indent,
-            wrap,
-            word_break,
-        });
+        let key = key.owned(text.clone());
         let state = &mut *self.state.borrow_mut();
+        let entry = (key, layout.clone(), Cell::new(state.frame), size);
         state.bytes += size;
-        state
-            .wrapped
-            .insert(key, (layout.clone(), Cell::new(state.frame), size));
+        if let Some(old) = state.wrapped.insert(hash, entry) {
+            state.bytes -= old.3;
+        }
         (text, layout)
     }
 
@@ -583,8 +581,8 @@ impl LineLayoutCache {
         font_size: Pixels,
         runs: &[FontRun],
         force_width: Option<Pixels>,
-    ) -> Rc<LineLayout> {
-        let key = &CacheKeyRef {
+    ) -> (SharedString, Rc<LineLayout>) {
+        let key = CacheKeyRef {
             text,
             font_size,
             runs,
@@ -594,12 +592,15 @@ impl LineLayoutCache {
             indent: px(0.),
             wrap: TextWrap::Wrap,
             word_break: WordBreak::Normal,
-        } as &dyn AsCacheKeyRef;
+        };
+        let hash = key.hashed();
         {
             let state = self.state.borrow();
-            if let Some((layout, used, _)) = state.lines.get(key) {
+            if let Some((found, layout, used, _)) = state.lines.get(&hash)
+                && found.as_ref() == key
+            {
                 used.set(state.frame);
-                return layout.clone();
+                return (found.text.clone(), layout.clone());
             }
         }
         let mut layout = platform.layout_line(text, font_size, runs);
@@ -612,24 +613,16 @@ impl LineLayoutCache {
             apply_force_width_to_layout(&mut layout, force_width);
         }
         let size = size_of_line(text, &layout);
-        let key = Rc::new(CacheKey {
-            text: text.into(),
-            font_size,
-            runs: runs.into(),
-            wrap_width: None,
-            force_width,
-            max_lines: None,
-            indent: px(0.),
-            wrap: TextWrap::Wrap,
-            word_break: WordBreak::Normal,
-        });
+        let text: SharedString = text.into();
+        let key = key.owned(text.clone());
         let layout = Rc::new(layout);
         let state = &mut *self.state.borrow_mut();
+        let entry = (key, layout.clone(), Cell::new(state.frame), size);
         state.bytes += size;
-        state
-            .lines
-            .insert(key, (layout.clone(), Cell::new(state.frame), size));
-        layout
+        if let Some(old) = state.lines.insert(hash, entry) {
+            state.bytes -= old.3;
+        }
+        (text, layout)
     }
 }
 
@@ -707,11 +700,6 @@ fn apply_spacing(layout: &mut LineLayout, text: &str, runs: &[FontRun]) {
     layout.width += shift;
 }
 
-trait AsCacheKeyRef {
-    fn as_cache_key_ref(&self) -> CacheKeyRef<'_>;
-}
-
-#[derive(Clone, Debug, Eq)]
 struct CacheKey {
     text: SharedString,
     font_size: Pixels,
@@ -737,22 +725,30 @@ struct CacheKeyRef<'a> {
     word_break: WordBreak,
 }
 
-impl PartialEq for dyn AsCacheKeyRef + '_ {
-    fn eq(&self, other: &dyn AsCacheKeyRef) -> bool {
-        self.as_cache_key_ref() == other.as_cache_key_ref()
+impl CacheKeyRef<'_> {
+    fn hashed(&self) -> u64 {
+        let mut hasher = FxHasher::default();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn owned(&self, text: SharedString) -> CacheKey {
+        CacheKey {
+            text,
+            font_size: self.font_size,
+            runs: self.runs.into(),
+            wrap_width: self.wrap_width,
+            force_width: self.force_width,
+            max_lines: self.max_lines,
+            indent: self.indent,
+            wrap: self.wrap,
+            word_break: self.word_break,
+        }
     }
 }
 
-impl Eq for dyn AsCacheKeyRef + '_ {}
-
-impl Hash for dyn AsCacheKeyRef + '_ {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_cache_key_ref().hash(state)
-    }
-}
-
-impl AsCacheKeyRef for CacheKey {
-    fn as_cache_key_ref(&self) -> CacheKeyRef<'_> {
+impl CacheKey {
+    fn as_ref(&self) -> CacheKeyRef<'_> {
         CacheKeyRef {
             text: &self.text,
             font_size: self.font_size,
@@ -764,30 +760,6 @@ impl AsCacheKeyRef for CacheKey {
             wrap: self.wrap,
             word_break: self.word_break,
         }
-    }
-}
-
-impl PartialEq for CacheKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_cache_key_ref().eq(&other.as_cache_key_ref())
-    }
-}
-
-impl Hash for CacheKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_cache_key_ref().hash(state);
-    }
-}
-
-impl<'a> Borrow<dyn AsCacheKeyRef + 'a> for Rc<CacheKey> {
-    fn borrow(&self) -> &(dyn AsCacheKeyRef + 'a) {
-        self.as_ref() as &dyn AsCacheKeyRef
-    }
-}
-
-impl AsCacheKeyRef for CacheKeyRef<'_> {
-    fn as_cache_key_ref(&self) -> CacheKeyRef<'_> {
-        *self
     }
 }
 
