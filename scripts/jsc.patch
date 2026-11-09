@@ -942,6 +942,21 @@ index 30d3a1f87..29319da33 100644
      list(APPEND JavaScriptCore_SOURCES ${JavaScriptCore_AOT_BUILTIN_TABLE_DATA_SOURCES})
  endif ()
  
+diff --git a/Source/JavaScriptCore/aot/image/AOTFunctionTexts.cpp b/Source/JavaScriptCore/aot/image/AOTFunctionTexts.cpp
+index 642121138..687c6b517 100644
+--- a/Source/JavaScriptCore/aot/image/AOTFunctionTexts.cpp
++++ b/Source/JavaScriptCore/aot/image/AOTFunctionTexts.cpp
+@@ -320,7 +320,9 @@ static void collectQuotedTextsOfModule(const TableEncoder& encoder, const Places
+             encoder.fail("QuotedTextOutsideTextOfModule"_s, ModuleID(index));
+             continue;
+         }
+-        if (!isReported[text])
++        // WARNING: apps keeps quoted texts of up to 1 KB. Longer ones, mostly calls with JSON or Wasm in their arguments,
++        // took 4.4 MB of DiffsHub's image. Errors there quote a shorter form, like `f()` for a call.
++        if (!isReported[text] || quoted.end - quoted.start > 1024)
+             continue;
+         LineColumn lineColumn = encoder.program.lineColumnFor(ModuleID(index), quoted.position);
+         result.quoted.append({ lineColumn.line, lineColumn.column, quoted.start, quoted.end });
 diff --git a/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp b/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp
 index bb1a23f92..016ebf4f7 100644
 --- a/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp
