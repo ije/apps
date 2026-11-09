@@ -112,6 +112,10 @@ struct State {
     sized: HashMap<(FontId, u32), CTFont>,
     // WARNING: the font of each shaped run's face, kept alive so its address stays unique.
     natives: HashMap<usize, (CTFont, FontId)>,
+    // WARNING: code repeats its words and indents across lines, so lines in a monospace font shape by runs of
+    // spaces and non-spaces, each once per font and size. Monospace fonts don't kern, so the line is the same.
+    segments: HashMap<(FontId, u32, Box<str>), std::rc::Rc<LineLayout>>,
+    monospace: HashMap<FontId, bool>,
 }
 
 static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
@@ -148,6 +152,8 @@ impl TextSystem {
             postscript_names_by_font_id: HashMap::default(),
             sized: HashMap::default(),
             natives: HashMap::default(),
+            segments: HashMap::default(),
+            monospace: HashMap::default(),
         }))
     }
 
@@ -670,6 +676,90 @@ impl State {
     }
 
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
+        if text.is_ascii() && !text.contains(['\t', '\n', '\r']) && !font_runs.is_empty() {
+            let fonts = &self.fonts;
+            let monospace = font_runs.iter().all(|run| {
+                *self
+                    .monospace
+                    .entry(run.font_id)
+                    .or_insert_with(|| fonts[run.font_id.0].is_monospace())
+            });
+            if monospace {
+                return self.layout_segments(text, font_size, font_runs);
+            }
+        }
+        self.layout_whole(text, font_size, font_runs)
+    }
+
+    fn layout_segments(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
+        if self.segments.len() > 32768 {
+            self.segments.clear();
+        }
+        let mut runs: Vec<ShapedRun> = Vec::new();
+        let (mut x, mut ascent, mut descent) = (0f32, px(0.), px(0.));
+        let mut start = 0;
+        for run in font_runs {
+            let part = &text[start..start + run.len];
+            let mut offset = 0;
+            while offset < part.len() {
+                let space = part.as_bytes()[offset] == b' ';
+                let end = part[offset..]
+                    .bytes()
+                    .position(|byte| (byte == b' ') != space)
+                    .map_or(part.len(), |length| offset + length);
+                let segment = &part[offset..end];
+                let key = (run.font_id, f32::from(run.font_size).to_bits(), Box::<str>::from(segment));
+                let shaped = match self.segments.get(&key) {
+                    Some(shaped) => shaped.clone(),
+                    None => {
+                        let single = FontRun { len: segment.len(), ..run.clone() };
+                        let shaped =
+                            std::rc::Rc::new(self.layout_whole(segment, run.font_size, &[single]));
+                        self.segments.insert(key, shaped.clone());
+                        shaped
+                    }
+                };
+                for shaped_run in &shaped.runs {
+                    let glyphs = match runs.last_mut() {
+                        Some(last)
+                            if last.font_id == shaped_run.font_id
+                                && last.font_size == shaped_run.font_size =>
+                        {
+                            &mut last.glyphs
+                        }
+                        _ => {
+                            runs.push(ShapedRun {
+                                font_id: shaped_run.font_id,
+                                font_size: shaped_run.font_size,
+                                glyphs: Vec::with_capacity(shaped_run.glyphs.len()),
+                            });
+                            &mut runs.last_mut().unwrap().glyphs
+                        }
+                    };
+                    glyphs.extend(shaped_run.glyphs.iter().map(|glyph| ShapedGlyph {
+                        position: point(glyph.position.x + px(x), glyph.position.y),
+                        index: glyph.index + start + offset,
+                        ..glyph.clone()
+                    }));
+                }
+                x += f32::from(shaped.width);
+                ascent = ascent.max(shaped.ascent);
+                descent = descent.max(shaped.descent);
+                offset = end;
+            }
+            start += run.len;
+        }
+        LineLayout {
+            runs,
+            font_size,
+            width: px(x),
+            ascent,
+            descent,
+            len: text.len(),
+        }
+    }
+
+    fn layout_whole(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
         let mut string = CFMutableAttributedString::new();
         let mut max_ascent = 0.0f32;
         let mut max_descent = 0.0f32;

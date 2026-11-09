@@ -257,6 +257,16 @@ impl Node {
         self
     }
 
+    // WARNING: a node is about 840 bytes, so loops that add many children push in place and reserve first, instead
+    // of moving the node through `child` and growing the list one by one.
+    pub fn push(&mut self, child: impl Into<Child>) {
+        self.children.push(child.into());
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        self.children.reserve(additional);
+    }
+
     pub fn children<C: Into<Child>>(mut self, children: impl IntoIterator<Item = C>) -> Self {
         self.children.extend(children.into_iter().map(Into::into));
         self

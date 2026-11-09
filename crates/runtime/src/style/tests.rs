@@ -556,7 +556,7 @@ fn container_queries_parse_and_follow_container_sizes() {
         compute_styles(&doc, 800., 600., None, &mut HashMap::new(), cache, None).values
     };
     assert!(compute(&mut cache)[outer].get(Prop::COLOR) != Some("red"));
-    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [200., 100.])]), &doc));
+    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [200., 100.])]), &doc));
     let values = compute(&mut cache);
     assert_eq!(&values[outer]["color"], "red");
     assert_eq!(&values[outer]["order"], "5");
@@ -564,8 +564,8 @@ fn container_queries_parse_and_follow_container_sizes() {
     assert_eq!(&values[inner]["color"], "red");
     assert_eq!(&values[inner]["width"], "1px");
     assert!(!values[inner].contains(Prop::ORDER) && !values[inner].contains(Prop::HEIGHT));
-    assert!(!cache.set_containers(&HashMap::from([(a, [450., 50.]), (b, [200., 100.])]), &doc));
-    assert!(cache.set_containers(&HashMap::from([(a, [90., 50.]), (b, [200., 100.])]), &doc));
+    assert!(!cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [450., 50.]), (b, [200., 100.])]), &doc));
+    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [90., 50.]), (b, [200., 100.])]), &doc));
     let values = compute(&mut cache);
     assert!(values[outer].get(Prop::COLOR) != Some("red"));
     assert_eq!(&values[outer]["z-index"], "3");
@@ -2700,7 +2700,7 @@ fn container_units_in_font_sizes_follow_the_nearest_container() {
         computed
     };
     compute(&mut cache);
-    assert!(cache.set_containers(&HashMap::from([(container, [500., 100.])]), &doc));
+    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(container, [500., 100.])]), &doc));
     let computed = compute(&mut cache);
     assert_eq!(
         computed.values[element(&doc, "#p")].get(Prop::FONT_SIZE),
@@ -2714,7 +2714,7 @@ fn container_units_in_font_sizes_follow_the_nearest_container() {
         computed.values[element(&doc, "#v")].get(Prop::FONT_SIZE),
         Some("8px")
     );
-    assert!(cache.set_containers(&HashMap::from([(container, [300., 100.])]), &doc));
+    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(container, [300., 100.])]), &doc));
     let computed = compute(&mut cache);
     assert_eq!(
         computed.values[element(&doc, "#p")].get(Prop::FONT_SIZE),
@@ -3108,12 +3108,12 @@ fn container_units_follow_each_container_and_the_viewport() {
         computed
     };
     compute(&mut cache, 800.);
-    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [200., 50.])]), &doc));
+    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [200., 50.])]), &doc));
     let computed = compute(&mut cache, 800.);
     assert_eq!(&computed.values[first]["font-size"], "20px");
     assert_eq!(&computed.values[second]["font-size"], "8px");
     assert_eq!(&computed.values[v]["font-size"], "40px");
-    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [300., 50.])]), &doc));
+    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [300., 50.])]), &doc));
     let computed = compute(&mut cache, 400.);
     assert_eq!(&computed.values[first]["font-size"], "20px");
     assert_eq!(&computed.values[second]["font-size"], "12px");
@@ -3135,14 +3135,14 @@ fn a_container_query_flip_restyles_only_inside_its_container() {
         computed
     };
     compute(&mut cache);
-    cache.set_containers(&HashMap::from([(a, [300., 50.]), (b, [300., 50.])]), &doc);
+    cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [300., 50.]), (b, [300., 50.])]), &doc);
     let before = compute(&mut cache);
-    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [300., 50.])]), &doc));
+    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [300., 50.])]), &doc));
     let after = compute(&mut cache);
     assert_eq!(after.values[p].get(Prop::COLOR), Some("red"));
     assert_ne!(after.values[q].get(Prop::COLOR), Some("red"));
     assert!(Rc::ptr_eq(&before.values[q], &after.values[q]));
-    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.]), (b, [500., 50.])]), &doc));
+    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [500., 50.]), (b, [500., 50.])]), &doc));
     assert_eq!(compute(&mut cache).values[q].get(Prop::COLOR), Some("red"));
 }
 
@@ -3221,11 +3221,11 @@ fn container_queries_flip_after_a_resize_that_keeps_media_results() {
         computed
     };
     compute(&mut cache, 800.);
-    cache.set_containers(&HashMap::from([(a, [300., 50.])]), &doc);
+    cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [300., 50.])]), &doc);
     let red = Some("red");
     assert_ne!(compute(&mut cache, 800.).values[p].get(Prop::COLOR), red);
     assert_ne!(compute(&mut cache, 700.).values[p].get(Prop::COLOR), red);
-    assert!(cache.set_containers(&HashMap::from([(a, [500., 50.])]), &doc));
+    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(a, [500., 50.])]), &doc));
     assert_eq!(compute(&mut cache, 700.).values[p].get(Prop::COLOR), red);
 }
 
@@ -3545,13 +3545,13 @@ fn new_containers_restyle_the_descendants_that_query_them() {
     assert_ne!(color(&out).as_deref(), Some("red"));
     doc.nodes[wrap].attrs.set("class", "wrap on");
     incremental(&doc, &mut cache, &mut last, [800., 600.]);
-    assert!(cache.set_containers(&HashMap::from([(wrap, [200., 50.])]), &doc));
+    assert!(cache.set_containers(&rustc_hash::FxHashMap::from_iter([(wrap, [200., 50.])]), &doc));
     let out = incremental(&doc, &mut cache, &mut last, [800., 600.]);
     assert_eq!(color(&out).as_deref(), Some("red"));
     assert!(!out.values[item].contains(Prop::WIDTH));
     doc.nodes[inner].attrs.set("class", "inner on");
     incremental(&doc, &mut cache, &mut last, [800., 600.]);
-    let sizes = HashMap::from([(wrap, [200., 50.]), (inner, [150., 40.])]);
+    let sizes = FxHashMap::from_iter([(wrap, [200., 50.]), (inner, [150., 40.])]);
     cache.set_containers(&sizes, &doc);
     let out = incremental(&doc, &mut cache, &mut last, [800., 600.]);
     assert_eq!(color(&out).as_deref(), Some("red"));
@@ -3886,13 +3886,13 @@ fn host_rules_query_the_containers_of_the_flat_tree() {
     let shadows = attach(&mut doc);
     let (mut cache, mut last) = (StyleCache::default(), None);
     shadowed(&doc, &shadows, &mut cache, &mut last);
-    let mut sizes = HashMap::from([
+    let mut sizes = FxHashMap::from_iter([
         (outer, [400., 50.]),
         (host, [200., 50.]),
         (slot, [100., 50.]),
         (p, [200., 50.]),
     ]);
-    let mut check = |sizes: &HashMap<usize, [f32; 2]>| {
+    let mut check = |sizes: &FxHashMap<usize, [f32; 2]>| {
         assert!(cache.set_containers(sizes, &doc));
         let out = shadowed(&doc, &shadows, &mut cache, &mut last);
         let get = |id: usize, prop: Prop| out.values[id].get(prop).map(str::to_owned);
@@ -3977,14 +3977,14 @@ fn part_and_slotted_rules_query_the_containers_of_the_node_they_reach() {
     let shadows = attach(&mut doc);
     let (mut cache, mut last) = (StyleCache::default(), None);
     shadowed(&doc, &shadows, &mut cache, &mut last);
-    let mut sizes = HashMap::from([
+    let mut sizes = FxHashMap::from_iter([
         (outer, [600., 50.]),
         (inner, [300., 50.]),
         (p, [100., 50.]),
         (slot, [300., 50.]),
         (s, [100., 50.]),
     ]);
-    let mut check = |sizes: &HashMap<usize, [f32; 2]>| {
+    let mut check = |sizes: &FxHashMap<usize, [f32; 2]>| {
         assert!(cache.set_containers(sizes, &doc));
         let out = shadowed(&doc, &shadows, &mut cache, &mut last);
         let get = |id: usize, prop: Prop| out.values[id].get(prop).map(str::to_owned);
@@ -4164,4 +4164,46 @@ fn parts_take_pseudo_classes_names_and_their_own_trees_host_rules() {
     step(&doc, false, true);
     #[cfg(debug_assertions)]
     assert_eq!(cache.incremental, 3);
+}
+
+#[test]
+fn siblings_share_matches_only_when_they_read_no_position_or_neighbor() {
+    // WARNING: the siblings have no attributes of their own, so they are candidates to share matches.
+    let doc = Document::parse(
+        "<html><head><style>li:first-child{order:1}li+li{z-index:2}li:nth-child(3){opacity:.5}b:empty{width:1px}p:has(i){height:2px}[style*=red]{left:3px}.row span{top:4px}.row span+span{right:5px}[data-n]{bottom:6px}[data-n='2']{max-width:7px}</style></head><body><div id=n><i data-n=1></i><i data-n=2></i><i data-n=2></i></div><ul id=l><li></li><li></li><li></li></ul><div id=e><b></b><b>x</b></div><div id=p><p><i></i></p><p></p></div><div id=s><s style='color:red'></s><s style='color:blue'></s></div><div id=r class=row><span></span><span></span></div></body></html>",
+    );
+    let values = styles(&doc, 800., 600.);
+    let get = |parent: &str, index: usize, name: &str| {
+        let kids: Vec<usize> = doc.nodes[element(&doc, parent)]
+            .children
+            .iter()
+            .copied()
+            .filter(|&kid| !doc.nodes[kid].tag.starts_with('#'))
+            .collect();
+        values[kids[index]].get(name).cloned()
+    };
+    for (parent, index, name, value) in [
+        ("#l", 0, "order", Some("1")),
+        ("#l", 1, "order", None),
+        ("#l", 0, "z-index", None),
+        ("#l", 1, "z-index", Some("2")),
+        ("#l", 2, "opacity", Some(".5")),
+        ("#l", 1, "opacity", None),
+        ("#e", 0, "width", Some("1px")),
+        ("#e", 1, "width", None),
+        ("#p", 0, "height", Some("2px")),
+        ("#p", 1, "height", None),
+        ("#s", 0, "left", Some("3px")),
+        ("#s", 1, "left", None),
+        ("#r", 0, "top", Some("4px")),
+        ("#r", 1, "top", Some("4px")),
+        ("#r", 0, "right", None),
+        ("#r", 1, "right", Some("5px")),
+        ("#n", 0, "bottom", Some("6px")),
+        ("#n", 0, "max-width", None),
+        ("#n", 1, "max-width", Some("7px")),
+        ("#n", 2, "max-width", Some("7px")),
+    ] {
+        assert_eq!(get(parent, index, name).as_deref(), value, "{parent} {index} {name}");
+    }
 }

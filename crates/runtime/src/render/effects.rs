@@ -7,20 +7,44 @@ use renderer::{BlendMode, Bounds, Corners, Length, PaintEffect, Pixels, Radii, R
 
 pub(crate) type Matrix = [f32; 16];
 
-pub(crate) type Ids = std::cell::OnceCell<std::collections::HashMap<String, Vec<usize>>>;
+// WARNING: with a walk, the ids of the nodes in the page's flat tree: freed and removed nodes can't be referenced, and
+// the arena is many times longer than the page when rows are rebuilt every frame.
+#[derive(Default)]
+pub(crate) struct Ids {
+    map: std::cell::OnceCell<std::collections::HashMap<String, Vec<usize>>>,
+    walk: Option<std::rc::Rc<Vec<(u32, u32)>>>,
+}
+
+impl Ids {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn of(walk: std::rc::Rc<Vec<(u32, u32)>>) -> Self {
+        Self { map: Default::default(), walk: Some(walk) }
+    }
+}
 
 pub(crate) fn index<'a>(
     ids: &'a Ids,
     doc: &Document,
 ) -> &'a std::collections::HashMap<String, Vec<usize>> {
-    ids.get_or_init(|| {
-        let mut ids = std::collections::HashMap::<String, Vec<usize>>::new();
-        for (node, value) in doc.nodes.iter().enumerate() {
-            if let Some(id) = value.attrs.get("id") {
-                ids.entry(id.clone()).or_default().push(node);
+    ids.map.get_or_init(|| {
+        let mut map = std::collections::HashMap::<String, Vec<usize>>::new();
+        let mut add = |node: usize| {
+            if let Some(id) = doc.nodes.get(node).and_then(|value| value.attrs.get("id")) {
+                map.entry(id.clone()).or_default().push(node);
             }
+        };
+        match &ids.walk {
+            Some(walk) => {
+                let mut nodes: Vec<usize> = walk.iter().map(|&(node, _)| node as usize).collect();
+                nodes.sort_unstable();
+                nodes.into_iter().for_each(&mut add);
+            }
+            None => (0..doc.nodes.len()).for_each(&mut add),
         }
-        ids
+        map
     })
 }
 

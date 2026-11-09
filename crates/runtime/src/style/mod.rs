@@ -4,6 +4,7 @@ use rustc_hash::FxHashMap;
 use std::{borrow::Cow, collections::HashMap, rc::Rc};
 
 mod animation;
+mod chunked;
 mod color;
 pub(crate) mod parser;
 mod properties;
@@ -13,6 +14,7 @@ mod tailwind;
 mod tests;
 mod text;
 mod value;
+pub(crate) use chunked::Chunked;
 
 pub(crate) use animation::{Animation, Motion, Scripted, easing};
 pub use color::color;
@@ -453,7 +455,7 @@ fn query_containers(
     conditions: &[(Option<String>, bool, MediaQuery)],
     chain: Option<&Container>,
     (scope, order): (usize, usize),
-    sizes: &HashMap<usize, [f32; 2]>,
+    sizes: &FxHashMap<usize, [f32; 2]>,
     font: impl Fn(usize) -> FontUnits,
     queries: &mut QueryCache,
 ) -> bool {
@@ -624,6 +626,14 @@ struct CachedStyle {
 }
 
 type Key = Option<(u8, String)>;
+
+struct Share {
+    from: usize,
+    rules: Rc<[(usize, [usize; 3])]>,
+    pseudos: Box<[usize]>,
+    dependencies: Box<[crate::dom::Dependency]>,
+    style: Option<u32>,
+}
 const PSEUDO: usize = 1 << (usize::BITS - 1);
 struct StyleScope {
     id: usize,
@@ -678,7 +688,7 @@ impl StyleScope {
         &mut self,
         rules: Vec<Collected>,
         tailwind: Option<&FxHashMap<usize, u64>>,
-        attributes: &mut rustc_hash::FxHashSet<String>,
+        attributes: &mut crate::dom::Named,
     ) {
         let mut lists = Vec::new();
         for (selectors, body, layer, container, media) in rules {
@@ -773,7 +783,7 @@ impl StyleScope {
         rules: &[Collected],
         blocks: &[Rc<MediaBlock>],
         doc: &Document,
-        attributes: &mut rustc_hash::FxHashSet<String>,
+        attributes: &mut crate::dom::Named,
     ) -> bool {
         let generated = |key: &u128| Some((key >> 64) as u64) == self.block && *key as u64 != 0;
         let Some(layer) = self
@@ -944,7 +954,7 @@ pub(crate) struct StyleCache {
     derived: Derived,
     pub(crate) adopted: FxHashMap<usize, Vec<u32>>,
     values: rustc_hash::FxHashMap<StyleKey, Rc<CachedStyle>>,
-    containers: HashMap<usize, [f32; 2]>,
+    containers: FxHashMap<usize, [f32; 2]>,
     sized: std::collections::HashSet<usize>,
     queries: QueryCache,
     pub(crate) units: bool,
@@ -966,6 +976,8 @@ pub(crate) struct StyleCache {
     // go) and `styled` (the walk of that output) must describe it.
     full: bool,
     styled: Option<Styled>,
+    // WARNING: debug builds check passes against one that matches every node itself, so shared matches can't hide a read.
+    unshared: bool,
     #[cfg(debug_assertions)]
     pub(crate) incremental: u64,
 }
@@ -1090,7 +1102,7 @@ impl StyleCache {
 
     pub(crate) fn set_containers(
         &mut self,
-        sizes: &HashMap<usize, [f32; 2]>,
+        sizes: &FxHashMap<usize, [f32; 2]>,
         doc: &Document,
     ) -> bool {
         self.units = false;
@@ -3752,8 +3764,8 @@ struct TreeWalk {
 
 #[derive(Default)]
 pub(crate) struct SpareStyles {
-    values: Vec<Rc<Style>>,
-    vars: Vec<Vars>,
+    values: Chunked<Rc<Style>>,
+    vars: Chunked<Vars>,
     flags: Vec<u8>,
     lengths: NodeLengths,
     user_select: Vec<(UserSelect, usize)>,
@@ -3786,8 +3798,8 @@ pub(crate) struct ComputedStyles {
     blended: std::cell::Cell<Option<bool>>,
     /// WARNING: the styles hold no custom properties, so a change of one keeps the styles of the nodes
     /// that don't read it. Only nodes with animations or transitions keep theirs, for the keyframes.
-    pub values: Vec<Rc<Style>>,
-    pub vars: Vec<Vars>,
+    pub values: Chunked<Rc<Style>>,
+    pub vars: Chunked<Vars>,
     pub flags: Vec<u8>,
     pub lengths: NodeLengths,
     pub pseudos: FxHashMap<usize, Rc<[Style; 2]>>,
@@ -3836,7 +3848,7 @@ pub fn styles(doc: &Document, width: f32, height: f32) -> Vec<BBTreeMap<String, 
     );
     out.values
         .iter()
-        .zip(&out.vars)
+        .zip(out.vars.iter())
         .map(|(style, vars)| {
             style
                 .own()
@@ -4679,6 +4691,10 @@ pub(crate) fn cascade(
     matches.set_hosts(&shadows.hosts);
     matches.update(doc, order);
     let mut candidates: Vec<usize> = Vec::new();
+    // WARNING: within a pass, the matches of a sibling with the same values that read only itself and its ancestors,
+    // by scope, parent and the values selectors read. Rows of a long list share most of theirs.
+    let mut shares: FxHashMap<(usize, Option<usize>, [u32; 4]), Share> = FxHashMap::default();
+    let unshared = style_cache.unshared;
     let ComputedStyles {
         values: styles,
         vars: custom,
@@ -5124,10 +5140,29 @@ pub(crate) fn cascade(
                         cached.pseudos.to_vec(),
                         cached.columns,
                     )
+                } else if let Some(share) = (!unshared && !node.tag.starts_with('#'))
+                    .then(|| {
+                        let values = matches.signature(id);
+                        shares
+                            .get(&(scope, node.parent, [values[0], values[3], values[4], values[5]]))
+                            .filter(|share| share.style.is_none_or(|style| style == values[6]))
+                    })
+                    .flatten()
+                {
+                    matches.transfer(share.from, id, &share.dependencies);
+                    matches.register(id);
+                    scoped.nodes[id] = Some(MatchedRules {
+                        checked: std::cell::Cell::new(matches.epoch),
+                        cached: None,
+                        dependencies: matches.dependencies.as_slice().into(),
+                        rules: share.rules.clone(),
+                        pseudos: share.pseudos.clone(),
+                        columns: 0,
+                    });
+                    (share.rules.to_vec(), share.pseudos.to_vec(), 0)
                 } else {
                     matches.dependencies.clear();
                     matches.depend(id, 0);
-                    matches.depend(id, 6);
                     candidates.clear();
                     if !node.tag.starts_with('#') {
                         candidates.extend(&scoped.universal);
@@ -5148,6 +5183,16 @@ pub(crate) fn cascade(
                         candidates.dedup();
                     }
                     let has = |key: &Key| has_key(node, key);
+                    let fresh = scoped.nodes[id].is_none();
+                    let test = |selector: &Selector, matches: &mut SelectorCache| {
+                        selector.always()
+                            || !selector.host_only()
+                                && if fresh {
+                                    selector.matches_fresh(doc, id, matches)
+                                } else {
+                                    selector.matches_reusing(doc, id, matches)
+                                }
+                    };
                     let split = candidates.partition_point(|&order| order < PSEUDO);
                     let matched: Vec<_> = candidates[..split]
                         .iter()
@@ -5155,9 +5200,7 @@ pub(crate) fn cascade(
                             let selectors = &rules[order].0;
                             scoped.elements[order]
                                 .iter()
-                                .filter(|(index, key)| {
-                                    has(key) && selectors[*index].matches_reusing(doc, id, matches)
-                                })
+                                .filter(|(index, key)| has(key) && test(&selectors[*index], matches))
                                 .map(|(index, _)| selectors[*index].specificity)
                                 .max()
                                 .map(|specificity| (order, specificity))
@@ -5166,7 +5209,7 @@ pub(crate) fn cascade(
                     let matched_pseudos: Vec<_> = candidates[split..]
                         .iter()
                         .map(|&index| index & !PSEUDO)
-                        .filter(|&index| scoped.pseudos[index].1.matches_reusing(doc, id, matches))
+                        .filter(|&index| test(&scoped.pseudos[index].1, matches))
                         .collect();
                     let mut columns = 0;
                     if node.tag == "table" {
@@ -5192,6 +5235,8 @@ pub(crate) fn cascade(
                             }
                         }
                     }
+                    let style = matches.reads(id, 6);
+                    matches.depend(id, 6);
                     matches.dependencies.sort_unstable();
                     matches.dependencies.dedup();
                     matches.register(id);
@@ -5206,6 +5251,18 @@ pub(crate) fn cascade(
                             list
                         }
                     };
+                    if !unshared && !node.tag.starts_with('#') && columns == 0 && matches.shareable(doc, id) {
+                        let values = matches.signature(id);
+                        shares
+                            .entry((scope, node.parent, [values[0], values[3], values[4], values[5]]))
+                            .or_insert_with(|| Share {
+                                from: id,
+                                rules: shared.clone(),
+                                pseudos: matched_pseudos.as_slice().into(),
+                                dependencies: matches.dependencies.as_slice().into(),
+                                style: style.then_some(values[6]),
+                            });
+                    }
                     scoped.nodes[id] = Some(MatchedRules {
                         checked: std::cell::Cell::new(matches.epoch),
                         cached: None,
@@ -6912,6 +6969,7 @@ pub(crate) fn cascade(
             containers: style_cache.containers.clone(),
             scripted: style_cache.scripted.clone(),
             tailwind: std::mem::take(&mut style_cache.tailwind),
+            unshared: true,
             ..Default::default()
         };
         let full = compute_styles(doc, width, height, text_system, cache, &mut fresh, context);

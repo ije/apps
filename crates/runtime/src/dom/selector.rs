@@ -163,11 +163,18 @@ struct Snapshot {
     revisions: [u32; KINDS],
 }
 const KINDS: usize = 7;
-const CHILDREN: u32 = 1 << 31;
+
+// WARNING: the attributes that selectors name, and of those the ones whose value they compare: a row's `data-line`
+// number changes nothing when selectors only test that it is present.
+#[derive(Default)]
+pub(crate) struct Named {
+    names: rustc_hash::FxHashSet<String>,
+    valued: rustc_hash::FxHashSet<String>,
+}
 
 #[derive(Default)]
 pub(crate) struct SelectorCache {
-    pub(crate) attributes: rustc_hash::FxHashSet<String>,
+    pub(crate) attributes: Named,
     nodes: Vec<Snapshot>,
     seen: Vec<u64>,
     values: Matches,
@@ -182,9 +189,10 @@ pub(crate) struct SelectorCache {
     // `dependents` lists, per node, the nodes whose matches read it (with stale entries, as a superset).
     // An incremental pass styles only dirty nodes, so every recorded dependency must reach `dependents`.
     pub(crate) dirty: Vec<bool>,
-    // WARNING: the top bit of an entry marks a node that read the children list, so a change of only the
-    // children marks just those nodes.
+    // WARNING: `children` holds the nodes that read the children list, so a change of only the children walks just
+    // those: a list that rebuilds its rows changes its children every frame, and every row reads the list.
     dependents: Vec<(u32, Vec<u32>)>,
+    children: Vec<(u32, Vec<u32>)>,
     // WARNING: by shadow root, its host. In its own tree a root stands for its host, which only `:host` matches.
     hosts: Rc<rustc_hash::FxHashMap<usize, usize>>,
 }
@@ -242,6 +250,9 @@ impl SelectorCache {
             *snapshot = Snapshot::default();
             self.seen[id] = 0;
             self.mark(id, false);
+            // WARNING: what read the node is marked, so its lists go, or a node that takes its id marks them again.
+            self.dependents[id] = Default::default();
+            self.children[id] = Default::default();
         }
     }
 
@@ -250,12 +261,13 @@ impl SelectorCache {
         if let Some(dirty) = self.dirty.get_mut(id) {
             *dirty = true;
         }
-        let only = if children { CHILDREN } else { 0 };
-        if let Some((_, dependents)) = self.dependents.get(id) {
-            for &node in dependents {
-                if node & only == only
-                    && let Some(dirty) = self.dirty.get_mut((node & !CHILDREN) as usize)
-                {
+        let lists = [&self.children, &self.dependents];
+        for (_, list) in lists[..if children { 1 } else { 2 }]
+            .iter()
+            .filter_map(|lists| lists.get(id))
+        {
+            for &node in list {
+                if let Some(dirty) = self.dirty.get_mut(node as usize) {
                     *dirty = true;
                 }
             }
@@ -269,27 +281,23 @@ impl SelectorCache {
             .chunk_by(|a, b| a.0 as usize / KINDS == b.0 as usize / KINDS)
         {
             let node = group[0].0 as usize / KINDS;
-            let Some((compacted, list)) = self.dependents.get_mut(node).filter(|_| node != id)
-            else {
+            let lists = if group.iter().any(|&(kind, _)| kind as usize % KINDS == 2) {
+                &mut self.children
+            } else {
+                &mut self.dependents
+            };
+            let Some((compacted, list)) = lists.get_mut(node).filter(|_| node != id) else {
                 continue;
             };
-            let entry = id as u32
-                | if group.iter().any(|&(kind, _)| kind as usize % KINDS == 2) {
-                    CHILDREN
-                } else {
-                    0
-                };
+            let entry = id as u32;
             if list.last() != Some(&entry) {
                 list.push(entry);
                 if list.len() >= 16.max(*compacted as usize * 2) {
-                    list.sort_unstable_by_key(|entry| entry & !CHILDREN);
-                    list.dedup_by(|later, kept| {
-                        let same = *later & !CHILDREN == *kept & !CHILDREN;
-                        if same {
-                            *kept |= *later & CHILDREN;
-                        }
-                        same
-                    });
+                    // WARNING: forgotten nodes go too, so a long-lived parent doesn't list every row it ever had.
+                    let seen = &self.seen;
+                    list.retain(|&node| seen.get(node as usize).is_some_and(|&seen| seen != 0));
+                    list.sort_unstable();
+                    list.dedup();
                     *compacted = list.len() as u32;
                 }
             }
@@ -309,6 +317,8 @@ impl SelectorCache {
         self.dirty.fill(true);
         self.dependents.truncate(len);
         self.dependents.shrink_to_fit();
+        self.children.truncate(len);
+        self.children.shrink_to_fit();
     }
 
     pub fn update(&mut self, doc: &Document, order: &[(u32, u32)]) {
@@ -327,6 +337,8 @@ impl SelectorCache {
             .resize(doc.nodes.len().max(self.dirty.len()), true);
         self.dependents
             .resize_with(doc.nodes.len().max(self.dependents.len()), Default::default);
+        self.children
+            .resize_with(doc.nodes.len().max(self.children.len()), Default::default);
         let mut changes = Vec::new();
         let mut retagged = Vec::new();
         for &(id, _) in order {
@@ -345,12 +357,12 @@ impl SelectorCache {
                 .iter()
                 // WARNING: only selectors read these, as pseudo-classes read none of them, so a list that recycles
                 // its rows keeps the matches of rows that changed only their labels.
-                .filter(|(key, _)| {
-                    key.as_str() != "style"
-                        && (!(key.starts_with("data-")
-                            || key.starts_with("aria-")
-                            || matches!(key.as_str(), "key" | "title" | "role" | "tabindex"))
-                            || self.attributes.contains(key.as_str()))
+                .filter_map(|(key, value)| {
+                    let selected = key.starts_with("data-")
+                        || key.starts_with("aria-")
+                        || matches!(key.as_str(), "key" | "title" | "role" | "tabindex");
+                    (key.as_str() != "style" && (!selected || self.attributes.names.contains(key.as_str())))
+                        .then(|| (key, (!selected || self.attributes.valued.contains(key.as_str())).then_some(value)))
                 })
                 .fold(rustc_hash::FxHasher::default(), |mut state, pair| {
                     pair.hash(&mut state);
@@ -443,6 +455,54 @@ impl SelectorCache {
             self.dependencies
                 .push(((id * KINDS + kind) as u32, node.revisions[kind]));
         }
+    }
+
+    pub(crate) fn signature(&self, id: usize) -> [u32; KINDS] {
+        self.nodes.get(id).map_or([0; KINDS], |node| node.values)
+    }
+
+    pub(crate) fn reads(&self, id: usize, kind: usize) -> bool {
+        let key = (id * KINDS + kind) as u32;
+        self.dependencies.iter().any(|&(read, _)| read == key)
+    }
+
+    // WARNING: the matches just made for `id` hold for a sibling with the same values only when they read nothing but
+    // `id` and its flat tree ancestors, and no children list of `id` or its parent, which positions and siblings read.
+    pub(crate) fn shareable(&self, doc: &Document, id: usize) -> bool {
+        let parent = doc.nodes[id].parent;
+        let mut chain = [0usize; 64];
+        let mut length = 0;
+        let mut up = parent;
+        while let Some(node) = up {
+            if length == chain.len() {
+                return false;
+            }
+            chain[length] = node;
+            length += 1;
+            up = doc.nodes[node].parent.or_else(|| self.hosts.get(&node).copied());
+        }
+        self.dependencies.iter().all(|&(read, _)| {
+            let (node, kind) = (read as usize / KINDS, read as usize % KINDS);
+            if node == id {
+                kind != 2
+            } else {
+                !(Some(node) == parent && kind == 2) && chain[..length].contains(&node)
+            }
+        })
+    }
+
+    // The dependencies of matches that `from` shared, as reads of `to` at its revisions.
+    pub(crate) fn transfer(&mut self, from: usize, to: usize, dependencies: &[Dependency]) {
+        self.dependencies.clear();
+        for &(read, revision) in dependencies {
+            let (node, kind) = (read as usize / KINDS, read as usize % KINDS);
+            self.dependencies.push(if node == from {
+                ((to * KINDS + kind) as u32, self.nodes[to].revisions[kind])
+            } else {
+                (read, revision)
+            });
+        }
+        self.dependencies.sort_unstable();
     }
 
     pub(crate) fn valid(&self, dependencies: &[Dependency]) -> bool {
@@ -608,14 +668,18 @@ impl Selector {
         Ok(())
     }
 
-    pub(crate) fn attributes(&self, names: &mut rustc_hash::FxHashSet<String>) {
+    pub(crate) fn attributes(&self, names: &mut Named) {
         if let Some((_, previous)) = &self.previous {
             previous.attributes(names);
         }
         for simple in &self.simple {
             match simple {
-                SimpleSelector::Attribute(name, ..) => {
-                    names.insert(name.to_ascii_lowercase());
+                SimpleSelector::Attribute(name, operator, ..) => {
+                    let name = name.to_ascii_lowercase();
+                    if !operator.is_empty() {
+                        names.valued.insert(name.clone());
+                    }
+                    names.names.insert(name);
                 }
                 SimpleSelector::Pseudo(_, _, parsed, _) => {
                     for selector in parsed {
@@ -1162,6 +1226,32 @@ impl Selector {
         self.matches_cached(doc, id, None, memo)
     }
 
+    // WARNING: for elements with no matched rules yet, so no memo entry of their own: the entry would only serve a
+    // later pass in which none of the node's own values changed, and pages that build rows each frame never have one.
+    // Steps up the tree still use and fill the memo, which siblings share.
+    pub(crate) fn matches_fresh(&self, doc: &Document, id: usize, memo: &mut SelectorCache) -> bool {
+        self.matches_with(doc, id, None, memo, false)
+    }
+
+    // WARNING: like `matches_cached` on an element: only `*` and no combinator matches every element, so callers
+    // skip matching. A shadow root is featureless, so it must not take this.
+    pub(crate) fn always(&self) -> bool {
+        self.previous.is_none()
+            && self
+                .simple
+                .iter()
+                .all(|simple| matches!(simple, SimpleSelector::Universal))
+    }
+
+    // WARNING: `:host` matches only the shadow root that stands for its host, never an element.
+    pub(crate) fn host_only(&self) -> bool {
+        self.previous.is_none()
+            && self
+                .simple
+                .iter()
+                .any(|simple| matches!(simple, SimpleSelector::Pseudo(name, ..) if name == "host"))
+    }
+
     pub(crate) fn matches_cached(
         &self,
         doc: &Document,
@@ -1169,13 +1259,25 @@ impl Selector {
         scope: Option<usize>,
         memo: &mut SelectorCache,
     ) -> bool {
+        self.matches_with(doc, id, scope, memo, true)
+    }
+
+    fn matches_with(
+        &self,
+        doc: &Document,
+        id: usize,
+        scope: Option<usize>,
+        memo: &mut SelectorCache,
+        store: bool,
+    ) -> bool {
         let key = (self as *const Self as usize, id, scope, false);
-        let compound = self.previous.is_none()
-            && self.simple.iter().all(|simple| match simple {
-                SimpleSelector::Pseudo(_, _, parsed, _) => parsed.is_empty(),
-                SimpleSelector::Parent(..) => false,
-                _ => true,
-            });
+        let compound = !store
+            || self.previous.is_none()
+                && self.simple.iter().all(|simple| match simple {
+                    SimpleSelector::Pseudo(_, _, parsed, _) => parsed.is_empty(),
+                    SimpleSelector::Parent(..) => false,
+                    _ => true,
+                });
         if !compound
             && let Some((result, dependencies)) = memo.values.get(&key)
             && memo.valid(dependencies)
@@ -1742,6 +1844,9 @@ impl Selector {
                     let start = memo.dependencies.len();
                     let mut matched = false;
                     while let Some(id) = ancestor {
+                        // WARNING: an ancestor's entry holds what was read from it upward, not what the nodes below it
+                        // read, or siblings that reach it through the memo take reads of each other's branches.
+                        let from = memo.dependencies.len();
                         memo.depend(id, 1);
                         let key = (&**previous as *const Self as usize, id, scope, true);
                         if let Some((result, dependencies)) = memo.values.get(&key)
@@ -1751,23 +1856,26 @@ impl Selector {
                             memo.dependencies.extend(dependencies.iter().copied());
                             break;
                         }
-                        visited.push(key);
+                        visited.push((key, from));
                         if previous.matches_cached(doc, id, scope, memo) {
                             matched = true;
                             break;
                         }
                         ancestor = doc.nodes[id].parent;
                     }
+                    for (key, from) in visited.into_iter().rev() {
+                        let mut dependencies = memo.dependencies[from..].to_vec();
+                        dependencies.sort_unstable();
+                        dependencies.dedup();
+                        let dependencies: Rc<[_]> = dependencies.into();
+                        memo.reserve(dependencies.len());
+                        memo.values.insert(key, (matched, dependencies));
+                    }
                     let mut dependencies = memo.dependencies[start..].to_vec();
                     dependencies.sort_unstable();
                     dependencies.dedup();
                     memo.dependencies.truncate(start);
                     memo.dependencies.extend(&dependencies);
-                    let dependencies: Rc<[_]> = dependencies.into();
-                    memo.reserve(dependencies.len());
-                    for key in visited {
-                        memo.values.insert(key, (matched, dependencies.clone()));
-                    }
                     matched
                 }
             }

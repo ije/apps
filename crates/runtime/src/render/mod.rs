@@ -1237,7 +1237,7 @@ impl PageView {
         for id in recolored {
             let mut node = Some(id).filter(|&id| id < styles.values.len());
             while let Some(id) = node {
-                dom.inline_text.remove(&id);
+                dom.measurements.texts.remove(&id);
                 node = doc.nodes[id].parent.filter(|_| {
                     styles.values[id]
                         .get(Prop::DISPLAY)
@@ -1256,7 +1256,7 @@ impl PageView {
         let mut stale = false;
         let mut around = rustc_hash::FxHashSet::default();
         for &id in &changed {
-            dom.inline_text.remove(&id);
+            dom.measurements.texts.remove(&id);
             if dom.layout_nodes[id]
                 .as_ref()
                 .is_some_and(|node| node.geometry == node.revision)
@@ -1484,7 +1484,7 @@ impl PageView {
             .collect();
         dom.measurements.pixel_ratio = window.scale_factor();
         let measured = RefCell::new(std::mem::take(&mut dom.measurements));
-        let inline_text = RefCell::new(std::mem::take(&mut dom.inline_text));
+        let walk = dom.style_walk.nodes.clone();
         for text in warnings {
             if host.logs.len() == 500 {
                 host.logs.pop_front();
@@ -1496,7 +1496,7 @@ impl PageView {
         let ids = {
             let mut ids = self.ids.borrow_mut();
             if ids.0 != doc.nodes.latest() {
-                *ids = (doc.nodes.latest(), Rc::default());
+                *ids = (doc.nodes.latest(), Rc::new(effects::Ids::of(walk)));
             }
             ids.1.clone()
         };
@@ -1510,7 +1510,6 @@ impl PageView {
             ancestors: Rc::default(),
             flex_parent: false,
             measured: &measured,
-            inline_text: &inline_text,
             perspective: None,
             siblings: &RefCell::default(),
             margins: &RefCell::default(),
@@ -1705,7 +1704,6 @@ impl PageView {
             dom.cull.info = info;
             dom.cull.visible = visible;
             dom.measurements = measured.into_inner();
-            dom.inline_text = inline_text.into_inner();
             dom.animating.clear();
             dom.animating_pseudos.clear();
             let restored = !restore.is_empty() || !restore_pseudos.is_empty();

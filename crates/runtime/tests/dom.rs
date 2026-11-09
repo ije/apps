@@ -985,7 +985,7 @@ fn shadow_cycles_child_access_release_and_retired_images() {
             serde_json::json!([[], []]),
         )
         .unwrap();
-    assert_eq!(freed, serde_json::json!([canvas]));
+    assert_eq!(freed[0], serde_json::json!([canvas]));
     assert!(host.borrow().pages[&1].doc.nodes[p].tag.is_empty());
     assert!(!host.borrow().pages[&1].dirty);
     let image: usize = engine.eval("image._id", "test").unwrap().parse().unwrap();

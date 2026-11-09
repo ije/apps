@@ -912,12 +912,21 @@ impl Motion {
 
     pub fn forget(&mut self, id: usize) {
         if let Some(previous) = self.previous.get_mut(id) {
-            *previous = Rc::default();
+            *previous = super::empty().0;
         }
-        self.clocks.remove(&id);
-        self.transitions.remove(&id);
-        self.scripted.remove(&id);
-        self.backdrop.remove(&id);
+        // WARNING: this runs for every freed node, and these maps are empty on most pages.
+        if !self.clocks.is_empty() {
+            self.clocks.remove(&id);
+        }
+        if !self.transitions.is_empty() {
+            self.transitions.remove(&id);
+        }
+        if !self.scripted.is_empty() {
+            self.scripted.remove(&id);
+        }
+        if !self.backdrop.is_empty() {
+            self.backdrop.remove(&id);
+        }
     }
 
     pub fn script(&mut self, node: usize, mut animation: Scripted, time: f64, rate: Option<f64>) {

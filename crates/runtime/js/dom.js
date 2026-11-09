@@ -15,7 +15,8 @@
   }
   const noAttrs = new Attrs(), noKids = Object.freeze([]);
   class Record { constructor(id, tag, text) { this.id = id; this.tag = tag; this.text = text; this.attrs = tag[0] === '#' ? null : noAttrs; this.up = null; this.kids = tag === '#text' || tag === '#comment' ? noKids : []; this.i = 0; this.shadow = null; this.host = null; this.ref = null; } }
-  const records = [], texts = [], orphans = [];
+  const records = [], texts = [];
+  let detached = false;
   // WARNING: `changed` marks writes that can detach or create nodes since the last `dom.release`, so idle sweeps skip it.
   let scheduled = false, changed = false, pool = [], reserve = 32, codes = new Int32Array(1024), size = 0;
   // WARNING: `stale` marks writes since the last layout, so the next geometry read lays the page out first, like a browser's forced reflow.
@@ -121,7 +122,7 @@
   const own = rec => rec.text ??= host('dom.source', rec.id);
   const text = root => { let value = ''; const stack = [root]; while (stack.length) { const rec = stack.pop(); if (rec !== root && (rec.tag === '#comment' || rec.tag === '#doctype')) continue; value += own(rec); for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return value; };
   const find = (root, test) => { const stack = []; for (let i = root.kids.length; i--;) stack.push(root.kids[i]); while (stack.length) { const rec = stack.pop(); if (test(rec)) return of(rec); if (rec.tag !== 'template') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return null; };
-  const detach = rec => { version++; if (rec.kids.length) { for (const kid of rec.kids) { kid.up = null; orphans.push(kid); } rec.kids = []; } rec.text = ''; };
+  const detach = rec => { version++; if (rec.kids.length) { for (const kid of rec.kids) kid.up = null; rec.kids = []; detached = true; } rec.text = ''; };
   // WARNING: wrappers hold their wrapped parent and children so that listeners and expandos live as long as their tree.
   const unhold = child => { const parent = child._parent; if (!parent) return; const last = parent._held.pop(); if (last !== child) { parent._held[child._slot] = last; last._slot = child._slot; } };
   const hold = (parent, child) => { unhold(child); child._parent = parent; child._slot = (parent._held ??= []).push(child) - 1; };
@@ -1995,7 +1996,8 @@
     // WARNING: removed trees without wrappers go at the next turn, so a page that rebuilds rows each frame doesn't fill the arena between timed sweeps.
     // Wrappers die only in a GC, so the first sweep after one checks them all, and timed sweeps between GCs check a slice.
     const collected = !canary.deref(), timed = force || collected || performance.now() >= sweepAt, dead = [];
-    if (!timed && !orphans.length) return;
+    if (!timed && !detached) return;
+    detached = false;
     if (collected) canary = new WeakRef({});
     if (timed) {
       sweepAt = performance.now() + 250;
@@ -2007,19 +2009,12 @@
       if (cursor >= wrapped.length) cursor = 0;
       const rec = wrapped[cursor];
       if (rec.ref?.deref()) { cursor++; continue; }
-      dead.push(rec.id); orphans.push(rec); rec.ref = null; wrapped[cursor] = wrapped[wrapped.length - 1]; wrapped.pop();
+      dead.push(rec.id); rec.ref = null; wrapped[cursor] = wrapped[wrapped.length - 1]; wrapped.pop();
     }
-    if (dead.length || registered.length || changed) { changed = false; call('dom.release', dead, registered.splice(0)); }
-    if (!orphans.length) return;
-    // WARNING: Rust frees detached trees without live wrappers in the release above, so their records go too. Each tree is walked once.
-    const seen = new Set(), roots = [];
-    for (let rec of orphans) for (; !seen.has(rec); rec = rec.up ?? rec.host) { seen.add(rec); if (!(rec.up ?? rec.host)) { roots.push(rec); break; } }
-    orphans.length = 0;
-    for (const root of roots) {
-      const stack = [root], gone = [];
-      while (stack.length) { const rec = stack.pop(); if (rec.ref?.deref()) { gone.length = 0; break; } gone.push(rec); for (const kid of rec.kids) stack.push(kid); if (rec.shadow) stack.push(rec.shadow); }
-      for (const rec of gone) if (records[rec.id] === rec) { records[rec.id] = undefined; const id = rec.attrs?.get('id'); if (id) idDrop(id, rec); }
-    }
+    if (!dead.length && !registered.length && !changed) return;
+    changed = false;
+    // WARNING: Rust frees detached trees without live wrappers and lists their nodes, so their records go too.
+    for (const id of call('dom.release', dead, registered.splice(0))[1]) { const rec = records[id]; if (!rec) continue; records[id] = undefined; const name = rec.attrs?.get('id'); if (name) idDrop(name, rec); }
   };
 
   // WARNING: drawing queues `code, ...args` as f64, so far coordinates stay exact, and `Canvas::draw` in `render/canvas.rs` runs them with its own copy of the state, with strings as UTF-16 lengths of consecutive parts of one text. Codes and argument counts must match it.

@@ -65,7 +65,7 @@ impl Drop for WakeOnDrop {
     }
 }
 
-fn connected(doc: &Document, hosts: &HashMap<usize, usize>, mut id: usize) -> bool {
+fn connected(doc: &Document, hosts: &rustc_hash::FxHashMap<usize, usize>, mut id: usize) -> bool {
     loop {
         if id == 0 {
             return true;
@@ -847,7 +847,7 @@ impl Host {
             if op == "dom.release"
                 && let Ok(ids) = &result
             {
-                for node in ids.as_array().into_iter().flatten() {
+                for node in ids[0].as_array().into_iter().flatten() {
                     if let Some(gpu) = self.graphics.get_mut(&id) {
                         let _ = gpu.call("resetCanvas", format!("[{node}]").as_bytes());
                     }

@@ -23,8 +23,6 @@ pub(super) struct Build<'a> {
     pub(super) ancestors: Rc<[usize]>,
     pub(super) flex_parent: bool,
     pub(super) measured: &'a RefCell<super::grid::Measurements>,
-    pub(super) inline_text:
-        &'a RefCell<rustc_hash::FxHashMap<usize, Option<Rc<style::InlineText>>>>,
     pub(super) perspective: Option<(f32, String)>,
     pub(super) siblings: &'a RefCell<HashMap<(usize, bool), Rc<Siblings>>>,
     pub(super) margins: &'a RefCell<Margins>,
@@ -585,7 +583,7 @@ pub(super) fn scroller(
     doc: &Document,
     styles: &ComputedStyles,
     mut ancestors: impl Iterator<Item = usize>,
-    handles: &std::collections::HashMap<usize, renderer::ScrollHandle>,
+    handles: &rustc_hash::FxHashMap<usize, renderer::ScrollHandle>,
 ) -> usize {
     ancestors
         .find(|&ancestor| {
@@ -1146,7 +1144,6 @@ fn check(
         ancestors: build.ancestors.clone(),
         flex_parent: build.flex_parent,
         measured: build.measured,
-        inline_text: build.inline_text,
         perspective: build.perspective.clone(),
         siblings: build.siblings,
         margins: build.margins,
@@ -1277,7 +1274,6 @@ fn create(
         ref ancestors,
         flex_parent,
         measured,
-        inline_text,
         perspective: ref parent_perspective,
         siblings,
         margins: margin_cache,
@@ -1349,7 +1345,6 @@ fn create(
         pixel_ratio,
         view,
         measured,
-        inline_text,
         siblings,
         margins: margin_cache,
         blocks,
@@ -1462,8 +1457,11 @@ fn create(
         return renderer::node().hidden().into();
     }
     let opacity = super::effects::opacity(style);
-    let effect_layer =
-        (made.layer || opacity < 1. && !node.children.is_empty() || composited).then_some(opacity);
+    // WARNING: a box at opacity 0 draws nothing, so it takes the element opacity, which skips its primitives, and
+    // not a layer: hidden truncation copies in a file tree cost two render passes each. It still lays out and takes
+    // events.
+    let effect_layer = (made.layer || opacity > 0. && opacity < 1. && !node.children.is_empty() || composited)
+        .then_some(opacity);
     let selection_colors = style::selection_colors(style, styles.selections.get(&id));
     let face = style::font(style);
     let line_height = match style::line_height(style) {
@@ -1644,8 +1642,9 @@ fn create(
     };
     let breaks = display != "inline"
         && flat.iter().any(|&child| doc.nodes[child].tag == "br")
-        && inline_text
+        && measured
             .borrow_mut()
+            .texts
             .entry(id)
             .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
             .is_none();
@@ -1672,8 +1671,9 @@ fn create(
         let merged = !text_field(node)
             && symbol.is_none()
             && !matches!(node.tag.as_str(), "svg" | "canvas" | "iframe")
-            && inline_text
+            && measured
                 .borrow_mut()
+                .texts
                 .entry(id)
                 .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
                 .is_some();
@@ -4462,8 +4462,9 @@ fn create(
         {
             None
         } else {
-            inline_text
+            measured
                 .borrow_mut()
+                .texts
                 .entry(id)
                 .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
                 .clone()
@@ -5172,7 +5173,7 @@ fn create(
                 match group.as_mut() {
                     Some((_, _, content)) => content.push(element),
                     None if columns.is_some() => collected.push(($child, element)),
-                    None => el = el.child(element),
+                    None => el.push(element),
                 }
             }};
         }
@@ -5217,6 +5218,7 @@ fn create(
             && style
                 .get(Prop::TEXT_WRAP)
                 .is_none_or(|value| !value.contains("nowrap"));
+        el.reserve(children.len());
         for (index, &child) in children.iter().enumerate() {
             if index != joined && shown(index) {
                 if let Some((slots, runs, then, zone)) = plan.as_mut()

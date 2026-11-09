@@ -1509,6 +1509,9 @@ impl Window {
     }
 
     pub fn paint_quad(&mut self, quad: PaintQuad) {
+        if self.opacity <= 0. {
+            return;
+        }
         let opacity = self.opacity;
         let quad = Quad {
             order: 0,
@@ -1574,6 +1577,9 @@ impl Window {
         shadows: &[BoxShadow],
         inset: bool,
     ) {
+        if self.opacity <= 0. {
+            return;
+        }
         let scale = self.scale_factor;
         let content_mask = self.snapped_content_mask();
         let element_bounds = self.cover_bounds(bounds);
@@ -1621,6 +1627,10 @@ impl Window {
     }
 
     pub fn paint_effect<R>(&mut self, effect: PaintEffect, f: impl FnOnce(&mut Self) -> R) -> R {
+        // WARNING: at opacity 0 nothing inside draws, but `f` still registers hitboxes and listeners.
+        if self.opacity <= 0. {
+            return f(self);
+        }
         let scale = self.scale_factor;
         let content_mask = self.content_mask().scale(scale);
         let mask = effect.mask.and_then(|(image, bounds)| {
@@ -1732,6 +1742,9 @@ impl Window {
     }
 
     fn paint_decoration(&mut self, line: Underline, style: DecorationStyle) {
+        if self.opacity <= 0. {
+            return;
+        }
         let thickness = line.thickness.0;
         let mut second = None;
         let mut first = line;
@@ -1785,6 +1798,9 @@ impl Window {
         color: Rgba,
         smoothing: bool,
     ) {
+        if self.opacity <= 0. {
+            return;
+        }
         let scale = self.scale_factor;
         let origin = origin.scale(scale);
         let variants = SUBPIXEL_VARIANTS_X as f32;
@@ -1832,6 +1848,9 @@ impl Window {
         glyph_id: GlyphId,
         font_size: Pixels,
     ) {
+        if self.opacity <= 0. {
+            return;
+        }
         let scale = self.scale_factor;
         let origin = origin
             .scale(scale)
@@ -1892,6 +1911,9 @@ impl Window {
     }
 
     pub fn paint_symbol(&mut self, name: &str, bounds: Bounds<Pixels>, color: Rgba) {
+        if self.opacity <= 0. {
+            return;
+        }
         #[cfg(target_os = "macos")]
         {
             if bounds.is_empty() || color.a <= 0. {
@@ -1950,6 +1972,9 @@ impl Window {
         image: Arc<RenderImage>,
         grayscale: bool,
     ) {
+        if self.opacity <= 0. {
+            return;
+        }
         let visible = bounds.intersect(&image_bounds);
         if visible.is_empty() || image_bounds.is_empty() {
             return;

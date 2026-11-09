@@ -11,6 +11,8 @@ pub(crate) struct Measurements {
     pub(crate) pixel_ratio: f32,
     // WARNING: the sizes of decoded images and video frames, kept with `State::images` and `svg_images`.
     pub(crate) naturals: rustc_hash::FxHashMap<usize, [f32; 2]>,
+    // WARNING: by node, its inline text: measuring and building both read it, and a changed node drops it.
+    pub(crate) texts: rustc_hash::FxHashMap<usize, Option<std::rc::Rc<style::InlineText>>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -680,8 +682,12 @@ pub(crate) fn intrinsic(
             vec![style::text_run(style, units, alt.len())],
             Box::default(),
         )),
-        None => style::inline_text(doc, styles, id)
-            .map(|inline| (inline.text.to_string().into(), inline.runs.into_vec(), inline.atoms)),
+        None => measured
+            .texts
+            .entry(id)
+            .or_insert_with(|| style::inline_text(doc, styles, id).map(std::rc::Rc::new))
+            .clone()
+            .map(|inline| (inline.text.to_string().into(), inline.runs.to_vec(), inline.atoms.clone())),
     } {
         for atom in &atoms {
             let [_, max, ..] = intrinsic(doc, atom.node, styles, available, None, text, measured);

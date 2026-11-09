@@ -4,7 +4,7 @@ mod selector;
 
 pub use document::{Document, Node, escape};
 pub(crate) use selector::{
-    ACTIVE, Dependency, FOCUS, FOCUS_VISIBLE, FOCUS_WITHIN, HOVER, Selector, SelectorCache,
+    ACTIVE, Dependency, FOCUS, FOCUS_VISIBLE, FOCUS_WITHIN, HOVER, Named, Selector, SelectorCache,
     SelectorList,
 };
 
@@ -361,10 +361,10 @@ pub struct State {
     pub(crate) removed: Vec<usize>,
     pub(crate) created: usize,
     pub(crate) detached: Vec<usize>,
-    live: HashSet<usize>,
+    live: rustc_hash::FxHashSet<usize>,
     pub bounds: LayoutMirror,
     #[allow(clippy::type_complexity)]
-    pub(crate) text_layouts: HashMap<
+    pub(crate) text_layouts: rustc_hash::FxHashMap<
         usize,
         (
             renderer::TextLayout,
@@ -374,8 +374,8 @@ pub struct State {
             [renderer::Pixels; 2],
         ),
     >,
-    pub scroll: HashMap<usize, renderer::ScrollHandle>,
-    scroll_offsets: HashMap<usize, renderer::Point<renderer::Pixels>>,
+    pub scroll: rustc_hash::FxHashMap<usize, renderer::ScrollHandle>,
+    scroll_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
     pub(crate) computed: Option<Rc<style::ComputedStyles>>,
     previous: Option<Rc<style::ComputedStyles>>,
     // WARNING: a list per node is megabytes on big pages, and a new one costs a page fault per 16 KB.
@@ -402,7 +402,6 @@ pub struct State {
     pub(crate) measurements: crate::render::grid::Measurements,
     pub painted: Vec<u64>,
     pub(crate) paint_count: u64,
-    pub(crate) inline_text: rustc_hash::FxHashMap<usize, Option<Rc<style::InlineText>>>,
     // WARNING: the last revision from the process-wide counter in `render`, so 0 means the state never drew.
     pub(crate) layout_revision: u64,
     style_epoch: u64,
@@ -416,30 +415,30 @@ pub struct State {
     style_theme: u32,
     pub focus: Option<usize>,
     interaction: [Vec<usize>; 3],
-    pub selection: HashMap<usize, [usize; 2]>,
+    pub selection: rustc_hash::FxHashMap<usize, [usize; 2]>,
     pub selection_caret: Option<usize>,
     pub dirty: bool,
     pub frame_requested: bool,
     pub(crate) wheel: bool,
-    pub canvases: HashMap<usize, crate::render::canvas::Canvas>,
-    pub(crate) sources: std::cell::RefCell<HashMap<usize, CanvasSource>>,
-    pub images: HashMap<usize, Arc<renderer::RenderImage>>,
+    pub canvases: rustc_hash::FxHashMap<usize, crate::render::canvas::Canvas>,
+    pub(crate) sources: std::cell::RefCell<rustc_hash::FxHashMap<usize, CanvasSource>>,
+    pub images: rustc_hash::FxHashMap<usize, Arc<renderer::RenderImage>>,
     pub shadows: rustc_hash::FxHashMap<usize, usize>,
-    pub(crate) hosts: HashMap<usize, usize>,
+    pub(crate) hosts: rustc_hash::FxHashMap<usize, usize>,
     pub retired: Vec<Arc<renderer::RenderImage>>,
     pub(crate) retired_canvases: HashSet<usize>,
     pub(crate) recycled: Vec<(usize, Arc<renderer::RenderImage>)>,
     decoded: Arc<Mutex<Vec<(usize, u64, Decoded)>>>,
     frames: Frames,
-    pub(crate) placeholders: HashMap<usize, Placeholder>,
-    decoding: HashMap<usize, u64>,
+    pub(crate) placeholders: rustc_hash::FxHashMap<usize, Placeholder>,
+    decoding: rustc_hash::FxHashMap<usize, u64>,
     pub(crate) reserved: HashSet<usize>,
-    pub(crate) svg_sources: HashMap<usize, String>,
-    pub(crate) svg_boxes: HashMap<usize, SvgBoxes>,
-    pub(crate) svg_trees: HashMap<usize, resvg::usvg::Tree>,
-    pub(crate) svg_images: HashMap<usize, (Rc<str>, [f32; 2])>,
-    pub(crate) masks: HashMap<usize, (String, Option<Arc<renderer::RenderImage>>)>,
-    pub svgs: HashMap<usize, (String, Arc<renderer::RenderImage>)>,
+    pub(crate) svg_sources: rustc_hash::FxHashMap<usize, String>,
+    pub(crate) svg_boxes: rustc_hash::FxHashMap<usize, SvgBoxes>,
+    pub(crate) svg_trees: rustc_hash::FxHashMap<usize, resvg::usvg::Tree>,
+    pub(crate) svg_images: rustc_hash::FxHashMap<usize, (Rc<str>, [f32; 2])>,
+    pub(crate) masks: rustc_hash::FxHashMap<usize, (String, Option<Arc<renderer::RenderImage>>)>,
+    pub svgs: rustc_hash::FxHashMap<usize, (String, Arc<renderer::RenderImage>)>,
     pub(crate) svg_cache: HashMap<
         String,
         (
@@ -464,7 +463,7 @@ pub struct State {
     pub(crate) animating: HashMap<usize, Rc<style::Style>>,
     pub(crate) animating_pseudos: HashMap<usize, Rc<[style::Style; 2]>>,
     pub(crate) recolored: Vec<usize>,
-    pub(crate) containers: HashMap<usize, [f32; 2]>,
+    pub(crate) containers: rustc_hash::FxHashMap<usize, [f32; 2]>,
     pub(crate) atoms: rustc_hash::FxHashMap<usize, [f32; 3]>,
     pub(crate) container_pass: bool,
     pub(crate) anchors: rustc_hash::FxHashMap<usize, renderer::Bounds<renderer::Pixels>>,
@@ -510,7 +509,7 @@ impl State {
         }
         self.style_cache.forget(&gone);
         for id in gone {
-            self.inline_text.remove(&id);
+            self.measurements.texts.remove(&id);
             if let Some(node) = self.layout_nodes.get_mut(id) {
                 *node = None;
             }
@@ -538,7 +537,7 @@ impl State {
         self.old_styles = None;
         self.style_walk = Default::default();
         self.select_marks = Vec::new();
-        self.inline_text = Default::default();
+        self.measurements.texts = Default::default();
         self.style_cache.trim(len);
         self.layout_nodes.truncate(len);
         self.layout_nodes.shrink_to_fit();
@@ -1272,7 +1271,7 @@ pub fn call(
                     if let Some(node) = state.layout_nodes.get_mut(id) {
                         *node = None;
                     }
-                    state.inline_text.remove(&id);
+                    state.measurements.texts.remove(&id);
                     state.retired.extend(state.images.remove(&id));
                     state.retired.extend(
                         state
@@ -1324,9 +1323,11 @@ pub fn call(
                     freed.push(id);
                 }
             }
+            // WARNING: the page drops the records of the freed nodes, so it doesn't walk the trees it detached again.
+            let list = json!([canvases, freed]);
             if !freed.is_empty() {
                 state.style_cache.forget(&freed);
-                let freed: HashSet<usize> = freed.into_iter().collect();
+                let freed: rustc_hash::FxHashSet<usize> = freed.into_iter().collect();
                 state.top_layer.retain(|node| !freed.contains(node));
                 state
                     .measurements
@@ -1341,7 +1342,7 @@ pub fn call(
                 });
                 state.dirty |= state.retired.len() > retired;
             }
-            return Ok(json!(canvases));
+            return Ok(list);
         }
         if op == "dom.rangeNodes" {
             let start = args[0].as_u64().context("Expected start node")? as usize;
