@@ -2081,8 +2081,11 @@ fn create(
                 .or_else(|| reader.parent(id, Prop::ALIGN_ITEMS))
                 .is_none_or(|value| matches!(value, "normal" | "stretch"))
     };
-    let input =
-        (node.tag == "input").then(|| node.attrs.get("type").map_or("text", String::as_str));
+    let input = (node.tag == "input").then(|| node.input_type());
+    let appkit = node.native_control();
+    if appkit.is_some() {
+        super::native::register(&view.controls, id);
+    }
     let check = input.is_some_and(|kind| {
         kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
     });
@@ -2151,11 +2154,28 @@ fn create(
             el = el.w(px(layout_ceil((zero * 34.).max(content), pixel_ratio)));
         }
     }
-    if input.is_some_and(|kind| {
-        ["button", "submit", "reset"]
-            .iter()
-            .any(|other| kind.eq_ignore_ascii_case(other))
-    }) {
+    // WARNING: an AppKit control covers the box, so the page draws none of it. A button is as wide as its title.
+    if appkit == Some(renderer::ControlKind::Button) {
+        let [padding, height] = super::native::size(renderer::ControlKind::Button);
+        if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
+            let label = node.attrs.get("value").map_or("", String::as_str);
+            let run = style::text_run(style, &units, label.len());
+            let width = text
+                .shape_line(label, px(units.font.em), &[run], None)
+                .width;
+            el = el.w(px(layout_ceil(f32::from(width) + padding, pixel_ratio)));
+        }
+        if style.get(Prop::HEIGHT).is_none_or(|value| value == "auto") {
+            el = el.h(px(height));
+        }
+    }
+    if appkit.is_none()
+        && input.is_some_and(|kind| {
+            ["button", "submit", "reset"]
+                .iter()
+                .any(|other| kind.eq_ignore_ascii_case(other))
+        })
+    {
         el = el.items_center().justify_center().child(SharedString::from(
             node.attrs.get("value").cloned().unwrap_or_else(|| {
                 if input.is_some_and(|kind| kind.eq_ignore_ascii_case("reset")) {
@@ -2692,6 +2712,7 @@ fn create(
                 },
             }
         });
+    let native = native.filter(|_| appkit.is_none());
     if native.is_some() {
         reader.log(Query::Look(id as u32), 0, hashed(node.state & LOOK));
     }
@@ -6062,14 +6083,13 @@ pub(crate) fn dimension(value: &str, integer: bool) -> Option<f32> {
 pub(super) fn text_field(node: &crate::dom::Node) -> bool {
     node.tag == "textarea"
         || node.tag == "input"
-            && !node.attrs.get("type").is_some_and(|kind| {
-                [
-                    "checkbox", "radio", "button", "submit", "reset", "image", "file", "color",
-                    "range", "hidden",
-                ]
-                .iter()
-                .any(|other| kind.eq_ignore_ascii_case(other))
-            })
+            && node.native_control().is_none()
+            && ![
+                "checkbox", "radio", "button", "submit", "reset", "image", "file", "color",
+                "range", "hidden",
+            ]
+            .iter()
+            .any(|other| node.input_type().eq_ignore_ascii_case(other))
 }
 
 // WARNING: an image without a picture stays a replaced element only with both size attributes, which give its
@@ -6088,7 +6108,17 @@ pub(super) fn natural_size(
             .unwrap_or(default)
     };
     let pictured = |size: [f32; 2]| (size, (size[0] > 0. && size[1] > 0.).then(|| size[0] / size[1]));
-    let kind = node.attrs.get("type").map_or("", String::as_str);
+    let kind = if node.tag == "input" {
+        node.input_type()
+    } else {
+        ""
+    };
+    if let Some(native) = node
+        .native_control()
+        .filter(|native| *native != renderer::ControlKind::Button)
+    {
+        return Some((super::native::size(native), None));
+    }
     // WARNING: a failed image keeps the size of the last picture it decoded, which it no longer shows.
     match (node.tag.as_str(), decoded.filter(|_| !broken_image(node))) {
         ("canvas", _) => Some(pictured([attr("width", 300.), attr("height", 150.)])),

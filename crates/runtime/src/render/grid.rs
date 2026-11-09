@@ -654,7 +654,7 @@ pub(crate) fn intrinsic(
         );
         content = [width, width, height];
     } else if node.tag == "input"
-        && let Some(kind) = node.attrs.get("type").filter(|value| {
+        && let Some(kind) = Some(node.input_type()).filter(|value| {
             ["button", "submit", "reset"]
                 .iter()
                 .any(|kind| value.eq_ignore_ascii_case(kind))
@@ -676,6 +676,10 @@ pub(crate) fn intrinsic(
                 .width,
         );
         content = [width, width, units.font.lh];
+        if node.native_control().is_some() {
+            let [padding, height] = super::native::size(renderer::ControlKind::Button);
+            content = [width + padding, width + padding, height];
+        }
     } else if let Some((source, mut runs, atoms)) = match alt {
         Some(alt) => Some((
             renderer::SharedString::from(alt.clone()),

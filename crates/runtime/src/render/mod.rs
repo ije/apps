@@ -9,6 +9,7 @@ pub(crate) mod grid;
 mod hud;
 pub mod image;
 mod input;
+pub(crate) mod native;
 mod paint;
 mod resvg;
 pub(crate) mod scrollbar;
@@ -39,6 +40,7 @@ pub(crate) struct PageState {
     pub(crate) browsers: RefCell<HashMap<usize, (crate::desktop::browser::Browser, String)>>,
     #[allow(clippy::type_complexity)]
     pub(crate) frames: RefCell<HashMap<usize, ([f64; 4], u64, bool)>>,
+    pub(crate) controls: RefCell<native::Controls>,
     tagged: RefCell<(u64, Vec<usize>, Vec<usize>)>,
     ids: RefCell<(u64, Rc<effects::Ids>)>,
     svgs: RefCell<HashMap<usize, element::Svg>>,
@@ -289,6 +291,7 @@ impl PageView {
             images: RefCell::default(),
             browsers: RefCell::default(),
             frames: RefCell::default(),
+            controls: RefCell::default(),
             tagged: RefCell::default(),
             ids: RefCell::default(),
             svgs: RefCell::default(),
@@ -789,6 +792,7 @@ impl PageView {
                 }
             }
         }
+        native::sync(&self.controls, &doc);
         // WARNING: iframe bounds are set where they are laid out, see `paint.rs`.
         let tagged = self.tagged.borrow();
         let frame_nodes = || tagged.2.iter().copied().filter(|&id| visible[id]);

@@ -137,22 +137,24 @@ details[open]>summary{list-style-type:disclosure-open}
 details:not([open])>:not(summary){display:none}
 button,input,select,textarea{margin:0;font-family:Arial;font-size:13.333333px;font-weight:normal;font-style:normal;line-height:normal;letter-spacing:normal;word-spacing:normal;text-transform:none;text-indent:0;text-shadow:none;text-align:start;color:light-dark(#000,#fff)}
 button,select,meter,progress{user-select:none}
-label,button,select,input[type=button i],input[type=submit i],input[type=reset i],input[type=checkbox i],input[type=radio i],input[type=range i],input[type=color i],input[type=file i]{cursor:default}
+label,button,select,input[type=button i],input[type=submit i],input[type=reset i],input[type=checkbox i],input[type=radio i],input[type=range i],input[type=color i],input[type=file i],input[type=ns-button i],input[type=ns-switch i],input[type=ns-range i],input[type=ns-color i]{cursor:default}
 svg:not(:root){overflow:hidden}
 input{padding:1px 2px;border:2px inset light-dark(#767676,#858585);background-color:light-dark(#fff,#3b3b3b)}
 textarea{font-family:monospace;padding:2px;overflow:auto;border:1px solid light-dark(#767676,#858585);background-color:light-dark(#fff,#3b3b3b)}
 select{border:1px solid light-dark(#767676,#858585);background-color:light-dark(#fff,#3b3b3b);box-sizing:border-box;white-space:pre}
-button,input[type=button i],input[type=submit i],input[type=reset i]{padding:1px 6px;border:2px outset light-dark(#000,#fff);background-color:light-dark(#efefef,#6b6b6b);box-sizing:border-box;text-align:center}
-input[type=checkbox i],input[type=radio i]{margin:3px 3px 3px 4px;padding:0;border:0;background-color:transparent;box-sizing:border-box}
+button,input[type=button i],input[type=submit i],input[type=reset i],input[type=ns-button i]{padding:1px 6px;border:2px outset light-dark(#000,#fff);background-color:light-dark(#efefef,#6b6b6b);box-sizing:border-box;text-align:center}
+input[type=checkbox i],input[type=radio i],input[type=ns-switch i]{margin:3px 3px 3px 4px;padding:0;border:0;background-color:transparent;box-sizing:border-box}
 input[type=radio i]{margin:3px 3px 0 5px}
-input[type=range i]{margin:2px;padding:0;border:0;background-color:transparent;color:light-dark(#101010,#fff)}
-input[type=color i]{width:50px;height:27px;border:1px solid light-dark(#000,#fff);background-color:light-dark(#efefef,#6b6b6b);box-sizing:border-box}
+input[type=range i],input[type=ns-range i]{margin:2px;padding:0;border:0;background-color:transparent;color:light-dark(#101010,#fff)}
+input[type=color i],input[type=ns-color i]{width:50px;height:27px;border:1px solid light-dark(#000,#fff);background-color:light-dark(#efefef,#6b6b6b);box-sizing:border-box}
 input[type=file i]{padding:0;border:0;background-color:transparent}
-input[type=search i]{box-sizing:border-box}
+input[type=search i],input[type=ns-search i]{box-sizing:border-box}
 summary{list-style-position:inside}
-button:disabled,input[type=button i]:disabled,input[type=submit i]:disabled,input[type=reset i]:disabled{color:light-dark(rgba(16,16,16,.3),rgba(255,255,255,.3));background-color:light-dark(rgba(239,239,239,.3),rgba(19,1,1,.3));border-color:light-dark(rgba(118,118,118,.3),rgba(195,195,195,.3))}
+button:disabled,input[type=button i]:disabled,input[type=submit i]:disabled,input[type=reset i]:disabled,input[type=ns-button i]:disabled{color:light-dark(rgba(16,16,16,.3),rgba(255,255,255,.3));background-color:light-dark(rgba(239,239,239,.3),rgba(19,1,1,.3));border-color:light-dark(rgba(118,118,118,.3),rgba(195,195,195,.3))}
 input:disabled,textarea:disabled{color:light-dark(#545454,#aaa)}
-input:disabled:not([type=checkbox i],[type=radio i],[type=range i],[type=color i],[type=file i],[type=button i],[type=submit i],[type=reset i]),textarea:disabled{background-color:light-dark(rgba(239,239,239,.3),rgba(59,59,59,.3));border-color:rgba(118,118,118,.3)}
+input:disabled:not([type=checkbox i],[type=radio i],[type=range i],[type=color i],[type=file i],[type=button i],[type=submit i],[type=reset i],[type=ns-button i],[type=ns-switch i],[type=ns-range i],[type=ns-color i]),textarea:disabled{background-color:light-dark(rgba(239,239,239,.3),rgba(59,59,59,.3));border-color:rgba(118,118,118,.3)}
+input:-internal-native-control{margin:0;padding:0!important;border:0!important;background:none!important;font-family:system-ui;font-size:13px;vertical-align:middle;box-sizing:border-box}
+input[type=ns-color i]:-internal-native-control{width:auto;height:auto}
 select:disabled{opacity:.7;color:light-dark(#808080,#aaa);border-color:rgba(118,118,118,.3)}
 input:focus-visible,textarea:focus-visible{outline:3px solid #8fb8f4}
 progress,meter{width:10em;height:1em;vertical-align:-.2em;box-sizing:border-box}

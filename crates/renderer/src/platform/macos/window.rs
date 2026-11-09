@@ -423,6 +423,7 @@ struct State {
     mirror: Arc<Mutex<Mirror>>,
     frames: Arc<Mutex<Frames>>,
     glass: Vec<super::glass::GlassView>,
+    controls: super::controls::Controls,
     motion: Option<Arc<Mutex<Option<PlatformInput>>>>,
     cursor: CursorStyle,
     last_key_equivalent: Option<KeyDownEvent>,
@@ -734,6 +735,7 @@ fn open_native(
             mirror: Arc::default(),
             frames: frames.clone(),
             glass: Vec::new(),
+            controls: Default::default(),
             motion: None,
             cursor: CursorStyle::Arrow,
             last_key_equivalent: None,
@@ -893,6 +895,16 @@ struct Waiting {
     queued: AtomicBool,
 }
 
+type ControlList = (Vec<crate::NativeControl>, Option<crate::ControlSink>);
+
+// WARNING: the newest list of native controls, which the main thread takes whole, so a busy main thread skips lists.
+#[derive(Default)]
+struct Controls {
+    sent: std::cell::RefCell<Vec<crate::NativeControl>>,
+    next: Arc<Mutex<Option<ControlList>>>,
+    queued: Arc<AtomicBool>,
+}
+
 pub(crate) struct Window {
     control: WindowControl,
     callbacks: Callbacks,
@@ -901,6 +913,7 @@ pub(crate) struct Window {
     frames: Arc<Mutex<Frames>>,
     quiet: std::cell::Cell<Option<crate::app::Timer>>,
     waiting: Arc<Waiting>,
+    controls: Controls,
     transparent: bool,
 }
 
@@ -937,6 +950,7 @@ impl Window {
             frames: opened.frames,
             quiet: std::cell::Cell::new(None),
             waiting: Arc::default(),
+            controls: Controls::default(),
             transparent: options.transparent,
         })
     }
@@ -1072,6 +1086,22 @@ impl Window {
 
     pub fn is_active(&self) -> bool {
         self.control.mirror().active
+    }
+
+    pub fn set_controls(&self, list: Vec<crate::NativeControl>, sink: Option<crate::ControlSink>) {
+        let controls = &self.controls;
+        if *controls.sent.borrow() == list {
+            return;
+        }
+        controls.sent.replace(list.clone());
+        *controls.next.lock().unwrap_or_else(PoisonError::into_inner) = Some((list, sink));
+        if !controls.queued.swap(true, Ordering::AcqRel) {
+            post_controls(
+                self.control.native.clone(),
+                controls.next.clone(),
+                controls.queued.clone(),
+            );
+        }
     }
 
     pub fn state(&self) -> WindowState {
@@ -1442,6 +1472,33 @@ impl Drop for Window {
             });
         }));
     }
+}
+
+fn post_controls(
+    native: Arc<NativeRef>,
+    next: Arc<Mutex<Option<ControlList>>>,
+    queued: Arc<AtomicBool>,
+) {
+    native_post(Box::new(move || {
+        queued.store(false, Ordering::Release);
+        on_main(&native, |_, state| {
+            // WARNING: a caller up the stack can hold the state, so the list waits for the next pass.
+            let Ok(mut state) = state.try_borrow_mut() else {
+                if !queued.swap(true, Ordering::AcqRel) {
+                    post_controls(native.clone(), next.clone(), queued.clone());
+                }
+                return;
+            };
+            let Some((list, sink)) = next.lock().unwrap_or_else(PoisonError::into_inner).take()
+            else {
+                return;
+            };
+            let state = &mut *state;
+            // SAFETY: the window retains its view.
+            let parent = unsafe { state.native_view.cast::<NSView>().as_ref() };
+            super::controls::update(&mut state.controls, parent, list, sink);
+        });
+    }));
 }
 
 fn attach(window: &NSWindow, state: &Shared) -> bool {

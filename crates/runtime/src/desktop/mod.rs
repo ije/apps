@@ -1172,6 +1172,27 @@ impl Desktop {
                             eprintln!("apps: page script: {error:#}");
                         }
                     }
+                    // WARNING: the page takes a control's events before the next frame, which tells main the last
+                    // one it took, so the page's value doesn't undo edits that it has not taken yet.
+                    let controls = crate::render::native::events(&data);
+                    for (node, event) in &controls {
+                        let value = serde_json::to_string(&event.value).unwrap_or_default();
+                        if let Some(renderer) = &view.renderer
+                            && let Err(error) = crate::render::scripted(cx, None, || {
+                                renderer.eval(
+                                    &format!("__appsNativeControl({node},{value},{})", event.done),
+                                    "apps:control",
+                                )
+                            })
+                        {
+                            eprintln!("apps: page script: {error:#}");
+                        }
+                    }
+                    if !controls.is_empty()
+                        && let Some(handle) = view.handle
+                    {
+                        cx.refresh_window(handle);
+                    }
                 }
             }
             app.titles(Some(cx))?;

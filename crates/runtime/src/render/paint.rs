@@ -591,6 +591,7 @@ impl Hooks for DomBox {
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let window = &mut *cx.window;
         let (bounds, matrix) = self.placed.get();
+        super::native::paint(&self.view, self.id, bounds, &self.style, window);
         {
             let mut host = self.view.host.borrow_mut();
             let dom = host.dom.entry(self.view.id).or_default();

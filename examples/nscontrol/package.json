@@ -1,0 +1,10 @@
+{
+  "name": "nscontrol",
+  "productName": "NSControl",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "dev": "apps run --watch",
+    "build": "apps build"
+  }
+}

@@ -535,6 +535,8 @@ pub struct Window {
     caret_covered: bool,
     #[cfg(target_os = "macos")]
     symbols: platform::symbols::Cache,
+    #[cfg(target_os = "macos")]
+    controls: (Vec<crate::NativeControl>, Option<crate::ControlSink>),
     pub(crate) dirty: bool,
     redraw: [bool; 2],
     rebuild: bool,
@@ -598,6 +600,8 @@ impl Window {
             caret_covered: false,
             #[cfg(target_os = "macos")]
             symbols: platform::symbols::Cache::default(),
+            #[cfg(target_os = "macos")]
+            controls: Default::default(),
             dirty: false,
             redraw: [false; 2],
             rebuild: false,
@@ -922,6 +926,30 @@ impl Window {
         }
     }
 
+    // WARNING: a native control shows above the page over the box that paints it in this frame, clipped by the
+    // current content mask. Only macOS has them, and `sink` gets their events on the main thread.
+    pub fn native_control(&mut self, control: crate::NativeControl, sink: &crate::ControlSink) {
+        #[cfg(target_os = "macos")]
+        {
+            let mut control = control;
+            let zoom = self.zoom;
+            let scale = |bounds: Bounds<Pixels>| {
+                Bounds::new(
+                    point(bounds.origin.x * zoom, bounds.origin.y * zoom),
+                    size(bounds.size.width * zoom, bounds.size.height * zoom),
+                )
+            };
+            control.clip = scale(self.content_mask().bounds);
+            control.bounds = scale(control.bounds);
+            self.controls.0.push(control);
+            if self.controls.1.is_none() {
+                self.controls.1 = Some(sink.clone());
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (control, sink);
+    }
+
     pub(crate) fn draw(&mut self, cx: &mut App) {
         #[cfg(target_os = "macos")]
         self.platform.demote();
@@ -993,6 +1021,9 @@ impl Window {
                     .filter(|caret| caret.overlay && !covered)
                     .map(|caret| (caret.bounds, caret.color, caret.since)),
             );
+            let controls = mem::take(&mut self.controls.0);
+            self.platform
+                .set_controls(controls, self.controls.1.clone());
         }
         self.scene.finish();
         let captures = mem::take(&mut self.captures);

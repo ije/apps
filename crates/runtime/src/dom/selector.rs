@@ -1505,9 +1505,8 @@ impl Selector {
                             match node.tag.as_str() {
                                 "input" => {
                                     node.checked()
-                                        && node.attrs.get("type").is_some_and(|kind| {
-                                            kind.eq_ignore_ascii_case("checkbox")
-                                                || kind.eq_ignore_ascii_case("radio")
+                                        && ["checkbox", "radio"].iter().any(|kind| {
+                                            node.input_type().eq_ignore_ascii_case(kind)
                                         })
                                 }
                                 "option" if node.state & super::DIRTY != 0 || node.checked() => {
@@ -1569,6 +1568,7 @@ impl Selector {
                                 && node.state & (super::MODAL | super::MODAL << 5) != 0
                         }
                         "-internal-sf-symbol" => node.sf_symbol().is_some(),
+                        "-internal-native-control" => node.native_control().is_some(),
                         "disabled" | "enabled" => {
                             matches!(
                                 node.tag.as_str(),
@@ -1589,10 +1589,10 @@ impl Selector {
                                 memo.depend(child, 3);
                             }
                             let required = node.attrs.contains_key("required");
-                            let empty = if node.attrs.get("type").is_some_and(|kind| {
-                                kind.eq_ignore_ascii_case("checkbox")
-                                    || kind.eq_ignore_ascii_case("radio")
-                            }) {
+                            let empty = if ["checkbox", "radio"]
+                                .iter()
+                                .any(|kind| node.input_type().eq_ignore_ascii_case(kind))
+                            {
                                 !node.checked()
                             } else {
                                 node.current_value().map_or(
@@ -1623,14 +1623,12 @@ impl Selector {
                             let writable = !node.attrs.contains_key("readonly")
                                 && !node.attrs.contains_key("disabled")
                                 && (node.tag == "textarea"
-                                    || node.attrs.get("type").is_none_or(|kind| {
-                                        ![
-                                            "hidden", "checkbox", "radio", "file", "submit",
-                                            "image", "reset", "button", "color", "range",
-                                        ]
-                                        .iter()
-                                        .any(|other| kind.eq_ignore_ascii_case(other))
-                                    }));
+                                    || ![
+                                        "hidden", "checkbox", "radio", "file", "submit", "image",
+                                        "reset", "button", "color", "range",
+                                    ]
+                                    .iter()
+                                    .any(|other| node.input_type().eq_ignore_ascii_case(other)));
                             writable == (name == "read-write")
                         }
                         "read-write" | "read-only" | "lang" | "dir" => {

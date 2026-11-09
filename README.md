@@ -143,6 +143,26 @@ Icons inherit `color` and default to `1em` square. CSS width and height, such as
 
 These icons are monochrome. Missing symbols and other platforms show an empty element with the same CSS bounds.
 
+Inputs with an `ns-*` type show native AppKit controls on macOS. Other platforms show the fallback input type:
+
+| Type | macOS | Fallback |
+|---|---|---|
+| `ns-button` | `NSButton` | `button` |
+| `ns-switch` | `NSSwitch` | `checkbox` |
+| `ns-range` | `NSSlider`, or `NSStepper` with a `step` attribute | `range` |
+| `ns-text` | `NSTextField` | `text` |
+| `ns-search` | `NSSearchField` | `search` |
+| `ns-color` | `NSColorWell` | `color` |
+| `ns-date` | `NSDatePicker` | `date` |
+
+```html
+<label><input type="ns-switch" name="wifi" checked> Wi-Fi</label>
+<input type="ns-range" min="1" max="10" step="1" value="2">
+<input type="ns-button" value="Save">
+```
+
+The element's `type` property returns the fallback type, and the controls fire the same events as the fallback inputs. See [examples/nscontrol](examples/nscontrol).
+
 Set `loaders` in `package.json` to import other file types. Each key is a file extension, and each value is a module path relative to `package.json` or a package name:
 
 ```json

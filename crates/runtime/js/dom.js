@@ -859,6 +859,8 @@
   }
   // WARNING: form controls keep their current value and checkedness apart from the content attributes; Rust gets them through ops 7 (value) and 8 (checked, modal).
   const inputTypes = new Set(['hidden','text','search','tel','url','email','password','date','month','week','time','datetime-local','number','range','color','checkbox','radio','file','submit','image','reset','button']);
+  // WARNING: `ns-*` types show AppKit controls on macOS, and behave as their fallback type everywhere.
+  const nativeTypes = new Map([['ns-button','button'],['ns-switch','checkbox'],['ns-range','range'],['ns-text','text'],['ns-search','search'],['ns-color','color'],['ns-date','date']]);
   const editable = node => node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement && /^(text|search|tel|url|email|password|number)$/.test(node.type);
   const setValue = (node, value) => { node._value = value; op(7, node._id, value, 0); const length = value.length; node._start = Math.min(node._start ?? length, length); node._end = Math.min(node._end ?? length, length); };
   // WARNING: a range's value is always sanitized: clamped to min and max and rounded to the step from min, so changing them changes the value, like in browsers.
@@ -925,7 +927,7 @@
     get name() { return this.getAttribute('name') ?? ''; }, set name(value) { this.setAttribute('name', value); },
   };
   class HTMLInputElement extends HTMLElement {
-    get type() { const type = (this.getAttribute('type') ?? '').toLowerCase(); return inputTypes.has(type) ? type : 'text'; } set type(value) { this.setAttribute('type', value); }
+    get type() { const type = (this.getAttribute('type') ?? '').toLowerCase(); return inputTypes.has(type) ? type : nativeTypes.get(type) ?? 'text'; } set type(value) { this.setAttribute('type', value); }
     get value() { const type = this.type; return /^(hidden|submit|image|reset|button)$/.test(type) ? this.getAttribute('value') ?? '' : type === 'checkbox' || type === 'radio' ? this.getAttribute('value') ?? 'on' : type === 'file' ? '' : type === 'range' ? rangeValue(this, this._value ?? this.getAttribute('value')) : this._value ?? this.getAttribute('value')?.replace(/[\r\n]/g, '') ?? ''; }
     set value(value) { value = String(value ?? ''); if (/^(hidden|submit|image|reset|button|checkbox|radio)$/.test(this.type)) this.setAttribute('value', value); else if (this.type !== 'file' || !value) { if (!value) this._files = null; setValue(this, value); } }
     get defaultValue() { return this.getAttribute('value') ?? ''; } set defaultValue(value) { this.setAttribute('value', value); }
@@ -3114,6 +3116,15 @@
     queryCommandSupported: name => editCommands.has(String(name).toLowerCase()),
     queryCommandEnabled(name) { const command = editCommands.get(String(name).toLowerCase()); return !!command && enabled(command); },
   });
+  // WARNING: an AppKit control sends a press as a click, and its values as user edits. `done` ends an edit, which fires `change`.
+  globalThis.__appsNativeControl = (id, value, done) => {
+    const target = wrap(id);
+    if (!target || disabled(target)) return;
+    if (value === null) return void fireClick(target, { detail: 1 }, true);
+    if (target.type === 'range') value = rangeValue(target, value);
+    if (value !== target.value) { setValue(target, value); target._edited = true; dispatch(target, trusted(new Event('input', { bubbles: true, composed: true }))); }
+    if (done) commit(target);
+  };
   globalThis.__appsFrameEvent=(id,event)=>{const target=wrap(id);if(event.type==='did-finish-load')dispatch(target,new Event('load'));else if(event.type==='did-fail-load')dispatch(target,new Event('error'));else if(event.type==='message')dispatch(target,new MessageEvent('message',{data:event.data,origin:'null'}));};
   globalThis.__appsClipboard = (type, text = '') => {
     const target = active ?? document.body, data = new DataTransfer();

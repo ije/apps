@@ -2,6 +2,7 @@ mod app;
 mod atlas;
 mod bounds_tree;
 mod color;
+mod control;
 mod frame;
 mod geometry;
 mod input;
@@ -15,6 +16,7 @@ mod window;
 
 pub use app::{App, THREAD_PER_APP, Timer, native, run, spawn};
 pub use color::*;
+pub use control::*;
 pub use geometry::*;
 pub use input::*;
 pub use node::{

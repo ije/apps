@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>NSControl</title>
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <h1>NSControl</h1>
+    <p>Native AppKit controls on macOS, standard inputs on other platforms.</p>
+    <form id="form">
+      <label for="name">Name</label>
+      <input id="name" name="name" type="ns-text" placeholder="Your name" style="width: 220px">
+
+      <label for="search">Search</label>
+      <input id="search" name="search" type="ns-search" placeholder="Search" style="width: 220px">
+
+      <label for="wifi">Wi-Fi</label>
+      <div class="row">
+        <input id="wifi" name="wifi" type="ns-switch" checked>
+        <output id="wifi-state">On</output>
+      </div>
+
+      <label for="volume">Volume</label>
+      <div class="row">
+        <input id="volume" name="volume" type="ns-range" min="0" max="100" value="40" style="width: 220px">
+        <output id="volume-value">40</output>
+      </div>
+
+      <label for="copies">Copies</label>
+      <div class="row">
+        <input id="copies" name="copies" type="ns-range" min="1" max="10" step="1" value="2">
+        <output id="copies-value">2</output>
+      </div>
+
+      <label for="color">Color</label>
+      <div class="row">
+        <input id="color" name="color" type="ns-color" value="#007aff">
+        <output id="color-value">#007aff</output>
+      </div>
+
+      <label for="date">Date</label>
+      <input id="date" name="date" type="ns-date" value="2026-11-09" min="2000-01-01" max="2099-12-31">
+
+      <span></span>
+      <div class="row">
+        <input id="save" type="ns-button" value="Save">
+        <input id="reset" type="ns-button" value="Reset to Defaults">
+        <input type="ns-button" value="Disabled" disabled>
+      </div>
+    </form>
+    <pre id="log"></pre>
+    <script type="module">
+      const $ = (id) => document.getElementById(id);
+      const log = (text) => {
+        $('log').textContent = `${text}\n${$('log').textContent}`.split('\n').slice(0, 40).join('\n');
+      };
+      for (const input of document.querySelectorAll('input')) {
+        input.addEventListener('input', () => log(`input  #${input.id || input.value} ${input.type === 'checkbox' ? input.checked : input.value}`));
+        input.addEventListener('change', () => log(`change #${input.id || input.value} ${input.type === 'checkbox' ? input.checked : input.value}`));
+      }
+      $('wifi').addEventListener('change', () => ($('wifi-state').textContent = $('wifi').checked ? 'On' : 'Off'));
+      $('volume').addEventListener('input', () => ($('volume-value').textContent = $('volume').value));
+      $('copies').addEventListener('input', () => ($('copies-value').textContent = $('copies').value));
+      $('color').addEventListener('input', () => ($('color-value').textContent = $('color').value));
+      $('save').addEventListener('click', () => log(`click  Save ${JSON.stringify(Object.fromEntries(new FormData($('form'))))}`));
+      $('reset').addEventListener('click', () => {
+        $('name').value = '';
+        $('search').value = '';
+        $('wifi').checked = true;
+        $('volume').value = 40;
+        $('copies').value = 2;
+        $('color').value = '#007aff';
+        $('date').value = '2026-11-09';
+        for (const id of ['volume', 'copies', 'color']) $(id).dispatchEvent(new Event('input'));
+        $('wifi').dispatchEvent(new Event('change'));
+        log('click  Reset');
+      });
+    </script>
+  </body>
+</html>

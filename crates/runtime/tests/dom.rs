@@ -1854,6 +1854,34 @@ fn sf_symbols_parse_and_serialize_as_void_elements() {
 }
 
 #[test]
+fn native_control_types_behave_as_their_fallbacks() {
+    checked_page(
+        "<form id='form'><input id='switch' name='wifi' type='ns-switch'><input id='range' type='NS-Range' value='250'><input id='text' type='ns-text' value='a'><input id='date' type='ns-date'><input id='button' type='ns-button' value='Go'></form>",
+        r#"
+        const $ = id => document.getElementById(id);
+        check('fallback types', () => [...document.querySelectorAll('input')].map(input => input.type).join() === 'checkbox,range,text,date,button');
+        check('attribute keeps the native type', () => $('switch').getAttribute('type') === 'ns-switch' && $('switch').matches('[type=ns-switch]'));
+        let events = '';
+        for (const id of ['switch', 'range', 'text', 'button']) for (const type of ['input', 'change', 'click']) $(id).addEventListener(type, () => events += `${id}:${type} `);
+        $('switch').click();
+        check('switch toggles like a checkbox', () => $('switch').checked && $('switch').matches(':checked') && new FormData($('form')).get('wifi') === 'on');
+        check('range sanitizes', () => $('range').value === '100');
+        const mac = navigator.platform.startsWith('Mac');
+        check('native boxes draw nothing on macOS', () => getComputedStyle($('text')).borderTopWidth === (mac ? '0px' : '2px'));
+        events = '';
+        __appsNativeControl($('text')._id, 'hello', false);
+        __appsNativeControl($('text')._id, 'hello', true);
+        __appsNativeControl($('range')._id, '33.3', false);
+        __appsNativeControl($('range')._id, '33.3', true);
+        __appsNativeControl($('switch')._id, null, true);
+        __appsNativeControl($('button')._id, null, true);
+        check('native edits run as user input', () => $('text').value === 'hello' && $('text').getAttribute('value') === 'a' && $('range').value === '33' && !$('switch').checked);
+        check('native events', () => events === 'text:input text:change range:input range:change switch:click switch:input switch:change button:click ');
+        "#,
+    );
+}
+
+#[test]
 fn parser_raw_text_tables_and_document_structure() {
     checked_page(
         "<!doctype html><title>x &amp; y</title><style>a>b{}</style><p>one<p>two<table><tr><td>cell</table>a &lt; b &notin; &#x80;",

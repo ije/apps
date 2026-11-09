@@ -130,6 +130,10 @@ On macOS, cache misses rasterize symbols with AppKit on the render thread. Other
 The renderer keeps a bounded alpha cache and draws the icons through its monochrome atlas. CSS color changes need no new bitmap.
 The cache keeps every symbol that the current frame uses, even past its bounds.
 
+Inputs with an `ns-*` type show AppKit controls on macOS. Their box paints nothing and takes the control's natural size, measured once on main. When it paints, it gives the window the control's state, its bounds and the clip of its ancestors.
+After the frame, a changed list goes to main, which keeps each control in a clipping view above the frame. Main takes only the newest list, so a busy main thread skips lists.
+A control's action goes back to the page's thread as user input. Each event has a number, and the page's lists carry the last number it took, so main doesn't set a value from the page while the page has not yet taken the control's own edits.
+
 The atlas keeps a tile that fails or is bigger than a GPU texture as an empty entry, so it is not built again each frame.
 A glyph bigger than 2048 device pixels on a side rasters at a smaller scale and stretches to its size.
 

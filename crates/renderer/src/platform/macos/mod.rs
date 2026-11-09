@@ -1,6 +1,7 @@
 // WARNING: macOS screens have a y axis that goes up from the bottom, with the origin at the
 // bottom left of the main display.
 
+mod controls;
 mod display_link;
 mod events;
 mod glass;
@@ -47,6 +48,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) use controls::control_size;
 pub(crate) use glass::available as supports_glass;
 pub(crate) use text::TextSystem;
 pub(crate) use window::Window;
