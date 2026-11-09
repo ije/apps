@@ -435,7 +435,7 @@ pub struct State {
     pub(crate) reserved: HashSet<usize>,
     pub(crate) svg_sources: rustc_hash::FxHashMap<usize, String>,
     pub(crate) svg_boxes: rustc_hash::FxHashMap<usize, SvgBoxes>,
-    pub(crate) svg_trees: rustc_hash::FxHashMap<usize, resvg::usvg::Tree>,
+    pub(crate) svg_trees: rustc_hash::FxHashMap<usize, usvg::Tree>,
     pub(crate) svg_images: rustc_hash::FxHashMap<usize, (Rc<str>, [f32; 2])>,
     pub(crate) masks: rustc_hash::FxHashMap<usize, (String, Option<Arc<renderer::RenderImage>>)>,
     pub svgs: rustc_hash::FxHashMap<usize, (String, Arc<renderer::RenderImage>)>,
@@ -689,7 +689,7 @@ fn new_canvas(node: &Node) -> Result<crate::render::canvas::Canvas> {
 pub(crate) type CanvasSource = (
     (u64, usize, [u32; 2]),
     Option<Rc<str>>,
-    Rc<resvg::tiny_skia::Pixmap>,
+    Rc<tiny_skia::Pixmap>,
 );
 
 // WARNING: images keep their premultiplied pixels for later draws, up to 64 MB in all, until the image or the
@@ -800,11 +800,11 @@ pub(crate) fn load_image(
             crate::render::image::decode(&bytes)
                 .map(Ok)
                 .or_else(|error| {
-                    let size = resvg::usvg::Tree::from_data(&bytes, &Default::default())
+                    let size = usvg::Tree::from_data(&bytes, &Default::default())
                         .map_err(|_| error)?
                         .size();
                     let text = if bytes.starts_with(&[0x1f, 0x8b]) {
-                        resvg::usvg::decompress_svgz(&bytes)?
+                        usvg::decompress_svgz(&bytes)?
                     } else {
                         bytes
                     };
@@ -2134,13 +2134,10 @@ pub fn call(
             }
             "dom.canvasAdopt" => {
                 let mut canvas = new_canvas(&doc.nodes[id])?;
-                canvas.pixels = resvg::tiny_skia::Pixmap::from_vec(
+                canvas.pixels = tiny_skia::Pixmap::from_vec(
                     crate::web::bytes(&args[1])?,
-                    resvg::tiny_skia::IntSize::from_wh(
-                        canvas.pixels.width(),
-                        canvas.pixels.height(),
-                    )
-                    .context("Invalid canvas size")?,
+                    tiny_skia::IntSize::from_wh(canvas.pixels.width(), canvas.pixels.height())
+                        .context("Invalid canvas size")?,
                 )
                 .context("Invalid canvas pixels")?;
                 state.created += canvas.pixels.data().len() >> 16;
@@ -2789,7 +2786,7 @@ pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Resul
     };
     let mut fonts = crate::render::canvas::fonts(false);
     let database = std::sync::Arc::make_mut(&mut fonts.0);
-    let ids = database.load_font_source(resvg::usvg::fontdb::Source::Binary(std::sync::Arc::new(
+    let ids = database.load_font_source(usvg::fontdb::Source::Binary(std::sync::Arc::new(
         bytes.clone(),
     )));
     let face = ids

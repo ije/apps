@@ -245,11 +245,9 @@ pub(super) fn css_background(
                                     let svg = std::fs::read_to_string(&path)
                                         .map_err(anyhow::Error::from)
                                         .and_then(|text| {
-                                            let natural = resvg::usvg::Tree::from_str(
-                                                &text,
-                                                &Default::default(),
-                                            )?
-                                            .size();
+                                            let natural =
+                                                usvg::Tree::from_str(&text, &Default::default())?
+                                                    .size();
                                             let fitted = fit.get_bounds(
                                                 renderer::Bounds::new(
                                                     renderer::point(px(0.), px(0.)),
@@ -288,10 +286,10 @@ pub(super) fn css_background(
                                 };
                                 let image = match super::canvas::pixmap(&image)
                                     .filter(|_| nx * ny > 1.)
-                                    .zip(resvg::tiny_skia::Pixmap::new(cell[0], cell[1]))
+                                    .zip(tiny_skia::Pixmap::new(cell[0], cell[1]))
                                 {
                                     Some((tile, mut pixels)) => {
-                                        use resvg::tiny_skia as skia;
+                                        use tiny_skia as skia;
                                         let [w, h] = cell.map(|side| side as f32);
                                         if let Some(rect) = skia::Rect::from_xywh(0., 0., w, h) {
                                             pixels.fill_rect(

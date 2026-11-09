@@ -109,6 +109,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "apps-mcp"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "serde_json",
+]
+
+[[package]]
 name = "apps-media"
 version = "0.0.0"
 dependencies = [
@@ -182,6 +191,7 @@ name = "apps-runtime"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "apps-mcp",
  "apps-media",
  "apps-renderer",
  "apps-webgpu",
@@ -205,17 +215,22 @@ dependencies = [
  "libffi",
  "libloading",
  "libsqlite3-sys",
+ "log",
  "md-5",
  "memchr",
  "memmap2",
  "miniz_oxide 0.8.9",
  "notify",
+ "oxc_allocator",
+ "oxc_codegen",
+ "oxc_parser",
+ "oxc_span",
  "png 0.17.16",
  "portable-pty",
  "postcard",
  "rav1d",
  "raw-window-handle",
- "resvg",
+ "rgb",
  "ring",
  "rustc-hash 2.1.3",
  "rustls",
@@ -225,10 +240,13 @@ dependencies = [
  "sha2",
  "socket2",
  "tempfile",
+ "tiny-skia",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tower-service",
  "url",
+ "usvg",
  "wuff",
  "zune-jpeg",
 ]
@@ -4174,23 +4192,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
-name = "resvg"
-version = "0.46.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b563218631706d614e23059436526d005b50ab5f2d506b55a17eb65c5eb83419"
-dependencies = [
- "gif",
- "image-webp",
- "log",
- "pico-args",
- "rgb",
- "svgtypes",
- "tiny-skia",
- "usvg",
- "zune-jpeg",
-]
-
-[[package]]
 name = "rgb"
 version = "0.8.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5102,11 +5103,7 @@ checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
 dependencies = [
  "futures-util",
  "log",
- "rustls",
- "rustls-native-certs",
- "rustls-pki-types",
  "tokio",
- "tokio-rustls",
  "tungstenite",
 ]
 
@@ -5249,8 +5246,6 @@ dependencies = [
  "httparse",
  "log",
  "rand",
- "rustls",
- "rustls-pki-types",
  "sha1",
  "thiserror 2.0.21",
  "utf-8",

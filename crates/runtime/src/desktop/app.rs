@@ -140,7 +140,7 @@ pub fn run(setup: impl FnOnce(&App) -> Result<()>) -> Result<()> {
         if let Some(path) = std::env::var_os("APPS_RUST_LIBRARIES") {
             let _ = DEV_LIBRARIES.set(path.into());
         }
-        serde_json::from_reader(std::io::BufReader::new(std::io::stdin().lock()))
+        crate::bundle::from_json(std::io::stdin().lock())
             .context("Cannot read renderer bundle from apps run")?
     } else {
         crate::bundle::read(&resources).context("Start this app with apps run or apps build")?

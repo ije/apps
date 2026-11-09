@@ -311,6 +311,14 @@ pub fn write(
     Ok(bytes.len())
 }
 
+// WARNING: dev bundles are JSON from a file or stdin. Parsing them from one byte slice keeps one copy of the
+// bundle deserializer in the runtime instead of one per reader type.
+pub fn from_json(mut input: impl std::io::Read) -> Result<Bundle> {
+    let mut bytes = Vec::new();
+    input.read_to_end(&mut bytes)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 pub fn read(directory: &Path) -> Result<Bundle> {
     let directory = if directory.join("Contents/Resources").is_dir() {
         directory.join("Contents/Resources")

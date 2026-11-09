@@ -68,8 +68,8 @@ fn failure((error, syscall, mut details): Failure) -> Value {
     details
 }
 
-async fn run<T: Transport>(
-    stream: T,
+async fn run(
+    stream: Accepted,
     mut commands: mpsc::UnboundedReceiver<Command>,
     mut paused: watch::Receiver<bool>,
     output: mpsc::Sender<Payload>,
@@ -139,11 +139,7 @@ async fn run<T: Transport>(
     tokio::try_join!(read, write).map(|_| ())
 }
 
-enum Accepted {
-    Tcp(TcpStream),
-    #[cfg(unix)]
-    Unix(tokio::net::UnixStream),
-}
+type Accepted = Box<dyn Transport>;
 struct Connection {
     commands: mpsc::UnboundedSender<Command>,
     paused: watch::Sender<bool>,
@@ -196,18 +192,8 @@ impl State {
         let (output, events) = mpsc::channel(64);
         let wake = crate::host::Waker::current();
         let task = crate::web::network()?.spawn(async move {
-            let result = async {
-                match future.await? {
-                    Accepted::Tcp(stream) => {
-                        run(stream, incoming, pausing, output.clone(), &wake).await
-                    }
-                    #[cfg(unix)]
-                    Accepted::Unix(stream) => {
-                        run(stream, incoming, pausing, output.clone(), &wake).await
-                    }
-                }
-            }
-            .await;
+            let result =
+                async { run(future.await?, incoming, pausing, output.clone(), &wake).await }.await;
             let failed = result.is_err();
             if let Err(error) = result {
                 let _ = output.send(failure(error).into()).await;
@@ -263,7 +249,7 @@ impl State {
                 stream.set_nonblocking(true)?;
                 let id = self.start(async move {
                     tokio::net::UnixStream::from_std(stream)
-                        .map(Accepted::Unix)
+                        .map(|stream| Box::new(stream) as Accepted)
                         .map_err(|error| (error, "connect", json!({})))
                 })?;
                 Ok(json!(id))
@@ -275,7 +261,7 @@ impl State {
                         #[cfg(unix)]
                         return tokio::net::UnixStream::connect(path)
                             .await
-                            .map(Accepted::Unix)
+                            .map(|stream| Box::new(stream) as Accepted)
                             .map_err(|error| (error, "connect", json!({"address":path})));
                         #[cfg(not(unix))]
                         return Err((
@@ -302,7 +288,7 @@ impl State {
                         .map_err(|_| lookup())?
                     {
                         match TcpStream::connect(address).await {
-                            Ok(stream) => return Ok(Accepted::Tcp(stream)),
+                            Ok(stream) => return Ok(Box::new(stream) as Accepted),
                             Err(error) => {
                                 last = (
                                     error,
@@ -370,11 +356,11 @@ impl State {
                             std::future::poll_fn(|cx| match accepting.lock().as_deref() {
                                 Ok(Some(Listener::Tcp(listener))) => listener
                                     .poll_accept(cx)
-                                    .map_ok(|(stream, _)| Accepted::Tcp(stream)),
+                                    .map_ok(|(stream, _)| Box::new(stream) as Accepted),
                                 #[cfg(unix)]
                                 Ok(Some(Listener::Unix(listener, _))) => listener
                                     .poll_accept(cx)
-                                    .map_ok(|(stream, _)| Accepted::Unix(stream)),
+                                    .map_ok(|(stream, _)| Box::new(stream) as Accepted),
                                 _ => Poll::Pending,
                             })
                             .await;
@@ -444,11 +430,7 @@ impl State {
                     }
                 }
                 for (server, stream) in accepted {
-                    let address = match &stream {
-                        Accepted::Tcp(stream) => stream.address(),
-                        #[cfg(unix)]
-                        Accepted::Unix(stream) => stream.address(),
-                    };
+                    let address = stream.address();
                     let socket = self.start(async { Ok(stream) })?;
                     events.push(
                         json!({"server":server,"id":socket,"kind":"connection","address":address}),

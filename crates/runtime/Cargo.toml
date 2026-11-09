@@ -23,7 +23,7 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 libc.workspace = true
 libffi = "5.2.0"
 libloading = "0.8"
-libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
+log = "0.4"
 memmap2 = "0.9"
 md-5 = "0.10"
 memchr = "2"
@@ -32,7 +32,7 @@ png = "0.17"
 portable-pty = "0.9"
 raw-window-handle.workspace = true
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
-resvg.workspace = true
+rgb = "0.8"
 rustc-hash.workspace = true
 ring = "0.17.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -41,15 +41,19 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 socket2 = "0.6"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros"] }
-tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-native-roots"] }
+tiny-skia.workspace = true
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "io-util", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false }
+tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["handshake"] }
 tower-service = "0.3"
 url.workspace = true
+usvg.workspace = true
 zune-jpeg = "0.5"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 avif-parse = "=2.1.0"
 image.workspace = true
+libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
 # WARNING: the published rav1d can abort on corrupt AV1 data.
 rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "6c6f463785a546dea18fd9ca0f14634c2ee0557c", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 wuff = "0.2"
@@ -61,8 +65,9 @@ apps-webgpu = { path = "../webgpu" }
 name = "apps-runtime"
 path = "src/main.rs"
 
-# WARNING: these put the WebGPU and media libraries next to test executables.
+# WARNING: these put the WebGPU, media and devtools MCP libraries next to test executables.
 [dev-dependencies]
+apps-mcp = { path = "../mcp" }
 apps-media = { path = "../media" }
 apps-webgpu = { path = "../webgpu" }
 image.workspace = true
@@ -71,3 +76,7 @@ tempfile = "3"
 [build-dependencies]
 cc = "1"
 miniz_oxide = "0.8"
+oxc_allocator = "=0.155.0"
+oxc_codegen = "=0.155.0"
+oxc_parser = { version = "=0.155.0", default-features = false }
+oxc_span = "=0.155.0"

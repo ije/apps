@@ -150,6 +150,10 @@ bash scripts/build-ffmpeg.sh
 
 `crates/perfhud` (`apps-perfhud`) is the FPS HUD that `apps run` shows on Cmd+Alt+F. The runtime loads the library next to its executable, and `apps build` never ships it, so built apps keep only the small hook in `crates/runtime/src/render/hud.rs`.
 
+## Devtools MCP Server
+
+`crates/mcp` (`apps-mcp`) is the devtools server of `apps run --enable-devtools-mcp`: HTTP, MCP, the debugger and the profiler. Like the FPS HUD, it is a library next to the runtime that `apps build` never ships. The runtime keeps only `crates/runtime/src/desktop/mcp.rs`: the JSC inspector bridge and the work that needs the app, like window lists, screenshots, input and memory.
+
 ## JSC
 
 The runtime uses [Bun's WebKit fork](https://github.com/oven-sh/WebKit).
@@ -158,7 +162,7 @@ The build enables Bun's JSC additions with the generic event loop.
 
 Like Bun, native code reads strings and bytes where JSC keeps them, without copies. It makes strings from Latin-1, UTF-16 or UTF-8 with one copy, and Uint8Arrays it fills without zeroing them. Conversions use the simdutf that JSC already has. `crates/runtime/src/jsc/encoding.rs` has `TextEncoder`, `TextDecoder`, the `Buffer` encodings, `atob()`, `btoa()`, `indexOf()` and `compare()` of `Buffer`.
 
-Each VM runs the runtime scripts in `crates/runtime/js` before page or app code. The build makes them ASCII, so the process keeps one copy that JSC reads in place. JSC's code cache is per VM, so when a second VM runs a runtime script, a thread compiles the script and all of its functions into bytecode, and later VMs decode that bytecode instead of compiling the script. A context in a new VM then starts in about 3 ms instead of 12 ms, and holds about 1 MB less. Decoded code points into the bytecode, so the process keeps it: about 2.6 MB for all runtime scripts. JSC compiles the source when the bytecode doesn't match it, for example while a debugger is attached.
+Each VM runs the runtime scripts in `crates/runtime/js` before page or app code. The build removes their whitespace and comments and makes them ASCII, so the process keeps one copy, about 0.8 MB, that JSC reads in place. JSC's code cache is per VM, so when a second VM runs a runtime script, a thread compiles the script and all of its functions into bytecode, and later VMs decode that bytecode instead of compiling the script. A context in a new VM then starts in about 3 ms instead of 12 ms, and holds about 1 MB less. Decoded code points into the bytecode, so the process keeps it: about 2.6 MB for all runtime scripts. JSC compiles the source when the bytecode doesn't match it, for example while a debugger is attached.
 
 `apps build --bytecode` builds this bytecode with the JavaScriptCore that ships with the app, also for the main script and the ASCII script chunks, and packs it in `app.bundle`. The runtime finds the bytecode of a chunk by where its source is in the mapped file, so page, preload, worker and imported chunks all use it, and JSC reads both in place, so they don't count in the footprint. A small app with one window and a preload goes from launch to its loaded page in 141 ms instead of 160 ms, and its footprint goes from 53 to 47 MB. DiffsHub goes from 255 to 196 ms and from 136 to 125 MB, and its bundle from 6.2 to 18.3 MB.
 

@@ -28,11 +28,20 @@ use url::{Url, quirks};
 
 pub(crate) fn network() -> Result<&'static tokio::runtime::Runtime> {
     if NETWORK.get().is_none() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let _ = NETWORK.set(runtime);
+        // WARNING: a current-thread runtime runs its tasks and IO only while a thread waits in its `block_on`.
+        if NETWORK.set(runtime).is_ok() {
+            std::thread::Builder::new()
+                .name("apps-network".into())
+                .spawn(|| {
+                    NETWORK
+                        .get()
+                        .unwrap()
+                        .block_on(std::future::pending::<()>())
+                })?;
+        }
     }
     Ok(NETWORK.get().unwrap())
 }

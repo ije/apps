@@ -10,6 +10,7 @@ mod hud;
 pub mod image;
 mod input;
 mod paint;
+mod resvg;
 pub(crate) mod scrollbar;
 pub(crate) mod text;
 

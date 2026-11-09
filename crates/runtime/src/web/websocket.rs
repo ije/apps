@@ -1,6 +1,7 @@
 use crate::web::bytes;
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{SinkExt, StreamExt};
+use rustls::pki_types::ServerName;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -14,6 +15,7 @@ use tokio::{
     sync::mpsc,
     task::JoinHandle,
 };
+use tokio_rustls::TlsConnector;
 use tokio_tungstenite::{
     WebSocketStream,
     tungstenite::{
@@ -36,8 +38,12 @@ impl Drop for Socket {
     }
 }
 
-async fn run<S: AsyncRead + AsyncWrite + Unpin>(
-    socket: WebSocketStream<S>,
+trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+type Stream = WebSocketStream<Box<dyn Io>>;
+
+async fn run(
+    socket: Stream,
     mut commands: mpsc::UnboundedReceiver<Message>,
     events: mpsc::Sender<crate::jsc::payload::Payload>,
     written: Arc<AtomicUsize>,
@@ -121,12 +127,10 @@ pub(crate) struct State {
 }
 
 impl State {
-    pub(crate) fn accept(
+    fn start(
         &mut self,
-        upgrade: hyper::upgrade::OnUpgrade,
-        protocol: String,
+        open: impl Future<Output = Result<(Stream, String)>> + Send + 'static,
     ) -> Result<u64> {
-        ensure!(self.sockets.len() < 1024, "Too many WebSockets");
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (event_tx, events) = mpsc::channel(64);
         let written = Arc::new(AtomicUsize::new(0));
@@ -134,13 +138,7 @@ impl State {
         let wake = crate::host::Waker::current();
         let task = crate::web::network()?.spawn(async move {
             let result = async {
-                let transport = hyper_util::rt::TokioIo::new(upgrade.await?);
-                let socket = WebSocketStream::from_raw_socket(
-                    transport,
-                    tokio_tungstenite::tungstenite::protocol::Role::Server,
-                    Some(limits()),
-                )
-                .await;
+                let (socket, protocol) = open.await?;
                 let _ = event_tx
                     .send(json!({"kind":"open","protocol":protocol}).into())
                     .await;
@@ -168,6 +166,24 @@ impl State {
         Ok(self.next_id)
     }
 
+    pub(crate) fn accept(
+        &mut self,
+        upgrade: hyper::upgrade::OnUpgrade,
+        protocol: String,
+    ) -> Result<u64> {
+        ensure!(self.sockets.len() < 1024, "Too many WebSockets");
+        self.start(async move {
+            let transport: Box<dyn Io> = Box::new(hyper_util::rt::TokioIo::new(upgrade.await?));
+            let socket = WebSocketStream::from_raw_socket(
+                transport,
+                tokio_tungstenite::tungstenite::protocol::Role::Server,
+                Some(limits()),
+            )
+            .await;
+            Ok((socket, protocol))
+        })
+    }
+
     pub(crate) fn call(&mut self, op: &str, args: &Value, renderer: bool) -> Result<Value> {
         match op {
             "connect" => {
@@ -184,62 +200,41 @@ impl State {
                         .headers_mut()
                         .insert("sec-websocket-protocol", protocols.join(", ").parse()?);
                 }
-                let (commands, command_rx) = mpsc::unbounded_channel();
-                let (event_tx, events) = mpsc::channel(64);
-                let written = Arc::new(AtomicUsize::new(0));
-                let counter = written.clone();
-                let wake = crate::host::Waker::current();
-                let task = crate::web::network()?.spawn(async move {
-                    let result = async {
-                        let stream = crate::web::connect(
-                            url.host_str().context("Missing WebSocket host")?,
-                            url.port_or_known_default()
-                                .context("Missing WebSocket port")?,
-                            renderer,
+                let id = self.start(async move {
+                    let host = url.host_str().context("Missing WebSocket host")?;
+                    let port = url
+                        .port_or_known_default()
+                        .context("Missing WebSocket port")?;
+                    let stream = crate::web::connect(host, port, renderer).await?;
+                    let stream: Box<dyn Io> = if url.scheme() == "wss" {
+                        let name = ServerName::try_from(host.trim_matches(['[', ']']).to_owned())?;
+                        Box::new(
+                            TlsConnector::from(crate::web::tls())
+                                .connect(name, stream)
+                                .await?,
                         )
-                        .await?;
-                        let (socket, response) = tokio_tungstenite::client_async_tls_with_config(
-                            request,
-                            stream,
-                            Some(limits()),
-                            Some(tokio_tungstenite::Connector::Rustls(crate::web::tls())),
-                        )
-                        .await?;
-                        let protocol = response
-                            .headers()
-                            .get("sec-websocket-protocol")
-                            .map(|v| v.to_str())
-                            .transpose()?
-                            .unwrap_or("");
-                        ensure!(
-                            protocol.is_empty() || protocols.iter().any(|p| p == protocol),
-                            "Server selected an unrequested protocol"
-                        );
-                        let _ = event_tx
-                            .send(json!({"kind":"open","protocol":protocol}).into())
-                            .await;
-                        wake.wake();
-                        run(socket, command_rx, event_tx.clone(), counter, wake.clone()).await
-                    }
-                    .await;
-                    if let Err(error) = result {
-                        let _ = event_tx
-                            .send(json!({"kind":"error","message":format!("{error:#}")}).into())
-                            .await;
-                        wake.wake();
-                    }
-                });
-                self.next_id += 1;
-                self.sockets.insert(
-                    self.next_id,
-                    Socket {
-                        commands,
-                        events,
-                        written,
-                        task,
-                    },
-                );
-                Ok(json!(self.next_id))
+                    } else {
+                        Box::new(stream)
+                    };
+                    let (socket, response) = tokio_tungstenite::client_async_with_config(
+                        request,
+                        stream,
+                        Some(limits()),
+                    )
+                    .await?;
+                    let protocol = response
+                        .headers()
+                        .get("sec-websocket-protocol")
+                        .map(|v| v.to_str())
+                        .transpose()?
+                        .unwrap_or("");
+                    ensure!(
+                        protocol.is_empty() || protocols.iter().any(|p| p == protocol),
+                        "Server selected an unrequested protocol"
+                    );
+                    Ok((socket, protocol.to_owned()))
+                })?;
+                Ok(json!(id))
             }
             "send" | "close" => {
                 let id = args[0].as_u64().context("Expected socket ID")?;

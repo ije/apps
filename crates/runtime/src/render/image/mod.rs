@@ -38,7 +38,16 @@ fn bgra(mut pixels: Vec<u8>, channels: usize) -> Vec<u8> {
 }
 
 pub fn decode(bytes: &[u8]) -> anyhow::Result<renderer::RenderImage> {
-    let (pixels, width, height) = match bytes {
+    let (pixels, width, height) = pixels(bytes)?;
+    Ok(renderer::RenderImage::new(
+        width as u32,
+        height as u32,
+        pixels,
+    ))
+}
+
+pub(crate) fn pixels(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize, usize)> {
+    Ok(match bytes {
         [0xFF, 0xD8, 0xFF, ..] => {
             use zune_jpeg::JpegDecoder;
             use zune_jpeg::zune_core::{colorspace::ColorSpace, options::DecoderOptions};
@@ -140,12 +149,7 @@ pub fn decode(bytes: &[u8]) -> anyhow::Result<renderer::RenderImage> {
             let (width, height) = image.dimensions();
             (bgra(image.into_raw(), 4), width as usize, height as usize)
         }
-    };
-    Ok(renderer::RenderImage::new(
-        width as u32,
-        height as u32,
-        pixels,
-    ))
+    })
 }
 
 pub(crate) fn data_file(url: &str) -> Option<std::path::PathBuf> {

@@ -2807,7 +2807,7 @@ mod tests {
         assert_eq!(doc.nodes[svg + 2].tag, "linearGradient");
         assert_eq!(doc.nodes[svg + 2].attrs["gradientUnits"], "userSpaceOnUse");
         let source = doc.serialize(svg);
-        let tree = resvg::usvg::Tree::from_str(&source, &Default::default()).unwrap();
+        let tree = usvg::Tree::from_str(&source, &Default::default()).unwrap();
         assert_eq!(tree.root().children().len(), 2);
     }
 

@@ -1347,7 +1347,9 @@ impl Desktop {
         drop(api);
         let main = main.context("Missing the main side")?;
         apps_webview::on_main_thread(|task| renderer::native::sync(task), renderer::native::post);
-        let mcp = mcp.map(|port| mcp::start(port, link.clone())).transpose()?;
+        if let Some(port) = mcp {
+            mcp::start(port, link.clone())?;
+        }
         let packed = pages
             .iter()
             .map(|(name, doc)| Ok((name.clone(), crate::bundle::pack_page(doc)?)))
@@ -1371,10 +1373,10 @@ impl Desktop {
         drop((host, pages));
         if renderer::THREAD_PER_APP {
             link.set_per_window();
-            let (template, link, mcp) = (template.clone(), link.clone(), mcp.clone());
+            let (template, link) = (template.clone(), link.clone());
             main.set_spawner(Box::new(move |id, queue| {
-                let (template, link, mcp) = (template.clone(), link.clone(), mcp.clone());
-                renderer::spawn(move |cx| Self::start(template, link, queue, mcp, Some(id), cx));
+                let (template, link) = (template.clone(), link.clone());
+                renderer::spawn(move |cx| Self::start(template, link, queue, Some(id), cx));
             }));
         }
         let exit = link.clone();
@@ -1491,7 +1493,7 @@ impl Desktop {
             main.drive();
             if !renderer::THREAD_PER_APP {
                 let (link, queue) = (link.clone(), link.shared_queue());
-                renderer::spawn(move |cx| Self::start(template, link, queue, mcp, None, cx));
+                renderer::spawn(move |cx| Self::start(template, link, queue, None, cx));
             }
             let first = main.first_window();
             if devtools {
@@ -1523,7 +1525,6 @@ impl Desktop {
         template: Arc<Template>,
         link: Link,
         queue: Arc<PageQueue>,
-        mcp: Option<mcp::Handle>,
         owner: Option<u64>,
         cx: &mut App,
     ) {
@@ -1546,9 +1547,7 @@ impl Desktop {
         crate::jsc::NATIVE.set(Some(|op, args| {
             renderer::native::sync(|| native::native_call(op, args))
         }));
-        if let Some(mcp) = mcp {
-            mcp.install(owner.unwrap_or(0));
-        }
+        mcp::install(owner.unwrap_or(0));
         let mut host = Host {
             link: Some(link.clone()),
             rust_main: template.rust_main,
@@ -1775,7 +1774,7 @@ fn png(
     rect: &serde_json::Value,
     css: bool,
 ) -> Result<([u32; 2], Vec<u8>)> {
-    use resvg::tiny_skia as skia;
+    use tiny_skia as skia;
     let mut image = skia::IntSize::from_wh(width, height)
         .and_then(|size| skia::Pixmap::from_vec(pixels, size))
         .context("Invalid frame")?;

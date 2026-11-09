@@ -60,6 +60,29 @@ fn web_images_decode_in_the_dom() {
     }
 }
 
+#[test]
+fn svg_raster_images_decode_through_the_runtime() {
+    use apps_runtime::render::canvas::{svg_pixels, svg_tree};
+    use base64::Engine;
+    for (kind, bytes) in [
+        ("png", include_bytes!("images/sample.png").as_slice()),
+        ("jpeg", include_bytes!("images/sample.jpg")),
+        ("gif", include_bytes!("images/sample.gif")),
+        ("webp", include_bytes!("images/sample.webp")),
+    ] {
+        let source = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"><image href="data:image/{kind};base64,{}" width="4" height="3"/></svg>"#,
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        let pixels = svg_pixels(&svg_tree(&source).unwrap(), 4, 3, None).unwrap();
+        for pixel in pixels.data().as_chunks::<4>().0 {
+            for (value, expected) in pixel.iter().zip([32, 128, 224, 255]) {
+                assert!(value.abs_diff(expected) <= 3, "{kind} {pixel:?}");
+            }
+        }
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn web_image_formats_are_enabled() {

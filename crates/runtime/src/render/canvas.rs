@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
-use resvg::{tiny_skia as skia, usvg};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use tiny_skia as skia;
 
 // WARNING: SVG rasters have at most this many pixels per side. Larger ones scale down to fit and draw scaled up.
 pub const RASTER_MAX: u32 = 4096;
@@ -1222,7 +1222,7 @@ pub fn svg_pixels(
     let size = tree.size();
     let ([fit_width, fit_height], [a, b, c, d, e, f]) =
         transform.unwrap_or(([width as f32, height as f32], [1., 0., 0., 1., 0., 0.]));
-    resvg::render(
+    super::resvg::render(
         tree,
         skia::Transform::from_scale(w as f32 / width as f32, h as f32 / height as f32)
             .pre_concat(skia::Transform::from_row(a, b, c, d, e, f))

@@ -116,6 +116,7 @@ fn sqlite_statements_values_and_lifecycle() {
         throws(() => reopened.prepare('SELECT 2'), 'Reentrant authorizer');
         reopened.setAuthorizer(null);
         assert(reopened.prepare('SELECT 3 AS x').get().x === 3, 'Usable after authorizer');
+        assert(reopened.prepare('PRAGMA recursive_triggers').get().recursive_triggers === 0, 'Recursive triggers off as in Node');
         reopened.close();
         const configured = new DatabaseSync(':memory:', { readBigInts: true, returnArrays: true, enableForeignKeyConstraints: false, enableDoubleQuotedStringLiterals: true });
         assert(configured.prepare('SELECT 1, "text"').get().join(',') === '1,text', 'Database defaults');

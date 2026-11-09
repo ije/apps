@@ -29,9 +29,9 @@ fn main() {
             }
             argv.extend(args);
             let bundle = match std::env::var_os("APPS_DEV_BUNDLE") {
-                Some(path) => serde_json::from_reader(std::io::BufReader::new(
+                Some(path) => apps_runtime::bundle::from_json(
                     std::fs::File::open(path).context("Cannot read the app bundle")?,
-                ))
+                )
                 .context("Cannot read the app bundle")?,
                 None => apps_runtime::bundle::read(&home)?,
             };
@@ -62,9 +62,8 @@ fn main() {
                 directory.is_none(),
                 "Cannot use a directory with --bundle-stdin"
             );
-            let bundle: apps_runtime::bundle::Bundle =
-                serde_json::from_reader(std::io::BufReader::new(std::io::stdin().lock()))
-                    .context("Cannot read the app bundle from stdin")?;
+            let bundle = apps_runtime::bundle::from_json(std::io::stdin().lock())
+                .context("Cannot read the app bundle from stdin")?;
             anyhow::ensure!(bundle.files.contains_key("app.js"), "Missing app.js");
             bundle
         } else {

@@ -609,15 +609,6 @@ fn receive(
     decoded
 }
 
-pub(crate) fn context(role: Role) -> Option<usize> {
-    HOSTS.with_borrow(|hosts| {
-        hosts
-            .iter()
-            .find(|(_, binding)| binding.2 == role)
-            .map(|(&ctx, _)| ctx)
-    })
-}
-
 pub(crate) fn contexts() -> Vec<(usize, Role)> {
     HOSTS.with_borrow(|hosts| {
         hosts

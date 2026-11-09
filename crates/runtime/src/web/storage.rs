@@ -1,5 +1,5 @@
+use crate::node::sqlite::ffi as sql;
 use anyhow::{Context, Result, bail, ensure};
-use libsqlite3_sys as sql;
 use serde_json::{Value, json};
 use std::{
     cell::RefCell,

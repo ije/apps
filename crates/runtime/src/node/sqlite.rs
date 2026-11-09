@@ -1,6 +1,7 @@
 use crate::host::Role;
 use anyhow::{Context, Result, bail, ensure};
-use libsqlite3_sys as ffi;
+#[cfg(not(target_os = "macos"))]
+pub(crate) use libsqlite3_sys as ffi;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -8,6 +9,165 @@ use std::{
     ptr,
     rc::Rc,
 };
+
+// WARNING: macOS links the system SQLite (3.39 or later on macOS 13) instead of a bundled 1 MB copy.
+// It is declared here, because libsqlite3-sys without `bundled` can link another copy that pkg-config finds.
+#[cfg(target_os = "macos")]
+#[allow(non_camel_case_types)]
+pub(crate) mod ffi {
+    use std::ffi::{c_char, c_int, c_uint, c_void};
+    pub enum sqlite3 {}
+    pub enum sqlite3_stmt {}
+    pub enum sqlite3_backup {}
+    type Destructor = Option<unsafe extern "C" fn(*mut c_void)>;
+    type Authorizer = Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            c_int,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+        ) -> c_int,
+    >;
+    type Callback = Option<
+        unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int,
+    >;
+    #[allow(non_snake_case)]
+    pub fn SQLITE_TRANSIENT() -> Destructor {
+        Some(unsafe { std::mem::transmute::<isize, unsafe extern "C" fn(*mut c_void)>(-1) })
+    }
+    macro_rules! constants {
+        ($($name:ident = $value:literal),*) => { $(pub const $name: c_int = $value;)* };
+    }
+    constants! {
+        SQLITE_OK = 0, SQLITE_BUSY = 5, SQLITE_LOCKED = 6, SQLITE_ROW = 100, SQLITE_DONE = 101,
+        SQLITE_INTEGER = 1, SQLITE_FLOAT = 2, SQLITE_TEXT = 3, SQLITE_BLOB = 4, SQLITE_NULL = 5,
+        SQLITE_OPEN_READONLY = 0x1, SQLITE_OPEN_READWRITE = 0x2, SQLITE_OPEN_CREATE = 0x4,
+        SQLITE_OPEN_NOMUTEX = 0x8000, SQLITE_OPEN_FULLMUTEX = 0x10000,
+        SQLITE_DBCONFIG_ENABLE_FKEY = 1002, SQLITE_DBCONFIG_DEFENSIVE = 1010,
+        SQLITE_DBCONFIG_DQS_DML = 1013, SQLITE_DBCONFIG_DQS_DDL = 1014,
+        SQLITE_DENY = 1, SQLITE_IGNORE = 2,
+        SQLITE_CREATE_INDEX = 1, SQLITE_CREATE_TABLE = 2, SQLITE_CREATE_TEMP_INDEX = 3,
+        SQLITE_CREATE_TEMP_TABLE = 4, SQLITE_CREATE_TEMP_TRIGGER = 5, SQLITE_CREATE_TEMP_VIEW = 6,
+        SQLITE_CREATE_TRIGGER = 7, SQLITE_CREATE_VIEW = 8, SQLITE_DELETE = 9, SQLITE_DROP_INDEX = 10,
+        SQLITE_DROP_TABLE = 11, SQLITE_DROP_TEMP_INDEX = 12, SQLITE_DROP_TEMP_TABLE = 13,
+        SQLITE_DROP_TEMP_TRIGGER = 14, SQLITE_DROP_TEMP_VIEW = 15, SQLITE_DROP_TRIGGER = 16,
+        SQLITE_DROP_VIEW = 17, SQLITE_INSERT = 18, SQLITE_PRAGMA = 19, SQLITE_READ = 20,
+        SQLITE_SELECT = 21, SQLITE_TRANSACTION = 22, SQLITE_UPDATE = 23, SQLITE_ATTACH = 24,
+        SQLITE_DETACH = 25, SQLITE_ALTER_TABLE = 26, SQLITE_REINDEX = 27, SQLITE_ANALYZE = 28,
+        SQLITE_CREATE_VTABLE = 29, SQLITE_DROP_VTABLE = 30, SQLITE_FUNCTION = 31,
+        SQLITE_SAVEPOINT = 32, SQLITE_RECURSIVE = 33
+    }
+    pub const SQLITE_PREPARE_PERSISTENT: c_uint = 1;
+    #[link(name = "sqlite3")]
+    unsafe extern "C" {
+        pub fn sqlite3_open_v2(
+            name: *const c_char,
+            db: *mut *mut sqlite3,
+            flags: c_int,
+            vfs: *const c_char,
+        ) -> c_int;
+        pub fn sqlite3_close(db: *mut sqlite3) -> c_int;
+        pub fn sqlite3_errmsg(db: *mut sqlite3) -> *const c_char;
+        pub fn sqlite3_errstr(code: c_int) -> *const c_char;
+        pub fn sqlite3_extended_errcode(db: *mut sqlite3) -> c_int;
+        pub fn sqlite3_busy_timeout(db: *mut sqlite3, ms: c_int) -> c_int;
+        pub fn sqlite3_db_config(db: *mut sqlite3, op: c_int, ...) -> c_int;
+        pub fn sqlite3_set_authorizer(
+            db: *mut sqlite3,
+            callback: Authorizer,
+            data: *mut c_void,
+        ) -> c_int;
+        pub fn sqlite3_exec(
+            db: *mut sqlite3,
+            sql: *const c_char,
+            callback: Callback,
+            data: *mut c_void,
+            error: *mut *mut c_char,
+        ) -> c_int;
+        pub fn sqlite3_get_autocommit(db: *mut sqlite3) -> c_int;
+        pub fn sqlite3_changes64(db: *mut sqlite3) -> i64;
+        pub fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> i64;
+        pub fn sqlite3_prepare_v2(
+            db: *mut sqlite3,
+            sql: *const c_char,
+            size: c_int,
+            statement: *mut *mut sqlite3_stmt,
+            tail: *mut *const c_char,
+        ) -> c_int;
+        pub fn sqlite3_prepare_v3(
+            db: *mut sqlite3,
+            sql: *const c_char,
+            size: c_int,
+            flags: c_uint,
+            statement: *mut *mut sqlite3_stmt,
+            tail: *mut *const c_char,
+        ) -> c_int;
+        pub fn sqlite3_finalize(statement: *mut sqlite3_stmt) -> c_int;
+        pub fn sqlite3_reset(statement: *mut sqlite3_stmt) -> c_int;
+        pub fn sqlite3_step(statement: *mut sqlite3_stmt) -> c_int;
+        pub fn sqlite3_clear_bindings(statement: *mut sqlite3_stmt) -> c_int;
+        pub fn sqlite3_sql(statement: *mut sqlite3_stmt) -> *const c_char;
+        pub fn sqlite3_expanded_sql(statement: *mut sqlite3_stmt) -> *mut c_char;
+        pub fn sqlite3_free(data: *mut c_void);
+        pub fn sqlite3_bind_parameter_count(statement: *mut sqlite3_stmt) -> c_int;
+        pub fn sqlite3_bind_parameter_name(
+            statement: *mut sqlite3_stmt,
+            index: c_int,
+        ) -> *const c_char;
+        pub fn sqlite3_bind_null(statement: *mut sqlite3_stmt, index: c_int) -> c_int;
+        pub fn sqlite3_bind_int64(statement: *mut sqlite3_stmt, index: c_int, value: i64) -> c_int;
+        pub fn sqlite3_bind_double(statement: *mut sqlite3_stmt, index: c_int, value: f64)
+        -> c_int;
+        pub fn sqlite3_bind_text(
+            statement: *mut sqlite3_stmt,
+            index: c_int,
+            value: *const c_char,
+            size: c_int,
+            free: Destructor,
+        ) -> c_int;
+        pub fn sqlite3_bind_blob(
+            statement: *mut sqlite3_stmt,
+            index: c_int,
+            value: *const c_void,
+            size: c_int,
+            free: Destructor,
+        ) -> c_int;
+        pub fn sqlite3_column_count(statement: *mut sqlite3_stmt) -> c_int;
+        pub fn sqlite3_column_type(statement: *mut sqlite3_stmt, index: c_int) -> c_int;
+        pub fn sqlite3_column_name(statement: *mut sqlite3_stmt, index: c_int) -> *const c_char;
+        pub fn sqlite3_column_decltype(statement: *mut sqlite3_stmt, index: c_int)
+        -> *const c_char;
+        pub fn sqlite3_column_database_name(
+            statement: *mut sqlite3_stmt,
+            index: c_int,
+        ) -> *const c_char;
+        pub fn sqlite3_column_table_name(
+            statement: *mut sqlite3_stmt,
+            index: c_int,
+        ) -> *const c_char;
+        pub fn sqlite3_column_origin_name(
+            statement: *mut sqlite3_stmt,
+            index: c_int,
+        ) -> *const c_char;
+        pub fn sqlite3_column_int64(statement: *mut sqlite3_stmt, index: c_int) -> i64;
+        pub fn sqlite3_column_double(statement: *mut sqlite3_stmt, index: c_int) -> f64;
+        pub fn sqlite3_column_text(statement: *mut sqlite3_stmt, index: c_int) -> *const u8;
+        pub fn sqlite3_column_blob(statement: *mut sqlite3_stmt, index: c_int) -> *const c_void;
+        pub fn sqlite3_column_bytes(statement: *mut sqlite3_stmt, index: c_int) -> c_int;
+        pub fn sqlite3_backup_init(
+            target: *mut sqlite3,
+            target_name: *const c_char,
+            source: *mut sqlite3,
+            source_name: *const c_char,
+        ) -> *mut sqlite3_backup;
+        pub fn sqlite3_backup_step(backup: *mut sqlite3_backup, pages: c_int) -> c_int;
+        pub fn sqlite3_backup_finish(backup: *mut sqlite3_backup) -> c_int;
+        pub fn sqlite3_backup_remaining(backup: *mut sqlite3_backup) -> c_int;
+        pub fn sqlite3_backup_pagecount(backup: *mut sqlite3_backup) -> c_int;
+    }
+}
 
 pub(crate) type AuthorizerCallback = Rc<dyn Fn(u64, i32, [Option<String>; 4]) -> Result<i32>>;
 struct Authorization {
@@ -179,6 +339,14 @@ impl State {
                         ptr::null_mut::<i32>(),
                     ))?;
                 }
+                // WARNING: the macOS SQLite turns recursive triggers on by default, and Node's doesn't.
+                database.check(ffi::sqlite3_exec(
+                    raw,
+                    c"PRAGMA recursive_triggers = OFF".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ))?;
                 self.next_id += 1;
                 self.databases.insert(self.next_id, database);
                 return Ok(json!(self.next_id));

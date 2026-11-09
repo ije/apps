@@ -28,17 +28,36 @@ fn main() {
         for entry in fs::read_dir(root.join(dir)).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|extension| extension == "js") {
-                // Escapes keep the scripts ASCII, which JSC reads in place.
-                let mut text = String::new();
-                for char in fs::read_to_string(&path).unwrap().chars() {
-                    if char.is_ascii() {
-                        text.push(char);
-                    } else {
-                        for unit in char.encode_utf16(&mut [0; 2]) {
-                            text += &format!("\\u{unit:04x}");
-                        }
-                    }
+                // WARNING: scripts lose only whitespace and comments, because the compressor drops the completion value
+                // of `napi.js`. napi.rs reads the lines of `napi.js`, so that one stays as written. JSC reads ASCII in place.
+                let source = fs::read_to_string(&path).unwrap();
+                if path.ends_with("node/napi.js") {
+                    let data = miniz_oxide::deflate::compress_to_vec(source.as_bytes(), 10);
+                    fs::write(out.join(dir).join("napi.js"), data).unwrap();
+                    continue;
                 }
+                let allocator = oxc_allocator::Allocator::default();
+                let parsed =
+                    oxc_parser::Parser::new(&allocator, &source, oxc_span::SourceType::script())
+                        .with_options(oxc_parser::ParseOptions {
+                            allow_return_outside_function: true,
+                            ..Default::default()
+                        })
+                        .parse();
+                assert!(
+                    !parsed.diagnostics.has_errors(),
+                    "Cannot parse {}",
+                    path.display()
+                );
+                let text = oxc_codegen::Codegen::new()
+                    .with_options(oxc_codegen::CodegenOptions {
+                        ascii_only: true,
+                        comments: oxc_codegen::CommentOptions::disabled(),
+                        ..oxc_codegen::CodegenOptions::minify()
+                    })
+                    .build(&parsed.program)
+                    .code;
+                assert!(text.is_ascii(), "{} must stay ASCII", path.display());
                 let data = miniz_oxide::deflate::compress_to_vec(text.as_bytes(), 10);
                 fs::write(out.join(dir).join(path.file_name().unwrap()), data).unwrap();
             }

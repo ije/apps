@@ -66,15 +66,16 @@ objc2-quartz-core = { version = "=0.3.2", default-features = false, features = [
 pathfinder_geometry = "0.5"
 pollster = "0.4.0"
 raw-window-handle = "0.6"
-resvg = { version = "0.46.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 rustc-hash = "2.1.0"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 smallvec = { version = "1.6", features = ["union", "const_new"] }
 swash = "0.2.6"
 taffy = { version = "=0.15.0", default-features = false }
+tiny-skia = "0.11.4"
 unicode-bidi = { version = "0.3.18", default-features = false, features = ["hardcoded-data"] }
 url = "2.5"
+usvg = { version = "0.46.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 wgpu = { version = "30.0.1", default-features = false }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
@@ -165,6 +166,48 @@ opt-level = "s"
 opt-level = "s"
 
 [profile.release.package.rustybuzz]
+opt-level = "s"
+
+[profile.release.package.tokio]
+opt-level = "s"
+
+[profile.release.package.tokio-rustls]
+opt-level = "s"
+
+[profile.release.package.tokio-tungstenite]
+opt-level = "s"
+
+[profile.release.package.futures-util]
+opt-level = "s"
+
+[profile.release.package.rustls-pki-types]
+opt-level = "s"
+
+[profile.release.package.rustls-native-certs]
+opt-level = "s"
+
+[profile.release.package.icu_normalizer]
+opt-level = "s"
+
+[profile.release.package.notify]
+opt-level = "s"
+
+[profile.release.package.portable-pty]
+opt-level = "s"
+
+[profile.release.package.anyhow]
+opt-level = "s"
+
+[profile.release.package.fontdb]
+opt-level = "s"
+
+[profile.release.package.svgtypes]
+opt-level = "s"
+
+[profile.release.package.simplecss]
+opt-level = "s"
+
+[profile.release.package.data-url]
 opt-level = "s"
 
 # WARNING: avif-parse asserts on truncated input before returning its decoding error.
