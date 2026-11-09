@@ -487,6 +487,147 @@ unsafe extern "C" fn compare(
     })
 }
 
+thread_local! {
+    static ENTROPY: std::cell::RefCell<(Vec<u8>, usize)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
+}
+
+// random(view): fills the bytes with OS randomness. Like Node's entropy cache, up to 256 bytes come from unused
+// bytes of a 4 KB block, so most calls make no system call. No byte is handed out twice and the block stays here.
+unsafe extern "C" fn random(
+    ctx: Ptr,
+    _: Ptr,
+    _: Ptr,
+    count: usize,
+    args: *const Ptr,
+    exception: *mut Ptr,
+) -> Ptr {
+    native(ctx, count, args, exception, |api, arg| {
+        let out = api.bytes(ctx, arg(0)).context("Expected a typed array")?;
+        ensure!(out.len() <= 65536, "Random byte quota exceeded");
+        let failed = |error| anyhow::anyhow!("Random source failed: {error}");
+        if out.len() > 256 {
+            getrandom::fill(out).map_err(failed)?;
+        } else {
+            ENTROPY.with_borrow_mut(|(block, at)| -> Result<()> {
+                if *at + out.len() > block.len() {
+                    block.resize(4096, 0);
+                    getrandom::fill(block).map_err(failed)?;
+                    *at = 0;
+                }
+                out.copy_from_slice(&block[*at..*at + out.len()]);
+                *at += out.len();
+                Ok(())
+            })?;
+        }
+        Ok(unsafe { (api.undefined)(ctx) })
+    })
+}
+
+// equal(a, b): whether the bytes are the same, compared in constant time.
+unsafe extern "C" fn equal(
+    ctx: Ptr,
+    _: Ptr,
+    _: Ptr,
+    count: usize,
+    args: *const Ptr,
+    exception: *mut Ptr,
+) -> Ptr {
+    native(ctx, count, args, exception, |api, arg| {
+        let a = &*api.bytes(ctx, arg(0)).context("Expected bytes")?;
+        let b = &*api.bytes(ctx, arg(1)).context("Expected bytes")?;
+        #[allow(deprecated)]
+        let same = ring::constant_time::verify_slices_are_equal(a, b).is_ok();
+        Ok(unsafe { (api.boolean)(ctx, same) })
+    })
+}
+
+// digest(name, bytes, key): the md5, sha1 or sha2 digest of the bytes, or their HMAC with a key. Returns a Uint8Array.
+unsafe extern "C" fn digest(
+    ctx: Ptr,
+    _: Ptr,
+    _: Ptr,
+    count: usize,
+    args: *const Ptr,
+    exception: *mut Ptr,
+) -> Ptr {
+    native(ctx, count, args, exception, |api, arg| {
+        let name = match api.chars(ctx, arg(0)) {
+            Some(Chars::Latin1(name)) => std::str::from_utf8(name).ok(),
+            _ => None,
+        }
+        .context("Expected a digest name")?;
+        let key = api.bytes(ctx, arg(2));
+        let mut hasher = crate::node::system::Hasher::new(name, key.as_deref())?;
+        hasher.update(api.bytes(ctx, arg(1)).context("Expected bytes")?);
+        let digest = hasher.digest();
+        let (array, out) = api.uint8_array(ctx, digest.len())?;
+        out.copy_from_slice(&digest);
+        Ok(array)
+    })
+}
+
+// url(input, base, part, value): parses a URL and sets one part when given. Returns [href, ...offsets] with the end of
+// the scheme, the start and end of the username, password and host, and the end of the port, path and query, so
+// the getters slice one string. Offsets count UTF-16 units.
+unsafe extern "C" fn url(
+    ctx: Ptr,
+    _: Ptr,
+    _: Ptr,
+    count: usize,
+    args: *const Ptr,
+    exception: *mut Ptr,
+) -> Ptr {
+    native(ctx, count, args, exception, |api, arg| {
+        use ::url::Position::*;
+        let text = |index| api.chars(ctx, arg(index)).map(|chars| api.utf8_string(chars));
+        let (input, base) = (text(0).context("Expected URL")?, text(1));
+        let (key, value) = (text(2), text(3));
+        let url = crate::web::url(&input, base.as_deref(), key.as_deref().zip(value.as_deref()))?;
+        let href = url.as_str();
+        let mut items = [ptr::null_mut(); 11];
+        items[0] = api.utf8(ctx, href.as_bytes())?;
+        for (item, position) in items[1..].iter_mut().zip([
+            AfterScheme,
+            BeforeUsername,
+            AfterUsername,
+            BeforePassword,
+            AfterPassword,
+            BeforeHost,
+            AfterHost,
+            AfterPort,
+            AfterPath,
+            AfterQuery,
+        ]) {
+            // WARNING: without a password, the url crate puts the end of the password after the `@`.
+            let position = match position {
+                BeforePassword | AfterPassword if url.password().is_none() => AfterUsername,
+                position => position,
+            };
+            let end = url[..position].len();
+            let end = if href.is_ascii() { end } else { href[..end].encode_utf16().count() };
+            *item = unsafe { (api.number)(ctx, end as f64) };
+        }
+        Ok(unsafe { (api.make_array)(ctx, items.len(), items.as_ptr(), ptr::null_mut()) })
+    })
+}
+
+// drain(): runs the queued microtasks now, so one loop turn runs its tasks with the microtasks of each in between.
+unsafe extern "C" fn drain(
+    ctx: Ptr,
+    _: Ptr,
+    _: Ptr,
+    count: usize,
+    args: *const Ptr,
+    exception: *mut Ptr,
+) -> Ptr {
+    native(ctx, count, args, exception, |api, _| unsafe {
+        if let Some(drain) = api.drain {
+            drain(ctx);
+        }
+        Ok((api.undefined)(ctx))
+    })
+}
+
 pub(crate) fn install(api: &JavaScriptCore, ctx: Ptr) {
     unsafe {
         let object = (api.object_make)(ctx, ptr::null_mut(), ptr::null_mut());
@@ -497,7 +638,15 @@ pub(crate) fn install(api: &JavaScriptCore, ctx: Ptr) {
             ("utf8Length", utf8_length),
             ("indexOf", index_of),
             ("compare", compare),
+            ("random", random),
+            ("equal", equal),
+            ("digest", digest),
+            ("drain", drain),
+            ("url", url),
         ] {
+            if name == "drain" && api.drain.is_none() {
+                continue;
+            }
             let name = api.string(name);
             (api.set)(
                 ctx,

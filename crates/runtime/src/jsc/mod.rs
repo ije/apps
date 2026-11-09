@@ -31,6 +31,7 @@ pub struct JavaScriptCore {
     group_release: unsafe extern "C" fn(Ptr),
     garbage_collect: unsafe extern "C" fn(Ptr),
     shrink: Option<unsafe extern "C" fn(Ptr)>,
+    pub(crate) drain: Option<unsafe extern "C" fn(Ptr)>,
     evaluate_latin1: Option<
         unsafe extern "C" fn(
             Ptr,
@@ -232,6 +233,10 @@ impl JavaScriptCore {
                 garbage_collect: *library.get(b"JSSynchronousGarbageCollectForDebugging\0")?,
                 shrink: library
                     .get(b"JSContextGroupShrinkFootprint\0")
+                    .ok()
+                    .map(|s| *s),
+                drain: library
+                    .get(b"JSGlobalContextDrainMicrotasks\0")
                     .ok()
                     .map(|s| *s),
                 evaluate_latin1: library.get(b"JSEvaluateScriptLatin1\0").ok().map(|s| *s),
@@ -1446,6 +1451,15 @@ fn gpu(binding: &Binding, ctx: Ptr, id: u64, op: &str, args: &[u8]) -> Result<se
 }
 
 fn buffer(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes, typed: bool) -> Ptr {
+    // WARNING: like Bun, small results are copied into memory that JSC owns: an external buffer costs more to make and
+    // to free, and the GC can't count it.
+    if typed
+        && bytes.len() <= 16384
+        && let Ok((array, out)) = api.uint8_array(ctx, bytes.len())
+    {
+        out.copy_from_slice(&bytes);
+        return array;
+    }
     let bytes = Box::new(Vec::from(bytes));
     unsafe {
         let array = (api.make_buffer)(

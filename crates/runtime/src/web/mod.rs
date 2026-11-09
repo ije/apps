@@ -346,6 +346,40 @@ pub struct State {
     agent: Option<Agent>,
 }
 
+// WARNING: a setter parses the href again and sets one part, as the URL standard does, so `new URL()` and setters share this.
+pub(crate) fn url(input: &str, base: Option<&str>, set: Option<(&str, &str)>) -> Result<Url> {
+    let base = base.map(Url::parse).transpose()?;
+    let mut url = Url::options().base_url(base.as_ref()).parse(input)?;
+    if let Some((key, value)) = set {
+        match key {
+            "href" => quirks::set_href(&mut url, value)?,
+            "protocol" => {
+                let _ = quirks::set_protocol(&mut url, value);
+            }
+            "username" => {
+                let _ = quirks::set_username(&mut url, value);
+            }
+            "password" => {
+                let _ = quirks::set_password(&mut url, value);
+            }
+            "host" => {
+                let _ = quirks::set_host(&mut url, value);
+            }
+            "hostname" => {
+                let _ = quirks::set_hostname(&mut url, value);
+            }
+            "port" => {
+                let _ = quirks::set_port(&mut url, value);
+            }
+            "pathname" => quirks::set_pathname(&mut url, value),
+            "search" => quirks::set_search(&mut url, value),
+            "hash" => quirks::set_hash(&mut url, value),
+            _ => bail!("Invalid URL component"),
+        }
+    }
+    Ok(url)
+}
+
 impl State {
     pub fn configure_storage(&mut self, host: &crate::host::Host, window: Option<u64>) {
         let namespace = host.app_name.as_deref().unwrap_or("apps");
@@ -359,73 +393,10 @@ impl State {
     }
     pub fn call(&mut self, op: &str, args: &mut Value) -> Result<Value> {
         match op {
-            "url" => {
-                let input = args[0].as_str().context("Expected URL")?;
-                let base = args[1].as_str().map(Url::parse).transpose()?;
-                let mut url = Url::options().base_url(base.as_ref()).parse(input)?;
-                if let Some(key) = args[2].as_str() {
-                    let value = args[3].as_str().context("Expected URL component")?;
-                    match key {
-                        "href" => quirks::set_href(&mut url, value)?,
-                        "protocol" => {
-                            let _ = quirks::set_protocol(&mut url, value);
-                        }
-                        "username" => {
-                            let _ = quirks::set_username(&mut url, value);
-                        }
-                        "password" => {
-                            let _ = quirks::set_password(&mut url, value);
-                        }
-                        "host" => {
-                            let _ = quirks::set_host(&mut url, value);
-                        }
-                        "hostname" => {
-                            let _ = quirks::set_hostname(&mut url, value);
-                        }
-                        "port" => {
-                            let _ = quirks::set_port(&mut url, value);
-                        }
-                        "pathname" => quirks::set_pathname(&mut url, value),
-                        "search" => quirks::set_search(&mut url, value),
-                        "hash" => quirks::set_hash(&mut url, value),
-                        _ => bail!("Invalid URL component"),
-                    }
-                }
-                // WARNING: a flat array of strings becomes JavaScript values directly, without JSON.
-                Ok(json!([
-                    url.as_str(),
-                    quirks::origin(&url),
-                    quirks::protocol(&url),
-                    url.username(),
-                    quirks::password(&url),
-                    quirks::host(&url),
-                    quirks::hostname(&url),
-                    quirks::port(&url),
-                    url.path(),
-                    quirks::search(&url),
-                    quirks::hash(&url)
-                ]))
-            }
             "params.parse" => Ok(json!(
                 url::form_urlencoded::parse(args[0].as_str().context("Expected query")?.as_bytes())
                     .collect::<Vec<_>>()
             )),
-            "params.stringify" => {
-                let pairs: Vec<(String, String)> = serde_json::from_value(args[0].clone())?;
-                Ok(json!(
-                    url::form_urlencoded::Serializer::new(String::new())
-                        .extend_pairs(pairs)
-                        .finish()
-                ))
-            }
-            "random" => {
-                let length = args[0].as_u64().context("Expected byte length")?;
-                ensure!(length <= 65536, "Random byte quota exceeded");
-                let mut bytes = vec![0; length as usize];
-                getrandom::fill(&mut bytes)
-                    .map_err(|e| anyhow::anyhow!("Random source failed: {e}"))?;
-                Ok(crate::jsc::payload::write(bytes))
-            }
             "digest" => {
                 let bytes = crate::node::bytes(&args[1])?;
                 let algorithm = match args[0].as_str().context("Expected algorithm")? {

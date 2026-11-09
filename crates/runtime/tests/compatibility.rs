@@ -90,6 +90,58 @@ fn node_buffer_matches_node() {
 }
 
 #[test]
+fn node_fast_paths_match_node() {
+    run(r##"
+        const {assert,buffer:{Buffer},crypto,fs,util,os}=__apps;
+        for (const [name, size, min, max] of [['UInt8', 1, 0, 255], ['Int8', 1, -128, 127], ['UInt16', 2, 0, 65535], ['Int16', 2, -32768, 32767], ['UInt32', 4, 0, 4294967295], ['Int32', 4, -2147483648, 2147483647]])
+        for (const end of size === 1 ? [''] : ['LE', 'BE']) for (const value of [min, max, 0, min + 1, max - 1, ((min + max) / 3) | 0]) {
+        const b = Buffer.alloc(size + 2);
+        assert.strictEqual(b[`write${name}${end}`](value, 1), size + 1);
+        assert.strictEqual(new DataView(b.buffer, b.byteOffset + 1)[`get${name.replace('UInt', 'Uint')}`](0, end === 'LE'), value, name + end);
+        assert.strictEqual(b[`read${name}${end}`](1), value);
+        }
+        assert.throws(() => Buffer.alloc(4).readUInt32LE('0'), { code: 'ERR_INVALID_ARG_TYPE' });
+        assert.throws(() => Buffer.alloc(4).readInt16BE(3), { code: 'ERR_OUT_OF_RANGE' });
+        assert.throws(() => Buffer.alloc(4).writeInt32LE(2 ** 31), { code: 'ERR_OUT_OF_RANGE' });
+        assert.deepStrictEqual([Buffer.from('abz', 'hex'), Buffer.from('abc', 'hex'), Buffer.from('zz00', 'hex')].map(b => b.toString('hex')), ['ab', 'ab', '']);
+        assert.deepStrictEqual(['aGVsbG8', 'aGVs\nbG8=', 'A', 'aGVsbG8=aGk='].map(text => Buffer.from(text, 'base64').toString()), ['hello', 'hello', '', 'hello']);
+        assert.strictEqual(Buffer.from('aGVsbG8', 'base64url').toString(), 'hello');
+        assert.deepStrictEqual([Buffer.from('héllo'), Buffer.from('ab\0c'), Buffer.from('ÿ', 'latin1'), Buffer.from('é', 'ascii')].map(b => b.toString('hex')), ['68c3a96c6c6f', '61620063', 'ff', 'e9']);
+        const write = (size, ...args) => { const b = Buffer.alloc(size); return [b.write(...args), b.toString('hex')]; };
+        assert.deepStrictEqual([write(4, 'abcdef', 1), write(4, 'aé'), write(4, 'ab', 1, 1), write(4, 'abc', 'latin1')], [[3, '00616263'], [3, '61c3a900'], [1, '00610000'], [3, '61626300']]);
+        assert.deepStrictEqual([Buffer.compare(Buffer.from('ab'), Buffer.from('abc')), Buffer.compare(Buffer.from('b'), Buffer.from('abc')), Buffer.from('x'.repeat(40)).compare(Buffer.from('x'.repeat(40))), Buffer.from('ab').equals(Buffer.from('ab'))], [-1, 1, 0, true]);
+        const hello = Buffer.from('hello');
+        assert.deepStrictEqual([hello.subarray(-3, -1).toString(), hello.subarray(4, 2).toString(), hello.slice(1).toString(), hello.subarray(1) instanceof Buffer, hello.subarray(NaN, Infinity).length], ['ll', '', 'ello', true, 5]);
+        assert.strictEqual(crypto.createHash('sha256').update('héllo').update(Buffer.from('x')).digest('hex'), crypto.createHash('sha256').update(Buffer.from('héllox')).digest('hex'));
+        assert.strictEqual(crypto.createHash('md5').update('a').digest('hex'), '0cc175b9c0f1b6a831c399e269772661');
+        assert.strictEqual(crypto.createHmac('sha256', 'k').update('a').digest('base64'), 'eNqRUR5nVYf1ud94vt669VYNoqu4gWLuh13N90SVHZ4=');
+        assert.deepStrictEqual([crypto.timingSafeEqual(Buffer.from('ab'), Buffer.from('ab')), crypto.timingSafeEqual(Buffer.from('ab'), Buffer.from('ac'))], [true, false]);
+        assert.match(crypto.randomUUID(), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+        const random = crypto.getRandomValues(new Uint32Array(80)); assert.ok(random.some(Boolean));
+        assert.strictEqual(new URL('https://me@x.y/').password, '');
+        assert.strictEqual(new URLSearchParams('a=%zz&b=%FF&c=+x').toString(), 'a=%25zz&b=%EF%BF%BD&c=+x');
+        assert.strictEqual(new URLSearchParams({ q: "a b!'()~*" }).toString(), 'q=a+b%21%27%28%29%7E*');
+        assert.strictEqual(util.inspect({ set: new Set([1]), map: new Map([[1, 2]]), date: new Date(0), re: /x/g, nested: { a: [1] } }), "{\n  set: Set(1) { 1 },\n  map: Map(1) { 1 => 2 },\n  date: 1970-01-01T00:00:00.000Z,\n  re: /x/g,\n  nested: { a: [ 1 ] }\n}");
+        const order = [];
+        await new Promise(resolve => {
+        setImmediate(() => { order.push('i1'); Promise.resolve().then(() => order.push('m1')); process.nextTick(() => order.push('t1')); });
+        const second = setImmediate(() => order.push('i2'));
+        setImmediate(() => { clearImmediate(fourth); order.push('i3'); });
+        const fourth = setImmediate(() => order.push('i4'));
+        setTimeout(() => { order.push('t'); queueMicrotask(() => order.push('m2')); }, 0);
+        setImmediate(resolve);
+        clearImmediate(second);
+        });
+        assert.deepStrictEqual(order.filter(item => item !== 't' && item !== 'm2'), ['i1', 't1', 'm1', 'i3']);
+        const path = os.tmpdir() + '/h2o-fast-' + process.pid + '.txt', expected = Array.from({ length: 100 }, (_, i) => String(i).padStart(3, '0')).join('');
+        const stream = fs.createWriteStream(path); for (let i = 0; i < 100; i++) stream.write(String(i).padStart(3, '0'));
+        await new Promise(resolve => stream.end(resolve));
+        assert.strictEqual(fs.readFileSync(path, 'utf8'), expected); assert.strictEqual(stream.bytesWritten, 300);
+        assert.deepStrictEqual([fs.existsSync(path), fs.existsSync(path + '.missing'), fs.statSync(path).size, fs.statSync(path).isFile()], [true, false, 300, true]);
+    "##);
+}
+
+#[test]
 fn node_path_matches_node_vectors() {
     run(r##"
         const {posix:P,win32:W}=__apps.path;

@@ -47,7 +47,9 @@ globalThis.__appsInspect = (() => {
     return `${constructor}${size} ` + (name !== '' && (position === -1 || (end !== constructor.length && constructor[end] === constructor[end].toLowerCase())) ? `[${name}] ` : '');
   };
   const keysOf = (value, hidden) => [...(hidden ? Object.getOwnPropertyNames(value) : Object.keys(value)), ...Object.getOwnPropertySymbols(value).filter(symbol => hidden || Object.prototype.propertyIsEnumerable.call(value, symbol))];
+  // WARNING: a brand check throws for other objects, and a throw costs about 1 µs, so `like` first asks the tag or the prototype chain.
   const indexKey = /^(?:0|[1-9]\d*)$/, is = (method, value) => { try { method.call(value); return true; } catch { return false; } };
+  const like = (kind, type, name, method, value) => (kind === name || value instanceof type) && is(method, value);
   const setSize = Object.getOwnPropertyDescriptor(Set.prototype, 'size').get, mapSize = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get, source = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source').get;
   const extra = (ctx, value, depth, key, typed) => { ctx.indentationLvl += 2; const text = format(ctx, value[key], depth, typed); ctx.indentationLvl -= 2; return `${ctx.stylize(`[${key}]`, 'string')}: ${text}`; };
   const property = (ctx, value, depth, key, array) => {
@@ -211,13 +213,13 @@ globalThis.__appsInspect = (() => {
         if (remaining > 0) output.push(output.length !== length ? empty(remaining) : more(remaining));
         return output;
       };
-    } else if (is(setSize, value)) {
+    } else if (like(kind, Set, 'Set', setSize, value)) {
       keys = keysOf(value, ctx.showHidden);
       const start = prefix(constructor, name, 'Set', `(${value.size})`);
       if (!value.size && !keys.length) return `${start}{}`;
       braces = [`${start}{`, '}'];
       formatter = () => { const output = []; ctx.indentationLvl += 2; for (const item of value) { if (output.length >= ctx.maxArrayLength) { output.push(more(value.size - output.length)); break; } output.push(format(ctx, item, depth)); } ctx.indentationLvl -= 2; return output; };
-    } else if (is(mapSize, value)) {
+    } else if (like(kind, Map, 'Map', mapSize, value)) {
       keys = keysOf(value, ctx.showHidden);
       const start = prefix(constructor, name, 'Map', `(${value.size})`);
       if (!value.size && !keys.length) return `${start}{}`;
@@ -242,12 +244,12 @@ globalThis.__appsInspect = (() => {
       } else if (constructor === 'Object') {
         if (kind === 'Arguments') braces[0] = '[Arguments] {'; else if (name !== '') braces[0] = `${prefix(constructor, name, 'Object')}{`;
         if (!keys.length) return `${braces[0]}}`;
-      } else if (value !== RegExp.prototype && is(source, value)) {
+      } else if (value !== RegExp.prototype && like(kind, RegExp, 'RegExp', source, value)) {
         base = RegExp.prototype.toString.call(value);
         const start = prefix(constructor, name, 'RegExp');
         if (start !== 'RegExp ') base = start + base;
         if (!keys.length || (ctx.depth !== null && depth > ctx.depth)) return ctx.stylize(base, 'regexp');
-      } else if (is(Date.prototype.getTime, value)) {
+      } else if (like(kind, Date, 'Date', Date.prototype.getTime, value)) {
         base = Number.isNaN(value.getTime()) ? Date.prototype.toString.call(value) : value.toISOString();
         const start = prefix(constructor, name, 'Date');
         if (start !== 'Date ') base = start + base;

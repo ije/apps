@@ -154,7 +154,7 @@ bash scripts/build-ffmpeg.sh
 
 The runtime uses [Bun's WebKit fork](https://github.com/oven-sh/WebKit).
 The build enables Bun's JSC additions with the generic event loop.
-`scripts/jsc.patch` restores C API locks and adds support for shared libraries. Each VM runs on one thread, so a native function keeps the lock while it runs, and the API calls it makes only count the lock up. A call into a native function costs about 0.07 µs.
+`scripts/jsc.patch` restores C API locks and adds support for shared libraries. Each VM runs on one thread, so a native function keeps the lock while it runs, and the API calls it makes find the lock held and skip it. A call into a native function costs about 0.02 µs. Like Bun's event loop, one call into a context's JavaScript runs a whole loop turn and drains the microtasks after each task with `JSGlobalContextDrainMicrotasks`, so a task costs no call from Rust.
 
 Like Bun, native code reads strings and bytes where JSC keeps them, without copies. It makes strings from Latin-1, UTF-16 or UTF-8 with one copy, and Uint8Arrays it fills without zeroing them. Conversions use the simdutf that JSC already has. `crates/runtime/src/jsc/encoding.rs` has `TextEncoder`, `TextDecoder`, the `Buffer` encodings, `atob()`, `btoa()`, `indexOf()` and `compare()` of `Buffer`.
 

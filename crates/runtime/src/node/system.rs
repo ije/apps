@@ -91,7 +91,7 @@ fn meminfo(key: &str) -> u64 {
 }
 
 #[derive(Clone)]
-pub(super) enum Hasher {
+pub(crate) enum Hasher {
     Md5(md5::Md5),
     Sha224(sha2::Sha224),
     Digest(ring::digest::Context),
@@ -100,7 +100,7 @@ pub(super) enum Hasher {
 }
 
 impl Hasher {
-    pub(super) fn new(name: &str, key: Option<&[u8]>) -> Result<Self> {
+    pub(crate) fn new(name: &str, key: Option<&[u8]>) -> Result<Self> {
         use sha2::Digest;
         if let Some(key) = key {
             let algorithm = match name {
@@ -139,7 +139,7 @@ impl Hasher {
         };
         Ok(Self::Digest(ring::digest::Context::new(algorithm)))
     }
-    pub(super) fn update(&mut self, data: &[u8]) {
+    pub(crate) fn update(&mut self, data: &[u8]) {
         use sha2::Digest;
         match self {
             Self::Md5(hasher) => hasher.update(data),
@@ -149,7 +149,7 @@ impl Hasher {
             Self::Keyed(inner, _) => inner.update(data),
         }
     }
-    fn digest(self) -> Vec<u8> {
+    pub(crate) fn digest(self) -> Vec<u8> {
         use sha2::Digest;
         match self {
             Self::Md5(hasher) => hasher.finalize().to_vec(),

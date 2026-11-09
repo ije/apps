@@ -324,7 +324,7 @@ index f96eb07c4..023862c18 100644
      auto typeCounts = vm.heap.objectTypeCounts();
      JSObject* objectTypeCounts = constructEmptyObject(globalObject);
 diff --git a/Source/JavaScriptCore/API/JSContextRef.cpp b/Source/JavaScriptCore/API/JSContextRef.cpp
-index b8e3b2619..6ba9acb7c 100644
+index b8e3b2619..d1ba29ee6 100644
 --- a/Source/JavaScriptCore/API/JSContextRef.cpp
 +++ b/Source/JavaScriptCore/API/JSContextRef.cpp
 @@ -43,7 +43,9 @@
@@ -337,7 +337,7 @@ index b8e3b2619..6ba9acb7c 100644
  #include "JSGlobalObjectInspectorController.h"
  #include "JSRemoteInspector.h"
  #endif
-@@ -85,6 +87,21 @@ void JSContextGroupRelease(JSContextGroupRef group)
+@@ -85,6 +87,28 @@ void JSContextGroupRelease(JSContextGroupRef group)
      vm.derefSuppressingSaferCPPChecking();
  }
  
@@ -346,6 +346,13 @@ index b8e3b2619..6ba9acb7c 100644
 +    VM& vm = *toJS(group);
 +    JSLockHolder locker(&vm);
 +    vm.shrinkFootprintNow({});
++}
++
++void JSGlobalContextDrainMicrotasks(JSContextRef ctx)
++{
++    VM& vm = toJS(ctx)->vm();
++    JSLockHolder locker(vm);
++    vm.drainMicrotasks();
 +}
 +
 +void JSGlobalContextSetModuleLoader(JSGlobalContextRef ctx, JSObjectRef loader)
@@ -359,7 +366,7 @@ index b8e3b2619..6ba9acb7c 100644
  static bool internalScriptTimeoutCallback(JSGlobalObject* globalObject, void* callbackPtr, void* callbackData)
  {
      JSShouldTerminateCallback callback = reinterpret_cast<JSShouldTerminateCallback>(callbackPtr);
-@@ -166,7 +183,7 @@ JSGlobalContextRef JSGlobalContextRetain(JSGlobalContextRef ctx)
+@@ -166,7 +190,7 @@ JSGlobalContextRef JSGlobalContextRetain(JSGlobalContextRef ctx)
  {
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -368,7 +375,7 @@ index b8e3b2619..6ba9acb7c 100644
  
      gcProtect(globalObject);
      vm.refSuppressingSaferCPPChecking();
-@@ -177,7 +194,7 @@ void JSGlobalContextRelease(JSGlobalContextRef ctx)
+@@ -177,7 +201,7 @@ void JSGlobalContextRelease(JSGlobalContextRef ctx)
  {
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -377,7 +384,7 @@ index b8e3b2619..6ba9acb7c 100644
  
      bool protectCountIsZero = vm.heap.unprotect(globalObject);
      if (protectCountIsZero)
-@@ -192,7 +209,7 @@ JSObjectRef JSContextGetGlobalObject(JSContextRef ctx)
+@@ -192,7 +216,7 @@ JSObjectRef JSContextGetGlobalObject(JSContextRef ctx)
          return nullptr;
      }
      JSGlobalObject* globalObject = toJS(ctx);
@@ -386,7 +393,7 @@ index b8e3b2619..6ba9acb7c 100644
  
      return toRef(uncheckedDowncast<JSObject>(JSValue(globalObject).toThis(globalObject, ECMAMode::sloppy())));
  }
-@@ -214,7 +231,7 @@ JSGlobalContextRef JSContextGetGlobalContext(JSContextRef ctx)
+@@ -214,7 +238,7 @@ JSGlobalContextRef JSContextGetGlobalContext(JSContextRef ctx)
          return nullptr;
      }
      JSGlobalObject* globalObject = toJS(ctx);
@@ -395,7 +402,7 @@ index b8e3b2619..6ba9acb7c 100644
  
      return toGlobalRef(globalObject);
  }
-@@ -227,6 +244,7 @@ JSStringRef JSGlobalContextCopyName(JSGlobalContextRef ctx)
+@@ -227,6 +251,7 @@ JSStringRef JSGlobalContextCopyName(JSGlobalContextRef ctx)
      }
  
      JSGlobalObject* globalObject = toJS(ctx);
@@ -403,7 +410,7 @@ index b8e3b2619..6ba9acb7c 100644
  
      String name = globalObject->name();
      if (name.isNull())
-@@ -243,6 +261,7 @@ void JSGlobalContextSetName(JSGlobalContextRef ctx, JSStringRef name)
+@@ -243,6 +268,7 @@ void JSGlobalContextSetName(JSGlobalContextRef ctx, JSStringRef name)
      }
  
      JSGlobalObject* globalObject = toJS(ctx);
@@ -411,7 +418,7 @@ index b8e3b2619..6ba9acb7c 100644
      globalObject->setName(name ? name->string() : String());
  }
  
-@@ -274,6 +293,67 @@ void JSGlobalContextSetInspectable(JSGlobalContextRef ctx, bool inspectable)
+@@ -274,6 +300,67 @@ void JSGlobalContextSetInspectable(JSGlobalContextRef ctx, bool inspectable)
      globalObject->setInspectable(inspectable);
  }
  
@@ -479,7 +486,7 @@ index b8e3b2619..6ba9acb7c 100644
  void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObjectRef function, JSValueRef* exception)
  {
      if (!ctx) {
-@@ -283,7 +363,7 @@ void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObje
+@@ -283,7 +370,7 @@ void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObje
  
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -489,10 +496,10 @@ index b8e3b2619..6ba9acb7c 100644
      JSObject* object = toJS(function);
      if (!object->isCallable()) {
 diff --git a/Source/JavaScriptCore/API/JSContextRefPrivate.h b/Source/JavaScriptCore/API/JSContextRefPrivate.h
-index c009bb5a2..6a9280b88 100644
+index c009bb5a2..ebec4bcb2 100644
 --- a/Source/JavaScriptCore/API/JSContextRefPrivate.h
 +++ b/Source/JavaScriptCore/API/JSContextRefPrivate.h
-@@ -69,6 +69,99 @@ JS_EXPORT JSStringRef JSContextCreateBacktrace(JSContextRef ctx, unsigned maxSta
+@@ -69,6 +69,106 @@ JS_EXPORT JSStringRef JSContextCreateBacktrace(JSContextRef ctx, unsigned maxSta
  typedef bool
  (*JSShouldTerminateCallback) (JSContextRef ctx, void* context);
  
@@ -502,6 +509,13 @@ index c009bb5a2..6a9280b88 100644
 +@param group The JavaScript context group to shrink.
 +*/
 +JS_EXPORT void JSContextGroupShrinkFootprint(JSContextGroupRef group);
++
++/*!
++@function
++@abstract Runs the queued microtasks, and those they queue, now. A host function can call it between two tasks of its own.
++@param ctx The JSContext.
++*/
++JS_EXPORT void JSGlobalContextDrainMicrotasks(JSContextRef ctx);
 +
 +/*!
 +@function
@@ -909,22 +923,32 @@ index 8efc3dcab..7fdee2ca1 100644
  
  void AgentRegistry::append(UniqueRef<InspectorAgentBase>&& agent)
 diff --git a/Source/JavaScriptCore/runtime/JSLock.cpp b/Source/JavaScriptCore/runtime/JSLock.cpp
-index 0fa9323dc..fb69268bc 100644
+index 0fa9323dc..a37ba6cf1 100644
 --- a/Source/JavaScriptCore/runtime/JSLock.cpp
 +++ b/Source/JavaScriptCore/runtime/JSLock.cpp
-@@ -56,6 +56,11 @@ JSLockHolder::JSLockHolder(VM& vm)
-     : m_vm(&vm)
+@@ -53,16 +53,29 @@ JSLockHolder::JSLockHolder(VM* vm)
+ }
+ 
+ JSLockHolder::JSLockHolder(VM& vm)
+-    : m_vm(&vm)
  {
-     protect(m_vm->apiLock())->lock();
-+    // A callback keeps its VM's lock, so another VM of this thread can call back into this one, which then only
-+    // counts the lock up. Its atom table must still be current, or names find no properties.
++    // A callback keeps its VM's lock, so the API calls it makes find the lock held with the VM's atom table current
++    // and skip it: counting it up would change nothing, and the outermost holder keeps the VM alive.
 +    auto& thread = Thread::currentSingleton();
++    if (thread.atomStringTable() == vm.atomStringTable() && vm.apiLock().currentThreadIsHoldingLock()) [[likely]]
++        return;
++    m_vm = &vm;
+     protect(m_vm->apiLock())->lock();
++    // Another VM of this thread can call back into this one, which then only counts the lock up. Its atom table
++    // must still be current, or names find no properties.
 +    if (thread.atomStringTable() != m_vm->atomStringTable())
 +        m_previousAtomStringTable = thread.setCurrentAtomStringTable(m_vm->atomStringTable());
  }
  
  JSLockHolder::~JSLockHolder()
-@@ -63,6 +68,8 @@ JSLockHolder::~JSLockHolder()
+ {
++    if (!m_vm)
++        return;
      RefPtr<JSLock> apiLock(&m_vm->apiLock());
      m_vm = nullptr;
      apiLock->unlock();

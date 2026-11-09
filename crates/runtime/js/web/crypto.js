@@ -97,7 +97,6 @@ globalThis.__appsCrypto = (call, encodeBytes, decodeBytes, base) => {
       for (let offset = 0; offset < size; offset += 65536) base.getRandomValues(result.subarray(offset, offset + 65536));
       if (callback) { queueMicrotask(() => callback(null, result)); return; } return result;
     },
-    timingSafeEqual: (a, b) => call('web.crypto.equal', encodeBytes(bytes(a)), encodeBytes(bytes(b))),
   };
   globalThis.CryptoKey = CryptoKey;
   globalThis.__appsCryptoCodec = { encode: key => { const data = {...keys.get(key)}; for(const field of ['private','public','pkcs8'])if(data[field])data[field]=encode(data[field]);return data; }, decode: value => { const data={...value};for(const field of ['private','public','pkcs8'])if(data[field])data[field]=typeof data[field]==='string'?decode(data[field]):new Uint8Array(data[field]);return create(data); } };

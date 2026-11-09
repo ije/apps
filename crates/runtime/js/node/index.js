@@ -14,8 +14,9 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const normalize = encoding => encoding == null ? 'utf8' : encodings[encoding] ?? encodings[String(encoding).toLowerCase()];
   const encodingOf = encoding => { const value = encoding === null ? undefined : normalize(encoding); if (!value) throw error(TypeError, 'ERR_UNKNOWN_ENCODING', `Unknown encoding: ${encoding}`); return value; };
   const encode = (value, encoding = 'utf8') => {
-    if (encoding === 'hex') return Uint8Array.fromHex(value.match(/^(?:[\da-f]{2})*/i)[0]);
-    if (encoding === 'base64' || encoding === 'base64url') { const pad = value.indexOf('='); let text = (pad < 0 ? value : value.slice(0, pad)).replace(/[^\w+/-]|_/g, c => c === '_' ? '/' : '').replace(/-/g, '+'); if (text.length % 4 === 1) text = text.slice(0, -1); return Uint8Array.fromBase64(text); }
+    // WARNING: well-formed text decodes natively. Node stops at the first bad hex pair and skips characters outside base64, so only text that the native decoders reject takes the slow cleanup.
+    if (encoding === 'hex') { try { return Uint8Array.fromHex(value.length & 1 ? value.slice(0, -1) : value); } catch { return Uint8Array.fromHex(value.match(/^(?:[\da-f]{2})*/i)[0]); } }
+    if (encoding === 'base64' || encoding === 'base64url') { try { return Uint8Array.fromBase64(value, { alphabet: encoding }); } catch {} const pad = value.indexOf('='); let text = (pad < 0 ? value : value.slice(0, pad)).replace(/[^\w+/-]|_/g, c => c === '_' ? '/' : '').replace(/-/g, '+'); if (text.length % 4 === 1) text = text.slice(0, -1); return Uint8Array.fromBase64(text); }
     return codec.encode(value, encodeKinds[encoding]);
   };
   const decode = (data, encoding) => {
@@ -42,10 +43,21 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     return last && offset < 0 ? -1 : codec.indexOf(buffer, needle, Math.max(offset, 0), last);
   };
   const size = value => { if (typeof value !== 'number') throw typeError('size', 'of type number', value); if (!(value >= 0 && value <= kMaxLength)) throw rangeError('size', `>= 0 && <= ${kMaxLength}`, value); return value; };
-  const compare = codec.compare;
+  const compare = (a, b) => {
+    if (a.length + b.length > 64) return codec.compare(a, b);
+    const n = Math.min(a.length, b.length);
+    for (let i = 0; i < n; i++) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+    return a.length < b.length ? -1 : a.length > b.length ? 1 : 0;
+  };
+  // WARNING: short ASCII text is copied by a loop, which costs a third of a native call and the view around its result.
+  const short = text => { if (text.length > 32) return false; for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 127) return false; return true; };
   class Buffer extends Uint8Array {
     static from(value, encoding, length) {
-      if (typeof value === 'string') { const data = encode(value, typeof encoding === 'string' && encoding ? encodingOf(encoding) : 'utf8'); return new Buffer(data.buffer, data.byteOffset, data.length); }
+      if (typeof value === 'string') {
+        encoding = typeof encoding === 'string' && encoding ? encodingOf(encoding) : 'utf8';
+        if ((encoding === 'utf8' || encoding === 'latin1' || encoding === 'ascii') && short(value)) { const out = new Buffer(value.length); for (let i = 0; i < value.length; i++) out[i] = value.charCodeAt(i); return out; }
+        const data = encode(value, encoding); return new Buffer(data.buffer, data.byteOffset, data.length);
+      }
       if (typeof value === 'object' && value !== null) {
         if (value instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer)) {
           const offset = +encoding || 0, max = value.byteLength - offset;
@@ -109,6 +121,13 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
       start = start === undefined ? 0 : integer(start, 'sourceStart'); end = end === undefined ? this.length : integer(end, 'sourceEnd', 0, this.length);
       return start >= end ? (targetStart >= targetEnd ? 0 : -1) : targetStart >= targetEnd ? 1 : compare(this.subarray(start, end), target.subarray(targetStart, targetEnd));
     }
+    // WARNING: Uint8Array's own subarray() looks up the species constructor, which costs 3x a direct one.
+    subarray(start, end) {
+      const length = this.length;
+      start = start === undefined ? 0 : (start = Math.trunc(start) || 0) < 0 ? Math.max(length + start, 0) : Math.min(start, length);
+      end = end === undefined ? length : (end = Math.trunc(end) || 0) < 0 ? Math.max(length + end, 0) : Math.min(end, length);
+      return new Buffer(this.buffer, this.byteOffset + start, Math.max(end - start, 0));
+    }
     slice(start, end) { return this.subarray(start, end); }
     copy(target, targetStart, start, end) {
       if (!(target instanceof Uint8Array)) throw typeError('target', bufferTypes, target);
@@ -123,8 +142,9 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
       if (offset === undefined) { offset = 0; length = this.length; }
       else if (length === undefined && typeof offset === 'string') { encoding = offset; offset = 0; length = this.length; }
       else { integer(offset, 'offset', 0, this.length); const remaining = this.length - offset; if (length === undefined) length = remaining; else if (typeof length === 'string') { encoding = length; length = remaining; } else length = Math.min(integer(length, 'length', 0, this.length), remaining); }
-      const target = this.subarray(offset, offset + length);
       encoding = encoding ? encodingOf(encoding) : 'utf8';
+      if ((encoding === 'utf8' || encoding === 'latin1' || encoding === 'ascii') && short(string)) { length = Math.min(length, string.length); for (let i = 0; i < length; i++) this[offset + i] = string.charCodeAt(i); return length; }
+      const target = this.subarray(offset, offset + length);
       if (encoding === 'utf8') return codec.encodeInto(string, target)[1];
       const data = encode(encoding === 'utf16le' ? string.slice(0, length >> 1) : string, encoding).subarray(0, length);
       target.set(data);
@@ -154,7 +174,31 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     includes(value, offset, encoding) { return search(this, value, offset, encoding, false) !== -1; }
     [inspect.custom]() { const max = buffer.INSPECT_MAX_BYTES, more = this.length - max; return `<${this.constructor.name} ${this.subarray(0, max).toHex().replace(/(..)(?!$)/g, '$1 ')}${more > 0 ? ` ... ${more} more byte${more > 1 ? 's' : ''}` : ''}>`; }
   }
-  for (const [suffix, type, size, min, max] of [['UInt8', 'Uint8', 1, 0, 255], ['Int8', 'Int8', 1, -128, 127], ['UInt16', 'Uint16', 2, 0, 65535], ['Int16', 'Int16', 2, -32768, 32767], ['UInt32', 'Uint32', 4, 0, 4294967295], ['Int32', 'Int32', 4, -2147483648, 2147483647], ['Float', 'Float32', 4], ['Double', 'Float64', 8], ['BigInt64', 'BigInt64', 8, -(2n ** 63n), 2n ** 63n - 1n], ['BigUInt64', 'BigUint64', 8, 0n, 2n ** 64n - 1n]]) for (const endian of size === 1 ? [''] : ['LE', 'BE']) {
+  // WARNING: integers up to 32 bits read and write their bytes directly, like Node, because a DataView per call costs 5x.
+  const check = (buffer, offset, size) => { if (typeof offset !== 'number' || buffer[offset] === undefined || buffer[offset + size - 1] === undefined) at(buffer, offset, size); };
+  Object.assign(Buffer.prototype, {
+    readUInt8(o = 0) { check(this, o, 1); return this[o]; },
+    readInt8(o = 0) { check(this, o, 1); return this[o] << 24 >> 24; },
+    readUInt16LE(o = 0) { check(this, o, 2); return this[o] | this[o + 1] << 8; },
+    readUInt16BE(o = 0) { check(this, o, 2); return this[o] << 8 | this[o + 1]; },
+    readInt16LE(o = 0) { check(this, o, 2); return (this[o] | this[o + 1] << 8) << 16 >> 16; },
+    readInt16BE(o = 0) { check(this, o, 2); return (this[o] << 8 | this[o + 1]) << 16 >> 16; },
+    readUInt32LE(o = 0) { check(this, o, 4); return (this[o] | this[o + 1] << 8 | this[o + 2] << 16) + this[o + 3] * 0x1000000; },
+    readUInt32BE(o = 0) { check(this, o, 4); return this[o] * 0x1000000 + (this[o + 1] << 16 | this[o + 2] << 8 | this[o + 3]); },
+    readInt32LE(o = 0) { check(this, o, 4); return this[o] | this[o + 1] << 8 | this[o + 2] << 16 | this[o + 3] << 24; },
+    readInt32BE(o = 0) { check(this, o, 4); return this[o] << 24 | this[o + 1] << 16 | this[o + 2] << 8 | this[o + 3]; },
+    writeUInt8(v, o = 0) { v = +v; limit(v, 0, 255, 1); check(this, o, 1); this[o] = v; return o + 1; },
+    writeInt8(v, o = 0) { v = +v; limit(v, -128, 127, 1); check(this, o, 1); this[o] = v; return o + 1; },
+    writeUInt16LE(v, o = 0) { v = +v; limit(v, 0, 65535, 2); check(this, o, 2); this[o] = v; this[o + 1] = v >>> 8; return o + 2; },
+    writeUInt16BE(v, o = 0) { v = +v; limit(v, 0, 65535, 2); check(this, o, 2); this[o] = v >>> 8; this[o + 1] = v; return o + 2; },
+    writeInt16LE(v, o = 0) { v = +v; limit(v, -32768, 32767, 2); check(this, o, 2); this[o] = v; this[o + 1] = v >>> 8; return o + 2; },
+    writeInt16BE(v, o = 0) { v = +v; limit(v, -32768, 32767, 2); check(this, o, 2); this[o] = v >>> 8; this[o + 1] = v; return o + 2; },
+    writeUInt32LE(v, o = 0) { v = +v; limit(v, 0, 4294967295, 4); check(this, o, 4); this[o] = v; this[o + 1] = v >>> 8; this[o + 2] = v >>> 16; this[o + 3] = v >>> 24; return o + 4; },
+    writeUInt32BE(v, o = 0) { v = +v; limit(v, 0, 4294967295, 4); check(this, o, 4); this[o] = v >>> 24; this[o + 1] = v >>> 16; this[o + 2] = v >>> 8; this[o + 3] = v; return o + 4; },
+    writeInt32LE(v, o = 0) { v = +v; limit(v, -2147483648, 2147483647, 4); check(this, o, 4); this[o] = v; this[o + 1] = v >>> 8; this[o + 2] = v >>> 16; this[o + 3] = v >>> 24; return o + 4; },
+    writeInt32BE(v, o = 0) { v = +v; limit(v, -2147483648, 2147483647, 4); check(this, o, 4); this[o] = v >>> 24; this[o + 1] = v >>> 16; this[o + 2] = v >>> 8; this[o + 3] = v; return o + 4; },
+  });
+  for (const [suffix, type, size, min, max] of [['Float', 'Float32', 4], ['Double', 'Float64', 8], ['BigInt64', 'BigInt64', 8, -(2n ** 63n), 2n ** 63n - 1n], ['BigUInt64', 'BigUint64', 8, 0n, 2n ** 64n - 1n]]) for (const endian of ['LE', 'BE']) {
     Buffer.prototype['read' + suffix + endian] = function(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength)['get' + type](at(this, offset, size), endian === 'LE'); };
     Buffer.prototype['write' + suffix + endian] = function(value, offset = 0) { if (typeof min === 'number') value = +value; if (min !== undefined) limit(value, min, max, size); new DataView(this.buffer, this.byteOffset, this.byteLength)['set' + type](at(this, offset, size), value, endian === 'LE'); return offset + size; };
   }
@@ -400,9 +444,9 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const options = value => typeof value === 'string' ? { encoding: value } : value ?? {};
   const kind = Symbol('type'), S = constants.fs;
   const typed = proto => Object.assign(proto, { isFile() { return this[kind]() === S.S_IFREG; }, isDirectory() { return this[kind]() === S.S_IFDIR; }, isSymbolicLink() { return this[kind]() === S.S_IFLNK; }, isBlockDevice() { return this[kind]() === S.S_IFBLK; }, isCharacterDevice() { return this[kind]() === S.S_IFCHR; }, isFIFO() { return this[kind]() === S.S_IFIFO; }, isSocket() { return this[kind]() === S.S_IFSOCK; } });
-  const statFields = ['dev', 'ino', 'mode', 'nlink', 'uid', 'gid', 'rdev', 'size', 'blksize', 'blocks', 'atimeMs', 'mtimeMs', 'ctimeMs', 'birthtimeMs'];
   class Stats {
-    constructor(value) { for (let i = 0; i < 14; i++) this[statFields[i]] = value[i]; this.birthtimeMs ??= this.ctimeMs; }
+    // WARNING: named writes give every Stats one shape; writes through computed names in a loop cost 2x.
+    constructor(v) { this.dev = v[0]; this.ino = v[1]; this.mode = v[2]; this.nlink = v[3]; this.uid = v[4]; this.gid = v[5]; this.rdev = v[6]; this.size = v[7]; this.blksize = v[8]; this.blocks = v[9]; this.atimeMs = v[10]; this.mtimeMs = v[11]; this.ctimeMs = v[12]; this.birthtimeMs = v[13] ?? v[12]; }
     [kind]() { return this.mode & S.S_IFMT; }
   }
   for (const name of ['atime', 'mtime', 'ctime', 'birthtime']) Object.defineProperty(Stats.prototype, name, { configurable: true, get() { return this[name] = new Date(this[name + 'Ms']); }, set(value) { Object.defineProperty(this, name, { value, writable: true, enumerable: true, configurable: true }); } });
@@ -516,7 +560,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     files[name] = (...args) => { const callback = args.pop(); if (typeof callback !== 'function') throw Object.assign(new TypeError('The "cb" argument must be of type function'), { code: 'ERR_INVALID_ARG_TYPE' }); task(...args).then(result => callback(null, result), callback); };
   }
   files.realpathSync.native = files.realpathSync; files.realpath.native = files.realpath;
-  files.existsSync = value => { try { sync('access', pathArg(value)); return true; } catch { return false; } };
+  files.existsSync = value => { try { return sync('exists', pathArg(value)); } catch { return false; } };
   files.readSync = (fd, buffer, offset = 0, length, position = null) => { if (offset !== null && typeof offset === 'object') ({ offset = 0, length, position = null } = offset); offset ??= 0; length ??= buffer.byteLength - offset; span(buffer.byteLength, offset, length); let data; try { data = bytes(sync('read', fd, length, position)); } catch (error) { throw failure(error, 'read', [fd]); } view(buffer).set(data, offset); return data.length; };
   files.writeSync = (fd, ...args) => { try { return sync('write', fd, ...chunk(...args)); } catch (error) { throw failure(error, 'write', [fd]); } };
   files.read = (fd, buffer, offset, length, position, callback) => {

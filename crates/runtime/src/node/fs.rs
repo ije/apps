@@ -455,6 +455,17 @@ impl Files {
                 #[cfg(not(unix))]
                 bail!("chmod is unavailable on this platform")
             }
+            "exists" => {
+                // WARNING: like Node, this asks access() rather than stat(), which costs a third more.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    let path = std::ffi::CString::new(path()?.as_os_str().as_bytes())?;
+                    Ok(Value::Bool(unsafe { libc::access(path.as_ptr(), libc::F_OK) } == 0))
+                }
+                #[cfg(not(unix))]
+                Ok(Value::Bool(path()?.exists()))
+            }
             "access" => {
                 #[cfg(unix)]
                 {

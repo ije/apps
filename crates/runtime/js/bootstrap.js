@@ -158,9 +158,9 @@
     if (typeof fn !== 'function') throw new TypeError('The "callback" argument must be of type function');
     resolved.then(() => { try { fn(); } catch (error) { try { fail(error); } catch (error) { moduleErrors.push(error); } } });
   };
-  // WARNING: Node's nextTick queue runs after each macrotask and before promise jobs; __appsTick returns -2 after each one, so the engine drains microtasks and calls it again.
+  // WARNING: Node's nextTick queue runs after each macrotask and before promise jobs, and the microtasks drain after them.
   const ticks = [], immediates = new Map();
-  let phase = 0, now = 0, checks = [];
+  let phase = 0, now = 0, checks = [], checked = 0;
   const fail = error => { if (!uncaught(error)) { if (role === 'main') throw error; console.error(error); } };
   const runTicks = () => {
     for (let i = 0; i < ticks.length; i++) { const [fn, args] = ticks[i]; try { fn(...args); } catch (error) { ticks.splice(0, i + 1); i = -1; fail(error); } }
@@ -193,8 +193,8 @@
   delete globalThis.__appsBridge;
   __appsSyncBridge();
   globalThis.__appsPending = () => modulesPending > 0 || moduleErrors.length > 0 || (children?.pending() ?? false) || (node?.poll.pending() ?? false) || (pty?.poll.pending() ?? false) || bridge.poll.pending() || workers.pending() || (net?.pending() ?? false);
-  // WARNING: one call runs one macrotask: pending ticks, one due timer, the I/O polls or one immediate (timers, poll and check phases, like Node).
-  globalThis.__appsTick = () => {
+  // WARNING: one step runs one macrotask: pending ticks, one due timer, the I/O polls or one immediate (timers, poll and check phases, like Node).
+  const step = () => {
     if (moduleErrors.length) throw moduleErrors.shift();
     if (ticks.length) { runTicks(); return -2; }
     if (phase === 0) {
@@ -231,12 +231,14 @@
         nativeShell?.poll?.();
       } catch (error) { fail(error); }
       runTicks();
-      checks = [...immediates];
+      checks = [...immediates.keys()]; checked = 0;
       return -2;
     }
-    while (checks.length) {
-      const [immediate, [fn, args]] = checks.shift();
-      if (!immediates.delete(immediate)) continue;
+    while (checked < checks.length) {
+      const immediate = checks[checked++], entry = immediates.get(immediate);
+      if (!entry) continue;
+      immediates.delete(immediate);
+      const [fn, args] = entry;
       try { fn(...args); } catch (error) { fail(error); }
       runTicks();
       return -2;
@@ -244,6 +246,10 @@
     phase = 0;
     return __appsDelay();
   };
+  // WARNING: like Bun's loop, one call runs a whole loop turn and drains the microtasks after each task, so tasks cost no engine round trip. It
+  // returns -2 once 1 s has passed, checked every 8 tasks because a clock read costs as much as a task, since the page watchdog stops one run of
+  // 10 s, and after each task without `codec.drain` (an older JavaScriptCore). The engine then drains the microtasks and calls again.
+  globalThis.__appsTick = () => { const start = clock(); for (let tasks = 1; ; tasks++) { const delay = step(); if (delay !== -2 || !codec.drain || (tasks % 8 === 0 && clock() - start > 1000)) return delay; codec.drain(); } };
   globalThis.__appsDelay = () => {
     if (ticks.length || immediates.size || bridge.poll.queued()) return 0;
     const at = earliest(), delay = at === Infinity ? -1 : Math.max(0, at - clock());
@@ -309,7 +315,7 @@
   delete globalThis.__appsNodeStreams;
   children = globalThis.__appsChildProcess(call, events.EventEmitter, stream);
   delete globalThis.__appsChildProcess;
-  const io = globalThis.__appsNodeIO({ call, sync: node.sync, asyncCall: node.asyncCall, Buffer: node.Buffer, stream, EventEmitter: events.EventEmitter, StringDecoder: node.string_decoder.StringDecoder, webcrypto: globalThis.__appsNodeCrypto.webcrypto, inspect });
+  const io = globalThis.__appsNodeIO({ call, sync: node.sync, asyncCall: node.asyncCall, Buffer: node.Buffer, stream, EventEmitter: events.EventEmitter, StringDecoder: node.string_decoder.StringDecoder, webcrypto: globalThis.__appsNodeCrypto.webcrypto, inspect, codec });
   delete globalThis.__appsNodeIO;
   node.util.types.isKeyObject = value => value instanceof io.crypto.KeyObject;
   net = globalThis.__appsNet(call, events.EventEmitter, stream, node.Buffer);
@@ -473,6 +479,8 @@
         step(0);
       }, done);
     }
+    // WARNING: like Node, chunks that queue while a write runs go out in one write, so each small write() costs no thread round trip.
+    _writev(chunks, done) { this._write(Buffer.concat(chunks.map(entry => entry.chunk)), null, done); }
     _final(done) { this.opening.then(fd => this.flush ? fs.fsync(fd, done) : done(), done); }
     close(callback) { if (callback) { if (this.closed) queueMicrotask(callback); else this.once('close', callback); } if (this.writable) this.end(); else this.destroy(); }
     destroySoon() { this.end(); }

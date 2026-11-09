@@ -1,4 +1,4 @@
-globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter, StringDecoder, webcrypto, inspect }) => {
+globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter, StringDecoder, webcrypto, inspect, codec }) => {
   const input = (value, encoding) => typeof value === 'string' ? Buffer.from(value, encoding) : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : value instanceof ArrayBuffer ? new Uint8Array(value) : (() => { throw Object.assign(new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView'), { code: 'ERR_INVALID_ARG_TYPE' }); })();
   const output = data => Buffer.from(data.buffer, data.byteOffset, data.byteLength);
   const encoded = (data, encoding) => encoding && encoding !== 'buffer' ? data.toString(encoding) : data;
@@ -148,7 +148,8 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     _flush(callback) { callback(null, this.digest()); }
     update(data, encoding) {
       if (this.#done) throw Object.assign(new Error('Digest already called'), { code: 'ERR_CRYPTO_HASH_FINALIZED' });
-      data = Buffer.from(input(data, encoding));
+      // WARNING: chunks wait for digest(), so views are copied: their owner can change them. A string's bytes are new already.
+      data = typeof data === 'string' ? input(data, encoding) : Buffer.from(input(data, encoding));
       this.#chunks.push(data); this.#size += data.length;
       if (this.#size >= 65536) {
         if (this.#id === null) { this.#id = sync('hash.new', this.#algorithm, this.#secret); handles.register(this, this.#id, this); }
@@ -159,10 +160,10 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     digest(encoding) {
       if (this.#done) throw Object.assign(new Error('Digest already called'), { code: 'ERR_CRYPTO_HASH_FINALIZED' });
       this.#done = true;
-      const data = Buffer.concat(this.#chunks);
+      const data = this.#chunks.length === 1 ? this.#chunks[0] : Buffer.concat(this.#chunks);
       this.#chunks = [];
       let result;
-      if (this.#id === null) result = sync('hash', this.#algorithm, data, this.#secret);
+      if (this.#id === null) result = codec.digest(this.#algorithm, data, this.#secret);
       else { if (data.length) sync('hash.update', this.#id, data); result = sync('hash.digest', this.#id); handles.unregister(this); }
       return encoded(output(result), encoding);
     }
@@ -301,7 +302,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     }
     equals(other) {
       const a = keys.get(this), b = keys.get(other) ?? fail('ERR_INVALID_ARG_TYPE', 'The "otherKeyObject" argument must be an instance of KeyObject', TypeError);
-      return a.type === b.type && (a.type === 'secret' ? a.key.length === b.key.length && call('web.crypto.equal', a.key, b.key) : encode(a, a.type === 'public' ? 'spki' : 'pkcs8').equals(encode(b, b.type === 'public' ? 'spki' : 'pkcs8')));
+      return a.type === b.type && (a.type === 'secret' ? a.key.length === b.key.length && codec.equal(a.key, b.key) : encode(a, a.type === 'public' ? 'spki' : 'pkcs8').equals(encode(b, b.type === 'public' ? 'spki' : 'pkcs8')));
     }
     export(o) {
       const data = keys.get(this);
@@ -430,7 +431,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     hkdf: (name, ikm, salt, info, length, callback) => { const args = hkdf(name, ikm, salt, info, length); asyncCall('hkdf', ...args).then(result => callback(null, arrayBuffer(result)), callback); },
     scryptSync: (...args) => { try { return output(sync('scrypt', ...scrypt(...args))); } catch (error) { throw scryptError(error); } },
     scrypt: (password, salt, length, o, callback) => { if (typeof o === 'function') [o, callback] = [{}, o]; asyncCall('scrypt', ...scrypt(password, salt, length, o)).then(result => callback(null, output(result)), error => callback(scryptError(error))); },
-    timingSafeEqual: (a, b) => { a = input(a); b = input(b); if (a.length !== b.length) throw Object.assign(new RangeError('Input buffers must have the same byte length'), { code: 'ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH' }); return call('web.crypto.equal', a, b); },
+    timingSafeEqual: (a, b) => { a = input(a); b = input(b); if (a.length !== b.length) throw Object.assign(new RangeError('Input buffers must have the same byte length'), { code: 'ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH' }); return codec.equal(a, b); },
     constants: { RSA_PKCS1_PADDING: 1, RSA_NO_PADDING: 3, RSA_PKCS1_OAEP_PADDING: 4, RSA_X931_PADDING: 5, RSA_PKCS1_PSS_PADDING: 6, RSA_PSS_SALTLEN_DIGEST: -1, RSA_PSS_SALTLEN_MAX_SIGN: -2, RSA_PSS_SALTLEN_AUTO: -2, POINT_CONVERSION_COMPRESSED: 2, POINT_CONVERSION_UNCOMPRESSED: 4, POINT_CONVERSION_HYBRID: 6 },
     createCipheriv: (algorithm, secret, iv, options) => new Cipher(false, algorithm, secret, iv, options),
     createDecipheriv: (algorithm, secret, iv, options) => new Cipher(true, algorithm, secret, iv, options),

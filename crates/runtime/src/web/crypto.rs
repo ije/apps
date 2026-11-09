@@ -202,17 +202,6 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                 Ok(base64(value))
             }
         }
-        "equal" => {
-            let a = bytes(&args[0])?;
-            let b = bytes(&args[1])?;
-            ensure!(
-                a.len() == b.len(),
-                "Input buffers must have the same length"
-            );
-            #[allow(deprecated)]
-            let equal = ring::constant_time::verify_slices_are_equal(&a, &b).is_ok();
-            Ok(json!(equal))
-        }
         _ => bail!("Unsupported crypto operation: {op}"),
     }
 }

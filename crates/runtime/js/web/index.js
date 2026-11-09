@@ -197,13 +197,27 @@ globalThis.__appsWeb = (call, codec) => {
   const params = new WeakMap(), urls = new WeakMap();
   const usv = value => { const text = String(value); return text.toWellFormed ? text.toWellFormed() : text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD'); };
   const updateParams = value => { const state = params.get(value); state.update?.(); };
+  // WARNING: well-formed queries decode with decodeURIComponent. A bad percent escape throws there, and then the native parser
+  // keeps it and replaces bad UTF-8, as the URL standard does.
+  const query = text => {
+    const list = [];
+    try {
+      for (const part of text.split('&')) {
+        if (!part) continue;
+        const at = part.indexOf('='), name = at < 0 ? part : part.slice(0, at), value = at < 0 ? '' : part.slice(at + 1);
+        list.push([decodeURIComponent(name.replaceAll('+', ' ')), decodeURIComponent(value.replaceAll('+', ' '))]);
+      }
+    } catch { return call('web.params.parse', text); }
+    return list;
+  };
+  const form = text => encodeURIComponent(text).replace(/[!'()~]|%20/g, c => c === '%20' ? '+' : '%' + c.charCodeAt(0).toString(16).toUpperCase());
   class URLSearchParams {
     constructor(input = '') {
       let list;
       if (typeof input === 'object' && input !== null) {
         if (input[Symbol.iterator]) list = Array.from(input, pair => { const values = Array.from(pair); if (values.length !== 2) throw new TypeError('Expected a pair'); return values.map(usv); });
         else list = Object.entries(input).map(pair => pair.map(usv));
-      } else list = call('web.params.parse', usv(input).replace(/^\?/, ''));
+      } else list = query(usv(input).replace(/^\?/, ''));
       params.set(this, { list });
     }
     get size() { return params.get(this).list.length; }
@@ -224,22 +238,36 @@ globalThis.__appsWeb = (call, codec) => {
     *values() { for (const [, value] of this) yield value; }
     forEach(fn, thisArg) { for (const [key, value] of this) fn.call(thisArg, value, key, this); }
     [Symbol.iterator]() { return this.entries(); }
-    toString() { return call('web.params.stringify', params.get(this).list); }
+    toString() { return params.get(this).list.map(([name, value]) => `${form(name)}=${form(value)}`).join('&'); }
   }
-  const parseURL = (...args) => {
-    let parts;
-    try { parts = call('web.url', ...args.map(value => typeof value === 'string' ? usv(value) : value)); } catch (error) { throw new TypeError(error.message); }
-    const [href, origin, protocol, username, password, host, hostname, port, pathname, search, hash] = parts;
-    return { href, origin, protocol, username, password, host, hostname, port, pathname, search, hash };
+  // WARNING: like ada in Node and Bun, a URL keeps its href and the offsets of its parts (see `url` in jsc/encoding.rs), and getters slice them.
+  const parseURL = (...args) => { try { return codec.url(...args.map(value => typeof value === 'string' ? usv(value) : value)); } catch (error) { throw new TypeError(error.message); } };
+  const parts = {
+    href: at => at[0],
+    protocol: at => at[0].slice(0, at[1] + 1),
+    username: at => at[0].slice(at[2], at[3]),
+    password: at => at[0].slice(at[4], at[5]),
+    host: at => at[0].slice(at[6], at[8]),
+    hostname: at => at[0].slice(at[6], at[7]),
+    port: at => at[0].slice(at[7] + 1, at[8]),
+    pathname: at => at[0].slice(at[8], at[9]),
+    search: at => at[10] - at[9] > 1 ? at[0].slice(at[9], at[10]) : '',
+    hash: at => at[0].length - at[10] > 1 ? at[0].slice(at[10]) : '',
   };
+  const special = new Set(['http:', 'https:', 'ws:', 'wss:', 'ftp:']);
   class URL {
     constructor(input, base) { urls.set(this, { data: parseURL(String(input), base === undefined ? null : String(base)), searchParams: null }); }
-    get origin() { return urls.get(this).data.origin; }
+    get origin() {
+      const at = urls.get(this).data, protocol = parts.protocol(at);
+      if (special.has(protocol)) return `${protocol}//${parts.host(at)}`;
+      if (protocol !== 'blob:') return 'null';
+      try { const inner = new URL(parts.pathname(at)); return inner.protocol === 'http:' || inner.protocol === 'https:' ? inner.origin : 'null'; } catch { return 'null'; }
+    }
     get searchParams() {
       const state = urls.get(this);
       if (!state.searchParams) {
-        state.searchParams = new URLSearchParams(state.data.search);
-        params.get(state.searchParams).update = () => { state.data = parseURL(state.data.href, null, 'search', state.searchParams.toString()); };
+        state.searchParams = new URLSearchParams(parts.search(state.data));
+        params.get(state.searchParams).update = () => { state.data = parseURL(state.data[0], null, 'search', state.searchParams.toString()); };
       }
       return state.searchParams;
     }
@@ -250,26 +278,19 @@ globalThis.__appsWeb = (call, codec) => {
   }
   for (const key of ['href', 'protocol', 'username', 'password', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) Object.defineProperty(URL.prototype, key, {
     enumerable: true, configurable: true,
-    get() { return urls.get(this).data[key]; },
-    set(value) { const state = urls.get(this); state.data = parseURL(state.data.href, null, key, String(value)); if ((key === 'search' || key === 'href') && state.searchParams) params.get(state.searchParams).list = call('web.params.parse', state.data.search.slice(1)); },
+    get() { return parts[key](urls.get(this).data); },
+    set(value) { const state = urls.get(this); state.data = parseURL(state.data[0], null, key, String(value)); if ((key === 'search' || key === 'href') && state.searchParams) params.get(state.searchParams).list = query(parts.search(state.data).slice(1)); },
   });
-  // WARNING: like Node's entropy cache, small requests take unused bytes of a 4 KB block of OS randomness, so they make
-  // no host call. No byte is handed out twice, and the block never leaves this scope.
-  let entropy = new Uint8Array(0), entropyAt = 0;
-  const random = size => {
-    if (size > 256) return decodeBytes(call('web.random', size));
-    if (entropyAt + size > entropy.length) { entropy = decodeBytes(call('web.random', 4096)); entropyAt = 0; }
-    return entropy.subarray(entropyAt, entropyAt += size);
-  };
+  const uuid = new Uint8Array(16);
   const crypto = globalThis.__appsCrypto(call, encodeBytes, decodeBytes, {
     getRandomValues(array) {
       if (!ArrayBuffer.isView(array) || array instanceof DataView || array instanceof Float32Array || array instanceof Float64Array || (typeof Float16Array !== 'undefined' && array instanceof Float16Array)) throw new DOMException('Expected an integer typed array', 'TypeMismatchError');
       if (array.byteLength > 65536) throw new DOMException('Random byte quota exceeded', 'QuotaExceededError');
-      bytes(array).set(random(array.byteLength)); return array;
+      codec.random(array); return array;
     },
     randomUUID() {
-      const values = random(16); values[6] = (values[6] & 15) | 64; values[8] = (values[8] & 63) | 128;
-      const hex = values.toHex();
+      codec.random(uuid); uuid[6] = (uuid[6] & 15) | 64; uuid[8] = (uuid[8] & 63) | 128;
+      const hex = uuid.toHex();
       return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
     },
     subtle: Object.freeze({
