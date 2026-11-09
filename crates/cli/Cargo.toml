@@ -11,8 +11,10 @@ path = "src/main.rs"
 [dependencies]
 apps-runtime = { path = "../runtime" }
 anyhow.workspace = true
+base64 = "0.22"
 bbtree.workspace = true
 ctrlc = "3"
+libloading = "0.8"
 notify = "8"
 object = { version = "0.39.1", default-features = false, features = ["read_core", "std", "elf", "macho", "pe"] }
 oxc_allocator = "=0.155.0"
@@ -28,6 +30,7 @@ oxc_sourcemap = "=9.0.0"
 oxc_span = "=0.155.0"
 oxc_transformer = "=0.155.0"
 serde_json.workspace = true
+sha2 = "0.10"
 tempfile = "3"
 url.workspace = true
 zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }

@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-revision=cdce396d50b4ffbb9125a4cb3b3fb76a8d59a62f
+revision=5a61071f79134bf41844e7ea31a8449147d85dd4
+# WARNING: keep this the revision in jsc-aot.cpp. Bun's AOT compiler must match the IR format and built-in table of JSC.
+bun_revision=2596ac5d391d47804c93a42bdbe615804aa62387
+aot=0
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 
 jobs=${NUMBER_OF_PROCESSORS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')}
@@ -11,6 +14,10 @@ fi
 
 while (($#)); do
   case "$1" in
+    --aot)
+      aot=1
+      shift
+      ;;
     --jobs)
       if (($# < 2)); then
         printf '%s\n' '--jobs requires a positive integer' >&2
@@ -24,7 +31,7 @@ while (($#)); do
       shift
       ;;
     -h | --help)
-      printf 'Usage: %s [--jobs N] [-- CMake options...]\n' "${0##*/}"
+      printf 'Usage: %s [--aot] [--jobs N] [-- CMake options...]\n' "${0##*/}"
       exit 0
       ;;
     --)
@@ -72,6 +79,11 @@ case "$(uname -m)" in
     ;;
 esac
 
+if ((aot)) && [[ $system != macos || $arch != aarch64 ]]; then
+  printf '%s\n' '--aot currently requires macOS arm64' >&2
+  exit 1
+fi
+
 source_dir=$root/target/bun-jsc/source
 output=$root/target/bun-jsc/$system-$arch
 build=$output/build
@@ -111,8 +123,8 @@ options=(
   -DENABLE_WEBGPU_SWIFT=OFF
   '-DCMAKE_INSTALL_RPATH=$ORIGIN'
   -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
-  -DCMAKE_C_FLAGS=-DENABLE_AOT=0
-  -DCMAKE_CXX_FLAGS=-DENABLE_AOT=0
+  '-DCMAKE_C_FLAGS=-DENABLE_AOT=0 -DAPPS_JSC_AOT_RUNTIME=0'
+  '-DCMAKE_CXX_FLAGS=-DENABLE_AOT=0 -DAPPS_JSC_AOT_RUNTIME=0'
 )
 
 case "$system" in
@@ -129,7 +141,7 @@ case "$system" in
     )
     ;;
   windows)
-    options+=('-DCMAKE_CXX_FLAGS=-DENABLE_AOT=0 -DU_STATIC_IMPLEMENTATION')
+    options+=('-DCMAKE_CXX_FLAGS=-DENABLE_AOT=0 -DAPPS_JSC_AOT_RUNTIME=0 -DU_STATIC_IMPLEMENTATION')
     ;;
 esac
 
@@ -160,7 +172,52 @@ if [[ $system == macos ]]; then
 fi
 mv -f "$output/.$name" "$output/$name"
 
+# `apps build --aot` loads libJavaScriptCoreCompiler.dylib to compile Bun's IR, and links app.dylib with
+# libJavaScriptCoreAOT.a, a JSC without JIT compilers or Inspector that runs the compiled code.
+if ((aot)); then
+  bun_source=$root/target/bun-aot/source
+  if [[ ! -d $bun_source ]]; then
+    git init "$bun_source"
+    git -C "$bun_source" remote add origin https://github.com/oven-sh/bun.git
+    git -C "$bun_source" sparse-checkout set --cone src scripts packages/bun-error packages/bun-usockets docs/lint
+    git -C "$bun_source" fetch --depth 1 origin "$bun_revision"
+    git -C "$bun_source" checkout --detach FETCH_HEAD
+  fi
+  if [[ $(git -C "$bun_source" rev-parse HEAD) != "$bun_revision" ]]; then
+    printf '%s must be at %s\n' "$bun_source" "$bun_revision" >&2
+    exit 1
+  fi
+  # WARNING: compiled code reads JSC fields and built-ins by offset and ID, so both builds use the same source, options
+  # and built-in table, made from Bun's source.
+  for runtime in 0 1; do
+    build=$output/build-compiler
+    flags="-DENABLE_AOT=1 -DAPPS_JSC_AOT_RUNTIME=$runtime"
+    aot_options=("${options[@]}" "-DAPPS_JSC_AOT_SOURCE=$root/scripts/jsc-aot.cpp" "-DCMAKE_C_FLAGS=$flags" "-DCMAKE_CXX_FLAGS=$flags")
+    if ((runtime)); then
+      build=$output/build-aot
+      aot_options+=(-DENABLE_STATIC_JSC=ON -DENABLE_REMOTE_INSPECTOR=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DAPPS_JSC_AOT_RUNTIME=ON)
+    fi
+    cmake -S "$source_dir" -B "$build" -G Ninja "${aot_options[@]}" "$@"
+    "${APPS_BUN:-bun}" "$root/scripts/jsc-aot-table.ts" "$bun_source" \
+      "$source_dir/Source/JavaScriptCore" "$build/JavaScriptCore/DerivedSources/aot"
+    cmake --build "$build" --target JavaScriptCore --parallel "$jobs"
+  done
+  name=libJavaScriptCoreCompiler.dylib
+  cp -p "$output/build-compiler/lib/JavaScriptCore.framework/JavaScriptCore" "$output/.$name"
+  install_name_tool -id "@rpath/$name" "$output/.$name"
+  xcrun strip -x "$output/.$name"
+  codesign --force --sign - "$output/.$name"
+  mv -f "$output/.$name" "$output/$name"
+  xcrun libtool -static -o "$output/.libJavaScriptCoreAOT.a" \
+    "$build/lib/libJavaScriptCore.a" "$build/lib/libWTF.a" "$build/lib/libbmalloc.a"
+  mv -f "$output/.libJavaScriptCoreAOT.a" "$output/libJavaScriptCoreAOT.a"
+fi
+
 {
+  if [[ -f $output/libJavaScriptCoreAOT.a ]]; then
+    cat "$root/target/bun-aot/source/LICENSE.md"
+    printf '\n'
+  fi
   printf 'JavaScriptCore from https://github.com/oven-sh/WebKit/tree/%s\n' "$revision"
   for component in JavaScriptCore WTF bmalloc; do
     find "$source_dir/Source/$component" \

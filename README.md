@@ -8,8 +8,9 @@ A tiny, fast, memory-safe Electron alternative with a compatible API.
 - `apps run --enable-devtools-mcp [--devtools-mcp-port <port>]`: Serve devtools to agents on `127.0.0.1`. The default port is `19876`, and `0` picks a free port. It is off by default.
 - `apps run main.js a b` or `apps run main.js -- --flag`: Pass arguments to the app. `process.argv` is `[execPath, entry, ...arguments]`.
 - `apps skill`: Print the agent skill that explains the devtools server.
-- `apps build [entry] [--out-dir <directory>] [--platform <platform>] [--arch <arch>] [--bytecode]`: Create a production app with Bun's JavaScriptCore. Defaults to `main` in `package.json`, then `index.ts`, `index.mts`, `index.mjs` or `index.js`.
+- `apps build [entry] [--out-dir <directory>] [--platform <platform>] [--arch <arch>] [--bytecode] [--aot]`: Create a production app with Bun's JavaScriptCore. Defaults to `main` in `package.json`, then `index.ts`, `index.mts`, `index.mjs` or `index.js`.
 - `apps build --bytecode`: Also pack the bytecode of the app's scripts and of the runtime, so the app starts faster and uses less memory. The bundle grows by about 2.6 MB plus about 1.5 times the size of the app's JavaScript, and the build must be for this machine.
+- `apps build --aot`: Compile the app's modules and the runtime scripts to native code, on macOS arm64. See [AOT build](#aot-build-experimental).
 
 The devtools server gives agents screenshots, DOM, JavaScript evaluation, console, mouse and keyboard input, memory, CPU and frame profiles, and a breakpoint debugger that uses source maps.
 Agents call the tools with plain HTTP (`curl -s http://127.0.0.1:<port>/` lists them), or connect an MCP client to `http://127.0.0.1:<port>/mcp`.
@@ -238,6 +239,42 @@ app.on('window-all-closed', () => {})
 ```
 
 The `window-all-closed` listener keeps the tray available after the settings window closes.
+
+## AOT build (experimental)
+
+`apps build --aot` compiles the app's modules and the runtime scripts to native code with Bun's AOT compiler.
+It works for JavaScript and TypeScript apps on macOS arm64, and can't be combined with `--bytecode`.
+Bun is needed only for the build.
+
+Set `APPS_BUN` to a Bun binary from revision `2596ac5d391d47804c93a42bdbe615804aa62387` ([Bun PR #47942](https://github.com/oven-sh/bun/pull/47942)), and build JSC with AOT support.
+Other revisions are rejected, because Bun's IR must match the format and the built-in table of the JSC compiler.
+
+```sh
+export APPS_BUN=/path/to/bun
+bash scripts/build-jsc.sh --aot
+cargo build -p apps -p apps-runtime
+./target/debug/apps build index.ts --aot
+```
+
+`--aot` fetches Bun's source into `target/bun-aot`, and also builds `libJavaScriptCoreCompiler.dylib`, which the CLI loads to compile, and `libJavaScriptCoreAOT.a`, a JSC without JIT compilers and Inspector.
+The CLI links the archive and the native code into `app.dylib` in `Contents/Resources`, in place of the app's JavaScriptCore library.
+
+The main module, module chunks, page modules, preloads, workers and the runtime scripts compile.
+Classic page scripts and code from strings run in JSC's interpreter.
+Packaged `.wasm` files and valid Wasm in base64 string literals passed to `atob()` compile too. Other Wasm runs in the interpreter.
+
+`app.bundle` keeps a reference with a build ID in place of each compiled script, so code that reads a script file gets the reference.
+The app doesn't start when `app.dylib` comes from another build or another runtime.
+
+Bun's AOT limits apply, for example to some changes of built-in objects.
+In a small test app, the app starts about as fast as with `--bytecode`, a hot loop runs about 2 times slower than with the JIT, and the app is 4.8 MB bigger.
+
+To run the integration test:
+
+```sh
+APPS_JSC_LIBRARY="$PWD/target/bun-jsc/macos-aarch64/libJavaScriptCore.dylib" \
+  cargo test -p apps --test aot -- --include-ignored
+```
 
 ## Rust main
 

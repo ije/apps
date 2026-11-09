@@ -1,3 +1,4 @@
+mod aot;
 mod build_target;
 mod bundler;
 mod commands;
@@ -44,7 +45,7 @@ fn run_cli() -> Result<i32> {
                 .is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         println!(
-            "apps {}\n\napps run [entry] [--watch|-W] [--devtools|-D] [--enable-devtools-mcp] [--devtools-mcp-port <port>] [--] [app arguments]\napps build [entry] [--out-dir <directory>] [--platform <macos|linux|windows>] [--arch <x64|arm64>] [--bytecode]\napps skill\n\nRun and build default to main in package.json, then index.ts, index.mts, index.mjs or index.js. Watching is off by default. Apps with type rust use Cargo for their main executable.\nOther arguments after the entry, and all arguments after --, go to the app in process.argv.\n--watch, -W       Restart when the entry or its imports change.\n--devtools, -D    Open Developer Tools in a standalone window.\n--enable-devtools-mcp       Serve devtools to agents at http://127.0.0.1:<port>, over plain HTTP and MCP (/mcp).\n--devtools-mcp-port <port>  Port of the devtools server. Default 19876, 0 picks a free port.\nCmd+Alt+F         Show or hide the FPS HUD of a window. Ctrl+Alt+F on Windows and Linux.\n--bytecode        Pack the bytecode of the app's scripts and of the runtime, so the app starts faster and uses less memory.\napps skill        Print the agent skill that explains the devtools server.\n\nPlatform and architecture default to this machine. Explicit targets use dist/<platform>-<arch>.\nSet APPS_RUNTIME to a matching runtime executable.\nBun JavaScriptCore is bundled with every app. Set APPS_JSC_LIBRARY to a matching shared library.",
+            "apps {}\n\napps run [entry] [--watch|-W] [--devtools|-D] [--enable-devtools-mcp] [--devtools-mcp-port <port>] [--] [app arguments]\napps build [entry] [--out-dir <directory>] [--platform <macos|linux|windows>] [--arch <x64|arm64>] [--bytecode] [--aot]\napps skill\n\nRun and build default to main in package.json, then index.ts, index.mts, index.mjs or index.js. Watching is off by default. Apps with type rust use Cargo for their main executable.\nOther arguments after the entry, and all arguments after --, go to the app in process.argv.\n--watch, -W       Restart when the entry or its imports change.\n--devtools, -D    Open Developer Tools in a standalone window.\n--enable-devtools-mcp       Serve devtools to agents at http://127.0.0.1:<port>, over plain HTTP and MCP (/mcp).\n--devtools-mcp-port <port>  Port of the devtools server. Default 19876, 0 picks a free port.\nCmd+Alt+F         Show or hide the FPS HUD of a window. Ctrl+Alt+F on Windows and Linux.\n--bytecode        Pack the bytecode of the app's scripts and of the runtime, so the app starts faster and uses less memory.\n--aot             Compile the app's modules to native code in app.dylib (macOS arm64). Set APPS_BUN to the pinned Bun compiler.\napps skill        Print the agent skill that explains the devtools server.\n\nPlatform and architecture default to this machine. Explicit targets use dist/<platform>-<arch>.\nSet APPS_RUNTIME to a matching runtime executable.\nBun JavaScriptCore is bundled with every app. Set APPS_JSC_LIBRARY to a matching shared library.",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(0);
@@ -66,6 +67,7 @@ fn run_cli() -> Result<i32> {
     let host = BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH)?;
     let mut target = host;
     let mut explicit_target = false;
+    let mut aot = false;
     let mut watch = false;
     let mut devtools = false;
     let mut mcp = false;
@@ -88,6 +90,7 @@ fn run_cli() -> Result<i32> {
                     .parse()
                     .context("Invalid devtools MCP port")?;
             }
+            "--aot" if command == "build" => aot = true,
             "--out-dir" if command == "build" => {
                 out = Some(std::path::absolute(
                     args.next().context("Expected output directory")?,
@@ -113,6 +116,11 @@ fn run_cli() -> Result<i32> {
             _ => bail!("Unknown option: {arg}"),
         }
     }
+    ensure!(
+        !aot || target == host && host.platform == "macos" && host.arch == "arm64",
+        "--aot currently requires a native macOS arm64 build"
+    );
+    ensure!(!aot || !bytecode, "--aot and --bytecode can't be combined");
     let entry = match entry {
         Some(entry) => entry,
         None => {
@@ -136,6 +144,10 @@ fn run_cli() -> Result<i32> {
         .canonicalize()
         .with_context(|| format!("Cannot find the entry {}", entry.display()))?;
     let rust = rust::project(&entry)?;
+    ensure!(
+        !aot || rust.is_none(),
+        "--aot currently supports JavaScript and TypeScript apps only"
+    );
     let root = rust
         .as_deref()
         .or_else(|| entry.parent())
@@ -191,8 +203,16 @@ fn run_cli() -> Result<i32> {
                 out != root && !entry.starts_with(&out),
                 "Output must be separate from source files"
             );
-            commands::build::run(&entry, &out, &runtime, rust.as_deref(), target, bytecode)
-                .map(|_| 0)
+            commands::build::run(
+                &entry,
+                &out,
+                &runtime,
+                rust.as_deref(),
+                target,
+                bytecode,
+                aot,
+            )
+            .map(|_| 0)
         }
         _ => unreachable!(),
     }

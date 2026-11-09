@@ -52,11 +52,22 @@ pub struct Bundle {
     pub scripts: HashMap<String, bytes::Bytes>,
 }
 
+// `apps build --aot` replaces each script it compiles with a reference to its native code in app.dylib. The build ID
+// ties the reference to one app.dylib. Without native code, the reference throws.
+pub const AOT_PREFIX: &str = "\"apps:aot:";
+
+pub fn aot_source(build: &str, name: &str) -> String {
+    format!("{AOT_PREFIX}{build}:{name}\";throw Error(\"Missing AOT image\");")
+}
+
 // WARNING: module code must stay outside the loader function, or it could see loader internals such as
 // `compile`. Definitions run in a second function whose only binding is `$appsDefine`.
 pub fn script_source(files: &BBTreeMap<String, String>, execute: bool) -> String {
-    let modules = js!("modules.js");
     let app = files.get("app.js").map_or("", String::as_str);
+    if execute && app.starts_with(AOT_PREFIX) {
+        return app.to_owned();
+    }
+    let modules = js!("modules.js");
     let mut source = String::with_capacity(modules.len() + app.len() + 64);
     source.push_str("(()=>{");
     source.push_str(&modules);

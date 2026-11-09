@@ -15,6 +15,7 @@ pub fn package_app(
     target: BuildTarget,
     app_binary: Option<&Path>,
     bytecode: bool,
+    aot: Option<&Path>,
 ) -> Result<(usize, PathBuf)> {
     let package = files.get("package.json").map(String::as_str);
     let (name, product_name, version, identifier) =
@@ -61,7 +62,7 @@ pub fn package_app(
         !files.contains_key(&executable_name)
             && !matches!(
                 executable_name.to_ascii_lowercase().as_str(),
-                "app.bundle" | ".apps-build" | "node_modules"
+                "app.bundle" | "app.dylib" | ".apps-build" | "node_modules"
             ),
         "Executable name conflicts with a bundle file: {executable_name}"
     );
@@ -175,6 +176,12 @@ pub fn package_app(
         }
         files.values().map(String::len).sum()
     };
+    if let Some(aot) = aot {
+        target
+            .validate_binary(aot)
+            .context("AOT runtime does not match the build target")?;
+        bytes += fs::copy(aot, assets.join("app.dylib"))? as usize;
+    }
     fs::write(stage.path().join(".apps-build"), b"1")?;
     let executable = if target.platform == "macos" {
         app_directory.join("Contents/MacOS").join(&executable_name)
@@ -214,12 +221,14 @@ pub fn package_app(
         stage.path().to_owned()
     };
     fs::create_dir_all(&libraries)?;
-    let destination = libraries.join(library_name);
-    ensure!(
-        !destination.exists(),
-        "JavaScriptCore conflicts with a build file"
-    );
-    bytes += fs::copy(&jsc, destination)? as usize;
+    if aot.is_none() {
+        let destination = libraries.join(library_name);
+        ensure!(
+            !destination.exists(),
+            "JavaScriptCore conflicts with a build file"
+        );
+        bytes += fs::copy(&jsc, destination)? as usize;
+    }
     let license = jsc.with_file_name("JavaScriptCore.LICENSE");
     if license.is_file() {
         let destination = libraries.join("JavaScriptCore.LICENSE");
@@ -282,6 +291,7 @@ pub fn package_app(
                         relative.to_str(),
                         Some(
                             "app.bundle"
+                                | "app.dylib"
                                 | "native.json"
                                 | "assets.json"
                                 | "package.json"
@@ -420,6 +430,7 @@ mod tests {
                     BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                     None,
                     false,
+                    None,
                 )
                 .unwrap();
                 let filename = if cfg!(windows) {
@@ -580,6 +591,7 @@ mod tests {
                     BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                     None,
                     false,
+                    None,
                 )
                 .unwrap();
                 assert_eq!(executable.file_stem().unwrap(), name);
@@ -624,6 +636,7 @@ mod tests {
                 target,
                 None,
                 false,
+                None,
             )
         };
         let error = build(r#"["video"]"#).unwrap_err();
@@ -685,6 +698,7 @@ mod tests {
                 target,
                 None,
                 false,
+                None,
             )
         };
         let error = build(r#"["webgpu"]"#).unwrap_err();
@@ -731,6 +745,7 @@ mod tests {
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(assets.join("app.js").is_file());
@@ -747,6 +762,7 @@ mod tests {
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(assets.join("app.bundle").is_file());
@@ -763,6 +779,7 @@ mod tests {
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(!assets.join("app.bundle").exists());
@@ -810,6 +827,7 @@ mod tests {
                 BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 None,
                 false,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -844,6 +862,7 @@ mod tests {
                 BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 None,
                 false,
+                None,
             )
             .unwrap();
             assert!(!assets.join("data/message.txt").exists());
@@ -872,6 +891,7 @@ mod tests {
                 BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 None,
                 false,
+                None,
             )
             .unwrap();
             for name in [
@@ -894,6 +914,7 @@ mod tests {
                     BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                     None,
                     false,
+                    None,
                 )
                 .unwrap_err();
                 assert!(
@@ -923,6 +944,7 @@ mod tests {
                     BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                     None,
                     false,
+                    None,
                 )
                 .unwrap_err();
                 assert!(error.to_string().contains("without backslashes"), "{error}");
@@ -938,6 +960,7 @@ mod tests {
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             None,
             false,
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("outside data"), "{error}");

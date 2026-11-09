@@ -2504,6 +2504,7 @@ fn native_addons_copy_package_paths_and_survive_relocation() {
                 .unwrap(),
             None,
             false,
+            None,
         )
         .unwrap();
         let moved = dir.path().join("relocated");

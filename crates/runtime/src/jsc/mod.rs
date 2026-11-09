@@ -1,3 +1,4 @@
+mod aot;
 pub(crate) mod encoding;
 pub(crate) mod payload;
 
@@ -14,6 +15,56 @@ use std::{
     rc::Rc,
 };
 
+type Script = (&'static str, fn() -> &'static str);
+
+// Runtime scripts by URL, in the order engines run them. Main, preload and worker engines run the node scripts, every
+// engine runs the web scripts, and pages run the page scripts, WebGPU only with its feature.
+const NODE_SCRIPTS: [Script; 12] = [
+    ("apps:ffi", || js!("node/ffi.js")),
+    ("apps:sqlite", || js!("node/sqlite.js")),
+    ("apps:events", || js!("events.js")),
+    ("apps:child_process", || js!("node/child_process.js")),
+    ("apps:serve", || js!("web/serve.js")),
+    ("apps:node", || js!("node/index.js")),
+    ("apps:node-streams", || js!("node/stream.js")),
+    ("apps:node-io", || js!("node/io.js")),
+    ("apps:node-http", || js!("node/http.js")),
+    ("apps:net", || js!("node/net.js")),
+    ("apps:pty", || js!("node/pty.js")),
+    ("apps:node-compat", || js!("node/compat.js")),
+];
+const WEB_SCRIPTS: [Script; 13] = [
+    ("apps:streams", || js!("web/streams.js")),
+    ("apps:crypto", || js!("web/crypto.js")),
+    ("apps:web", || js!("web/index.js")),
+    ("apps:platform", || js!("web/platform.js")),
+    ("apps:bridge", || js!("bridge.js")),
+    ("apps:browser", || js!("browser.js")),
+    ("apps:electron", || js!("electron.js")),
+    ("apps:worker", || js!("web/worker.js")),
+    ("apps:browser-environment", || js!("web/environment.js")),
+    ("apps:inspect", || js!("inspect.js")),
+    ("apps:bootstrap", || js!("bootstrap.js")),
+    ("apps:wasm", || js!("web/wasm.js")),
+    ("apps:file-system", || js!("web/file_system.js")),
+];
+const PAGE_SCRIPTS: [Script; 2] = [
+    ("apps:gpu", || js!("web/gpu.js")),
+    ("apps:dom", || js!("dom.js")),
+];
+
+// Identifies the runtime scripts, see build.rs.
+pub const RUNTIME_SCRIPTS: &str = env!("APPS_RUNTIME_SCRIPTS");
+
+// All runtime scripts, by URL, for `apps build --aot`.
+pub fn runtime_scripts() -> impl Iterator<Item = (&'static str, &'static str)> {
+    NODE_SCRIPTS
+        .into_iter()
+        .chain(WEB_SCRIPTS)
+        .chain(PAGE_SCRIPTS)
+        .map(|(url, source)| (url, source()))
+}
+
 pub(crate) type Ptr = *mut c_void;
 type Callback = unsafe extern "C" fn(Ptr, Ptr, Ptr, usize, *const Ptr, *mut Ptr) -> Ptr;
 
@@ -26,6 +77,7 @@ type Scripts = (
 static SCRIPTS: std::sync::Mutex<Scripts> = std::sync::Mutex::new((Vec::new(), false));
 
 pub struct JavaScriptCore {
+    aot: Option<&'static aot::Image>,
     _library: Library,
     group: Ptr,
     group_release: unsafe extern "C" fn(Ptr),
@@ -111,6 +163,7 @@ pub struct JavaScriptCore {
     json_string: unsafe extern "C" fn(Ptr, Ptr, u32, *mut Ptr) -> Ptr,
     get_chars: unsafe extern "C" fn(Ptr, Ptr, *mut usize, *mut bool) -> *const c_void,
     get_bytes: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr, *mut usize) -> bool,
+    eval_enabled: unsafe extern "C" fn(Ptr, bool, Ptr),
     make_latin1: unsafe extern "C" fn(Ptr, *const u8, usize) -> Ptr,
     make_utf16: unsafe extern "C" fn(Ptr, *const u16, usize) -> Ptr,
     make_utf8: unsafe extern "C" fn(Ptr, *const c_char, usize) -> Ptr,
@@ -154,6 +207,11 @@ pub fn library_path(executable: &Path, platform: &str) -> Result<PathBuf> {
     .any(|bundle| directory.join(bundle).is_file())
         && executable == std::env::current_exe()?.canonicalize()?
     {
+        // WARNING: app.dylib of `apps build --aot` holds JavaScriptCore and the app's native code.
+        let aot = directory.join("../Resources/app.dylib");
+        if aot.is_file() {
+            return Ok(aot);
+        }
         return ["../Frameworks", "."]
             .iter()
             .map(|folder| directory.join(folder).join(name))
@@ -210,12 +268,14 @@ impl JavaScriptCore {
                 // memory of dead cells, like string buffers, stayed until allocation reached their blocks, hundreds
                 // of MB on pages that allocate a lot. A sweep after each collection frees it, in a few ms.
                 std::env::set_var("JSC_sweepSynchronously", "1");
+                let _ = aot::load(&path);
                 group = Some(group_create());
                 std::env::remove_var("JSC_useSharedArrayBuffer");
                 std::env::remove_var("JSC_heapGrowthMaxIncrease");
                 std::env::remove_var("JSC_sweepSynchronously");
             });
             Ok(Rc::new(Self {
+                aot: aot::load(&path)?,
                 // WARNING: engines of one thread share a VM, so JSC reuses compiled runtime code across windows.
                 group: group.unwrap_or_else(|| group_create()),
                 inspectable: library
@@ -303,6 +363,7 @@ impl JavaScriptCore {
                 json_string: *library.get(b"JSValueCreateJSONString\0")?,
                 get_chars: *library.get(b"JSValueGetStringCharacters\0")?,
                 get_bytes: *library.get(b"JSValueGetBytes\0")?,
+                eval_enabled: *library.get(b"JSGlobalContextSetEvalEnabled\0")?,
                 make_latin1: *library.get(b"JSValueMakeStringLatin1\0")?,
                 make_utf16: *library.get(b"JSValueMakeStringUTF16\0")?,
                 make_utf8: *library.get(b"JSValueMakeStringUTF8\0")?,
@@ -753,6 +814,22 @@ unsafe extern "C" fn chunk(
         }
         return ptr::null_mut();
     };
+    if let Some(aot) = api.aot {
+        match aot.find(&source) {
+            Ok(Some(module)) => return aot.call(&api, ctx, module, ptr::null_mut(), exception),
+            Ok(None) => {}
+            Err(error) => {
+                if !exception.is_null() {
+                    let message = api.string(&format!("Error: {error:#}"));
+                    unsafe {
+                        *exception = (api.make_string)(ctx, message);
+                        (api.string_release)(message);
+                    }
+                }
+                return ptr::null_mut();
+            }
+        }
+    }
     let url = api.string(&format!("apps:///{name}"));
     // WARNING: `JSEvaluateScript` keeps its own copy of the source, as UTF-16 if it holds a NUL or any non-ASCII
     // byte. JSC points at these bytes instead, so they are never released. Mapped pages stay clean, so they don't
@@ -1960,6 +2037,9 @@ impl JsContext {
             ),
             "apps:role",
         )?;
+        if let Some(aot) = engine.api.aot {
+            aot.attach(ctx);
+        }
         if !matches!(role, Role::Renderer(_)) {
             let name = engine.api.string("__appsLoadAddon");
             unsafe {
@@ -1987,32 +2067,13 @@ impl JsContext {
                 );
                 (engine.api.string_release)(name);
             }
-            engine.run(js!("node/ffi.js"), "apps:ffi")?;
-            engine.run(js!("node/sqlite.js"), "apps:sqlite")?;
-            engine.run(js!("events.js"), "apps:events")?;
-            engine.run(js!("node/child_process.js"), "apps:child_process")?;
-            engine.run(js!("web/serve.js"), "apps:serve")?;
-            engine.run(js!("node/index.js"), "apps:node")?;
-            engine.run(js!("node/stream.js"), "apps:node-streams")?;
-            engine.run(js!("node/io.js"), "apps:node-io")?;
-            engine.run(js!("node/http.js"), "apps:node-http")?;
-            engine.run(js!("node/net.js"), "apps:net")?;
-            engine.run(js!("node/pty.js"), "apps:pty")?;
-            engine.run(js!("node/compat.js"), "apps:node-compat")?;
+            for (url, source) in NODE_SCRIPTS {
+                engine.run(source(), url)?;
+            }
         }
-        engine.run(js!("web/streams.js"), "apps:streams")?;
-        engine.run(js!("web/crypto.js"), "apps:crypto")?;
-        engine.run(js!("web/index.js"), "apps:web")?;
-        engine.run(js!("web/platform.js"), "apps:platform")?;
-        engine.run(js!("bridge.js"), "apps:bridge")?;
-        engine.run(js!("browser.js"), "apps:browser")?;
-        engine.run(js!("electron.js"), "apps:electron")?;
-        engine.run(js!("web/worker.js"), "apps:worker")?;
-        engine.run(js!("web/environment.js"), "apps:browser-environment")?;
-        engine.run(js!("inspect.js"), "apps:inspect")?;
-        engine.run(js!("bootstrap.js"), "apps:bootstrap")?;
-        engine.run(js!("web/wasm.js"), "apps:wasm")?;
-        engine.run(js!("web/file_system.js"), "apps:file-system")?;
+        for (url, source) in WEB_SCRIPTS {
+            engine.run(source(), url)?;
+        }
         let name = engine.api.string("__appsRejection");
         unsafe {
             let callback = (engine.api.get)(ctx, (engine.api.global)(ctx), name, ptr::null_mut());
@@ -2034,12 +2095,18 @@ impl JsContext {
             "apps:rejections",
         )?;
         if matches!(role, Role::Renderer(_)) {
-            if enabled("webgpu") {
-                engine.run(js!("web/gpu.js"), "apps:gpu")?;
+            for (url, source) in PAGE_SCRIPTS {
+                if url != "apps:gpu" || enabled("webgpu") {
+                    engine.run(source(), url)?;
+                }
             }
-            engine.run(js!("dom.js"), "apps:dom")?;
+            // WARNING: pages can't turn strings into code: eval() and the constructors of every function kind throw.
             if !enabled("jsExecute") {
-                engine.run(js!("lockdown.js"), "apps:lockdown")?;
+                let message = engine.api.string("Code generation is disabled in pages");
+                unsafe {
+                    (engine.api.eval_enabled)(ctx, false, message);
+                    (engine.api.string_release)(message);
+                }
             }
         }
         Ok(engine)
@@ -2050,8 +2117,17 @@ impl JsContext {
     }
 
     // Runs a runtime script, which JSC reads in place. When a second engine runs it, a thread builds its bytecode, and
-    // later engines of the process decode that instead of compiling the script.
+    // later engines of the process decode that instead of compiling the script. Apps built with --aot run native code.
     fn run(&self, source: &'static str, url: &'static str) -> Result<()> {
+        if let Some(aot) = self.api.aot
+            && let Some(module) = aot.runtime(url)
+        {
+            let mut exception = ptr::null_mut();
+            let start = std::time::Instant::now();
+            let result = aot.call(&self.api, self.ctx, module, ptr::null_mut(), &mut exception);
+            self.api.busy.set(self.api.busy.get() + start.elapsed());
+            return self.checked(url, result, exception).map(drop);
+        }
         let Some(evaluate) = self.api.evaluate_latin1 else {
             return self.eval(source, url).map(drop);
         };
@@ -2095,13 +2171,17 @@ impl JsContext {
         };
         self.api.busy.set(self.api.busy.get() + start.elapsed());
         unsafe { (self.api.string_release)(source_url) };
+        self.checked(url, result, exception).map(drop)
+    }
+
+    fn checked(&self, url: &str, result: Ptr, exception: Ptr) -> Result<Ptr> {
         if !exception.is_null() {
             let message = self.api.text(self.ctx, exception);
             self.log(url, &message);
             bail!("{message}");
         }
         anyhow::ensure!(!result.is_null(), "JSC returned no value");
-        Ok(())
+        Ok(result)
     }
 
     pub fn eval_page(&self, source: &str, url: &str) -> Result<String> {
@@ -2133,11 +2213,18 @@ impl JsContext {
         {
             self.sources.borrow_mut().insert(url.into(), source.into());
         }
+        let compiled = match self.api.aot {
+            Some(aot) => aot.find(source.as_bytes())?.map(|module| (aot, module)),
+            None => None,
+        };
         let source_url = self.api.string(url);
         let mut exception = ptr::null_mut();
         let start = std::time::Instant::now();
-        let result = match (self.api.evaluate_latin1, bundled(source.as_bytes())) {
-            (Some(evaluate), Some(bytecode)) => unsafe {
+        let result = match (compiled, self.api.evaluate_latin1, bundled(source.as_bytes())) {
+            (Some((aot, module)), ..) => {
+                aot.call(&self.api, self.ctx, module, this, &mut exception)
+            }
+            (None, Some(evaluate), Some(bytecode)) => unsafe {
                 evaluate(
                     self.ctx,
                     source.as_ptr().cast(),
@@ -2160,13 +2247,7 @@ impl JsContext {
         };
         self.api.busy.set(self.api.busy.get() + start.elapsed());
         unsafe { (self.api.string_release)(source_url) };
-        if !exception.is_null() {
-            let message = self.api.text(self.ctx, exception);
-            self.log(url, &message);
-            bail!("{message}");
-        }
-        anyhow::ensure!(!result.is_null(), "JSC returned no value");
-        Ok(self.api.text(self.ctx, result))
+        Ok(self.api.text(self.ctx, self.checked(url, result, exception)?))
     }
 
     fn log(&self, url: &str, message: &str) {

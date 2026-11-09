@@ -17,12 +17,16 @@ index 2eec0af71..fa8825211 100644
          throwException(globalObject, scope, toJS(globalObject, exception));
          return JSValue::encode(jsUndefined());
 diff --git a/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp b/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
-index 81101c17f..beca22083 100644
+index 81101c17f..b5e730482 100644
 --- a/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
 +++ b/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
-@@ -28,6 +28,21 @@
+@@ -27,11 +27,33 @@
+ #include "JSAPIGlobalObject.h"
  
  #include "GlobalObjectMethodTable.h"
++#if ENABLE(AOT)
++#include "AOTModuleHost.h"
++#endif
  #include "JSCellInlines.h"
 +#if !JSC_OBJC_API_ENABLED
 +#include "CallFrameInlines.h"
@@ -42,7 +46,15 @@ index 81101c17f..beca22083 100644
  #include "StructureCreateInlines.h"
  
  namespace JSC {
-@@ -44,10 +59,10 @@ const GlobalObjectMethodTable* JSAPIGlobalObject::globalObjectMethodTable()
+ 
++#if ENABLE(AOT)
++extern const AOT::ModuleHost appsAOTModuleHost;
++#endif
++
+ const ClassInfo JSAPIGlobalObject::s_info = { "GlobalObject"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSAPIGlobalObject) };
+ 
+ #if !JSC_OBJC_API_ENABLED
+@@ -44,10 +66,10 @@ const GlobalObjectMethodTable* JSAPIGlobalObject::globalObjectMethodTable()
          &javaScriptRuntimeFlags,
          &shouldInterruptScriptBeforeTimeout,
          nullptr, // moduleTypeIsAllowed
@@ -57,7 +69,17 @@ index 81101c17f..beca22083 100644
          nullptr, // moduleLoaderEvaluate
          &promiseRejectionTracker,
          &reportUncaughtExceptionAtEventLoop,
-@@ -74,8 +89,109 @@ void JSAPIGlobalObject::reportUncaughtExceptionAtEventLoop(JSGlobalObject* globa
+@@ -64,6 +86,9 @@ const GlobalObjectMethodTable* JSAPIGlobalObject::globalObjectMethodTable()
+ #if USE(BUN_JSC_ADDITIONS)
+         nullptr, // requireBuiltinModule
+         nullptr, // nativeBinding
++#if ENABLE(AOT)
++        &appsAOTModuleHost,
++#endif
+ #endif
+     };
+     return &table;
+@@ -74,8 +99,109 @@ void JSAPIGlobalObject::reportUncaughtExceptionAtEventLoop(JSGlobalObject* globa
      Base::reportUncaughtExceptionAtEventLoop(globalObject, exception);
  }
  
@@ -882,15 +904,15 @@ index cad190295..8cf9d0efd 100644
 +    return simdutf::convert_utf16le_to_utf8(static_cast<const char16_t*>(characters), length, output);
 +}
 diff --git a/Source/JavaScriptCore/CMakeLists.txt b/Source/JavaScriptCore/CMakeLists.txt
-index 02389f1e1..045edddb0 100644
+index e494e5464..00f81cfc7 100644
 --- a/Source/JavaScriptCore/CMakeLists.txt
 +++ b/Source/JavaScriptCore/CMakeLists.txt
-@@ -2118,6 +2118,12 @@ set(JavaScriptCore_PRIVATE_FRAMEWORK_HEADERS
+@@ -2117,6 +2117,12 @@ set(JavaScriptCore_PRIVATE_FRAMEWORK_HEADERS
      parser/ModuleAnalyzer.h
  )
  include(aot/AOT.cmake)
-+if (NOT ENABLE_STATIC_JSC)
-+    list(APPEND JavaScriptCore_SOURCES ${JavaScriptCore_AOT_PROGRAM_SOURCES})
++if (NOT ENABLE_STATIC_JSC OR APPS_JSC_AOT_SOURCE)
++    list(APPEND JavaScriptCore_SOURCES ${JavaScriptCore_AOT_PROGRAM_SOURCES} ${APPS_JSC_AOT_SOURCE})
 +    if (APPLE)
 +        list(APPEND JavaScriptCore_LIBRARIES objc)
 +    endif ()
@@ -898,7 +920,7 @@ index 02389f1e1..045edddb0 100644
  
  if(USE_INSPECTOR_SOCKET_SERVER)
      list(APPEND JavaScriptCore_PRIVATE_FRAMEWORK_HEADERS
-@@ -2357,7 +2363,7 @@ endif ()
+@@ -2356,7 +2362,7 @@ endif ()
  # CombinedDomains.json will be generated in both projects.
  # However, for static JSC builds, we cannot have this dependency as it creates
  # a cycle - instead, we ensure headers are copied by adding them to the default target.
@@ -907,6 +929,99 @@ index 02389f1e1..045edddb0 100644
      add_dependencies(JavaScriptCore_CopyPrivateHeaders JavaScriptCore)
  endif()
  
+diff --git a/Source/JavaScriptCore/aot/AOT.cmake b/Source/JavaScriptCore/aot/AOT.cmake
+index 30d3a1f87..29319da33 100644
+--- a/Source/JavaScriptCore/aot/AOT.cmake
++++ b/Source/JavaScriptCore/aot/AOT.cmake
+@@ -36,7 +36,7 @@ list(APPEND JavaScriptCore_SOURCES
+ )
+ 
+ # A shared library has no undefined symbols.
+-if (NOT ENABLE_STATIC_JSC)
++if (NOT ENABLE_STATIC_JSC OR APPS_JSC_AOT_SOURCE)
+     list(APPEND JavaScriptCore_SOURCES ${JavaScriptCore_AOT_BUILTIN_TABLE_DATA_SOURCES})
+ endif ()
+ 
+diff --git a/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp b/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp
+index bb1a23f92..016ebf4f7 100644
+--- a/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp
++++ b/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp
+@@ -26,7 +26,7 @@
+ #include <signal.h>
+ #include <sys/mman.h>
+ #if OS(DARWIN)
+-#include <crt_externs.h>
++#include <dlfcn.h>
+ #include <mach-o/loader.h>
+ #include <mach/mach.h>
+ #include <mach/mach_vm.h>
+@@ -319,7 +319,10 @@ static constexpr bool dataHasSegmentsOfItsOwn = false;
+ 
+ static std::optional<SegmentOfExecutable> findSegmentOfExecutable(const uint8_t* address)
+ {
+-    const mach_header_64* executable = _NSGetMachExecuteHeader();
++    Dl_info info;
++    if (!dladdr(address, &info))
++        return std::nullopt;
++    const auto* executable = static_cast<const mach_header_64*>(info.dli_fbase);
+     if (!executable || executable->magic != MH_MAGIC_64)
+         return std::nullopt;
+     auto findSegment = [&](auto&& isWanted) -> const segment_command_64* {
+diff --git a/Source/JavaScriptCore/aot/runtime/AOTRemovableFeature.h b/Source/JavaScriptCore/aot/runtime/AOTRemovableFeature.h
+index 7316d4ee7..5fa790e56 100644
+--- a/Source/JavaScriptCore/aot/runtime/AOTRemovableFeature.h
++++ b/Source/JavaScriptCore/aot/runtime/AOTRemovableFeature.h
+@@ -96,6 +96,10 @@ ALWAYS_INLINE FeatureRemoval removalOf(RemovableFeature feature)
+ 
+ ALWAYS_INLINE bool isFeatureRemoved(RemovableFeature feature)
+ {
++#if APPS_JSC_AOT_RUNTIME
++    if (feature == RemovableFeature::JIT)
++        return true;
++#endif
+     return removalOf(feature) != FeatureRemoval::Present;
+ }
+ 
+@@ -124,7 +128,7 @@ inline std::optional<RemovableFeature> removedFeatureAt(const void* address)
+     return static_cast<RemovableFeature>(range.feature);
+ }
+ 
+-#if COMPILER(CLANG) && (CPU(X86_64) || CPU(ARM64))
++#if COMPILER(CLANG) && (CPU(X86_64) || CPU(ARM64)) && !APPS_JSC_AOT_RUNTIME
+ 
+ #if OS(DARWIN)
+ #define JSC_REMOVABLE_RECORD_SECTION ".pushsection __DWARF,__bun_entries,regular,debug\n"
+@@ -183,7 +187,7 @@ inline __attribute__((__always_inline__)) void recordRemovableDefinition()
+     static_assert(static_cast<uint16_t>(feature) < removableFeatureIndexLimit);
+     static_assert(stub == RemovedFeatureStub::Abort || stub == RemovedFeatureStub::Throw);
+     static_assert(stub == RemovedFeatureStub::Throw || !builtin);
+-#if COMPILER(CLANG) && (CPU(X86_64) || CPU(ARM64))
++#if COMPILER(CLANG) && (CPU(X86_64) || CPU(ARM64)) && !APPS_JSC_AOT_RUNTIME
+     [[gnu::used]] static const void* const start = __builtin_function_start(function);
+ #endif
+     JSC_EMIT_REMOVABLE_RECORD("771:\n", "771b", __builtin_function_start(function), GuardOrigin::Definition);
+@@ -276,6 +280,10 @@ ALWAYS_INLINE std::invoke_result_t<decltype(function), Arguments...> callRemovab
+     static_assert(!std::is_member_pointer_v<decltype(function)>, "guard a member function at its definition");
+     static_assert(RemovedFeatureStubFits<stub, function>);
+     using Result = std::invoke_result_t<decltype(function), Arguments...>;
++#if APPS_JSC_AOT_RUNTIME
++    if constexpr (feature == RemovableFeature::JIT)
++        return resultForRemovedFeature<feature, stub, Result, origin, builtin>(arguments...);
++#endif
+     if constexpr (stub != RemovedFeatureStub::Abort) {
+         if (isFeatureRemoved(feature)) [[unlikely]]
+             return resultForRemovedFeature<feature, stub, Result, origin, builtin>(arguments...);
+@@ -325,6 +333,10 @@ ALWAYS_INLINE Result callRemovableBody(Realm realm, Body&& body)
+     static_assert(stub != RemovedFeatureStub::Throw, "use JSC_REMOVABLE_HOST_FUNCTION_DEFINITION");
+     static_assert(removedFeatureStubFitsTypes<stub, Result, Realm>);
+     using EntryPoint = RemovableBody<feature, stub, Result, std::remove_reference_t<Body>>;
++#if APPS_JSC_AOT_RUNTIME
++    if constexpr (feature == RemovableFeature::JIT)
++        return resultForRemovedFeature<feature, stub, Result>(realm);
++#endif
+     if constexpr (stub != RemovedFeatureStub::Abort) {
+         if (isFeatureRemoved(feature)) [[unlikely]]
+             return resultForRemovedFeature<feature, stub, Result>(realm);
 diff --git a/Source/JavaScriptCore/inspector/InspectorAgentRegistry.cpp b/Source/JavaScriptCore/inspector/InspectorAgentRegistry.cpp
 index 8efc3dcab..7fdee2ca1 100644
 --- a/Source/JavaScriptCore/inspector/InspectorAgentRegistry.cpp
@@ -922,6 +1037,20 @@ index 8efc3dcab..7fdee2ca1 100644
  }
  
  void AgentRegistry::append(UniqueRef<InspectorAgentBase>&& agent)
+diff --git a/Source/JavaScriptCore/runtime/JSGlobalObject.h b/Source/JavaScriptCore/runtime/JSGlobalObject.h
+index 4fcb81318..e4cdc54f0 100644
+--- a/Source/JavaScriptCore/runtime/JSGlobalObject.h
++++ b/Source/JavaScriptCore/runtime/JSGlobalObject.h
+@@ -543,6 +543,9 @@ public:
+     // FIXME: <http://webkit.org/b/246237> Local inspection should be controlled by `inspectable` API.
+     std::unique_ptr<Inspector::JSGlobalObjectInspectorController> m_inspectorController;
+     RefPtr<JSGlobalObjectDebuggable> m_inspectorDebuggable;
++#elif APPS_JSC_AOT_RUNTIME
++    // WARNING: the compiler builds with Inspector; keep subsequent field offsets identical.
++    void* m_unusedInspector[2] { };
+ #endif
+ 
+     const Ref<WatchpointSet> m_masqueradesAsUndefinedWatchpointSet;
 diff --git a/Source/JavaScriptCore/runtime/JSLock.cpp b/Source/JavaScriptCore/runtime/JSLock.cpp
 index 0fa9323dc..a37ba6cf1 100644
 --- a/Source/JavaScriptCore/runtime/JSLock.cpp
@@ -970,14 +1099,14 @@ index 0c7028e26..f6086fc4f 100644
  
  class JSLock : public ThreadSafeRefCounted<JSLock> {
 diff --git a/Source/JavaScriptCore/runtime/JSMicrotask.cpp b/Source/JavaScriptCore/runtime/JSMicrotask.cpp
-index b17afacd7..475ba4957 100644
+index 696fea038..8f751890f 100644
 --- a/Source/JavaScriptCore/runtime/JSMicrotask.cpp
 +++ b/Source/JavaScriptCore/runtime/JSMicrotask.cpp
-@@ -643,6 +643,14 @@ static void asyncGeneratorDrainQueue(JSGlobalObject* globalObject, JSAsyncGenera
+@@ -659,6 +659,14 @@ static void asyncGeneratorDrainQueue(JSGlobalObject* globalObject, JSAsyncGenera
      generator->setState(static_cast<int32_t>(JSAsyncGenerator::AsyncGeneratorState::Completed));
  }
  
-+#if !ENABLE(STATIC_JSC)
++#if !ENABLE(STATIC_JSC) || APPS_JSC_AOT_RUNTIME
 +extern "C" void Bun__reportUnhandledError(JSGlobalObject* globalObject, EncodedJSValue value)
 +{
 +    globalObject->globalObjectMethodTable()->reportUncaughtExceptionAtEventLoop(
@@ -988,8 +1117,82 @@ index b17afacd7..475ba4957 100644
  void reportErrorOfMicrotask(JSGlobalObject* globalObject, JSValue exceptionOrValue)
  {
      if (Bun__reportUnhandledError)
+diff --git a/Source/JavaScriptCore/runtime/Options.cpp b/Source/JavaScriptCore/runtime/Options.cpp
+index 84f24b2c0..3973cd8f1 100644
+--- a/Source/JavaScriptCore/runtime/Options.cpp
++++ b/Source/JavaScriptCore/runtime/Options.cpp
+@@ -804,7 +804,9 @@ double Options::sizeClassProgressionWithAOT()
+ 
+ static void applyCompiledCodeDefaults()
+ {
+-#if ENABLE(AOT)
++#if APPS_JSC_AOT_RUNTIME
++    Options::useAOT() = true;
++#elif ENABLE(AOT)
+     if (Options::aotImagePath())
+         Options::useAOT() = true;
+ #else
+@@ -1148,7 +1150,7 @@ void Options::initializeWithOptionsCustomization(NOESCAPE const ScopedLambda<voi
+ 
+ #if !PLATFORM(COCOA)
+ #define OVERRIDE_OPTION_WITH_HEURISTICS(type_, name_, defaultValue_, availability_, description_) \
+-                overrideOptionWithHeuristic(name_(), name_##ID, "JSC_" #name_, Availability::availability_);
++                overrideOptionWithHeuristic(g_jscConfig.options.name_, name_##ID, "JSC_" #name_, Availability::availability_);
+                 FOR_EACH_JSC_OPTION(OVERRIDE_OPTION_WITH_HEURISTICS)
+ #undef OVERRIDE_OPTION_WITH_HEURISTICS
+ 
+diff --git a/Source/JavaScriptCore/runtime/Options.h b/Source/JavaScriptCore/runtime/Options.h
+index 1c8bfc193..88b365d33 100644
+--- a/Source/JavaScriptCore/runtime/Options.h
++++ b/Source/JavaScriptCore/runtime/Options.h
+@@ -137,6 +137,29 @@ public:
+     static constexpr double sizeClassProgressionForCompiledCode = 1.1;
+     JS_EXPORT_PRIVATE static double sizeClassProgressionWithAOT();
+ 
++#if APPS_JSC_AOT_RUNTIME
++    // WARNING: preserve feature layouts for the compiler's image ABI; constant options let the linker remove JIT compilers.
++    struct DisabledJITOption {
++        bool& storage;
++        constexpr operator bool() const { return false; }
++        DisabledJITOption& operator=(bool) { storage = false; return *this; }
++    };
++
++    template<ID id, typename T> ALWAYS_INLINE static decltype(auto) optionValue(T& value)
++    {
++        if constexpr (id == useJITID || id == useBaselineJITID || id == useDFGJITID || id == useFTLJITID
++            || id == useRegExpJITID || id == useBBQJITID || id == useOMGJITID)
++            return DisabledJITOption { value };
++        else
++            return (value);
++    }
++#define DECLARE_OPTION_ACCESSORS(type_, name_, defaultValue_, availability_, description_) \
++public: \
++    ALWAYS_INLINE static decltype(auto) name_() \
++    { \
++        return optionValue<name_##ID>(g_jscConfig.options.name_); \
++    }
++#else
+ #define DECLARE_OPTION_ACCESSORS(type_, name_, defaultValue_, availability_, description_) \
+ public: \
+     ALWAYS_INLINE static OptionsStorage::type_& name_() \
+@@ -145,11 +168,14 @@ public: \
+         return g_jscConfig.options.name_; \
+     }
+ 
++#endif
+     FOR_EACH_JSC_OPTION(DECLARE_OPTION_ACCESSORS)
+ #undef DECLARE_OPTION_ACCESSORS
+ 
+     // What the folders outside aot/ ask. Without the ahead-of-time compiler it is a constant, so what hangs on it is not in the binary.
+-#if ENABLE(AOT)
++#if APPS_JSC_AOT_RUNTIME
++    static constexpr bool runsCompiledImage() { return true; }
++#elif ENABLE(AOT)
+     ALWAYS_INLINE static bool runsCompiledImage() { return useAOT(); }
+ #else
+     static constexpr bool runsCompiledImage() { return false; }
 diff --git a/Source/cmake/OptionsJSCOnly.cmake b/Source/cmake/OptionsJSCOnly.cmake
-index 236626fbf..b2ec46a3e 100644
+index 236626fbf..4ef33ef89 100644
 --- a/Source/cmake/OptionsJSCOnly.cmake
 +++ b/Source/cmake/OptionsJSCOnly.cmake
 @@ -41,7 +41,7 @@ WEBKIT_OPTION_END()
@@ -1006,7 +1209,7 @@ index 236626fbf..b2ec46a3e 100644
  endif ()
  
 -if (USE_BUN_JSC_ADDITIONS)
-+if (USE_BUN_JSC_ADDITIONS AND ENABLE_STATIC_JSC)
++if (USE_BUN_JSC_ADDITIONS AND ENABLE_STATIC_JSC AND NOT APPS_JSC_AOT_RUNTIME)
      set(CMAKE_POSITION_INDEPENDENT_CODE False)
  endif ()
  

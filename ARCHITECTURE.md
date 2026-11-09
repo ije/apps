@@ -83,6 +83,8 @@ The runtime maps the file into memory. Script chunks and addons stay in the mapp
 
 A folder with `app.bundle` or `app.js` is a built app. It passes all of its arguments to `process.argv`, and it loads JavaScriptCore only from its own folder.
 
+With `apps build --aot`, Bun compiles the app's modules and the runtime scripts to IR, and `libJavaScriptCoreCompiler.dylib` compiles the IR to native code. The CLI links that code with `libJavaScriptCoreAOT.a`, a JSC without JIT compilers or Inspector, into `app.dylib`, which the app loads as its JavaScriptCore. The IR names built-ins by ID and compiled code reads JSC fields by offset, so both JSC builds use the same source and Bun's built-in table. The bundle keeps a reference with a build ID in place of each compiled script, and the runtime finds the code of a runtime script by its URL. A hash of the runtime scripts, from `build.rs`, ties `app.dylib` to one runtime. Each context locks the built-ins that compiled code relies on once, before its runtime scripts run.
+
 ## Modules
 
 `apps build` links ES modules through one array of slots per bundle. A module is a plain function that writes its exports to its slots when its body ends, and importers read `slots[k]` directly. Re-exports and `export *` resolve at build time to the module that holds the binding, so barrels cost nothing at run time. A binding that code can write after the body ends, in a function, a method or an instance field, keeps a closure in its slot, which importers call.

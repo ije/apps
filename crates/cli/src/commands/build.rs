@@ -13,6 +13,7 @@ pub fn run(
     rust: Option<&Path>,
     target: BuildTarget,
     bytecode: bool,
+    aot: bool,
 ) -> Result<()> {
     let started = Instant::now();
     if rust.is_none() {
@@ -20,7 +21,7 @@ pub fn run(
             "Invalid runtime. Build the workspace or set APPS_RUNTIME to a matching executable",
         )?;
     }
-    let files = bundler::compile(entry, bundler::Realm::Main, None, Rc::default(), true, None)?;
+    let mut files = bundler::compile(entry, bundler::Realm::Main, None, Rc::default(), true, None)?;
     if let Some(source) = files.get("native.json") {
         let addons: std::collections::BTreeMap<String, PathBuf> = serde_json::from_str(source)?;
         for path in addons.values() {
@@ -58,6 +59,9 @@ pub fn run(
     if let Some(path) = &binary {
         target.validate_binary(path)?;
     }
+    let compiled = aot
+        .then(|| crate::aot::compile(&mut files, runtime))
+        .transpose()?;
     let (bytes, _) = packaging::package_app(
         out,
         &files,
@@ -67,6 +71,10 @@ pub fn run(
         target,
         binary.as_deref(),
         bytecode,
+        compiled
+            .as_ref()
+            .map(|directory| directory.path().join("app.dylib"))
+            .as_deref(),
     )?;
     println!(
         "apps: built {} bytes in {} ms → {}",

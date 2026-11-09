@@ -23,6 +23,14 @@ fn main() {
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     println!("cargo:rerun-if-changed={}", root.join("js").display());
+    // WARNING: app.dylib of `apps build --aot` holds native code of these scripts, so it runs only with the same ones.
+    let mut scripts = 0u64;
+    let mut hash = |path: &std::path::Path, text: &str| {
+        let bytes = path.to_string_lossy().into_owned() + text;
+        scripts = scripts.wrapping_add(bytes.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+        }));
+    };
     for dir in ["js", "js/node", "js/web"] {
         fs::create_dir_all(out.join(dir)).unwrap();
         for entry in fs::read_dir(root.join(dir)).unwrap() {
@@ -32,6 +40,7 @@ fn main() {
                 // of `napi.js`. napi.rs reads the lines of `napi.js`, so that one stays as written. JSC reads ASCII in place.
                 let source = fs::read_to_string(&path).unwrap();
                 if path.ends_with("node/napi.js") {
+                    hash(path.strip_prefix(&root).unwrap(), &source);
                     let data = miniz_oxide::deflate::compress_to_vec(source.as_bytes(), 10);
                     fs::write(out.join(dir).join("napi.js"), data).unwrap();
                     continue;
@@ -58,11 +67,13 @@ fn main() {
                     .build(&parsed.program)
                     .code;
                 assert!(text.is_ascii(), "{} must stay ASCII", path.display());
+                hash(path.strip_prefix(&root).unwrap(), &text);
                 let data = miniz_oxide::deflate::compress_to_vec(text.as_bytes(), 10);
                 fs::write(out.join(dir).join(path.file_name().unwrap()), data).unwrap();
             }
         }
     }
+    println!("cargo:rustc-env=APPS_RUNTIME_SCRIPTS={scripts:016x}");
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let directory = root.join(format!("../../target/bun-jsc/{target}-{arch}"));
     println!("cargo:rustc-env=APPS_JSC_BUILD_DIR={}", directory.display());
