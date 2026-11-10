@@ -540,6 +540,7 @@ pub struct Window {
     controls: (Vec<crate::NativeControl>, Option<crate::ControlSink>),
     pub(crate) dirty: bool,
     redraw: [bool; 2],
+    restart: (bool, u8),
     rebuild: bool,
     patches: Vec<crate::Node>,
     drawing: bool,
@@ -605,6 +606,7 @@ impl Window {
             controls: Default::default(),
             dirty: false,
             redraw: [false; 2],
+            restart: (false, 0),
             rebuild: false,
             patches: Vec::new(),
             drawing: false,
@@ -653,6 +655,16 @@ impl Window {
     pub fn redraw(&mut self) {
         if self.drawing {
             self.redraw[0] = true;
+        } else {
+            self.refresh();
+        }
+    }
+
+    // The page changed while this pass was built, like when animation events ran. The pass is built again, up to a few
+    // times per frame, and it doesn't use up the extra pass that sizes settle in.
+    pub fn restart(&mut self) {
+        if self.drawing {
+            self.restart.0 = true;
         } else {
             self.refresh();
         }
@@ -975,7 +987,7 @@ impl Window {
             {
                 self.caret = None;
             }
-            if self.redraw[1] {
+            if self.redraw[1] || self.restart.1 > 0 {
                 let states = mem::take(&mut self.next_states);
                 self.states.extend(states);
             } else {
@@ -991,19 +1003,28 @@ impl Window {
                     tree.layout(root, self.viewport_size, self);
                     tree.prepaint(root, self);
                     self.hover_count = self.next.hit_test(self.mouse_position, &mut self.hit_test);
-                    if !self.redraw[0] || self.redraw[1] {
+                    let restarting = self.restart.0 && self.restart.1 < 4;
+                    let again = self.redraw[0] || self.restart.0;
+                    if !restarting && (!again || self.redraw[1]) {
                         tree.paint(root, self);
                     }
                 }
                 self.tree = Some(tree);
             }
             self.drawing = false;
-            let again = mem::take(&mut self.redraw[0]);
+            let restart = mem::take(&mut self.restart.0);
+            if restart && self.restart.1 < 4 {
+                self.restart.1 += 1;
+                self.redraw[0] = false;
+                continue;
+            }
+            let again = mem::take(&mut self.redraw[0]) || restart;
             if again && !self.redraw[1] {
                 self.redraw[1] = true;
                 continue;
             }
             self.redraw[1] = false;
+            self.restart.1 = 0;
             if again {
                 self.refresh();
             }

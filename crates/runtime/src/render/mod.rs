@@ -1927,7 +1927,7 @@ impl PageView {
                 cx.defer(move |cx| animation_events(&view, events, cx));
             } else {
                 animation_events(&self.0, events, cx);
-                window.redraw();
+                window.restart();
             }
         }
         let id = self.id;
