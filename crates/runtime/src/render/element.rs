@@ -1850,8 +1850,8 @@ fn create(
                 "table" | "inline-table" => renderer::Baseline::FirstOnly,
                 _ => renderer::Baseline::Auto,
             };
-            el.style().contains = u8::from(made.absolute) * renderer::Escape::ABSOLUTE
-                | u8::from(made.fixed) * renderer::Escape::FIXED;
+            el.style().contains = (u8::from(made.absolute) * renderer::Escape::ABSOLUTE)
+                | (u8::from(made.fixed) * renderer::Escape::FIXED);
             el.style().escape = match position {
                 "absolute" => renderer::Escape::ABSOLUTE,
                 "fixed" => renderer::Escape::FIXED,

@@ -89,7 +89,7 @@ output=$root/target/bun-jsc/$system-$arch
 build=$output/build
 
 if [[ ! -d $source_dir ]]; then
-  git clone --depth 1 --filter=blob:none --sparse \
+  git clone --config core.autocrlf=false --depth 1 --filter=blob:none --sparse \
     --branch "autobuild-$revision" https://github.com/oven-sh/WebKit.git "$source_dir"
 fi
 

@@ -2,10 +2,6 @@ name: Release
 on:
   push:
     tags: ['v*']
-    # Tags can reuse only main's caches. Build JSC and FFmpeg on main when their scripts change.
-    branches: [main]
-    paths: [scripts/build-jsc.sh, 'scripts/jsc*', 'scripts/aot-front-end/**', scripts/build-ffmpeg.sh, crates/media/native/ffmpeg.c, .github/workflows/release.yml]
-  workflow_dispatch:
 permissions:
   contents: read
 jobs:

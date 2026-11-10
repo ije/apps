@@ -510,7 +510,6 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                     #[cfg_attr(target_os = "linux", link_name = "__res_ninit")]
                     fn res_ninit(state: *mut u64) -> i32;
                     #[cfg_attr(target_os = "macos", link_name = "res_9_nsend")]
-                    #[cfg_attr(target_os = "linux", link_name = "__res_nsend")]
                     fn res_nsend(
                         state: *mut u64,
                         query: *const u8,

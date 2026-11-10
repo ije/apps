@@ -1,10 +1,13 @@
+use std::process::Command;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::{
     fs,
     path::Path,
-    process::{Command, Output, Stdio},
+    process::{Output, Stdio},
     time::{Duration, Instant},
 };
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run(path: &Path) -> Output {
     let mut child = Command::new(path)
         .env_remove("APPS_JSC_LIBRARY")

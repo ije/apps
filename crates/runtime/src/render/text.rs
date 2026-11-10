@@ -641,12 +641,14 @@ fn with_atoms(
     }
 }
 
+type MeasuredSize = ((bool, Option<Pixels>), renderer::Size<Pixels>);
+
 struct Measured {
     data: Rc<style::InlineText>,
     atoms: Box<[([f32; 3], Option<AlignItems>)]>,
     styled: std::cell::RefCell<Option<renderer::TextStyle>>,
     measured: Rc<std::cell::Cell<[Pixels; 2]>>,
-    cached: std::cell::Cell<Option<((bool, Option<Pixels>), renderer::Size<Pixels>)>>,
+    cached: std::cell::Cell<Option<MeasuredSize>>,
     baselines: std::cell::Cell<[Pixels; 2]>,
 }
 

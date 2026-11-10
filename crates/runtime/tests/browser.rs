@@ -1,5 +1,5 @@
 #[test]
-fn browser_window_rejects_url_loads() {
+fn browser_window_rejects_remote_urls_and_loads_local_urls() {
     use apps_runtime::{
         host::Role,
         jsc::{JavaScriptCore, JsContext},
@@ -19,20 +19,52 @@ fn browser_window_rejects_url_loads() {
         if (!(win.contentView instanceof __apps.View) || win.contentView.children.length || 'addBrowserView' in win) throw Error('Window content view');
         __appsEvent('resize', win.id, { width: 1000, height: 700 });
         if (win.contentView.getBounds().width !== 1000 || win.contentView.getBounds().height !== 700) throw Error('Content view follows window size');
-        for (const url of ['https://example.com', 'http://localhost', 'file:///page.html', 'apps:///page.html', undefined, { toString() { throw Error('URL conversion'); } }]) {
-            let error;
-            try { win.loadURL(url); } catch (caught) { error = caught; }
-            if (!(error instanceof Error) || error.message !== 'loadURL is not allowed, use WebContentsView to load webpage') throw Error('Window navigation must throw');
-        }
+        globalThis.navigation = 'pending';
+        Promise.all(['https://example.com', 'http://localhost', undefined].map(url => {
+            const result = win.loadURL(url);
+            if (!(result instanceof Promise)) throw Error('Navigation must return a Promise');
+            return result.then(() => { throw Error('Remote navigation must reject'); }, error => {
+                if (error.code !== 'ERR_DISALLOWED_URL_SCHEME') throw error;
+            });
+        })).then(() => navigation = 'done', error => navigation = String(error));
+        let error;
+        try { win.loadURL({ toString() { throw Error('URL conversion'); } }); } catch (caught) { error = caught; }
+        if (error?.message !== 'URL conversion') throw Error('URL conversion must throw');
     "#, "test").unwrap();
+    engine.tick().unwrap();
+    assert_eq!(engine.eval("navigation", "test").unwrap(), "done");
     assert!(host.borrow().commands.is_empty());
-    engine
-        .eval("win.loadFile('apps:///page.html')", "test")
-        .unwrap();
-    assert_eq!(
-        host.borrow().commands.as_slice(),
-        &[serde_json::json!({"op":"window","args":["loadFile",1,"apps:///page.html",1]})]
-    );
+    for (index, (method, url)) in [
+        ("loadFile", "apps:///page.html"),
+        ("loadURL", "file:///page.html"),
+        ("loadURL", "apps:///page.html"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        host.borrow_mut().commands.clear();
+        engine
+            .eval(
+                &format!(
+                    "globalThis.loaded = false; win.{method}('{url}').then(() => loaded = true)"
+                ),
+                "test",
+            )
+            .unwrap();
+        let request = index + 1;
+        assert_eq!(
+            host.borrow().commands.as_slice(),
+            &[serde_json::json!({"op":"window","args":["loadFile",1,url,request]})]
+        );
+        engine
+            .eval(
+                &format!("__appsEvent('loaded', win.id, {{ request: {request}, url: '{url}' }})"),
+                "test",
+            )
+            .unwrap();
+        engine.tick().unwrap();
+        assert_eq!(engine.eval("loaded", "test").unwrap(), "true");
+    }
 }
 
 #[test]

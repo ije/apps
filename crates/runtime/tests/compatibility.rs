@@ -383,7 +383,7 @@ fn bridge_clones_files_and_preload_reads_dropped_paths() {
     let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
     preload.eval("const {contextBridge,webUtils}=__apps;contextBridge.exposeInMainWorld('desktop',{path:file=>webUtils.getPathForFile(file),describe:file=>[file.constructor.name,file.name,file.type,file.size,file.lastModified],echo:value=>value});", "test").unwrap();
     let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
-    page.eval("document.addEventListener('drop',event=>globalThis.dropped=event.dataTransfer.files[0]);__appsDrop([{name:'notes.txt',file:1,bytes:[104,105],lastModified:7}],0,0);", "test").unwrap();
+    page.eval("document.addEventListener('dragover',event=>event.preventDefault());document.addEventListener('drop',event=>globalThis.dropped=event.dataTransfer.files[0]);__appsDrag('enter',0,0,['notes.txt']);__appsDrop([{name:'notes.txt',file:1,bytes:[104,105],lastModified:7}],0,0);", "test").unwrap();
     assert_eq!(
         page.eval("typeof __appsFiles+':'+('path' in dropped)", "test")
             .unwrap(),
