@@ -982,6 +982,22 @@ index bfae38ab7..d352b651b 100644
      if (!executable || executable->magic != MH_MAGIC_64)
          return std::nullopt;
      auto findSegment = [&](auto&& isWanted) -> const segment_command_64* {
+diff --git a/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp b/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp
+index ae28871d..e9aacda8 100644
+--- a/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp
++++ b/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp
+@@ -362,10 +362,7 @@ static JSFunction* makeFunctionOfMissingHost(JSGlobalObject* realm, const Builti
+ {
+     if (key.kind() != BuiltinCellKey::Kind::Object || BuiltinBindings::provides(table.at(key.builtin()).origin))
+         return nullptr;
+-    bool hasFunctionOfCompiler = std::ranges::any_of(table.overloadSummariesOf(key.builtin()), [](const BuiltinOverloadSummary& overload) {
+-        return overload.kind == BuiltinImplementationKind::Compiled || overload.kind == BuiltinImplementationKind::Inline;
+-    });
+-    if (!hasFunctionOfCompiler)
++    if (table.overloadSummariesOf(key.builtin()).empty())
+         return nullptr;
+     VM& vm = realm->vm();
+     return JSFunction::create(vm, realm, 0, table.identifierOf(vm, table.at(key.builtin()).name).string(), exitForFunctionOfMissingHost, ImplementationVisibility::Public);
 diff --git a/Source/JavaScriptCore/aot/runtime/AOTRemovableFeature.h b/Source/JavaScriptCore/aot/runtime/AOTRemovableFeature.h
 index 7316d4ee7..5fa790e56 100644
 --- a/Source/JavaScriptCore/aot/runtime/AOTRemovableFeature.h
