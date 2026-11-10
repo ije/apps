@@ -257,6 +257,7 @@ struct QuadVarying {
     // Naga has no `clip_distance`, so fragments clip with these.
     @location(2) clip_distances: vec4<f32>,
     @location(3) @interpolate(flat) background_color: vec4<f32>,
+    @location(4) @interpolate(flat) plain: u32,
 }
 
 @vertex
@@ -271,11 +272,21 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.border_color = rgba(quad.border_color);
     out.quad_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask.bounds);
+    // Plain boxes fill with their color, so their pixels don't read the quad again.
+    let radii = quad.corner_radii.x;
+    let widths = quad.border_widths;
+    let mask = quad.content_mask.radii.x;
+    out.plain = u32(all(vec4<f32>(radii.top_left, radii.top_right, radii.bottom_right, radii.bottom_left) == vec4<f32>(0.0)) &&
+        all(vec4<f32>(widths.top, widths.right, widths.bottom, widths.left) == vec4<f32>(0.0)) &&
+        all(vec4<f32>(mask.top_left, mask.top_right, mask.bottom_right, mask.bottom_left) == vec4<f32>(0.0)));
     return out;
 }
 
 @fragment
 fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
+    if (input.plain != 0u) {
+        return select(input.background_color, vec4<f32>(0.0), any(input.clip_distances < vec4<f32>(0.0)));
+    }
     let color = quad_color(input);
     let alpha = mask_alpha(window_position(input.position), b_quads[input.quad_id].content_mask);
     let multiplier = select(1.0, alpha, globals.premultiplied_alpha != 0u);

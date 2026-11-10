@@ -260,6 +260,7 @@ struct QuadVertexOutput {
     float4 position: SV_Position;
     nointerpolation float4 border_color: COLOR0;
     nointerpolation float4 background_color: COLOR1;
+    nointerpolation uint plain: TEXCOORD1;
     float4 clip_distance: SV_ClipDistance;
 };
 
@@ -268,6 +269,7 @@ struct QuadFragmentInput {
     float4 position: SV_Position;
     nointerpolation float4 border_color: COLOR0;
     nointerpolation float4 background_color: COLOR1;
+    nointerpolation uint plain: TEXCOORD1;
 };
 
 StructuredBuffer<Quad> quads: register(t1);
@@ -281,6 +283,14 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
     output.border_color = quad.border_color;
     output.background_color = quad.background;
     output.quad_id = quad_id;
+    // Plain boxes fill with their color, so their pixels don't read the quad again.
+    output.plain = all(float4(quad.corner_radii.x.top_left, quad.corner_radii.x.top_right,
+                              quad.corner_radii.x.bottom_right, quad.corner_radii.x.bottom_left) == 0.0) &&
+                   all(float4(quad.border_widths.top, quad.border_widths.right,
+                              quad.border_widths.bottom, quad.border_widths.left) == 0.0) &&
+                   all(float4(quad.content_mask.radii.x.top_left, quad.content_mask.radii.x.top_right,
+                              quad.content_mask.radii.x.bottom_right,
+                              quad.content_mask.radii.x.bottom_left) == 0.0);
     output.clip_distance = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask.bounds);
     return output;
 }
@@ -553,6 +563,9 @@ float4 quad_color(QuadFragmentInput input, Quad quad, float2 position) {
 }
 
 float4 quad_fragment(QuadFragmentInput input): SV_Target {
+    if (input.plain) {
+        return input.background_color;
+    }
     Quad quad = quads[input.quad_id];
     float2 position = window_position(input.position);
     float4 color = quad_color(input, quad, position);

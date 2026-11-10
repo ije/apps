@@ -327,6 +327,7 @@ struct QuadVertexOutput {
   float4 position [[position]];
   float4 border_color [[flat]];
   float4 background_color [[flat]];
+  uint plain [[flat]];
   float clip_distance [[clip_distance]][4];
 };
 
@@ -335,6 +336,7 @@ struct QuadFragmentInput {
   float4 position [[position]];
   float4 border_color [[flat]];
   float4 background_color [[flat]];
+  uint plain [[flat]];
 };
 
 vertex QuadVertexOutput quad_vertex(uint vertex_id [[vertex_id]],
@@ -345,11 +347,20 @@ vertex QuadVertexOutput quad_vertex(uint vertex_id [[vertex_id]],
   Quad quad = quads[quad_id];
   float4 device_position = to_device_position(unit, quad.bounds, globals);
   float4 clip_distance = distance_from_clip_rect(unit, quad.bounds, quad.content_mask.bounds);
+  // Plain boxes fill with their color, so their pixels don't read the quad again.
+  bool plain = all(float4(quad.corner_radii.x.top_left, quad.corner_radii.x.top_right,
+                          quad.corner_radii.x.bottom_right, quad.corner_radii.x.bottom_left) == 0.0) &&
+               all(float4(quad.border_widths.top, quad.border_widths.right,
+                          quad.border_widths.bottom, quad.border_widths.left) == 0.0) &&
+               all(float4(quad.content_mask.radii.x.top_left, quad.content_mask.radii.x.top_right,
+                          quad.content_mask.radii.x.bottom_right,
+                          quad.content_mask.radii.x.bottom_left) == 0.0);
   return QuadVertexOutput{
       quad_id,
       device_position,
       rgba(quad.border_color),
       rgba(quad.background),
+      plain,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -621,6 +632,9 @@ float4 quad_color(QuadFragmentInput input, Quad quad, float2 position) {
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads [[buffer(0)]],
                               constant Globals &globals [[buffer(1)]]) {
+  if (input.plain) {
+    return input.background_color;
+  }
   Quad quad = quads[input.quad_id];
   float2 position = window_position(input.position, globals);
   float4 color = quad_color(input, quad, position);

@@ -1,8 +1,8 @@
 use crate::{
     BlendMode, Bounds, Point, ScaledPixels, Size,
     scene::{
-        AtlasTextureId, Batch, EffectPrimitive, MonochromeSprite, PolychromeSprite, Quad, Scene,
-        Shadow, SortKey, Underline,
+        AtlasTextureId, Batch, DrawOrder, EffectPrimitive, MonochromeSprite, PolychromeSprite,
+        Quad, Scene, Shadow, SortKey, Underline,
     },
 };
 use std::{mem, ops::Range};
@@ -145,9 +145,17 @@ pub struct RenderFrame {
     pub promoted: Vec<(usize, Target, [i32; 4])>,
 }
 
-fn extend<T: Copy>(items: &mut Vec<T>, primitives: &[T], keys: &[SortKey]) -> Range<u32> {
+fn extend<T: Copy>(
+    items: &mut Vec<T>,
+    primitives: &[T],
+    keys: &[SortKey],
+    mut keep: impl FnMut(&mut T) -> bool,
+) -> Range<u32> {
     let start = items.len() as u32;
-    items.extend(keys.iter().map(|key| primitives[key[2] as usize]));
+    items.extend(keys.iter().filter_map(|key| {
+        let mut item = primitives[key[2] as usize];
+        keep(&mut item).then_some(item)
+    }));
     start..items.len() as u32
 }
 
@@ -411,23 +419,122 @@ impl RenderFrame {
     ) {
         self.commands.push(Command::Pass(target, clear));
         let primitives = &scene.layers[layer];
+        // Skip what a later opaque box hides, since stacked page backgrounds can fill the window many
+        // times. An effect that reads the target could see the hidden pixels, so then nothing is skipped.
+        let mut occluders: Vec<(DrawOrder, Bounds<ScaledPixels>, f32)> = Vec::new();
+        if !primitives.effects.iter().any(|primitive| {
+            scene.layers[primitive.layer]
+                .effect
+                .as_ref()
+                .is_some_and(|effect| {
+                    effect.backdrop.is_some() || effect.blend_mode != BlendMode::Normal
+                })
+        }) {
+            let min = self.window[0] as f32 * self.window[1] as f32 / 64.;
+            occluders.extend(
+                primitives
+                    .quads
+                    .iter()
+                    .filter(|quad| {
+                        quad.background.a >= 1.
+                            && quad.border_widths == Default::default()
+                            && quad.corner_radii == Default::default()
+                            && quad.content_mask.corner_radii == Default::default()
+                    })
+                    .filter_map(|quad| {
+                        let bounds = quad.bounds.intersect(&quad.content_mask.bounds);
+                        let area = bounds.size.width.0 * bounds.size.height.0;
+                        (area >= min).then_some((quad.order, bounds, area))
+                    }),
+            );
+            if occluders.len() > 16 {
+                occluders.select_nth_unstable_by(16, |a, b| b.2.total_cmp(&a.2));
+                occluders.truncate(16);
+            }
+            occluders.sort_unstable_by_key(|occluder| std::cmp::Reverse(occluder.0));
+        }
+        // With `trim`, an occluder that spans the box cuts off the side it covers.
+        let visible = |order: DrawOrder, bounds: &mut Bounds<ScaledPixels>, trim: bool| {
+            for (_, over, _) in occluders.iter().take_while(|occluder| occluder.0 > order) {
+                let (left, top, right, bottom) = (
+                    bounds.origin.x,
+                    bounds.origin.y,
+                    bounds.right(),
+                    bounds.bottom(),
+                );
+                let across = over.origin.x <= left && over.right() >= right;
+                let down = over.origin.y <= top && over.bottom() >= bottom;
+                if across && down {
+                    return false;
+                }
+                if !trim || !(across || down) {
+                    continue;
+                }
+                let [mut x0, mut y0, mut x1, mut y1] = [left, top, right, bottom];
+                if down && over.origin.x <= left && over.right() > left {
+                    x0 = over.right();
+                } else if down && over.right() >= right && over.origin.x < right {
+                    x1 = over.origin.x;
+                } else if across && over.origin.y <= top && over.bottom() > top {
+                    y0 = over.bottom();
+                } else if across && over.bottom() >= bottom && over.origin.y < bottom {
+                    y1 = over.origin.y;
+                }
+                *bounds = Bounds::from_corners(Point::new(x0, y0), Point::new(x1, y1));
+            }
+            true
+        };
+        let shown =
+            |order: DrawOrder, mut bounds: Bounds<ScaledPixels>| visible(order, &mut bounds, false);
         for batch in scene.batches(layer) {
             let command = match batch {
                 Batch::Quads(keys) => {
-                    Command::Quads(extend(&mut self.quads, &primitives.quads, keys))
+                    Command::Quads(extend(&mut self.quads, &primitives.quads, keys, |quad| {
+                        let mask = &mut quad.content_mask;
+                        let mut bounds = quad.bounds.intersect(&mask.bounds);
+                        let trim = mask.corner_radii == Default::default();
+                        let shown = visible(quad.order, &mut bounds, trim);
+                        if trim {
+                            mask.bounds = bounds;
+                        }
+                        shown
+                    }))
                 }
-                Batch::Shadows(keys) => {
-                    Command::Shadows(extend(&mut self.shadows, &primitives.shadows, keys))
-                }
-                Batch::Underlines(keys) => {
-                    Command::Underlines(extend(&mut self.underlines, &primitives.underlines, keys))
-                }
-                Batch::Mono(texture, keys) => {
-                    Command::Mono(texture, extend(&mut self.mono, &primitives.mono, keys))
-                }
-                Batch::Poly(texture, keys) => {
-                    Command::Poly(texture, extend(&mut self.poly, &primitives.poly, keys))
-                }
+                Batch::Shadows(keys) => Command::Shadows(extend(
+                    &mut self.shadows,
+                    &primitives.shadows,
+                    keys,
+                    |shadow| {
+                        let reach = shadow
+                            .bounds
+                            .dilate(ScaledPixels(shadow.blur_radius.0 * 3.));
+                        shown(shadow.order, reach.intersect(&shadow.content_mask.bounds))
+                    },
+                )),
+                Batch::Underlines(keys) => Command::Underlines(extend(
+                    &mut self.underlines,
+                    &primitives.underlines,
+                    keys,
+                    |line| shown(line.order, line.bounds.intersect(&line.content_mask.bounds)),
+                )),
+                Batch::Mono(texture, keys) => Command::Mono(
+                    texture,
+                    extend(&mut self.mono, &primitives.mono, keys, |sprite| {
+                        shown(
+                            sprite.order,
+                            sprite.bounds.intersect(&sprite.content_mask.bounds),
+                        )
+                    }),
+                ),
+                Batch::Poly(texture, keys) => Command::Poly(
+                    texture,
+                    extend(&mut self.poly, &primitives.poly, keys, |sprite| {
+                        shown(
+                            sprite.order,
+                            sprite.bounds.intersect(&sprite.content_mask.bounds),
+                        )
+                    }),
+                ),
                 Batch::Effects(keys) => {
                     for key in keys {
                         let primitive = &primitives.effects[key[2] as usize];
@@ -440,6 +547,15 @@ impl RenderFrame {
                     continue;
                 }
             };
+            if let Command::Quads(range)
+            | Command::Shadows(range)
+            | Command::Underlines(range)
+            | Command::Mono(_, range)
+            | Command::Poly(_, range) = &command
+                && range.is_empty()
+            {
+                continue;
+            }
             self.commands.push(command);
         }
     }
@@ -802,6 +918,61 @@ mod tests {
                 .any(|composite| composite.opacity == 0.25)
         );
         frame
+    }
+
+    #[test]
+    fn opaque_boxes_hide_what_they_cover() {
+        let bounds = |[x, y, w, h]: [f32; 4]| {
+            Bounds::new(
+                crate::point(ScaledPixels(x), ScaledPixels(y)),
+                Size::new(ScaledPixels(w), ScaledPixels(h)),
+            )
+        };
+        let mask = ContentMask {
+            bounds: bounds([0., 0., 100., 100.]),
+            ..Default::default()
+        };
+        let quads = |boxes: &[([f32; 4], f32)]| {
+            let mut scene = Scene::default();
+            for &(rect, alpha) in boxes {
+                scene.insert(Primitive::Quad(Quad {
+                    bounds: bounds(rect),
+                    content_mask: mask,
+                    background: crate::Rgba {
+                        a: alpha,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }));
+            }
+            scene.finish();
+            let mut frame = RenderFrame::default();
+            frame.record(&scene, [100, 100], 16384, true);
+            frame
+                .quads
+                .iter()
+                .map(|quad| {
+                    let b = quad.bounds.intersect(&quad.content_mask.bounds);
+                    [b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0]
+                })
+                .collect::<Vec<_>>()
+        };
+        let page = ([0., 0., 100., 100.], 1.);
+        let dot = ([10., 10., 20., 20.], 1.);
+        assert_eq!(quads(&[page, page, dot]).len(), 2);
+        assert_eq!(quads(&[page, (page.0, 0.5), dot]).len(), 3);
+        let side = ([0., 0., 30., 100.], 1.);
+        let main = ([30., 0., 70., 100.], 1.);
+        assert_eq!(quads(&[page, side, main]).len(), 2);
+        let header = ([0., 0., 100., 20.], 1.);
+        assert_eq!(
+            quads(&[page, header, ([0., 20., 30., 80.], 1.)]),
+            [
+                [30., 20., 70., 80.],
+                [0., 0., 100., 20.],
+                [0., 20., 30., 80.]
+            ]
+        );
     }
 
     #[test]
