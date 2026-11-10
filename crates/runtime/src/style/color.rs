@@ -276,6 +276,24 @@ pub fn color(value: &str) -> Option<(u32, u8)> {
     color
 }
 
+// Returns whether a color is a legacy sRGB color (hex, named, rgb(), hsl() or hwb()), and its Oklab channels and alpha.
+// Missing components stay NaN.
+pub(crate) fn oklab(value: &str) -> Option<(bool, [f64; 4])> {
+    let value = value.trim();
+    let (space, channels, alpha) = parse(value, 0)?;
+    let legacy = value.split_once('(').is_none_or(|(name, body)| {
+        ["rgb", "rgba", "hsl", "hsla", "hwb"]
+            .iter()
+            .any(|legacy| name.eq_ignore_ascii_case(legacy))
+            && !body
+                .trim_start()
+                .get(..5)
+                .is_some_and(|word| word.eq_ignore_ascii_case("from "))
+    });
+    let [l, a, b] = convert(space, channels, Space::Oklab);
+    Some((legacy, [l, a, b, alpha]))
+}
+
 fn parse(value: &str, depth: u8) -> Option<(Space, [f64; 3], f64)> {
     if let Some(hex) = value.strip_prefix('#') {
         if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {

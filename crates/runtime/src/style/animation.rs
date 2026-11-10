@@ -2142,6 +2142,7 @@ pub(crate) enum Lerp {
     List(Vec<Lerp>, &'static str),
     Function(String, Box<Lerp>),
     Color((u32, u8), (u32, u8)),
+    Oklab([f64; 4], [f64; 4]),
     Number(f64, f64, String, bool),
     Calc(String, String, bool),
     Matrix(Box<[[f64; 13]; 2]>, bool),
@@ -2510,7 +2511,24 @@ impl Lerp {
             };
         }
         if let (Some(a), Some(b)) = (color(from), color(to)) {
-            return Some(Self::Color(a, b));
+            // WARNING: as in browsers, colors interpolate in sRGB only when both are legacy sRGB colors.
+            return Some(match (super::color::oklab(from), super::color::oklab(to)) {
+                (Some((false, mut a)), Some((_, mut b)))
+                | (Some((_, mut a)), Some((false, mut b))) => {
+                    for (a, b) in a.iter_mut().zip(&mut b) {
+                        if a.is_nan() {
+                            *a = *b;
+                        } else if b.is_nan() {
+                            *b = *a;
+                        }
+                    }
+                    Self::Oklab(
+                        a.map(|v| if v.is_nan() { 0. } else { v }),
+                        b.map(|v| if v.is_nan() { 0. } else { v }),
+                    )
+                }
+                _ => Self::Color(a, b),
+            });
         }
         for separator in [',', ' '] {
             let (a, b) = (components(from, separator), components(to, separator));
@@ -2670,6 +2688,27 @@ impl Lerp {
                     let digit = (value >> shift & 15) as usize;
                     out.push(char::from(b"0123456789abcdef"[digit]));
                 }
+            }
+            Self::Oklab(a, b) => {
+                let alpha = (a[3] + (b[3] - a[3]) * t).clamp(0., 1.);
+                out.push_str("oklab(");
+                for index in 0..3 {
+                    if index > 0 {
+                        out.push(' ');
+                    }
+                    let premultiplied = a[index] * a[3] + (b[index] * b[3] - a[index] * a[3]) * t;
+                    let value = if alpha > 0. {
+                        premultiplied / alpha
+                    } else {
+                        a[index] + (b[index] - a[index]) * t
+                    };
+                    round(value, false, out);
+                }
+                if alpha < 1. {
+                    out.push_str(" / ");
+                    round(alpha, false, out);
+                }
+                out.push(')');
             }
             Self::Number(a, b, unit, integer) => {
                 round(a + (b - a) * t, *integer, out);
@@ -2978,6 +3017,18 @@ mod tests {
         assert_eq!(
             mix("color", "transparent", "red", 0.5).unwrap(),
             "#ff000080"
+        );
+        assert_eq!(
+            mix("color", "oklch(0.205 0 0)", "oklch(0.922 0 0)", 0.5).unwrap(),
+            "oklab(0.5635 0 0)"
+        );
+        assert_eq!(
+            mix("color", "transparent", "oklab(1 0 0 / 0.04)", 0.5).unwrap(),
+            "oklab(1 0 0 / 0.02)"
+        );
+        assert_eq!(
+            mix("color", "#000", "oklab(1 none 0)", 0.5).unwrap(),
+            "oklab(0.5 0 0)"
         );
         assert_eq!(mix("width", "0", "10px", 0.5).unwrap(), "5px");
         assert_eq!(mix("opacity", "1", "0", 0.25).unwrap(), "0.75");
