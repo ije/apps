@@ -3,3 +3,5 @@ target/
 **/.apps/
 **/dist/
 **/node_modules/
+packages/apps-*/bin/
+packages/apps/README.md

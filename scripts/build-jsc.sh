@@ -2,7 +2,8 @@
 set -euo pipefail
 
 revision=5a61071f79134bf41844e7ea31a8449147d85dd4
-# WARNING: keep this the revision in jsc-aot.cpp. Bun's AOT compiler must match the IR format and built-in table of JSC.
+# WARNING: keep this the revision in jsc-aot.cpp and of the Bun in .github/workflows/release.yml.
+# Bun's AOT compiler must match the IR format and built-in table of JSC.
 bun_revision=2596ac5d391d47804c93a42bdbe615804aa62387
 aot=0
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -177,7 +178,9 @@ if ((aot)); then
   if [[ ! -d $bun_source ]]; then
     git init "$bun_source"
     git -C "$bun_source" remote add origin https://github.com/oven-sh/bun.git
-    git -C "$bun_source" sparse-checkout set --cone src scripts packages/bun-error packages/bun-usockets docs/lint
+  fi
+  git -C "$bun_source" sparse-checkout set --cone src scripts packages completions patches docs/lint
+  if ! git -C "$bun_source" rev-parse -q --verify HEAD >/dev/null; then
     git -C "$bun_source" fetch --depth 1 origin "$bun_revision"
     git -C "$bun_source" checkout --detach FETCH_HEAD
   fi
@@ -209,6 +212,16 @@ if ((aot)); then
   xcrun libtool -static -o "$output/.libJavaScriptCoreAOT.a" \
     "$build/lib/libJavaScriptCore.a" "$build/lib/libWTF.a" "$build/lib/libbmalloc.a"
   mv -f "$output/.libJavaScriptCoreAOT.a" "$output/libJavaScriptCoreAOT.a"
+
+  # WARNING: Bun's AOT front end makes the IR, so apps build --aot needs no Bun. It builds with Bun's nightly toolchain.
+  bun=$(command -v "${APPS_BUN:-bun}")
+  codegen=$(PATH="$(dirname "$bun"):$PATH" "$bun" "$root/scripts/jsc-aot-front-end.ts" "$bun_source" "$source_dir/Source/JavaScriptCore")
+  (cd "$bun_source" && BUN_CODEGEN_DIR=$codegen cargo build --release -p apps_aot)
+  name=libapps_aot.dylib
+  xcrun clang -dynamiclib -arch arm64 -mmacosx-version-min=13.0 -o "$output/.$name" -Wl,-install_name,"@rpath/$name" \
+    -Wl,-dead_strip -Wl,-x -Wl,-exported_symbol,_apps_aot_front_end -Wl,-exported_symbol,_apps_aot_free \
+    "$bun_source/target/release/libapps_aot.a" -liconv -lc -lm
+  mv -f "$output/.$name" "$output/$name"
 fi
 
 {

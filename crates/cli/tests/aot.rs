@@ -42,7 +42,7 @@ fn rejects_unsupported_aot_targets() {
 
 #[test]
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[ignore = "requires pinned APPS_BUN, AOT-enabled APPS_JSC_LIBRARY, and apps-runtime"]
+#[ignore = "requires an AOT-enabled APPS_JSC_LIBRARY and apps-runtime"]
 fn packages_and_runs_native_modules() {
     use object::{Object, ObjectSection};
 
@@ -334,10 +334,11 @@ setTimeout(async () => {
     }
     fs::write(resources.join("app.bundle"), &original).unwrap();
 
-    let output = build
-        .env("APPS_BUN", root.join("missing-bun"))
-        .output()
-        .unwrap();
+    let jsc = std::path::PathBuf::from(std::env::var_os("APPS_JSC_LIBRARY").unwrap());
+    let without_aot = root.join("without-aot").join(jsc.file_name().unwrap());
+    fs::create_dir_all(without_aot.parent().unwrap()).unwrap();
+    fs::copy(&jsc, &without_aot).unwrap();
+    let output = build.env("APPS_JSC_LIBRARY", without_aot).output().unwrap();
     assert!(!output.status.success());
     assert_eq!(fs::read(resources.join("app.bundle")).unwrap(), original);
 

@@ -1,0 +1,118 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+    # WARNING: tag runs can't share caches with each other, only use those of main, so main builds JSC and FFmpeg
+    # when their scripts change. Only tag runs publish.
+    branches: [main]
+    paths: [scripts/build-jsc.sh, 'scripts/jsc*', 'scripts/aot-front-end/**', scripts/build-ffmpeg.sh, crates/media/native/ffmpeg.c, .github/workflows/release.yml]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { target: darwin-arm64, os: macos-15, jsc: --aot }
+          - { target: darwin-x64, os: macos-15-intel }
+          - { target: linux-x64, os: ubuntu-24.04 }
+          - { target: linux-arm64, os: ubuntu-24.04-arm }
+          - { target: win32-x64, os: windows-2025, msvc: x64, vcpkg: x64-windows-static-md, msys: MINGW64, ffmpeg: 'toolchain:p nasm:p' }
+          - { target: win32-arm64, os: windows-11-arm, msvc: arm64, vcpkg: arm64-windows-static-md, msys: CLANGARM64, ffmpeg: 'toolchain:p', configure: '--cc=clang --arch=aarch64' }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - if: runner.os == 'macOS'
+        run: xcrun -sdk macosx metal --version || { xcodebuild -downloadComponent MetalToolchain && xcrun -sdk macosx metal --version; }
+      - if: runner.os == 'macOS' && runner.arch == 'X64'
+        uses: ilammy/setup-nasm@v1
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang-19 ninja-build ruby nasm libicu-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libfreetype6-dev libasound2-dev libudev-dev libglib2.0-dev libwebkit2gtk-4.1-dev libvulkan-dev
+
+      # WARNING: build-jsc.sh --aot runs the codegen of its Bun revision with this Bun, so keep this npm version at it.
+      - if: matrix.jsc == '--aot'
+        run: |
+          npm install --prefix "$RUNNER_TEMP/bun" @oven/bun-darwin-aarch64@1.4.4-canary.20261108.1
+          bun=$RUNNER_TEMP/bun/node_modules/@oven/bun-darwin-aarch64/bin/bun
+          revision=$(sed -n 's/^bun_revision=//p' scripts/build-jsc.sh)
+          [[ $("$bun" --revision) == *+"${revision:0:9}" ]] || { echo "This Bun is not $revision" >&2; exit 1; }
+          echo "APPS_BUN=$bun" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        id: jsc
+        with:
+          path: target/bun-jsc
+          key: bun-jsc-${{ runner.os }}-${{ runner.arch }}-${{ matrix.jsc && format('aot-{0}', hashFiles('scripts/build-jsc.sh', 'scripts/jsc.patch', 'scripts/jsc-aot*', 'scripts/aot-front-end/**')) || hashFiles('scripts/build-jsc.sh', 'scripts/jsc.patch') }}
+      - if: runner.os == 'macOS' && steps.jsc.outputs.cache-hit != 'true'
+        run: bash scripts/build-jsc.sh ${{ matrix.jsc }}
+      - if: runner.os == 'Linux' && steps.jsc.outputs.cache-hit != 'true'
+        run: bash scripts/build-jsc.sh -- -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19
+      - if: runner.os == 'Windows' && steps.jsc.outputs.cache-hit != 'true'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc }}
+      - if: runner.os == 'Windows' && steps.jsc.outputs.cache-hit != 'true'
+        run: |
+          vcpkg install icu:${{ matrix.vcpkg }}
+          bash scripts/build-jsc.sh -- -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl "-DICU_ROOT=$VCPKG_INSTALLATION_ROOT/installed/${{ matrix.vcpkg }}"
+
+      - uses: actions/cache@v4
+        id: ffmpeg
+        with:
+          path: |
+            target/ffmpeg
+            !target/ffmpeg/source
+          key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'crates/media/native/ffmpeg.c') }}
+      - if: runner.os != 'Windows' && steps.ffmpeg.outputs.cache-hit != 'true'
+        run: bash scripts/build-ffmpeg.sh
+      - if: runner.os == 'Windows' && steps.ffmpeg.outputs.cache-hit != 'true'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msys }}
+          install: make diffutils curl xz
+          pacboy: ${{ matrix.ffmpeg }}
+      - if: runner.os == 'Windows' && steps.ffmpeg.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: bash scripts/build-ffmpeg.sh ${{ matrix.configure }}
+
+      - run: bash scripts/build-npm.sh "$([[ $GITHUB_REF_TYPE == tag ]] && echo "${GITHUB_REF_NAME#v}" || echo 0.0.0)"
+      - run: npm pack ./packages/apps-${{ matrix.target }} --pack-destination npm
+      - if: matrix.target == 'linux-x64'
+        run: npm pack ./packages/apps --pack-destination npm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-${{ matrix.target }}
+          path: npm/*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          path: npm
+          merge-multiple: true
+      # WARNING: platform packages go first, so @pierre/apps never names one that is not published yet.
+      - run: |
+          tag=
+          [[ $GITHUB_REF_NAME == *-* ]] && tag=--tag=next
+          for file in npm/pierre-apps-{darwin,linux,win32}-*.tgz npm/pierre-apps-[0-9]*.tgz; do
+            spec=$(tar -xzOf "$file" package/package.json | jq -r '.name + "@" + .version')
+            if npm view "$spec" version >/dev/null 2>&1; then echo "$spec is already published"; continue; fi
+            npm publish "$file" --access public $tag
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

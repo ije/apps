@@ -1,0 +1,40 @@
+{
+  "name": "@pierre/apps",
+  "version": "0.0.0",
+  "description": "A tiny, fast, memory-safe Electron alternative with a compatible API",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.mjs",
+  "types": "types/index.d.ts",
+  "bin": {
+    "apps": "bin/apps.mjs"
+  },
+  "files": [
+    "bin",
+    "types",
+    "index.mjs",
+    "install.mjs"
+  ],
+  "scripts": {
+    "postinstall": "node install.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@types/node": ">=22"
+  },
+  "peerDependenciesMeta": {
+    "@types/node": {
+      "optional": true
+    }
+  },
+  "optionalDependencies": {
+    "@pierre/apps-darwin-arm64": "0.0.0",
+    "@pierre/apps-darwin-x64": "0.0.0",
+    "@pierre/apps-linux-arm64": "0.0.0",
+    "@pierre/apps-linux-x64": "0.0.0",
+    "@pierre/apps-win32-arm64": "0.0.0",
+    "@pierre/apps-win32-x64": "0.0.0"
+  }
+}

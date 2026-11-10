@@ -1,0 +1,18 @@
+{
+  "name": "@pierre/apps-darwin-arm64",
+  "version": "0.0.0",
+  "description": "The macOS arm64 binaries of @pierre/apps",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.mjs",
+  "files": [
+    "bin",
+    "index.mjs"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ]
+}

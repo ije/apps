@@ -2,6 +2,12 @@
 
 A tiny, fast, memory-safe Electron alternative with a compatible API.
 
+```sh
+npm install --save-dev @pierre/apps
+```
+
+The package has the types of `@pierre/apps`, `node:ffi`, `import.meta.env` and asset imports like `./icon.png` and `./notes.md?raw`. A TypeScript project with only page code gets them with `"types": ["@pierre/apps"]`.
+
 - `apps run [entry]`: Compile and run the app in memory. Defaults to `main` in `package.json`, then `index.ts`, `index.mts`, `index.mjs` or `index.js`.
 - `apps run --watch` / `-W`: Restart when the main code changes, and reload the pages when only page code changes. Watching is off by default.
 - `apps run --devtools` / `-D`: Open Developer Tools in a standalone window.
@@ -195,10 +201,9 @@ The default port is `3000`.
 
 `apps build --aot` compiles the app's modules and the runtime scripts to native code with Bun's AOT compiler.
 It works for JavaScript and TypeScript apps on macOS arm64, and can't be combined with `--bytecode`.
-Bun is needed only for the build.
+The npm package of `apps` has the compilers, so the build needs no Bun.
 
-Set `APPS_BUN` to a Bun binary from revision `2596ac5d391d47804c93a42bdbe615804aa62387` ([Bun PR #47942](https://github.com/oven-sh/bun/pull/47942)), and build JSC with AOT support.
-Other revisions are rejected, because Bun's IR must match the format and the built-in table of the JSC compiler.
+From source, build JSC with AOT support. It checks out Bun's source at revision `2596ac5d391d47804c93a42bdbe615804aa62387` ([Bun PR #47942](https://github.com/oven-sh/bun/pull/47942)) and runs Bun's codegen, so set `APPS_BUN` to a Bun binary from that revision. `npm install @oven/bun-darwin-aarch64@1.4.4-canary.20261108.1` has it.
 
 ```sh
 export APPS_BUN=/path/to/bun
@@ -207,8 +212,12 @@ cargo build -p apps -p apps-runtime
 ./target/debug/apps build index.ts --aot
 ```
 
-`--aot` fetches Bun's source into `target/bun-aot`, and also builds `libJavaScriptCoreCompiler.dylib`, which the CLI loads to compile, and `libJavaScriptCoreAOT.a`, a JSC without JIT compilers and Inspector.
-The CLI links the archive and the native code into `app.dylib` in `Contents/Resources`, in place of the app's JavaScriptCore library.
+`--aot` also builds three libraries:
+- `libapps_aot.dylib`: Bun's AOT front end, made from Bun's Rust crates with Bun's nightly toolchain (`scripts/aot-front-end`). It turns the app's modules into IR, byte for byte what `bun build --compile --aot` writes.
+- `libJavaScriptCoreCompiler.dylib`: compiles the IR to native code.
+- `libJavaScriptCoreAOT.a`: a JSC without JIT compilers and Inspector.
+
+The CLI loads the first two, and links the archive and the native code into `app.dylib` in `Contents/Resources`, in place of the app's JavaScriptCore library.
 
 The main module, module chunks, page modules, preloads, workers and the runtime scripts compile.
 Classic page scripts and code from strings run in JSC's interpreter.

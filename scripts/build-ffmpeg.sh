@@ -14,7 +14,8 @@ case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*) system=windows ;;
   *) printf 'Unsupported operating system\n' >&2; exit 1 ;;
 esac
-case "$(uname -m)" in
+# WARNING: MSYS2 runs emulated on Windows arm64, so uname reports x86_64 there.
+case "${MSYSTEM_CARCH:-$(uname -m)}" in
   arm64 | aarch64) arch=aarch64 ;;
   x86_64 | amd64 | AMD64) arch=x86_64 ;;
   *) printf 'Unsupported architecture\n' >&2; exit 1 ;;
@@ -75,6 +76,7 @@ case "$system" in
     options+=("--extra-cflags=-ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables")
     ;;
 esac
+options+=("$@")
 if [[ $arch == x86_64 ]] && ! command -v nasm >/dev/null; then
   printf 'FFmpeg needs nasm on x86_64\n' >&2
   exit 1

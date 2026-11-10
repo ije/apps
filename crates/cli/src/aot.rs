@@ -38,25 +38,28 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         *mut c_char,
         usize,
     ) -> bool;
-    let (compile, required) = unsafe {
-        let revision: unsafe extern "C" fn() -> *const c_char =
-            *compiler.get(b"JSGetAOTCompilerRevision\0")?;
+    let compile = unsafe { *compiler.get::<Compile>(b"JSCompileAOT\0")? };
+    let front = library.with_file_name("libapps_aot.dylib");
+    let front = unsafe { libloading::Library::new(&front) }.with_context(|| {
+        format!(
+            "Cannot load {}; run bash scripts/build-jsc.sh --aot",
+            front.display()
+        )
+    })?;
+    type FrontEnd = unsafe extern "C" fn(
+        *const c_char,
+        *const *const c_char,
+        usize,
+        *mut *mut u8,
+        *mut usize,
+    ) -> bool;
+    type Free = unsafe extern "C" fn(*mut u8, usize);
+    let (front_end, free) = unsafe {
         (
-            *compiler.get::<Compile>(b"JSCompileAOT\0")?,
-            CStr::from_ptr(revision()).to_str()?.to_owned(),
+            *front.get::<FrontEnd>(b"apps_aot_front_end\0")?,
+            *front.get::<Free>(b"apps_aot_free\0")?,
         )
     };
-    let bun = std::env::var_os("APPS_BUN").unwrap_or_else(|| "bun".into());
-    let revision = Command::new(&bun)
-        .arg("--revision")
-        .output()
-        .context("Cannot run Bun. Set APPS_BUN to an AOT-enabled Bun compiler")?;
-    let revision = String::from_utf8_lossy(&revision.stdout);
-    let revision = revision.trim().rsplit('+').next().unwrap_or("");
-    ensure!(
-        revision.len() >= 9 && required.starts_with(revision),
-        "--aot requires Bun revision {required}; set APPS_BUN to that compiler"
-    );
     let directory = tempfile::Builder::new().prefix("apps-aot-").tempdir()?;
     fs::write(
         directory.path().join("package.json"),
@@ -171,18 +174,24 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
             fs::write(directory.path().join(&name), bytes)?;
             wasm_paths.push(name);
         }
-        let validation = Command::new(&bun)
-            .current_dir(directory.path())
-            .args(["-e", "import {readFileSync} from 'node:fs'; console.log(JSON.stringify(process.argv.slice(1).map(path=>WebAssembly.validate(readFileSync(path)))));"])
-            .args(&wasm_paths)
-            .output()
-            .context("Cannot validate embedded Wasm with Bun")?;
-        ensure!(
-            validation.status.success(),
-            "Cannot validate embedded Wasm: {}",
-            String::from_utf8_lossy(&validation.stderr)
-        );
-        let valid: Vec<bool> = serde_json::from_slice(&validation.stdout)?;
+        let engine = apps_runtime::jsc::JsContext::new(
+            apps_runtime::jsc::JavaScriptCore::load()?,
+            Default::default(),
+            apps_runtime::host::Role::Main,
+        )?;
+        let modules = serde_json::to_string(
+            &wasm
+                .iter()
+                .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+                .collect::<Vec<_>>(),
+        )?;
+        let valid = engine
+            .eval(
+                &format!("JSON.stringify({modules}.map(text=>WebAssembly.validate(Uint8Array.from(atob(text),c=>c.charCodeAt(0)))))"),
+                "apps:aot",
+            )
+            .context("Cannot validate embedded Wasm")?;
+        let valid: Vec<bool> = serde_json::from_str(&valid)?;
         ensure!(
             valid.len() == wasm_paths.len(),
             "Invalid Wasm validation result"
@@ -202,24 +211,29 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
     let host_path = directory.path().join("host.js");
     fs::write(&host_path, host)?;
     paths.push(host_path);
-    let program = directory.path().join("program.ir");
-    let output = Command::new(&bun)
-        .current_dir(directory.path())
-        .args(["build", "--compile", "--aot", "--no-builtin-modules"])
-        .args(&paths)
-        .arg(format!("--aot-out={}", program.display()))
-        .arg("--outfile")
-        .arg(directory.path().join("unused"))
-        .output()
-        .context("Cannot run Bun. Set APPS_BUN to an AOT-enabled Bun compiler")?;
-    // WARNING: Bun can fail after it wrote valid IR for a standalone JSC host, so check for the IR file, not the exit
-    // status.
+    let folder = CString::new(directory.path().as_os_str().as_encoded_bytes())?;
+    let entries = paths
+        .iter()
+        .map(|path| CString::new(path.as_os_str().as_encoded_bytes()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let entries: Vec<_> = entries.iter().map(|entry| entry.as_ptr()).collect();
+    let (mut output, mut length) = (std::ptr::null_mut(), 0);
+    let built = unsafe {
+        front_end(
+            folder.as_ptr(),
+            entries.as_ptr(),
+            entries.len(),
+            &mut output,
+            &mut length,
+        )
+    };
+    let program = unsafe { std::slice::from_raw_parts(output, length) }.to_vec();
+    unsafe { free(output, length) };
     ensure!(
-        program.is_file(),
-        "Bun did not emit AOT IR. Use the AOT-enabled Bun compiler {required} and set APPS_BUN.\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        built,
+        "Cannot compile the app for --aot:\n{}",
+        String::from_utf8_lossy(&program)
     );
-    let program = fs::read(program)?;
     let image = directory.path().join("image.bin");
     let image_path = CString::new(image.as_os_str().as_encoded_bytes())?;
     let mut modules = vec![0; paths.len()];

@@ -1,0 +1,19 @@
+# Bun's AOT front end as a C library for `apps build --aot`. build-jsc.sh --aot builds it in Bun's workspace.
+[package]
+name = "apps_aot"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "lib.rs"
+# WARNING: a cdylib exports the C functions of every Bun crate, which keeps code that needs Bun's C++. build-jsc.sh
+# links this archive into a dylib that exports only the functions of lib.rs.
+crate-type = ["staticlib"]
+
+[dependencies]
+bun_aot.workspace = true
+bun_ast.workspace = true
+bun_bundler = { workspace = true, features = ["test_support"] }
+bun_options_types.workspace = true
+bun_sema_driver.workspace = true
+bun_sema_standalone = { path = "../sema/standalone", features = ["test_support"] }
