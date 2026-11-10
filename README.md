@@ -215,9 +215,9 @@ cargo build -p apps -p apps-runtime
 `--aot` also builds three libraries:
 - `libapps_aot.dylib`: Bun's AOT front end, made from Bun's Rust crates with Bun's nightly toolchain (`scripts/aot-front-end`). It turns the app's modules into IR, byte for byte what `bun build --compile --aot` writes.
 - `libJavaScriptCoreCompiler.dylib`: compiles the IR to native code.
-- `libJavaScriptCoreAOT.a`: a JSC without JIT compilers and Inspector.
+- `libJavaScriptCoreAOT.dylib`: a JSC without JIT compilers and Inspector.
 
-The CLI loads the first two, and links the archive and the native code into `app.dylib` in `Contents/Resources`, in place of the app's JavaScriptCore library.
+The CLI loads the first two and links the native code into `app.dylib` in `Contents/Resources`. The third is the app's JavaScriptCore library.
 
 The main module, module chunks, page modules, preloads, workers and the runtime scripts compile.
 Classic page scripts and code from strings run in JSC's interpreter.

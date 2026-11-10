@@ -26,24 +26,26 @@ pub(super) struct Image {
 }
 
 // Register before the first context group: JSC reads the image options during registration.
-pub(super) fn load(path: &Path) -> Result<Option<&'static Image>> {
+pub(super) fn load(jsc: &Library, path: &Path) -> Result<Option<&'static Image>> {
     // Never unload this library: JSC retains the image in process-wide tables.
     static IMAGE: OnceLock<std::result::Result<Option<Image>, String>> = OnceLock::new();
-    let image = IMAGE.get_or_init(|| read(path).map_err(|error| format!("{error:#}")));
+    let image = IMAGE.get_or_init(|| read(jsc, path).map_err(|error| format!("{error:#}")));
     image
         .as_ref()
         .map(Option::as_ref)
         .map_err(|error| anyhow!("{error}"))
 }
 
-fn read(path: &Path) -> Result<Option<Image>> {
+fn read(jsc: &Library, path: &Path) -> Result<Option<Image>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
     let library = unsafe { Library::new(path) }?;
     unsafe {
-        let Ok(size) = library.get::<*const usize>(b"apps_aot_manifest_size\0") else {
-            return Ok(None);
-        };
-        let manifest =
-            std::slice::from_raw_parts(*library.get::<*const u8>(b"apps_aot_manifest\0")?, **size);
+        let manifest = std::slice::from_raw_parts(
+            *library.get::<*const u8>(b"apps_aot_manifest\0")?,
+            **library.get::<*const usize>(b"apps_aot_manifest_size\0")?,
+        );
         let manifest: Manifest =
             serde_json::from_slice(manifest).context("Invalid AOT manifest")?;
         ensure!(manifest.version == 1, "Unsupported AOT manifest version");
@@ -55,8 +57,9 @@ fn read(path: &Path) -> Result<Option<Image>> {
             manifest.scripts.values().all(|&module| module != 0),
             "Invalid AOT module ID"
         );
-        let register: unsafe extern "C" fn(*const u8, usize, *mut c_char, usize) -> bool =
-            *library.get(b"JSLoadAOT\0")?;
+        let register: unsafe extern "C" fn(*const u8, usize, *mut c_char, usize) -> bool = *jsc
+            .get(b"JSLoadAOT\0")
+            .context("app.dylib needs the JavaScriptCore of its build")?;
         let mut error = [0; 1024];
         ensure!(
             register(
@@ -69,8 +72,8 @@ fn read(path: &Path) -> Result<Option<Image>> {
             CStr::from_ptr(error.as_ptr()).to_string_lossy()
         );
         Ok(Some(Image {
-            attach: *library.get(b"JSAttachAOT\0")?,
-            function: *library.get(b"JSGetAOTFunction\0")?,
+            attach: *jsc.get(b"JSAttachAOT\0")?,
+            function: *jsc.get(b"JSGetAOTFunction\0")?,
             _library: library,
             build: manifest.build,
             modules: manifest.scripts,

@@ -176,46 +176,52 @@ setTimeout(async () => {
     let header = file.section_by_name("__header").unwrap();
     assert_eq!(&header.data().unwrap()[..8], b"BUNAOT01");
     let header = header.file_range().unwrap().0 as usize;
-    let mut commands = file.macho_load_commands().unwrap();
-    while let Some(command) = commands.next().unwrap() {
-        if let Some(dylib) = command.dylib().unwrap() {
-            let name =
-                std::str::from_utf8(command.string(file.endian(), dylib.dylib.name).unwrap())
-                    .unwrap();
-            assert!(
-                name.starts_with("/usr/lib/") || name.starts_with("/System/Library/"),
-                "app.dylib must only depend on system libraries: {name}"
-            );
-            assert!(!name.contains("JavaScriptCore"));
-        }
-    }
-    let exports: std::collections::BTreeSet<_> = file
-        .exports()
-        .unwrap()
-        .iter()
-        .map(|symbol| std::str::from_utf8(symbol.name()).unwrap().to_owned())
-        .collect();
-    for name in [
-        "_JSContextGroupCreate",
-        "_JSLoadAOT",
-        "_JSAttachAOT",
-        "_JSGetAOTFunction",
-        "_apps_aot_image",
-        "_apps_aot_manifest",
+    let jsc =
+        fs::read(out.join("AotTest.app/Contents/Frameworks/libJavaScriptCore.dylib")).unwrap();
+    for (bytes, prefix, names) in [
+        (
+            &native,
+            "_apps_aot_",
+            &["_apps_aot_image", "_apps_aot_manifest"][..],
+        ),
+        (
+            &jsc,
+            "_JS",
+            &[
+                "_JSContextGroupCreate",
+                "_JSLoadAOT",
+                "_JSAttachAOT",
+                "_JSGetAOTFunction",
+            ][..],
+        ),
     ] {
-        assert!(exports.contains(name), "Missing export: {name}");
-    }
-    assert!(!exports.contains("_JSCompileAOT"));
-    assert!(!exports.contains("_JSGetAOTCompilerRevision"));
-    assert!(
-        exports
+        let file = object::read::macho::MachOFile64::<object::Endianness>::parse(bytes.as_slice())
+            .unwrap();
+        let mut commands = file.macho_load_commands().unwrap();
+        while let Some(command) = commands.next().unwrap() {
+            if let Some(dylib) = command.dylib().unwrap() {
+                let name =
+                    std::str::from_utf8(command.string(file.endian(), dylib.dylib.name).unwrap())
+                        .unwrap();
+                assert!(
+                    name.starts_with("/usr/lib/") || name.starts_with("/System/Library/"),
+                    "AOT libraries must only depend on system libraries: {name}"
+                );
+            }
+        }
+        let exports: std::collections::BTreeSet<_> = file
+            .exports()
+            .unwrap()
             .iter()
-            .all(|name| name.starts_with("_JS") || name.starts_with("_apps_aot_"))
-    );
-    assert!(
-        !out.join("AotTest.app/Contents/Frameworks/libJavaScriptCore.dylib")
-            .exists()
-    );
+            .map(|symbol| std::str::from_utf8(symbol.name()).unwrap().to_owned())
+            .collect();
+        for name in names {
+            assert!(exports.contains(*name), "Missing export: {name}");
+        }
+        assert!(!exports.contains("_JSCompileAOT"));
+        assert!(!exports.contains("_JSGetAOTCompilerRevision"));
+        assert!(exports.iter().all(|name| name.starts_with(prefix)));
+    }
     assert_eq!(
         u32::from_le_bytes(native[header + 72..header + 76].try_into().unwrap()),
         3
@@ -272,8 +278,8 @@ setTimeout(async () => {
         );
     }
     assert!(
-        !zip.file_names()
-            .any(|name| name.unwrap().ends_with("/libJavaScriptCore.dylib"))
+        zip.by_name("AotTest.app/Contents/Frameworks/libJavaScriptCore.dylib")
+            .is_ok()
     );
     drop(zip);
     let output = run(&executable);
@@ -297,10 +303,7 @@ setTimeout(async () => {
     fs::rename(&dylib, resources.join("saved.dylib")).unwrap();
     let output = run(&executable);
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("The app's JavaScriptCore library is missing")
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Missing AOT image"));
     fs::rename(resources.join("saved.dylib"), &dylib).unwrap();
 
     let original = fs::read(resources.join("app.bundle")).unwrap();

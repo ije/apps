@@ -17,10 +17,12 @@ use std::{
 
 pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<tempfile::TempDir> {
     let library = apps_runtime::jsc::library_path(runtime, "macos")?;
-    let archive = library
-        .with_file_name("libJavaScriptCoreAOT.a")
-        .canonicalize()
-        .context("--aot needs libJavaScriptCoreAOT.a; run bash scripts/build-jsc.sh --aot")?;
+    ensure!(
+        library
+            .with_file_name("libJavaScriptCoreAOT.dylib")
+            .is_file(),
+        "--aot needs libJavaScriptCoreAOT.dylib; run bash scripts/build-jsc.sh --aot"
+    );
     let compiler = library.with_file_name("libJavaScriptCoreCompiler.dylib");
     let compiler = unsafe { libloading::Library::new(&compiler) }.with_context(|| {
         format!(
@@ -307,32 +309,22 @@ _apps_aot_manifest:
             data = layout[0] + layout[1],
         ),
     )?;
-    fs::write(directory.path().join("exports.txt"), "_JS*\n_apps_aot_*\n")?;
     let output = Command::new("xcrun")
         .current_dir(directory.path())
         .args([
-            "clang++",
+            "clang",
             "-dynamiclib",
             "-arch",
             "arm64",
             "-mmacosx-version-min=13.0",
             "-Wl,-install_name,@rpath/app.dylib",
-            "-Wl,-dead_strip",
-            "-Wl,-x",
-            "-Wl,-exported_symbols_list,exports.txt",
             "-Wl,-segprot,__AOT_HEADER,r,r",
             "-Wl,-segprot,__AOT_CODE,rx,rx",
             "-Wl,-segprot,__AOT_CONST,r,r",
             "image.s",
             "-o",
             "app.dylib",
-            "-licucore",
-            "-lobjc",
-            "-Xlinker",
-            "-force_load",
-            "-Xlinker",
         ])
-        .arg(&archive)
         .output()
         .context("--aot needs the Xcode command line tools")?;
     ensure!(

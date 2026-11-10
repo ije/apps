@@ -201,10 +201,6 @@ pub fn library_path(executable: &Path, platform: &str) -> Result<PathBuf> {
     .any(|bundle| directory.join(bundle).is_file())
         && executable == std::env::current_exe()?.canonicalize()?
     {
-        let aot = directory.join("../Resources/app.dylib");
-        if aot.is_file() {
-            return Ok(aot);
-        }
         return ["../Frameworks", "."]
             .iter()
             .map(|folder| directory.join(folder).join(name))
@@ -246,6 +242,7 @@ impl JavaScriptCore {
         let path = library_path(&std::env::current_exe()?, std::env::consts::OS)?;
         let library = unsafe { Library::new(&path) }
             .with_context(|| format!("Cannot load Bun JavaScriptCore from {}", path.display()))?;
+        let image = path.with_file_name("../Resources/app.dylib");
         unsafe {
             let group_create: unsafe extern "C" fn() -> Ptr =
                 *library.get(b"JSContextGroupCreate\0")?;
@@ -263,7 +260,7 @@ impl JavaScriptCore {
                 // In JSC's cell cage every block the heap holds stays resident. AOT images use wide
                 // references, which need no cage.
                 std::env::set_var("JSC_markedBlockCageSizeInMB", "0");
-                let _ = aot::load(&path);
+                let _ = aot::load(&library, &image);
                 group = Some(group_create());
                 std::env::remove_var("JSC_useSharedArrayBuffer");
                 std::env::remove_var("JSC_heapGrowthMaxIncrease");
@@ -271,7 +268,7 @@ impl JavaScriptCore {
                 std::env::remove_var("JSC_markedBlockCageSizeInMB");
             });
             Ok(Rc::new(Self {
-                aot: aot::load(&path)?,
+                aot: aot::load(&library, &image)?,
                 group: group.unwrap_or_else(|| group_create()),
                 inspectable: library
                     .get(b"JSGlobalContextSetInspectable\0")

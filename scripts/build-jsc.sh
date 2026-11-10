@@ -2,9 +2,8 @@
 set -euo pipefail
 
 revision=5a61071f79134bf41844e7ea31a8449147d85dd4
-# Match jsc-aot.cpp and the release workflow's Bun revision: AOT needs identical IR formats and built-in
-# tables.
 bun_revision=2596ac5d391d47804c93a42bdbe615804aa62387
+
 aot=0
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 
@@ -209,23 +208,28 @@ if ((aot)); then
   xcrun strip -x "$output/.$name"
   codesign --force --sign - "$output/.$name"
   mv -f "$output/.$name" "$output/$name"
-  xcrun libtool -static -o "$output/.libJavaScriptCoreAOT.a" \
-    "$build/lib/libJavaScriptCore.a" "$build/lib/libWTF.a" "$build/lib/libbmalloc.a"
-  mv -f "$output/.libJavaScriptCoreAOT.a" "$output/libJavaScriptCoreAOT.a"
+  name=libJavaScriptCoreAOT.dylib
+  xcrun clang++ -dynamiclib -arch arm64 -mmacosx-version-min=13.0 -o "$output/.$name" -Wl,-install_name,"@rpath/$name" \
+    -Wl,-dead_strip -Wl,-x -Wl,-exported_symbols_list,"$root/scripts/jsc.exports" -Wl,-all_load \
+    "$build/lib/libJavaScriptCore.a" "$build/lib/libWTF.a" "$build/lib/libbmalloc.a" -licucore -lobjc
+  mv -f "$output/.$name" "$output/$name"
 
   # Build the AOT front end with Bun's nightly toolchain.
   bun=$(command -v "${APPS_BUN:-bun}")
   codegen=$(PATH="$(dirname "$bun"):$PATH" "$bun" "$root/scripts/jsc-aot-front-end.ts" "$bun_source" "$source_dir/Source/JavaScriptCore")
-  (cd "$bun_source" && BUN_CODEGEN_DIR=$codegen cargo build --release -p apps_aot)
+  # Bun's release profile adds 4 MB without a speed gain. `z` saves 3.5 MB but takes 2.5x longer. -S removes 5
+  # MB of debug maps.
+  (cd "$bun_source" && BUN_CODEGEN_DIR=$codegen cargo build --release -p apps_aot \
+    --config 'profile.release.opt-level="s"' --config 'profile.release.lto="fat"')
   name=libapps_aot.dylib
   xcrun clang -dynamiclib -arch arm64 -mmacosx-version-min=13.0 -o "$output/.$name" -Wl,-install_name,"@rpath/$name" \
-    -Wl,-dead_strip -Wl,-x -Wl,-exported_symbol,_apps_aot_front_end -Wl,-exported_symbol,_apps_aot_free \
+    -Wl,-dead_strip -Wl,-x -Wl,-S -Wl,-exported_symbol,_apps_aot_front_end -Wl,-exported_symbol,_apps_aot_free \
     "$bun_source/target/release/libapps_aot.a" -liconv -lc -lm
   mv -f "$output/.$name" "$output/$name"
 fi
 
 {
-  if [[ -f $output/libJavaScriptCoreAOT.a ]]; then
+  if [[ -f $output/libJavaScriptCoreAOT.dylib ]]; then
     cat "$root/target/bun-aot/source/LICENSE.md"
     printf '\n'
   fi

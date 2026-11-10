@@ -179,7 +179,7 @@ pub fn package_app(
     if let Some(aot) = aot {
         target
             .validate_binary(aot)
-            .context("AOT runtime does not match the build target")?;
+            .context("app.dylib does not match the build target")?;
         bytes += fs::copy(aot, assets.join("app.dylib"))? as usize;
     }
     fs::write(stage.path().join(".apps-build"), b"1")?;
@@ -212,6 +212,12 @@ pub fn package_app(
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
     }
+    // AOT code runs only in the JSC that its compiler was built with.
+    let jsc = if aot.is_some() {
+        jsc.with_file_name("libJavaScriptCoreAOT.dylib")
+    } else {
+        jsc
+    };
     target
         .validate_binary(&jsc)
         .context("JavaScriptCore does not match the build target")?;
@@ -221,14 +227,12 @@ pub fn package_app(
         stage.path().to_owned()
     };
     fs::create_dir_all(&libraries)?;
-    if aot.is_none() {
-        let destination = libraries.join(library_name);
-        ensure!(
-            !destination.exists(),
-            "JavaScriptCore conflicts with a build file"
-        );
-        bytes += fs::copy(&jsc, destination)? as usize;
-    }
+    let destination = libraries.join(library_name);
+    ensure!(
+        !destination.exists(),
+        "JavaScriptCore conflicts with a build file"
+    );
+    bytes += fs::copy(&jsc, destination)? as usize;
     let license = jsc.with_file_name("JavaScriptCore.LICENSE");
     if license.is_file() {
         let destination = libraries.join("JavaScriptCore.LICENSE");

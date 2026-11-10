@@ -29,7 +29,9 @@ esac
 node -e '
 const fs = require("fs"), version = process.argv[1]
 for (const dir of fs.readdirSync("packages")) {
-  const file = `packages/${dir}/package.json`, pkg = JSON.parse(fs.readFileSync(file, "utf8"))
+  const file = `packages/${dir}/package.json`
+  if (!fs.existsSync(file)) continue
+  const pkg = JSON.parse(fs.readFileSync(file, "utf8"))
   pkg.version = version
   for (const name in pkg.optionalDependencies) pkg.optionalDependencies[name] = version
   fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n")
@@ -46,7 +48,7 @@ jsc=target/bun-jsc/$system-$arch
 jscs=("${lib}JavaScriptCore$ext" JavaScriptCore.LICENSE)
 # Linux links WebGPU into the runtime, and apps build --aot works only on macOS arm64.
 [[ $os != linux ]] && files+=("${lib}apps_webgpu$ext")
-[[ $os-$cpu == darwin-arm64 ]] && jscs+=(libJavaScriptCoreAOT.a libJavaScriptCoreCompiler.dylib libapps_aot.dylib)
+[[ $os-$cpu == darwin-arm64 ]] && jscs+=(libJavaScriptCoreAOT.dylib libJavaScriptCoreCompiler.dylib libapps_aot.dylib)
 rm -rf "$bin"
 mkdir -p "$bin"
 for file in "${files[@]}"; do cp "target/release/$file" "$bin/"; done
