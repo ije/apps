@@ -99,7 +99,7 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
     let mut paths = Vec::new();
     let mut globals = BTreeSet::new();
     for (name, source) in scripts {
-        // WARNING: wrapping a classic script changes its global declarations. Keep those scripts in JSC.
+        // Do not wrap classic scripts: wrappers change their global declarations.
         if name.starts_with("script-")
             && !source.starts_with(loader)
             && !source.starts_with("(($appsDefine)=>{\n")
@@ -116,7 +116,8 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         let semantic = oxc_semantic::SemanticBuilder::new()
             .with_build_nodes(source.contains("AGFzbQEAAA") && source.contains("atob"))
             .build(&parsed.program);
-        // WARNING: wrappers can hide embedded Wasm from Bun's reachability scan. Add its bytes as compiler inputs; JSC matches them by digest at run time.
+        // Wrappers can hide Wasm from Bun's scan. Supply its bytes separately so JSC can match them by
+        // digest.
         for node in semantic.semantic.nodes().iter() {
             let AstKind::CallExpression(call) = node.kind() else {
                 continue;
@@ -165,7 +166,7 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         !names.is_empty(),
         "No bundled modules to compile with --aot"
     );
-    // WARNING: this entry never runs. It tells Bun that the host supplies these globals at run time.
+    // This entry only declares host globals for Bun. It never runs.
     let mut host = "const unknown=JSON.parse('{}',function(){return this;});\n".to_owned();
     if !wasm.is_empty() {
         let mut wasm_paths = Vec::with_capacity(wasm.len());

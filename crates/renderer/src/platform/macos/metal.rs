@@ -211,7 +211,7 @@ impl Pipelines {
             // SAFETY: index zero is within the color attachment array.
             let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
             attachment.setPixelFormat(FORMAT);
-            // WARNING: colors are drawn unpremultiplied over targets that hold premultiplied colors.
+            // Colors are drawn unpremultiplied over targets that hold premultiplied colors.
             let source = match blend {
                 Blend::Over => Some(MTLBlendFactor::SourceAlpha),
                 Blend::Premultiplied => Some(MTLBlendFactor::One),
@@ -240,8 +240,7 @@ impl Pipelines {
         })
     }
 
-    // WARNING: on Apple GPUs any blit encoder makes the driver hold about 84 MB more until drawing stops, so copies are
-    // draws.
+    // Use draws for copies: a blit encoder retains about 84 MB in the Apple GPU driver until frames stop.
     fn copy(
         &self,
         commands: &ProtocolObject<dyn MTLCommandBuffer>,
@@ -295,7 +294,7 @@ impl Renderer {
         let layer = CAMetalLayer::new();
         layer.setDevice(Some(&device));
         layer.setPixelFormat(FORMAT);
-        // WARNING: without a color space the display shows CSS colors in its own wider gamut, more saturated than browsers.
+        // Set sRGB to prevent wide-gamut displays from oversaturating CSS colors.
         layer.setColorspace(srgb.as_deref());
         layer.setOpaque(!transparent);
         layer.setMaximumDrawableCount(3);
@@ -306,11 +305,11 @@ impl Renderer {
             objc2_quartz_core::CAAutoresizingMask::LayerWidthSizable
                 | objc2_quartz_core::CAAutoresizingMask::LayerHeightSizable,
         );
-        // WARNING: AppKit sets the flip of a hosted layer from its view, and the overlay view is flipped, so
-        // promoted layers and the caret are placed from the top left, like the frame during a resize.
+        // AppKit derives layer orientation from the view. Flip the overlay so layers and the caret use
+        // top-left coordinates.
         let overlay = CALayer::new();
         overlay.setGeometryFlipped(true);
-        // WARNING: promoted layers can move past the window's content, which must not show them over the title bar.
+        // Promoted layers can move past the window's content, which must not show them over the title bar.
         overlay.setMasksToBounds(true);
         let unified = device.hasUnifiedMemory();
         let shared = device.supportsFamily(MTLGPUFamily::Apple1);
@@ -389,8 +388,7 @@ impl Renderer {
                     CGSize::new(w, h),
                 ));
                 sublayer.setPosition(objc2_core_foundation::CGPoint::new(x, y));
-                // WARNING: promoted layers go below the caret, since promotion can't see the caret and may promote a
-                // layer under it.
+                // Keep promoted layers below the caret: promotion does not account for it.
                 self.overlay.insertSublayer_atIndex(&sublayer, 0);
                 self.promoted.push(Promoted {
                     key,
@@ -550,7 +548,7 @@ impl Renderer {
         &self.overlay
     }
 
-    // WARNING: only the drawing thread may change the drawable size, so a frame always fits its scene.
+    // Only the drawing thread may change the drawable size, so a frame always fits its scene.
     pub fn set_drawable_size(&mut self, size: CGSize) {
         self.size = size;
     }
@@ -559,8 +557,8 @@ impl Renderer {
         self.present.take()
     }
 
-    // WARNING: glass views and the frame must change in one Core Animation transaction of the main thread. While
-    // AppKit waits for a resize frame, they go back with it, so they show in AppKit's transaction.
+    // Present glass and the frame in one main-thread Core Animation transaction, including AppKit's resize
+    // transaction.
     pub fn take_glass_update(
         &mut self,
         apply: impl FnOnce(Vec<super::glass::GlassSurface>) + Send + 'static,
@@ -610,8 +608,8 @@ impl Renderer {
         self.layer.setOpaque(!transparent);
     }
 
-    // WARNING: frames often pause briefly, so this frees only retired tiles. Buffers, layer textures and spare pages
-    // wait for `release`, or each burst of frames makes them again.
+    // Free only retired tiles here. Keep buffers, textures and spare pages until release to avoid churn
+    // between frame bursts.
     pub fn trim(&mut self) {
         if self.completed.load(Ordering::Acquire) == self.committed {
             self.atlas.free_retired(|| {});
@@ -620,7 +618,7 @@ impl Renderer {
 
     pub fn release(&mut self) {
         self.atlas.release_images();
-        // WARNING: command buffers of one queue complete in order, so an empty one waits for the frames in flight.
+        // An empty command buffer waits for earlier frames on the same queue.
         self.atlas.free_retired(|| {
             if let Some(commands) = self.queue.commandBuffer() {
                 commands.commit();
@@ -636,8 +634,8 @@ impl Renderer {
             pool.resize(MIN_INSTANCE_BUFFER_SIZE);
             pool.buffers.clear();
         });
-        // WARNING: the layer frees its spare drawables only when their size changes. It keeps showing its
-        // last frame, and the next frame sets the size back.
+        // Change size to release spare drawables. The layer keeps its last frame until the next draw restores
+        // the size.
         self.layer.setDrawableSize(CGSize::new(1., 1.));
         for glass in &self.glass {
             glass.surface.layer.setDrawableSize(CGSize::new(1., 1.));
@@ -715,8 +713,8 @@ impl Renderer {
                         sublayer.setFramebufferOnly(false);
                         sublayer.setOpaque(false);
                         sublayer.setPresentsWithTransaction(true);
-                        // WARNING: as many as the window layer, so a frame shown but not yet committed by the
-                        // main thread doesn't make the next frame wait for a drawable of this layer.
+                        // Match the window's drawable count so an uncommitted frame cannot block the next
+                        // one.
                         sublayer.setMaximumDrawableCount(3);
                         sublayer.setAllowsNextDrawableTimeout(false);
                         sublayer
@@ -746,8 +744,7 @@ impl Renderer {
         if capture && !native_capture {
             self.demote();
         }
-        // WARNING: new or removed sublayers show in the Core Animation transaction, so the frame that
-        // draws their layers elsewhere presents in it too.
+        // Present the frame in the same transaction that adds or removes promoted sublayers.
         let resizing = self.presents_with_transaction;
         let transact = resizing || mem::take(&mut self.restacked) || native_transaction;
         self.layer.setPresentsWithTransaction(transact);
@@ -957,8 +954,7 @@ impl Renderer {
         }
         self.frame = frame;
         result?;
-        // WARNING: Metal calls the completion handler on its own thread, so the buffer goes back to
-        // the pool in a task of the thread that drew.
+        // Metal completes on its own thread. Return buffers to the pool on the drawing thread.
         let done = Cell::new(Some(SendBuffer(writer.finish())));
         let thread = super::app_thread();
         self.committed += 1;
@@ -1078,7 +1074,7 @@ impl Renderer {
                     set_globals(encoder, &frame.globals(*target, &text));
                     current = (*target, false);
                 }
-                // WARNING: targets are cleared right away, since a later pass may draw into them.
+                // Targets are cleared right away, since a later pass may draw into them.
                 Command::Pass(target, clear) => {
                     end!();
                     current = (*target, *clear);
@@ -1114,7 +1110,7 @@ impl Renderer {
                     end!();
                     current.1 = false;
                     let (from, to) = (frame.origin(*src), frame.origin(*dst));
-                    // WARNING: a pooled texture can hold other layers, so the rest of it is loaded.
+                    // A pooled texture can hold other layers, so the rest of it is loaded.
                     pipelines.copy(
                         commands,
                         texture(*src),

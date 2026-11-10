@@ -1,5 +1,4 @@
-// WARNING: these structs must match the `repr(C)` structs in `scene.rs` and `frame.rs`, like the
-// Metal and WGSL shaders. Structured buffers are tightly packed, so `float4` needs no padding.
+// Match scene.rs, frame.rs, Metal and WGSL layouts. HLSL structured buffers pack float4 without padding.
 
 cbuffer Globals: register(b0) {
     float4 gamma_ratios;
@@ -13,7 +12,7 @@ cbuffer Globals: register(b0) {
     uint2 globals_pad;
 };
 
-// WARNING: instance IDs start at zero, so draws pass the index of their first instance.
+// Instance IDs start at zero, so draws pass the index of their first instance.
 cbuffer Batch: register(b1) {
     uint batch_start;
     uint3 batch_pad;
@@ -125,7 +124,7 @@ float gaussian(float x, float sigma) {
 float4 over(float4 below, float4 above) {
     float4 result;
     float alpha = above.a + below.a * (1.0 - above.a);
-    // WARNING: two transparent colors would divide by zero, and blending a NaN is undefined on some GPUs.
+    // Two transparent colors would divide by zero, and blending a NaN is undefined on some GPUs.
     if (alpha <= 0.0) {
         return float4(0.0, 0.0, 0.0, 0.0);
     }
@@ -319,8 +318,7 @@ float4 quad_color(QuadFragmentInput input, Quad quad, float2 position) {
         top ? quad.border_widths.top : quad.border_widths.bottom
     );
 
-    // WARNING: zero-width borders turn negative so that `inner_sdf >= antialias_threshold`, which draws no
-    // anti-aliasing pixels for them.
+    // Negative inner widths prevent antialiasing pixels on zero-width borders.
     float2 reduced_border = float2(
         border.x == 0.0 ? -antialias_threshold : border.x,
         border.y == 0.0 ? -antialias_threshold : border.y
@@ -745,7 +743,7 @@ MonochromeSpriteVertexOutput monochrome_sprite_vertex(uint vertex_id: SV_VertexI
 
 float4 monochrome_sprite_fragment(MonochromeSpriteVertexOutput input): SV_Target {
     float sample = t_sprite.Sample(s_sprite, input.tile_position).r;
-    // WARNING: sample the texture before this early return, since sampling needs derivatives from uniform control flow.
+    // Sample before the early return: derivatives require uniform control flow.
     if (any(input.clip_distance < 0.0)) {
         return float4(0.0, 0.0, 0.0, 0.0);
     }

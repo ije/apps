@@ -207,7 +207,7 @@ unsafe fn build_view_class() -> *const AnyClass {
             sel!(viewDidChangeEffectiveAppearance),
             view_did_change_effective_appearance as extern "C" fn(_, Sel),
         );
-        // WARNING: keeps AppKit from beeping on keys with modifiers.
+        // Keeps AppKit from beeping on keys with modifiers.
         decl.add_method(
             sel!(doCommandBySelector:),
             do_command_by_selector as extern "C" fn(_, Sel, Sel),
@@ -233,7 +233,7 @@ unsafe fn build_window_class() -> *const AnyClass {
         let mut decl = ClassBuilder::new(c"AppsWindow", class!(NSWindow)).unwrap();
         decl.add_ivar::<*mut c_void>(STATE_IVAR);
         decl.add_ivar::<isize>(VISUAL_EFFECT_STATE_IVAR);
-        // WARNING: Liquid Glass needs this private getter. Its ivar stays readable when AppKit reenters with State borrowed.
+        // Liquid Glass needs this private getter. Its ivar stays readable when AppKit reenters with State borrowed.
         if class!(NSWindow)
             .instance_method(sel!(_hasActiveAppearance))
             .is_some()
@@ -466,7 +466,7 @@ impl State {
             .native_window()
             .screen()
             .map_or(2., |screen| screen.backingScaleFactor() as f32);
-        // WARNING: AppKit can report 0 for a window without a screen.
+        // AppKit can report 0 for a window without a screen.
         if factor == 0. { 2. } else { factor }
     }
 
@@ -505,7 +505,7 @@ impl State {
                 .map_or_else(Default::default, |screen| screen.visibleFrame());
             frame.size.width == visible.size.width && frame.size.height == visible.size.height
         };
-        // WARNING: a window outside all displays has no screen.
+        // A window outside all displays has no screen.
         let screen = window.screen().or_else(|| {
             NSScreen::screens(MainThreadMarker::new().unwrap())
                 .iter()
@@ -542,7 +542,7 @@ impl State {
         let screen: *mut AnyObject = unsafe { msg_send![self.native_window, screen] };
         let mut frames = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
         frames.visible = self.is_visible();
-        // WARNING: AppKit can report no screen while displays are reconfigured.
+        // AppKit can report no screen while displays are reconfigured.
         frames.display = display_id_for_screen(screen);
         frames.sync();
     }
@@ -583,7 +583,7 @@ impl State {
         if self.traffic_light_frames.is_none() {
             self.traffic_light_frames = self.capture_traffic_light_frames();
         }
-        // WARNING: AppKit can recreate the standard buttons, so each layout reads the live views.
+        // AppKit can recreate the standard buttons, so each layout reads the live views.
         let Some(buttons) = self.traffic_light_buttons() else {
             return;
         };
@@ -787,7 +787,7 @@ fn open_native(
         anyhow::ensure!(!native_view.is_null(), "AppKit did not create the view");
         if options.transparent {
             let () = msg_send![native_window, setOpaque: Bool::NO];
-            // WARNING: not `clearColor`, which breaks the window shadow.
+            // Not `clearColor`, which breaks the window shadow.
             let color = NSColor::colorWithSRGBRed_green_blue_alpha(0., 0., 0., 0.0001);
             let () = msg_send![native_window, setBackgroundColor: &*color];
         }
@@ -840,15 +840,14 @@ fn open_native(
             let () = msg_send![native_window, setTitleVisibility: NSWindowTitleVisibility::Hidden];
         }
         let () = msg_send![native_view, setAutoresizingMask: NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable];
-        // WARNING: views become layer backed on their own after joining a window, which breaks the
-        // Metal layer, so this one is layer backed from the start.
+        // Enable layer backing before the view joins a window, or AppKit can replace the Metal layer.
         let () = msg_send![native_view, setWantsLayer: Bool::YES];
         let () = msg_send![native_view, setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawPolicy::DuringViewResize];
-        // WARNING: during a resize a frame can show at another size; top-left placement keeps it in place instead of
-        // stretching the window. AppKit owns this layer's gravity, so set it on the view.
+        // Set top-left gravity on the view: AppKit owns layer gravity, and resize frames can arrive at an old
+        // size.
         let () = msg_send![native_view, setLayerContentsPlacement: NSViewLayerContentsPlacement::TopLeft];
-        // WARNING: AppKit puts subview layers over sublayers added by hand to the frame layer, so promoted layers and
-        // the caret go in this view's layer. Order from the bottom: frame, glass, this view, web views.
+        // Use an overlay view: AppKit reorders manually added sublayers. Keep frame, glass, overlay and web
+        // views in that order.
         let overlay_view: *mut AnyObject = msg_send![overlay_class, alloc];
         let overlay_view: *mut AnyObject = msg_send![overlay_view, initWithFrame: content_bounds];
         anyhow::ensure!(!overlay_view.is_null(), "AppKit did not create the view");
@@ -866,7 +865,7 @@ fn open_native(
         if options.show {
             let () = msg_send![native_window, makeKeyAndOrderFront: ptr::null_mut::<AnyObject>()];
         }
-        // WARNING: the origin from `initWithContentRect` can be off when the key screen is not the primary one.
+        // The origin from `initWithContentRect` can be off when the key screen is not the primary one.
         let () = msg_send![native_window, setFrameTopLeftPoint: rect.origin];
         if options.frameless {
             set_button_visibility(&state, false);
@@ -876,7 +875,7 @@ fn open_native(
         lock.locate_frames();
         drop(lock);
         state.borrow_mut().move_traffic_light();
-        // WARNING: the two strong references live in the ivars of the window and the view.
+        // The two strong references live in the ivars of the window and the view.
         drop(state);
         Ok((native_window, NonNull::new_unchecked(native_view)))
     })
@@ -921,8 +920,7 @@ fn set_button_visibility(state: &Shared, visible: bool) {
 
 type Open = Box<dyn FnOnce(&NativeRef) + Send>;
 
-// WARNING: the main thread opens the window after `Window::open` returns, and the render thread waits for it before it
-// draws or hands out the view. AppKit must release it on the main thread.
+// Wait for main to open the window before rendering or exposing its view. Release it on main.
 #[derive(Default)]
 struct NativeRef {
     window: AtomicPtr<AnyObject>,
@@ -978,8 +976,7 @@ pub struct WindowControl {
     mirror: Arc<Mutex<Mirror>>,
 }
 
-// WARNING: only the newest frame waits for main and a newer one drops it, so a busy main thread never makes the render
-// thread wait for a drawable.
+// Keep only the newest frame for main so a busy main thread cannot exhaust drawables.
 #[derive(Default)]
 struct Waiting {
     present: Mutex<Option<Present>>,
@@ -1051,8 +1048,9 @@ impl Window {
             native.view.store(view.as_ptr(), Ordering::Release);
             native.window.store(window, Ordering::Release);
             measure_screens();
-            // SAFETY: the window was just made. WARNING: the render thread laid out with the guess, and main waits for
-            // a change to send the first state, so both hear of the real size.
+            // SAFETY: the window was just made.
+            // Send the real size to both threads: render used the estimate, and main sends state only after a
+            // change.
             if let Some(state) = unsafe { get_state(&*window) } {
                 update_size(&state);
             }
@@ -1152,7 +1150,7 @@ impl Window {
         let native = self.control.native.clone();
         let update = renderer.take_glass_update(move |surfaces| {
             on_main(&native, |_, state| {
-                // WARNING: a caller up the stack can hold the state, and the next update brings the views up to date.
+                // A caller up the stack can hold the state, and the next update brings the views up to date.
                 if let Ok(mut state) = state.try_borrow_mut() {
                     // SAFETY: the window retains its view.
                     let parent = unsafe { state.native_view.cast::<NSView>().as_ref() };
@@ -1272,7 +1270,7 @@ impl WindowControl {
         });
     }
 
-    // WARNING: until the window opened, its mirror holds a guess, so on main the window opens first.
+    // Open the window before main reads its state. The mirror initially holds an estimate.
     pub fn state(&self) -> Option<WindowState> {
         if MainThreadMarker::new().is_some() {
             self.native.window();
@@ -1295,7 +1293,7 @@ impl WindowControl {
             };
             let zoom = || window.standardWindowButton(NSWindowButton::ZoomButton);
             let style = |flag: NSWindowStyleMask, on: bool| {
-                // WARNING: a style mask change resets the zoom button.
+                // A style mask change resets the zoom button.
                 let enabled = zoom().is_none_or(|zoom| zoom.isEnabled());
                 let mut mask = window.styleMask();
                 mask.set(flag, on);
@@ -1406,7 +1404,7 @@ impl WindowControl {
                     return;
                 }
                 WindowChange::AspectRatio(ratio, extra) => {
-                    // WARNING: resize increments clear the aspect ratio.
+                    // Resize increments clear the aspect ratio.
                     if ratio > 0. {
                         window.setContentAspectRatio(NSSize::new(ratio as f64, 1.));
                     } else {
@@ -1526,8 +1524,9 @@ impl WindowControl {
             else {
                 return;
             };
-            // SAFETY: the event was this window's, and it starts the drag loop. WARNING: the page
-            // asks late, so the button can be up by now, and a drag without a button never ends.
+            // SAFETY: the event was this window's, and it starts the drag loop.
+            // Check that the button is still down: the page request can arrive late, and a buttonless drag
+            // never ends.
             unsafe {
                 let pressed: NSUInteger = msg_send![class!(NSEvent), pressedMouseButtons];
                 if pressed & 1 != 0 {
@@ -1603,8 +1602,7 @@ impl Drop for Window {
                     state.closed = true;
                 }
                 let () = msg_send![native, setDelegate: ptr::null_mut::<AnyObject>()];
-                // WARNING: a sheet that is not ended blocks its parent, a sheet shown next and quitting,
-                // which can already be posted, so it ends now.
+                // End the sheet now: it can block its parent, the next sheet and an already queued quit.
                 detach(&*native.cast::<NSWindow>());
             }
             post_local(move || unsafe {
@@ -1622,7 +1620,7 @@ fn post_controls(
     native_post(Box::new(move || {
         queued.store(false, Ordering::Release);
         on_main(&native, |_, state| {
-            // WARNING: a caller up the stack can hold the state, so the list waits for the next pass.
+            // A caller up the stack can hold the state, so the list waits for the next pass.
             let Ok(mut state) = state.try_borrow_mut() else {
                 if !queued.swap(true, Ordering::AcqRel) {
                     post_controls(native.clone(), next.clone(), queued.clone());
@@ -1654,7 +1652,7 @@ fn attach(window: &NSWindow, state: &Shared) -> bool {
             parent.beginSheet_completionHandler(window, None);
         }
     } else if window.parentWindow().as_deref() != Some(&*parent) {
-        // WARNING: joining a parent resets its level.
+        // Joining a parent resets its level.
         let level = parent.level();
         // SAFETY: both are live windows, and a window never becomes its own ancestor.
         unsafe { parent.addChildWindow_ordered(window, NSWindowOrderingMode::Above) };
@@ -1921,8 +1919,7 @@ extern "C" fn reset_cursor_rects(this: &AnyObject, _: Sel) {
 }
 
 extern "C" fn handle_key_equivalent(this: &AnyObject, _: Sel, event: *mut AnyObject) -> Bool {
-    // WARNING: AppKit offers key equivalents to every view of the window. The web views of `<webview>`,
-    // `<iframe>` and `WebContentsView` are subviews of this one, so their keys stay with them while one has focus.
+    // AppKit sends key equivalents to every view. Leave keys with a focused web view.
     // SAFETY: plain AppKit calls on this view, its window and its subviews.
     unsafe {
         let window: *mut AnyObject = msg_send![this, window];
@@ -1992,7 +1989,7 @@ fn input_context_handles(this: &AnyObject, event: *mut AnyObject) -> bool {
     }
 }
 
-// WARNING: things to test when changing this:
+// Things to test when changing this:
 //  U.S. layout: `alt-t` reaches the app; typing `j k` in a field inserts both characters.
 //  Brazilian layout: `" space` types an unmarked quote, `" backspace` deletes the marked quote.
 //  Japanese input: `a i left down up enter enter` types 愛, and `j i` types じ.
@@ -2012,8 +2009,7 @@ fn handle_key_event(this: &AnyObject, event: *mut AnyObject, key_equivalent: boo
     };
     let down = match &input {
         PlatformInput::KeyDown(down) => {
-            // WARNING: AppKit sends some keys as a key equivalent, then again as a key down when that was
-            // not handled. The second one is skipped.
+            // Skip duplicate key-down events after an unhandled AppKit key equivalent.
             let same = |a: &KeyDownEvent, b: &KeyDownEvent| {
                 a.keystroke == b.keystroke && a.is_held == b.is_held
             };
@@ -2033,8 +2029,7 @@ fn handle_key_event(this: &AnyObject, event: *mut AnyObject, key_equivalent: boo
     };
     drop(lock);
     let composing = down && callbacks.marked_text_range().is_some();
-    // WARNING: like Electron, a key that main's filter blocks still goes to a composing input method, which only can't
-    // pass it on to the page.
+    // Pass blocked keys to an active input method, but prevent it from forwarding them to the page.
     let blocked = crate::app::native::key(callbacks.id, &input, &|| {
         composing || !down && callbacks.marked_text_range().is_some()
     });
@@ -2043,9 +2038,8 @@ fn handle_key_event(this: &AnyObject, event: *mut AnyObject, key_equivalent: boo
             let keystroke = &down.keystroke;
             let modifiers = keystroke.modifiers;
             let plain = !modifiers.control && !modifiers.function && !modifiers.platform;
-            // WARNING: composed keys, keys without text (arrows, escape) and printable keys of a composing
-            // input method go to the input method first. It calls `doCommandBySelector:` for keys
-            // it does not want, which sends them to the app.
+            // Let the input method handle composition and non-text keys first. doCommandBySelector: forwards
+            // rejected keys to the app.
             let ime_printable = !composing
                 && plain
                 && keystroke
@@ -2097,7 +2091,7 @@ fn handle_key_event(this: &AnyObject, event: *mut AnyObject, key_equivalent: boo
                 callbacks.replace_text_in_range(None, text);
                 return Bool::YES;
             }
-            // WARNING: key equivalents with modifiers other than fn stay with AppKit, or cmd-` stops working.
+            // Key equivalents with modifiers other than fn stay with AppKit, or cmd-` stops working.
             if key_equivalent
                 && modifiers
                     != (Modifiers {
@@ -2235,7 +2229,7 @@ fn synthetic_drag(state: Weak<RefCell<State>>, id: usize, event: MouseMoveEvent)
             if lock.synthetic_drag_counter != id {
                 return;
             }
-            // WARNING: A menu can take the mouse up, so the button must still be down.
+            // A menu can take the mouse up, so the button must still be down.
             let pressed: NSUInteger = unsafe { msg_send![class!(NSEvent), pressedMouseButtons] };
             let bit = match event.pressed_button {
                 Some(MouseButton::Left) | None => 0,
@@ -2370,7 +2364,7 @@ extern "C" fn window_did_exit_fullscreen(this: &AnyObject, _: Sel, _: *mut AnyOb
     };
     if let Ok(mut lock) = state.try_borrow_mut() {
         lock.is_exiting_fullscreen = false;
-        // WARNING: buttons moved during the transition hold their fullscreen frames.
+        // Buttons moved during the transition hold their fullscreen frames.
         lock.traffic_light_frames = lock.pre_fullscreen_traffic_light_frames.take();
         lock.move_traffic_light();
     }
@@ -2418,8 +2412,7 @@ extern "C" fn window_did_change_key_status(this: &AnyObject, selector: Sel, _: *
         return;
     };
     let active = lock.native_window().isKeyWindow();
-    // WARNING: AppKit can send a spurious `windowDidBecomeKey` to the previous key window when a popup
-    // opens while the app is inactive, which later keeps that window from being activated.
+    // Ignore AppKit's spurious activation of the previous key window when a popup opens in an inactive app.
     if selector == sel!(windowDidBecomeKey:) && !active {
         let window = lock.native_window;
         drop(lock);
@@ -2492,12 +2485,9 @@ extern "C" fn display_layer(this: &AnyObject, _: Sel, _: *mut AnyObject) {
     let Some(callbacks) = callbacks(this) else {
         return;
     };
-    // WARNING: the window server takes the new window size at once. Until the commit of this
-    // transaction it shows the old layers displaced by the resize, so a frame that takes long moves
-    // the whole window, even with its frame in sync. A late frame shows after the commit instead,
-    // and only the bottom edge can tell. While one is on its way, more would only queue up.
-    // A window that is not ordered in, like one created hidden, shows nothing, so its frame skips the
-    // transaction and its wait. Ordering it in asks for a display again, which then presents in it.
+    // Present resize frames within AppKit's transaction when ready. Late frames must wait until after commit
+    // to avoid shifting the window. Keep one pending frame. Hidden windows skip the transaction until ordered
+    // in.
     // SAFETY: plain view and window properties.
     let visible = unsafe {
         let window: *mut AnyObject = msg_send![this, window];

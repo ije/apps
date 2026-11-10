@@ -1,4 +1,4 @@
-// WARNING: screen coordinates are physical pixels with the origin at the top left of the primary
+// Screen coordinates are physical pixels with the origin at the top left of the primary
 // display. Logical pixels divide them by the window's scale factor.
 
 mod directx;
@@ -99,7 +99,7 @@ impl Platform {
     }
 
     pub fn quit(&self) {
-        // WARNING: quitting asks the app first, which is busy while this runs.
+        // Quitting asks the app first, which is busy while this runs.
         run_after(Duration::ZERO, || {
             if crate::app::events::should_quit() {
                 // SAFETY: ends the message loop of this thread.

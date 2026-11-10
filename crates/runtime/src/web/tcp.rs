@@ -86,7 +86,7 @@ async fn run(
     }
     let control = stream.control().map_err(io("connect"))?;
     let (mut reader, mut writer) = tokio::io::split(stream);
-    // WARNING: reads go on while a write waits for the peer, or two sockets piped into each other deadlock.
+    // Reads go on while a write waits for the peer, or two sockets piped into each other deadlock.
     let read = async {
         let mut bytes = [0; 16384];
         loop {
@@ -164,7 +164,7 @@ struct Server {
 }
 impl Drop for Server {
     fn drop(&mut self) {
-        // WARNING: the listener closes here, on the JavaScript thread, so `close()` frees the address before `listen()` runs again.
+        // The listener closes here, on the JavaScript thread, so `close()` frees the address before `listen()` runs again.
         if let Ok(mut listener) = self.listener.lock() {
             #[cfg(unix)]
             if let Some(Listener::Unix(_, path)) = listener.as_ref() {
@@ -234,7 +234,7 @@ impl State {
             #[cfg(unix)]
             "open" => {
                 use std::os::fd::FromRawFd;
-                // WARNING: a copy, so destroying the socket leaves the inherited descriptor to its owner.
+                // A copy, so destroying the socket leaves the inherited descriptor to its owner.
                 let fd = unsafe {
                     libc::fcntl(
                         args[0].as_i64().context("Expected descriptor")? as i32,

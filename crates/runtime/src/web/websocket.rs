@@ -51,7 +51,7 @@ async fn run(
 ) -> Result<()> {
     let (writer, mut reader) = socket.split();
     let writer = tokio::sync::Mutex::new(writer);
-    // WARNING: reads must go on while a send waits for the peer, or two peers that both stream can deadlock.
+    // Reads must go on while a send waits for the peer, or two peers that both stream can deadlock.
     let read = async {
         while let Some(message) = reader.next().await {
             let event = match message? {
@@ -96,7 +96,7 @@ async fn run(
                 wake.wake();
             }
             if closing {
-                // WARNING: a peer that never answers the close frame would keep the socket CLOSING forever.
+                // A peer that never answers the close frame would keep the socket CLOSING forever.
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 let _ = events
                     .send(json!({"kind":"close","code":1006,"reason":"","clean":false}).into())

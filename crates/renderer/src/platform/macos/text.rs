@@ -111,7 +111,7 @@ struct State {
     postscript_names_by_font_id: HashMap<FontId, String>,
     local: HashSet<FontId>,
     sized: HashMap<(FontId, u32), CTFont>,
-    // WARNING: keyed by the font's address, so each font stays alive here, or a new font could reuse the address.
+    // Retain fonts used as pointer keys to prevent address reuse.
     natives: HashMap<usize, (CTFont, FontId)>,
     segments: HashMap<(FontId, u32), HashMap<Box<str>, Rc<LineLayout>>>,
     monospace: HashMap<FontId, bool>,
@@ -159,7 +159,7 @@ static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| 
     // SAFETY: the function follows the Create Rule and returns an array of strings.
     let families: CFArray<CFString> =
         unsafe { CFArray::wrap_under_create_rule(CTFontManagerCopyAvailableFontFamilyNames()) };
-    // WARNING: macOS leaves these out of the list, though it has them and browsers find them.
+    // MacOS leaves these out of the list, though it has them and browsers find them.
     families
         .iter()
         .map(|name| name.to_string())
@@ -167,8 +167,7 @@ static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| 
         .collect()
 });
 
-// WARNING: fonts stay alive here, since a face's address names it. Each entry is found once outside the map's lock, so
-// lookups of other entries don't wait.
+// Retain fonts used as pointer keys. Initialize entries outside the map lock to avoid blocking other lookups.
 type Shared<K, V> = std::sync::LazyLock<std::sync::Mutex<HashMap<K, Arc<OnceLock<V>>>>>;
 type Faces = Option<Vec<(FontKitFont, String)>>;
 type SystemKey = (String, Vec<(String, u32)>, Option<Vec<String>>);
@@ -193,7 +192,7 @@ fn shared<K: std::hash::Hash + Eq, V: Clone>(
 
 impl TextSystem {
     pub fn new() -> Self {
-        // WARNING: listing the font families takes about 20 ms, so it starts here, off the first frame's path.
+        // Listing the font families takes about 20 ms, so it starts here, off the first frame's path.
         static LISTING: std::sync::Once = std::sync::Once::new();
         LISTING.call_once(|| {
             let _ = std::thread::Builder::new()
@@ -253,8 +252,8 @@ impl TextSystem {
                 font_ids
             }
         };
-        // WARNING: font-kit maps Medium (0.23) to weight 530, so 500 would pick Regular. Map Apple's weight
-        // constants to CSS weights 100 to 900 instead, as browsers do.
+        // Map Apple weights directly to CSS: font-kit maps Medium to 530, so CSS 500 incorrectly selects
+        // Regular.
         let properties = candidates
             .iter()
             .map(|font_id| {
@@ -287,7 +286,7 @@ impl TextSystem {
             },
         )?;
         let mut font_id = candidates[index];
-        // WARNING: old Apple fonts like Skia use a 0.5 to 3.2 `wght` scale, so they keep their named faces.
+        // Old Apple fonts like Skia use a 0.5 to 3.2 `wght` scale, so they keep their named faces.
         let native = state.fonts[font_id.0].native_font();
         let axis = || {
             native
@@ -454,7 +453,7 @@ impl State {
 
                 apply_features_and_fallbacks(&mut font, features, fallbacks)?;
 
-                // WARNING: `font.properties()` panics on fonts whose traits are not CFNumbers.
+                // `font.properties()` panics on fonts whose traits are not CFNumbers.
                 let traits = font.native_font().all_traits();
                 if unsafe {
                     !(traits
@@ -480,8 +479,7 @@ impl State {
                 let Some(postscript_name) = font.postscript_name() else {
                     continue;
                 };
-                // WARNING: dedup only within this call: a family can load again under another `FontKey`, and
-                // a check against `font_ids_by_postscript_name` would leave that call empty.
+                // Deduplicate only within this call. A global check can leave a second FontKey with no faces.
                 if postscript_names_seen.insert(postscript_name.clone()) {
                     faces.push((font, postscript_name));
                 }
@@ -530,8 +528,7 @@ impl State {
         self.fonts[font_id.0].glyph_for_char(ch).map(GlyphId)
     }
 
-    // WARNING: every new copy of a variable face, like the system font, builds its CoreText caches
-    // again, which costs most of the time of shaping a line.
+    // Reuse variable faces: each copy rebuilds CoreText caches at substantial shaping cost.
     fn sized(&mut self, font_id: FontId, size: f32) -> CTFont {
         if self.sized.len() >= 512 {
             self.sized.clear();
@@ -663,8 +660,8 @@ impl State {
 
             let mut bytes;
 
-            // WARNING: an alpha-only context makes glyphs about 17% heavier than an opaque one. Like Skia, antialiased
-            // text draws black on white in an opaque context, whose inverse is the mask.
+            // Use an opaque black-on-white context, then invert the mask. Alpha-only contexts make glyphs
+            // about 17% heavier.
             let opaque_mask = !params.is_emoji && params.dilation == 0;
             let cx = if params.is_emoji {
                 bytes = vec![0; bitmap_size.width.0 as usize * 4 * bitmap_size.height.0 as usize];
@@ -718,8 +715,8 @@ impl State {
                 -glyph_bounds.origin.x.0 as CGFloat,
                 (glyph_bounds.origin.y.0 + glyph_bounds.size.height.0) as CGFloat,
             );
-            // WARNING: CoreText draws emoji larger under about 24 points, while Chromium draws them at device size.
-            // So they draw at twice the size or more, and they stay in proportion to the text at any scale.
+            // Rasterize small emoji at twice the size or more to avoid CoreText's enlargement below 24
+            // points.
             let oversize = if params.is_emoji {
                 params.scale_factor.max(2.)
             } else {
@@ -828,7 +825,7 @@ impl State {
         parts.clear();
         let (mut start, mut nudged, mut missing) = (0, false, 0);
         for (index, run) in font_runs.iter().enumerate() {
-            // WARNING: every other run shapes a hair larger, as in `layout_whole`, or CoreText merges the runs and
+            // Every other run shapes a hair larger, as in `layout_whole`, or CoreText merges the runs and
             // forms ligatures across them.
             let size = if nudged {
                 px(f32::from(run.font_size).next_up())
@@ -1023,8 +1020,8 @@ impl State {
             {
                 continue;
             }
-            // WARNING: CoreText moves some glyphs, like an opening quote, at the start of a run, so a part without a
-            // space before it starts where its run starts, and one without a space after it ends where its run ends.
+            // CoreText adjusts glyphs at run edges. Preserve run boundaries for fragments without adjacent
+            // spaces.
             let edge = |index: usize| match index - at {
                 end if end == layout.len => Some(xs[glyphs.len()]),
                 index => starts
@@ -1412,15 +1409,15 @@ impl State {
 
         {
             let mut text = text;
-            // WARNING: CoreText merges adjacent runs in equal fonts, so every other run is set a hair larger to stop
-            // ligatures across them. The first run keeps its exact size, since SF tracks by exact point size.
+            // Vary alternate run sizes to prevent cross-run ligatures. Keep the first size exact for SF
+            // tracking.
             let mut break_ligature = false;
             for run in font_runs {
                 let text_run;
                 (text_run, text) = text.split_at(run.len);
 
                 let utf16_start = string.char_len();
-                // WARNING: `replace_str` can drop some code points, like a BOM at the start.
+                // `replace_str` can drop some code points, like a BOM at the start.
                 string.replace_str(&CFString::new(text_run), CFRange::init(utf16_start, 0));
                 let utf16_end = string.char_len();
 
@@ -1488,7 +1485,7 @@ impl State {
                 }
             };
             let is_emoji = self.is_emoji(font_id);
-            // WARNING: the emoji font that system fonts fall back to has wider advances than Chromium's.
+            // The emoji font that system fonts fall back to has wider advances than Chromium's.
             let doubled = is_emoji
                 .then(|| {
                     core_text::font::new_from_name(
@@ -1543,7 +1540,7 @@ impl State {
                             1,
                         )
                     } as f32;
-                    // WARNING: where CoreText enlarges emoji, Chromium's advance is one device pixel less.
+                    // Where CoreText enlarges emoji, Chromium's advance is one device pixel less.
                     let drawn = if drawn > f32::from(run_size) * 2. {
                         drawn - 1.
                     } else {

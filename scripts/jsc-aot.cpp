@@ -139,7 +139,7 @@ extern constinit const AOT::ModuleHost appsAOTModuleHost {
 }
 
 #if !APPS_JSC_AOT_RUNTIME
-// WARNING: keep this the `bun_revision` of build-jsc.sh. Bun's IR must match this compiler and its built-in table.
+// Match build-jsc.sh's bun_revision: Bun's IR and built-in table must match this compiler.
 extern "C" JS_EXPORT const char* JSGetAOTCompilerRevision()
 {
     return "2596ac5d391d47804c93a42bdbe615804aa62387";
@@ -151,8 +151,8 @@ extern "C" JS_EXPORT bool JSCompileAOT(const uint8_t* bytes, size_t size, const 
     auto options = AOT::makeDefaultCompileOptions();
     options.admittedCode = AOT::Wire::AdmittedCode::ReplacedBuiltins;
     options.output = AOT::Wire::OutputOptions::RunsInSeveralRealms;
-    // WARNING: narrow references need the cell cage, whose allocator keeps every block resident. The runtime turns the
-    // cage off, which on DiffsHub's stress test keeps about 110 MB less resident.
+    // Use wide references to disable the cell cage, which keeps heap blocks resident (110 MB on DiffsHub's
+    // stress test).
     options.target.referenceWidth = AOT::Wire::ReferenceWidth::Wide;
     auto output = AOT::compileProgram({ bytes, size }, options);
     auto image = output->section(AOT::Wire::ResultSection::Image);

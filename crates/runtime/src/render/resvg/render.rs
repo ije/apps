@@ -69,14 +69,13 @@ fn render_group(
             (bbox.height().ceil() as u32).checked_add(4)?,
         )?
     } else {
-        // WARNING: don't expand the box of a group with filters by 2px, since it already acts as the clipping region.
+        // Don't expand the box of a group with filters by 2px, since it already acts as the clipping region.
         let bbox = bbox.to_int_rect();
         super::geom::fit_to_rect(bbox, ctx.max_bbox)?
     };
 
     if group.filters().is_empty() {
-        // WARNING: clip paths, masks, opacity and blending work per pixel, so a layer without filters keeps only the
-        // pixels of its parent, not up to 25 times the canvas.
+        // Limit unfiltered layers to parent bounds. Per-pixel effects need no extra area.
         let parent = tiny_skia::IntRect::from_xywh(0, 0, pixmap.width(), pixmap.height())?;
         ibbox = super::geom::fit_to_rect(ibbox, parent)?;
     }
@@ -140,10 +139,8 @@ fn render_group(
     Some(())
 }
 
-// WARNING: equals `draw_pixmap` at `(x, y)` with `SourceOver`, `opacity` and no transform pixel for pixel, as the
-// highp pipeline computes `d * (1 - sa) + s` in f32 without FMA. That pipeline runs every pixel through function
-// stages, so this skips transparent pixels and copies opaque ones instead. Unlike tiny-skia, a negative offset
-// doesn't repeat the last column or row past the image, which tiny-skia's rounding toward zero did.
+// Match tiny-skia's highp f32 SourceOver arithmetic without FMA. Skip transparent pixels and copy opaque
+// ones. Negative offsets must not repeat edge pixels.
 pub fn draw_over(
     dst: &mut tiny_skia::PixmapMut,
     src: tiny_skia::PixmapRef,
@@ -186,8 +183,7 @@ pub fn draw_over(
     }
 }
 
-// WARNING: equals `draw_pixmap` at `(x, y)` onto a transparent pixmap, apart from the negative offsets that
-// `draw_over` notes.
+// Match draw_pixmap onto transparent pixels, except for the negative-offset correction in draw_over.
 pub fn copy_pixmap(dst: &mut tiny_skia::Pixmap, src: &tiny_skia::Pixmap, x: i32, y: i32) {
     let (dw, sw) = (dst.width() as i32, src.width() as i32);
     let [left, top] = [x.max(0), y.max(0)];
@@ -204,8 +200,7 @@ pub fn copy_pixmap(dst: &mut tiny_skia::Pixmap, src: &tiny_skia::Pixmap, x: i32,
     }
 }
 
-// WARNING: equals `Pixmap::apply_mask`, whose lowp pipeline computes `(d * m + 255) >> 8`, so a mask of 255 keeps
-// the pixel and 0 clears it.
+// Match Pixmap::apply_mask: (d * m + 255) >> 8. Mask 255 preserves pixels. Mask 0 clears them.
 pub fn apply_mask(pixmap: &mut tiny_skia::Pixmap, mask: &tiny_skia::Mask) {
     for (pixel, &m) in pixmap
         .data_mut()

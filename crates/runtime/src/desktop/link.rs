@@ -101,8 +101,8 @@ impl PageQueue {
 struct Queues {
     main: Mutex<VecDeque<ToMain>>,
     page: Arc<PageQueue>,
-    // WARNING: `None` while all windows share `page`. Pushes hold this lock, so none can land in the shared
-    // queue after `set_per_window` took it.
+    // Hold this lock on pushes so set_per_window cannot leave messages in the old shared queue. None uses
+    // `page`.
     pages: Mutex<Option<HashMap<u64, Arc<PageQueue>>>>,
     created: AtomicU64,
     wake_main: OnceLock<Wake>,
@@ -285,12 +285,11 @@ impl Link {
         self.0.exit_code.load(Ordering::Acquire)
     }
 
-    // WARNING: blocks until main answers. Main must never wait for a page like this, or the two can deadlock.
+    // Blocks on main. Main must not wait on a page this way, or both can deadlock.
     pub(crate) fn ask(&self, message: impl FnOnce(Answer) -> ToMain) -> Result<Payload> {
         let (answer, reply) = mpsc::sync_channel(1);
         self.main(message(answer));
-        // WARNING: without a render thread both sides share this thread, so the main side runs here, even
-        // under a main script, or the wait below would never end.
+        // Without a render thread, run main's work here to avoid waiting on this same thread.
         if let Some(main) = MAIN.with_borrow(Weak::upgrade) {
             main.receive_with(true);
         }
@@ -447,8 +446,7 @@ impl Main {
         self.receive_with(!self.driving.get())
     }
 
-    // WARNING: AppKit runs nested loops under main scripts, like for a sync dialog or a popup. There, messages that run
-    // a script must wait until the outer script returns; the others still run.
+    // Nested AppKit loops must defer script messages until the outer script returns. Other messages can run.
     pub(crate) fn receive_with(&self, scripts: bool) -> bool {
         let messages = std::mem::take(
             &mut *self
@@ -511,7 +509,7 @@ impl Main {
                     }
                 }
                 (ToMain::Window(id, window, control), _) => {
-                    // WARNING: A window that closed on its way here must not stay retained.
+                    // A window that closed on its way here must not stay retained.
                     if self.opened.borrow().contains(&id) {
                         self.windows.borrow_mut().insert(id, (window, control));
                         let mut changed = self.changed.borrow_mut();
@@ -546,7 +544,7 @@ impl Main {
             later.append(&mut queue);
             *queue = later;
         }
-        // WARNING: a nested loop can run this inside a host call of the main script, so attaches wait for that call.
+        // A nested loop can run this inside a host call of the main script, so attaches wait for that call.
         if let Ok(mut host) = self.host.try_borrow_mut() {
             for (browser, parent) in host.browsers.take_attaches() {
                 let window = self
@@ -598,8 +596,7 @@ impl Main {
             .find_map(|(&id, (other, _))| (*other == window).then_some(id))
     }
 
-    // WARNING: this never runs a script inside another one, like in a loop nested under `dialog.showMessageBoxSync()`
-    // or a host call; there the key goes on as not prevented.
+    // Do not reenter a main script from a nested loop or host call. Let the key pass.
     pub(crate) fn before_input(
         &self,
         id: u64,
@@ -646,7 +643,7 @@ impl Main {
         self.driving.set(true);
         let result = engine.call("__appsBeforeInput", &[&id.to_string(), &input.to_string()]);
         self.driving.set(false);
-        // WARNING: listeners can add timers and IPC, which only a turn of main runs.
+        // Listeners can add timers and IPC, which only a turn of main runs.
         self.link.wake_main();
         result
             .inspect_err(|error| eprintln!("apps: {error}"))
@@ -693,11 +690,11 @@ impl Main {
             return;
         }
         if action == "close" {
-            // WARNING: a nested loop can run this inside a host call of the main script, so it waits for that call.
+            // A nested loop can run this inside a host call of the main script, so it waits for that call.
             if self.host.try_borrow_mut().is_err() {
                 return self.link.main(ToMain::Native(command));
             }
-            // WARNING: on Windows a hide calls `window_event` at once, so the `windows` borrow must end first.
+            // On Windows a hide calls `window_event` at once, so the `windows` borrow must end first.
             let removed = self.windows.borrow_mut().remove(&id);
             if let Some((_, control)) = removed {
                 control.change(WindowChange::Hide);
@@ -723,7 +720,7 @@ impl Main {
             }
             return;
         }
-        // WARNING: AppKit can run a nested loop in these calls, which runs main tasks, so no borrow lasts across them.
+        // AppKit can run a nested loop in these calls, which runs main tasks, so no borrow lasts across them.
         let (window, parent) = {
             let windows = self.windows.borrow();
             let Some((_, window)) = windows.get(&id) else {
@@ -786,7 +783,7 @@ impl Main {
             "focusable" => WindowChange::Focusable(on),
             "aspectRatio" => WindowChange::AspectRatio(number(2).0, size(number(3), number(4))),
             "parent" => {
-                // WARNING: windows start on their own threads, so the parent can arrive after its child.
+                // Windows start on their own threads, so the parent can arrive after its child.
                 if let Some((parent, None)) = &parent
                     && self.opened.borrow().contains(parent)
                 {
@@ -869,7 +866,7 @@ impl Main {
         let _ = jobs.send(job);
     }
 
-    // WARNING: a script that main runs outside a turn counts as one, so a nested loop under it runs no other script.
+    // Mark scripts outside a main turn as a turn to prevent reentry through nested loops.
     pub(crate) fn eval(&self, source: &str, url: &str) -> Result<String> {
         let engine = self.engine.as_ref().context("Missing the main script")?;
         let driving = self.driving.replace(true);
@@ -889,7 +886,7 @@ impl Main {
         match result {
             Ok(Some(delay)) => {
                 let at = Instant::now() + Duration::from_millis(delay);
-                // WARNING: a timer can't be cancelled, so keep the armed one unless this one is earlier.
+                // A timer can't be cancelled, so keep the armed one unless this one is earlier.
                 if self.wake.get().is_none_or(|armed| {
                     armed <= Instant::now() || at + Duration::from_micros(500) < armed
                 }) {
@@ -959,7 +956,7 @@ impl Main {
             delay = delay.min(0);
         }
         if let Some(engine) = &self.engine {
-            // WARNING: IPC, microtasks and the scripts above can add timers after the tick, so read the delay again.
+            // IPC, microtasks and the scripts above can add timers after the tick, so read the delay again.
             if let Ok(next) = engine
                 .call("__appsDelay", &[])
                 .map(|next| next.parse::<f64>().unwrap_or(-1.))
@@ -1065,7 +1062,7 @@ mod tests {
         main.driving.set(false);
         main.receive();
         assert_eq!(runs(), "event");
-        // WARNING: closing stops the page id for the whole process, so it is one no other test uses.
+        // Use a unique page ID: close stops it process-wide.
         main.native(json!({"op":"window","args":["close",901]}));
         crate::jsc::page_stopped(901);
         for id in [901, 902] {

@@ -80,7 +80,7 @@ pub struct Node {
     pub(crate) content: Content,
 }
 
-// WARNING: styles are boxed so builder chains move a pointer, not a 736-byte style.
+// Box styles to avoid 736-byte moves in builder chains.
 pub(crate) enum NodeStyle {
     Own(Box<Style>),
     Shared(Rc<Style>),
@@ -115,8 +115,7 @@ impl NodeStyle {
     }
 }
 
-// WARNING: child nodes are boxed so a child list doesn't reserve room for several whole nodes, and moving children
-// moves pointers.
+// Box children to keep child lists and moves small.
 pub enum Child {
     Node(Box<Node>),
     Kept(ElementId),
@@ -200,13 +199,12 @@ pub trait Hooks: 'static {
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window)
     }
-    // WARNING: a kept box skips prepaint and calls only `kept`. Return false only when prepaint reads nothing beyond
-    // the box and leaves no state for paint.
+    // Kept boxes skip prepaint. Return false only if prepaint has no external reads or state for paint.
     fn volatile(&self) -> bool {
         true
     }
-    // WARNING: return true only when the hook paints its box within its bounds and its children where they lie, or
-    // paint may skip it wrongly.
+    // Return true only if paint stays within the box and child bounds. Otherwise culling can hide visible
+    // content.
     fn bounded(&self) -> bool {
         false
     }
@@ -360,7 +358,7 @@ impl Node {
         &self.style
     }
 
-    // WARNING: share a style only between nodes whose inputs fully determine the same style.
+    // Share a style only between nodes whose inputs fully determine the same style.
     pub fn shared_style(&mut self) -> Rc<Style> {
         if let NodeStyle::Own(style) = &mut self.style {
             self.style = NodeStyle::Shared(Rc::new(std::mem::take(&mut **style)));
@@ -1284,7 +1282,7 @@ impl ScrollHandle {
         content: crate::Size<Pixels>,
         scale: f32,
     ) -> Point<Pixels> {
-        // WARNING: padding was truncated to layout units, so it is truncated the same way here.
+        // Padding was truncated to layout units, so it is truncated the same way here.
         let snap = |length: crate::Length| match length {
             crate::Length::Px(value) => px(crate::geometry::to_layout_unit(value.0, scale) / scale),
             crate::Length::Fraction(fraction) => bounds.size.width * fraction,
@@ -1298,7 +1296,7 @@ impl ScrollHandle {
             snap(style.padding.left) + snap(style.padding.right),
             snap(style.padding.top) + snap(style.padding.bottom),
         );
-        // WARNING: Taffy and these sums differ after a few decimals, so the range rounds to two places.
+        // Taffy and these sums differ after a few decimals, so the range rounds to two places.
         let round = |value: Pixels| (value * 100.).round() / 100.;
         let max = Point::from(content + padding - bounds.size)
             .map(round)

@@ -11,7 +11,7 @@ pub(crate) struct Measurements {
     pub(crate) pixel_ratio: f32,
     pub(crate) naturals: rustc_hash::FxHashMap<usize, [f32; 2]>,
     pub(crate) texts: rustc_hash::FxHashMap<usize, Option<std::rc::Rc<style::InlineText>>>,
-    // WARNING: keyed by style address, so set it only while a grid lays out, when its styles outlive the map.
+    // Use style-address keys only during grid layout, while styles outlive the map.
     #[allow(clippy::type_complexity)]
     pub(crate) edges: Option<rustc_hash::FxHashMap<(*const style::Style, u32), [[f32; 4]; 3]>>,
 }
@@ -538,7 +538,7 @@ pub(crate) fn intrinsic(
     let style = &styles.values[id];
     let units = &styles.lengths[id];
     let display = style.get(Prop::DISPLAY).unwrap_or("");
-    // WARNING: measuring recurses per DOM level, so deep pages must not overflow the stack.
+    // Measuring recurses per DOM level, so deep pages must not overflow the stack.
     if display == "none"
         || std::iter::successors(node.parent, |&parent| doc.nodes[parent].parent)
             .nth(256)
@@ -1503,8 +1503,7 @@ pub(crate) fn layout(
             mark(&mut occupied, placed[index], *span);
         }
     }
-    // WARNING: dense packing rescans placed cells for every item, so a budget of cell checks
-    // bounds pathological grids, which then fall back to sparse placement.
+    // Bound dense-placement cell scans, then fall back to sparse placement.
     let mut budget = 1usize << 24;
     let mut lanes = HashMap::new();
     for (index, (position, span)) in items.iter().enumerate() {

@@ -191,7 +191,7 @@ impl Gpu {
                 let mut desc = D3D11_BLEND_DESC::default();
                 let target = &mut desc.RenderTarget[0];
                 target.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
-                // WARNING: colors are drawn unpremultiplied over targets that hold premultiplied colors.
+                // Colors are drawn unpremultiplied over targets that hold premultiplied colors.
                 if let Some(source) = source {
                     target.BlendEnable = true.into();
                     target.SrcBlend = source;
@@ -575,7 +575,7 @@ impl Renderer {
     fn render(&mut self, scene: &Scene, capture: bool) -> Result<Option<Vec<u8>>> {
         let gpu = gpu()?;
         if !Rc::ptr_eq(&gpu, &self.gpu) || self.surface.is_none() {
-            // WARNING: a window has one composition target, so the old one goes first.
+            // A window has one composition target, so the old one goes first.
             self.surface = None;
             self.pool.clear();
             self.gpu = gpu;

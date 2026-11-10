@@ -790,7 +790,7 @@ fn native_browser_window_extras_and_child_windows() {
             parent.setPosition(left + 40, top + 30);
             await moved;
             expect(same(child.getPosition(), [x + 40, y + 30]), 'child follows its parent: ' + JSON.stringify(child.getPosition()));
-            // WARNING: the window server moves children a moment after the parent, so a child detached at once can still follow.
+            // The window server moves children a moment after the parent, so a child detached at once can still follow.
             await sleep(300);
             child.setParentWindow(null);
             parent.setPosition(left, top);

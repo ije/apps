@@ -87,7 +87,7 @@ static WKWebsiteDataStore *AppsDataStore(NSString *partition) {
 - (void)observeValueForKeyPath:(NSString *)path ofObject:(WKWebView *)view change:(NSDictionary *)change context:(void *)context {
     if ([path isEqual:@"title"]) { if (view.title.length) AppsEmit(self, @{ @"type": @"page-title-updated", @"title": view.title }); }
     else if ([path hasPrefix:@"can"]) AppsEmit(self, @{ @"type": @"history", @"canGoBack": @(view.canGoBack), @"canGoForward": @(view.canGoForward) });
-    // WARNING: a load changes the URL just before it starts, and the history updates just after the URL, so check once they are settled. `loading` can't tell, because it is also set while going back within a document.
+    // Defer the check until URL and history updates settle. `loading` also changes for same-document history.
     else dispatch_async(dispatch_get_main_queue(), ^{
         NSString *url = view.URL.absoluteString;
         if (self.provisional || !url || [url isEqual:self.committedURL]) return;
@@ -96,7 +96,7 @@ static WKWebsiteDataStore *AppsDataStore(NSString *partition) {
     });
 }
 - (void)webView:(WKWebView *)view didFinishNavigation:(WKNavigation *)navigation {
-    // WARNING: WebKit updates `title` just after this call, and code reads the title when the load ends.
+    // WebKit updates `title` just after this call, and code reads the title when the load ends.
     dispatch_async(dispatch_get_main_queue(), ^{
         AppsEmit(self, @{ @"type": @"did-finish-load", @"url": view.URL.absoluteString ?: @"", @"title": view.title ?: @"", @"canGoBack": @(view.canGoBack), @"canGoForward": @(view.canGoForward) });
     });
@@ -196,7 +196,7 @@ void apps_browser_bounds(void *handle, double x, double y, double width, double 
 }
 
 char *apps_browser_command(void *handle, const char *operation, const char *argumentsJSON) {
-    // WARNING: completion blocks must not retain the owner; WebKit keeps unsettled callbacks, which would leak the view and its web process.
+    // Do not retain the owner: WebKit can keep pending callbacks and leak the view and web process.
     __weak AppsBrowser *owner = (__bridge AppsBrowser *)handle;
     NSString *op = AppsString(operation);
     id args = AppsValue(argumentsJSON);
@@ -241,7 +241,7 @@ char *apps_browser_command(void *handle, const char *operation, const char *argu
             else if (value) event[@"value"] = value;
             AppsEmit(owner, event);
         };
-        // WARNING: page CSP blocks eval in the page world, so those pages run the script in an isolated world, which has its own globals.
+        // CSP can block page-world eval. The isolated world works but has separate globals.
         [view callAsyncJavaScript:@"return await (0,eval)(source)" arguments:arguments inFrame:nil inContentWorld:WKContentWorld.pageWorld completionHandler:^(id value, NSError *error) {
             if ([error.userInfo[@"WKJavaScriptExceptionMessage"] hasPrefix:@"EvalError: Refused to evaluate"]) [owner.view callAsyncJavaScript:@"return await (0,eval)(source)" arguments:arguments inFrame:nil inContentWorld:[WKContentWorld worldWithName:@"apps"] completionHandler:done];
             else done(value, error);
@@ -300,7 +300,7 @@ char *apps_browser_command(void *handle, const char *operation, const char *argu
         }];
     } else if ([op isEqualToString:@"inspect"]) {
         if (@available(macOS 13.3, *)) view.inspectable = YES;
-        // WARNING: WebKit has no public API for opening its inspector window.
+        // WebKit has no public API for opening its inspector window.
         SEL inspectorSelector = NSSelectorFromString(@"_inspector");
         if (![view respondsToSelector:inspectorSelector]) return strdup("{\"error\":\"Use Safari Develop to inspect this view\"}");
 #pragma clang diagnostic push

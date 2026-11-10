@@ -31,7 +31,7 @@ pub(crate) fn network() -> Result<&'static tokio::runtime::Runtime> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        // WARNING: a current-thread runtime runs its tasks and IO only while a thread waits in its `block_on`.
+        // A current-thread runtime runs its tasks and IO only while a thread waits in its `block_on`.
         if NETWORK.set(runtime).is_ok() {
             std::thread::Builder::new()
                 .name("apps-network".into())
@@ -61,7 +61,7 @@ impl rustls::client::danger::ServerCertVerifier for NativeRoots {
         ocsp_response: &[u8],
         now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // WARNING: loading the OS root certificates takes about 100 ms, so wait for the first TLS handshake.
+        // Loading the OS root certificates takes about 100 ms, so wait for the first TLS handshake.
         self.0
             .get_or_init(|| {
                 let mut roots = rustls::RootCertStore::empty();
@@ -191,8 +191,8 @@ pub(crate) static ASSETS: std::sync::OnceLock<HashMap<String, std::path::PathBuf
 pub(crate) static LOCAL_NETWORK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-// WARNING: pages can't reach private networks, except loopback ports that this app's own servers bind. Every resolved
-// address is checked, redirects included, so DNS can't point a page elsewhere.
+// Check every resolved address, including redirects. Permit private networks only on loopback ports bound by
+// this app.
 pub(crate) async fn connect(
     host: &str,
     port: u16,
@@ -264,7 +264,7 @@ pub(crate) fn private_address(ip: std::net::IpAddr) -> bool {
         }
         std::net::IpAddr::V6(ip) => {
             let s = ip.segments();
-            // WARNING: NAT64 prefixes reach the embedded IPv4 address, so check that address instead.
+            // NAT64 prefixes reach the embedded IPv4 address, so check that address instead.
             if s[0] == 0x64 && s[1] == 0xff9b && (s[2..6] == [0; 4] || s[2] == 1) {
                 let [a, b, c, d] = [(s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8];
                 return private_address(std::net::Ipv4Addr::new(a, b, c, d).into());
@@ -534,9 +534,9 @@ impl State {
                         wake.wake();
                         let (mut buffer, mut input, mut wanted, mut ended, mut pulled) = (Vec::new(), bytes::Bytes::new(), false, false, false);
                         loop {
-                            // WARNING: an unread body holds its buffer until GC, so read ahead little before the first pull.
+                            // Limit read-ahead before the first pull: unread bodies retain buffers until GC.
                             let limit = if pulled { 1 << 20 } else { 64 << 10 };
-                            // WARNING: gzip data can inflate 1000 times, so inflate it in small steps.
+                            // Gzip data can inflate 1000 times, so inflate it in small steps.
                             while !input.is_empty() && buffer.len() < limit {
                                 match &mut gzip {
                                     Some(decoder) => { decoder.write_all(&input.split_to(input.len().min(4096)))?; buffer.append(decoder.get_mut()); }

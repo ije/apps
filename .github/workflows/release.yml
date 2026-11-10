@@ -2,8 +2,7 @@ name: Release
 on:
   push:
     tags: ['v*']
-    # WARNING: tag runs can't share caches with each other, only use those of main, so main builds JSC and FFmpeg
-    # when their scripts change. Only tag runs publish.
+    # Tags can reuse only main's caches. Build JSC and FFmpeg on main when their scripts change.
     branches: [main]
     paths: [scripts/build-jsc.sh, 'scripts/jsc*', 'scripts/aot-front-end/**', scripts/build-ffmpeg.sh, crates/media/native/ffmpeg.c, .github/workflows/release.yml]
   workflow_dispatch:
@@ -37,7 +36,7 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang-19 ninja-build ruby nasm libicu-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libfreetype6-dev libasound2-dev libudev-dev libglib2.0-dev libwebkit2gtk-4.1-dev libvulkan-dev
 
-      # WARNING: build-jsc.sh --aot runs the codegen of its Bun revision with this Bun, so keep this npm version at it.
+      # Keep this Bun version in sync with build-jsc.sh for AOT codegen.
       - if: matrix.jsc == '--aot'
         run: |
           npm install --prefix "$RUNNER_TEMP/bun" @oven/bun-darwin-aarch64@1.4.4-canary.20261108.1
@@ -105,7 +104,7 @@ jobs:
         with:
           path: npm
           merge-multiple: true
-      # WARNING: platform packages go first, so @pierre/apps never names one that is not published yet.
+      # Publish platform packages before @pierre/apps references them.
       - run: |
           tag=
           [[ $GITHUB_REF_NAME == *-* ]] && tag=--tag=next

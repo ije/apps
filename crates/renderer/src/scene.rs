@@ -151,7 +151,7 @@ impl Scene {
         self.layers[0].tree.insert(bounds)
     }
 
-    // WARNING: text doesn't count. A glyph over a caret doesn't hide it, while a popup always paints a box.
+    // Text doesn't count. A glyph over a caret doesn't hide it, while a popup always paints a box.
     #[cfg(target_os = "macos")]
     pub(crate) fn covers(&self, order: DrawOrder, reach: Bounds<ScaledPixels>) -> bool {
         let window = &self.layers[0];
@@ -189,7 +189,7 @@ impl Scene {
 
     pub(crate) fn insert(&mut self, primitive: Primitive) {
         let (bounds, mask) = match &primitive {
-            // WARNING: the shader draws the blur up to 3 sigma outside the shadow bounds.
+            // The shader draws the blur up to 3 sigma outside the shadow bounds.
             Primitive::Shadow(shadow) => (
                 shadow
                     .bounds
@@ -546,8 +546,7 @@ pub enum BorderStyle {
     Double = 3,
 }
 
-// WARNING: the GPU structs below are read by all three shader files, so a layout change goes into
-// shaders.metal, shaders.hlsl and shaders.wgsl together.
+// Update shaders.metal, shaders.hlsl and shaders.wgsl whenever these GPU layouts change.
 
 #[derive(Default, Debug, Copy, Clone)]
 #[repr(C)]
@@ -604,7 +603,7 @@ pub(crate) struct MonochromeSprite {
 #[repr(C)]
 pub(crate) struct PolychromeSprite {
     pub order: DrawOrder,
-    // WARNING: bit 8 marks a premultiplied image, which the shaders divide by alpha after sampling.
+    // Bit 8 marks a premultiplied image, which the shaders divide by alpha after sampling.
     pub grayscale: u32,
     pub tile: AtlasTile,
     pub opacity: f32,

@@ -189,8 +189,7 @@ thread_local! {
     static FULLSCREEN_SHEET: Rc<Stylesheet> = Rc::new(Stylesheet::parse(&format!("{UA}{FULLSCREEN_UA}")));
     #[cfg(target_os = "macos")]
     static GLASS_SHEET: Rc<Stylesheet> = Rc::new(Stylesheet::parse(include_str!("tailwind/liquid-glass.css")));
-    // WARNING: keyed by the address of the `font-family` value, so the entry must hold it to keep the address from
-    // being reused.
+    // Retain font-family values used as pointer keys to prevent address reuse.
     #[allow(clippy::type_complexity)]
     pub(crate) static FONT_NAMES: std::cell::RefCell<(HashMap<String, String>, FxHashMap<*const u8, (Option<Rc<str>>, renderer::SharedString)>)> = Default::default();
 }
@@ -657,7 +656,7 @@ struct StyleScope {
     sequence: u64,
 }
 
-// WARNING: while rules are collected, `rank` is the index of the layer in `Collect.layers`, not its rank.
+// While rules are collected, `rank` is the index of the layer in `Collect.layers`, not its rank.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Layer {
     origin: u8,
@@ -969,7 +968,7 @@ pub(crate) struct StyleCache {
     derived: Derived,
     pub(crate) adopted: FxHashMap<usize, Vec<u32>>,
     values: rustc_hash::FxHashMap<StyleKey, Vec<Rc<CachedStyle>>>,
-    // WARNING: values keys hold tag names by these numbers, which are never freed: a page uses few tag names.
+    // Values keys hold tag names by these numbers, which are never freed: a page uses few tag names.
     tags: FxHashMap<String, u32>,
     heritage: FxHashMap<*const Style, (Rc<Style>, Rc<Style>)>,
     inherited: rustc_hash::FxHashSet<Rc<Style>>,
@@ -982,8 +981,7 @@ pub(crate) struct StyleCache {
     tables: FxHashMap<usize, CollapsedTable>,
     tailwind: tailwind::Compiler,
     registry: Rc<Registry>,
-    // WARNING: keyed by the source list's address, so the entry must hold the source to keep the address from being
-    // reused.
+    // Retain source lists used as pointer keys to prevent address reuse.
     #[allow(clippy::type_complexity)]
     inheritable: FxHashMap<*const Vec<(Prop, Rc<str>)>, (Vars, Option<Vars>)>,
     pub(crate) scripted: Registry,
@@ -992,7 +990,7 @@ pub(crate) struct StyleCache {
     walk: Option<Rc<TreeWalk>>,
     shadows: Rc<Shadows>,
     matches: SelectorCache,
-    // WARNING: an incremental pass starts from the last stored output, so `full` and `styled` must always describe that
+    // An incremental pass starts from the last stored output, so `full` and `styled` must always describe that
     // output.
     full: bool,
     styled: Option<Styled>,
@@ -1001,7 +999,7 @@ pub(crate) struct StyleCache {
     pub(crate) incremental: u64,
 }
 
-// WARNING: an incremental pass may start only from a stored pass that styled with the same environment.
+// An incremental pass may start only from a stored pass that styled with the same environment.
 #[derive(PartialEq)]
 struct Environment {
     viewport: [f32; 2],
@@ -1012,7 +1010,7 @@ struct Environment {
     scheme: Option<Rc<str>>,
 }
 
-// WARNING: `scopes` must stay sorted by root, and a tree that the stored pass styled must use the same scope again.
+// `scopes` must stay sorted by root, and a tree that the stored pass styled must use the same scope again.
 struct Styled {
     nodes: Rc<Vec<(u32, u32)>>,
     tree: Rc<Vec<u32>>,
@@ -1062,7 +1060,7 @@ impl StyleCache {
             special: Vec::new(),
             tables: Vec::new(),
         });
-        // WARNING: this skip relies on a new shadow map whenever the tree or its shadow roots change.
+        // This skip relies on a new shadow map whenever the tree or its shadow roots change.
         if !(walk.built.0 == doc.nodes.tree() && Rc::ptr_eq(&walk.built.1, shadows))
             && walk.walk.update(doc, &shadows.composed, None)
         {
@@ -1395,7 +1393,7 @@ impl StyleCache {
         {
             self.walk = None;
         }
-        // WARNING: a filtered list is also the source of its own entry, so dropping one entry can free another.
+        // A filtered list is also the source of its own entry, so dropping one entry can free another.
         loop {
             let count = self.inheritable.len();
             self.inheritable
@@ -1409,7 +1407,7 @@ impl StyleCache {
             .retain(|_, (style, _)| Rc::strong_count(style) > 1);
         self.inherited.retain(|style| Rc::strong_count(style) > 1);
         self.cssom.retain(|_, (used, ..)| *used >= pass);
-        // WARNING: incremental passes don't visit clean nodes, so values that nodes still hold stay.
+        // Incremental passes don't visit clean nodes, so values that nodes still hold stay.
         if self.values.len() > 4096 {
             self.values.retain(|_, values| {
                 values.retain(|value| value.used.get() == pass || Rc::strong_count(value) > 1);
@@ -1423,7 +1421,7 @@ impl StyleCache {
         self.pass += 1;
     }
 }
-// WARNING: origin values are in precedence order and important ones rank `IMPORTANT - origin`, so don't reorder them.
+// Origin values are in precedence order and important ones rank `IMPORTANT - origin`, so don't reorder them.
 const AGENT: u8 = 0;
 const USER: u8 = 1;
 const HINT: u8 = 2;
@@ -1431,7 +1429,7 @@ const AUTHOR: u8 = 3;
 const ANIMATION: u8 = 4;
 const IMPORTANT: u8 = 8;
 
-// WARNING: the derived `Ord` compares fields in declaration order, which must stay the cascade's order.
+// The derived `Ord` compares fields in declaration order, which must stay the cascade's order.
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct CascadeRank {
     level: u8,
@@ -1525,7 +1523,7 @@ enum MediaQuery {
     Or(Vec<MediaQuery>),
 }
 
-// WARNING: keep sorted; `@supports`, `CSS.supports()`, `el.style` and the devtools lint all read this, so list only what @pierre/apps applies.
+// Keep sorted and list only supported properties. CSS queries, style APIs and devtools share this list.
 const SUPPORTED_PROPERTIES: &[(&str, &str)] = &[
     ("-macos-glass", "none|regular|clear"),
     ("-macos-glass-interactive", "false|true"),
@@ -2063,7 +2061,7 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
     )
 }
 
-// WARNING: keep sorted.
+// Keep sorted.
 const INITIAL: &[(&str, &str)] = &[
     ("-macos-glass", "none"),
     ("-macos-glass-interactive", "false"),
@@ -3470,7 +3468,7 @@ struct Collect<'a> {
 }
 
 impl Collect<'_> {
-    // WARNING: a new layer moves the ranks of others, so this runs once, after every sheet is collected.
+    // A new layer moves the ranks of others, so this runs once, after every sheet is collected.
     fn rank(&mut self) {
         let mut sorted: Vec<usize> = (0..self.layers.len()).collect();
         sorted.sort_by(|&a, &b| {
@@ -4009,7 +4007,7 @@ pub(crate) fn cascade(
                 && previous.lengths.list_len() <= 4096
         });
     let mut fast = out.values.is_empty() && previous.is_some() && !style_cache.full;
-    // WARNING: this scan relies on the page setting `top_layer` whenever a node is fullscreen.
+    // This scan relies on the page setting `top_layer` whenever a node is fullscreen.
     let fullscreen = context.is_none_or(|context| context.top_layer)
         && order
             .iter()
@@ -4043,7 +4041,7 @@ pub(crate) fn cascade(
         if !resized {
             style_cache.queries.clear();
         }
-        // WARNING: scopes can share `@media` blocks, so set new results only after every scope has checked them.
+        // Scopes can share `@media` blocks, so set new results only after every scope has checked them.
         let probe = blank();
         let mut flipped: Vec<Rc<MediaBlock>> = Vec::new();
         for block in style_cache.scopes.iter().flat_map(|scope| &scope.blocks) {
@@ -4229,8 +4227,8 @@ pub(crate) fn cascade(
         if tree == 0 {
             theme = tailwind.as_ref().map(|update| update.root.clone());
         }
-        // WARNING: built-in sheets are collected last so author sheets set the layer order; built-in rules still go
-        // first within those layers.
+        // Collect built-in sheets last so author sheets define layer order. Keep built-in rules first within
+        // each layer.
         let builtin = usize::from(cfg!(target_os = "macos"));
         let sources = (builtin..sheets.len()).chain(0..builtin);
         let exact = style_cache.scopes.iter().position(|cached| {
@@ -4339,7 +4337,7 @@ pub(crate) fn cascade(
                             .any(|rule| Rc::ptr_eq(rule.0, &cached.rules[order].0))
                     })
                     .collect();
-                // WARNING: deleted rules stay in the scope with the `DELETED` origin, no declarations and no keys, so rule orders stay valid.
+                // Preserve deleted rule positions with DELETED origin and no declarations or keys.
                 let mut author: Vec<usize> = (0..cached.rules.len())
                     .filter(|&order| {
                         !matches!(cached.rules[order].2.origin, AGENT | DELETED)
@@ -4658,8 +4656,7 @@ pub(crate) fn cascade(
         })
         .collect();
     used.sort_unstable();
-    // WARNING: passes that are not stored change the cache's viewport, registry and scopes too, so the
-    // stored pass that `previous` comes from must have had the same.
+    // Reuse previous only with the same viewport, registry and scopes. Unstored passes can change these too.
     fast &= style_cache.styled.as_ref().is_some_and(|old| {
         old.environment == environment
             && used.iter().all(|scope| {
@@ -4896,7 +4893,7 @@ pub(crate) fn cascade(
             settle!(@changed id, $up);
         };
     }
-    // WARNING: a pass with animated values must leave the dirty marks, as the next stored pass starts again from the
+    // A pass with animated values must leave the dirty marks, as the next stored pass starts again from the
     // last stored one.
     let mut moving = Vec::new();
     if fast && !stored {
@@ -5245,7 +5242,7 @@ pub(crate) fn cascade(
                     (share.rules.clone(), share.pseudos.clone(), 0)
                 } else {
                     matches.dependencies.clear();
-                    // WARNING: candidates come from the node's classes, so its matches always read them.
+                    // Candidates come from the node's classes, so its matches always read them.
                     matches.depend(id, 0);
                     matches.depend(id, 7);
                     candidates.clear();
@@ -5739,8 +5736,7 @@ pub(crate) fn cascade(
                 .entry(Prop::COLOR_SCHEME)
                 .or_insert((CascadeRank::default(), scheme.clone()));
         }
-        // WARNING: `transition` and `animation` stay shorthands here, and a longhand always wins over them
-        // later, so a stronger shorthand must remove the longhands it resets.
+        // Remove longhands reset by a stronger shorthand: longhands otherwise win during later expansion.
         for (shorthand, longhands) in [
             (
                 Prop::TRANSITION,
@@ -6084,7 +6080,7 @@ pub(crate) fn cascade(
             value => units.resolve(value, parent.em),
         }
         .filter(|size| size.is_finite() && *size >= 0.)
-        // WARNING: glyph rasterization allocates by font size, so huge sizes abort the process.
+        // Glyph rasterization allocates by font size, so huge sizes abort the process.
         .map(|size| size.min(10_000.))
         .unwrap_or(parent.em);
         let monospace = |style: Option<&Style>| {
@@ -6547,8 +6543,7 @@ pub(crate) fn cascade(
         if !effects.is_empty() {
             animations.insert(id, effects);
         }
-        // WARNING: frame caches compare styles by pointer, so reuse last frame's style when the values match, or
-        // rebuilt scopes lay out the whole page again.
+        // Reuse equal styles from the previous frame. Pointer changes invalidate layout caches.
         let units_bits = |units: &Lengths| {
             [units.font, units.root].map(|font| {
                 [font.em, font.ch, font.ex, font.cap, font.ic, font.lh]
@@ -6641,7 +6636,7 @@ pub(crate) fn cascade(
                     (contained || queried || deferred).then(|| seen.clone()),
                 ));
             }
-            // WARNING: the key doesn't hold the container, so styles with container units are not shared.
+            // The key doesn't hold the container, so styles with container units are not shared.
             if !queried && !deferred {
                 if !keyword && passed.is_some() {
                     key.inputs.parent = passed.map(|passed| (passed, false));
@@ -6867,7 +6862,7 @@ pub(crate) fn cascade(
             }
         }
     }
-    // WARNING: this adjusts styles after caching, so cached styles stay unadjusted.
+    // This adjusts styles after caching, so cached styles stay unadjusted.
     const SIDES: [[Prop; 4]; 4] = [
         [
             Prop::BORDER_TOP_STYLE,
@@ -7196,7 +7191,7 @@ pub(crate) fn cascade(
                 Rc::new(style)
             }
         };
-        // WARNING: writes only where the style changed, as each write copies a shared chunk of the styles.
+        // Writes only where the style changed, as each write copies a shared chunk of the styles.
         authored.reserve(adjusted.iter().map(|line| line.0.len()).sum::<usize>() + 1);
         for (id, own, style) in lines
             .iter()
@@ -7403,7 +7398,7 @@ const LOGICAL: [(Prop, Prop, Prop); 16] = [
     ),
 ];
 
-// WARNING: `var()` results stop at this many bytes, like in browsers, so references that fan out cannot grow exponentially.
+// `var()` results stop at this many bytes, like in browsers, so references that fan out cannot grow exponentially.
 const SUBSTITUTION_LIMIT: usize = 1 << 20;
 
 fn substitute(
@@ -7450,7 +7445,7 @@ fn substitute(
         {
             Some(resolved) => out.push_str(&resolved),
             None => match comma {
-                // WARNING: nested fallbacks recurse, and so do the references in them, so their depth is capped.
+                // Nested fallbacks recurse, and so do the references in them, so their depth is capped.
                 Some(comma)
                     if nesting < 32
                         && substitute(body[comma + 1..end].trim(), lookup, out, nesting + 1) => {}
@@ -7458,7 +7453,7 @@ fn substitute(
             },
         }
         rest = &body[end + 1..];
-        // WARNING: `var()` substitutes tokens, so `var(--a)var(--b)` stays two values.
+        // `var()` substitutes tokens, so `var(--a)var(--b)` stays two values.
         if out[mark..].starts_with(word) && out[..mark].ends_with(|c: char| word(c) || c == ')') {
             out.insert(mark, ' ');
         }
@@ -7624,7 +7619,7 @@ impl Substitution<'_> {
             _ => {
                 let mut value = Some(raw.clone());
                 if raw.contains("var(") {
-                    // WARNING: each nested reference recurses, so chains are invalid past this depth.
+                    // Each nested reference recurses, so chains are invalid past this depth.
                     if self.depth > 128 {
                         value = None;
                     } else {
@@ -7760,8 +7755,7 @@ fn resolve_style(
         if prop.is_custom() || !slot.contains("light-dark(") {
             return true;
         }
-        // WARNING: replacing each call in place is quadratic, so one pass marks the dropped text as
-        // ranges (+1 at the start, -1 at the end) and a second pass copies the rest.
+        // Mark removed ranges, then copy once. Repeated in-place replacements are quadratic.
         let bytes = slot.as_bytes();
         let mut dropped = vec![0i32; bytes.len() + 1];
         let mut open: Vec<(usize, Option<usize>, u32)> = Vec::new();
@@ -7944,8 +7938,8 @@ impl Declarations {
         self.resolved(false)
     }
 
-    // WARNING: interned names are never freed, and scripts can make any number of inline names, so inline
-    // styles drop unknown properties instead of interning them.
+    // Drop unknown inline properties before interning: scripts can create unlimited names, and interned names
+    // never free.
     fn resolved(&self, inline: bool) -> Style {
         let mut result = Style::new();
         for declaration in &self.0 {

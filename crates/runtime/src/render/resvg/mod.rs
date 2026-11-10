@@ -1,7 +1,7 @@
 // Copyright 2017 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-// WARNING: a copy of resvg 0.46.0 whose raster images decode through `render::image`, so it must stay in
+// A copy of resvg 0.46.0 whose raster images decode through `render::image`, so it must stay in
 // step with the usvg version.
 
 #![allow(clippy::field_reassign_with_default)]

@@ -172,7 +172,7 @@ impl Database {
         Ok(db)
     }
     fn query(&self, source: &str, parameters: &[&str]) -> Result<Vec<Vec<Option<String>>>> {
-        // WARNING: a cached statement holds its read lock and bound values until it is reset.
+        // A cached statement holds its read lock and bound values until it is reset.
         struct Statement(*mut sql::sqlite3_stmt);
         impl Drop for Statement {
             fn drop(&mut self) {
@@ -252,8 +252,7 @@ impl Database {
     }
 }
 
-// WARNING: the bytes must sort like the keys: numbers, dates, strings, binary, then arrays. String and binary units
-// never start with 0, so a 0 byte ends them.
+// Preserve key order: numbers, dates, strings, binary, arrays. Zero terminates string and binary units.
 fn encode_key(key: &Value, out: &mut Vec<u8>) -> Result<()> {
     let unit = |out: &mut Vec<u8>, unit: u32| {
         if unit < 0x7f {
@@ -363,7 +362,7 @@ fn decode_key(bytes: &[u8], at: &mut usize) -> Option<Value> {
     })
 }
 
-// WARNING: the stored form of an IndexedDB key: hex keeps the byte order in a TEXT column.
+// The stored form of an IndexedDB key: hex keeps the byte order in a TEXT column.
 fn hex_key(wire: &str) -> Result<String> {
     let mut bytes = Vec::new();
     encode_key(&serde_json::from_str(wire)?, &mut bytes)?;
@@ -390,8 +389,8 @@ type SessionKey = (String, u64);
 type Session = (usize, BTreeMap<String, String>);
 static SESSIONS: OnceLock<Mutex<HashMap<SessionKey, Session>>> = OnceLock::new();
 static WAITING: Mutex<Vec<crate::host::Waker>> = Mutex::new(Vec::new());
-// WARNING: SQLite doesn't wait for a connection that switches the journal mode, whatever the busy
-// timeout, and each window opens its databases on its own thread.
+// Serialize journal-mode changes: SQLite ignores the busy timeout for them, and windows open databases on
+// separate threads.
 static SETUP: Mutex<()> = Mutex::new(());
 struct Transaction {
     database: Database,
@@ -570,7 +569,7 @@ impl State {
             let db = self.local_database.as_ref().unwrap();
             let key = args[0].as_str().unwrap_or("");
             if matches!(op, "keys" | "length" | "key") {
-                // WARNING: other connections can change the keys, and `data_version` only moves for their commits.
+                // Other connections can change the keys, and `data_version` only moves for their commits.
                 let version = db
                     .query("PRAGMA data_version", &[])?
                     .into_iter()
@@ -657,7 +656,7 @@ impl State {
                     "deleteStore"=>{tx.database.query("DELETE FROM entries WHERE db=? AND store=?",&[&tx.name,store])?;tx.database.query("DELETE FROM stores WHERE db=? AND name=?",&[&tx.name,store])?;},
                     "deleteDatabase"=>{tx.database.query("DELETE FROM entries WHERE db=?",&[&tx.name])?;tx.database.query("DELETE FROM stores WHERE db=?",&[&tx.name])?;tx.database.query("DELETE FROM databases WHERE name=?",&[&tx.name])?;},
                     "scan"|"delete"=>{
-                        // WARNING: stored keys never prefix each other, so a key with `00` appended is the smallest key above it.
+                        // Stored keys never prefix each other, so a key with `00` appended is the smallest key above it.
                         let bound=|index:usize,after:bool,end:&str|args[index].as_str().map_or(Ok(end.to_owned()),|key|hex_key(key).map(|mut hex|{if after{hex.push_str("00")}hex}));
                         let (lower,upper)=(bound(2,args[4]==true,"")?,bound(3,args[5]!=true,"z")?);
                         let range=[tx.name.as_str(),store,&lower,&upper];

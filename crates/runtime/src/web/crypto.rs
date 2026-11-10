@@ -168,8 +168,8 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
             let iv = bytes(&args[1])?;
             let aad = bytes(&args[2])?;
             let mut data = bytes(&args[3])?;
-            // WARNING: ring reads the tag from the last 16 bytes, so a separate tag must be exactly that long, or a short
-            // tag would authenticate a truncated message.
+            // Require a 16-byte tag. ring reads the last 16 bytes, so a shorter tag could authenticate a
+            // truncated message.
             if op == "decrypt" && !args[4].is_null() {
                 let tag = bytes(&args[4])?;
                 ensure!(

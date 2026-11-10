@@ -164,7 +164,7 @@ mod missing {
 use missing::*;
 
 static PLAYING: [AtomicPtr<Sound>; 64] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 64];
-// WARNING: odd while the audio callback reads `PLAYING`, so a removed sound is freed only after that read ends.
+// Odd while the audio callback reads `PLAYING`. Do not free removed sounds until that read ends.
 static MIXING: AtomicU64 = AtomicU64::new(0);
 
 fn ticks(at: Instant) -> u64 {
@@ -173,14 +173,13 @@ fn ticks(at: Instant) -> u64 {
         .as_nanos() as u64
 }
 
-// WARNING: only the decoder writes samples and only the audio callback reads them, through a ring of atomic samples,
-// so neither waits for the other.
+// Only the decoder writes samples. Only the audio callback reads them. Neither can wait for the other.
 struct Sound {
     ring: OnceLock<(Box<[AtomicU32]>, usize)>,
     write: AtomicUsize,
     read: AtomicUsize,
-    // WARNING: samples before `skip` were dropped by a seek. Only the reader moves `read`: the audio callback, or
-    // `drop_played` when there is no output.
+    // Samples before `skip` are stale after a seek. Only the audio callback, or `drop_played` without output,
+    // can advance `read`.
     skip: AtomicUsize,
     gain: AtomicU32,
     played: [AtomicU64; 3],
@@ -218,7 +217,7 @@ impl Sound {
         self.write.load(Acquire) - self.read.load(Acquire).max(self.skip.load(Acquire))
     }
 
-    // WARNING: runs on the audio callback: no locks, allocations or frees.
+    // Runs on the audio callback: no locks, allocations or frees.
     fn mix(&self, out: &mut [f32], now: u64) {
         let Some((ring, _)) = self.ring.get() else {
             return;
@@ -286,7 +285,7 @@ impl Sound {
         clock.speed = speed.unwrap_or(clock.speed);
     }
 
-    // WARNING: call with the player's state lock held, or the decoder can queue samples of the old position.
+    // Hold the state lock to prevent the decoder from queuing samples at the old position.
     fn flush(&self) {
         lock(&self.clock).marks.clear();
         self.skip.store(self.write.load(Acquire), Release);
@@ -319,8 +318,7 @@ impl Sound {
         count
     }
 
-    // WARNING: call only without an audio output, since this moves `read`, which otherwise only the audio callback
-    // does.
+    // Call only without audio output. Otherwise, the audio callback owns `read`.
     fn drop_played(&self) {
         let Some((_, channels)) = self.ring.get() else {
             return;
@@ -377,11 +375,11 @@ fn mixer() -> Option<&'static Mixer> {
     MIXER
         .get_or_init(|| {
             use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-            // WARNING: sets the time base here, so the audio callback never waits to set it.
+            // Sets the time base here, so the audio callback never waits to set it.
             ticks(Instant::now());
             let (ready, config) = mpsc::channel();
             let (control, commands) = mpsc::channel::<bool>();
-            // WARNING: cpal streams are not `Send` on every platform, so one thread owns the stream for the app's life.
+            // cpal streams are not `Send` on every platform, so one thread owns the stream for the app's life.
             std::thread::Builder::new()
                 .name("apps-audio".into())
                 .spawn(move || {
@@ -729,7 +727,7 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
                     audio_end = time + (samples.len() / channels) as f64 * step;
                     let state = lock(&shared.state);
                     if state.generation == generation && !samples.is_empty() {
-                        // WARNING: FFmpeg reuses the sample buffer, so what doesn't fit in the ring waits in a copy.
+                        // FFmpeg reuses the sample buffer, so what doesn't fit in the ring waits in a copy.
                         let taken = sound.push(samples, time, step);
                         pending.extend_from_slice(&samples[taken..]);
                         (pending_time, pending_step) =
@@ -945,8 +943,7 @@ pub unsafe extern "C" fn apps_media_control(media: *mut c_void, id: u64, op: u32
             let gain = if player.muted { 0. } else { player.volume };
             shared.sound.gain.store(gain.to_bits(), Relaxed);
         }
-        // WARNING: the resampler rate is the output rate divided by the speed as an int, so speeds stay in 1/16 to 16,
-        // like Chromium.
+        // Keep speed within 1/16 to 16 so the integer resampler rate stays valid.
         SPEED if value > 0. && value.is_finite() => {
             let value = value.clamp(1. / 16., 16.);
             state.speed = Some(value);

@@ -171,7 +171,7 @@ globalThis.__appsPlatform = (call, node, codec) => {
   const rejections = new WeakMap(), nativeThen = Promise.prototype.then;
   let tracking = false;
   globalThis.__appsRejection = (promise, reason) => {
-    // WARNING: a custom `then` slows every promise in JSC, so it is installed only after the first rejection.
+    // A custom `then` slows every promise in JSC, so it is installed only after the first rejection.
     if (!tracking) {
       tracking = true;
       Object.defineProperty(Promise.prototype, 'then', { configurable: true, writable: true, value: function then(onFulfilled, onRejected) {

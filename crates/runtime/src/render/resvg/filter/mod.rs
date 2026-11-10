@@ -106,8 +106,7 @@ impl PixmapExt for tiny_skia::Pixmap {
     }
 }
 
-// WARNING: demultiplies, maps and multiplies in one pass with resvg's f32 rounding. Alpha 0 always gives 0 and
-// alpha 255 only maps.
+// Preserve resvg's f32 rounding across demultiply, map and multiply. Alpha 0 stays zero. Alpha 255 only maps.
 fn convert(data: &mut [RGBA8], table: &[u8; 256]) {
     for p in data {
         match p.a {
@@ -256,8 +255,7 @@ impl Image {
         }
     }
 
-    // WARNING: an input of another size is drawn at the top left of a transparent `width` x `height` image, as
-    // `draw_pixmap` did, because the per-pixel primitives need equal sizes.
+    // Pad differently sized inputs at the top left: per-pixel filters need equal dimensions.
     fn fit(self, width: u32, height: u32) -> Result<Self, Error> {
         if self.width() == width && self.height() == height {
             return Ok(self);
@@ -294,7 +292,6 @@ pub fn apply(
     source: &mut tiny_skia::Pixmap,
 ) {
     let (width, height) = (source.width(), source.height());
-    // WARNING: the source moves into an `Rc`, so inputs share it and an unchanged result moves back without a copy.
     let Some(empty) = tiny_skia::Pixmap::new(1, 1) else {
         return;
     };
@@ -421,8 +418,8 @@ fn apply_inner(
 
             let color_space = result.color_space;
 
-            // WARNING: clears the same 4 bands as resvg's `fill_rect` calls did, which miss part of the outside
-            // when the subregion lies past the region.
+            // Preserve resvg's four-band clearing, including its incomplete coverage when the subregion
+            // exceeds the region.
             let mut pixmap = result.take()?;
             let (w, h) = (pixmap.width() as i32, pixmap.height() as i32);
             let span = |start: i32, end: i32, size: i32| {
@@ -555,7 +552,7 @@ fn apply_drop_shadow(
         fe.color().blue,
         fe.opacity().to_u8(),
     );
-    // WARNING: a shadow pixel depends only on its alpha, so the 256 alphas go through the color steps once.
+    // Precompute the 256 alpha results: shadow colors depend only on alpha.
     let mut table = tiny_skia::Pixmap::try_create(256, 1)?;
     for (alpha, p) in table.pixels_mut().iter_mut().enumerate() {
         let mut color = color;
@@ -1023,7 +1020,7 @@ fn resolve_std_dev(std_dx: f32, std_dy: f32, ts: usvg::Transform) -> Option<(f64
         return None;
     }
 
-    // WARNING: tiny sigmas are dropped, because the IIR blur turns them into a transparent image.
+    // Tiny sigmas are dropped, because the IIR blur turns them into a transparent image.
     if std_dx < 0.05 {
         std_dx = 0.0;
     }

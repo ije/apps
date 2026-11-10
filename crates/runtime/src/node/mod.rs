@@ -40,7 +40,7 @@ pub(crate) fn on_exit(child: Exit, done: impl FnOnce() + Send + 'static) -> std:
     std::thread::Builder::new()
         .name("apps-exit".into())
         .spawn(move || {
-            // WARNING: WNOWAIT keeps the zombie, so the PID cannot be reused while this waits.
+            // WNOWAIT keeps the zombie, so the PID cannot be reused while this waits.
             #[cfg(unix)]
             while unsafe {
                 let mut info = std::mem::zeroed();
@@ -420,7 +420,7 @@ impl State {
                     .codecs
                     .get_mut(&args[0].as_u64().context("Expected zlib ID")?)
                 {
-                    // WARNING: zlib-rs cannot switch to a level with another match strategy mid-stream, so such a change keeps the old level.
+                    // zlib-rs cannot switch to a level with another match strategy mid-stream, so such a change keeps the old level.
                     let _ = encoder.set_level(flate2::Compression::new(
                         args[1].as_u64().filter(|level| *level <= 9).unwrap_or(6) as u32,
                     ));
@@ -449,7 +449,7 @@ impl State {
                         mpsc::Sender<crate::jsc::payload::Payload>,
                         crate::host::Waker,
                     );
-                    // WARNING: the handler may only write to a non-blocking pipe; a thread turns each byte into `resize` events.
+                    // The handler may only write to a non-blocking pipe; a thread turns each byte into `resize` events.
                     static PIPE: AtomicI32 = AtomicI32::new(-1);
                     static SUBSCRIBERS: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
                     extern "C" fn resized(_: libc::c_int) {

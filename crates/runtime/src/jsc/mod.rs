@@ -190,7 +190,7 @@ pub fn library_path(executable: &Path, platform: &str) -> Result<PathBuf> {
         .parent()
         .context("Missing executable directory")?;
     let name = library_name(platform)?;
-    // WARNING: a built app must never load a library named by the environment or the build machine.
+    // A built app must never load a library named by the environment or the build machine.
     if [
         "app.bundle",
         "app.js",
@@ -249,18 +249,18 @@ impl JavaScriptCore {
         unsafe {
             let group_create: unsafe extern "C" fn() -> Ptr =
                 *library.get(b"JSContextGroupCreate\0")?;
-            // WARNING: JSC reads its options from the environment once, when the first group is created. `set_var` is
-            // sound here only because the first load runs before other threads start.
+            // Set JSC options before the first group and before other threads start. Only then is set_var
+            // sound.
             static OPTIONS: std::sync::Once = std::sync::Once::new();
             let mut group = None;
             OPTIONS.call_once(|| {
                 std::env::set_var("JSC_useSharedArrayBuffer", "1");
-                // WARNING: with 16 GB of RAM or more, a heap may grow to about 4x its live size before a full GC. This makes it about 2x.
+                // Limit heap growth to about 2x live size instead of 4x on machines with at least 16 GB.
                 std::env::set_var("JSC_heapGrowthMaxIncrease", "1");
-                // WARNING: JSC's incremental sweeper runs on a timer that the generic event loop never fires, so
-                // without a sweep after each collection dead cells keep hundreds of MB.
+                // Sweep after each collection: JSC's timer never fires on the generic event loop, leaving
+                // dead cells resident.
                 std::env::set_var("JSC_sweepSynchronously", "1");
-                // WARNING: in JSC's cell cage every block the heap holds stays resident. AOT images use wide
+                // In JSC's cell cage every block the heap holds stays resident. AOT images use wide
                 // references, which need no cage.
                 std::env::set_var("JSC_markedBlockCageSizeInMB", "0");
                 let _ = aot::load(&path);
@@ -419,8 +419,8 @@ impl JavaScriptCore {
         self.shrink.is_some() && self.busy.get() >= std::time::Duration::from_millis(20)
     }
 
-    // WARNING: JSC's GC timers don't fire on the generic event loop, so the runtime collects itself. A collection drops
-    // compiled code and costs much CPU, so the timers and polls that apps always have must not trigger it.
+    // JSC's GC timers never fire here. Ignore idle polls and timers when scheduling costly collections that
+    // discard compiled code.
     pub(crate) fn shrink_due(&self) -> bool {
         use std::time::Duration;
         let (now, busy) = (std::time::Instant::now(), self.busy.get());
@@ -459,7 +459,7 @@ impl Drop for JavaScriptCore {
     }
 }
 
-// WARNING: the bytecode is never freed, because decoded code points into it.
+// The bytecode is never freed, because decoded code points into it.
 fn create_bytecode(
     api: &JavaScriptCore,
     ctx: Ptr,
@@ -591,12 +591,12 @@ thread_local! {
     static ARMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INSPECTED: RefCell<rustc_hash::FxHashMap<usize, Ptr>> = RefCell::default();
     static INSPECTOR_MESSAGES: RefCell<Vec<(usize, String)>> = const { RefCell::new(Vec::new()) };
-    // WARNING: the render loop sets this, so engines without windows, like the CLI's, don't link the renderer.
+    // The render loop sets this, so engines without windows, like the CLI's, don't link the renderer.
     pub(crate) static REFLOW: std::cell::Cell<Option<fn(u64)>> = const { std::cell::Cell::new(None) };
     pub(crate) static CLIPBOARD: std::cell::Cell<Option<Clipboard>> = const { std::cell::Cell::new(None) };
-    // WARNING: the render thread sets this, because only the main thread can make native calls.
+    // The render thread sets this, because only the main thread can make native calls.
     pub(crate) static NATIVE: std::cell::Cell<Option<NativeCall>> = const { std::cell::Cell::new(None) };
-    // WARNING: the render thread must stop before statics go, so the main thread sets this.
+    // The render thread must stop before statics go, so the main thread sets this.
     pub(crate) static BEFORE_EXIT: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
     static RUN_TICKS: std::cell::Cell<(std::time::Duration, u32)> = const { std::cell::Cell::new((std::time::Duration::ZERO, 0)) };
 }
@@ -616,7 +616,7 @@ fn bridge(
     unsafe {
         (api.string_release)(name);
     }
-    // WARNING: JSC casts call targets to objects without checking, so a primitive would crash.
+    // JSC casts call targets to objects without checking, so a primitive would crash.
     anyhow::ensure!(
         error.is_null()
             && unsafe { (api.value_type)(context, receiver) } == 5
@@ -746,7 +746,7 @@ unsafe extern "C" fn compile(
     let Some((api, host, role)) = binding else {
         return ptr::null_mut();
     };
-    // WARNING: without jsExecute, pages compile only while Rust evaluates one of their own scripts, never from later strings.
+    // Without jsExecute, pages compile only while Rust evaluates one of their own scripts, never from later strings.
     if matches!(role, Role::Renderer(_))
         && ARMED.get() != ctx as usize
         && !host
@@ -784,7 +784,7 @@ unsafe extern "C" fn compile(
     result
 }
 
-// WARNING: this runs only scripts of the app bundle, by name, and never arms code generation.
+// This runs only scripts of the app bundle, by name, and never arms code generation.
 unsafe extern "C" fn chunk(
     ctx: Ptr,
     _function: Ptr,
@@ -840,8 +840,8 @@ unsafe extern "C" fn chunk(
         }
     }
     let url = api.string(&format!("apps:///{name}"));
-    // WARNING: JSC reads these bytes in place, so they are never released. `JSEvaluateScript` would copy the source
-    // instead, as UTF-16 if it has a NUL or a non-ASCII byte.
+    // Keep these bytes alive for JSC. JSEvaluateScript copies source and uses UTF-16 for NUL or non-ASCII
+    // input.
     let result = if let Some(evaluate) = api.evaluate_latin1
         && source.is_ascii()
     {
@@ -873,8 +873,7 @@ unsafe extern "C" fn chunk(
     result
 }
 
-// WARNING: turns the `\udXXX` escapes that `JSON.stringify` writes for lone surrogates into `\ufffd`
-// in place, because serde_json rejects them.
+// Replace lone-surrogate escapes with \ufffd: serde_json rejects them.
 fn well_formed(json: &mut str) {
     let mut from = 0;
     while let Some(at) = json.get(from..).and_then(|rest| rest.find('\\')) {
@@ -896,8 +895,8 @@ const PAGE: u8 = 4;
 const NODE: u8 = MAIN | PRELOAD;
 const ALL: u8 = NODE | PAGE;
 
-// WARNING: deny by default: a host operation that no row names is unavailable. The first row that matches
-// wins, and a name that ends with `.` matches a prefix. Modules keep their own checks as a backstop.
+// Deny unlisted host operations. The first match wins. A trailing `.` matches prefixes. Keep module-level
+// checks too.
 const ACCESS: &[(&str, u8)] = &[
     ("log", ALL),
     ("bridge.dispatch", ALL),
@@ -1027,7 +1026,7 @@ unsafe extern "C" fn call(
             return result;
         }
         let role = binding.2;
-        // WARNING: a forced layout builds the page, which borrows the host, so it runs before any borrow.
+        // A forced layout builds the page, which borrows the host, so it runs before any borrow.
         if let Role::Renderer(id) = role
             && op == "dom.reflow"
         {
@@ -1095,7 +1094,7 @@ unsafe extern "C" fn call(
                 2 => Value::Bool(unsafe { (api.to_boolean)(ctx, value) }),
                 3 => {
                     let number = unsafe { (api.to_number)(ctx, value, ptr::null_mut()) };
-                    // WARNING: this matches `JSON.stringify` and serde, so ops see the same integers and non-finite numbers become null.
+                    // This matches `JSON.stringify` and serde, so ops see the same integers and non-finite numbers become null.
                     if number.fract() == 0. && number.abs() < 1e21 {
                         if (0. ..18446744073709551616.).contains(&number) {
                             Value::from(number as u64)
@@ -1111,7 +1110,7 @@ unsafe extern "C" fn call(
                 4 => Value::String(api.text(ctx, value)),
                 5 if unsafe { (api.is_function)(ctx, value) } => Value::Null,
                 5 => {
-                    // WARNING: these bytes are not static: they borrow the arguments, which live only until the call
+                    // These bytes are not static: they borrow the arguments, which live only until the call
                     // returns.
                     buffers.push(bytes::Bytes::from_static(crate::jsc::payload::view(
                         &api, ctx, value,
@@ -1421,7 +1420,7 @@ fn dispatch(
         }
         Ok(serde_json::Value::Null)
     } else if let (Role::Renderer(id), "dom.open") = (role, op) {
-        // WARNING: main runs these with page data, so only these shapes and `<webview>` methods pass.
+        // Main runs these with page data, so only these shapes and `<webview>` methods pass.
         let data = &values[3];
         let valid = match (values[0].as_str(), values[1].as_str()) {
             (Some("open"), _) => (1..5).all(|index| values[index].is_string()),
@@ -1475,7 +1474,7 @@ fn dispatch(
             .ask(|answer| crate::desktop::link::ToMain::Open(id, args.clone(), answer))?
             .into_value())
     } else if let (Role::Renderer(_), "dom.clipboard") = (role, op) {
-        // WARNING: `execCommand` checks for user input before it calls this.
+        // `execCommand` checks for user input before it calls this.
         Ok(CLIPBOARD
             .get()
             .and_then(|clipboard| clipboard(values[0].as_str().map(str::to_owned)))
@@ -1487,8 +1486,7 @@ fn dispatch(
     }
 }
 
-// WARNING: JSC cannot see the native DOM, so without this report the wrappers of removed nodes wait for an unrelated
-// GC, and pages that rebuild rows grow without bound.
+// Account for native DOM memory so removed wrappers trigger GC before row churn exhausts memory.
 fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
     let created = binding
         .1
@@ -1498,8 +1496,7 @@ fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
     if let Some(report) = binding.0.extra_memory
         && let Some(created) = created.filter(|&created| created > 0)
     {
-        // WARNING: report only nodes with wrappers. JSC drops this cost only in a full collection, so counting all
-        // nodes makes pages that rebuild rows each frame run many full GCs a second.
+        // Count only wrapped nodes: JSC resets this cost only after a full GC.
         unsafe { report(ctx, created * 65536) };
     }
 }
@@ -1507,7 +1504,7 @@ fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
 fn gpu(binding: &Binding, ctx: Ptr, id: u64, op: &str, args: &[u8]) -> Result<serde_json::Value> {
     let mut host = binding.1.try_borrow_mut().context("Host is busy")?;
     let result = host.gpu(id, op, args);
-    // WARNING: JSC cannot see GPU memory, so wrappers that own it would wait for an unrelated GC.
+    // JSC cannot see GPU memory, so wrappers that own it would wait for an unrelated GC.
     if let Some(report) = binding.0.extra_memory
         && let Some(gpu) = host.graphics.get_mut(&id)
         && let bytes = gpu.take_allocated()
@@ -1520,8 +1517,7 @@ fn gpu(binding: &Binding, ctx: Ptr, id: u64, op: &str, args: &[u8]) -> Result<se
 }
 
 fn buffer(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes, typed: bool) -> Ptr {
-    // WARNING: like Bun, small results are copied into memory that JSC owns: an external buffer costs more to make and
-    // to free, and the GC can't count it.
+    // Copy small results into JSC memory. External buffers cost more and escape GC accounting.
     if typed
         && bytes.len() <= 16384
         && let Ok((array, out)) = api.uint8_array(ctx, bytes.len())
@@ -1564,7 +1560,7 @@ fn output(api: &JavaScriptCore, ctx: Ptr, payload: crate::jsc::payload::Payload)
                         .iter()
                         .all(|value| !value.is_array() && !value.is_object()) =>
             {
-                // WARNING: the items stay on the stack, where JSC's conservative scan keeps them alive.
+                // The items stay on the stack, where JSC's conservative scan keeps them alive.
                 let mut items = [ptr::null_mut(); 32];
                 let count = values.len();
                 for (item, value) in items.iter_mut().zip(values) {
@@ -1733,7 +1729,7 @@ fn call_json<T>(
             let value = unsafe { (api.json_value)(ctx, text) };
             unsafe {
                 (api.string_release)(text);
-                // WARNING: values kept in a heap Vec are invisible to JSC's stack scan.
+                // Values kept in a heap Vec are invisible to JSC's stack scan.
                 (api.protect)(ctx, value);
             }
             value
@@ -1780,7 +1776,7 @@ unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
     let (Role::Renderer(id) | Role::Preload(id)) = role else {
         return false;
     };
-    // WARNING: the limit ends with this call, so a script that goes on needs a new one.
+    // The limit ends with this call, so a script that goes on needs a new one.
     let again = || {
         if let Some(limit) = api.execution_limit {
             unsafe { limit(api.group, PAGE_TICK, Some(page_limit), ptr::null_mut()) };
@@ -1793,8 +1789,8 @@ unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
     if !matches!(role, Role::Renderer(_)) {
         return again();
     }
-    // WARNING: JSC doesn't say which run a tick belongs to and restarts its budget per run, so ticks count per value of
-    // `busy`, which changes only when a run returns.
+    // Count watchdog ticks per busy value: JSC resets its budget per run but does not identify each tick's
+    // run.
     let busy = api.busy.get();
     let ticks = match RUN_TICKS.get() {
         (last, ticks) if last == busy => ticks + 1,
@@ -1846,7 +1842,7 @@ struct Interrupt {
     limit: unsafe extern "C" fn(Ptr, f64, Option<unsafe extern "C" fn(Ptr, Ptr) -> bool>, Ptr),
 }
 
-// WARNING: bundles run one entry script per call of this source, so callers loop until it returns `false`.
+// Bundles run one entry script per call of this source, so callers loop until it returns `false`.
 pub(crate) const NEXT: &str = "this.__appsNext?.()";
 
 pub struct JsContext {
@@ -1927,7 +1923,7 @@ impl JsContext {
         } else if matches!(role, Role::Renderer(_))
             && let Some(limit) = engine.api.execution_limit
         {
-            // WARNING: the limit is per context group, which every engine of this thread shares.
+            // The limit is per context group, which every engine of this thread shares.
             unsafe {
                 limit(
                     engine.api.group,
@@ -1990,7 +1986,7 @@ impl JsContext {
             let name = engine.api.string("__appsCompile");
             unsafe {
                 let callback = (engine.api.function)(ctx, name, compile);
-                // WARNING: pages get the compiler only as `this` of their own scripts, see `eval_page`.
+                // Pages get the compiler only as `this` of their own scripts, see `eval_page`.
                 let target = if matches!(role, Role::Renderer(_)) {
                     engine.scope = (engine.api.object_make)(ctx, ptr::null_mut(), ptr::null_mut());
                     (engine.api.protect)(ctx, engine.scope);
@@ -2023,7 +2019,7 @@ impl JsContext {
             (engine.api.set)(ctx, target, name, callback, 0, ptr::null_mut());
             (engine.api.string_release)(name);
         }
-        // WARNING: bootstrap scripts call into the host, so the host is only borrowed per check.
+        // Bootstrap scripts call into the host, so the host is only borrowed per check.
         let enabled = |feature| host.borrow().enabled(feature);
         let disabled: Vec<_> = crate::bundle::FEATURES
             .iter()
@@ -2204,7 +2200,7 @@ impl JsContext {
     }
 
     fn evaluate(&self, source: &str, url: &str, this: Ptr) -> Result<String> {
-        // WARNING: `NEXT` runs under the URL of the script it continues, so it must not replace that script's source.
+        // `NEXT` runs under the URL of the script it continues, so it must not replace that script's source.
         if self.devtools
             && source != NEXT
             && (matches!(url, "app.js" | "apps:page" | "apps:preload") || !url.starts_with("apps:"))
@@ -2355,14 +2351,15 @@ impl JsContext {
             napi.sweep();
             napi.drain();
         }
-        // WARNING: -2 means one macrotask ran. Run one per call, so the VM drains the microtasks between them.
+        // Run one macrotask per call so JSC drains microtasks between tasks. -2 signals a completed
+        // macrotask.
         loop {
             let delay = call_json(&self.api, self.ctx, "__appsTick", &[], |value| unsafe {
                 (self.api.to_number)(self.ctx, value, ptr::null_mut())
             })
             .inspect_err(|error| self.log("apps:tick", &error.to_string()))?;
             if delay != -2. {
-                // WARNING: delays can be fractional, so round up or the loop wakes before the timer is due.
+                // Delays can be fractional, so round up or the loop wakes before the timer is due.
                 return Ok(if delay.is_finite() {
                     delay.ceil() as i64
                 } else {
@@ -2389,7 +2386,7 @@ impl JsContext {
             .iter_mut()
             .find(|script| script.0 == entry)
         {
-            // WARNING: JSC reads the main script in place, from its bytecode, so it stays for the rest of the process.
+            // JSC reads the main script in place, from its bytecode, so it stays for the rest of the process.
             script.1 = Box::leak(source.into_owned().into_boxed_str());
             source = std::borrow::Cow::Borrowed(script.1);
         }
@@ -2461,7 +2458,7 @@ impl Drop for JsContext {
             INSPECTED.with_borrow_mut(|inspected| inspected.remove(&(self.ctx as usize)))
             && let Some(inspector) = &self.api.inspector
         {
-            // WARNING: a connected inspector keeps the global object alive.
+            // A connected inspector keeps the global object alive.
             unsafe { (inspector.disconnect)(self.ctx, connection) };
         }
         unsafe {
@@ -2665,7 +2662,7 @@ mod tests {
     fn runaway_page_scripts_stop_but_main_keeps_running() {
         let api = JavaScriptCore::load().unwrap();
         let host = Rc::new(RefCell::new(Host::default()));
-        // WARNING: the stop list is global, so this page has an id no other test uses.
+        // The stop list is global, so this page has an id no other test uses.
         host.borrow_mut().pages.insert(
             900,
             crate::host::Page {

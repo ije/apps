@@ -254,7 +254,7 @@ impl TextSystem {
     pub fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
         let mut state = self.0.borrow_mut();
         let result = if text.contains(['\u{2028}', '\u{2029}']) {
-            // WARNING: DirectWrite breaks lines at these even without wrapping, so each part is laid out alone.
+            // DirectWrite breaks lines at these even without wrapping, so each part is laid out alone.
             let mut layout = LineLayout {
                 font_size,
                 len: text.len(),
@@ -529,7 +529,7 @@ impl State {
                 if index > 0 {
                     layout.SetFontCollection(&font.collection, range)?;
                     layout.SetFontFamilyName(&font.family, range)?;
-                    // WARNING: alternating sizes by one ulp keeps ligatures from forming across runs.
+                    // Alternating sizes by one ulp keeps ligatures from forming across runs.
                     layout.SetFontSize(
                         if index % 2 == 1 {
                             run.font_size.0.next_up()

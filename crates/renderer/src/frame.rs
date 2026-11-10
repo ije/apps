@@ -217,7 +217,7 @@ impl RenderFrame {
             self.record_layer(scene, layer, target, true, 1);
             self.promoted.push((layer, target, region));
         }
-        // WARNING: shelf textures grow while the frame is recorded, so composites read their final size.
+        // Shelf textures grow while the frame is recorded, so composites read their final size.
         if !self.shelves.is_empty() {
             for command in 0..self.commands.len() {
                 if let Command::Composite { src, index, .. } = self.commands[command] {
@@ -328,7 +328,7 @@ impl RenderFrame {
         let size = self
             .window
             .map(|value| (value.div_ceil(256) * 256).min(self.max_texture as u32) as i32);
-        // WARNING: A transparent pixel around each tile keeps filtering from reading the next tile.
+        // A transparent pixel around each tile keeps filtering from reading the next tile.
         let (w, h) = (region[2] + 2, region[3] + 2);
         if w > size[0] / 2 || h > size[1] / 2 {
             return None;
@@ -354,7 +354,7 @@ impl RenderFrame {
             (shelf.x, shelf.y, shelf.row) = (0, shelf.y + shelf.row, 0);
         }
         if shelf.y + h > size[1] {
-            // WARNING: the waiting tiles must be drawn before the texture is cleared for reuse.
+            // The waiting tiles must be drawn before the texture is cleared for reuse.
             (shelf.x, shelf.y, shelf.row) = (0, 0, 0);
             clear = true;
             self.flush(target, depth);
@@ -632,7 +632,7 @@ impl RenderFrame {
         let Some(region) = self.region(content, reach) else {
             return;
         };
-        // WARNING: tiles must hold all their content, since drawing past a tile would reach the next one.
+        // Tiles must hold all their content, since drawing past a tile would reach the next one.
         let whole = Some(region)
             == self.region(content, [f32::MIN, f32::MIN, f32::INFINITY, f32::INFINITY]);
         let tile = (!copies && !blurs && whole)

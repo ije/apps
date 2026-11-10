@@ -262,7 +262,7 @@
       this._drawn = true; this.canvas._pump?.();
       return this._texture;
     }
-    // WARNING: reads like `drawImage()` block here for up to 100 ms, because the last frame is still on its way to the CPU.
+    // Reads like `drawImage()` block here for up to 100 ms, because the last frame is still on its way to the CPU.
     _flush() { if (this._drawn) { this._drawn = false; call('dom.canvasCommit', this._node, true); } }
     _resize() { if (this._texture) garbage.unregister(this._texture); this._texture = null; call('gpu.resetCanvas', this._node); }
   }

@@ -90,8 +90,8 @@ windows = { version = "0.62", features = [
 windows-core = "0.62"
 xkbcommon = { version = "0.8", default-features = false }
 
-# WARNING: oxc_react_compiler comes from git, so its oxc crates must be the crates.io ones that the bundler uses.
-# It stays above [patch.crates-io], because Rust apps copy the rest of this file.
+# Use the bundler's crates.io oxc dependencies for oxc_react_compiler. Keep this above [patch.crates-io],
+# which Rust apps copy.
 [patch."https://github.com/oxc-project/oxc"]
 oxc_allocator = "=0.155.0"
 oxc_ast = "=0.155.0"
@@ -109,7 +109,7 @@ oxc_syntax = "=0.155.0"
 
 [patch.crates-io]
 calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
-# WARNING: this fork avoids a panic when a failed EGL call reports EGL_SUCCESS.
+# This fork avoids a panic when a failed EGL call reports EGL_SUCCESS.
 khronos-egl = { git = "https://github.com/zed-industries/khronos-egl", rev = "42214b36347b108fd9630ca6254b96dde59e04fe" }
 
 [profile.release]
@@ -121,7 +121,7 @@ panic = "abort"
 [profile.release.package.apps-runtime]
 opt-level = 2
 
-# WARNING: these crates build for size to keep the runtime under 10 MB. None of them runs per frame.
+# Optimize these crates for size. None runs per frame.
 
 [profile.release.package.apps-webview]
 opt-level = "s"
@@ -210,6 +210,6 @@ opt-level = "s"
 [profile.release.package.data-url]
 opt-level = "s"
 
-# WARNING: avif-parse asserts on truncated input before returning its decoding error.
+# avif-parse asserts on truncated input before returning its decoding error.
 [profile.dev.package.avif-parse]
 debug-assertions = false

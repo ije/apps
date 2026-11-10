@@ -58,8 +58,8 @@ pub(crate) struct LayoutNode {
     pub marks: u16,
 }
 
-// WARNING: page JS reads this buffer by fixed offsets: 4 header floats (stale, capacity, layout count, moved), 8 floats
-// per node, then one `MIRROR_*` byte per node.
+// Match the JS buffer layout: 4 header floats (stale, capacity, layout count, moved), 8 floats per node, then
+// MIRROR_* bytes.
 #[derive(Default)]
 pub struct LayoutMirror {
     memory: Option<Arc<MirrorMemory>>,
@@ -234,7 +234,7 @@ impl LayoutMirror {
                     self.capacity,
                 );
                 *memory.as_ptr().add(2) = *old.0.as_ptr().add(2);
-                // WARNING: pages keep reading the old buffer until they see this flag and fetch the new one.
+                // Pages keep reading the old buffer until they see this flag and fetch the new one.
                 *old.0.as_ptr() = 1.;
             }
         }
@@ -284,7 +284,7 @@ impl LayoutMirror {
     pub(crate) fn touch(&mut self) {
         self.reserve(0);
         if let Some(memory) = &self.memory {
-            // WARNING: an f32 stops counting at 2^24, so the count wraps. Pages only compare it for equality.
+            // An f32 stops counting at 2^24, so the count wraps. Pages only compare it for equality.
             unsafe {
                 let count = memory.0.as_ptr().add(2);
                 *count = (*count + 1.) % 16_777_216.;
@@ -293,7 +293,7 @@ impl LayoutMirror {
         }
     }
 
-    // WARNING: `nodes` must hold every node shown in either list and every node past the end of `old`.
+    // `nodes` must hold every node shown in either list and every node past the end of `old`.
     pub(crate) fn hide(
         &mut self,
         visible: &[bool],
@@ -381,8 +381,7 @@ pub struct State {
     scroll_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
     pub(crate) computed: Option<Rc<style::ComputedStyles>>,
     previous: Option<Rc<style::ComputedStyles>>,
-    // WARNING: kept so the next pass reuses its lists: a per-node list is megabytes on big pages, and a new one costs a
-    // page fault per 16 KB.
+    // Reuse per-node lists to avoid megabytes of allocations and page faults each pass.
     old_styles: Option<Rc<style::ComputedStyles>>,
     pub(crate) style_walk: Walk,
     editable: Vec<usize>,
@@ -490,8 +489,7 @@ impl State {
         }
     }
 
-    // WARNING: removed nodes wait for a GC, and a scrolling list removes them faster than GCs run, so their data must
-    // go here or it outgrows the document.
+    // Free removed nodes' data now: row churn can outpace GC and retain more than the live document.
     fn drop_removed(&mut self, doc: &Document) {
         let mut gone = Vec::new();
         for root in std::mem::take(&mut self.removed) {
@@ -554,8 +552,8 @@ impl State {
         len < before
     }
 
-    // WARNING: inertness stays out of `ComputedStyles.user_select`, because kept boxes read that with their
-    // revision, and a modal dialog changes it without one.
+    // Keep inertness outside ComputedStyles.user_select: modal changes have no revision to invalidate kept
+    // boxes.
     pub(crate) fn inert(&self, id: usize) -> bool {
         self.select_marks
             .get(id)
@@ -596,8 +594,7 @@ impl State {
         doc.nodes[id] = node;
         self.detached.push(id);
         if let Some(cached) = &mut self.computed {
-            // WARNING: every per-node list must grow here, and a detached node gets what a full pass gives it, or
-            // reads of the new node index past their end and incremental passes keep other values.
+            // Grow every per-node list here. Initialize detached nodes as a full style pass does.
             if let Some(computed) = Rc::get_mut(cached) {
                 let (style, vars) = style::empty();
                 computed.values.resize(doc.nodes.len(), style.clone());
@@ -689,7 +686,7 @@ fn new_canvas(node: &Node) -> Result<crate::render::canvas::Canvas> {
     Ok(canvas)
 }
 
-// WARNING: keyed by the SVG source address, so the entry must hold the source to keep the address from being reused.
+// Retain SVG sources used as pointer keys to prevent address reuse.
 pub(crate) type CanvasSource = (
     (u64, usize, [u32; 2]),
     Option<Rc<str>>,
@@ -752,7 +749,7 @@ pub(crate) fn show_frame(
     if state.recycled.is_empty() {
         state.retired_canvases.clear();
     }
-    // WARNING: a poster that decodes later must not replace the frame.
+    // A poster that decodes later must not replace the frame.
     state.decoding.remove(&id);
     let size = image.as_ref().map(|image| image.size());
     match size {
@@ -773,8 +770,8 @@ pub(crate) fn show_frame(
         state.cull.seen = None;
     }
     state.dirty = true;
-    // WARNING: only the first frame replaced since the renderer drained `recycled` can be on the GPU; return later
-    // ones, or unrendered windows grow it without bound.
+    // Only the first replaced frame can be on the GPU. Recycle later frames immediately to bound memory in
+    // unrendered windows.
     match old {
         Some(old) if state.retired_canvases.insert(id) => {
             state.recycled.push((id, old));
@@ -918,7 +915,7 @@ pub fn call(
             let mut changed = Vec::new();
             for (&id, handle) in &state.scroll {
                 let offset = scroll_offset(handle, handle.offset());
-                // WARNING: `set_offset` stops a smooth scroll, so it only runs when the range clamps the offset.
+                // `set_offset` stops a smooth scroll, so it only runs when the range clamps the offset.
                 if offset != handle.offset() {
                     handle.set_offset(offset);
                 }
@@ -1141,7 +1138,7 @@ pub fn call(
                         initial.map_or(String::new(), |value| format!("initial-value:{value}"))
                     );
                     let registered = style::Stylesheet::parse(&rule).property();
-                    // WARNING: `Prop::new` leaks the names it interns, so only a valid new registration interns one.
+                    // `Prop::new` leaks the names it interns, so only a valid new registration interns one.
                     match registered {
                         _ if !name.starts_with("--") => Err("SyntaxError"),
                         _ if style::Prop::find(name)
@@ -1609,7 +1606,7 @@ pub fn call(
                 let parsed = match args[2].as_str() {
                     _ if tag == "#document" => Document::parse(source),
                     Some(context) => Document::fragment(source, context),
-                    // WARNING: shadow roots and template contents parse in `template` context, so the `<tr>` rows that
+                    // Shadow roots and template contents parse in `template` context, so the `<tr>` rows that
                     // Lit renders are kept.
                     None if tag.starts_with('#') => Document::fragment(source, "template"),
                     None => Document::fragment(source, tag),
@@ -1703,7 +1700,7 @@ pub fn call(
                     _ => None,
                 };
                 let scripted = slot.and_then(|slot| state.motion.scripted(id, slot, &styles));
-                // WARNING: the compositor can play animations between frames, so they are sampled now.
+                // The compositor can play animations between frames, so they are sampled now.
                 let current = state
                     .animating
                     .contains_key(&id)
@@ -2015,8 +2012,8 @@ pub fn call(
                     if state.retired.is_empty() {
                         state.retired_canvases.clear();
                     }
-                    // WARNING: only the first image replaced since the renderer drained `retired` can be on the GPU;
-                    // drop later ones, or unrendered windows grow it without bound.
+                    // Only the first replaced image can be on the GPU. Drop later images immediately to bound
+                    // memory in unrendered windows.
                     if !Arc::ptr_eq(&old, &canvas.image) && state.retired_canvases.insert(id) {
                         state.retired.push(old);
                     }
@@ -2031,7 +2028,7 @@ pub fn call(
                     state.retired.extend(state.images.remove(&id));
                     state.sources.get_mut().remove(&id);
                 }
-                // WARNING: offscreen drawing changes nothing on the page, so it must not cost page frames.
+                // Offscreen drawing changes nothing on the page, so it must not cost page frames.
                 state.dirty |= doc.nodes[id].tag == "canvas";
                 Ok(Value::Null)
             }
@@ -2314,7 +2311,7 @@ pub fn call(
                     .clone()
                     .context("Text geometry requires a displayed window")?;
                 let [x, y, width, full] = *bounds;
-                // WARNING: a focus change just before a click can drop the cached styles, so they are computed again here.
+                // A focus change just before a click can drop the cached styles, so they are computed again here.
                 let computed = styles(doc, state, viewport, Some((&system, state.pixel_ratio)));
                 let (style, units) = (&computed.values[id], &computed.lengths[id]);
                 let node = &doc.nodes[id];
@@ -2481,8 +2478,7 @@ pub fn call(
             }
             "dom.client" => {
                 let rect = state.bounds.get(&id).copied().unwrap_or_default();
-                // WARNING: resize observers read the last frame's styles on purpose; styling the changed page here
-                // would cost a pass per callback.
+                // Reuse the last frame's styles for resize observers to avoid a style pass per callback.
                 let last = (args[1].as_bool() == Some(true))
                     .then(|| state.computed.clone().or_else(|| state.previous.clone()))
                     .flatten()
@@ -2832,7 +2828,7 @@ pub(crate) fn use_font(state: &mut State, family: &str, name: &str, added: bool)
     }
     state.font_loads += 1;
     style::FONT_NAMES.with(|names| *names.borrow_mut() = Default::default());
-    // WARNING: a new style cache would drop constructed and CSSOM-edited sheets, so only the values that used font metrics go.
+    // Invalidate only font-dependent values. A new style cache loses constructed and CSSOM-edited sheets.
     state.style_cache.metrics = None;
     state.invalidate();
     if !same {

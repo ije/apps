@@ -4,7 +4,8 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 
-// WARNING: binary arguments of a call can borrow JavaScript memory, so bytes leave a frame only through `read` and `snapshot`, which copy borrowed bytes. A `slice` must not outlive its call or a `read` of the same argument.
+// Only read and snapshot can export borrowed bytes by copying them. A slice expires on call return or another
+// read of that argument.
 thread_local! { static FRAMES: RefCell<Vec<Vec<Bytes>>> = const { RefCell::new(Vec::new()) }; }
 
 #[derive(Clone, Default)]
@@ -126,7 +127,7 @@ pub(crate) fn slice(value: &Value) -> Option<Result<&[u8]>> {
     )
 }
 
-// WARNING: the pointer stays valid only until the current call returns.
+// The pointer stays valid only until the current call returns.
 pub(crate) fn get(index: usize) -> Option<(*const u8, usize)> {
     FRAMES.with(|frames| {
         let frames = frames.borrow();
@@ -146,7 +147,7 @@ pub(crate) fn write(bytes: impl Into<Bytes>) -> Value {
     })
 }
 
-// WARNING: the slice has an unbounded lifetime, but stays valid only while the value lives and no JavaScript runs.
+// The slice has an unbounded lifetime, but stays valid only while the value lives and no JavaScript runs.
 pub(crate) fn view<'a>(
     api: &crate::jsc::JavaScriptCore,
     ctx: crate::jsc::Ptr,
@@ -171,7 +172,7 @@ impl Drop for Roots<'_> {
     }
 }
 
-// WARNING: the bytes of each item of array `values`. They stay valid while the returned `Roots` live.
+// These bytes remain valid only while the returned Roots live.
 pub(crate) fn input<'a>(
     api: &'a crate::jsc::JavaScriptCore,
     ctx: crate::jsc::Ptr,
@@ -195,8 +196,8 @@ pub(crate) fn input<'a>(
             && count.fract() == 0.,
         "Invalid binary arguments"
     );
-    // WARNING: a getter can drop and collect earlier items, so all items are read and protected before any bytes are
-    // borrowed. The bytes are not pinned, so host operations must not run JavaScript.
+    // Protect all items before borrowing bytes: getters can trigger GC. Host operations must not run
+    // JavaScript while bytes are borrowed.
     let mut roots = Roots {
         api,
         ctx,
@@ -214,7 +215,7 @@ pub(crate) fn input<'a>(
         let bytes = view(api, ctx, value)?;
         total += bytes.len();
         ensure!(total <= 1 << 31, "Binary arguments are too large");
-        // WARNING: these borrow the arguments of the running call, so callers that keep them must copy them first.
+        // These borrow the arguments of the running call, so callers that keep them must copy them first.
         buffers.push(Bytes::from_static(bytes));
     }
     Ok((buffers, roots))

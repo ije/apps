@@ -7,8 +7,7 @@ use renderer::{BlendMode, Bounds, Corners, Length, PaintEffect, Pixels, Radii, R
 
 pub(crate) type Matrix = [f32; 16];
 
-// WARNING: find ids through the walk, not the node arena: removed nodes must not match, and the arena can be many times
-// longer than the page.
+// Find IDs through the tree walk. The arena includes removed nodes and can greatly exceed the live page.
 #[derive(Default)]
 pub(crate) struct Ids {
     map: std::cell::OnceCell<std::collections::HashMap<String, Vec<usize>>>,
@@ -84,7 +83,7 @@ fn rotate(axis: [f32; 3], angle: f32) -> Option<Matrix> {
         return None;
     }
     let [x, y, z] = axis.map(|value| value / length);
-    // WARNING: quarter turns are exact, like in browsers, so `rotate(90deg)` stays a 2D matrix.
+    // Quarter turns are exact, like in browsers, so `rotate(90deg)` stays a 2D matrix.
     let quarter = angle / std::f32::consts::FRAC_PI_2;
     let (s, c) = if (quarter - quarter.round()).abs() < 1e-6 {
         [(0., 1.), (1., 0.), (0., -1.), (-1., 0.)][(quarter.round() as i64).rem_euclid(4) as usize]
@@ -1310,8 +1309,7 @@ pub(crate) struct Establishes {
     pub(crate) transformed: bool,
 }
 
-// WARNING: building, culling and kept keys must all decide this here. Callers add what depends on other boxes:
-// `z-index` on flex and grid items, and opacity layers.
+// Share this decision across build, cull and cache keys. Callers add flex/grid z-index and opacity layers.
 pub(crate) fn establishes(style: &Style) -> Establishes {
     let set = |props: &[Prop]| {
         props

@@ -25,7 +25,7 @@ pub fn package_app(
     let disabled = apps_runtime::bundle::disabled_features(package)?;
     let enabled = |feature| disabled & apps_runtime::bundle::feature_bit(feature) == 0;
     let webgpu = apps_runtime::gpu::library_name(target.platform).filter(|_| enabled("webgpu"));
-    // WARNING: FFmpeg is LGPL, so it ships as its own library with its license, which users can replace.
+    // FFmpeg is LGPL, so it ships as its own library with its license, which users can replace.
     let media = if enabled("video") || enabled("audio") {
         let ffmpeg = apps_runtime::media::ffmpeg_name(target.platform);
         ensure!(

@@ -6,8 +6,8 @@ edition.workspace = true
 
 [lib]
 path = "lib.rs"
-# WARNING: a cdylib exports the C functions of every Bun crate, which keeps code that needs Bun's C++. build-jsc.sh
-# links this archive into a dylib that exports only the functions of lib.rs.
+# Build an archive: a cdylib exports Bun's C functions and retains C++ dependencies. build-jsc.sh exports only
+# lib.rs functions.
 crate-type = ["staticlib"]
 
 [dependencies]

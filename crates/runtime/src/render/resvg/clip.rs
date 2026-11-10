@@ -8,9 +8,7 @@ pub fn apply(
     transform: tiny_skia::Transform,
     pixmap: &mut tiny_skia::Pixmap,
 ) {
-    // WARNING: a clip of one path is that path's coverage, which is what clearing it from an opaque pixmap and
-    // inverting the alpha gave, so it fills a mask directly. Clips of more paths keep the pixmap, because its
-    // rounding where they overlap differs from a mask's.
+    // A single path can fill a mask directly. Keep pixmaps for multiple paths: overlap rounding differs.
     let mut ts = transform.pre_concat(clip.transform());
     let mut group = clip.root();
     let path = loop {

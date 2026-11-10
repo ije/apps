@@ -3,8 +3,7 @@ use std::cell::UnsafeCell;
 use std::ffi::{CStr, c_char, c_int};
 use std::ptr::{copy_nonoverlapping, null_mut, write_bytes};
 
-// WARNING: macOS malloc keeps freed memory in the footprint unless `MallocSpaceEfficient=1` is set, and reads it before
-// any code here runs, so a process without it starts itself again.
+// Set MallocSpaceEfficient before process startup or macOS retains freed memory. Restart once if absent.
 const SETTING: &CStr = c"MallocSpaceEfficient=1";
 const NAME: &CStr = c"MallocSpaceEfficient";
 
@@ -16,7 +15,6 @@ unsafe extern "C" {
     fn _NSGetExecutablePath(path: *mut c_char, size: *mut u32) -> c_int;
 }
 
-// WARNING: runs before `main`, before any code of the app.
 unsafe extern "C" fn start(
     _count: c_int,
     arguments: *const *const c_char,
@@ -54,8 +52,7 @@ const SMALL: usize = 512;
 const CLASSES: usize = SMALL / 16 + 1;
 const KEPT: u32 = 1024 * 1024;
 
-// WARNING: `MallocSpaceEfficient` makes malloc and free slow, and frames build and drop thousands of small blocks, so
-// each thread keeps freed small blocks, up to 1 MB per size, until it is quiet.
+// MallocSpaceEfficient slows small allocations. Cache up to 1 MB per size per thread until idle.
 struct Bins {
     heads: [*mut u8; CLASSES],
     bytes: [u32; CLASSES],
@@ -108,7 +105,7 @@ fn rounded(class: usize) -> Layout {
 
 // SAFETY: small blocks are malloc blocks of their class size, so each fits its class on any thread, and `small` gives
 // the same answer for both ends of a block, because they see the same layout.
-// WARNING: these stay out of line, or fat LTO copies them to every allocation and the runtime grows by 900 KB.
+// Keep these out of line: fat LTO otherwise duplicates them at allocations and adds 900 KB.
 unsafe impl GlobalAlloc for Allocator {
     #[inline(never)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {

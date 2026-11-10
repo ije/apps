@@ -92,7 +92,7 @@ unsafe extern "C" fn receive(context: *mut c_void, message: *const c_char) {
     }
     if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
         let mut events = events.lock().unwrap_or_else(PoisonError::into_inner);
-        // WARNING: only page events can flood the queue. Results and navigation events always queue, or their callers never settle.
+        // Never drop results or navigation events: callers wait for them.
         if events.len() >= 4096 && matches!(value["type"].as_str(), Some("message" | "window-open"))
         {
             return;
@@ -210,9 +210,8 @@ impl Browser {
             let set = move || unsafe {
                 apps_browser_bounds(browser.get(), bounds[0], bounds[1], bounds[2], bounds[3]);
             };
-            // WARNING: a page calls this while it paints, so it never waits for the main thread. Its
-            // `Drop` waits for the main thread, so this runs first. On the main thread `Drop` runs at
-            // once, so this must too.
+            // Do not wait for main during paint. Schedule removal before Drop waits for it. On main, remove
+            // immediately.
             match MAIN_THREAD
                 .get()
                 .filter(|_| unsafe { pthread_main_np() } == 0)

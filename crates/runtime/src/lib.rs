@@ -1,6 +1,6 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// WARNING: the inflated text is leaked on purpose, because JSC reads runtime scripts in place.
+// The inflated text is leaked on purpose, because JSC reads runtime scripts in place.
 macro_rules! js {
     ($path:literal) => {{
         static SOURCE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();

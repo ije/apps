@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { compileScript, compileStyle, parse } from 'vue/compiler-sfc'
 
-// WARNING: handles only components with <script setup>.
+// Handles only components with <script setup>.
 export default {
   load({ filename, content }: { filename: string; content: string }) {
     const { descriptor, errors } = parse(content, { filename })

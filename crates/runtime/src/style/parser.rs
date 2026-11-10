@@ -91,7 +91,7 @@ impl Rules {
                 }
                 Ok(Item::Declaration(declaration)) => declaration,
                 Ok(Item::Scope(..) | Item::Starting) => continue,
-                // WARNING: `--color-*: initial` is no declaration for the tokenizer, so it comes as an error.
+                // `--color-*: initial` is no declaration for the tokenizer, so it comes as an error.
                 Err((_, source, _)) if theme => match source.split_once(':') {
                     Some((name, value))
                         if name.trim().starts_with("--")
@@ -912,7 +912,7 @@ impl NodeLengths {
 
     pub(crate) fn set(&mut self, id: usize, lengths: Lengths) {
         if self.list[self.last as usize] != lengths {
-            // WARNING: only the newest values are searched, or a page with a font size per node gets quadratic.
+            // Only the newest values are searched, or a page with a font size per node gets quadratic.
             let mut newest = self.list.iter().enumerate().rev().take(32);
             self.last = match newest.find(|(_, old)| **old == lengths) {
                 Some((index, _)) => index as u32,

@@ -28,7 +28,7 @@ const BLOOM: usize = 4;
 type Bloom = [u64; BLOOM];
 pub(crate) type Ancestry = (Bloom, Box<[u16]>, u16);
 
-// WARNING: node and selector sides must both lowercase tags and attribute names, or the filter rejects real matches.
+// Lowercase tags and attributes on both sides, or the filter rejects valid matches.
 fn feature(bloom: &mut Bloom, kind: u8, value: &str) {
     let hash = rustc_hash::FxBuildHasher.hash_one((kind, value));
     for shift in [0, 32] {
@@ -200,7 +200,7 @@ pub(crate) struct SelectorCache {
     revision: u32,
     pub(crate) epoch: u64,
     changes: std::collections::VecDeque<(u64, Vec<u32>)>,
-    // WARNING: an incremental pass styles only `dirty` nodes, so every recorded dependency must reach `dependents`.
+    // An incremental pass styles only `dirty` nodes, so every recorded dependency must reach `dependents`.
     pub(crate) dirty: Vec<bool>,
     dependents: Vec<(u32, Vec<u32>)>,
     children: Vec<(u32, Vec<u32>)>,
@@ -230,7 +230,7 @@ impl SelectorCache {
         self.hosts = hosts.clone();
     }
 
-    // WARNING: results are keyed by selector address, so they must go whenever the scopes that held the selectors go.
+    // Clear selector results when scopes change: selector addresses key the cache.
     pub(crate) fn forget_selectors(&mut self) {
         self.values.clear();
         self.size = 0;
@@ -269,7 +269,7 @@ impl SelectorCache {
             *snapshot = Snapshot::default();
             self.seen[id] = 0;
             self.mark(id, false);
-            // WARNING: clear the lists of a forgotten node, or a node that reuses its id marks them again.
+            // Clear the lists of a forgotten node, or a node that reuses its id marks them again.
             self.dependents[id] = Default::default();
             self.children[id] = Default::default();
         }
@@ -292,7 +292,7 @@ impl SelectorCache {
         }
     }
 
-    // WARNING: `dependencies` must be sorted, as `chunk_by` groups them by node.
+    // `dependencies` must be sorted, as `chunk_by` groups them by node.
     pub(crate) fn register(&mut self, id: usize) {
         for group in self
             .dependencies
@@ -311,8 +311,8 @@ impl SelectorCache {
             if list.last() != Some(&entry) {
                 list.push(entry);
                 if list.len() >= 16.max(*compacted as usize * 2) {
-                    // WARNING: compaction must also drop forgotten nodes, or a long-lived parent lists every row it
-                    // ever had.
+                    // Drop forgotten nodes during compaction, or parents retain dependencies on every past
+                    // child.
                     self.stamp = self.stamp.wrapping_add(1);
                     if self.stamp == 0 {
                         self.stamps.fill(0);
@@ -386,7 +386,7 @@ impl SelectorCache {
             let attributes = node
                 .attrs
                 .iter()
-                // WARNING: these attributes count only when selectors name them, so no pseudo-class may read them.
+                // These attributes count only when selectors name them, so no pseudo-class may read them.
                 .filter_map(|(key, value)| {
                     let selected = key.starts_with("data-")
                         || key.starts_with("aria-")
@@ -458,8 +458,7 @@ impl SelectorCache {
                 }
             }
         }
-        // WARNING: every new child retags its parent. A parent whose children changed in this update must not come
-        // again, or each child walks all of its dependents.
+        // Retag each parent once per update to avoid revisiting its dependents for every child.
         for parent in retagged {
             if let Some(slot) = self.nodes.get_mut(parent)
                 && slot.revisions[2].wrapping_sub(start).wrapping_sub(1)
@@ -470,7 +469,7 @@ impl SelectorCache {
                 changes.push((parent * KINDS + 2) as u32);
             }
         }
-        // WARNING: dropping cached `:nth-child(An+B of S)` positions must count as a children change of their parent.
+        // Dropping cached `:nth-child(An+B of S)` positions must count as a children change of their parent.
         let mut checked = 0;
         while checked < changes.len() && !self.nth.is_empty() {
             let mut fresh = changes[checked..].to_vec();
@@ -745,7 +744,7 @@ impl Selector {
                     })
                     .collect::<Option<Vec<_>>>()?;
                 let selectors = list(&relative.join(","))?;
-                // WARNING: nested `:has()` is invalid and makes matching cost O(N²) or more.
+                // Nested `:has()` is invalid and makes matching cost O(N²) or more.
                 if selectors
                     .iter()
                     .any(|selector| selector.states(&mut Vec::new()) & HAS != 0)
@@ -988,8 +987,8 @@ impl Selector {
         })
     }
 
-    // WARNING: the kinds read here must match what `matches_with` records for an ancestor compound: classes alone (8),
-    // else tag and attributes (0), plus `style` (6).
+    // Match matches_with's ancestor dependencies: classes (8), otherwise tag and attributes (0), plus style
+    // (6).
     pub(crate) fn ancestry(&self) -> Option<&Ancestry> {
         self.ancestry
             .get_or_init(|| {
@@ -1047,7 +1046,7 @@ impl Selector {
             .filter_map(|selector| match selector {
                 SimpleSelector::Id(id) => Some((0, id.as_str())),
                 SimpleSelector::Class(class) => Some((1, class.as_str())),
-                // WARNING: keys compare exactly, so mixed-case names, which also match lowercase HTML names, must get
+                // Keys compare exactly, so mixed-case names, which also match lowercase HTML names, must get
                 // no key.
                 SimpleSelector::Tag(name) if !name.bytes().any(|c| c.is_ascii_uppercase()) => {
                     Some((2, name.as_str()))
@@ -1198,7 +1197,7 @@ impl Selector {
                 });
             let mut compounds = 0;
             while !rest.is_empty() {
-                // WARNING: matching recurses per compound, so long chains can overflow the stack.
+                // Matching recurses per compound, so long chains can overflow the stack.
                 compounds += 1;
                 if compounds > 256 {
                     return Some(Vec::new());
@@ -1449,7 +1448,7 @@ impl Selector {
         self.matches_with(doc, id, None, memo, false, true)
     }
 
-    // WARNING: a shadow root is featureless, so callers must not skip matching for it with this.
+    // A shadow root is featureless, so callers must not skip matching for it with this.
     pub(crate) fn always(&self) -> bool {
         self.previous.is_none()
             && self
@@ -2072,8 +2071,8 @@ impl Selector {
                     let start = memo.dependencies.len();
                     let mut matched = false;
                     while let Some(id) = ancestor {
-                        // WARNING: an ancestor's memo entry must hold only what was read from it upward, or siblings
-                        // that reach it take reads of each other's branches.
+                        // Memoize only reads from the ancestor upward, or sibling lookups inherit each
+                        // other's branch dependencies.
                         let from = memo.dependencies.len();
                         memo.depend(id, 1);
                         let key = (&**previous as *const Self as usize, id, scope, true);

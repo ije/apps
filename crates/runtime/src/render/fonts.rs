@@ -62,7 +62,7 @@ pub(crate) fn load(
         .font_faces()
         .into_iter()
         .map(|(family, src, range)| {
-            // WARNING: declarations keep `U+0400-04FF` as tokens joined by `/**/`.
+            // Declarations keep `U+0400-04FF` as tokens joined by `/**/`.
             let range = range.map(|range| range.replace("/**/", ""));
             (family, sources(&src), src, range)
         })

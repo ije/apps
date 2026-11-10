@@ -57,8 +57,7 @@ pub fn aot_source(build: &str, name: &str) -> String {
     format!("{AOT_PREFIX}{build}:{name}\";throw Error(\"Missing AOT image\");")
 }
 
-// WARNING: module code must stay outside the loader function, or it could see loader internals such as
-// `compile`. Definitions run in a second function whose only binding is `$appsDefine`.
+// Keep module code outside the loader scope to hide internals such as `compile`. Expose only `$appsDefine`.
 pub fn script_source(files: &BBTreeMap<String, String>, execute: bool) -> String {
     let app = files.get("app.js").map_or("", String::as_str);
     if execute && app.starts_with(AOT_PREFIX) {
@@ -297,8 +296,7 @@ pub fn write(
     );
     let mut bytes = HEADER.to_vec();
     bytes.extend(postcard::to_allocvec(&bundle)?);
-    // WARNING: JSC reads bytecode in place and needs it 8-byte aligned, so each one starts at an 8-byte aligned file
-    // offset.
+    // Align bytecode to 8 bytes: JSC reads it in place.
     if !bytecode.is_empty() {
         let index: Vec<_> = bytecode
             .iter()
@@ -310,7 +308,7 @@ pub fn write(
             bytes.extend_from_slice(data);
         }
     }
-    // WARNING: running apps map app.bundle, so a new bundle replaces the file instead of rewriting it.
+    // Running apps map app.bundle, so a new bundle replaces the file instead of rewriting it.
     let temporary = path.with_extension("bin.tmp");
     fs::write(&temporary, &bytes)
         .and_then(|()| fs::rename(&temporary, path))
@@ -318,16 +316,14 @@ pub fn write(
     Ok(bytes.len())
 }
 
-// WARNING: read the whole input into one slice before parsing, so the runtime has one copy of the bundle deserializer
-// instead of one per reader type.
+// Parse one slice to avoid a separate deserializer for each reader type.
 pub fn from_json(mut input: impl std::io::Read) -> Result<Bundle> {
     let mut bytes = Vec::new();
     input.read_to_end(&mut bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-// WARNING: the bundle pipe moves off fd 0 and /dev/null takes its place, so child processes that inherit stdin never
-// read bundles or hold the pipe open.
+// Replace stdin with /dev/null so child processes cannot read bundles or keep the bundle pipe open.
 pub fn from_stdin() -> Result<(Bundle, impl std::io::BufRead + Send + 'static)> {
     #[cfg(unix)]
     let input = unsafe {
@@ -385,8 +381,7 @@ pub fn read(directory: &Path) -> Result<Bundle> {
             pages: BBTreeMap<String, Document>,
         }
         let file = fs::File::open(&path).context("Cannot read app.bundle")?;
-        // WARNING: script chunks stay in the mapped file until they run, so app.bundle must not change
-        // while the app runs.
+        // Do not modify app.bundle while it runs: script chunks reference the mapped file.
         let bytes = bytes::Bytes::from_owner(
             unsafe { memmap2::Mmap::map(&file) }.context("Cannot read app.bundle")?,
         );
@@ -432,7 +427,7 @@ pub fn read(directory: &Path) -> Result<Bundle> {
             };
             ensure!(!duplicate, "Duplicate bundle key");
         }
-        // WARNING: JSC reads bytecode and script chunks in place, so the mapping stays for the rest of the process.
+        // JSC reads bytecode and script chunks in place, so the mapping stays for the rest of the process.
         let mapped = |data: &[u8]| unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
         for (name, range) in bytecode {
             let source = bundle.scripts.get(name).map(|source| mapped(source));

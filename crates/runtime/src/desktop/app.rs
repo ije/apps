@@ -34,8 +34,8 @@ struct State {
 }
 
 impl App {
-    // WARNING: handlers run on a pool of up to 4 threads, so a handler that never returns must start its own thread and
-    // report with [`AppHandle`].
+    // Handlers share at most 4 threads. A handler that never returns needs its own thread and [`AppHandle`]
+    // for replies.
     pub fn handle(
         &self,
         channel: &str,

@@ -55,7 +55,7 @@ pub fn apply_features_and_fallbacks(
         let new_descriptor = CTFontDescriptorCreateWithAttributes(attrs);
         CFRelease(attrs as _);
         let new_descriptor = CTFontDescriptor::wrap_under_create_rule(new_descriptor);
-        // WARNING: font-kit uses the older core-text wrappers. Borrow the same CF objects
+        // font-kit uses the older core-text wrappers. Borrow the same CF objects
         // for the generated API, then transfer its create-rule ownership back.
         let native_font = font.native_font();
         let generated_font = &*native_font

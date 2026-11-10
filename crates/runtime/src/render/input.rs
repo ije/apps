@@ -39,9 +39,9 @@ pub(super) fn paint_caret(
         *caret = None;
     }
     let (_, since, wake) = caret.get_or_insert((key, now, None));
-    // WARNING: a timer can fire just before its time, so the phase rounds up within 8 ms.
+    // A timer can fire just before its time, so the phase rounds up within 8 ms.
     let phase = ((now - *since + Duration::from_millis(8)).as_millis() / BLINK.as_millis()) as u32;
-    // WARNING: the first phase draws, so typing and scrolling move the caret in the same frame as the text.
+    // The first phase draws, so typing and scrolling move the caret in the same frame as the text.
     if phase > 0 && window.overlay_caret(bounds, color, *since, phase.is_multiple_of(2)) {
         *wake = None;
         return;
@@ -577,7 +577,7 @@ impl renderer::View for PageView {
         cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
         let state = self.editing()?;
-        // WARNING: the IME asks right after an edit, before the next frame lays out the new text, so reflow first.
+        // The IME asks right after an edit, before the next frame lays out the new text, so reflow first.
         super::scripted(cx, Some(window), || super::reflow(self.id));
         let id = state["id"].as_u64()? as usize;
         let host = self.host.borrow();

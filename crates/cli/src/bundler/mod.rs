@@ -86,8 +86,7 @@ impl Shared {
         self.disabled & apps_runtime::bundle::feature_bit(feature) == 0
     }
 
-    // WARNING: unlike Node, `imports` keys without `#` in the app's package.json map bare specifiers in every module,
-    // dependencies included, like an import map.
+    // Unlike Node, bare `imports` keys apply to all modules, including dependencies.
     fn aliased(&self, specifier: &str) -> bool {
         !specifier.starts_with(['.', '/', '#'])
             && self.aliases.as_ref().is_some_and(|(_, keys)| {
@@ -102,7 +101,7 @@ impl Shared {
             })
     }
 
-    // WARNING: like TypeScript, only the nearest tsconfig.json counts, even when it has no paths.
+    // Like TypeScript, only the nearest tsconfig.json counts, even when it has no paths.
     fn tsconfig(&self, directory: &Path) -> Result<Option<Rc<TsPaths>>> {
         if let Some(found) = self.tsconfigs.borrow().get(directory) {
             return Ok(found.clone());
@@ -207,7 +206,7 @@ fn tsconfig_paths(file: &Path, depth: usize) -> Result<Paths> {
     Ok((paths, base))
 }
 
-// WARNING: cached modules contain `$appsImport(N)` and `$appsN<id>`, so a graph never reuses or changes module ids.
+// Never reuse module IDs: cached code embeds them in `$appsImport(N)` and `$appsN<id>`.
 #[derive(Default)]
 pub struct Cache {
     graphs: RefCell<HashMap<(Realm, PathBuf), Graph>>,
@@ -422,7 +421,7 @@ impl<'a> Imports<'a, '_> {
             .get(&self.scoping.get_reference(reference).symbol_id()?)
     }
 
-    // WARNING: `(0, ns.f)` keeps `this` undefined when an imported function is called.
+    // `(0, ns.f)` keeps `this` undefined when an imported function is called.
     fn callee(&self, expression: &mut Expression<'a>) {
         if let Expression::Identifier(ident) = expression
             && let Some((dep, name)) = self.binding(ident).filter(|(_, name)| name != "*").cloned()
@@ -573,8 +572,7 @@ impl<'a> Slots<'a, '_> {
         namespace_read(&self.ast, self.allocator, span, origin, &name)
     }
 
-    // WARNING: keep the `(0, read)()` form: a plain member call would pass the slots or the namespace as `this`. Like
-    // other bundlers, a called import gets `this` undefined.
+    // Keep `(0, read)()` so imported calls receive `this` as undefined.
     fn callee(&mut self, expression: &mut Expression<'a>) {
         if let Some((dep, name)) = Self::import(expression) {
             let span = expression.span();
@@ -681,8 +679,8 @@ fn in_cycles(modules: &[Module]) -> Vec<bool> {
     cyclic
 }
 
-// WARNING: importers must read a root binding live when code can write it after the body ends: in functions, methods,
-// accessors or instance fields.
+// Imports need live reads for bindings that functions, methods, accessors or instance fields can write after
+// module evaluation.
 struct Writes<'b> {
     scoping: &'b oxc_semantic::Scoping,
     late: bool,
@@ -710,7 +708,7 @@ impl<'a> Visit<'a> for Writes<'_> {
     }
 
     fn visit_class_element(&mut self, element: &ClassElement<'a>) {
-        // WARNING: oxc gives field initializers no scope, so only the AST tells an instance field from a static one.
+        // oxc gives field initializers no scope, so only the AST tells an instance field from a static one.
         let late = match element {
             ClassElement::StaticBlock(_) => false,
             ClassElement::PropertyDefinition(property) => !property.r#static,
@@ -1230,8 +1228,8 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                             };
                             let enabled = shared.enabled("jsExecute")
                                 || (!data && shared.enabled("httpImport"));
-                            // WARNING: packages often keep such an import on a path the app never takes, so in
-                            // node_modules it fails when it runs, not at build time.
+                            // Unresolved imports in node_modules fail at run time, so unused paths do not
+                            // break the build.
                             if !enabled
                                 && self
                                     .path
@@ -1323,8 +1321,7 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
             };
             if let Some((name, specifier)) = import {
                 let base = self.path.parent().unwrap_or(Path::new("."));
-                // WARNING: like esbuild, a require() that cannot be resolved is not a build error; it throws
-                // MODULE_NOT_FOUND when it runs.
+                // Unresolved require() calls throw MODULE_NOT_FOUND at run time, like esbuild.
                 let dep = if name == "$appsImport" {
                     self.builder.resolve(base, specifier, false)?
                 } else if let Ok((path, inline)) = self.builder.locate(base, specifier, true) {
@@ -1450,7 +1447,7 @@ impl Builder {
         Ok(self.app_name(path)?.to_string_lossy().replace('\\', "/"))
     }
 
-    // WARNING: names key `require.cache`, `import.meta.url` and `__filename`, so two files must never share one.
+    // File names must be unique: they key `require.cache`, `import.meta.url` and `__filename`.
     fn app_name(&self, path: &Path) -> Result<PathBuf> {
         let relative = app_relative(&self.shared.root, path);
         let name = relative.to_string_lossy().replace('\\', "/");
@@ -1520,7 +1517,7 @@ impl Builder {
                 let mut parts = line.split(' ').skip(1);
                 (parts.next().unwrap_or_default(), parts.collect())
             };
-            // WARNING: Node's require(esm) returns the 'module.exports' export, so CommonJS gets the module object itself.
+            // Node's require(esm) returns the 'module.exports' export, so CommonJS gets the module object itself.
             let source = format!(
                 "const api={object};export default api;export{{api as 'module.exports'}};{}",
                 names
@@ -1722,7 +1719,7 @@ impl Builder {
         } else if key != "." {
             key
         } else {
-            // WARNING: Node ignores `module`. Like esbuild, node realms prefer `main` and require() never uses `module`.
+            // Node ignores `module`. Like esbuild, node realms prefer `main` and require() never uses `module`.
             let fields: &[&str] = match (self.realm == Realm::Renderer, require) {
                 (true, true) => &["browser", "main"],
                 (true, false) => &["browser", "module", "main"],
@@ -1741,7 +1738,7 @@ impl Builder {
                 .to_owned()
         };
         let target = resolve_file(&directory.join(entry))?;
-        // WARNING: only package exports stay in their folder. An app's `imports` can name a symlinked package in node_modules.
+        // Only package exports must stay inside their folder. App imports can reach symlinked packages.
         ensure!(
             imports || target.starts_with(&directory),
             "Package export escapes its directory"
@@ -1998,7 +1995,7 @@ impl Builder {
             path.display(),
             semantic.diagnostics
         );
-        // WARNING: the React Compiler must run on the program as parsed, before any other transform.
+        // The React Compiler must run on the program as parsed, before any other transform.
         let compiled = react.then(|| {
             oxc_react_compiler::compile(
                 &program,
@@ -2070,7 +2067,7 @@ impl Builder {
                 || ["require", "module", "exports", "__dirname", "__filename"]
                     .iter()
                     .any(|name| references.contains_key(*name)));
-        // WARNING: direct `eval` needs import names in scope, so only those modules keep the `with` scope.
+        // Direct `eval` needs import names in scope, so only those modules keep the `with` scope.
         let linked = !commonjs && !references.contains_key("eval");
         let mut asynchronous = TopLevelAwait(false, false);
         asynchronous.visit_program(&program);
@@ -2408,7 +2405,7 @@ impl Builder {
                 None => map.to_json_string(),
             };
             let mut map: Value = serde_json::from_str(&map)?;
-            // WARNING: the runtime adds one line before the module body, so the source map starts with an empty line.
+            // The runtime adds one line before the module body, so the source map starts with an empty line.
             map["mappings"] = format!(";{}", map["mappings"].as_str().unwrap()).into();
             module.map = Some(map);
             module.url = Some(if is_remote(&path) {
@@ -2524,7 +2521,7 @@ fn expand_braces(pattern: &str) -> Vec<String> {
     }
 }
 
-// WARNING: JSC keeps a whole script as UTF-16 when it has one non-ASCII character.
+// JSC keeps a whole script as UTF-16 when it has one non-ASCII character.
 fn ascii_json(value: &Value) -> Result<String> {
     let json = serde_json::to_string(value)?;
     let mut result = String::with_capacity(json.len());
@@ -2635,7 +2632,7 @@ pub fn compile(
                 .collect::<Vec<_>>()
                 .join(",")
         )?;
-        // WARNING: the entry is inline, so its path only names it and must not be a file that a loader imports.
+        // The inline entry needs a synthetic path that no loader can import.
         let entry = manifest
             .as_ref()
             .unwrap()
@@ -2683,8 +2680,7 @@ pub fn compile(
     }
     if let Some(cache) = &cache {
         let previous = cache.loaders.replace(loaders.clone());
-        // WARNING: cached modules keep the output of the loaders and features that compiled them, so a change to either
-        // must drop them.
+        // Loader or feature changes must invalidate cached modules.
         if previous.as_ref().map(Rc::as_ptr) != loaders.as_ref().map(Rc::as_ptr) {
             cache
                 .graphs
@@ -2947,8 +2943,7 @@ fn bundle(
         };
         let origin = |dep: usize, name: &str| walk(dep, name, &mut Vec::new());
         let mut uses_of: Vec<Vec<(usize, Option<String>)>> = vec![Vec::new(); modules.len()];
-        // WARNING: a built-in module reads its exports from an object of the runtime, whose getters make node modules
-        // on first use, so its reads of exports that no importer uses are dropped.
+        // Drop unused built-in exports: their getters initialize runtime modules.
         let minifier = |module: &Module| MinifierOptions {
             compress: Some(CompressOptions {
                 treeshake: TreeShakeOptions {
@@ -3135,8 +3130,7 @@ fn bundle(
             codegen.print_expression(&assignment.right);
             factories[id] = codegen.into_source_text();
         }
-        // WARNING: reads skip a barrel, but a barrel that was read through must still run, for the side effects of its
-        // imports.
+        // Barrel imports still need to run for their side effects.
         let mut through = BTreeSet::new();
         for id in (0..modules.len()).filter(|&id| flat[id]) {
             for (target, name) in &uses_of[id] {
@@ -3244,8 +3238,8 @@ fn bundle(
                 .context("Missing module factory body")?
                 .statements = parsed.program.body;
             let result = Minifier::new(minifier(module)).minify(&allocator, &mut program);
-            // WARNING: the linker also saw reads in dead code, of modules that may be pruned, so only what the
-            // minifier kept gets an argument. Parameters stay in place, so the others get nothing.
+            // Pruned imports need no argument. Preserve parameter positions for imports that survive
+            // minification.
             let mut kept = Uses(Vec::new());
             kept.visit_program(&program);
             let kept: BTreeSet<usize> = kept.0.into_iter().map(|(dep, _)| dep).collect();
@@ -3277,7 +3271,7 @@ fn bundle(
             codegen.print_expression(&assignment.right);
             factories[id] = codegen.into_source_text();
         }
-        // WARNING: an import that skips a pruned barrel still needs its origin to run, in the barrel's place.
+        // An import that skips a pruned barrel still needs its origin to run, in the barrel's place.
         let linked_deps = |id: usize| -> Vec<usize> {
             let mut deps = Vec::new();
             for &dep in &modules[id].deps {
@@ -3402,7 +3396,7 @@ fn bundle(
                     let _ = write!(line, ",imports:{}", ascii_json(&json!(imports))?);
                 }
             }
-            // WARNING: codegen cannot escape some text, like raw template strings. Those modules compile from a string, so the bundle stays ASCII.
+            // Compile raw non-ASCII templates from strings to keep the bundle ASCII.
             if factory.is_ascii() {
                 let _ = writeln!(line, ",factory:{factory}}});");
             } else {
@@ -3411,8 +3405,7 @@ fn bundle(
             }
             builder.lines[id] = Some(line.into());
         }
-        // WARNING: pages compile strings only while their own script runs, so modules that compile from a string must
-        // stay in the bundle, not in `import()` chunks.
+        // Keep string-compiled modules in the bundle. Pages cannot compile them from later import() chunks.
         let mut owner = vec![usize::MAX; modules.len()];
         let mut groups = VecDeque::from([entries
             .iter()
@@ -3801,7 +3794,7 @@ fn remote(directory: &Path, reference: &str, http: bool) -> Result<Option<(PathB
         }
     };
     let mut path = url.to_string();
-    // WARNING: `parent()` drops a trailing slash, so a directory URL gets an empty fragment.
+    // Keep an empty fragment on directory URLs: `parent()` removes the trailing slash.
     if url.path().ends_with('/') && url.query().is_none() {
         path.push('#');
     }
@@ -4116,8 +4109,7 @@ fn html(
 }
 
 fn local(root: &Path, directory: &Path, reference: &str) -> Result<PathBuf> {
-    // WARNING: like browsers, `\` is `/`. Like a web server root, `/x` is the app folder, and a path from it or an
-    // absolute path, like `C:/x` on Windows, cannot leave it.
+    // Treat `\` as `/`. Root-relative and absolute paths must stay inside the app folder.
     let reference = reference.replace('\\', "/");
     let rooted = !matches!(
         Path::new(&reference).components().next(),
@@ -4208,7 +4200,7 @@ fn css_package(directory: &Path, name: &str) -> Result<PathBuf> {
         .ok()
         .and_then(|source| serde_json::from_str(&source).ok())
         .unwrap_or_default();
-    // WARNING: like Tailwind's resolver, `exports` uses the `style` condition, and a package without a match falls back
+    // Like Tailwind's resolver, `exports` uses the `style` condition, and a package without a match falls back
     // to plain paths.
     if let Some(entry) = metadata.get("exports").and_then(|exports| {
         let key = if subpath.is_empty() {

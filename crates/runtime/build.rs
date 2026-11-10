@@ -7,8 +7,7 @@ fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     napi_exports::export_symbols(&root.join("src/node/napi.rs"));
     let target = env::var("CARGO_CFG_TARGET_OS").unwrap();
-    // WARNING: elements build recursively on the main thread, one frame per DOM level, and debug
-    // frames are about 500 KB. The default 8 MB stack overflows on ordinary pages.
+    // Debug layout uses about 500 KB of stack per DOM level. The default 8 MB main stack is too small.
     match (target.as_str(), env::var("CARGO_CFG_TARGET_ENV").as_deref()) {
         ("macos", _) => {
             println!("cargo:rustc-link-arg-bin=apps-runtime=-Wl,-stack_size,0x4000000")
@@ -35,8 +34,8 @@ fn main() {
         for entry in fs::read_dir(root.join(dir)).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|extension| extension == "js") {
-                // WARNING: strip only whitespace and comments, because the compressor drops script completion values.
-                // `napi.js` stays as written, because napi.rs reads its lines.
+                // Strip only whitespace and comments: compression loses script completion values. Preserve
+                // napi.js line numbers for napi.rs.
                 let source = fs::read_to_string(&path).unwrap();
                 if path.ends_with("node/napi.js") {
                     hash(path.strip_prefix(&root).unwrap(), &source);

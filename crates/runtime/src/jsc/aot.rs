@@ -25,10 +25,9 @@ pub(super) struct Image {
     function: unsafe extern "C" fn(Ptr, u32, *mut Ptr) -> Ptr,
 }
 
-// WARNING: the first call registers the image with JSC, which reads its options then, so it must run before the first
-// context group.
+// Register before the first context group: JSC reads the image options during registration.
 pub(super) fn load(path: &Path) -> Result<Option<&'static Image>> {
-    // WARNING: JSC keeps the image in process-wide tables, so its library is never unloaded.
+    // Never unload this library: JSC retains the image in process-wide tables.
     static IMAGE: OnceLock<std::result::Result<Option<Image>, String>> = OnceLock::new();
     let image = IMAGE.get_or_init(|| read(path).map_err(|error| format!("{error:#}")));
     image
@@ -80,7 +79,7 @@ fn read(path: &Path) -> Result<Option<Image>> {
 }
 
 impl Image {
-    // WARNING: call once per context, after the host installed its globals and before compiled code runs.
+    // Call once per context, after the host installed its globals and before compiled code runs.
     pub(super) fn attach(&self, ctx: Ptr) {
         unsafe { (self.attach)(ctx) }
     }

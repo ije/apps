@@ -13,8 +13,8 @@ use std::{
 const MAX_GLYPH_PIXELS: usize = 4 << 20;
 pub(crate) const MAX_GLYPH_SIDE: i32 = 2048;
 const MAX_AGE: u32 = 60;
-// WARNING: removed tiles are freed this many frames later, when no frame in flight reads them. That holds for at most 3
-// drawables per window; more drawables need a bigger value.
+// Keep retired tiles until in-flight frames finish. Increase this delay if a window uses more than 3
+// drawables.
 const IN_FLIGHT: u32 = 2;
 const MIN_TEXTURE_SIDE: i32 = 1024;
 
@@ -90,8 +90,7 @@ impl<B: AtlasBackend> Atlas<B> {
             entry.used.set(self.frame.get());
             return entry.tile.map(|tile| (tile, entry.bounds));
         }
-        // WARNING: a tile that fails or is too big stays as an empty entry, or each frame would build it again
-        // and the backend could keep a texture for it each time.
+        // Cache failed or oversized tiles as empty to prevent allocation retries every frame.
         let (tile, bounds) = match build() {
             Ok(Some((bounds, size, bytes))) => {
                 let max = self.backend.borrow().max_side();
@@ -177,7 +176,7 @@ impl<B: AtlasBackend> Atlas<B> {
         }
     }
 
-    // WARNING: the scene still reads the tiles of the last frame, so they must stay.
+    // The scene still reads the tiles of the last frame, so they must stay.
     #[cfg(target_os = "macos")]
     pub fn release_images(&self) {
         let frame = self.frame.get();
@@ -293,7 +292,7 @@ impl Packer {
         &mut self,
         size: Size<DevicePixels>,
     ) -> Option<(crate::Bounds<DevicePixels>, u32)> {
-        // WARNING: a page made for a big tile takes no small ones, or an icon keeps it after the big tile is gone.
+        // Keep small tiles off large pages so an icon cannot retain a large texture.
         if page_size(size) != self.size {
             return None;
         }

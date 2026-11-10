@@ -46,7 +46,7 @@ impl Radii<Length> {
 }
 
 impl Length {
-    // WARNING: taffy treats calc handles as opaque, so the handle packs the fraction's bits and the offset in 1/64
+    // taffy treats calc handles as opaque, so the handle packs the fraction's bits and the offset in 1/64
     // device pixels instead of a pointer.
     fn calc(fraction: f32, offset: Pixels, scale: f32) -> Option<*const ()> {
         let offset = (to_layout_unit(offset.0, scale) * 64.) as i32;

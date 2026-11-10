@@ -206,8 +206,7 @@ impl Host {
         }
     }
 
-    // WARNING: `dom.js` mirrors the tree for reads, so only this batch and `dom.html` may change the nodes, attributes
-    // or text of a page.
+    // Only dom.batch and dom.html can change page trees: dom.js mirrors them for reads.
     pub(crate) fn batch(&mut self, id: u64, codes: &[u8], mut text: &str) -> Result<Value> {
         let node = |doc: &Document, value: i32| {
             usize::try_from(value)
@@ -235,8 +234,8 @@ impl Host {
         let state = self.dom.entry(id).or_default();
         let doc = &mut page.doc;
         let mut errors = Vec::new();
-        // WARNING: during a batch, parent links are current, but `stale` names a parent whose children list still holds
-        // children that left, and `run` holds children not yet in their parent's list.
+        // Parent links are current during a batch. `stale` has obsolete child entries. `run` has children
+        // awaiting insertion.
         let (mut stale, mut run, mut runs) = (None, None, Vec::new());
         'ops: for op in codes.as_chunks::<16>().0 {
             let [code, a, b, c] =
@@ -283,7 +282,7 @@ impl Host {
                         state.place(
                             doc,
                             id,
-                            // WARNING: pages lower-case HTML names themselves; SVG and other namespaces keep their case.
+                            // Pages lower-case HTML names themselves; SVG and other namespaces keep their case.
                             Node {
                                 tag: tag.into(),
                                 text: parts[1].into(),
@@ -429,7 +428,7 @@ impl Host {
                         if state.computed.is_some() && connected(doc, &state.hosts, id) {
                             state.invalidate();
                         }
-                        // WARNING: kept walks of the tree read these attributes, so their edits must use `get_mut` and
+                        // Kept walks of the tree read these attributes, so their edits must use `get_mut` and
                         // count as tree changes.
                         let current =
                             if matches!(key, "slot" | "name" | "contenteditable" | "inert") {
@@ -545,8 +544,7 @@ impl Host {
                 })
             })();
             match result {
-                // WARNING: offscreen canvas nodes are never on the page, so their changes must not mark it dirty, or
-                // making many of them costs frames.
+                // Offscreen canvas changes must not dirty the page or schedule frames.
                 Ok(changed) => {
                     page.dirty |= changed
                         && usize::try_from(a)
@@ -724,8 +722,7 @@ impl Host {
             {
                 state.text_system = Some(std::rc::Rc::new(renderer::TextSystem::new()));
             }
-            // WARNING: `dom.requestFrame` treats a text system as a window, and a worker's canvas makes one, so a
-            // worker returns here and its animation frames stay on their timer.
+            // Workers use timer-based animation frames even when their canvas creates a text system.
             if id == WORKER_PAGE && op == "dom.requestFrame" {
                 return Ok(json!(false));
             }
@@ -831,8 +828,7 @@ impl Host {
             )
             .unwrap_or_else(|| Err(anyhow::anyhow!("Unknown DOM operation: {op}")));
             page.dirty |= std::mem::take(&mut state.dirty);
-            // WARNING: a worker has no renderer to drop retired images on the GPU, so they are cleared here, or they
-            // grow without bound.
+            // Clear retired worker images here: workers have no renderer to release them.
             if id == WORKER_PAGE {
                 state.retired.clear();
             }
@@ -971,7 +967,7 @@ impl Host {
                     json!({"node":node,"rustMain":self.rust_main,"platform":if cfg!(target_os="macos"){"darwin"}else if cfg!(windows){"win32"}else{"linux"},"arch":if cfg!(target_arch="aarch64"){"arm64"}else if cfg!(target_arch="x86_64"){"x64"}else{std::env::consts::ARCH},"execPath":std::env::current_exe().ok(),"locale":locale,"appPath":self.app_path,"version":crate::VERSION,"javascriptcore":if std::env::var_os("APPS_JSC_LIBRARY").is_some(){"custom"}else{"bun"},"isPackaged":self.packaged,"appName":self.app_name.as_deref().unwrap_or("apps"),"appVersion":self.app_version.as_deref().unwrap_or("0.0.0"),"pid":std::process::id(),"argv":argv,"env":env,"homedir":std::env::var(if cfg!(windows){"USERPROFILE"}else{"HOME"}).unwrap_or_default(),"tmpdir":std::env::temp_dir(),"hostname":crate::node::hostname(),"parallelism":std::thread::available_parallelism().map_or(1,usize::from)}),
                 )
             }
-            // WARNING: getcwd takes about 9 µs on macOS, so like Node the process keeps the path until `chdir`.
+            // getcwd takes about 9 µs on macOS, so like Node the process keeps the path until `chdir`.
             "cwd" => {
                 let mut cwd = CWD.lock().unwrap_or_else(|error| error.into_inner());
                 if cwd.is_none() {

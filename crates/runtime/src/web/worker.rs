@@ -39,7 +39,7 @@ pub(crate) fn exit(code: i32) -> bool {
 thread_local! { static PARENT: RefCell<Option<Parent>> = const { RefCell::new(None) }; }
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-// WARNING: an engine that is dropped never polls again, so a subscriber whose queue overflows is removed.
+// An engine that is dropped never polls again, so a subscriber whose queue overflows is removed.
 struct Subscriber {
     names: Vec<String>,
     queue: Vec<(String, Payload)>,
@@ -71,7 +71,7 @@ pub(crate) struct State {
     channels: Vec<u64>,
 }
 
-// WARNING: a preload context ends without its thread ending, so its subscribers leave with its state.
+// A preload context ends without its thread ending, so its subscribers leave with its state.
 impl Drop for State {
     fn drop(&mut self) {
         if !self.channels.is_empty() {

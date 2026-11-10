@@ -53,7 +53,6 @@ pub(crate) fn start(port: u16, link: Link) -> Result<()> {
         .context("Missing executable directory")?
         .to_owned();
     let name = libloading::library_filename("apps_mcp");
-    // WARNING: `cargo test` puts the library of a dev-dependency in `deps`.
     let path = [".", "deps"]
         .iter()
         .map(|folder| directory.join(folder).join(&name))
@@ -88,7 +87,7 @@ pub(crate) fn start(port: u16, link: Link) -> Result<()> {
             profiling: *library.get(b"apps_mcp_profiling\0")?,
             frame: *library.get(b"apps_mcp_frame\0")?,
         };
-        // WARNING: the server threads run until the app quits, so the library is never unloaded.
+        // The server threads run until the app quits, so the library is never unloaded.
         std::mem::forget(library);
         (start, functions)
     };
@@ -150,7 +149,7 @@ pub(crate) fn frame(window: u64, started: Instant) {
     }
 }
 
-// WARNING: runs while JSC is paused in `ctx`. It must dispatch protocol messages until `done` is set.
+// Runs while JSC is paused in `ctx`. It must dispatch protocol messages until `done` is set.
 pub(crate) fn paused(ctx: usize, done: *mut bool) {
     match LIBRARY.get() {
         Some(library) => unsafe { (library.paused)(ctx, done) },
@@ -199,7 +198,7 @@ struct Slot(*mut c_void, Done);
 
 unsafe impl Send for Slot {}
 
-// WARNING: the library waits for one answer to each call, so a call that ends without one answers with an error.
+// Always reply, even on error: the library waits for each call.
 impl Drop for Slot {
     fn drop(&mut self) {
         let text = "The window closed";
@@ -480,7 +479,7 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
     }
     let reply = reply.clone();
     let sent = format!("Sent {action} to window {window}");
-    // WARNING: input handlers borrow the desktop, which `Desktop::drive` holds now.
+    // Input handlers borrow the desktop, which `Desktop::drive` holds now.
     cx.defer(move |cx| {
         let result = cx.update_window(handle, |window, cx| {
             for event in events {

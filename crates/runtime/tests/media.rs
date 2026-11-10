@@ -30,8 +30,7 @@ fn page(disabled: u32) -> (Rc<RefCell<Host>>, JsContext, String) {
     (host, engine, base.to_string())
 }
 
-// WARNING: CoreAudio reads the executable's folder once per process, and target/debug/deps can make that take seconds,
-// so this wait is long.
+// Allow CoreAudio's one-time executable-folder scan to finish. target/debug/deps can make it take seconds.
 fn wait(engine: &JsContext, ready: &str) -> String {
     for _ in 0..30000 {
         engine.tick().unwrap();

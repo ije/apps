@@ -3,8 +3,7 @@
 
 using namespace metal;
 
-// WARNING: these structs must match the `repr(C)` structs in `scene.rs` and `frame.rs`, like the
-// HLSL and WGSL shaders.
+// Keep these layouts in sync with scene.rs, frame.rs, HLSL and WGSL.
 
 struct Globals {
   float4 gamma_ratios;
@@ -48,7 +47,7 @@ struct ContentMask {
   Radii radii;
 };
 
-// WARNING: four floats, not `float4`, which Metal aligns to 16 bytes.
+// Four floats, not `float4`, which Metal aligns to 16 bytes.
 struct Rgba {
   float r;
   float g;
@@ -201,7 +200,7 @@ float4 distance_from_clip_rect(float2 unit_vertex, Bounds bounds, Bounds clip_bo
 
 float4 over(float4 below, float4 above) {
   float alpha = above.a + below.a * (1.0 - above.a);
-  // WARNING: two transparent colors would divide by zero, and blending a NaN is undefined on some GPUs.
+  // Two transparent colors would divide by zero, and blending a NaN is undefined on some GPUs.
   if (alpha <= 0.0) {
     return float4(0.0);
   }
@@ -386,8 +385,7 @@ float4 quad_color(QuadFragmentInput input, Quad quad, float2 position) {
     left ? quad.border_widths.left : quad.border_widths.right,
     top ? quad.border_widths.top : quad.border_widths.bottom);
 
-  // WARNING: zero-width borders turn negative so that `inner_sdf >= antialias_threshold`, which draws no
-  // anti-aliasing pixels for them.
+  // Negative inner widths prevent antialiasing pixels on zero-width borders.
   float2 reduced_border = float2(
     border.x == 0.0 ? -antialias_threshold : border.x,
     border.y == 0.0 ? -antialias_threshold : border.y);
@@ -792,7 +790,7 @@ fragment float4 monochrome_sprite_fragment(
     constant Globals &globals [[buffer(1)]],
     texture2d<float> atlas_texture [[texture(0)]]) {
   float4 sample = atlas_texture.sample(linear_sampler, input.tile_position);
-  // WARNING: sample the texture before this early return, since sampling needs derivatives from uniform control flow.
+  // Sample before the early return: derivatives require uniform control flow.
   if (any(input.clip_distance < float4(0.0))) {
     return float4(0.0);
   }

@@ -214,7 +214,7 @@ globalThis.__appsBrowserEnvironment = (call, task) => {
       current = target; if (replace) entries[position] = { url: current.href, state: null }; else { entries.splice(++position); entries.push({ url: current.href, state: null }); } dispatchEvent(Object.assign(new Event('popstate'), { state: null })); changed(oldURL); entryChanged();
     } else call('dom.navigate', target.href, replace, reload);
   };
-  // WARNING: URL origins of non-special schemes are opaque, but code uses `location.origin` as a base URL, as with a privileged Electron scheme.
+  // URL origins of non-special schemes are opaque, but code uses `location.origin` as a base URL, as with a privileged Electron scheme.
   const originOf = url => url.protocol === 'apps:' ? 'apps://app' : url.protocol === 'file:' ? 'file://' : url.origin;
   class Location {
     assign(url) { navigate(url); }

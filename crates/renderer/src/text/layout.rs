@@ -400,8 +400,7 @@ impl WrappedLineLayout {
                     .unwrapped_layout
                     .closest_index_for_x(position_in_unwrapped_line.x))
             } else {
-                // WARNING: the shaper can place a trailing zero-width wrap boundary glyph slightly past
-                // the line's width, so the row can extend past where `index_for_x` has glyphs.
+                // A trailing zero-width glyph can exceed the line width, beyond index_for_x's glyph range.
                 self.unwrapped_layout
                     .index_for_x(position_in_unwrapped_line.x)
                     .ok_or(wrapped_line_end_index)
@@ -625,8 +624,7 @@ impl LineLayoutCache {
     }
 }
 
-// WARNING: combining marks, like Thai vowel signs or Arabic diacritics, are shaped at the x of their base
-// character, so they must not take a cell. A glyph less than half a cell past the last base is one.
+// Combining marks share the base character's cell. Treat glyphs within half a cell of the last base as marks.
 fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
     let mut glyph_pos: usize = 0;
     let mut last_base_shaped_x = px(f32::NEG_INFINITY);

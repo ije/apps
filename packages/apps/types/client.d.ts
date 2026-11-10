@@ -27,7 +27,7 @@ declare namespace NodeJS {
   }
 }
 
-// WARNING: empty so these resolve without the DOM lib. They merge with the DOM types.
+// Empty so these resolve without the DOM lib. They merge with the DOM types.
 interface Worker {}
 interface SharedWorker {}
 

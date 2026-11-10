@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# WARNING: FFmpeg is LGPL only while GPL and nonfree parts stay off. Apps load this library
-# dynamically and ship FFmpeg.LICENSE next to it, so users can replace it.
+# Keep GPL and nonfree components disabled. Ship the replaceable shared library with FFmpeg.LICENSE.
 set -euo pipefail
 
 version=9.0.2
@@ -14,7 +13,7 @@ case "$(uname -s)" in
   MINGW* | MSYS* | CYGWIN*) system=windows ;;
   *) printf 'Unsupported operating system\n' >&2; exit 1 ;;
 esac
-# WARNING: MSYS2 runs emulated on Windows arm64, so uname reports x86_64 there.
+# MSYS2 runs emulated on Windows arm64, so uname reports x86_64 there.
 case "${MSYSTEM_CARCH:-$(uname -m)}" in
   arm64 | aarch64) arch=aarch64 ;;
   x86_64 | amd64 | AMD64) arch=x86_64 ;;
@@ -90,12 +89,11 @@ if ! grep -q '^License: LGPL version 2.1 or later' "$build/configure.log"; then
   exit 1
 fi
 make -C "$build" -j"$jobs"
-# WARNING: the prefix is /, so the library does not carry a build path. Only the headers install: the
-# static libraries stay in the build folder, so nothing can link FFmpeg statically.
+# Use / as the prefix to exclude build paths. Install only headers to prevent static linkage.
 make -C "$build" install-headers DESTDIR="$build/install"
 rm -rf "$build/install/share" "$build/install/lib/pkgconfig"
 
-# WARNING: the library exports only what the media library calls, so the linker drops the rest of FFmpeg.
+# The library exports only what the media library calls, so the linker drops the rest of FFmpeg.
 lib=$build/install/lib
 mkdir -p "$lib"
 config=$build/ffbuild/config.mak
@@ -133,7 +131,8 @@ esac
   cat "$source_dir/COPYING.LGPLv2.1"
 } > "$build/install/FFmpeg.LICENSE"
 
-# WARNING: macOS caches a library's code signature per file, so a rewrite in place kills every process that loads it. Replace the folder.
+# Replace the folder. In-place writes invalidate macOS code signatures and kill processes that load the
+# library.
 rm -rf "$output"
 mv "$build/install" "$output"
 rm -rf "$build"

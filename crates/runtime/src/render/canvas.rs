@@ -7,7 +7,7 @@ pub const RASTER_MAX: u32 = 4096;
 
 #[derive(Clone)]
 struct State {
-    // WARNING: f64, so a far translation and a far point cancel exactly.
+    // F64, so a far translation and a far point cancel exactly.
     transform: [f64; 6],
     fill: skia::Shader<'static>,
     stroke: skia::Shader<'static>,
@@ -131,7 +131,7 @@ pub fn ink(system: &renderer::TextSystem, line: &renderer::LineLayout) -> [f32; 
 
 fn gradient(spec: &str) -> Option<skia::Shader<'static>> {
     let (shape, stops): (Vec<f32>, Vec<(f32, String)>) = serde_json::from_str(spec).ok()?;
-    // WARNING: tiny-skia has no start radius, so the stops move out by it. Inside it the first color fills.
+    // tiny-skia has no start radius, so the stops move out by it. Inside it the first color fills.
     let start = if shape.len() == 6 {
         shape[2] / shape[5]
     } else {
@@ -169,7 +169,7 @@ fn gradient(spec: &str) -> Option<skia::Shader<'static>> {
     }
 }
 
-// WARNING: `None` past the range where tiny-skia drops the whole path, so such a call is skipped like one with
+// `None` past the range where tiny-skia drops the whole path, so such a call is skipped like one with
 // non-finite arguments.
 fn device<const N: usize>(
     [a, b, c, d, e, f]: [f64; 6],
@@ -201,8 +201,8 @@ fn concat([a, b, c, d, e, f]: [f64; 6], [ma, mb, mc, md, me, mf]: [f64; 6]) -> [
     ]
 }
 
-// WARNING: strokes are built in the space of the linear part, so their width is in canvas units and far
-// translations never meet f32 points. The paint shader maps canvas points into that space.
+// Build strokes without translation to preserve width and avoid f32 precision loss. Map paint into the same
+// space.
 fn stroke_space([a, b, c, d, e, f]: [f64; 6]) -> Option<(skia::Transform, skia::Transform)> {
     let det = a * d - b * c;
     let shift = [(d * e - c * f) / det, (a * f - b * e) / det];
@@ -422,7 +422,7 @@ impl Canvas {
             &std::collections::HashMap<String, String>,
         )>,
     ) -> Result<()> {
-        // WARNING: the codes and argument counts must match `CanvasRenderingContext2D` in `dom.js`.
+        // The codes and argument counts must match `CanvasRenderingContext2D` in `dom.js`.
         const ARGS: [usize; 41] = [
             0, 0, 6, 6, 1, 1, 1, 1, 1, 1, 1, 0, 0, 2, 2, 4, 6, 4, 1, 0, 1, 4, 4, 4, 4, 11, 5, 4, 6,
             8, 5, 12, 1, 1, 1, 1, 1, 1, 1, 1, 1,
@@ -447,7 +447,7 @@ impl Canvas {
             line_join: state.join,
             dash: skia::StrokeDash::new(state.dash.clone(), state.dash_offset),
         };
-        // WARNING: these modes also change pixels outside the shape, so the shape draws into a layer that covers the canvas.
+        // These modes also change pixels outside the shape, so the shape draws into a layer that covers the canvas.
         let mut covered: Option<skia::Pixmap> = None;
         let finish = |pixels: &mut skia::Pixmap, saved: skia::Pixmap, state: &State| {
             let layer = std::mem::replace(pixels, saved);
@@ -690,13 +690,13 @@ impl Canvas {
                     if !t.is_finite() || !scale.is_finite() || scale <= 1e-3 {
                         continue;
                     }
-                    // WARNING: glyphs rasterize at most 1024 pixels per em and larger text scales the layer up, so a huge font or transform cannot allocate huge glyphs.
+                    // Cap glyph rasterization at 1024 pixels per em, then scale, to bound allocations.
                     let mut raster = scale.min(1024. / f32::from(line.font_size));
                     let upright =
                         raster == scale && t.kx == 0. && t.ky == 0. && t.sx > 0. && t.sx == t.sy;
                     let canvas = skia::Rect::from_xywh(0., 0., width as f32, height as f32);
-                    // WARNING: a stretched or skewed transform maps the canvas to a huge part of the layer, so the
-                    // layer gets coarser until the visible ink fits in twice the canvas sides and 2^24 pixels.
+                    // Reduce layer resolution until visible ink fits within twice the canvas dimensions and
+                    // 2^24 pixels.
                     if !upright
                         && let Some(visible) = t
                             .pre_scale(1. / raster, 1. / raster)
@@ -800,7 +800,7 @@ impl Canvas {
                         .then(|| skia::Pixmap::new((right - left) as u32, (bottom - top) as u32))
                         .flatten()
                     else {
-                        // WARNING: a covering mode moved the canvas into `covered`, so it must be put back before
+                        // A covering mode moved the canvas into `covered`, so it must be put back before
                         // skipping.
                         if let Some(saved) = covered.take() {
                             self.pixels = saved;
@@ -914,7 +914,7 @@ impl Canvas {
                     let (kx, ky) = (dw / sw, dh / sh);
                     let size = [iw * kx * t[0].hypot(t[1]), ih * ky * t[2].hypot(t[3])]
                         .map(|side| side.abs().ceil().min(f64::from(RASTER_MAX)) as u32);
-                    // WARNING: a negative node draws the canvas onto itself, so it is copied for each call.
+                    // A negative node draws the canvas onto itself, so it is copied for each call.
                     let own;
                     let source = if a[0] < 0. {
                         own = covered.as_ref().unwrap_or(&self.pixels).clone();
@@ -1210,8 +1210,7 @@ pub fn render_svg(
     Ok(render_image(&svg_pixels(tree, width, height, transform)?))
 }
 
-// WARNING: every SVG raster must go through here, so `RASTER_MAX` bounds them all. `transform` stays in the pixels of
-// the asked size.
+// Route all SVG rasterization here to enforce RASTER_MAX. Keep transforms in requested-size pixels.
 pub fn svg_pixels(
     tree: &usvg::Tree,
     width: u32,
@@ -1239,7 +1238,7 @@ pub type SvgGeometry = ([f32; 2], [f32; 4], Vec<(String, [f32; 4], [f32; 4])>);
 pub fn svg_boxes(tree: &usvg::Tree) -> SvgGeometry {
     let rect = |rect: usvg::Rect| [rect.x(), rect.y(), rect.width(), rect.height()];
     let mut boxes = Vec::new();
-    // WARNING: usvg applies the transform of a `<use>` twice in `abs_transform`, so canvas boxes come from the
+    // usvg applies the transform of a `<use>` twice in `abs_transform`, so canvas boxes come from the
     // relative transforms.
     let root = tree.root().abs_transform();
     let mut pending: Vec<_> = tree

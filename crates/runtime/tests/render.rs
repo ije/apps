@@ -935,8 +935,8 @@ fn video_frames_keep_the_boxes_around_them() {
     let runtime = std::path::Path::new(env!("CARGO_BIN_EXE_apps-runtime"))
         .parent()
         .unwrap();
-    // WARNING: the runtime loads the media library only from its own folder, and cargo leaves the library of the
-    // dev-dependency in `deps`. A loaded library is never written in place, as macOS would kill its users.
+    // Copy the media library from deps to the executable's folder. Replace it atomically to preserve macOS
+    // code signatures.
     let library = runtime.join("libapps_media.dylib");
     let copy = runtime.join(format!("libapps_media.{}.tmp", std::process::id()));
     std::fs::copy(runtime.join("deps/libapps_media.dylib"), &copy).unwrap();

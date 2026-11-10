@@ -86,7 +86,7 @@ pub struct Node {
     pub children: Vec<usize>,
     pub parent: Option<usize>,
     pub(crate) stylesheet: Option<Rc<crate::style::Stylesheet>>,
-    // WARNING: this is the parse of the `style` attribute in `attrs`, so every write of `style` must clear it.
+    // Clear this cache on every style attribute write.
     pub(crate) inline: Option<crate::style::Declarations>,
     #[serde(skip)]
     pub(crate) state: u16,
@@ -145,8 +145,7 @@ impl Nodes {
         self.list.iter_mut()
     }
 
-    // WARNING: tree walks are cached by the tree revision, which `edit` doesn't change, so never change `parent` or
-    // `children` through it.
+    // Never change parent or children through edit: it does not invalidate cached tree walks.
     pub(crate) fn edit(&mut self, id: usize) -> Option<&mut Node> {
         let node = self.list.get_mut(id)?;
         self.latest = stamp();
@@ -158,7 +157,7 @@ impl Nodes {
         self.tree
     }
 
-    // WARNING: the revision stays, so the frame must put the old children back before it ends.
+    // The revision stays, so the frame must put the old children back before it ends.
     pub fn compose_children(&mut self, id: usize, children: Vec<usize>) -> Vec<usize> {
         std::mem::replace(&mut self.list[id].children, children)
     }

@@ -16,8 +16,7 @@ fn redraw_when_decoded(
     decoding: Decoding,
 ) -> impl FnOnce(&mut renderer::Window, &mut renderer::App) {
     move |window, _| {
-        // WARNING: a later box with the same file can take the image first. Then only this closure holds the slot, and
-        // the first box still has to paint.
+        // Retain the slot in this closure: another box can take the image before this one paints.
         if Arc::strong_count(&decoding) == 1
             || decoding
                 .lock()
@@ -115,8 +114,8 @@ pub(super) fn css_background(
                                 !matches!(repeat.trim(), "no-repeat" | "repeat-y"),
                                 !matches!(repeat.trim(), "no-repeat" | "repeat-x"),
                             );
-                            // WARNING: small tiles on a big box would paint millions of images, so past 4096 tiles
-                            // a layer paints a bitmap of several tiles, at least 256 device pixels per repeating side.
+                            // Group backgrounds above 4096 tiles into bitmaps of at least 256 device pixels
+                            // per repeating side to bound draw calls.
                             let count = |repeats: bool, extent: f32, side: f32| {
                                 if repeats { (extent / side).ceil() } else { 1. }
                             };
@@ -165,7 +164,7 @@ pub(super) fn css_background(
                                         && [image.size().width, image.size().height].map(u32::from)
                                             != cell
                             }) {
-                                // WARNING: take a decoded bitmap only where a layer holds it at once, since `retire`
+                                // Take a decoded bitmap only where a layer holds it at once, since `retire`
                                 // drops unheld bitmaps.
                                 let bitmap = match decoded(backgrounds) {
                                     Some(bitmap) => bitmap,
@@ -327,8 +326,8 @@ pub(super) fn css_background(
                                 return;
                             }
                             if tiled {
-                                // WARNING: find the visible tiles by index, so a far position or a tiny tile never
-                                // loops forever.
+                                // Calculate visible tile indices directly. Iteration from distant origins or
+                                // across tiny tiles can run indefinitely.
                                 let visible = window.content_mask().bounds.intersect(&bounds);
                                 let [width, height] = [width * nx, height * ny];
                                 let origin = [
@@ -417,8 +416,8 @@ pub(super) fn css_background(
                     if width <= 0. || height <= 0. {
                         return;
                     }
-                    // WARNING: a one-axis gradient draws as a 3 px strip stretched over the box. Its outer pixels stay
-                    // outside the box, so filtering never reads other atlas tiles.
+                    // Keep the gradient strip's outer pixels outside the box so filtering cannot sample
+                    // neighboring atlas tiles.
                     let scale = window.scale_factor();
                     let axis = strip.filter(|_| {
                         matches!(size.as_str(), "" | "auto" | "auto auto")
@@ -485,8 +484,7 @@ pub(super) fn css_background(
                     };
                     let entry = dom.backgrounds.get(&key);
                     if entry.is_none_or(|(old, image)| old != &inputs || !fits(image)) {
-                        // WARNING: only new boxes take and fill the cache, or an animated gradient would keep its old
-                        // frames.
+                        // Cache only on new boxes, or animated gradients retain old frames.
                         let new = entry.is_none();
                         let cached = new
                             .then(|| {
@@ -537,7 +535,7 @@ pub(super) fn css_background(
                     if let Some((_, image)) = dom.backgrounds.get(&key)
                         && let Some([x, y]) = tiled
                     {
-                        // WARNING: tiles snap to device pixels, so their edges never sample other atlas tiles.
+                        // Tiles snap to device pixels, so their edges never sample other atlas tiles.
                         let visible = window.content_mask().bounds.intersect(&bounds);
                         let start = |edge, at: f32, side: f32, cell: f32, low| {
                             let at = f32::from(edge) + at - if at > 0. { side } else { 0. };

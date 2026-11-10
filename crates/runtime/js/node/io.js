@@ -148,7 +148,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     _flush(callback) { callback(null, this.digest()); }
     update(data, encoding) {
       if (this.#done) throw Object.assign(new Error('Digest already called'), { code: 'ERR_CRYPTO_HASH_FINALIZED' });
-      // WARNING: chunks wait for digest(), so views are copied: their owner can change them. A string's bytes are new already.
+      // Copy views before digest(): callers can mutate their bytes. String bytes are already private.
       data = typeof data === 'string' ? input(data, encoding) : Buffer.from(input(data, encoding));
       this.#chunks.push(data); this.#size += data.length;
       if (this.#size >= 65536) {
@@ -180,7 +180,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
       this.#decrypt = decrypt; this.#key = secret(key); this.#iv = input(iv);
       if (this.#key.length * 8 !== Number(bits)) throw Object.assign(new RangeError('Invalid key length'), { code: 'ERR_CRYPTO_INVALID_KEYLEN' });
       if (this.#iv.length !== 12) throw Object.assign(new TypeError('Invalid initialization vector'), { code: 'ERR_CRYPTO_INVALID_IV' });
-      // WARNING: ring verifies only 16-byte GCM tags, so a decipher rejects the shorter tags that Node also takes.
+      // ring verifies only 16-byte GCM tags, so a decipher rejects the shorter tags that Node also takes.
       const length = options?.authTagLength;
       if (length !== undefined && !(Number.isInteger(length) && (decrypt ? length === 16 : length === 4 || length === 8 || length >= 12 && length <= 16))) throw invalidTag(length);
       this.#tagLength = length ?? 16;
@@ -191,8 +191,8 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     update(data, inputEncoding, outputEncoding) {
       if (this.#done) throw Object.assign(new Error('Unsupported state'), { code: 'ERR_CRYPTO_INVALID_STATE' });
       const bytes = input(data, inputEncoding), end = this.#size + bytes.length;
-      // WARNING: GCM's AES-CTR keystream doesn't depend on the data, so sealing zeros yields it. The pad grows by
-      // doubling to keep the total work linear.
+      // Encrypt zeros to obtain the data-independent AES-CTR keystream. Double the pad size to keep total
+      // work linear.
       if (end > this.#pad.length) { const size = Math.max(end, this.#pad.length * 2, 4096); this.#pad = output(call('web.crypto.encrypt', this.#key, this.#iv, new Uint8Array(0), new Uint8Array(size))).subarray(0, size); }
       const out = Buffer.allocUnsafe(bytes.length);
       for (let i = 0; i < bytes.length; i++) out[i] = bytes[i] ^ this.#pad[this.#size + i];
@@ -244,7 +244,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
   const curveOf = name => Object.keys(curves).find(curve => curve === name || curves[curve][1] === name || curves[curve][0] === name || (curve === 'P-256' && name === 'secp256r1'));
   const point = data => { const size = curves[data.curve]?.[2]; if (!size || data.x.length !== 1 + 2 * size || data.x[0] !== 4 || (data.d && data.d.length !== size)) unsupported(); return data; };
   const rsaKey = (bytes, type) => { const [n, e, d, p, q, dp, dq, qi] = items(der(bytes)[1]).slice(type === 'private' ? 1 : 0).map(([, value]) => trim(value)); if (!e || (type === 'private' && !qi)) unsupported(); return type === 'private' ? { type, kind: 'rsa', n, e, d, p, q, dp, dq, qi } : { type, kind: 'rsa', n, e }; };
-  // WARNING: ring cannot derive an EC public key, so private EC keys must carry it, as OpenSSL writes them.
+  // ring cannot derive an EC public key, so private EC keys must carry it, as OpenSSL writes them.
   const ecKey = (bytes, curve) => {
     const list = items(der(bytes)[1]), params = list.find(([tag]) => tag === 0xa0), x = list.find(([tag]) => tag === 0xa1);
     if (params) curve = curveOf(der(params[1])[1].toString('hex'));
@@ -350,7 +350,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
   };
   const secret = (value, encoding) => value instanceof KeyObject ? keys.get(value).key ?? fail('ERR_CRYPTO_INVALID_KEY_OBJECT_TYPE', `Invalid key object type ${value.type}, expected secret.`, TypeError) : Buffer.from(input(value, encoding));
   const signing = { sha1: ['SHA-1', 20], sha256: ['SHA-256', 32], sha384: ['SHA-384', 48], sha512: ['SHA-512', 64] };
-  // WARNING: ring pads RSA-PSS with a salt as long as the digest, so other salt lengths are rejected.
+  // ring pads RSA-PSS with a salt as long as the digest, so other salt lengths are rejected.
   const signature = (algorithm, data, key, signed) => {
     const verify = signed !== undefined, opts = key !== null && typeof key === 'object' && !ArrayBuffer.isView(key) ? key : {}, value = load(key, verify ? 'public' : 'private');
     const name = algorithm == null ? 'sha256' : String(algorithm).toLowerCase().replace(/^(?:rsa-|ecdsa-with-)/, '').replace('-', ''), [hash, size] = signing[name] ?? fail('ERR_CRYPTO_INVALID_DIGEST', `Invalid digest: ${algorithm}`, TypeError);

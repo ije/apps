@@ -662,7 +662,7 @@ impl Window {
         self.rebuild = true;
     }
 
-    // WARNING: the node needs its element id, or the patch is ignored.
+    // The node needs its element id, or the patch is ignored.
     pub fn patch(&mut self, node: crate::Node) {
         self.patches.push(node);
     }
@@ -692,7 +692,7 @@ impl Window {
         self.tracks.clear();
     }
 
-    // WARNING: when `repeat` is not 1, the last sample must equal the first.
+    // When `repeat` is not 1, the last sample must equal the first.
     pub fn promote(
         &mut self,
         key: u64,
@@ -735,8 +735,7 @@ impl Window {
             None => Some(content),
         };
         let region = crate::frame::region(content);
-        // WARNING: the compositor draws the layer over the window without its clip, so it must stay inside the clip
-        // with nothing painted over it there.
+        // Promoted layers bypass window clips. Keep them inside the clip with no overlapping content above.
         let window = Bounds::new(Point::default(), self.viewport_size.scale(scale));
         let reach = reach.map(|reach| reach.intersect(&window));
         if reach.is_some_and(|reach| reach.is_empty()) {
@@ -798,7 +797,7 @@ impl Window {
         if self.will_draw() {
             return false;
         }
-        // WARNING: the atlas and text caches keep their frame, so the tiles this scene reads stay.
+        // The atlas and text caches keep their frame, so the tiles this scene reads stay.
         let _ = self.platform.draw(&self.scene, false);
         true
     }
@@ -896,8 +895,8 @@ impl Window {
         self.dirty || !self.next_frame_callbacks.is_empty()
     }
 
-    // WARNING: a caret that blinks by drawing keeps about 126 MB of Metal driver memory alive. Core Animation blinks it
-    // only at the top level, clear of round corners, with nothing over it; else this returns false.
+    // Core Animation avoids about 126 MB of Metal memory for caret blinking. Use it only without effects,
+    // rounded clips or overlaps.
     pub fn overlay_caret(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -1273,7 +1272,7 @@ impl Window {
         self.scroll_chain = Some(chain);
     }
 
-    // WARNING: these keys pass main's key filter like real ones, so this blocks until main answers.
+    // These keys pass main's key filter like real ones, so this blocks until main answers.
     pub fn dispatch_keystroke(&mut self, keystroke: Keystroke, cx: &mut App) -> bool {
         let id = self.id;
         let filter = |input: PlatformInput| {
@@ -1426,8 +1425,8 @@ impl Window {
         self.content_masks.push((mask, snapped));
     }
 
-    // WARNING: replaces the clips of the boxes between this one and its containing block, so the mask must come from
-    // the same layer. Pop it with `pop_content_mask`.
+    // Use a mask from the containing block's layer: it replaces intermediate clips. Pair with
+    // pop_content_mask.
     pub(crate) fn push_escaped_content_mask(&mut self, mask: ContentMask<Pixels>) {
         self.push_content_mask(mask);
     }
@@ -1724,7 +1723,7 @@ impl Window {
     }
 
     pub fn paint_effect<R>(&mut self, effect: PaintEffect, f: impl FnOnce(&mut Self) -> R) -> R {
-        // WARNING: at opacity 0 nothing inside draws, but `f` still registers hitboxes and listeners.
+        // At opacity 0 nothing inside draws, but `f` still registers hitboxes and listeners.
         if self.opacity <= 0. {
             return f(self);
         }
@@ -1780,7 +1779,7 @@ impl Window {
             content_mask,
         };
         self.scene.push_effect(state, effect.key);
-        // WARNING: ancestor clips apply after the effect, in window space, so the layer starts unclipped.
+        // Ancestor clips apply after the effect, in window space, so the layer starts unclipped.
         self.push_content_mask(unbounded_mask());
         let result = f(self);
         self.content_masks.pop();
@@ -1901,7 +1900,7 @@ impl Window {
         let scale = self.scale_factor;
         let origin = origin.scale(scale);
         let variants = SUBPIXEL_VARIANTS_X as f32;
-        // WARNING: like Skia, halves round up, so a baseline at y.5 draws on the same row as in Chromium.
+        // Like Skia, halves round up, so a baseline at y.5 draws on the same row as in Chromium.
         let quantized = point(
             (origin.x.0 * variants + 0.5).floor() / variants,
             (origin.y.0 + 0.5).floor(),

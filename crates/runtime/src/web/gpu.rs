@@ -122,7 +122,7 @@ fn load() -> Result<Library> {
         .context("Missing executable directory")?;
     let name =
         library_name(std::env::consts::OS).context("WebGPU is unavailable on this platform")?;
-    // WARNING: like JavaScriptCore, the library only loads from the app, never from the environment.
+    // Like JavaScriptCore, the library only loads from the app, never from the environment.
     let path = ["../Frameworks", "."]
         .iter()
         .map(|folder| directory.join(folder).join(name))
@@ -145,7 +145,7 @@ fn load() -> Result<Library> {
             presented: *library.get(b"apps_webgpu_presented\0")?,
             allocated: *library.get(b"apps_webgpu_allocated\0")?,
         };
-        // WARNING: wgpu threads may outlive every device, so the library is never unloaded.
+        // wgpu threads may outlive every device, so the library is never unloaded.
         std::mem::forget(library);
         Ok(functions)
     }

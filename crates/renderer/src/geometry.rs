@@ -761,7 +761,7 @@ impl<P: Default> From<Bounds<P>> for ContentMask<P> {
     }
 }
 
-// WARNING: rounds midpoints toward zero, so a 1px line at 150% stays 1 device pixel.
+// Rounds midpoints toward zero, so a 1px line at 150% stays 1 device pixel.
 pub(crate) fn round_half_toward_zero(value: f32) -> f32 {
     (value.abs() - 0.5).ceil().copysign(value)
 }
@@ -774,8 +774,7 @@ pub(crate) fn round_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     round_half_toward_zero(logical * scale_factor)
 }
 
-// WARNING: truncates to 1/64 of a device pixel, like Chrome's `LayoutUnit`. The tiny bias keeps a size
-// that is already in layout units from losing one to float error.
+// Match Chrome's 1/64-pixel truncation. The bias prevents float error from subtracting a layout unit.
 pub fn to_layout_unit(logical: f32, scale_factor: f32) -> f32 {
     (logical * scale_factor * 64. * (1. + 1e-6)).trunc() / 64.
 }

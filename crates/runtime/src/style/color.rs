@@ -260,7 +260,7 @@ pub fn color(value: &str) -> Option<(u32, u8)> {
     }
     let color = parse(value, 0).map(|(space, channels, alpha)| {
         let rgb = convert(space, channels, Space::Srgb);
-        // WARNING: browsers keep channels as f32, so 0.1 * 255 rounds up to 26.
+        // Browsers keep channels as f32, so 0.1 * 255 rounds up to 26.
         let [r, g, b] = rgb.map(|v| ((v as f32).clamp(0., 1.) * 255.).round() as u32);
         (
             r << 16 | g << 8 | b,
@@ -567,7 +567,7 @@ fn parse(value: &str, depth: u8) -> Option<(Space, [f64; 3], f64)> {
 fn convert(from: Space, values: [f64; 3], to: Space) -> [f64; 3] {
     match (from, to) {
         _ if from == to => values,
-        // WARNING: a round trip through XYZ moves channels like 25.5 below the rounding point.
+        // A round trip through XYZ moves channels like 25.5 below the rounding point.
         (Space::Hsl | Space::Hwb, Space::Srgb) => hsl(from, values),
         _ => from_xyz(to, to_xyz(from, values)),
     }

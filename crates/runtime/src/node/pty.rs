@@ -49,11 +49,11 @@ mod tests {
 impl Drop for Session {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take().filter(|_| !self.exited) {
-            // WARNING: kill() waits up to 200 ms for SIGHUP, so it must not run on the UI thread.
+            // kill() waits up to 200 ms for SIGHUP, so it must not run on the UI thread.
             let _ = std::thread::Builder::new()
                 .name("apps-pty-kill".into())
                 .spawn(move || {
-                    // WARNING: Never signal a reaped child; its PID may belong to another process.
+                    // Never signal a reaped child; its PID may belong to another process.
                     if let Ok(None) = child.try_wait()
                         && child.kill().is_ok()
                     {
@@ -229,7 +229,7 @@ impl State {
                         })?;
                     }
                     _ => {
-                        // WARNING: Never signal a reaped child; its PID may belong to another process.
+                        // Never signal a reaped child; its PID may belong to another process.
                         let Some(child) = session.child.as_mut().filter(|_| !session.exited) else {
                             return Ok(Value::Null);
                         };

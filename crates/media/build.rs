@@ -22,7 +22,7 @@ fn main() {
     }
     println!("cargo:rustc-cfg=ffmpeg");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    // WARNING: only the cdylib links FFmpeg, so test executables that link the rlib don't need it.
+    // Only the cdylib links FFmpeg, so test executables that link the rlib don't need it.
     cc::Build::new()
         .file(root.join("native/ffmpeg.c"))
         .include(ffmpeg.join("include"))
@@ -46,7 +46,7 @@ fn main() {
     let path = lib.join(name);
     for folder in [profile.to_owned(), profile.join("deps")] {
         let target = folder.join(name);
-        // WARNING: macOS kills processes that load a library rewritten in place, so copy to a new file.
+        // MacOS kills processes that load a library rewritten in place, so copy to a new file.
         if fs::read(&target).ok() != Some(fs::read(&path).unwrap()) {
             let temporary = folder.join(format!(".{name}"));
             fs::copy(&path, &temporary).unwrap();

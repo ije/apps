@@ -8,7 +8,7 @@
     if (!response.ok || !['default', 'basic', 'cors'].includes(response.type)) throw new TypeError('Invalid WebAssembly response');
     return response.arrayBuffer();
   };
-  // WARNING: JSC's native async Wasm APIs need a platform run loop that apps does not drive.
+  // JSC's native async Wasm APIs need a platform run loop that apps does not drive.
   const methods = {
     async compile(source, options = undefined) { return new Module(source, options); },
     async instantiate(source, imports = undefined, options = undefined) {

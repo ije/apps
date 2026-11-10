@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-// WARNING: changes with `Item` or a function signature, and must match the runtime.
+// Update this ABI version with `Item` or function signatures, and match the runtime.
 const ABI: u32 = 1;
 const CAPACITY: usize = 120;
 const READOUT: Duration = Duration::from_millis(500);
@@ -181,7 +181,7 @@ pub unsafe extern "C" fn apps_perfhud_paint(
         let mut draws: Vec<f32> = hud.frames.iter().map(|draw| draw * 1e3).collect();
         draws.sort_unstable_by(f32::total_cmp);
         let count = draws.len().max(1) as f32;
-        // WARNING: `sum()` of no floats is -0.
+        // `sum()` of no floats is -0.
         let mean = draws.iter().fold(0., |sum, draw| sum + draw) / count;
         hud.readout = Readout {
             hz: refresh.map(|period| 1. / period),

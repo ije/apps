@@ -126,7 +126,7 @@ fn init(mut seed: i32) -> (Vec<usize>, Vec<[[f64; 2]; 4]>) {
     (lattice_selector, gradient)
 }
 
-// WARNING: the four channels share the lattice of each octave and keep resvg's per-channel arithmetic.
+// The four channels share the lattice of each octave and keep resvg's per-channel arithmetic.
 fn turbulence(
     mut x: f64,
     mut y: f64,

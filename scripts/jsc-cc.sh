@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# WARNING: CMake runs every JSC compile through this. The runtime, GC, WTF and bmalloc keep -O3,
-# the JIT compiler back ends and the inspector use -Oz, and the rest keeps the -Os default.
-# Operations and slow paths that JIT code calls stay at -Os.
+# Keep runtime, GC, WTF and bmalloc at -O3. Use -Oz for compiler backends and Inspector, -Os elsewhere,
+# including JIT operations.
 source=${!#}
 case $source in
   */WTF/* | */bmalloc/* | */JavaScriptCore/runtime/* | */JavaScriptCore/heap/* | \

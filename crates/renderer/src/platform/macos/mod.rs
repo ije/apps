@@ -1,4 +1,4 @@
-// WARNING: macOS screens have a y axis that goes up from the bottom, with the origin at the
+// MacOS screens have a y axis that goes up from the bottom, with the origin at the
 // bottom left of the main display.
 
 mod controls;
@@ -131,12 +131,10 @@ impl Inbox {
     }
 }
 
-// WARNING: render thread inboxes are leaked on purpose, since `Callbacks` of native views can name one after its thread
-// ends.
+// Keep render inboxes alive after thread exit: native view callbacks can still reference them.
 pub(crate) type AppThread = &'static Inbox;
 
-// WARNING: `ask` also runs this inbox, so a page that waits for main never waits for main's `ask` of that page to time
-// out.
+// Process the inbox during ask so a page waiting for main cannot deadlock main's request.
 static MAIN: Inbox = Inbox::new();
 static MAIN_QUEUED: AtomicBool = AtomicBool::new(false);
 static RENDERS: Mutex<Vec<AppThread>> = Mutex::new(Vec::new());
@@ -156,8 +154,8 @@ impl<T> Sendable<T> {
     }
 }
 
-// WARNING: main work runs from a run loop source in the common modes, not the main dispatch queue, which AppKit doesn't
-// serve in loops nested in its blocks, like menus and modal panels.
+// Use a common-modes run loop source: AppKit does not serve the main dispatch queue inside nested menus or
+// modal panels.
 fn main_source() -> CFRunLoopSourceRef {
     static SOURCE: OnceLock<usize> = OnceLock::new();
     *SOURCE.get_or_init(|| {
@@ -264,8 +262,7 @@ enum Asked<R> {
     Abandoned,
 }
 
-// WARNING: `f` always runs, but while an earlier `f` is late nothing waits, so a hung page costs AppKit one wait and
-// not one per question.
+// Allow only one outstanding wait per page so a hung page cannot repeatedly block AppKit.
 pub(crate) fn ask<R: Send + 'static>(
     thread: AppThread,
     f: impl FnOnce() -> R + Send + 'static,
@@ -294,8 +291,7 @@ pub(crate) fn ask_within<R: Send + 'static>(
                 *answer = Asked::Answered(value);
             }
             drop(answer);
-            // WARNING: the waiter checks the slot while it holds this lock, so taking it here keeps the
-            // notification from falling between that check and its wait.
+            // Hold the waiter's lock to prevent a notification between its slot check and wait.
             drop(MAIN.tasks.lock().unwrap_or_else(PoisonError::into_inner));
             MAIN.ready.notify_all();
         }),
@@ -376,7 +372,7 @@ pub(crate) fn spawn_render(
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push(thread);
-    // WARNING: page boxes recurse as deep as the stack allows, and the main thread has this size.
+    // Page boxes recurse as deep as the stack allows, and the main thread has this size.
     std::thread::Builder::new()
         .name("apps-render".into())
         .stack_size(64 << 20)
@@ -431,7 +427,7 @@ pub(crate) fn spawn_render(
                     }) {
                         (due.2)();
                     }
-                    // WARNING: this thread has no run loop to commit Core Animation changes.
+                    // This thread has no run loop to commit Core Animation changes.
                     CATransaction::flush();
                 });
             }
@@ -442,14 +438,13 @@ pub(crate) fn spawn_render(
             };
             thread.late.store(0, Ordering::Release);
             drop(left);
-            // WARNING: timers can hold the page side, whose drop needs the other thread locals.
+            // Drop timers before thread locals: timers can own page state that needs them.
             autoreleasepool(|_| {
                 TIMERS.take();
                 done();
                 CATransaction::flush();
             });
-            // WARNING: the process must not exit under the teardown above, so a thread that ends
-            // counts as gone only now.
+            // Count the thread as stopped only after teardown, or the process can exit during it.
             leave_renders(thread);
         })
         .expect("Cannot start a render thread");
@@ -476,8 +471,8 @@ impl Platform {
     }
 
     pub fn quit(&self) {
-        // WARNING: terminating closes windows, whose callbacks need the app, so it runs after
-        // the current event.
+        // Terminating closes windows, whose callbacks need the app, so it runs after
+    // the current event.
         native_post(Box::new(|| {
             post_local(|| {
                 let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
@@ -558,8 +553,7 @@ pub(crate) fn run_after(delay: Duration, f: impl FnOnce() + 'static) {
 }
 
 pub(crate) fn native_after(delay: Duration, f: impl FnOnce() + 'static) {
-    // WARNING: a common-modes run loop timer, not `dispatch_after`, so it fires in nested loops and isn't late by a
-    // tenth of its delay.
+    // Use a common-modes timer so nested loops run it without dispatch_after's delay tolerance.
     let f: Box<dyn FnOnce()> = Box::new(f);
     let mut context = CFRunLoopTimerContext {
         version: 0,
@@ -579,7 +573,7 @@ pub(crate) fn native_after(delay: Duration, f: impl FnOnce() + 'static) {
             fire,
             &mut context,
         );
-        // WARNING: a tenth of the delay, at most 1 ms, so a due task doesn't wait for timer coalescing.
+        // A tenth of the delay, at most 1 ms, so a due task doesn't wait for timer coalescing.
         CFRunLoopTimerSetTolerance(timer, (delay.as_secs_f64() / 10.).min(0.001));
         CFRunLoopAddTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
         CFRelease(timer as _);
@@ -614,8 +608,7 @@ extern "C-unwind" fn will_finish_launching(_: &AnyObject, _: Sel, _: *mut AnyObj
 
 extern "C-unwind" fn did_finish_launching(_: &AnyObject, _: Sel, _: *mut AnyObject) {
     let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
-    // WARNING: the policy is set here and not before the run loop, or the menu bar of an
-    // unbundled app started from a terminal can't be clicked.
+    // Set the policy after the run loop starts, or unbundled apps can have an unclickable menu bar.
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     window::measure_screens();
     if let Some(launch) = LAUNCH.with_borrow_mut(Option::take) {

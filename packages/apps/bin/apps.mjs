@@ -9,7 +9,7 @@ try {
   console.error(`apps: ${name} is missing. Reinstall @pierre/apps with optional dependencies.`)
   process.exit(1)
 }
-// WARNING: apps stops the app on Ctrl+C, so Node must outlive it.
+// apps stops the app on Ctrl+C, so Node must outlive it.
 process.on('SIGINT', () => {})
 const { status, signal, error } = spawnSync(binary, process.argv.slice(2), { stdio: 'inherit' })
 if (error) throw error

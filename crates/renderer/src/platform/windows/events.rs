@@ -38,7 +38,7 @@ pub(super) fn key_event(
 ) -> Option<PlatformInput> {
     let mut vkey = VIRTUAL_KEY(wparam.0 as u16);
     let scan_code = (lparam.0 >> 16) as u32 & 0xFF;
-    // WARNING: a key that the input method takes comes as VK_PROCESSKEY. Its scan code still names the `code`.
+    // A key that the input method takes comes as VK_PROCESSKEY. Its scan code still names the `code`.
     let ime = vkey == VK_PROCESSKEY;
     if ime {
         let extended = if lparam.0 & (1 << 24) != 0 { 0xE000 } else { 0 };

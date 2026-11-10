@@ -385,7 +385,7 @@ impl Client {
             state.ime_commit = None;
             state.composing.take().and(state.text_input.clone())
         };
-        // WARNING: text-input-v3 has no reset, so the input method is turned off and on.
+        // text-input-v3 has no reset, so the input method is turned off and on.
         if let Some(text_input) = text_input {
             text_input.disable();
             text_input.commit();
@@ -394,7 +394,7 @@ impl Client {
     }
 
     pub fn primary_display_bounds(&self) -> Option<Bounds<Pixels>> {
-        // WARNING: `Window::state()` calls this every frame, and a panic ends the app.
+        // `Window::state()` calls this every frame, and a panic ends the app.
         let state = self.state.try_borrow().ok()?;
         let output = state
             .outputs
@@ -1251,7 +1251,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
                 let Some(window) = state.focused(&state.mouse_focus) else {
                     return;
                 };
-                // WARNING: compositors decline requests that name a release serial, so only presses are kept.
+                // Compositors decline requests that name a release serial, so only presses are kept.
                 if button_state == wl_pointer::ButtonState::Pressed {
                     state.press = Some((serial, window.surface.clone()));
                 }
@@ -1289,7 +1289,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
                 let text_input = state.text_input.clone();
                 drop(state);
                 if composing && let Some(text_input) = text_input {
-                    // WARNING: text-input-v3 has no reset, so the input method is turned off and on.
+                    // text-input-v3 has no reset, so the input method is turned off and on.
                     text_input.disable();
                     text_input.commit();
                     client.enable_ime();
@@ -1362,7 +1362,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Handle {
 
 impl State {
     fn add_discrete(&mut self, axis: wl_pointer::Axis, steps: f32) {
-        // WARNING: compositors send both kinds of steps; seats from version 8 only use value120.
+        // Compositors send both kinds of steps; seats from version 8 only use value120.
         let horizontal = axis == wl_pointer::Axis::HorizontalScroll || self.modifiers.shift;
         let delta = self.discrete.get_or_insert_default();
         if horizontal {

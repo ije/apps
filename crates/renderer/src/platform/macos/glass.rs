@@ -38,7 +38,7 @@ fn content_class() -> &'static AnyClass {
     static CLASS: OnceLock<usize> = OnceLock::new();
     let class = *CLASS.get_or_init(|| {
         let mut class = ClassBuilder::new(c"AppsGlassContentView", class!(NSView)).unwrap();
-        // WARNING: the input target belongs to the same window and must outlive these subviews.
+        // The input target belongs to the same window and must outlive these subviews.
         unsafe {
             class.add_ivar::<*mut AnyObject>(TARGET);
             for selector in [
@@ -186,8 +186,7 @@ pub(crate) fn update(views: &mut Vec<GlassView>, parent: &NSView, surfaces: Vec<
         }
         native.surface = surface;
     }
-    // WARNING: glass views stay below every other subview. Glass painted over a promoted layer or the caret stops
-    // them, so the overlay view that holds those goes above, and so do web views, which the renderer can't see.
+    // Keep glass below the overlay and web views. Glass above promoted layers or the caret stops them.
     if restack {
         for native in views.iter().rev() {
             parent.addSubview_positioned_relativeTo(

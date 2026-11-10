@@ -64,8 +64,7 @@ pub(crate) struct Cull {
     pub(crate) walk: crate::dom::Walk,
     pub(crate) parents: Vec<u32>,
     pub(crate) painted: Vec<usize>,
-    // WARNING: per-frame flags may be set only on nodes listed here, or on any node while `None`, since a frame clears
-    // just these.
+    // Set frame flags only on listed nodes, unless None. Only those flags clear next frame.
     pub(crate) fresh: Option<Vec<usize>>,
     pub(crate) marked: Vec<bool>,
     pub(crate) cascaded: bool,
@@ -221,15 +220,14 @@ pub(super) fn content(node: &crate::dom::Node) -> (u64, u64) {
     let mut shape = rustc_hash::FxHasher::default();
     node.tag.hash(&mut shape);
     node.text.hash(&mut shape);
-    // WARNING: a text field's value is left out on purpose: a new value builds the field again in place, see
-    // `element::Patch`.
+    // Exclude field values from revisions: element::Patch rebuilds changed fields in place.
     if !super::element::text_field(node) {
         node.value.hash(&mut shape);
     }
     (node.state & (crate::dom::CHECKED | crate::dom::DIRTY | crate::dom::BROKEN)).hash(&mut shape);
     let mut own = shape.finish();
-    // WARNING: `class` and `style` are left out on purpose. They act through the computed style, so a paint-only class
-    // change keeps the node's revision.
+    // Exclude class and style attributes: computed styles track their effects without invalidating layout for
+    // paint-only changes.
     let mut attrs = rustc_hash::FxHasher::default();
     for pair in node.attrs.iter() {
         let name = pair.0.as_str();
@@ -444,7 +442,7 @@ pub(super) fn lines(
         let Some((member, [left, top, end, bottom])) =
             item(child).filter(|(_, [left, _, end, _])| end > left)
         else {
-            // WARNING: the open line may end elsewhere, and a zero width box could share a line with a spacer.
+            // The open line may end elsewhere, and a zero width box could share a line with a spacer.
             lines.pop();
             break;
         };

@@ -80,7 +80,7 @@ impl TextState {
         }
         let (old, runs) = (self.runs.borrow(), new.runs.borrow());
         let mut last: Option<(&TextRun, &TextRun)> = None;
-        // WARNING: runs split where their decoration changes, which breaks ligatures, so those places must stay.
+        // Runs split where their decoration changes, which breaks ligatures, so those places must stay.
         let same = old.len() == runs.len()
             && old
                 .iter()
@@ -143,7 +143,7 @@ impl TextState {
             && wrap_width == inner.wrap_width
             && inner.shaped_width != Some(px(0.))
             && truncate.is_none()
-            // WARNING: A truncated layout answers an unconstrained probe with the truncated size,
+            // A truncated layout answers an unconstrained probe with the truncated size,
             // so it is never reused.
             && !inner.truncated
         {
@@ -151,7 +151,7 @@ impl TextState {
         }
         let min_content = probe == Some(0);
         let system = window.text_system().clone();
-        // WARNING: like CSS, `BreakWord` does not break inside words for the min-content size.
+        // Like CSS, `BreakWord` does not break inside words for the min-content size.
         let word_break = match style.word_break {
             WordBreak::BreakWord if min_content => WordBreak::Normal,
             word_break => word_break,
@@ -183,8 +183,7 @@ impl TextState {
             }
             (lines, reach)
         };
-        // WARNING: one unwrapped line that fits skips `truncate_text`, which would shape it once to find no cut and
-        // then shape it again.
+        // Skip truncate_text for a line that fits, or it shapes twice.
         let fits = truncate.as_ref().is_some_and(|(_, width)| {
             float == px(0.)
                 && wrap_width.is_none()
@@ -369,7 +368,7 @@ impl TextState {
             kept[probe] = Some((size, baselines));
             probes.set(kept);
         }
-        // WARNING: taffy can take the final size from its cache, so a probe keeps the painted layout.
+        // taffy can take the final size from its cache, so a probe keeps the painted layout.
         if probe.is_none() || layout.0.borrow().is_none() {
             self.repaint.set(false);
             *layout.0.borrow_mut() = Some(TextLayoutInner {
@@ -389,7 +388,7 @@ impl TextState {
 }
 
 impl TextState {
-    /// WARNING: taffy can answer the final width from its cache across frames, while the text was last shaped for another width.
+    /// taffy can answer the final width from its cache across frames, while the text was last shaped for another width.
     pub(crate) fn fit(&self, width: Pixels, window: &mut Window) {
         let style = self.style.borrow();
         let wraps = style.white_space == WhiteSpace::Normal || style.text_overflow.is_some();

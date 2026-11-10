@@ -3,7 +3,7 @@ use rav1d::{PlanarImageComponent as Plane, pixel::MatrixCoefficients as Matrix};
 use std::io::Cursor;
 
 pub fn decode_avif(bytes: &[u8], limits: Limits) -> ImageResult<RgbaImage> {
-    // WARNING: rav1d builds large frame contexts on the stack, which overflows small worker stacks.
+    // rav1d builds large frame contexts on the stack, which overflows small worker stacks.
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("avif".into())

@@ -285,7 +285,7 @@ fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
         Some(NSHomeFunctionKey) => "home".to_string(),
         Some(NSEndFunctionKey) => "end".to_string(),
         Some(NSDeleteFunctionKey) => "delete".to_string(),
-        // WARNING: the Insert key sends NSHelpFunctionKey, not NSInsertFunctionKey.
+        // The Insert key sends NSHelpFunctionKey, not NSInsertFunctionKey.
         Some(NSHelpFunctionKey) => "insert".to_string(),
         Some(NSF1FunctionKey) => "f1".to_string(),
         Some(NSF2FunctionKey) => "f2".to_string(),
@@ -323,7 +323,7 @@ fn parse_keystroke(native_event: &NSEvent) -> Keystroke {
         Some(NSF34FunctionKey) => "f34".to_string(),
         Some(NSF35FunctionKey) => "f35".to_string(),
         _ => {
-            // WARNING: cases to test when modifying this:
+            // Cases to test when modifying this:
             //           qwerty key | none | cmd   | cmd-shift
             // * Armenian         s | ս    | cmd-s | cmd-shift-s  (layout is non-ASCII, so use the cmd layout)
             // * Dvorak+QWERTY    s | o    | cmd-s | cmd-shift-s  (layout switches on cmd)

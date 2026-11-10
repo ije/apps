@@ -217,7 +217,7 @@ impl Inner {
 
     fn read_single(&self, reader: &Connection, target: Atom) -> Result<(Vec<u8>, Atom)> {
         let atoms = &self.atoms;
-        // WARNING: deleted first, so the property notification shows when the owner got the request.
+        // Deleted first, so the property notification shows when the owner got the request.
         reader
             .conn
             .delete_property(reader.window, atoms.APPS_CLIPBOARD)?;
@@ -258,7 +258,7 @@ impl Inner {
                     if reply.type_ != atoms.INCR {
                         return Ok((reply.value, reply.type_));
                     }
-                    // WARNING: the property is deleted only with its own type, which says the segments may come.
+                    // The property is deleted only with its own type, which says the segments may come.
                     let reply = reader
                         .conn
                         .get_property(
@@ -324,7 +324,7 @@ impl Inner {
                         }
                     }
                 }
-                // WARNING: some clipboard managers say they are done before they ask for the contents.
+                // Some clipboard managers say they are done before they ask for the contents.
                 Event::SelectionNotify(event)
                     if event.selection == self.atoms.CLIPBOARD_MANAGER =>
                 {
@@ -403,7 +403,7 @@ impl Inner {
         if self.text.lock().unwrap().is_none() || !self.is_owner()? {
             return Ok(());
         }
-        // WARNING: locked before the request, so the server thread can't finish before this waits.
+        // Locked before the request, so the server thread can't finish before this waits.
         let mut handover = self.handover.lock().unwrap();
         self.server.conn.convert_selection(
             self.server.window,

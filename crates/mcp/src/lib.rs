@@ -100,7 +100,7 @@ thread_local! {
 
 const PAUSED: &str = "The app is paused in the debugger. Resume it with the debugger tool first";
 
-// WARNING: pages can redefine globals, so this formatter uses only syntax and builtins it checks itself.
+// Pages can redefine globals, so this formatter uses only syntax and builtins it checks itself.
 const SHOW: &str = r#"function(){const seen=new WeakSet(),plain=(v,d)=>{if(typeof v==='bigint')return v+'n';if(typeof v==='symbol'||v===undefined)return String(v);if(typeof v==='function')return`[Function ${v.name||'(anonymous)'}]`;if(v===null||typeof v!=='object')return v;if(typeof Node==='function'&&v instanceof Node)return String(v.outerHTML??v.textContent??'').slice(0,4000);if(v instanceof Error)return`${v.name}: ${v.message}`+(v.stack?'\n'+v.stack:'');if(v instanceof Date)return v.toISOString();if(seen.has(v))return'[Circular]';if(d>4)return Array.isArray(v)?`[Array(${v.length})]`:`[${v.constructor?.name??'Object'}]`;seen.add(v);if(v instanceof Map||v instanceof Set||Array.isArray(v)||ArrayBuffer.isView(v))return Array.from(v).slice(0,100).map(e=>plain(e,d+1));const o={};for(const k of Object.keys(v).slice(0,100)){try{o[k]=plain(v[k],d+1)}catch{o[k]='[Thrown]'}}return o},show=v=>{const p=plain(v,0),s=typeof p==='string'?p:JSON.stringify(p)??String(p);return s.length>120&&typeof p==='object'?JSON.stringify(p,null,1):s};return this instanceof Promise?this.then(show,e=>{throw show(e)}):show(this)}"#;
 
 #[unsafe(no_mangle)]
@@ -188,7 +188,7 @@ fn serve(mut stream: TcpStream) -> Result<()> {
             let value = value.trim();
             match name.to_ascii_lowercase().as_str() {
                 "content-length" => length = value.parse()?,
-                // WARNING: web pages can reach localhost, so only local hosts and origins may call tools.
+                // Web pages can reach localhost, so only local hosts and origins may call tools.
                 "host" => allowed &= local(value),
                 "origin" => {
                     allowed &= local(value.split_once("://").map_or(value, |(_, host)| host))
@@ -365,7 +365,7 @@ fn dispatch(tool: &str, args: Value, key: Option<u64>) -> Result<Value> {
             }
             Err(_) => {
                 let paused = SHARED.paused.lock().unwrap().clone();
-                // WARNING: this call itself may have hit a breakpoint, and then only the debugger tool can answer.
+                // This call itself may have hit a breakpoint, and then only the debugger tool can answer.
                 if let Some(at) = paused.filter(|_| SHARED.pauses.load(Ordering::Acquire) != pauses)
                 {
                     if let Ok(value) = result.try_recv() {
@@ -600,7 +600,7 @@ pub unsafe extern "C" fn apps_mcp_paused(ctx: usize, done: *mut bool) {
     SHARED
         .page_paused
         .store(page.map_or(0, |key| key + 1), Ordering::Release);
-    // WARNING: JSC sets `done` while a dispatched message runs, so read it again each time.
+    // JSC sets `done` while a dispatched message runs, so read it again each time.
     while !unsafe { std::ptr::read_volatile(done) } {
         if let Some(call) = next(true) {
             run(call, std::ptr::null_mut());

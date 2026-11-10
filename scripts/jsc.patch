@@ -951,7 +951,7 @@ index 642121138..687c6b517 100644
              continue;
          }
 -        if (!isReported[text])
-+        // WARNING: apps keeps quoted texts of up to 1 KB. Longer ones, mostly calls with JSON or Wasm in their arguments,
++        // apps keeps quoted texts of up to 1 KB. Longer ones, mostly calls with JSON or Wasm in their arguments,
 +        // took 4.4 MB of DiffsHub's image. Errors there quote a shorter form, like `f()` for a call.
 +        if (!isReported[text] || quoted.end - quoted.start > 1024)
              continue;
@@ -1061,7 +1061,7 @@ index 4fcb81318..e4cdc54f0 100644
      std::unique_ptr<Inspector::JSGlobalObjectInspectorController> m_inspectorController;
      RefPtr<JSGlobalObjectDebuggable> m_inspectorDebuggable;
 +#elif APPS_JSC_AOT_RUNTIME
-+    // WARNING: the compiler builds with Inspector; keep subsequent field offsets identical.
++    // The compiler builds with Inspector; keep subsequent field offsets identical.
 +    void* m_unusedInspector[2] { };
  #endif
  
@@ -1165,7 +1165,7 @@ index 1c8bfc193..88b365d33 100644
      JS_EXPORT_PRIVATE static double sizeClassProgressionWithAOT();
  
 +#if APPS_JSC_AOT_RUNTIME
-+    // WARNING: preserve feature layouts for the compiler's image ABI; constant options let the linker remove JIT compilers.
++    // Preserve feature layouts for the compiler's image ABI; constant options let the linker remove JIT compilers.
 +    struct DisabledJITOption {
 +        bool& storage;
 +        constexpr operator bool() const { return false; }

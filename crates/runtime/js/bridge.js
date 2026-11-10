@@ -1,15 +1,15 @@
 globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   const pending=new Map(),functions=new Map(),functionIds=new WeakMap(),handlers=new Map(),queue=[],refs=new Map(),refIds=new WeakMap(),facades=new Map(),emitter=EventEmitter?new EventEmitter():null;
   const random=crypto.randomUUID.bind(crypto),errors={Error,EvalError,RangeError,ReferenceError,SyntaxError,TypeError,URIError};
-  // WARNING: a dropped File carries the index of its path in Rust, never the path. A page can forge an index, but it only names files that were dropped on that page.
+  // Expose dropped-file indices, never paths. Forged indices can access only files dropped on that page.
   const files=hooks.files=new WeakMap();
   const peer=role=>role==='main'?'main':typeof role==='object'&&role!==null?'preload'in role?'preload:'+role.preload:'renderer'in role?'renderer:'+role.renderer:null:null;
   const send=(target,message)=>call('bridge.dispatch',target,message);
   const uncloneable=()=>{throw new Error('An object could not be cloned.');};
   const jsonEncoder=new TextEncoder(),jsonDecoder=new TextDecoder();
   const capability=(action,target,once)=>{const id=random();functions.set(id,{action,recipient:peer(target),persistent:!once,once});return id;};
-  // WARNING: only data that JSON keeps exactly may cross as JSON: finite numbers but -0, no undefined, no holes, plain
-  // prototypes and no object twice.
+  // Use JSON only for lossless data: finite numbers except -0, no undefined or holes, plain prototypes and no
+  // repeated objects.
   let floats=false;
   const plain=(value,seen)=>{
     if(value===null||typeof value==='string'||typeof value==='boolean')return true;
@@ -23,8 +23,8 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     return true;
   };
   const encode=(value,target,strict=true,persistent=false,seen=new Map())=>{
-    // WARNING: Rust forwards bytes without parsing them, and its JSON parser can change the last bit of a float, so
-    // plain data with floats or of more than 4 KB goes as UTF-8 JSON, and other numbers that are not safe integers go as text.
+    // Use text when Number.isSafeInteger fails to preserve numeric precision through Rust. Encode plain
+    // data with those numbers, or over 4 KB, as UTF-8 JSON.
     if(!seen.size&&(typeof value==='object'&&value!==null||typeof value==='string')){
       floats=false;
       if(plain(value,new Set())){const text=JSON.stringify(value);return floats||text.length>4096?{type:'json',value:jsonEncoder.encode(text)}:{type:'json',value};}
@@ -90,7 +90,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   };
   const emit=(channel,...args)=>emitter.listenerCount(channel)>0&&emitter.emit(channel,...args);
   const report=error=>(hooks.report??console.error)(error);
-  // WARNING: events, invoke handlers and replies of one peer keep their send order, as they do over one Electron IPC channel.
+  // Events, invoke handlers and replies of one peer keep their send order, as they do over one Electron IPC channel.
   const drain=()=>{for(const message of queue.splice(0)){try{if(typeof message==='function')message();else emit(message.channel,event(message.sender),...decode(message.args,message.sender));}catch(error){report(error);}}};
   const enqueue=task=>{queue.push(task);};
   globalThis.__appsBridgeDrain=()=>{if(!queue.length)return false;drain();return true;};
@@ -152,7 +152,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   const ipcRenderer=emitter;
   if(preload){
     Object.assign(ipcRenderer,{invoke:(channel,...args)=>{const result=new Promise(resolve=>resolve(rpc('main',{kind:'invoke',channel,args:encode(args,'main')})));return queue.length?new Promise(resolve=>enqueue(()=>resolve(result))):result;},send:(channel,...args)=>send('main',{kind:'event',channel,args:encode(args,'main')}),sendSync:(channel,...args)=>decode(send('main',{kind:'sync',channel,args:encode(args,'main')}),'main')});
-    // WARNING: page objects never enter the preload realm: the preload `document` is a proxy, and the page answers with clones and object handles.
+    // Page objects never enter the preload realm: the preload `document` is a proxy, and the page answers with clones and object handles.
     const remote=(...args)=>answer(send(page,{kind:'dom',args:encode(args,page)}),page);
     const read=value=>Array.isArray(value)?value.map(read):value&&typeof value==='object'&&'$ref'in value?facade(value.$ref):value;
     const released=new Set(),flush=()=>{if(!released.size)return;const ids=[...released];released.clear();try{remote('release',0,null,ids);}catch{}};

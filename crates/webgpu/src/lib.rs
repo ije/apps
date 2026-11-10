@@ -17,7 +17,7 @@ pub const ABI: u32 = 1;
 
 pub type Alloc = extern "C" fn(output: *mut c_void, length: usize) -> *mut u8;
 
-// WARNING: only `wake` and `drop_waker` may be called from other threads.
+// Only `wake` and `drop_waker` may be called from other threads.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Host {
@@ -282,7 +282,7 @@ fn bytes(value: &Value) -> Result<Vec<u8>> {
 }
 
 fn unmap(device: &Device, buffer: &Buffer) {
-    // WARNING: wgpu keeps a failed mapping reserved until unmap, which then reports a validation error.
+    // wgpu keeps a failed mapping reserved until unmap, which then reports a validation error.
     let scope = device.push_error_scope(ErrorFilter::Validation);
     buffer.unmap();
     let _ = pollster::block_on(scope.pop());
@@ -477,7 +477,7 @@ impl Gpu {
                 .name("apps-gpu".into())
                 .spawn(move || {
                     while wait.recv().is_ok() {
-                        // WARNING: a waiting poll holds the device lock that `destroy()` needs, so each wait stays short.
+                        // Keep poll waits short: they hold the lock that destroy() needs.
                         while done.pending.load(Ordering::Acquire) > 0 {
                             let wait = PollType::Wait {
                                 submission_index: None,
@@ -1154,7 +1154,7 @@ impl Gpu {
                     usage,
                     view_formats: &[],
                 });
-                // WARNING: 32768×32768 pixels need 4 GiB, so the readback size is computed in u64.
+                // Use u64: a 32768×32768 readback needs 4 GiB.
                 let size = u64::from(
                     (width * 4).div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT)
                         * COPY_BYTES_PER_ROW_ALIGNMENT,

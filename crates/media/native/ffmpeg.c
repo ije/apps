@@ -143,13 +143,13 @@ AppsMedia *apps_ffmpeg_open(const char *path, const uint8_t *data, int64_t size,
     AVRational aspect = av_guess_sample_aspect_ratio(m->format, m->video.stream, NULL);
     double width = m->video.stream->codecpar->width, height = m->video.stream->codecpar->height;
     if (aspect.num > 0 && aspect.den > 0) width *= av_q2d(aspect);
-    // WARNING: the file sets the size, so frames are scaled to fit 8192 pixels per side to bound their memory.
+    // Cap frame dimensions at 8192 to bound allocations from media input.
     double fit = fmin(1, 8192 / fmax(width, height));
     if (width > 0 && height > 0) {
       m->width = (int)fmax(1, lrint(width * fit));
       m->height = (int)fmax(1, lrint(height * fit));
     } else {
-      // WARNING: without a size the caller never wants video, so its packets must not queue.
+      // Without a size the caller never wants video, so its packets must not queue.
       avcodec_free_context(&m->video.codec);
       m->video.stream = NULL;
     }
@@ -239,7 +239,7 @@ static double seconds(AppsMedia *m, Track *track, int64_t time) {
 
 static int audio(AppsMedia *m, const float **samples, int *count, double *time) {
   AVFrame *frame = m->frame;
-  // WARNING: swr_convert reads the planes of the layout it was set up with, so a format change needs a new one.
+  // Recreate the resampler on format changes: swr_convert reads planes using its original layout.
   if (m->resample && (frame->format != m->input_format || frame->sample_rate != m->input_rate ||
                       av_channel_layout_compare(&frame->ch_layout, &m->input)))
     swr_free(&m->resample);
@@ -311,7 +311,7 @@ int apps_ffmpeg_next(AppsMedia *m, int want, double *time, int *width, int *heig
                                                                                            : NULL;
     if (track && (status = push(track, m->packet)) < 0) return status;
     av_packet_unref(m->packet);
-    // WARNING: packets of a track that is not wanted stay in memory, so the caller decodes that track first.
+    // Packets of a track that is not wanted stay in memory, so the caller decodes that track first.
     if (track && !(want & (track == &m->video ? 1 : 2)) && (track->length >= 4096 || track->bytes >= 32 << 20))
       return 4;
   }
@@ -345,7 +345,7 @@ int apps_ffmpeg_pixels(AppsMedia *m, uint8_t *pixels) {
 
 int apps_ffmpeg_seek(AppsMedia *m, double time) {
   int64_t start = m->format->start_time == AV_NOPTS_VALUE ? 0 : m->format->start_time;
-  // WARNING: a double outside the int64_t range is undefined behavior when converted, and so is a signed overflow.
+  // Guard both the double-to-int64_t conversion and signed addition against overflow.
   int64_t target = (int64_t)(fmin(fmax(time, 0), 1e9) * AV_TIME_BASE);
   target = start > INT64_MAX - target ? INT64_MAX : target + start;
   int status = avformat_seek_file(m->format, -1, INT64_MIN, target, target, 0);

@@ -344,7 +344,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
     },
     get defaultSession() { return this.fromPartition('persist:default'); },
   });
-  // WARNING: Linux webviews need GTK pumping from poll; other platforms wake the loop on events.
+  // Linux webviews need GTK pumping from poll; other platforms wake the loop on events.
   return { View, WebContentsView, session, poll, pending: () => contents.size > 0 && process.platform === 'linux', reserve: () => call('browser.reserve'), all: () => [...contents.values()].filter(item => ![...partitions.values()].includes(item)),
     contentView(window, options) {
       const view = new View(), state = layouts.get(view);
@@ -436,7 +436,7 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false) => {
     replies.set(id, resolve);
     try { native(op, { ...value, async: id }); } catch (error) { replies.delete(id); throw error; }
   });
-  // WARNING: not frozen, as in Electron, where tests replace its functions.
+  // Not frozen, as in Electron, where tests replace its functions.
   const dialog = {
     showOpenDialog: async (...args) => later('dialog.open', options(args)),
     showOpenDialogSync: (...args) => { const result = native('dialog.open', options(args)); return result.canceled ? undefined : result.filePaths; },

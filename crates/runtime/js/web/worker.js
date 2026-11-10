@@ -75,7 +75,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task) => {
     if (new Set(values).size !== values.length || values.some(v => !(v instanceof ArrayBuffer && typeof v.transfer === 'function') && !(globalThis.ImageBitmap && v instanceof ImageBitmap) && !(globalThis.OffscreenCanvas && v instanceof OffscreenCanvas))) throw new DOMException('Only ArrayBuffer, ImageBitmap and OffscreenCanvas can be transferred', 'DataCloneError');
     return values;
   };
-  // WARNING: messages send moved or copied buffers and never the caller's own, because a worker that hasn't started yet gets them later, after the caller may have changed them.
+  // Send transferred or copied buffers: workers can receive them after the caller mutates its buffers.
   const message = (value, options) => {
     const transfer = transfers(options), buffers = [], text = stringify(encode(value, buffers, transfer));
     const wire = [text, ...buffers.map(buffer => new Uint8Array(fresh.has(buffer) ? buffer : transfer.includes(buffer) ? buffer.transfer() : buffer.slice(0)))];
@@ -162,7 +162,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task) => {
       target._pending.push(structuredClone(value, Array.isArray(options) ? { transfer: options } : options));
       if (target._started || target.onmessage || target._listeners.has('message')) target._deliver();
     }
-    // WARNING: a message is a task, like in browsers. React schedules its work with these, so as a microtask its work would run before the frame's style pass and never yield to painting.
+    // Dispatch messages as tasks so React yields to style and paint. Microtasks run before the frame.
     _deliver() { task(() => { if (!this._closed && this._pending.length) this._emit('message', this._pending.shift()); }); }
     start() { this._started = true; for (let i = 0; i < this._pending.length; i++) this._deliver(); }
     close() { this._closed = true; this._pending.length = 0; }

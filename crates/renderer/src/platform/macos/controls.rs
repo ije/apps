@@ -116,7 +116,7 @@ extern "C" fn flipped(_: &AnyObject, _: Sel) -> Bool {
     Bool::YES
 }
 
-// WARNING: the clip is wider than its control, and that margin belongs to the page below.
+// The clip is wider than its control, and that margin belongs to the page below.
 extern "C" fn hit_test(this: &AnyObject, _: Sel, point: NSPoint) -> *mut AnyObject {
     let hit: *mut AnyObject = unsafe { msg_send![super(this, class!(NSView)), hitTest: point] };
     if ptr::eq(hit, this) {
@@ -273,7 +273,7 @@ fn color(control: &AnyObject) -> Option<String> {
     }
 }
 
-// WARNING: date pickers use UTC, so a day is a whole number of days since 1970.
+// Date pickers use UTC, so a day is a whole number of days since 1970.
 fn date(control: &AnyObject) -> String {
     let seconds: f64 = unsafe {
         let date: *mut AnyObject = msg_send![control, dateValue];
@@ -530,8 +530,7 @@ pub(crate) fn update(
             if fresh || old.enabled != state.enabled {
                 let () = msg_send![control, setEnabled: Bool::new(state.enabled)];
             }
-            // WARNING: the page's value applies only after the page has taken every edit made here, or it would undo
-            // edits it has not seen.
+            // Apply page values only after it acknowledges all native edits, or stale values can undo them.
             let current = shared
                 .entries
                 .get(&state.key)

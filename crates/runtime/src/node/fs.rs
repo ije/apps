@@ -38,7 +38,7 @@ fn kind(ty: fs::FileType) -> u32 {
     }
 }
 
-// WARNING: `Stats` in node/index.js reads these numbers by position, so keep both in the same order.
+// Match the positional Stats fields in node/index.js.
 fn stat(meta: &fs::Metadata) -> Value {
     let ms = |time: std::io::Result<SystemTime>| {
         time.ok().map(|time| match time.duration_since(UNIX_EPOCH) {
@@ -94,7 +94,7 @@ fn stat(meta: &fs::Metadata) -> Value {
     }
 }
 
-// WARNING: handles start here, so smaller descriptors are the ones that this process inherited, like fd 3 from a parent.
+// Handles start here, so smaller descriptors are the ones that this process inherited, like fd 3 from a parent.
 const FIRST_HANDLE: u64 = 1 << 20;
 
 #[cfg(unix)]
@@ -310,8 +310,7 @@ impl Files {
                 if args[2].as_u64().unwrap_or(0) & 1 != 0 && fs::symlink_metadata(target).is_ok() {
                     return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
                 }
-                // WARNING: fs::copy truncates the target first, so copying a file onto itself or onto a hard link of it
-                // would empty it. Like libuv, such a copy does nothing.
+                // Skip copies onto the same inode: fs::copy truncates the destination first.
                 #[cfg(unix)]
                 let same = {
                     use std::os::unix::fs::MetadataExt;
@@ -378,8 +377,8 @@ impl Files {
                         };
                         time.context("Time is out of range")
                     };
-                    // WARNING: FILE_WRITE_ATTRIBUTES (0x100) and FILE_FLAG_BACKUP_SEMANTICS (0x02000000) are needed to
-                    // set times on directories and read-only files.
+                    // FILE_WRITE_ATTRIBUTES and FILE_FLAG_BACKUP_SEMANTICS permit timestamp changes on
+                    // directories and read-only files.
                     OpenOptions::new()
                         .access_mode(0x100)
                         .custom_flags(0x0200_0000)
@@ -455,7 +454,7 @@ impl Files {
                 bail!("chmod is unavailable on this platform")
             }
             "exists" => {
-                // WARNING: like Node, this asks access() rather than stat(), which costs a third more.
+                // Like Node, this asks access() rather than stat(), which costs a third more.
                 #[cfg(unix)]
                 {
                     use std::os::unix::ffi::OsStrExt;

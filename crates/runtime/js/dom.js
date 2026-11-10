@@ -1,8 +1,7 @@
 (() => {
   const host = globalThis.__appsDOM, eventState = globalThis.__appsEventState, droppedFiles = globalThis.__appsFiles, microtask = queueMicrotask, json = JSON.parse;
   delete globalThis.__appsDOM; delete globalThis.__appsEventState; delete globalThis.__appsFiles;
-  // WARNING: queued writes must reach Rust in `dom.batch` before any other host call. `noAttrs` and `noKids` are
-  // shared, so replace them and never add to them.
+  // Flush dom.batch before any other host call. Replace shared noAttrs and noKids. Never mutate them.
   class Attrs {
     constructor(list = []) { this.list = list; }
     get size() { return this.list.length / 2; }
@@ -35,7 +34,8 @@
     resync();
   };
   const drain = () => { scheduled = false; flush(); };
-  // WARNING: queued strings are joined, so a part that ends in a lone high surrogate sends U+FFFD in its place, as it would alone; otherwise it pairs with the next part and the UTF-16 lengths stop matching.
+  // Replace trailing lone high surrogates with U+FFFD before concatenation, or adjacent strings can pair them
+  // and change UTF-16 lengths.
   const alone = value => { const last = value.charCodeAt(value.length - 1); return last >= 0xd800 && last < 0xdc00 ? value.slice(0, -1) + '\u{fffd}' : value; };
   const op = (code, a, b = 0, c = 0) => {
     if (size === codes.length) { const grown = new Int32Array(size * 2); grown.set(codes); codes = grown; }
@@ -44,8 +44,8 @@
   };
   let webviewScan = true, pickFiles;
   const call = (name, ...args) => { flush(); if (name === 'dom.html') { changed = true; webviewScan ||= /<webview/i.test(args[1]); } if (name === 'dom.html' || name === 'dom.scroll' || name === 'dom.focus' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font' || name === 'dom.animation') { stale = true; version++; } return host(name, ...args); };
-  // WARNING: page code must never reach the layout mirror arrays, so the constructors are kept and no prototype getter
-  // such as `length` is read. A nonzero first float means Rust moved the buffer.
+  // Keep mirror arrays private. Retain constructors and avoid prototype getters. A nonzero first float means
+  // Rust moved the buffer.
   const F32 = Float32Array, U8 = Uint8Array;
   let geometry = new F32(1), marks, limit = 0, flagged = -1; geometry[0] = 1;
   let observing = false;
@@ -56,10 +56,9 @@
   };
   const slot = node => { layout(); const i = 4 + node._id * 8; if (i >= limit || marks[node._id] & 16) return -1; if (node._linked !== version) { if (!node.isConnected) return -1; node._linked = version; } return i; };
   const metric = (node, k) => { const i = slot(node); return i < 0 ? 0 : geometry[i + k]; };
-  // WARNING: while observers measure the last frame, client boxes come from its styles and must not be cached for later
-  // reads.
+  // Do not cache client boxes from observer reads: they use the previous frame's styles.
   const client = node => { if (slot(node) < 0) return [0, 0, 0, 0, 0, 0, 0, 0]; if (observing) return call('dom.client', node._id, true); const cached = node._client; if (cached?.[8] === geometry[2] && cached[9] === version) return cached; return node._client = [...call('dom.client', node._id), geometry[2], version]; };
-  // WARNING: only scroll boxes have a scroll range, so other boxes take the border boxes of their children as their
+  // Only scroll boxes have a scroll range, so other boxes take the border boxes of their children as their
   // scrollable overflow, then their end padding.
   const extent = (node, axis) => {
     const box = client(node), i = slot(node);
@@ -103,8 +102,8 @@
     }
     return media;
   };
-  // WARNING: Rust skips writes that fail its checks, so a failed batch reloads the trees from Rust. Records must stay
-  // the same objects, because wrappers point to them.
+  // Reload after failed batches: Rust can skip invalid writes. Preserve record identities because wrappers
+  // reference them.
   const resync = () => {
     const lists = [], seen = new Set();
     for (const rec of records) if (rec && !rec.up) try { lists.push(json(host('dom.tree', rec.id))); } catch {}
@@ -125,7 +124,7 @@
     for (const rec of records) if (rec?.up && !seen.has(rec)) rec.up = null;
   };
   const of = rec => rec ? rec.ref?.deref() ?? wrap(rec.id) : null;
-  // WARNING: keep only one cached list: a list holds the wrappers of its nodes, which keep removed nodes alive.
+  // Keep only one cached list: a list holds the wrappers of its nodes, which keep removed nodes alive.
   const listCache = { nodes: [null, null, -1], elements: [null, null, -1] };
   const cachedList = (cache, rec, make) => { if (cache[0] !== rec || cache[1] !== rec.kids || cache[2] !== version) { cache[0] = rec; cache[1] = rec.kids; cache[2] = version; cache[3] = make(); } return cache[3]; };
   const ids = new Map();
@@ -159,8 +158,7 @@
     return rec.tag[0] !== '#' || rec.tag === '#text' ? find(parent._shadow._m, slot => slot.tag === 'slot' && (slot.attrs.get('name') ?? '') === name) : null;
   };
   const path = node => { const result = []; while (node) { result.push(node); const parent = node.parentNode; node = assignedSlot(node, parent) ?? parent ?? (node instanceof ShadowRoot ? node.host : null); } return result; };
-  // WARNING: observers key targets by the wrapper's `WeakRef` and the global sets hold `WeakRef`s, so observers that
-  // are never disconnected don't keep removed trees alive.
+  // Use WeakRefs for observer targets and global sets so forgotten observers cannot retain removed trees.
   const watch = (observer, target, value, set) => { observer.targets.set(target._m.ref, value); (target._observers ??= new Set()).add(observer); set.add(observer._ref ??= new WeakRef(observer)); };
   const unwatch = (observer, target, set) => { observer.targets.delete(target._m.ref); target._observers?.delete(observer); if (!observer.targets.size) set.delete(observer._ref); };
   const unwatchAll = (observer, set) => { for (const ref of observer.targets.keys()) ref.deref()?._observers?.delete(observer); observer.targets.clear(); set.delete(observer._ref); };
@@ -253,7 +251,7 @@
     if (native) trusted(event);
     return activateClick(target, event, init, native);
   };
-  // WARNING: every `click` MouseEvent runs this, also from `dispatchEvent`, and Base UI's switches and checkboxes rely on that.
+  // Every `click` MouseEvent runs this, also from `dispatchEvent`, and Base UI's switches and checkboxes rely on that.
   const activateClick = (target, event, init = {}, native = false) => {
     const activator = path(target).find(node => node.nodeType === 1 && activation(node)), kind = activator?.localName === 'input' ? activator.type : '';
     if (activator && disabled(activator)) return dispatch(target, event);
@@ -339,8 +337,7 @@
     if (self) test(rec);
     find(rec, test);
   };
-  // WARNING: garbage ranges stay until a GC, so a mutation must visit only the ranges indexed at the nodes it touches,
-  // never all ranges.
+  // Visit only ranges at affected nodes: garbage ranges remain until GC.
   const anchors = new Map();
   let rangeSync = false;
   const place = (range, start, node, offset) => {
@@ -387,12 +384,12 @@
     const previous = active; active = null; call('dom.focus', []); if (windowFocused) { dispatch(previous, new FocusEvent('blur', { composed: true })); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true })); }
   };
   const ignore = () => {};
-  // WARNING: a `replace` that inserts must call `removed` once the old children left both trees, so their disconnected
-  // callbacks run before re-inserted ones connect.
+  // Call removed after both trees detach the old children, before reinserted children run connected
+  // callbacks.
   const replaceAll = scoped((node, replace) => {
     const rec = node._m, observed = watched(node);
     if (!rec.kids.length && !observed && !shadows) { replace(ignore); return; }
-    // WARNING: a wrapper keeps its removed subtree in the arena until a GC, so only an observer's record wraps the old children.
+    // A wrapper keeps its removed subtree in the arena until a GC, so only an observer's record wraps the old children.
     const kids = definitions.size > 0 && node.isConnected ? rec.kids.slice() : [], old = observed ? rec.kids.map(of) : [];
     if (rec.kids.length) { if (node._shadow) for (const kid of rec.kids) signal(node, of(kid)); rangesClear(node); }
     let pending = kids.length > 0;
@@ -447,7 +444,7 @@
     get(list, key, receiver) { const i = tokenIndex(key); return i < 0 ? Reflect.get(list, key, receiver) : tokens(list)[i]; },
     has(list, key) { const i = tokenIndex(key); return i < 0 ? Reflect.has(list, key) : i < tokens(list).length; },
   };
-  // WARNING: methods run with the proxy as `this`, so they look up the list once instead of trapping each field read.
+  // Resolve the list once per method to avoid repeated proxy traps.
   const rawLists = new WeakMap(), rawList = list => rawLists.get(list) ?? list;
   class DOMTokenList {
     constructor(element, name) { this._element = element; this._name = name; this._source = null; this._tokens = null; const proxy = new Proxy(this, indexed); rawLists.set(proxy, this); return proxy; }
@@ -489,8 +486,8 @@
       if (!(child instanceof Node)) throw new TypeError('Expected a Node');
       before ??= null;
       if (child.nodeType === 11) {
-        // WARNING: a wrapper keeps its subtree in the arena until a GC, so children without one move as records. `wrap`
-        // infers the namespace from the parent, so SVG contexts keep wrapping.
+        // Move unwrapped children as records to avoid retaining removed trees. Keep SVG wrapping: wrap infers
+        // namespaces from parents.
         if (!(observers.size > 0 && !quiet) && !anchors.size && !this._shadow && !child._svg && !this._svg && !(this instanceof SVGElement) && (this.nodeType === 1 || this.nodeType === 11 || this._id === 0) && child._m.kids.some(kid => !kid.ref?.deref() && kid.tag !== 'link')) {
           const rec = this._m, ref = before?._m ?? null;
           if (ref && ref.up !== rec) throw new DOMException('Reference is not a child', 'NotFoundError');
@@ -753,7 +750,7 @@
     removeAttributeNode(attr) { if (!(attr instanceof Attr) || attr.ownerElement !== this || !this._m.attrs.has(attr.name)) throw new DOMException('The attribute is not on this element', 'NotFoundError'); attr._value = this._m.attrs.get(attr.name); this.removeAttribute(attr.name); attr.ownerElement = null; return attr; }
     get style() {
       if (this._style) return this._style;
-      // WARNING: the parsed list is shared, not copied, so declaration code must never change its entries.
+      // The parsed list is shared, not copied, so declaration code must never change its entries.
       let text = null, list = [];
       return this._style = declaration({ read: () => { const now = this.getAttribute('style') ?? ''; if (now !== text) { text = now; list = declare(now); } return list; }, write: next => { text = declarationText(next); list = next; this.setAttribute('style', text); } });
     }
@@ -808,7 +805,7 @@
       finishComposition();
       const previous = active; active = this; call('dom.focus', path(this).map(node => node._id), ring = focusVisible(this), !windowFocused);
       if (this.isContentEditable && selection.isCollapsed) selection._send();
-      // WARNING: like Chrome, focus changes fire no events while the window is not focused. The window's `focus` fires them for the element focused then.
+      // Defer focus events while the window lacks focus. On window focus, emit them for the current element.
       if (!windowFocused) return;
       const mark = native ? trusted : event => event;
       if (previous) { commit(previous); dispatch(previous, mark(new FocusEvent('blur', { composed: true, relatedTarget: this }))); dispatch(previous, mark(new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this }))); }
@@ -868,7 +865,8 @@
   };
   const setRange = (node, raw) => { const value = rangeValue(node, raw); if (value !== node.value) { setValue(node, value); dispatch(node, trusted(new Event('input', { bubbles: true, composed: true }))); } };
   const formState = (node, bits) => { if (node._bits !== bits) { node._bits = bits; op(8, node._id, bits); } };
-  // WARNING: user edits change the internal value and checkedness, never the page-visible `value` and `checked` properties, which frameworks wrap to tell their own writes apart.
+  // User edits must change internal state, not value or checked properties: frameworks intercept those
+  // properties to detect script writes.
   const setChecked = (node, value) => { node._checked = value; formState(node, node._bits & ~3 | (value ? 3 : 2)); if (value && node.type === 'radio') for (const other of group(node)) if (other !== node && (other._checked ?? other.hasAttribute('checked'))) { other._checked = false; formState(other, other._bits & ~3 | 2); } };
   const formOf = node => { const id = node.getAttribute('form'); if (id !== null) { const form = id && node.getRootNode().getElementById?.(id); return form?.localName === 'form' ? form : null; } for (let rec = node._m.up; rec && rec.tag[0] !== '#'; rec = rec.up) if (rec.tag === 'form') return of(rec); return null; };
   const listed = /^(button|fieldset|input|object|output|select|textarea)$/;
@@ -944,7 +942,7 @@
       if (active === this) call('dom.selection', this._id, start, end);
       if (changed) { selectionChanged(this); setTimeout(() => this.dispatchEvent(new Event('select', { bubbles: true })), 0); }
     }
-    // WARNING: Chromium and WebKit focus the field in `select()`; editors rely on it to move typing into the field.
+    // Chromium and WebKit focus the field in `select()`; editors rely on it to move typing into the field.
     select() { this.focus(); this.setSelectionRange(0, this.value.length); }
     setRangeText(text, start = this.selectionStart, end = this.selectionEnd, mode = 'preserve') {
       text = String(text); start = Number(start) >>> 0; end = Number(end) >>> 0;
@@ -1066,8 +1064,7 @@
       return entries;
     }
   }
-  // WARNING: Rust mirrors the top layer order through op 9 and its boxes through op 8 bits: 4 modal, 8 popover, 16
-  // fullscreen. Keep both sides in sync.
+  // Match Rust's top-layer protocol: op 9 for order, op 8 flags 4 (modal), 8 (popover), 16 (fullscreen).
   const layer = (node, on) => { const i = topLayer.indexOf(node); if (i >= 0) topLayer.splice(i, 1); if (on) topLayer.push(node); op(9, node._id, on ? 1 : 0); };
   const flag = (node, bit, on) => formState(node, on ? node._bits | bit : node._bits & ~bit);
   const drop = (list, node) => { const i = list.indexOf(node); if (i >= 0) list.splice(i, 1); };
@@ -1285,8 +1282,7 @@
     if (placeholders) for (const [node, width, height] of call('dom.frames')) { const canvas = wrap(node); if (canvas.width !== width) canvas.setAttribute('width', width); if (canvas.height !== height) canvas.setAttribute('height', height); }
   };
   globalThis.__appsImages = root => { find(root._m, rec => { if (rec.tag === 'img' && rec.attrs.has('src')) { const image = of(rec); if (!image._loading) image._loadImage?.(); } else if ((rec.tag === 'video' || rec.tag === 'audio') && !of(rec)._network) of(rec)._select(); return false; }); };
-  // WARNING: `playing` holds playing elements on purpose, so they keep playing after the page drops them, like in
-  // browsers.
+  // Retain playing media after page code drops it, as browsers do.
   const players = new Map(), playing = new Set(), mediaFeatures = globalThis.__appsMedia ?? {};
   delete globalThis.__appsMedia;
   const [PLAY, PAUSE, SEEK, VOLUME, MUTED, SPEED] = [0, 1, 2, 3, 4, 5];
@@ -1598,7 +1594,7 @@
     get fullscreenElement() { for (let node = fullscreens.at(-1); node;) { const root = node.getRootNode(); if (root === this) return node; node = root.host ?? null; } return null; }
     get styleSheets() { return styleSheetsOf(this); }
   }
-  // WARNING: `define` resolves `whenDefined` before the upgrades it queued run, so a throwing upgrade can't leave it pending.
+  // `define` resolves `whenDefined` before the upgrades it queued run, so a throwing upgrade can't leave it pending.
   const customElements = {
     define: scoped((name, Type) => {
       if (typeof Type !== 'function') throw new TypeError('Expected a constructor');
@@ -1982,8 +1978,7 @@
   let sweepAt = 0, cursor = 0, canary = new WeakRef({});
   globalThis.__appsDomSweep = (force = false) => {
     scheduled = false; flush();
-    // WARNING: removed trees without wrappers must go at the next turn, or a page that rebuilds rows each frame fills
-    // the arena between timed sweeps.
+    // Release removed, unwrapped trees next turn so row churn cannot fill the arena between sweeps.
     const collected = !canary.deref(), timed = force || collected || performance.now() >= sweepAt, dead = [];
     if (!timed && !detached) return;
     detached = false;
@@ -2004,8 +1999,8 @@
     for (const id of call('dom.release', dead, registered.splice(0))[1]) { const rec = records[id]; if (!rec) continue; records[id] = undefined; const name = rec.attrs?.get('id'); if (name) idDrop(name, rec); }
   };
 
-  // WARNING: op codes and argument counts must match `Canvas::draw` in `render/canvas.rs`. Arguments stay f64 so far
-  // coordinates stay exact.
+  // Match Canvas::draw opcodes and argument counts in render/canvas.rs. Keep f64 precision for large
+  // coordinates.
   class CanvasRenderingContext2D {
     constructor(canvas, options) { this.canvas = canvas; this._alpha = options?.alpha !== false; this._ops = new Float64Array(256); this._size = 0; this._texts = []; this._data = []; this._reset(); }
     _reset() { this._state = { fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif', textAlign: 'start', textBaseline: 'alphabetic', globalAlpha: 1, lineWidth: 1, lineCap: 'butt', lineJoin: 'miter', miterLimit: 10, lineDash: [], lineDashOffset: 0, globalCompositeOperation: 'source-over', letterSpacing: '0px', wordSpacing: '0px', imageSmoothingEnabled: true, imageSmoothingQuality: 'low', shadowBlur: 0, shadowColor: 'rgba(0, 0, 0, 0)', shadowOffsetX: 0, shadowOffsetY: 0, filter: 'none', fontKerning: 'auto', fontStretch: 'normal', fontVariantCaps: 'normal', textRendering: 'auto', direction: 'inherit', lang: 'inherit' }; this._stack = []; }
@@ -2107,8 +2102,7 @@
   class ImageData {
     constructor(data,width,height) { if (typeof data==='number') {height=width;width=data;data=new Uint8ClampedArray(width*height*4);} else {if (!(data instanceof Uint8ClampedArray)) throw new TypeError('Expected Uint8ClampedArray');height??=data.length/(width*4);} if(!Number.isInteger(width)||!Number.isInteger(height)||width<=0||height<=0||data.length!==width*height*4) throw new DOMException('Invalid image dimensions','IndexSizeError');Object.assign(this,{data,width,height,colorSpace:'srgb'}); }
   }
-  // WARNING: must parse like `dimension()` in render: HTML non-negative integers, leading digits after whitespace and
-  // an optional `+`.
+  // Match render's dimension(): leading HTML non-negative integers after whitespace and an optional +.
   const canvasSize = (value, fallback) => { const digits = /^[\t\n\f\r ]*\+?(\d+)/.exec(value ?? '')?.[1], size = digits ? Number(digits) : NaN; return size <= 2147483647 ? size : fallback; };
   class HTMLCanvasElement extends HTMLElement {
     get clientWidth(){const width=this.getBoundingClientRect().width;if(width)return width;const value=getComputedStyle(this).width;return /^\d+(?:\.\d+)?px$/.test(value)?parseFloat(value):this.width;}
@@ -2123,8 +2117,7 @@
   }
   const transferred = () => new DOMException('The canvas was transferred', 'InvalidStateError');
   const canvasContext = (canvas, type, options, Context2D) => { if (canvas._contextType && canvas._contextType !== type) return null; if (!['webgpu','2d','bitmaprenderer'].includes(type)) return null; canvas._contextType = type; return canvas._context ??= type === '2d' ? new Context2D(canvas, options) : type === 'bitmaprenderer' ? new ImageBitmapRenderingContext(canvas) : new GPUCanvasContext(canvas, canvas._id); };
-  // WARNING: bitmap draws wait in their context's queue, so closing a bitmap must run them first. Flushing per draw, as
-  // for other canvases, would redraw a whole canvas per sprite.
+  // Flush queued draws before bitmap closure. A flush per draw redraws the canvas for every sprite.
   const bitmapDraws = new Set();
   const drawable = image => image instanceof HTMLImageElement || image instanceof HTMLCanvasElement || image instanceof HTMLVideoElement || image instanceof OffscreenCanvas || image instanceof ImageBitmap;
   const imageSize = image => [image.videoWidth ?? image.naturalWidth ?? image.width, image.videoHeight ?? image.naturalHeight ?? image.height];
@@ -2373,7 +2366,7 @@
   const easingOf = value => {
     value = String(value).trim();
     if (easings.has(value)) return value;
-    // WARNING: `dom.supports` accepts a list for `animation-timing-function`, so commas outside functions must be
+    // `dom.supports` accepts a list for `animation-timing-function`, so commas outside functions must be
     // rejected here.
     if (!value || value.replace(/\([^)]*\)/g, '').includes(',') || !call('dom.supports', 'animation-timing-function', value)) throw new TypeError(`'${value}' is not a valid easing`);
     if (easings.size > 256) easings.clear();
@@ -2579,7 +2572,7 @@
     get pending() { return this.#playing || this.#pausing; }
     get ready() { return this.#ready; }
     get finished() { return this.#finished; }
-    // WARNING: browsers resolve the promises at once but fire the events in a later task.
+    // Browsers resolve the promises at once but fire the events in a later task.
     #fire(type, timelineTime, currentTime = this.#current()) { setTimeout(() => this.dispatchEvent(new AnimationPlaybackEvent(type, { currentTime, timelineTime }))); }
     #commit() {
       const now = this.#now();
@@ -2887,7 +2880,7 @@
   };
   globalThis.__appsWebviewEvent = (id, name, detail) => attachedWebviews.get(id)?.dispatchEvent(Object.assign(new Event(name), detail));
   globalThis.__appsWebviewReply = (id, value, error) => { const reply = webviewReplies.get(id); webviewReplies.delete(id); if (error === null) reply?.[0](value); else reply?.[1](new Error(error)); };
-  // WARNING: this reads the flags of the last frame with `observing` set; a forced layout here would cost every frame.
+  // Use the last frame's observer flags. A forced layout here adds work every frame.
   globalThis.__appsLayout = () => { if (active) { observing = true; const lost = !focusable(active); observing = false; if (lost) active.blur(); } syncWebviews(); for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(), at = geometry[2]; if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === at) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) observer.callback(entries, observer); } };
   const resizeLayout=globalThis.__appsLayout;
   globalThis.__appsMediaChanged=()=>{
@@ -2904,7 +2897,7 @@
       query.dispatchEvent(new MediaQueryListEvent('change', { media: query.media, matches }));
     }
   };
-  // WARNING: resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
+  // Resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
   globalThis.__appsLayout=()=>{resizeLayout();for(const id of call('dom.scrollEvents'))wrap(id)?.dispatchEvent(new Event('scroll',{bubbles:!id}));__appsMediaChanged();};
   const mediaLayout=globalThis.__appsLayout;
   globalThis.__appsLayout=()=>{
@@ -2977,8 +2970,7 @@
     else if (history.undo.push({ at, removed, inserted, typed }) > 100) history.undo.shift();
   };
   let composed = null;
-  // WARNING: focus changes must call this before `active` changes. Like Chromium, an ended composition keeps its text
-  // and fires only `compositionend`.
+  // Call before active changes. End composition with its text intact and only a compositionend event.
   const finishComposition = () => {
     if (composing === null) return;
     const target = active, [at, removed, text] = composed;
@@ -3002,7 +2994,8 @@
       dispatch(target, trusted(new CompositionEvent('compositionstart', { bubbles: true, composed: true, data: '' })));
     }
     if (isComposing) dispatch(target, trusted(new CompositionEvent('compositionupdate', { bubbles: true, composed: true, data: text })));
-    // WARNING: a text offset at a block boundary also fits the end of the block before it, and an empty block has no text. So use the selection when it is the replaced text, else look up the first replaced character.
+    // Offsets at block boundaries are ambiguous. Reuse a matching selection, or locate the first replaced
+    // character.
     const replaced = () => {
       if (selection.rangeCount && start === Math.min(state.start,state.end) && end === Math.max(state.start,state.end) && target.contains(selection.getRangeAt(0).startContainer)) return selection.getRangeAt(0).cloneRange();
       const range = document.createRange(), [node,at] = textPoint(target,start + (start < end));
@@ -3038,7 +3031,7 @@
     }
     return true;
   };
-  // WARNING: entries hold offsets into the text, so a change that bypassed the history clears it.
+  // Entries hold offsets into the text, so a change that bypassed the history clears it.
   const undo = redo => {
     const history = active && histories.get(active), state = __appsEditing(), entry = history?.[redo ? 'redo' : 'undo'].pop();
     if (!entry || !state) return false;
@@ -3066,7 +3059,7 @@
   };
   globalThis.__appsEdit = (command, text = '') => command === 'copy' || command === 'cut' ? __appsClipboard(command) : void (command === 'paste' || command === 'pasteAndMatchStyle' ? __appsClipboard('paste', text) : edit(command, text));
   const editCommands = new Map(['copy', 'cut', 'paste', 'selectAll', 'insertText', 'delete', 'forwardDelete', 'undo', 'redo'].map(name => [name.toLowerCase(), name]));
-  // WARNING: like browsers, page scripts reach the clipboard only while they handle user input.
+  // Like browsers, page scripts reach the clipboard only while they handle user input.
   const enabled = command => {
     const state = __appsEditing(), ranged = state ? state.start !== state.end : !selection.isCollapsed, writable = !!state && !active.readOnly && !disabled(active);
     return (command === 'selectAll' || (command === 'undo' || command === 'redo' ? !!histories.get(active)?.[command].length : command === 'copy' ? ranged : writable && (command !== 'cut' || ranged))) && (!/^(copy|cut|paste)$/.test(command) || native > 0);
@@ -3203,7 +3196,7 @@
   let press = null, last = null, sliding = null;
   const slide = (node, x) => { const rect = node.getBoundingClientRect(), thumb = Math.min(rect.height, 16), [min, max] = rangeBounds(node); setRange(node, min + Math.min(1, Math.max(0, (x - rect.left - thumb / 2) / (rect.width - thumb || 1))) * (max - min)); };
   const mouseInit = (data, extra) => ({ bubbles: true, cancelable: true, composed: true, view: window, clientX: data.clientX, clientY: data.clientY, screenX: data.screenX ?? data.clientX, screenY: data.screenY ?? data.clientY, ctrlKey: !!data.ctrlKey, metaKey: !!data.metaKey, altKey: !!data.altKey, shiftKey: !!data.shiftKey, button: data.button ?? 0, buttons: data.buttons ?? 0, detail: data.detail ?? 0, movementX: last ? data.clientX - last[0] : 0, movementY: last ? data.clientY - last[1] : 0, pointerId: 1, pointerType: 'mouse', isPrimary: true, ...extra });
-  // WARNING: browsers settle the `finished` promise of a CSS animation before its end event, so that event waits for the promise reactions.
+  // Queue the end event after finished-promise reactions, as browsers do.
   globalThis.__appsDispatch = (name, ids, data = {}) => { const run = () => { native++; try { return nativeEvent(name, ids, data); } finally { native--; } }; if (/^(animation|transition)(end|cancel)$/.test(name) && cssEvent(name, ids[0], data)) { microtask(run); return true; } return run(); };
   const nativeEvent = (name, ids, data) => {
     if (name === 'pointerexit') { hover(null, data); last = null; return true; }
@@ -3235,7 +3228,7 @@
       if (data.nativeKey !== undefined) {
         const raw = data.nativeKey, upper = raw.toUpperCase(), named = nativeKeys[raw] ?? (/^f\d{1,2}$/.test(raw) ? upper : null);
         const code = /^[a-z]$/i.test(raw) ? 'Key' + upper : /^\d$/.test(raw) ? 'Digit' + raw : ({ ' ':'Space', space:'Space', '-':'Minus', '=':'Equal', '[':'BracketLeft', ']':'BracketRight', '\\':'Backslash', ';':'Semicolon', "'":'Quote', ',':'Comma', '.':'Period', '/':'Slash', '`':'Backquote' })[raw] ?? named ?? '';
-        // WARNING: like Chrome, a key that the input method took has key code 229, and its key is `Process` except on macOS.
+        // Like Chrome, a key that the input method took has key code 229, and its key is `Process` except on macOS.
         const { ime, ...rest } = data, key = ime && !navigator.platform.includes('Mac') ? 'Process' : named ?? data.keyChar ?? (data.shiftKey ? upper : raw);
         data = { ...rest, key, code, keyCode: ime ? 229 : keyCodes[key] ?? (/^[a-z0-9]$/i.test(raw) ? upper.charCodeAt(0) : /^F\d+$/.test(code) ? 111 + Number(code.slice(1)) : 0) };
       }

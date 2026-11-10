@@ -102,7 +102,7 @@ impl Platform {
         post_local(on_launch);
         let client = self.client.clone();
         let result = self.event_loop.borrow_mut().run(None, &mut (), |_| {
-            // WARNING: requests with replies can read X events into xcb's queue, which doesn't wake the loop.
+            // Requests with replies can read X events into xcb's queue, which doesn't wake the loop.
             if let Client::X11(client) = &client {
                 client.process_events();
             }
@@ -114,7 +114,7 @@ impl Platform {
     }
 
     pub fn quit(&self) {
-        // WARNING: quitting asks the app, which is busy while it calls this.
+        // Quitting asks the app, which is busy while it calls this.
         let signal = self.signal.clone();
         post_local(move || {
             if crate::app::events::should_quit() {

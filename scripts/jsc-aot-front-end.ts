@@ -51,7 +51,7 @@ for (const name of ["lolhtml", "rust-argon2", "zstd", "boringssl"]) {
   run("scripts/build/fetch-cli.ts", "dep", name, repo, commit, join(root, "vendor", name), cache, ...patches);
 }
 
-// WARNING: the crate is a member of Bun's workspace, so it builds with Bun's lockfile, patches and toolchain.
+// The crate is a member of Bun's workspace, so it builds with Bun's lockfile, patches and toolchain.
 const crate = join(root, "src/apps_aot");
 mkdirSync(crate, { recursive: true });
 for (const file of ["Cargo.toml", "lib.rs"]) copyFileSync(join(import.meta.dir, "aot-front-end", file), join(crate, file));

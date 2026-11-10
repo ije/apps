@@ -422,7 +422,7 @@ impl Client {
                             events.extend(last_release.take());
                             events.push(change);
                         }
-                        // WARNING: A release right before a press of the same key is X11 key repeat.
+                        // A release right before a press of the same key is X11 key repeat.
                         if let Some(Event::KeyRelease(release)) = last_release.take()
                             && (release.detail != press.detail
                                 || press.time.saturating_sub(release.time) > 20)
@@ -555,8 +555,7 @@ impl Client {
                 .ime_press
                 .is_some_and(|pending| pending.detail == key.detail)
         {
-            // WARNING: the input method can take a key without any answer, like a key that switches its mode, so a
-            // press waits for its change only until the key comes up. A later change is not that key's.
+            // An input method can consume a key without a reply. Wait for its change only until key release.
             state.ime_press = None;
         }
     }
@@ -678,7 +677,7 @@ impl Client {
                 let window = self.window(event.event)?;
                 {
                     let mut state = self.state.borrow_mut();
-                    // WARNING: the scroll valuators are global, so a scroll elsewhere must not become one big delta.
+                    // The scroll valuators are global, so a scroll elsewhere must not become one big delta.
                     for pointer in state.pointers.values_mut() {
                         pointer.horizontal.value = None;
                         pointer.vertical.value = None;
@@ -812,7 +811,7 @@ impl Client {
                         return Some(());
                     }
                 };
-                // WARNING: emulated wheel presses come with the smooth scroll motion events, which scroll instead.
+                // Emulated wheel presses come with the smooth scroll motion events, which scroll instead.
                 if !event
                     .flags
                     .contains(xinput::PointerEventFlags::POINTER_EMULATED)

@@ -18,9 +18,8 @@ pub fn apply(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
     let zero = vec![0; stride];
     let mut prefix = Vec::new();
 
-    // WARNING: each pass writes `round(sum * 1 / (2r + 1))` of the window with zero padding, as fastblur does. The
-    // vertical pass keeps one sum per column and walks rows in memory order, and the horizontal one takes window
-    // sums from prefix sums, so both loops vectorize.
+    // Preserve fastblur's zero padding and round(sum * (1 / (2r + 1))). Use column sums and horizontal prefix sums
+    // for vectorization.
     for (box_size_horz, box_size_vert) in boxes_horz.iter().zip(boxes_vert.iter()) {
         let radius = ((box_size_vert - 1) / 2) as usize;
         if radius == 0 {
@@ -116,7 +115,7 @@ fn create_box_gauss(sigma: f32) -> [i32; STEPS] {
     }
 }
 
-// WARNING: exact only for x <= 2^23, but much faster than `f32::round`.
+// Exact only for x <= 2^23, but much faster than `f32::round`.
 #[inline]
 fn round(mut x: f32) -> f32 {
     x += 12582912.0;

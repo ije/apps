@@ -137,7 +137,7 @@ impl Gpu {
             (kind, info.backend != wgpu::Backend::Vulkan)
         });
         let mut errors = Vec::new();
-        // WARNING: hybrid GPUs can report a surface they fail to configure, so each one is tried.
+        // Hybrid GPUs can report a surface they fail to configure, so each one is tried.
         for adapter in adapters {
             let caps = surface.get_capabilities(&adapter);
             if caps.formats.is_empty() || caps.alpha_modes.is_empty() {
@@ -332,7 +332,7 @@ impl Gpu {
                     cache: None,
                 })
         };
-        // WARNING: colors are drawn unpremultiplied over targets that hold premultiplied colors.
+        // Colors are drawn unpremultiplied over targets that hold premultiplied colors.
         let over = Some(wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::SrcAlpha,
@@ -447,7 +447,7 @@ impl Renderer {
         atlas: Rc<GpuAtlas>,
     ) -> Result<Self> {
         let caps = surface.get_capabilities(&gpu.adapter);
-        // WARNING: an sRGB surface would convert the colors the shaders already write in sRGB.
+        // An sRGB surface would convert the colors the shaders already write in sRGB.
         let format = [
             wgpu::TextureFormat::Bgra8Unorm,
             wgpu::TextureFormat::Rgba8Unorm,
@@ -578,7 +578,7 @@ impl Renderer {
         let output = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(output) => output,
             wgpu::CurrentSurfaceTexture::Suboptimal(output) => {
-                // WARNING: textures must go before the surface can be configured again.
+                // Textures must go before the surface can be configured again.
                 drop(output);
                 surface.configure(&self.gpu.device, &self.config);
                 return (
@@ -610,7 +610,7 @@ impl Renderer {
             Ok(readback) => readback,
             Err(error) => {
                 eprintln!("apps: failed to render: {error:#}");
-                // WARNING: queue writes are staged before encoding, so they are flushed even when the frame fails.
+                // Queue writes are staged before encoding, so they are flushed even when the frame fails.
                 self.gpu.queue.submit(std::iter::empty());
                 return (Drawn::Repaint, capture.then(|| Err(error)));
             }
@@ -624,7 +624,7 @@ impl Renderer {
     }
 
     fn recover(&mut self) -> Result<()> {
-        // WARNING: a window has one swapchain at a time, so the old surface goes first.
+        // A window has one swapchain at a time, so the old surface goes first.
         self.surface = None;
         let (gpu, surface) = Gpu::get(self.display, self.window)?;
         let transparent = self.config.alpha_mode == self.alpha_modes[1];
@@ -751,7 +751,7 @@ impl Renderer {
             bytes(&frame.composites),
             bytes(&frame.blurs),
         ];
-        // WARNING: wgpu rejects empty bindings, so empty arrays still take 16 bytes.
+        // wgpu rejects empty bindings, so empty arrays still take 16 bytes.
         let limits = gpu.device.limits();
         let alignment = u64::from(limits.min_storage_buffer_offset_alignment);
         let mut offsets = [0; 7];
@@ -856,7 +856,7 @@ impl Renderer {
                     pass.set_bind_group(0, &self.globals_group, &[globals_offset(*target)]);
                     current = (*target, false);
                 }
-                // WARNING: targets are cleared right away, since a later pass may draw into them.
+                // Targets are cleared right away, since a later pass may draw into them.
                 Command::Pass(target, clear) => {
                     pass = None;
                     current = (*target, *clear);

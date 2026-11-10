@@ -64,7 +64,7 @@ type Reloaded = (
 static RELOADED: std::sync::Mutex<Option<Reloaded>> = std::sync::Mutex::new(None);
 
 thread_local! {
-    // WARNING: no destructor, because at exit it would run after `HOSTS`, which its drop needs.
+    // Skip destruction: this needs HOSTS, which exits first.
     static PAGE_SIDE: std::mem::ManuallyDrop<RefCell<Option<Rc<RefCell<Desktop>>>>> = const { std::mem::ManuallyDrop::new(RefCell::new(None)) };
 }
 
@@ -196,8 +196,7 @@ impl Desktop {
     ) -> Result<Self> {
         let api = JavaScriptCore::load()?;
         let windows = !pages.is_empty() || files.keys().any(|name| name.ends_with(".html"));
-        // WARNING: AppKit's launch and the first frame wait for the window server, the Metal driver and CoreText font
-        // data, so this thread loads them early. The calls look unused but save launch time.
+        // Preload the window server, Metal and CoreText here to avoid delays at launch and the first frame.
         #[cfg(target_os = "macos")]
         if windows {
             let _ = std::thread::Builder::new()
@@ -242,7 +241,7 @@ impl Desktop {
                 });
         }
         let link = Link::new();
-        // WARNING: install the waker before the app runs, because native producers of this thread capture it then.
+        // Install the waker before the app runs, because native producers of this thread capture it then.
         crate::host::Waker::install({
             let link = link.clone();
             move || link.wake_main()
@@ -639,7 +638,8 @@ impl Desktop {
                             }
                         };
                         renderer::text::warm(crate::style::font_lists(&doc));
-                        // WARNING: only pages that ship with the app run `<script type="preload">` with Node; user files and HTML strings never do.
+                        // Only bundled pages can run Node preloads. Never enable them for user files or HTML
+                        // strings.
                         let trusted = location.starts_with("apps:///")
                             || !page
                                 && file.as_ref().is_some_and(|path| {
@@ -705,7 +705,7 @@ impl Desktop {
                                 state.text_system = Some(window.text_system().clone());
                                 state.pixel_ratio = window.scale_factor();
                                 state.window = window.window_state();
-                                // WARNING: like Playwright, pages count as focused while the devtools MCP server runs, so tests in hidden windows get focus events.
+                                // Like Playwright, pages count as focused while the devtools MCP server runs, so tests in hidden windows get focus events.
                                 view.focused = window.is_window_active() || mcp::enabled();
                             });
                         }
@@ -760,8 +760,7 @@ impl Desktop {
                                 renderer.eval_page(source, url)
                             }
                         };
-                        // WARNING: a bundle runs one page script per `__appsNext` call, so the VM drains microtasks
-                        // between them like browsers do.
+                        // Run one page script per __appsNext call so JSC drains microtasks between scripts.
                         const NEXT: &str = "this.__appsNext?.()";
                         for (mut source, url) in scripts
                             .iter()
@@ -932,7 +931,7 @@ impl Desktop {
                                         Ok(([width, height], bytes)) => serde_json::json!({"id":request,"width":width,"height":height,"png":base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)}),
                                         Err(error) => serde_json::json!({"id":request,"error":error.to_string()}),
                                     };
-                                    // WARNING: the window is busy drawing here, so a capture requested by the reply must wait for the next drive.
+                                    // The window is busy drawing here, so a capture requested by the reply must wait for the next drive.
                                     cx.defer(move |cx| {
                                         link.event(format!("__appsEvent('captured',{id},{data})"), "apps:capture");
                                         Desktop::drive(runtime, cx);
@@ -1275,8 +1274,8 @@ impl Desktop {
                             eprintln!("apps: page script: {error:#}");
                         }
                     }
-                    // WARNING: the page must take control events before the next frame, which tells main the last one
-                    // it took, or the page's value undoes edits it has not taken yet.
+                    // Process native control events before the next frame acknowledges them, or stale page
+                    // values can undo edits.
                     let controls = crate::render::native::events(&data);
                     for (node, event) in &controls {
                         let value = serde_json::to_string(&event.value).unwrap_or_default();
@@ -1304,7 +1303,7 @@ impl Desktop {
                 delay = delay.min(0);
             }
             drop(host);
-            // WARNING: IPC, microtasks and the scripts above can add timers after an engine's tick, so read all delays again.
+            // IPC, microtasks and the scripts above can add timers after an engine's tick, so read all delays again.
             for engine in app
                 .views
                 .values()
@@ -1363,7 +1362,7 @@ impl Desktop {
                 let wait = Duration::from_millis(delay);
                 let at = Instant::now() + wait;
                 let mut app = runtime.borrow_mut();
-                // WARNING: a replaced timer stays registered until it fires, so keep the armed one unless the new deadline is earlier.
+                // A replaced timer stays registered until it fires, so keep the armed one unless the new deadline is earlier.
                 if app.wake.as_ref().is_none_or(|(armed, _)| {
                     *armed <= Instant::now() || at + Duration::from_micros(500) < *armed
                 }) {
@@ -1593,7 +1592,7 @@ impl Desktop {
                         .args(&command[1..])
                         .spawn();
                 }
-                // WARNING: AppKit exits with 0 after this hook, so a failure code must exit here.
+                // AppKit exits with 0 after this hook, so a failure code must exit here.
                 if exit.exit_code() != 0 {
                     std::process::exit(exit.exit_code());
                 }
@@ -1625,7 +1624,7 @@ impl Desktop {
                     None => link.main(ToMain::OpenTools),
                 }
             }
-            // WARNING: the first main menu costs AppKit 20-30 ms, so the default menu waits for the first frame.
+            // The first main menu costs AppKit 20-30 ms, so the default menu waits for the first frame.
             #[cfg(target_os = "macos")]
             match first {
                 Some(id) => link.page(ToPage::Window(
@@ -1635,7 +1634,6 @@ impl Desktop {
                 None => link.event("__appsInitMenu()".into(), "apps:menu"),
             }
             renderer::native::activate(true);
-            // WARNING: the main side lives as long as the app.
             std::mem::forget(main);
         });
         Ok(exit.exit_code())
@@ -1663,7 +1661,7 @@ impl Desktop {
         );
         let waker = cx.waker();
         queue.set_wake(move || waker.wake());
-        // WARNING: without a thread per window this one also runs the main side, which must wake too.
+        // Without a thread per window this one also runs the main side, which must wake too.
         let (main, page) = (crate::host::Waker::current(), queue.clone());
         crate::host::Waker::install(move || {
             main.wake();
@@ -1730,8 +1728,8 @@ fn shrink_when_quiet(runtime: Rc<RefCell<Desktop>>, cx: &mut App) {
     };
     let before = frames(&runtime, cx);
     cx.timer(Duration::from_secs(1), move |cx| {
-        // WARNING: this GC blocks the thread that draws, so it waits for a window that animates. A blinking
-        // caret draws about twice a second and doesn't count, or a focused text field would stop all GCs.
+        // Defer GC during animation: it blocks rendering. Allow caret-only frames so focused fields cannot
+        // prevent GC.
         let drawing = frames(&runtime, cx).saturating_sub(before) > 4;
         if drawing || !api.shrink_due() {
             return shrink_when_quiet(runtime, cx);

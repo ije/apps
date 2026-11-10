@@ -33,8 +33,7 @@ pub(crate) struct Cache {
 }
 
 impl Cache {
-    // WARNING: an entry that the current frame used is never dropped, so the cache can grow past its limits for
-    // one frame. Otherwise a frame with more symbols than fit would rasterize each one again in every frame.
+    // Keep every symbol used this frame, even over capacity, to avoid rasterizing it again each frame.
     pub fn get(&mut self, name: &str, size: [u16; 2], frame: u64) -> Option<Rc<Symbol>> {
         if let Some(entry) = self
             .images
@@ -90,7 +89,7 @@ impl Cache {
     }
 }
 
-// WARNING: this runs on the render thread. NSImage draws on any thread into a graphics context of that thread.
+// This runs on the render thread. NSImage draws on any thread into a graphics context of that thread.
 fn rasterize(name: &str, [width, height]: [u16; 2]) -> Option<Vec<u8>> {
     if width == 0 || height == 0 {
         return None;

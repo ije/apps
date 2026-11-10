@@ -10,8 +10,7 @@ use std::{
     rc::Rc,
 };
 
-// WARNING: macOS uses the system SQLite, declared here, because libsqlite3-sys without `bundled` can link another copy
-// that pkg-config finds.
+// Use macOS system SQLite directly: pkg-config can make libsqlite3-sys link a different copy.
 #[cfg(target_os = "macos")]
 #[allow(non_camel_case_types)]
 pub(crate) mod ffi {
@@ -228,7 +227,7 @@ impl Database {
         if matches!(code, ffi::SQLITE_OK | ffi::SQLITE_ROW | ffi::SQLITE_DONE) {
             return Ok(());
         }
-        // WARNING: sqlite.js splits the message at U+0001 into message, errcode and errstr.
+        // sqlite.js splits the message at U+0001 into message, errcode and errstr.
         let code = unsafe { ffi::sqlite3_extended_errcode(self.0) };
         bail!(
             "{}\u{1}{code}\u{1}{}",
@@ -290,7 +289,7 @@ impl State {
                 "SQLITE_CREATE_VTABLE":ffi::SQLITE_CREATE_VTABLE,"SQLITE_DROP_VTABLE":ffi::SQLITE_DROP_VTABLE,"SQLITE_FUNCTION":ffi::SQLITE_FUNCTION,"SQLITE_SAVEPOINT":ffi::SQLITE_SAVEPOINT,"SQLITE_RECURSIVE":ffi::SQLITE_RECURSIVE
             }));
         }
-        // WARNING: Handles belong to this JSC context. Statements must be finalized before their database closes.
+        // Handles belong to this JSC context. Statements must be finalized before their database closes.
         unsafe {
             if op == "sqlite.open" {
                 let path = CString::new(args[0].as_str().context("Expected database path")?)?;
@@ -339,7 +338,7 @@ impl State {
                         ptr::null_mut::<i32>(),
                     ))?;
                 }
-                // WARNING: the macOS SQLite turns recursive triggers on by default, and Node's doesn't.
+                // The macOS SQLite turns recursive triggers on by default, and Node's doesn't.
                 database.check(ffi::sqlite3_exec(
                     raw,
                     c"PRAGMA recursive_triggers = OFF".as_ptr(),

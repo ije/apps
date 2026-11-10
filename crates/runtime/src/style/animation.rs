@@ -392,8 +392,7 @@ impl Animation {
     }
 }
 
-// WARNING: set a new rate or time from the current local time (`time` at `since` plus elapsed time at `rate`). Page
-// times can be huge, so keep them f64, never `Duration`.
+// Base rate and time changes on the current local time. Use f64: large page times can exceed Duration.
 #[derive(Clone)]
 struct Playback {
     time: f64,
@@ -774,8 +773,7 @@ impl Scripted {
 #[derive(Default)]
 pub(crate) struct Motion {
     previous: Vec<Rc<Style>>,
-    // WARNING: `previous` must equal `seen` after each update, except at `touched`, as updates visit only the chunks
-    // written since, not the whole arena.
+    // Keep previous equal to seen except at touched indices. Updates visit only changed chunks.
     seen: super::Chunked<Rc<Style>>,
     touched: Vec<usize>,
     clocks: FxHashMap<usize, Vec<Clock>>,
@@ -795,7 +793,7 @@ pub(crate) struct Motion {
 }
 
 impl Motion {
-    // WARNING: clocks line up with the effects only after `update`, so a style change before it skips them.
+    // Clocks line up with the effects only after `update`, so a style change before it skips them.
     fn pairs<'a>(
         &'a self,
         id: usize,
@@ -1341,7 +1339,7 @@ impl Motion {
                 changed.push(id);
             }
         }
-        // WARNING: a child can have a smaller id than its parent, so exits sort by depth to start a parent's exit
+        // A child can have a smaller id than its parent, so exits sort by depth to start a parent's exit
         // first.
         exits.sort_by_cached_key(|&id| {
             std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent).count()
@@ -1349,7 +1347,7 @@ impl Motion {
         for id in exits.into_iter().chain(changed) {
             let new = &styles.values[id];
             let old = std::mem::replace(&mut self.previous[id], new.clone());
-            // WARNING: a container query pass recomputes styles inside one frame, so it must not start transitions.
+            // A container query pass recomputes styles inside one frame, so it must not start transitions.
             if repass {
                 continue;
             }
@@ -1680,8 +1678,7 @@ impl Motion {
             }
         }
         self.transitions.retain(|_, list| !list.is_empty());
-        // WARNING: drop layout values equal to the base, like an exit animation's shown `display`, or the box lays out
-        // again every frame.
+        // Drop layout values equal to the base to avoid layout on every animation frame.
         animated.retain(|&id, values| {
             values.retain(|key, value| {
                 PAINT.contains(&key) || styles.values[id].value(key) != Some(&*value)
@@ -1792,7 +1789,7 @@ impl Motion {
                     }
                     faded || hidden
                 };
-            // WARNING: parked animations resume only because render checks parked boxes after layout, and scrolls,
+            // Parked animations resume only because render checks parked boxes after layout, and scrolls,
             // resizes and DOM changes draw a frame.
             let parked = !unseen && still && change < end && !shown(id);
             if parked && self.parked.last() != Some(&id) {
@@ -1862,7 +1859,7 @@ impl Motion {
 fn add(property: &str, under: &str, value: &str, accumulate: bool) -> Option<String> {
     fn number(text: &str) -> Option<(f64, &str)> {
         let bytes = text.as_bytes();
-        // WARNING: an `e` is an exponent only before a digit or sign, so `2em` keeps its unit.
+        // An `e` is an exponent only before a digit or sign, so `2em` keeps its unit.
         let end = (0..bytes.len())
             .find(|&index| {
                 let byte = bytes[index];
@@ -2174,7 +2171,7 @@ fn rotation([x, y, z, w]: [f64; 4]) -> [f64; 16] {
 }
 
 fn decompose(list: &str) -> Option<([f64; 13], bool)> {
-    // WARNING: relative units and percentages give NaN with these units, so `math` rejects them.
+    // Relative units and percentages give NaN with these units, so `math` rejects them.
     let units = super::Lengths {
         font: super::FontUnits::new(f32::NAN),
         root: super::FontUnits::new(f32::NAN),
@@ -2511,7 +2508,7 @@ impl Lerp {
             };
         }
         if let (Some(a), Some(b)) = (color(from), color(to)) {
-            // WARNING: as in browsers, colors interpolate in sRGB only when both are legacy sRGB colors.
+            // As in browsers, colors interpolate in sRGB only when both are legacy sRGB colors.
             return Some(match (super::color::oklab(from), super::color::oklab(to)) {
                 (Some((false, mut a)), Some((_, mut b)))
                 | (Some((_, mut a)), Some((false, mut b))) => {

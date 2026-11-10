@@ -434,8 +434,8 @@ props! {
 }
 
 thread_local! {
-    // WARNING: interned names are leaked. They are bounded by the property names that the app's CSS uses, and by
-    // the custom property names that scripts set inline; inline styles drop other unknown names.
+    // Interned names never free. Accept only app CSS names and inline custom properties. Reject other unknown
+    // inline names.
     static INTERNED: RefCell<(Vec<&'static str>, FxHashMap<&'static str, Prop>)> = Default::default();
 }
 
@@ -447,8 +447,7 @@ impl Prop {
                 if let Some(&prop) = ids.get(name) {
                     return prop;
                 }
-                // WARNING: ids are per thread, so the leaked names are shared across threads to leak each name only
-                // once.
+                // Share leaked names across threads even though property IDs are thread-local.
                 static LEAKED: std::sync::Mutex<rustc_hash::FxHashSet<&'static str>> =
                     std::sync::Mutex::new(rustc_hash::FxHashSet::with_hasher(
                         rustc_hash::FxBuildHasher,
@@ -699,7 +698,7 @@ fn merge(list: &mut Vec<(Prop, Rc<str>)>, start: usize) {
     {
         return;
     }
-    // WARNING: the sort must stay stable, so reverse, dedup and reverse keeps the later of two values for one property.
+    // Preserve stable order and retain the last value for each property.
     list.sort_by_key(|entry| entry.0);
     list.reverse();
     list.dedup_by_key(|entry| entry.0);

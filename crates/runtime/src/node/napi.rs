@@ -78,7 +78,7 @@ struct Holder {
 }
 
 unsafe extern "C" fn release_holder(_: Ptr, holder: Ptr) {
-    // WARNING: JSC frees array buffers at the end of a GC, maybe on a GC thread. Only queue the ID here.
+    // JSC frees array buffers at the end of a GC, maybe on a GC thread. Only queue the ID here.
     let holder = unsafe { Box::from_raw(holder.cast::<Holder>()) };
     if let Ok(mut queue) = holder.queue.lock() {
         queue.push(holder.id);
@@ -95,11 +95,11 @@ pub(crate) struct State {
     wrap_finalizers: RefCell<HashMap<u64, Finalizer>>,
     helpers: HashMap<String, Ptr>,
     callbacks: RefCell<HashMap<usize, Function>>,
-    // WARNING: Scope addresses cross the C ABI and must remain stable.
+    // Scope addresses cross the C ABI and must remain stable.
     #[allow(clippy::vec_box)]
     scopes: RefCell<Vec<Box<Scope>>>,
     references: RefCell<HashMap<usize, Box<Reference>>>,
-    // WARNING: GC can reuse an object address before its holder is finalized, so address maps keep the holder ID.
+    // GC can reuse an object address before its holder is finalized, so address maps keep the holder ID.
     wraps: RefCell<HashMap<u64, Ptr>>,
     externals: RefCell<HashMap<usize, (u64, Ptr)>>,
     held: RefCell<Vec<Ptr>>,
@@ -288,9 +288,9 @@ impl State {
         (id, Box::into_raw(Box::new(holder)))
     }
 
-    // WARNING: finalizers call into the addon and may run JavaScript, so only `tick` runs them, never a Node-API call.
+    // Finalizers call into the addon and may run JavaScript, so only `tick` runs them, never a Node-API call.
     pub(crate) fn sweep(&self) {
-        // WARNING: Finalizers can load addons, which pushes to `environments`.
+        // Finalizers can load addons, which pushes to `environments`.
         let environments = self.environments.borrow().clone();
         for environment in &environments {
             environment.sweep();
@@ -594,8 +594,8 @@ impl State {
         let packed = path
             .to_str()
             .and_then(|key| host.borrow().scripts.get(key).cloned());
-        // WARNING: dlopen needs a file. A hash of name and content keeps copies at other paths separate modules, and a
-        // loaded library must be replaced by rename, never written in place.
+        // Replace cached addons by rename, never in place. Hash name and content so copies at different paths
+        // remain separate modules.
         let path = match packed {
             Some(bytes) => {
                 let home = std::path::PathBuf::from(
@@ -654,7 +654,7 @@ impl State {
         .into();
         #[cfg(not(unix))]
         let library = unsafe { Library::new(&path)? };
-        // WARNING: older addons register from a static constructor, which ran when the library opened.
+        // Older addons register from a static constructor, which ran when the library opened.
         let register = match unsafe {
             library
                 .get::<unsafe extern "C" fn(*const State, Ptr) -> Ptr>(b"napi_register_module_v1\0")
@@ -675,7 +675,7 @@ impl State {
         }
         let environment = State::new(self.api.clone(), self.ctx, &host, true)?;
         self.environments.borrow_mut().push(environment.clone());
-        // WARNING: Like Node.js, never unload an addon. Its threads and static destructors may still run.
+        // Like Node.js, never unload an addon. Its threads and static destructors may still run.
         std::mem::forget(library);
         environment.scopes.borrow_mut().push(Box::new(Scope {
             kept: HashSet::new(),
@@ -1938,7 +1938,7 @@ api!(napi_create_external_arraybuffer(
     result: *mut Ptr,
 ) {
     check((!data.is_null() || length == 0) && !result.is_null(), 1)?;
-    // WARNING: The finalizer follows the bytes, not the wrapper, because ArrayBuffer.transfer() moves them.
+    // The finalizer follows the bytes, not the wrapper, because ArrayBuffer.transfer() moves them.
     let (id, holder) = env.holder();
     let mut exception = ptr::null_mut();
     let value = (env.api.make_buffer)(env.ctx, data, length, Some(release_holder), holder.cast(), &mut exception);
@@ -2200,8 +2200,7 @@ pub(crate) unsafe extern "C" fn load(
     }
 }
 
-// WARNING: addon threads call these, so they take no environment, skip the thread check, and must touch only
-// thread-safe state.
+// Addon threads call these without an environment. Access only thread-safe state.
 macro_rules! raw_api {
     ($name:ident($($arg:ident: $ty:ty),* $(,)?) $body:block) => {
         #[unsafe(no_mangle)]
@@ -2211,7 +2210,7 @@ macro_rules! raw_api {
 
 api!(napi_adjust_external_memory(env, change: i64, result: *mut i64) {
     check(!result.is_null(), 1)?;
-    // WARNING: JSC cannot see addon memory, so objects that own it would wait for an unrelated GC. JSC takes no decreases.
+    // Report addon memory so GC can account for it. JSC does not accept decreases.
     if change > 0
         && let Some(report) = env.api.extra_memory
     {
@@ -2333,7 +2332,7 @@ api!(napi_get_node_version(env, result: *mut *const NodeVersion) {
 api!(napi_get_uv_event_loop(env, result: *mut Ptr) {
     let _ = env;
     check(!result.is_null(), 1)?;
-    // WARNING: there is no libuv loop, and a fake pointer would crash the addon later, so this always fails.
+    // Fail without libuv: a fake loop pointer can crash the addon.
     *result = ptr::null_mut();
     Err(9)
 });
@@ -2540,7 +2539,7 @@ struct Threadsafe {
     wake: crate::host::Waker,
 }
 impl Threadsafe {
-    // WARNING: the flag changes under the queue lock, so a blocked caller can't miss the wakeup.
+    // The flag changes under the queue lock, so a blocked caller can't miss the wakeup.
     fn close(&self) {
         let _queue = self
             .queue
@@ -2599,8 +2598,8 @@ api!(napi_create_threadsafe_function(
         ready: env.ready.clone(),
         wake: crate::host::Waker::current(),
     });
-    // WARNING: each acquiring thread owns a reference, and `threadsafe_live` owns the JavaScript thread's, so a thread
-    // that calls after another one aborted still reaches live memory.
+    // Each acquiring thread and threadsafe_live own references. Keep the allocation alive after another
+    // thread aborts.
     let raw = Arc::as_ptr(&function);
     for _ in 0..threads {
         Arc::increment_strong_count(raw);
@@ -2667,7 +2666,7 @@ raw_api!(napi_release_threadsafe_function(function: *const Threadsafe, mode: i32
     let Ok(previous) = released else {
         return 1;
     };
-    // WARNING: this takes over the caller's reference, so the function stays alive until this call returns.
+    // This takes over the caller's reference, so the function stays alive until this call returns.
     let tsfn = unsafe { Arc::from_raw(function) };
     if mode == 1 {
         tsfn.close();
@@ -2737,7 +2736,7 @@ impl State {
     }
 
     fn run_threadsafe(&self, function: &Threadsafe) {
-        // WARNING: one function can have several entries here, so a later one may name a function that already ended.
+        // One function can have several entries here, so a later one may name a function that already ended.
         if function.finalized.load(Ordering::Acquire) {
             return;
         }
@@ -2770,8 +2769,7 @@ impl State {
         }
     }
 
-    // WARNING: like Node, values still queued at the end go to the call callback with a null environment, so it can
-    // free them.
+    // Pass queued values to the callback with a null environment at shutdown so it can free them.
     fn end_threadsafe(&self, function: &Threadsafe) {
         function.finalized.store(true, Ordering::Release);
         if function.referenced.load(Ordering::Acquire) {

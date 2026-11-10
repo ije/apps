@@ -234,8 +234,7 @@ impl Hash for RenderGlyphParams {
 pub struct Fonts {
     pub(crate) platform: platform::TextSystem,
     fonts: RefCell<FxHashMap<Font, Option<FontId>>>,
-    // WARNING: found by the pointers of their family and features, since hashing a whole font for every run costs more
-    // than its shaping cache lookups.
+    // Use family and feature pointers as keys: full font hashes cost more than shaping-cache lookups.
     recent: RefCell<Vec<(Font, FontId)>>,
     metrics: RefCell<FxHashMap<FontId, FontMetrics>>,
     generation: Cell<usize>,
@@ -505,7 +504,7 @@ impl TextSystem {
     ) -> Option<[f32; 4]> {
         #[cfg(target_os = "macos")]
         let bounds = self.platform.glyph_bounds(font_id, glyph_id, font_size.0);
-        // WARNING: other platforms measure raster bounds at this scale, so the bounds are off by up to its inverse.
+        // Other platforms measure raster bounds at this scale, so the bounds are off by up to its inverse.
         #[cfg(not(target_os = "macos"))]
         let bounds = {
             const SCALE: f32 = 8.;

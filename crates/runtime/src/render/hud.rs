@@ -110,7 +110,7 @@ fn load() -> Result<Library> {
             tick: *library.get(b"apps_perfhud_tick\0")?,
             paint: *library.get(b"apps_perfhud_paint\0")?,
         };
-        // WARNING: the usage thread of a hidden HUD can still run, so the library is never unloaded.
+        // The usage thread of a hidden HUD can still run, so the library is never unloaded.
         std::mem::forget(library);
         Ok(functions)
     }

@@ -12,7 +12,7 @@ set -euo pipefail
 version=${1:?Usage: bash scripts/build-npm.sh <version>}
 cd "$(dirname "$0")/.."
 
-# WARNING: npm picks the package by Node's platform and arch, which uname can't tell under emulation.
+# npm picks the package by Node's platform and arch, which uname can't tell under emulation.
 read -r os cpu < <(node -p 'process.platform + " " + process.arch')
 case $os in
   darwin) system=macos lib=lib ext=.dylib exe= ;;
@@ -44,7 +44,7 @@ bin=packages/apps-$os-$cpu/bin
 files=("apps$exe" "apps-runtime$exe" "${lib}apps_media$ext" "${lib}ffmpeg$ext" FFmpeg.LICENSE "${lib}apps_perfhud$ext" "${lib}apps_mcp$ext")
 jsc=target/bun-jsc/$system-$arch
 jscs=("${lib}JavaScriptCore$ext" JavaScriptCore.LICENSE)
-# WARNING: Linux links WebGPU into the runtime, and apps build --aot works only on macOS arm64.
+# Linux links WebGPU into the runtime, and apps build --aot works only on macOS arm64.
 [[ $os != linux ]] && files+=("${lib}apps_webgpu$ext")
 [[ $os-$cpu == darwin-arm64 ]] && jscs+=(libJavaScriptCoreAOT.a libJavaScriptCoreCompiler.dylib libapps_aot.dylib)
 rm -rf "$bin"

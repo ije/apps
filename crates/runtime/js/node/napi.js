@@ -15,7 +15,7 @@
   own: (object, key) => Object.hasOwn(object, key),
   delete: (object, key) => delete object[key],
   keys: object => { const keys = []; for (const key in object) keys.push(key); return keys; },
-  // WARNING: like V8's key collector, a filtered own key still hides the same key on prototypes.
+  // Like V8's key collector, a filtered own key still hides the same key on prototypes.
   all_keys: (object, own, filter, strings) => {
     const keys = [], seen = new Set();
     for (let target = object; target !== null; target = own ? null : Object.getPrototypeOf(target)) {

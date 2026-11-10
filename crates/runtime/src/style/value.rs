@@ -89,7 +89,7 @@ pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
     let (mut open, mut depth, mut start, mut closed) = (0u64, 0u32, 0, false);
     let simple = 'scan: {
         for (index, &byte) in bytes.iter().enumerate() {
-            // WARNING: the tokenizer ends a value after a block, as in `rotate(1deg)scale(2)`, so this fast scan must
+            // The tokenizer ends a value after a block, as in `rotate(1deg)scale(2)`, so this fast scan must
             // give up there.
             if std::mem::take(&mut closed)
                 && separator == ' '
@@ -261,7 +261,7 @@ impl Lengths {
             shadows.push(renderer::BoxShadow {
                 color: renderer::rgba((ink.0 << 8) | u32::from(ink.1)),
                 offset: renderer::point(renderer::px(lengths[0]), renderer::px(lengths[1])),
-                // WARNING: the renderer uses the blur radius as the Gaussian sigma, which is half the CSS blur radius.
+                // The renderer uses the blur radius as the Gaussian sigma, which is half the CSS blur radius.
                 blur_radius: renderer::px(lengths.get(2).copied().unwrap_or(0.).max(0.) / 2.),
                 spread_radius: renderer::px(lengths.get(3).copied().unwrap_or(0.)),
                 inset,

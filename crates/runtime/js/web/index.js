@@ -81,8 +81,8 @@ globalThis.__appsWeb = (call, codec) => {
           catch (error) { console.error(error); }
           state.passive = false;
         }
-        // WARNING: only own `on*` properties run here; accessor handlers, like DOM ones, are already listeners and
-        // would run twice.
+        // Run only own on* properties. Accessor handlers already have listeners, so a second call duplicates
+        // their events.
         try { const handler = Object.hasOwn(this, 'on' + event.type) ? this['on' + event.type] : null; if (!state.immediate && typeof handler === 'function') handler.call(this, event); }
         catch (error) { console.error(error); }
       } finally { Object.assign(state, { currentTarget: null, eventPhase: 0, dispatching: false, stopped: false, immediate: false, passive: false }); }

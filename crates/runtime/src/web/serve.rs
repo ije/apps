@@ -80,7 +80,7 @@ impl State {
                 let listener = tokio::net::TcpListener::from_std(listener)?;
                 let (sender, events) = mpsc::channel(64);
                 let wake = crate::host::Waker::current();
-                // WARNING: `stop` drops the listener on the JavaScript thread, so the port is free before it returns.
+                // `stop` drops the listener on the JavaScript thread, so the port is free before it returns.
                 let listener = Arc::new(Mutex::new(Some((
                     listener,
                     crate::web::Listening::new(address),
@@ -137,7 +137,7 @@ impl State {
                                         return Ok::<_, Infallible>(Response::builder().status(503).body(full(Bytes::new())).unwrap());
                                     }
                                     wake.wake();
-                                    // WARNING: `poll` only sees a dropped reply, so wake it when the client goes away.
+                                    // `poll` only sees a dropped reply, so wake it when the client goes away.
                                     let _closed = crate::host::WakeOnDrop(wake.clone());
                                     let (failed, failure) = oneshot::channel();
                                     tokio::spawn(async move {
@@ -322,7 +322,7 @@ impl State {
                         (receiver, closed, full),
                         |(mut receiver, closed, full)| async move {
                             let bytes = receiver.recv().await.flatten()?;
-                            // WARNING: a writer that found the queue full waits for this wake.
+                            // A writer that found the queue full waits for this wake.
                             if full.swap(false, Ordering::AcqRel) {
                                 closed.0.wake();
                             }

@@ -1543,8 +1543,8 @@ struct Config {
     variants: Vec<(String, String)>,
     utilities: Vec<(String, String)>,
     expanding: std::cell::RefCell<Vec<usize>>,
-    // WARNING: a result that a cycle or the depth cap cut short depends on where expansion started, so `cut` keeps it
-    // out of `expanded`.
+    // Do not cache expansions cut short by cycles or depth limits: their result depends on the starting
+    // point.
     #[allow(clippy::type_complexity)]
     expanded: std::cell::RefCell<FxHashMap<(usize, Option<String>, Option<String>), Option<Body>>>,
     cut: std::cell::Cell<bool>,
@@ -1796,7 +1796,7 @@ impl Config {
         let mut new = BTreeSet::new();
         if !fresh.is_empty() {
             fresh.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            // WARNING: keys must stay below 2^56, so a selector index fits below them in 64 bits.
+            // Keys must stay below 2^56, so a selector index fits below them in 64 bits.
             const KEYS: u64 = 1 << 56;
             let mut renumber = false;
             if fresh.len() <= 16 {
@@ -2124,8 +2124,7 @@ impl Config {
         let mut branches = vec![(Vec::<String>::new(), vec![base.to_owned()])];
         let mut ranks = Vec::new();
         let mut content = false;
-        // WARNING: each variant multiplies the selectors by its comma parts and their `&`s, so
-        // their total size is capped.
+        // Cap selector size: comma parts and & expansion multiply at each variant.
         let (mut size, limit) = (0, (base.len() + 64) * 256);
         for name in parts {
             let (rank, variant) = self.variant(name, 0)?;
@@ -2553,8 +2552,7 @@ impl Config {
                 if let Some(body) = self.expanded.borrow().get(&key) {
                     return body.clone();
                 }
-                // WARNING: `@apply` compiles classes again, so a utility that applies itself, or a long
-                // chain of them, would never end.
+                // Bound recursive @apply expansion to stop cycles and deep chains.
                 let expanding = self.expanding.borrow().len();
                 if expanding > 16 || self.expanding.borrow().contains(&index) {
                     self.cut.set(true);
@@ -2591,7 +2589,7 @@ impl Config {
             return None;
         }
         let mut body = Body::default();
-        // WARNING: utilities that apply several others multiply their size with each level, so it is capped.
+        // Cap @apply output: multiple utilities can multiply at every level.
         let mut size = 0;
         let weigh = |pairs: &Pairs| {
             pairs
@@ -2625,7 +2623,7 @@ impl Config {
                 };
                 let mut raw = raw.trim().to_owned();
                 let mut valid = true;
-                // WARNING: never scan substituted text again: it comes from the class and could hold more calls.
+                // Never scan substituted text again: it comes from the class and could hold more calls.
                 let mut from = 0;
                 while let Some(((start, open, close), function, input)) =
                     [("--value", value), ("--modifier", modifier)]
@@ -2758,11 +2756,10 @@ impl Config {
         if !calls(value) {
             return value.to_owned();
         }
-        // WARNING: one pass resolves the innermost calls first, at their `)`. Scanning again per
-        // function and per failed call is exponential.
+        // Resolve innermost calls in one pass. Repeated scans of failed calls can be exponential.
         let mut out = String::with_capacity(value.len());
         let mut open: Vec<(usize, Option<&str>)> = Vec::new();
-        // WARNING: each call reads all of its arguments, so calls nested past this depth stay as written.
+        // Each call reads all of its arguments, so calls nested past this depth stay as written.
         let mut nested = 0;
         let (mut quote, mut chars) = (None, value.chars());
         while let Some(character) = chars.next() {
@@ -2845,7 +2842,7 @@ impl Config {
                 }
             }
             _ => {
-                // WARNING: author CSS separates `spacing` and `.4` with `/**/` when it is serialized.
+                // Author CSS separates `spacing` and `.4` with `/**/` when it is serialized.
                 let arguments = arguments.replace("/**/", "");
                 let (path, alpha) = match split(&arguments, '/').as_slice() {
                     [path] => (path.trim(), None),
@@ -2946,8 +2943,7 @@ impl Config {
             let index = class.find(open)?;
             return functional(&class[..index], Some(&class[index + 1..]));
         }
-        // WARNING: a value is a named value, so only dashes after the last character it can't hold
-        // start one. Checking each suffix again is quadratic.
+        // Scan valid suffix boundaries once: checking each suffix again is quadratic.
         let named = class
             .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '%' | '-')))
             .map_or(0, |index| index + 1);
@@ -3272,7 +3268,7 @@ impl Config {
                     _ => match value {
                         "auto" if !negative => "auto".into(),
                         "full" => "100%".into(),
-                        // WARNING: Tailwind keeps the old spacing for the deprecated `start-*` and `end-*`.
+                        // Tailwind keeps the old spacing for the deprecated `start-*` and `end-*`.
                         _ if matches!(root, "start" | "end") && value != "px" => {
                             let base = self.function("--spacing", "1")?;
                             self.spacing(value)?;

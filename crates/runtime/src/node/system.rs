@@ -562,7 +562,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                     query.extend_from_slice(label.as_bytes());
                 }
                 query.extend_from_slice(&[0, (kind >> 8) as u8, kind as u8, 0, 1]);
-                // WARNING: `__res_state` has the same head in BIND, macOS and glibc: retrans, retry, options, nscount at 16 and three sockaddr_in at 20.
+                // `__res_state` has the same head in BIND, macOS and glibc: retrans, retry, options, nscount at 16 and three sockaddr_in at 20.
                 let mut state = [0u64; 128];
                 let mut packet = vec![0u8; 65536];
                 let size = unsafe {
@@ -604,7 +604,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                     );
                     let error = std::io::Error::last_os_error();
                     res_ndestroy(state.as_mut_ptr());
-                    // WARNING: libresolv fails on SERVFAIL, NOTIMP and REFUSED but leaves that reply in the buffer.
+                    // libresolv fails on SERVFAIL, NOTIMP and REFUSED but leaves that reply in the buffer.
                     let replied = packet[..2] == query[..2] && packet[2] & 0x80 != 0;
                     ensure!(
                         size >= 12 || replied,
@@ -1030,7 +1030,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
             {
                 let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
                 unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
-                // WARNING: `tv_usec` is `i32` on macOS and `i64` on Linux.
+                // `tv_usec` is `i32` on macOS and `i64` on Linux.
                 #[allow(clippy::useless_conversion)]
                 let micros =
                     |time: libc::timeval| time.tv_sec * 1_000_000 + i64::from(time.tv_usec);
@@ -1048,7 +1048,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
             unsafe {
                 let mut usage: libc::rusage = std::mem::zeroed();
                 libc::getrusage(libc::RUSAGE_SELF, &mut usage);
-                // WARNING: `tv_usec` is `i32` on macOS and `i64` on Linux.
+                // `tv_usec` is `i32` on macOS and `i64` on Linux.
                 #[allow(clippy::useless_conversion)]
                 let micros =
                     |time: libc::timeval| time.tv_sec * 1_000_000 + i64::from(time.tv_usec);
@@ -1090,7 +1090,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                     }
                     return Ok(Value::Null);
                 }
-                // WARNING: -1 is a valid priority, so only errno tells a failure apart.
+                // -1 is a valid priority, so only errno tells a failure apart.
                 #[cfg(target_os = "macos")]
                 {
                     *libc::__error() = 0;

@@ -23,7 +23,7 @@ oxc_ast_visit = "=0.155.0"
 oxc_codegen = "=0.155.0"
 oxc_minifier = "=0.155.0"
 oxc_parser = { version = "=0.155.0", default-features = false }
-# WARNING: crates.io stops at 0.143.0, so this tag must match the oxc version above. See the patch in the root Cargo.toml.
+# Keep this tag in sync with oxc above. crates.io stops at 0.143.0.
 oxc_react_compiler = { git = "https://github.com/oxc-project/oxc", tag = "crates_v0.155.0" }
 oxc_semantic = "=0.155.0"
 oxc_sourcemap = "=9.0.0"
@@ -35,7 +35,6 @@ tempfile = "3"
 url.workspace = true
 zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
-# WARNING: these put the WebGPU and media libraries next to test executables.
 [dev-dependencies]
 apps-media = { path = "../media" }
 apps-webgpu = { path = "../webgpu" }

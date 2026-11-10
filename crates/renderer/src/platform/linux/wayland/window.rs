@@ -49,7 +49,7 @@ pub(super) struct Shared {
 }
 
 struct State {
-    // WARNING: taken when the window closes: GPU objects must not outlive the surface.
+    // Taken when the window closes: GPU objects must not outlive the surface.
     renderer: Option<Renderer>,
     xdg: xdg_surface::XdgSurface,
     toplevel: xdg_toplevel::XdgToplevel,
@@ -322,7 +322,7 @@ impl Drop for Window {
     fn drop(&mut self) {
         let mut state = self.shared.state.borrow_mut();
         state.renderer.take();
-        // WARNING: roles go before their surfaces.
+        // Roles go before their surfaces.
         if let Some(decoration) = &state.decoration {
             decoration.destroy();
         }

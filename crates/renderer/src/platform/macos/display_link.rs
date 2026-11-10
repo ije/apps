@@ -1,14 +1,11 @@
 //! Frame pacing for macOS windows on `CVDisplayLink`. A window subscribes only while it wants
 //! frames, so idle windows get no callbacks.
 //!
-//! WARNING: `CVDisplayLinkStop` returns before the last output callback ends, so links are never
-//! released. Each display keeps one link in a static registry. The callback context is the
-//! display id, not a pointer, and the callback only reads the registry.
+//! CVDisplayLinkStop can return before the callback ends. Keep links in the static registry and pass display
+//! IDs, not pointers.
 //!
-//! WARNING: The output callback takes the registry lock on the link's io thread, maybe while it
-//! holds CoreVideo locks. Never call CoreVideo while holding the registry lock. Registry changes
-//! and link start/stop hold `CHANGES`, which the callback never takes, because the render thread
-//! and the main thread both make them.
+//! Never call CoreVideo under the registry lock: its callback takes that lock. Serialize changes with
+//! CHANGES, which the callback never takes.
 //!
 //! `std::sync::Mutex` is used because on macOS it is an `os_unfair_lock`, whose priority
 //! donation helps the high-priority io thread.
@@ -61,7 +58,7 @@ unsafe impl Send for DisplayEntry {}
 struct SubscriberId(u64);
 
 fn lock_registry() -> MutexGuard<'static, Registry> {
-    // WARNING: ignore poison: the map stays valid, and a panic in the extern "C" callback aborts.
+    // Ignore poison: the map stays valid, and a panic in the C callback aborts.
     REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -106,7 +103,7 @@ fn subscribe(
         let subscriber_id = SubscriberId(registry.next_subscriber_id);
         registry.next_subscriber_id += 1;
         let entry = match (registry.displays.entry(display_id), new_link) {
-            // WARNING: dropping an unused `new_link` is safe: a link that never started has no io thread.
+            // Dropping an unused `new_link` is safe: a link that never started has no io thread.
             (btree_map::Entry::Occupied(entry), _) => entry.into_mut(),
             (btree_map::Entry::Vacant(vacant), Some(link)) => vacant.insert(DisplayEntry {
                 link,
@@ -164,7 +161,7 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
     };
 
     if let Some(mut link) = link_to_stop {
-        // WARNING: A last output callback can still run after this. It finds no subscribers.
+        // A last output callback can still run after this. It finds no subscribers.
         let _ = unsafe { link.stop() };
     }
 }
@@ -196,7 +193,7 @@ impl WindowFrameSource {
             frame_requests.set_context(data);
             frame_requests.set_finalizer_f(free);
             frame_requests.set_event_handler_f(callback);
-            // WARNING: Destroying a suspended dispatch source is undefined behavior.
+            // Destroying a suspended dispatch source is undefined behavior.
             frame_requests.resume();
             frame_requests
         };
@@ -231,8 +228,7 @@ impl WindowFrameSource {
 impl Drop for WindowFrameSource {
     fn drop(&mut self) {
         self.stop();
-        // WARNING: the callback can't reach this source after `stop`. Cancel so the handler never runs
-        // again, and the finalizer frees its context.
+        // After stop, cancel the source to prevent more callbacks. Its finalizer frees the context.
         self.frame_requests.cancel();
     }
 }

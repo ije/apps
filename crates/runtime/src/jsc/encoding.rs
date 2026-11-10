@@ -2,8 +2,8 @@ use super::{Callback, HOSTS, JavaScriptCore, Ptr};
 use anyhow::{Context, Result, bail, ensure};
 use std::ptr;
 
-// WARNING: characters and bytes borrow JavaScript memory. Copy them before any JavaScript runs: a string used as a
-// property key can swap its storage for an atom, and a buffer can be detached or resized.
+// Copy borrowed characters and bytes before JavaScript runs. Property keys can change string storage. Buffers
+// can detach or resize.
 pub(crate) enum Chars<'a> {
     Latin1(&'a [u8]),
     Utf16(&'a [u16]),
@@ -80,8 +80,7 @@ impl JavaScriptCore {
         unsafe { String::from_utf8_unchecked(text) }
     }
 
-    // WARNING: SIMD counts a lone surrogate as 2 bytes and can't convert it, so `write_utf8` returns false and the
-    // caller must encode again with `encode_utf16`, which writes U+FFFD.
+    // SIMD cannot encode lone surrogates. If write_utf8 fails, retry with encode_utf16 to emit U+FFFD.
     fn simd_utf8(&self, chars: &Chars, out: *mut u8) -> usize {
         let (pointer, length, latin1) = match *chars {
             Chars::Latin1(text) => (text.as_ptr().cast(), text.len(), true),
@@ -100,8 +99,7 @@ impl JavaScriptCore {
     }
 }
 
-// WARNING: a lone surrogate counts 3 bytes, for the U+FFFD that replaces it. The u16 sums vectorize, and chunks of 4096
-// units keep them from overflowing.
+// Lone surrogates need 3 bytes for U+FFFD. Limit chunks to 4096 units to prevent u16 sum overflow.
 fn utf8_len(units: &[u16]) -> usize {
     let wide: usize = units
         .chunks(4096)
@@ -350,7 +348,7 @@ unsafe extern "C" fn decode(
             )?,
             3..=5 => {
                 let end = bytes.len() & !1;
-                // WARNING: all supported targets are little-endian, so aligned UTF-16LE bytes are already units.
+                // All supported targets are little-endian, so aligned UTF-16LE bytes are already units.
                 let (head, units, _) = unsafe { bytes[..end].align_to::<u16>() };
                 let lone = |units: &[u16]| {
                     units.iter().enumerate().position(|(index, &unit)| {
@@ -479,7 +477,7 @@ thread_local! {
     static ENTROPY: std::cell::RefCell<(Vec<u8>, usize)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
 }
 
-// WARNING: hand out each byte of the cached entropy block at most once, or two callers get the same random bytes.
+// Consume each cached entropy byte at most once to prevent duplicate random output.
 unsafe extern "C" fn random(
     ctx: Ptr,
     _: Ptr,
@@ -587,7 +585,7 @@ unsafe extern "C" fn url(
             AfterPath,
             AfterQuery,
         ]) {
-            // WARNING: without a password, the url crate puts the end of the password after the `@`.
+            // Without a password, the url crate puts the end of the password after the `@`.
             let position = match position {
                 BeforePassword | AfterPassword if url.password().is_none() => AfterUsername,
                 position => position,

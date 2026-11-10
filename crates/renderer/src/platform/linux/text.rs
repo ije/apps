@@ -26,8 +26,7 @@ struct FontKey {
 }
 
 enum Fonts {
-    /// WARNING: scanning the system fonts can take hundreds of milliseconds, so it runs off the
-    /// launch path until the first font is needed.
+    /// Defer the system font scan until first use. It can cost hundreds of milliseconds.
     Loading(Option<JoinHandle<(String, fontdb::Database)>>),
     Ready(Box<FontSystem>),
 }
@@ -228,7 +227,7 @@ impl TextSystem {
             len: text.len(),
             ..Default::default()
         };
-        // WARNING: paragraph separators break cosmic-text lines, so each paragraph is shaped on its own.
+        // Paragraph separators break cosmic-text lines, so each paragraph is shaped on its own.
         let mut start = 0;
         if text
             .bytes()
@@ -397,7 +396,7 @@ impl State {
                 }
             }
             let emoji = self.loaded[font_id.0].emoji;
-            // WARNING: variation selectors shape to glyph 3 in emoji fonts, which can't be drawn.
+            // Variation selectors shape to glyph 3 in emoji fonts, which can't be drawn.
             if glyph.glyph_id == 3 && emoji {
                 continue;
             }

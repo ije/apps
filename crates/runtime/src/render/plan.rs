@@ -4,8 +4,7 @@ use renderer::{Pixels, Radii, Rgba, rgba};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 
-// WARNING: a plan must come only from the computed style, its units and the pixel ratio, so it reads no box and its
-// memo hides no read.
+// Plans can depend only on computed style, units and pixel ratio. Box reads escape cache dependency tracking.
 #[derive(PartialEq)]
 pub(super) struct Plan {
     pub(super) made: Establishes,
@@ -128,7 +127,7 @@ impl Plan {
 
 type Stored = (Rc<Style>, Lengths, u32, Rc<Plan>);
 
-// WARNING: keyed by style pointer, so each entry holds its style to keep the pointer from being reused.
+// Retain styles used as pointer keys to prevent address reuse.
 #[derive(Default)]
 pub(super) struct Plans {
     map: FxHashMap<*const Style, Vec<Stored>>,

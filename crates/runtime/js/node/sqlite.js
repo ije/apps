@@ -2,7 +2,7 @@ globalThis.__appsSQLite = native => {
   const token = {};
   const databases = new WeakMap(), authorizers = new Map();
   let authorizing = false;
-  // WARNING: SQLite state is borrowed while the authorizer runs, so native calls must not re-enter it.
+  // SQLite state is borrowed while the authorizer runs, so native calls must not re-enter it.
   const call = (...args) => {
     if (authorizing) throw new Error('SQLite cannot be used inside an authorizer');
     try { return native(...args); } catch (error) {

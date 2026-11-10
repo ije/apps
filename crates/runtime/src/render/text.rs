@@ -299,8 +299,8 @@ fn row_extents<'a>(
                         edges.push((row, height * scale, *align == AlignItems::FlexEnd));
                         continue;
                     }
-                    // WARNING: a box on the baseline as tall as the line differs from the strut by a fraction of a
-                    // device pixel, which must not move the row.
+                    // Do not shift the row for fractional-pixel differences between a full-line baseline box
+                    // and the strut.
                     let [above, below] = [baseline * scale, (height - baseline) * scale];
                     rows[row] = [
                         rows[row][0].max(if above - root[0] < 1. { 0. } else { above }),
@@ -817,8 +817,7 @@ impl renderer::Hooks for InlineText {
         let node_layout = cx.text_layout().cloned();
         let window = &mut *cx.window;
         if let Some(measured) = &measured {
-            // WARNING: bounds snap to device pixels and can be a little narrower than the measured
-            // wrap or text width, which must not wrap or truncate again.
+            // Snapped bounds can be narrower than measured text. Do not wrap or truncate again.
             let wrap = measured
                 .get()
                 .into_iter()
@@ -829,7 +828,7 @@ impl renderer::Hooks for InlineText {
             let system = window.text_system().clone();
             let (text, mut runs) = first_line(&self.data, width, font_size, &system);
             with_atoms(&self.data, |index| self.atoms[index].size[0], &mut runs);
-            // WARNING: like Chromium, text starts at its exact place, and only each row's baseline snaps to a device pixel.
+            // Like Chromium, text starts at its exact place, and only each row's baseline snaps to a device pixel.
             let placed = renderer::Bounds::new(exact.origin, bounds.size);
             let layout =
                 renderer::TextLayout::shape(text, runs.clone(), &style, wrap, placed, window);

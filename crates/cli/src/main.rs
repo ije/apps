@@ -13,7 +13,7 @@ use build_target::BuildTarget;
 use std::path::PathBuf;
 
 fn main() {
-    // WARNING: Bundling recurses once per import depth. The main thread stack is too small for deep graphs.
+    // Bundling recurses once per import depth. The main thread stack is too small for deep graphs.
     let result = std::thread::Builder::new()
         .stack_size(256 << 20)
         .spawn(run_cli)
@@ -163,7 +163,7 @@ fn run_cli() -> Result<i32> {
             target.platform,
             target.arch
         );
-        // WARNING: npm links `apps` to this file, and macOS reports the link path.
+        // npm links `apps` to this file, and macOS reports the link path.
         std::env::current_exe()?
             .canonicalize()?
             .with_file_name(if target.platform == "windows" {

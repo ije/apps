@@ -16,8 +16,8 @@ pub fn apply(operator: MorphologyOperator, rx: f32, ry: f32, src: ImageRefMut) {
         return;
     }
 
-    // WARNING: the min or max over a rectangle is separable, and the van Herk/Gil-Werman passes cost the same for
-    // any radius, so this equals resvg's direct window scan.
+    // Keep resvg's rectangular min/max result. Separable van Herk/Gil-Werman passes make cost independent of
+    // radius.
     let (mut g, mut h) = (Vec::new(), Vec::new());
     for y in 0..height {
         pass(

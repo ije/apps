@@ -67,7 +67,7 @@ pub(crate) struct PageState {
     animated: RefCell<Vec<usize>>,
     #[cfg(debug_assertions)]
     around: RefCell<rustc_hash::FxHashSet<usize>>,
-    // WARNING: the key holds a plan pointer, so each entry must hold its plan to keep the pointer from being reused.
+    // Retain plans used as pointer keys to prevent address reuse.
     shared: RefCell<rustc_hash::FxHashMap<u64, Vec<element::Shared>>>,
     focused: Cell<Option<usize>>,
     patches: RefCell<rustc_hash::FxHashMap<usize, element::Patch>>,
@@ -86,7 +86,7 @@ type Clips = Vec<(usize, [bool; 2])>;
 type Mismatches = rustc_hash::FxHashSet<(usize, [u32; 4])>;
 type CompositedTransform = (renderer::Bounds<renderer::Pixels>, Option<(f32, [f32; 2])>);
 
-// WARNING: layout revisions are unique across pages and reloads, so a kept box never matches a node of another page.
+// Layout revisions are unique across pages and reloads, so a kept box never matches a node of another page.
 static LAYOUT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 thread_local! {
@@ -94,7 +94,7 @@ thread_local! {
     static VIEWS: RefCell<HashMap<u64, std::rc::Weak<PageState>>> = RefCell::default();
 }
 
-// WARNING: `f` must not use `cx` or `window`: a reflow reaches them through pointers while it runs.
+// Do not use cx or window inside f: reflow accesses them through pointers.
 pub(crate) fn scripted<R>(cx: &mut App, window: Option<&mut Window>, f: impl FnOnce() -> R) -> R {
     crate::jsc::REFLOW.set(Some(reflow));
     crate::jsc::CLIPBOARD.set(Some(clipboard));
@@ -155,8 +155,7 @@ pub(crate) fn reflow(id: u64) {
     else {
         return;
     };
-    // WARNING: composite frames move boxes without a layout, so a read after them must lay the page out even when it is
-    // not dirty.
+    // Reflow after composite frames even if the page is clean: boxes moved without layout.
     if view.host.try_borrow_mut().map_or(true, |host| {
         !host.pages.get(&id).is_some_and(|page| page.dirty)
             && !host.dom.get(&id).is_some_and(|dom| dom.bounds.moved())
@@ -205,8 +204,7 @@ fn queue_layout(view: Rc<PageState>, window: &mut Window) {
     });
 }
 
-// WARNING: queue one run per frame at most. A second run calls the callbacks the first requested, both queue again, and
-// runs pile up every frame.
+// Run animation callbacks at most once per frame, or recursive requests accumulate.
 pub(crate) fn queue_animation_frame(view: Rc<PageState>, window: &mut Window) {
     if !view.queued.replace(true) {
         window.on_next_frame(move |window, cx| animation_frame(view, window, cx));
@@ -406,7 +404,7 @@ impl PageView {
             state.bounds.touch();
         }
         let data = self.0.clone();
-        // WARNING: presses go to the page in the bubble phase, after drag areas and scrollbars could stop them.
+        // Presses go to the page in the bubble phase, after drag areas and scrollbars could stop them.
         let pointer_events = renderer::canvas(|_, _| (), move |_, _, window| {
             let parked = data.parked.take();
             let size = window.viewport_size();
@@ -512,7 +510,7 @@ impl PageView {
         let width = f32::from(size.width);
         let height = f32::from(size.height);
         let resized = host.viewports.insert(self.id, [width, height]) != Some([width, height]);
-        // WARNING: the desktop is borrowed while it opens a window, so resize events go through a deferred
+        // The desktop is borrowed while it opens a window, so resize events go through a deferred
         // `Desktop::drive`.
         if resized && !host.resized.contains(&self.id) {
             host.resized.push(self.id);
@@ -540,8 +538,8 @@ impl PageView {
         let mut doc = std::mem::take(&mut page.doc);
         let state = &mut *host;
         let dom = state.dom.entry(self.id).or_default();
-        // WARNING: a reload or navigation brings a new `dom::State`, whose nodes reuse the old page's ids, so nothing
-        // kept by node id may outlive it. A state stamps its first layout revision in its first frame.
+        // Clear node-ID caches on reload or navigation: the new DOM reuses IDs. Stamp its layout revision on
+        // the first frame.
         if dom.layout_revision == 0 {
             self.kept.take();
             self.patches.take();
@@ -559,8 +557,8 @@ impl PageView {
             self.frames.borrow_mut().retain(|&id, _| id == usize::MAX);
         }
         {
-            // WARNING: a box draws again once per mismatch until a pass has none, so sizes that flip between
-            // passes can't draw forever either.
+            // Redraw once per mismatch until a pass has none, to stop alternating sizes from causing endless
+            // frames.
             let [current, seen] = &mut *self.mismatched.borrow_mut();
             if current.is_empty() || seen.len() > 1024 {
                 seen.clear();
@@ -602,8 +600,7 @@ impl PageView {
             .map(|(&node, children)| (node, doc.nodes.compose_children(node, children.clone())))
             .collect();
         let seen = (doc.nodes.latest(), dom.focus);
-        // WARNING: take the styles out of `cull.seen` for the frame, or its extra `Rc` makes animated values copy the
-        // styles instead of swapping them.
+        // Remove cull.seen's extra Rc during the frame so animated styles can swap values without copying.
         let last = dom.cull.seen.take();
         let walked = dom.cull.walk.nodes.clone();
         let same = last.as_ref().is_some_and(|(latest, focus, computed)| {
@@ -759,8 +756,7 @@ impl PageView {
             && dom.motion.pseudos.is_empty()
             && backdrops.is_empty();
         animate(&self.0, dom, next, now, compositing, window, cx);
-        // WARNING: animated values replace `styles.values` and `styles.pseudos` only while this frame is built;
-        // `restore` and `restore_pseudos` put the cascade back.
+        // Restore cascade values and pseudos after the frame: animations replace them temporarily.
         let mut restore = Vec::new();
         let mut restore_pseudos = Vec::new();
         let pseudos = std::mem::take(&mut dom.motion.pseudos);
@@ -786,8 +782,8 @@ impl PageView {
             }
         }
         let relaid = !restore.is_empty();
-        // WARNING: every map keyed by node id must drop entries here for hidden or gone nodes and in `dom.release` for
-        // freed ones, since ids are reused.
+        // Clear node-ID caches for hidden or removed nodes here, and freed nodes in dom.release. New nodes
+        // can reuse their IDs.
         let shown = |id: usize| visible.get(id) == Some(&true);
         drop_hidden_images(dom, &visible, &styles, |image| window.drop_image(image));
         if flipped {
@@ -840,7 +836,7 @@ impl PageView {
                 })
                 .collect();
             if !unscrolled.is_empty() {
-                // WARNING: pages read offsets from the layout mirror, which only handles write, so these write zeros first.
+                // Pages read offsets from the layout mirror, which only handles write, so these write zeros first.
                 for &id in &unscrolled {
                     dom.scroll.insert(id, Default::default());
                 }
@@ -947,8 +943,7 @@ impl PageView {
                 color => color,
             })
             .unwrap_or((0xffffff, 255));
-        // WARNING: a late frame in a live resize shows the native window color at the edge. Don't set it on a
-        // transparent window, or the page can never become see-through again.
+        // Never set a transparent window's native color: it prevents later transparency.
         #[cfg(target_os = "macos")]
         if background.1 == 255
             && state
@@ -1040,7 +1035,7 @@ impl PageView {
                         }
                     }
                 };
-                // WARNING: relies on a node getting a new revision when it leaves or joins the tree.
+                // Relies on a node getting a new revision when it leaves or joins the tree.
                 for &(id, _) in walk.nodes.iter() {
                     if doc.nodes.revision(id as usize) > *latest {
                         mark(id as usize);
@@ -1078,8 +1073,7 @@ impl PageView {
             }
             dom.cull.painted.clear();
             dom.cull.painted.extend(paint.iter().map(|(id, _)| *id));
-            // WARNING: a style with the same values can resolve to other sizes, like `rem` after the root font changed,
-            // so units are compared too.
+            // Compare units too: equal style values can resolve differently after a root font change.
             let units = |lengths: &style::Lengths| {
                 let [font, root] = [lengths.font, lengths.root];
                 let mut hasher = rustc_hash::FxHasher::default();
@@ -1149,8 +1143,7 @@ impl PageView {
                     _ => {
                         let flags = own_flags(&node.tag, style, id);
                         let pseudos = styles.pseudos.get(&id);
-                        // WARNING: these build from siblings, rows, counters or quotes, which no read records. Any
-                        // other tag that does must be listed here.
+                        // List every tag with unrecorded sibling, row, counter or quote dependencies.
                         let framed = matches!(
                             node.tag.as_str(),
                             "fieldset"
@@ -1804,7 +1797,7 @@ impl PageView {
                 }
             }
         }
-        // WARNING: build in place from the outside in, so a box already built inside another one's build is skipped.
+        // Build in place from the outside in, so a box already built inside another one's build is skipped.
         let mut places: Vec<(usize, usize)> = {
             let (kept, built) = (self.kept.borrow(), self.built.take());
             self.repaint
@@ -1916,7 +1909,7 @@ impl PageView {
                 }
                 dom.invalidate();
             }
-            // WARNING: one extra pass per frame at most, so container queries that resize their container cannot loop.
+            // Allow at most one extra pass per frame to bound container-query resize loops.
             let changed = dom.update_containers(&doc);
             let repass = changed && !dom.container_pass;
             dom.container_pass = repass;
@@ -1964,8 +1957,8 @@ impl PageView {
             .child(pointer_events)
             .child(root)
             .child({
-                // WARNING: scroll boxes take their range in prepaint, after the `sync_scroll` at the start of this
-                // pass, so the mirror takes it again once the page has prepainted.
+                // Refresh the layout mirror after prepaint: scroll ranges change after the initial
+                // sync_scroll.
                 let data = self.0.clone();
                 renderer::canvas(
                     move |_, _| {
@@ -2020,7 +2013,7 @@ impl PageView {
 }
 
 const TRANSFORM_PROPS: [Prop; 4] = [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE];
-// WARNING: must list every property that `effects::opacity` and `effects::transform` read.
+// Must list every property that `effects::opacity` and `effects::transform` read.
 const COMPOSITED_PROPS: [Prop; 6] = [
     Prop::OPACITY,
     Prop::TRANSFORM,
@@ -2078,7 +2071,7 @@ fn animate(
     }
 }
 
-// WARNING: animation handlers can hide or remove a popup, so run them before its final frame is painted.
+// Animation handlers can hide or remove a popup, so run them before its final frame is painted.
 fn animation_events(
     view: &Rc<PageState>,
     events: Vec<(usize, &'static str, String, f64)>,
@@ -2280,7 +2273,7 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
                         samples.1.as_deref(),
                     ) || samples.1.is_none() && !shown(*id)
                 });
-                // WARNING: if any layer can't be promoted, demote all, or the layers promoted before it stop with their
+                // Demote all layers if any promotion fails, or previously promoted layers stop with their
                 // timeline.
                 if !on {
                     window.demote();
@@ -2335,7 +2328,7 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     if !patched || (!promoted || fresh) && !window.present() {
         window.refresh();
     }
-    // WARNING: handlers can change the page, and `Desktop::drive` can't refresh the window it runs in, so refresh here.
+    // Handlers can change the page, and `Desktop::drive` can't refresh the window it runs in, so refresh here.
     if !events.is_empty() {
         animation_events(&view, events, cx);
         if view
@@ -2490,8 +2483,8 @@ fn drop_hidden_images(
             release(canvas.image.clone());
         }
     }
-    // WARNING: keys must match their makers: shared `url()` images use id `usize::MAX`, control rasters use layer
-    // `usize::MAX` minus their kind.
+    // Match cache-key producers: shared URL images use ID usize::MAX. Control rasters use layer usize::MAX
+    // minus control kind.
     dom.backgrounds.retain(|&(id, layer), (_, image)| {
         let keep = if id == usize::MAX {
             Arc::strong_count(image) > 1

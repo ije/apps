@@ -184,8 +184,7 @@ pub fn run(
                         .arg("--")
                         .arg(entry);
                 }
-                // WARNING: without MallocSpaceEfficient=1 the runtime starts itself again to set it, which costs about
-                // 10 ms.
+                // Set MallocSpaceEfficient before launch to avoid the runtime's 10 ms restart.
                 #[cfg(target_os = "macos")]
                 cmd.env("MallocSpaceEfficient", "1");
                 if let Some(path) = &dev_bundle {
@@ -209,7 +208,8 @@ pub fn run(
                                 files,
                                 ..Default::default()
                             };
-                            // WARNING: a script that `ELECTRON_RUN_AS_NODE` runs reads its chunk from this file, so it must be there before the app starts.
+                            // Write the bundle before launch: ELECTRON_RUN_AS_NODE reads script chunks from
+                            // it.
                             if let Some(path) = &dev_bundle
                                 && bundle.files.keys().any(|name| name.starts_with("script-"))
                             {
@@ -322,8 +322,7 @@ pub fn run(
                     Ok(next) => {
                         files = next_files;
                         failed = false;
-                        // WARNING: the running main side keeps its code, so only pages and the chunks that only
-                        // pages load may change without a restart.
+                        // Main keeps its code. Only page-exclusive code can change without a restart.
                         let pages = child.is_some()
                             && binary.is_some()
                             && running.as_ref().is_some_and(|running| {

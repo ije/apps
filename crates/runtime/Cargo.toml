@@ -54,7 +54,7 @@ zune-jpeg = "0.5"
 avif-parse = "=2.1.0"
 image.workspace = true
 libsqlite3-sys = { version = "0.39.1", features = ["bundled"] }
-# WARNING: the published rav1d can abort on corrupt AV1 data.
+# The published rav1d can abort on corrupt AV1 data.
 rav1d = { git = "https://github.com/memorysafety/rav1d", rev = "6c6f463785a546dea18fd9ca0f14634c2ee0557c", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 wuff = "0.2"
 
@@ -65,7 +65,6 @@ apps-webgpu = { path = "../webgpu" }
 name = "apps-runtime"
 path = "src/main.rs"
 
-# WARNING: these put the WebGPU, media and devtools MCP libraries next to test executables.
 [dev-dependencies]
 apps-mcp = { path = "../mcp" }
 apps-media = { path = "../media" }

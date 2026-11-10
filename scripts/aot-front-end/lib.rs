@@ -14,15 +14,14 @@ use std::fmt::Write;
 #[path = "../aot/standalone/engine_stubs.rs"]
 mod engine_stubs;
 
-// WARNING: bun_sema_standalone has this stand-in too, but the linker loads no archive member for a weak symbol.
+// bun_sema_standalone has this stand-in too, but the linker loads no archive member for a weak symbol.
 #[unsafe(no_mangle)]
 #[linkage = "weak"]
 extern "C" fn Bun__AOT__offsetInCode(_address: *const std::ffi::c_void) -> i64 {
     -1
 }
 
-// WARNING: this is what `bun build --compile --aot --no-builtin-modules --aot-out=<file>` writes, without the engine
-// run that follows it in Bun. libJavaScriptCoreCompiler.dylib compiles these bytes.
+// Emit Bun's AOT IR without starting its engine. libJavaScriptCoreCompiler.dylib compiles these bytes.
 fn front_end(directory: &[u8], entries: &[&[u8]]) -> Result<Vec<u8>, String> {
     let options = AotOptions {
         omits_builtin_modules: true,

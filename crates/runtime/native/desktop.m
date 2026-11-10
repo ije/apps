@@ -44,7 +44,7 @@ static uint32_t AppsReadTheme(void) {
         | (workspace.accessibilityDisplayShouldReduceMotion << 5);
 }
 
-// WARNING: pages read this on their thread, and only the main thread can ask NSScreen.
+// Pages read this on their thread, and only the main thread can ask NSScreen.
 static _Atomic(int) AppsDisplayP3 = -1;
 
 bool apps_display_p3(void) {
@@ -58,7 +58,7 @@ bool apps_image_decode(const uint8_t *bytes, size_t length, uint8_t *(*allocate)
         CGImageSourceRef source = CGImageSourceCreateWithData(data, NULL);
         CFRelease(data);
         if (!source) return false;
-        // WARNING: only these web formats decode, so a file that works on macOS also works with the other platforms' decoders.
+        // Only these web formats decode, so a file that works on macOS also works with the other platforms' decoders.
         NSString *type = (__bridge NSString *)CGImageSourceGetType(source);
         CGImageRef image = type && [@[@"org.webmproject.webp", @"com.microsoft.bmp", @"com.microsoft.ico", @"public.avif"] containsObject:type] ? CGImageSourceCreateImageAtIndex(source, 0, NULL) : NULL;
         CFRelease(source);
@@ -90,7 +90,7 @@ bool apps_font_sfnt(const uint8_t *bytes, size_t length, uint8_t *(*allocate)(vo
     CTFontRef font = descriptors && CFArrayGetCount(descriptors) ? CTFontCreateWithFontDescriptor(CFArrayGetValueAtIndex(descriptors, 0), 0, NULL) : NULL;
     if (descriptors) CFRelease(descriptors);
     if (!font) return false;
-    // WARNING: the array holds the tags themselves, not CFNumbers.
+    // The array holds the tags themselves, not CFNumbers.
     CFArrayRef list = CTFontCopyAvailableTables(font, kCTFontTableOptionNoOptions);
     CFIndex count = list ? CFArrayGetCount(list) : 0;
     CTFontTableTag *tags = malloc(count * sizeof *tags);
@@ -154,8 +154,7 @@ static id AppsValue(const char *text) {
 }
 
 static NSData *AppsSecretLookup(OSStatus *status);
-// WARNING: macOS asks to reset the keychain when it finds none, as in a process with another HOME, so such a process
-// gets no secret store. The answer is cached so checks never ask twice.
+// Disable secret storage if no keychain exists, or macOS prompts for a reset. Cache the result.
 static NSData *AppsSecret(OSStatus *status) {
     static NSData *secret;
     static OSStatus result;
@@ -193,8 +192,7 @@ static NSData *AppsSecretLookup(OSStatus *status) {
     return *status == errSecSuccess ? secret : nil;
 }
 
-// WARNING: events come from any thread and the main script takes them with `poll`, so they wait under a lock and not
-// on the main dispatch queue, which AppKit doesn't serve while a popup or modal panel runs in one of its blocks.
+// Queue events under a lock: AppKit does not serve main dispatch blocks inside nested menus or modal panels.
 static os_unfair_lock AppsEventsLock = OS_UNFAIR_LOCK_INIT;
 static NSMutableArray *AppsEvents;
 static void AppsNativeEmit(NSDictionary *event) {
@@ -804,7 +802,7 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
     } else if ([op isEqualToString:@"prefs.swipe"]) result = @(NSEvent.isSwipeTrackingFromScrollEventsEnabled);
     else if ([op isEqualToString:@"prefs.trusted"]) result = @(AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{ (__bridge id)kAXTrustedCheckOptionPrompt: @([args boolValue]) }));
     else if ([op isEqualToString:@"prefs.media"] || [op isEqualToString:@"prefs.askMedia"]) {
-        // WARNING: AVFoundation and LocalAuthentication load on first use, so apps that never ask for them don't link or load them.
+        // Load AVFoundation and LocalAuthentication only on first use to avoid startup costs.
         dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_LAZY);
         BOOL ask = [op isEqualToString:@"prefs.askMedia"];
         NSString *type = ask ? args[@"type"] : args, *media = [type isEqual:@"camera"] ? @"vide" : @"soun", *key = [type isEqual:@"camera"] ? @"NSCameraUsageDescription" : @"NSMicrophoneUsageDescription";
@@ -813,7 +811,7 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
             result = @"granted";
             if (@available(macOS 10.15, *)) result = CGPreflightScreenCaptureAccess() ? @"granted" : @"denied";
         } else if (!ask) result = @[@"not-determined", @"restricted", @"denied", @"granted"][MIN(3, MAX(0, [device authorizationStatusForMediaType:media]))];
-        // WARNING: macOS kills an app that asks for camera or microphone access without a usage description in its Info.plist.
+        // MacOS kills an app that asks for camera or microphone access without a usage description in its Info.plist.
         else if (!NSBundle.mainBundle.infoDictionary[key]) return strdup(AppsJSON(@{ @"error": [NSString stringWithFormat:@"askForMediaAccess() needs %@ in the app's Info.plist", key] }).UTF8String);
         else [device requestAccessForMediaType:media completionHandler:^(BOOL granted) { AppsNativeEmit(@{ @"type": @"reply", @"id": args[@"async"], @"value": @(granted) }); }];
     } else if ([op isEqualToString:@"prefs.touchID"] || [op isEqualToString:@"prefs.promptTouchID"]) {
@@ -823,7 +821,7 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
             result = @NO;
             if (@available(macOS 10.13.2, *)) result = @([context canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics error:nil] && context.biometryType == LABiometryTypeTouchID);
         } else [context evaluatePolicy:LAPolicyDeviceOwnerAuthentication localizedReason:args[@"reason"] reply:^(BOOL success, NSError *error) {
-            // WARNING: the prompt ends when its context is freed, so the reply keeps it.
+            // The prompt ends when its context is freed, so the reply keeps it.
             (void)context;
             AppsNativeEmit(@{ @"type": @"reply", @"id": args[@"async"], @"value": success ? @YES : error.localizedDescription ?: @"Authentication failed" });
         }];
@@ -838,13 +836,13 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         else if ([type isEqual:@"url"]) result = [defaults URLForKey:key].absoluteString ?: @"";
         else {
             id value = [type isEqual:@"array"] ? [defaults arrayForKey:key] ?: @[] : [defaults dictionaryForKey:key] ?: @{};
-            // WARNING: dates and data in defaults are not JSON, and NSJSONSerialization throws on them.
+            // Dates and data in defaults are not JSON, and NSJSONSerialization throws on them.
             if ([NSJSONSerialization isValidJSONObject:value]) result = value;
         }
     } else if ([op isEqualToString:@"prefs.setDefault"] || [op isEqualToString:@"prefs.registerDefaults"]) {
         BOOL set = [op isEqualToString:@"prefs.setDefault"], url = set && [args[@"type"] isEqual:@"url"];
         id value = url ? [NSURL URLWithString:args[@"value"]] : set ? args[@"value"] : args;
-        // WARNING: NSUserDefaults throws on values that are not property lists, like JSON null.
+        // NSUserDefaults throws on values that are not property lists, like JSON null.
         if (!value || (!url && ![NSPropertyListSerialization propertyList:value isValidForFormat:NSPropertyListBinaryFormat_v1_0])) return strdup(AppsJSON(@{ @"error": set ? [@"Unable to convert value to: " stringByAppendingString:args[@"type"]] : @"Invalid user defaults" }).UTF8String);
         if (!set) [NSUserDefaults.standardUserDefaults registerDefaults:value];
         else if (url) [NSUserDefaults.standardUserDefaults setURL:value forKey:args[@"key"]];
@@ -965,7 +963,7 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
             };
             NSWindow *window = NSApp.keyWindow ?: NSApp.mainWindow ?: NSApp.orderedWindows.firstObject, *host = nil;
             if (request && !window) {
-                // WARNING: an alert without a window has no non-modal form, so it hangs from a clear window.
+                // An alert without a window has no non-modal form, so it hangs from a clear window.
                 NSRect screen = NSScreen.mainScreen.visibleFrame;
                 host = [[NSWindow alloc] initWithContentRect:NSMakeRect(NSMidX(screen) - 210, NSMidY(screen) + 120, 420, 1) styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
                 host.opaque = NO;

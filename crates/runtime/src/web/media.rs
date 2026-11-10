@@ -22,7 +22,7 @@ static HOST: Host = Host {
 };
 
 extern "C" fn alloc_pixels(length: usize) -> *mut u8 {
-    // WARNING: media files pick the frame size, so a failed allocation returns null instead of aborting.
+    // Media files pick the frame size, so a failed allocation returns null instead of aborting.
     let mut pixels = Vec::<MaybeUninit<u8>>::new();
     if pixels.try_reserve_exact(length).is_err() {
         return std::ptr::null_mut();
@@ -81,7 +81,7 @@ fn load() -> Result<Library> {
         .parent()
         .context("Missing executable directory")?;
     let name = library_name(std::env::consts::OS);
-    // WARNING: like JavaScriptCore, the library only loads from the app, never from the environment.
+    // Like JavaScriptCore, the library only loads from the app, never from the environment.
     let path = ["../Frameworks", "."]
         .iter()
         .map(|folder| directory.join(folder).join(name))
@@ -107,7 +107,7 @@ fn load() -> Result<Library> {
             frame: *library.get(b"apps_media_frame\0")?,
             recycle: *library.get(b"apps_media_recycle\0")?,
         };
-        // WARNING: player and audio threads may outlive every page, so the library is never unloaded.
+        // Player and audio threads may outlive every page, so the library is never unloaded.
         std::mem::forget(library);
         Ok(functions)
     }

@@ -207,7 +207,7 @@ pub(super) struct DomBox {
     pub(super) frame: bool,
 }
 
-// WARNING: with its counts, a box's `Rc` must stay within the small blocks of the runtime's allocator.
+// With its counts, a box's `Rc` must stay within the small blocks of the runtime's allocator.
 const _: () = assert!(size_of::<DomBox>() + 16 <= 512);
 
 impl DomBox {
@@ -410,8 +410,7 @@ impl Hooks for DomBox {
                 })
             }
         {
-            // WARNING: redraw once per mismatch only, or a size that the next pass builds the same way draws again in
-            // every frame.
+            // Redraw only once per mismatch to avoid endless frames when layout repeats the same size.
             if let Some([width, height]) = self.sized
                 && ((f32::from(block.size.width) - width).abs() > 0.5
                     || (f32::from(block.size.height) - height).abs() > 0.5)
@@ -513,7 +512,7 @@ impl Hooks for DomBox {
             offset += translation;
             bounds.origin += translation;
             matrix = None;
-            // WARNING: boxes positioned in this block include the translation through the offset, so the block must too.
+            // Boxes positioned in this block include the translation through the offset, so the block must too.
             let view = &*self.view;
             if self.block.is_some()
                 && let Some(block) = view
@@ -532,7 +531,7 @@ impl Hooks for DomBox {
             let flags = {
                 let mut host = view.host.borrow_mut();
                 let dom = host.dom.entry(view.id).or_default();
-                // WARNING: grid tracks are sized before transforms, so they compare with the untransformed box.
+                // Grid tracks are sized before transforms, so they compare with the untransformed box.
                 if let Some(axes) = dom.flexed_grids.get(&self.id)
                     && axes
                         .iter()
@@ -894,8 +893,8 @@ impl DomBox {
             key: self.composited.then_some(self.id as u64),
             ..Default::default()
         };
-        // WARNING: isolation only contains `mix-blend-mode`. It is no backdrop root, so without blending a group
-        // would hide what is behind from a `backdrop-filter` inside.
+        // Isolation affects mix-blend-mode only. An extra group without blending incorrectly hides content
+        // from descendant backdrop filters.
         let isolate = style
             .get(Prop::ISOLATION)
             .is_some_and(|value| value == "isolate")
@@ -1022,7 +1021,7 @@ fn mask_svg(
         ) && let Some(start) = svg.find('>')
             && let Some(end) = svg.rfind("</svg>")
         {
-            // WARNING: each layer is its own SVG document, so its `id`s must not collide.
+            // Each layer is its own SVG document, so its `id`s must not collide.
             content.push_str(
                 &svg[start + 1..end]
                     .replace("id=\"", &format!("id=\"m{index}"))

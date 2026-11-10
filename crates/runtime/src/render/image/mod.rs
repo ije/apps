@@ -55,7 +55,7 @@ pub(crate) fn pixels(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize, usize)> {
             decoder.decode_headers()?;
             let (width, height) = decoder.dimensions().context("Invalid JPEG")?;
             anyhow::ensure!(fits(width, height), "Image is too large");
-            // WARNING: zune-jpeg converts only YCbCr to BGRA, and picks the converter when it reads the headers.
+            // zune-jpeg converts only YCbCr to BGRA, and picks the converter when it reads the headers.
             let ycbcr = decoder.input_colorspace() == Some(ColorSpace::YCbCr);
             if ycbcr {
                 decoder = JpegDecoder::new_with_options(

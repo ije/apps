@@ -1,5 +1,4 @@
-// WARNING: these structs must match the `repr(C)` structs in `scene.rs` and `frame.rs`, like the
-// Metal and HLSL shaders.
+// Keep these layouts in sync with scene.rs, frame.rs, Metal and HLSL.
 
 // Contrast and gamma correction adapted from https://github.com/microsoft/terminal/blob/1283c0f5b99a2961673249fa77c6b986efb5086c/src/renderer/atlas/dwrite.hlsl
 // Copyright (c) Microsoft Corporation.
@@ -81,7 +80,7 @@ struct ContentMask {
     radii: Radii,
 }
 
-// WARNING: four floats, not `vec4<f32>`, which WGSL aligns to 16 bytes.
+// Four floats, not `vec4<f32>`, which WGSL aligns to 16 bytes.
 struct Rgba {
     r: f32,
     g: f32,
@@ -138,7 +137,7 @@ fn rgba(color: Rgba) -> vec4<f32> {
 
 fn over(below: vec4<f32>, above: vec4<f32>) -> vec4<f32> {
     let alpha = above.a + below.a * (1.0 - above.a);
-    // WARNING: two transparent colors would divide by zero, and blending a NaN is undefined on some GPUs.
+    // Two transparent colors would divide by zero, and blending a NaN is undefined on some GPUs.
     if (alpha <= 0.0) {
         return vec4<f32>(0.0);
     }
@@ -255,7 +254,7 @@ struct QuadVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) border_color: vec4<f32>,
     @location(1) @interpolate(flat) quad_id: u32,
-    // WARNING: Naga has no `clip_distance`, so fragments clip with these.
+    // Naga has no `clip_distance`, so fragments clip with these.
     @location(2) clip_distances: vec4<f32>,
     @location(3) @interpolate(flat) background_color: vec4<f32>,
 }
@@ -321,8 +320,7 @@ fn quad_color(input: QuadVarying) -> vec4<f32> {
         select(quad.border_widths.right, quad.border_widths.left, left),
         select(quad.border_widths.bottom, quad.border_widths.top, top));
 
-    // WARNING: zero-width borders turn negative so that `inner_sdf >= antialias_threshold`, which draws no
-    // anti-aliasing pixels for them.
+    // Negative inner widths prevent antialiasing pixels on zero-width borders.
     let reduced_border =
         vec2<f32>(select(border.x, -antialias_threshold, border.x == 0.0),
                   select(border.y, -antialias_threshold, border.y == 0.0));
@@ -809,7 +807,7 @@ fn fs_mono_sprite(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
     let sample = textureSample(t_sprite, s_sprite, input.tile_position).r;
     let alpha_corrected = apply_contrast_and_gamma_correction(sample, input.color.rgb, globals.grayscale_enhanced_contrast, globals.gamma_ratios);
 
-    // WARNING: sample the texture before this early return, since sampling needs derivatives from uniform control flow.
+    // Sample before the early return: derivatives require uniform control flow.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
@@ -853,7 +851,7 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     let sample = textureSample(t_sprite, s_sprite, input.tile_position);
-    // WARNING: sample the texture before this early return, since sampling needs derivatives from uniform control flow.
+    // Sample before the early return: derivatives require uniform control flow.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }

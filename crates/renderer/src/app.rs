@@ -111,8 +111,7 @@ pub fn spawn(init: impl FnOnce(&mut App) + Send + 'static) {
             install(Rc::new(platform::Platform::new()));
             update(init);
         },
-        // WARNING: windows can hold things whose drop needs other thread locals, so the app drops here and not in its
-        // own thread-local destructor.
+        // Drop windows before thread-local teardown: their destructors need other thread locals.
         || {
             APP.with_borrow_mut(|slot| *slot = None);
         },
@@ -129,7 +128,7 @@ pub fn run(native: impl FnOnce() + 'static) {
     {
         install(platform.clone());
         platform.run(Box::new(native));
-        // WARNING: windows hold native views whose callbacks reach for the app, so they close first.
+        // Close native views before the app: their callbacks can still access it.
         let windows = cell().map(|cell| std::mem::take(&mut cell.app.borrow_mut().windows));
         drop(windows);
         APP.with_borrow_mut(|slot| *slot = None);
@@ -603,13 +602,12 @@ pub mod native {
         }
     }
 
-    // WARNING: calling the `composing` argument asks the page thread and waits for it, so call it only when the answer
-    // matters.
+    // Call `composing` only when needed: it blocks on the page thread.
     pub fn on_key(f: impl FnMut(WindowId, &PlatformInput, &dyn Fn() -> bool) -> bool + 'static) {
         HANDLERS.with_borrow_mut(|handlers| handlers.key = Some(Box::new(f)));
     }
 
-    // WARNING: a key that comes while the filter runs, from a loop nested in it, passes unfiltered.
+    // Keys from nested loops bypass a filter already in progress.
     pub(crate) fn key(id: WindowId, input: &PlatformInput, composing: &dyn Fn() -> bool) -> bool {
         let Some(mut callback) = HANDLERS.with_borrow_mut(|handlers| handlers.key.take()) else {
             return false;

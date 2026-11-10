@@ -198,7 +198,7 @@ pub(crate) fn cursor(value: &str) -> Option<renderer::CursorStyle> {
     })
 }
 
-// WARNING: keyed by style pointer, so the entry must hold its style to keep the pointer from being reused.
+// Retain styles used as pointer keys to prevent address reuse.
 fn styled_run(style: &Rc<Style>, units: &Lengths, len: usize) -> renderer::TextRun {
     type Runs = rustc_hash::FxHashMap<*const Style, (Rc<Style>, Vec<(Lengths, renderer::TextRun)>)>;
     thread_local!(static RUNS: std::cell::RefCell<Runs> = Default::default());
@@ -425,7 +425,7 @@ pub(crate) fn holds_block_box(doc: &Document, styles: &ComputedStyles, id: usize
     }
 }
 
-// WARNING: keyed by style pointers, so the entry must hold both styles to keep the pointers from being reused.
+// Retain both styles used as pointer keys to prevent address reuse.
 fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
     type Pairs = rustc_hash::FxHashMap<(*const Style, *const Style), (Rc<Style>, Rc<Style>, bool)>;
     thread_local!(static PAIRS: std::cell::RefCell<Pairs> = Default::default());
@@ -631,7 +631,7 @@ pub(crate) fn inline_text(
             .find(|&&sibling| !makes_no_line(doc, styles, sibling))
     }));
     let mut text = String::new();
-    // WARNING: two runs fit a small block of the runtime's allocator, four don't.
+    // Two runs fit a small block of the runtime's allocator, four don't.
     let mut runs: Vec<renderer::TextRun> = Vec::with_capacity(2);
     let mut line_heights = Vec::new();
     let mut ranges = Vec::new();

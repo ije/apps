@@ -44,7 +44,7 @@ pub(super) struct Shared {
 }
 
 struct State {
-    // WARNING: taken when the window closes: GPU objects must not outlive the X window.
+    // Taken when the window closes: GPU objects must not outlive the X window.
     renderer: Option<Renderer>,
     bounds: Bounds<Pixels>,
     active: bool,
@@ -562,7 +562,7 @@ impl Shared {
         let resized = {
             let mut state = self.state.borrow_mut();
             let resized = logical.size != state.bounds.size;
-            // WARNING: the origin of a resize event can be wrong, so only moves update it.
+            // The origin of a resize event can be wrong, so only moves update it.
             if resized {
                 state.bounds.size = logical.size;
                 if let Some(renderer) = &mut state.renderer {

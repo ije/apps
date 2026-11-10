@@ -28,13 +28,12 @@
   const nested = (value, depth) => {
     if (value === null || typeof value !== 'object') return false;
     if (depth > 32 || value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return true;
-    // WARNING: `for in` makes a string key per array index, which is many times slower on long arrays like a WebGPU
-    // command list.
+    // Avoid for-in on arrays: it allocates string keys for every index.
     if (Array.isArray(value)) { for (let i = 0; i < value.length; i++) if (nested(value[i], depth + 1)) return true; return false; }
     for (const key in value) if (nested(value[key], depth + 1)) return true;
     return false;
   };
-  // WARNING: a JSON.stringify replacer is slow in JSC, so only arguments that hold bytes go through `pack`.
+  // Avoid JSON.stringify replacers in JSC. Pack only arguments with bytes.
   const call = (op, ...args) => {
     for (let i = 0; i < args.length; i++) {
       const arg = args[i];
@@ -94,8 +93,8 @@
       write('log', [line('┌', '┬', '┐'), cells(header), line('├', '┼', '┤'), ...rows.map(row => cells(header.map(name => row[name] ?? ''))), line('└', '┴', '┘')].join('\n'));
     },
   });
-  // WARNING: a timer never changes its `at`: refresh and intervals schedule a new object, and a heap entry is live only
-  // while `timers` maps its id to it. Use the monotonic `clock`.
+  // Keep timer deadlines immutable and monotonic. Refresh and intervals create new objects. Only the object
+  // in timers is live.
   const timers = new Map(), heap = [];
   let timerID = 0, refs = 0, nesting = 0, limit = 0;
   const before = (a, b) => a.at < b.at || (a.at === b.at && a.id < b.id);
@@ -193,8 +192,7 @@
     if (phase === 0) {
       phase = 1; now = clock(); limit = timerID;
     }
-    // WARNING: timers started in this phase have ids above `limit` and wait for the next phase, or a timer that starts
-    // a 0 ms timer would never end the phase.
+    // Defer new timers to the next phase so recursive 0 ms timers cannot starve the loop.
     if (phase === 1 && earliest() <= now && heap[0].id <= limit) {
       const timer = pop();
       nesting = timer.level;
@@ -207,7 +205,7 @@
     if (phase === 1) {
       phase = 2;
       try {
-        // WARNING: WeakRef targets only die in a GC, so sweep only after the canary is collected.
+        // WeakRef targets only die in a GC, so sweep only after the canary is collected.
         if (!collected.deref()) { collected = new WeakRef({}); for (const registry of finalizers) for (const [key, entry] of registry.live) if (!entry.ref.deref()) { registry.live.delete(key); registry.release(entry.value); } }
         globalThis.__appsDomSweep?.();
         globalThis.__appsDecoded?.();
@@ -240,8 +238,7 @@
     phase = 0;
     return __appsDelay();
   };
-  // WARNING: return -2 within about 1 s, or the 10 s page watchdog stops a long run of short tasks. Read the clock only
-  // every 8 tasks, since a read costs about one task.
+  // Yield -2 within about 1 s to avoid the page watchdog. Check time every 8 tasks to limit clock overhead.
   globalThis.__appsTick = () => { const start = clock(); for (let tasks = 1; ; tasks++) { const delay = step(); if (delay !== -2 || !codec.drain || (tasks % 8 === 0 && clock() - start > 1000)) return delay; codec.drain(); } };
   globalThis.__appsDelay = () => {
     if (ticks.length || immediates.size || bridge.poll.queued()) return 0;
@@ -305,8 +302,7 @@
   const childProcess = once(() => children = installChildren(call, events.EventEmitter, stream()));
   let ioMade;
   const io = once(() => ioMade = installIO({ call, sync: node.sync, asyncCall: node.asyncCall, Buffer: node.Buffer, stream: stream(), EventEmitter: events.EventEmitter, StringDecoder: node.string_decoder.StringDecoder, webcrypto: globalThis.__appsNodeCrypto.webcrypto, inspect, codec }));
-  // WARNING: don't call `io()` here: a KeyObject exists only after `crypto` was made, and making it just for this check
-  // costs startup.
+  // Do not initialize crypto through io() just for this check. No KeyObject can exist before crypto loads.
   node.util.types.isKeyObject = value => ioMade !== undefined && value instanceof ioMade.crypto.KeyObject;
   const bytes = globalThis.__appsBytes;
   delete globalThis.__appsBytes;
@@ -327,7 +323,7 @@
   delete globalThis.__appsElectron;
   const electronNet = Object.freeze({ fetch: async (input, init) => { const handler = electron.handled(input); return handler ? handler(new Request(input, init)) : fetch(input, init); }, request: options => new (clientRequest())(options), isOnline, get online() { return isOnline(); } });
   const ptyModule = once(() => pty = installPty(call));
-  // WARNING: like Node.js, main has `fetch` but no `XMLHttpRequest`, and libraries look for it to detect a browser.
+  // Like Node.js, main has `fetch` but no `XMLHttpRequest`, and libraries look for it to detect a browser.
   for (const name of ['FileReader', 'ProgressEvent', 'XMLHttpRequest', 'XMLHttpRequestEventTarget', 'XMLHttpRequestUpload']) delete globalThis[name];
   browsers = globalThis.__appsBrowser(call, events.EventEmitter, () => ready, contents => app.emit('web-contents-created', event(), contents), electron.nativeImage);
   delete globalThis.__appsBrowser;
@@ -341,8 +337,7 @@
     return Number(process.exitCode ?? 0) | 0;
   };
   const quitApp = code => call('quit', finish(code));
-  // WARNING: the endless loop is on purpose: it keeps code after exit() from running until the watchdog sees the stop
-  // flag and ends the worker.
+  // Wait for the watchdog to stop the worker. Code after exit() must not run.
   const exit = code => { call('process.exit', finish(code)); for (;;); };
   const env = new Proxy(info.env, {
     set: (target, name, value) => { target[name] = String(value); return true; },
@@ -404,7 +399,7 @@
   addEventListener('unhandledrejection', event => { if (!process.listenerCount('unhandledRejection')) return; event.preventDefault(); process.emit('unhandledRejection', event.reason, event.promise); });
   const output = fd => {
     const tty = node.tty.isatty(fd), writable = new (stream().Writable)({ write(data, _encoding, done) { call('process.write', fd, data); done(); } });
-    // WARNING: Writes stay synchronous so they keep their order with console output.
+    // Writes stay synchronous so they keep their order with console output.
     writable.write = (data, encoding, callback) => { if (typeof encoding === 'function') { callback = encoding; encoding = undefined; } call('process.write', fd, typeof data === 'string' && !encoding ? data : Buffer.from(data, encoding)); if (callback) queueMicrotask(callback); return true; };
     Object.defineProperties(writable, { fd: { value: fd, enumerable: true }, isTTY: { value: tty || undefined, enumerable: true } });
     return tty ? node.terminal(writable, stream()) : writable;
@@ -412,7 +407,7 @@
   const outputs = [];
   for (const [fd, name] of [[1, 'stdout'], [2, 'stderr']]) Object.defineProperty(process, name, { enumerable: true, configurable: true, get: () => outputs[fd] ??= output(fd), set: value => { outputs[fd] = value; } });
   const fs = node.fs;
-  // WARNING: reading it holds a thread of the file pool until input comes, so it opens on first use.
+  // Reading it holds a thread of the file pool until input comes, so it opens on first use.
   let stdin;
   Object.defineProperty(process, 'stdin', { enumerable: true, configurable: true, get() {
     if (stdin) return stdin;
@@ -644,7 +639,7 @@
     else quit();
   };
   hooks.contents = id => windows.get(id)?.webContents ?? null;
-  // WARNING: results go to the page as data for a fixed page function, never as code.
+  // Results go to the page as data for a fixed page function, never as code.
   const deliver = (win, name, ...args) => { if (!win.isDestroyed()) call('window', 'deliver', win.id, name, args); };
   const webviews = new Map();
   const webview = (win, op, guestId, data) => {
@@ -727,9 +722,9 @@
   const materials = { 'appearance-based': 0, titlebar: 3, selection: 4, menu: 5, popover: 6, sidebar: 7, header: 10, sheet: 11, window: 12, hud: 13, 'fullscreen-ui': 15, tooltip: 17, content: 18, 'under-window': 21, 'under-page': 22 };
   const material = type => { if (!type) return null; if (!Object.hasOwn(materials, type)) throw new TypeError(`Invalid vibrancy type: ${type}`); return materials[type]; };
   const effectStates = ['followWindow', 'active', 'inactive'];
-  // WARNING: a parent destroys or keeps its children natively, so they leave it before it closes.
+  // A parent destroys or keeps its children natively, so they leave it before it closes.
   const orphan = win => { for (const child of win.getChildWindows()) { states.get(child).parent = 0; call('window', 'parent', child.id, null); } };
-  // WARNING: Electron reads 4 and 8 digit hex colors as ARGB, CSS reads them as RGBA.
+  // Electron reads 4 and 8 digit hex colors as ARGB, CSS reads them as RGBA.
   const argb = color => /^#([\da-f]{4}|[\da-f]{8})$/i.test(color) ? '#' + color.slice(color.length === 5 ? 2 : 3) + color.slice(1, color.length === 5 ? 2 : 3) : color;
   const resize = (win, next, content) => {
     const windowState = state(win), { bounds, content: inner } = windowState, base = content ? inner : bounds, target = { ...base };
@@ -1006,7 +1001,8 @@
       windowState.native = data;
       Object.assign(windowState, { bounds: { x, y, width, height }, content: { x: left, y: top, width: innerWidth, height: innerHeight }, minimized: data.minimized, maximized: data.maximized, fullscreen: data.fullscreen, visible: data.visible, focused: data.focused });
       const resized = old.frame[2] !== width || old.frame[3] !== height;
-      // WARNING: zoom and fullscreen animations report the frames in between as normal, so only moves and finished live resizes are normal bounds.
+      // Record normal bounds only on moves or completed live resizes. Zoom and fullscreen transitions report
+      // intermediate frames.
       if (win.isNormal() && !data.resizing && (old.resizing || !resized)) windowState.normal = { x, y, width, height };
       win.contentView.setBounds({ x: 0, y: 0, width: innerWidth, height: innerHeight });
       for (const [key, on, off] of [['minimized', 'minimize', 'restore'], ['maximized', 'maximize', 'unmaximize'], ['fullscreen', 'enter-full-screen', 'leave-full-screen'], ['visible', 'show', 'hide']])
@@ -1033,7 +1029,7 @@
     else if (name === 'open-url' || name === 'open-file') app.emit(name, event(), data);
     else if (name === 'before-quit') quit();
     else if (name === 'executed') {
-      // WARNING: any page can send `executed`, so it settles only a pending executeJavaScript() of its own window.
+      // A page can forge executed messages. Settle only its own window's pending executeJavaScript call.
       const request = captures.get(data.request);
       if (request?.win !== id || request.op !== 'execute') return;
       captures.delete(data.request);
@@ -1127,7 +1123,7 @@
   const compat = once(() => installCompat(events.EventEmitter, stream(), netModule().api));
   const crypto = once(() => ({ ...globalThis.__appsNodeCrypto, ...io().crypto }));
   const lazy = (target, key, get) => Object.defineProperty(target, key, { get, enumerable: true, configurable: true });
-  // WARNING: the keys keep their order, which `builtinModules` lists.
+  // The keys keep their order, which `builtinModules` lists.
   const modules = {};
   for (const key of ['async_hooks', 'diagnostics_channel', 'sea', 'tls', 'undici', 'v8']) lazy(modules, key, () => compat()[key]);
   Object.assign(modules, { fs, path, os, process, events });

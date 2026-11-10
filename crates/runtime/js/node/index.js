@@ -14,8 +14,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const normalize = encoding => encoding == null ? 'utf8' : encodings[encoding] ?? encodings[String(encoding).toLowerCase()];
   const encodingOf = encoding => { const value = encoding === null ? undefined : normalize(encoding); if (!value) throw error(TypeError, 'ERR_UNKNOWN_ENCODING', `Unknown encoding: ${encoding}`); return value; };
   const encode = (value, encoding = 'utf8') => {
-    // WARNING: Node stops at the first bad hex pair and skips characters outside base64, so text that the native
-    // decoders reject must take the slow cleanup.
+    // Native decoders reject input Node accepts: stop at invalid hex pairs and skip non-base64 characters.
     if (encoding === 'hex') { try { return Uint8Array.fromHex(value.length & 1 ? value.slice(0, -1) : value); } catch { return Uint8Array.fromHex(value.match(/^(?:[\da-f]{2})*/i)[0]); } }
     if (encoding === 'base64' || encoding === 'base64url') { try { return Uint8Array.fromBase64(value, { alphabet: encoding }); } catch {} const pad = value.indexOf('='); let text = (pad < 0 ? value : value.slice(0, pad)).replace(/[^\w+/-]|_/g, c => c === '_' ? '/' : '').replace(/-/g, '+'); if (text.length % 4 === 1) text = text.slice(0, -1); return Uint8Array.fromBase64(text); }
     return codec.encode(value, encodeKinds[encoding]);
@@ -50,7 +49,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     for (let i = 0; i < n; i++) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
     return a.length < b.length ? -1 : a.length > b.length ? 1 : 0;
   };
-  // WARNING: short ASCII text is copied by a loop, which costs a third of a native call and the view around its result.
+  // Copy short ASCII strings directly: a native call and view cost 3x more.
   const short = text => { if (text.length > 32) return false; for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 127) return false; return true; };
   class Buffer extends Uint8Array {
     static from(value, encoding, length) {
@@ -122,7 +121,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
       start = start === undefined ? 0 : integer(start, 'sourceStart'); end = end === undefined ? this.length : integer(end, 'sourceEnd', 0, this.length);
       return start >= end ? (targetStart >= targetEnd ? 0 : -1) : targetStart >= targetEnd ? 1 : compare(this.subarray(start, end), target.subarray(targetStart, targetEnd));
     }
-    // WARNING: Uint8Array's own subarray() looks up the species constructor, which costs 3x a direct one.
+    // Uint8Array's own subarray() looks up the species constructor, which costs 3x a direct one.
     subarray(start, end) {
       const length = this.length;
       start = start === undefined ? 0 : (start = Math.trunc(start) || 0) < 0 ? Math.max(length + start, 0) : Math.min(start, length);
@@ -175,7 +174,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     includes(value, offset, encoding) { return search(this, value, offset, encoding, false) !== -1; }
     [inspect.custom]() { const max = buffer.INSPECT_MAX_BYTES, more = this.length - max; return `<${this.constructor.name} ${this.subarray(0, max).toHex().replace(/(..)(?!$)/g, '$1 ')}${more > 0 ? ` ... ${more} more byte${more > 1 ? 's' : ''}` : ''}>`; }
   }
-  // WARNING: integers up to 32 bits read and write their bytes directly, like Node, because a DataView per call costs 5x.
+  // Access up to 32-bit integers directly: a DataView per call costs 5x more.
   const check = (buffer, offset, size) => { if (typeof offset !== 'number' || buffer[offset] === undefined || buffer[offset + size - 1] === undefined) at(buffer, offset, size); };
   Object.assign(Buffer.prototype, {
     readUInt8(o = 0) { check(this, o, 1); return this[o]; },
@@ -446,7 +445,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const kind = Symbol('type'), S = constants.fs;
   const typed = proto => Object.assign(proto, { isFile() { return this[kind]() === S.S_IFREG; }, isDirectory() { return this[kind]() === S.S_IFDIR; }, isSymbolicLink() { return this[kind]() === S.S_IFLNK; }, isBlockDevice() { return this[kind]() === S.S_IFBLK; }, isCharacterDevice() { return this[kind]() === S.S_IFCHR; }, isFIFO() { return this[kind]() === S.S_IFIFO; }, isSocket() { return this[kind]() === S.S_IFSOCK; } });
   class Stats {
-    // WARNING: named writes give every Stats one shape; writes through computed names in a loop cost 2x.
+    // Use named writes to preserve one Stats shape. Computed writes in a loop cost 2x more.
     constructor(v) { this.dev = v[0]; this.ino = v[1]; this.mode = v[2]; this.nlink = v[3]; this.uid = v[4]; this.gid = v[5]; this.rdev = v[6]; this.size = v[7]; this.blksize = v[8]; this.blocks = v[9]; this.atimeMs = v[10]; this.mtimeMs = v[11]; this.ctimeMs = v[12]; this.birthtimeMs = v[13] ?? v[12]; }
     [kind]() { return this.mode & S.S_IFMT; }
   }
@@ -477,7 +476,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     return Object.assign(error, { errno: constants.errno[error.code] ? -constants.errno[error.code] : undefined, syscall }, file === undefined ? {} : { path: file }, dest === undefined ? {} : { dest });
   };
   const files = { constants: S, promises: { constants: S }, Stats, Dirent, openAsBlob: async (file, o = {}) => new Blob([await files.promises.readFile(file)], { type: o.type ?? '' }) };
-  // WARNING: reads and writes check their range before the call, because a failure after it would still move the file position.
+  // Check ranges before I/O, or failed operations can still move the file position.
   const span = (size, offset, length, write) => {
     if (!write) integer(offset, 'offset', 0, Number.MAX_SAFE_INTEGER);
     else if (offset > size) throw rangeError('offset', `<= ${size}`, offset);

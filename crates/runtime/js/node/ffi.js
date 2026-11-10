@@ -133,7 +133,7 @@ globalThis.__appsFFI = (native, codec) => {
         if (args.length !== sig.parameters.length) throw new TypeError('Incorrect number of FFI arguments');
         const keep = [storage, this];
         for (let index = 0; index < args.length; index++) write(view, (index + 1) * 8, sig.parameters[index].kind, args[index], keep);
-        // WARNING: keep must stay a native call argument so string and buffer arguments outlive the call.
+        // Keep must stay a native call argument so string and buffer arguments outlive the call.
         send(request, storage, keep);
         return read(view, 0, sig.result.kind);
       };

@@ -46,8 +46,8 @@ fn gaussian_channel(data: &mut [u8], d: &BlurData, channel: usize, buf: &mut [f6
     }
 }
 
-// WARNING: rows and columns are independent, so the passes run 4 rows at a time and the vertical one walks rows
-// in memory order. Each value still gets resvg's operations in resvg's order.
+// Process four independent rows together, with vertical passes in memory order. Preserve resvg's operation
+// order per value.
 fn gaussianiir2d(d: &BlurData, buf: &mut [f64]) {
     let width = d.width;
     let (lambda_x, dnu_x) = if d.sigma_x > 0.0 {

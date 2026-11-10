@@ -165,7 +165,7 @@ impl Window {
                     SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
                 );
             }
-            // WARNING: without this, a window without a title bar can keep the taskbar behind it.
+            // Without this, a window without a title bar can keep the taskbar behind it.
             let _ = SetPropW(hwnd, w!("NonRudeHWND"), Some(HANDLE(1 as _)));
             DragAcceptFiles(hwnd, true);
             set_dark_mode(hwnd);
@@ -497,8 +497,7 @@ impl Window {
                 let _ = ShowWindow(hwnd, SW_SHOW);
             }
             if GetForegroundWindow() != hwnd {
-                // WARNING: Windows only lets a process that just got input take the foreground, so this
-                // sends an Alt press.
+                // Windows permits foreground activation only after input. Send an Alt press first.
                 let key = |flags| INPUT {
                     r#type: INPUT_KEYBOARD,
                     Anonymous: INPUT_0 {
@@ -616,7 +615,7 @@ pub(super) fn key_down(msg: &MSG) -> bool {
         let handled = crate::app::native::key(callbacks.id, &input, &|| {
             callbacks.marked_text_range().is_some()
         }) || callbacks.input(input);
-        // WARNING: the input method gets its keys from TranslateMessage, so it gets them even when stopped.
+        // The input method gets its keys from TranslateMessage, so it gets them even when stopped.
         handled && msg.wParam.0 as u16 != VK_PROCESSKEY.0
     })
 }
@@ -736,7 +735,7 @@ unsafe extern "system" fn window_proc(
         if raw.is_null() {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
-        // WARNING: the window can close while its message runs, so the message keeps the state alive.
+        // The window can close while its message runs, so the message keeps the state alive.
         Rc::increment_strong_count(raw);
         let inner = Rc::from_raw(raw);
         let result = handle(&inner, msg, wparam, lparam)
@@ -819,7 +818,7 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
             WM_MOUSEACTIVATE => Some(MA_ACTIVATE as isize),
             WM_ACTIVATE => {
                 if wparam.0 & 0xFFFF != WA_INACTIVE as usize {
-                    // WARNING: alt-tab can leave a stale Alt, since the key up went to another window.
+                    // Alt-tab can leave a stale Alt, since the key up went to another window.
                     if let Ok(mut state) = inner.state.try_borrow_mut() {
                         state.keys = events::KeyState::default();
                     }
@@ -950,7 +949,7 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                 if !inner.hide_title_bar {
                     return area.map(|area| area as isize);
                 }
-                // WARNING: without a title bar the default handling has no top resize edge.
+                // Without a title bar the default handling has no top resize edge.
                 let (frame_x, frame_y) = frame_thickness(hwnd);
                 let point = screen();
                 if has(WS_THICKFRAME)
@@ -976,7 +975,7 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                         if enabled {
                             let _ = ImmAssociateContextEx(hwnd, HIMC::default(), IACE_DEFAULT);
                         } else {
-                            // WARNING: the IME context is per thread, so only this window's composition ends.
+                            // The IME context is per thread, so only this window's composition ends.
                             let context = ImmGetContext(hwnd);
                             if GetFocus() == hwnd && !context.is_invalid() {
                                 let _ = ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_COMPLETE, 0);
@@ -1184,7 +1183,7 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                 {
                     callbacks.input(input);
                 }
-                // WARNING: also keeps a released Alt from opening the window menu.
+                // Also keeps a released Alt from opening the window menu.
                 Some(0)
             }
             WM_CHAR => {
@@ -1228,7 +1227,7 @@ fn handle(inner: &Inner, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<isi
                 {
                     callbacks.replace_text_in_range(None, &String::from_utf16_lossy(&text));
                 }
-                // WARNING: no flags cancel the composition.
+                // No flags cancel the composition.
                 let marked = match flags {
                     0 => Some(Vec::new()),
                     _ if flags & GCS_COMPSTR.0 != 0 => events::composition(context, GCS_COMPSTR),

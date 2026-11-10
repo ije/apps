@@ -1,5 +1,5 @@
 'use strict';
-// WARNING: module code runs outside this function; strict mode also keeps `caller` from reaching loader functions.
+// Keep module code outside the loader scope. Strict mode blocks access through caller.
 const devtools = this.__appsDevtools ?? globalThis.__appsCompile !== undefined;
 const compile = this.__appsCompile ?? ((source) => (0, eval)(source));
 const chunk = this.__appsChunk ?? globalThis.__appsChunk;
@@ -21,9 +21,9 @@ const define = definition => {
   if (definition.source !== undefined) { definition.factory = compile(`(${definition.source})`, ''); delete definition.source; }
   if (definition.code === undefined) return;
   if (definition.map && devtools) { const sources = globalThis.__appsSources ??= new Map(); definition.map.sources.forEach((name, index) => sources.set(name, definition.map.sourcesContent[index])); }
-  // WARNING: JSC ignores a sourceMappingURL that contains a quote, and encodeURIComponent keeps `'`.
+  // JSC ignores a sourceMappingURL that contains a quote, and encodeURIComponent keeps `'`.
   const debug = definition.map && devtools ? `\n//# sourceURL=${definition.url}\n//# sourceMappingURL=data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(definition.map)).replaceAll("'", '%27')}\n` : '';
-  // WARNING: pages compile only while their own script runs, so development modules compile here, before any of them runs.
+  // Pages compile only while their own script runs, so development modules compile here, before any of them runs.
   let source;
   if (definition.commonjs) source = `(function(exports,require,module,__filename,__dirname,$appsRequire,$appsImport){\n${definition.code}\n})${debug}`;
   else {
@@ -70,7 +70,7 @@ const $appsRequire = target => {
   if (!Object.hasOwn(result, 'default')) return result;
   const names = Object.keys(result);
   if (names.length === 1) return result.default;
-  // WARNING: like Node, require() of a module with a default export adds __esModule, so transpiled interop picks `default`.
+  // Like Node, require() of a module with a default export adds __esModule, so transpiled interop picks `default`.
   return modules.get(target).required ??= Object.preventExtensions(Object.defineProperties(Object.create(null), Object.fromEntries([['__esModule', { value: true, enumerable: true }], ...names.map(name => [name, { enumerable: true, get: () => result[name] }])])));
 };
 const cache = Object.create(null);
@@ -214,8 +214,8 @@ return (body, execute) => {
     if (result instanceof Promise) globalThis.__appsTrackModule(result.then(start));
     else start();
   };
-  // WARNING: pages and page workers run one entry per `__appsNext` call of the runtime, so microtasks run between
-  // scripts, and those of a classic script still see it as `document.currentScript`, like in browsers.
+  // Run one entry per __appsNext call. Microtasks between scripts must still see the classic script as
+  // document.currentScript.
   if (this !== globalThis) {
     const pending = entries.slice();
     this.__appsNext = () => { globalThis.__appsScript?.(null); if (!pending.length) return false; entry(pending.shift()); return true; };

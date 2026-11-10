@@ -1,5 +1,5 @@
 globalThis.__appsNodeCompat = (EventEmitter, stream, net) => {
-  // WARNING: JSC gives no hook into `await` here, so a store lasts for the synchronous part of run() and in functions from bind() and snapshot().
+  // JSC cannot hook await. Stores cover synchronous run() calls and functions from bind() or snapshot().
   let current = new Map();
   const within = (context, fn, self, args) => { const saved = current; current = context; try { return Reflect.apply(fn, self, args); } finally { current = saved; } };
   class AsyncLocalStorage {

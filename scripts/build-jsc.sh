@@ -2,8 +2,8 @@
 set -euo pipefail
 
 revision=5a61071f79134bf41844e7ea31a8449147d85dd4
-# WARNING: keep this the revision in jsc-aot.cpp and of the Bun in .github/workflows/release.yml.
-# Bun's AOT compiler must match the IR format and built-in table of JSC.
+# Match jsc-aot.cpp and the release workflow's Bun revision: AOT needs identical IR formats and built-in
+# tables.
 bun_revision=2596ac5d391d47804c93a42bdbe615804aa62387
 aot=0
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -105,7 +105,7 @@ git -C "$source_dir" sparse-checkout set \
   Source/ThirdParty/capstone Source/WebGPU Tools/Scripts Tools/jsc
 
 patch=$root/scripts/jsc.patch
-# WARNING: Bun removes C API locks. Keep this patch when updating the pinned source.
+# Bun removes C API locks. Keep this patch when updating the pinned source.
 if ! git -C "$source_dir" apply --reverse --check "$patch" 2>/dev/null; then
   git -C "$source_dir" apply "$patch"
 fi
@@ -130,7 +130,7 @@ options=(
 
 case "$system" in
   macos)
-    # WARNING: jsc-cc.sh picks -O3, -Os or -Oz per file. Clang rejects a PCH built at another level.
+    # jsc-cc.sh picks -O3, -Os or -Oz per file. Clang rejects a PCH built at another level.
     options+=(
       -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
       '-DCMAKE_C_FLAGS_RELEASE=-Os -DNDEBUG'
@@ -164,7 +164,7 @@ case "$system" in
     ;;
 esac
 
-# WARNING: macOS caches a library's code signature per file, so a rewrite in place kills every process that loads it. Replace it with a new file.
+# Replace the file. In-place writes invalidate macOS code signatures and kill processes that load the library.
 cp -p "$library" "$output/.$name"
 if [[ $system == macos ]]; then
   install_name_tool -id "@rpath/$name" "$output/.$name"
@@ -188,8 +188,8 @@ if ((aot)); then
     printf '%s must be at %s\n' "$bun_source" "$bun_revision" >&2
     exit 1
   fi
-  # WARNING: compiled code reads JSC fields and built-ins by offset and ID, so both builds use the same source, options
-  # and built-in table, made from Bun's source.
+  # Both builds need identical sources, options and Bun built-in tables: AOT code embeds field offsets and
+  # built-in IDs.
   for runtime in 0 1; do
     build=$output/build-compiler
     flags="-DENABLE_AOT=1 -DAPPS_JSC_AOT_RUNTIME=$runtime"
@@ -213,7 +213,7 @@ if ((aot)); then
     "$build/lib/libJavaScriptCore.a" "$build/lib/libWTF.a" "$build/lib/libbmalloc.a"
   mv -f "$output/.libJavaScriptCoreAOT.a" "$output/libJavaScriptCoreAOT.a"
 
-  # WARNING: Bun's AOT front end makes the IR, so apps build --aot needs no Bun. It builds with Bun's nightly toolchain.
+  # Build the AOT front end with Bun's nightly toolchain.
   bun=$(command -v "${APPS_BUN:-bun}")
   codegen=$(PATH="$(dirname "$bun"):$PATH" "$bun" "$root/scripts/jsc-aot-front-end.ts" "$bun_source" "$source_dir/Source/JavaScriptCore")
   (cd "$bun_source" && BUN_CODEGEN_DIR=$codegen cargo build --release -p apps_aot)

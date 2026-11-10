@@ -102,8 +102,8 @@ impl Slot {
 }
 
 impl Slot {
-    // WARNING: a freed slot is cleared in place to keep its children's capacity. Its heavy parts drop after the frame
-    // draws, so a pass that drops thousands of boxes doesn't free them on the way.
+    // Keep freed slots' child capacity. Defer heavy drops until after drawing to avoid frees during the
+    // frame.
     fn release(&mut self, blank: &Rc<Styled>, graveyard: &mut Vec<Remains>) {
         self.live = false;
         self.children.clear();
@@ -182,8 +182,7 @@ pub struct Tree {
     initial: Rc<TextStyle>,
     blank: Rc<Styled>,
     styles: Interned<Styled>,
-    // WARNING: keyed by pointer, so each entry holds its style, or a freed style's address could be reused by another
-    // style.
+    // Retain styles used as pointer keys to prevent address reuse.
     shared: FxHashMap<*const Style, (Rc<Style>, Rc<Styled>)>,
     texts: Interned<TextStyle>,
     stacks: Vec<Vec<(i32, u32, ContentMask<Pixels>)>>,
@@ -248,8 +247,7 @@ impl Tree {
             self.slots[usize::from(root)].parent = NONE;
             self.orphans.extend(self.root.replace(index_of(root)));
         }
-        // WARNING: marks hold for one pass only, so dropped boxes are freed here. Freeing can compact the arena and
-        // move the root, so read the root after it.
+        // Read the root after freeing dropped boxes: arena compaction can move it.
         self.free_orphans();
         root.and(self.root).map(|root| NodeId::from(root as usize))
     }
@@ -589,7 +587,7 @@ impl Tree {
         while index != NONE {
             let slot = &mut self.slots[index as usize];
             let parent = slot.parent;
-            // WARNING: an empty cache means its parents were cleared too, unless it was just made.
+            // An empty cache means its parents were cleared too, unless it was just made.
             if matches!(slot.cache.clear(), ClearState::AlreadyEmpty)
                 && parent != NONE
                 && self.slots[parent as usize].cache.is_empty()
@@ -801,7 +799,7 @@ impl Tree {
             self.keep(index, parent, window);
             return;
         }
-        // WARNING: an out-of-flow box is volatile, so its ancestors are never kept and its containing block pushed its
+        // An out-of-flow box is volatile, so its ancestors are never kept and its containing block pushed its
         // clip to `blocks` in this pass.
         let escape = slot.style.escape;
         slot.escaped = (escape != 0).then(|| {
@@ -1048,7 +1046,7 @@ impl Tree {
         });
     }
 
-    // WARNING: text can run past its box across, and its glyphs a line past it down, so text reaches across the window.
+    // Text can overflow horizontally and one glyph line vertically. Extend its reach across the window.
     fn reach(&mut self, index: u32) {
         let slot = &self.slots[index as usize];
         let reach = slot
@@ -1097,7 +1095,7 @@ impl Tree {
     fn paint_node(&mut self, index: u32, listed: bool, window: &mut Window) {
         let slot = &self.slots[index as usize];
         let escaped = slot.escaped;
-        // WARNING: a layers node paints the z-indexed boxes of its stacking context, whose reach holds them.
+        // A layers node paints the z-indexed boxes of its stacking context, whose reach holds them.
         if slot.listed != listed
             || self.unbounded == 0
                 && !matches!(slot.kind, Kind::Layers(_))
@@ -1110,7 +1108,7 @@ impl Tree {
         if let Some(mask) = escaped {
             window.push_escaped_content_mask(mask);
         }
-        // WARNING: below a transform or an effect, boxes paint elsewhere than their bounds, so none is skipped.
+        // Below a transform or an effect, boxes paint elsewhere than their bounds, so none is skipped.
         let unbounded = slot.hooks.as_ref().is_some_and(|hooks| !hooks.bounded());
         self.unbounded += u32::from(unbounded);
         let smoothing = mem::replace(&mut window.font_smoothing, slot.text.font_smoothing);
@@ -1530,8 +1528,8 @@ impl LayoutTree<'_> {
                 return LayoutOutput::from_outer_size(size);
             }
         }
-        // WARNING: taffy calls the measured height of an absolute box definite. With `height: auto` and without
-        // both insets it comes from the content, so percentage heights inside must act as `auto`.
+        // Taffy treats measured absolute heights as definite. With auto height and no paired insets, child
+        // percentage heights must stay auto.
         if style.position == taffy::Position::Absolute
             && inputs.run_mode == RunMode::PerformLayout
             && style.size.height.is_auto()
@@ -1569,8 +1567,7 @@ impl LayoutTree<'_> {
         output
     }
 
-    // WARNING: sums follow taffy's order so boxes land on the same values as with taffy; a row this path can't match
-    // exactly must go to taffy.
+    // Preserve Taffy's sum order for exact layout values. Fall back to Taffy for unsupported rows.
     fn row(&mut self, node: NodeId, inputs: LayoutInput) -> Option<LayoutOutput> {
         use taffy::{AlignContentKeyword, CompactLength, MaybeMath, MaybeResolve, ResolveOrZero};
         let LayoutInput {
@@ -2021,8 +2018,7 @@ impl LayoutTree<'_> {
         Some(output)
     }
 
-    // WARNING: sums follow taffy's order so boxes land on the same values as with taffy; a column whose items could
-    // flex, shrink or move must go to taffy.
+    // Preserve Taffy's sum order. Columns that can flex, shrink or move items must use Taffy.
     fn stack(&mut self, node: NodeId, inputs: LayoutInput) -> Option<LayoutOutput> {
         use taffy::{
             AlignContentKeyword, CompactLength, MaybeMath, MaybeResolve, ResolveOrZero,
@@ -2215,7 +2211,7 @@ impl LayoutTree<'_> {
                 None,
             );
             let height = output.size.height;
-            // WARNING: taffy's content sizes take a fixed height even below the padding, which the box itself doesn't.
+            // Taffy's content sizes take a fixed height even below the padding, which the box itself doesn't.
             if styled.tag() == CompactLength::LENGTH_TAG && styled.value() != height {
                 return None;
             }
@@ -2690,7 +2686,7 @@ impl LayoutPartialTree for LayoutTree<'_> {
         crate::style::resolve_calc(handle, basis)
     }
 
-    // WARNING: a box that only moved is not marked changed, since its kept prepaint follows it.
+    // A box that only moved is not marked changed, since its kept prepaint follows it.
     fn set_unrounded_layout(&mut self, node: NodeId, layout: &Layout) {
         let index = usize::from(node);
         let old = mem::replace(&mut self.slots[index].layout, *layout);
@@ -2709,8 +2705,7 @@ impl LayoutPartialTree for LayoutTree<'_> {
     }
 }
 
-// WARNING: out-of-flow boxes are positioned by their parent, which is always their containing block, and
-// layout is never rounded, so the hoisted lists are not kept.
+// Hoisted lists are unnecessary: parents position out-of-flow boxes, and layout stays unrounded.
 impl LayoutContainingBlock for LayoutTree<'_> {
     type OofItemStyle<'a>
         = &'a taffy::Style

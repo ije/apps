@@ -4016,8 +4016,8 @@ fn rust_main_bundles_pages_from_the_package_root() -> Result<()> {
     Ok(())
 }
 
-// WARNING: builtins.txt is made from the runtime's own module objects. After a runtime module changes its exports, run
-// `APPS_UPDATE_BUILTINS=1 cargo test -p apps builtin_table` to write it again.
+// After runtime exports change, regenerate builtins.txt with `APPS_UPDATE_BUILTINS=1 cargo test -p apps
+// builtin_table`.
 #[test]
 fn builtin_table_matches_the_runtime() {
     let engine = apps_runtime::jsc::JsContext::new(

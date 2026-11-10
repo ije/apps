@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# WARNING: the rlib lets tests build the library.
 [lib]
 crate-type = ["cdylib", "rlib"]
 

@@ -47,8 +47,7 @@ pub(super) struct Build<'a> {
     pub(super) plan: RefCell<Rc<[usize]>>,
 }
 
-// WARNING: a build must read other boxes, the host and the frame only through `Build::log`, or the box must never be
-// kept.
+// Log external reads through Build::log, or disable reuse of this box.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum Query {
     Margins,
@@ -552,7 +551,7 @@ impl<'a> Build<'a> {
                     .map(|size| size.map(f32::to_bits)),
             ),
             Query::Track(node, axis) => {
-                // WARNING: the 0.5 px must match prepaint, which draws again only for a size more than half a pixel
+                // The 0.5 px must match prepaint, which draws again only for a size more than half a pixel
                 // off.
                 let used = f32::from_bits(read.value as u32);
                 return match dom
@@ -611,7 +610,7 @@ pub(super) fn positioner(
         .or((!fixed).then_some(0))
 }
 
-// WARNING: find the scroll container by style, not by handle, since scripts make handles for any box.
+// Find the scroll container by style, not by handle, since scripts make handles for any box.
 pub(super) fn scroller(
     doc: &Document,
     styles: &ComputedStyles,
@@ -689,7 +688,7 @@ impl SvgSource<'_> {
                 }
             }
         }
-        // WARNING: resvg doesn't take CSS transforms, `transform-box` or `transform-origin`, so they become a matrix.
+        // resvg doesn't take CSS transforms, `transform-box` or `transform-origin`, so they become a matrix.
         if transform
             && element != root
             && [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE]
@@ -720,7 +719,7 @@ impl SvgSource<'_> {
         let parent = doc.nodes[element]
             .parent
             .map(|parent| &self.styles.values[parent]);
-        // WARNING: resvg ignores `vector-effect: non-scaling-stroke` and `pathLength`, so stroke widths and dashes are
+        // resvg ignores `vector-effect: non-scaling-stroke` and `pathLength`, so stroke widths and dashes are
         // scaled here.
         let width = if element != root
             && self.scale != 1.
@@ -771,8 +770,8 @@ impl SvgSource<'_> {
                 }
                 Prop::VECTOR_EFFECT => continue,
                 Prop::FONT_SIZE => format!("{}px", units.font.em),
-                // WARNING: resvg resolves `currentColor` with the `color` the element inherits in the source, which for
-                // `<use>` content is the `<use>`'s color, not the color where the content is defined.
+                // Resolve currentColor from the <use> element's inherited color, not the referenced
+                // definition.
                 Prop::FILL
                 | Prop::STROKE
                 | Prop::STOP_COLOR
@@ -818,7 +817,7 @@ impl SvgSource<'_> {
     fn shape(&self, element: usize) -> Option<([f32; 4], f32)> {
         let attrs = |node| {
             let mut attrs = self.attrs(node, false, node != element);
-            // WARNING: resvg drops shapes without paint.
+            // resvg drops shapes without paint.
             attrs.push(("fill", "#000".into()));
             if node == element {
                 attrs.extend([("id", "apps-shape".into()), ("transform", String::new())]);
@@ -879,8 +878,7 @@ pub(super) type Walked = (
 );
 
 thread_local! {
-    // WARNING: building stops at this address, so a quarter of the stack stays for layout and paint, which recurse as
-    // deep.
+    // Reserve a quarter of the stack for layout and paint, which recurse as deeply as build.
     static STACK_LIMIT: usize = {
         let marker = 0u8;
         let here = &raw const marker as usize;
@@ -899,7 +897,7 @@ thread_local! {
             }
             (low as usize, size)
         };
-        // WARNING: assumes the 64 MB main stack that build.rs links on Windows.
+        // Assumes the 64 MB main stack that build.rs links on Windows.
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let (low, size) = (here.saturating_sub(60 << 20), 64 << 20);
         (low + size / 4).min(here)
@@ -947,8 +945,7 @@ pub(super) fn element(
             (grid.baseline, grid.first_item.is_some(), tracks.finish())
         }),
     };
-    // WARNING: debug checks must only look in `repaint`, not remove from it, or the build that the renderer takes would
-    // not build the box again.
+    // Debug checks must not remove repaint entries, or the real build can skip the box.
     #[cfg(debug_assertions)]
     let repainted = if build.checking {
         build.view.repaint.borrow().contains(&id)
@@ -1413,7 +1410,7 @@ fn create(
             } else {
                 "inline"
             });
-    // WARNING: like Chrome, an inline broken image with alt text ignores its size, also when only the UA sheet made it
+    // Like Chrome, an inline broken image with alt text ignores its size, also when only the UA sheet made it
     // an inline block.
     let broken = broken_image(node);
     let alt = broken
@@ -1443,12 +1440,11 @@ fn create(
                 reader.parent(id, Prop::DISPLAY),
                 Some("grid" | "inline-grid")
             ));
-    // WARNING: a box whose opacity animates keeps one stacking context and effect layer at every
-    // value, so animation frames only patch the layer's opacity.
+    // Keep one stacking context and layer throughout opacity animations so frames only patch opacity.
     let composited = info[id].flags & cull::COMPOSITED != 0;
     let made = parsed.made;
-    // WARNING: the renderer paints a z-indexed box in its nearest stacking ancestor, so every box that paints
-    // through a layer must be one, or such boxes escape its transform, opacity or clip.
+    // Every layer needs a stacking context so z-indexed descendants cannot escape its transform, opacity or
+    // clip.
     let stacking = id == 0 || composited || made.stacking || layered;
     let chain: Rc<[usize]> = ancestors.iter().copied().chain([id]).collect();
     let child_build = Build {
@@ -1553,8 +1549,8 @@ fn create(
                 if block == 0 {
                     return viewport();
                 }
-                // WARNING: read the last layout before the estimate. The estimate can miss min and max sizes, and
-                // prepaint would then draw again in every frame.
+                // Prefer the last layout to the estimate: missed min/max constraints can cause endless
+                // redraws.
                 let size = reader.block_size(view.host.borrow().dom.get(&view.id), block);
                 reader.log(
                     Query::Block(block as u32),
@@ -1565,13 +1561,12 @@ fn create(
             })
     };
     let containing = block_size.unwrap_or(containing);
-    // WARNING: element building and layout recurse per level, so deep pages must not overflow the stack.
+    // Element building and layout recurse per level, so deep pages must not overflow the stack.
     if chain.len() > 256 || style.get(Prop::DISPLAY).is_some_and(|s| s == "none") {
         return renderer::node().hidden().into();
     }
     let opacity = parsed.opacity;
-    // WARNING: a box at opacity 0 must use element opacity, not a layer: hidden copies are common and each layer costs
-    // two render passes.
+    // Use element opacity at zero. A hidden layer still costs two render passes.
     let effect_layer =
         (made.layer || opacity > 0. && opacity < 1. && !node.children.is_empty() || composited)
             .then_some(opacity);
@@ -1602,8 +1597,7 @@ fn create(
         renderer::Child::Node(node) => node.style_ref().align_self,
         renderer::Child::Kept(id) | renderer::Child::Placed(id, _) => build.tree.align_self(*id),
     };
-    // WARNING: taffy wraps an item that doesn't fit when any item is before it, even the zero-width strut, so the strut
-    // and the first item form one item.
+    // Combine the zero-width strut with the first item, or Taffy can wrap the first item after the strut.
     let with_strut = |mut element: renderer::Child| {
         let align = align_of(&mut element);
         let mut group = renderer::node()
@@ -1734,8 +1728,8 @@ fn create(
         _ => None,
     };
     let line_align = Some(renderer::AlignItems::Baseline);
-    // WARNING: in a flex row taffy drops the box's own ratio for a percentage width, so an auto height comes from the
-    // in-flow picture, which keeps the ratio.
+    // Use the in-flow image's ratio for auto height: Taffy drops a flex-row item's ratio with percentage
+    // width.
     let (mut natural, mut natural_ratio) = match node.tag.as_str() {
         "img" | "video" => (None, None),
         _ => natural_size(doc, id, None).map_or((None, None), |(size, ratio)| (Some(size), ratio)),
@@ -1744,8 +1738,7 @@ fn create(
     let checking = reader.checking;
     #[cfg(not(debug_assertions))]
     let checking = false;
-    // WARNING: a shared style may come only from the plan, the call, its own reads and the child facts in `share`. Code
-    // that sets it from anything else must add that to the key.
+    // Include every shared-style input in the key: plan, call, own reads and child facts.
     let share = (parsed.shareable
         && !checking
         && slot.is_none()
@@ -2228,7 +2221,7 @@ fn create(
                 }
                 pending.extend(&doc.nodes[child].children);
             }
-            // WARNING: CSS keywords ignore case, but resvg only reads `currentColor`.
+            // CSS keywords ignore case, but resvg only reads `currentColor`.
             let lower = source.to_ascii_lowercase();
             let mut end = 0;
             let mut replaced = String::with_capacity(source.len());
@@ -2247,7 +2240,7 @@ fn create(
         let mut host = view.host.borrow_mut();
         let state = host.dom.entry(view.id).or_default();
         if built || !state.svg_sources.contains_key(&id) {
-            // WARNING: paint checks only the raster size of inline SVGs, so a changed source must drop the raster here.
+            // Discard the raster on source changes: paint checks only inline SVG dimensions.
             if state.svgs.get(&id).is_some_and(|(old, _)| *old != source)
                 && let Some((_, image)) = state.svgs.remove(&id)
                 && Arc::strong_count(&image) == 1
@@ -2739,7 +2732,7 @@ fn create(
     let mut border_kinds = sides.map(|(_, kind, _)| style.get(kind).unwrap_or("none"));
     if inline_box {
         let [above, below] = [padding[0] + borders[0], padding[2] + borders[2]];
-        // WARNING: like browsers, padding and borders of an inline box hang outside its line, hence the negative
+        // Like browsers, padding and borders of an inline box hang outside its line, hence the negative
         // margins.
         margin[0] = -above;
         margin[2] = -below;
@@ -3369,8 +3362,8 @@ fn create(
                 let align = match value {
                     "center" => renderer::AlignContent::Center,
                     "flex-end" => renderer::AlignContent::FlexEnd,
-                    // WARNING: taffy's `Start` and `End` ignore flex-direction reversal: `Start` is the left or top
-                    // edge, rtl rows are `RowReverse`, and `left`/`right` act as `start` on a column.
+                    // Taffy's Start/End ignore flex reversal. RTL rows use RowReverse. In columns, left/right
+                    // behave as start.
                     "start" | "end" | "left" | "right" => {
                         if match value {
                             "left" => false,
@@ -4716,8 +4709,8 @@ fn create(
         && (hit_test || node.tag == "#text")
         && !drag
         && {
-            // WARNING: a box that sets its own mode still reads its parent, because an ancestor in an exit transition
-            // gets `display: none` with no new revision.
+            // Read the parent even with an explicit mode: an ancestor exit can set display: none without a
+            // new revision.
             let (mode, origin) = styles.user_select[id];
             let origin = if origin == id {
                 node.parent.unwrap_or(id)
@@ -4994,7 +4987,7 @@ fn create(
                     same.then(|| dom.cull.widths.get(&id).map(|size| size[0].max(0.)))
                         .flatten()
                 };
-                // WARNING: laid-out bounds are in layout units, so a fitting grid may look narrower.
+                // Laid-out bounds are in layout units, so a fitting grid may look narrower.
                 content[0] = last.map_or(content[0].min(max), |last| {
                     if last + 0.5 >= max {
                         last.max(max)
@@ -5139,8 +5132,8 @@ fn create(
             if auto && !flexed {
                 el = el.h(px(rows + vertical));
             }
-            // WARNING: grid items are absolute, so a flexed grid needs an in-flow box of its content height for the
-            // content-based flex basis and `min-height: auto`. Rows stretched to the last height can't give it.
+            // Absolute grid items need an in-flow content-height box for flex basis and min-height: auto.
+            // Previously stretched rows cannot provide it.
             if flexed {
                 let [.., height] = super::grid::intrinsic(
                     doc,
@@ -5178,7 +5171,7 @@ fn create(
         } else {
             flat.clone()
         };
-        // WARNING: each level of boxes is one large native frame, so levels past the stack budget are not drawn.
+        // Each level of boxes is one large native frame, so levels past the stack budget are not drawn.
         let marker = 0u8;
         if (&raw const marker as usize) < STACK_LIMIT.with(|limit| *limit) {
             children.clear();
@@ -5379,7 +5372,7 @@ fn create(
                 for &(child, _, [x, y, width, height], _) in &grid.cells {
                     let placed = dom.cull.placed.get(child).copied().unwrap_or_default();
                     let [top, right, bottom, left] = placed.2;
-                    // WARNING: the cell sizes come before layout snaps boxes to pixels, so they compare with the unsnapped cell sizes of the last layout.
+                    // Compare unsnapped cell sizes: layout snaps them later.
                     if placed.1 == [width, height]
                         && cull::member(
                             info[child],
@@ -5391,7 +5384,7 @@ fn create(
                         )
                         .is_some()
                     {
-                        // WARNING: layout truncates each inset and margin to layout units, so the offsets from the anchor do too.
+                        // Layout truncates each inset and margin to layout units, so the offsets from the anchor do too.
                         let snap =
                             |value: f32| renderer::to_layout_unit(value, pixel_ratio) / pixel_ratio;
                         culled.push((
@@ -5566,7 +5559,7 @@ fn create(
                     ))
                 });
                 let bounds = placement.as_ref().map(|(bounds, _)| *bounds);
-                // WARNING: a kept text field builds again from its patch, which must hold its new place.
+                // A kept text field builds again from its patch, which must hold its new place.
                 let field = placement
                     .as_ref()
                     .filter(|_| view.patches.borrow().contains_key(&child))
@@ -5666,7 +5659,7 @@ fn create(
                             })
                         })
                 {
-                    // WARNING: the placeholder must come before the box, which reads its bounds in prepaint.
+                    // The placeholder must come before the box, which reads its bounds in prepaint.
                     let block = child_style
                         .get(Prop::DISPLAY)
                         .is_some_and(|value| !value.starts_with("inline"));
@@ -5879,13 +5872,12 @@ fn create(
             .mb(px(margin[2]))
             .ml(px(margin[3]));
     }
-    // WARNING: Windows moves the window in the native hit test (`window_drag_area`), macOS and Linux on the first drag.
+    // Windows moves the window in the native hit test (`window_drag_area`), macOS and Linux on the first drag.
     if drag {
         el = el.window_drag_area().on_mouse_down(MouseButton::Left, {
             let view = view.clone();
             move |event: &renderer::MouseDownEvent, window, cx| {
-                // WARNING: a drag box gets the presses of all its children, so the box under the pointer
-                // decides: the nearest one that sets a region, as a `no-drag` button must get its click.
+                // Use the nearest drag-region box under the pointer so no-drag children keep their clicks.
                 let dragged = view.host.try_borrow().is_ok_and(|host| {
                     let viewport = *host.viewports.get(&view.id).unwrap_or(&[800., 600.]);
                     let (Some(page), Some(state)) =
@@ -5994,8 +5986,7 @@ fn create(
             }))
         })
         .flatten();
-    // WARNING: blocks lay out as a stretched flex column, so replaced elements, controls and ratio-sized blocks must
-    // set their own alignment, or they stretch.
+    // Set alignment on replaced elements, controls and ratio-sized blocks to prevent flex-column stretching.
     if hit.is_none()
         && !flex_parent
         && slot.is_none()
@@ -6222,7 +6213,7 @@ fn create(
                 .map(|read| {
                     Some(Read {
                         query: read.query.moved(id as u32, u32::MAX)?,
-                        // WARNING: unlike kept records, entries hold the box's own reads, so its own scope is 1 and 0
+                        // Unlike kept records, entries hold the box's own reads, so its own scope is 1 and 0
                         // stays the page.
                         scope: if read.scope == 0 {
                             0
@@ -6377,8 +6368,8 @@ pub(super) fn pseudo_content(
     text
 }
 
-// WARNING: taffy passes min and max sizes through the aspect ratio even when the other side is set, unlike CSS, so
-// `max-width: 100%` must not limit the height of a sized image.
+// Taffy applies min/max constraints through aspect ratio even with an explicit opposite size. Prevent
+// max-width from changing explicit image heights.
 fn only_auto_ratio(mut el: renderer::Node, style: &style::Style) -> renderer::Node {
     let set = |prop| style.get(prop).is_some_and(|value| value != "auto");
     let limited = |prop| style.get(prop).is_some_and(|value| value != "none");
@@ -6712,7 +6703,7 @@ fn in_flow(doc: &Document, info: &[cull::Info], id: usize) -> bool {
         && info[id].flags & cull::OUT_OF_FLOW == 0
 }
 
-// WARNING: culled spacers take the margins of their first and last box from here, so these must stay the margins the box is laid out with.
+// Keep these margins equal to layout margins: culled spacers use them.
 pub(super) fn margins(
     build: &Build<'_>,
     id: usize,
@@ -6730,8 +6721,8 @@ pub(super) fn margins(
         let collapses = container(build, parent);
         let open =
             [0, 2].map(|side| collapses && margin_collapses_through(build, parent, side, width));
-        // WARNING: the key misses animated values, fonts, the viewport and container units, so animated boxes skip it
-        // and `render_page` clears the walks when the others change.
+        // Skip animated boxes. Clear walks when fonts, viewport or container units change: the key excludes
+        // them.
         let key = (build.info[parent].revision, width.to_bits(), open);
         let animated = build.info[parent].flags & cull::ANIMATED != 0;
         if let Some((old, used)) = build.view.walked.borrow().get(&parent)
@@ -6941,7 +6932,7 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> ([f32; 2], [f32; 2], b
     };
     let (mut top, mut bottom) = (own(Prop::MARGIN_TOP), own(Prop::MARGIN_BOTTOM));
     let children = flow(build, id);
-    // WARNING: this recurses into first and last children, so margins stop collapsing past the stack budget.
+    // This recurses into first and last children, so margins stop collapsing past the stack budget.
     let marker = 0u8;
     let deep = (&raw const marker as usize) < STACK_LIMIT.with(|limit| *limit);
     let blocks = container(build, id) && !deep;
@@ -7389,8 +7380,8 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                 && let Some(entry) = state.svg_boxes.get_mut(&id)
             {
                 if entry.0 != *source {
-                    // WARNING: a repeated draw skips paint, so a tree of the old source can still wait in `svg_trees`
-                    // and must go here.
+                    // Drop stale svg_trees entries here: repeated draws can skip paint and leave old sources
+                    // cached.
                     state.svg_trees.remove(&id);
                     let (size, content, boxes) = match state.svg_cache.get(source) {
                         Some((geometry, _)) => geometry.clone(),

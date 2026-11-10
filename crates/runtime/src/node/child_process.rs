@@ -264,7 +264,7 @@ impl State {
                         _ => builder.stderr(stdio),
                     };
                 }
-                // WARNING: child ends are raised above the fds they become, so one `dup2` can't overwrite another end.
+                // Child ends are raised above the fds they become, so one `dup2` can't overwrite another end.
                 #[cfg(unix)]
                 let mut pipes = Vec::new();
                 #[cfg(unix)]
@@ -311,7 +311,7 @@ impl State {
                                 Ok(())
                             });
                         }
-                        // WARNING: the child ends stay open until `spawn` below, then close in this process.
+                        // The child ends stay open until `spawn` below, then close in this process.
                         builder_ends = ends;
                     }
                 }
@@ -586,7 +586,7 @@ impl State {
                         .find(|(name, _)| *name == signal)
                         .with_context(|| format!("Unknown signal: {signal}"))?
                         .1;
-                    // WARNING: Only signal a child that this context owns and has not reaped.
+                    // Only signal a child that this context owns and has not reaped.
                     if unsafe {
                         libc::kill(
                             if process.detached {

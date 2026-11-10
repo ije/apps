@@ -47,7 +47,7 @@ globalThis.__appsInspect = (() => {
     return `${constructor}${size} ` + (name !== '' && (position === -1 || (end !== constructor.length && constructor[end] === constructor[end].toLowerCase())) ? `[${name}] ` : '');
   };
   const keysOf = (value, hidden) => [...(hidden ? Object.getOwnPropertyNames(value) : Object.keys(value)), ...Object.getOwnPropertySymbols(value).filter(symbol => hidden || Object.prototype.propertyIsEnumerable.call(value, symbol))];
-  // WARNING: a brand check throws for other objects, and a throw costs about 1 µs, so `like` first asks the tag or the prototype chain.
+  // Check tags or prototypes first: a failed brand check throws and costs about 1 µs.
   const indexKey = /^(?:0|[1-9]\d*)$/, is = (method, value) => { try { method.call(value); return true; } catch { return false; } };
   const like = (kind, type, name, method, value) => (kind === name || value instanceof type) && is(method, value);
   const setSize = Object.getOwnPropertyDescriptor(Set.prototype, 'size').get, mapSize = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get, source = Object.getOwnPropertyDescriptor(RegExp.prototype, 'source').get;

@@ -157,7 +157,7 @@ fn gpu_time() -> Option<Duration> {
     let creator = format!("pid {},", std::process::id());
     let [creator_key, usage_key, time_key] =
         ["IOUserClientCreator", "AppUsage", "accumulatedGPUTime"].map(CFString::from_static_string);
-    // WARNING: `io_name_t` is a 128-byte array that the call copies whole.
+    // `io_name_t` is a 128-byte array that the call copies whole.
     let mut plane = [0 as c_char; 128];
     for (slot, byte) in plane.iter_mut().zip(b"IOService") {
         *slot = *byte as c_char;

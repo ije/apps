@@ -34,7 +34,7 @@ impl Events {
             event = json!({"type":"evaluation", "id":event["id"], "error":"Browser result exceeds 4 MiB"});
         }
         let mut queue = self.0.lock().unwrap();
-        // WARNING: only page events can flood the queue. Results and navigation events always queue, or their callers never settle.
+        // Never drop results or navigation events: callers wait for them.
         if queue.len() >= 4096 && matches!(event["type"].as_str(), Some("message" | "window-open"))
         {
             return;
@@ -180,7 +180,7 @@ impl Browser {
                     if data["mainFrame"] == true { ipc_events.push(json!({"type":"dom-ready"})); }
                 }
                 else if data["message"].is_object() {
-                    // WARNING: the page writes the body, so the URL comes from the request and the frame is unknown.
+                    // The page controls the body. Use the request URL and leave the frame unknown.
                     ipc_events.push(json!({"type":"message", "data":data["message"], "url":request.uri().to_string(), "mainFrame":null}));
                 }
             })
@@ -307,7 +307,7 @@ impl Browser {
             }
             "focus" => self.view.focus()?,
             "zoom" => self.view.zoom(arguments.as_f64().unwrap())?,
-            // WARNING: wry has no per-view color scheme, so guests follow the system.
+            // wry has no per-view color scheme, so guests follow the system.
             "appearance" => {}
             _ => {
                 return self
