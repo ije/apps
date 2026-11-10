@@ -226,7 +226,7 @@ Packaged `.wasm` files and valid Wasm in base64 string literals passed to `atob(
 The app doesn't start when `app.dylib` comes from another build or another runtime.
 
 Bun's AOT limits apply, for example to some changes of built-in objects.
-On DiffsHub, AOT starts with about half the CPU and holds about 50 MB less memory, but the app is 16 MB bigger, and `%` on numbers that are not known to be integers is about 2 times slower than with the JIT.
+On DiffsHub, AOT starts with about half the CPU and holds about 50 MB less memory, but the app is 12 MB bigger, and `%` on numbers that are not known to be integers is about 2 times slower than with the JIT.
 
 To run the integration test:
 

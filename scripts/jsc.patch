@@ -904,10 +904,10 @@ index cad190295..8cf9d0efd 100644
 +    return simdutf::convert_utf16le_to_utf8(static_cast<const char16_t*>(characters), length, output);
 +}
 diff --git a/Source/JavaScriptCore/CMakeLists.txt b/Source/JavaScriptCore/CMakeLists.txt
-index b4d3aae89..8936785ec 100644
+index b4d3aae89..79fb3d9b0 100644
 --- a/Source/JavaScriptCore/CMakeLists.txt
 +++ b/Source/JavaScriptCore/CMakeLists.txt
-@@ -2118,6 +2118,12 @@ set(JavaScriptCore_PRIVATE_FRAMEWORK_HEADERS
+@@ -2118,6 +2118,15 @@ set(JavaScriptCore_PRIVATE_FRAMEWORK_HEADERS
      parser/ModuleAnalyzer.h
  )
  include(aot/AOT.cmake)
@@ -915,12 +915,15 @@ index b4d3aae89..8936785ec 100644
 +    list(APPEND JavaScriptCore_SOURCES ${JavaScriptCore_AOT_PROGRAM_SOURCES} ${APPS_JSC_AOT_SOURCE})
 +    if (APPLE)
 +        list(APPEND JavaScriptCore_LIBRARIES objc)
++        if (APPS_JSC_AOT_SOURCE)
++            list(APPEND JavaScriptCore_LIBRARIES compression)
++        endif ()
 +    endif ()
 +endif ()
  
  if(USE_INSPECTOR_SOCKET_SERVER)
      list(APPEND JavaScriptCore_PRIVATE_FRAMEWORK_HEADERS
-@@ -2357,7 +2363,7 @@ endif ()
+@@ -2357,7 +2366,7 @@ endif ()
  # CombinedDomains.json will be generated in both projects.
  # However, for static JSC builds, we cannot have this dependency as it creates
  # a cycle - instead, we ensure headers are copied by adding them to the default target.
@@ -983,7 +986,7 @@ index bfae38ab7..d352b651b 100644
          return std::nullopt;
      auto findSegment = [&](auto&& isWanted) -> const segment_command_64* {
 diff --git a/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp b/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp
-index ae28871d..e9aacda8 100644
+index ae28871d9..e9aacda81 100644
 --- a/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp
 +++ b/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp
 @@ -362,10 +362,7 @@ static JSFunction* makeFunctionOfMissingHost(JSGlobalObject* realm, const Builti

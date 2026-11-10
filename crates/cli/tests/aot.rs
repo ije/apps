@@ -94,6 +94,9 @@ import {execFileSync,spawnSync} from 'node:child_process';
 import sloppy from 'sloppy';
 import wasmURL from './sum.wasm';
 assert.equal(sloppy(), true);
+function aotSource(value) { return 918273645 + value; }
+assert.ok(aotSource.toString().includes(aotSource(0)));
+assert.throws(() => globalThis.aotMissing.call918(), /evaluating 'globalThis\.aotMissing\.call918'/);
 const entries = [];
 for (const [key, value] of Object.entries(JSON.parse('{"left":3,"right":4}'))) entries.push(key, value);
 assert.equal(entries.join(','), 'left,3,right,4');
@@ -225,6 +228,10 @@ setTimeout(async () => {
     assert_eq!(
         u32::from_le_bytes(native[header + 72..header + 76].try_into().unwrap()),
         4
+    );
+    assert!(
+        !native.windows(9).any(|bytes| bytes == b"918273645"),
+        "function source must be compressed"
     );
     assert!(
         u32::from_le_bytes(native[header + 352..header + 356].try_into().unwrap()) > 0,

@@ -211,7 +211,7 @@ if ((aot)); then
   name=libJavaScriptCoreAOT.dylib
   xcrun clang++ -dynamiclib -arch arm64 -mmacosx-version-min=13.0 -o "$output/.$name" -Wl,-install_name,"@rpath/$name" \
     -Wl,-dead_strip -Wl,-x -Wl,-exported_symbols_list,"$root/scripts/jsc.exports" -Wl,-all_load \
-    "$build/lib/libJavaScriptCore.a" "$build/lib/libWTF.a" "$build/lib/libbmalloc.a" -licucore -lobjc
+    "$build/lib/libJavaScriptCore.a" "$build/lib/libWTF.a" "$build/lib/libbmalloc.a" -licucore -lobjc -lcompression
   mv -f "$output/.$name" "$output/$name"
 
   # Build the AOT front end with Bun's nightly toolchain.

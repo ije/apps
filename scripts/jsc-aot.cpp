@@ -25,6 +25,7 @@
 #include "JSObjectInlines.h"
 #include "Options.h"
 #include "ObjectConstructor.h"
+#include <compression.h>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -135,6 +136,9 @@ extern constinit const AOT::ModuleHost appsAOTModuleHost {
     .createModuleNotFoundError = [](JSGlobalObject* global, const String& specifier, const String&, bool) -> JSValue {
         return createTypeError(global, makeString("Cannot find AOT module: "_s, specifier));
     },
+    .decompressText = [](std::span<uint8_t> text, std::span<const uint8_t> compressed) {
+        return compression_decode_buffer(text.data(), text.size(), compressed.data(), compressed.size(), nullptr, COMPRESSION_ZLIB) == text.size();
+    },
 };
 }
 
@@ -154,7 +158,12 @@ extern "C" JS_EXPORT bool JSCompileAOT(const uint8_t* bytes, size_t size, const 
     // Use wide references to disable the cell cage, which keeps heap blocks resident (110 MB on DiffsHub's
     // stress test).
     options.target.referenceWidth = AOT::Wire::ReferenceWidth::Wide;
-    auto output = AOT::compileProgram({ bytes, size }, options);
+    AOT::ProgramOwner owner;
+    owner.functionTexts.mostBytesCompressed = [](size_t size) { return size + size / 8 + 64; };
+    owner.functionTexts.compress = [](std::span<uint8_t> compressed, std::span<const uint8_t> text) {
+        return compression_encode_buffer(compressed.data(), compressed.size(), text.data(), text.size(), nullptr, COMPRESSION_ZLIB);
+    };
+    auto output = AOT::compileProgram({ bytes, size }, options, nullptr, owner);
     auto image = output->section(AOT::Wire::ResultSection::Image);
     if (image.empty()) {
         auto text = output->section(AOT::Wire::ResultSection::Text);

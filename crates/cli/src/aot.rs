@@ -94,8 +94,13 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         .map(|(name, source)| (name.as_str(), source.as_str()))
         .collect();
     scripts.push(("app.js", &app));
+    let disabled =
+        apps_runtime::bundle::disabled_features(files.get("package.json").map(String::as_str))?;
+    let webgpu = disabled & apps_runtime::bundle::feature_bit("webgpu") == 0;
     for script in apps_runtime::jsc::runtime_scripts() {
-        scripts.push(script);
+        if webgpu || script.0 != "apps:gpu" {
+            scripts.push(script);
+        }
     }
     let mut names = Vec::new();
     let mut paths = Vec::new();
