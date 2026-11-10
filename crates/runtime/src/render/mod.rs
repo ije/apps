@@ -1963,6 +1963,22 @@ impl PageView {
             })
             .child(pointer_events)
             .child(root)
+            .child({
+                // WARNING: scroll boxes take their range in prepaint, after the `sync_scroll` at the start of this
+                // pass, so the mirror takes it again once the page has prepainted.
+                let data = self.0.clone();
+                renderer::canvas(
+                    move |_, _| {
+                        if let Ok(mut host) = data.host.try_borrow_mut()
+                            && let Some(dom) = host.dom.get_mut(&data.id)
+                        {
+                            dom.sync_scroll();
+                        }
+                    },
+                    |_, _, _| (),
+                )
+                .absolute()
+            })
             .children(page_bar.map(|look| scrollbar::Scrollbar {
                 id: 0,
                 handle: page_scroll.clone(),

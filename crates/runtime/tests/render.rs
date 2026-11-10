@@ -1743,3 +1743,24 @@ fn flex_and_grid_lines_stretch_replaced_elements_and_controls() {
         assert_eq!(rects[id], rect, "{id}, as in Chrome: {text}");
     }
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn scroll_sizes_count_overflowing_content_like_chrome() {
+    let text = run_hidden(
+        r#"await load('page.html');
+        console.log('SIZES ' + await run(`(() => {
+            const box = style => '<div style="' + style + '"><div style="height:24px;padding-bottom:10px"></div></div>';
+            const cases = ['overflow:hidden;height:0', 'overflow:hidden;height:0;padding:4px', 'height:0', 'display:inline'];
+            document.body.innerHTML = cases.map(box).join('') + '<div id=chat style="overflow:auto;height:50px"><p style="height:40px;margin:0"></p></div>';
+            const sizes = [...document.body.children].slice(0, cases.length).map(node => node.scrollHeight);
+            const chat = document.getElementById('chat');
+            sizes.push(chat.scrollHeight);
+            chat.insertAdjacentHTML('beforeend', '<p style="height:40px;margin:0"></p>');
+            sizes.push(chat.scrollHeight);
+            return sizes.join(',');
+        })()`));"#,
+        &[("page.html", "<!doctype html><body style='margin:0'></body>")],
+    );
+    assert!(text.contains("SIZES 34,42,34,0,50,80"), "{text}");
+}

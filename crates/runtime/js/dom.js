@@ -59,6 +59,22 @@
   // WARNING: while observers measure the last frame, client boxes come from its styles and must not be cached for later
   // reads.
   const client = node => { if (slot(node) < 0) return [0, 0, 0, 0, 0, 0, 0, 0]; if (observing) return call('dom.client', node._id, true); const cached = node._client; if (cached?.[8] === geometry[2] && cached[9] === version) return cached; return node._client = [...call('dom.client', node._id), geometry[2], version]; };
+  // WARNING: only scroll boxes have a scroll range, so other boxes take the border boxes of their children as their
+  // scrollable overflow, then their end padding.
+  const extent = (node, axis) => {
+    const box = client(node), i = slot(node);
+    if (i < 0 || marks[node._id] & 2) return Math.round(box[2 + axis] + (i < 0 ? 0 : geometry[i + 6 + axis]));
+    if (!box[2] && !box[3] && !box[4] && !box[5] && !box[6] && !box[7] && /^(inline|contents)$/.test(getComputedStyle(node).display)) return 0;
+    const start = geometry[i + axis] + box[axis], pending = [...(node._m.shadow ?? node._m).kids];
+    let end = 0;
+    while (pending.length) {
+      const kid = pending.pop(), j = 4 + kid.id * 8;
+      if (j >= limit || (marks[kid.id] & 49) !== 1) continue;
+      if (geometry[j + 2] || geometry[j + 3]) end = Math.max(end, geometry[j + axis] + geometry[j + 2 + axis] - start);
+      else if (kid.tag[0] !== '#') pending.push(...(kid.shadow ?? kid).kids);
+    }
+    return Math.round(Math.max(box[2 + axis], end && end + box[5 + axis]));
+  };
   const offset = (node, axis) => {
     if (slot(node) < 0 || node === document.body) return 0;
     const start = node.getBoundingClientRect()[axis ? 'top' : 'left'], parent = node.offsetParent;
@@ -756,7 +772,7 @@
     get clientLeft() { return Math.round(client(this)[0]); } get clientTop() { return Math.round(client(this)[1]); }
     get scrollTop() { return metric(pageScroller(this) ? document : this, 5); } set scrollTop(value) { call('dom.scroll', this._id, null, Number(value)); }
     get scrollLeft() { return metric(pageScroller(this) ? document : this, 4); } set scrollLeft(value) { call('dom.scroll', this._id, Number(value), null); }
-    get scrollWidth() { return pageScroller(this) ? Math.round(innerWidth + metric(document, 6)) : Math.round(client(this)[2] + metric(this, 6)); } get scrollHeight() { return pageScroller(this) ? Math.round(innerHeight + metric(document, 7)) : Math.round(client(this)[3] + metric(this, 7)); }
+    get scrollWidth() { return pageScroller(this) ? Math.round(innerWidth + metric(document, 6)) : extent(this, 0); } get scrollHeight() { return pageScroller(this) ? Math.round(innerHeight + metric(document, 7)) : extent(this, 1); }
     scrollTo(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); call('dom.scroll', this._id, left ?? null, top ?? null, behavior); }
     scroll(left, top) { this.scrollTo(left, top); }
     scrollBy(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); this.scrollTo({ left: this.scrollLeft + (left ?? 0), top: this.scrollTop + (top ?? 0), behavior }); }
