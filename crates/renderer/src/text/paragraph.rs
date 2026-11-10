@@ -316,43 +316,7 @@ impl TextState {
             size.width = size.width.max(line_size.width);
         }
         if min_content {
-            size.width = px(0.);
-            let mut start = float - top - style.text_indent;
-            for line in lines.iter() {
-                let unwrapped = &line.unwrapped_layout;
-                let mut breaks = line.wrap_boundaries.iter().peekable();
-                let mut glyphs = unwrapped
-                    .runs
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(run_index, run)| {
-                        run.glyphs
-                            .iter()
-                            .enumerate()
-                            .map(move |(glyph_index, glyph)| {
-                                (
-                                    WrapBoundary {
-                                        run_index,
-                                        glyph_index,
-                                    },
-                                    glyph,
-                                )
-                            })
-                    })
-                    .peekable();
-                while let Some((boundary, glyph)) = glyphs.next() {
-                    if breaks.next_if(|next| **next == boundary).is_some() {
-                        start = glyph.position.x;
-                    }
-                    let end = glyphs
-                        .peek()
-                        .map_or(unwrapped.width, |(_, next)| next.position.x);
-                    if line.text.as_bytes().get(glyph.index) != Some(&b' ') {
-                        size.width = size.width.max(end - start);
-                    }
-                }
-                start = px(0.);
-            }
+            size.width = widest_piece(&lines, float - top - style.text_indent);
         }
         size.width = size.width.max(float);
         size.height += top;
@@ -385,6 +349,47 @@ impl TextState {
         }
         (size, Some(baselines))
     }
+}
+
+/// The widest piece between the wrap boundaries of `lines`, without spaces. The first piece starts at `start`.
+pub fn widest_piece(lines: &[WrappedLine], mut start: Pixels) -> Pixels {
+    let mut width = px(0.);
+    for line in lines {
+        let unwrapped = &line.unwrapped_layout;
+        let mut breaks = line.wrap_boundaries.iter().peekable();
+        let mut glyphs = unwrapped
+            .runs
+            .iter()
+            .enumerate()
+            .flat_map(|(run_index, run)| {
+                run.glyphs
+                    .iter()
+                    .enumerate()
+                    .map(move |(glyph_index, glyph)| {
+                        (
+                            WrapBoundary {
+                                run_index,
+                                glyph_index,
+                            },
+                            glyph,
+                        )
+                    })
+            })
+            .peekable();
+        while let Some((boundary, glyph)) = glyphs.next() {
+            if breaks.next_if(|next| **next == boundary).is_some() {
+                start = glyph.position.x;
+            }
+            let end = glyphs
+                .peek()
+                .map_or(unwrapped.width, |(_, next)| next.position.x);
+            if line.text.as_bytes().get(glyph.index) != Some(&b' ') {
+                width = width.max(end - start);
+            }
+        }
+        start = px(0.);
+    }
+    width
 }
 
 impl TextState {

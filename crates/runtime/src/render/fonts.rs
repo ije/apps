@@ -303,4 +303,33 @@ mod tests {
         load(&mut doc, &mut state);
         assert!(state.font_text.1.is_empty());
     }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn faces_of_one_family_match_by_their_weight_class() {
+        let system = std::rc::Rc::new(renderer::TextSystem::new());
+        let assets = HashMap::from(["test.woff2", "test-medium.woff2"].map(|name| {
+            let fonts = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fonts");
+            (name.to_owned(), PathBuf::from(fonts).join(name))
+        }));
+        let mut doc = Document::parse(
+            "<style>@font-face { font-family: Brand; src: url(test.woff2) }
+            @font-face { font-family: Brand; src: url(test-medium.woff2) }</style><p>AB</p>",
+        );
+        let mut state = State::default();
+        state.text_system = Some(system.clone());
+        state.base = url::Url::parse("apps:///index.html").ok();
+        crate::dom::styles(&mut doc, &mut state, [800., 600.], Some((&system, 1.)));
+        load(&doc, &mut state, &assets);
+        for (weight, width) in [(400, 15.), (500, 7.5), (600, 7.5)] {
+            let font = format!("{weight} 10px Brand");
+            assert_eq!(
+                crate::render::canvas::line(&system, &state.font_aliases, &font, "AB", [0.; 2])
+                    .0
+                    .width,
+                renderer::px(width),
+                "{font}"
+            );
+        }
+    }
 }

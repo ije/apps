@@ -558,9 +558,11 @@ impl<'a> Build<'a> {
                     .and_then(|dom| dom.cull.widths.get(&(node as usize)))
                     .map(|size| size[usize::from(axis)])
                 {
+                    // A node keeps its size, so a read that finds none was made without one too.
+                    None => Replay::Same,
                     Some(size) if size.to_bits() == used.to_bits() => Replay::Same,
                     Some(size) if (size - used).abs() <= 0.5 => Replay::Close,
-                    _ => Replay::Changed,
+                    Some(_) => Replay::Changed,
                 };
             }
             Query::Baselines(grid) => baselines(doc, dom, grid as usize),
@@ -2118,8 +2120,9 @@ fn create(
                 pending.push(target);
             }
         }
-        if let Some(value) = uses(doc, styles, ids, id) {
-            reader.log(Query::Uses(id as u32), 1, value);
+        let used = uses(doc, styles, ids, id);
+        if used.is_some() {
+            reader.log(Query::Uses(id as u32), 1, hashed(used));
         }
         let key = ([width, height], std::hash::Hasher::finish(&hasher));
         let props = || style::SVG.iter().chain(&SVG_SOURCE);
@@ -2620,13 +2623,12 @@ fn create(
         None
     };
     let reserved = look.as_ref().map_or([0.; 2], |look| {
-        let host = view.host.borrow();
-        let handle = host.dom.get(&view.id).and_then(|dom| dom.scroll.get(&id));
-        reader.log(Query::Scroll(id as u32), 0, hashed(scrolled(handle)));
-        let max = handle
-            .map(renderer::ScrollHandle::max_offset)
-            .unwrap_or_default();
-        look.space(look.shown(scrolls, max))
+        // Make the handle before the read, or the read logs none and its replay finds the handle.
+        let mut host = view.host.borrow_mut();
+        let dom = host.dom.entry(view.id).or_default();
+        let handle = dom.scroll.entry(id).or_default();
+        reader.log(Query::Scroll(id as u32), 0, hashed(scrolled(Some(handle))));
+        look.space(look.shown(scrolls, handle.max_offset()))
     });
     let mut padding = parsed.padding.unwrap_or_else(|| {
         units
@@ -4667,8 +4669,9 @@ fn create(
         .get(Prop::WHITE_SPACE)
         .is_some_and(|v| matches!(v, "pre" | "pre-wrap" | "break-spaces"))
         || node.tag == "pre";
-    if (node.tag == "#text"
-        || display == "inline" && symbol.is_none() && !flex_parent && slot.is_none())
+    if hit.is_none()
+        && (node.tag == "#text"
+            || display == "inline" && symbol.is_none() && !flex_parent && slot.is_none())
         && style
             .get(Prop::WHITE_SPACE)
             .is_none_or(|value| !matches!(value, "pre" | "nowrap"))

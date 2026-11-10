@@ -646,7 +646,7 @@ struct Measured {
     atoms: Box<[([f32; 3], Option<AlignItems>)]>,
     styled: std::cell::RefCell<Option<renderer::TextStyle>>,
     measured: Rc<std::cell::Cell<[Pixels; 2]>>,
-    cached: std::cell::Cell<Option<(Option<Pixels>, renderer::Size<Pixels>)>>,
+    cached: std::cell::Cell<Option<((bool, Option<Pixels>), renderer::Size<Pixels>)>>,
     baselines: std::cell::Cell<[Pixels; 2]>,
 }
 
@@ -695,22 +695,28 @@ impl From<InlineText> for renderer::Node {
                         *styled.borrow_mut() = Some(style.clone());
                     }
                     let (font_size, line_height) = (style.font_size, style.line_height);
+                    let wraps = style.white_space == renderer::WhiteSpace::Normal;
+                    let min_content = wraps
+                        && known.width.is_none()
+                        && available.width == renderer::AvailableSpace::MinContent;
                     let width = known
                         .width
                         .or(match available.width {
                             renderer::AvailableSpace::Definite(width) => Some(width),
                             _ => None,
                         })
-                        .filter(|_| style.white_space == renderer::WhiteSpace::Normal);
+                        .filter(|_| wraps);
+                    let key = (min_content, width);
                     if let Some((_, size)) = cached
                         .get()
-                        .filter(|(cached, _): &(_, renderer::Size<Pixels>)| *cached == width)
+                        .filter(|(cached, _): &(_, renderer::Size<Pixels>)| *cached == key)
                     {
                         measured.set([width.unwrap_or_default(), size.width]);
                         return (size, Some(kept_baselines.get()));
                     }
                     let system = window.text_system().clone();
-                    let (text, mut runs) = first_line(data, width, font_size, &system);
+                    let wrap = if min_content { Some(px(0.)) } else { width };
+                    let (text, mut runs) = first_line(data, wrap, font_size, &system);
                     with_atoms(data, |index| atoms[index].0[0], &mut runs);
                     let mut size = renderer::Size::<Pixels>::default();
                     let lines = system
@@ -718,11 +724,20 @@ impl From<InlineText> for renderer::Node {
                             text,
                             font_size,
                             &runs,
-                            width,
-                            style.line_clamp,
+                            wrap,
+                            style.line_clamp.filter(|_| !min_content),
                             style.text_indent,
-                            style.text_wrap,
-                            style.word_break,
+                            if min_content {
+                                renderer::TextWrap::Wrap
+                            } else {
+                                style.text_wrap
+                            },
+                            match style.word_break {
+                                renderer::WordBreak::BreakWord if min_content => {
+                                    renderer::WordBreak::Normal
+                                }
+                                word_break => word_break,
+                            },
                         )
                         .unwrap_or_default();
                     for (index, line) in lines.iter().enumerate() {
@@ -732,6 +747,9 @@ impl From<InlineText> for renderer::Node {
                         }
                         size.height += line_size.height;
                         size.width = size.width.max(line_size.width);
+                    }
+                    if min_content {
+                        size.width = renderer::widest_piece(&lines, -style.text_indent);
                     }
                     let strut = (system.resolve_font(&style.font()), font_size, line_height);
                     let scale = window.scale_factor();
@@ -758,7 +776,7 @@ impl From<InlineText> for renderer::Node {
                         size.height - extents.last().map_or(px(0.), |row| row[1]) - line_height
                             + base,
                     ];
-                    cached.set(Some((width, size)));
+                    cached.set(Some((key, size)));
                     kept_baselines.set(baselines);
                     measured.set([width.unwrap_or_default(), size.width]);
                     (size, Some(baselines))

@@ -259,7 +259,19 @@ impl TextSystem {
             .map(|font_id| {
                 let font = &state.fonts[font_id.0];
                 let mut properties = font.properties();
-                if let Some(weight) = font
+                // CoreText puts a font loaded from data on another weight scale (0.2 for Medium), so read its
+                // class.
+                let class = state
+                    .local
+                    .contains(font_id)
+                    .then(|| font.load_font_table(u32::from_be_bytes(*b"OS/2")))
+                    .flatten()
+                    .filter(|table| table.len() >= 6)
+                    .map(|table| f32::from(u16::from_be_bytes([table[4], table[5]])))
+                    .filter(|class| (1. ..=1000.).contains(class));
+                if let Some(class) = class {
+                    properties.weight = font_kit::properties::Weight(class);
+                } else if let Some(weight) = font
                     .native_font()
                     .all_traits()
                     .get(unsafe { kCTFontWeightTrait })

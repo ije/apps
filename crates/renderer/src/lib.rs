@@ -28,7 +28,7 @@ pub use style::*;
 pub use text::{
     DecorationStyle, Font, FontId, FontStyle, FontWeight, LineLayout, SUBPIXEL_VARIANTS_X,
     SharedString, StrikethroughStyle, TextAlign, TextLayout, TextRun, TextSystem, TextWrap,
-    UnderlineStyle, WhiteSpace, WordBreak, WrapBoundary, WrappedLineLayout, font,
+    UnderlineStyle, WhiteSpace, WordBreak, WrapBoundary, WrappedLineLayout, font, widest_piece,
 };
 pub use tree::Tree;
 pub use window::*;

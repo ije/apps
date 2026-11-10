@@ -1386,6 +1386,44 @@ fn boxes_that_never_cull_keep_the_boxes_around_them() {
     }
 }
 
+#[test]
+#[ignore = "requires the macOS window server"]
+fn first_builds_log_reads_that_replay_the_same() {
+    // Debug builds build the second wrapper again when it takes the style of the first.
+    let wrapper = "<div class=w><div style='height:50px;overflow:auto'>short</div>\
+                   <div class=b></div><span>inline</span><p>block</p></div>";
+    let text = run_hidden(
+        &format!(
+            r#"{STEPS}
+            await load('reads.html');
+            await win.webContents.capturePage();
+            await step('text', () => run("document.getElementById('o').textContent = 'y'"));
+            await step('scroller', () => run("document.getElementById('a').innerHTML = '<div id=s style=\"height:50px;overflow:auto\">short</div>'"));
+            await step('grid', () => run("for (const box of document.querySelectorAll('.b')) box.innerHTML = '<div style=\"display:grid\"><span>cell</span></div>'"));
+            "#
+        ),
+        &[(
+            "reads.html",
+            &format!(
+                "<body id=body style='margin:0'><p id=o style='margin:0'>x</p>\
+                 <svg style='display:none'><symbol id=dot viewBox='0 0 10 10'><circle cx=5 cy=5 r=4 /></symbol></svg>\
+                 <div id=i><svg width=10 height=10><use href='#dot' /></svg></div><div id=a></div>{wrapper}{wrapper}</body>"
+            ),
+        )],
+    );
+    let texted = built(&text, "text");
+    assert!(
+        !texted.contains(&"i"),
+        "a box with a <use> icon is kept: {texted:?}"
+    );
+    let scroller = built(&text, "scroller");
+    assert_eq!(
+        scroller.iter().filter(|id| **id == "s").count(),
+        1,
+        "a new scroll box builds once: {scroller:?}"
+    );
+}
+
 const PICTURE: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADIAAAAoCAYAAAC8cqlMAAAASUlEQVR4nO3PsQ0AMAjAMP5/mp7RCHnIHs/O7IXm9wAISDyQWiC1QGqB1AKpBVILpBZILZBaILVAaoHUAqkFUgukFkgtkFpnIA+Vw5FCgTkXpwAAAABJRU5ErkJggg==";
 
 fn picture_rects(name: &str, page: &str) -> (String, std::collections::HashMap<String, String>) {
@@ -1635,6 +1673,32 @@ fn inline_blocks_shrink_to_their_line_like_chrome() {
         rects["l1"].starts_with("0,0,") && at("l1", 2) > 40.,
         "a word wider than its line stays on it: {text}"
     );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn paragraphs_with_inline_boxes_shrink_to_fit_like_chrome() {
+    let (text, rects) = picture_rects(
+        "fit.html",
+        "<body style='margin:0;font:16px/18px sans-serif'><style>.w{display:flex;flex-direction:column;align-items:center;width:200px}\
+         p{margin:0}.x{display:inline-block;width:50px;height:10px}</style>\
+         <div class=w><p id=p0>Some text before the <span class=x></span> box and some more text after it</p></div>\
+         <div class=w><p id=p1>Some text with <span style='font-size:20px'>bigger words</span> that wraps in the column</p></div>\
+         <div class=w style='width:30px'><p id=p2>a <span class=x></span> b</p></div>\
+         <div class=w style='width:30px'><p id=p3>a <span style='font-size:20px'>big</span> b</p></div></body>",
+    );
+    for (id, rect) in [
+        ("p0", [0., 0., 200., 54.]),
+        ("p1", [0., 0., 200., 57.]),
+        ("p2", [-10., 0., 50., 54.]),
+        ("p3", [0., 0., 30., 55.5]),
+    ] {
+        let at = rects[id].split(',').map(|v| v.parse::<f32>().unwrap());
+        assert!(
+            at.zip(rect).all(|(at, side)| (at - side).abs() < 0.05),
+            "{id} at {rect:?}, as in Chrome: {text}"
+        );
+    }
 }
 
 #[test]
