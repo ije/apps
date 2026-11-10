@@ -117,9 +117,17 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         let parsed =
             oxc_parser::Parser::new(&allocator, source, oxc_span::SourceType::cjs()).parse();
         ensure!(parsed.diagnostics.is_empty(), "Invalid AOT script {name}");
-        let [Statement::ExpressionStatement(expression)] = parsed.program.body.as_slice() else {
+        let Some((Statement::ExpressionStatement(expression), before)) =
+            parsed.program.body.split_last()
+        else {
             continue;
         };
+        if before
+            .iter()
+            .any(|statement| !matches!(statement, Statement::ExpressionStatement(_)))
+        {
+            continue;
+        }
         let semantic = oxc_semantic::SemanticBuilder::new()
             .with_build_nodes(source.contains("AGFzbQEAAA") && source.contains("atob"))
             .build(&parsed.program);
@@ -158,11 +166,15 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
                 .map(|name| name.to_string()),
         );
         let span = expression.expression.span();
+        let start = before
+            .first()
+            .map_or(span.start, |statement| statement.span().start);
         let path = directory.path().join(format!("entry-{}.cjs", names.len()));
         fs::write(
             &path,
             format!(
-                "module.exports=function(){{return (\n{}\n);}};\n",
+                "module.exports=function(){{{}return (\n{}\n);}};\n",
+                &source[start as usize..span.start as usize],
                 &source[span.start as usize..span.end as usize]
             ),
         )?;

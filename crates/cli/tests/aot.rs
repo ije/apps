@@ -261,7 +261,9 @@ setTimeout(async () => {
     assert_eq!(manifest["runtime"], apps_runtime::jsc::RUNTIME_SCRIPTS);
     let id = manifest["build"].as_str().unwrap();
     let scripts = manifest["scripts"].as_object().unwrap();
-    assert!(scripts["apps:dom"].as_u64().unwrap() > 0);
+    for (name, _) in apps_runtime::jsc::runtime_scripts() {
+        assert_eq!(scripts.contains_key(name), name != "apps:gpu", "{name}");
+    }
     for name in ["app.js", worker.as_str()] {
         assert!(scripts[name].as_u64().unwrap() > 0, "{name} must compile");
     }
