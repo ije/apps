@@ -371,6 +371,7 @@ impl SelectorCache {
         let mut changes = Vec::new();
         let mut quieted = Vec::new();
         let mut retagged = Vec::new();
+        let start = self.revision;
         for &(id, _) in order {
             let id = id as usize;
             let revision = doc.nodes.revision(id);
@@ -457,8 +458,13 @@ impl SelectorCache {
                 }
             }
         }
+        // WARNING: every new child retags its parent. A parent whose children changed in this update must not come
+        // again, or each child walks all of its dependents.
         for parent in retagged {
-            if let Some(slot) = self.nodes.get_mut(parent) {
+            if let Some(slot) = self.nodes.get_mut(parent)
+                && slot.revisions[2].wrapping_sub(start).wrapping_sub(1)
+                    >= self.revision.wrapping_sub(start)
+            {
                 self.revision = self.revision.wrapping_add(1);
                 slot.revisions[2] = self.revision;
                 changes.push((parent * KINDS + 2) as u32);
@@ -2136,6 +2142,37 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(!selector[0].matches(&doc, leaf));
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn retagged_children_record_their_parent_once() {
+        let mut doc = Document::parse("<ul><li>a</li><li>b</li><li>c</li></ul>");
+        let [ul, li] =
+            ["ul", "li"].map(|tag| doc.nodes.iter().position(|node| node.tag == tag).unwrap());
+        let order = |doc: &Document| -> Vec<(u32, u32)> {
+            (0..doc.nodes.len())
+                .map(|id| {
+                    (
+                        id as u32,
+                        doc.nodes[id].parent.map_or(u32::MAX, |up| up as u32),
+                    )
+                })
+                .collect()
+        };
+        let parent = |cache: &SelectorCache| {
+            cache.changes.back().map_or(0, |(_, changes)| {
+                changes
+                    .iter()
+                    .filter(|&&change| change as usize == ul * KINDS + 2)
+                    .count()
+            })
+        };
+        let mut cache = SelectorCache::default();
+        cache.update(&doc, &order(&doc));
+        assert_eq!(parent(&cache), 1);
+        doc.nodes[li].tag = "p".into();
+        cache.update(&doc, &order(&doc));
+        assert_eq!(parent(&cache), 1);
     }
 
     #[test]

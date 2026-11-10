@@ -312,13 +312,15 @@ pub fn fonts(system: bool) -> MutexGuard<'static, (Arc<usvg::fontdb::Database>, 
 
 pub(crate) fn render_image(pixels: &skia::Pixmap) -> Arc<renderer::RenderImage> {
     let mut bytes = vec![0; pixels.data().len()];
-    for (out, pixel) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(pixels.pixels()) {
-        if pixel.alpha() != 0 {
-            let pixel = pixel.demultiply();
-            *out = [pixel.blue(), pixel.green(), pixel.red(), pixel.alpha()];
-        }
+    for (out, &[r, g, b, a]) in bytes
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(pixels.data().as_chunks::<4>().0)
+    {
+        *out = [b, g, r, a];
     }
-    Arc::new(renderer::RenderImage::new(
+    Arc::new(renderer::RenderImage::new_premultiplied(
         pixels.width(),
         pixels.height(),
         bytes,
@@ -328,12 +330,21 @@ pub(crate) fn render_image(pixels: &skia::Pixmap) -> Arc<renderer::RenderImage> 
 pub(crate) fn pixmap(image: &renderer::RenderImage) -> Option<skia::Pixmap> {
     let size = image.size();
     let mut pixels = skia::Pixmap::new(size.width.into(), size.height.into())?;
-    for (out, pixel) in pixels
-        .pixels_mut()
-        .iter_mut()
-        .zip(image.bytes().as_chunks::<4>().0)
-    {
-        *out = skia::ColorU8::from_rgba(pixel[2], pixel[1], pixel[0], pixel[3]).premultiply();
+    let source = image.bytes().as_chunks::<4>().0;
+    if image.is_premultiplied() {
+        for (out, &[b, g, r, a]) in pixels
+            .data_mut()
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(source)
+        {
+            *out = [r, g, b, a];
+        }
+    } else {
+        for (out, pixel) in pixels.pixels_mut().iter_mut().zip(source) {
+            *out = skia::ColorU8::from_rgba(pixel[2], pixel[1], pixel[0], pixel[3]).premultiply();
+        }
     }
     Some(pixels)
 }
@@ -1503,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn images_keep_straight_alpha_at_display_resolution() {
+    fn images_keep_premultiplied_alpha_at_display_resolution() {
         let mut canvas = Canvas::new(2, 2).unwrap();
         canvas
             .draw(
@@ -1514,11 +1525,13 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(&canvas.image.bytes()[..4], &[0, 0, 255, 128]);
+        assert!(canvas.image.is_premultiplied());
+        assert_eq!(&canvas.image.bytes()[..4], &[0, 0, 128, 128]);
         assert_eq!(canvas.pixels.pixels()[0].red(), 128);
+        assert_eq!(pixmap(&canvas.image).unwrap().data()[..4], [128, 0, 0, 128]);
         let image = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000" opacity="0.5"/></svg>"##, 4, 4, None).unwrap();
         assert_eq!(u32::from(image.size().width), 4);
-        assert_eq!(image.bytes(), [0, 0, 255, 128].repeat(16));
+        assert_eq!(image.bytes(), [0, 0, 128, 128].repeat(16));
         let rotated = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000"/><path d="M2 0h2v2H2Z" fill="#0000ff"/></svg>"##, 1, 2, Some(([2., 1.], [0., 1., -1., 0., 1., 0.]))).unwrap();
         assert_eq!(
             rotated.bytes(),

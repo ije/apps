@@ -124,7 +124,7 @@ pub(super) struct Run {
 }
 
 pub(super) fn cosmetic(old: &style::Style, new: &style::Style) -> bool {
-    let paint = |prop: Prop| {
+    fn rule(prop: Prop) -> bool {
         let name = prop.name();
         prop.is_custom()
             || [
@@ -174,6 +174,16 @@ pub(super) fn cosmetic(old: &style::Style, new: &style::Style) -> bool {
                     | Prop::WEBKIT_FONT_SMOOTHING
                     | Prop::MOZ_OSX_FONT_SMOOTHING
             )
+    }
+    static PAINT: std::sync::LazyLock<Vec<bool>> = std::sync::LazyLock::new(|| {
+        Prop::names()
+            .iter()
+            .map(|name| rule(Prop::new(name)))
+            .collect()
+    });
+    let paint = |prop: Prop| {
+        prop.index()
+            .map_or_else(|| rule(prop), |index| PAINT[index])
     };
     let (mut a, mut b) = (old.iter().peekable(), new.iter().peekable());
     loop {

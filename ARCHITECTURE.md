@@ -121,6 +121,8 @@ Inputs with an `ns-*` type show AppKit controls on macOS. Their box paints nothi
 
 The atlas keeps a tile that fails or is bigger than a GPU texture as an empty entry, so it is not built again each frame. A glyph bigger than 2048 device pixels on a side rasters at a smaller scale and stretches to its size.
 
+Canvases and SVG images give the renderer premultiplied pixels, and the image shader divides by alpha after it samples them. So a canvas frame costs one copy, and scaled translucent edges get no dark fringes. Decoded images and video frames keep straight alpha.
+
 
 ## Offscreen Canvases
 

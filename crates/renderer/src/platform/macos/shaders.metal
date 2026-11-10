@@ -844,6 +844,9 @@ fragment float4 polychrome_sprite_fragment(
   float corners = square ? 1.0 : saturate(0.5 - quad_sdf(position, sprite.bounds, sprite.corner_radii));
 
   float4 color = sample;
+  if ((sprite.grayscale & 0x100) != 0 && color.a > 0.0) {
+    color.rgb /= color.a;
+  }
   if ((sprite.grayscale & 0xFF) != 0) {
     float grayscale = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
     color.rgb = float3(grayscale);

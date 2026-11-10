@@ -802,6 +802,9 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     float corners = square ? 1.0 : saturate(0.5 - quad_sdf(position, sprite.bounds, sprite.corner_radii));
 
     float4 color = sample;
+    if ((sprite.grayscale & 0x100u) != 0u && color.a > 0.0) {
+        color.rgb /= color.a;
+    }
     if ((sprite.grayscale & 0xFFu) != 0u) {
         float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = float4(grayscale, sample.a);

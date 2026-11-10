@@ -2121,7 +2121,7 @@ impl Window {
             .scale(self.scale_factor);
         self.scene.insert(Primitive::Poly(PolychromeSprite {
             order: 0,
-            grayscale: grayscale as u32,
+            grayscale: u32::from(grayscale) | u32::from(image.is_premultiplied()) << 8,
             tile,
             opacity: self.opacity,
             pad: 0,

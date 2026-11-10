@@ -604,6 +604,7 @@ pub(crate) struct MonochromeSprite {
 #[repr(C)]
 pub(crate) struct PolychromeSprite {
     pub order: DrawOrder,
+    // WARNING: bit 8 marks a premultiplied image, which the shaders divide by alpha after sampling.
     pub grayscale: u32,
     pub tile: AtlasTile,
     pub opacity: f32,
@@ -643,6 +644,7 @@ pub struct RenderImage {
     width: u32,
     height: u32,
     bytes: Vec<u8>,
+    premultiplied: bool,
 }
 
 impl RenderImage {
@@ -653,7 +655,17 @@ impl RenderImage {
             width,
             height,
             bytes,
+            premultiplied: false,
         }
+    }
+    pub fn new_premultiplied(width: u32, height: u32, bytes: Vec<u8>) -> Self {
+        Self {
+            premultiplied: true,
+            ..Self::new(width, height, bytes)
+        }
+    }
+    pub fn is_premultiplied(&self) -> bool {
+        self.premultiplied
     }
     pub fn size(&self) -> Size<DevicePixels> {
         Size::new(

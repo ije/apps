@@ -507,6 +507,10 @@ impl Prop {
         (self.0 as usize) < NAMES.len()
     }
 
+    pub(crate) fn index(self) -> Option<usize> {
+        self.is_known().then_some(self.0 as usize)
+    }
+
     pub(crate) fn names() -> &'static [&'static str] {
         &NAMES
     }

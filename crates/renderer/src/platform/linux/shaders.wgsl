@@ -868,7 +868,10 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     }
 
     var color = sample;
-    if (sprite.grayscale != 0u) {
+    if ((sprite.grayscale & 0x100u) != 0u && color.a > 0.0) {
+        color = vec4<f32>(color.rgb / color.a, color.a);
+    }
+    if ((sprite.grayscale & 0xFFu) != 0u) {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
