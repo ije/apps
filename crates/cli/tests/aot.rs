@@ -381,4 +381,25 @@ setTimeout(async () => {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+
+    for feature in ["jsExecute", "httpImport"] {
+        fs::write(
+            root.join("package.json"),
+            format!(r#"{{"name":"AotTest","features":["{feature}"]}}"#),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_apps"))
+            .current_dir(root)
+            .args(["build", "main.js", "--aot"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains(&format!("--aot is ignored, because the {feature} feature")),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!dylib.exists());
+    }
 }

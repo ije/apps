@@ -59,7 +59,17 @@ pub fn run(
     if let Some(path) = &binary {
         target.validate_binary(path)?;
     }
-    let compiled = aot
+    let disabled =
+        apps_runtime::bundle::disabled_features(files.get("package.json").map(String::as_str))?;
+    let dynamic = ["jsExecute", "httpImport"]
+        .into_iter()
+        .find(|feature| disabled & apps_runtime::bundle::feature_bit(feature) == 0);
+    if aot && let Some(feature) = dynamic {
+        eprintln!(
+            "apps: warning: --aot is ignored, because the {feature} feature runs code that is not compiled"
+        );
+    }
+    let compiled = (aot && dynamic.is_none())
         .then(|| crate::aot::compile(&mut files, runtime))
         .transpose()?;
     let (bytes, _) = packaging::package_app(
