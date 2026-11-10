@@ -733,6 +733,15 @@ mod tests {
     }
 
     #[test]
+    fn layout_units_keep_huge_lengths() {
+        assert_eq!(to_layout_unit(10_665_899., 1.), 10_665_899.);
+        assert_eq!(to_layout_unit(-10_665_899., 1.), -10_665_899.);
+        assert_eq!(to_layout_unit(12_000_000., 2.), 24_000_000.);
+        assert_eq!(to_layout_unit(0.999_999_94, 1.), 1.);
+        assert_eq!(to_layout_unit(0.99, 1.), 63. / 64.);
+    }
+
+    #[test]
     fn calc_handles_keep_the_fraction_and_offset() {
         for (fraction, offset, scale) in [
             (0.5, 8., 2.),

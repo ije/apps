@@ -776,7 +776,9 @@ pub(crate) fn round_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
 
 // Match Chrome's 1/64-pixel truncation. The bias prevents float error from subtracting a layout unit.
 pub fn to_layout_unit(logical: f32, scale_factor: f32) -> f32 {
-    (logical * scale_factor * 64. * (1. + 1e-6)).trunc() / 64.
+    let units = logical * scale_factor * 64.;
+    // Keep the bias below one unit: a relative bias adds 10px to a 10,000,000px length.
+    (units + (units.abs() * 1e-6).min(0.5).copysign(units)).trunc() / 64.
 }
 
 pub(crate) fn round_stroke_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {

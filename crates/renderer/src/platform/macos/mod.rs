@@ -472,7 +472,7 @@ impl Platform {
 
     pub fn quit(&self) {
         // Terminating closes windows, whose callbacks need the app, so it runs after
-    // the current event.
+        // the current event.
         native_post(Box::new(|| {
             post_local(|| {
                 let app = NSApplication::sharedApplication(MainThreadMarker::new().unwrap());
