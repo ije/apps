@@ -890,10 +890,7 @@ impl PageView {
                     .iter()
                     .find(|(painted, _)| *painted == id)
                     .map_or(&styles.values[id], |(_, style)| style);
-                shown = style
-                    .get(Prop::OPACITY)
-                    .and_then(|value| value.parse::<f32>().ok())
-                    .is_none_or(|value| value > 0.);
+                shown = effects::opacity(style) > 0.;
                 current = doc.nodes[id].parent;
             }
             if frame.2 != shown {
@@ -1692,11 +1689,8 @@ impl PageView {
                     {
                         el = el.bg(rgba(color << 8 | alpha as u32));
                     }
-                    if let Some(opacity) = backdrop
-                        .get(Prop::OPACITY)
-                        .and_then(|value| value.parse::<f32>().ok())
-                    {
-                        el = el.opacity(opacity.clamp(0., 1.));
+                    if backdrop.get(Prop::OPACITY).is_some() {
+                        el = el.opacity(effects::opacity(backdrop).clamp(0., 1.));
                     }
                     if backdrop
                         .get(Prop::BACKGROUND_IMAGE)

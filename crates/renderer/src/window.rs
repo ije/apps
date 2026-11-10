@@ -1426,6 +1426,16 @@ impl Window {
         self.content_masks.push((mask, snapped));
     }
 
+    // WARNING: replaces the clips of the boxes between this one and its containing block, so the mask must come from
+    // the same layer. Pop it with `pop_content_mask`.
+    pub(crate) fn push_escaped_content_mask(&mut self, mask: ContentMask<Pixels>) {
+        self.push_content_mask(mask);
+    }
+
+    pub(crate) fn pop_content_mask(&mut self) {
+        self.content_masks.pop();
+    }
+
     pub fn with_content_mask<R>(
         &mut self,
         mask: Option<ContentMask<Pixels>>,

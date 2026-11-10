@@ -57,6 +57,7 @@ struct Slot {
     below: bool,
     volatile: bool,
     reach: Option<Bounds<Pixels>>,
+    escaped: Option<ContentMask<Pixels>>,
 }
 
 type Remains = (
@@ -95,6 +96,7 @@ impl Slot {
             below: false,
             volatile: false,
             reach: None,
+            escaped: None,
         }
     }
 }
@@ -133,6 +135,7 @@ impl Slot {
         self.placed = None;
         self.below = false;
         self.volatile = false;
+        self.escaped = None;
     }
 
     fn taffy(&self) -> &taffy::Style {
@@ -184,6 +187,7 @@ pub struct Tree {
     shared: FxHashMap<*const Style, (Rc<Style>, Rc<Styled>)>,
     texts: Interned<TextStyle>,
     stacks: Vec<Vec<(i32, u32, ContentMask<Pixels>)>>,
+    blocks: Vec<(u8, ContentMask<Pixels>)>,
     painting: Vec<u32>,
     unbounded: u32,
     previous: Vec<Hitbox>,
@@ -498,6 +502,7 @@ impl Tree {
         slot.style = styled;
         slot.stretched = stretched;
         slot.volatile = hooks.as_ref().is_some_and(|hooks| hooks.volatile())
+            || slot.style.escape != 0
             || events
                 .as_ref()
                 .is_some_and(|events| events.scroll.is_some());
@@ -716,6 +721,7 @@ impl Tree {
         mem::swap(&mut self.previous, &mut self.hitboxes);
         self.hitboxes.clear();
         self.stacks.clear();
+        self.blocks.clear();
         #[cfg(debug_assertions)]
         let start = window.hitbox_places().len();
         self.prepaint_node(index_of(root), Point::default(), window);
@@ -743,6 +749,7 @@ impl Tree {
             window.truncate_hitboxes(start);
             self.hitboxes.clear();
             self.stacks.clear();
+            self.blocks.clear();
             self.full = true;
             self.prepaint_node(index_of(root), Point::default(), window);
             self.full = false;
@@ -794,6 +801,24 @@ impl Tree {
             self.keep(index, parent, window);
             return;
         }
+        // WARNING: an out-of-flow box is volatile, so its ancestors are never kept and its containing block pushed its
+        // clip to `blocks` in this pass.
+        let escape = slot.style.escape;
+        slot.escaped = (escape != 0).then(|| {
+            self.blocks
+                .iter()
+                .rev()
+                .find(|(contains, _)| contains & escape != 0)
+                .map_or_else(
+                    || ContentMask::from(Bounds::new(Point::default(), window.viewport_size())),
+                    |(_, mask)| *mask,
+                )
+        });
+        let slot = &mut self.slots[index as usize];
+        if let Some(mask) = slot.escaped {
+            window.push_escaped_content_mask(mask);
+        }
+        let placement = window.placement();
         slot.placed = Some((prepaints, origin, placement));
         slot.origin = origin;
         slot.listed = false;
@@ -830,6 +855,9 @@ impl Tree {
         {
             list.push((order, index, window.content_mask()));
             self.slots[index as usize].listed = true;
+        }
+        if self.slots[index as usize].escaped.is_some() {
+            window.pop_content_mask();
         }
     }
 
@@ -880,12 +908,18 @@ impl Tree {
                     list.clear();
                     self.stacks.push(list);
                 }
+                if style.contains != 0 {
+                    self.blocks.push((style.contains, window.content_mask()));
+                }
                 window.with_element_offset(offset, |window| {
                     for child in 0..self.slots[index as usize].children.len() {
                         let child = index_of(self.slots[index as usize].children[child]);
                         self.prepaint_node(child, origin, window);
                     }
                 });
+                if style.contains != 0 {
+                    self.blocks.pop();
+                }
                 if style.stacking {
                     let mut list = self.stacks.pop().unwrap_or_default();
                     list.sort_by_key(|(order, ..)| *order);
@@ -1062,15 +1096,19 @@ impl Tree {
 
     fn paint_node(&mut self, index: u32, listed: bool, window: &mut Window) {
         let slot = &self.slots[index as usize];
+        let escaped = slot.escaped;
         // WARNING: a layers node paints the z-indexed boxes of its stacking context, whose reach holds them.
         if slot.listed != listed
             || self.unbounded == 0
                 && !matches!(slot.kind, Kind::Layers(_))
-                && slot
-                    .reach
-                    .is_some_and(|reach| !reach.intersects(&window.content_mask().bounds))
+                && slot.reach.is_some_and(|reach| {
+                    !reach.intersects(&escaped.unwrap_or_else(|| window.content_mask()).bounds)
+                })
         {
             return;
+        }
+        if let Some(mask) = escaped {
+            window.push_escaped_content_mask(mask);
         }
         // WARNING: below a transform or an effect, boxes paint elsewhere than their bounds, so none is skipped.
         let unbounded = slot.hooks.as_ref().is_some_and(|hooks| !hooks.bounded());
@@ -1103,6 +1141,9 @@ impl Tree {
         }
         self.unbounded -= u32::from(unbounded);
         window.font_smoothing = smoothing;
+        if escaped.is_some() {
+            window.pop_content_mask();
+        }
     }
 
     fn paint_box(&mut self, index: u32, style: &Style, window: &mut Window) {

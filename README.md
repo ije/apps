@@ -39,6 +39,8 @@ It copies only the files and folders in `files` of `package.json`, at their path
 }
 ```
 
+`paths` in the nearest `tsconfig.json`, with `baseUrl` and relative `extends`, map imports in app modules like TypeScript does, for example `"@/*": ["./src/*"]`. A CSS `@import` of a package uses its `exports` with the `style` condition, like Tailwind. So the [shadcn/ui manual installation](https://ui.shadcn.com/docs/installation/manual) works as written. See [examples/shadcn](examples/shadcn).
+
 Set `preload` in `package.json` to expose module exports to page scripts:
 
 ```json

@@ -65,6 +65,13 @@ struct Shared {
     env: Value,
     process_entries: RefCell<BTreeSet<PathBuf>>,
     names: RefCell<HashMap<String, PathBuf>>,
+    tsconfigs: RefCell<HashMap<PathBuf, Option<Rc<TsPaths>>>>,
+}
+
+struct TsPaths {
+    file: PathBuf,
+    base: PathBuf,
+    paths: serde_json::Map<String, Value>,
 }
 
 struct Loaders {
@@ -94,6 +101,110 @@ impl Shared {
                 })
             })
     }
+
+    // WARNING: like TypeScript, only the nearest tsconfig.json counts, even when it has no paths.
+    fn tsconfig(&self, directory: &Path) -> Result<Option<Rc<TsPaths>>> {
+        if let Some(found) = self.tsconfigs.borrow().get(directory) {
+            return Ok(found.clone());
+        }
+        let file = directory.join("tsconfig.json");
+        let found = if file.is_file() {
+            let (paths, base) = tsconfig_paths(&file, 0)?;
+            paths.map(|(directory, paths)| {
+                Rc::new(TsPaths {
+                    file,
+                    base: base.unwrap_or(directory),
+                    paths,
+                })
+            })
+        } else {
+            match directory.parent() {
+                Some(parent) => self.tsconfig(parent)?,
+                None => None,
+            }
+        };
+        self.tsconfigs
+            .borrow_mut()
+            .insert(directory.to_owned(), found.clone());
+        Ok(found)
+    }
+}
+
+type Paths = (
+    Option<(PathBuf, serde_json::Map<String, Value>)>,
+    Option<PathBuf>,
+);
+
+// Returns `paths` with the folder they are relative to without `baseUrl`, and `baseUrl`. Each comes from the nearest
+// config in the `extends` chain that sets it.
+fn tsconfig_paths(file: &Path, depth: usize) -> Result<Paths> {
+    ensure!(
+        depth < 16,
+        "tsconfig.json extends itself: {}",
+        file.display()
+    );
+    let source =
+        fs::read_to_string(file).with_context(|| format!("Cannot read {}", file.display()))?;
+    let mut json = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                json.push(c);
+                while let Some(c) = chars.next() {
+                    json.push(c);
+                    if c == '\\' {
+                        json.extend(chars.next());
+                    } else if c == '"' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.next_if_eq(&'/').is_some() => {
+                while chars.next_if(|&c| c != '\n').is_some() {}
+            }
+            '/' if chars.next_if_eq(&'*').is_some() => {
+                while let Some(c) = chars.next() {
+                    if c == '*' && chars.next_if_eq(&'/').is_some() {
+                        break;
+                    }
+                }
+            }
+            '}' | ']' => {
+                let end = json.trim_end().len();
+                if json[..end].ends_with(',') {
+                    json.truncate(end - 1);
+                }
+                json.push(c);
+            }
+            _ => json.push(c),
+        }
+    }
+    let config: Value =
+        serde_json::from_str(&json).with_context(|| format!("Invalid {}", file.display()))?;
+    let directory = file.parent().context("Missing tsconfig.json folder")?;
+    let options = &config["compilerOptions"];
+    let mut paths = options["paths"]
+        .as_object()
+        .map(|paths| (directory.to_owned(), paths.clone()));
+    let mut base = options["baseUrl"].as_str().map(|url| directory.join(url));
+    if let Some(parent) = config["extends"]
+        .as_str()
+        .filter(|_| paths.is_none() || base.is_none())
+        && parent.starts_with('.')
+    {
+        let mut parent = directory.join(parent);
+        if parent
+            .extension()
+            .is_none_or(|extension| extension != "json")
+        {
+            parent.as_mut_os_string().push(".json");
+        }
+        let (inherited, inherited_base) = tsconfig_paths(&parent, depth + 1)?;
+        paths = paths.or(inherited);
+        base = base.or(inherited_base);
+    }
+    Ok((paths, base))
 }
 
 // WARNING: cached modules contain `$appsImport(N)` and `$appsN<id>`, so a graph never reuses or changes module ids.
@@ -1481,6 +1592,42 @@ impl Builder {
             }
             return Ok((path, None));
         }
+        if !specifier.starts_with('#')
+            && !base
+                .components()
+                .any(|part| part.as_os_str() == "node_modules")
+            && let Some(config) = self.shared.tsconfig(base)?
+            && let Some((star, targets)) = config
+                .paths
+                .iter()
+                .filter_map(|(pattern, targets)| match pattern.split_once('*') {
+                    Some((prefix, suffix)) => (specifier.len() >= prefix.len() + suffix.len()
+                        && specifier.starts_with(prefix)
+                        && specifier.ends_with(suffix))
+                    .then(|| {
+                        let star = &specifier[prefix.len()..specifier.len() - suffix.len()];
+                        (Some(star), prefix.len(), targets)
+                    }),
+                    None => (pattern == specifier).then_some((None, usize::MAX, targets)),
+                })
+                .max_by_key(|(_, length, _)| *length)
+                .map(|(star, _, targets)| (star, targets))
+            && let Some(path) = targets.as_array().into_iter().flatten().find_map(|target| {
+                let target = target.as_str()?;
+                let target =
+                    star.map_or_else(|| target.to_owned(), |star| target.replace('*', star));
+                resolve_file(&config.base.join(target)).ok()
+            })
+        {
+            self.files.borrow_mut().insert(config.file.clone());
+            if let Some(cache) = cache {
+                cache
+                    .resolutions
+                    .borrow_mut()
+                    .insert(resolution, (path.clone(), None, Some(config.file.clone())));
+            }
+            return Ok((path, None));
+        }
         let alias = self.shared.aliased(specifier);
         let imports = alias || specifier.starts_with('#');
         let (directory, key) = if let Some((directory, _)) =
@@ -1551,64 +1698,13 @@ impl Builder {
         };
         let entry = if let Some(exports) = metadata.get(if imports { "imports" } else { "exports" })
         {
-            let mut replacement = None;
-            let selected = if let Some(map) = exports
-                .as_object()
-                .filter(|map| imports || map.keys().any(|k| k.starts_with(['.', '#'])))
-            {
-                if let Some(value) = map.get(&key) {
-                    value
-                } else {
-                    let (prefix, suffix, value) = map
-                        .iter()
-                        .filter_map(|(pattern, value)| {
-                            let (prefix, suffix) = pattern.split_once('*')?;
-                            (key.starts_with(prefix)
-                                && key.ends_with(suffix)
-                                && key.len() >= prefix.len() + suffix.len())
-                            .then_some((prefix, suffix, value))
-                        })
-                        .max_by_key(|(prefix, suffix, _)| (prefix.len(), suffix.len()))
-                        .with_context(|| format!("Package does not export {key}"))?;
-                    replacement = Some(&key[prefix.len()..key.len() - suffix.len()]);
-                    value
-                }
-            } else {
-                ensure!(key == ".", "Package does not export {key}");
-                exports
-            };
             let conditions: &[&str] = match (self.realm == Realm::Renderer, require) {
                 (true, true) => &["browser", "require", "default"],
                 (true, false) => &["browser", "import", "default"],
                 (false, true) => &["node", "require", "module-sync", "node-addons", "default"],
                 (false, false) => &["node", "import", "module-sync", "node-addons", "default"],
             };
-            let mut candidates = vec![selected];
-            let mut path = None;
-            while let Some(value) = candidates.pop() {
-                match value {
-                    Value::String(value) => {
-                        path = Some(value.as_str());
-                        break;
-                    }
-                    Value::Array(values) => candidates.extend(values.iter().rev()),
-                    Value::Object(values) => candidates.extend(
-                        values
-                            .iter()
-                            .filter(|(key, _)| conditions.contains(&key.as_str()))
-                            .map(|(_, value)| value)
-                            .rev(),
-                    ),
-                    Value::Null => break,
-                    _ => {}
-                }
-            }
-            let value = path.context("Package has no supported export condition")?;
-            let value = if let Some(replacement) = replacement {
-                value.replace('*', replacement)
-            } else {
-                value.to_owned()
-            };
+            let value = exported(exports, &key, conditions, imports)?;
             if imports && !value.starts_with(['.', '/', '#']) {
                 ensure!(
                     !self.shared.aliased(&value),
@@ -4045,6 +4141,60 @@ fn local(root: &Path, directory: &Path, reference: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+fn exported(exports: &Value, key: &str, conditions: &[&str], imports: bool) -> Result<String> {
+    let mut replacement = None;
+    let selected = if let Some(map) = exports
+        .as_object()
+        .filter(|map| imports || map.keys().any(|k| k.starts_with(['.', '#'])))
+    {
+        if let Some(value) = map.get(key) {
+            value
+        } else {
+            let (prefix, suffix, value) = map
+                .iter()
+                .filter_map(|(pattern, value)| {
+                    let (prefix, suffix) = pattern.split_once('*')?;
+                    (key.starts_with(prefix)
+                        && key.ends_with(suffix)
+                        && key.len() >= prefix.len() + suffix.len())
+                    .then_some((prefix, suffix, value))
+                })
+                .max_by_key(|(prefix, suffix, _)| (prefix.len(), suffix.len()))
+                .with_context(|| format!("Package does not export {key}"))?;
+            replacement = Some(&key[prefix.len()..key.len() - suffix.len()]);
+            value
+        }
+    } else {
+        ensure!(key == ".", "Package does not export {key}");
+        exports
+    };
+    let mut candidates = vec![selected];
+    let mut path = None;
+    while let Some(value) = candidates.pop() {
+        match value {
+            Value::String(value) => {
+                path = Some(value.as_str());
+                break;
+            }
+            Value::Array(values) => candidates.extend(values.iter().rev()),
+            Value::Object(values) => candidates.extend(
+                values
+                    .iter()
+                    .filter(|(key, _)| conditions.contains(&key.as_str()))
+                    .map(|(_, value)| value)
+                    .rev(),
+            ),
+            Value::Null => break,
+            _ => {}
+        }
+    }
+    let value = path.context("Package has no supported export condition")?;
+    Ok(match replacement {
+        Some(replacement) => value.replace('*', replacement),
+        None => value.to_owned(),
+    })
+}
+
 fn css_package(directory: &Path, name: &str) -> Result<PathBuf> {
     let count = if name.starts_with('@') { 2 } else { 1 };
     let package = name.split('/').take(count).collect::<Vec<_>>().join("/");
@@ -4054,13 +4204,29 @@ fn css_package(directory: &Path, name: &str) -> Result<PathBuf> {
         .map(|directory| directory.join("node_modules").join(&package))
         .find(|path| path.is_dir())
         .with_context(|| format!("Cannot resolve CSS import {name}"))?;
+    let metadata: Value = fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|source| serde_json::from_str(&source).ok())
+        .unwrap_or_default();
+    // WARNING: like Tailwind's resolver, `exports` uses the `style` condition, and a package without a match falls back
+    // to plain paths.
+    if let Some(entry) = metadata.get("exports").and_then(|exports| {
+        let key = if subpath.is_empty() {
+            "."
+        } else {
+            &format!("./{subpath}")
+        };
+        exported(exports, key, &["style", "default"], false)
+            .ok()
+            .filter(|entry| entry.starts_with("./") && entry.ends_with(".css"))
+    }) {
+        return Ok(root.join(entry));
+    }
     if !subpath.is_empty() {
         return Ok(root.join(subpath));
     }
-    let metadata: Value = serde_json::from_str(&fs::read_to_string(root.join("package.json"))?)?;
-    let entry = metadata["exports"]["."]["style"]
+    let entry = metadata["style"]
         .as_str()
-        .or_else(|| metadata["style"].as_str())
         .or_else(|| {
             metadata["main"]
                 .as_str()
@@ -4204,7 +4370,9 @@ fn css(
                 let target = if name.starts_with(['.', '/']) || Path::new(name).is_absolute() {
                     local(&shared.root, directory, name)?
                 } else {
-                    css_package(directory, name)?.canonicalize()?
+                    css_package(directory, name)?
+                        .canonicalize()
+                        .with_context(|| format!("Cannot resolve CSS import {name}"))?
                 };
                 css(&target, None, stack, files, shared)?
             }

@@ -334,6 +334,17 @@ pub struct Style {
     pub opacity: Option<f32>,
     pub z_index: Option<i32>,
     pub stacking: bool,
+    /// [`Escape`] bits of the out-of-flow boxes that this box contains.
+    pub contains: u8,
+    /// An [`Escape`] bit when the box is out of flow: only the clips of its containing block apply.
+    pub escape: u8,
+}
+
+pub struct Escape;
+
+impl Escape {
+    pub const ABSOLUTE: u8 = 1;
+    pub const FIXED: u8 = 2;
 }
 
 impl Default for Style {
@@ -376,6 +387,8 @@ impl Default for Style {
             opacity: None,
             z_index: None,
             stacking: false,
+            contains: 0,
+            escape: 0,
         }
     }
 }

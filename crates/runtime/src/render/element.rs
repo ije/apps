@@ -60,7 +60,7 @@ pub(super) enum Query {
     Break,
     UserSelect,
     Positioner(bool),
-    Backdrop,
+    Backdrop(u32),
     Scroller,
     Editable,
     Cell,
@@ -90,6 +90,7 @@ impl Query {
             Query::Block(node) => Query::Block(at(node)?),
             Query::Scroll(node) => Query::Scroll(at(node)?),
             Query::Width(node) => Query::Width(at(node)?),
+            Query::Backdrop(node) => Query::Backdrop(at(node)?),
             Query::Track(node, axis) => Query::Track(at(node)?, axis),
             Query::Baselines(node) => Query::Baselines(at(node)?),
             Query::Atom(node) => Query::Atom(at(node)?),
@@ -284,14 +285,11 @@ fn insets(styles: &ComputedStyles, node: usize, padding: bool, width: f32) -> [f
     })
 }
 
-fn backdrop(styles: &ComputedStyles, ancestors: &[usize], id: usize) -> Option<(usize, u32)> {
-    std::iter::once(id)
-        .chain(ancestors.iter().rev().copied())
-        .enumerate()
-        .find_map(|(up, node)| {
-            let (ink, alpha) = style::color(styles.values[node].get(Prop::BACKGROUND_COLOR)?)?;
-            (alpha >= 128).then_some((up, ink))
-        })
+fn backdrop(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<(usize, u32)> {
+    std::iter::successors(Some(id), |&node| doc.nodes[node].parent).find_map(|node| {
+        let (ink, alpha) = style::color(styles.values[node].get(Prop::BACKGROUND_COLOR)?)?;
+        (alpha >= 128).then_some((node, ink))
+    })
 }
 
 const LOOK: u16 = crate::dom::HOVER | crate::dom::ACTIVE;
@@ -521,7 +519,7 @@ impl<'a> Build<'a> {
                 self.ancestors.iter().rev().copied(),
                 |ancestor| super::effects::establishes(&styles.values[ancestor]),
             )),
-            Query::Backdrop => hashed(backdrop(styles, &self.ancestors, id).map(|(_, ink)| ink)),
+            Query::Backdrop(node) => hashed(backdrop(doc, styles, node as usize)),
             Query::Scroller => {
                 let Some(handles) = dom.map(|dom| &dom.scroll) else {
                     return Replay::Changed;
@@ -1345,7 +1343,7 @@ impl std::fmt::Debug for Query {
             Query::Break => write!(f, "Break"),
             Query::UserSelect => write!(f, "UserSelect"),
             Query::Positioner(fixed) => write!(f, "Positioner({fixed})"),
-            Query::Backdrop => write!(f, "Backdrop"),
+            Query::Backdrop(node) => write!(f, "Backdrop({node})"),
             Query::Scroller => write!(f, "Scroller"),
             Query::Editable => write!(f, "Editable"),
             Query::Cell => write!(f, "Cell"),
@@ -1832,7 +1830,7 @@ fn create(
                 scope: if read.scope == 0 {
                     0
                 } else {
-                    (depth + 1).saturating_sub(usize::from(read.scope)).max(1) as u16
+                    (depth + 2).saturating_sub(usize::from(read.scope)).max(1) as u16
                 },
                 reader: depth as u16,
                 ..here(read)
@@ -1856,6 +1854,13 @@ fn create(
                 "flex" | "inline-flex" | "grid" | "inline-grid" => renderer::Baseline::First,
                 "table" | "inline-table" => renderer::Baseline::FirstOnly,
                 _ => renderer::Baseline::Auto,
+            };
+            el.style().contains = u8::from(made.absolute) * renderer::Escape::ABSOLUTE
+                | u8::from(made.fixed) * renderer::Escape::FIXED;
+            el.style().escape = match position {
+                "absolute" => renderer::Escape::ABSOLUTE,
+                "fixed" => renderer::Escape::FIXED,
+                _ => 0,
             };
             {
                 let text = el.text_style();
@@ -2595,11 +2600,11 @@ fn create(
     }
     let scrolls = overflow.map(|axis| axis == renderer::Overflow::Scroll);
     let look = if scrolls.contains(&true) {
-        let backdrop = backdrop(styles, ancestors, id);
+        let backdrop = backdrop(doc, styles, id);
         reader.log(
-            Query::Backdrop,
-            backdrop.map_or(1, |(up, _)| depth + 1 - up),
-            hashed(backdrop.map(|(_, ink)| ink)),
+            Query::Backdrop(id as u32),
+            backdrop.map_or(1, |(provider, _)| reader.scope_of(id, provider)),
+            hashed(backdrop),
         );
         reader.log(
             Query::Theme,
@@ -4561,9 +4566,8 @@ fn create(
                         }
                     }
                     Prop::OPACITY => {
-                        if let Ok(opacity) = value.parse::<f32>() {
-                            decoration = decoration.opacity(opacity.clamp(0., 1.));
-                        }
+                        decoration =
+                            decoration.opacity(super::effects::opacity(pseudo).clamp(0., 1.));
                     }
                     Prop::BOX_SHADOW => {
                         decoration.style().box_shadow = pseudo_units.shadows(value, false);
@@ -5131,8 +5135,33 @@ fn create(
             let auto = style.get(Prop::HEIGHT).is_none_or(|v| v == "auto");
             let rows = grid.rows.iter().sum::<f32>()
                 + grid.rows.len().saturating_sub(1) as f32 * grid.gap[1];
+            let vertical = padding[0] + padding[2] + borders[0] + borders[2];
             if auto && !flexed {
-                el = el.h(px(rows + padding[0] + padding[2] + borders[0] + borders[2]));
+                el = el.h(px(rows + vertical));
+            }
+            // WARNING: grid items are absolute, so a flexed grid needs an in-flow box of its content height for the
+            // content-based flex basis and `min-height: auto`. Rows stretched to the last height can't give it.
+            if flexed {
+                let [.., height] = super::grid::intrinsic(
+                    doc,
+                    id,
+                    styles,
+                    Some(
+                        content[0]
+                            + padding[1]
+                            + padding[3]
+                            + borders[1]
+                            + borders[3]
+                            + margin[1]
+                            + margin[3],
+                    ),
+                    None,
+                    text,
+                    &mut measured.borrow_mut(),
+                );
+                el = el.child(
+                    renderer::node().h(px((height - vertical - margin[0] - margin[2]).max(0.))),
+                );
             }
             if !flexed && made.absolute {
                 blocks.borrow_mut().insert(
@@ -6193,10 +6222,12 @@ fn create(
                 .map(|read| {
                     Some(Read {
                         query: read.query.moved(id as u32, u32::MAX)?,
+                        // WARNING: unlike kept records, entries hold the box's own reads, so its own scope is 1 and 0
+                        // stays the page.
                         scope: if read.scope == 0 {
                             0
                         } else {
-                            (depth + 1 - usize::from(read.scope)) as u16
+                            (depth + 2 - usize::from(read.scope)) as u16
                         },
                         reader: 0,
                         ..*read

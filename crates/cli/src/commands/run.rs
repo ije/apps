@@ -263,10 +263,9 @@ pub fn run(
                                 notify::event::ModifyKind::Data(_)
                                     | notify::event::ModifyKind::Metadata(_)
                             )
-                        ) || event
-                            .paths
-                            .iter()
-                            .any(|path| path.ends_with("package.json")))
+                        ) || event.paths.iter().any(|path| {
+                            path.ends_with("package.json") || path.ends_with("tsconfig.json")
+                        }))
                     {
                         cache.resolutions.borrow_mut().clear();
                     }

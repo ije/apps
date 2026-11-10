@@ -2724,6 +2724,53 @@ fn app_imports_map_bare_specifiers_in_dependencies() {
 }
 
 #[test]
+fn tsconfig_paths_and_css_package_exports() {
+    let dir = tempfile::tempdir().unwrap();
+    for (path, source) in [
+        (
+            "tsconfig.base.json",
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["./missing/*","./src/*"],"exact":["./src/exact.ts"]}}}"#,
+        ),
+        (
+            "tsconfig.json",
+            "{\n  // \"extends\": \"./other\",\n  \"extends\": \"./tsconfig.base\",\n  /* , */ \"compilerOptions\": { \"strict\": true, \"jsx\": \"a//b\", },\n}",
+        ),
+        (
+            "app.ts",
+            "import { a } from '@/lib/a'; import { exact } from 'exact'; import { dep } from 'dep'; globalThis.result = [a, exact, dep].join(':'); console.log(import.meta.resolve('./index.html'));",
+        ),
+        ("src/lib/a.ts", "export const a = 'a';"),
+        ("src/exact.ts", "export const exact = 'exact';"),
+        (
+            "node_modules/dep/package.json",
+            r#"{"type":"module","main":"index.js"}"#,
+        ),
+        ("node_modules/dep/index.js", "export const dep = 'dep';"),
+        (
+            "node_modules/kit/package.json",
+            r#"{"exports":{".":{"types":"./index.d.ts","default":"./index.js"},"./theme.css":"./dist/theme.css"}}"#,
+        ),
+        ("node_modules/kit/dist/theme.css", ".kit{color:red}"),
+        ("style.css", "@import 'kit/theme.css';"),
+        ("index.html", "<link rel='stylesheet' href='style.css'>"),
+    ] {
+        fs::create_dir_all(dir.path().join(path).parent().unwrap()).unwrap();
+        fs::write(dir.path().join(path), source).unwrap();
+    }
+    let entry = dir.path().join("app.ts");
+    let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
+    assert!(files["page-0.html"].contains(".kit{color:red}"));
+    let engine = apps_runtime::jsc::JsContext::new(
+        apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+        Rc::default(),
+        apps_runtime::host::Role::Main,
+    )
+    .unwrap();
+    engine.load_bundle(&files, "app.js").unwrap();
+    assert_eq!(engine.eval("result", "test").unwrap(), "a:exact:dep");
+}
+
+#[test]
 fn workers_keep_native_addons_from_earlier_modules() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("node_modules/native")).unwrap();
