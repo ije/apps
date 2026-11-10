@@ -5,22 +5,17 @@ use super::{ImageRefMut, f32_bound};
 use usvg::filter::{ComponentTransfer, TransferFunction};
 
 pub fn apply(fe: &ComponentTransfer, src: ImageRefMut) {
+    let tables = [fe.func_r(), fe.func_g(), fe.func_b(), fe.func_a()].map(|func| {
+        std::array::from_fn::<u8, 256, _>(|c| match is_dummy(func) {
+            true => c as u8,
+            false => transfer(func, c as u8),
+        })
+    });
     for pixel in src.data {
-        if !is_dummy(fe.func_r()) {
-            pixel.r = transfer(fe.func_r(), pixel.r);
-        }
-
-        if !is_dummy(fe.func_b()) {
-            pixel.b = transfer(fe.func_b(), pixel.b);
-        }
-
-        if !is_dummy(fe.func_g()) {
-            pixel.g = transfer(fe.func_g(), pixel.g);
-        }
-
-        if !is_dummy(fe.func_a()) {
-            pixel.a = transfer(fe.func_a(), pixel.a);
-        }
+        pixel.r = tables[0][pixel.r as usize];
+        pixel.g = tables[1][pixel.g as usize];
+        pixel.b = tables[2][pixel.b as usize];
+        pixel.a = tables[3][pixel.a as usize];
     }
 }
 

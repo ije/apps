@@ -8,6 +8,46 @@ pub fn apply(
     transform: tiny_skia::Transform,
     pixmap: &mut tiny_skia::Pixmap,
 ) {
+    // WARNING: a clip of one path is that path's coverage, which is what clearing it from an opaque pixmap and
+    // inverting the alpha gave, so it fills a mask directly. Clips of more paths keep the pixmap, because its
+    // rounding where they overlap differs from a mask's.
+    let mut ts = transform.pre_concat(clip.transform());
+    let mut group = clip.root();
+    let path = loop {
+        match group.children() {
+            [usvg::Node::Path(path)] => break Some(path),
+            [usvg::Node::Group(child)] if child.clip_path().is_none() => {
+                ts = ts.pre_concat(child.transform());
+                group = child;
+            }
+            [usvg::Node::Text(text)] => group = text.flattened(),
+            _ => break None,
+        }
+    };
+    if let Some(path) = path {
+        let Some(mut mask) = tiny_skia::Mask::new(pixmap.width(), pixmap.height()) else {
+            return;
+        };
+        let bounds = path.data().bounds();
+        if let Some(fill) = path.fill()
+            && path.is_visible()
+            && bounds.width() != 0.0
+            && bounds.height() != 0.0
+        {
+            let rule = match fill.rule() {
+                usvg::FillRule::NonZero => tiny_skia::FillRule::Winding,
+                usvg::FillRule::EvenOdd => tiny_skia::FillRule::EvenOdd,
+            };
+            let anti_alias = path.rendering_mode().use_shape_antialiasing();
+            mask.fill_path(path.data(), rule, anti_alias, ts);
+        }
+        if let Some(clip) = clip.clip_path() {
+            apply(clip, transform, pixmap);
+        }
+        super::render::apply_mask(pixmap, &mask);
+        return;
+    }
+
     let mut clip_pixmap = tiny_skia::Pixmap::new(pixmap.width(), pixmap.height()).unwrap();
     clip_pixmap.fill(tiny_skia::Color::BLACK);
 
@@ -24,7 +64,7 @@ pub fn apply(
 
     let mut mask = tiny_skia::Mask::from_pixmap(clip_pixmap.as_ref(), tiny_skia::MaskType::Alpha);
     mask.invert();
-    pixmap.apply_mask(&mask);
+    super::render::apply_mask(pixmap, &mask);
 }
 
 fn draw_children(

@@ -1654,6 +1654,13 @@ mod tests {
     }
 
     #[test]
+    fn svg_filters_past_their_layer_draw() {
+        let tree = svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200"><filter id="f" filterUnits="userSpaceOnUse" x="0" y="0" width="200" height="2000"><feComposite in="SourceGraphic" in2="SourceGraphic" operator="arithmetic" k2="1"/></filter><rect x="20" y="20" width="160" height="160" fill="#2e8b57" filter="url(#f)"/></svg>"##).unwrap();
+        let pixels = svg_pixels(&tree, 200, 200, None).unwrap();
+        assert_eq!(pixels.pixel(100, 100).unwrap().alpha(), 255);
+    }
+
+    #[test]
     fn svg_sources_draw_capped_at_their_canvas_size() {
         let tree = svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="30000" height="10"><path d="M0 0h15000v10H0Z" fill="#ff0000"/><path d="M15000 0h15000v10H15000Z" fill="#0000ff"/></svg>"##).unwrap();
         let pixels = svg_pixels(&tree, 30000, 10, None).unwrap();

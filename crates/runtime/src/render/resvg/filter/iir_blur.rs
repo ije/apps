@@ -46,23 +46,25 @@ fn gaussian_channel(data: &mut [u8], d: &BlurData, channel: usize, buf: &mut [f6
     }
 }
 
+// WARNING: rows and columns are independent, so the passes run 4 rows at a time and the vertical one walks rows
+// in memory order. Each value still gets resvg's operations in resvg's order.
 fn gaussianiir2d(d: &BlurData, buf: &mut [f64]) {
+    let width = d.width;
     let (lambda_x, dnu_x) = if d.sigma_x > 0.0 {
         let (lambda, dnu) = gen_coefficients(d.sigma_x, d.steps);
 
-        for y in 0..d.height {
+        for rows in buf.chunks_mut(width * 4) {
+            let n = rows.len() / width;
             for _ in 0..d.steps {
-                let idx = d.width * y;
-
-                for x in 1..d.width {
-                    buf[idx + x] += dnu * buf[idx + x - 1];
+                for x in 1..width {
+                    for row in 0..n {
+                        rows[row * width + x] += dnu * rows[row * width + x - 1];
+                    }
                 }
-
-                let mut x = d.width - 1;
-
-                while x > 0 {
-                    buf[idx + x - 1] += dnu * buf[idx + x];
-                    x -= 1;
+                for x in (1..width).rev() {
+                    for row in 0..n {
+                        rows[row * width + x - 1] += dnu * rows[row * width + x];
+                    }
                 }
             }
         }
@@ -74,21 +76,17 @@ fn gaussianiir2d(d: &BlurData, buf: &mut [f64]) {
 
     let (lambda_y, dnu_y) = if d.sigma_y > 0.0 {
         let (lambda, dnu) = gen_coefficients(d.sigma_y, d.steps);
-        for x in 0..d.width {
-            for _ in 0..d.steps {
-                let idx = x;
-
-                let mut y = d.width;
-                while y < buf.len() {
-                    buf[idx + y] += dnu * buf[idx + y - d.width];
-                    y += d.width;
+        for _ in 0..d.steps {
+            for y in 1..d.height {
+                let (done, rest) = buf.split_at_mut(y * width);
+                for (out, prev) in rest[..width].iter_mut().zip(&done[(y - 1) * width..]) {
+                    *out += dnu * prev;
                 }
-
-                y = buf.len() - d.width;
-
-                while y > 0 {
-                    buf[idx + y - d.width] += dnu * buf[idx + y];
-                    y -= d.width;
+            }
+            for y in (1..d.height).rev() {
+                let (rest, done) = buf.split_at_mut(y * width);
+                for (out, next) in rest[(y - 1) * width..].iter_mut().zip(&done[..width]) {
+                    *out += dnu * next;
                 }
             }
         }

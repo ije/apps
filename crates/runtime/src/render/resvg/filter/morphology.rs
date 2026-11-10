@@ -6,59 +6,95 @@ use rgb::RGBA8;
 use usvg::filter::MorphologyOperator;
 
 pub fn apply(operator: MorphologyOperator, rx: f32, ry: f32, src: ImageRefMut) {
-    let columns = std::cmp::min(rx.ceil() as u32 * 2, src.width);
-    let rows = std::cmp::min(ry.ceil() as u32 * 2, src.height);
-    let target_x = (columns as f32 / 2.0).floor() as u32;
-    let target_y = (rows as f32 / 2.0).floor() as u32;
-
-    let width_max = src.width as i32 - 1;
-    let height_max = src.height as i32 - 1;
-
-    let mut buf = vec![RGBA8::default(); src.data.len()];
-    let mut buf = ImageRefMut::new(src.width, src.height, &mut buf);
-    let mut x = 0;
-    let mut y = 0;
-    for _ in src.data.iter() {
-        let mut new_p = RGBA8::default();
-        if operator == MorphologyOperator::Erode {
-            new_p.r = 255;
-            new_p.g = 255;
-            new_p.b = 255;
-            new_p.a = 255;
-        }
-
-        for oy in 0..rows {
-            for ox in 0..columns {
-                let tx = x as i32 - target_x as i32 + ox as i32;
-                let ty = y as i32 - target_y as i32 + oy as i32;
-
-                if tx < 0 || tx > width_max || ty < 0 || ty > height_max {
-                    continue;
-                }
-
-                let p = src.pixel_at(tx as u32, ty as u32);
-                if operator == MorphologyOperator::Erode {
-                    new_p.r = std::cmp::min(p.r, new_p.r);
-                    new_p.g = std::cmp::min(p.g, new_p.g);
-                    new_p.b = std::cmp::min(p.b, new_p.b);
-                    new_p.a = std::cmp::min(p.a, new_p.a);
-                } else {
-                    new_p.r = std::cmp::max(p.r, new_p.r);
-                    new_p.g = std::cmp::max(p.g, new_p.g);
-                    new_p.b = std::cmp::max(p.b, new_p.b);
-                    new_p.a = std::cmp::max(p.a, new_p.a);
-                }
-            }
-        }
-
-        *buf.pixel_at_mut(x, y) = new_p;
-
-        x += 1;
-        if x == src.width {
-            x = 0;
-            y += 1;
-        }
+    let columns = std::cmp::min(rx.ceil() as u32 * 2, src.width) as usize;
+    let rows = std::cmp::min(ry.ceil() as u32 * 2, src.height) as usize;
+    let (width, height) = (src.width as usize, src.height as usize);
+    let erode = operator == MorphologyOperator::Erode;
+    if columns == 0 || rows == 0 {
+        let fill = if erode { 255 } else { 0 };
+        src.data.fill(RGBA8::new(fill, fill, fill, fill));
+        return;
     }
 
-    src.data.copy_from_slice(buf.data);
+    // WARNING: the min or max over a rectangle is separable, and the van Herk/Gil-Werman passes cost the same for
+    // any radius, so this equals resvg's direct window scan.
+    let (mut g, mut h) = (Vec::new(), Vec::new());
+    for y in 0..height {
+        pass(
+            src.data,
+            y * width,
+            width,
+            1,
+            1,
+            columns,
+            erode,
+            &mut g,
+            &mut h,
+        );
+    }
+    for x in (0..width).step_by(128) {
+        let lanes = (width - x).min(128);
+        pass(
+            src.data, x, height, width, lanes, rows, erode, &mut g, &mut h,
+        );
+    }
+}
+
+// Item `i` is the `lanes` pixels at `offset + i * stride`. It takes the min or max of the items
+// `i - k / 2 .. i - k / 2 + k` that are in `0..n`.
+fn pass(
+    data: &mut [RGBA8],
+    offset: usize,
+    n: usize,
+    stride: usize,
+    lanes: usize,
+    k: usize,
+    erode: bool,
+    g: &mut Vec<RGBA8>,
+    h: &mut Vec<RGBA8>,
+) {
+    let before = k / 2;
+    let blocks = (n + k - 1).div_ceil(k);
+    let identity = if erode {
+        RGBA8::new(255, 255, 255, 255)
+    } else {
+        RGBA8::default()
+    };
+    let op = |a: RGBA8, b: RGBA8| {
+        if erode {
+            RGBA8::new(a.r.min(b.r), a.g.min(b.g), a.b.min(b.b), a.a.min(b.a))
+        } else {
+            RGBA8::new(a.r.max(b.r), a.g.max(b.g), a.b.max(b.b), a.a.max(b.a))
+        }
+    };
+    g.clear();
+    g.resize(blocks * k * lanes, identity);
+    for i in 0..n {
+        g[(i + before) * lanes..][..lanes].copy_from_slice(&data[offset + i * stride..][..lanes]);
+    }
+    h.clear();
+    h.extend_from_slice(g);
+    for block in 0..blocks {
+        let start = block * k;
+        for t in start + 1..start + k {
+            let (done, rest) = g.split_at_mut(t * lanes);
+            for (out, prev) in rest[..lanes].iter_mut().zip(&done[(t - 1) * lanes..]) {
+                *out = op(*out, *prev);
+            }
+        }
+        for t in (start..start + k - 1).rev() {
+            let (rest, done) = h.split_at_mut((t + 1) * lanes);
+            for (out, next) in rest[t * lanes..].iter_mut().zip(&done[..lanes]) {
+                *out = op(*out, *next);
+            }
+        }
+    }
+    for i in 0..n {
+        let out = &mut data[offset + i * stride..][..lanes];
+        let left = &h[i * lanes..][..lanes];
+        let right = &g[(i + k - 1) * lanes..][..lanes];
+        for ((out, a), b) in out.iter_mut().zip(left).zip(right) {
+            *out = op(*a, *b);
+        }
+    }
 }

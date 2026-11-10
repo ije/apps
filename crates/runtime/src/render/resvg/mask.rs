@@ -27,7 +27,7 @@ pub fn apply(
 
         super::render::render_nodes(mask.root(), ctx, transform, &mut mask_pixmap.as_mut());
 
-        mask_pixmap.apply_mask(&alpha_mask);
+        super::render::apply_mask(&mut mask_pixmap, &alpha_mask);
     }
 
     if let Some(mask) = mask.mask() {
@@ -40,5 +40,5 @@ pub fn apply(
     };
 
     let mask = tiny_skia::Mask::from_pixmap(mask_pixmap.as_ref(), mask_type);
-    pixmap.apply_mask(&mask);
+    super::render::apply_mask(pixmap, &mask);
 }

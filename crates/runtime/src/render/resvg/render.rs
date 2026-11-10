@@ -75,7 +75,10 @@ fn render_group(
     };
 
     if group.filters().is_empty() {
-        ibbox = super::geom::fit_to_rect(ibbox, ctx.max_bbox)?;
+        // WARNING: clip paths, masks, opacity and blending work per pixel, so a layer without filters keeps only the
+        // pixels of its parent, not up to 25 times the canvas.
+        let parent = tiny_skia::IntRect::from_xywh(0, 0, pixmap.width(), pixmap.height())?;
+        ibbox = super::geom::fit_to_rect(ibbox, parent)?;
     }
 
     let shift_ts = {
@@ -109,22 +112,118 @@ fn render_group(
         super::mask::apply(mask, ctx, transform, &mut sub_pixmap);
     }
 
-    let paint = tiny_skia::PixmapPaint {
-        opacity: group.opacity().get(),
-        blend_mode: convert_blend_mode(group.blend_mode()),
-        quality: tiny_skia::FilterQuality::Nearest,
-    };
-
-    pixmap.draw_pixmap(
-        ibbox.x(),
-        ibbox.y(),
-        sub_pixmap.as_ref(),
-        &paint,
-        tiny_skia::Transform::identity(),
-        None,
-    );
+    let blend_mode = convert_blend_mode(group.blend_mode());
+    if blend_mode == tiny_skia::BlendMode::SourceOver {
+        draw_over(
+            pixmap,
+            sub_pixmap.as_ref(),
+            ibbox.x(),
+            ibbox.y(),
+            group.opacity().get(),
+        );
+    } else {
+        let paint = tiny_skia::PixmapPaint {
+            opacity: group.opacity().get(),
+            blend_mode,
+            quality: tiny_skia::FilterQuality::Nearest,
+        };
+        pixmap.draw_pixmap(
+            ibbox.x(),
+            ibbox.y(),
+            sub_pixmap.as_ref(),
+            &paint,
+            tiny_skia::Transform::identity(),
+            None,
+        );
+    }
 
     Some(())
+}
+
+// WARNING: equals `draw_pixmap` at `(x, y)` with `SourceOver`, `opacity` and no transform pixel for pixel, as the
+// highp pipeline computes `d * (1 - sa) + s` in f32 without FMA. That pipeline runs every pixel through function
+// stages, so this skips transparent pixels and copies opaque ones instead. Unlike tiny-skia, a negative offset
+// doesn't repeat the last column or row past the image, which tiny-skia's rounding toward zero did.
+pub fn draw_over(
+    dst: &mut tiny_skia::PixmapMut,
+    src: tiny_skia::PixmapRef,
+    x: i32,
+    y: i32,
+    opacity: f32,
+) {
+    let (dw, sw) = (dst.width() as i32, src.width() as i32);
+    let [left, top] = [x.max(0), y.max(0)];
+    let right = (x + sw).min(dw);
+    let bottom = (y + src.height() as i32).min(dst.height() as i32);
+    if left >= right || top >= bottom {
+        return;
+    }
+    let len = (right - left) as usize * 4;
+    let k = 1.0 / 255.0;
+    let (src, dst) = (src.data(), dst.data_mut());
+    for row in top..bottom {
+        let from = &src[((row - y) * sw + left - x) as usize * 4..][..len];
+        let to = &mut dst[(row * dw + left) as usize * 4..][..len];
+        for (d, s) in to
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(from.as_chunks::<4>().0)
+        {
+            if *s == [0; 4] {
+                continue;
+            }
+            if s[3] == 255 && opacity == 1.0 {
+                *d = *s;
+                continue;
+            }
+            let inv = 1.0 - s[3] as f32 * k * opacity;
+            for (d, s) in d.iter_mut().zip(s) {
+                let v = *d as f32 * k * inv + *s as f32 * k * opacity;
+                *d = (v.clamp(0.0, 1.0) * 255.0).round_ties_even() as u8;
+            }
+        }
+    }
+}
+
+// WARNING: equals `draw_pixmap` at `(x, y)` onto a transparent pixmap, apart from the negative offsets that
+// `draw_over` notes.
+pub fn copy_pixmap(dst: &mut tiny_skia::Pixmap, src: &tiny_skia::Pixmap, x: i32, y: i32) {
+    let (dw, sw) = (dst.width() as i32, src.width() as i32);
+    let [left, top] = [x.max(0), y.max(0)];
+    let right = (x + sw).min(dw);
+    let bottom = (y + src.height() as i32).min(dst.height() as i32);
+    if left >= right || top >= bottom {
+        return;
+    }
+    let len = (right - left) as usize * 4;
+    let (src, dst) = (src.data(), dst.data_mut());
+    for row in top..bottom {
+        dst[(row * dw + left) as usize * 4..][..len]
+            .copy_from_slice(&src[((row - y) * sw + left - x) as usize * 4..][..len]);
+    }
+}
+
+// WARNING: equals `Pixmap::apply_mask`, whose lowp pipeline computes `(d * m + 255) >> 8`, so a mask of 255 keeps
+// the pixel and 0 clears it.
+pub fn apply_mask(pixmap: &mut tiny_skia::Pixmap, mask: &tiny_skia::Mask) {
+    for (pixel, &m) in pixmap
+        .data_mut()
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(mask.data())
+    {
+        match m {
+            255 => {}
+            0 => *pixel = [0; 4],
+            m => {
+                for c in pixel {
+                    *c = ((*c as u16 * m as u16 + 255) >> 8) as u8;
+                }
+            }
+        }
+    }
 }
 
 pub fn convert_blend_mode(mode: usvg::BlendMode) -> tiny_skia::BlendMode {
@@ -145,5 +244,51 @@ pub fn convert_blend_mode(mode: usvg::BlendMode) -> tiny_skia::BlendMode {
         usvg::BlendMode::Saturation => tiny_skia::BlendMode::Saturation,
         usvg::BlendMode::Color => tiny_skia::BlendMode::Color,
         usvg::BlendMode::Luminosity => tiny_skia::BlendMode::Luminosity,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pixel_helpers_match_tiny_skia() {
+        let mut seed = 0x9e37_79b9u32;
+        let mut next = |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % n
+        };
+        for _ in 0..2000 {
+            let mut images = [0, 0].map(|_| {
+                let mut pixmap = tiny_skia::Pixmap::new(next(9) + 1, next(9) + 1).unwrap();
+                for pixel in pixmap.data_mut().as_chunks_mut::<4>().0 {
+                    let alpha = [0, 255, next(256)][next(3) as usize];
+                    *pixel = [0, 0, 0, 0].map(|_| (next(256) % (alpha + 1)) as u8);
+                    pixel[3] = alpha as u8;
+                }
+                pixmap
+            });
+            let [x, y] = [next(6) as i32, next(6) as i32];
+            let opacity = [1.0, 0.5, 0.3, 0.77][next(4) as usize];
+            let [src, dst] = &mut images;
+            let mut expected = dst.clone();
+            let paint = tiny_skia::PixmapPaint {
+                opacity,
+                ..Default::default()
+            };
+            let identity = tiny_skia::Transform::identity();
+            expected.draw_pixmap(x, y, src.as_ref(), &paint, identity, None);
+            super::draw_over(&mut dst.as_mut(), src.as_ref(), x, y, opacity);
+            assert_eq!(dst.data(), expected.data());
+
+            let mut mask = tiny_skia::Mask::new(dst.width(), dst.height()).unwrap();
+            for value in mask.data_mut() {
+                *value = [0, 255, next(256) as u8][next(3) as usize];
+            }
+            let mut expected = dst.clone();
+            expected.apply_mask(&mask);
+            super::apply_mask(dst, &mask);
+            assert_eq!(dst.data(), expected.data());
+        }
     }
 }

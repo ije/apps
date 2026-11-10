@@ -98,20 +98,40 @@ impl PixmapExt for tiny_skia::Pixmap {
     }
 
     fn into_srgb(&mut self) {
-        demultiply_alpha(self.data_mut().as_rgba_mut());
-        from_linear_rgb(self.data_mut().as_rgba_mut());
-        multiply_alpha(self.data_mut().as_rgba_mut());
+        convert(self.data_mut().as_rgba_mut(), LINEAR_RGB_TO_SRGB_TABLE);
     }
 
     fn into_linear_rgb(&mut self) {
-        demultiply_alpha(self.data_mut().as_rgba_mut());
-        into_linear_rgb(self.data_mut().as_rgba_mut());
-        multiply_alpha(self.data_mut().as_rgba_mut());
+        convert(self.data_mut().as_rgba_mut(), SRGB_TO_LINEAR_RGB_TABLE);
+    }
+}
+
+// WARNING: demultiplies, maps and multiplies in one pass with resvg's f32 rounding. Alpha 0 always gives 0 and
+// alpha 255 only maps.
+fn convert(data: &mut [RGBA8], table: &[u8; 256]) {
+    for p in data {
+        match p.a {
+            0 => (p.r, p.g, p.b) = (0, 0, 0),
+            255 => {
+                p.r = table[p.r as usize];
+                p.g = table[p.g as usize];
+                p.b = table[p.b as usize];
+            }
+            a => {
+                let a = a as f32 / 255.0;
+                for c in [&mut p.r, &mut p.g, &mut p.b] {
+                    *c = (table[(*c as f32 / a + 0.5) as u8 as usize] as f32 * a + 0.5) as u8;
+                }
+            }
+        }
     }
 }
 
 fn multiply_alpha(data: &mut [RGBA8]) {
     for p in data {
+        if p.a == 255 {
+            continue;
+        }
         let a = p.a as f32 / 255.0;
         p.b = (p.b as f32 * a + 0.5) as u8;
         p.g = (p.g as f32 * a + 0.5) as u8;
@@ -121,6 +141,9 @@ fn multiply_alpha(data: &mut [RGBA8]) {
 
 fn demultiply_alpha(data: &mut [RGBA8]) {
     for p in data {
+        if p.a == 255 {
+            continue;
+        }
         let a = p.a as f32 / 255.0;
         p.b = (p.b as f32 / a + 0.5) as u8;
         p.g = (p.g as f32 / a + 0.5) as u8;
@@ -167,22 +190,6 @@ const LINEAR_RGB_TO_SRGB_TABLE: &[u8; 256] = &[
     241, 241, 242, 242, 243, 243, 244, 244, 245, 245, 246, 246, 246, 247, 247, 248,
     248, 249, 249, 250, 250, 251, 251, 251, 252, 252, 253, 253, 254, 254, 255, 255,
 ];
-
-fn into_linear_rgb(data: &mut [RGBA8]) {
-    for p in data {
-        p.r = SRGB_TO_LINEAR_RGB_TABLE[p.r as usize];
-        p.g = SRGB_TO_LINEAR_RGB_TABLE[p.g as usize];
-        p.b = SRGB_TO_LINEAR_RGB_TABLE[p.b as usize];
-    }
-}
-
-fn from_linear_rgb(data: &mut [RGBA8]) {
-    for p in data {
-        p.r = LINEAR_RGB_TO_SRGB_TABLE[p.r as usize];
-        p.g = LINEAR_RGB_TO_SRGB_TABLE[p.g as usize];
-        p.b = LINEAR_RGB_TO_SRGB_TABLE[p.b as usize];
-    }
-}
 
 #[inline]
 fn f32_bound(min: f32, val: f32, max: f32) -> f32 {
@@ -249,6 +256,20 @@ impl Image {
         }
     }
 
+    // WARNING: an input of another size is drawn at the top left of a transparent `width` x `height` image, as
+    // `draw_pixmap` did, because the per-pixel primitives need equal sizes.
+    fn fit(self, width: u32, height: u32) -> Result<Self, Error> {
+        if self.width() == width && self.height() == height {
+            return Ok(self);
+        }
+        let mut pixmap = tiny_skia::Pixmap::try_create(width, height)?;
+        super::render::copy_pixmap(&mut pixmap, self.as_ref(), 0, 0);
+        Ok(Image {
+            image: Rc::new(pixmap),
+            ..self
+        })
+    }
+
     fn width(&self) -> u32 {
         self.image.width()
     }
@@ -272,27 +293,38 @@ pub fn apply(
     ts: tiny_skia::Transform,
     source: &mut tiny_skia::Pixmap,
 ) {
-    let result = apply_inner(filter, ts, source);
-    let result = result.and_then(|image| apply_to_canvas(image, source));
-
-    if result.is_err() {
-        source.fill(tiny_skia::Color::TRANSPARENT);
-    }
+    let (width, height) = (source.width(), source.height());
+    // WARNING: the source moves into an `Rc`, so inputs share it and an unchanged result moves back without a copy.
+    let Some(empty) = tiny_skia::Pixmap::new(1, 1) else {
+        return;
+    };
+    let graphic = Rc::new(std::mem::replace(source, empty));
+    let result = apply_inner(filter, ts, graphic).and_then(|image| {
+        image
+            .into_color_space(usvg::filter::ColorInterpolation::SRGB)?
+            .fit(width, height)?
+            .take()
+    });
 
     match result {
-        Ok(_) => {}
-        Err(Error::InvalidRegion) => {
-            log::warn!("Filter has an invalid region.");
+        Ok(pixmap) => *source = pixmap,
+        Err(error) => {
+            if let Some(pixmap) = tiny_skia::Pixmap::new(width, height) {
+                *source = pixmap;
+            }
+            if let Error::InvalidRegion = error {
+                log::warn!("Filter has an invalid region.");
+            }
         }
-        Err(Error::NoResults) => {}
     }
 }
 
 fn apply_inner(
     filter: &usvg::filter::Filter,
     ts: usvg::Transform,
-    source: &mut tiny_skia::Pixmap,
+    source: Rc<tiny_skia::Pixmap>,
 ) -> Result<Image, Error> {
+    let source = &source;
     let region = filter
         .rect()
         .transform(ts)
@@ -389,36 +421,36 @@ fn apply_inner(
 
             let color_space = result.color_space;
 
-            let pixmap = {
-                let mut paint = tiny_skia::Paint::default();
-                paint.set_color(tiny_skia::Color::BLACK);
-                paint.blend_mode = tiny_skia::BlendMode::Clear;
-
-                let mut pixmap = result.take()?;
-                let w = pixmap.width() as f32;
-                let h = pixmap.height() as f32;
-
-                if let Some(rect) = tiny_skia::Rect::from_xywh(0.0, 0.0, w, subregion2.y() as f32) {
-                    pixmap.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
-                }
-
-                if let Some(rect) = tiny_skia::Rect::from_xywh(0.0, 0.0, subregion2.x() as f32, h) {
-                    pixmap.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
-                }
-
-                if let Some(rect) = tiny_skia::Rect::from_xywh(subregion2.right() as f32, 0.0, w, h)
-                {
-                    pixmap.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
-                }
-
-                if let Some(rect) =
-                    tiny_skia::Rect::from_xywh(0.0, subregion2.bottom() as f32, w, h)
-                {
-                    pixmap.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
-                }
-
-                pixmap
+            // WARNING: clears the same 4 bands as resvg's `fill_rect` calls did, which miss part of the outside
+            // when the subregion lies past the region.
+            let mut pixmap = result.take()?;
+            let (w, h) = (pixmap.width() as i32, pixmap.height() as i32);
+            let span = |start: i32, end: i32, size: i32| {
+                start.clamp(0, size) as usize..end.clamp(0, size) as usize
             };
+            let rows = [
+                span(0, subregion2.y(), h),
+                span(subregion2.bottom(), subregion2.bottom() + h, h),
+            ];
+            let columns = [
+                span(0, subregion2.x(), w),
+                span(subregion2.right(), subregion2.right() + w, w),
+            ];
+            for (y, row) in pixmap
+                .data_mut()
+                .as_chunks_mut::<4>()
+                .0
+                .chunks_exact_mut(w as usize)
+                .enumerate()
+            {
+                if rows.iter().any(|rows| rows.contains(&y)) {
+                    row.fill([0; 4]);
+                    continue;
+                }
+                for columns in columns.clone() {
+                    row[columns].fill([0; 4]);
+                }
+            }
 
             result = Image {
                 image: Rc::new(pixmap),
@@ -443,21 +475,17 @@ fn apply_inner(
 fn get_input(
     input: &usvg::filter::Input,
     region: IntRect,
-    source: &tiny_skia::Pixmap,
+    source: &Rc<tiny_skia::Pixmap>,
     results: &[FilterResult],
 ) -> Result<Image, Error> {
     match input {
-        usvg::filter::Input::SourceGraphic => {
-            let image = source.clone();
-
-            Ok(Image {
-                image: Rc::new(image),
-                region,
-                color_space: usvg::filter::ColorInterpolation::SRGB,
-            })
-        }
+        usvg::filter::Input::SourceGraphic => Ok(Image {
+            image: source.clone(),
+            region,
+            color_space: usvg::filter::ColorInterpolation::SRGB,
+        }),
         usvg::filter::Input::SourceAlpha => {
-            let mut image = source.clone();
+            let mut image = (**source).clone();
             for p in image.data_mut().as_rgba_mut() {
                 p.r = 0;
                 p.g = 0;
@@ -507,9 +535,9 @@ fn apply_drop_shadow(
         None => return Ok(input),
     };
 
+    let input = input.into_color_space(cs)?;
     let mut pixmap = tiny_skia::Pixmap::try_create(input.width(), input.height())?;
-    let input_pixmap = input.into_color_space(cs)?.take()?;
-    let mut shadow_pixmap = input_pixmap.clone();
+    let mut shadow_pixmap = input.as_ref().clone();
 
     if let Some((std_dx, std_dy, use_box_blur)) =
         resolve_std_dev(fe.std_dev_x().get(), fe.std_dev_y().get(), ts)
@@ -527,34 +555,24 @@ fn apply_drop_shadow(
         fe.color().blue,
         fe.opacity().to_u8(),
     );
-    for p in shadow_pixmap.pixels_mut() {
+    // WARNING: a shadow pixel depends only on its alpha, so the 256 alphas go through the color steps once.
+    let mut table = tiny_skia::Pixmap::try_create(256, 1)?;
+    for (alpha, p) in table.pixels_mut().iter_mut().enumerate() {
         let mut color = color;
-        color.apply_opacity(p.alpha() as f32 / 255.0);
+        color.apply_opacity(alpha as f32 / 255.0);
         *p = color.premultiply().to_color_u8();
     }
-
     match cs {
-        usvg::filter::ColorInterpolation::SRGB => shadow_pixmap.into_srgb(),
-        usvg::filter::ColorInterpolation::LinearRGB => shadow_pixmap.into_linear_rgb(),
+        usvg::filter::ColorInterpolation::SRGB => table.into_srgb(),
+        usvg::filter::ColorInterpolation::LinearRGB => table.into_linear_rgb(),
+    }
+    let table = table.pixels();
+    for p in shadow_pixmap.pixels_mut() {
+        *p = table[p.alpha() as usize];
     }
 
-    pixmap.draw_pixmap(
-        dx as i32,
-        dy as i32,
-        shadow_pixmap.as_ref(),
-        &tiny_skia::PixmapPaint::default(),
-        tiny_skia::Transform::identity(),
-        None,
-    );
-
-    pixmap.draw_pixmap(
-        0,
-        0,
-        input_pixmap.as_ref(),
-        &tiny_skia::PixmapPaint::default(),
-        tiny_skia::Transform::identity(),
-        None,
-    );
+    super::render::copy_pixmap(&mut pixmap, &shadow_pixmap, dx as i32, dy as i32);
+    super::render::draw_over(&mut pixmap.as_mut(), input.as_ref().as_ref(), 0, 0, 1.0);
 
     Ok(Image::from_image(pixmap, cs))
 }
@@ -597,14 +615,7 @@ fn apply_offset(
     }
 
     let mut pixmap = tiny_skia::Pixmap::try_create(input.width(), input.height())?;
-    pixmap.draw_pixmap(
-        dx as i32,
-        dy as i32,
-        input.as_ref().as_ref(),
-        &tiny_skia::PixmapPaint::default(),
-        tiny_skia::Transform::identity(),
-        None,
-    );
+    super::render::copy_pixmap(&mut pixmap, input.as_ref(), dx as i32, dy as i32);
 
     Ok(Image::from_image(pixmap, input.color_space))
 }
@@ -619,27 +630,11 @@ fn apply_blend(
     let input1 = input1.into_color_space(cs)?;
     let input2 = input2.into_color_space(cs)?;
 
-    let mut pixmap = tiny_skia::Pixmap::try_create(region.width(), region.height())?;
-
-    pixmap.draw_pixmap(
-        0,
-        0,
-        input2.as_ref().as_ref(),
-        &tiny_skia::PixmapPaint::default(),
-        tiny_skia::Transform::identity(),
-        None,
-    );
-
-    pixmap.draw_pixmap(
-        0,
-        0,
-        input1.as_ref().as_ref(),
-        &tiny_skia::PixmapPaint {
-            blend_mode: super::render::convert_blend_mode(fe.mode()),
-            ..tiny_skia::PixmapPaint::default()
-        },
-        tiny_skia::Transform::identity(),
-        None,
+    let mut pixmap = input2.fit(region.width(), region.height())?.take()?;
+    draw(
+        &mut pixmap,
+        input1.as_ref(),
+        super::render::convert_blend_mode(fe.mode()),
     );
 
     Ok(Image::from_image(pixmap, cs))
@@ -657,33 +652,25 @@ fn apply_composite(
     let input1 = input1.into_color_space(cs)?;
     let input2 = input2.into_color_space(cs)?;
 
-    let mut pixmap = tiny_skia::Pixmap::try_create(region.width(), region.height())?;
-
     if let Operator::Arithmetic { k1, k2, k3, k4 } = fe.operator() {
-        let pixmap1 = input1.take()?;
-        let pixmap2 = input2.take()?;
+        let mut pixmap = tiny_skia::Pixmap::try_create(region.width(), region.height())?;
+        let input1 = input1.fit(region.width(), region.height())?;
+        let input2 = input2.fit(region.width(), region.height())?;
 
         composite::arithmetic(
             k1,
             k2,
             k3,
             k4,
-            pixmap1.as_image_ref(),
-            pixmap2.as_image_ref(),
+            input1.as_ref().as_image_ref(),
+            input2.as_ref().as_image_ref(),
             pixmap.as_image_ref_mut(),
         );
 
         return Ok(Image::from_image(pixmap, cs));
     }
 
-    pixmap.draw_pixmap(
-        0,
-        0,
-        input2.as_ref().as_ref(),
-        &tiny_skia::PixmapPaint::default(),
-        tiny_skia::Transform::identity(),
-        None,
-    );
+    let mut pixmap = input2.fit(region.width(), region.height())?.take()?;
 
     let blend_mode = match fe.operator() {
         Operator::Over => tiny_skia::BlendMode::SourceOver,
@@ -694,42 +681,52 @@ fn apply_composite(
         Operator::Arithmetic { .. } => tiny_skia::BlendMode::SourceOver,
     };
 
-    pixmap.draw_pixmap(
-        0,
-        0,
-        input1.as_ref().as_ref(),
-        &tiny_skia::PixmapPaint {
-            blend_mode,
-            ..tiny_skia::PixmapPaint::default()
-        },
-        tiny_skia::Transform::identity(),
-        None,
-    );
+    draw(&mut pixmap, input1.as_ref(), blend_mode);
 
     Ok(Image::from_image(pixmap, cs))
+}
+
+fn draw(
+    pixmap: &mut tiny_skia::Pixmap,
+    input: &tiny_skia::Pixmap,
+    blend_mode: tiny_skia::BlendMode,
+) {
+    if blend_mode == tiny_skia::BlendMode::SourceOver {
+        super::render::draw_over(&mut pixmap.as_mut(), input.as_ref(), 0, 0, 1.0);
+    } else {
+        pixmap.draw_pixmap(
+            0,
+            0,
+            input.as_ref(),
+            &tiny_skia::PixmapPaint {
+                blend_mode,
+                ..tiny_skia::PixmapPaint::default()
+            },
+            tiny_skia::Transform::identity(),
+            None,
+        );
+    }
 }
 
 fn apply_merge(
     fe: &usvg::filter::Merge,
     cs: usvg::filter::ColorInterpolation,
     region: IntRect,
-    source: &tiny_skia::Pixmap,
+    source: &Rc<tiny_skia::Pixmap>,
     results: &[FilterResult],
 ) -> Result<Image, Error> {
-    let mut pixmap = tiny_skia::Pixmap::try_create(region.width(), region.height())?;
-
+    let mut pixmap: Option<tiny_skia::Pixmap> = None;
     for input in fe.inputs() {
-        let input = get_input(input, region, source, results)?;
-        let input = input.into_color_space(cs)?;
-        pixmap.draw_pixmap(
-            0,
-            0,
-            input.as_ref().as_ref(),
-            &tiny_skia::PixmapPaint::default(),
-            tiny_skia::Transform::identity(),
-            None,
-        );
+        let input = get_input(input, region, source, results)?.into_color_space(cs)?;
+        match &mut pixmap {
+            Some(pixmap) => draw(pixmap, input.as_ref(), tiny_skia::BlendMode::SourceOver),
+            None => pixmap = Some(input.fit(region.width(), region.height())?.take()?),
+        }
     }
+    let pixmap = match pixmap {
+        Some(pixmap) => pixmap,
+        None => tiny_skia::Pixmap::try_create(region.width(), region.height())?,
+    };
 
     Ok(Image::from_image(pixmap, cs))
 }
@@ -880,22 +877,26 @@ fn apply_displacement_map(
     input1: Image,
     input2: Image,
 ) -> Result<Image, Error> {
-    let pixmap1 = input1.into_color_space(cs)?.take()?;
-    let pixmap2 = input2.into_color_space(cs)?.take()?;
+    let input1 = input1
+        .into_color_space(cs)?
+        .fit(region.width(), region.height())?;
+    let input2 = input2
+        .into_color_space(cs)?
+        .fit(region.width(), region.height())?;
 
     let mut pixmap = tiny_skia::Pixmap::try_create(region.width(), region.height())?;
 
     let (sx, sy) = match scale_coordinates(fe.scale(), fe.scale(), ts) {
         Some(v) => v,
-        None => return Ok(Image::from_image(pixmap1, cs)),
+        None => return Ok(Image::from_image(input1.take()?, cs)),
     };
 
     displacement_map::apply(
         fe,
         sx,
         sy,
-        pixmap1.as_image_ref(),
-        pixmap2.as_image_ref(),
+        input1.as_ref().as_image_ref(),
+        input2.as_ref().as_image_ref(),
         pixmap.as_image_ref_mut(),
     );
 
@@ -944,6 +945,7 @@ fn apply_diffuse_lighting(
     let mut pixmap = tiny_skia::Pixmap::try_create(region.width(), region.height())?;
 
     let light_source = transform_light_source(fe.light_source(), region, ts);
+    let input = input.fit(region.width(), region.height())?;
 
     lighting::diffuse_lighting(
         fe,
@@ -965,6 +967,7 @@ fn apply_specular_lighting(
     let mut pixmap = tiny_skia::Pixmap::try_create(region.width(), region.height())?;
 
     let light_source = transform_light_source(fe.light_source(), region, ts);
+    let input = input.fit(region.width(), region.height())?;
 
     lighting::specular_lighting(
         fe,
@@ -1011,22 +1014,6 @@ fn transform_light_source(
     }
 
     source
-}
-
-fn apply_to_canvas(input: Image, pixmap: &mut tiny_skia::Pixmap) -> Result<(), Error> {
-    let input = input.into_color_space(usvg::filter::ColorInterpolation::SRGB)?;
-
-    pixmap.fill(tiny_skia::Color::TRANSPARENT);
-    pixmap.draw_pixmap(
-        0,
-        0,
-        input.as_ref().as_ref(),
-        &tiny_skia::PixmapPaint::default(),
-        tiny_skia::Transform::identity(),
-        None,
-    );
-
-    Ok(())
 }
 
 fn resolve_std_dev(std_dx: f32, std_dy: f32, ts: usvg::Transform) -> Option<(f64, f64, bool)> {
