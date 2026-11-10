@@ -36,14 +36,12 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang-19 ninja-build ruby nasm libicu-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libfreetype6-dev libasound2-dev libudev-dev libglib2.0-dev libwebkit2gtk-4.1-dev libvulkan-dev
 
-      # Keep this Bun version in sync with build-jsc.sh for AOT codegen.
+      # Use the Bun release that Bun's CI builds build-jsc.sh's Bun revision with: `bun.version` in Bun's
+      # scripts/build/ci-images/spec.ts.
       - if: matrix.jsc == '--aot'
         run: |
-          npm install --prefix "$RUNNER_TEMP/bun" @oven/bun-darwin-aarch64@1.4.4-canary.20261108.1
-          bun=$RUNNER_TEMP/bun/node_modules/@oven/bun-darwin-aarch64/bin/bun
-          revision=$(sed -n 's/^bun_revision=//p' scripts/build-jsc.sh)
-          [[ $("$bun" --revision) == *+"${revision:0:9}" ]] || { echo "This Bun is not $revision" >&2; exit 1; }
-          echo "APPS_BUN=$bun" >> "$GITHUB_ENV"
+          npm install --prefix "$RUNNER_TEMP/bun" @oven/bun-darwin-aarch64@1.4.4
+          echo "APPS_BUN=$RUNNER_TEMP/bun/node_modules/@oven/bun-darwin-aarch64/bin/bun" >> "$GITHUB_ENV"
       - uses: actions/cache@v4
         id: jsc
         with:

@@ -142,7 +142,7 @@ extern constinit const AOT::ModuleHost appsAOTModuleHost {
 // Match build-jsc.sh's bun_revision: Bun's IR and built-in table must match this compiler.
 extern "C" JS_EXPORT const char* JSGetAOTCompilerRevision()
 {
-    return "2596ac5d391d47804c93a42bdbe615804aa62387";
+    return "98cda0d8b1243fc3dbf6963f0a12e708efb20d80";
 }
 
 extern "C" JS_EXPORT bool JSCompileAOT(const uint8_t* bytes, size_t size, const char* path, uint32_t* entries, size_t count, size_t* layout, char* error, size_t capacity)

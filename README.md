@@ -203,10 +203,9 @@ The default port is `3000`.
 It works for JavaScript and TypeScript apps on macOS arm64, and can't be combined with `--bytecode`.
 The npm package of `apps` has the compilers, so the build needs no Bun.
 
-From source, build JSC with AOT support. It checks out Bun's source at revision `2596ac5d391d47804c93a42bdbe615804aa62387` ([Bun PR #47942](https://github.com/oven-sh/bun/pull/47942)) and runs Bun's codegen, so set `APPS_BUN` to a Bun binary from that revision. `npm install @oven/bun-darwin-aarch64@1.4.4-canary.20261108.1` has it.
+From source, build JSC with AOT support. It checks out Bun's source at revision `98cda0d8b1243fc3dbf6963f0a12e708efb20d80` ([Bun PR #48120](https://github.com/oven-sh/bun/pull/48120)) and runs Bun's codegen with the `bun` on your `PATH`, or the one that `APPS_BUN` names. Use Bun 1.4.4, the release that Bun builds this revision with.
 
 ```sh
-export APPS_BUN=/path/to/bun
 bash scripts/build-jsc.sh --aot
 cargo build -p apps -p apps-runtime
 ./target/debug/apps build index.ts --aot

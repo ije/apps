@@ -904,10 +904,10 @@ index cad190295..8cf9d0efd 100644
 +    return simdutf::convert_utf16le_to_utf8(static_cast<const char16_t*>(characters), length, output);
 +}
 diff --git a/Source/JavaScriptCore/CMakeLists.txt b/Source/JavaScriptCore/CMakeLists.txt
-index e494e5464..00f81cfc7 100644
+index b4d3aae89..8936785ec 100644
 --- a/Source/JavaScriptCore/CMakeLists.txt
 +++ b/Source/JavaScriptCore/CMakeLists.txt
-@@ -2117,6 +2117,12 @@ set(JavaScriptCore_PRIVATE_FRAMEWORK_HEADERS
+@@ -2118,6 +2118,12 @@ set(JavaScriptCore_PRIVATE_FRAMEWORK_HEADERS
      parser/ModuleAnalyzer.h
  )
  include(aot/AOT.cmake)
@@ -920,7 +920,7 @@ index e494e5464..00f81cfc7 100644
  
  if(USE_INSPECTOR_SOCKET_SERVER)
      list(APPEND JavaScriptCore_PRIVATE_FRAMEWORK_HEADERS
-@@ -2356,7 +2362,7 @@ endif ()
+@@ -2357,7 +2363,7 @@ endif ()
  # CombinedDomains.json will be generated in both projects.
  # However, for static JSC builds, we cannot have this dependency as it creates
  # a cycle - instead, we ensure headers are copied by adding them to the default target.
@@ -930,7 +930,7 @@ index e494e5464..00f81cfc7 100644
  endif()
  
 diff --git a/Source/JavaScriptCore/aot/AOT.cmake b/Source/JavaScriptCore/aot/AOT.cmake
-index 30d3a1f87..29319da33 100644
+index 7605cd11b..dc605fe07 100644
 --- a/Source/JavaScriptCore/aot/AOT.cmake
 +++ b/Source/JavaScriptCore/aot/AOT.cmake
 @@ -36,7 +36,7 @@ list(APPEND JavaScriptCore_SOURCES
@@ -943,10 +943,10 @@ index 30d3a1f87..29319da33 100644
  endif ()
  
 diff --git a/Source/JavaScriptCore/aot/image/AOTFunctionTexts.cpp b/Source/JavaScriptCore/aot/image/AOTFunctionTexts.cpp
-index 642121138..687c6b517 100644
+index dd82c75e9..3e37705b6 100644
 --- a/Source/JavaScriptCore/aot/image/AOTFunctionTexts.cpp
 +++ b/Source/JavaScriptCore/aot/image/AOTFunctionTexts.cpp
-@@ -320,7 +320,9 @@ static void collectQuotedTextsOfModule(const TableEncoder& encoder, const Places
+@@ -374,7 +374,9 @@ static void collectQuotedTextsOfModule(const TableEncoder& encoder, const Places
              encoder.fail("QuotedTextOutsideTextOfModule"_s, ModuleID(index));
              continue;
          }
@@ -958,7 +958,7 @@ index 642121138..687c6b517 100644
          LineColumn lineColumn = encoder.program.lineColumnFor(ModuleID(index), quoted.position);
          result.quoted.append({ lineColumn.line, lineColumn.column, quoted.start, quoted.end });
 diff --git a/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp b/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp
-index bb1a23f92..016ebf4f7 100644
+index bfae38ab7..d352b651b 100644
 --- a/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp
 +++ b/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp
 @@ -26,7 +26,7 @@
@@ -1053,7 +1053,7 @@ index 8efc3dcab..7fdee2ca1 100644
  
  void AgentRegistry::append(UniqueRef<InspectorAgentBase>&& agent)
 diff --git a/Source/JavaScriptCore/runtime/JSGlobalObject.h b/Source/JavaScriptCore/runtime/JSGlobalObject.h
-index 4fcb81318..e4cdc54f0 100644
+index 4fcb81318..6c802b79f 100644
 --- a/Source/JavaScriptCore/runtime/JSGlobalObject.h
 +++ b/Source/JavaScriptCore/runtime/JSGlobalObject.h
 @@ -543,6 +543,9 @@ public:
@@ -1114,7 +1114,7 @@ index 0c7028e26..f6086fc4f 100644
  
  class JSLock : public ThreadSafeRefCounted<JSLock> {
 diff --git a/Source/JavaScriptCore/runtime/JSMicrotask.cpp b/Source/JavaScriptCore/runtime/JSMicrotask.cpp
-index 696fea038..8f751890f 100644
+index 476f988e0..1ff1ad29a 100644
 --- a/Source/JavaScriptCore/runtime/JSMicrotask.cpp
 +++ b/Source/JavaScriptCore/runtime/JSMicrotask.cpp
 @@ -659,6 +659,14 @@ static void asyncGeneratorDrainQueue(JSGlobalObject* globalObject, JSAsyncGenera
@@ -1157,7 +1157,7 @@ index 84f24b2c0..3973cd8f1 100644
  #undef OVERRIDE_OPTION_WITH_HEURISTICS
  
 diff --git a/Source/JavaScriptCore/runtime/Options.h b/Source/JavaScriptCore/runtime/Options.h
-index 1c8bfc193..88b365d33 100644
+index 1c8bfc193..6ea04a815 100644
 --- a/Source/JavaScriptCore/runtime/Options.h
 +++ b/Source/JavaScriptCore/runtime/Options.h
 @@ -137,6 +137,29 @@ public:

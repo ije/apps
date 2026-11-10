@@ -224,7 +224,7 @@ setTimeout(async () => {
     }
     assert_eq!(
         u32::from_le_bytes(native[header + 72..header + 76].try_into().unwrap()),
-        3
+        4
     );
     assert!(
         u32::from_le_bytes(native[header + 352..header + 356].try_into().unwrap()) > 0,

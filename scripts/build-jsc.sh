@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-revision=5a61071f79134bf41844e7ea31a8449147d85dd4
-bun_revision=2596ac5d391d47804c93a42bdbe615804aa62387
+revision=ee59053d32ace3b79efd73f5e46a8576ca52f53c
+bun_revision=98cda0d8b1243fc3dbf6963f0a12e708efb20d80
 
 aot=0
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -178,7 +178,7 @@ if ((aot)); then
     git init "$bun_source"
     git -C "$bun_source" remote add origin https://github.com/oven-sh/bun.git
   fi
-  git -C "$bun_source" sparse-checkout set --cone src scripts packages completions patches docs/lint
+  git -C "$bun_source" sparse-checkout set --cone src scripts packages completions patches docs/lint test/aot/native
   if ! git -C "$bun_source" rev-parse -q --verify HEAD >/dev/null; then
     git -C "$bun_source" fetch --depth 1 origin "$bun_revision"
     git -C "$bun_source" checkout --detach FETCH_HEAD
