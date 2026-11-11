@@ -846,9 +846,7 @@ impl Window {
     }
 
     pub(crate) fn draw(&mut self, app: &mut App) {
-        #[cfg(target_os = "macos")]
-        self.platform.demote();
-        self.tracks.clear();
+        self.demote();
         self.drawn_at = Instant::now();
         self.frames_drawn += 1;
         loop {
@@ -1280,14 +1278,10 @@ impl Window {
         )
     }
 
-    fn push_content_mask(&mut self, mask: Clip<Pixels>) {
+    // Pair with pop_content_mask.
+    pub(crate) fn push_content_mask(&mut self, mask: Clip<Pixels>) {
         let snapped = self.snap_mask(mask);
         self.content_masks.push((mask, snapped));
-    }
-
-    // The mask from the containing block's layer replaces intermediate clips. Pair with pop_content_mask.
-    pub(crate) fn push_escaped_content_mask(&mut self, mask: Clip<Pixels>) {
-        self.push_content_mask(mask);
     }
 
     pub(crate) fn pop_content_mask(&mut self) {

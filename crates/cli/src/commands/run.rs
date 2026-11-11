@@ -232,14 +232,20 @@ pub fn run(
                 .as_ref()
                 .is_some_and(std::thread::JoinHandle::is_finished)
             {
-                input = watch.then_some(
-                    writer
-                        .take()
-                        .unwrap()
-                        .join()
-                        .unwrap_or_else(|_| Err(anyhow::anyhow!("Bundle writer panicked")))
-                        .context("Cannot send the app bundle to the runtime")?,
-                );
+                let sent = writer
+                    .take()
+                    .unwrap()
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("Bundle writer panicked")))
+                    .context("Cannot send the app bundle to the runtime");
+                // While watching, an app that ends before it reads the bundle is reported below, and the
+                // next change starts it again.
+                input = if watch {
+                    sent.ok()
+                } else {
+                    sent?;
+                    None
+                };
             }
             if let Some(process) = &mut child
                 && let Some(status) = process.try_wait()?

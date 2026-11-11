@@ -1,5 +1,5 @@
 use crate::{Button, Event, Key, Modifiers, Pixels, WheelPhase, point, px};
-use core_foundation::{
+use core_foundation_sys::{
     data::{CFDataGetBytePtr, CFDataRef},
     string::CFStringRef,
 };
@@ -42,9 +42,7 @@ fn button(number: isize) -> Option<Button> {
 }
 
 /// Positions are from the top of a content view `height` points tall.
-pub(crate) unsafe fn translate(native: *mut AnyObject, height: Pixels) -> Option<Event> {
-    // SAFETY: the caller passes an NSEvent or nil.
-    let native = unsafe { native.cast::<NSEvent>().as_ref() }?;
+pub(crate) fn translate(native: &NSEvent, height: Pixels) -> Option<Event> {
     let kind = native.r#type();
     // Read flags and locations only for the kinds below.
     let flags = || native.modifierFlags();
@@ -79,7 +77,6 @@ pub(crate) unsafe fn translate(native: *mut AnyObject, height: Pixels) -> Option
             button: button(native.buttonNumber())?,
             modifiers: modifiers(),
             clicks: native.clickCount() as usize,
-            first_click: false,
         },
         Kind::LeftMouseUp | Kind::RightMouseUp | Kind::OtherMouseUp => Event::PointerUp {
             at: at(),
@@ -111,7 +108,6 @@ pub(crate) unsafe fn translate(native: *mut AnyObject, height: Pixels) -> Option
                 },
                 modifiers: modifiers(),
                 clicks: 1,
-                first_click: false,
             }
         }
         Kind::ScrollWheel => {

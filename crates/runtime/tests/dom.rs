@@ -1960,9 +1960,14 @@ fn focus_follows_focusability_removal_and_shadow_roots() {
         check('activeElement retargets to the host', () => document.activeElement === $('host') && root.activeElement === root.firstChild);
         $('host').remove();
         check('removing a host blurs', () => document.activeElement === document.body);
-        const order = [];
+        document.insertBefore(document.createComment('first'), document.documentElement);
+        const order = [], top = document.childNodes, kinds = [...top].map(node => node.nodeType).join();
         for (let n = 0; n < 4; n++) { __appsDispatch('keydown', [], { key: 'Tab' }); order.push(document.activeElement.id); }
         check('tab order', () => order.join() === 'first,tab,link,first');
+        check('tab keeps node lists in order', () => kinds === '8,1' && [...top].map(node => node.nodeType).join() === kinds);
+        const link = document.head.appendChild(document.createElement('link')); link.rel = 'stylesheet';
+        link.getBoundingClientRect();
+        check('a link without a stylesheet has no sheet', () => link.sheet === null);
         __appsDispatch('keydown', [], { key: 'Tab', shiftKey: true });
         check('shift tab', () => document.activeElement.id === 'link');
         "#,

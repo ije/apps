@@ -60,7 +60,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     return ~crc >>> 0;
   };
   for (const [name, format, inflate] of [['Gzip', 'gzip', false], ['Gunzip', 'gzip', true], ['Deflate', 'deflate', false], ['Inflate', 'deflate', true], ['DeflateRaw', 'deflate-raw', false], ['InflateRaw', 'deflate-raw', true], ['Unzip', 'unzip', true]]) {
-    const method = name[0].toLowerCase() + name.slice(1), args = (data, o) => [format, inflate, input(data), o?.level ?? -1, o?.maxOutputLength];
+    const method = name[0].toLowerCase() + name.slice(1), args = (data, o) => [format, inflate, input(data), o?.level ?? -1, o?.maxOutputLength, o?.windowBits, o?.dictionary ? input(o.dictionary) : null];
     zlib[method + 'Sync'] = (data, o) => { try { return output(sync('zlib', ...args(data, o))); } catch (error) { throw zlibError(error); } };
     zlib[method] = (data, o, callback) => { if (typeof o === 'function') { callback = o; o = {}; } asyncCall('zlib', ...args(data, o)).then(result => callback(null, output(result)), error => callback(zlibError(error))); };
     zlib[name] = { [name]: class extends Zlib { constructor(o) { super(format, inflate, o); } } }[name];

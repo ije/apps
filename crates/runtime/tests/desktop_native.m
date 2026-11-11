@@ -140,11 +140,14 @@ int main(int argc, const char *argv[]) {
         }
         [window makeKeyWindow];
         if (![NSApp sendAction:select.action to:select.target from:select] || text.selectedRange.length != text.string.length) return 15;
+        // The page view is a subview of the content view, as in a real window.
         AppsView *view = [[AppsView alloc] initWithFrame:window.contentView.bounds];
-        window.contentView = view;
+        window.contentView = [[NSView alloc] initWithFrame:view.frame];
+        [window.contentView addSubview:view];
         [window makeFirstResponder:view];
         if (![NSApp sendAction:copy.action to:copy.target from:copy] || view.key.keyCode != kVK_ANSI_C || view.key.modifierFlags != NSEventModifierFlagCommand) return 16;
         NSMenuItem *devtools = [[menu itemWithTitle:@"View"].submenu itemWithTitle:@"Toggle Developer Tools"];
+        [window makeFirstResponder:nil];
         if (![NSApp sendAction:devtools.action to:devtools.target from:devtools] || view.key.keyCode != kVK_ANSI_I || view.key.modifierFlags != (NSEventModifierFlagCommand | NSEventModifierFlagOption)) return 17;
         [window close];
         native("menu.set", "[{\"label\":\"Custom\",\"submenu\":[{\"label\":\"Copy\",\"role\":\"copy\"}]}]");

@@ -5,7 +5,6 @@ use super::render::Context;
 
 pub fn render(
     path: &usvg::Path,
-    blend_mode: tiny_skia::BlendMode,
     ctx: &Context,
     transform: tiny_skia::Transform,
     pixmap: &mut tiny_skia::PixmapMut,
@@ -14,11 +13,12 @@ pub fn render(
         return;
     }
 
+    let blend_mode = tiny_skia::BlendMode::SourceOver;
     if path.paint_order() == usvg::PaintOrder::FillAndStroke {
         fill_path(path, blend_mode, ctx, transform, pixmap);
-        stroke_path(path, blend_mode, ctx, transform, pixmap);
+        stroke_path(path, ctx, transform, pixmap);
     } else {
-        stroke_path(path, blend_mode, ctx, transform, pixmap);
+        stroke_path(path, ctx, transform, pixmap);
         fill_path(path, blend_mode, ctx, transform, pixmap);
     }
 }
@@ -75,7 +75,6 @@ pub fn fill_path(
 
 fn stroke_path(
     path: &usvg::Path,
-    blend_mode: tiny_skia::BlendMode,
     ctx: &Context,
     transform: tiny_skia::Transform,
     pixmap: &mut tiny_skia::PixmapMut,
@@ -107,7 +106,6 @@ fn stroke_path(
         }
     }
     paint.anti_alias = path.rendering_mode().use_shape_antialiasing();
-    paint.blend_mode = blend_mode;
 
     pixmap.stroke_path(path.data(), &paint, &stroke.to_tiny_skia(), transform, None);
 

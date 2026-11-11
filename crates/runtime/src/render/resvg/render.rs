@@ -1,8 +1,6 @@
 // Copyright 2018 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use super::OptionLog;
-
 pub struct Context {
     pub max_bbox: tiny_skia::IntRect,
 }
@@ -29,13 +27,7 @@ pub fn render_node(
             render_group(group, ctx, transform, pixmap);
         }
         usvg::Node::Path(path) => {
-            super::path::render(
-                path,
-                tiny_skia::BlendMode::SourceOver,
-                ctx,
-                transform,
-                pixmap,
-            );
+            super::path::render(path, ctx, transform, pixmap);
         }
         usvg::Node::Image(image) => {
             super::image::render(image, transform, pixmap);
@@ -71,36 +63,27 @@ fn render_group(
     } else {
         // Don't expand the box of a group with filters by 2px, since it already acts as the clipping region.
         let bbox = bbox.to_int_rect();
-        super::geom::fit_to_rect(bbox, ctx.max_bbox)?
+        bbox.intersect(&ctx.max_bbox)?
     };
 
     if group.filters().is_empty() {
         // Limit unfiltered layers to parent bounds. Per-pixel effects need no extra area.
         let parent = tiny_skia::IntRect::from_xywh(0, 0, pixmap.width(), pixmap.height())?;
-        ibbox = super::geom::fit_to_rect(ibbox, parent)?;
+        ibbox = ibbox.intersect(&parent)?;
     }
 
-    let shift_ts = {
-        let mut dx = bbox.x();
-        let mut dy = bbox.y();
+    let transform = tiny_skia::Transform::from_translate(-ibbox.x() as f32, -ibbox.y() as f32)
+        .pre_concat(transform);
 
-        dx -= bbox.x() - ibbox.x() as f32;
-        dy -= bbox.y() - ibbox.y() as f32;
-
-        tiny_skia::Transform::from_translate(-dx, -dy)
+    let Some(mut sub_pixmap) = tiny_skia::Pixmap::new(ibbox.width(), ibbox.height()) else {
+        log::warn!("Failed to allocate a group layer for: {:?}.", ibbox);
+        return None;
     };
-
-    let transform = shift_ts.pre_concat(transform);
-
-    let mut sub_pixmap = tiny_skia::Pixmap::new(ibbox.width(), ibbox.height())
-        .log_none(|| log::warn!("Failed to allocate a group layer for: {:?}.", ibbox))?;
 
     render_nodes(group, ctx, transform, &mut sub_pixmap.as_mut());
 
-    if !group.filters().is_empty() {
-        for filter in group.filters() {
-            super::filter::apply(filter, transform, &mut sub_pixmap);
-        }
+    for filter in group.filters() {
+        super::filter::apply(filter, transform, &mut sub_pixmap);
     }
 
     if let Some(clip_path) = group.clip_path() {

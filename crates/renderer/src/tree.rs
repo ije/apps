@@ -805,8 +805,9 @@ impl Tree {
                 )
         });
         let slot = &mut self.slots[index as usize];
+        // The mask from the containing block's layer replaces intermediate clips.
         if let Some(mask) = slot.escaped {
-            window.push_escaped_content_mask(mask);
+            window.push_content_mask(mask);
         }
         let placement = window.placement();
         slot.placed = Some((prepaints, origin, placement));
@@ -1093,7 +1094,7 @@ impl Tree {
             return;
         }
         if let Some(mask) = escaped {
-            window.push_escaped_content_mask(mask);
+            window.push_content_mask(mask);
         }
         // Below a transform or an effect, boxes paint elsewhere than their bounds, so none is skipped.
         let unbounded = slot.hooks.as_ref().is_some_and(|hooks| !hooks.bounded());

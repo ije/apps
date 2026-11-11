@@ -1197,7 +1197,6 @@ impl Shared {
                         button,
                         modifiers: keys::held(),
                         clicks: self.press(button, at),
-                        first_click: false,
                     });
                     // X buttons report that they were handled.
                     Some(isize::from(msg == WM_XBUTTONDOWN))
@@ -1228,7 +1227,6 @@ impl Shared {
                         button,
                         modifiers: keys::held(),
                         clicks: self.press(button, at),
-                        first_click: false,
                     });
                     let hit = wparam.0 as u32;
                     if taken {

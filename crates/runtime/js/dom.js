@@ -54,7 +54,7 @@
     if (geometry[0]) { const buffer = host('dom.layout', true), capacity = new F32(buffer, 0, 4)[1]; limit = 4 + capacity * 8; geometry = new F32(buffer, 0, limit); marks = new U8(buffer, limit * 4, capacity); }
     return geometry;
   };
-  const slot = node => { layout(); const i = 4 + node._id * 8; if (i >= limit || marks[node._id] & 16) return -1; if (node._linked !== version) { if (!node.isConnected) return -1; node._linked = version; } return i; };
+  const slot = node => { layout(); const i = 4 + node._id * 8; if (i >= limit || marks[node._id] & 16) return -1; if (node._placed !== version) { if (!node.isConnected) return -1; node._placed = version; } return i; };
   const metric = (node, k) => { const i = slot(node); return i < 0 ? 0 : geometry[i + k]; };
   // Do not cache client boxes from observer reads: they use the previous frame's styles.
   const client = node => { if (slot(node) < 0) return [0, 0, 0, 0, 0, 0, 0, 0]; if (observing) return call('dom.client', node._id, true); const cached = node._client; if (cached?.[8] === geometry[2] && cached[9] === version) return cached; return node._client = [...call('dom.client', node._id), geometry[2], version]; };
@@ -143,7 +143,7 @@
   const wrapped = [], names = new Map(), types = { __proto__: null, '#document': 9, '#text': 3, '#comment': 8, '#fragment': 11, '#doctype': 10 }, events = new WeakMap(), registered = [], pointers = new Set(), captures = new Map(), observers = new Set();
   let readyState = 'loading', currentScript = null, active = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null, quiet = 0, shadows = 0, moving = false, wheeling = false, iterating = false, native = 0;
   const selectionPending = new Set();
-  const topLayer = [], modals = [], dialogs = [], autos = [], hints = [], fullscreens = [], watchers = [];
+  const topLayer = [], dialogs = [], autos = [], hints = [], fullscreens = [], watchers = [];
   const selectionChanged = (target = document) => {
     if (selectionPending.has(target)) return;
     selectionPending.add(target);
@@ -197,9 +197,10 @@
     const targets = shadow ? ancestors.map(node => { const value = seen; if (node instanceof ShadowRoot && seen.getRootNode() === node) seen = node.host; return value; }) : null;
     Object.assign(state, { target, path: ancestors, dispatching: true });
     const invoke = (index, capture) => {
-      const node = ancestors[index], listeners = events.get(node);
+      const node = ancestors[index], listeners = events.get(node), list = listeners?.get(event.type);
+      if (!list?.length) return;
       state.currentTarget = node; state.target = targets?.[index] ?? target; state.eventPhase = state.target === node ? 2 : capture ? 1 : 3;
-      for (const item of [...(listeners?.get(event.type) ?? [])]) {
+      for (const item of [...list]) {
         if (state.immediate) break;
         if (item.capture !== capture || !listeners.get(event.type).includes(item)) continue;
         if (item.once) node.removeEventListener(event.type, item.fn, item.capture);
@@ -1112,14 +1113,14 @@
   };
   const closeDialog = dialog => {
     drop(dialogs, dialog); drop(watchers, dialog);
-    if (dialog._modal) { dialog._modal = false; drop(modals, dialog); flag(dialog, 4, false); layer(dialog, false); }
+    if (dialog._modal) { dialog._modal = false; flag(dialog, 4, false); layer(dialog, false); }
   };
   const openDialog = (dialog, modal) => {
     if (!dispatch(dialog, new ToggleEvent('beforetoggle', { cancelable: true, oldState: 'closed', newState: 'open' })) || dialog.open || modal && (!dialog.isConnected || dialog._popover)) return;
     toggled(dialog, 'closed', 'open');
     dialog.setAttribute('open', '');
     dialog._focus = active; dialogs.push(dialog); watchers.push(dialog);
-    if (modal) { dialog._modal = true; modals.push(dialog); flag(dialog, 4, true); layer(dialog, true); }
+    if (modal) { dialog._modal = true; flag(dialog, 4, true); layer(dialog, true); }
     hideUntil(ancestorPopover(dialog, hints, null) ?? ancestorPopover(dialog, autos, null) ?? document);
     ([...dialog.querySelectorAll('[autofocus]')].find(focusable) ?? [...dialog.querySelectorAll('*')].find(focusable) ?? dialog).focus();
   };
@@ -1700,7 +1701,6 @@
     createEvent(type) { const Type = { event: Event, events: Event, htmlevents: Event, customevent: CustomEvent, uievent: UIEvent, uievents: UIEvent, focusevent: FocusEvent, mouseevent: MouseEvent, mouseevents: MouseEvent, keyboardevent: KeyboardEvent }[String(type).toLowerCase()]; if (!Type) throw new DOMException('Unsupported event interface', 'NotSupportedError'); return new Type(''); }
     importNode(node, deep = false) { return node.cloneNode(deep); }
     adoptNode(node) { node.remove(); return node; }
-    get adoptedStyleSheets(){return this._sheets??[];} set adoptedStyleSheets(sheets){for(const sheet of this._sheets??[]){sheet._owners.get(this)?.remove();sheet._owners.delete(this);}this._sheets=Array.from(sheets);for(const sheet of this._sheets){if(!(sheet instanceof CSSStyleSheet))throw new TypeError('Expected CSSStyleSheet');const style=document.createElement('style');style.textContent=sheet._text;(this.head??this.documentElement).append(style);sheet._owners.set(this,style);}}
     getElementById(id) {
       id = String(id);
       const at = id && ids.get(id), root = this._m;
@@ -3190,7 +3190,7 @@
   };
   const tabOrder = () => {
     const list = [], stack = [document];
-    while (stack.length) { const node = stack.pop(); if (node.nodeType === 1 && node.tabIndex >= 0 && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable)) list.push(node); stack.push(...(node._shadow ?? node).childNodes.reverse()); }
+    while (stack.length) { const node = stack.pop(); if (node.nodeType === 1 && node.tabIndex >= 0 && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable)) list.push(node); const kids = (node._shadow ?? node).childNodes; for (let index = kids.length; index--;) stack.push(kids[index]); }
     return list.map((node, order) => [node.tabIndex > 0 ? node.tabIndex : Infinity, order, node]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(entry => entry[2]);
   };
   let press = null, last = null, sliding = null;

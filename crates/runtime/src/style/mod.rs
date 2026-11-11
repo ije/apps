@@ -2264,15 +2264,6 @@ const SHORTHANDS: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "border-radius",
-        &[
-            "border-top-left-radius",
-            "border-top-right-radius",
-            "border-bottom-right-radius",
-            "border-bottom-left-radius",
-        ],
-    ),
-    (
         "border-style",
         &[
             "border-top-style",
@@ -2305,7 +2296,6 @@ const SHORTHANDS: &[(&str, &[&str])] = &[
         ],
     ),
     ("flex", &["flex-grow", "flex-shrink", "flex-basis"]),
-    ("flex-flow", &["flex-direction", "flex-wrap"]),
     ("gap", &["row-gap", "column-gap"]),
     ("overflow", &["overflow-x", "overflow-y"]),
     (
@@ -2347,7 +2337,6 @@ const SHORTHANDS: &[(&str, &[&str])] = &[
         "outline",
         &["outline-width", "outline-style", "outline-color"],
     ),
-    ("columns", &["column-width", "column-count"]),
     (
         "text-decoration",
         &[
@@ -2389,14 +2378,16 @@ pub(crate) fn resolved(
             .map_or_else(String::new, |value| value.to_string());
     }
     let get = |name: &str| resolved(style, units, name, size, container, registry);
-    let list = |shorthand: Prop, key: &str| {
-        let count = style
-            .get(shorthand)
-            .map_or(1, |value| components(value, ',').len().max(1));
-        let parts: Vec<String> = components(&get(&format!("{}-{key}", shorthand.name())), ',')
-            .into_iter()
-            .map(|part| part.trim().to_owned())
-            .collect();
+    // The item count comes from the longhand that defines it, because not every shorthand is stored.
+    let list = |shorthand: &str, key: &str, defining: &str| {
+        let parts = |key: &str| -> Vec<String> {
+            components(&get(&format!("{shorthand}-{key}")), ',')
+                .into_iter()
+                .map(|part| part.trim().to_owned())
+                .collect()
+        };
+        let count = parts(defining).len().max(1);
+        let parts = parts(key);
         (0..count)
             .map(|index| {
                 parts
@@ -2430,7 +2421,7 @@ pub(crate) fn resolved(
             return parts.join(" ");
         }
         "background" => {
-            let images = list(Prop::BACKGROUND, "image");
+            let images = list("background", "image", "image");
             let layers: Vec<String> = (0..images.len())
                 .map(|index| {
                     let pick = |key: &str| {
@@ -2463,10 +2454,10 @@ pub(crate) fn resolved(
             return layers.join(", ");
         }
         "transition" | "animation" => {
-            let shorthand = if name == "transition" {
-                Prop::TRANSITION
+            let defining = if name == "transition" {
+                "property"
             } else {
-                Prop::ANIMATION
+                "name"
             };
             let keys: &[(&str, &str)] = if name == "transition" {
                 &[
@@ -2488,8 +2479,10 @@ pub(crate) fn resolved(
                     ("name", "none"),
                 ]
             };
-            let columns: Vec<Vec<String>> =
-                keys.iter().map(|(key, _)| list(shorthand, key)).collect();
+            let columns: Vec<Vec<String>> = keys
+                .iter()
+                .map(|(key, _)| list(name, key, defining))
+                .collect();
             let count = columns.iter().map(Vec::len).max().unwrap_or(1);
             return (0..count)
                 .map(|index| {
@@ -7567,7 +7560,7 @@ fn syntax_matches(syntax: &str, value: &str) -> bool {
 struct Substitution<'a> {
     declared: &'a [(Prop, Rc<str>)],
     state: Vec<(u8, usize, Option<Rc<str>>)>,
-    inherited: &'a Style,
+    inherited: &'a Vars,
     parent: Option<&'a Style>,
     vars: Option<&'a Vars>,
     registry: &'a Registry,
@@ -7578,9 +7571,7 @@ struct Substitution<'a> {
 impl Substitution<'_> {
     fn get(&mut self, prop: Prop) -> Option<Rc<str>> {
         let Ok(index) = self.declared.binary_search_by_key(&prop, |entry| entry.0) else {
-            return self
-                .inherited
-                .value(prop)
+            return var(self.inherited, prop)
                 .cloned()
                 .or_else(|| self.registry.get(&prop)?.2.clone());
         };
@@ -7656,7 +7647,8 @@ fn resolve_style(
     registry: &Registry,
 ) {
     if !declared.is_empty() {
-        let inherited = style.clone();
+        // Only custom properties are declared or referenced here.
+        let inherited = style.vars().clone();
         let mut resolver = Substitution {
             declared,
             state: vec![(0, 0, None); declared.len()],
@@ -7673,7 +7665,7 @@ fn resolve_style(
             .collect();
         if values
             .iter()
-            .any(|(prop, value)| inherited.value(*prop) != value.as_ref())
+            .any(|(prop, value)| var(&inherited, *prop) != value.as_ref())
         {
             let mut vars = (**style.vars()).clone();
             for (prop, value) in values {

@@ -762,7 +762,7 @@ impl Desktop {
                             }
                         };
                         // Run one page script per __appsNext call so JSC drains microtasks between scripts.
-                        const NEXT: &str = "this.__appsNext?.()";
+                        use crate::jsc::NEXT;
                         for (mut source, url) in scripts
                             .iter()
                             .filter(|(kind, _)| *kind == "module")
@@ -1666,7 +1666,7 @@ impl Desktop {
         let (main, page) = (crate::host::Waker::current(), queue.clone());
         crate::host::Waker::install(move || {
             main.wake();
-            page.wake_now();
+            page.wake();
         });
         crate::jsc::NATIVE.set(Some(|op, args| {
             renderer::native::sync(|| native::native_call(op, args))

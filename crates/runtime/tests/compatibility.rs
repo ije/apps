@@ -979,6 +979,7 @@ fn node_fs_descriptors_handles_and_streams() {
         assert.throws(()=>fs.writeSync(fd,Buffer.alloc(4),5),{{code:'ERR_OUT_OF_RANGE',message:'The value of "offset" is out of range. It must be <= 4. Received 5'}});
         assert.throws(()=>fs.write(fd,Buffer.alloc(4),1,4,()=>{{}}),{{code:'ERR_OUT_OF_RANGE',message:'The value of "length" is out of range. It must be <= 3. Received 4'}});
         assert.strictEqual(fs.readSync(fd,Buffer.alloc(4),{{offset:1,length:3,position:1}}),3);
+        assert.strictEqual(fs.readSync(fd,Buffer.alloc(4),0,3,1n),3);
         fs.closeSync(fd);
         assert.throws(()=>fs.closeSync(fd),{{code:'EBADF',syscall:'close',message:'EBADF: bad file descriptor, close'}});
         assert.throws(()=>fs.readSync(fd,Buffer.alloc(1)),{{code:'EBADF',syscall:'read'}});
@@ -1032,6 +1033,15 @@ fn node_zlib_streams_crypto_digests_and_os_priority() {
         assert.strictEqual(zlib.gunzipSync(Buffer.concat([zlib.gzipSync('a'),zlib.gzipSync('b')])).toString(),'ab');
         assert.strictEqual(zlib.deflateSync('aaaaaaaaaa',{level:0}).toString('hex'),'7801010a00f5ff6161616161616161616114e103cb');
         const unzip=zlib.createUnzip();unzip.end(zlib.deflateSync('unzipped'));assert.strictEqual(await stream.consumers.text(unzip),'unzipped');
+        const dictionary=Buffer.from('hello world'),text='hello world hello world',packed=zlib.deflateRawSync(text,{dictionary});
+        assert.ok(packed.length<zlib.deflateRawSync(text).length,'one-shot deflate uses the dictionary');
+        assert.strictEqual(zlib.inflateRawSync(packed,{dictionary}).toString(),text);
+        const streamed=zlib.createInflateRaw({dictionary});streamed.end(packed);assert.strictEqual(await stream.consumers.text(streamed),text);
+        assert.strictEqual((await new Promise((resolve,reject)=>zlib.inflateRaw(packed,{dictionary},(error,data)=>error?reject(error):resolve(data)))).toString(),text);
+        assert.strictEqual(zlib.inflateRawSync(zlib.deflateRawSync(text,{windowBits:9}),{windowBits:9}).toString(),text);
+        const wrapped=zlib.deflateSync(text,{dictionary});assert.strictEqual(zlib.inflateSync(wrapped,{dictionary}).toString(),text);
+        const inflating=zlib.createInflate({dictionary});inflating.end(wrapped);assert.strictEqual(await stream.consumers.text(inflating),text);
+        assert.throws(()=>zlib.inflateSync(wrapped),{code:'Z_DATA_ERROR'});assert.throws(()=>zlib.inflateSync(wrapped,{dictionary:Buffer.from('other')}),{code:'Z_DATA_ERROR'});
         assert.deepStrictEqual([zlib.crc32('hello'),zlib.crc32(Buffer.from('world'),zlib.crc32('hello ')),zlib.crc32('')],[907060870,222957957,0]);
         const key=Buffer.alloc(32,1),iv=Buffer.alloc(12,2),cipher=crypto.createCipheriv('aes-256-gcm',key,iv);cipher.setAAD(Buffer.from('aad'));
         const first=cipher.update('hello '),second=cipher.update('world','utf8','hex');

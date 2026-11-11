@@ -145,7 +145,6 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "block2",
- "core-foundation",
  "core-foundation-sys",
  "cosmic-text",
  "dispatch2",

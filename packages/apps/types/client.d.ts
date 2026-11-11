@@ -96,6 +96,8 @@ declare module '*.flac' { const url: string; export default url }
 declare module '*.aac' { const url: string; export default url }
 declare module '*.wasm' { const url: string; export default url }
 declare module '*.glb' { const url: string; export default url }
+declare module '*.bcmap' { const url: string; export default url }
+declare module '*.pfb' { const url: string; export default url }
 
 declare module 'node:ffi' {
   type FFIType =

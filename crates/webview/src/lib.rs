@@ -375,9 +375,6 @@ impl Browser {
         self.command("evaluate", &serde_json::json!({"id":id,"script":script}))
             .map(|_| ())
     }
-    pub fn inspect(&self) -> Result<()> {
-        self.command("inspect", &Value::Null).map(|_| ())
-    }
     pub fn poll(&self) -> Vec<Value> {
         #[cfg(target_os = "macos")]
         {

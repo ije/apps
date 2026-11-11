@@ -1040,22 +1040,7 @@ pub(crate) fn gradient_svg(
             } else {
                 ("", "")
             };
-            let at = style::components(at, ' ');
-            let (cx, cy) = match at.as_slice() {
-                [only] if matches!(*only, "top" | "bottom") => ("center", *only),
-                [only] => (*only, "center"),
-                [a, b, ..] if matches!(*a, "top" | "bottom") || matches!(*b, "left" | "right") => {
-                    (*b, *a)
-                }
-                [a, b, ..] => (*a, *b),
-                [] => ("center", "center"),
-            };
-            let [cx, cy] = [(cx, tw), (cy, th)].map(|(token, extent)| match token {
-                "left" | "top" => 0.,
-                "center" => extent / 2.,
-                "right" | "bottom" => extent,
-                value => units.resolve(value, extent).unwrap_or(extent / 2.),
-            });
+            let [cx, cy, _] = origin(at, &units, [tw, th]);
             center = (cx, cy);
             let lengths: Vec<f32> = shape
                 .split_whitespace()
@@ -1112,16 +1097,8 @@ pub(crate) fn gradient_svg(
                     .strip_prefix("from")
                     .and_then(|v| angle(v.trim()))
                     .unwrap_or(0.);
-                let at = style::components(at, ' ');
-                let token = |index: usize, extent: f32| match at.get(index).copied() {
-                    Some("left" | "top") => 0.,
-                    Some("right" | "bottom") => extent,
-                    Some(value) if value != "center" => {
-                        units.resolve(value, extent).unwrap_or(extent / 2.)
-                    }
-                    _ => extent / 2.,
-                };
-                center = (token(0, tw), token(1, th));
+                let [cx, cy, _] = origin(at, &units, [tw, th]);
+                center = (cx, cy);
             }
             360.
         }

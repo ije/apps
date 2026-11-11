@@ -41,7 +41,6 @@
   is_error: value => value instanceof Error,
   is_promise: value => value instanceof Promise,
   is_dataview: value => value instanceof DataView,
-  boolean: value => !!value,
   number: value => +value,
   string: value => String(value),
   to_object: value => { if (value == null) throw TypeError('Cannot convert null or undefined to object'); return Object(value); },

@@ -600,10 +600,6 @@ impl renderer::Hooks for AtomBox {
         cx.window
             .scope(renderer::Scope::Offset(offset), |window| inner(window));
     }
-
-    fn paint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        inner(cx.window);
-    }
 }
 
 fn with_atoms(

@@ -827,15 +827,10 @@ impl PageView {
                             })
                 })
                 .collect();
-            if !unscrolled.is_empty() {
-                // Pages read offsets from the layout mirror, which only handles write, so these write zeros first.
-                for &id in &unscrolled {
-                    dom.scroll.insert(id, Default::default());
-                }
-                dom.sync_scroll();
-                for id in unscrolled {
-                    dom.scroll.remove(&id);
-                }
+            // Pages read offsets from the layout mirror, which only handles write.
+            for id in unscrolled {
+                dom.scroll.remove(&id);
+                dom.bounds.unscroll(id);
             }
         }
         native::sync(&self.controls, &doc);

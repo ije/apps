@@ -17,7 +17,7 @@ enum Event {
     Data(&'static str, Vec<u8>),
     End(&'static str),
     Error(&'static str, io::Error),
-    Written(&'static str, usize),
+    Written(&'static str),
     #[cfg(unix)]
     Finish(&'static str),
     Exit,
@@ -139,10 +139,10 @@ impl State {
                     };
                     match event {
                         Ok(Event::Data(stream, data)) => {
-                            let output = if stream == "stdout" {
-                                &mut stdout
-                            } else {
-                                &mut stderr
+                            let output = match stream {
+                                "stdout" => &mut stdout,
+                                "stderr" => &mut stderr,
+                                _ => continue,
                             };
                             output.extend(data);
                             if output.len() > limit {
@@ -189,10 +189,8 @@ impl State {
                 Ok(result)
             }
             "unref" => {
-                if let Some(process) = self
-                    .children
-                    .get_mut(&args[0].as_u64().context("Expected child ID")?)
-                {
+                // A child that failed to spawn has no ID.
+                if let Some(process) = args[0].as_u64().and_then(|id| self.children.get_mut(&id)) {
                     process.unreferenced = args[1] == true;
                 }
                 Ok(Value::Null)
@@ -374,7 +372,7 @@ impl State {
                                     let _ = sender.send(Event::Error(name, error));
                                     break;
                                 }
-                                if sender.send(Event::Written(name, bytes.len())).is_err() {
+                                if sender.send(Event::Written(name)).is_err() {
                                     return;
                                 }
                                 wake.wake();
@@ -459,7 +457,7 @@ impl State {
                                     let _ = sender.send(Event::Error("stdin", error));
                                     break;
                                 }
-                                if sender.send(Event::Written("stdin", bytes.len())).is_err() {
+                                if sender.send(Event::Written("stdin")).is_err() {
                                     return;
                                 }
                                 wake.wake();
@@ -508,7 +506,7 @@ impl State {
                         events.push(match event {
                             Event::Data(stream, data) => json!({"id": id, "event": "data", "stream": stream, "data": crate::jsc::payload::write(data)}),
                             Event::Error(stream, error) => json!({"id": id, "event": "error", "stream": stream, "error": error_value(&error)}),
-                            Event::Written(stream, bytes) => json!({"id": id, "event": "written", "stream": stream, "bytes": bytes}),
+                            Event::Written(stream) => json!({"id": id, "event": "written", "stream": stream}),
                             #[cfg(unix)]
                             Event::Finish(stream) => {
                                 process.open_streams -= 1;
@@ -555,7 +553,7 @@ impl State {
                     }
                     let bytes = crate::node::bytes(&args[1])?;
                     process.extra[index].1.send(Some(bytes.to_vec()))?;
-                    return Ok(json!(bytes.len()));
+                    return Ok(Value::Null);
                 }
                 let input = process.input.as_ref().context("Child stdin is closed")?;
                 if op == "end" {
@@ -563,10 +561,8 @@ impl State {
                     process.input.take();
                     return Ok(Value::Null);
                 }
-                let bytes = crate::node::bytes(&args[1])?;
-                let size = bytes.len();
-                input.send(Some(bytes.to_vec()))?;
-                Ok(json!(size))
+                input.send(Some(crate::node::bytes(&args[1])?.to_vec()))?;
+                Ok(Value::Null)
             }
             "kill" => {
                 let Some(process) = self

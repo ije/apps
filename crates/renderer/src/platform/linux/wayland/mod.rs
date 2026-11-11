@@ -1036,13 +1036,11 @@ impl Client {
                     } else if let Some(text) = pending {
                         Ime::Commit(text).apply(calls);
                     }
-                    let first_click = false;
                     calls.input(Event::PointerDown {
                         at,
                         button,
                         modifiers,
                         clicks,
-                        first_click,
                     });
                 });
             }

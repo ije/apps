@@ -121,8 +121,10 @@ pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> Child 
             let backgrounds = &mut host.dom.entry(view.id).or_default().backgrounds;
             let key = (id, usize::MAX - look.control as usize);
             let [rw, rh] = [width, height].map(|side| (side * scale).ceil() as u32);
-            if backgrounds.get(&key).is_none_or(|(old, _)| old != &source)
-                && let Ok(image) = super::canvas::svg(&source, rw, rh, None)
+            if backgrounds.get(&key).is_none_or(|(old, image)| {
+                old != &source
+                    || [image.size().width, image.size().height].map(|side| side as u32) != [rw, rh]
+            }) && let Ok(image) = super::canvas::svg(&source, rw, rh, None)
                 && let Some((_, old)) = backgrounds.insert(key, (source, image))
                 && std::sync::Arc::strong_count(&old) == 1
             {

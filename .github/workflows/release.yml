@@ -46,7 +46,7 @@ jobs:
         id: jsc
         with:
           path: target/bun-jsc
-          key: bun-jsc-${{ runner.os }}-${{ runner.arch }}-${{ matrix.jsc && format('aot-{0}', hashFiles('scripts/build-jsc.sh', 'scripts/jsc.patch', 'scripts/jsc-aot*', 'scripts/aot-front-end/**')) || hashFiles('scripts/build-jsc.sh', 'scripts/jsc.patch') }}
+          key: bun-jsc-${{ runner.os }}-${{ runner.arch }}-${{ matrix.jsc && format('aot-{0}', hashFiles('scripts/build-jsc.sh', 'scripts/jsc*', 'scripts/aot-front-end/**')) || hashFiles('scripts/build-jsc.sh', 'scripts/jsc.patch', 'scripts/jsc.exports', 'scripts/jsc-cc.sh') }}
       - if: runner.os == 'macOS' && steps.jsc.outputs.cache-hit != 'true'
         run: bash scripts/build-jsc.sh ${{ matrix.jsc }}
       - if: runner.os == 'Linux' && steps.jsc.outputs.cache-hit != 'true'

@@ -63,7 +63,6 @@ pub(crate) struct Input {
     controls: RefCell<controls::Controls>,
     cursor: Cell<Cursor>,
     motion: RefCell<Option<Motion>>,
-    first_mouse: Cell<bool>,
     press: RefCell<Option<Retained<NSEvent>>>,
     pub files_over: Cell<bool>,
     drag_serial: Cell<usize>,
@@ -138,7 +137,6 @@ define_class!(
 
         #[unsafe(method(acceptsFirstMouse:))]
         fn first_mouse(&self, _: Option<&NSEvent>) -> bool {
-            self.ivars().first_mouse.set(true);
             true
         }
 
@@ -495,7 +493,6 @@ impl AppsView {
             controls: RefCell::default(),
             cursor: Cell::new(Cursor::Default),
             motion: RefCell::new(None),
-            first_mouse: Cell::new(false),
             press: RefCell::new(None),
             files_over: Cell::new(false),
             drag_serial: Cell::new(0),
@@ -545,10 +542,7 @@ impl AppsView {
     fn key(&self, event: &NSEvent, equivalent: bool) -> bool {
         let ivars = self.ivars();
         let callbacks = ivars.callbacks;
-        // SAFETY: AppKit passes a live NSEvent.
-        let Some(input) =
-            (unsafe { translate(std::ptr::from_ref(event).cast_mut().cast(), self.height()) })
-        else {
+        let Some(input) = translate(event, self.height()) else {
             return false;
         };
         let down = match &input {
@@ -660,10 +654,7 @@ impl AppsView {
 
     fn pointer(&self, event: &NSEvent) {
         let ivars = self.ivars();
-        // SAFETY: AppKit passes a live NSEvent.
-        let Some(mut input) =
-            (unsafe { translate(std::ptr::from_ref(event).cast_mut().cast(), self.height()) })
-        else {
+        let Some(mut input) = translate(event, self.height()) else {
             return;
         };
         match &mut input {
@@ -683,14 +674,6 @@ impl AppsView {
                 *button = Button::Right;
                 *modifiers = modifiers.with(Modifiers::CTRL, false);
                 *clicks = 1;
-            }
-            Event::PointerDown {
-                button: Button::Left,
-                first_click,
-                ..
-            } if ivars.first_mouse.get() => {
-                *first_click = true;
-                ivars.first_mouse.set(false);
             }
             _ => {}
         }

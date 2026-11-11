@@ -1,8 +1,8 @@
 // Copyright 2017 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-// A copy of resvg 0.46.0 whose raster images decode through `render::image`, so it must stay in
-// step with the usvg version.
+// A copy of resvg 0.46.0, adapted to usvg 0.49.0, whose raster images decode through
+// `render::image`, so it must stay in step with the usvg version.
 
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::identity_op)]
@@ -13,7 +13,6 @@
 
 mod clip;
 mod filter;
-mod geom;
 mod image;
 mod mask;
 mod path;
@@ -35,18 +34,4 @@ pub fn render(
 
     let ctx = render::Context { max_bbox };
     render::render_nodes(tree.root(), &ctx, transform, pixmap);
-}
-
-pub(crate) trait OptionLog {
-    fn log_none<F: FnOnce()>(self, f: F) -> Self;
-}
-
-impl<T> OptionLog for Option<T> {
-    #[inline]
-    fn log_none<F: FnOnce()>(self, f: F) -> Self {
-        self.or_else(|| {
-            f();
-            None
-        })
-    }
 }

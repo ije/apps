@@ -24,7 +24,7 @@ pub(super) struct Build<'a> {
     pub(super) flex_parent: bool,
     pub(super) measured: &'a RefCell<super::grid::Measurements>,
     pub(super) perspective: Option<(f32, String)>,
-    pub(super) siblings: &'a RefCell<HashMap<(usize, bool), Rc<Siblings>>>,
+    pub(super) siblings: &'a RefCell<HashMap<usize, Rc<Siblings>>>,
     pub(super) margins: &'a RefCell<Margins>,
     pub(super) blocks: &'a RefCell<rustc_hash::FxHashMap<usize, [f32; 2]>>,
     pub(super) ids: &'a Rc<super::effects::Ids>,
@@ -148,6 +148,9 @@ pub(super) struct Kept {
     pub(super) reads: Box<[Read]>,
     ancestors: Rc<[usize]>,
     epoch: std::cell::Cell<u64>,
+    // The call drops a height that the style doesn't read, but a build in place needs it: a stretched image
+    // takes its width from it.
+    containing: std::cell::Cell<[f32; 2]>,
     pub(super) culled: bool,
     #[cfg(debug_assertions)]
     pub(super) print: u64,
@@ -635,7 +638,8 @@ pub(super) fn scroller(
         .unwrap_or(0)
 }
 
-type Siblings = (Vec<usize>, rustc_hash::FxHashMap<usize, usize>);
+// The place of each list item among the list items of its parent.
+type Siblings = rustc_hash::FxHashMap<usize, usize>;
 
 const SVG_SOURCE: [Prop; 13] = [
     Prop::TRANSLATE,
@@ -1026,6 +1030,7 @@ pub(super) fn element(
             break 'keep None;
         }
         record.epoch.set(build.epoch);
+        record.containing.set(containing);
         if record.culled {
             build.culls.set(build.culls.get() + 1);
         }
@@ -1129,6 +1134,7 @@ pub(super) fn element(
                         reads,
                         ancestors: build.ancestors.clone(),
                         epoch: build.epoch.into(),
+                        containing: containing.into(),
                         culled: build.culls.get() != culls,
                         #[cfg(debug_assertions)]
                         print,
@@ -1149,7 +1155,7 @@ pub(super) fn repaint(build: &Build<'_>, id: usize) -> Option<renderer::Node> {
     let old = build.view.kept.borrow_mut().remove(&id)?;
     let (ancestors, containing, container, flex_parent) = (
         old.ancestors.clone(),
-        old.call.containing,
+        old.containing.get(),
         old.call.container,
         old.call.flex_parent,
     );
@@ -4102,29 +4108,27 @@ fn create(
         let items = node.parent.map(|parent| {
             siblings
                 .borrow_mut()
-                .entry((parent, true))
+                .entry(parent)
                 .or_insert_with(|| {
-                    let items: Vec<usize> = doc.nodes[parent]
-                        .children
-                        .iter()
-                        .copied()
-                        .filter(|&child| {
-                            styles.values[child]
-                                .get(Prop::DISPLAY)
-                                .is_some_and(|value| value == "list-item")
-                        })
-                        .collect();
-                    let index = items.iter().enumerate().map(|(index, &item)| (item, index));
-                    let index = index.collect();
-                    Rc::new((items, index))
+                    let items = doc.nodes[parent].children.iter().copied().filter(|&child| {
+                        styles.values[child]
+                            .get(Prop::DISPLAY)
+                            .is_some_and(|value| value == "list-item")
+                    });
+                    Rc::new(
+                        items
+                            .enumerate()
+                            .map(|(index, item)| (item, index))
+                            .collect(),
+                    )
                 })
                 .clone()
         });
         let position = items
             .as_ref()
-            .and_then(|items| items.1.get(&id).copied())
+            .and_then(|items| items.get(&id).copied())
             .unwrap_or(0) as i64;
-        let count = items.as_ref().map_or(1, |items| items.0.len()) as i64;
+        let count = items.as_ref().map_or(1, |items| items.len()) as i64;
         let start = list
             .and_then(|list| list.attrs.get("start"))
             .and_then(|value| value.parse::<i64>().ok());
@@ -7401,6 +7405,16 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                                 .unwrap_or_default();
                             if let Some(tree) = tree {
                                 state.svg_trees.insert(id, tree);
+                                // Bound the cache here: this is the only place that adds sources.
+                                if state.svg_cache.len() >= 256 {
+                                    for image in
+                                        state.svg_cache.drain().flat_map(|(_, entry)| entry.1)
+                                    {
+                                        if Arc::strong_count(&image) == 1 {
+                                            window.release_image(image);
+                                        }
+                                    }
+                                }
                                 state
                                     .svg_cache
                                     .insert(source.clone(), (geometry.clone(), Vec::new()));
@@ -7492,18 +7506,13 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                 };
                 match image {
                     Ok(image) => {
-                        if inline && shared.is_none() && raster[0] <= 96 && raster[1] <= 96 {
-                            if let Some((_, images)) = state.svg_cache.get_mut(source) {
-                                images.push(image.clone());
-                            }
-                            if state.svg_cache.len() > 256 {
-                                for image in state.svg_cache.drain().flat_map(|(_, entry)| entry.1)
-                                {
-                                    if Arc::strong_count(&image) == 1 {
-                                        window.release_image(image);
-                                    }
-                                }
-                            }
+                        if inline
+                            && shared.is_none()
+                            && raster[0] <= 96
+                            && raster[1] <= 96
+                            && let Some((_, images)) = state.svg_cache.get_mut(source)
+                        {
+                            images.push(image.clone());
                         }
                         if let Some((_, old)) = state.svgs.insert(id, (source.to_owned(), image))
                             && Arc::strong_count(&old) == 1

@@ -237,7 +237,6 @@ pub(crate) struct Window {
     control: WindowControl,
     callbacks: Callbacks,
     renderer: Renderer,
-    atlas: Rc<Atlas>,
     pacer: Shared<Pacer>,
     idle: Cell<u32>,
     quiet: Option<crate::app::Timer>,
@@ -256,10 +255,7 @@ impl std::ops::Deref for Window {
 
 impl Window {
     pub fn open(options: &WindowOptions, callbacks: Callbacks) -> Result<Self> {
-        let mut renderer = Renderer::new(options.transparent)?;
-        if options.transparent {
-            renderer.update_transparency(true);
-        }
+        let renderer = Renderer::new(options.transparent)?;
         let pacer = Pacer::new(callbacks);
         let snapshot = Arc::new(Mutex::new(guess(options)));
         let layers = Sendable::new((renderer.layer().clone(), renderer.overlay().clone()));
@@ -288,7 +284,6 @@ impl Window {
         Ok(Self {
             control: WindowControl { native, snapshot },
             callbacks,
-            atlas: renderer.atlas().clone(),
             renderer,
             pacer,
             idle: Cell::new(0),
@@ -305,7 +300,7 @@ impl Window {
     }
 
     pub fn atlas(&self) -> &Rc<Atlas> {
-        &self.atlas
+        self.renderer.atlas()
     }
 
     pub fn scale_factor(&self) -> f32 {
@@ -399,9 +394,9 @@ impl Window {
         timing: [f64; 3],
         opacities: &[f32],
         transforms: &[[f64; 16]],
-    ) -> bool {
+    ) {
         self.renderer
-            .promote(key, index, region, timing, opacities, transforms)
+            .promote(key, index, region, timing, opacities, transforms);
     }
 
     pub fn demote(&mut self) {

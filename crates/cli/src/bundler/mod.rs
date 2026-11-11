@@ -4311,13 +4311,7 @@ fn css(
         let (spec, options) = match spec.strip_prefix("url(") {
             Some(inner) => {
                 let close = inner.find(')').context("Expected a closing parenthesis")?;
-                let target = inner[..close].trim();
-                let target = if target.starts_with(['\'', '"']) {
-                    target
-                } else {
-                    &spec[4..4 + close]
-                };
-                (target, inner[close + 1..].trim())
+                (inner[..close].trim(), inner[close + 1..].trim())
             }
             None => match spec.as_bytes().first() {
                 Some(&quote @ (b'\'' | b'"')) => {

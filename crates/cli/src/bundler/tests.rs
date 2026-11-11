@@ -3664,7 +3664,7 @@ fn css_imports_keep_layer_supports_and_media_conditions() {
     }
     fs::write(
         dir.path().join("style.css"),
-        "@import \"./a.css\" layer(base);@import url(./b.css) layer;@import './c.css' supports(display: grid) screen and (min-width: 1px);@import url('./d.css') print;@import './e.css' layer(x.y) supports(not (display: nonsense));",
+        "@import \"./a.css\" layer(base);@import url( ./b.css ) layer;@import './c.css' supports(display: grid) screen and (min-width: 1px);@import url('./d.css') print;@import './e.css' layer(x.y) supports(not (display: nonsense));",
     )
     .unwrap();
     fs::write(

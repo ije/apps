@@ -381,16 +381,6 @@ impl Rect<f32> {
             self.size.height,
         ]
     }
-    // Returns `[x, y, width, height]`.
-    pub fn cover(&self) -> [i32; 4] {
-        let [x, y] = [self.left().floor(), self.top().floor()];
-        [
-            x as i32,
-            y as i32,
-            (self.right().ceil() - x) as i32,
-            (self.bottom().ceil() - y) as i32,
-        ]
-    }
 }
 
 impl<T: Add<Output = T>> Add<Point<T>> for Rect<T> {

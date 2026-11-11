@@ -52,7 +52,8 @@ impl Length {
 // Taffy treats calc handles as opaque, so a handle holds the share's bits above the offset in 1/64 device
 // pixels instead of an address. Taffy tags the low 3 bits.
 fn calc(share: f32, offset: Pixels, scale: f32) -> Option<*const ()> {
-    let units = (to_layout_unit(offset.0, scale) * 64.) as i32;
+    // The offset stops at 2^22 device pixels: past that, the shift below would flip its sign.
+    let units = ((to_layout_unit(offset.0, scale) * 64.) as i32).clamp(-(1 << 28), (1 << 28) - 1);
     let bits = u64::from(share.to_bits()) << 32 | u64::from((units << 3) as u32);
     (units != 0).then(|| std::ptr::without_provenance(bits as usize))
 }
@@ -425,6 +426,10 @@ mod tests {
             );
         }
         assert!(calc(0.5, px(0.), 2.).is_none());
+        for (offset, limit) in [(5_000_000., 4_194_304.), (-5_000_000., -4_194_304.)] {
+            let size = resolve_calc(calc(1., px(offset), 1.).unwrap(), 0.);
+            assert!((size - limit).abs() < 1., "{offset} became {size}");
+        }
     }
 
     #[test]

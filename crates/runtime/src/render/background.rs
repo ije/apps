@@ -242,9 +242,8 @@ pub(super) fn css_background(
                                     let svg = std::fs::read_to_string(&path)
                                         .map_err(anyhow::Error::from)
                                         .and_then(|text| {
-                                            let natural =
-                                                usvg::Tree::from_str(&text, &Default::default())?
-                                                    .size();
+                                            let tree = super::canvas::svg_tree(&text)?;
+                                            let natural = tree.size();
                                             let fitted = fit.place(
                                                 renderer::Rect::new(
                                                     renderer::point(px(0.), px(0.)),
@@ -255,8 +254,8 @@ pub(super) fn css_background(
                                                     natural.height().round().max(1.) as u32 as i32,
                                                 ),
                                             );
-                                            super::canvas::svg(
-                                                &text,
+                                            super::canvas::render_svg(
+                                                &tree,
                                                 raster[0],
                                                 raster[1],
                                                 Some((

@@ -251,8 +251,14 @@ static void AppsLater(dispatch_block_t block) {
     NSArray *command = item.representedObject;
     if ([command[0] length] && [NSApp sendAction:NSSelectorFromString(command[0]) to:nil from:item]) return;
     NSWindow *window = NSApp.keyWindow;
-    NSResponder *responder = [command[2] boolValue] ? window.contentView : window.firstResponder;
-    if (![responder isKindOfClass:NSClassFromString(@"AppsView")]) return;
+    Class page = NSClassFromString(@"AppsView");
+    NSResponder *responder = window.firstResponder;
+    // The page view is a subview of the content view, next to vibrancy and web views.
+    if ([command[2] boolValue]) {
+        responder = nil;
+        for (NSView *view in window.contentView.subviews) if ([view isKindOfClass:page]) responder = view;
+    }
+    if (![responder isKindOfClass:page]) return;
     NSArray *key = command[1];
     NSString *text = [key[2] intValue] == kVK_Delete ? @"\177" : key[0];
     NSEvent *event = [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:[key[1] unsignedIntegerValue] timestamp:NSProcessInfo.processInfo.systemUptime windowNumber:window.windowNumber context:nil characters:text charactersIgnoringModifiers:text isARepeat:NO keyCode:[key[2] unsignedShortValue]];

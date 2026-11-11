@@ -800,8 +800,12 @@ impl Client {
                 let window = self.window(press.event)?;
                 let modifiers = mask_modifiers(press.mods.effective as u16);
                 let at = self.at(press.event_x, press.event_y);
-                // A click ends a composition, or commits a waiting dead key.
-                let (composing, pending) = {
+                // Buttons 4 to 7 are wheel notches: up, down, left, right.
+                let notch = (4..=7).contains(&press.detail);
+                // A click ends a composition, or commits a waiting dead key. A wheel notch is no click.
+                let (composing, pending) = if notch {
+                    (false, None)
+                } else {
                     let mut live = self.live.borrow_mut();
                     (live.composing && live.ime.is_some(), live.composer.reset())
                 };
@@ -811,7 +815,6 @@ impl Client {
                 } else if let Some(text) = pending {
                     Ime::Commit(text).apply(window.calls);
                 }
-                // Buttons 4 to 7 are wheel notches: up, down, left, right.
                 let wheel = match press.detail {
                     4 => point(0., NOTCH_LINES),
                     5 => point(0., -NOTCH_LINES),
@@ -820,13 +823,11 @@ impl Client {
                     detail => {
                         let button = button(detail)?;
                         let clicks = self.live.borrow_mut().clicks.press(button, at);
-                        let first_click = false;
                         window.calls.input(Event::PointerDown {
                             at,
                             button,
                             modifiers,
                             clicks,
-                            first_click,
                         });
                         return Some(());
                     }

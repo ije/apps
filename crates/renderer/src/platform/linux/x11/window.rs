@@ -32,6 +32,8 @@ pub(super) struct Toplevel {
     me: Weak<Toplevel>,
     id: xproto::Window,
     visual: xproto::Visualid,
+    // The server keeps a colormap and a counter until the client frees them, not until the window closes.
+    colormap: Option<xproto::Colormap>,
     pub calls: Callbacks,
     client: Weak<Client>,
     // Taken first when the window closes: GPU objects must not outlive the X window.
@@ -79,15 +81,16 @@ impl Toplevel {
                     .map(|visual| (visual.visual_id, depth.depth))
             })
             .next();
-        let colormap = match argb {
+        let own_colormap = match argb {
             Some((visual, _)) => {
                 let colormap = xcb.generate_id()?;
                 xcb.create_colormap(xproto::ColormapAlloc::NONE, colormap, screen.root, visual)?
                     .check()?;
-                colormap
+                Some(colormap)
             }
-            None => screen.default_colormap,
+            None => None,
         };
+        let colormap = own_colormap.unwrap_or(screen.default_colormap);
         let (visual, depth) = argb.unwrap_or((screen.root_visual, screen.root_depth));
         let scale = client.scale;
         let mut pixels = options.bounds.to_device(scale);
@@ -194,6 +197,9 @@ impl Toplevel {
             Ok(made) => made,
             Err(error) => {
                 let _ = xcb.destroy_window(window);
+                if let Some(colormap) = own_colormap {
+                    let _ = xcb.free_colormap(colormap);
+                }
                 let _ = xcb.flush();
                 return Err(error);
             }
@@ -212,6 +218,7 @@ impl Toplevel {
             me: me.clone(),
             id: window,
             visual,
+            colormap: own_colormap,
             calls,
             client: Rc::downgrade(client),
             atlas: renderer.atlas().clone(),
@@ -548,6 +555,10 @@ impl Drop for Toplevel {
             }
         }
         let _ = client.xcb.destroy_window(self.id);
+        let _ = sync::destroy_counter(&*client.xcb, self.shape.borrow().counter);
+        if let Some(colormap) = self.colormap {
+            let _ = client.xcb.free_colormap(colormap);
+        }
         let _ = client.xcb.flush();
     }
 }

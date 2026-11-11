@@ -137,7 +137,6 @@ pub enum Event {
         button: Button,
         modifiers: Modifiers,
         clicks: usize,
-        first_click: bool,
     },
     PointerUp {
         at: Point<Pixels>,

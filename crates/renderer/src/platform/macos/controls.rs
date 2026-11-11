@@ -66,17 +66,9 @@ fn detach(view: &View) {
     view.clip.removeFromSuperview();
 }
 
-fn registered(
-    cell: &'static OnceLock<usize>,
-    build: impl FnOnce() -> &'static AnyClass,
-) -> &'static AnyClass {
-    let class = *cell.get_or_init(|| build() as *const AnyClass as usize);
-    unsafe { &*(class as *const AnyClass) }
-}
-
 fn clip_class() -> &'static AnyClass {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    registered(&CLASS, || {
+    static CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
+    CLASS.get_or_init(|| {
         let mut class = ClassBuilder::new(c"AppsControlClip", class!(NSView)).unwrap();
         unsafe {
             class.add_method(sel!(isFlipped), flipped as extern "C" fn(_, _) -> Bool);
@@ -90,8 +82,8 @@ fn clip_class() -> &'static AnyClass {
 }
 
 fn target_class() -> &'static AnyClass {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    registered(&CLASS, || {
+    static CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
+    CLASS.get_or_init(|| {
         let mut class = ClassBuilder::new(c"AppsControlTarget", class!(NSObject)).unwrap();
         unsafe {
             class.add_ivar::<*const c_void>(SHARED);
@@ -328,15 +320,16 @@ fn nsdate(days: i64) -> *mut AnyObject {
     unsafe { msg_send![class!(NSDate), dateWithTimeIntervalSince1970: days as f64 * 86400.] }
 }
 
-fn create(kind: ControlKind, target: Option<&AnyObject>) -> Retained<AnyObject> {
+// The caller sets the target and the action.
+fn create(kind: ControlKind) -> Retained<AnyObject> {
     unsafe {
         let control: Retained<AnyObject> = match kind {
             ControlKind::Button => {
-                msg_send![class!(NSButton), buttonWithTitle: &*NSString::from_str(""), target: target, action: sel!(controlAction:)]
+                msg_send![class!(NSButton), buttonWithTitle: &*NSString::from_str(""), target: None::<&AnyObject>, action: None::<Sel>]
             }
             ControlKind::Switch => msg_send![class!(NSSwitch), new],
             ControlKind::Slider => {
-                msg_send![class!(NSSlider), sliderWithTarget: target, action: sel!(controlAction:)]
+                msg_send![class!(NSSlider), sliderWithTarget: None::<&AnyObject>, action: None::<Sel>]
             }
             ControlKind::Stepper => msg_send![class!(NSStepper), new],
             ControlKind::Text => {
@@ -387,7 +380,7 @@ fn measure() -> [[f32; 2]; 8] {
         ControlKind::Date,
     ];
     kinds.map(|kind| unsafe {
-        let control = create(kind, None);
+        let control = create(kind);
         if kind == ControlKind::Button {
             let () = msg_send![&*control, setTitle: &*NSString::from_str("Button")];
         }
@@ -453,7 +446,7 @@ pub(crate) fn update(
             .position(|view| view.state.key == state.key);
         let fresh = index.is_none();
         let index = index.unwrap_or_else(|| unsafe {
-            let control = create(state.kind, Some(&target));
+            let control = create(state.kind);
             let () = msg_send![&*control, setTarget: &*target];
             let () = msg_send![&*control, setAction: sel!(controlAction:)];
             let () = msg_send![&*control, setTag: state.key as isize];

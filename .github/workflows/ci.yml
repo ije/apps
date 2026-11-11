@@ -21,7 +21,7 @@ jobs:
         id: jsc
         with:
           path: target/bun-jsc
-          key: bun-jsc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-jsc.sh', 'scripts/jsc.patch') }}
+          key: bun-jsc-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-jsc.sh', 'scripts/jsc.patch', 'scripts/jsc.exports', 'scripts/jsc-cc.sh') }}
       - if: runner.os == 'Windows' && steps.jsc.outputs.cache-hit != 'true'
         uses: ilammy/msvc-dev-cmd@v1
       - if: runner.os == 'Windows' && steps.jsc.outputs.cache-hit != 'true'

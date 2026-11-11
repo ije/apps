@@ -192,6 +192,76 @@ fn positioned_boxes_follow_their_containing_block_and_scroller() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn scrollbars_fade_after_a_drag_that_ends_outside_the_window() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const input = body => fetch(MCP + '/input', { method: 'POST', body: JSON.stringify({ window: win.id, ...body }) }).then(response => response.text());
+        // Counts the device pixels of the bar's column that are not the white page.
+        const knob = async () => (await win.webContents.capturePage({ x: 393, y: 0, width: 1, height: 200 })).toBitmap().filter((value, index) => index % 4 === 0 && value < 250).length;
+        await input({ action: 'drag', x: 393, y: 15, to_x: 600, to_y: 60 });
+        const [held, top] = [await knob(), await run("document.getElementById('s').scrollTop")];
+        await new Promise(resolve => setTimeout(resolve, 1600));
+        const idle = await knob();
+        if (!held || !top || idle) fail('bar after the drag: ' + held + ' knob pixels at ' + top + ', then ' + idle);
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0;background:#fff;overflow:hidden'>\
+             <div id=s style='width:400px;height:200px;overflow:auto'><div style='height:3000px'></div></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn stretched_images_keep_their_size_when_they_restyle_in_place() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const input = body => fetch(MCP + '/input', { method: 'POST', body: JSON.stringify({ window: win.id, ...body }) }).then(response => response.text());
+        const look = async () => {
+            for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+            return run("['i','j'].map(id => (r => [r.x, r.y, r.width, r.height].join())(document.getElementById(id).getBoundingClientRect())).join(' | ') + ' ' + getComputedStyle(document.getElementById('i')).opacity");
+        };
+        const before = await look();
+        await input({ action: 'move', x: 10, y: 10 });
+        const hover = await look();
+        if (!before.startsWith('0,0,48,48 | 48,0,') || hover !== before.replace(/ 1$/, ' .8')) fail('hover: ' + before + ' then ' + hover);
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0'><style>img:hover{opacity:.8}</style><div style='display:flex;height:48px'>\
+             <img id=i src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2296%22 height=%2296%22%3E%3Crect width=%2296%22 height=%2296%22 fill=%22red%22/%3E%3C/svg%3E'>\
+             <span id=j>after</span></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn boxes_that_stop_scrolling_report_their_content_extent() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const heights = () => run("['a','b'].map(id => document.getElementById(id).scrollHeight).join()");
+        const first = await heights();
+        await run("document.getElementById('a').scrollTop = 0; document.getElementById('b').style.overflow = 'visible'");
+        await win.webContents.capturePage();
+        await win.webContents.capturePage();
+        const second = await heights();
+        if (first !== '500,500' || second !== '500,500') fail('scroll extents: ' + first + ' then ' + second);
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0'><div id=a style='height:50px'><div style='height:500px'></div></div>\
+             <div id=b style='height:50px;overflow:hidden'><div style='height:500px'></div></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn kept_boxes_follow_what_their_build_read_outside_them() {
     run_hidden(
         r#"

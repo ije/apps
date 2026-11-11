@@ -221,7 +221,8 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         return true;
     };
     let length = |part: &str| {
-        part.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'))
+        part.trim_start_matches(['-', '+'])
+            .starts_with(|c: char| c.is_ascii_digit() || c == '.')
             || ["calc(", "min(", "max(", "clamp(", "var("]
                 .iter()
                 .any(|f| part.starts_with(f))
@@ -486,7 +487,6 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 match part {
                     "inside" | "outside" => values[1] = part.into(),
                     _ if part.starts_with("url(") => values[2] = part.into(),
-                    "none" => values[0] = part.into(),
                     _ => values[0] = part.into(),
                 }
             }

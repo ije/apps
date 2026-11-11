@@ -381,11 +381,10 @@ impl Renderer {
         [step, repeat, since]: [f64; 3],
         opacities: &[f32],
         transforms: &[[f64; 16]],
-    ) -> bool {
+    ) {
         CATransaction::setDisableActions(true);
         let scale = self.layer.contentsScale();
         let [x, y, w, h] = region.map(|value| value as f64 / scale);
-        let mut fresh = false;
         if let Some(at) = self
             .promoted
             .iter()
@@ -419,7 +418,6 @@ impl Renderer {
                     drawn: false,
                 });
                 self.restacked = true;
-                fresh = true;
                 self.promoted.len() - 1
             }
         };
@@ -483,7 +481,6 @@ impl Renderer {
                 &*Retained::as_ptr(&values).cast::<NSArray>()
             });
         }
-        fresh
     }
 
     pub fn demote(&mut self) {

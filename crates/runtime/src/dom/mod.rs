@@ -324,6 +324,16 @@ impl LayoutMirror {
         }
     }
 
+    // Pages take the content extent of a box without the scroller mark, so the mark must go with the handle.
+    pub(crate) fn unscroll(&mut self, id: usize) {
+        if id < self.capacity {
+            unsafe {
+                *self.slot(id).add(4).cast::<[f32; 4]>() = [0.; 4];
+                *self.flags(id) &= !MIRROR_SCROLLER;
+            }
+        }
+    }
+
     pub(crate) fn share(&mut self) -> (*mut std::ffi::c_void, usize, *mut std::ffi::c_void) {
         self.reserve(0);
         let memory = self.memory.clone().expect("Layout memory");

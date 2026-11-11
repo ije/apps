@@ -159,6 +159,12 @@ pub struct Gpu {
 
 impl Gpu {
     pub fn call(&mut self, op: &str, args: &[u8]) -> Result<Value> {
+        // A released node is never asked for its image again, so its last frame must go here.
+        if op == "resetCanvas"
+            && let Ok([node]) = serde_json::from_slice::<[usize; 1]>(args)
+        {
+            self.images.remove(&node);
+        }
         let (raw, library) = match self.raw {
             Some(raw) => raw,
             None => {

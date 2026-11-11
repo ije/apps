@@ -396,6 +396,21 @@ fn synchronous_children_honor_stdio_modes() {
 
 #[cfg(unix)]
 #[test]
+fn extra_pipes_and_failed_spawns_keep_node_behavior() {
+    run(r#"
+        const { spawn, spawnSync } = __apps.child_process;
+        const result = spawnSync('/bin/sh', ['-c', 'echo out; echo err >&2; echo extra >&3'], { stdio: ['pipe', 'pipe', 'pipe', 'pipe'] });
+        if (String(result.stdout) !== 'out\n' || String(result.stderr) !== 'err\n') throw Error(`Extra pipe output leaked: ${result.stdout} ${result.stderr}`);
+        const missing = spawn('/apps-missing-command', [], { detached: true });
+        const failed = __apps.events.once(missing, 'error');
+        if (missing.unref() !== missing || missing.ref() !== missing) throw Error('ref and unref return the child');
+        const [error] = await failed;
+        if (error.code !== 'ENOENT') throw Error(`Spawn failed with ${error.code}`);
+    "#);
+}
+
+#[cfg(unix)]
+#[test]
 fn child_process_options_stdio_and_sync_errors() {
     run(r#"
         const { spawn, spawnSync, execFile } = __apps.child_process, { Writable } = __apps.stream, { once } = __apps.events;

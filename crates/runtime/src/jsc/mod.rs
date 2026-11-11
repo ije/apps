@@ -2019,8 +2019,7 @@ impl JsContext {
         // Bootstrap scripts call into the host, so the host is only borrowed per check.
         let enabled = |feature| host.borrow().enabled(feature);
         let disabled: Vec<_> = crate::bundle::FEATURES
-            .iter()
-            .map(|(name, _)| *name)
+            .into_iter()
             .filter(|name| !enabled(name))
             .collect();
         engine.eval(

@@ -156,31 +156,28 @@ pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String,
     Ok((name.into(), product_name.into(), version.into(), identifier))
 }
 
-pub const FEATURES: [(&str, bool); 7] = [
-    ("webgpu", false),
-    ("video", false),
-    ("audio", false),
-    ("jsExecute", false),
-    ("httpImport", false),
-    ("localNetwork", false),
-    ("reactCompiler", false),
+// Every feature is off unless package.json turns it on.
+pub const FEATURES: [&str; 7] = [
+    "webgpu",
+    "video",
+    "audio",
+    "jsExecute",
+    "httpImport",
+    "localNetwork",
+    "reactCompiler",
 ];
 
 pub fn feature_bit(feature: &str) -> u32 {
     1 << FEATURES
         .iter()
-        .position(|(name, _)| *name == feature)
+        .position(|name| *name == feature)
         .expect("Known feature")
 }
 
 pub fn disabled_features(source: Option<&str>) -> Result<u32> {
     let package: serde_json::Value =
         serde_json::from_str(source.unwrap_or("{}")).context("Invalid package.json")?;
-    let mut disabled = FEATURES
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, enabled))| !enabled)
-        .fold(0, |bits, (index, _)| bits | 1 << index);
+    let mut disabled = (1 << FEATURES.len()) - 1;
     let Some(features) = package.get("features") else {
         return Ok(disabled);
     };
@@ -199,11 +196,11 @@ pub fn disabled_features(source: Option<&str>) -> Result<u32> {
         } else {
             1 << FEATURES
                 .iter()
-                .position(|(known, _)| *known == name)
+                .position(|known| *known == name)
                 .with_context(|| {
                     format!(
                         "Unknown feature {name:?} in package.json; expected *, {}",
-                        FEATURES.map(|(name, _)| name).join(", ")
+                        FEATURES.join(", ")
                     )
                 })?
         };

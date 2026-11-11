@@ -2810,6 +2810,88 @@ fn scope_rules_stop_at_limits_and_scope_matches_the_root() {
 }
 
 #[test]
+fn conditional_rules_keep_their_scope_and_starting_style() {
+    let doc = Document::parse(
+        "<style>@scope (.card) to (.content) { @media all { img { width: 1px } :scope { height: 2px } } @supports (width: 1px) { img { order: 3 } } @layer l { img { z-index: 4 } } } @starting-style { @media all { #a { opacity: 0 } } }</style><div class=card id=c><img id=a><div class=content><img id=b></div></div><img id=o>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    assert_eq!(get("#a", "width").as_deref(), Some("1px"));
+    assert_eq!(get("#a", "order").as_deref(), Some("3"));
+    assert_eq!(get("#a", "z-index").as_deref(), Some("4"));
+    assert_eq!(get("#c", "height").as_deref(), Some("2px"));
+    for outside in ["#b", "#o"] {
+        assert_eq!(get(outside, "width"), None);
+        assert_eq!(get(outside, "order"), None);
+        assert_eq!(get(outside, "z-index"), None);
+    }
+    assert_eq!(get("#a", "opacity"), None);
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    assert_eq!(
+        computed.starting[&element(&doc, "#a")].get(Prop::OPACITY),
+        Some("0")
+    );
+}
+
+#[test]
+fn shorthands_keep_vendor_keywords_out_of_lengths() {
+    let doc = Document::parse(
+        "<style>#a{outline:5px auto -webkit-focus-ring-color}#b{outline:-1px solid red;border:+2px solid red}</style><div id=a></div><div id=b></div>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    assert_eq!(get("#a", "outline-width").as_deref(), Some("5px"));
+    assert_eq!(get("#a", "outline-style").as_deref(), Some("auto"));
+    assert_eq!(get("#b", "outline-width").as_deref(), Some("-1px"));
+    assert_eq!(get("#b", "border-top-width").as_deref(), Some("+2px"));
+}
+
+#[test]
+fn computed_list_shorthands_count_items_by_their_longhands() {
+    let doc = Document::parse(
+        "<style>#a{transition-property:opacity,transform;transition-duration:1s;background-image:url(a.png),url(b.png);animation-name:x,y;animation-duration:1s}#b{background:url(a.png),url(b.png) red}</style><div id=a></div><div id=b></div>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let get = |selector, name| {
+        let id = element(&doc, selector);
+        resolved(
+            &computed.values[id],
+            &computed.lengths[id],
+            name,
+            None,
+            &|| [800., 600.],
+            &Registry::default(),
+        )
+    };
+    assert_eq!(get("#a", "transition"), "opacity 1s, transform 1s");
+    assert_eq!(get("#a", "animation"), "1s x, 1s y");
+    assert_eq!(
+        get("#a", "background"),
+        "url(a.png) repeat scroll 0% 0% / auto padding-box border-box, rgba(0, 0, 0, 0) url(b.png) repeat scroll 0% 0% / auto padding-box border-box"
+    );
+    assert_eq!(
+        get("#b", "background"),
+        "url(a.png) repeat scroll 0% 0% / auto padding-box border-box, rgb(255, 0, 0) url(b.png) repeat scroll 0% 0% / auto padding-box border-box"
+    );
+}
+
+#[test]
 fn counters_number_generated_content_and_list_items() {
     let doc = Document::parse(
         "<style>body{counter-reset:section}h2{counter-increment:section}h2::before{content:counter(section) '. '}ol.c{counter-reset:item;list-style:none}ol.c li{counter-increment:item}ol.c li::before{content:counters(item, '.') ' ' counter(item, upper-roman)}.hidden{display:none}</style><body><h2 id=a>A</h2><h2 class=hidden>H</h2><h2 id=b>B</h2><ol class=c><li id=x>x<ol class=c><li>w</li><li id=y>y</li></ol></li></ol><ol start=5><li id=l1>a</li><li id=l2 value=10>b</li><li id=l3>c</li></ol><ol reversed><li id=r1>a</li><li id=r2>b</li></ol></body>",

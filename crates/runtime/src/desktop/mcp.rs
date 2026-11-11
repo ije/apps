@@ -186,7 +186,7 @@ extern "C" fn contexts(list: *mut c_void, push: extern "C" fn(*mut c_void, usize
 extern "C" fn wake(key: u64) {
     match LINK.get() {
         Some(link) if key == u64::MAX => link.wake_main(),
-        Some(link) => link.wake_page(Some(key)),
+        Some(link) => link.wake_page(key),
         None => {}
     }
 }
@@ -336,7 +336,6 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
         button,
         modifiers,
         clicks,
-        first_click: false,
     };
     let up = |at, clicks| Event::PointerUp {
         at,

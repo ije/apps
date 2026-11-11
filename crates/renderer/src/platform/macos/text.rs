@@ -349,12 +349,13 @@ impl TextSystem {
 
     pub fn families(&self) -> Vec<String> {
         let mut names = FAMILIES.clone();
-        let book = self.0.borrow();
-        for added in &book.added {
-            if names.last() != Some(&added.family) {
-                names.push(added.family.clone());
-            }
-        }
+        names.extend(
+            self.0
+                .borrow()
+                .added
+                .iter()
+                .map(|added| added.family.clone()),
+        );
         names
     }
 

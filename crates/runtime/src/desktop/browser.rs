@@ -7,7 +7,6 @@ use std::collections::HashMap;
 pub struct State {
     pub(crate) application: String,
     views: HashMap<u64, Browser>,
-    events: Vec<Value>,
     next_id: u64,
     attaches: Vec<(u64, u64)>,
     parents: HashMap<u64, u64>,
@@ -52,16 +51,17 @@ impl State {
                 self.next_id += 1;
                 Ok(self.next_id.into())
             }
-            "poll" => {
-                let mut events = std::mem::take(&mut self.events);
-                events.extend(self.views.iter().flat_map(|(&id, browser)| {
-                    browser
-                        .poll()
-                        .into_iter()
-                        .map(move |event| serde_json::json!({"view":id,"event":event}))
-                }));
-                Ok(Value::Array(events))
-            }
+            "poll" => Ok(Value::Array(
+                self.views
+                    .iter()
+                    .flat_map(|(&id, browser)| {
+                        browser
+                            .poll()
+                            .into_iter()
+                            .map(move |event| serde_json::json!({"view":id,"event":event}))
+                    })
+                    .collect(),
+            )),
             "destroy" => {
                 let id = arguments[0].as_u64().context("Expected browser id")?;
                 self.views.remove(&id);

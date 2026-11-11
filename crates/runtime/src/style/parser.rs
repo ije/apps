@@ -515,6 +515,8 @@ impl<'i> AtRuleParser<'i> for Rules {
                 names,
                 Rules {
                     parent: self.parent.clone(),
+                    scope: self.scope,
+                    suffix: self.suffix.clone(),
                     ..Rules::default()
                 }
                 .body(input),
@@ -524,6 +526,8 @@ impl<'i> AtRuleParser<'i> for Rules {
                 supported,
                 Rules {
                     parent: self.parent.clone(),
+                    scope: self.scope,
+                    suffix: self.suffix.clone(),
                     ..Rules::default()
                 }
                 .body(input),
@@ -589,6 +593,8 @@ impl<'i> AtRuleParser<'i> for Rules {
                 queries,
                 Rules {
                     parent: self.parent.clone(),
+                    scope: self.scope,
+                    suffix: self.suffix.clone(),
                     ..Rules::default()
                 }
                 .body(input),
@@ -599,6 +605,8 @@ impl<'i> AtRuleParser<'i> for Rules {
                 query,
                 Rules {
                     parent: self.parent.clone(),
+                    scope: self.scope,
+                    suffix: self.suffix.clone(),
                     ..Rules::default()
                 }
                 .body(input),

@@ -1102,9 +1102,6 @@ api!(napi_is_dataview(env, value: Ptr, result: *mut bool) {
     *result = (env.api.to_boolean)(env.ctx, value);
     Ok(())
 });
-api!(napi_coerce_to_boolean(env, value: Ptr, result: *mut Ptr) {
-    env.value(result, env.js("boolean", &[value])?)
-});
 api!(napi_coerce_to_number(env, value: Ptr, result: *mut Ptr) {
     env.value(result, env.js("number", &[value])?)
 });

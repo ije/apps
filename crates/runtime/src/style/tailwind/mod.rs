@@ -1843,8 +1843,6 @@ impl Config {
                 for (index, (_, key, _)) in self.sorted.iter_mut().enumerate() {
                     *key = step * (index as u64 + 1);
                 }
-            }
-            if renumber {
                 self.keys.clear();
             }
             for (_, key, rules) in &self.sorted {
@@ -3158,8 +3156,6 @@ impl Config {
                     | "border-b"
                     | "border-l"
                     | "divide"
-                    | "divide-x"
-                    | "divide-y"
                     | "outline"
                     | "ring"
                     | "inset-ring"
@@ -3401,7 +3397,7 @@ impl Config {
                         &format!("border-color:{color}"),
                     ));
                 }
-                let width = width("1px").filter(|_| modifier.is_none())?;
+                let width = width("1px")?;
                 let axis = &root[7..];
                 let reverse = format!("--tw-divide-{axis}-reverse");
                 let source = if axis == "x" {
@@ -3613,14 +3609,6 @@ impl Config {
                     _ => return None,
                 };
                 if root == "line-clamp" {
-                    if bare == Some("none") {
-                        return Body::new(&[
-                            ("overflow", "visible".into()),
-                            ("display", "block".into()),
-                            ("-webkit-box-orient", "horizontal".into()),
-                            ("-webkit-line-clamp", "unset".into()),
-                        ]);
-                    }
                     return Body::new(&[
                         ("overflow", "hidden".into()),
                         ("display", "-webkit-box".into()),
@@ -3803,19 +3791,16 @@ impl Config {
             }
             "bg-linear" | "bg-gradient-to" | "bg-radial" | "bg-conic" => {
                 let interpolation = match modifier {
-                    None => None,
+                    None => "in oklab".into(),
                     Some(modifier) if modifier.starts_with(['[', '(']) => {
-                        Some(self.arbitrary(modifier)?)
+                        self.arbitrary(modifier)?
                     }
-                    Some(
-                        modifier @ ("srgb" | "hsl" | "oklab" | "oklch" | "longer" | "shorter"
-                        | "increasing" | "decreasing"),
-                    ) => Some(match modifier {
-                        "longer" | "shorter" | "increasing" | "decreasing" => {
-                            format!("in oklch {modifier} hue")
-                        }
-                        _ => format!("in {modifier}"),
-                    }),
+                    Some(modifier @ ("longer" | "shorter" | "increasing" | "decreasing")) => {
+                        format!("in oklch {modifier} hue")
+                    }
+                    Some(modifier @ ("srgb" | "hsl" | "oklab" | "oklch")) => {
+                        format!("in {modifier}")
+                    }
                     _ => return None,
                 };
                 let kind = match root {
@@ -3863,7 +3848,6 @@ impl Config {
                     format!("{kind}-gradient(var(--tw-gradient-stops))"),
                 );
                 if kind == "linear" {
-                    let interpolation = interpolation.unwrap_or_else(|| "in oklab".into());
                     let mut body = Body::new(&[("--tw-gradient-position", position.clone())])?;
                     body = body.nest(
                         &["@supports (background-image: linear-gradient(in lab, red, red))"],
@@ -3874,7 +3858,6 @@ impl Config {
                         .push((Vec::new(), "&".into(), vec![(image.0.into(), image.1)]));
                     return Some(body);
                 }
-                let interpolation = interpolation.unwrap_or_else(|| "in oklab".into());
                 let position = if position.is_empty() {
                     interpolation
                 } else {

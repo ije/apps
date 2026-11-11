@@ -85,10 +85,10 @@ pub fn build(root: &Path, entry: &Path, release: bool, target: BuildTarget) -> R
         fs::create_dir_all(&directory)?;
         manifest = directory.join("Cargo.toml");
         let (_, profiles) = include_str!("../../../Cargo.toml")
-            .split_once("[patch.crates-io]")
-            .unwrap();
+            .split_once("[profile.release]")
+            .context("The workspace Cargo.toml has no release profile")?;
         let source = format!(
-            "[workspace]\n[package]\nname = {}\nversion = \"0.0.0\"\nedition = \"2024\"\n[[bin]]\nname = {}\npath = {}\n[dependencies]\napps = {{ package = \"apps-runtime\", path = {} }}\n[patch.crates-io]{profiles}",
+            "[workspace]\n[package]\nname = {}\nversion = \"0.0.0\"\nedition = \"2024\"\n[[bin]]\nname = {}\npath = {}\n[dependencies]\napps = {{ package = \"apps-runtime\", path = {} }}\n[profile.release]{profiles}",
             json!(name),
             json!(name),
             json!(entry),

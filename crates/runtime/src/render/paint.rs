@@ -765,6 +765,7 @@ impl DomBox {
                 Prop::WEBKIT_MASK_POSITION,
                 Prop::MASK_REPEAT,
                 Prop::WEBKIT_MASK_REPEAT,
+                Prop::MASK_COMPOSITE,
             ]
             .map(|prop| style.get(prop).unwrap_or(""))
             .into_iter()

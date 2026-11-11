@@ -163,13 +163,14 @@ impl Hasher {
         }
     }
     pub(super) fn finish(self) -> Value {
-        crate::web::base64(&self.digest())
+        crate::jsc::payload::write(self.digest())
     }
 }
 
 pub(crate) enum Codec {
     Encode(flate2::Compress),
-    Decode(flate2::Decompress, bool),
+    // The dictionary of a zlib stream waits here until its header asks for it.
+    Decode(flate2::Decompress, bool, Option<Vec<u8>>),
 }
 
 impl Codec {
@@ -193,17 +194,21 @@ impl Codec {
                 format == "deflate",
                 bits,
             )),
-            ("gzip", true) => Self::Decode(Decompress::new_gzip(bits), true),
+            ("gzip", true) => Self::Decode(Decompress::new_gzip(bits), true, None),
             ("deflate" | "deflate-raw", true) => Self::Decode(
                 Decompress::new_with_window_bits(format == "deflate", bits),
                 false,
+                None,
             ),
             _ => bail!("Unsupported zlib format"),
         };
         if let Some(dictionary) = dictionary {
             match &mut codec {
                 Self::Encode(encoder) => encoder.set_dictionary(dictionary).map(drop)?,
-                Self::Decode(decoder, _) => decoder.set_dictionary(dictionary).map(drop)?,
+                Self::Decode(_, _, pending) if format == "deflate" => {
+                    *pending = Some(dictionary.to_vec())
+                }
+                Self::Decode(decoder, ..) => decoder.set_dictionary(dictionary).map(drop)?,
             }
         }
         Ok(codec)
@@ -250,7 +255,7 @@ impl Codec {
                         encoder.total_out() - written,
                     )
                 }
-                Self::Decode(decoder, gzip) => {
+                Self::Decode(decoder, gzip, dictionary) => {
                     if *ended && *gzip && input.starts_with(&[0x1f, 0x8b]) {
                         *decoder = Decompress::new_gzip(15);
                         *ended = false;
@@ -264,12 +269,19 @@ impl Codec {
                     } else {
                         FlushDecompress::Sync
                     };
-                    let status =
-                        decoder
-                            .decompress_vec(input, &mut output, mode)
-                            .map_err(|error| {
-                                anyhow::anyhow!("{}", error.message().unwrap_or("invalid data"))
-                            })?;
+                    let mut result = decoder.decompress_vec(input, &mut output, mode);
+                    if result
+                        .as_ref()
+                        .is_err_and(|error| error.needs_dictionary().is_some())
+                        && let Some(dictionary) = dictionary.take()
+                    {
+                        decoder.set_dictionary(&dictionary)?;
+                        let rest = &input[(decoder.total_in() - read) as usize..];
+                        result = decoder.decompress_vec(rest, &mut output, mode);
+                    }
+                    let status = result.map_err(|error| {
+                        anyhow::anyhow!("{}", error.message().unwrap_or("invalid data"))
+                    })?;
                     (
                         status,
                         decoder.total_in() - read,
@@ -296,16 +308,6 @@ impl Codec {
 
 pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
     match op {
-        "hash" => {
-            let key = if args[2].is_null() {
-                None
-            } else {
-                Some(bytes(&args[2])?)
-            };
-            let mut hasher = Hasher::new(args[0].as_str().context("Expected digest")?, key)?;
-            hasher.update(bytes(&args[1])?);
-            Ok(hasher.finish())
-        }
         "hkdf" => {
             let name = args[0].as_str().context("Expected digest")?;
             let length = args[4].as_u64().context("Expected key length")? as usize;
@@ -327,7 +329,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
             }
             ensure!(output.len() >= length, "Invalid key length");
             output.truncate(length);
-            Ok(crate::web::base64(&output))
+            Ok(crate::jsc::payload::write(output))
         }
         "scrypt" => {
             let [n, r, p, length, limit] =
@@ -421,7 +423,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                 password,
                 &mut key,
             );
-            Ok(crate::web::base64(&key))
+            Ok(crate::jsc::payload::write(key))
         }
         "pbkdf2" => {
             let algorithm = match args[4].as_str().unwrap_or("") {
@@ -469,7 +471,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                     block.copy_from_slice(&sum[..block.len()]);
                 }
             }
-            Ok(crate::web::base64(&key))
+            Ok(crate::jsc::payload::write(key))
         }
         "zlib" => {
             let input = bytes(&args[2])?;
@@ -479,15 +481,22 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                 format => format,
             };
             let inflate = args[1] == true;
+            let dictionary = if args[6].is_null() {
+                None
+            } else {
+                Some(bytes(&args[6])?)
+            };
             let mut ended = false;
-            let output = Codec::new(format, inflate, args[3].as_i64(), None, None)?.write(
-                input,
-                4,
-                &mut ended,
-                args[4].as_u64().unwrap_or(1 << 30),
-            )?;
+            let output = Codec::new(
+                format,
+                inflate,
+                args[3].as_i64(),
+                args[5].as_u64(),
+                dictionary,
+            )?
+            .write(input, 4, &mut ended, args[4].as_u64().unwrap_or(1 << 30))?;
             ensure!(!inflate || ended, "unexpected end of file");
-            Ok(crate::web::base64(&output))
+            Ok(crate::jsc::payload::write(output))
         }
         "lookup" => {
             use std::net::ToSocketAddrs;

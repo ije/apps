@@ -85,14 +85,10 @@ impl PageQueue {
         let _ = self.wake.set(Box::new(wake));
     }
 
-    fn wake(&self) {
+    pub(crate) fn wake(&self) {
         if let Some(wake) = self.wake.get() {
             wake();
         }
-    }
-
-    pub(crate) fn wake_now(&self) {
-        self.wake();
     }
 }
 
@@ -181,11 +177,13 @@ impl Link {
         self.main(ToMain::Spawn(id));
     }
 
-    pub(crate) fn wake_page(&self, window: Option<u64>) {
-        match (&*self.pages(), window) {
-            (None, _) => self.0.page.wake(),
-            (Some(pages), Some(id)) => pages.get(&id).into_iter().for_each(|queue| queue.wake()),
-            (Some(_), None) => {}
+    pub(crate) fn wake_page(&self, window: u64) {
+        match &*self.pages() {
+            None => self.0.page.wake(),
+            Some(pages) => pages
+                .get(&window)
+                .into_iter()
+                .for_each(|queue| queue.wake()),
         }
     }
 
