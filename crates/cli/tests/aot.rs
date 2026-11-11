@@ -218,8 +218,11 @@ setTimeout(async () => {
         let exports: std::collections::BTreeSet<_> = file
             .exports()
             .unwrap()
-            .iter()
-            .map(|symbol| std::str::from_utf8(symbol.name()).unwrap().to_owned())
+            .map(|symbol| {
+                std::str::from_utf8(symbol.unwrap().name().name().unwrap())
+                    .unwrap()
+                    .to_owned()
+            })
             .collect();
         for name in names {
             assert!(exports.contains(*name), "Missing export: {name}");

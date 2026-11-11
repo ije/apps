@@ -3,7 +3,7 @@ use crate::{
     dom::Document,
     style::{self, Lengths, Style, components, parser},
 };
-use renderer::{BlendMode, Bounds, Corners, Length, PaintEffect, Pixels, Radii, Rgba, point, px};
+use renderer::{BlendMode, Color, Corners, Length, PaintEffect, Pixels, Radii, Rect, point, px};
 
 pub(crate) type Matrix = [f32; 16];
 
@@ -147,7 +147,7 @@ pub(crate) fn origin(value: &str, units: &Lengths, size: [f32; 2]) -> [f32; 3] {
 pub(crate) fn transform(
     style: &Style,
     units: &Lengths,
-    bounds: Bounds<Pixels>,
+    bounds: Rect<Pixels>,
     parent_perspective: Option<(f32, [f32; 2])>,
 ) -> Option<Matrix> {
     let size = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
@@ -322,7 +322,7 @@ pub(crate) fn map(matrix: &Matrix, [x, y]: [f32; 2]) -> Option<[f32; 2]> {
     })
 }
 
-pub(crate) fn backface(matrix: &Matrix, bounds: Bounds<Pixels>) -> bool {
+pub(crate) fn backface(matrix: &Matrix, bounds: Rect<Pixels>) -> bool {
     let center = bounds.center();
     let [cx, cy] = [f32::from(center.x), f32::from(center.y)];
     let (Some(a), Some(b), Some(c)) = (
@@ -473,7 +473,7 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Ve
                     .and_then(|value| style::color(value))
                     .unwrap_or((0, 255));
                 let opacity = numbers("flood-opacity").first().copied().unwrap_or(1.);
-                let mut ink: Rgba = renderer::rgba(color.0 << 8 | color.1 as u32);
+                let mut ink: Color = renderer::Color::hex(color.0 << 8 | color.1 as u32);
                 ink.a *= opacity;
                 effects.push(PaintEffect {
                     shadow: Some((
@@ -522,7 +522,7 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Ve
     {
         let sigma = effects.remove(blur).blur;
         effects.push(PaintEffect {
-            shadow: Some((offset, sigma, renderer::black().opacity(0.5))),
+            shadow: Some((offset, sigma, renderer::Color::BLACK.fade(0.5))),
             ..Default::default()
         });
     }
@@ -1433,8 +1433,7 @@ mod tests {
     #[test]
     fn transforms_move_with_their_box() {
         let units = Lengths::new(16., 800., 600.);
-        let at =
-            |x: f32, y: f32| Bounds::new(renderer::point(px(x), px(y)), size(px(120.), px(40.)));
+        let at = |x: f32, y: f32| Rect::new(renderer::point(px(x), px(y)), size(px(120.), px(40.)));
         for pairs in [
             &[("transform", "rotate(30deg) translate(10%, 2em) scale(1.5)")][..],
             &[
@@ -1493,7 +1492,7 @@ mod tests {
     #[test]
     fn transforms_map_window_points_around_the_origin() {
         let units = Lengths::new(16., 800., 600.);
-        let bounds = Bounds::new(point(px(100.), px(50.)), size(px(10.), px(20.)));
+        let bounds = Rect::new(point(px(100.), px(50.)), size(px(10.), px(20.)));
         let moved = transform(
             &style(&[("transform", "translate(5px, 50%)")]),
             &units,

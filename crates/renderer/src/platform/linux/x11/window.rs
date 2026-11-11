@@ -1,536 +1,282 @@
-use super::{ALL_DEVICE_GROUPS, ALL_DEVICES, Client, check, reply};
+use super::Client;
+use crate::platform::linux::gpu::{Atlas, Capture, Drawn, Renderer};
+use crate::platform::linux::{Action, Display as _, Native, run_after};
 use crate::{
-    Bounds, Pixels, Scene, Size, WindowOptions, WindowState,
-    app::Callbacks,
-    platform::linux::{
-        gpu::{Capture, Drawn, GpuAtlas, Renderer},
-        post_local, with_loop,
-    },
-    point, px, size,
+    Pixels, Rect, Scene, Size, WindowOptions, WindowState, app::Callbacks, point, px, size,
 };
-use anyhow::{Context as _, Result};
-use calloop::{
-    RegistrationToken,
-    timer::{TimeoutAction, Timer},
-};
-use raw_window_handle as rwh;
+use anyhow::Result;
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle, XcbDisplayHandle, XcbWindowHandle};
 use std::{
-    cell::{Cell, RefCell},
-    num::NonZeroU32,
-    ptr::NonNull,
-    rc::{Rc, Weak},
-    time::Instant,
+    cell::Cell, cell::RefCell, num::NonZeroU32, ptr::NonNull, rc::Rc, rc::Weak, time::Instant,
 };
-use x11rb::{
-    connection::Connection as _,
-    properties::WmSizeHints,
-    protocol::{
-        sync,
-        xinput::{self, ConnectionExt as _},
-        xproto::{self, ConnectionExt as _},
-    },
-    wrapper::ConnectionExt as _,
-};
+use x11rb::connection::Connection as _;
+use x11rb::properties::WmSizeHints;
+use x11rb::protocol::sync;
+use x11rb::protocol::xinput::{ConnectionExt as _, XIEventMask};
+use x11rb::protocol::xproto::{self, AtomEnum, ConnectionExt as _, EventMask, PropMode};
+use x11rb::wrapper::ConnectionExt as _;
 
-pub(super) struct Shared {
-    pub id: xproto::Window,
-    pub callbacks: Callbacks,
+struct Shape {
+    bounds: Rect,
+    active: bool,
+    fullscreen: bool,
+    // Vertical and horizontal.
+    maximized: [bool; 2],
+    hidden: bool,
+    // The window manager waits for this counter after a resize, until the frame of the new size is drawn.
+    counter: sync::Counter,
+    synced: Option<sync::Int64>,
+}
+
+pub(super) struct Toplevel {
+    me: Weak<Toplevel>,
+    id: xproto::Window,
+    visual: xproto::Visualid,
+    pub calls: Callbacks,
     client: Weak<Client>,
-    state: RefCell<State>,
+    // Taken first when the window closes: GPU objects must not outlive the X window.
+    renderer: RefCell<Option<Renderer>>,
+    atlas: Rc<Atlas>,
+    shape: RefCell<Shape>,
     mapped: Cell<bool>,
     obscured: Cell<bool>,
     wants: Cell<bool>,
-    timer: Cell<Option<RegistrationToken>>,
+    // Frames come from a timer at the display refresh while this is set. Changing `round` stops a timer.
+    ticking: Cell<bool>,
+    round: Cell<u64>,
 }
 
-struct State {
-    // Taken when the window closes: GPU objects must not outlive the X window.
-    renderer: Option<Renderer>,
-    bounds: Bounds<Pixels>,
-    active: bool,
-    fullscreen: bool,
-    maximized: [bool; 2],
-    hidden: bool,
-    counter: sync::Counter,
-    sync: Option<sync::Int64>,
+fn handle(id: xproto::Window, visual: xproto::Visualid) -> RawWindowHandle {
+    let mut handle =
+        XcbWindowHandle::new(NonZeroU32::new(id).expect("X11 window ids are not zero"));
+    handle.visual_id = NonZeroU32::new(visual);
+    RawWindowHandle::Xcb(handle)
 }
 
-pub(crate) struct Window {
-    shared: Rc<Shared>,
-    client: Rc<Client>,
-    atlas: Rc<GpuAtlas>,
-    visual: xproto::Visualid,
-}
-
-impl Window {
+impl Toplevel {
     pub fn open(
         client: &Rc<Client>,
         options: &WindowOptions,
-        callbacks: Callbacks,
-    ) -> Result<Self> {
-        let xcb = &client.xcb;
+        calls: Callbacks,
+    ) -> Result<Rc<Self>> {
+        let xcb = &*client.xcb;
         let atoms = &client.atoms;
         let screen = &xcb.setup().roots[client.screen];
-        let visual = options
-            .transparent
-            .then(|| {
-                screen.allowed_depths.iter().find_map(|depth| {
-                    let visual = depth.visuals.iter().find(|visual| {
-                        (visual.red_mask, visual.green_mask, visual.blue_mask)
-                            == (0xFF0000, 0xFF00, 0xFF)
-                            && depth.depth == 32
-                    })?;
-                    Some((visual.visual_id, depth.depth))
-                })
+        // Transparent windows need a 32-bit visual with alpha.
+        let rgb = |visual: &&xproto::Visualtype| {
+            (visual.red_mask, visual.green_mask, visual.blue_mask) == (0xff0000, 0xff00, 0xff)
+        };
+        let deep = screen
+            .allowed_depths
+            .iter()
+            .filter(|depth| depth.depth == 32 && options.transparent);
+        let argb = deep
+            .flat_map(|depth| {
+                depth
+                    .visuals
+                    .iter()
+                    .find(rgb)
+                    .map(|visual| (visual.visual_id, depth.depth))
             })
-            .flatten();
-        let colormap = match visual {
+            .next();
+        let colormap = match argb {
             Some((visual, _)) => {
                 let colormap = xcb.generate_id()?;
-                check(xcb.create_colormap(
-                    xproto::ColormapAlloc::NONE,
-                    colormap,
-                    screen.root,
-                    visual,
-                ))?;
+                xcb.create_colormap(xproto::ColormapAlloc::NONE, colormap, screen.root, visual)?
+                    .check()?;
                 colormap
             }
             None => screen.default_colormap,
         };
-        let (visual, depth) = visual.unwrap_or((screen.root_visual, screen.root_depth));
-        let scale = client.scale_factor;
-        let mut bounds = options.bounds.to_device_pixels(scale);
-        if bounds.size.width.0 <= 0 || bounds.size.height.0 <= 0 {
-            bounds.size = size(800.into(), 600.into());
+        let (visual, depth) = argb.unwrap_or((screen.root_visual, screen.root_depth));
+        let scale = client.scale;
+        let mut pixels = options.bounds.to_device(scale);
+        if pixels.size.width <= 0 || pixels.size.height <= 0 {
+            pixels.size = size(800, 600);
         }
-        let id = xcb.generate_id()?;
-        check(
-            xcb.create_window(
-                depth,
-                id,
-                screen.root,
-                bounds.origin.x.0 as i16,
-                bounds.origin.y.0 as i16,
-                bounds.size.width.0 as u16,
-                bounds.size.height.0 as u16,
-                0,
-                xproto::WindowClass::INPUT_OUTPUT,
-                visual,
-                &xproto::CreateWindowAux::new()
-                    .border_pixel(screen.black_pixel)
-                    .colormap(colormap)
-                    .event_mask(
-                        xproto::EventMask::EXPOSURE
-                            | xproto::EventMask::STRUCTURE_NOTIFY
-                            | xproto::EventMask::FOCUS_CHANGE
-                            | xproto::EventMask::KEY_PRESS
-                            | xproto::EventMask::KEY_RELEASE
-                            | xproto::EventMask::PROPERTY_CHANGE
-                            | xproto::EventMask::VISIBILITY_CHANGE,
-                    ),
-            ),
-        )?;
-        let setup = (|| -> Result<(sync::Counter, Renderer)> {
-            check(xcb.change_property32(
-                xproto::PropMode::REPLACE,
-                id,
-                atoms._NET_WM_PID,
-                xproto::AtomEnum::CARDINAL,
-                &[std::process::id()],
-            ))?;
-            check(xcb.change_property32(
-                xproto::PropMode::REPLACE,
-                id,
-                atoms.WM_PROTOCOLS,
-                xproto::AtomEnum::ATOM,
-                &[atoms.WM_DELETE_WINDOW, atoms._NET_WM_SYNC_REQUEST],
-            ))?;
-            reply(sync::initialize(&**xcb, 3, 1)).context("X11 sync")?;
+        let heard = [
+            EventMask::EXPOSURE,
+            EventMask::STRUCTURE_NOTIFY,
+            EventMask::FOCUS_CHANGE,
+            EventMask::KEY_PRESS,
+            EventMask::KEY_RELEASE,
+            EventMask::PROPERTY_CHANGE,
+            EventMask::VISIBILITY_CHANGE,
+        ];
+        let heard = heard
+            .into_iter()
+            .fold(EventMask::NO_EVENT, |all, one| all | one);
+        let aux = xproto::CreateWindowAux::new()
+            .border_pixel(screen.black_pixel)
+            .colormap(colormap)
+            .event_mask(heard);
+        let window = xcb.generate_id()?;
+        let (x, y) = (pixels.origin.x as i16, pixels.origin.y as i16);
+        let (width, height) = (pixels.size.width as u16, pixels.size.height as u16);
+        let class = xproto::WindowClass::INPUT_OUTPUT;
+        xcb.create_window(
+            depth,
+            window,
+            screen.root,
+            x,
+            y,
+            width,
+            height,
+            0,
+            class,
+            visual,
+            &aux,
+        )?
+        .check()?;
+        let made = (|| -> Result<(sync::Counter, Renderer)> {
+            let put = |property, kind: AtomEnum, values: &[u32]| -> Result<()> {
+                xcb.change_property32(PropMode::REPLACE, window, property, kind, values)?
+                    .check()?;
+                Ok(())
+            };
+            put(atoms.Pid, AtomEnum::CARDINAL, &[std::process::id()])?;
+            put(
+                atoms.Protocols,
+                AtomEnum::ATOM,
+                &[atoms.DeleteWindow, atoms.SyncRequest],
+            )?;
             let counter = xcb.generate_id()?;
-            check(sync::create_counter(
-                &**xcb,
-                counter,
-                sync::Int64 { lo: 0, hi: 0 },
-            ))?;
-            check(xcb.change_property32(
-                xproto::PropMode::REPLACE,
-                id,
-                atoms._NET_WM_SYNC_REQUEST_COUNTER,
-                xproto::AtomEnum::CARDINAL,
-                &[counter],
-            ))?;
-            check(xcb.change_property32(
-                xproto::PropMode::REPLACE,
-                id,
-                atoms.XdndAware,
-                xproto::AtomEnum::ATOM,
-                &[5],
-            ))?;
+            sync::create_counter(xcb, counter, sync::Int64 { lo: 0, hi: 0 })?.check()?;
+            put(atoms.SyncCounter, AtomEnum::CARDINAL, &[counter])?;
+            // Drops speak XDND version 5.
+            put(atoms.DndAware, AtomEnum::ATOM, &[5])?;
             if options.titlebar_hidden || options.frameless {
-                check(xcb.change_property32(
-                    xproto::PropMode::REPLACE,
-                    id,
-                    atoms._MOTIF_WM_HINTS,
-                    atoms._MOTIF_WM_HINTS,
-                    &[1 << 1, 0, 0, 0, 0],
-                ))?;
+                // Motif hints with only the decorations flag, and no decorations.
+                let hints = [2, 0, 0, 0, 0];
+                xcb.change_property32(
+                    PropMode::REPLACE,
+                    window,
+                    atoms.MotifHints,
+                    atoms.MotifHints,
+                    &hints,
+                )?
+                .check()?;
             }
-            check(xcb.xinput_xi_select_events(
-                id,
-                &[xinput::EventMask {
-                    deviceid: ALL_DEVICE_GROUPS,
-                    mask: vec![
-                        xinput::XIEventMask::MOTION
-                            | xinput::XIEventMask::BUTTON_PRESS
-                            | xinput::XIEventMask::BUTTON_RELEASE
-                            | xinput::XIEventMask::ENTER
-                            | xinput::XIEventMask::LEAVE,
-                    ],
-                }],
-            ))?;
-            check(xcb.xinput_xi_select_events(
-                id,
-                &[xinput::EventMask {
-                    deviceid: ALL_DEVICES,
-                    mask: vec![
-                        xinput::XIEventMask::HIERARCHY | xinput::XIEventMask::DEVICE_CHANGED,
-                    ],
-                }],
-            ))?;
+            let pointer =
+                XIEventMask::MOTION | XIEventMask::BUTTON_PRESS | XIEventMask::BUTTON_RELEASE;
+            let pointer = pointer | XIEventMask::ENTER | XIEventMask::LEAVE;
+            let devices = XIEventMask::HIERARCHY | XIEventMask::DEVICE_CHANGED;
+            // Device 1 is all master devices, and 0 all devices.
+            for (deviceid, mask) in [(1u16, pointer), (0, devices)] {
+                let masks = [x11rb::protocol::xinput::EventMask {
+                    deviceid,
+                    mask: vec![mask],
+                }];
+                xcb.xinput_xi_select_events(window, &masks)?.check()?;
+            }
             xcb.flush()?;
+            let raw = NonNull::new(xcb.get_raw_xcb_connection());
+            let display = RawDisplayHandle::Xcb(XcbDisplayHandle::new(raw, client.screen as i32));
+            let pixels = [u32::from(width), u32::from(height)];
             let renderer = Renderer::new(
-                display_handle(client),
-                window_handle(id, visual),
-                bounds.size,
+                display,
+                handle(window, visual),
+                pixels,
                 options.transparent,
                 false,
             )?;
             let mut hints = WmSizeHints::new();
-            let max = renderer.max_texture_size() as i32;
+            let max = renderer.max_side() as i32;
             hints.max_size = Some((max, max));
             if !options.resizable {
-                hints.min_size = Some((bounds.size.width.0, bounds.size.height.0));
+                hints.min_size = Some((i32::from(width), i32::from(height)));
                 hints.max_size = hints.min_size;
             }
-            check(hints.set_normal_hints(&**xcb, id))?;
+            hints.set_normal_hints(xcb, window)?.check()?;
             Ok((counter, renderer))
         })();
-        let (counter, renderer) = match setup {
-            Ok(setup) => setup,
+        let (counter, renderer) = match made {
+            Ok(made) => made,
             Err(error) => {
-                let _ = xcb.destroy_window(id);
+                let _ = xcb.destroy_window(window);
                 let _ = xcb.flush();
                 return Err(error);
             }
         };
-        let atlas = renderer.atlas().clone();
-        let shared = Rc::new(Shared {
-            id,
-            callbacks,
+        let bounds = pixels.map(|value| px(value as f32 / scale));
+        let shape = Shape {
+            bounds,
+            active: false,
+            fullscreen: false,
+            maximized: [false; 2],
+            hidden: false,
+            counter,
+            synced: None,
+        };
+        let made = Rc::new_cyclic(|me| Self {
+            me: me.clone(),
+            id: window,
+            visual,
+            calls,
             client: Rc::downgrade(client),
-            state: RefCell::new(State {
-                renderer: Some(renderer),
-                bounds: bounds.map(|value| px(value.0 as f32 / scale)),
-                active: false,
-                fullscreen: false,
-                maximized: [false; 2],
-                hidden: false,
-                counter,
-                sync: None,
-            }),
+            atlas: renderer.atlas().clone(),
+            renderer: RefCell::new(Some(renderer)),
+            shape: RefCell::new(shape),
             mapped: Cell::new(false),
             obscured: Cell::new(false),
             wants: Cell::new(false),
-            timer: Cell::new(None),
+            ticking: Cell::new(false),
+            round: Cell::new(0),
         });
         client
-            .state
+            .live
             .borrow_mut()
             .windows
-            .insert(id, Rc::downgrade(&shared));
-        let window = Self {
-            shared,
-            client: client.clone(),
-            atlas,
-            visual,
-        };
-        window.set_title(&options.title);
+            .insert(window, Rc::downgrade(&made));
+        made.act(Action::Title(options.title.clone()));
         let name = super::super::app_name();
         let class = [name.as_bytes(), b"\0", name.as_bytes(), b"\0"].concat();
         let _ = xcb.change_property8(
-            xproto::PropMode::REPLACE,
-            id,
-            xproto::AtomEnum::WM_CLASS,
-            xproto::AtomEnum::STRING,
+            PropMode::REPLACE,
+            window,
+            AtomEnum::WM_CLASS,
+            AtomEnum::STRING,
             &class,
         );
         if options.show {
-            let _ = xcb.map_window(id);
+            let _ = xcb.map_window(window);
         }
         let _ = xcb.flush();
-        Ok(window)
+        Ok(made)
     }
 
-    pub fn atlas(&self) -> &Rc<GpuAtlas> {
-        &self.atlas
-    }
-
-    pub fn scale_factor(&self) -> f32 {
-        self.client.scale_factor
-    }
-
-    pub fn content_size(&self) -> Size<Pixels> {
-        self.shared.state.borrow().bounds.size
-    }
-
-    pub fn request_frame(&self) {
-        self.shared.wants.set(true);
-        self.shared.start_frames();
-    }
-
-    pub fn force_frame(&self) {
-        let shared = Rc::downgrade(&self.shared);
-        post_local(move || {
-            if let Some(shared) = shared.upgrade() {
-                shared.callbacks.frame();
-            }
-        });
-    }
-
-    pub fn draw(&self, scene: &Scene, capture: bool) -> Capture {
-        let (drawn, capture) = {
-            let mut state = self.shared.state.borrow_mut();
-            let (drawn, capture) = state.renderer.as_mut()?.draw(scene, capture);
-            if let Some(value) = state.sync.take() {
-                let _ = sync::set_counter(&*self.client.xcb, state.counter, value);
-                let _ = self.client.xcb.flush();
-            }
-            (drawn, capture)
-        };
-        if drawn == Drawn::Repaint {
-            self.shared.callbacks.appearance_changed();
-        }
-        capture
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.shared.state.borrow().active
-    }
-
-    pub fn set_title(&self, title: &str) {
-        let xcb = &self.client.xcb;
-        let id = self.shared.id;
-        let _ = xcb.change_property8(
-            xproto::PropMode::REPLACE,
-            id,
-            xproto::AtomEnum::WM_NAME,
-            xproto::AtomEnum::STRING,
-            title.as_bytes(),
-        );
-        let _ = xcb.change_property8(
-            xproto::PropMode::REPLACE,
-            id,
-            self.client.atoms._NET_WM_NAME,
-            self.client.atoms.UTF8_STRING,
-            title.as_bytes(),
-        );
-        let _ = xcb.flush();
-    }
-
-    pub fn set_parent(&self, parent: Option<rwh::RawWindowHandle>) {
-        let (xcb, id) = (&self.client.xcb, self.shared.id);
-        let _ = match parent {
-            Some(rwh::RawWindowHandle::Xcb(parent)) => xcb.change_property32(
-                xproto::PropMode::REPLACE,
-                id,
-                xproto::AtomEnum::WM_TRANSIENT_FOR,
-                xproto::AtomEnum::WINDOW,
-                &[parent.window.get()],
-            ),
-            _ => xcb.delete_property(id, xproto::AtomEnum::WM_TRANSIENT_FOR.into()),
-        };
-        let _ = xcb.flush();
-    }
-
-    pub fn state(&self) -> WindowState {
-        let state = self.shared.state.borrow();
-        let display = self
-            .shared
-            .client
-            .upgrade()
-            .and_then(|client| client.primary_display_bounds())
-            .unwrap_or_default();
-        WindowState {
-            frame: state.bounds,
-            content: state.bounds,
-            minimized: state.hidden,
-            maximized: state.maximized == [true; 2] && !state.hidden && !state.fullscreen,
-            fullscreen: state.fullscreen,
-            visible: self.shared.mapped.get(),
-            resizing: false,
-            display,
-            work_area: display,
-        }
-    }
-
-    pub fn minimize(&self) {
-        self.client.send_wm_message(
-            self.shared.id,
-            self.client.atoms.WM_CHANGE_STATE,
-            [3, 0, 0, 0, 0],
-        );
-    }
-
-    pub fn zoom(&self) {
-        let atoms = &self.client.atoms;
-        self.client.send_wm_message(
-            self.shared.id,
-            atoms._NET_WM_STATE,
-            [
-                2,
-                atoms._NET_WM_STATE_MAXIMIZED_VERT,
-                atoms._NET_WM_STATE_MAXIMIZED_HORZ,
-                1,
-                0,
-            ],
-        );
-    }
-
-    pub fn toggle_fullscreen(&self) {
-        let atoms = &self.client.atoms;
-        self.client.send_wm_message(
-            self.shared.id,
-            atoms._NET_WM_STATE,
-            [2, atoms._NET_WM_STATE_FULLSCREEN, 0, 1, 0],
-        );
-    }
-
-    pub fn cancel_composition(&self) {
-        self.client.reset_ime();
-    }
-
-    pub fn activate(&self) {
-        if !self.shared.mapped.get() {
-            let _ = self.client.xcb.map_window(self.shared.id);
-        }
-        self.client.send_wm_message(
-            self.shared.id,
-            self.client.atoms._NET_ACTIVE_WINDOW,
-            [1, x11rb::CURRENT_TIME, 0, 0, 0],
-        );
-    }
-
-    pub fn resize(&self, size: Size<Pixels>) {
-        let size = size.to_device_pixels(self.client.scale_factor);
-        let _ = self.client.xcb.configure_window(
-            self.shared.id,
-            &xproto::ConfigureWindowAux::new()
-                .width(size.width.0.max(1) as u32)
-                .height(size.height.0.max(1) as u32),
-        );
-        let _ = self.client.xcb.flush();
-    }
-
-    pub fn start_window_move(&self) {
-        let xcb = &self.client.xcb;
-        let _ = xcb.ungrab_pointer(x11rb::CURRENT_TIME);
-        let Ok(pointer) = reply(xcb.query_pointer(self.shared.id)) else {
-            return;
-        };
-        const MOVE: u32 = 8;
-        self.client.send_wm_message(
-            self.shared.id,
-            self.client.atoms._NET_WM_MOVERESIZE,
-            [pointer.root_x as u32, pointer.root_y as u32, MOVE, 1, 1],
-        );
-    }
-
-    pub fn raw_window_handle(&self) -> rwh::RawWindowHandle {
-        window_handle(self.shared.id, self.visual)
-    }
-}
-
-impl Drop for Window {
-    fn drop(&mut self) {
-        self.shared.stop_frames();
-        self.shared.state.borrow_mut().renderer.take();
-        self.client
-            .state
-            .borrow_mut()
-            .windows
-            .remove(&self.shared.id);
-        let mut state = self.client.state.borrow_mut();
-        if state.keyboard_focus == Some(self.shared.id) {
-            state.keyboard_focus = None;
-        }
-        if state.mouse_focus == Some(self.shared.id) {
-            state.mouse_focus = None;
-        }
-        drop(state);
-        let _ = self.client.xcb.destroy_window(self.shared.id);
-        let _ = self.client.xcb.flush();
-    }
-}
-
-impl Shared {
     fn visible(&self) -> bool {
         self.mapped.get() && !self.obscured.get()
     }
 
-    fn start_frames(self: &Rc<Self>) {
-        if self.timer.get().is_some() || !self.visible() {
+    fn start(&self) {
+        if self.ticking.get() || !self.visible() {
             return;
         }
-        let Some(refresh) = self.client.upgrade().map(|client| client.refresh) else {
-            return;
-        };
-        let shared = Rc::downgrade(self);
-        let token = with_loop(|handle| {
-            handle.insert_source(Timer::immediate(), move |deadline, _, _| {
-                let Some(shared) = shared.upgrade() else {
-                    return TimeoutAction::Drop;
-                };
-                let more = shared.callbacks.frame();
-                if shared.timer.get().is_none() {
-                    return TimeoutAction::Drop;
-                }
-                if more == Some(false) {
-                    shared.wants.set(false);
-                    shared.timer.set(None);
-                    return TimeoutAction::Drop;
-                }
-                let now = Instant::now();
-                let mut next = deadline + refresh;
-                while next < now {
-                    next += refresh;
-                }
-                TimeoutAction::ToInstant(next)
-            })
-        });
-        self.timer.set(token.ok());
+        self.ticking.set(true);
+        tick(self.me.clone(), self.round.get(), Instant::now());
     }
 
-    fn stop_frames(&self) {
-        if let Some(token) = self.timer.take() {
-            with_loop(|handle| handle.remove(token));
-        }
+    fn stop(&self) {
+        self.ticking.set(false);
+        self.round.set(self.round.get() + 1);
     }
 
-    fn visibility_changed(self: &Rc<Self>) {
+    fn visibility_changed(&self) {
         if !self.visible() {
-            self.stop_frames();
+            self.stop();
         } else if self.wants.get() {
-            self.start_frames();
+            self.start();
         }
-        self.callbacks.changed();
+        self.calls.changed();
     }
 
-    pub fn set_mapped(self: &Rc<Self>, mapped: bool) {
+    pub fn set_mapped(&self, mapped: bool) {
         self.mapped.set(mapped);
         self.visibility_changed();
     }
 
-    pub fn set_obscured(self: &Rc<Self>, obscured: bool) {
+    pub fn set_obscured(&self, obscured: bool) {
         if self.obscured.replace(obscured) != obscured {
             self.visibility_changed();
         }
@@ -538,45 +284,42 @@ impl Shared {
 
     pub fn expose(&self) {
         if self.mapped.get() {
-            self.callbacks.appearance_changed();
+            self.calls.appearance_changed();
         }
     }
 
-    pub fn set_active(&self, active: bool) {
-        self.state.borrow_mut().active = active;
-        self.callbacks.changed();
+    pub fn focus(&self, active: bool) {
+        self.shape.borrow_mut().active = active;
+        self.calls.changed();
     }
 
     pub fn sync_request(&self, value: sync::Int64) {
-        self.state.borrow_mut().sync = Some(value);
+        self.shape.borrow_mut().synced = Some(value);
     }
 
+    // A configure in device pixels.
     pub fn configure(&self, x: i32, y: i32, width: i32, height: i32) {
-        let Some(scale) = self.client.upgrade().map(|client| client.scale_factor) else {
+        let Some(scale) = self.client.upgrade().map(|client| client.scale) else {
             return;
         };
-        let logical = Bounds::new(
-            point(px(x as f32 / scale), px(y as f32 / scale)),
-            size(px(width as f32 / scale), px(height as f32 / scale)),
-        );
+        let extent = size(px(width as f32 / scale), px(height as f32 / scale));
         let resized = {
-            let mut state = self.state.borrow_mut();
-            let resized = logical.size != state.bounds.size;
-            // The origin of a resize event can be wrong, so only moves update it.
+            let mut shape = self.shape.borrow_mut();
+            let resized = extent != shape.bounds.size;
+            // The origin that comes with a resize can be wrong, so only moves set it.
             if resized {
-                state.bounds.size = logical.size;
-                if let Some(renderer) = &mut state.renderer {
-                    renderer.update_drawable_size(size(width.into(), height.into()));
+                shape.bounds.size = extent;
+                if let Some(renderer) = &mut *self.renderer.borrow_mut() {
+                    renderer.resize([width.max(1) as u32, height.max(1) as u32]);
                 }
             } else {
-                state.bounds.origin = logical.origin;
+                shape.bounds.origin = point(px(x as f32 / scale), px(y as f32 / scale));
             }
             resized
         };
-        if resized {
-            self.callbacks.resized(logical.size, scale);
-        } else {
-            self.callbacks.changed();
+        match resized {
+            true => self.calls.resized(extent, scale),
+            false => self.calls.changed(),
         }
     }
 
@@ -584,51 +327,227 @@ impl Shared {
         let Some(client) = self.client.upgrade() else {
             return;
         };
-        let Ok(property) = reply(client.xcb.get_property(
-            false,
-            self.id,
-            client.atoms._NET_WM_STATE,
-            xproto::AtomEnum::ATOM,
-            0,
-            u32::MAX,
-        )) else {
+        let atoms = &client.atoms;
+        let asked =
+            client
+                .xcb
+                .get_property(false, self.id, atoms.State, AtomEnum::ATOM, 0, u32::MAX);
+        let Some(property) = asked.ok().and_then(|cookie| cookie.reply().ok()) else {
             return;
         };
-        let atoms = &client.atoms;
         {
-            let mut state = self.state.borrow_mut();
-            state.fullscreen = false;
-            state.maximized = [false; 2];
-            state.hidden = false;
+            let mut shape = self.shape.borrow_mut();
+            (shape.fullscreen, shape.maximized, shape.hidden) = (false, [false; 2], false);
             for atom in property.value32().into_iter().flatten() {
-                if atom == atoms._NET_WM_STATE_FOCUSED {
-                    state.active = true;
-                } else if atom == atoms._NET_WM_STATE_FULLSCREEN {
-                    state.fullscreen = true;
-                } else if atom == atoms._NET_WM_STATE_MAXIMIZED_VERT {
-                    state.maximized[0] = true;
-                } else if atom == atoms._NET_WM_STATE_MAXIMIZED_HORZ {
-                    state.maximized[1] = true;
-                } else if atom == atoms._NET_WM_STATE_HIDDEN {
-                    state.hidden = true;
+                match atom {
+                    _ if atom == atoms.Focused => shape.active = true,
+                    _ if atom == atoms.Fullscreen => shape.fullscreen = true,
+                    _ if atom == atoms.Tall => shape.maximized[0] = true,
+                    _ if atom == atoms.Wide => shape.maximized[1] = true,
+                    _ if atom == atoms.Hidden => shape.hidden = true,
+                    _ => {}
                 }
             }
         }
-        self.callbacks.changed();
+        self.calls.changed();
     }
 }
 
-fn window_handle(id: xproto::Window, visual: xproto::Visualid) -> rwh::RawWindowHandle {
-    let mut handle =
-        rwh::XcbWindowHandle::new(NonZeroU32::new(id).expect("X11 window ids are not zero"));
-    handle.visual_id = NonZeroU32::new(visual);
-    rwh::RawWindowHandle::Xcb(handle)
+fn tick(window: Weak<Toplevel>, round: u64, at: Instant) {
+    run_after(at.saturating_duration_since(Instant::now()), move || {
+        let Some(strong) = window.upgrade() else {
+            return;
+        };
+        if strong.round.get() != round {
+            return;
+        }
+        let more = strong.calls.frame();
+        if strong.round.get() != round {
+            return;
+        }
+        if more == Some(false) {
+            strong.wants.set(false);
+            strong.stop();
+            return;
+        }
+        let Some(refresh) = strong.client.upgrade().map(|client| client.refresh) else {
+            return;
+        };
+        let now = Instant::now();
+        let mut next = at + refresh;
+        while next < now {
+            next += refresh;
+        }
+        tick(window, round, next);
+    });
 }
 
-fn display_handle(client: &Client) -> rwh::RawDisplayHandle {
-    let connection = as_raw_xcb_connection::AsRawXcbConnection::as_raw_xcb_connection(&*client.xcb);
-    rwh::RawDisplayHandle::Xcb(rwh::XcbDisplayHandle::new(
-        NonNull::new(connection.cast()),
-        client.screen as i32,
-    ))
+impl Native for Toplevel {
+    fn scale(&self) -> f32 {
+        self.client.upgrade().map_or(1., |client| client.scale)
+    }
+
+    fn extent(&self) -> Size<Pixels> {
+        self.shape.borrow().bounds.size
+    }
+
+    fn state(&self) -> WindowState {
+        let shape = self.shape.borrow();
+        let display = self
+            .client
+            .upgrade()
+            .and_then(|client| client.display_bounds());
+        let display = display.unwrap_or_default();
+        WindowState {
+            frame: shape.bounds,
+            content: shape.bounds,
+            minimized: shape.hidden,
+            maximized: shape.maximized == [true; 2] && !shape.hidden && !shape.fullscreen,
+            fullscreen: shape.fullscreen,
+            visible: self.mapped.get(),
+            resizing: false,
+            display,
+            work_area: display,
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.shape.borrow().active
+    }
+
+    fn atlas(&self) -> Rc<Atlas> {
+        self.atlas.clone()
+    }
+
+    fn want_frames(&self) {
+        self.wants.set(true);
+        self.start();
+    }
+
+    fn draw(&self, scene: &Scene, capture: bool) -> Capture {
+        let (drawn, capture) = match &mut *self.renderer.borrow_mut() {
+            Some(renderer) => renderer.draw(scene, capture),
+            None => return capture.then(|| Err(anyhow::anyhow!("The window is closed"))),
+        };
+        let (counter, synced) = {
+            let mut shape = self.shape.borrow_mut();
+            (shape.counter, shape.synced.take())
+        };
+        if let (Some(value), Some(client)) = (synced, self.client.upgrade()) {
+            let _ = sync::set_counter(&*client.xcb, counter, value);
+            let _ = client.xcb.flush();
+        }
+        if drawn == Drawn::Again {
+            self.calls.appearance_changed();
+        }
+        capture
+    }
+
+    fn release(&self) {
+        if let Some(renderer) = &mut *self.renderer.borrow_mut() {
+            renderer.release();
+        }
+    }
+
+    fn act(&self, action: Action) {
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        let (xcb, atoms, id) = (&client.xcb, &client.atoms, self.id);
+        match action {
+            Action::Title(title) => {
+                let (name, string) = (AtomEnum::WM_NAME.into(), AtomEnum::STRING.into());
+                for (property, kind) in [(name, string), (atoms.Name, atoms.UTF8_STRING)] {
+                    let _ = xcb.change_property8(
+                        PropMode::REPLACE,
+                        id,
+                        property,
+                        kind,
+                        title.as_bytes(),
+                    );
+                }
+            }
+            // ICCCM iconic state.
+            Action::Minimize => client.ask_manager(id, atoms.ChangeState, [3, 0, 0, 0, 0]),
+            // Toggles of window manager states, from a normal application.
+            Action::Zoom => client.ask_manager(id, atoms.State, [2, atoms.Tall, atoms.Wide, 1, 0]),
+            Action::Fullscreen => {
+                client.ask_manager(id, atoms.State, [2, atoms.Fullscreen, 0, 1, 0])
+            }
+            Action::Raise => {
+                if !self.mapped.get() {
+                    let _ = xcb.map_window(id);
+                }
+                client.ask_manager(id, atoms.ActiveWindow, [1, x11rb::CURRENT_TIME, 0, 0, 0]);
+            }
+            Action::Resize(extent) => {
+                let pixels = extent.to_device(client.scale);
+                let [width, height] = [pixels.width, pixels.height].map(|side| side.max(1) as u32);
+                let _ = xcb.configure_window(
+                    id,
+                    &xproto::ConfigureWindowAux::new()
+                        .width(width)
+                        .height(height),
+                );
+            }
+            Action::Move => {
+                // The window manager can't grab the pointer while the press keeps it grabbed for this window.
+                let _ = xcb.ungrab_pointer(x11rb::CURRENT_TIME);
+                let Some(pointer) = xcb
+                    .query_pointer(id)
+                    .ok()
+                    .and_then(|cookie| cookie.reply().ok())
+                else {
+                    return;
+                };
+                // A move with button 1, from a normal application.
+                let (x, y) = (pointer.root_x as u32, pointer.root_y as u32);
+                client.ask_manager(id, atoms.MoveResize, [x, y, 8, 1, 1]);
+            }
+            Action::Parent(parent) => {
+                let transient = AtomEnum::WM_TRANSIENT_FOR;
+                let _ = match parent {
+                    Some(RawWindowHandle::Xcb(parent)) => {
+                        let owner = [parent.window.get()];
+                        xcb.change_property32(
+                            PropMode::REPLACE,
+                            id,
+                            transient,
+                            AtomEnum::WINDOW,
+                            &owner,
+                        )
+                    }
+                    _ => xcb.delete_property(id, transient.into()),
+                };
+            }
+            Action::CancelComposition => client.reset_ime(),
+        }
+        let _ = xcb.flush();
+    }
+
+    fn handle(&self) -> RawWindowHandle {
+        handle(self.id, self.visual)
+    }
+}
+
+impl Drop for Toplevel {
+    fn drop(&mut self) {
+        self.stop();
+        self.renderer.take();
+        let Some(client) = self.client.upgrade() else {
+            return;
+        };
+        {
+            let mut live = client.live.borrow_mut();
+            live.windows.remove(&self.id);
+            if live.focus == Some(self.id) {
+                live.focus = None;
+            }
+            if live.hover == Some(self.id) {
+                live.hover = None;
+            }
+        }
+        let _ = client.xcb.destroy_window(self.id);
+        let _ = client.xcb.flush();
+    }
 }

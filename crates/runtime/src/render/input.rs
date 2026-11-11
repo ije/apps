@@ -8,10 +8,7 @@ use crate::{
     style,
 };
 use anyhow::{Context as _, Result, ensure};
-use renderer::{
-    App, Bounds, FileDropEvent, Pixels, PlatformInput, Point, Utf16Selection, Window, point, px,
-    size,
-};
+use renderer::{App, Event, Pixels, Point, Rect, Utf16Selection, Window, point, px, size};
 use std::{
     ops::Range,
     rc::Rc,
@@ -25,12 +22,12 @@ pub(super) type Blink = ([usize; 3], Instant, Option<(u32, renderer::Timer)>);
 pub(super) fn paint_caret(
     view: &PageState,
     key: [usize; 3],
-    bounds: Bounds<Pixels>,
-    color: renderer::Rgba,
+    bounds: Rect<Pixels>,
+    color: renderer::Color,
     window: &mut Window,
 ) {
     const BLINK: Duration = renderer::CARET_BLINK;
-    if color.a == 0. || !window.is_window_active() {
+    if color.a == 0. || !window.is_active() {
         return;
     }
     let now = Instant::now();
@@ -51,7 +48,7 @@ pub(super) fn paint_caret(
         *wake = Some((phase, window.timer(due - now, |window, _| window.refresh())));
     }
     if phase.is_multiple_of(2) {
-        window.paint_quad(renderer::fill(bounds, color));
+        window.draw_rect(bounds, color);
     }
 }
 
@@ -63,9 +60,9 @@ pub(super) struct FieldText {
     pub(super) run: renderer::TextRun,
     pub(super) placeholder: bool,
     pub(super) single_line: bool,
-    pub(super) caret: renderer::Rgba,
+    pub(super) caret: renderer::Color,
     pub(super) selection: (Option<u32>, u32),
-    pub(super) handle: renderer::ScrollHandle,
+    pub(super) handle: renderer::ScrollRef,
     pub(super) selected: std::cell::Cell<Option<[usize; 2]>>,
 }
 
@@ -126,9 +123,7 @@ impl renderer::Hooks for FieldText {
             let mut offset = old;
             match selected {
                 Some([_, end]) => {
-                    if let Some(caret) =
-                        layout.position_for_index(crate::dom::utf16_index(&self.text, end))
-                    {
+                    if let Some(caret) = layout.point_at(crate::dom::utf16_index(&self.text, end)) {
                         let line = layout.line_height();
                         if caret.x < shown.left() {
                             offset.x += shown.left() - caret.x;
@@ -171,24 +166,24 @@ impl renderer::Hooks for FieldText {
             .filter(|[start, end, _]| start < end)
             .map(|[start, end, _]| super::text::TextHighlight {
                 range: start..end,
-                color: self.selection.0.map(renderer::rgba),
-                background: renderer::rgba(self.selection.1),
+                color: self.selection.0.map(renderer::Color::hex),
+                background: renderer::Color::hex(self.selection.1),
             })
             .into_iter()
             .collect();
-        let strut = window.text_system().resolve_font(&self.run.font);
+        let strut = window.text_system().face(&self.run.font);
         let mask = window.content_mask().bounds;
         let mut origin = layout.bounds().origin;
         let mut offset = 0;
-        for line in layout.line_layouts() {
-            let height = line_height * (line.wrap_boundaries.len() + 1);
+        for line in layout.lines().iter() {
+            let height = line_height * line.rows();
             if origin.y >= mask.bottom() {
                 break;
             }
             if origin.y + height > mask.top() {
                 super::text::paint_text(
-                    &line.unwrapped_layout,
-                    &line.wrap_boundaries,
+                    &line.line,
+                    &line.breaks,
                     origin,
                     line_height,
                     std::slice::from_ref(&self.run),
@@ -206,12 +201,12 @@ impl renderer::Hooks for FieldText {
         }
         if let Some([start, end, caret]) = selected
             && start == end
-            && let Some(at) = layout.position_for_index(caret)
+            && let Some(at) = layout.point_at(caret)
         {
             paint_caret(
                 &self.view,
                 [self.id, caret, text.len()],
-                Bounds::new(at, size(px(1.), line_height)),
+                Rect::new(at, size(px(1.), line_height)),
                 self.caret,
                 window,
             );
@@ -381,16 +376,20 @@ impl renderer::View for PageView {
         self.drive(cx);
     }
 
-    fn event(&mut self, event: &PlatformInput, window: &mut Window, cx: &mut App) {
+    fn event(&mut self, event: &Event, window: &mut Window, cx: &mut App) {
         let id = self.id;
         match event {
-            PlatformInput::KeyDown(event) => {
-                let key = event.keystroke.key.as_str();
-                let modifiers = &event.keystroke.modifiers;
-                match tool(&event.keystroke).filter(|_| !self.host.borrow().packaged) {
+            Event::KeyDown {
+                key: named,
+                modifiers,
+                repeat,
+                ime,
+            } => {
+                let key = named.name.as_str();
+                match tool(key, *modifiers).filter(|_| !self.host.borrow().packaged) {
                     Some(Tool::Hud) => {
                         super::hud::Hud::toggle(&self.0, window);
-                        cx.stop_propagation();
+                        cx.stop_event();
                         return;
                     }
                     Some(Tool::DevTools) => {
@@ -399,7 +398,7 @@ impl renderer::View for PageView {
                             serde_json::json!({"op":"window","args":["devtools",id]}),
                         );
                         self.drive(cx);
-                        cx.stop_propagation();
+                        cx.stop_event();
                         return;
                     }
                     None => {}
@@ -409,33 +408,33 @@ impl renderer::View for PageView {
                     id,
                     "keydown",
                     &[],
-                    serde_json::json!({"nativeKey":event.keystroke.key,"keyChar":event.keystroke.key_char,"ctrlKey":modifiers.control,"metaKey":modifiers.platform,"altKey":modifiers.alt,"shiftKey":modifiers.shift,"repeat":event.is_held,"ime":event.ime}),
+                    serde_json::json!({"nativeKey":named.name,"keyChar":named.text,"ctrlKey":modifiers.ctrl(),"metaKey":modifiers.command(),"altKey":modifiers.alt(),"shiftKey":modifiers.shift(),"repeat":repeat,"ime":ime}),
                     Some(window),
                     cx,
                 );
                 if !allowed {
-                    cx.stop_propagation();
+                    cx.stop_event();
                     return;
                 }
-                if event.ime {
+                if *ime {
                     return;
                 }
                 if cfg!(target_os = "macos")
-                    && modifiers.platform
-                    && !modifiers.control
-                    && !modifiers.alt
+                    && modifiers.command()
+                    && !modifiers.ctrl()
+                    && !modifiers.alt()
                     && key == "q"
                 {
-                    cx.stop_propagation();
+                    cx.stop_event();
                     cx.quit();
                     return;
                 }
                 let primary = if cfg!(target_os = "macos") {
-                    modifiers.platform && !modifiers.control
+                    modifiers.command() && !modifiers.ctrl()
                 } else {
-                    modifiers.control && !modifiers.platform
+                    modifiers.ctrl() && !modifiers.command()
                 };
-                if primary && !modifiers.alt && matches!(key, "c" | "x" | "v") {
+                if primary && !modifiers.alt() && matches!(key, "c" | "x" | "v") {
                     let renderer = self
                         .runtime
                         .borrow()
@@ -450,52 +449,48 @@ impl renderer::View for PageView {
                         };
                         super::edit(&renderer, Some((cx, Some(&mut *window))), command, "");
                     }
-                    cx.stop_propagation();
+                    cx.stop_event();
                     window.refresh();
                 }
             }
-            PlatformInput::KeyUp(event) => {
-                let modifiers = &event.keystroke.modifiers;
+            Event::KeyUp {
+                key,
+                modifiers,
+                ime,
+            } => {
                 Desktop::dispatch(
                     self.runtime.clone(),
                     id,
                     "keyup",
                     &[],
-                    serde_json::json!({"nativeKey":event.keystroke.key,"keyChar":event.keystroke.key_char,"ctrlKey":modifiers.control,"metaKey":modifiers.platform,"altKey":modifiers.alt,"shiftKey":modifiers.shift,"ime":event.ime}),
+                    serde_json::json!({"nativeKey":key.name,"keyChar":key.text,"ctrlKey":modifiers.ctrl(),"metaKey":modifiers.command(),"altKey":modifiers.alt(),"shiftKey":modifiers.shift(),"ime":ime}),
                     Some(window),
                     cx,
                 );
             }
-            PlatformInput::ModifiersChanged(event) => {
-                let modifiers = &event.modifiers;
+            Event::ModifiersChanged { modifiers, .. } => {
                 Desktop::dispatch(
                     self.runtime.clone(),
                     id,
                     "modifiers",
                     &[],
-                    serde_json::json!({"ctrlKey":modifiers.control,"metaKey":modifiers.platform,"altKey":modifiers.alt,"shiftKey":modifiers.shift}),
+                    serde_json::json!({"ctrlKey":modifiers.ctrl(),"metaKey":modifiers.command(),"altKey":modifiers.alt(),"shiftKey":modifiers.shift()}),
                     Some(window),
                     cx,
                 );
             }
-            PlatformInput::FileDrop(FileDropEvent::Entered { paths, position }) => {
+            Event::FileEnter { paths, at } => {
                 *self.dropped.borrow_mut() = paths.clone();
-                self.drag_files("enter", *position, window, cx);
+                self.drag_files("enter", *at, window, cx);
             }
-            PlatformInput::FileDrop(FileDropEvent::Pending { position }) => {
-                self.drag_files("over", *position, window, cx)
-            }
-            PlatformInput::FileDrop(FileDropEvent::Exited) => {
-                self.drag_files("leave", Point::default(), window, cx)
-            }
-            PlatformInput::FileDrop(FileDropEvent::Submit { position }) => {
-                self.drop_files(*position, window, cx)
-            }
+            Event::FileOver { at } => self.drag_files("over", *at, window, cx),
+            Event::FileLeave => self.drag_files("leave", Point::default(), window, cx),
+            Event::FileDrop { at } => self.drop_files(*at, window, cx),
             _ => {}
         }
     }
 
-    fn text_for_range(
+    fn text_in(
         &mut self,
         range: Range<usize>,
         actual: &mut Option<Range<usize>>,
@@ -510,7 +505,7 @@ impl renderer::View for PageView {
         Some(String::from_utf16_lossy(&text[range]))
     }
 
-    fn selected_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<Utf16Selection> {
+    fn selection(&mut self, _: &mut Window, _: &mut App) -> Option<Utf16Selection> {
         let state = self.editing()?;
         let start = state["start"].as_u64()? as usize;
         let end = state["end"].as_u64()? as usize;
@@ -520,13 +515,13 @@ impl renderer::View for PageView {
         })
     }
 
-    fn marked_text_range(&mut self, _: &mut Window, _: &mut App) -> Option<Range<usize>> {
+    fn composition(&mut self, _: &mut Window, _: &mut App) -> Option<Range<usize>> {
         let state = self.editing()?;
         Some(state["marked"][0].as_u64()? as usize..state["marked"][1].as_u64()? as usize)
             .filter(|range| range.start <= range.end)
     }
 
-    fn unmark_text(&mut self, window: &mut Window, cx: &mut App) {
+    fn end_composition(&mut self, window: &mut Window, cx: &mut App) {
         if let Some(state) = self.editing()
             && let (Some(start), Some(end), Some(text)) = (
                 state["marked"][0].as_u64(),
@@ -549,7 +544,7 @@ impl renderer::View for PageView {
         }
     }
 
-    fn replace_text_in_range(
+    fn insert(
         &mut self,
         range: Option<Range<usize>>,
         text: &str,
@@ -559,7 +554,7 @@ impl renderer::View for PageView {
         self.input(text, range, false, None, window, cx);
     }
 
-    fn replace_and_mark_text_in_range(
+    fn compose(
         &mut self,
         range: Option<Range<usize>>,
         text: &str,
@@ -570,12 +565,12 @@ impl renderer::View for PageView {
         self.input(text, range, true, selected, window, cx);
     }
 
-    fn bounds_for_range(
+    fn rect_of(
         &mut self,
         range: Range<usize>,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Bounds<Pixels>> {
+    ) -> Option<Rect<Pixels>> {
         let state = self.editing()?;
         // The IME asks right after an edit, before the next frame lays out the new text, so reflow first.
         super::scripted(cx, Some(window), || super::reflow(self.id));
@@ -623,16 +618,16 @@ impl renderer::View for PageView {
             let to = super::text::text_position(layout, text, rows, end)
                 .filter(|to| to.y == at.y && to.x >= at.x)
                 .unwrap_or(at);
-            return Some(Bounds::new(at, size(to.x - at.x, layout.line_height())));
+            return Some(Rect::new(at, size(to.x - at.x, layout.line_height())));
         }
         let bounds = dom.bounds.get(&id)?;
-        Some(Bounds::new(
+        Some(Rect::new(
             point(px(bounds[0]), px(bounds[1])),
             size(px(bounds[2]), px(bounds[3])),
         ))
     }
 
-    fn character_index_for_point(
+    fn index_at(
         &mut self,
         point: Point<Pixels>,
         window: &mut Window,
@@ -684,13 +679,13 @@ impl renderer::View for PageView {
         let run = renderer::TextRun {
             len: selected.len(),
             font: face,
-            color: renderer::black(),
+            color: renderer::Color::BLACK,
             ..Default::default()
         };
         let line = window
             .text_system()
-            .shape_line(selected, px(font_size), &[run], None);
-        let index = line.closest_index_for_x(point.x - px(bounds[0]));
+            .shape_line(selected, px(font_size), &run);
+        let index = line.line.nearest_index(point.x - px(bounds[0]));
         Some((offset + selected[..index].encode_utf16().count()).min(text.encode_utf16().count()))
     }
 }

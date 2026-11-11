@@ -2,7 +2,7 @@
   "name": "@pierre/apps-linux-arm64",
   "version": "0.0.0",
   "description": "The Linux arm64 binaries of @pierre/apps",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "main": "index.mjs",
   "files": [

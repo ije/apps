@@ -2908,7 +2908,7 @@ pub(crate) fn resolved(
             let [width, height] = size.unwrap_or_default();
             let mut flat = style.clone();
             flat.insert(Prop::TRANSFORM_ORIGIN, "0 0");
-            let bounds = renderer::Bounds::new(
+            let bounds = renderer::Rect::new(
                 renderer::point(renderer::px(0.), renderer::px(0.)),
                 renderer::size(renderer::px(width), renderer::px(height)),
             );
@@ -3949,7 +3949,7 @@ pub(crate) fn font_names(system: &renderer::TextSystem, aliases: &HashMap<String
         if names.0.is_empty() {
             names.1.clear();
             names.0 = system
-                .all_font_names()
+                .families()
                 .into_iter()
                 .map(|name| (name.to_ascii_lowercase(), name))
                 .chain(
@@ -6115,17 +6115,15 @@ pub(crate) fn cascade(
         if let Some(text) = text_system {
             let font = font(&style);
             let (id, metrics) = font_metrics.entry(font.clone()).or_insert_with(|| {
-                let id = text.resolve_font(&font);
+                let id = text.face(&font);
                 let size = renderer::px(1.);
                 (
                     id,
                     [
-                        text.ch_advance(id, size).map(f32::from).unwrap_or(0.5),
-                        f32::from(text.x_height(id, size)),
-                        f32::from(text.cap_height(id, size)),
-                        text.advance(id, size, '水')
-                            .map(|s| f32::from(s.width))
-                            .unwrap_or(1.),
+                        text.advance(id, size, '0').map(f32::from).unwrap_or(0.5),
+                        text.metrics(id).x_height * size.0,
+                        text.metrics(id).cap_height * size.0,
+                        text.advance(id, size, '水').map(f32::from).unwrap_or(1.),
                     ],
                 )
             });

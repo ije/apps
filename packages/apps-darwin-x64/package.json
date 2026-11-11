@@ -2,7 +2,7 @@
   "name": "@pierre/apps-darwin-x64",
   "version": "0.0.0",
   "description": "The macOS x64 binaries of @pierre/apps",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "main": "index.mjs",
   "files": [

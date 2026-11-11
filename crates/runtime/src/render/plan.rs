@@ -1,6 +1,6 @@
 use super::effects::{self, Establishes};
 use crate::style::{self, Lengths, Prop, Style};
-use renderer::{Pixels, Radii, Rgba, rgba};
+use renderer::{Color, Pixels, Radii};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 
@@ -19,7 +19,7 @@ pub(super) struct Plan {
     pub(super) selection: (Option<u32>, u32),
     pub(super) padding: Option<[f32; 4]>,
     pub(super) borders: Option<[f32; 4]>,
-    pub(super) border_colors: [Rgba; 4],
+    pub(super) border_colors: [Color; 4],
     pub(super) radii: Option<Radii<renderer::Length>>,
     pub(super) shareable: bool,
 }
@@ -32,8 +32,8 @@ impl Plan {
                 .any(|&prop| style.get(prop).is_some_and(|value| value.contains('%')))
         };
         let ink = style.get(Prop::COLOR).and_then(style::color);
-        let text = ink.map_or(rgba(0x000000ff), |(ink, alpha)| {
-            rgba(ink << 8 | alpha as u32)
+        let text = ink.map_or(Color::hex(0x000000ff), |(ink, alpha)| {
+            Color::hex(ink << 8 | alpha as u32)
         });
         let borders = style::BORDERS.map(|[width, kind, _]| {
             if style
@@ -91,7 +91,7 @@ impl Plan {
                 style
                     .get(name)
                     .and_then(style::color)
-                    .map_or(text, |(ink, alpha)| rgba(ink << 8 | alpha as u32))
+                    .map_or(text, |(ink, alpha)| Color::hex(ink << 8 | alpha as u32))
             }),
             radii: (!relative(&corners)).then(|| effects::radii(style, units, || [0.; 2])),
             shareable: matches!(

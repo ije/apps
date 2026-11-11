@@ -7,29 +7,30 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
-raw-window-handle = { version = "0.6", features = ["std"] }
-url = "2.5"
+raw-window-handle = { version = "0.6.2", features = ["std"] }
+url = "2.5.8"
 
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
-wry = { version = "=0.57.1", default-features = false, features = ["os-webview", "devtools"] }
-tempfile = "3"
-base64 = "0.22"
-getrandom = "0.3"
-sha2 = "0.10"
+wry = { version = "=0.57.2", default-features = false, features = ["os-webview", "devtools"] }
+tempfile = "3.27.0"
+base64 = "0.23.1"
+getrandom = "0.4.3"
+sha2 = "0.11.1"
 image = { version = "=0.25.10", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-gtk = "0.18"
-gdkx11 = "0.18"
+# Wry and WebKitGTK require the GTK 0.18 types.
+gtk = "0.18.2"
+gdkx11 = "0.18.2"
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-dom_query = "0.28"
-webview2-com = "0.39"
-windows = { version = "0.62", features = ["Win32_System_Com", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_LibraryLoader", "Win32_System_WinRT"] }
+dom_query = "0.29.0"
+webview2-com = "0.39.1"
+windows = { version = "0.62.2", features = ["Win32_System_Com", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_LibraryLoader", "Win32_System_WinRT"] }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27.0"
 
 [build-dependencies]
-cc = "1"
+cc = "1.11.1"

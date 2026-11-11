@@ -1,10 +1,9 @@
 use crate::{
-    AlignContent, AlignItems, AvailableSpace, Baseline, Bounds, ContentMask, Display, ElementId,
-    Hitbox, HitboxBehavior, Hooks, Inline, Pixels, Point, Size, Style, TextStyle, Visibility,
-    Window,
+    AlignContent, AlignItems, AvailableSpace, Baseline, Clip, Display, Hit, Hooks, Inline, Pixels,
+    Point, Rect, Region, Scope, Size, Style, TextStyle, Visibility, Window,
     geometry::round_half_up,
-    node::{Child, Content, Events, MeasureFn, Measurement, Node, NodeCx, NodeStyle},
-    point, px, quad, size,
+    node::{Child, Content, Events, MeasureFn, Measurement, Node, NodeCx, NodeKey, NodeStyle},
+    point, px, size,
     text::{TextState, same_shaping},
 };
 use rustc_hash::{FxHashMap, FxHasher};
@@ -48,16 +47,16 @@ struct Slot {
     layout: Layout,
     baselines: Baselines,
     origin: Point<f32>,
-    bounds: [Bounds<Pixels>; 3],
+    bounds: [Rect<Pixels>; 3],
     hitbox: u32,
     listed: bool,
     free: [bool; 2],
     #[allow(clippy::type_complexity)]
-    placed: Option<(u32, Point<f32>, (Point<Pixels>, ContentMask<Pixels>, usize))>,
+    placed: Option<(u32, Point<f32>, (Point<Pixels>, Clip<Pixels>, usize))>,
     below: bool,
     volatile: bool,
-    reach: Option<Bounds<Pixels>>,
-    escaped: Option<ContentMask<Pixels>>,
+    reach: Option<Rect<Pixels>>,
+    escaped: Option<Clip<Pixels>>,
 }
 
 type Remains = (
@@ -158,10 +157,7 @@ impl std::ops::Deref for Styled {
     }
 }
 
-type Refined = (
-    Rc<TextStyle>,
-    Vec<(crate::style::TextStyleRefinement, Rc<TextStyle>)>,
-);
+type Refined = (Rc<TextStyle>, Vec<(crate::TextOverrides, Rc<TextStyle>)>);
 
 #[derive(Default)]
 pub struct Tree {
@@ -176,8 +172,8 @@ pub struct Tree {
     root: Option<u32>,
     measured_with: (f32, usize),
     stretch: Option<Size<Pixels>>,
-    hitboxes: Vec<Hitbox>,
-    layers: FxHashMap<u32, Vec<(i32, u32, ContentMask<Pixels>)>>,
+    hitboxes: Vec<Region>,
+    layers: FxHashMap<u32, Vec<(i32, u32, Clip<Pixels>)>>,
     kids: Vec<NodeId>,
     initial: Rc<TextStyle>,
     blank: Rc<Styled>,
@@ -185,18 +181,18 @@ pub struct Tree {
     // Retain styles used as pointer keys to prevent address reuse.
     shared: FxHashMap<*const Style, (Rc<Style>, Rc<Styled>)>,
     texts: Interned<TextStyle>,
-    stacks: Vec<Vec<(i32, u32, ContentMask<Pixels>)>>,
-    blocks: Vec<(u8, ContentMask<Pixels>)>,
+    stacks: Vec<Vec<(i32, u32, Clip<Pixels>)>>,
+    blocks: Vec<(u8, Clip<Pixels>)>,
     painting: Vec<u32>,
     unbounded: u32,
-    previous: Vec<Hitbox>,
+    previous: Vec<Region>,
     prepaints: u32,
     full: bool,
     graveyard: Vec<Remains>,
     refined: FxHashMap<usize, Refined>,
 }
 
-fn identity(id: Option<ElementId>, scope: u64) -> u64 {
+fn identity(id: Option<NodeKey>, scope: u64) -> u64 {
     let mut hasher = FxHasher::default();
     (id.map(|id| id.0), scope).hash(&mut hasher);
     hasher.finish()
@@ -219,16 +215,16 @@ impl Tree {
         self.scopes.clear();
     }
 
-    pub fn contains(&self, id: impl Into<ElementId>) -> bool {
+    pub fn contains(&self, id: impl Into<NodeKey>) -> bool {
         self.keys.contains_key(&(identity(Some(id.into()), 0), 0))
     }
 
-    pub fn style_of(&self, id: impl Into<ElementId>) -> Option<&Style> {
+    pub fn style_of(&self, id: impl Into<NodeKey>) -> Option<&Style> {
         let &index = self.keys.get(&(identity(Some(id.into()), 0), 0))?;
         Some(&self.slots[index as usize].style)
     }
 
-    pub fn align_self(&self, id: ElementId) -> Option<crate::AlignSelf> {
+    pub fn align_self(&self, id: NodeKey) -> Option<AlignItems> {
         let &index = self.keys.get(&(identity(Some(id), 0), 0))?;
         self.slots[index as usize].style.align_self
     }
@@ -313,7 +309,7 @@ impl Tree {
             return;
         }
         slot.inherited = inherited.clone();
-        let text = if slot.style.text.is_empty() {
+        let text = if slot.style.text.inherits() {
             inherited.clone()
         } else {
             let own = slot.style.clone();
@@ -365,7 +361,7 @@ impl Tree {
         *occurrence += 1;
         let kept = self.keys.get(&key).copied();
         let text = match kept.map(|index| &self.slots[index as usize]) {
-            _ if style.text.is_empty() => inherited.clone(),
+            _ if style.text.inherits() => inherited.clone(),
             Some(slot)
                 if Rc::ptr_eq(&slot.inherited, inherited) && slot.style.text == style.text =>
             {
@@ -551,11 +547,7 @@ impl Tree {
         NodeId::from(index as usize)
     }
 
-    fn refine(
-        &mut self,
-        inherited: &Rc<TextStyle>,
-        own: &crate::style::TextStyleRefinement,
-    ) -> Rc<TextStyle> {
+    fn refine(&mut self, inherited: &Rc<TextStyle>, own: &crate::TextOverrides) -> Rc<TextStyle> {
         let key = Rc::as_ptr(inherited) as usize;
         if let Some((_, list)) = self.refined.get(&key)
             && let Some((_, text)) = list.iter().find(|(kept, _)| kept == own)
@@ -698,13 +690,13 @@ impl Tree {
         }
     }
 
-    fn bounds(&self, index: u32, origin: Point<f32>, window: &Window) -> [Bounds<Pixels>; 2] {
+    fn bounds(&self, index: u32, origin: Point<f32>, window: &Window) -> [Rect<Pixels>; 2] {
         let scale = window.scale_factor();
         let layout = &self.slots[index as usize].layout;
         let far = point(origin.x + layout.size.width, origin.y + layout.size.height);
-        let snapped = Bounds::from_corners(origin.map(round_half_up), far.map(round_half_up));
-        let offset = window.element_offset();
-        let exact = Bounds::new(
+        let snapped = Rect::between(origin.map(round_half_up), far.map(round_half_up));
+        let offset = window.offset();
+        let exact = Rect::new(
             origin.map(|value| Pixels(value / scale)),
             size(
                 Pixels(layout.size.width / scale),
@@ -721,7 +713,7 @@ impl Tree {
         self.stacks.clear();
         self.blocks.clear();
         #[cfg(debug_assertions)]
-        let start = window.hitbox_places().len();
+        let start = window.region_places().len();
         self.prepaint_node(index_of(root), Point::default(), window);
         #[cfg(debug_assertions)]
         if !window.redraws() {
@@ -735,16 +727,16 @@ impl Tree {
                 boxes
             };
             let places = |tree: &Tree| {
-                let place = |hitbox: &Hitbox| (hitbox.bounds, hitbox.content_mask, hitbox.behavior);
+                let place = |hitbox: &Region| (hitbox.bounds, hitbox.hit);
                 tree.hitboxes.iter().map(place).collect::<Vec<_>>()
             };
             let kept = (
                 boxes(self),
                 places(self),
-                window.hitbox_places()[start..].to_vec(),
+                window.region_places()[start..].to_vec(),
                 self.layers.clone(),
             );
-            window.truncate_hitboxes(start);
+            window.truncate_regions(start);
             self.hitboxes.clear();
             self.stacks.clear();
             self.blocks.clear();
@@ -754,7 +746,7 @@ impl Tree {
             let full = (
                 boxes(self),
                 places(self),
-                window.hitbox_places()[start..].to_vec(),
+                window.region_places()[start..].to_vec(),
                 self.layers.clone(),
             );
             let first = |kept: &[_], full: &[_]| {
@@ -808,7 +800,7 @@ impl Tree {
                 .rev()
                 .find(|(contains, _)| contains & escape != 0)
                 .map_or_else(
-                    || ContentMask::from(Bounds::new(Point::default(), window.viewport_size())),
+                    || Clip::from(Rect::new(Point::default(), window.viewport_size())),
                     |(_, mask)| *mask,
                 )
         });
@@ -868,7 +860,7 @@ impl Tree {
             .events
             .as_ref()
             .and_then(|events| events.scroll.clone());
-        let needs_hitbox = Events::needs_hitbox(slot.events.as_deref(), style);
+        let needs_hitbox = Events::needs_region(slot.events.as_deref(), style);
         let content = match &scroll {
             Some(_) if !slot.children.is_empty() => {
                 let mut min = point(f32::MAX, f32::MAX);
@@ -884,8 +876,8 @@ impl Tree {
             }
             _ => bounds.size,
         };
-        window.with_content_mask(style.overflow_mask(bounds), |window| {
-            let hitbox = needs_hitbox.then(|| window.insert_hitbox(bounds, HitboxBehavior::Normal));
+        window.scope(Scope::Clip(style.overflow_mask(bounds)), |window| {
+            let hitbox = needs_hitbox.then(|| window.add_region(bounds, Hit::Pass));
             let offset = match &scroll {
                 Some(handle) => {
                     handle.drive(window);
@@ -909,7 +901,7 @@ impl Tree {
                 if style.contains != 0 {
                     self.blocks.push((style.contains, window.content_mask()));
                 }
-                window.with_element_offset(offset, |window| {
+                window.scope(Scope::Offset(offset), |window| {
                     for child in 0..self.slots[index as usize].children.len() {
                         let child = index_of(self.slots[index as usize].children[child]);
                         self.prepaint_node(child, origin, window);
@@ -932,12 +924,7 @@ impl Tree {
         self.slots[index as usize].below = below;
     }
 
-    fn place(
-        &mut self,
-        index: u32,
-        origin: Point<f32>,
-        window: &mut Window,
-    ) -> [Bounds<Pixels>; 2] {
+    fn place(&mut self, index: u32, origin: Point<f32>, window: &mut Window) -> [Rect<Pixels>; 2] {
         let [bounds, exact] = self.bounds(index, origin, window);
         let scale = window.scale_factor();
         let slot = &mut self.slots[index as usize];
@@ -953,7 +940,7 @@ impl Tree {
                 px((slot.layout.size.width - sides.left - sides.right) / scale),
                 window,
             );
-            state.layout.place(Bounds::new(
+            state.layout.place(Rect::new(
                 exact.origin + point(left, top),
                 size(
                     bounds.size.width - left - right,
@@ -1021,10 +1008,10 @@ impl Tree {
             true => self.place(index, origin, window),
             false => [self.slots[index as usize].bounds[1]; 2],
         };
-        window.with_content_mask(style.overflow_mask(bounds), |window| {
+        window.scope(Scope::Clip(style.overflow_mask(bounds)), |window| {
             let slot = &mut self.slots[index as usize];
             if let Some(hitbox) = self.previous.get(slot.hitbox as usize) {
-                self.hitboxes.push(window.place_hitbox(hitbox, bounds));
+                self.hitboxes.push(window.move_region(hitbox, bounds));
                 slot.hitbox = (self.hitboxes.len() - 1) as u32;
             }
             if style.display != Display::None {
@@ -1063,10 +1050,10 @@ impl Tree {
                             + shadow.spread_radius,
                     )
                 });
-                let mut reach = slot.bounds[1].dilate(grow);
+                let mut reach = slot.bounds[1].outset(grow);
                 if matches!(slot.kind, Kind::Text(..) | Kind::Measured) {
-                    let line = slot.text.line_height_in_pixels() * 2.;
-                    reach = Bounds::new(
+                    let line = slot.text.line_height.round() * 2.;
+                    reach = Rect::new(
                         point(px(-1e9), reach.origin.y - line),
                         size(px(2e9), reach.size.height + line * 2.),
                     );
@@ -1075,7 +1062,7 @@ impl Tree {
             });
         let reach = reach.and_then(|reach| {
             slot.children.iter().try_fold(reach, |reach, &child| {
-                Some(reach.union(&self.slots[index_of(child) as usize].reach?))
+                Some(reach.union(self.slots[index_of(child) as usize].reach?))
             })
         });
         self.slots[index as usize].reach = reach;
@@ -1100,7 +1087,7 @@ impl Tree {
             || self.unbounded == 0
                 && !matches!(slot.kind, Kind::Layers(_))
                 && slot.reach.is_some_and(|reach| {
-                    !reach.intersects(&escaped.unwrap_or_else(|| window.content_mask()).bounds)
+                    !reach.intersects(escaped.unwrap_or_else(|| window.content_mask()).bounds)
                 })
         {
             return;
@@ -1154,32 +1141,25 @@ impl Tree {
             self.paint_layers(negative, window);
             return;
         }
-        window.with_element_opacity(style.opacity, |window| {
+        window.scope(Scope::Opacity(style.opacity), |window| {
             let radii = style.corner_radii.resolve(bounds.size);
-            window.paint_drop_shadows(bounds, radii, &style.box_shadow);
+            window.draw_shadows(bounds, radii, &style.box_shadow, false);
             if let Some(background) = style.background.filter(|color| !color.is_transparent()) {
-                window.paint_quad(quad(
-                    bounds,
-                    radii,
-                    background,
-                    px(0.),
-                    background.alpha(0.),
-                    style.border_style,
-                ));
+                window.draw_box(bounds, radii, background, Default::default());
             }
-            window.paint_inset_shadows(bounds, radii, &style.box_shadow);
+            window.draw_shadows(bounds, radii, &style.box_shadow, true);
             let mask = style.overflow_mask(bounds);
-            window.with_content_mask(mask, |window| {
+            window.scope(Scope::Clip(mask), |window| {
                 let slot = &self.slots[index as usize];
                 if let Some(hitbox) = self.hitboxes.get(slot.hitbox as usize) {
-                    if let Some(cursor) = style.mouse_cursor {
-                        window.set_cursor_style(cursor, hitbox);
+                    if let Some(cursor) = style.cursor {
+                        window.set_cursor(hitbox, cursor);
                     }
                     if let Some(events) = &slot.events {
                         if events.drag {
-                            window.insert_window_drag_hitbox(hitbox);
+                            window.add_drag_area(hitbox);
                         }
-                        events.paint(style, slot.text.line_height_in_pixels(), hitbox, window);
+                        events.listen(style, slot.text.line_height.round(), hitbox, window);
                     }
                 }
                 let painted = matches!(slot.kind, Kind::Text(..) | Kind::Measured)
@@ -1229,14 +1209,17 @@ impl Tree {
             if let Some(color) = style.border_color.filter(|color| !color.is_transparent())
                 && style.border_widths.any(|width| !width.is_zero())
             {
-                window.paint_quad(quad(
+                window.draw_box(
                     bounds,
                     radii,
-                    color.alpha(0.),
-                    style.border_widths,
-                    color,
-                    style.border_style,
-                ));
+                    color.with_alpha(0.),
+                    crate::Border {
+                        widths: style.border_widths,
+                        color,
+                        style: style.border_style,
+                        sides: 0,
+                    },
+                );
             }
         });
     }
@@ -1247,7 +1230,9 @@ impl Tree {
         };
         let list = self.layers.remove(&context).unwrap_or_default();
         for &(_, index, mask) in list.iter().filter(|(order, ..)| (*order < 0) == negative) {
-            window.with_content_mask(Some(mask), |window| self.paint_node(index, true, window));
+            window.scope(Scope::Clip(Some(mask)), |window| {
+                self.paint_node(index, true, window)
+            });
         }
         self.layers.insert(context, list);
     }
@@ -1317,14 +1302,18 @@ impl Fingerprint for Style {
         {
             length(hasher, value);
         }
-        for color in [self.background, self.border_color, self.text.color] {
+        for color in [
+            self.background,
+            self.border_color,
+            self.text.color().copied(),
+        ] {
             color
                 .map(|color| [color.r, color.g, color.b, color.a].map(f32::to_bits))
                 .hash(hasher);
         }
         self.border_widths.top.0.to_bits().hash(hasher);
         self.text
-            .font_size
+            .font_size()
             .map(|size| size.0.to_bits())
             .hash(hasher);
     }
@@ -2833,14 +2822,14 @@ impl LayoutGridContainer for LayoutTree<'_> {
 #[cfg(test)]
 mod tests {
     use super::{Tree, identity, index_of};
-    use crate::{Child, ElementId, node, px, size};
+    use crate::{Child, NodeKey, node, px, size};
 
     fn live(tree: &Tree) -> usize {
         tree.slots.iter().filter(|slot| slot.live).count()
     }
 
     fn slot(tree: &Tree, id: usize) -> &super::Slot {
-        let index = tree.keys[&(identity(Some(ElementId::from(id)), 0), 0)];
+        let index = tree.keys[&(identity(Some(NodeKey::from(id)), 0), 0)];
         &tree.slots[index as usize]
     }
 
@@ -2864,7 +2853,7 @@ mod tests {
         tree.commit_root(page(vec![moved]), viewport, 1.);
         assert!(tree.contains(2usize) && !tree.contains(1usize));
         assert_eq!(live(&tree), 1 + 1 + 3);
-        let parent = tree.keys[&(identity(Some(ElementId::from(4usize)), 0), 0)];
+        let parent = tree.keys[&(identity(Some(NodeKey::from(4usize)), 0), 0)];
         assert_eq!(slot(&tree, 2).parent, parent);
         assert!(
             slot(&tree, 2)
@@ -2900,7 +2889,7 @@ mod tests {
         let child = index_of(slot(&tree, 3).children[0]);
         assert_eq!(
             tree.slots[child as usize].parent,
-            tree.keys[&(identity(Some(ElementId::from(3usize)), 0), 0)]
+            tree.keys[&(identity(Some(NodeKey::from(3usize)), 0), 0)]
         );
         assert_eq!(slot(&tree, 3).parent, root);
     }
@@ -2911,7 +2900,7 @@ mod tests {
         let viewport = size(px(100.), px(100.));
         let page = |font: f32, child: Child| {
             let mut page = node().id(0usize).child(child);
-            page.style().text.font_size = Some(px(font));
+            page.style().text.set_font_size(px(font));
             page.into()
         };
         tree.begin(1., 0);
@@ -2929,7 +2918,7 @@ mod tests {
         let viewport = size(px(100.), px(100.));
         let page = |color: u32, child: Child| {
             let mut page = node().id(0usize).child(child);
-            page.style().text.color = Some(crate::rgba(color));
+            page.style().text.set_color(crate::Color::hex(color));
             page.into()
         };
         let text = |tree: &Tree| index_of(slot(tree, 1).children[0]) as usize;
@@ -2943,7 +2932,10 @@ mod tests {
         let first = state(&tree);
         tree.begin(1., 0);
         tree.commit_root(page(0x0000ffff, Child::Kept(1usize.into())), viewport, 1.);
-        assert_eq!(tree.slots[text(&tree)].text.color, crate::rgba(0x0000ffff));
+        assert_eq!(
+            tree.slots[text(&tree)].text.color,
+            crate::Color::hex(0x0000ffff)
+        );
         assert!(std::rc::Rc::ptr_eq(&first, &state(&tree)));
         tree.begin(1., 0);
         tree.commit_root(
@@ -2951,7 +2943,10 @@ mod tests {
             viewport,
             1.,
         );
-        assert_eq!(tree.slots[text(&tree)].text.color, crate::rgba(0x00ff00ff));
+        assert_eq!(
+            tree.slots[text(&tree)].text.color,
+            crate::Color::hex(0x00ff00ff)
+        );
         assert!(std::rc::Rc::ptr_eq(&first, &state(&tree)));
     }
 
@@ -2970,8 +2965,8 @@ mod tests {
         tree.begin(1., 0);
         tree.commit_root(page(field(10.).into()), viewport, 1.);
         let (parent, own, inner) = (
-            tree.keys[&(identity(Some(ElementId::from(1usize)), 0), 0)],
-            tree.keys[&(identity(Some(ElementId::from(2usize)), 0), 0)],
+            tree.keys[&(identity(Some(NodeKey::from(1usize)), 0), 0)],
+            tree.keys[&(identity(Some(NodeKey::from(2usize)), 0), 0)],
             slot(&tree, 2).children.clone(),
         );
         let slots = live(&tree);
@@ -3001,7 +2996,7 @@ mod tests {
         let place = |x: f32, width: f32| {
             Child::Placed(
                 1usize.into(),
-                crate::Bounds {
+                crate::Rect {
                     origin: crate::point(px(x), px(2.)),
                     size: size(px(width), px(8.)),
                 },

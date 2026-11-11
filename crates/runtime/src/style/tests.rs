@@ -885,7 +885,7 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
         inline.runs.iter().map(|run| run.len).sum::<usize>(),
         inline.text.len()
     );
-    let ink = |color: u32| renderer::rgba(color);
+    let ink = |color: u32| renderer::Color::hex(color);
     assert_eq!(
         (inline.runs[0].len, inline.runs[0].color),
         (2, ink(0xff0000ff))
@@ -903,10 +903,7 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
         colors[..3],
         [ink(0xff0000ff), ink(0x0000ffff), ink(0x00ff00ff)]
     );
-    assert!(
-        runs.iter()
-            .all(|run| run.font.weight == renderer::FontWeight(700.))
-    );
+    assert!(runs.iter().all(|run| run.font.weight == 700.));
     let doc = Document::parse(
         "<p style='text-shadow:1px 1px red'>a <span style='text-shadow:none'>b</span></p><table><tr><td>a</td><td style='vertical-align:top'>b</td></tr></table>",
     );
@@ -1726,7 +1723,7 @@ fn filters_fold_into_one_color_matrix() {
         shadows[0].offset,
         renderer::point(renderer::px(2.), renderer::px(3.))
     );
-    assert_eq!(shadows[0].color, renderer::rgba(0x00ffffff));
+    assert_eq!(shadows[0].color, renderer::Color::hex(0x00ffffff));
     let twice = matrix.unwrap().then(matrix.unwrap());
     assert!(
         twice

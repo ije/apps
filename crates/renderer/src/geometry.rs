@@ -1,320 +1,246 @@
 use std::{
-    fmt::{self, Debug},
+    fmt,
+    hash::{Hash, Hasher},
+    iter::Sum,
     ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign},
 };
 
-pub trait Unit:
-    Copy + Debug + Default + PartialEq + PartialOrd + Add<Output = Self> + Sub<Output = Self> + Half
-{
-}
-impl<T> Unit for T where
-    T: Copy + Debug + Default + PartialEq + PartialOrd + Add<Output = T> + Sub<Output = T> + Half
-{
-}
-
-pub trait Half {
-    fn half(&self) -> Self;
-}
-
-macro_rules! unit {
-    ($name:ident, $inner:ty) => {
-        impl Add for $name {
-            type Output = Self;
-            fn add(self, other: Self) -> Self {
-                Self(self.0 + other.0)
-            }
-        }
-        impl AddAssign for $name {
-            fn add_assign(&mut self, other: Self) {
-                self.0 += other.0;
-            }
-        }
-        impl Sub for $name {
-            type Output = Self;
-            fn sub(self, other: Self) -> Self {
-                Self(self.0 - other.0)
-            }
-        }
-        impl SubAssign for $name {
-            fn sub_assign(&mut self, other: Self) {
-                self.0 -= other.0;
-            }
-        }
-        impl Neg for $name {
-            type Output = Self;
-            fn neg(self) -> Self {
-                Self(-self.0)
-            }
-        }
-        impl std::iter::Sum for $name {
-            fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
-                iter.fold(Self::default(), |a, b| a + b)
-            }
-        }
-        impl From<$inner> for $name {
-            fn from(value: $inner) -> Self {
-                Self(value)
-            }
-        }
-        impl From<$name> for $inner {
-            fn from(value: $name) -> Self {
-                value.0
-            }
-        }
-    };
-}
-
-macro_rules! float_unit {
-    ($name:ident) => {
-        unit!($name, f32);
-        impl $name {
-            pub const ZERO: Self = Self(0.);
-            pub fn floor(self) -> Self {
-                Self(self.0.floor())
-            }
-            pub fn ceil(self) -> Self {
-                Self(self.0.ceil())
-            }
-            pub fn round(self) -> Self {
-                Self(self.0.round())
-            }
-            pub fn abs(self) -> Self {
-                Self(self.0.abs())
-            }
-            pub fn max(self, other: Self) -> Self {
-                Self(self.0.max(other.0))
-            }
-            pub fn min(self, other: Self) -> Self {
-                Self(self.0.min(other.0))
-            }
-            pub fn clamp(self, low: Self, high: Self) -> Self {
-                Self(self.0.max(low.0).min(high.0))
-            }
-            pub fn signum(self) -> f32 {
-                self.0.signum()
-            }
-            pub fn is_zero(self) -> bool {
-                self.0 == 0.
-            }
-        }
-        impl Half for $name {
-            fn half(&self) -> Self {
-                Self(self.0 / 2.)
-            }
-        }
-        impl Mul<f32> for $name {
-            type Output = Self;
-            fn mul(self, other: f32) -> Self {
-                Self(self.0 * other)
-            }
-        }
-        impl Mul<$name> for f32 {
-            type Output = $name;
-            fn mul(self, other: $name) -> $name {
-                $name(self * other.0)
-            }
-        }
-        impl Mul<$name> for usize {
-            type Output = $name;
-            fn mul(self, other: $name) -> $name {
-                $name(self as f32 * other.0)
-            }
-        }
-        impl Mul<usize> for $name {
-            type Output = Self;
-            fn mul(self, other: usize) -> Self {
-                Self(self.0 * other as f32)
-            }
-        }
-        impl MulAssign<f32> for $name {
-            fn mul_assign(&mut self, other: f32) {
-                self.0 *= other;
-            }
-        }
-        impl Div for $name {
-            type Output = f32;
-            fn div(self, other: Self) -> f32 {
-                self.0 / other.0
-            }
-        }
-        impl Div<f32> for $name {
-            type Output = Self;
-            fn div(self, other: f32) -> Self {
-                Self(self.0 / other)
-            }
-        }
-        impl Eq for $name {}
-        #[allow(clippy::derive_ord_xor_partial_ord)]
-        impl Ord for $name {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.0.total_cmp(&other.0)
-            }
-        }
-        impl std::hash::Hash for $name {
-            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-                self.0.to_bits().hash(state);
-            }
-        }
-        impl From<f64> for $name {
-            fn from(value: f64) -> Self {
-                Self(value as f32)
-            }
-        }
-        impl From<$name> for f64 {
-            fn from(value: $name) -> Self {
-                value.0 as f64
-            }
-        }
-        impl Debug for $name {
-            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                write!(f, "{}", self.0)
-            }
-        }
-    };
-}
-
+// A CSS pixel. Device space uses plain `f32` and `i32`.
 #[derive(Clone, Copy, Default, PartialEq, PartialOrd)]
 #[repr(transparent)]
 pub struct Pixels(pub f32);
-float_unit!(Pixels);
-
-impl Pixels {
-    pub const MAX: Self = Self(f32::MAX);
-    pub fn scale(self, factor: f32) -> ScaledPixels {
-        ScaledPixels(self.0 * factor)
-    }
-}
-
-#[derive(Clone, Copy, Default, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub struct ScaledPixels(pub f32);
-float_unit!(ScaledPixels);
-
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct DevicePixels(pub i32);
-unit!(DevicePixels, i32);
-
-impl Half for DevicePixels {
-    fn half(&self) -> Self {
-        Self(self.0 / 2)
-    }
-}
-impl Half for f32 {
-    fn half(&self) -> Self {
-        self / 2.
-    }
-}
-impl Mul<i32> for DevicePixels {
-    type Output = Self;
-    fn mul(self, other: i32) -> Self {
-        Self(self.0 * other)
-    }
-}
-impl From<u32> for DevicePixels {
-    fn from(value: u32) -> Self {
-        Self(value as i32)
-    }
-}
-impl From<DevicePixels> for u32 {
-    fn from(value: DevicePixels) -> Self {
-        value.0 as u32
-    }
-}
-impl From<usize> for DevicePixels {
-    fn from(value: usize) -> Self {
-        Self(value as i32)
-    }
-}
-impl From<DevicePixels> for usize {
-    fn from(value: DevicePixels) -> Self {
-        value.0 as usize
-    }
-}
-impl From<DevicePixels> for u64 {
-    fn from(value: DevicePixels) -> Self {
-        value.0 as u64
-    }
-}
-impl From<ScaledPixels> for DevicePixels {
-    fn from(value: ScaledPixels) -> Self {
-        Self(value.0.ceil() as i32)
-    }
-}
-impl From<DevicePixels> for ScaledPixels {
-    fn from(value: DevicePixels) -> Self {
-        Self(value.0 as f32)
-    }
-}
 
 pub const fn px(value: f32) -> Pixels {
     Pixels(value)
 }
 
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
-#[repr(C)]
-pub struct Point<T> {
-    pub x: T,
-    pub y: T,
+macro_rules! forward {
+    ($($name:ident)*) => {
+        $(pub fn $name(self) -> Self {
+            Self(self.0.$name())
+        })*
+    };
 }
 
-pub const fn point<T>(x: T, y: T) -> Point<T> {
-    Point { x, y }
-}
+impl Pixels {
+    pub const ZERO: Self = Self(0.);
+    pub const MAX: Self = Self(f32::MAX);
 
-impl<T: Copy> Point<T> {
-    pub const fn new(x: T, y: T) -> Self {
-        Self { x, y }
-    }
-    pub fn map<U>(self, f: impl Fn(T) -> U) -> Point<U> {
-        Point {
-            x: f(self.x),
-            y: f(self.y),
-        }
-    }
-}
+    forward!(floor ceil round abs);
 
-impl<T: Copy + PartialOrd> Point<T> {
     pub fn max(self, other: Self) -> Self {
-        Self {
-            x: if self.x >= other.x { self.x } else { other.x },
-            y: if self.y >= other.y { self.y } else { other.y },
-        }
+        Self(self.0.max(other.0))
     }
     pub fn min(self, other: Self) -> Self {
-        Self {
-            x: if self.x <= other.x { self.x } else { other.x },
-            y: if self.y <= other.y { self.y } else { other.y },
-        }
+        Self(self.0.min(other.0))
+    }
+    pub fn clamp(self, low: Self, high: Self) -> Self {
+        self.max(low).min(high)
+    }
+    pub fn signum(self) -> f32 {
+        self.0.signum()
+    }
+    pub fn is_zero(self) -> bool {
+        self.0 == 0.
+    }
+    pub fn scale(self, factor: f32) -> f32 {
+        self.0 * factor
     }
 }
 
-impl Point<Pixels> {
-    pub fn scale(self, factor: f32) -> Point<ScaledPixels> {
-        self.map(|value| value.scale(factor))
+impl Eq for Pixels {}
+#[allow(clippy::derive_ord_xor_partial_ord)]
+impl Ord for Pixels {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
     }
 }
+impl Hash for Pixels {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u32(self.0.to_bits());
+    }
+}
+impl fmt::Debug for Pixels {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+macro_rules! pixel_ops {
+    ($($op:ident $name:ident($rhs:ty) -> $out:ty = |$a:ident, $b:ident| $value:expr;)*) => {
+        $(impl $op<$rhs> for Pixels {
+            type Output = $out;
+            fn $name(self, $b: $rhs) -> $out {
+                let $a = self;
+                $value
+            }
+        })*
+    };
+}
 
-impl<T: Add<Output = T>> Add for Point<T> {
+pixel_ops! {
+    Add add(Pixels) -> Pixels = |a, b| Pixels(a.0 + b.0);
+    Sub sub(Pixels) -> Pixels = |a, b| Pixels(a.0 - b.0);
+    Mul mul(f32) -> Pixels = |a, b| Pixels(a.0 * b);
+    Mul mul(usize) -> Pixels = |a, b| Pixels(a.0 * b as f32);
+    Div div(f32) -> Pixels = |a, b| Pixels(a.0 / b);
+    Div div(Pixels) -> f32 = |a, b| a.0 / b.0;
+}
+
+impl Mul<Pixels> for f32 {
+    type Output = Pixels;
+    fn mul(self, value: Pixels) -> Pixels {
+        value * self
+    }
+}
+impl Mul<Pixels> for usize {
+    type Output = Pixels;
+    fn mul(self, value: Pixels) -> Pixels {
+        value * self
+    }
+}
+impl Neg for Pixels {
     type Output = Self;
-    fn add(self, other: Self) -> Self {
-        point(self.x + other.x, self.y + other.y)
+    fn neg(self) -> Self {
+        Self(-self.0)
     }
 }
+impl AddAssign for Pixels {
+    fn add_assign(&mut self, other: Self) {
+        self.0 += other.0;
+    }
+}
+impl SubAssign for Pixels {
+    fn sub_assign(&mut self, other: Self) {
+        self.0 -= other.0;
+    }
+}
+impl MulAssign<f32> for Pixels {
+    fn mul_assign(&mut self, factor: f32) {
+        self.0 *= factor;
+    }
+}
+impl Sum for Pixels {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        Self(iter.map(|value| value.0).sum())
+    }
+}
+impl From<f32> for Pixels {
+    fn from(value: f32) -> Self {
+        Self(value)
+    }
+}
+impl From<f64> for Pixels {
+    fn from(value: f64) -> Self {
+        Self(value as f32)
+    }
+}
+impl From<Pixels> for f32 {
+    fn from(value: Pixels) -> Self {
+        value.0
+    }
+}
+impl From<Pixels> for f64 {
+    fn from(value: Pixels) -> Self {
+        value.0 as f64
+    }
+}
+
+pub trait Scalar: Copy + Default + PartialOrd + Add<Output = Self> + Sub<Output = Self> {
+    fn half(self) -> Self;
+}
+impl Scalar for Pixels {
+    fn half(self) -> Self {
+        Self(self.0 / 2.)
+    }
+}
+impl Scalar for f32 {
+    fn half(self) -> Self {
+        self / 2.
+    }
+}
+impl Scalar for i32 {
+    fn half(self) -> Self {
+        self / 2
+    }
+}
+
+fn lower<T: PartialOrd>(a: T, b: T) -> T {
+    if b < a { b } else { a }
+}
+
+fn upper<T: PartialOrd>(a: T, b: T) -> T {
+    if b > a { b } else { a }
+}
+
+macro_rules! pair {
+    ($name:ident, $make:ident, $a:ident, $b:ident) => {
+        #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
+        #[repr(C)]
+        pub struct $name<T = Pixels> {
+            pub $a: T,
+            pub $b: T,
+        }
+
+        pub const fn $make<T>($a: T, $b: T) -> $name<T> {
+            $name { $a, $b }
+        }
+
+        impl<T> $name<T> {
+            pub const fn new($a: T, $b: T) -> Self {
+                Self { $a, $b }
+            }
+            pub fn map<U>(self, f: impl Fn(T) -> U) -> $name<U> {
+                $make(f(self.$a), f(self.$b))
+            }
+        }
+
+        impl $name {
+            pub fn scale(self, factor: f32) -> $name<f32> {
+                self.map(|value| value.0 * factor)
+            }
+        }
+
+        pair!($name, $make, $a, $b, Add add(Self), Sub sub(Self));
+        pair!($name, $make, $a, $b, Mul mul(f32), Div div(f32));
+    };
+    ($name:ident, $make:ident, $a:ident, $b:ident, $($op:ident $method:ident(Self)),*) => {
+        $(impl<T: $op<Output = T>> $op for $name<T> {
+            type Output = Self;
+            fn $method(self, other: Self) -> Self {
+                $make(self.$a.$method(other.$a), self.$b.$method(other.$b))
+            }
+        })*
+    };
+    ($name:ident, $make:ident, $a:ident, $b:ident, $($op:ident $method:ident(f32)),*) => {
+        $(impl<T: $op<f32, Output = T>> $op<f32> for $name<T> {
+            type Output = Self;
+            fn $method(self, factor: f32) -> Self {
+                $make(self.$a.$method(factor), self.$b.$method(factor))
+            }
+        })*
+    };
+}
+
+pair!(Point, point, x, y);
+pair!(Size, size, width, height);
+
+impl<T: PartialOrd> Point<T> {
+    pub fn max(self, other: Self) -> Self {
+        point(upper(self.x, other.x), upper(self.y, other.y))
+    }
+    pub fn min(self, other: Self) -> Self {
+        point(lower(self.x, other.x), lower(self.y, other.y))
+    }
+}
+
 impl<T: Add<Output = T> + Copy> AddAssign for Point<T> {
     fn add_assign(&mut self, other: Self) {
-        *self = point(self.x + other.x, self.y + other.y);
-    }
-}
-impl<T: Sub<Output = T>> Sub for Point<T> {
-    type Output = Self;
-    fn sub(self, other: Self) -> Self {
-        point(self.x - other.x, self.y - other.y)
+        *self = *self + other;
     }
 }
 impl<T: Sub<Output = T> + Copy> SubAssign for Point<T> {
     fn sub_assign(&mut self, other: Self) {
-        *self = point(self.x - other.x, self.y - other.y);
+        *self = *self - other;
     }
 }
 impl<T: Neg<Output = T>> Neg for Point<T> {
@@ -323,75 +249,13 @@ impl<T: Neg<Output = T>> Neg for Point<T> {
         point(-self.x, -self.y)
     }
 }
-impl<T: Mul<f32, Output = T>> Mul<f32> for Point<T> {
-    type Output = Self;
-    fn mul(self, factor: f32) -> Self {
-        point(self.x * factor, self.y * factor)
-    }
-}
-impl<T: Div<f32, Output = T>> Div<f32> for Point<T> {
-    type Output = Self;
-    fn div(self, factor: f32) -> Self {
-        point(self.x / factor, self.y / factor)
+
+impl Size {
+    pub fn to_device(self, factor: f32) -> Size<i32> {
+        self.map(|value| (value.0 * factor).round() as i32)
     }
 }
 
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
-#[repr(C)]
-pub struct Size<T> {
-    pub width: T,
-    pub height: T,
-}
-
-pub const fn size<T>(width: T, height: T) -> Size<T> {
-    Size { width, height }
-}
-
-impl<T: Copy> Size<T> {
-    pub const fn new(width: T, height: T) -> Self {
-        Self { width, height }
-    }
-    pub fn map<U>(self, f: impl Fn(T) -> U) -> Size<U> {
-        Size {
-            width: f(self.width),
-            height: f(self.height),
-        }
-    }
-}
-
-impl Size<Pixels> {
-    pub fn scale(self, factor: f32) -> Size<ScaledPixels> {
-        self.map(|value| value.scale(factor))
-    }
-    pub fn to_device_pixels(self, factor: f32) -> Size<DevicePixels> {
-        self.map(|value| DevicePixels((value.0 * factor).round() as i32))
-    }
-}
-
-impl<T: Add<Output = T>> Add for Size<T> {
-    type Output = Self;
-    fn add(self, other: Self) -> Self {
-        size(self.width + other.width, self.height + other.height)
-    }
-}
-impl<T: Sub<Output = T>> Sub for Size<T> {
-    type Output = Self;
-    fn sub(self, other: Self) -> Self {
-        size(self.width - other.width, self.height - other.height)
-    }
-}
-impl<T: Mul<f32, Output = T>> Mul<f32> for Size<T> {
-    type Output = Self;
-    fn mul(self, factor: f32) -> Self {
-        size(self.width * factor, self.height * factor)
-    }
-}
-impl<T: Div<f32, Output = T>> Div<f32> for Size<T> {
-    type Output = Self;
-    fn div(self, factor: f32) -> Self {
-        size(self.width / factor, self.height / factor)
-    }
-}
 impl<T> From<Point<T>> for Size<T> {
     fn from(point: Point<T>) -> Self {
         size(point.x, point.y)
@@ -405,20 +269,30 @@ impl<T> From<Size<T>> for Point<T> {
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
-pub struct Bounds<T> {
+pub struct Rect<T = Pixels> {
     pub origin: Point<T>,
     pub size: Size<T>,
 }
 
-impl<T: Unit> Bounds<T> {
+pub const fn rect<T>(x: T, y: T, width: T, height: T) -> Rect<T> {
+    Rect {
+        origin: point(x, y),
+        size: size(width, height),
+    }
+}
+
+impl<T> Rect<T> {
     pub const fn new(origin: Point<T>, size: Size<T>) -> Self {
         Self { origin, size }
     }
-    pub fn from_corners(top_left: Point<T>, bottom_right: Point<T>) -> Self {
-        Self {
-            origin: top_left,
-            size: size(bottom_right.x - top_left.x, bottom_right.y - top_left.y),
-        }
+    pub fn map<U>(self, f: impl Fn(T) -> U) -> Rect<U> {
+        Rect::new(self.origin.map(&f), self.size.map(&f))
+    }
+}
+
+impl<T: Scalar> Rect<T> {
+    pub fn between(min: Point<T>, max: Point<T>) -> Self {
+        rect(min.x, min.y, max.x - min.x, max.y - min.y)
     }
     pub fn left(&self) -> T {
         self.origin.x
@@ -443,114 +317,110 @@ impl<T: Unit> Bounds<T> {
     }
     pub fn center(&self) -> Point<T> {
         point(
-            self.origin.x + self.size.width.half(),
-            self.origin.y + self.size.height.half(),
+            self.left() + self.size.width.half(),
+            self.top() + self.size.height.half(),
         )
     }
-    pub fn contains(&self, point: &Point<T>) -> bool {
-        point.x >= self.left()
+    pub fn is_empty(&self) -> bool {
+        let zero = T::default();
+        self.size.width <= zero || self.size.height <= zero
+    }
+    // The right and bottom sides are outside.
+    pub fn contains(&self, point: Point<T>) -> bool {
+        self.left() <= point.x
             && point.x < self.right()
-            && point.y >= self.top()
+            && self.top() <= point.y
             && point.y < self.bottom()
     }
-    pub fn intersects(&self, other: &Self) -> bool {
+    pub fn intersects(&self, other: Self) -> bool {
         self.left() < other.right()
             && other.left() < self.right()
             && self.top() < other.bottom()
             && other.top() < self.bottom()
     }
-    pub fn intersect(&self, other: &Self) -> Self {
-        let top_left = self.origin.max(other.origin);
-        let bottom_right = self.bottom_right().min(other.bottom_right());
-        Self::from_corners(top_left, top_left.max(bottom_right))
+    // Boxes that don't meet give an empty box, never a negative size.
+    pub fn intersect(&self, other: Self) -> Self {
+        let min = self.origin.max(other.origin);
+        Self::between(min, self.bottom_right().min(other.bottom_right()).max(min))
     }
-    pub fn union(&self, other: &Self) -> Self {
-        Self::from_corners(
+    pub fn union(&self, other: Self) -> Self {
+        Self::between(
             self.origin.min(other.origin),
             self.bottom_right().max(other.bottom_right()),
         )
     }
-    pub fn is_empty(&self) -> bool {
-        self.size.width <= T::default() || self.size.height <= T::default()
+    pub fn outset(&self, by: T) -> Self {
+        Self::between(
+            point(self.left() - by, self.top() - by),
+            point(self.right() + by, self.bottom() + by),
+        )
     }
-    pub fn half_perimeter(&self) -> T {
-        self.size.width + self.size.height
-    }
-    pub fn dilate(&self, amount: T) -> Self {
-        Self {
-            origin: point(self.origin.x - amount, self.origin.y - amount),
-            size: size(
-                self.size.width + amount + amount,
-                self.size.height + amount + amount,
-            ),
-        }
-    }
-    pub fn inset(&self, amount: T) -> Self {
-        Self {
-            origin: point(self.origin.x + amount, self.origin.y + amount),
-            size: size(
-                self.size.width - amount - amount,
-                self.size.height - amount - amount,
-            ),
-        }
-    }
-    pub fn map<U>(self, f: impl Fn(T) -> U) -> Bounds<U> {
-        Bounds {
-            origin: point(f(self.origin.x), f(self.origin.y)),
-            size: size(f(self.size.width), f(self.size.height)),
-        }
+    pub fn inset(&self, by: T) -> Self {
+        Self::between(
+            point(self.left() + by, self.top() + by),
+            point(self.right() - by, self.bottom() - by),
+        )
     }
 }
 
-impl Bounds<Pixels> {
-    pub fn scale(&self, factor: f32) -> Bounds<ScaledPixels> {
-        self.map(|value| value.scale(factor))
+impl Rect {
+    pub fn scale(&self, factor: f32) -> Rect<f32> {
+        self.map(|value| value.0 * factor)
     }
-    pub fn to_device_pixels(&self, factor: f32) -> Bounds<DevicePixels> {
-        self.map(|value| DevicePixels((value.0 * factor).round() as i32))
+    pub fn to_device(&self, factor: f32) -> Rect<i32> {
+        self.map(|value| (value.0 * factor).round() as i32)
     }
 }
 
-impl<T: Unit> Add<Point<T>> for Bounds<T> {
+impl Rect<f32> {
+    pub fn to_array(&self) -> [f32; 4] {
+        [
+            self.origin.x,
+            self.origin.y,
+            self.size.width,
+            self.size.height,
+        ]
+    }
+    // Returns `[x, y, width, height]`.
+    pub fn cover(&self) -> [i32; 4] {
+        let [x, y] = [self.left().floor(), self.top().floor()];
+        [
+            x as i32,
+            y as i32,
+            (self.right().ceil() - x) as i32,
+            (self.bottom().ceil() - y) as i32,
+        ]
+    }
+}
+
+impl<T: Add<Output = T>> Add<Point<T>> for Rect<T> {
     type Output = Self;
     fn add(self, offset: Point<T>) -> Self {
-        Self {
-            origin: self.origin + offset,
-            size: self.size,
-        }
+        Self::new(self.origin + offset, self.size)
     }
 }
-impl<T: Unit> Sub<Point<T>> for Bounds<T> {
+impl<T: Sub<Output = T>> Sub<Point<T>> for Rect<T> {
     type Output = Self;
     fn sub(self, offset: Point<T>) -> Self {
-        Self {
-            origin: self.origin - offset,
-            size: self.size,
-        }
+        Self::new(self.origin - offset, self.size)
     }
 }
-impl<T: Unit + Mul<f32, Output = T>> Mul<f32> for Bounds<T> {
+impl<T: Mul<f32, Output = T>> Mul<f32> for Rect<T> {
     type Output = Self;
     fn mul(self, factor: f32) -> Self {
-        Self {
-            origin: self.origin * factor,
-            size: self.size * factor,
-        }
+        Self::new(self.origin * factor, self.size * factor)
     }
 }
-impl<T: Unit + Div<f32, Output = T>> Div<f32> for Bounds<T> {
+impl<T: Div<f32, Output = T>> Div<f32> for Rect<T> {
     type Output = Self;
-    fn div(self, factor: f32) -> Self {
-        Self {
-            origin: self.origin / factor,
-            size: self.size / factor,
-        }
+    fn div(self, divisor: f32) -> Self {
+        Self::new(self.origin / divisor, self.size / divisor)
     }
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
-pub struct Edges<T> {
+pub struct Edges<T = Pixels> {
     pub top: T,
     pub right: T,
     pub bottom: T,
@@ -579,9 +449,16 @@ impl<T: Copy> Edges<T> {
     }
 }
 
+impl From<Pixels> for Edges {
+    fn from(value: Pixels) -> Self {
+        Self::all(value)
+    }
+}
+
+// Clockwise from the top left, like CSS.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
-pub struct Corners<T> {
+pub struct Corners<T = Pixels> {
     pub top_left: T,
     pub top_right: T,
     pub bottom_right: T,
@@ -605,28 +482,29 @@ impl<T: Copy> Corners<T> {
             bottom_left: f(self.bottom_left),
         }
     }
-}
-
-impl Corners<Pixels> {
-    pub fn scale(&self, factor: f32) -> Corners<ScaledPixels> {
-        self.map(|value| value.scale(factor))
-    }
-}
-
-impl<T: Copy + PartialEq + Default> Corners<T> {
-    pub fn is_zero(&self) -> bool {
+    pub fn to_array(&self) -> [T; 4] {
         [
             self.top_left,
             self.top_right,
             self.bottom_right,
             self.bottom_left,
         ]
-        .iter()
-        .all(|value| *value == T::default())
     }
 }
 
-impl From<Pixels> for Corners<Pixels> {
+impl<T: Copy + Default + PartialEq> Corners<T> {
+    pub fn is_zero(&self) -> bool {
+        *self == Self::all(T::default())
+    }
+}
+
+impl Corners {
+    pub fn scale(&self, factor: f32) -> Corners<f32> {
+        self.map(|value| value.0 * factor)
+    }
+}
+
+impl From<Pixels> for Corners {
     fn from(value: Pixels) -> Self {
         Self::all(value)
     }
@@ -634,7 +512,7 @@ impl From<Pixels> for Corners<Pixels> {
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
-pub struct Radii<T> {
+pub struct Radii<T = Pixels> {
     pub x: Corners<T>,
     pub y: Corners<T>,
 }
@@ -645,133 +523,140 @@ impl<T: Copy> From<Corners<T>> for Radii<T> {
     }
 }
 
-impl From<Pixels> for Radii<Pixels> {
+impl From<Pixels> for Radii {
     fn from(value: Pixels) -> Self {
         Corners::all(value).into()
     }
 }
 
-impl<T: Copy + PartialEq + Default> Radii<T> {
+impl<T: Copy + Default + PartialEq> Radii<T> {
     pub fn is_zero(&self) -> bool {
         self.x.is_zero() && self.y.is_zero()
     }
 }
 
-impl Radii<Pixels> {
-    pub fn scale(&self, factor: f32) -> Radii<ScaledPixels> {
+impl Radii<f32> {
+    pub fn to_array(&self) -> [f32; 8] {
+        let ([a, b, c, d], [e, f, g, h]) = (self.x.to_array(), self.y.to_array());
+        [a, b, c, d, e, f, g, h]
+    }
+}
+
+impl Radii {
+    pub fn scale(&self, factor: f32) -> Radii<f32> {
         Radii {
             x: self.x.scale(factor),
             y: self.y.scale(factor),
         }
     }
-    pub fn clamp_radii_for_quad_size(self, size: Size<Pixels>) -> Self {
-        let (mut x, mut y) = (self.x, self.y);
-        for (x, y) in [
-            (&mut x.top_left, &mut y.top_left),
-            (&mut x.top_right, &mut y.top_right),
-            (&mut x.bottom_right, &mut y.bottom_right),
-            (&mut x.bottom_left, &mut y.bottom_left),
-        ] {
-            if *x <= Pixels::ZERO || *y <= Pixels::ZERO {
-                (*x, *y) = (Pixels::ZERO, Pixels::ZERO);
+
+    pub fn fit(self, size: Size) -> Self {
+        let (mut x, mut y) = (self.x.to_array(), self.y.to_array());
+        for corner in 0..4 {
+            if x[corner].0 <= 0. || y[corner].0 <= 0. {
+                (x[corner], y[corner]) = (Pixels::ZERO, Pixels::ZERO);
             }
         }
-        let fit = |side: Pixels, a: Pixels, b: Pixels| {
+        let mut factor = 1f32;
+        for (side, a, b) in [
+            (size.width, x[0], x[1]),
+            (size.width, x[3], x[2]),
+            (size.height, y[0], y[3]),
+            (size.height, y[1], y[2]),
+        ] {
             let sum = a + b;
-            if sum > side { side / sum } else { 1. }
-        };
-        let factor = fit(size.width, x.top_left, x.top_right)
-            .min(fit(size.width, x.bottom_left, x.bottom_right))
-            .min(fit(size.height, y.top_left, y.bottom_left))
-            .min(fit(size.height, y.top_right, y.bottom_right))
-            .max(0.);
-        if factor < 1. {
-            (x, y) = (x.map(|r| r * factor), y.map(|r| r * factor));
+            if sum > side {
+                factor = factor.min(side / sum);
+            }
         }
-        Self { x, y }
+        let factor = factor.max(0.);
+        let corners = |[top_left, top_right, bottom_right, bottom_left]: [Pixels; 4]| Corners {
+            top_left: top_left * factor,
+            top_right: top_right * factor,
+            bottom_right: bottom_right * factor,
+            bottom_left: bottom_left * factor,
+        };
+        Self {
+            x: corners(x),
+            y: corners(y),
+        }
     }
+
     pub fn inset(self, top: Pixels, right: Pixels, bottom: Pixels, left: Pixels) -> Self {
-        let shrink = |radius: Pixels, by: Pixels| (radius - by).max(Pixels::ZERO);
+        let less = |radius: Pixels, by: Pixels| (radius - by).max(Pixels::ZERO);
         Self {
             x: Corners {
-                top_left: shrink(self.x.top_left, left),
-                top_right: shrink(self.x.top_right, right),
-                bottom_right: shrink(self.x.bottom_right, right),
-                bottom_left: shrink(self.x.bottom_left, left),
+                top_left: less(self.x.top_left, left),
+                top_right: less(self.x.top_right, right),
+                bottom_right: less(self.x.bottom_right, right),
+                bottom_left: less(self.x.bottom_left, left),
             },
             y: Corners {
-                top_left: shrink(self.y.top_left, top),
-                top_right: shrink(self.y.top_right, top),
-                bottom_right: shrink(self.y.bottom_right, bottom),
-                bottom_left: shrink(self.y.bottom_left, bottom),
+                top_left: less(self.y.top_left, top),
+                top_right: less(self.y.top_right, top),
+                bottom_right: less(self.y.bottom_right, bottom),
+                bottom_left: less(self.y.bottom_left, bottom),
             },
         }
     }
 }
-impl From<Pixels> for Edges<Pixels> {
-    fn from(value: Pixels) -> Self {
-        Self::all(value)
-    }
-}
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 #[repr(C)]
-pub struct ContentMask<P> {
-    pub bounds: Bounds<P>,
-    pub rounded: Bounds<P>,
-    pub corner_radii: Radii<P>,
+pub struct Clip<T = Pixels> {
+    pub bounds: Rect<T>,
+    pub rounded: Rect<T>,
+    pub radii: Radii<T>,
 }
 
-impl ContentMask<Pixels> {
-    pub fn rounded(bounds: Bounds<Pixels>, corner_radii: impl Into<Radii<Pixels>>) -> Self {
+impl Clip {
+    pub fn rounded(bounds: Rect, radii: impl Into<Radii>) -> Self {
         Self {
             bounds,
             rounded: bounds,
-            corner_radii: corner_radii.into().clamp_radii_for_quad_size(bounds.size),
+            radii: radii.into().fit(bounds.size),
         }
     }
-    pub fn scale(&self, factor: f32) -> ContentMask<ScaledPixels> {
-        ContentMask {
+    pub fn scale(&self, factor: f32) -> Clip<f32> {
+        Clip {
             bounds: self.bounds.scale(factor),
             rounded: self.rounded.scale(factor),
-            corner_radii: self.corner_radii.scale(factor),
+            radii: self.radii.scale(factor),
         }
     }
     pub fn intersect(&self, other: &Self) -> Self {
-        let rounded = if self.corner_radii.is_zero() {
-            other
-        } else {
-            self
-        };
+        let round = if self.radii.is_zero() { other } else { self };
         Self {
-            bounds: self.bounds.intersect(&other.bounds),
-            rounded: rounded.rounded,
-            corner_radii: rounded.corner_radii,
+            bounds: self.bounds.intersect(other.bounds),
+            rounded: round.rounded,
+            radii: round.radii,
         }
     }
 }
 
-impl<P: Default> From<Bounds<P>> for ContentMask<P> {
-    fn from(bounds: Bounds<P>) -> Self {
+impl<T: Default> From<Rect<T>> for Clip<T> {
+    fn from(bounds: Rect<T>) -> Self {
         Self {
             bounds,
-            rounded: Bounds::default(),
-            corner_radii: Radii::default(),
+            rounded: Rect::default(),
+            radii: Radii::default(),
         }
     }
 }
 
-// Rounds midpoints toward zero, so a 1px line at 150% stays 1 device pixel.
-pub(crate) fn round_half_toward_zero(value: f32) -> f32 {
-    (value.abs() - 0.5).ceil().copysign(value)
+// Snaps a device coordinate to a whole pixel. A tie goes toward zero, so a 1px line at 150% stays
+// 1 device pixel.
+pub(crate) fn snap(device: f32) -> f32 {
+    let whole = device.trunc();
+    if (device - whole).abs() > 0.5 {
+        whole + device.signum()
+    } else {
+        whole
+    }
 }
 
 pub(crate) fn round_half_up(value: f32) -> f32 {
     (value + 0.5).floor()
-}
-
-pub(crate) fn round_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
-    round_half_toward_zero(logical * scale_factor)
 }
 
 // Match Chrome's 1/64-pixel truncation. The bias prevents float error from subtracting a layout unit.
@@ -781,10 +666,10 @@ pub fn to_layout_unit(logical: f32, scale_factor: f32) -> f32 {
     (units + (units.abs() * 1e-6).min(0.5).copysign(units)).trunc() / 64.
 }
 
-pub(crate) fn round_stroke_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
+// A stroke that exists is at least one device pixel wide.
+pub(crate) fn snap_width(logical: f32, scale_factor: f32) -> f32 {
     if logical == 0. {
-        0.
-    } else {
-        round_to_device_pixel(logical.max(0.), scale_factor).max(1.)
+        return 0.;
     }
+    snap(logical.max(0.) * scale_factor).max(1.)
 }

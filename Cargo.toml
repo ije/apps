@@ -6,24 +6,20 @@ resolver = "3"
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
-anyhow = "1"
-bbtree = "=0.1.5"
-block2 = "0.6"
-core-foundation = "0.10"
-core-foundation-sys = "0.8.6"
-core-graphics = "0.24"
-core-text = "21"
-dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
-etagere = "0.2"
-font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "94b0f28166665e8fd2f53ff6d268a14955c82269", package = "zed-font-kit", version = "0.14.1-zed", default-features = false }
-foreign-types = "0.5"
+anyhow = "1.0.104"
+bbtree = "=0.2.1"
+block2 = "0.6.2"
+core-foundation = "0.10.1"
+core-foundation-sys = "0.8.7"
+dispatch2 = { version = "0.3.1", default-features = false, features = ["std"] }
+etagere = "0.3.0"
 image = { version = "=0.25.10", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "webp"] }
-libc = "0.2"
-objc2 = "0.6"
+libc = "0.2.191"
+objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSApplication",
     "NSButton",
@@ -61,23 +57,20 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "objc2-core-foundation",
     "std",
 ] }
-objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGColorSpace", "objc2"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColorSpace", "objc2"] }
 objc2-quartz-core = { version = "=0.3.2", default-features = false, features = ["std", "CALayer", "CAMetalLayer"] }
-pathfinder_geometry = "0.5"
-pollster = "0.4.0"
-raw-window-handle = "0.6"
-rustc-hash = "2.1.0"
-serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["preserve_order"] }
-smallvec = { version = "1.6", features = ["union", "const_new"] }
-swash = "0.2.6"
-taffy = { version = "=0.15.0", default-features = false }
-tiny-skia = "0.11.4"
-unicode-bidi = { version = "0.3.18", default-features = false, features = ["hardcoded-data"] }
-url = "2.5"
-usvg = { version = "0.46.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+pollster = "1.0.1"
+raw-window-handle = "0.6.2"
+rustc-hash = "2.1.3"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+swash = "0.2.10"
+taffy = { version = "=0.15.1", default-features = false }
+tiny-skia = "0.12.0"
+url = "2.5.8"
+usvg = { version = "0.49.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "svgz"] }
 wgpu = { version = "30.0.1", default-features = false }
-windows = { version = "0.62", features = [
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_Com",
@@ -87,31 +80,26 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-windows-core = "0.62"
-xkbcommon = { version = "0.8", default-features = false }
+# windows-core must match the types and macros in windows.
+windows-core = "0.62.2"
+xkbcommon = { version = "0.9.0", default-features = false }
 
 # Use the bundler's crates.io oxc dependencies for oxc_react_compiler. Keep this above [patch.crates-io],
 # which Rust apps copy.
 [patch."https://github.com/oxc-project/oxc"]
-oxc_allocator = "=0.155.0"
-oxc_ast = "=0.155.0"
-oxc_ast_macros = "=0.155.0"
-oxc_ast_visit = "=0.155.0"
-oxc_data_structures = "=0.155.0"
-oxc_diagnostics = "=0.155.0"
-oxc_ecmascript = "=0.155.0"
-oxc_estree = "=0.155.0"
-oxc_regular_expression = "=0.155.0"
-oxc_semantic = "=0.155.0"
-oxc_span = "=0.155.0"
-oxc_str = "=0.155.0"
-oxc_syntax = "=0.155.0"
-
-[patch.crates-io]
-calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
-# This fork avoids a panic when a failed EGL call reports EGL_SUCCESS.
-khronos-egl = { git = "https://github.com/zed-industries/khronos-egl", rev = "42214b36347b108fd9630ca6254b96dde59e04fe" }
-
+oxc_allocator = "=0.158.0"
+oxc_ast = "=0.158.0"
+oxc_ast_macros = "=0.158.0"
+oxc_ast_visit = "=0.158.0"
+oxc_data_structures = "=0.158.0"
+oxc_diagnostics = "=0.158.0"
+oxc_ecmascript = "=0.158.0"
+oxc_estree = "=0.158.0"
+oxc_regular_expression = "=0.158.0"
+oxc_semantic = "=0.158.0"
+oxc_span = "=0.158.0"
+oxc_str = "=0.158.0"
+oxc_syntax = "=0.158.0"
 [profile.release]
 lto = "fat"
 codegen-units = 1
@@ -163,9 +151,6 @@ opt-level = "s"
 opt-level = "s"
 
 [profile.release.package.rav1d]
-opt-level = "s"
-
-[profile.release.package.rustybuzz]
 opt-level = "s"
 
 [profile.release.package.tokio]

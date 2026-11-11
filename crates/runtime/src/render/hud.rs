@@ -1,6 +1,6 @@
 use super::PageState;
 use anyhow::{Context, Result, ensure};
-use renderer::{Bounds, TextAlign, TextRun, Timer, Window, point, px, size};
+use renderer::{Rect, TextAlign, TextRun, Timer, Window, point, px, size};
 use std::{
     cell::{Cell, RefCell},
     ffi::c_void,
@@ -133,17 +133,17 @@ fn tick(view: Weak<PageState>, window: &Window) -> Timer {
 extern "C" fn paint(window: *mut c_void, item: &Item) {
     let window = unsafe { &mut *window.cast::<Window>() };
     let [x, y, width, height] = item.bounds;
-    let bounds = Bounds::new(point(px(x), px(y)), size(px(width), px(height)));
-    let color = renderer::rgba(item.color);
+    let bounds = Rect::new(point(px(x), px(y)), size(px(width), px(height)));
+    let color = renderer::Color::hex(item.color);
     if item.len == 0 {
-        window.paint_quad(renderer::fill(bounds, color).corner_radii(px(item.size)));
+        window.draw_box(bounds, px(item.size), color, Default::default());
         return;
     }
     let text = unsafe { std::slice::from_raw_parts(item.text, item.len) };
     let text = String::from_utf8_lossy(text);
     let run = TextRun {
         len: text.len(),
-        font: renderer::font(FONT),
+        font: renderer::Font::new(FONT),
         color,
         background_color: None,
         underline: None,
@@ -154,9 +154,7 @@ extern "C" fn paint(window: *mut c_void, item: &Item) {
         inset: Default::default(),
         nowrap: false,
     };
-    let line = window
-        .text_system()
-        .shape_line(&text, px(item.size), &[run], None);
+    let line = window.text_system().shape_line(&text, px(item.size), &run);
     let align = match item.align {
         1 => TextAlign::Center,
         2 => TextAlign::Right,

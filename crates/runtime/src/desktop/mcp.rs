@@ -1,10 +1,7 @@
 use super::{Desktop, link::Link, png, window_state};
 use crate::{host::Role, jsc};
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
-use renderer::{
-    App, FileDropEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PlatformInput, ScrollDelta, ScrollPhase, ScrollWheelEvent, WindowId, point, px,
-};
+use renderer::{App, Button, Event, Key, Modifiers, WheelPhase, WindowId, point, px};
 use serde_json::{Value, json};
 use std::{
     ffi::{CStr, c_char, c_void},
@@ -318,47 +315,46 @@ fn screenshot(
 fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result<Option<Value>> {
     let (window, handle) = page(args, desktop)?;
     let action = args["action"].as_str().context("Expected an action")?;
-    let position = point(
+    let at = point(
         px(args["x"].as_f64().unwrap_or(0.) as f32),
         px(args["y"].as_f64().unwrap_or(0.) as f32),
     );
     let button = match args["button"].as_str() {
-        Some("right") => MouseButton::Right,
-        Some("middle") => MouseButton::Middle,
-        _ => MouseButton::Left,
+        Some("right") => Button::Right,
+        Some("middle") => Button::Middle,
+        _ => Button::Left,
     };
     let count = args["count"].as_u64().unwrap_or(1).max(1) as usize;
-    let modifiers = Modifiers::default();
+    let modifiers = Modifiers::NONE;
+    let moved = |at, held| Event::PointerMove {
+        at,
+        held,
+        modifiers,
+    };
+    let down = |at, clicks| Event::PointerDown {
+        at,
+        button,
+        modifiers,
+        clicks,
+        first_click: false,
+    };
+    let up = |at, clicks| Event::PointerUp {
+        at,
+        button,
+        modifiers,
+        clicks,
+    };
     let mut events = Vec::new();
     let mut keys = Vec::new();
     match action {
         "click" => {
-            events.push(PlatformInput::MouseMove(MouseMoveEvent {
-                position,
-                pressed_button: None,
-                modifiers,
-            }));
-            for click_count in 1..=count {
-                events.push(PlatformInput::MouseDown(MouseDownEvent {
-                    button,
-                    position,
-                    modifiers,
-                    click_count,
-                    first_mouse: false,
-                }));
-                events.push(PlatformInput::MouseUp(MouseUpEvent {
-                    button,
-                    position,
-                    modifiers,
-                    click_count,
-                }));
+            events.push(moved(at, None));
+            for clicks in 1..=count {
+                events.push(down(at, clicks));
+                events.push(up(at, clicks));
             }
         }
-        "move" => events.push(PlatformInput::MouseMove(MouseMoveEvent {
-            position,
-            pressed_button: None,
-            modifiers,
-        })),
+        "move" => events.push(moved(at, None)),
         "drop" => {
             let paths = args["paths"]
                 .as_array()
@@ -366,113 +362,69 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
                 .iter()
                 .filter_map(|path| path.as_str().map(std::path::PathBuf::from))
                 .collect();
-            events.push(PlatformInput::FileDrop(FileDropEvent::Entered {
-                position,
-                paths,
-            }));
+            events.push(Event::FileEnter { at, paths });
             let end = point(
-                px(args["to_x"].as_f64().map_or(position.x.0, |x| x as f32)),
-                px(args["to_y"].as_f64().map_or(position.y.0, |y| y as f32)),
+                px(args["to_x"].as_f64().map_or(at.x.0, |x| x as f32)),
+                px(args["to_y"].as_f64().map_or(at.y.0, |y| y as f32)),
             );
-            events.push(PlatformInput::FileDrop(FileDropEvent::Pending {
-                position: end,
-            }));
+            events.push(Event::FileOver { at: end });
             if args["hold"].as_bool() != Some(true) {
-                events.push(PlatformInput::FileDrop(
-                    if args["leave"].as_bool() == Some(true) {
-                        FileDropEvent::Exited
-                    } else {
-                        FileDropEvent::Submit { position: end }
-                    },
-                ));
+                events.push(if args["leave"].as_bool() == Some(true) {
+                    Event::FileLeave
+                } else {
+                    Event::FileDrop { at: end }
+                });
             }
         }
-        "press" => events.push(PlatformInput::MouseDown(MouseDownEvent {
-            button,
-            position,
-            modifiers,
-            click_count: 1,
-            first_mouse: false,
-        })),
-        "pressed_move" => events.push(PlatformInput::MouseMove(MouseMoveEvent {
-            position,
-            pressed_button: Some(button),
-            modifiers,
-        })),
-        "release" => events.push(PlatformInput::MouseUp(MouseUpEvent {
-            button,
-            position,
-            modifiers,
-            click_count: 1,
-        })),
+        "press" => events.push(down(at, 1)),
+        "pressed_move" => events.push(moved(at, Some(button))),
+        "release" => events.push(up(at, 1)),
         "drag" => {
             let end = point(
                 px(args["to_x"].as_f64().context("Expected to_x")? as f32),
                 px(args["to_y"].as_f64().context("Expected to_y")? as f32),
             );
-            events.push(PlatformInput::MouseMove(MouseMoveEvent {
-                position,
-                pressed_button: None,
-                modifiers,
-            }));
-            events.push(PlatformInput::MouseDown(MouseDownEvent {
-                button,
-                position,
-                modifiers,
-                click_count: 1,
-                first_mouse: false,
-            }));
+            events.push(moved(at, None));
+            events.push(down(at, 1));
             for step in 1..=8 {
-                events.push(PlatformInput::MouseMove(MouseMoveEvent {
-                    position: position + (end - position) * (step as f32 / 8.),
-                    pressed_button: Some(button),
-                    modifiers,
-                }));
+                events.push(moved(at + (end - at) * (step as f32 / 8.), Some(button)));
             }
-            events.push(PlatformInput::MouseUp(MouseUpEvent {
-                button,
-                position: end,
-                modifiers,
-                click_count: 1,
-            }));
+            events.push(up(end, 1));
         }
-        "scroll" => {
-            let delta = point(
+        "scroll" => events.push(Event::Wheel {
+            at,
+            delta: point(
                 -args["delta_x"].as_f64().unwrap_or(0.) as f32,
                 -args["delta_y"].as_f64().unwrap_or(0.) as f32,
-            );
-            events.push(PlatformInput::ScrollWheel(ScrollWheelEvent {
-                position,
-                delta: if args["lines"].as_bool() == Some(true) {
-                    ScrollDelta::Lines(delta)
-                } else {
-                    ScrollDelta::Pixels(delta.map(px))
-                },
-                phase: match args["phase"].as_str() {
-                    Some("began") => ScrollPhase::Began,
-                    Some("changed") => ScrollPhase::Changed,
-                    Some("ended") => ScrollPhase::Ended,
-                    Some("momentum") => ScrollPhase::Momentum,
-                    Some("momentum_ended") => ScrollPhase::MomentumEnded,
-                    _ => ScrollPhase::None,
-                },
-                modifiers,
-            }));
-        }
+            ),
+            lines: args["lines"].as_bool() == Some(true),
+            phase: match args["phase"].as_str() {
+                Some("began") => WheelPhase::Began,
+                Some("changed") => WheelPhase::Changed,
+                Some("ended") => WheelPhase::Ended,
+                Some("momentum") => WheelPhase::Momentum,
+                Some("momentum_ended") => WheelPhase::MomentumEnded,
+                _ => WheelPhase::None,
+            },
+            modifiers,
+        }),
         "key" => {
             let key = args["key"].as_str().context("Expected a key")?;
             for part in key.split_whitespace() {
-                keys.push(Keystroke::parse(part).with_context(|| format!("Invalid key: {part}"))?);
+                keys.push(Key::parse(part).with_context(|| format!("Invalid key: {part}"))?);
             }
         }
         "type" => {
             for character in args["text"].as_str().context("Expected text")?.chars() {
                 let text = character.to_string();
-                keys.push(Keystroke {
+                let name = text.to_lowercase();
+                keys.push((
+                    Key {
+                        name,
+                        text: Some(text),
+                    },
                     modifiers,
-                    key: text.to_lowercase(),
-                    key_char: Some(text),
-                });
+                ));
             }
         }
         _ => bail!("Unknown input action: {action}"),
@@ -485,8 +437,8 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
             for event in events {
                 window.dispatch_event(event, cx);
             }
-            for key in keys {
-                window.dispatch_keystroke(key, cx);
+            for (key, modifiers) in keys {
+                window.press_key(key, modifiers, cx);
             }
         });
         reply.send(result.map(|_| sent.into()).context("The window closed"));

@@ -693,7 +693,8 @@ pub(crate) fn intrinsic(
         );
         let run = style::text_run(style, units, label.len());
         let width = f32::from(
-            text.shape_line(label, renderer::px(units.font.em), &[run], None)
+            text.shape_line(label, renderer::px(units.font.em), &run)
+                .line
                 .width,
         );
         content = [width, width, units.font.lh];
@@ -734,18 +735,20 @@ pub(crate) fn intrinsic(
         );
         let shape = |runs: &[renderer::TextRun]| {
             text.shape_text(
-                source.clone(),
+                &source,
                 renderer::px(units.font.em),
                 runs,
-                available.filter(|_| wrap).map(renderer::px),
-                style
-                    .get(Prop::WEBKIT_LINE_CLAMP)
-                    .or_else(|| style.get(Prop::LINE_CLAMP))
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .map(|lines| lines.max(1)),
-                word_break,
+                &renderer::Wrapping {
+                    width: available.filter(|_| wrap).map(renderer::px),
+                    max_lines: style
+                        .get(Prop::WEBKIT_LINE_CLAMP)
+                        .or_else(|| style.get(Prop::LINE_CLAMP))
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .map(|lines| lines.max(1)),
+                    word_break,
+                    ..Default::default()
+                },
             )
-            .unwrap_or_default()
         };
         let float = if alt.is_some() { 16. } else { 0. };
         let beside = alt
@@ -773,29 +776,26 @@ pub(crate) fn intrinsic(
         }
         let mut line_start = 0;
         for line in &lines {
-            let layout = &line.unwrapped_layout;
-            let width = f32::from(layout.width);
+            let width = f32::from(line.line.width);
             content[1] = content[1].max(width);
-            content[2] += (1 + line.wrap_boundaries.len()) as f32 * units.font.lh;
-            let mut glyphs = layout.runs.iter().flat_map(|run| &run.glyphs).peekable();
+            content[2] += line.rows() as f32 * units.font.lh;
+            let mut glyphs = line.line.glyphs.iter().peekable();
             let (mut start, mut previous) = (0., ' ');
             while let Some(glyph) = glyphs.next() {
                 let character = line
                     .text
-                    .get(glyph.index..)
+                    .get(glyph.index as usize..)
                     .and_then(|v| v.chars().next())
                     .unwrap_or(' ');
                 if !character.is_whitespace() {
-                    let x = f32::from(glyph.position.x);
+                    let x = f32::from(glyph.x);
                     if anywhere || previous.is_whitespace() || character > '\u{2e7f}' {
                         start = x - opening
                             .iter()
-                            .find(|(at, _)| *at == line_start + glyph.index)
+                            .find(|(at, _)| *at == line_start + glyph.index as usize)
                             .map_or(0., |(_, inset)| *inset);
                     }
-                    let end = glyphs
-                        .peek()
-                        .map_or(width, |next| f32::from(next.position.x));
+                    let end = glyphs.peek().map_or(width, |next| f32::from(next.x));
                     content[0] = content[0].max(end - start);
                 }
                 previous = character;
@@ -1006,19 +1006,18 @@ pub(crate) fn intrinsic(
                 None if string.is_empty() => sides(0)[1],
                 None => {
                     let run = style::text_run(pseudo, &units, string.len());
-                    let shaped = text
-                        .shape_text(
-                            string.into(),
-                            renderer::px(units.font.em),
-                            &[run],
-                            None,
-                            None,
-                            style::word_break(pseudo),
-                        )
-                        .unwrap_or_default();
+                    let shaped = text.shape_text(
+                        &string,
+                        renderer::px(units.font.em),
+                        &[run],
+                        &renderer::Wrapping {
+                            word_break: style::word_break(pseudo),
+                            ..Default::default()
+                        },
+                    );
                     shaped
                         .iter()
-                        .map(|line| f32::from(line.unwrapped_layout.width))
+                        .map(|line| f32::from(line.line.width))
                         .fold(0., f32::max)
                         + sides(0)[1]
                 }
@@ -1044,7 +1043,7 @@ pub(crate) fn intrinsic(
             .get("size")
             .is_none_or(|size| size.trim().parse::<u32>().is_ok_and(|size| size <= 1))
     {
-        let face = text.resolve_font(&style::font(style));
+        let face = text.face(&style::font(style));
         let [ascent, descent, _] = text
             .line_metrics(face, renderer::px(units.font.em * measured.pixel_ratio))
             .map(f32::from);

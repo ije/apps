@@ -1,9 +1,8 @@
 use crate::style::Prop;
 use crate::style::{self, Style};
 use renderer::{
-    Bounds, Corners, DispatchPhase, Edges, Hitbox, HitboxBehavior, MouseButton, MouseDownEvent,
-    MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Rgba, ScrollHandle, Timer, Window,
-    point, px, quad, rgba, size, transparent_black,
+    Button, Color, Corners, Edges, Event, Hit, Pixels, Point, Rect, Region, ScrollRef, Timer,
+    Window, point, px, size,
 };
 use std::{
     cell::RefCell,
@@ -19,10 +18,10 @@ const SHORTEST: f32 = 26.;
 
 #[derive(Clone, Copy)]
 struct Part {
-    fill: Rgba,
+    fill: Color,
     radius: f32,
     border: f32,
-    edge: Rgba,
+    edge: Color,
     clip: f32,
 }
 
@@ -39,8 +38,8 @@ impl Part {
             style
                 .get(prop)
                 .and_then(style::color)
-                .map_or(transparent_black(), |(ink, alpha)| {
-                    rgba(ink << 8 | alpha as u32)
+                .map_or(Color::TRANSPARENT, |(ink, alpha)| {
+                    Color::hex(ink << 8 | alpha as u32)
                 })
         };
         let border = if style
@@ -64,27 +63,28 @@ impl Part {
         }
     }
 
-    fn paint(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+    fn paint(&self, bounds: Rect<Pixels>, window: &mut Window) {
         let radius = self
             .radius
             .min(f32::from(bounds.size.width.min(bounds.size.height)) / 2.);
-        window.paint_quad(quad(
+        window.draw_box(
             bounds.inset(px(self.clip)),
             Corners::all(px((radius - self.clip).max(0.))),
             self.fill,
-            Edges::all(px(0.)),
-            transparent_black(),
             Default::default(),
-        ));
+        );
         if self.border > 0. && !self.edge.is_transparent() {
-            window.paint_quad(quad(
+            window.draw_box(
                 bounds,
                 Corners::all(px(radius)),
-                transparent_black(),
-                Edges::all(px(self.border)),
-                self.edge,
-                Default::default(),
-            ));
+                Color::TRANSPARENT,
+                renderer::Border {
+                    widths: Edges::all(px(self.border)),
+                    color: self.edge,
+                    style: Default::default(),
+                    sides: 0,
+                },
+            );
         }
     }
 }
@@ -92,7 +92,7 @@ impl Part {
 pub(crate) struct Look {
     dark: bool,
     thin: bool,
-    colors: Option<[Rgba; 2]>,
+    colors: Option<[Color; 2]>,
     custom: Option<([f32; 2], [Option<Part>; 5])>,
     pub(super) forced: [bool; 2],
 }
@@ -125,7 +125,7 @@ impl Look {
                 let parts = style::components(value, ' ');
                 let [thumb, track] =
                     [parts.first()?, parts.get(1)?].map(|value| style::color(value));
-                Some([thumb?, track?].map(|(ink, alpha)| rgba(ink << 8 | alpha as u32)))
+                Some([thumb?, track?].map(|(ink, alpha)| Color::hex(ink << 8 | alpha as u32)))
             }),
             custom: None,
             forced: [
@@ -194,8 +194,8 @@ pub(super) struct State {
 }
 
 pub(super) struct Bar {
-    hitbox: Hitbox,
-    zone: Bounds<Pixels>,
+    hitbox: Region,
+    zone: Rect<Pixels>,
     track: [f32; 2],
     thumb: [f32; 2],
     view: f32,
@@ -208,7 +208,7 @@ fn along(position: Point<Pixels>, axis: usize) -> f32 {
 
 pub(super) struct Scrollbar {
     pub(super) id: usize,
-    pub(super) handle: ScrollHandle,
+    pub(super) handle: ScrollRef,
     pub(super) look: Option<Look>,
     pub(super) axes: [bool; 2],
     pub(super) reserved: [f32; 2],
@@ -250,13 +250,9 @@ impl From<Scrollbar> for renderer::Child {
 impl Scrollbar {
     fn bars(&self, window: &mut Window) -> Prepainted {
         let look = self.look.as_ref()?;
-        let state = window.with_element_state(
-            ("scrollbar", self.id).into(),
-            |state: Option<Rc<RefCell<State>>>, _| {
-                let state = state.unwrap_or_default();
-                (state.clone(), state)
-            },
-        );
+        let state = window
+            .keyed::<Rc<RefCell<State>>>(("scrollbar", self.id).into())
+            .clone();
         let (bounds, max, offset, stretch) = (
             self.handle.bounds(),
             self.handle.max_offset(),
@@ -308,7 +304,7 @@ impl Scrollbar {
                 inner[axis + 2] - inner[axis] - if shown[cross] { thickness[cross] } else { 0. };
             origin[cross] = inner[cross + 2] - thickness[axis];
             extent[cross] = thickness[axis];
-            let zone = Bounds::new(
+            let zone = Rect::new(
                 point(px(origin[0]), px(origin[1])),
                 size(px(extent[0]), px(extent[1])),
             );
@@ -334,7 +330,7 @@ impl Scrollbar {
                 }
             }
             Some(Bar {
-                hitbox: window.insert_hitbox(zone, HitboxBehavior::BlockMouseExceptScroll),
+                hitbox: window.add_region(zone, Hit::Shield),
                 zone,
                 track,
                 thumb,
@@ -416,38 +412,46 @@ impl Scrollbar {
             let cross = [bar_width - INSET - width, width];
             let (thumb_color, track_color) = look
                 .colors
-                .map_or((rgba(knob), rgba(track)), |[thumb, track]| (thumb, track));
+                .map_or((Color::hex(knob), Color::hex(track)), |[thumb, track]| {
+                    (thumb, track)
+                });
             let edge = |color: u32| {
                 if look.colors.is_some() {
-                    transparent_black()
+                    Color::TRANSPARENT
                 } else {
-                    rgba(color).opacity(alpha)
+                    Color::hex(color).fade(alpha)
                 }
             };
             if active {
-                window.paint_quad(quad(
+                window.draw_box(
                     span(bar.track[0], bar.track[1], cross),
                     Corners::all(px(width / 2.)),
-                    track_color.opacity(alpha),
-                    Edges::all(hairline),
-                    edge(track_edge),
-                    Default::default(),
-                ));
+                    track_color.fade(alpha),
+                    renderer::Border {
+                        widths: Edges::all(hairline),
+                        color: edge(track_edge),
+                        style: Default::default(),
+                        sides: 0,
+                    },
+                );
             }
-            window.paint_quad(quad(
+            window.draw_box(
                 span(bar.thumb[0], bar.thumb[1], cross),
                 Corners::all(px(width / 2.)),
-                thumb_color.opacity(alpha),
-                Edges::all(hairline),
-                edge(knob_edge),
-                Default::default(),
-            ));
+                thumb_color.fade(alpha),
+                renderer::Border {
+                    widths: Edges::all(hairline),
+                    color: edge(knob_edge),
+                    style: Default::default(),
+                    sides: 0,
+                },
+            );
         }
         if let Some((_, parts)) = &look.custom
             && let (Some(corner), [Some(x), Some(y)]) = (parts[3], &*bars)
         {
             corner.paint(
-                Bounds::from_corners(
+                Rect::between(
                     point(y.zone.origin.x, x.zone.origin.y),
                     point(y.zone.right(), x.zone.bottom()),
                 ),
@@ -456,19 +460,18 @@ impl Scrollbar {
         }
         drop(current);
         let handle = self.handle.clone();
-        window.on_mouse_event({
+        window.on_capture({
             let (state, bars) = (state.clone(), bars.clone());
-            move |event: &MouseMoveEvent, phase, window, _| {
-                if phase != DispatchPhase::Capture {
+            move |event, window, _| {
+                let Event::PointerMove { at: position, .. } = *event else {
                     return;
-                }
+                };
                 let mut state = state.borrow_mut();
                 if let Some((axis, grab)) = state.drag {
                     if let Some(bar) = &bars[axis] {
                         let travel = bar.track[1] - bar.thumb[1];
                         let ratio = if travel > 0. {
-                            ((along(event.position, axis) - grab - bar.track[0]) / travel)
-                                .clamp(0., 1.)
+                            ((along(position, axis) - grab - bar.track[0]) / travel).clamp(0., 1.)
                         } else {
                             0.
                         };
@@ -484,8 +487,8 @@ impl Scrollbar {
                     return;
                 }
                 let hover = bars.iter().enumerate().find_map(|(axis, bar)| {
-                    let bar = bar.as_ref().filter(|bar| bar.hitbox.is_hovered(window))?;
-                    let position = along(event.position, axis);
+                    let bar = bar.as_ref().filter(|bar| bar.hitbox.hovered(window))?;
+                    let position = along(position, axis);
                     Some((
                         axis,
                         position >= bar.thumb[0] && position < bar.thumb[0] + bar.thumb[1],
@@ -500,11 +503,11 @@ impl Scrollbar {
                 }
             }
         });
-        window.on_mouse_event({
+        window.on_capture({
             let state = state.clone();
-            move |_: &MouseExitEvent, phase, window, _| {
+            move |event, window, _| {
                 let mut state = state.borrow_mut();
-                if phase == DispatchPhase::Capture
+                if matches!(event, Event::PointerLeave { .. })
                     && state.drag.is_none()
                     && state.hover.take().is_some()
                 {
@@ -513,22 +516,24 @@ impl Scrollbar {
                 }
             }
         });
-        window.on_mouse_event({
+        window.on_bubble({
             let (state, handle) = (state.clone(), self.handle.clone());
-            move |event: &MouseDownEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
+            move |event, window, cx| {
+                let Event::PointerDown {
+                    at: position,
+                    button: Button::Left,
+                    ..
+                } = *event
+                else {
                     return;
-                }
+                };
                 let Some((axis, bar)) = bars.iter().enumerate().find_map(|(axis, bar)| {
-                    Some((
-                        axis,
-                        bar.as_ref().filter(|bar| bar.hitbox.is_hovered(window))?,
-                    ))
+                    Some((axis, bar.as_ref().filter(|bar| bar.hitbox.hovered(window))?))
                 }) else {
                     return;
                 };
-                cx.stop_propagation();
-                let position = along(event.position, axis);
+                cx.stop_event();
+                let position = along(position, axis);
                 let mut state = state.borrow_mut();
                 state.active = Some(Instant::now());
                 if position >= bar.thumb[0] && position < bar.thumb[0] + bar.thumb[1] {
@@ -548,11 +553,15 @@ impl Scrollbar {
                 window.refresh();
             }
         });
-        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, _| {
+        window.on_capture(move |event, window, _| {
             let mut state = state.borrow_mut();
-            if phase == DispatchPhase::Capture
-                && event.button == MouseButton::Left
-                && state.drag.take().is_some()
+            if matches!(
+                event,
+                Event::PointerUp {
+                    button: Button::Left,
+                    ..
+                }
+            ) && state.drag.take().is_some()
             {
                 state.active = Some(Instant::now());
                 window.refresh();

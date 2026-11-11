@@ -76,10 +76,7 @@ fn videos_decode_frames_seek_and_end() {
             .unwrap();
         let image = host.borrow().dom[&1].images[&id].clone();
         assert_eq!(
-            [
-                u32::from(image.size().width),
-                u32::from(image.size().height)
-            ],
+            [image.size().width as u32, image.size().height as u32],
             [64, 48]
         );
         for (value, expected) in image.bytes()[..4].iter().zip([32, 128, 224, 255]) {
@@ -207,10 +204,7 @@ fn absurd_pixel_aspect_ratios_fit_the_frame_size_limit() {
         .unwrap();
     let image = host.borrow().dom[&1].images[&id].clone();
     assert_eq!(
-        [
-            u32::from(image.size().width),
-            u32::from(image.size().height)
-        ],
+        [image.size().width as u32, image.size().height as u32],
         [8192, 32]
     );
 }

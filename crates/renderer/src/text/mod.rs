@@ -1,16 +1,24 @@
-mod layout;
+mod breaks;
+mod cache;
+mod draw;
 mod line;
 mod paragraph;
+mod raster;
+mod style;
 
-pub use layout::*;
+pub use breaks::Wrapping;
+pub use cache::Span;
+pub use draw::Decoration;
 pub use line::*;
 pub use paragraph::*;
+pub use raster::*;
+pub use style::*;
 
-use crate::{Bounds, Pixels, Point, Rgba, Size, platform, px};
-use anyhow::{Context as _, Result};
+use crate::{Pixels, Rect, platform, px};
+use anyhow::Result;
+use cache::Cache;
 use rustc_hash::FxHashMap;
 use std::{
-    borrow::Cow,
     cell::{Cell, RefCell},
     hash::{Hash, Hasher},
     rc::Rc,
@@ -18,236 +26,77 @@ use std::{
 
 pub type SharedString = Rc<str>;
 
-#[derive(Hash, PartialEq, Eq, Clone, Copy, Debug, Default)]
-#[repr(C)]
-pub struct FontId(pub usize);
+pub const SUBPIXEL_STEPS: u8 = 4;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-#[repr(C)]
-pub struct GlyphId(pub u32);
+/// Dense from 0, never reused.
+pub type FontId = u32;
 
-pub const SUBPIXEL_VARIANTS_X: u8 = 4;
+pub type GlyphId = u16;
 
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
-pub struct FontWeight(pub f32);
+/// CSS weight, 1 to 1000.
+pub type FontWeight = f32;
 
-impl Default for FontWeight {
-    fn default() -> Self {
-        Self::NORMAL
-    }
-}
+pub type Features = Rc<[(String, u32)]>;
 
-impl Hash for FontWeight {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.to_bits().hash(state);
-    }
-}
-
-impl Eq for FontWeight {}
-
-impl FontWeight {
-    pub const NORMAL: Self = Self(400.);
-}
-
-#[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Default)]
-pub enum FontStyle {
-    #[default]
-    Normal,
-    Italic,
-    Oblique,
-}
-
-#[derive(Clone, Default, Debug, PartialEq, Eq, Hash)]
-pub struct FontFeatures(pub Rc<[(String, u32)]>);
-
-impl FontFeatures {
-    pub fn tag_value_list(&self) -> &[(String, u32)] {
-        &self.0
-    }
-}
-
-#[derive(Clone, Default, Debug, PartialEq, Eq, Hash)]
-pub struct FontFallbacks(pub Rc<[String]>);
-
-impl FontFallbacks {
-    pub fn fallback_list(&self) -> &[String] {
-        &self.0
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, PartialEq)]
 pub struct Font {
-    pub family: SharedString,
-    pub features: FontFeatures,
-    pub fallbacks: Option<FontFallbacks>,
+    pub family: Rc<str>,
+    pub features: Features,
     pub weight: FontWeight,
     pub style: FontStyle,
 }
 
 thread_local! {
-    pub(crate) static SYSTEM_UI_FONT: SharedString = ".SystemUIFont".into();
+    // One shared name, so fonts of the default family compare by pointer in `face`.
+    pub(crate) static SYSTEM_UI_FONT: Rc<str> = ".SystemUIFont".into();
+}
+
+impl Font {
+    pub fn new(family: impl Into<Rc<str>>) -> Self {
+        Self {
+            family: family.into(),
+            features: Features::default(),
+            weight: 400.,
+            style: FontStyle::Normal,
+        }
+    }
 }
 
 impl Default for Font {
     fn default() -> Self {
-        font(SYSTEM_UI_FONT.with(Rc::clone))
+        Self::new(SYSTEM_UI_FONT.with(Rc::clone))
     }
 }
 
-pub fn font(family: impl Into<SharedString>) -> Font {
-    Font {
-        family: family.into(),
-        features: FontFeatures::default(),
-        fallbacks: None,
-        weight: FontWeight::default(),
-        style: FontStyle::default(),
+// Fonts key maps, and a weight is a float.
+impl Eq for Font {}
+
+impl Hash for Font {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (
+            &self.family,
+            &self.features,
+            self.weight.to_bits(),
+            self.style,
+        )
+            .hash(state);
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct FontMetrics {
-    pub units_per_em: u32,
+/// In em units. `descent` is negative.
+#[derive(Clone, Copy)]
+pub struct FaceMetrics {
     pub ascent: f32,
     pub descent: f32,
     pub line_gap: f32,
     pub cap_height: f32,
     pub x_height: f32,
-    pub bounding_box: Bounds<f32>,
-    pub tall_ascent: bool,
+    pub bounds: Rect<f32>,
     pub em_ascent: f32,
+    pub tall: bool,
 }
 
-impl FontMetrics {
-    fn scale(&self, value: f32, font_size: Pixels) -> Pixels {
-        Pixels(value / self.units_per_em as f32 * font_size.0)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum DecorationStyle {
-    #[default]
-    Solid,
-    Double,
-    Dotted,
-    Dashed,
-    Wavy,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct UnderlineStyle {
-    pub thickness: Pixels,
-    pub color: Option<Rgba>,
-    pub style: DecorationStyle,
-    pub offset: Option<Pixels>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct StrikethroughStyle {
-    pub thickness: Pixels,
-    pub color: Option<Rgba>,
-    pub style: DecorationStyle,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum TextAlign {
-    #[default]
-    Left,
-    Center,
-    Right,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum WordBreak {
-    #[default]
-    Normal,
-    BreakWord,
-    Anywhere,
-    BreakAll,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum TextWrap {
-    #[default]
-    Wrap,
-    Balance,
-    Pretty,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum WhiteSpace {
-    #[default]
-    Normal,
-    Nowrap,
-}
-
-#[derive(Clone, Debug, PartialEq, Default)]
-pub struct TextRun {
-    pub len: usize,
-    pub font: Font,
-    pub color: Rgba,
-    pub background_color: Option<Rgba>,
-    pub underline: Option<UnderlineStyle>,
-    pub strikethrough: Option<StrikethroughStyle>,
-    pub letter_spacing: Pixels,
-    pub word_spacing: Pixels,
-    pub font_size: Option<Pixels>,
-    pub inset: [Pixels; 2],
-    pub nowrap: bool,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct FontRun {
-    pub len: usize,
-    pub font_id: FontId,
-    pub letter_spacing: Pixels,
-    pub word_spacing: Pixels,
-    pub font_size: Pixels,
-    pub inset: [Pixels; 2],
-    pub nowrap: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct RenderGlyphParams {
-    pub font_id: FontId,
-    pub glyph_id: GlyphId,
-    pub font_size: Pixels,
-    pub subpixel_variant: Point<u8>,
-    pub scale_factor: f32,
-    pub is_emoji: bool,
-    pub dilation: u8,
-}
-
-impl Eq for RenderGlyphParams {}
-
-impl Hash for RenderGlyphParams {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.font_id.0.hash(state);
-        self.glyph_id.0.hash(state);
-        self.font_size.0.to_bits().hash(state);
-        self.subpixel_variant.hash(state);
-        self.scale_factor.to_bits().hash(state);
-        self.is_emoji.hash(state);
-        self.dilation.hash(state);
-    }
-}
-
-pub struct Fonts {
-    pub(crate) platform: platform::TextSystem,
-    fonts: RefCell<FxHashMap<Font, Option<FontId>>>,
-    // Use family and feature pointers as keys: full font hashes cost more than shaping-cache lookups.
-    recent: RefCell<Vec<(Font, FontId)>>,
-    metrics: RefCell<FxHashMap<FontId, FontMetrics>>,
-    generation: Cell<usize>,
-}
-
-pub struct TextSystem {
-    shared: Rc<Fonts>,
-    font_runs: Cell<Vec<FontRun>>,
-    lines: LineLayoutCache,
-    generation: Cell<usize>,
-}
-
-const FALLBACKS: [&str; 6] = [
+const STAND_INS: [&str; 6] = [
     "Helvetica",
     "Segoe UI",
     "Noto Sans",
@@ -256,519 +105,318 @@ const FALLBACKS: [&str; 6] = [
     "Arial",
 ];
 
-impl std::ops::Deref for TextSystem {
-    type Target = Fonts;
-    fn deref(&self) -> &Fonts {
-        &self.shared
-    }
+#[derive(Default)]
+pub struct Fonts {
+    // Backends are called from one thread at a time.
+    platform: platform::TextSystem,
+    resolved: RefCell<FxHashMap<Font, Option<FontId>>>,
+    // Hashing a whole `Font` costs more than a shaping cache lookup, so recent fonts match by pointer first.
+    recent: RefCell<Vec<(Font, FontId)>>,
+    metrics: RefCell<Vec<Option<FaceMetrics>>>,
+    generation: Cell<usize>,
 }
 
-impl Default for TextSystem {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub fn warm(lists: Vec<Vec<String>>) {
-    #[cfg(target_os = "macos")]
-    if !lists.is_empty() {
-        let _ = std::thread::Builder::new()
-            .name("apps-fonts".into())
-            .spawn(move || {
-                let text = TextSystem::new();
-                let names: FxHashMap<String, String> = text
-                    .all_font_names()
-                    .into_iter()
-                    .map(|name| (name.to_lowercase(), name))
-                    .collect();
-                for list in lists {
-                    if let Some(name) = list
-                        .iter()
-                        .find_map(|family| names.get(&family.to_lowercase()))
-                    {
-                        text.resolve_font(&font(name.clone()));
-                    }
-                }
-            });
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = lists;
-}
-
-impl TextSystem {
-    pub fn new() -> Self {
-        Self {
-            shared: Rc::new(Fonts {
-                platform: platform::TextSystem::new(),
-                fonts: RefCell::default(),
-                recent: RefCell::default(),
-                metrics: RefCell::default(),
-                generation: Cell::new(0),
-            }),
-            font_runs: Cell::default(),
-            lines: LineLayoutCache::default(),
-            generation: Cell::new(0),
-        }
-    }
-
-    pub(crate) fn for_window(&self) -> Self {
-        Self {
-            shared: self.shared.clone(),
-            font_runs: Cell::default(),
-            lines: LineLayoutCache::default(),
-            generation: Cell::new(self.shared.generation.get()),
-        }
-    }
-
-    fn lines(&self) -> &LineLayoutCache {
-        let generation = self.shared.generation.get();
-        if self.generation.replace(generation) != generation {
-            self.lines.clear();
-        }
-        &self.lines
-    }
-
-    pub fn all_font_names(&self) -> Vec<String> {
-        let mut names = self.platform.all_font_names();
+impl Fonts {
+    pub fn families(&self) -> Vec<String> {
+        let mut names = self.platform.families();
         names.sort_unstable();
         names.dedup();
         names
     }
 
-    pub(crate) fn generation(&self) -> usize {
-        self.shared.generation.get()
-    }
-
-    pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
-        self.platform.add_fonts(fonts)?;
-        self.fonts.borrow_mut().clear();
-        self.recent.borrow_mut().clear();
-        self.shared.generation.set(self.shared.generation.get() + 1);
-        Ok(())
-    }
-
-    pub fn resolve_font(&self, font: &Font) -> FontId {
+    pub fn face(&self, font: &Font) -> FontId {
         let same = |kept: &Font| {
             Rc::ptr_eq(&kept.family, &font.family)
-                && Rc::ptr_eq(&kept.features.0, &font.features.0)
-                && kept.fallbacks.as_ref().map(|list| Rc::as_ptr(&list.0))
-                    == font.fallbacks.as_ref().map(|list| Rc::as_ptr(&list.0))
-                && (kept.weight, kept.style) == (font.weight, font.style)
+                && Rc::ptr_eq(&kept.features, &font.features)
+                && kept.weight == font.weight
+                && kept.style == font.style
         };
         if let Some(&(_, id)) = self.recent.borrow().iter().find(|(kept, _)| same(kept)) {
             return id;
         }
-        if let Some(Some(id)) = self.fonts.borrow().get(font) {
+        let known = self.resolved.borrow().get(font).copied();
+        if let Some(Some(id)) = known {
             let mut recent = self.recent.borrow_mut();
             if recent.len() == 8 {
                 recent.remove(0);
             }
-            recent.push((font.clone(), *id));
-            return *id;
+            recent.push((font.clone(), id));
+            return id;
         }
-        let lookup = |candidate: &Font| {
-            if let Some(id) = self.fonts.borrow().get(candidate) {
-                return *id;
-            }
-            let id = self.platform.font_id(candidate).ok();
-            self.fonts.borrow_mut().insert(candidate.clone(), id);
-            id
+        let find = |wanted: &Font| {
+            let known = self.resolved.borrow().get(wanted).copied();
+            known.unwrap_or_else(|| {
+                let id = self.platform.font(wanted);
+                self.resolved.borrow_mut().insert(wanted.clone(), id);
+                id
+            })
         };
-        let id = lookup(font).or_else(|| {
-            FALLBACKS.iter().find_map(|family| {
-                lookup(&Font {
-                    family: (*family).into(),
-                    ..font.clone()
+        let id = find(font)
+            .or_else(|| {
+                STAND_INS.iter().find_map(|family| {
+                    find(&Font {
+                        family: (*family).into(),
+                        ..font.clone()
+                    })
                 })
             })
-        });
-        let id = id.unwrap_or_default();
-        self.fonts.borrow_mut().insert(font.clone(), Some(id));
+            .unwrap_or(0);
+        self.resolved.borrow_mut().insert(font.clone(), Some(id));
         id
     }
 
-    fn read_metrics<T>(&self, font_id: FontId, read: impl FnOnce(&FontMetrics) -> T) -> T {
-        if let Some(metrics) = self.metrics.borrow().get(&font_id) {
-            return read(metrics);
+    /// In em units: multiply by the font size.
+    pub fn metrics(&self, font: FontId) -> FaceMetrics {
+        let at = font as usize;
+        if let Some(Some(metrics)) = self.metrics.borrow().get(at) {
+            return *metrics;
         }
-        let metrics = self.platform.font_metrics(font_id);
-        self.metrics.borrow_mut().insert(font_id, metrics);
-        read(&metrics)
+        let metrics = self.platform.metrics(font);
+        let mut all = self.metrics.borrow_mut();
+        if all.len() <= at {
+            all.resize(at + 1, None);
+        }
+        all[at] = Some(metrics);
+        metrics
     }
 
-    pub fn bounding_box(&self, font_id: FontId, font_size: Pixels) -> Bounds<Pixels> {
-        self.read_metrics(font_id, |metrics| {
-            (metrics.bounding_box / metrics.units_per_em as f32 * font_size.0).map(px)
-        })
+    pub fn glyph_box(&self, font: FontId, size: Pixels) -> Rect<Pixels> {
+        (self.metrics(font).bounds * size.0).map(px)
     }
 
-    pub fn advance(&self, font_id: FontId, font_size: Pixels, ch: char) -> Result<Size<Pixels>> {
-        let glyph = self
-            .platform
-            .glyph_for_char(font_id, ch)
-            .with_context(|| format!("glyph not found for character '{ch}'"))?;
-        let advance = self.platform.advance(font_id, glyph)? / self.units_per_em(font_id) as f32;
-        Ok(advance.map(|value| px(value * font_size.0)))
+    pub fn advance(&self, font: FontId, size: Pixels, ch: char) -> Option<Pixels> {
+        let glyph = self.platform.glyph(font, ch)?;
+        Some(px(self.platform.advance(font, glyph) * size.0))
     }
 
-    pub fn ch_advance(&self, font_id: FontId, font_size: Pixels) -> Result<Pixels> {
-        Ok(self.advance(font_id, font_size, '0')?.width)
+    /// Rounded, as browsers build line boxes.
+    pub fn line_metrics(&self, font: FontId, size: Pixels) -> [Pixels; 3] {
+        let metrics = self.metrics(font);
+        let [ascent, descent, gap] = [metrics.ascent, -metrics.descent, metrics.line_gap]
+            .map(|value| (value * size.0).round());
+        // Like WebKit, the classic Mac faces get 15% more ascent.
+        let extra = if metrics.tall {
+            ((ascent + descent) * 0.15).round()
+        } else {
+            0.
+        };
+        [px(ascent + extra), px(descent), px(gap)]
     }
 
-    pub fn units_per_em(&self, font_id: FontId) -> u32 {
-        self.read_metrics(font_id, |metrics| metrics.units_per_em)
-    }
-
-    pub fn cap_height(&self, font_id: FontId, font_size: Pixels) -> Pixels {
-        self.read_metrics(font_id, |metrics| {
-            metrics.scale(metrics.cap_height, font_size)
-        })
-    }
-
-    pub fn x_height(&self, font_id: FontId, font_size: Pixels) -> Pixels {
-        self.read_metrics(font_id, |metrics| {
-            metrics.scale(metrics.x_height, font_size)
-        })
-    }
-
-    pub fn ascent(&self, font_id: FontId, font_size: Pixels) -> Pixels {
-        self.read_metrics(font_id, |metrics| metrics.scale(metrics.ascent, font_size))
-    }
-
-    pub fn em_ascent(&self, font_id: FontId, font_size: Pixels) -> Pixels {
-        self.read_metrics(font_id, |metrics| px(metrics.em_ascent * font_size.0))
-    }
-
-    pub fn line_metrics(&self, font_id: FontId, font_size: Pixels) -> [Pixels; 3] {
-        self.read_metrics(font_id, |metrics| {
-            let scale = |value: f32| (value / metrics.units_per_em as f32 * font_size.0).round();
-            let (ascent, descent) = (scale(metrics.ascent), scale(-metrics.descent));
-            let tall = if metrics.tall_ascent {
-                ((ascent + descent) * 0.15).round()
-            } else {
-                0.
-            };
-            [px(ascent + tall), px(descent), px(scale(metrics.line_gap))]
-        })
-    }
-
-    pub fn baseline(
-        &self,
-        font_id: FontId,
-        font_size: Pixels,
-        line_height: Pixels,
-        scale: f32,
-    ) -> Pixels {
-        let [ascent, descent, _] = self.line_metrics(font_id, font_size * scale);
+    pub fn baseline(&self, font: FontId, size: Pixels, line_height: Pixels, scale: f32) -> Pixels {
+        let [ascent, descent, _] = self.line_metrics(font, size * scale);
         (((line_height * scale - ascent - descent) / 2.).floor() + ascent) / scale
     }
 
-    pub fn descent(&self, font_id: FontId, font_size: Pixels) -> Pixels {
-        self.read_metrics(font_id, |metrics| metrics.scale(metrics.descent, font_size))
+    /// `[left, right, top, bottom]`, y up.
+    pub fn glyph_bounds(&self, font: FontId, glyph: GlyphId, size: Pixels) -> Option<[f32; 4]> {
+        self.platform
+            .ink(font, glyph, size.0)
+            .filter(|[left, right, top, bottom]| right > left && top > bottom)
+    }
+}
+
+pub fn warm(lists: Vec<Vec<String>>) {
+    if !lists.is_empty() {
+        platform::TextSystem::warm(lists);
+    }
+}
+
+#[derive(Default)]
+pub struct TextSystem {
+    fonts: Rc<Fonts>,
+    cache: Cache,
+    generation: Cell<usize>,
+    spans: Cell<Vec<Span>>,
+}
+
+impl std::ops::Deref for TextSystem {
+    type Target = Fonts;
+    fn deref(&self) -> &Fonts {
+        &self.fonts
+    }
+}
+
+impl TextSystem {
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub(crate) fn rasterize_glyph(
-        &self,
-        params: &RenderGlyphParams,
-        max: i32,
-    ) -> Result<Option<crate::atlas::Raster<Vec<u8>>>> {
-        let mut params = *params;
-        let mut bounds = self.platform.glyph_raster_bounds(&params)?;
-        let side = bounds.size.width.0.max(bounds.size.height.0);
-        let stretch = side as f32 / max as f32;
-        if stretch > 1. {
-            params.scale_factor /= stretch;
-            params.subpixel_variant = crate::point(0, 0);
-            bounds = self.platform.glyph_raster_bounds(&params)?;
+    pub(crate) fn for_window(&self) -> Self {
+        Self::sharing(self.fonts.clone())
+    }
+
+    fn sharing(fonts: Rc<Fonts>) -> Self {
+        Self {
+            generation: Cell::new(fonts.generation.get()),
+            fonts,
+            cache: Cache::default(),
+            spans: Cell::default(),
         }
-        if bounds.size.width.0 == 0 || bounds.size.height.0 == 0 {
-            return Ok(None);
+    }
+
+    pub(crate) fn generation(&self) -> usize {
+        self.fonts.generation.get()
+    }
+
+    pub fn add_font(&self, bytes: Vec<u8>) -> Result<()> {
+        self.platform.add_font(bytes)?;
+        self.resolved.borrow_mut().clear();
+        self.recent.borrow_mut().clear();
+        self.fonts.generation.set(self.fonts.generation.get() + 1);
+        Ok(())
+    }
+
+    fn cache(&self) -> &Cache {
+        let now = self.fonts.generation.get();
+        if self.generation.replace(now) != now {
+            self.cache.clear();
         }
-        let (size, bytes) = self.platform.rasterize_glyph(&params, bounds)?;
-        let shown = if stretch > 1. {
-            let scale = |value: crate::DevicePixels| {
-                crate::DevicePixels((value.0 as f32 * stretch).round() as i32)
-            };
-            Bounds::new(bounds.origin.map(scale), size.map(scale))
-        } else {
-            Bounds::new(bounds.origin, size)
-        };
-        Ok(Some((shown, size, bytes)))
+        &self.cache
     }
 
-    pub fn glyph_bounds(
-        &self,
-        font_id: FontId,
-        glyph_id: GlyphId,
-        font_size: Pixels,
-    ) -> Option<[f32; 4]> {
-        #[cfg(target_os = "macos")]
-        let bounds = self.platform.glyph_bounds(font_id, glyph_id, font_size.0);
-        // Other platforms measure raster bounds at this scale, so the bounds are off by up to its inverse.
-        #[cfg(not(target_os = "macos"))]
-        let bounds = {
-            const SCALE: f32 = 8.;
-            let bounds = self
-                .platform
-                .glyph_raster_bounds(&RenderGlyphParams {
-                    font_id,
-                    glyph_id,
-                    font_size,
-                    subpixel_variant: crate::point(0, 0),
-                    scale_factor: SCALE,
-                    is_emoji: false,
-                    dilation: 0,
-                })
-                .ok()?;
-            let [x, y, w, h] = [
-                bounds.origin.x.0,
-                bounds.origin.y.0,
-                bounds.size.width.0,
-                bounds.size.height.0,
-            ]
-            .map(|v| v as f32 / SCALE);
-            Some([x, x + w, -y, -(y + h)])
-        };
-        bounds.filter(|[left, right, top, bottom]| right > left && top > bottom)
+    pub(crate) fn end_frame(&self) {
+        self.cache.end_frame();
     }
 
-    pub fn glyph_pixels(
-        &self,
-        font_id: FontId,
-        glyph_id: GlyphId,
-        font_size: Pixels,
-        scale_factor: f32,
-        subpixel: u8,
-        is_emoji: bool,
-    ) -> Option<(
-        Point<crate::DevicePixels>,
-        Size<crate::DevicePixels>,
-        Vec<u8>,
-    )> {
-        self.rasterize_glyph(
-            &RenderGlyphParams {
-                font_id,
-                glyph_id,
-                font_size,
-                subpixel_variant: crate::point(subpixel, 0),
-                scale_factor,
-                is_emoji,
-                dilation: 0,
-            },
-            i32::MAX,
-        )
-        .ok()
-        .flatten()
-        .map(|(bounds, size, bytes)| (bounds.origin, size, bytes))
-    }
-
-    pub(crate) fn finish_frame(&self) {
-        self.lines.finish_frame();
-    }
-
-    fn font_runs<'a>(
+    /// Runs split where their paint changes, so ligatures do not form across a color change.
+    fn spans<'a>(
         &self,
         runs: impl Iterator<Item = (usize, &'a TextRun)>,
         font_size: Pixels,
         glyphs_only: bool,
-    ) -> Vec<FontRun> {
-        let mut font_runs = self.font_runs.take();
-        font_runs.clear();
+    ) -> Vec<Span> {
+        let mut spans = self.spans.take();
+        spans.clear();
         let mut last: Option<(&TextRun, FontId)> = None;
         for (len, run) in runs {
-            let decoration_changed = !last.is_some_and(|(last, _)| {
-                last.color == run.color
-                    && last.underline == run.underline
-                    && last.strikethrough == run.strikethrough
-                    && (glyphs_only || last.background_color == run.background_color)
+            let repaint = last.is_none_or(|(last, _)| {
+                last.color != run.color
+                    || last.underline != run.underline
+                    || last.strikethrough != run.strikethrough
+                    || !glyphs_only && last.background_color != run.background_color
             });
-            let font_id = match last {
+            let font = match last {
                 Some((last, id)) if last.font == run.font => id,
-                _ => self.resolve_font(&run.font),
+                _ => self.face(&run.font),
             };
-            last = Some((run, font_id));
+            last = Some((run, font));
             let size = run.font_size.unwrap_or(font_size);
-            match font_runs.last_mut() {
-                Some(font_run)
-                    if font_run.font_id == font_id
-                        && font_run.letter_spacing == run.letter_spacing
-                        && font_run.word_spacing == run.word_spacing
-                        && font_run.font_size == size
-                        && font_run.inset[1] == Pixels::ZERO
-                        && run.inset[0] == Pixels::ZERO
-                        && font_run.nowrap == run.nowrap
-                        && !decoration_changed =>
-                {
-                    font_run.len += len;
-                    font_run.inset[1] = run.inset[1];
-                }
-                _ => font_runs.push(FontRun {
-                    len,
-                    font_id,
-                    letter_spacing: run.letter_spacing,
-                    word_spacing: run.word_spacing,
-                    font_size: size,
-                    inset: run.inset,
-                    nowrap: run.nowrap,
-                }),
+            if let Some(span) = spans.last_mut()
+                && !repaint
+                && span.font == font
+                && span.size == size
+                && span.letter_spacing == run.letter_spacing
+                && span.word_spacing == run.word_spacing
+                && span.nowrap == run.nowrap
+                && span.inset[1] == Pixels::ZERO
+                && run.inset[0] == Pixels::ZERO
+            {
+                span.len += len;
+                span.inset[1] = run.inset[1];
+                continue;
             }
+            spans.push(Span {
+                len,
+                font,
+                size,
+                letter_spacing: run.letter_spacing,
+                word_spacing: run.word_spacing,
+                inset: run.inset,
+                nowrap: run.nowrap,
+            });
         }
-        font_runs
+        spans
     }
 
-    pub fn layout_line(
-        &self,
-        text: &str,
-        font_size: Pixels,
-        runs: &[TextRun],
-        force_width: Option<Pixels>,
-    ) -> Rc<LineLayout> {
-        let font_runs = self.font_runs(runs.iter().map(|run| (run.len, run)), font_size, true);
-        let (_, layout) =
-            self.lines()
-                .layout_line(&self.platform, text, font_size, &font_runs, force_width);
-        self.font_runs.set(font_runs);
-        layout
-    }
-
-    pub fn shape_line(
-        &self,
-        text: &str,
-        font_size: Pixels,
-        runs: &[TextRun],
-        force_width: Option<Pixels>,
-    ) -> ShapedLine {
+    pub fn shape_line(&self, text: &str, font_size: Pixels, run: &TextRun) -> TextLine {
         debug_assert!(
             !text.contains('\n'),
-            "text argument should not contain newlines"
+            "shape_line takes text without newlines"
         );
-        let mut decoration_runs = Vec::<DecorationRun>::new();
-        for run in runs {
-            match decoration_runs.last_mut() {
-                Some(last) if last.same(run) => last.len += run.len as u32,
-                _ => decoration_runs.push(DecorationRun::new(run, run.len)),
-            }
-        }
-        let layout = self.layout_line(text, font_size, runs, force_width);
-        ShapedLine {
-            layout,
-            decoration_runs,
+        let spans = self.spans(std::iter::once((run.len, run)), font_size, true);
+        let (text, line, _) = self
+            .cache()
+            .get(&self.platform, text, font_size, &spans, None);
+        self.spans.set(spans);
+        TextLine {
+            line,
+            breaks: Rc::default(),
+            wrap: None,
+            text,
+            looks: looks(std::iter::once((run.len, run))),
         }
     }
 
     pub fn shape_text(
         &self,
-        text: SharedString,
+        text: &str,
         font_size: Pixels,
         runs: &[TextRun],
-        wrap_width: Option<Pixels>,
-        line_clamp: Option<usize>,
-        word_break: WordBreak,
-    ) -> Result<Vec<WrappedLine>> {
-        self.shape_text_indented(
-            text,
-            font_size,
+        wrapping: &Wrapping,
+    ) -> Vec<TextLine> {
+        let mut cursor = RunCursor {
             runs,
-            wrap_width,
-            line_clamp,
-            px(0.),
-            TextWrap::Wrap,
-            word_break,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn shape_text_indented(
-        &self,
-        text: SharedString,
-        font_size: Pixels,
-        runs: &[TextRun],
-        wrap_width: Option<Pixels>,
-        line_clamp: Option<usize>,
-        indent: Pixels,
-        wrap: TextWrap,
-        word_break: WordBreak,
-    ) -> Result<Vec<WrappedLine>> {
-        let mut runs = runs.iter().filter(|run| run.len > 0).peekable();
-        let mut used = 0;
+            at: 0,
+            used: 0,
+        };
         let mut pieces = Vec::new();
-        let mut lines = Vec::new();
-        let mut wrapped = 0;
-        for (index, line_text) in text.split('\n').enumerate() {
-            pieces.clear();
-            let mut decoration_runs = Vec::<DecorationRun>::new();
-            let mut left = line_text.len();
-            while left > 0
-                && let Some(&run) = runs.peek()
+        let (mut rows, mut lines) = (0, Vec::new());
+        for (index, source) in text.split('\n').enumerate() {
+            if wrapping.width.is_some()
+                && rows > 0
+                && wrapping.max_lines.is_some_and(|max| rows >= max)
             {
-                let len = left.min(run.len - used);
-                match decoration_runs.last_mut() {
-                    Some(last) if last.same(run) => last.len += len as u32,
-                    _ => decoration_runs.push(DecorationRun::new(run, len)),
-                }
-                pieces.push((len, run));
-                used += len;
-                left -= len;
-                if used == run.len {
-                    runs.next();
-                    used = 0;
-                }
+                break;
             }
-            let font_runs = self.font_runs(pieces.iter().copied(), font_size, false);
-            let (text, layout) = self.lines().layout_wrapped_line(
-                &self.platform,
-                line_text,
-                font_size,
-                &font_runs,
-                wrap_width,
-                line_clamp.map(|max| max.saturating_sub(wrapped)),
-                if index == 0 { indent } else { px(0.) },
-                wrap,
-                word_break,
-            );
-            self.font_runs.set(font_runs);
-            wrapped += layout.wrap_boundaries.len();
-            lines.push(WrappedLine {
-                layout,
-                decoration_runs,
-                text,
+            pieces.clear();
+            cursor.take(source.len(), |len, run| pieces.push((len, run)));
+            let spans = self.spans(pieces.iter().copied(), font_size, false);
+            let wrap = wrapping.width.map(|width| Wrapping {
+                width: Some(width),
+                max_lines: wrapping.max_lines.map(|max| max.saturating_sub(rows)),
+                indent: if index == 0 { wrapping.indent } else { px(0.) },
+                ..*wrapping
             });
-            if let Some(&run) = runs.peek() {
-                used += 1;
-                if used == run.len {
-                    runs.next();
-                    used = 0;
-                }
+            let (text, line, breaks) =
+                self.cache()
+                    .get(&self.platform, source, font_size, &spans, wrap.as_ref());
+            self.spans.set(spans);
+            rows += breaks.len() + 1;
+            // The newline takes one byte of the runs.
+            cursor.take(1, |_, _| {});
+            lines.push(TextLine {
+                line,
+                breaks,
+                wrap: wrapping.width,
+                text,
+                looks: looks(pieces.iter().copied()),
+            });
+        }
+        lines
+    }
+}
+
+struct RunCursor<'a> {
+    runs: &'a [TextRun],
+    at: usize,
+    used: usize,
+}
+
+impl<'a> RunCursor<'a> {
+    fn take(&mut self, mut len: usize, mut piece: impl FnMut(usize, &'a TextRun)) {
+        while len > 0
+            && let Some(run) = self.runs.get(self.at)
+        {
+            let part = len.min(run.len - self.used);
+            if part > 0 {
+                piece(part, run);
+            }
+            (self.used, len) = (self.used + part, len - part);
+            if self.used == run.len {
+                (self.at, self.used) = (self.at + 1, 0);
             }
         }
-        Ok(lines)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DecorationRun {
-    pub len: u32,
-    pub color: Rgba,
-    pub background_color: Option<Rgba>,
-    pub underline: Option<UnderlineStyle>,
-    pub strikethrough: Option<StrikethroughStyle>,
-}
-
-impl DecorationRun {
-    fn new(run: &TextRun, len: usize) -> Self {
-        Self {
-            len: len as u32,
-            color: run.color,
-            background_color: run.background_color,
-            underline: run.underline,
-            strikethrough: run.strikethrough,
-        }
-    }
-    fn same(&self, run: &TextRun) -> bool {
-        self.color == run.color
-            && self.underline == run.underline
-            && self.strikethrough == run.strikethrough
-            && self.background_color == run.background_color
     }
 }
 
@@ -777,47 +425,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn huge_glyphs_raster_small_and_stretch_to_their_size() {
+    fn metrics_scale_and_stand_ins_cover_missing_families() {
         let text = TextSystem::new();
-        let font_id = text.resolve_font(&font("Helvetica"));
-        let glyph_id = text.platform.glyph_for_char(font_id, 'W').unwrap();
-        let params = RenderGlyphParams {
-            font_id,
-            glyph_id,
-            font_size: px(10000.),
-            subpixel_variant: crate::point(2, 0),
-            scale_factor: 2.,
-            is_emoji: false,
-            dilation: 0,
+        let helvetica = text.face(&Font::new("Helvetica"));
+        let missing = text.face(&Font::new("No Such Family h2o"));
+        assert!(missing == helvetica);
+        let [ascent, descent, _] = text.line_metrics(helvetica, px(16.));
+        assert!(ascent > descent && descent > px(0.));
+        let metrics = text.metrics(helvetica);
+        assert!(
+            metrics.x_height > 0.4 && metrics.cap_height > metrics.x_height && metrics.descent < 0.
+        );
+        assert!(
+            text.advance(helvetica, px(16.), '0')
+                .is_some_and(|width| width > px(5.))
+        );
+    }
+
+    #[test]
+    fn faces_follow_requests_and_recent_requests_skip_hashing() {
+        let text = TextSystem::new();
+        let regular = Font::new("Helvetica");
+        let bold = Font {
+            weight: 700.,
+            ..regular.clone()
         };
-        let full = text.platform.glyph_raster_bounds(&params).unwrap();
-        assert!(full.size.width.0 > 16384);
-        let max = crate::atlas::MAX_GLYPH_SIDE;
-        let (shown, size, bytes) = text.rasterize_glyph(&params, max).unwrap().unwrap();
-        assert!(size.width.0.max(size.height.0) <= max + 4);
-        assert_eq!(bytes.len(), (size.width.0 * size.height.0) as usize);
-        assert!(bytes.iter().any(|alpha| *alpha > 0));
-        let stretch = full.size.width.0.max(full.size.height.0) / max + 1;
-        for (shown, full) in [
-            (shown.origin.x, full.origin.x),
-            (shown.origin.y, full.origin.y),
-            (shown.size.width, full.size.width),
-            (shown.size.height, full.size.height),
+        let (plain, heavy) = (text.face(&regular), text.face(&bold));
+        assert!(plain != heavy && text.face(&regular) == plain && text.face(&bold) == heavy);
+        let recent = text.recent.borrow();
+        assert!(
+            recent
+                .iter()
+                .any(|(kept, id)| Rc::ptr_eq(&kept.family, &regular.family) && *id == plain)
+        );
+        // The baseline snaps to device pixels at the scale.
+        let baseline = text.baseline(plain, px(16.), px(20.), 2.);
+        assert!(baseline > px(10.) && baseline < px(20.) && (baseline.0 * 2.).fract() == 0.);
+    }
+
+    #[test]
+    fn classic_mac_faces_get_taller_line_boxes() {
+        let text = TextSystem::new();
+        for (family, tall) in [
+            ("Helvetica", true),
+            ("Times", true),
+            ("Menlo", false),
+            ("Georgia", false),
         ] {
+            let id = text.face(&Font::new(family));
+            let metrics = text.metrics(id);
+            let [ascent, descent, _] = text.line_metrics(id, px(20.));
+            let plain = (metrics.ascent * 20.).round();
+            let extra = if tall {
+                ((plain + descent.0) * 0.15).round()
+            } else {
+                0.
+            };
             assert!(
-                (shown.0 - full.0).abs() <= 3 * stretch,
-                "{shown:?} vs {full:?}"
+                metrics.tall == tall && ascent.0 == plain + extra,
+                "{family}"
             );
         }
-        let small = RenderGlyphParams {
-            font_size: px(16.),
-            ..params
-        };
-        let (shown, size, _) = text.rasterize_glyph(&small, max).unwrap().unwrap();
-        assert_eq!(shown.size, size);
-        assert_eq!(
-            shown.origin,
-            text.platform.glyph_raster_bounds(&small).unwrap().origin
-        );
     }
 }

@@ -1,1006 +1,985 @@
+use super::open_type;
 use crate::{
-    Bounds, DevicePixels, Pixels, Rgba, Size, point, px, size,
+    Color, Pixels, Rect, Size, point, px, size,
     text::{
-        Font, FontFallbacks, FontFeatures, FontId, FontMetrics, FontRun, FontStyle, FontWeight,
-        GlyphId, LineLayout, RenderGlyphParams, SUBPIXEL_VARIANTS_X, ShapedGlyph, ShapedRun,
-        SharedString,
+        FaceMetrics, Features, Font, FontId, FontStyle, Glyph, GlyphId, GlyphRaster, Line,
+        SUBPIXEL_STEPS, SharedString, Span,
     },
 };
-use anyhow::Result;
-use anyhow::anyhow;
-use core_foundation::{
-    array::{CFArray, CFArrayRef},
-    attributed_string::CFMutableAttributedString,
-    base::{CFRange, TCFType},
-    dictionary::CFDictionary,
-    number::CFNumber,
-    string::CFString,
+use anyhow::{Context as _, Result, bail};
+use objc2_core_foundation::{
+    CFArray, CFData, CFDictionary, CFIndex, CFMutableAttributedString, CFNumber, CFRange,
+    CFRetained, CFString, CFType, CGFloat, CGPoint, CGRect, CGSize,
 };
-use core_graphics::{
-    base::{CGFloat, CGGlyph, kCGImageAlphaPremultipliedLast},
-    color_space::CGColorSpace,
-    context::{CGContext, CGTextDrawingMode},
-    geometry::{CGPoint, CGRect, CGSize},
+use objc2_core_graphics::{CGBitmapContextCreate, CGColorSpace, CGContext, CGTextDrawingMode};
+use objc2_core_text::{
+    CTFont, CTFontCollection, CTFontDescriptor, CTFontManagerCopyAvailableFontFamilyNames,
+    CTFontManagerCreateFontDescriptorsFromData, CTFontOrientation, CTFontSymbolicTraits, CTLine,
+    CTRun, kCTFontAttributeName, kCTFontFamilyNameAttribute, kCTFontSlantTrait,
+    kCTFontSymbolicTrait, kCTFontWeightTrait, kCTFontWidthTrait,
 };
-use core_text::{
-    font::CTFont,
-    font_descriptor::{
-        kCTFontOrientationDefault, kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait,
-        kCTFontWidthTrait,
-    },
-    line::CTLine,
-    string_attributes::kCTFontAttributeName,
+use rustc_hash::FxHashMap;
+use std::{
+    cell::{OnceCell, RefCell},
+    hash::Hash,
+    mem,
+    ops::Range,
+    ptr::{self, NonNull},
+    rc::Rc,
+    sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError},
 };
-use font_kit::{
-    font::Font as FontKitFont,
-    handle::Handle,
-    hinting::HintingOptions,
-    metrics::Metrics,
-    properties::{Style as FontkitStyle, Weight as FontkitWeight},
-    source::SystemSource,
-    sources::mem::MemSource,
-};
-use pathfinder_geometry::{
-    rect::{RectF, RectI},
-    transform2d::Transform2F,
-    vector::Vector2F,
-};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use smallvec::SmallVec;
-use std::cell::RefCell;
-use std::{borrow::Cow, char, convert::TryFrom, mem, rc::Rc, sync::Arc};
 
-use core_foundation::base::CFType;
-use std::sync::OnceLock;
+#[derive(Clone)]
+struct Shared(CFRetained<CTFont>);
 
-use super::open_type::apply_features_and_fallbacks;
+// SAFETY: CoreText fonts are immutable, and Apple documents them as safe to use from any thread at once.
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
 
-const WGHT: i64 = 0x77676874;
+/// Each value is made outside the map lock, so a slow load does not block other lookups.
+struct Process<K, V>(LazyLock<Mutex<FxHashMap<K, Arc<OnceLock<V>>>>>);
 
-unsafe extern "C" {
-    static kCTFontVariationAttribute: core_foundation::string::CFStringRef;
-    static kCTFontVariationAxisIdentifierKey: core_foundation::string::CFStringRef;
-    static kCTFontVariationAxisDefaultValueKey: core_foundation::string::CFStringRef;
-    fn CTFontCopyVariation(
-        font: core_text::font::CTFontRef,
-    ) -> core_foundation::dictionary::CFDictionaryRef;
-    fn CTFontCreateCopyWithAttributes(
-        font: core_text::font::CTFontRef,
-        size: CGFloat,
-        matrix: *const core_graphics::geometry::CGAffineTransform,
-        attributes: core_text::font_descriptor::CTFontDescriptorRef,
-    ) -> core_text::font::CTFontRef;
-}
-
-fn variation_weight(font: &CTFont) -> Option<f32> {
-    let variations = unsafe { CTFontCopyVariation(font.as_concrete_TypeRef()) };
-    if variations.is_null() {
-        return None;
+impl<K: Hash + Eq, V: Clone> Process<K, V> {
+    const fn new() -> Self {
+        Self(LazyLock::new(Default::default))
     }
-    let variations: CFDictionary<CFNumber, CFNumber> =
-        unsafe { CFDictionary::wrap_under_create_rule(variations) };
-    variations
-        .find(CFNumber::from(WGHT))
-        .and_then(|weight| weight.to_f64())
-        .map(|weight| weight as f32)
-}
 
-#[allow(non_upper_case_globals)]
-const kCGImageAlphaOnly: u32 = 7;
-#[allow(non_upper_case_globals)]
-const kCGImageAlphaNoneSkipFirst: u32 = 6;
-#[allow(non_upper_case_globals)]
-const kCGBitmapByteOrder32Little: u32 = 2 << 12;
-
-pub(crate) struct TextSystem(RefCell<State>);
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct FontKey {
-    font_family: SharedString,
-    font_features: FontFeatures,
-    font_fallbacks: Option<FontFallbacks>,
-}
-
-struct State {
-    memory_source: MemSource,
-    system_source: SystemSource,
-    fonts: Vec<FontKitFont>,
-    font_selections: HashMap<Font, FontId>,
-    font_ids_by_postscript_name: HashMap<String, FontId>,
-    font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
-    postscript_names_by_font_id: HashMap<FontId, String>,
-    local: HashSet<FontId>,
-    sized: HashMap<(FontId, u32), CTFont>,
-    // Retain fonts used as pointer keys to prevent address reuse.
-    natives: HashMap<usize, (CTFont, FontId)>,
-    segments: HashMap<(FontId, u32), HashMap<Box<str>, Rc<LineLayout>>>,
-    monospace: HashMap<FontId, bool>,
-    faces: HashMap<(FontId, u32), Face>,
-    words: usize,
-    parts: Vec<Part>,
-    metrics: HashMap<FontId, Metrics>,
-}
-
-#[derive(Default)]
-struct Face {
-    words: HashMap<Box<str>, [Option<Rc<Word>>; 4]>,
-    spaced: HashMap<char, bool>,
-    misses: u32,
-    numbers: Option<Box<Numbers>>,
-}
-
-struct Numbers {
-    font: FontId,
-    glyphs: [GlyphId; 11],
-    ends: [f64; 11],
-    advances: [[f64; 11]; 11],
-    triples: Box<[bool]>,
-    edges: [[u8; 11]; 11],
-}
-
-type Part = (
-    usize,
-    Pixels,
-    std::ops::Range<usize>,
-    usize,
-    Option<Rc<Word>>,
-);
-
-type Exact = (Vec<f64>, Vec<(usize, f64)>);
-
-type Glyphs = Box<[(f64, FontId, GlyphId, f32, usize)]>;
-
-struct Word(Glyphs, f64);
-
-static FAMILIES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
-    unsafe extern "C" {
-        fn CTFontManagerCopyAvailableFontFamilyNames() -> CFArrayRef;
+    fn get(&self, key: K, make: impl FnOnce() -> V) -> V {
+        let slot = (self.0.lock().unwrap_or_else(PoisonError::into_inner))
+            .entry(key)
+            .or_default()
+            .clone();
+        slot.get_or_init(make).clone()
     }
-    // SAFETY: the function follows the Create Rule and returns an array of strings.
-    let families: CFArray<CFString> =
-        unsafe { CFArray::wrap_under_create_rule(CTFontManagerCopyAvailableFontFamilyNames()) };
-    // MacOS leaves these out of the list, though it has them and browsers find them.
-    families
+}
+
+type Faces = Option<Vec<(Shared, String)>>;
+
+static SYSTEM_FACES: Process<(String, Vec<(String, u32)>), Faces> = Process::new();
+/// Keyed by font pointer. The faces stay alive in `SYSTEM_FACES`.
+static AXES: Process<usize, Option<f32>> = Process::new();
+static WEIGHTS: Process<(usize, u32), Option<(Shared, String)>> = Process::new();
+
+static FAMILIES: LazyLock<Vec<String>> = LazyLock::new(|| {
+    // SAFETY: CoreText returns an array of strings.
+    let names = unsafe { CTFontManagerCopyAvailableFontFamilyNames() };
+    let names = unsafe { names.cast_unchecked::<CFString>() };
+    // macOS leaves these out of the list, though it has them and browsers find them.
+    names
         .iter()
         .map(|name| name.to_string())
         .chain(["Times".into(), "Courier".into()])
         .collect()
 });
 
-// Retain fonts used as pointer keys. Initialize entries outside the map lock to avoid blocking other lookups.
-type Shared<K, V> = std::sync::LazyLock<std::sync::Mutex<HashMap<K, Arc<OnceLock<V>>>>>;
-type Faces = Option<Vec<(FontKitFont, String)>>;
-type SystemKey = (String, Vec<(String, u32)>, Option<Vec<String>>);
-static SYSTEM_FAMILIES: Shared<SystemKey, Faces> = std::sync::LazyLock::new(Default::default);
-static AXES: Shared<usize, Option<f32>> = std::sync::LazyLock::new(Default::default);
-static WEIGHTS: Shared<(usize, u32), Option<(FontKitFont, String)>> =
-    std::sync::LazyLock::new(Default::default);
+pub(crate) struct TextSystem(RefCell<Book>);
 
-fn shared<K: std::hash::Hash + Eq, V: Clone>(
-    map: &Shared<K, V>,
-    key: K,
-    find: impl FnOnce() -> V,
-) -> V {
-    let entry = map
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(key)
-        .or_default()
-        .clone();
-    entry.get_or_init(find).clone()
+struct Face {
+    font: CFRetained<CTFont>,
+    local: bool,
+    emoji: bool,
+    mono: bool,
+    units: OnceCell<Units>,
+    matching: OnceCell<(f32, FontStyle, f32)>,
 }
 
-impl TextSystem {
-    pub fn new() -> Self {
+/// In font units, computed as font-kit did, so layout keeps its numbers.
+#[derive(Clone, Copy)]
+struct Units {
+    per_em: u32,
+    /// Font units per point at the face's size.
+    per_point: f32,
+    ascent: f32,
+    descent: f32,
+    gap: f32,
+    cap: f32,
+    x: f32,
+    /// `[min x, min y, max x, max y]`.
+    bounds: [f32; 4],
+}
+
+impl Face {
+    fn new(font: CFRetained<CTFont>, name: &str, local: bool) -> Self {
+        // SAFETY: plain CoreText queries.
+        let traits = unsafe { font.symbolic_traits() };
+        Self {
+            emoji: name == "AppleColorEmoji" || name == ".AppleColorEmojiUI",
+            mono: traits.contains(CTFontSymbolicTraits::TraitMonoSpace),
+            font,
+            local,
+            units: OnceCell::new(),
+            matching: OnceCell::new(),
+        }
+    }
+
+    fn units(&self) -> Units {
+        *self.units.get_or_init(|| {
+            let font = &self.font;
+            // SAFETY: plain CoreText queries.
+            unsafe {
+                let per_em = font.units_per_em();
+                let per_point = f64::from(per_em) / font.size();
+                let scaled = |value: CGFloat| (value * per_point) as f32;
+                let rect = font.bounding_box();
+                let (x, y) = (rect.origin.x as f32, rect.origin.y as f32);
+                let bounds = [
+                    x,
+                    y,
+                    x + rect.size.width as f32,
+                    y + rect.size.height as f32,
+                ]
+                .map(|v| v * per_point as f32);
+                Units {
+                    per_em,
+                    per_point: per_point as f32,
+                    ascent: scaled(font.ascent()),
+                    descent: scaled(-font.descent()),
+                    gap: scaled(font.leading()),
+                    cap: scaled(font.cap_height()),
+                    x: scaled(font.x_height()),
+                    bounds,
+                }
+            }
+        })
+    }
+
+    /// `[min x, min y, max x, max y]` in font units.
+    fn outline(&self, glyph: GlyphId) -> [f32; 4] {
+        let mut id = glyph;
+        // SAFETY: one glyph in, the overall rect out.
+        let rect = unsafe {
+            self.font.bounding_rects_for_glyphs(
+                CTFontOrientation::Default,
+                NonNull::from(&mut id),
+                ptr::null_mut(),
+                1,
+            )
+        };
+        let (x, y) = (rect.origin.x as f32, rect.origin.y as f32);
+        let per_point = self.units().per_point;
+        [
+            x,
+            y,
+            x + rect.size.width as f32,
+            y + rect.size.height as f32,
+        ]
+        .map(|value| value * per_point)
+    }
+
+    fn matching(&self) -> (f32, FontStyle, f32) {
+        *self.matching.get_or_init(|| {
+            // SAFETY: plain CoreText queries.
+            let (traits, symbolic) = unsafe { (self.font.traits(), self.font.symbolic_traits()) };
+            let traits = unsafe { traits.cast_unchecked::<CFString, CFType>() };
+            let number = |key: &CFString| traits.get(key)?.downcast::<CFNumber>().ok();
+            // SAFETY: the keys are CoreText constants.
+            let [weight, width, slant] =
+                unsafe { [kCTFontWeightTrait, kCTFontWidthTrait, kCTFontSlantTrait] }
+                    .map(|key| number(key).and_then(|value| value.as_f64()).unwrap_or(0.));
+            let style = if symbolic.contains(CTFontSymbolicTraits::TraitItalic) {
+                FontStyle::Italic
+            } else if slant > 0. {
+                FontStyle::Oblique
+            } else {
+                FontStyle::Normal
+            };
+            let class = self
+                .local
+                .then(|| open_type::weight_class(&self.font))
+                .flatten();
+            // SAFETY: the key is a CoreText constant.
+            let trait_weight =
+                number(unsafe { kCTFontWeightTrait }).and_then(|value| value.as_f32());
+            let weight = class
+                .or_else(|| trait_weight.map(css_weight))
+                .unwrap_or_else(|| find_index(weight as f32, &KIT_WEIGHTS) * 100. + 100.);
+            (weight, style, css_stretch(width as f32))
+        })
+    }
+}
+
+/// CoreText weights of the CSS weights 100 to 900 for Apple's faces. A plain linear scale maps Medium to 530,
+/// so CSS 500 would pick Regular.
+const APPLE_WEIGHTS: [f32; 9] = [-0.8, -0.6, -0.4, 0., 0.23, 0.3, 0.4, 0.56, 0.62];
+/// The scale font-kit used when a face has no numeric weight trait.
+const KIT_WEIGHTS: [f32; 9] = [-0.7, -0.5, -0.23, 0., 0.2, 0.3, 0.4, 0.6, 0.8];
+/// CSS stretch at CoreText widths -1 to 1 in quarters.
+const STRETCHES: [f32; 9] = [0.5, 0.625, 0.75, 0.875, 1., 1.125, 1.25, 1.5, 2.];
+
+fn css_weight(weight: f32) -> f32 {
+    let below = APPLE_WEIGHTS
+        .iter()
+        .rposition(|&knot| weight >= knot)
+        .unwrap_or(0);
+    let fraction = match APPLE_WEIGHTS.get(below + 1) {
+        Some(next) if weight >= APPLE_WEIGHTS[0] => {
+            (weight - APPLE_WEIGHTS[below]) / (next - APPLE_WEIGHTS[below])
+        }
+        _ => 0.,
+    };
+    100. * (below as f32 + 1. + fraction)
+}
+
+fn css_stretch(width: f32) -> f32 {
+    let at = (width + 1.) * 4.;
+    let (low, high) = (
+        STRETCHES[at.floor() as usize],
+        STRETCHES[at.ceil() as usize],
+    );
+    low + (high - low) * at.fract()
+}
+
+fn find_index(value: f32, knots: &[f32]) -> f32 {
+    let above = match knots
+        .binary_search_by(|knot| knot.partial_cmp(&value).unwrap_or(std::cmp::Ordering::Less))
+    {
+        Ok(at) => return at as f32,
+        Err(above) => above,
+    };
+    if above == 0 || above >= knots.len() {
+        return above as f32;
+    }
+    let (low, high) = (knots[above - 1], knots[above]);
+    (above - 1) as f32 + (value - low) / (high - low)
+}
+
+fn nearest_value(
+    values: impl Iterator<Item = f32> + Clone,
+    wanted: f32,
+    down: bool,
+) -> Option<f32> {
+    let below = values
+        .clone()
+        .filter(|&value| value <= wanted)
+        .reduce(f32::max);
+    let above = values.filter(|&value| value > wanted).reduce(f32::min);
+    if down {
+        below.or(above)
+    } else {
+        above.or(below)
+    }
+}
+
+fn best(faces: &[(f32, FontStyle, f32)], weight: f32, style: FontStyle) -> Option<usize> {
+    let mut set: Vec<usize> = (0..faces.len()).collect();
+    let stretch = nearest_value(set.iter().map(|&at| faces[at].2), 1., true)?;
+    set.retain(|&at| faces[at].2 == stretch);
+    let order = match style {
+        FontStyle::Italic => [FontStyle::Italic, FontStyle::Oblique, FontStyle::Normal],
+        FontStyle::Oblique => [FontStyle::Oblique, FontStyle::Italic, FontStyle::Normal],
+        FontStyle::Normal => [FontStyle::Normal, FontStyle::Oblique, FontStyle::Italic],
+    };
+    let style = order
+        .into_iter()
+        .find(|style| set.iter().any(|&at| faces[at].1 == *style))?;
+    set.retain(|&at| faces[at].1 == style);
+    let weights = set.iter().map(|&at| faces[at].0);
+    let has = |value: f32| weights.clone().any(|weight| weight == value);
+    let chosen = if has(weight) {
+        weight
+    } else if (400. ..450.).contains(&weight) && has(500.) {
+        500.
+    } else if (450. ..=500.).contains(&weight) && has(400.) {
+        400.
+    } else {
+        nearest_value(weights.clone(), weight, weight <= 500.)?
+    };
+    set.into_iter().find(|&at| faces[at].0 == chosen)
+}
+
+struct Added {
+    family: String,
+    descriptor: CFRetained<CTFontDescriptor>,
+}
+
+#[derive(Default)]
+struct Book {
+    faces: Vec<Face>,
+    /// PostScript names, plus `#wght<weight>` for weight instances.
+    names: FxHashMap<String, FontId>,
+    families: FxHashMap<(SharedString, Features), Rc<[FontId]>>,
+    /// Sorted by family, stable.
+    added: Vec<Added>,
+    // Each sized copy rebuilds CoreText caches at a cost, so the copies stay.
+    sized: FxHashMap<(FontId, u32), CFRetained<CTFont>>,
+    // Keyed by pointer; the kept font keeps the address from being reused.
+    natives: FxHashMap<usize, (CFRetained<CTFont>, FontId)>,
+    words: Words,
+    scratch: Scratch,
+}
+
+#[derive(Default)]
+struct Scratch {
+    ids: Vec<u16>,
+    points: Vec<CGPoint>,
+    indices: Vec<CFIndex>,
+}
+
+impl Default for TextSystem {
+    fn default() -> Self {
         // Listing the font families takes about 20 ms, so it starts here, off the first frame's path.
         static LISTING: std::sync::Once = std::sync::Once::new();
         LISTING.call_once(|| {
             let _ = std::thread::Builder::new()
                 .name("font families".into())
-                .spawn(|| std::sync::LazyLock::force(&FAMILIES).len());
+                .spawn(|| LazyLock::force(&FAMILIES).len());
         });
-        Self(RefCell::new(State {
-            memory_source: MemSource::empty(),
-            system_source: SystemSource::new(),
-            fonts: Vec::new(),
-            font_selections: HashMap::default(),
-            font_ids_by_postscript_name: HashMap::default(),
-            font_ids_by_font_key: HashMap::default(),
-            postscript_names_by_font_id: HashMap::default(),
-            local: HashSet::default(),
-            sized: HashMap::default(),
-            natives: HashMap::default(),
-            segments: HashMap::default(),
-            monospace: HashMap::default(),
-            faces: HashMap::default(),
-            words: 0,
-            parts: Vec::new(),
-            metrics: HashMap::default(),
-        }))
+        Self(RefCell::default())
+    }
+}
+
+impl TextSystem {
+    pub fn add_font(&self, bytes: Vec<u8>) -> Result<()> {
+        // SAFETY: CoreText parses the data and returns an array of descriptors.
+        let descriptor = unsafe {
+            let all = CTFontManagerCreateFontDescriptorsFromData(&CFData::from_bytes(&bytes));
+            all.cast_unchecked::<CTFontDescriptor>().get(0)
+        }
+        .context("Unsupported or invalid font data")?;
+        // SAFETY: the descriptor comes from CoreText.
+        let family =
+            unsafe { CTFont::with_font_descriptor(&descriptor, 16., ptr::null()).family_name() }
+                .to_string();
+        let book = &mut *self.0.borrow_mut();
+        book.added.push(Added { family, descriptor });
+        book.added.sort_by(|a, b| a.family.cmp(&b.family));
+        book.families.clear();
+        Ok(())
     }
 
-    pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
-        self.0.borrow_mut().add_fonts(fonts)
-    }
-
-    pub fn all_font_names(&self) -> Vec<String> {
+    pub fn families(&self) -> Vec<String> {
         let mut names = FAMILIES.clone();
-        if let Ok(fonts_in_memory) = self.0.borrow().memory_source.all_families() {
-            names.extend(fonts_in_memory);
+        let book = self.0.borrow();
+        for added in &book.added {
+            if names.last() != Some(&added.family) {
+                names.push(added.family.clone());
+            }
         }
         names
     }
 
-    pub fn font_id(&self, font: &Font) -> Result<FontId> {
-        let mut state = self.0.borrow_mut();
-        if let Some(font_id) = state.font_selections.get(font) {
-            return Ok(*font_id);
+    pub fn font(&self, font: &Font) -> Option<FontId> {
+        self.0.borrow_mut().font(font)
+    }
+
+    pub fn metrics(&self, font: FontId) -> FaceMetrics {
+        let book = self.0.borrow();
+        let face = book.face(font);
+        let units = face.units();
+        let per_em = units.per_em as f32;
+        let [x0, y0, x1, y1] = units.bounds;
+        let typo = open_type::typo_metrics(&face.font);
+        // SAFETY: a plain CoreText query.
+        let family = unsafe { face.font.family_name() }.to_string();
+        FaceMetrics {
+            ascent: units.ascent / per_em,
+            descent: units.descent / per_em,
+            line_gap: units.gap / per_em,
+            cap_height: units.cap / per_em,
+            x_height: units.x / per_em,
+            bounds: Rect::new(point(x0, y0), size(x1 - x0, y1 - y0)) / per_em,
+            em_ascent: match typo {
+                Some([ascent, descent]) => ascent / (ascent - descent),
+                None => units.ascent / (units.ascent - units.descent),
+            },
+            tall: matches!(family.as_str(), "Times" | "Helvetica" | "Courier"),
         }
-        let font_key = FontKey {
-            font_family: font.family.clone(),
-            font_features: font.features.clone(),
-            font_fallbacks: font.fallbacks.clone(),
+    }
+
+    pub fn glyph(&self, font: FontId, ch: char) -> Option<GlyphId> {
+        let (mut units, mut glyphs) = ([0u16; 2], [0u16; 2]);
+        ch.encode_utf16(&mut units);
+        // SAFETY: both buffers hold two values.
+        unsafe {
+            self.0.borrow().face(font).font.glyphs_for_characters(
+                NonNull::from(&mut units).cast(),
+                NonNull::from(&mut glyphs).cast(),
+                2,
+            )
         };
-        let candidates = match state.font_ids_by_font_key.get(&font_key) {
-            Some(font_ids) => font_ids.clone(),
-            None => {
-                let font_ids =
-                    state.load_family(&font.family, &font.features, font.fallbacks.as_ref())?;
-                state
-                    .font_ids_by_font_key
-                    .insert(font_key, font_ids.clone());
-                font_ids
+        Some(glyphs[0]).filter(|&glyph| glyph != 0)
+    }
+
+    pub fn advance(&self, font: FontId, glyph: GlyphId) -> f32 {
+        let book = self.0.borrow();
+        let face = book.face(font);
+        let (mut id, mut advance) = (glyph, CGSize::default());
+        // SAFETY: one glyph in, one advance out.
+        unsafe {
+            face.font.advances_for_glyphs(
+                CTFontOrientation::Default,
+                NonNull::from(&mut id),
+                &mut advance,
+                1,
+            )
+        };
+        let units = face.units();
+        advance.width as f32 * units.per_point / units.per_em as f32
+    }
+
+    pub fn ink(&self, font: FontId, glyph: GlyphId, size: f32) -> Option<[f32; 4]> {
+        let book = self.0.borrow();
+        let face = book.face(font);
+        let [x0, y0, x1, y1] = face.outline(glyph);
+        let scale = size / face.units().per_em as f32;
+        Some([x0 * scale, x1 * scale, y1 * scale, y0 * scale])
+    }
+
+    pub fn shape(&self, text: &str, font_size: Pixels, spans: &[Span]) -> Line {
+        self.0.borrow_mut().shape(text, font_size, spans)
+    }
+
+    pub fn raster_bounds(&self, glyph: &GlyphRaster) -> Result<Rect<i32>> {
+        let book = self.0.borrow();
+        let face = book.face(glyph.font);
+        let k = glyph.size.0 / face.units().per_em as f32;
+        let [x0, y0, x1, y1] = face.outline(glyph.glyph).map(|value| value * k);
+        // To y down, measured from the top.
+        let (width, height) = (x1 - x0, y1 - y0);
+        let (left, top) = (x0, -y0 - height);
+        let s = glyph.scale;
+        let min = point((left * s).floor() as i32, (top * s).floor() as i32);
+        let max = point(
+            ((left + width) * s).ceil() as i32,
+            ((top + height) * s).ceil() as i32,
+        );
+        Ok(Rect::new(min, size(max.x - min.x, max.y - min.y)).outset(1))
+    }
+
+    pub fn rasterize(
+        &self,
+        glyph: &GlyphRaster,
+        bounds: Rect<i32>,
+    ) -> Result<(Size<i32>, Vec<u8>)> {
+        if bounds.size.width == 0 || bounds.size.height == 0 {
+            bail!("glyph bounds are empty");
+        }
+        let mut canvas = bounds.size;
+        if glyph.subpixel > 0 {
+            canvas.width += 1;
+        }
+        let (width, height) = (canvas.width as usize, canvas.height as usize);
+        // Glyphs draw black on opaque white and the mask inverts after: an alpha-only canvas makes them about 17%
+        // heavier. Dilated glyphs want exactly that, and emoji want color.
+        let opaque = !glyph.emoji && glyph.dilation == 0;
+        let (channels, info) = match (glyph.emoji, opaque) {
+            (true, _) => (4, 1),               // premultiplied RGBA
+            (false, true) => (4, 6 | 2 << 12), // BGRX
+            (false, false) => (1, 7),          // alpha only
+        };
+        let mut bytes = vec![0u8; width * height * channels];
+        let space = if channels == 4 {
+            CGColorSpace::new_device_rgb()
+        } else {
+            CGColorSpace::new_device_gray()
+        };
+        // SAFETY: the buffer matches the size, row length and pixel format, and outlives the context.
+        let context = unsafe {
+            CGBitmapContextCreate(
+                bytes.as_mut_ptr().cast(),
+                width,
+                height,
+                8,
+                width * channels,
+                space.as_deref(),
+                info,
+            )
+        }
+        .context("Could not make a glyph canvas")?;
+        let cx = Some(&*context);
+        if opaque {
+            CGContext::set_gray_fill_color(cx, 1., 1.);
+            CGContext::fill_rect(
+                cx,
+                CGRect::new(CGPoint::ZERO, CGSize::new(width as _, height as _)),
+            );
+            CGContext::set_allows_font_smoothing(cx, false);
+            CGContext::set_should_smooth_fonts(cx, false);
+        }
+        CGContext::translate_ctm(
+            cx,
+            -bounds.origin.x as CGFloat,
+            (bounds.origin.y + bounds.size.height) as CGFloat,
+        );
+        // CoreText enlarges emoji below 24 points, so small emoji draw at twice the size or more.
+        let oversize = if glyph.emoji { glyph.scale.max(2.) } else { 1. };
+        let scale = (glyph.scale / oversize) as CGFloat;
+        CGContext::scale_ctm(cx, scale, scale);
+        CGContext::set_text_drawing_mode(cx, CGTextDrawingMode::Fill);
+        CGContext::set_allows_antialiasing(cx, true);
+        CGContext::set_should_antialias(cx, true);
+        CGContext::set_allows_font_subpixel_positioning(cx, true);
+        CGContext::set_should_subpixel_position_fonts(cx, true);
+        CGContext::set_allows_font_subpixel_quantization(cx, false);
+        CGContext::set_should_subpixel_quantize_fonts(cx, false);
+        if glyph.dilation > 0 {
+            CGContext::set_should_smooth_fonts(cx, true);
+            CGContext::set_gray_fill_color(cx, f64::from(glyph.dilation) * 0.25, 1.);
+        } else {
+            CGContext::set_gray_fill_color(cx, 0., 1.);
+        }
+        let shift = f32::from(glyph.subpixel) / f32::from(SUBPIXEL_STEPS);
+        let font = self
+            .0
+            .borrow_mut()
+            .sized(glyph.font, glyph.size.0 * oversize);
+        let (mut id, mut at) = (
+            glyph.glyph,
+            CGPoint::new((shift / glyph.scale) as CGFloat, 0.),
+        );
+        // SAFETY: one glyph at one position, drawn into a live context.
+        unsafe { font.draw_glyphs(NonNull::from(&mut id), NonNull::from(&mut at), 1, &context) };
+        if opaque {
+            bytes = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|pixel| 255 - pixel[1])
+                .collect();
+        } else if glyph.emoji {
+            for pixel in bytes.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+                let alpha = f32::from(pixel[3]) / 255.;
+                if alpha > 0. {
+                    for channel in &mut pixel[..3] {
+                        *channel = (f32::from(*channel) / alpha).min(255.) as u8;
+                    }
+                }
+            }
+        }
+        Ok((canvas, bytes))
+    }
+
+    pub fn warm(lists: Vec<Vec<String>>) {
+        let load = move || {
+            let mut names = FAMILIES.clone();
+            names.sort_unstable();
+            names.dedup();
+            let names: FxHashMap<String, String> = names
+                .into_iter()
+                .map(|name| (name.to_lowercase(), name))
+                .collect();
+            let text = Self::default();
+            for list in lists {
+                if let Some(name) = list
+                    .iter()
+                    .find_map(|family| names.get(&family.to_lowercase()))
+                {
+                    text.font(&Font::new(name.as_str()));
+                }
             }
         };
-        // Map Apple weights directly to CSS: font-kit maps Medium to 530, so CSS 500 incorrectly selects
-        // Regular.
-        let properties = candidates
-            .iter()
-            .map(|font_id| {
-                let font = &state.fonts[font_id.0];
-                let mut properties = font.properties();
-                // CoreText puts a font loaded from data on another weight scale (0.2 for Medium), so read its
-                // class.
-                let class = state
-                    .local
-                    .contains(font_id)
-                    .then(|| font.load_font_table(u32::from_be_bytes(*b"OS/2")))
-                    .flatten()
-                    .filter(|table| table.len() >= 6)
-                    .map(|table| f32::from(u16::from_be_bytes([table[4], table[5]])))
-                    .filter(|class| (1. ..=1000.).contains(class));
-                if let Some(class) = class {
-                    properties.weight = font_kit::properties::Weight(class);
-                } else if let Some(weight) = font
-                    .native_font()
-                    .all_traits()
-                    .get(unsafe { kCTFontWeightTrait })
-                    .downcast::<CFNumber>()
-                    .and_then(|weight| weight.to_f32())
-                {
-                    let knots = [-0.8, -0.6, -0.4, 0., 0.23, 0.3, 0.4, 0.56, 0.62];
-                    let index = knots.iter().rposition(|&knot| weight >= knot).unwrap_or(0);
-                    let next = knots.get(index + 1).filter(|_| weight >= knots[0]);
-                    let fraction =
-                        next.map_or(0., |next| (weight - knots[index]) / (next - knots[index]));
-                    properties.weight =
-                        font_kit::properties::Weight(100. * (index as f32 + 1. + fraction));
-                }
-                properties
-            })
-            .collect::<SmallVec<[_; 4]>>();
-        let index = font_kit::matching::find_best_match(
-            &properties,
-            &font_kit::properties::Properties {
-                style: font_kit_style(font.style),
-                weight: font_kit_weight(font.weight),
-                stretch: Default::default(),
-            },
-        )?;
-        let mut font_id = candidates[index];
-        // Old Apple fonts like Skia use a 0.5 to 3.2 `wght` scale, so they keep their named faces.
-        let native = state.fonts[font_id.0].native_font();
-        let axis = || {
-            native
-                .get_variation_axes()
-                .and_then(|axes| {
-                    axes.iter().find_map(|axis| {
-                        let number = |key| axis.find(key)?.downcast::<CFNumber>();
-                        (number(unsafe { kCTFontVariationAxisIdentifierKey })?.to_i64()? == WGHT)
-                            .then(|| {
-                                number(unsafe { kCTFontVariationAxisDefaultValueKey })?.to_f32()
-                            })?
-                    })
-                })
-                .filter(|weight| *weight >= 100.)
-        };
-        let default = match state.local.contains(&font_id) {
-            true => axis(),
-            false => shared(&AXES, native.as_concrete_TypeRef() as usize, axis),
-        };
-        if default.is_some() && variation_weight(&native).or(default) != Some(font.weight.0) {
-            font_id = state.weighted(font_id, font.weight.0);
-        }
-        state.font_selections.insert(font.clone(), font_id);
-        Ok(font_id)
+        let _ = std::thread::Builder::new()
+            .name("apps-fonts".into())
+            .spawn(load);
     }
 
-    pub fn font_metrics(&self, font_id: FontId) -> FontMetrics {
-        let state = self.0.borrow();
-        let font = &state.fonts[font_id.0];
-        let metrics = font_kit_metrics(font.metrics());
-        let typo = font
-            .load_font_table(u32::from_be_bytes(*b"OS/2"))
-            .filter(|table| table.len() >= 72)
-            .map(|table| {
-                [68, 70].map(|at| f32::from(i16::from_be_bytes([table[at], table[at + 1]])))
-            })
-            .filter(|[ascent, descent]| *ascent > 0. && *descent < 0.);
-        FontMetrics {
-            tall_ascent: matches!(
-                font.family_name().as_str(),
-                "Times" | "Helvetica" | "Courier"
-            ),
-            em_ascent: typo.map_or(metrics.em_ascent, |[ascent, descent]| {
-                ascent / (ascent - descent)
-            }),
-            ..metrics
-        }
-    }
-
-    pub fn glyph_bounds(
-        &self,
-        font_id: FontId,
-        glyph_id: GlyphId,
-        font_size: f32,
-    ) -> Option<[f32; 4]> {
-        let state = self.0.borrow();
-        let font = &state.fonts[font_id.0];
-        let bounds = font.typographic_bounds(glyph_id.0).ok()?;
-        let scale = font_size / font.metrics().units_per_em as f32;
-        Some([
-            bounds.min_x() * scale,
-            bounds.max_x() * scale,
-            bounds.max_y() * scale,
-            bounds.min_y() * scale,
-        ])
-    }
-
-    pub fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
-        self.0.borrow().advance(font_id, glyph_id)
-    }
-
-    pub fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
-        self.0.borrow().glyph_for_char(font_id, ch)
-    }
-
-    pub fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
-        self.0.borrow().raster_bounds(params)
-    }
-
-    pub fn rasterize_glyph(
-        &self,
-        params: &RenderGlyphParams,
-        raster_bounds: Bounds<DevicePixels>,
-    ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        self.0.borrow_mut().rasterize_glyph(params, raster_bounds)
-    }
-
-    pub fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
-        self.0.borrow_mut().layout_line(text, font_size, font_runs)
-    }
-
-    pub fn glyph_dilation_for_color(&self, color: Rgba) -> u8 {
-        if !font_smoothing_allowed_by_user() {
+    pub fn dilation(&self, color: Color) -> u8 {
+        static SMOOTHING: OnceLock<bool> = OnceLock::new();
+        let smoothing = *SMOOTHING.get_or_init(|| {
+            use objc2_core_foundation::{
+                CFPreferencesCopyAppValue, kCFPreferencesCurrentApplication,
+            };
+            let key = CFString::from_static_str("AppleFontSmoothing");
+            // SAFETY: the application id is a CoreFoundation constant.
+            let value =
+                CFPreferencesCopyAppValue(&key, unsafe { kCFPreferencesCurrentApplication });
+            value
+                .and_then(|value| value.downcast::<CFNumber>().ok())
+                .is_none_or(|value| value.as_i64() != Some(0))
+        });
+        if !smoothing {
             return 0;
         }
         let luminance = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
-        (((4.0 * luminance) + 0.5).floor() as i32).clamp(0, 4) as u8
+        ((4. * luminance + 0.5).floor() as i32).clamp(0, 4) as u8
     }
 }
 
-fn font_smoothing_allowed_by_user() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    *ALLOWED.get_or_init(|| {
-        use core_foundation_sys::preferences::{
-            CFPreferencesCopyAppValue, kCFPreferencesCurrentApplication,
-        };
+impl Book {
+    fn face(&self, font: FontId) -> &Face {
+        &self.faces[font as usize]
+    }
 
-        let key = CFString::new("AppleFontSmoothing");
-        let value_ref = unsafe {
-            CFPreferencesCopyAppValue(key.as_concrete_TypeRef(), kCFPreferencesCurrentApplication)
+    fn register(&mut self, font: CFRetained<CTFont>, name: String, local: bool) -> FontId {
+        let id = self.faces.len() as FontId;
+        self.faces.push(Face::new(font, &name, local));
+        self.names.insert(name, id);
+        id
+    }
+
+    fn font(&mut self, font: &Font) -> Option<FontId> {
+        let key = (font.family.clone(), font.features.clone());
+        let candidates = match self.families.get(&key) {
+            Some(found) => found.clone(),
+            None => {
+                let found: Rc<[FontId]> = self.load(&font.family, &font.features)?.into();
+                self.families.insert(key, found.clone());
+                found
+            }
         };
-        if value_ref.is_null() {
-            return true;
+        let matching: Vec<_> = candidates
+            .iter()
+            .map(|&id| self.face(id).matching())
+            .collect();
+        let mut id = candidates[best(&matching, font.weight, font.style)?];
+        let face = self.face(id);
+        let default = if face.local {
+            open_type::default_weight(&face.font)
+        } else {
+            let pointer = CFRetained::as_ptr(&face.font).as_ptr() as usize;
+            AXES.get(pointer, || open_type::default_weight(&face.font))
+        };
+        if default.is_some() && open_type::weight(&face.font).or(default) != Some(font.weight) {
+            id = self.weighted(id, font.weight);
         }
-        let value = unsafe { CFType::wrap_under_create_rule(value_ref) };
-        let Some(number) = value.downcast_into::<CFNumber>() else {
-            return true;
-        };
-        number.to_i64() != Some(0)
-    })
-}
-
-impl State {
-    fn add_fonts(&mut self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
-        let fonts = fonts
-            .into_iter()
-            .map(|bytes| match bytes {
-                Cow::Borrowed(embedded_font) => {
-                    let data_provider = unsafe {
-                        core_graphics::data_provider::CGDataProvider::from_slice(embedded_font)
-                    };
-                    let font = core_graphics::font::CGFont::from_data_provider(data_provider)
-                        .map_err(|()| anyhow!("Could not load an embedded font."))?;
-                    let font = font_kit::loaders::core_text::Font::from_core_graphics_font(font);
-                    Ok(Handle::from_native(&font))
-                }
-                Cow::Owned(bytes) => Ok(Handle::from_memory(Arc::new(bytes), 0)),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.memory_source.add_fonts(fonts.into_iter())?;
-        self.font_selections.clear();
-        self.font_ids_by_font_key.clear();
-        Ok(())
+        Some(id)
     }
 
-    fn load_family(
-        &mut self,
-        name: &str,
-        features: &FontFeatures,
-        fallbacks: Option<&FontFallbacks>,
-    ) -> Result<SmallVec<[FontId; 4]>> {
-        let name = if name == ".SystemUIFont" {
+    fn load(&mut self, family: &str, features: &[(String, u32)]) -> Option<Vec<FontId>> {
+        let family = if family == ".SystemUIFont" {
             ".AppleSystemUIFont"
         } else {
-            name
+            family
         };
-
-        let mut font_ids = SmallVec::new();
-        let load = |family: font_kit::family_handle::FamilyHandle| {
-            let mut faces = Vec::new();
-            let mut postscript_names_seen = HashSet::default();
-            for font in family.fonts() {
-                let mut font = font.load()?;
-
-                apply_features_and_fallbacks(&mut font, features, fallbacks)?;
-
-                // `font.properties()` panics on fonts whose traits are not CFNumbers.
-                let traits = font.native_font().all_traits();
-                if unsafe {
-                    !(traits
-                        .get(kCTFontSymbolicTrait)
-                        .downcast::<CFNumber>()
-                        .is_some()
-                        && traits
-                            .get(kCTFontWidthTrait)
-                            .downcast::<CFNumber>()
-                            .is_some()
-                        && traits
-                            .get(kCTFontWeightTrait)
-                            .downcast::<CFNumber>()
-                            .is_some()
-                        && traits
-                            .get(kCTFontSlantTrait)
-                            .downcast::<CFNumber>()
-                            .is_some())
-                } {
-                    continue;
-                }
-
-                let Some(postscript_name) = font.postscript_name() else {
-                    continue;
-                };
-                // Deduplicate only within this call. A global check can leave a second FontKey with no faces.
-                if postscript_names_seen.insert(postscript_name.clone()) {
-                    faces.push((font, postscript_name));
-                }
-            }
-            anyhow::Ok(faces)
-        };
-        let (faces, local) = match self.memory_source.select_family_by_name(name) {
-            Ok(family) => (load(family)?, true),
-            Err(_) => {
-                let key = (
-                    name.to_owned(),
-                    features.0.to_vec(),
-                    fallbacks.map(|fallbacks| fallbacks.fallback_list().to_vec()),
-                );
-                let faces = shared(&SYSTEM_FAMILIES, key, || {
-                    load(self.system_source.select_family_by_name(name).ok()?).ok()
-                });
-                (
-                    faces.ok_or_else(|| anyhow!("no font family {name}"))?,
-                    false,
+        let start = self
+            .added
+            .partition_point(|added| added.family.as_str() < family);
+        let added: Vec<_> = self.added[start..]
+            .iter()
+            .take_while(|added| added.family == family)
+            .map(|added| {
+                // SAFETY: the descriptor came from CoreText.
+                unsafe { CTFont::with_font_descriptor(&added.descriptor, 16., ptr::null()) }
+            })
+            .collect();
+        let (faces, local) = if added.is_empty() {
+            let faces = SYSTEM_FACES.get((family.to_owned(), features.to_vec()), || {
+                Some(
+                    usable(installed(family)?.into_iter(), features)
+                        .map(|(font, name)| (Shared(font), name))
+                        .collect(),
                 )
-            }
+            })?;
+            (
+                faces
+                    .into_iter()
+                    .map(|(font, name)| (font.0, name))
+                    .collect::<Vec<_>>(),
+                false,
+            )
+        } else {
+            (usable(added.into_iter(), features).collect(), true)
         };
-        for (font, postscript_name) in faces {
-            let font_id = FontId(self.fonts.len());
-            if local {
-                self.local.insert(font_id);
-            }
-            font_ids.push(font_id);
-            self.font_ids_by_postscript_name
-                .insert(postscript_name.clone(), font_id);
-            self.postscript_names_by_font_id
-                .insert(font_id, postscript_name);
-            self.fonts.push(font);
+        Some(
+            faces
+                .into_iter()
+                .map(|(font, name)| self.register(font, name, local))
+                .collect(),
+        )
+    }
+
+    fn weighted(&mut self, id: FontId, weight: f32) -> FontId {
+        let face = self.face(id);
+        let local = face.local;
+        let make = || {
+            let font = open_type::with_weight(&face.font, weight);
+            // SAFETY: a plain CoreText query.
+            let name = format!(
+                "{}#wght{}",
+                unsafe { font.post_script_name() },
+                open_type::weight(&font)?
+            );
+            Some((Shared(font), name))
+        };
+        let made = if local {
+            make()
+        } else {
+            let pointer = CFRetained::as_ptr(&face.font).as_ptr() as usize;
+            WEIGHTS.get((pointer, weight.to_bits()), make)
+        };
+        let Some((font, name)) = made else {
+            return id;
+        };
+        match self.names.get(&name) {
+            Some(&known) => known,
+            None => self.register(font.0, name, local),
         }
-        Ok(font_ids)
     }
 
-    fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
-        Ok(size_from_vector2f(
-            self.fonts[font_id.0].advance(glyph_id.0)?,
-        ))
+    fn native(&mut self, font: &CTFont) -> FontId {
+        // SAFETY: plain CoreText queries.
+        let name = unsafe { font.post_script_name() }.to_string();
+        let instance = open_type::weight(font)
+            .and_then(|weight| self.names.get(&format!("{name}#wght{weight}")));
+        if let Some(&id) = instance.or_else(|| self.names.get(&name)) {
+            return id;
+        }
+        // SAFETY: the graphics font comes from a live CoreText font.
+        let face = unsafe {
+            CTFont::with_graphics_font(&font.graphics_font(ptr::null_mut()), 16., ptr::null(), None)
+        };
+        self.register(face, name, false)
     }
 
-    fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
-        self.fonts[font_id.0].glyph_for_char(ch).map(GlyphId)
-    }
-
-    // Reuse variable faces: each copy rebuilds CoreText caches at substantial shaping cost.
-    fn sized(&mut self, font_id: FontId, size: f32) -> CTFont {
+    fn sized(&mut self, font: FontId, size: f32) -> CFRetained<CTFont> {
         if self.sized.len() >= 512 {
             self.sized.clear();
         }
-        let fonts = &self.fonts;
+        let faces = &self.faces;
         self.sized
-            .entry((font_id, size.to_bits()))
-            .or_insert_with(|| {
-                fonts[font_id.0]
-                    .native_font()
-                    .clone_with_font_size(size as CGFloat)
+            .entry((font, size.to_bits()))
+            // SAFETY: a copy at another size.
+            .or_insert_with(|| unsafe {
+                faces[font as usize]
+                    .font
+                    .copy_with_attributes(size as CGFloat, ptr::null(), None)
             })
             .clone()
     }
 
-    fn weighted(&mut self, font_id: FontId, weight: f32) -> FontId {
-        let base = self.fonts[font_id.0].native_font();
-        let make = || {
-            let variations = CFDictionary::from_CFType_pairs(&[(
-                CFNumber::from(WGHT).as_CFType(),
-                CFNumber::from(f64::from(weight)).as_CFType(),
-            )]);
-            let attributes = CFDictionary::from_CFType_pairs(&[(
-                unsafe { CFString::wrap_under_get_rule(kCTFontVariationAttribute) },
-                variations.as_CFType(),
-            )]);
-            let descriptor = core_text::font_descriptor::new_from_attributes(&attributes);
-            let font = unsafe {
-                CTFont::wrap_under_create_rule(CTFontCreateCopyWithAttributes(
-                    base.as_concrete_TypeRef(),
-                    base.pt_size(),
-                    std::ptr::null(),
-                    descriptor.as_concrete_TypeRef(),
-                ))
-            };
-            let name = variation_weight(&font)
-                .map(|weight| format!("{}#wght{weight}", font.postscript_name()))?;
-            Some((
-                unsafe { font_kit::font::Font::from_native_font(&font) },
-                name,
-            ))
-        };
-        let weighted = match self.local.contains(&font_id) {
-            true => make(),
-            false => shared(
-                &WEIGHTS,
-                (base.as_concrete_TypeRef() as usize, weight.to_bits()),
-                make,
-            ),
-        };
-        let Some((font, name)) = weighted else {
-            return font_id;
-        };
-        if let Some(&id) = self.font_ids_by_postscript_name.get(&name) {
-            return id;
+    fn shape(&mut self, text: &str, font_size: Pixels, spans: &[Span]) -> Line {
+        if spans.is_empty() {
+            return self.shape_whole(text, font_size, spans, None);
         }
-        let id = FontId(self.fonts.len());
-        if self.local.contains(&font_id) {
-            self.local.insert(id);
-        }
-        self.font_ids_by_postscript_name.insert(name.clone(), id);
-        self.postscript_names_by_font_id.insert(id, name);
-        self.fonts.push(font);
-        id
-    }
-
-    fn id_for_native_font(&mut self, requested_font: CTFont) -> FontId {
-        let postscript_name = requested_font.postscript_name();
-        if let Some(font_id) = variation_weight(&requested_font)
-            .and_then(|weight| {
-                self.font_ids_by_postscript_name
-                    .get(&format!("{postscript_name}#wght{weight}"))
-            })
-            .or_else(|| self.font_ids_by_postscript_name.get(&postscript_name))
+        if text.is_ascii()
+            && !text.contains(['\t', '\n', '\r'])
+            && spans.iter().all(|span| self.face(span.font).mono)
         {
-            *font_id
-        } else {
-            let font_id = FontId(self.fonts.len());
-            self.font_ids_by_postscript_name
-                .insert(postscript_name.clone(), font_id);
-            self.postscript_names_by_font_id
-                .insert(font_id, postscript_name);
-            self.fonts
-                .push(font_kit::font::Font::from_core_graphics_font(
-                    requested_font.copy_to_CGFont(),
-                ));
-            font_id
+            return self.shape_pieces(text, font_size, spans);
         }
-    }
-
-    fn is_emoji(&self, font_id: FontId) -> bool {
-        self.postscript_names_by_font_id
-            .get(&font_id)
-            .is_some_and(|postscript_name| {
-                postscript_name == "AppleColorEmoji" || postscript_name == ".AppleColorEmojiUI"
-            })
-    }
-
-    fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
-        let font = &self.fonts[params.font_id.0];
-        let scale = Transform2F::from_scale(params.scale_factor);
-        let bounds: Bounds<DevicePixels> = bounds_from_rect_i32(font.raster_bounds(
-            params.glyph_id.0,
-            params.font_size.into(),
-            scale,
-            HintingOptions::None,
-            font_kit::canvas::RasterizationOptions::GrayscaleAa,
-        )?);
-
-        Ok(bounds.dilate(DevicePixels(1)))
-    }
-
-    fn rasterize_glyph(
-        &mut self,
-        params: &RenderGlyphParams,
-        glyph_bounds: Bounds<DevicePixels>,
-    ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        if glyph_bounds.size.width.0 == 0 || glyph_bounds.size.height.0 == 0 {
-            anyhow::bail!("glyph bounds are empty");
-        } else {
-            let mut bitmap_size = glyph_bounds.size;
-            if params.subpixel_variant.x > 0 {
-                bitmap_size.width += DevicePixels(1);
-            }
-            if params.subpixel_variant.y > 0 {
-                bitmap_size.height += DevicePixels(1);
-            }
-            let bitmap_size = bitmap_size;
-
-            let mut bytes;
-
-            // Use an opaque black-on-white context, then invert the mask. Alpha-only contexts make glyphs
-            // about 17% heavier.
-            let opaque_mask = !params.is_emoji && params.dilation == 0;
-            let cx = if params.is_emoji {
-                bytes = vec![0; bitmap_size.width.0 as usize * 4 * bitmap_size.height.0 as usize];
-                CGContext::create_bitmap_context(
-                    Some(bytes.as_mut_ptr() as *mut _),
-                    bitmap_size.width.0 as usize,
-                    bitmap_size.height.0 as usize,
-                    8,
-                    bitmap_size.width.0 as usize * 4,
-                    &CGColorSpace::create_device_rgb(),
-                    kCGImageAlphaPremultipliedLast,
-                )
-            } else if opaque_mask {
-                bytes = vec![0; bitmap_size.width.0 as usize * 4 * bitmap_size.height.0 as usize];
-                CGContext::create_bitmap_context(
-                    Some(bytes.as_mut_ptr() as *mut _),
-                    bitmap_size.width.0 as usize,
-                    bitmap_size.height.0 as usize,
-                    8,
-                    bitmap_size.width.0 as usize * 4,
-                    &CGColorSpace::create_device_rgb(),
-                    kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little,
-                )
-            } else {
-                bytes = vec![0; bitmap_size.width.0 as usize * bitmap_size.height.0 as usize];
-                CGContext::create_bitmap_context(
-                    Some(bytes.as_mut_ptr() as *mut _),
-                    bitmap_size.width.0 as usize,
-                    bitmap_size.height.0 as usize,
-                    8,
-                    bitmap_size.width.0 as usize,
-                    &CGColorSpace::create_device_gray(),
-                    kCGImageAlphaOnly,
-                )
-            };
-
-            if opaque_mask {
-                cx.set_gray_fill_color(1.0, 1.0);
-                cx.fill_rect(CGRect::new(
-                    &CGPoint::new(0., 0.),
-                    &CGSize::new(
-                        bitmap_size.width.0 as CGFloat,
-                        bitmap_size.height.0 as CGFloat,
-                    ),
-                ));
-                cx.set_allows_font_smoothing(false);
-                cx.set_should_smooth_fonts(false);
-            }
-
-            cx.translate(
-                -glyph_bounds.origin.x.0 as CGFloat,
-                (glyph_bounds.origin.y.0 + glyph_bounds.size.height.0) as CGFloat,
-            );
-            // Rasterize small emoji at twice the size or more to avoid CoreText's enlargement below 24
-            // points.
-            let oversize = if params.is_emoji {
-                params.scale_factor.max(2.)
-            } else {
-                1.
-            };
-            let drawn = (params.scale_factor / oversize) as CGFloat;
-            cx.scale(drawn, drawn);
-
-            let subpixel_shift = params
-                .subpixel_variant
-                .map(|v| v as f32 / SUBPIXEL_VARIANTS_X as f32);
-            cx.set_text_drawing_mode(CGTextDrawingMode::CGTextFill);
-            cx.set_allows_antialiasing(true);
-            cx.set_should_antialias(true);
-            cx.set_allows_font_subpixel_positioning(true);
-            cx.set_should_subpixel_position_fonts(true);
-            cx.set_allows_font_subpixel_quantization(false);
-            cx.set_should_subpixel_quantize_fonts(false);
-
-            if params.dilation > 0 {
-                let luminance = params.dilation as f64 * 0.25;
-                cx.set_should_smooth_fonts(true);
-                cx.set_gray_fill_color(luminance, 1.0);
-            } else {
-                cx.set_gray_fill_color(0.0, 1.0);
-            }
-            self.sized(params.font_id, f32::from(params.font_size) * oversize)
-                .draw_glyphs(
-                    &[params.glyph_id.0 as CGGlyph],
-                    &[CGPoint::new(
-                        (subpixel_shift.x / params.scale_factor) as CGFloat,
-                        (subpixel_shift.y / params.scale_factor) as CGFloat,
-                    )],
-                    cx,
-                );
-
-            if opaque_mask {
-                bytes = bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|pixel| 255 - pixel[1])
-                    .collect();
-            }
-            if params.is_emoji {
-                for pixel in bytes.as_chunks_mut::<4>().0 {
-                    pixel.swap(0, 2);
-                    let a = pixel[3] as f32 / 255.;
-                    if a > 0. {
-                        for channel in &mut pixel[..3] {
-                            *channel = (*channel as f32 / a).min(255.) as u8;
-                        }
-                    }
-                }
-            }
-
-            Ok((bitmap_size, bytes))
-        }
-    }
-
-    fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
-        if text.is_ascii() && !text.contains(['\t', '\n', '\r']) && !font_runs.is_empty() {
-            let fonts = &self.fonts;
-            let monospace = font_runs.iter().all(|run| {
-                *self
-                    .monospace
-                    .entry(run.font_id)
-                    .or_insert_with(|| fonts[run.font_id.0].is_monospace())
-            });
-            if monospace {
-                return self.layout_segments(text, font_size, font_runs);
-            }
-        }
-        let simple = |ch: char| {
+        let plain = |ch: char| {
             matches!(ch, ' '..='~' | '\u{a0}'..='\u{58f}' | '\u{1e00}'..='\u{1fff}' | '\u{2010}'..='\u{2027}'
                 | '\u{2030}'..='\u{205e}' | '\u{20a0}'..='\u{20cf}')
         };
-        if !font_runs.is_empty()
-            && text.chars().all(simple)
-            && let Some(layout) = self.layout_words(text, font_size, font_runs)
-        {
-            #[cfg(debug_assertions)]
-            assert!(
-                same_lines(
-                    &self.layout_whole(text, font_size, font_runs, None),
-                    &layout
-                ),
-                "words of {text:?} shape unlike the whole line"
-            );
-            return layout;
+        if text.chars().all(plain) {
+            let mut parts = mem::take(&mut self.words.parts);
+            parts.clear();
+            let line = self.shape_words(text, font_size, spans, &mut parts);
+            self.words.parts = parts;
+            if let Some(line) = line {
+                debug_assert!(
+                    same(&self.shape_whole(text, font_size, spans, None), &line),
+                    "words of {text:?} shape unlike the whole line"
+                );
+                return line;
+            }
         }
-        self.layout_whole(text, font_size, font_runs, None)
+        self.shape_whole(text, font_size, spans, None)
     }
 
-    fn layout_words(
+    fn shape_pieces(&mut self, text: &str, font_size: Pixels, spans: &[Span]) -> Line {
+        self.words.trim(true);
+        let mut glyphs = Vec::with_capacity(text.len());
+        let (mut x, mut ascent, mut descent) = (0f32, px(0.), px(0.));
+        let mut start = 0;
+        for span in spans {
+            let key = (span.font, span.size.0.to_bits());
+            for (offset, piece) in pieces(&text[start..start + span.len]) {
+                let found = self
+                    .words
+                    .pieces
+                    .get(&key)
+                    .and_then(|cached| cached.get(piece))
+                    .cloned();
+                let shaped = match found {
+                    Some(shaped) => shaped,
+                    None => {
+                        let alone = Span {
+                            len: piece.len(),
+                            ..*span
+                        };
+                        let shaped = Rc::new(
+                            match self.digits(span.font, span.size, piece, 0..piece.len()) {
+                                Some(word) => {
+                                    let units = self.face(span.font).units();
+                                    let scale = span.size.0 / units.per_em as f32;
+                                    let line = Line {
+                                        glyphs: word
+                                            .glyphs
+                                            .iter()
+                                            .map(|piece| piece.glyph(span.size, 0., 0))
+                                            .collect(),
+                                        width: px(word.width as f32),
+                                        ascent: px(0f32.max(units.ascent * scale)),
+                                        descent: px(0f32.max(-units.descent * scale)),
+                                        len: piece.len(),
+                                        font_size: span.size,
+                                        sorted: false,
+                                    };
+                                    debug_assert!(
+                                        same(
+                                            &line,
+                                            &self.shape_whole(piece, span.size, &[alone], None)
+                                        ),
+                                        "digits of {piece:?} shape unlike the whole piece"
+                                    );
+                                    line
+                                }
+                                None => self.shape_whole(piece, span.size, &[alone], None),
+                            },
+                        );
+                        self.words.count += 1;
+                        self.words
+                            .pieces
+                            .entry(key)
+                            .or_default()
+                            .insert(piece.into(), shaped.clone());
+                        shaped
+                    }
+                };
+                let at = (start + offset) as u32;
+                glyphs.extend(shaped.glyphs.iter().map(|glyph| Glyph {
+                    x: glyph.x + px(x),
+                    index: glyph.index + at,
+                    ..*glyph
+                }));
+                x += shaped.width.0;
+                ascent = ascent.max(shaped.ascent);
+                descent = descent.max(shaped.descent);
+            }
+            start += span.len;
+        }
+        Line {
+            glyphs,
+            width: px(x),
+            ascent,
+            descent,
+            len: text.len(),
+            font_size,
+            sorted: false,
+        }
+    }
+
+    fn shape_words(
         &mut self,
         text: &str,
         font_size: Pixels,
-        font_runs: &[FontRun],
-    ) -> Option<LineLayout> {
-        if self.words > 16384 {
-            self.faces.clear();
-            self.words = 0;
-        }
-        let mut parts = mem::take(&mut self.parts);
-        parts.clear();
-        let (mut start, mut nudged, mut missing) = (0, false, 0);
-        for (index, run) in font_runs.iter().enumerate() {
-            // Every other run shapes a hair larger, as in `layout_whole`, or CoreText merges the runs and
-            // forms ligatures across them.
-            let size = if nudged {
-                px(f32::from(run.font_size).next_up())
+        spans: &[Span],
+        parts: &mut Vec<Part>,
+    ) -> Option<Line> {
+        self.words.trim(false);
+        let (mut start, mut nudge, mut missing) = (0, false, 0);
+        for (index, span) in spans.iter().enumerate() {
+            // Every other span shapes a hair larger, as in `shape_whole`, or CoreText joins the spans and forms
+            // ligatures across them.
+            let size = if nudge {
+                px(span.size.0.next_up())
             } else {
-                run.font_size
+                span.size
             };
-            let part = &text[start..start + run.len];
-            let key = (run.font_id, f32::from(size).to_bits());
-            let mut offset = 0;
-            while offset < part.len() {
-                let space = part.as_bytes()[offset] == b' ';
-                let end = part[offset..]
-                    .bytes()
-                    .position(|byte| (byte == b' ') != space)
-                    .map_or(part.len(), |length| offset + length);
-                let around = (offset > 0) as usize | ((end < part.len()) as usize) << 1;
-                parts.push((index, size, start + offset..start + end, around, None));
-                offset = end;
-            }
-            let first = parts.len()
-                - parts
-                    .iter()
-                    .rev()
-                    .take_while(|part| part.0 == index)
-                    .count();
-            let mut face = self.faces.get(&key);
-            for at in first..parts.len() {
-                let (range, around) = (parts[at].2.clone(), parts[at].3);
-                if text.as_bytes()[range.start] == b' '
-                    && let Some(next) = text[range.end..].chars().next().filter(|_| around & 2 != 0)
+            let key = (span.font, size.0.to_bits());
+            let source = &text[start..start + span.len];
+            for (offset, piece) in pieces(source) {
+                let range = start + offset..start + offset + piece.len();
+                let around = u8::from(offset > 0) | u8::from(range.end < start + source.len()) << 1;
+                if piece.starts_with(' ')
+                    && around & 2 != 0
+                    && let Some(next) = text[range.end..].chars().next()
+                    && !self.spaced(span.font, size, next)
                 {
-                    let spaced = match face.and_then(|face| face.spaced.get(&next)) {
-                        Some(&spaced) => spaced,
-                        None => {
-                            let spaced = self.spaced(run.font_id, size, next);
-                            face = self.faces.get(&key);
-                            spaced
-                        }
-                    };
-                    if !spaced {
-                        self.parts = parts;
-                        return None;
-                    }
+                    return None;
                 }
-                parts[at].4 = face.and_then(|face| face.words.get(&text[range])?[around].clone());
-                missing += parts[at].4.is_none() as usize;
+                let word = (self.words.faces.get(&key)).and_then(|face| {
+                    face.words.get(&text[range.clone()])?[usize::from(around)].clone()
+                });
+                missing += usize::from(word.is_none());
+                parts.push(Part {
+                    span: index,
+                    size,
+                    range,
+                    around,
+                    word,
+                });
             }
-            nudged ^= run.len > 0;
-            start += run.len;
+            nudge ^= span.len > 0;
+            start += span.len;
         }
         if missing > 2 {
-            let mut exact = Exact::default();
-            let whole = self.layout_whole(text, font_size, font_runs, Some(&mut exact));
-            self.harvest(text, 0, &whole, &exact, font_runs, &mut parts);
-            self.parts = parts;
+            let mut pens = Pens::default();
+            let whole = self.shape_whole(text, font_size, spans, Some(&mut pens));
+            self.harvest(text, 0, &whole, &pens, spans, parts);
             return Some(whole);
         }
         for at in 0..parts.len() {
-            let (index, size, range, around, None) = parts[at].clone() else {
-                continue;
-            };
-            let before = text[..range.start]
-                .chars()
-                .next_back()
-                .filter(|_| around & 1 != 0);
-            let after = text[range.end..].chars().next().filter(|_| around & 2 != 0);
-            let context = range.start - before.map_or(0, char::len_utf8)
-                ..range.end + after.map_or(0, char::len_utf8);
-            let word = range.start - context.start..range.end - context.start;
-            if let Some(word) =
-                self.numbers(font_runs[index].font_id, size, &text[context.clone()], word)
-            {
-                parts[at].4 = Some(Rc::new(word));
+            if parts[at].word.is_some() {
                 continue;
             }
-            let single = FontRun {
+            let Part {
+                span,
+                size,
+                ref range,
+                around,
+                ..
+            } = parts[at];
+            let before = (around & 1 != 0)
+                .then(|| text[..range.start].chars().next_back())
+                .flatten();
+            let after = (around & 2 != 0)
+                .then(|| text[range.end..].chars().next())
+                .flatten();
+            let context = range.start - before.map_or(0, char::len_utf8)
+                ..range.end + after.map_or(0, char::len_utf8);
+            let inner = range.start - context.start..range.end - context.start;
+            if let Some(word) = self.digits(spans[span].font, size, &text[context.clone()], inner) {
+                parts[at].word = Some(Rc::new(word));
+                continue;
+            }
+            let alone = Span {
                 len: context.len(),
-                font_size: size,
-                ..font_runs[index]
+                size,
+                ..spans[span]
             };
-            let mut exact = Exact::default();
-            let shaped =
-                self.layout_whole(&text[context.clone()], size, &[single], Some(&mut exact));
+            let mut pens = Pens::default();
+            let shaped = self.shape_whole(&text[context.clone()], size, &[alone], Some(&mut pens));
             self.harvest(
                 text,
                 context.start,
                 &shaped,
-                &exact,
-                font_runs,
+                &pens,
+                spans,
                 &mut parts[at..at + 1],
             );
-            if parts[at].4.is_none() {
-                self.parts = parts;
-                return None;
-            }
+            parts[at].word.as_ref()?;
         }
-        let mut runs: Vec<ShapedRun> = Vec::with_capacity(1);
-        let mut count: usize = parts
+        let count = parts
             .iter()
-            .filter_map(|part| Some(part.4.as_ref()?.0.len()))
+            .map(|part| part.word.as_ref().map_or(0, |word| word.glyphs.len()))
             .sum();
-        let (mut x, mut last) = (0f64, (usize::MAX, font_size));
-        for (index, size, range, _, word) in &parts {
-            let Some(Word(glyphs, width)) = word.as_deref() else {
+        let mut glyphs = Vec::with_capacity(count);
+        let mut x = 0f64;
+        let mut last: Option<(usize, Pixels)> = None;
+        for part in parts.iter() {
+            let Some(word) = &part.word else {
                 continue;
             };
-            if *index != last.0 {
-                let shaped = f32::from(*size);
-                let run_size = font_runs
+            let size = match last {
+                Some((span, size)) if span == part.span => size,
+                _ => nearest(spans, part.size.0, font_size),
+            };
+            last = Some((part.span, size));
+            glyphs.extend(
+                word.glyphs
                     .iter()
-                    .map(|run| run.font_size)
-                    .min_by(|a, b| {
-                        (f32::from(*a) - shaped)
-                            .abs()
-                            .total_cmp(&(f32::from(*b) - shaped).abs())
-                    })
-                    .unwrap_or(font_size);
-                last = (*index, run_size);
-            }
-            for &(at, font_id, id, y, offset) in glyphs {
-                let glyph = ShapedGlyph {
-                    id,
-                    position: point(px((x + at) as f32), px(y)),
-                    index: range.start + offset,
-                    is_emoji: false,
-                };
-                match runs.last_mut() {
-                    Some(run) if run.font_id == font_id && run.font_size == last.1 => {
-                        run.glyphs.push(glyph)
-                    }
-                    _ => {
-                        let mut glyphs = Vec::with_capacity(count);
-                        glyphs.push(glyph);
-                        runs.push(ShapedRun {
-                            font_id,
-                            font_size: last.1,
-                            glyphs,
-                        })
-                    }
-                }
-                count -= 1;
-            }
-            x += width;
+                    .map(|piece| piece.glyph(size, x, part.range.start)),
+            );
+            x += word.width;
         }
-        self.parts = parts;
         let (mut ascent, mut descent) = (0f32, 0f32);
-        for run in font_runs {
-            let fonts = &self.fonts;
-            let metrics = self
-                .metrics
-                .entry(run.font_id)
-                .or_insert_with(|| fonts[run.font_id.0].metrics());
-            let scale = f32::from(run.font_size) / metrics.units_per_em as f32;
-            ascent = ascent.max(metrics.ascent * scale);
-            descent = descent.max(-metrics.descent * scale);
+        for span in spans {
+            let units = self.face(span.font).units();
+            let scale = span.size.0 / units.per_em as f32;
+            ascent = ascent.max(units.ascent * scale);
+            descent = descent.max(-units.descent * scale);
         }
-        Some(LineLayout {
-            runs,
-            font_size,
+        Some(Line {
+            glyphs,
             width: px(x as f32),
             ascent: px(ascent),
             descent: px(descent),
             len: text.len(),
+            font_size,
+            sorted: false,
         })
     }
 
@@ -1008,215 +987,171 @@ impl State {
         &mut self,
         text: &str,
         at: usize,
-        layout: &LineLayout,
-        (xs, starts): &Exact,
-        font_runs: &[FontRun],
+        line: &Line,
+        pens: &Pens,
+        spans: &[Span],
         parts: &mut [Part],
     ) {
-        let glyphs: Vec<_> = layout
-            .runs
-            .iter()
-            .flat_map(|run| run.glyphs.iter().map(move |glyph| (run.font_id, glyph)))
-            .collect();
-        if glyphs.iter().any(|(_, glyph)| glyph.is_emoji) {
+        let glyphs = &line.glyphs;
+        if glyphs.iter().any(|glyph| glyph.emoji) {
             return;
         }
-        for (index, size, range, around, word) in parts {
-            let first = glyphs.partition_point(|(_, glyph)| glyph.index + at < range.start);
-            let count = glyphs[first..].partition_point(|(_, glyph)| glyph.index + at < range.end);
+        for part in parts {
+            let first =
+                glyphs.partition_point(|glyph| glyph.index as usize + at < part.range.start);
+            let count = glyphs[first..]
+                .partition_point(|glyph| (glyph.index as usize + at) < part.range.end);
             let own = &glyphs[first..first + count];
-            if word.is_some()
+            if part.word.is_some()
                 || own
                     .first()
-                    .is_none_or(|(font, _)| own.iter().any(|(other, _)| other != font))
+                    .is_none_or(|head| own.iter().any(|glyph| glyph.font != head.font))
             {
                 continue;
             }
-            // CoreText adjusts glyphs at run edges. Preserve run boundaries for fragments without adjacent
-            // spaces.
+            // CoreText adjusts glyphs at the edges of its runs, so a word without a space beside it takes its
+            // edge from a run boundary.
             let edge = |index: usize| match index - at {
-                end if end == layout.len => Some(xs[glyphs.len()]),
-                index => starts
+                end if end == line.len => Some(pens.xs[glyphs.len()]),
+                index => pens
+                    .starts
                     .iter()
                     .find(|start| start.0 == index)
                     .map(|start| start.1),
             };
-            let (Some(left), Some(right)) = (
-                if *around & 1 == 0 {
-                    edge(range.start)
-                } else {
-                    Some(xs[first])
-                },
-                if *around & 2 == 0 {
-                    edge(range.end)
-                } else {
-                    Some(xs[first + count])
-                },
-            ) else {
+            let left = if part.around & 1 == 0 {
+                edge(part.range.start)
+            } else {
+                Some(pens.xs[first])
+            };
+            let right = if part.around & 2 == 0 {
+                edge(part.range.end)
+            } else {
+                Some(pens.xs[first + count])
+            };
+            let (Some(left), Some(right)) = (left, right) else {
                 continue;
             };
-            let shaped = Rc::new(Word(
-                own.iter()
-                    .zip(&xs[first..])
-                    .map(|((font, glyph), x)| {
-                        (
-                            x - left,
-                            *font,
-                            glyph.id,
-                            f32::from(glyph.position.y),
-                            glyph.index + at - range.start,
-                        )
+            let word = Rc::new(Word {
+                glyphs: own
+                    .iter()
+                    .zip(&pens.xs[first..])
+                    .map(|(glyph, x)| Piece {
+                        x: x - left,
+                        font: glyph.font,
+                        id: glyph.id,
+                        y: glyph.y.0,
+                        offset: (glyph.index as usize + at - part.range.start) as u32,
                     })
                     .collect(),
-                right - left,
-            ));
-            self.words += 1;
-            self.faces
-                .entry((font_runs[*index].font_id, f32::from(*size).to_bits()))
-                .or_default()
+                width: right - left,
+            });
+            self.words.count += 1;
+            let face = self
                 .words
-                .entry(text[range.clone()].into())
-                .or_default()[*around] = Some(shaped.clone());
-            *word = Some(shaped);
+                .faces
+                .entry((spans[part.span].font, part.size.0.to_bits()))
+                .or_default();
+            face.words
+                .entry(text[part.range.clone()].into())
+                .or_default()[usize::from(part.around)] = Some(word.clone());
+            part.word = Some(word);
         }
     }
 
-    fn numbers(
+    fn spaced(&mut self, font: FontId, size: Pixels, next: char) -> bool {
+        let key = (font, size.0.to_bits());
+        if let Some(&spaced) = self
+            .words
+            .faces
+            .get(&key)
+            .and_then(|face| face.spaced.get(&next))
+        {
+            return spaced;
+        }
+        let span = Span {
+            len: 1,
+            font,
+            size,
+            letter_spacing: px(0.),
+            word_spacing: px(0.),
+            inset: [px(0.); 2],
+            nowrap: false,
+        };
+        let space = self.shape_whole(" ", size, &[span], None).width;
+        let pair = format!(" {next}");
+        let both = self.shape_whole(
+            &pair,
+            size,
+            &[Span {
+                len: pair.len(),
+                ..span
+            }],
+            None,
+        );
+        let spaced = (both.glyphs.iter().find(|glyph| glyph.index > 0))
+            .is_some_and(|glyph| (glyph.x - space).abs() < px(1e-4));
+        self.words
+            .faces
+            .entry(key)
+            .or_default()
+            .spaced
+            .insert(next, spaced);
+        spaced
+    }
+
+    /// `word` is the part of `text` to return; the rest is context.
+    fn digits(
         &mut self,
-        font_id: FontId,
+        font: FontId,
         size: Pixels,
         text: &str,
-        word: std::ops::Range<usize>,
+        word: Range<usize>,
     ) -> Option<Word> {
         const CHARS: &[u8; 11] = b"0123456789 ";
         let bytes = text.as_bytes();
         if !bytes.iter().all(|byte| CHARS.contains(byte)) {
             return None;
         }
-        let digit = |byte: u8| {
+        let slot = |byte: u8| {
             if byte == b' ' {
                 10
             } else {
-                (byte - b'0') as usize
+                usize::from(byte - b'0')
             }
         };
-        let key = (font_id, f32::from(size).to_bits());
-        let face = self.faces.entry(key).or_default();
+        let key = (font, size.0.to_bits());
+        let face = self.words.faces.entry(key).or_default();
         face.misses = face.misses.saturating_add(1);
-        let (misses, numbers) = (face.misses, face.numbers.take());
-        let shape = |state: &mut State, chars: &[usize]| {
-            let text: String = chars.iter().map(|&at| CHARS[at] as char).collect();
-            let run = FontRun {
-                len: text.len(),
-                font_id,
-                font_size: size,
-                letter_spacing: px(0.),
-                word_spacing: px(0.),
-                inset: [px(0.); 2],
-                nowrap: false,
-            };
-            let mut exact = Exact::default();
-            let layout = state.layout_whole(&text, size, &[run], Some(&mut exact));
-            let glyphs: Vec<_> = layout
-                .runs
-                .iter()
-                .flat_map(|run| {
-                    run.glyphs.iter().map(move |glyph| {
-                        let plain = glyph.position.y == px(0.) && !glyph.is_emoji;
-                        (run.font_id, glyph.id, glyph.index, plain)
-                    })
-                })
-                .collect();
-            (glyphs, exact.0)
-        };
-        let mut numbers = match numbers {
-            Some(numbers) => numbers,
-            None if misses == 32 => {
-                let mut numbers = Box::new(Numbers {
-                    font: FontId(usize::MAX),
-                    glyphs: [GlyphId(0); 11],
-                    ends: [0.; 11],
-                    advances: [[f64::NAN; 11]; 11],
-                    triples: vec![false; 1331].into(),
-                    edges: [[0; 11]; 11],
-                });
-                for at in 0..11 {
-                    let (glyphs, xs) = shape(self, &[at]);
-                    let [(font, id, 0, true)] = glyphs[..] else {
-                        return None;
-                    };
-                    if xs[0] != 0. || at > 0 && font != numbers.font {
-                        return None;
-                    }
-                    (numbers.font, numbers.glyphs[at], numbers.ends[at]) = (font, id, xs[1]);
-                }
-                let (mut lyndon, mut order) = (vec![-1isize], Vec::new());
-                while let Some(last) = lyndon.last_mut() {
-                    *last += 1;
-                    let length = lyndon.len();
-                    if 3 % length == 0 {
-                        order.extend(lyndon.iter().map(|&at| at as usize));
-                    }
-                    while lyndon.len() < 3 {
-                        lyndon.push(lyndon[lyndon.len() - length]);
-                    }
-                    while lyndon.last() == Some(&10) {
-                        lyndon.pop();
-                    }
-                }
-                order.extend([order[0], order[1]]);
-                let (glyphs, xs) = shape(self, &order);
-                if glyphs.len() != order.len() {
-                    return None;
-                }
-                let mut moved = vec![false; order.len()];
-                for (at, &(font, id, index, plain)) in glyphs.iter().enumerate() {
-                    moved[at] |= !plain
-                        || font != numbers.font
-                        || id != numbers.glyphs[order[at]]
-                        || index != at;
-                    if let Some(&next) = order.get(at + 1) {
-                        let advance = &mut numbers.advances[order[at]][next];
-                        if advance.is_nan() {
-                            *advance = xs[at + 1] - xs[at];
-                        } else if (*advance - (xs[at + 1] - xs[at])).abs() > 1e-9 {
-                            moved[at] = true;
-                            moved[at + 1] = true;
-                        }
-                    }
-                }
-                for at in 0..order.len() - 2 {
-                    numbers.triples[order[at] * 121 + order[at + 1] * 11 + order[at + 2]] =
-                        !moved[at..at + 3].contains(&true);
-                }
-                numbers
-            }
+        let misses = face.misses;
+        let mut table = match face.digits.take() {
+            Some(table) => table,
+            None if misses == 32 => self.digit_table(font, size, CHARS)?,
             None => return None,
         };
-        let n = bytes.len();
-        let word = 'stitch: {
+        let stitched = 'stitch: {
             if bytes.windows(3).any(|three| {
-                !numbers.triples[digit(three[0]) * 121 + digit(three[1]) * 11 + digit(three[2])]
+                !table.triples[slot(three[0]) * 121 + slot(three[1]) * 11 + slot(three[2])]
             }) {
                 break 'stitch None;
             }
+            let n = bytes.len();
             for (a, b) in [(0, 1), (n.wrapping_sub(2), n.wrapping_sub(1))] {
-                let Some((a, b)) = bytes.get(a).zip(bytes.get(b)) else {
+                let Some((&a, &b)) = bytes.get(a).zip(bytes.get(b)) else {
                     break;
                 };
-                let (a, b) = (digit(*a), digit(*b));
-                if numbers.edges[a][b] == 0 {
-                    let (glyphs, xs) = shape(self, &[a, b]);
-                    let advance = numbers.advances[a][b];
-                    let same = matches!(glyphs[..], [(first, x, 0, true), (second, y, 1, true)]
-                        if first == numbers.font && second == numbers.font
-                            && x == numbers.glyphs[a] && y == numbers.glyphs[b])
+                let (a, b) = (slot(a), slot(b));
+                if table.edges[a][b] == 0 {
+                    let (glyphs, xs) = self.shape_digits(font, size, CHARS, &[a, b]);
+                    let advance = table.advances[a][b];
+                    let kept = matches!(glyphs[..], [(f, x, 0, true), (g, y, 1, true)]
+                        if f == table.font && g == table.font && x == table.glyphs[a] && y == table.glyphs[b])
                         && xs[0] == 0.
                         && (xs[1] - advance).abs() < 1e-9
-                        && (xs[2] - advance - numbers.ends[b]).abs() < 1e-9;
-                    numbers.edges[a][b] = if same { 1 } else { 2 };
+                        && (xs[2] - advance - table.ends[b]).abs() < 1e-9;
+                    table.edges[a][b] = if kept { 1 } else { 2 };
                 }
-                if numbers.edges[a][b] != 1 {
+                if table.edges[a][b] != 1 {
                     break 'stitch None;
                 }
             }
@@ -1227,516 +1162,625 @@ impl State {
                     left = x;
                 }
                 if at >= word.start {
-                    glyphs.push((
-                        x - left,
-                        numbers.font,
-                        numbers.glyphs[digit(byte)],
-                        0.,
-                        at - word.start,
-                    ));
+                    glyphs.push(Piece {
+                        x: x - left,
+                        font: table.font,
+                        id: table.glyphs[slot(byte)],
+                        y: 0.,
+                        offset: (at - word.start) as u32,
+                    });
                 }
                 x += match bytes.get(at + 1) {
-                    Some(&next) => numbers.advances[digit(byte)][digit(next)],
-                    None => numbers.ends[digit(byte)],
+                    Some(&next) => table.advances[slot(byte)][slot(next)],
+                    None => table.ends[slot(byte)],
                 };
             }
-            Some(Word(glyphs.into(), x - left))
+            Some(Word {
+                glyphs: glyphs.into(),
+                width: x - left,
+            })
         };
-        self.faces.get_mut(&key)?.numbers = Some(numbers);
-        word
+        self.words.faces.get_mut(&key)?.digits = Some(table);
+        stitched
     }
 
-    fn spaced(&mut self, font_id: FontId, size: Pixels, ch: char) -> bool {
-        let key = (font_id, f32::from(size).to_bits());
-        if let Some(&spaced) = self.faces.get(&key).and_then(|face| face.spaced.get(&ch)) {
-            return spaced;
+    fn digit_table(&mut self, font: FontId, size: Pixels, chars: &[u8; 11]) -> Option<Box<Digits>> {
+        let mut table = Box::new(Digits {
+            font: FontId::MAX,
+            glyphs: [0; 11],
+            ends: [0.; 11],
+            advances: [[f64::NAN; 11]; 11],
+            triples: vec![false; 11 * 11 * 11].into(),
+            edges: [[0; 11]; 11],
+        });
+        for at in 0..11 {
+            let (glyphs, xs) = self.shape_digits(font, size, chars, &[at]);
+            let [(face, id, 0, true)] = glyphs[..] else {
+                return None;
+            };
+            if xs[0] != 0. || at > 0 && face != table.font {
+                return None;
+            }
+            (table.font, table.glyphs[at], table.ends[at]) = (face, id, xs[1]);
         }
-        let pair = format!(" {ch}");
-        let run = FontRun {
-            len: 1,
-            font_id,
-            font_size: size,
+        // The concatenated Lyndon words of lengths 1 and 3 in order: the least de Bruijn sequence.
+        let mut order = Vec::with_capacity(11 * 11 * 11 + 2);
+        let mut lyndon = vec![0];
+        loop {
+            if 3 % lyndon.len() == 0 {
+                order.extend_from_slice(&lyndon);
+            }
+            let period = lyndon.len();
+            while lyndon.len() < 3 {
+                lyndon.push(lyndon[lyndon.len() - period]);
+            }
+            while lyndon.last() == Some(&10) {
+                lyndon.pop();
+            }
+            match lyndon.last_mut() {
+                Some(last) => *last += 1,
+                None => break,
+            }
+        }
+        order.extend([order[0], order[1]]);
+        let (glyphs, xs) = self.shape_digits(font, size, chars, &order);
+        if glyphs.len() != order.len() {
+            return None;
+        }
+        let mut moved = vec![false; order.len()];
+        for (at, &(face, id, index, plain)) in glyphs.iter().enumerate() {
+            moved[at] |=
+                !plain || face != table.font || id != table.glyphs[order[at]] || index != at;
+            if let Some(&next) = order.get(at + 1) {
+                let step = xs[at + 1] - xs[at];
+                let advance = &mut table.advances[order[at]][next];
+                if advance.is_nan() {
+                    *advance = step;
+                } else if (*advance - step).abs() > 1e-9 {
+                    moved[at] = true;
+                    moved[at + 1] = true;
+                }
+            }
+        }
+        for (at, three) in order.windows(3).enumerate() {
+            table.triples[three[0] * 121 + three[1] * 11 + three[2]] =
+                !moved[at..at + 3].contains(&true);
+        }
+        Some(table)
+    }
+
+    fn shape_digits(
+        &mut self,
+        font: FontId,
+        size: Pixels,
+        chars: &[u8; 11],
+        slots: &[usize],
+    ) -> (Vec<Plain>, Vec<f64>) {
+        let text: String = slots.iter().map(|&slot| char::from(chars[slot])).collect();
+        let span = Span {
+            len: text.len(),
+            font,
+            size,
             letter_spacing: px(0.),
             word_spacing: px(0.),
             inset: [px(0.); 2],
             nowrap: false,
         };
-        let space = self.layout_whole(" ", size, &[run], None).width;
-        let both = self.layout_whole(
-            &pair,
-            size,
-            &[FontRun {
-                len: pair.len(),
-                ..run
-            }],
-            None,
-        );
-        let spaced = both
-            .runs
-            .iter()
-            .flat_map(|run| &run.glyphs)
-            .find(|glyph| glyph.index > 0)
-            .is_some_and(|glyph| (glyph.position.x - space).abs() < px(1e-4));
-        self.faces.entry(key).or_default().spaced.insert(ch, spaced);
-        spaced
+        let mut pens = Pens::default();
+        let line = self.shape_whole(&text, size, &[span], Some(&mut pens));
+        let glyphs = (line.glyphs.iter())
+            .map(|glyph| {
+                (
+                    glyph.font,
+                    glyph.id,
+                    glyph.index as usize,
+                    glyph.y == px(0.) && !glyph.emoji,
+                )
+            })
+            .collect();
+        (glyphs, pens.xs)
     }
 
-    fn layout_segments(
+    fn shape_whole(
         &mut self,
         text: &str,
         font_size: Pixels,
-        font_runs: &[FontRun],
-    ) -> LineLayout {
-        if self.words > 16384 {
-            self.faces.clear();
-            self.segments.clear();
-            self.words = 0;
-        }
-        let mut runs: Vec<ShapedRun> = Vec::new();
-        let (mut x, mut ascent, mut descent) = (0f32, px(0.), px(0.));
-        let mut start = 0;
-        for run in font_runs {
-            let part = &text[start..start + run.len];
-            let key = (run.font_id, f32::from(run.font_size).to_bits());
-            let mut offset = 0;
-            while offset < part.len() {
-                let space = part.as_bytes()[offset] == b' ';
-                let end = part[offset..]
-                    .bytes()
-                    .position(|byte| (byte == b' ') != space)
-                    .map_or(part.len(), |length| offset + length);
-                let segment = &part[offset..end];
-                let found = self
-                    .segments
-                    .get(&key)
-                    .and_then(|map| map.get(segment))
-                    .cloned();
-                let shaped = match found {
-                    Some(shaped) => shaped,
-                    None => {
-                        let single = FontRun {
-                            len: segment.len(),
-                            ..*run
-                        };
-                        let numbers =
-                            self.numbers(run.font_id, run.font_size, segment, 0..segment.len());
-                        let shaped = Rc::new(match numbers {
-                            Some(Word(glyphs, width)) => {
-                                let fonts = &self.fonts;
-                                let metrics = self
-                                    .metrics
-                                    .entry(run.font_id)
-                                    .or_insert_with(|| fonts[run.font_id.0].metrics());
-                                let scale = f32::from(run.font_size) / metrics.units_per_em as f32;
-                                let layout = LineLayout {
-                                    runs: vec![ShapedRun {
-                                        font_id: glyphs[0].1,
-                                        font_size: run.font_size,
-                                        glyphs: glyphs
-                                            .iter()
-                                            .map(|&(x, _, id, y, index)| ShapedGlyph {
-                                                id,
-                                                position: point(px(x as f32), px(y)),
-                                                index,
-                                                is_emoji: false,
-                                            })
-                                            .collect(),
-                                    }],
-                                    font_size: run.font_size,
-                                    width: px(width as f32),
-                                    ascent: px(0f32.max(metrics.ascent * scale)),
-                                    descent: px(0f32.max(-metrics.descent * scale)),
-                                    len: segment.len(),
-                                };
-                                #[cfg(debug_assertions)]
-                                assert!(
-                                    same_lines(
-                                        &layout,
-                                        &self.layout_whole(segment, run.font_size, &[single], None)
-                                    ),
-                                    "digits of {segment:?} shape unlike the whole segment"
-                                );
-                                layout
-                            }
-                            None => self.layout_whole(segment, run.font_size, &[single], None),
-                        });
-                        self.words += 1;
-                        self.segments
-                            .entry(key)
-                            .or_default()
-                            .insert(segment.into(), shaped.clone());
-                        shaped
-                    }
-                };
-                for shaped_run in &shaped.runs {
-                    let glyphs = match runs.last_mut() {
-                        Some(last)
-                            if last.font_id == shaped_run.font_id
-                                && last.font_size == shaped_run.font_size =>
-                        {
-                            &mut last.glyphs
-                        }
-                        _ => {
-                            runs.push(ShapedRun {
-                                font_id: shaped_run.font_id,
-                                font_size: shaped_run.font_size,
-                                glyphs: Vec::with_capacity(text.len() - start - offset),
-                            });
-                            &mut runs.last_mut().unwrap().glyphs
-                        }
-                    };
-                    glyphs.extend(shaped_run.glyphs.iter().map(|glyph| ShapedGlyph {
-                        position: point(glyph.position.x + px(x), glyph.position.y),
-                        index: glyph.index + start + offset,
-                        ..glyph.clone()
-                    }));
-                }
-                x += f32::from(shaped.width);
-                ascent = ascent.max(shaped.ascent);
-                descent = descent.max(shaped.descent);
-                offset = end;
-            }
-            start += run.len;
-        }
-        LineLayout {
-            runs,
-            font_size,
-            width: px(x),
-            ascent,
-            descent,
-            len: text.len(),
-        }
-    }
-
-    fn layout_whole(
-        &mut self,
-        text: &str,
-        font_size: Pixels,
-        font_runs: &[FontRun],
-        mut exact: Option<&mut Exact>,
-    ) -> LineLayout {
-        let mut string = CFMutableAttributedString::new();
-        let mut max_ascent = 0.0f32;
-        let mut max_descent = 0.0f32;
-
-        {
-            let mut text = text;
-            // Vary alternate run sizes to prevent cross-run ligatures. Keep the first size exact for SF
-            // tracking.
-            let mut break_ligature = false;
-            for run in font_runs {
-                let text_run;
-                (text_run, text) = text.split_at(run.len);
-
-                let utf16_start = string.char_len();
-                // `replace_str` can drop some code points, like a BOM at the start.
-                string.replace_str(&CFString::new(text_run), CFRange::init(utf16_start, 0));
-                let utf16_end = string.char_len();
-
-                let length = utf16_end - utf16_start;
-                let cf_range = CFRange::init(utf16_start, length);
-                let fonts = &self.fonts;
-                let font_metrics = *self
-                    .metrics
-                    .entry(run.font_id)
-                    .or_insert_with(|| fonts[run.font_id.0].metrics());
-                let font_scale = f32::from(run.font_size) / font_metrics.units_per_em as f32;
-                max_ascent = max_ascent.max(font_metrics.ascent * font_scale);
-                max_descent = max_descent.max(-font_metrics.descent * font_scale);
-
-                let font_size = if break_ligature {
-                    px(f32::from(run.font_size).next_up())
-                } else {
-                    run.font_size
-                };
-                let font = self.sized(run.font_id, font_size.into());
-                unsafe {
-                    string.set_attribute(cf_range, kCTFontAttributeName, &font);
-                }
-                if length > 0 {
-                    break_ligature = !break_ligature;
-                }
-            }
-        }
-        let line = CTLine::new_with_attributed_string(string.as_concrete_TypeRef());
-        let glyph_runs = line.glyph_runs();
-        let mut runs = <Vec<ShapedRun>>::with_capacity(glyph_runs.len() as usize);
-        let mut index_converter = StringIndexConverter::new(text);
-        let mut shift = 0f32;
-        let mut emoji_end = None;
-        let mut pen = 0f64;
-        for run in glyph_runs.into_iter() {
-            let mut first = exact.is_some();
-            let attributes = run.attributes().unwrap();
-            let font = unsafe {
-                attributes
-                    .get(kCTFontAttributeName)
-                    .downcast::<CTFont>()
-                    .unwrap()
+        spans: &[Span],
+        mut pens: Option<&mut Pens>,
+    ) -> Line {
+        let string =
+            CFMutableAttributedString::new(None, 0).expect("CFAttributedStringCreateMutable");
+        let (mut ascent, mut descent) = (0f32, 0f32);
+        let (mut rest, mut nudge) = (text, false);
+        for span in spans {
+            let piece;
+            (piece, rest) = rest.split_at(span.len);
+            let start = string.length();
+            // SAFETY: the string is live and the range is its end.
+            // WARNING: a CFString drops some code points, like a leading byte order mark, so measure the length after the append.
+            unsafe {
+                CFMutableAttributedString::replace_string(
+                    Some(&string),
+                    CFRange::new(start, 0),
+                    Some(&CFString::from_str(piece)),
+                )
             };
-            let shaped_size = font.pt_size() as f32;
-            let run_size = font_runs
-                .iter()
-                .map(|run| run.font_size)
-                .min_by(|a, b| {
-                    (f32::from(*a) - shaped_size)
-                        .abs()
-                        .total_cmp(&(f32::from(*b) - shaped_size).abs())
-                })
-                .unwrap_or(font_size);
+            let range = CFRange::new(start, string.length() - start);
+            let units = self.face(span.font).units();
+            let scale = span.size.0 / units.per_em as f32;
+            ascent = ascent.max(units.ascent * scale);
+            descent = descent.max(-units.descent * scale);
+            // Alternate spans shape a hair larger so CoreText keeps them apart and forms no ligatures across
+            // them. The first stays exact for the tracking of SF.
+            let size = if nudge {
+                span.size.0.next_up()
+            } else {
+                span.size.0
+            };
+            let font = self.sized(span.font, size);
+            // SAFETY: the range is inside the string, and the value is a font.
+            unsafe {
+                CFMutableAttributedString::set_attribute(
+                    Some(&string),
+                    range,
+                    Some(kCTFontAttributeName),
+                    Some(&font),
+                )
+            };
+            if range.length > 0 {
+                nudge = !nudge;
+            }
+        }
+        // SAFETY: CoreText lays out a live attributed string, and its runs are CTRuns with font attributes.
+        let line = unsafe { CTLine::with_attributed_string(&string) };
+        let runs = unsafe { line.glyph_runs() };
+        let runs = unsafe { runs.cast_unchecked::<CTRun>() };
+        let mut glyphs = Vec::with_capacity(unsafe { line.glyph_count() } as usize);
+        let mut scratch = mem::take(&mut self.scratch);
+        let mut cursor = Utf16Cursor {
+            text,
+            utf8: 0,
+            utf16: 0,
+        };
+        let (mut shift, mut emoji_end, mut pen) = (0f32, None::<f32>, 0f64);
+        for run in runs.iter() {
+            let font = unsafe {
+                let attributes = run.attributes();
+                let attributes = attributes.cast_unchecked::<CFString, CFType>();
+                CFRetained::cast_unchecked::<CTFont>(
+                    attributes.get(kCTFontAttributeName).expect("run font"),
+                )
+            };
+            let run_size = nearest(spans, unsafe { font.size() } as f32, font_size);
             if self.natives.len() >= 512 {
                 self.natives.clear();
             }
-            let key = font.as_concrete_TypeRef() as usize;
-            let font_id = match self.natives.get(&key) {
-                Some((_, font_id)) => *font_id,
+            let key = CFRetained::as_ptr(&font).as_ptr() as usize;
+            let id = match self.natives.get(&key) {
+                Some(&(_, id)) => id,
                 None => {
-                    let font_id = self.id_for_native_font(font.clone());
-                    self.natives.insert(key, (font.clone(), font_id));
-                    font_id
+                    let id = self.native(&font);
+                    self.natives.insert(key, (font.clone(), id));
+                    id
                 }
             };
-            let is_emoji = self.is_emoji(font_id);
+            let emoji = self.face(id).emoji;
             // The emoji font that system fonts fall back to has wider advances than Chromium's.
-            let doubled = is_emoji
-                .then(|| {
-                    core_text::font::new_from_name(
-                        "AppleColorEmoji",
-                        f64::from(f32::from(run_size)) * 2.,
-                    )
-                    .ok()
-                })
-                .flatten();
-
-            let glyphs = match runs.last_mut() {
-                Some(run) if run.font_id == font_id && run.font_size == run_size => &mut run.glyphs,
-                _ => {
-                    runs.push(ShapedRun {
-                        font_id,
-                        font_size: run_size,
-                        glyphs: Vec::with_capacity(run.glyph_count().try_into().unwrap_or(0)),
-                    });
-                    &mut runs.last_mut().unwrap().glyphs
+            let wide = emoji.then(|| unsafe {
+                CTFont::with_name(
+                    &CFString::from_static_str("AppleColorEmoji"),
+                    f64::from(run_size.0) * 2.,
+                    ptr::null(),
+                )
+            });
+            let count = unsafe { run.glyph_count() } as usize;
+            let all = CFRange::new(0, 0);
+            scratch.ids.resize(count, 0);
+            scratch.points.resize(count, CGPoint::ZERO);
+            scratch.indices.resize(count, 0);
+            // SAFETY: each buffer holds `count` values.
+            unsafe {
+                if count > 0 {
+                    run.glyphs(all, NonNull::new_unchecked(scratch.ids.as_mut_ptr()));
+                    run.positions(all, NonNull::new_unchecked(scratch.points.as_mut_ptr()));
+                    run.string_indices(all, NonNull::new_unchecked(scratch.indices.as_mut_ptr()));
                 }
-            };
-            for ((&glyph_id, position), &glyph_utf16_index) in run
-                .glyphs()
-                .iter()
-                .zip(run.positions().iter())
-                .zip(run.string_indices().iter())
-            {
-                index_converter.seek_to_utf16_index(usize::try_from(glyph_utf16_index).unwrap());
+            }
+            let mut first = true;
+            for k in 0..count {
+                cursor.seek(scratch.indices[k] as usize);
+                let at = scratch.points[k];
                 if let Some(end) = emoji_end.take() {
-                    shift = end - position.x as f32;
+                    shift = end - at.x as f32;
                 }
-                let x = position.x as f32 + shift;
-                if let Some((xs, starts)) = &mut exact {
+                let x = at.x as f32 + shift;
+                if let Some(pens) = pens.as_deref_mut() {
                     if mem::take(&mut first) {
-                        starts.push((index_converter.utf8_index, pen));
+                        pens.starts.push((cursor.utf8, pen));
                     }
-                    xs.push(position.x + f64::from(shift));
+                    pens.xs.push(at.x + f64::from(shift));
                 }
-                glyphs.push(ShapedGlyph {
-                    id: GlyphId(glyph_id as u32),
-                    position: point(x, position.y as f32).map(px),
-                    index: index_converter.utf8_index,
-                    is_emoji,
+                let mut id_raw = scratch.ids[k];
+                glyphs.push(Glyph {
+                    x: px(x),
+                    y: px(at.y as f32),
+                    size: run_size,
+                    font: id,
+                    index: cursor.utf8 as u32,
+                    id: id_raw,
+                    emoji,
                 });
-                if let Some(doubled) = &doubled {
-                    // SAFETY: the pointer is to one glyph, and the advances can be null.
-                    let drawn = unsafe {
-                        doubled.get_advances_for_glyphs(
-                            kCTFontOrientationDefault,
-                            &glyph_id,
-                            std::ptr::null_mut(),
+                if let Some(wide) = &wide {
+                    // SAFETY: one glyph; the advances out pointer may be null.
+                    let mut drawn = unsafe {
+                        wide.advances_for_glyphs(
+                            CTFontOrientation::Default,
+                            NonNull::from(&mut id_raw),
+                            ptr::null_mut(),
                             1,
                         )
                     } as f32;
                     // Where CoreText enlarges emoji, Chromium's advance is one device pixel less.
-                    let drawn = if drawn > f32::from(run_size) * 2. {
-                        drawn - 1.
-                    } else {
-                        drawn
-                    };
+                    if drawn > run_size.0 * 2. {
+                        drawn -= 1.;
+                    }
                     emoji_end = Some(x + drawn / 2.);
                 }
             }
-            if exact.is_some() {
-                pen += run.get_typographic_bounds().width;
+            if pens.is_some() {
+                // SAFETY: the null pointers ask for the width only.
+                pen += unsafe {
+                    run.typographic_bounds(all, ptr::null_mut(), ptr::null_mut(), ptr::null_mut())
+                };
             }
         }
-        let typographic_bounds = line.get_typographic_bounds();
-        if let Some((xs, _)) = exact {
-            xs.push(typographic_bounds.width + f64::from(shift));
+        self.scratch = scratch;
+        // SAFETY: the null pointers ask for the width only.
+        let width =
+            unsafe { line.typographic_bounds(ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) };
+        if let Some(pens) = pens {
+            pens.xs.push(width + f64::from(shift));
         }
-        LineLayout {
-            runs,
-            font_size,
-            width: px(emoji_end.unwrap_or(typographic_bounds.width as f32 + shift)),
-            ascent: max_ascent.into(),
-            descent: max_descent.into(),
+        Line {
+            glyphs,
+            width: px(emoji_end.unwrap_or(width as f32 + shift)),
+            ascent: px(ascent),
+            descent: px(descent),
             len: text.len(),
+            font_size,
+            sorted: false,
         }
     }
 }
 
-#[cfg(debug_assertions)]
-fn same_lines(a: &LineLayout, b: &LineLayout) -> bool {
-    let glyphs = |layout: &LineLayout| {
-        layout
-            .runs
-            .iter()
-            .flat_map(|run| {
-                run.glyphs
-                    .iter()
-                    .map(move |glyph| (run.font_id, run.font_size, glyph.clone()))
-            })
-            .collect::<Vec<_>>()
-    };
-    let (a_glyphs, b_glyphs) = (glyphs(a), glyphs(b));
-    a.runs.len() == b.runs.len()
-        && (a.width - b.width).abs() < px(1e-3)
-        && (a.ascent, a.descent) == (b.ascent, b.descent)
-        && a_glyphs.len() == b_glyphs.len()
-        && a_glyphs
-            .iter()
-            .zip(&b_glyphs)
-            .all(|((a_font, a_size, a), (b_font, b_size, b))| {
-                (a_font, a_size, a.id, a.index, a.is_emoji, a.position.y)
-                    == (b_font, b_size, b.id, b.index, b.is_emoji, b.position.y)
-                    && (a.position.x - b.position.x).abs() < px(1e-3)
-            })
+fn installed(family: &str) -> Option<Vec<CFRetained<CTFont>>> {
+    let name = CFString::from_str(family);
+    // SAFETY: a descriptor and collection query with valid attributes.
+    unsafe {
+        let attributes =
+            CFDictionary::<CFString, CFType>::from_slices(&[kCTFontFamilyNameAttribute], &[&name]);
+        let query = CTFontDescriptor::with_attributes(attributes.as_opaque());
+        let collection = CTFontCollection::with_font_descriptors(
+            Some(CFArray::from_objects(&[&*query]).as_opaque()),
+            None,
+        );
+        let found = collection.matching_font_descriptors()?;
+        let found = found.cast_unchecked::<CTFontDescriptor>();
+        Some(
+            found
+                .iter()
+                .map(|descriptor| CTFont::with_font_descriptor(&descriptor, 16., ptr::null()))
+                .collect(),
+        )
+        .filter(|faces: &Vec<_>| !faces.is_empty())
+    }
 }
 
-#[derive(Debug, Clone)]
-struct StringIndexConverter<'a> {
+fn usable<'a>(
+    faces: impl Iterator<Item = CFRetained<CTFont>> + 'a,
+    features: &'a [(String, u32)],
+) -> impl Iterator<Item = (CFRetained<CTFont>, String)> + 'a {
+    let mut seen = Vec::<String>::new();
+    faces.filter_map(move |face| {
+        let face = open_type::with_features(&face, features);
+        // SAFETY: plain CoreText queries.
+        let traits = unsafe { face.traits() };
+        let traits = unsafe { traits.cast_unchecked::<CFString, CFType>() };
+        // SAFETY: the keys are CoreText constants.
+        let keys = unsafe {
+            [
+                kCTFontSymbolicTrait,
+                kCTFontWidthTrait,
+                kCTFontWeightTrait,
+                kCTFontSlantTrait,
+            ]
+        };
+        if !keys.iter().all(|key| {
+            traits
+                .get(key)
+                .is_some_and(|value| value.downcast::<CFNumber>().is_ok())
+        }) {
+            return None;
+        }
+        let name = unsafe { face.post_script_name() }.to_string();
+        // Duplicates drop only within one family load, so a second load never ends up without faces.
+        if seen.contains(&name) {
+            return None;
+        }
+        seen.push(name.clone());
+        Some((face, name))
+    })
+}
+
+fn pieces(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        let first = *bytes.get(start)?;
+        let len = bytes[start..]
+            .iter()
+            .position(|&byte| (byte == b' ') != (first == b' '))
+            .unwrap_or(bytes.len() - start);
+        let piece = (start, &text[start..start + len]);
+        start += len;
+        Some(piece)
+    })
+}
+
+fn nearest(spans: &[Span], shaped: f32, fallback: Pixels) -> Pixels {
+    spans
+        .iter()
+        .map(|span| span.size)
+        .min_by(|a, b| (a.0 - shaped).abs().total_cmp(&(b.0 - shaped).abs()))
+        .unwrap_or(fallback)
+}
+
+/// Maps UTF-16 offsets from CoreText to UTF-8 offsets, walking either way.
+struct Utf16Cursor<'a> {
     text: &'a str,
-    utf8_index: usize,
-    utf16_index: usize,
+    utf8: usize,
+    utf16: usize,
 }
 
-impl<'a> StringIndexConverter<'a> {
-    fn new(text: &'a str) -> Self {
-        Self {
-            text,
-            utf8_index: 0,
-            utf16_index: 0,
-        }
-    }
-
-    fn seek_to_utf16_index(&mut self, utf16_target: usize) {
-        while self.utf16_index > utf16_target
-            && let Some(c) = self.text[..self.utf8_index].chars().next_back()
+impl Utf16Cursor<'_> {
+    fn seek(&mut self, utf16: usize) {
+        while self.utf16 > utf16
+            && let Some(ch) = self.text[..self.utf8].chars().next_back()
         {
-            self.utf8_index -= c.len_utf8();
-            self.utf16_index -= c.len_utf16();
+            self.utf8 -= ch.len_utf8();
+            self.utf16 -= ch.len_utf16();
         }
-        for (offset, c) in self.text[self.utf8_index..].char_indices() {
-            if self.utf16_index >= utf16_target {
-                self.utf8_index += offset;
+        for ch in self.text[self.utf8..].chars() {
+            if self.utf16 >= utf16 {
                 return;
             }
-            self.utf16_index += c.len_utf16();
+            self.utf8 += ch.len_utf8();
+            self.utf16 += ch.len_utf16();
         }
-        self.utf8_index = self.text.len();
     }
 }
 
-fn font_kit_metrics(metrics: Metrics) -> FontMetrics {
-    FontMetrics {
-        units_per_em: metrics.units_per_em,
-        ascent: metrics.ascent,
-        descent: metrics.descent,
-        line_gap: metrics.line_gap,
-        cap_height: metrics.cap_height,
-        x_height: metrics.x_height,
-        tall_ascent: false,
-        em_ascent: metrics.ascent / (metrics.ascent - metrics.descent),
-        bounding_box: bounds_from_rect(metrics.bounding_box),
+/// A shaped glyph of digits: face, glyph, source index, and whether it sits on the baseline and is no emoji.
+type Plain = (FontId, GlyphId, usize, bool);
+
+#[derive(Default)]
+struct Pens {
+    xs: Vec<f64>,
+    starts: Vec<(usize, f64)>,
+}
+
+#[derive(Default)]
+struct Words {
+    faces: FxHashMap<(FontId, u32), FaceWords>,
+    pieces: FxHashMap<(FontId, u32), FxHashMap<Box<str>, Rc<Line>>>,
+    count: usize,
+    parts: Vec<Part>,
+}
+
+impl Words {
+    fn trim(&mut self, pieces: bool) {
+        if self.count > 16384 {
+            self.faces.clear();
+            if pieces {
+                self.pieces.clear();
+            }
+            self.count = 0;
+        }
     }
 }
 
-fn bounds_from_rect(rect: RectF) -> Bounds<f32> {
-    Bounds {
-        origin: point(rect.origin_x(), rect.origin_y()),
-        size: size(rect.width(), rect.height()),
+#[derive(Default)]
+struct FaceWords {
+    /// By text, then by whether text comes before (bit 0) and after (bit 1) it in its span.
+    words: FxHashMap<Box<str>, [Option<Rc<Word>>; 4]>,
+    spaced: FxHashMap<char, bool>,
+    misses: u32,
+    digits: Option<Box<Digits>>,
+}
+
+struct Digits {
+    font: FontId,
+    glyphs: [GlyphId; 11],
+    ends: [f64; 11],
+    advances: [[f64; 11]; 11],
+    triples: Box<[bool]>,
+    /// Pairs at word edges: 0 unknown, 1 stitch, 2 shape.
+    edges: [[u8; 11]; 11],
+}
+
+struct Word {
+    glyphs: Box<[Piece]>,
+    width: f64,
+}
+
+#[derive(Clone, Copy)]
+struct Piece {
+    x: f64,
+    font: FontId,
+    id: GlyphId,
+    y: f32,
+    offset: u32,
+}
+
+impl Piece {
+    fn glyph(&self, size: Pixels, pen: f64, start: usize) -> Glyph {
+        Glyph {
+            x: px((pen + self.x) as f32),
+            y: px(self.y),
+            size,
+            font: self.font,
+            index: start as u32 + self.offset,
+            id: self.id,
+            emoji: false,
+        }
     }
 }
 
-fn bounds_from_rect_i32(rect: RectI) -> Bounds<DevicePixels> {
-    Bounds {
-        origin: point(DevicePixels(rect.origin_x()), DevicePixels(rect.origin_y())),
-        size: size(DevicePixels(rect.width()), DevicePixels(rect.height())),
-    }
+struct Part {
+    span: usize,
+    size: Pixels,
+    range: Range<usize>,
+    around: u8,
+    word: Option<Rc<Word>>,
 }
 
-fn size_from_vector2f(vec: Vector2F) -> Size<f32> {
-    size(vec.x(), vec.y())
-}
-
-fn font_kit_weight(value: FontWeight) -> FontkitWeight {
-    FontkitWeight(value.0)
-}
-
-fn font_kit_style(style: FontStyle) -> FontkitStyle {
-    match style {
-        FontStyle::Normal => FontkitStyle::Normal,
-        FontStyle::Italic => FontkitStyle::Italic,
-        FontStyle::Oblique => FontkitStyle::Oblique,
-    }
+fn same(a: &Line, b: &Line) -> bool {
+    (a.width - b.width).abs() < px(1e-3)
+        && (a.ascent, a.descent) == (b.ascent, b.descent)
+        && a.glyphs.len() == b.glyphs.len()
+        && a.glyphs.iter().zip(&b.glyphs).all(|(a, b)| {
+            (a.font, a.size, a.id, a.index, a.emoji, a.y)
+                == (b.font, b.size, b.id, b.index, b.emoji, b.y)
+                && (a.x - b.x).abs() < px(1e-3)
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn name(text: &TextSystem, id: FontId) -> String {
+        let book = text.0.borrow();
+        book.names
+            .iter()
+            .find(|(_, kept)| **kept == id)
+            .unwrap()
+            .0
+            .clone()
+    }
+
     #[test]
     fn system_fonts_load_once_per_process() {
         let names = |text: &TextSystem, weight: f32| {
-            let font = Font {
-                weight: crate::FontWeight(weight),
-                ..crate::text::font(".SystemUIFont")
-            };
-            let id = text.font_id(&font).unwrap();
-            text.0.borrow().postscript_names_by_font_id[&id].clone()
+            let id = text
+                .font(&Font {
+                    weight,
+                    ..Font::new(".SystemUIFont")
+                })
+                .unwrap();
+            name(text, id)
         };
-        let [first, second] = [TextSystem::new(), TextSystem::new()];
+        let [first, second] = [TextSystem::default(), TextSystem::default()];
         let bold = names(&first, 600.);
         assert!(bold.ends_with("#wght600"), "{bold}");
         assert_eq!(
             [names(&second, 400.), names(&second, 600.)],
             [names(&first, 400.), bold]
         );
-        let missing = crate::text::font("No Such Family h2o");
-        assert!(first.font_id(&missing).is_err() && second.font_id(&missing).is_err());
-        let families = SYSTEM_FAMILIES.lock().unwrap();
-        assert!(families.iter().any(|(key, faces)| {
-            key.0 == "No Such Family h2o" && faces.get().is_some_and(Option::is_none)
-        }));
-        let system = families
+        let missing = Font::new("No Such Family h2o");
+        assert!(first.font(&missing).is_none() && second.font(&missing).is_none());
+        let faces = SYSTEM_FACES.0.lock().unwrap();
+        assert!(
+            faces
+                .iter()
+                .any(|(key, faces)| key.0 == "No Such Family h2o"
+                    && faces.get().is_some_and(Option::is_none))
+        );
+        let system = faces
             .iter()
             .find(|(key, _)| key.0 == ".AppleSystemUIFont")
             .unwrap();
-        let face = &system.1.get().unwrap().as_ref().unwrap()[0].0;
-        let shared = second.0.borrow().fonts.iter().any(|font| {
-            font.native_font().as_concrete_TypeRef() == face.native_font().as_concrete_TypeRef()
-        });
+        let face = &system.1.get().unwrap().as_ref().unwrap()[0].0.0;
+        let shared = second
+            .0
+            .borrow()
+            .faces
+            .iter()
+            .any(|kept| CFRetained::as_ptr(&kept.font) == CFRetained::as_ptr(face));
         assert!(shared, "the second text system uses the process's faces");
     }
 
     #[test]
     fn fonts_from_memory_stay_with_their_text_system() {
         let bytes = std::fs::read("/System/Library/Fonts/Supplemental/Chalkduster.ttf").unwrap();
-        let text = TextSystem::new();
-        text.add_fonts(vec![Cow::Owned(bytes)]).unwrap();
-        let id = text.font_id(&crate::text::font("Chalkduster")).unwrap();
-        assert!(text.0.borrow().local.contains(&id));
+        let text = TextSystem::default();
+        text.add_font(bytes).unwrap();
+        assert!(text.families().iter().any(|family| family == "Chalkduster"));
+        let id = text.font(&Font::new("Chalkduster")).unwrap();
+        assert!(text.0.borrow().face(id).local);
         assert!(
-            !SYSTEM_FAMILIES
+            !SYSTEM_FACES
+                .0
                 .lock()
                 .unwrap()
                 .keys()
                 .any(|key| key.0 == "Chalkduster")
         );
+    }
+
+    #[test]
+    fn css_matching_prefers_the_spec_order() {
+        let faces = [
+            (400., FontStyle::Normal, 1.),
+            (700., FontStyle::Normal, 1.),
+            (300., FontStyle::Italic, 1.),
+        ];
+        assert_eq!(best(&faces, 400., FontStyle::Normal), Some(0));
+        assert_eq!(best(&faces, 600., FontStyle::Normal), Some(1));
+        assert_eq!(best(&faces, 500., FontStyle::Normal), Some(0));
+        assert_eq!(best(&faces, 900., FontStyle::Italic), Some(2));
+        let narrow = [
+            (400., FontStyle::Normal, 0.75),
+            (400., FontStyle::Normal, 1.25),
+        ];
+        assert_eq!(best(&narrow, 400., FontStyle::Normal), Some(0));
+        assert_eq!(
+            (css_weight(0.), css_weight(0.23), css_weight(-1.)),
+            (400., 500., 100.)
+        );
+        assert_eq!((css_stretch(0.), css_stretch(-1.)), (1., 0.5));
+        assert_eq!(find_index(0.1, &KIT_WEIGHTS), 3.5);
+    }
+
+    #[test]
+    fn word_and_digit_caches_shape_like_whole_lines() {
+        let text = TextSystem::default();
+        let id = text.font(&Font::new("Helvetica")).unwrap();
+        let span = |len| Span {
+            len,
+            font: id,
+            size: px(16.),
+            letter_spacing: px(0.),
+            word_spacing: px(0.),
+            inset: [px(0.); 2],
+            nowrap: false,
+        };
+        for sample in [
+            "Hello world, again",
+            "Type 1234 and 5678 then 90",
+            "AV Wa To. fi fl",
+        ] {
+            let line = text.shape(sample, px(16.), &[span(sample.len())]);
+            for _ in 0..40 {
+                let again = text.shape(sample, px(16.), &[span(sample.len())]);
+                assert!(same(&line, &again), "{sample}");
+            }
+            let whole =
+                text.0
+                    .borrow_mut()
+                    .shape_whole(sample, px(16.), &[span(sample.len())], None);
+            assert!(same(&line, &whole), "{sample}");
+        }
+        assert!(text.0.borrow().words.count > 0);
     }
 }

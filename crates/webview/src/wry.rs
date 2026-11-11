@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
+    fmt::Write,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -146,8 +147,11 @@ impl Browser {
                             .map(|home| std::path::PathBuf::from(home).join(".local/share"))
                     })
                     .context("User data directory is unavailable")?;
-                root.join("apps/webview")
-                    .join(format!("{:x}", Sha256::digest(session_key.as_bytes())))
+                let mut hash = String::with_capacity(64);
+                for byte in Sha256::digest(session_key.as_bytes()) {
+                    write!(hash, "{byte:02x}")?;
+                }
+                root.join("apps/webview").join(hash)
             };
             std::fs::create_dir_all(&directory)?;
             let session = Rc::new(Session {

@@ -11,7 +11,7 @@ use crate::{
     dom::Document,
     style::{self, ComputedStyles},
 };
-use renderer::{Bounds, Child, MouseButton, SharedString, point, px, relative, rgba, size};
+use renderer::{Child, Color, Rect, SharedString, point, px, relative, size};
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 
 pub(super) struct Build<'a> {
@@ -403,7 +403,7 @@ fn uses(
     found.then(|| hasher.finish())
 }
 
-fn scrolled(handle: Option<&renderer::ScrollHandle>) -> Option<[bool; 2]> {
+fn scrolled(handle: Option<&renderer::ScrollRef>) -> Option<[bool; 2]> {
     handle.map(|handle| {
         let max = handle.max_offset();
         [max.x > px(0.5), max.y > px(0.5)]
@@ -417,7 +417,7 @@ fn pictured(
     hashed((
         image.map(|image| {
             let size = image.size();
-            [size.width.0, size.height.0]
+            [size.width, size.height]
         }),
         vector.map(|(_, natural)| natural.map(f32::to_bits)),
     ))
@@ -617,7 +617,7 @@ pub(super) fn scroller(
     doc: &Document,
     styles: &ComputedStyles,
     mut ancestors: impl Iterator<Item = usize>,
-    handles: &rustc_hash::FxHashMap<usize, renderer::ScrollHandle>,
+    handles: &rustc_hash::FxHashMap<usize, renderer::ScrollRef>,
 ) -> usize {
     ancestors
         .find(|&ancestor| {
@@ -704,7 +704,7 @@ impl SvgSource<'_> {
                 .then(|| self.shape(element))
                 .flatten()
                 .map_or([0., 0., self.view[0], self.view[1]], |(rect, _)| rect);
-            let bounds = Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
+            let bounds = Rect::new(point(px(x), px(y)), size(px(w), px(h)));
             attrs.push((
                 "transform",
                 super::effects::transform(own, units, bounds, None).map_or(String::new(), |m| {
@@ -1185,7 +1185,7 @@ pub(super) fn repaint(build: &Build<'_>, id: usize) -> Option<renderer::Node> {
 
 #[cfg(debug_assertions)]
 pub(super) fn same_in_place(fresh: &Child, placed: &[renderer::Node], tree: &renderer::Tree) {
-    fn find(child: &Child, id: renderer::ElementId) -> Option<&renderer::Node> {
+    fn find(child: &Child, id: renderer::NodeKey) -> Option<&renderer::Node> {
         let Child::Node(node) = child else {
             return None;
         };
@@ -1580,7 +1580,7 @@ fn create(
     let line_height = parsed.line_height;
     let above = || {
         f32::from(text.baseline(
-            text.resolve_font(face),
+            text.face(face),
             px(units.font.em),
             px(line_height),
             pixel_ratio,
@@ -1654,8 +1654,8 @@ fn create(
                     super::input::paint_caret(
                         &painter,
                         [id, 0, 0],
-                        Bounds::new(bounds.origin, size(px(1.), px(line_height))),
-                        rgba(ink),
+                        Rect::new(bounds.origin, size(px(1.), px(line_height))),
+                        Color::hex(ink),
                         window,
                     );
                 }
@@ -1725,8 +1725,8 @@ fn create(
     let line_justify = match (style.get(Prop::TEXT_ALIGN), rtl) {
         (Some("right" | "-webkit-right"), _)
         | (Some("end"), false)
-        | (None | Some("start"), true) => Some(renderer::JustifyContent::End),
-        (Some("center" | "-webkit-center"), _) => Some(renderer::JustifyContent::Center),
+        | (None | Some("start"), true) => Some(renderer::AlignContent::End),
+        (Some("center" | "-webkit-center"), _) => Some(renderer::AlignContent::Center),
         _ => None,
     };
     let line_align = Some(renderer::AlignItems::Baseline);
@@ -1859,16 +1859,16 @@ fn create(
             };
             {
                 let text = el.text_style();
-                text.letter_spacing = Some(parsed.spacing[0]);
-                text.word_spacing = Some(parsed.spacing[1]);
-                text.font_smoothing = Some(!parsed.smoothing);
-                text.text_indent = Some(px(style
+                text.set_letter_spacing(parsed.spacing[0]);
+                text.set_word_spacing(parsed.spacing[1]);
+                text.set_font_smoothing(!parsed.smoothing);
+                text.set_text_indent(px(style
                     .get(Prop::TEXT_INDENT)
                     .and_then(|value| units.resolve(value, containing[0]))
                     .unwrap_or(0.)));
             }
             if face.style != renderer::FontStyle::Normal {
-                el.text_style().font_style = Some(face.style);
+                el.text_style().set_font_style(face.style);
             }
             el
         }
@@ -1949,7 +1949,7 @@ fn create(
                 .as_ref()
                 .map(|image| {
                     let size = image.size();
-                    [u32::from(size.width) as f32, u32::from(size.height) as f32]
+                    [size.width as u32 as f32, size.height as u32 as f32]
                 })
                 .or(vector.as_ref().map(|(_, natural)| *natural)),
         )
@@ -2015,7 +2015,7 @@ fn create(
                 alt.clone(),
                 Some(vec![style::text_run(style, &units, alt.len())]),
             );
-            text.text_style().float = Some(px(16.));
+            text.text_style().set_float(px(16.));
             el.child(
                 renderer::node()
                     .min_h(px(16.))
@@ -2027,14 +2027,17 @@ fn create(
                 renderer::canvas(
                     |_, _| (),
                     |bounds, _, window| {
-                        window.paint_quad(renderer::quad(
+                        window.draw_box(
                             bounds,
                             px(0.),
-                            renderer::transparent_black(),
-                            px(1.),
-                            rgba(0xc0c0c0ff),
-                            renderer::BorderStyle::Solid,
-                        ));
+                            renderer::Color::TRANSPARENT,
+                            renderer::Border {
+                                widths: px(1.).into(),
+                                color: Color::hex(0xc0c0c0ff),
+                                style: renderer::BorderStyle::Solid,
+                                sides: 0,
+                            },
+                        );
                         if bounds.size.width >= px(18.) && bounds.size.height >= px(18.) {
                             paint_broken_icon(bounds.origin + point(px(2.), px(2.)), window);
                         }
@@ -2316,8 +2319,8 @@ fn create(
             .pt(px(2.))
             .pb(px(2.))
             .border(px(1.))
-            .border_color(rgba(edge << 8 | 0xff))
-            .bg(rgba(fill << 8 | 0xff))
+            .border_color(Color::hex(edge << 8 | 0xff))
+            .bg(Color::hex(fill << 8 | 0xff))
             .child("Choose File");
         button.style().corner_radii = renderer::Corners::all(px(2.).into()).into();
         el = el
@@ -2327,13 +2330,13 @@ fn create(
             .child(button)
             .child(renderer::node().whitespace_nowrap().child("No file chosen"));
         if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
-            let face = text.resolve_font(&parsed.face);
+            let face = text.face(&parsed.face);
             let em = px(units.font.em);
             let width = |label: &str| {
                 let run = renderer::TextRun {
                     len: label.len(),
                     font: parsed.face.clone(),
-                    color: renderer::black(),
+                    color: renderer::Color::BLACK,
                     background_color: None,
                     underline: None,
                     strikethrough: None,
@@ -2343,10 +2346,10 @@ fn create(
                     inset: Default::default(),
                     nowrap: false,
                 };
-                f32::from(text.shape_line(label, em, &[run], None).width)
+                f32::from(text.shape_line(label, em, &run).line.width)
             };
             let zero = text
-                .ch_advance(face, em)
+                .advance(face, em, '0')
                 .map_or(units.font.em / 2., f32::from);
             let content = width("Choose File") + 16. + 4. + width("No file chosen");
             el = el.w(px(layout_ceil((zero * 34.).max(content), pixel_ratio)));
@@ -2357,9 +2360,7 @@ fn create(
         if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
             let label = node.attrs.get("value").map_or("", String::as_str);
             let run = style::text_run(style, &units, label.len());
-            let width = text
-                .shape_line(label, px(units.font.em), &[run], None)
-                .width;
+            let width = text.shape_line(label, px(units.font.em), &run).line.width;
             el = el.w(px(layout_ceil(f32::from(width) + padding, pixel_ratio)));
         }
         if style.get(Prop::HEIGHT).is_none_or(|value| value == "auto") {
@@ -2387,12 +2388,12 @@ fn create(
     }
     if editable && node.tag != "textarea" {
         let above = f32::from(text.baseline(
-            text.resolve_font(&parsed.face),
+            text.face(&parsed.face),
             px(units.font.em),
             px(units.font.lh),
             pixel_ratio,
         ));
-        el.style().justify_content = Some(renderer::JustifyContent::Center);
+        el.style().justify_content = Some(renderer::AlignContent::Center);
         el = el.child(
             renderer::node()
                 .w(px(0.))
@@ -2417,19 +2418,19 @@ fn create(
         let text_color = style
             .get(Prop::COLOR)
             .and_then(style::color)
-            .map(|(c, a)| rgba((c << 8) | a as u32))
-            .unwrap_or(renderer::black());
+            .map(|(c, a)| Color::hex((c << 8) | a as u32))
+            .unwrap_or(renderer::Color::BLACK);
         let caret_color = style
             .get(Prop::CARET_COLOR)
             .and_then(style::color)
-            .map(|(color, alpha)| rgba((color << 8) | alpha as u32))
+            .map(|(color, alpha)| Color::hex((color << 8) | alpha as u32))
             .unwrap_or(text_color);
         let placeholder_color = styles
             .text_pseudos
             .get(&id)
             .and_then(|pseudos| style::color(pseudos[3].as_ref()?.get(Prop::COLOR)?))
-            .map(|(color, alpha)| rgba((color << 8) | alpha as u32))
-            .unwrap_or(rgba(0x757575ff));
+            .map(|(color, alpha)| Color::hex((color << 8) | alpha as u32))
+            .unwrap_or(Color::hex(0x757575ff));
         let single_line = node.tag != "textarea";
         let padding = units.edges(style, style::PADDING, containing[0]);
         let empty = text.is_empty();
@@ -2486,44 +2487,42 @@ fn create(
             .line_height(px(line_height));
         clip.style().restrict_scroll_to_axis = true;
         clip.style().overscroll = overscroll(style);
-        el = el
-            .cursor(renderer::CursorStyle::IBeam)
-            .child(if single_line {
-                let line = renderer::node().flex_shrink_0().child(field);
-                clip.top(px(padding[0]))
-                    .right(px(padding[1]))
-                    .bottom(px(padding[2]))
-                    .left(px(padding[3]))
-                    .overflow_hidden()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .whitespace_nowrap()
-                    .child(match line_justify {
-                        Some(renderer::JustifyContent::End) => line.ml_auto(),
-                        Some(renderer::JustifyContent::Center) => line.ml_auto().mr_auto(),
-                        _ => line,
-                    })
-            } else {
-                clip.style().overflow.x = renderer::Overflow::Scroll;
-                clip.top_0()
-                    .right(px(0.))
-                    .bottom(px(0.))
-                    .left_0()
-                    .pt(px(padding[0]))
-                    .pr(px(padding[1]))
-                    .pb(px(padding[2]))
-                    .pl(px(padding[3]))
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .child(field)
-            });
+        el = el.cursor(renderer::Cursor::Text).child(if single_line {
+            let line = renderer::node().flex_shrink_0().child(field);
+            clip.top(px(padding[0]))
+                .right(px(padding[1]))
+                .bottom(px(padding[2]))
+                .left(px(padding[3]))
+                .overflow_hidden()
+                .flex()
+                .flex_row()
+                .items_center()
+                .whitespace_nowrap()
+                .child(match line_justify {
+                    Some(renderer::AlignContent::End) => line.ml_auto(),
+                    Some(renderer::AlignContent::Center) => line.ml_auto().mr_auto(),
+                    _ => line,
+                })
+        } else {
+            clip.style().overflow.x = renderer::Overflow::Scroll;
+            clip.top_0()
+                .right(px(0.))
+                .bottom(px(0.))
+                .left_0()
+                .pt(px(padding[0]))
+                .pr(px(padding[1]))
+                .pb(px(padding[2]))
+                .pl(px(padding[3]))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .child(field)
+        });
     }
     if hit.is_none()
         && let Some((ink, alpha)) = parsed.ink
     {
-        el = el.text_color(rgba((ink << 8) | alpha as u32));
+        el = el.text_color(Color::hex((ink << 8) | alpha as u32));
     }
     let inline_box = display == "inline"
         && symbol.is_none()
@@ -2537,7 +2536,7 @@ fn create(
         && !style
             .get(Prop::POSITION)
             .is_some_and(|value| matches!(value, "absolute" | "fixed"));
-    let mut inline_fill = renderer::transparent_black();
+    let mut inline_fill = renderer::Color::TRANSPARENT;
     let mut cell_background = parsed.background;
     if cell_background.is_none() && matches!(node.tag.as_str(), "td" | "th") {
         cell_background = row_fill(doc, styles, id);
@@ -2556,7 +2555,7 @@ fn create(
         );
     }
     if let Some(color) = cell_background {
-        let color = rgba((color.0 << 8) | color.1 as u32);
+        let color = Color::hex((color.0 << 8) | color.1 as u32);
         let blended = style
             .get(Prop::BACKGROUND_BLEND_MODE)
             .is_some_and(|value| value.split(',').any(|mode| mode.trim() != "normal"))
@@ -2711,8 +2710,8 @@ fn create(
     {
         el = el.ml_auto();
     }
-    let ink = parsed.ink.map_or(rgba(0x000000ff), |(ink, alpha)| {
-        rgba(ink << 8 | alpha as u32)
+    let ink = parsed.ink.map_or(Color::hex(0x000000ff), |(ink, alpha)| {
+        Color::hex(ink << 8 | alpha as u32)
     });
     let mut borders = parsed.borders.unwrap_or_else(|| {
         style::BORDERS.map(|[width, kind, _]| {
@@ -2745,12 +2744,13 @@ fn create(
         let border = if same && borders.iter().any(|width| *width > 0.) {
             border_colors[0]
         } else {
-            renderer::transparent_black()
+            renderer::Color::TRANSPARENT
         };
         if border.a > 0. || inline_fill.a > 0. {
-            let font = text.resolve_font(&parsed.face);
+            let font = text.face(&parsed.face);
             let size_px = px(units.font.em);
-            let height = f32::from(text.ascent(font, size_px) - text.descent(font, size_px));
+            let metrics = text.metrics(font);
+            let height = metrics.ascent * size_px.0 - metrics.descent * size_px.0;
             let line_height = units.font.lh;
             let radii = super::effects::radii(style, &units, || containing);
             let (sides, pad_y, fill) = (borders, padding[0] + padding[2], inline_fill);
@@ -2776,23 +2776,26 @@ fn create(
                             if top + quad.height < mask.top() {
                                 continue;
                             }
-                            window.paint_quad(renderer::quad(
-                                Bounds::new(point(bounds.left() - px(sides[3]), top), quad),
+                            window.draw_box(
+                                Rect::new(point(bounds.left() - px(sides[3]), top), quad),
                                 radii.resolve(quad),
                                 fill,
-                                renderer::Edges {
-                                    top: px(sides[0]),
-                                    right: px(sides[1]),
-                                    bottom: px(sides[2]),
-                                    left: px(sides[3]),
+                                renderer::Border {
+                                    widths: renderer::Edges {
+                                        top: px(sides[0]),
+                                        right: px(sides[1]),
+                                        bottom: px(sides[2]),
+                                        left: px(sides[3]),
+                                    },
+                                    color: border,
+                                    style: if dashed {
+                                        renderer::BorderStyle::Dashed
+                                    } else {
+                                        renderer::BorderStyle::Solid
+                                    },
+                                    sides: 0,
                                 },
-                                border,
-                                if dashed {
-                                    renderer::BorderStyle::Dashed
-                                } else {
-                                    renderer::BorderStyle::Solid
-                                },
-                            ));
+                            );
                         }
                     },
                 )
@@ -2802,7 +2805,7 @@ fn create(
                 .size_full(),
             );
             if same {
-                border_colors = [renderer::transparent_black(); 4];
+                border_colors = [renderer::Color::TRANSPARENT; 4];
             }
         }
     }
@@ -2933,11 +2936,11 @@ fn create(
                 borders[side] = borders[side].min(1.);
                 border_kinds[side] = "solid";
                 if let Some(edge) = edge {
-                    border_colors[side] = rgba(edge << 8 | 0xff);
+                    border_colors[side] = Color::hex(edge << 8 | 0xff);
                 }
             }
             if let Some(fill) = fill {
-                el = el.bg(rgba(fill << 8 | 0xff));
+                el = el.bg(Color::hex(fill << 8 | 0xff));
             }
         }
         if let Some(rows) = list
@@ -2968,7 +2971,7 @@ fn create(
                             let run = renderer::TextRun {
                                 len: label.len(),
                                 font: font.clone(),
-                                color: renderer::black(),
+                                color: renderer::Color::BLACK,
                                 background_color: None,
                                 underline: None,
                                 strikethrough: None,
@@ -2979,7 +2982,7 @@ fn create(
                                 nowrap: false,
                             };
                             widest = widest
-                                .max(f32::from(text.shape_line(&label, size, &[run], None).width));
+                                .max(f32::from(text.shape_line(&label, size, &run).line.width));
                         }
                         _ => {}
                     }
@@ -2997,7 +3000,7 @@ fn create(
                     .is_none_or(|size| size.trim().parse::<u32>().is_ok_and(|size| size <= 1))
                 && style.get(Prop::HEIGHT).is_none_or(|value| value == "auto")
             {
-                let face = text.resolve_font(&parsed.face);
+                let face = text.face(&parsed.face);
                 let [ascent, descent, _] = text
                     .line_metrics(face, px(units.font.em * pixel_ratio))
                     .map(f32::from);
@@ -3036,7 +3039,7 @@ fn create(
             view.clone(),
         ));
         borders[0] = height;
-        border_colors = [renderer::transparent_black(); 4];
+        border_colors = [renderer::Color::TRANSPARENT; 4];
         border_kinds = ["solid"; 4];
     }
     if hit.is_none() {
@@ -3062,7 +3065,7 @@ fn create(
         {
             el = el.border_color(border_colors[first]);
         } else {
-            el = el.border_color(renderer::transparent_black());
+            el = el.border_color(renderer::Color::TRANSPARENT);
         }
         if visible
             .iter()
@@ -3442,16 +3445,16 @@ fn create(
                 el = el.whitespace_nowrap().flex_nowrap()
             }
             Prop::WORD_BREAK | Prop::OVERFLOW_WRAP => {
-                el.text_style().word_break = Some(style::word_break(style));
+                el.text_style().set_word_break(style::word_break(style));
             }
             Prop::TEXT_WRAP => {
-                el.text_style().text_wrap = Some(if value.contains("balance") {
+                el.text_style().set_text_wrap(if value.contains("balance") {
                     renderer::TextWrap::Balance
                 } else if value.contains("pretty") {
                     renderer::TextWrap::Pretty
                 } else {
                     renderer::TextWrap::Wrap
-                })
+                });
             }
             Prop::CURSOR => {
                 if let Some(cursor) = style::cursor(value) {
@@ -3661,7 +3664,7 @@ fn create(
             _ => None,
         };
         let below = |style: &style::Style, font: style::FontUnits| {
-            let face = text.resolve_font(&style::font(style));
+            let face = text.face(&style::font(style));
             font.lh - f32::from(text.baseline(face, px(font.em), px(font.lh), pixel_ratio))
         };
         let line = styles.lengths[parent].font;
@@ -3715,7 +3718,7 @@ fn create(
         let lift = if !edge {
             0.
         } else if matches!(align, "text-top" | "text-bottom") {
-            let face = text.resolve_font(&style::font(parent_style));
+            let face = text.face(&style::font(parent_style));
             let [ascent, descent, _] = text
                 .line_metrics(face, px(line.em * pixel_ratio))
                 .map(|value| f32::from(value) / pixel_ratio);
@@ -3817,7 +3820,7 @@ fn create(
         el = el.child(
             renderer::canvas(
                 |_, _| (),
-                move |bounds, _, window| window.paint_symbol(&symbol, bounds, ink),
+                move |bounds, _, window| window.draw_symbol(&symbol, bounds, ink),
             )
             .absolute()
             .top(px(padding[0]))
@@ -3855,15 +3858,15 @@ fn create(
         .filter(|_| hit.is_none())
     {
         let text = el.text_style();
-        text.white_space = Some(renderer::WhiteSpace::Normal);
-        text.line_clamp = Some(lines.max(1));
-        text.text_overflow = Some("…".into());
+        text.set_white_space(renderer::WhiteSpace::Normal);
+        text.set_line_clamp(Some(lines.max(1)));
+        text.set_text_overflow(Some("…".into()));
     } else if hit.is_none()
         && style.get(Prop::TEXT_OVERFLOW) == Some("ellipsis")
         && matches!(style.get(Prop::WHITE_SPACE), Some("nowrap" | "pre"))
         && el.style_ref().overflow.x != renderer::Overflow::Visible
     {
-        el.text_style().text_overflow = Some("…".into());
+        el.text_style().set_text_overflow(Some("…".into()));
     }
     if position == "fixed" {
         let viewport = units.viewport;
@@ -3905,7 +3908,7 @@ fn create(
         let color = style
             .get(Prop::OUTLINE_COLOR)
             .and_then(style::color)
-            .map_or(ink, |(ink, alpha)| rgba(ink << 8 | alpha as u32));
+            .map_or(ink, |(ink, alpha)| Color::hex(ink << 8 | alpha as u32));
         let mut outline = renderer::node()
             .absolute()
             .top(px(-grow - borders[0]))
@@ -3929,10 +3932,10 @@ fn create(
             .iter()
             .any(|&side| border_colors[side] != border_colors[visible[0]])
     {
-        let mut bands = vec![([0.; 4], borders, [renderer::transparent_black(); 4])];
+        let mut bands = vec![([0.; 4], borders, [renderer::Color::TRANSPARENT; 4])];
         let split = (0..4).any(|side| matches!(border_kinds[side], "groove" | "ridge"));
         if split {
-            bands.push(([0.; 4], [0.; 4], [renderer::transparent_black(); 4]));
+            bands.push(([0.; 4], [0.; 4], [renderer::Color::TRANSPARENT; 4]));
         }
         for side in 0..4 {
             let color = border_colors[side];
@@ -3973,7 +3976,7 @@ fn create(
             renderer::canvas(
                 |_, _| (),
                 move |bounds, _, window| {
-                    let outer = Bounds::new(
+                    let outer = Rect::new(
                         point(
                             bounds.left() - px(borders[3]),
                             bounds.top() - px(borders[0]),
@@ -3984,33 +3987,33 @@ fn create(
                         ),
                     );
                     for (inset, widths, colors) in &bands {
-                        let bounds = Bounds::from_corners(
+                        let bounds = Rect::between(
                             outer.origin + point(px(inset[3]), px(inset[0])),
                             outer.bottom_right() - point(px(inset[1]), px(inset[2])),
                         );
                         let corners = radius
                             .resolve(outer.size)
                             .inset(px(inset[0]), px(inset[1]), px(inset[2]), px(inset[3]))
-                            .clamp_radii_for_quad_size(bounds.size);
+                            .fit(bounds.size);
                         for side in 0..4 {
                             if widths[side] <= 0. {
                                 continue;
                             }
-                            window.paint_quad(
-                                renderer::quad(
-                                    bounds,
-                                    corners,
-                                    renderer::transparent_black(),
-                                    renderer::Edges {
+                            window.draw_box(
+                                bounds,
+                                corners,
+                                renderer::Color::TRANSPARENT,
+                                renderer::Border {
+                                    widths: renderer::Edges {
                                         top: px(widths[0]),
                                         right: px(widths[1]),
                                         bottom: px(widths[2]),
                                         left: px(widths[3]),
                                     },
-                                    colors[side],
-                                    kinds[side],
-                                )
-                                .sides(1 << side),
+                                    color: colors[side],
+                                    style: kinds[side],
+                                    sides: 1 << side,
+                                },
                             );
                         }
                     }
@@ -4161,7 +4164,7 @@ fn create(
         let inside = style
             .get(Prop::LIST_STYLE_POSITION)
             .is_some_and(|value| value == "inside");
-        let face = text.resolve_font(&style::font(marker_style.unwrap_or(style)));
+        let face = text.face(&style::font(marker_style.unwrap_or(style)));
         let size = marker_style
             .and_then(|marker| marker.get(Prop::FONT_SIZE))
             .and_then(|value| units.resolve(value, units.font.em))
@@ -4177,7 +4180,7 @@ fn create(
         };
         let mut top = padding[0];
         if !inside && marker_style.is_some() {
-            let own = text.resolve_font(&parsed.face);
+            let own = text.face(&parsed.face);
             let rise = f32::from(text.baseline(face, px(size), px(line), pixel_ratio))
                 - f32::from(text.baseline(own, px(units.font.em), px(units.font.lh), pixel_ratio));
             if rise > 0. {
@@ -4192,7 +4195,7 @@ fn create(
             let leading = ((line * pixel_ratio - ascent - descent) / 2.).floor();
             let space = text
                 .advance(face, px(size), ' ')
-                .map_or(size / 4., |space| f32::from(space.width));
+                .map_or(size / 4., f32::from);
             let look = super::control::Look {
                 control: super::control::Control::Disclosure,
                 checked: kind == "disclosure-open",
@@ -4232,8 +4235,8 @@ fn create(
                 .unwrap_or(style)
                 .get(Prop::COLOR)
                 .and_then(style::color)
-                .map_or(rgba(0x000000ff), |(ink, alpha)| {
-                    rgba(ink << 8 | alpha as u32)
+                .map_or(Color::hex(0x000000ff), |(ink, alpha)| {
+                    Color::hex(ink << 8 | alpha as u32)
                 });
             let [ascent, descent, _] = metrics;
             let offset = (ascent * 2. / 3.).floor();
@@ -4269,9 +4272,9 @@ fn create(
                 .font_weight(face.weight)
                 .text_size(px(size))
                 .line_height(px(line));
-            marker_box.text_style().font_style = Some(face.style);
+            marker_box.text_style().set_font_style(face.style);
             if let Some((ink, alpha)) = marker.get(Prop::COLOR).and_then(style::color) {
-                marker_box = marker_box.text_color(rgba(ink << 8 | alpha as u32));
+                marker_box = marker_box.text_color(Color::hex(ink << 8 | alpha as u32));
             }
         }
         el = el.child(marker_box);
@@ -4396,7 +4399,7 @@ fn create(
                 style::LineHeight::Normal => {}
             }
             if let Some((ink, alpha)) = pseudo.get(Prop::COLOR).and_then(style::color) {
-                decoration = decoration.text_color(rgba(ink << 8 | alpha as u32));
+                decoration = decoration.text_color(Color::hex(ink << 8 | alpha as u32));
             }
             let absolute = pseudo
                 .get(Prop::POSITION)
@@ -4446,14 +4449,14 @@ fn create(
                 pseudo
                     .get(color)
                     .and_then(style::color)
-                    .map_or(ink, |(ink, alpha)| rgba(ink << 8 | alpha as u32))
+                    .map_or(ink, |(ink, alpha)| Color::hex(ink << 8 | alpha as u32))
             });
             let shown: Vec<usize> = (0..4).filter(|&side| pseudo_borders[side] > 0.).collect();
             if let Some(&first) = shown.first() {
                 if shown.iter().all(|&side| colors[side] == colors[first]) {
                     decoration = decoration.border_color(colors[first]);
                 } else {
-                    decoration = decoration.border_color(renderer::transparent_black());
+                    decoration = decoration.border_color(renderer::Color::TRANSPARENT);
                     let kinds =
                         sides.map(|(_, kind, _)| border_style(pseudo.get(kind).unwrap_or("solid")));
                     let (borders, radius) = (pseudo_borders, pseudo_radius);
@@ -4461,7 +4464,7 @@ fn create(
                         renderer::canvas(
                             |_, _| (),
                             move |bounds, _, window| {
-                                let outer = Bounds::new(
+                                let outer = Rect::new(
                                     point(
                                         bounds.left() - px(borders[3]),
                                         bounds.top() - px(borders[0]),
@@ -4471,28 +4474,26 @@ fn create(
                                         bounds.size.height + px(borders[0] + borders[2]),
                                     ),
                                 );
-                                let corners = radius
-                                    .resolve(outer.size)
-                                    .clamp_radii_for_quad_size(outer.size);
+                                let corners = radius.resolve(outer.size).fit(outer.size);
                                 for side in 0..4 {
                                     if borders[side] <= 0. {
                                         continue;
                                     }
-                                    window.paint_quad(
-                                        renderer::quad(
-                                            outer,
-                                            corners,
-                                            renderer::transparent_black(),
-                                            renderer::Edges {
+                                    window.draw_box(
+                                        outer,
+                                        corners,
+                                        renderer::Color::TRANSPARENT,
+                                        renderer::Border {
+                                            widths: renderer::Edges {
                                                 top: px(borders[0]),
                                                 right: px(borders[1]),
                                                 bottom: px(borders[2]),
                                                 left: px(borders[3]),
                                             },
-                                            colors[side],
-                                            kinds[side],
-                                        )
-                                        .sides(1 << side),
+                                            color: colors[side],
+                                            style: kinds[side],
+                                            sides: 1 << side,
+                                        },
                                     );
                                 }
                             },
@@ -4557,7 +4558,7 @@ fn create(
                     }
                     Prop::BACKGROUND_COLOR => {
                         if let Some((color, alpha)) = style::color(value) {
-                            decoration = decoration.bg(rgba(color << 8 | alpha as u32));
+                            decoration = decoration.bg(Color::hex(color << 8 | alpha as u32));
                         }
                     }
                     Prop::OPACITY => {
@@ -4619,7 +4620,7 @@ fn create(
                 Some((blur, color_matrix)) => decoration.hooks(super::paint::Effected {
                     effect: renderer::PaintEffect {
                         backdrop: Some(renderer::Backdrop {
-                            bounds: Bounds::default(),
+                            bounds: Rect::default(),
                             corner_radii: Default::default(),
                             blur,
                             color_matrix,
@@ -4729,7 +4730,7 @@ fn create(
         }
         && style.get(Prop::CURSOR).is_none_or(|value| value == "auto")
     {
-        el = el.cursor(renderer::CursorStyle::IBeam);
+        el = el.cursor(renderer::Cursor::Text);
     }
     let mut plans = 0;
     if let Some(data) = inline {
@@ -4797,7 +4798,7 @@ fn create(
         let (mut trim_top, mut trim_bottom) = (0., 0.);
         if over || under {
             let system = build.text;
-            let font = system.resolve_font(&parsed.face);
+            let font = system.face(&parsed.face);
             let (size, height) = (px(units.font.em), px(units.font.lh));
             let baseline = f32::from(system.baseline(font, size, height, build.pixel_ratio));
             let [ascent, descent, _] = system.line_metrics(font, size).map(f32::from);
@@ -5475,7 +5476,7 @@ fn create(
         }
         let line_break = || {
             let mut el = renderer::node().w_full();
-            el.style().align_self = Some(renderer::AlignSelf::FlexStart);
+            el.style().align_self = Some(renderer::AlignItems::FlexStart);
             el
         };
         let hangs = !preserve
@@ -5716,7 +5717,7 @@ fn create(
                             0.
                         },
                     ));
-                    placeholder.style().align_self = Some(renderer::AlignSelf::FlexStart);
+                    placeholder.style().align_self = Some(renderer::AlignItems::FlexStart);
                     match line.take() {
                         Some(open) => line = Some(open.child(placeholder)),
                         None if all_inline || block => place!(placeholder, None),
@@ -5877,9 +5878,18 @@ fn create(
     }
     // Windows moves the window in the native hit test (`window_drag_area`), macOS and Linux on the first drag.
     if drag {
-        el = el.window_drag_area().on_mouse_down(MouseButton::Left, {
+        el = el.window_drag_area().on_pointer({
             let view = view.clone();
-            move |event: &renderer::MouseDownEvent, window, cx| {
+            move |event, window, cx| {
+                let renderer::Event::PointerDown {
+                    at: position,
+                    button: renderer::Button::Left,
+                    clicks,
+                    ..
+                } = *event
+                else {
+                    return;
+                };
                 // Use the nearest drag-region box under the pointer so no-drag children keep their clicks.
                 let dragged = view.host.try_borrow().is_ok_and(|host| {
                     let viewport = *host.viewports.get(&view.id).unwrap_or(&[800., 600.]);
@@ -5891,7 +5901,7 @@ fn create(
                     let Some(computed) = &state.computed else {
                         return true;
                     };
-                    let at = [event.position.x, event.position.y].map(f32::from);
+                    let at = [position.x, position.y].map(f32::from);
                     crate::dom::hit_test(&page.doc, state, computed, viewport, at, true, false)
                         .as_u64()
                         .is_none_or(|target| {
@@ -5908,13 +5918,13 @@ fn create(
                 if !dragged {
                     return;
                 }
-                cx.stop_propagation();
-                if event.click_count != 2 {
+                cx.stop_event();
+                if clicks != 2 {
                     view.moving.set(true);
                 } else if cfg!(target_os = "macos") {
-                    window.titlebar_double_click();
+                    window.control().titlebar_double_click();
                 } else {
-                    window.zoom_window();
+                    window.control().zoom();
                 }
             }
         });
@@ -6113,7 +6123,7 @@ fn create(
             })
             .flatten(),
         leading: (display == "inline" && !node.tag.starts_with('#')).then(|| {
-            let face = text.resolve_font(&parsed.face);
+            let face = text.face(&parsed.face);
             let [ascent, descent, _] = text
                 .line_metrics(face, px(units.font.em * pixel_ratio))
                 .map(f32::from);
@@ -6546,8 +6556,8 @@ fn paint_broken_icon(origin: renderer::Point<renderer::Pixels>, window: &mut ren
     }) else {
         return;
     };
-    let bounds = Bounds::new(origin, size(px(16.), px(16.)));
-    window.paint_image(bounds, bounds, px(0.), image, false);
+    let bounds = Rect::new(origin, size(px(16.), px(16.)));
+    window.draw_image(bounds, bounds, px(0.), image, false);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6574,37 +6584,32 @@ pub(super) fn field_size(
             value
         };
         let run = style::text_run(style, units, shown.len());
-        let lines = text
-            .shape_text(
-                shown.into(),
-                px(units.font.em),
-                &[run],
-                wrap_width
+        let lines = text.shape_text(
+            &shown,
+            px(units.font.em),
+            &[run],
+            &renderer::Wrapping {
+                width: wrap_width
                     .filter(|_| {
                         textarea && !matches!(style.get(Prop::WHITE_SPACE), Some("pre" | "nowrap"))
                     })
                     .map(px),
-                None,
-                style::word_break(style),
-            )
-            .unwrap_or_default();
+                word_break: style::word_break(style),
+                ..Default::default()
+            },
+        );
         return [
             if width {
                 lines
                     .iter()
-                    .map(|line| f32::from(line.unwrapped_layout.width))
+                    .map(|line| f32::from(line.line.width))
                     .fold(0., f32::max)
                     + 1.
             } else {
                 0.
             },
             if textarea {
-                lines
-                    .iter()
-                    .map(|line| 1 + line.wrap_boundaries.len())
-                    .sum::<usize>()
-                    .max(1) as f32
-                    * units.font.lh
+                lines.iter().map(|line| line.rows()).sum::<usize>().max(1) as f32 * units.font.lh
             } else {
                 units.font.lh
             },
@@ -6625,7 +6630,7 @@ pub(super) fn field_size(
             .and_then(|value| value.split(',').next())
             .map(|value| value.trim().trim_matches(['"', '\'']).to_ascii_lowercase())
             .unwrap_or_default();
-        let id = text.resolve_font(&face);
+        let id = text.face(&face);
         let scale = pixel_ratio;
         let (char_width, extra) = if "|american typewriter|arial hebrew|chalkboard|cochin|\
             corsiva hebrew|courier|euphemia ucas|geneva|gill sans|hei|helvetica|hoefler text|\
@@ -6635,15 +6640,15 @@ pub(super) fn field_size(
             .contains(&format!("|{family}|"))
         {
             let zero = text
-                .ch_advance(id, em)
+                .advance(id, em, '0')
                 .map_or(units.font.em / 2., f32::from);
             (zero * scale, 0.)
         } else {
             let average = if face.family.as_ref() == ".SystemUIFont" {
-                (f32::from(text.x_height(id, em)) * scale).round()
+                (text.metrics(id).x_height * em.0 * scale).round()
             } else {
                 text.advance(id, em, 'x')
-                    .map_or(units.font.em / 2., |size| f32::from(size.width))
+                    .map_or(units.font.em / 2., f32::from)
                     * scale
             };
             let ascent = f32::from(text.line_metrics(id, em * scale)[0]);
@@ -6677,7 +6682,7 @@ pub(super) fn place(
     pixel_ratio: f32,
     [x, y, cell_width, cell_height]: [f32; 4],
 ) -> Child {
-    let place = Bounds {
+    let place = Rect {
         origin: point(px(x), px(y)),
         size: size(
             px(layout_ceil(
@@ -7019,7 +7024,7 @@ fn float_side(style: &style::Style) -> Option<bool> {
     }
 }
 
-type ColumnRule = (f32, renderer::Rgba, renderer::BorderStyle);
+type ColumnRule = (f32, renderer::Color, renderer::BorderStyle);
 
 fn columns(
     style: &style::Style,
@@ -7091,8 +7096,8 @@ fn columns(
             let color = rule_color
                 .or_else(|| style.get(Prop::COLOR))
                 .and_then(style::color)
-                .map_or(renderer::black(), |(ink, alpha)| {
-                    rgba(ink << 8 | alpha as u32)
+                .map_or(renderer::Color::BLACK, |(ink, alpha)| {
+                    Color::hex(ink << 8 | alpha as u32)
                 });
             (width, color, border_style(kind))
         })
@@ -7104,7 +7109,7 @@ fn column_rules(
     count: usize,
     gap: f32,
     width: f32,
-    color: renderer::Rgba,
+    color: renderer::Color,
     kind: renderer::BorderStyle,
 ) -> Child {
     renderer::canvas(
@@ -7113,17 +7118,20 @@ fn column_rules(
             let column = (f32::from(bounds.size.width) - gap * (count - 1) as f32) / count as f32;
             for index in 1..count {
                 let x = bounds.left() + px(index as f32 * (column + gap) - gap / 2. - width / 2.);
-                window.paint_quad(renderer::quad(
-                    Bounds::new(point(x, bounds.top()), size(px(width), bounds.size.height)),
+                window.draw_box(
+                    Rect::new(point(x, bounds.top()), size(px(width), bounds.size.height)),
                     renderer::Corners::default(),
-                    renderer::transparent_black(),
-                    renderer::Edges {
-                        left: px(width),
-                        ..Default::default()
+                    renderer::Color::TRANSPARENT,
+                    renderer::Border {
+                        widths: renderer::Edges {
+                            left: px(width),
+                            ..Default::default()
+                        },
+                        color,
+                        style: kind,
+                        sides: 0,
                     },
-                    color,
-                    kind,
-                ));
+                );
             }
         },
     )
@@ -7202,7 +7210,7 @@ fn fieldset_border(
     height: f32,
     middle: f32,
     widths: [f32; 4],
-    colors: [renderer::Rgba; 4],
+    colors: [renderer::Color; 4],
     kinds: [&str; 4],
     view: Rc<super::PageState>,
 ) -> Child {
@@ -7220,10 +7228,10 @@ fn fieldset_border(
             let top = bounds.top() + px(middle - widths[0] / 2.);
             let [left, right, bottom] = [bounds.left(), bounds.right(), bounds.bottom()];
             let sides = [
-                Bounds::from_corners(point(left, top), point(right, top + px(widths[0]))),
-                Bounds::from_corners(point(right - px(widths[1]), top), point(right, bottom)),
-                Bounds::from_corners(point(left, bottom - px(widths[2])), point(right, bottom)),
-                Bounds::from_corners(point(left, top), point(left + px(widths[3]), bottom)),
+                Rect::between(point(left, top), point(right, top + px(widths[0]))),
+                Rect::between(point(right - px(widths[1]), top), point(right, bottom)),
+                Rect::between(point(left, bottom - px(widths[2])), point(right, bottom)),
+                Rect::between(point(left, top), point(left + px(widths[3]), bottom)),
             ];
             for (side, rect) in sides.into_iter().enumerate() {
                 if widths[side] <= 0. {
@@ -7270,17 +7278,14 @@ fn fieldset_border(
                 };
                 for ((start, end), color) in halves.into_iter().zip([outer, inner]) {
                     let part = if side % 2 == 0 {
-                        Bounds::from_corners(point(rect.left(), start), point(rect.right(), end))
+                        Rect::between(point(rect.left(), start), point(rect.right(), end))
                     } else {
-                        Bounds::from_corners(point(start, rect.top()), point(end, rect.bottom()))
+                        Rect::between(point(start, rect.top()), point(end, rect.bottom()))
                     };
                     let pieces = match gap.filter(|_| side == 0) {
                         Some([from, to]) => vec![
-                            Bounds::from_corners(
-                                part.origin,
-                                point(from.max(part.left()), part.bottom()),
-                            ),
-                            Bounds::from_corners(
+                            Rect::between(part.origin, point(from.max(part.left()), part.bottom())),
+                            Rect::between(
                                 point(to.min(part.right()), part.top()),
                                 part.bottom_right(),
                             ),
@@ -7288,7 +7293,7 @@ fn fieldset_border(
                         None => vec![part],
                     };
                     for piece in pieces.into_iter().filter(|piece| piece.size.width > px(0.)) {
-                        window.paint_quad(renderer::fill(piece, color));
+                        window.draw_rect(piece, color);
                     }
                 }
             }
@@ -7311,12 +7316,12 @@ fn border_style(kind: &str) -> renderer::BorderStyle {
     }
 }
 
-fn shade_border(color: renderer::Rgba, dark: bool) -> renderer::Rgba {
+fn shade_border(color: renderer::Color, dark: bool) -> renderer::Color {
     let rgba = color;
     let value = rgba.r.max(rgba.g).max(rgba.b);
     if value <= 0. {
         let gray = if dark { 0.33 } else { 0.66 };
-        return renderer::Rgba {
+        return renderer::Color {
             r: gray,
             g: gray,
             b: gray,
@@ -7333,7 +7338,7 @@ fn shade_border(color: renderer::Rgba, dark: bool) -> renderer::Rgba {
     } else {
         (value + 0.33).min(1.) / value
     };
-    renderer::Rgba {
+    renderer::Color {
         r: (rgba.r * factor).min(1.),
         g: (rgba.g * factor).min(1.),
         b: (rgba.b * factor).min(1.),
@@ -7359,7 +7364,7 @@ fn inset_shadows(
                 px(borders[2]),
                 px(borders[3]),
             );
-            window.paint_inset_shadows(bounds, radii, &shadows)
+            window.draw_shadows(bounds, radii, &shadows, true)
         },
     )
     .absolute()
@@ -7429,7 +7434,7 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                 let [scale_x, scale_y] =
                     [0, 1].map(|axis| [width, height][axis] / entry.2[axis].max(f32::EPSILON));
                 for &(node, [x, y, w, h], _) in &entry.3 {
-                    let rect = window.transformed_bounds(Bounds::new(
+                    let rect = window.transformed_bounds(Rect::new(
                         point(
                             bounds.left() + px(x * scale_x),
                             bounds.top() + px(y * scale_y),
@@ -7467,8 +7472,8 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
             let Some(source) = source else { return };
             if state.svgs.get(&id).is_none_or(|(old, image)| {
                 !inline && old != source
-                    || u32::from(image.size().width) != raster[0]
-                    || u32::from(image.size().height) != raster[1]
+                    || (image.size().width as u32) != raster[0]
+                    || (image.size().height as u32) != raster[1]
             }) {
                 let shared = state
                     .svg_cache
@@ -7476,10 +7481,7 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                     .filter(|_| inline)
                     .and_then(|(_, images)| {
                         images.iter().find(|image| {
-                            [
-                                u32::from(image.size().width),
-                                u32::from(image.size().height),
-                            ] == raster
+                            [image.size().width as u32, image.size().height as u32] == raster
                         })
                     })
                     .cloned();
@@ -7498,7 +7500,7 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                                 for image in state.svg_cache.drain().flat_map(|(_, entry)| entry.1)
                                 {
                                     if Arc::strong_count(&image) == 1 {
-                                        window.drop_image(image);
+                                        window.release_image(image);
                                     }
                                 }
                             }
@@ -7506,7 +7508,7 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                         if let Some((_, old)) = state.svgs.insert(id, (source.to_owned(), image))
                             && Arc::strong_count(&old) == 1
                         {
-                            window.drop_image(old);
+                            window.release_image(old);
                         }
                     }
                     Err(error) => eprintln!("apps: SVG: {error}"),
@@ -7515,7 +7517,7 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
             let image = state.svgs.get(&id).map(|(_, image)| image.clone());
             drop(host);
             if let Some(image) = image {
-                window.paint_image(bounds, bounds, renderer::Corners::default(), image, false);
+                window.draw_image(bounds, bounds, renderer::Corners::default(), image, false);
             }
         },
     )

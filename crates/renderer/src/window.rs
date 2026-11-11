@@ -1,23 +1,16 @@
 use crate::{
-    App, Backdrop, BorderStyle, Bounds, BoxShadow, Child, ContentMask, CursorStyle, DevicePixels,
-    Edges, ElementId, Modifiers, MouseEvent, PaintEffect, Pixels, PlatformInput, Point, Radii,
-    RenderImage, Rgba, ScaledPixels, ScrollDelta, ScrollHandle, ScrollPhase, Size, Tree,
-    Utf16Selection,
-    atlas::AtlasKey,
-    geometry::{round_half_toward_zero, round_stroke_to_device_pixel, round_to_device_pixel},
-    input::{DispatchPhase, KeyDownEvent, KeyUpEvent, Keystroke},
+    App, Backdrop, BorderStyle, BoxShadow, Child, Clip, Color, Cursor, Edges, Event, Key,
+    Modifiers, NodeKey, PaintEffect, Pixels, Point, Radii, Rect, RenderImage, ScrollRef, Size,
+    Tree, Utf16Selection, WheelPhase,
+    atlas::TileKey,
+    geometry::{snap, snap_width},
     platform, point, px,
-    scene::{
-        BackdropState, EffectState, MonochromeSprite, PolychromeSprite, Primitive, Quad, Scene,
-        Shadow, Underline,
-    },
+    scene::{BackdropState, EffectState, Scene},
     size,
-    text::{
-        DecorationStyle, FontId, GlyphId, RenderGlyphParams, SUBPIXEL_VARIANTS_X,
-        StrikethroughStyle, TextSystem, UnderlineStyle,
-    },
+    text::{DecorationStyle, FontId, GlyphId, GlyphRaster, SUBPIXEL_STEPS, TextSystem},
 };
 use anyhow::Result;
+use raw_window_handle::HandleError;
 use rustc_hash::FxHashMap;
 use std::{
     any::{Any, TypeId},
@@ -27,64 +20,60 @@ use std::{
     ops::Range,
     rc::Rc,
     sync::Arc,
+    time::{Duration, Instant},
 };
+
+#[path = "paint.rs"]
+mod paint;
+pub use paint::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowId(pub u64);
 
+/// Text input calls use UTF-16 offsets.
 pub trait View: 'static {
-    fn render(&mut self, tree: &Tree, window: &mut Window, cx: &mut App) -> Child;
+    fn render(&mut self, tree: &Tree, window: &mut Window, app: &mut App) -> Child;
+    fn window_changed(&mut self, window: &mut Window, app: &mut App);
+    /// Pointer events go to hit regions, not here.
+    fn event(&mut self, event: &Event, window: &mut Window, app: &mut App);
 
-    fn window_changed(&mut self, window: &mut Window, cx: &mut App);
-
-    fn event(&mut self, event: &PlatformInput, window: &mut Window, cx: &mut App);
-
-    fn selected_text_range(&mut self, window: &mut Window, cx: &mut App) -> Option<Utf16Selection>;
-    fn marked_text_range(&mut self, window: &mut Window, cx: &mut App) -> Option<Range<usize>>;
-    fn text_for_range(
+    fn selection(&mut self, window: &mut Window, app: &mut App) -> Option<Utf16Selection>;
+    fn composition(&mut self, window: &mut Window, app: &mut App) -> Option<Range<usize>>;
+    fn text_in(
         &mut self,
         range: Range<usize>,
-        adjusted: &mut Option<Range<usize>>,
+        actual: &mut Option<Range<usize>>,
         window: &mut Window,
-        cx: &mut App,
+        app: &mut App,
     ) -> Option<String>;
-    fn replace_text_in_range(
+    fn insert(
         &mut self,
-        range: Option<Range<usize>>,
+        replacing: Option<Range<usize>>,
         text: &str,
         window: &mut Window,
-        cx: &mut App,
+        app: &mut App,
     );
-    fn replace_and_mark_text_in_range(
+    fn compose(
         &mut self,
-        range: Option<Range<usize>>,
+        replacing: Option<Range<usize>>,
         text: &str,
         selected: Option<Range<usize>>,
         window: &mut Window,
-        cx: &mut App,
+        app: &mut App,
     );
-    fn unmark_text(&mut self, window: &mut Window, cx: &mut App);
-    fn bounds_for_range(
-        &mut self,
-        range: Range<usize>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<Bounds<Pixels>>;
-    fn character_index_for_point(
-        &mut self,
-        point: Point<Pixels>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<usize>;
+    fn end_composition(&mut self, window: &mut Window, app: &mut App);
+    fn rect_of(&mut self, range: Range<usize>, window: &mut Window, app: &mut App) -> Option<Rect>;
+    fn index_at(&mut self, at: Point<Pixels>, window: &mut Window, app: &mut App) -> Option<usize>;
 }
 
 #[derive(Clone, Debug)]
 pub struct WindowOptions {
-    pub bounds: Bounds<Pixels>,
+    pub bounds: Rect,
+    // `bounds` includes the title bar and frame.
     pub outer_size: bool,
     pub title: String,
     pub titlebar_hidden: bool,
-    pub traffic_light_position: Option<Point<Pixels>>,
+    pub buttons_at: Option<Point<Pixels>>,
     pub frameless: bool,
     pub transparent: bool,
     pub show: bool,
@@ -96,11 +85,11 @@ pub struct WindowOptions {
 impl Default for WindowOptions {
     fn default() -> Self {
         Self {
-            bounds: Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.))),
+            bounds: crate::rect(px(0.), px(0.), px(800.), px(600.)),
             outer_size: true,
             title: String::new(),
             titlebar_hidden: false,
-            traffic_light_position: None,
+            buttons_at: None,
             frameless: false,
             transparent: false,
             show: true,
@@ -113,84 +102,22 @@ impl Default for WindowOptions {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct WindowState {
-    pub frame: Bounds<Pixels>,
-    pub content: Bounds<Pixels>,
+    pub frame: Rect,
+    pub content: Rect,
     pub minimized: bool,
     pub maximized: bool,
     pub fullscreen: bool,
     pub visible: bool,
     pub resizing: bool,
-    pub display: Bounds<Pixels>,
-    pub work_area: Bounds<Pixels>,
+    pub display: Rect,
+    pub work_area: Rect,
 }
 
-#[cfg(target_os = "macos")]
 pub use crate::platform::WindowControl;
-
-#[cfg(not(target_os = "macos"))]
-#[derive(Clone)]
-pub struct WindowControl(WindowId);
-
-#[cfg(not(target_os = "macos"))]
-impl WindowControl {
-    fn run(&self, f: impl FnOnce(&platform::Window) + 'static) {
-        let id = self.0;
-        crate::app::update(move |app| {
-            app.update_window(id, |window, _| f(&window.platform));
-        });
-    }
-    pub fn change(&self, change: WindowChange) {
-        self.run(move |window| window.change(change));
-    }
-    pub fn set_title(&self, title: &str) {
-        let title = title.to_owned();
-        self.run(move |window| window.set_title(&title));
-    }
-    pub fn set_button_visibility(&self, visible: bool) {
-        self.run(move |window| window.set_button_visibility(visible));
-    }
-    pub fn set_button_position(&self, position: Option<Point<Pixels>>) {
-        self.run(move |window| window.set_button_position(position));
-    }
-    pub fn minimize(&self) {
-        self.run(|window| window.minimize());
-    }
-    pub fn zoom(&self) {
-        self.run(|window| window.zoom());
-    }
-    pub fn toggle_fullscreen(&self) {
-        self.run(|window| window.toggle_fullscreen());
-    }
-    pub fn activate(&self) {
-        self.run(|window| window.activate());
-    }
-    pub fn resize(&self, size: Size<Pixels>) {
-        self.run(move |window| window.resize(size));
-    }
-    pub fn is_active(&self) -> bool {
-        let id = self.0;
-        crate::app::try_update(|app| app.update_window(id, |window, _| window.platform.is_active()))
-            .flatten()
-            .unwrap_or(false)
-    }
-    pub fn state(&self) -> Option<WindowState> {
-        let id = self.0;
-        crate::app::try_update(|app| app.update_window(id, |window, _| window.platform.state()))
-            .flatten()
-    }
-    pub fn raw_window_handle(&self) -> Result<raw_window_handle::RawWindowHandle> {
-        let id = self.0;
-        crate::app::try_update(|app| {
-            app.update_window(id, |window, _| window.platform.raw_window_handle())
-        })
-        .flatten()
-        .ok_or_else(|| anyhow::anyhow!("The window is closed"))?
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WindowChange {
-    Frame(Bounds<Pixels>),
+    Frame(Rect),
     Center,
     Show(bool),
     Hide,
@@ -203,7 +130,7 @@ pub enum WindowChange {
     Maximizable(bool),
     Closable(bool),
     Movable(bool),
-    Background(Rgba),
+    Background(Color),
     Opacity(f32),
     Shadow(bool),
     IgnoreMouse(bool, bool),
@@ -216,320 +143,289 @@ pub enum WindowChange {
     CancelComposition,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct HitboxId(u64);
+#[derive(Clone, Copy, Debug)]
+pub enum Scope {
+    Clip(Option<Clip<Pixels>>),
+    Offset(Point<Pixels>),
+    Opacity(Option<f32>),
+}
 
-impl HitboxId {
-    pub fn is_hovered(self, window: &Window) -> bool {
-        window.hit_test[..window.hover_count].contains(&self)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Hit {
+    Pass,
+    /// Regions below it are not hovered, but they still take the wheel.
+    Shield,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Region {
+    key: u64,
+    pub bounds: Rect,
+    pub hit: Hit,
+}
+
+impl Region {
+    pub fn hovered(&self, window: &Window) -> bool {
+        window.under[..window.hovered].contains(&self.key)
     }
-    pub fn should_handle_scroll(self, window: &Window) -> bool {
-        window.hit_test.contains(&self)
-    }
-}
-
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum HitboxBehavior {
-    #[default]
-    Normal,
-    BlockMouseExceptScroll,
-}
-
-#[derive(Clone, Debug)]
-pub struct Hitbox {
-    pub id: HitboxId,
-    pub bounds: Bounds<Pixels>,
-    pub content_mask: ContentMask<Pixels>,
-    pub behavior: HitboxBehavior,
-    transform: Option<Rc<HitTransform>>,
-}
-
-impl std::ops::Deref for Hitbox {
-    type Target = Bounds<Pixels>;
-    fn deref(&self) -> &Bounds<Pixels> {
-        &self.bounds
+    /// True even behind a shield, so it can scroll.
+    pub fn under_pointer(&self, window: &Window) -> bool {
+        window.under.contains(&self.key)
     }
 }
 
-impl Hitbox {
-    pub fn is_hovered(&self, window: &Window) -> bool {
-        self.id.is_hovered(window)
-    }
-    pub fn should_handle_scroll(&self, window: &Window) -> bool {
-        self.id.should_handle_scroll(window)
-    }
-}
+// Column-major 3x3 matrices of the z = 0 plane of a CSS transform.
+type Plane = [f32; 9];
 
-#[derive(Debug, PartialEq)]
-struct HitTransform {
-    local: Cell<[f32; 9]>,
-    key: Option<u64>,
-    outer: Option<Rc<HitTransform>>,
-    forward: Cell<[f32; 9]>,
-    inverse: Cell<[f32; 9]>,
-    window_mask: Bounds<Pixels>,
-}
-
-impl HitTransform {
-    fn refresh(&self, key: u64, local: [f32; 9], done: &mut Vec<*const Self>) {
-        if done.contains(&(self as *const Self)) {
-            return;
-        }
-        if let Some(outer) = &self.outer {
-            outer.refresh(key, local, done);
-        }
-        if self.key == Some(key) {
-            self.local.set(local);
-        }
-        let forward = match &self.outer {
-            Some(outer) => mul3(&outer.forward.get(), &self.local.get()),
-            None => self.local.get(),
-        };
-        if let Some(inverse) = invert3(&forward) {
-            self.forward.set(forward);
-            self.inverse.set(inverse);
-        }
-        done.push(self);
-    }
-
-    fn map(m: &[f32; 9], position: Point<Pixels>) -> Option<Point<Pixels>> {
-        let [x, y] = [position.x.0, position.y.0];
-        let w = m[2] * x + m[5] * y + m[8];
-        (w.abs() > 1e-6).then(|| {
-            point(
-                px((m[0] * x + m[3] * y + m[6]) / w),
-                px((m[1] * x + m[4] * y + m[7]) / w),
-            )
-        })
-    }
-}
-
-fn plane(m: &[f32; 16]) -> [f32; 9] {
+fn plane_of(m: &[f32; 16]) -> Plane {
     [m[0], m[1], m[3], m[4], m[5], m[7], m[12], m[13], m[15]]
 }
 
-fn device_matrix(mut matrix: [f32; 16], scale: f32) -> [f32; 16] {
-    for row in [3, 7, 11] {
-        matrix[row] /= scale;
+fn compose(outer: &Plane, inner: &Plane) -> Plane {
+    let mut out = [0.; 9];
+    for (index, out) in out.iter_mut().enumerate() {
+        let (v, row) = (&inner[index - index % 3..], index % 3);
+        *out = outer[row] * v[0] + outer[3 + row] * v[1] + outer[6 + row] * v[2];
     }
-    for column in [12, 13, 14] {
-        matrix[column] *= scale;
+    out
+}
+
+fn invert(m: &Plane) -> Option<Plane> {
+    let cross = |a: &[f32], b: &[f32]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let (c0, c1, c2) = (&m[0..3], &m[3..6], &m[6..9]);
+    let rows = [cross(c1, c2), cross(c2, c0), cross(c0, c1)];
+    let det = c0[0] * rows[0][0] + c0[1] * rows[0][1] + c0[2] * rows[0][2];
+    (det.abs() > 1e-9).then(|| std::array::from_fn(|i| rows[i % 3][i / 3] / det))
+}
+
+fn project(m: &Plane, at: Point<Pixels>) -> Option<Point<Pixels>> {
+    let (x, y) = (at.x.0, at.y.0);
+    let [u, v, w] = [0, 1, 2].map(|row| m[row] * x + m[3 + row] * y + m[6 + row]);
+    (w.abs() > 1e-6).then(|| point(px(u / w), px(v / w)))
+}
+
+// CSS-pixel matrices become device-pixel matrices at this scale.
+fn device_matrix(mut matrix: [f32; 16], scale: f32) -> [f32; 16] {
+    for i in 0..3 {
+        matrix[i * 4 + 3] /= scale;
+        matrix[12 + i] *= scale;
     }
     matrix
 }
 
-fn mul3(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
-    std::array::from_fn(|index| {
-        let (column, row) = (index / 3, index % 3);
-        (0..3).map(|k| a[k * 3 + row] * b[column * 3 + k]).sum()
-    })
+/// Composited animations change `local` without a new frame.
+#[derive(Debug, PartialEq)]
+struct HitTransform {
+    key: Option<u64>,
+    outer: Option<Rc<HitTransform>>,
+    local: Cell<Plane>,
+    to_window: Cell<Plane>,
+    from_window: Cell<Plane>,
+    // The window clip when the outermost transform began. Points outside it miss.
+    area: Rect,
 }
 
-fn invert3(m: &[f32; 9]) -> Option<[f32; 9]> {
-    let [a, b, c, d, e, f, g, h, i] = *m;
-    let det = a * (e * i - f * h) - d * (b * i - c * h) + g * (b * f - c * e);
-    (det.abs() > 1e-9).then(|| {
-        [
-            (e * i - f * h) / det,
-            (c * h - b * i) / det,
-            (b * f - c * e) / det,
-            (f * g - d * i) / det,
-            (a * i - c * g) / det,
-            (c * d - a * f) / det,
-            (d * h - e * g) / det,
-            (b * g - a * h) / det,
-            (a * e - b * d) / det,
-        ]
-    })
-}
+impl HitTransform {
+    fn chain(self: &Rc<Self>) -> impl Iterator<Item = &Rc<Self>> {
+        std::iter::successors(Some(self), |inner| inner.outer.as_ref())
+    }
 
-#[derive(Clone, Debug)]
-pub struct PaintQuad {
-    pub bounds: Bounds<Pixels>,
-    pub corner_radii: Radii<Pixels>,
-    pub background: Rgba,
-    pub border_widths: Edges<Pixels>,
-    pub border_color: Rgba,
-    pub border_style: BorderStyle,
-    pub border_sides: u8,
-}
-
-impl PaintQuad {
-    pub fn sides(self, border_sides: u8) -> Self {
-        Self {
-            border_sides,
-            ..self
+    fn update(&self, key: u64, local: &Plane, seen: &mut Vec<*const Self>) {
+        if seen.contains(&(self as *const Self)) {
+            return;
         }
-    }
-
-    pub fn corner_radii(self, radii: impl Into<Radii<Pixels>>) -> Self {
-        Self {
-            corner_radii: radii.into(),
-            ..self
+        if let Some(outer) = &self.outer {
+            outer.update(key, local, seen);
         }
+        if self.key == Some(key) {
+            self.local.set(*local);
+        }
+        let to_window = match &self.outer {
+            Some(outer) => compose(&outer.to_window.get(), &self.local.get()),
+            None => self.local.get(),
+        };
+        if let Some(from_window) = invert(&to_window) {
+            self.to_window.set(to_window);
+            self.from_window.set(from_window);
+        }
+        seen.push(self);
     }
 }
 
-pub fn quad(
-    bounds: Bounds<Pixels>,
-    corner_radii: impl Into<Radii<Pixels>>,
-    background: Rgba,
-    border_widths: impl Into<Edges<Pixels>>,
-    border_color: Rgba,
-    border_style: BorderStyle,
-) -> PaintQuad {
-    PaintQuad {
-        bounds,
-        corner_radii: corner_radii.into(),
-        background,
-        border_widths: border_widths.into(),
-        border_color,
-        border_style,
-        border_sides: 0,
+struct Placed {
+    region: Region,
+    clip: Clip<Pixels>,
+    transform: Option<Rc<HitTransform>>,
+}
+
+impl Placed {
+    fn contains(&self, at: Point<Pixels>) -> bool {
+        let local = match &self.transform {
+            None => Some(at),
+            Some(transform) if transform.area.contains(at) => {
+                project(&transform.from_window.get(), at)
+            }
+            Some(_) => None,
+        };
+        local.is_some_and(|local| {
+            self.region
+                .bounds
+                .intersect(self.clip.bounds)
+                .contains(local)
+        })
     }
 }
 
-pub fn fill(bounds: Bounds<Pixels>, background: Rgba) -> PaintQuad {
-    quad(
-        bounds,
-        px(0.),
-        background,
-        px(0.),
-        crate::transparent_black(),
-        BorderStyle::Solid,
-    )
-}
-
-pub(crate) type MouseListener =
-    Box<dyn FnMut(&PlatformInput, DispatchPhase, &mut Window, &mut App)>;
-type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
+type Listener = Box<dyn FnMut(&Event, &mut Window, &mut App)>;
+pub(crate) type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 pub(crate) type CaptureCallback = Box<dyn FnOnce(Result<([u32; 2], Vec<u8>)>, &mut App)>;
 
 #[derive(Default)]
-struct Frame {
-    hitboxes: Vec<Hitbox>,
-    mouse_listeners: Vec<Option<MouseListener>>,
-    cursors: Vec<(HitboxId, CursorStyle)>,
-    drag_areas: Vec<HitboxId>,
+struct Input {
+    regions: Vec<Placed>,
+    listeners: Vec<(bool, Listener)>,
+    cursors: Vec<(u64, Cursor)>,
+    drag_areas: Vec<u64>,
 }
 
-impl Frame {
+impl Input {
     fn clear(&mut self) {
-        self.hitboxes.clear();
-        self.mouse_listeners.clear();
+        self.regions.clear();
+        self.listeners.clear();
         self.cursors.clear();
         self.drag_areas.clear();
     }
 
     fn turn(&self, key: u64, matrix: &[f32; 16]) {
-        let local = plane(matrix);
-        let mut done = Vec::new();
-        for hitbox in &self.hitboxes {
-            if let Some(transform) = &hitbox.transform
-                && std::iter::successors(Some(transform), |inner| inner.outer.as_ref())
-                    .any(|inner| inner.key == Some(key))
-            {
-                transform.refresh(key, local, &mut done);
+        let local = plane_of(matrix);
+        let mut seen = Vec::new();
+        for transform in self
+            .regions
+            .iter()
+            .filter_map(|placed| placed.transform.as_ref())
+        {
+            if transform.chain().any(|inner| inner.key == Some(key)) {
+                transform.update(key, &local, &mut seen);
             }
         }
     }
 
-    fn hit_test(&self, position: Point<Pixels>, ids: &mut Vec<HitboxId>) -> usize {
-        ids.clear();
+    fn probe(&self, at: Point<Pixels>, under: &mut Vec<u64>) -> usize {
+        under.clear();
         let mut hovered = None;
-        for hitbox in self.hitboxes.iter().rev() {
-            let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            let local = match &hitbox.transform {
-                Some(transform) if transform.window_mask.contains(&position) => {
-                    HitTransform::map(&transform.inverse.get(), position)
-                }
-                Some(_) => None,
-                None => Some(position),
-            };
-            if local.is_some_and(|local| bounds.contains(&local)) {
-                ids.push(hitbox.id);
-                match hitbox.behavior {
-                    HitboxBehavior::BlockMouseExceptScroll if hovered.is_none() => {
-                        hovered = Some(ids.len())
-                    }
-                    _ => {}
-                }
+        for placed in self
+            .regions
+            .iter()
+            .rev()
+            .filter(|placed| placed.contains(at))
+        {
+            under.push(placed.region.key);
+            if placed.region.hit == Hit::Shield {
+                hovered.get_or_insert(under.len());
             }
         }
-        hovered.unwrap_or(ids.len())
+        hovered.unwrap_or(under.len())
     }
 }
 
 #[derive(Default)]
 pub(crate) struct ScrollGesture {
-    pub(crate) latch: Option<ScrollHandle>,
+    pub(crate) latch: Option<ScrollRef>,
     pub(crate) spent: bool,
     pub(crate) speed: Point<f32>,
-    pub(crate) edge: Option<(ScrollHandle, Point<Pixels>)>,
+    pub(crate) edge: Option<(ScrollRef, Point<Pixels>)>,
 }
 
-pub const CARET_BLINK: std::time::Duration = std::time::Duration::from_millis(500);
+pub const CARET_BLINK: Duration = Duration::from_millis(500);
 
 #[cfg(target_os = "macos")]
 struct Caret {
-    bounds: Bounds<ScaledPixels>,
-    color: Rgba,
-    since: std::time::Instant,
-    order: crate::scene::DrawOrder,
+    bounds: Rect<f32>,
+    color: Color,
+    since: Instant,
+    order: u32,
     painted: bool,
     overlay: bool,
 }
 
-fn round_corners(mask: &ContentMask<ScaledPixels>) -> [Bounds<ScaledPixels>; 4] {
-    let [x, y, right, bottom] = [
-        mask.rounded.origin.x,
-        mask.rounded.origin.y,
-        mask.rounded.origin.x + mask.rounded.size.width,
-        mask.rounded.origin.y + mask.rounded.size.height,
-    ];
-    let (rx, ry) = (&mask.corner_radii.x, &mask.corner_radii.y);
+fn round_corners(mask: &Clip<f32>) -> [Rect<f32>; 4] {
+    let (r, x, y) = (mask.rounded, &mask.radii.x, &mask.radii.y);
+    let (right, bottom) = (r.origin.x + r.size.width, r.origin.y + r.size.height);
     [
-        (x, y, rx.top_left, ry.top_left),
-        (right - rx.top_right, y, rx.top_right, ry.top_right),
-        (
-            right - rx.bottom_right,
-            bottom - ry.bottom_right,
-            rx.bottom_right,
-            ry.bottom_right,
+        crate::rect(r.origin.x, r.origin.y, x.top_left, y.top_left),
+        crate::rect(right - x.top_right, r.origin.y, x.top_right, y.top_right),
+        crate::rect(
+            right - x.bottom_right,
+            bottom - y.bottom_right,
+            x.bottom_right,
+            y.bottom_right,
         ),
-        (x, bottom - ry.bottom_left, rx.bottom_left, ry.bottom_left),
+        crate::rect(
+            r.origin.x,
+            bottom - y.bottom_left,
+            x.bottom_left,
+            y.bottom_left,
+        ),
     ]
-    .map(|(x, y, width, height)| Bounds::new(point(x, y), size(width, height)))
 }
 
-type Track = (u64, std::time::Instant, f32, f32, Vec<[f32; 16]>);
+struct Track {
+    key: u64,
+    start: Instant,
+    step: f32,
+    repeat: f32,
+    frames: Vec<[f32; 16]>,
+}
+
+impl Track {
+    fn current(&self) -> Option<&[f32; 16]> {
+        let count = self.frames.len().saturating_sub(1).max(1);
+        let end = self.repeat * count as f32;
+        let at = (self.start.elapsed().as_secs_f32() / self.step)
+            .min(end)
+            .round();
+        let index = if at >= end {
+            (end.round() as usize).saturating_sub(1) % count + 1
+        } else {
+            at as usize % count
+        };
+        self.frames.get(index).or(self.frames.last())
+    }
+}
 
 pub struct Window {
-    pub(crate) id: WindowId,
+    id: WindowId,
     pub(crate) platform: platform::Window,
     pub(crate) view: Option<Box<dyn View>>,
     text_system: Rc<TextSystem>,
-    pub(crate) scale_factor: f32,
-    pub(crate) viewport_size: Size<Pixels>,
+    scale_factor: f32,
+    viewport_size: Size<Pixels>,
     pub(crate) zoom: f32,
     native: (Size<Pixels>, f32),
     tree: Option<Tree>,
     scene: Scene,
-    next: Frame,
-    rendered: Frame,
-    hit_test: Vec<HitboxId>,
-    hover_count: usize,
-    next_hitbox: u64,
-    content_masks: Vec<(ContentMask<Pixels>, ContentMask<ScaledPixels>)>,
+    // `pending` is being built; `live` is on screen and takes the input.
+    pending: Input,
+    live: Input,
+    under: Vec<u64>,
+    hovered: usize,
+    next_region: u64,
+    content_masks: Vec<(Clip<Pixels>, Clip<f32>)>,
     offsets: Vec<Point<Pixels>>,
     pub(crate) font_smoothing: bool,
     hit_transform: Option<Rc<HitTransform>>,
     opacity: f32,
-    states: FxHashMap<(ElementId, TypeId), Box<dyn Any>>,
-    next_states: FxHashMap<(ElementId, TypeId), Box<dyn Any>>,
-    next_frame_callbacks: Vec<FrameCallback>,
+    states: FxHashMap<(NodeKey, TypeId), Box<dyn Any>>,
+    next_states: FxHashMap<(NodeKey, TypeId), Box<dyn Any>>,
+    frame_callbacks: Vec<FrameCallback>,
     pub(crate) captures: Vec<CaptureCallback>,
-    pub(crate) ime_key: Option<(KeyDownEvent, bool)>,
+    pub(crate) ime_key: Option<(Event, bool)>,
     #[cfg(target_os = "macos")]
     caret: Option<Caret>,
     #[cfg(target_os = "macos")]
@@ -539,20 +435,22 @@ pub struct Window {
     #[cfg(target_os = "macos")]
     controls: (Vec<crate::NativeControl>, Option<crate::ControlSink>),
     pub(crate) dirty: bool,
-    redraw: [bool; 2],
-    restart: (bool, u8),
+    drawing: bool,
+    // `again`: the page asked for another pass while one was built. `settling`: this is that extra pass.
+    again: bool,
+    settling: bool,
+    restart: bool,
+    restarts: u8,
     rebuild: bool,
     patches: Vec<crate::Node>,
-    drawing: bool,
-    pub(crate) mouse_position: Point<Pixels>,
-    pub(crate) modifiers: Modifiers,
-    pub(crate) removed: bool,
-    cursor: Option<CursorStyle>,
-    drawn_at: std::time::Instant,
+    pub(crate) pointer: Point<Pixels>,
+    pub(crate) closed: bool,
+    cursor: Option<Cursor>,
+    drawn_at: Instant,
     frames_drawn: u64,
     tracks: Vec<Track>,
-    pub(crate) rails: ([f32; 2], std::time::Instant),
-    pub(crate) scroll_chain: Option<Vec<ScrollHandle>>,
+    pub(crate) rails: ([f32; 2], Instant),
+    pub(crate) scroll_chain: Option<Vec<ScrollRef>>,
     pub(crate) gesture: ScrollGesture,
 }
 
@@ -562,8 +460,7 @@ impl Window {
         platform: platform::Window,
         text_system: Rc<TextSystem>,
     ) -> Self {
-        let scale_factor = platform.scale_factor();
-        let viewport_size = platform.content_size();
+        let (scale_factor, viewport_size) = (platform.scale_factor(), platform.content_size());
         Self {
             id,
             platform,
@@ -575,11 +472,11 @@ impl Window {
             native: (viewport_size, scale_factor),
             tree: Some(Tree::default()),
             scene: Scene::default(),
-            next: Frame::default(),
-            rendered: Frame::default(),
-            hit_test: Vec::new(),
-            hover_count: 0,
-            next_hitbox: 0,
+            pending: Input::default(),
+            live: Input::default(),
+            under: Vec::new(),
+            hovered: 0,
+            next_region: 0,
             content_masks: Vec::new(),
             offsets: Vec::new(),
             font_smoothing: true,
@@ -587,13 +484,7 @@ impl Window {
             opacity: 1.,
             states: FxHashMap::default(),
             next_states: FxHashMap::default(),
-            next_frame_callbacks: Vec::new(),
-            drawn_at: std::time::Instant::now(),
-            frames_drawn: 0,
-            tracks: Vec::new(),
-            rails: ([0.; 2], std::time::Instant::now()),
-            scroll_chain: None,
-            gesture: ScrollGesture::default(),
+            frame_callbacks: Vec::new(),
             captures: Vec::new(),
             ime_key: None,
             #[cfg(target_os = "macos")]
@@ -605,15 +496,22 @@ impl Window {
             #[cfg(target_os = "macos")]
             controls: Default::default(),
             dirty: false,
-            redraw: [false; 2],
-            restart: (false, 0),
+            drawing: false,
+            again: false,
+            settling: false,
+            restart: false,
+            restarts: 0,
             rebuild: false,
             patches: Vec::new(),
-            drawing: false,
-            mouse_position: Point::default(),
-            modifiers: Modifiers::default(),
-            removed: false,
+            pointer: Point::default(),
+            closed: false,
             cursor: None,
+            drawn_at: Instant::now(),
+            frames_drawn: 0,
+            tracks: Vec::new(),
+            rails: ([0.; 2], Instant::now()),
+            scroll_chain: None,
+            gesture: ScrollGesture::default(),
         }
     }
 
@@ -625,10 +523,12 @@ impl Window {
         &self.text_system
     }
 
+    /// Includes the zoom.
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
     }
 
+    /// In CSS pixels, with the zoom.
     pub fn viewport_size(&self) -> Size<Pixels> {
         self.viewport_size
     }
@@ -638,11 +538,13 @@ impl Window {
     }
 
     pub fn set_zoom(&mut self, zoom: f32) {
-        if self.zoom != zoom {
-            self.mouse_position = self.mouse_position * (self.zoom / zoom);
-            self.zoom = zoom;
-            self.mark_resized(self.native.0, self.native.1);
+        if self.zoom == zoom {
+            return;
         }
+        self.pointer = self.pointer * (self.zoom / zoom);
+        self.zoom = zoom;
+        let (size, scale) = self.native;
+        self.mark_resized(size, scale);
     }
 
     pub fn refresh(&mut self) {
@@ -653,20 +555,17 @@ impl Window {
     }
 
     pub fn redraw(&mut self) {
-        if self.drawing {
-            self.redraw[0] = true;
-        } else {
-            self.refresh();
+        match self.drawing {
+            true => self.again = true,
+            false => self.refresh(),
         }
     }
 
-    // The page changed while this pass was built, like when animation events ran. The pass is built again, up to a few
-    // times per frame, and it doesn't use up the extra pass that sizes settle in.
+    // The page changed while this pass was built. The pass is built again, a few times per frame at most, and this doesn't use up the extra pass that sizes settle in.
     pub fn restart(&mut self) {
-        if self.drawing {
-            self.restart.0 = true;
-        } else {
-            self.refresh();
+        match self.drawing {
+            true => self.restart = true,
+            false => self.refresh(),
         }
     }
 
@@ -674,13 +573,13 @@ impl Window {
         self.rebuild = true;
     }
 
-    // The node needs its element id, or the patch is ignored.
+    // The node needs its key, or the patch is ignored.
     pub fn patch(&mut self, node: crate::Node) {
         self.patches.push(node);
     }
 
     pub fn redrawing(&self) -> bool {
-        self.redraw[1]
+        self.settling
     }
 
     pub fn will_draw(&self) -> bool {
@@ -692,8 +591,8 @@ impl Window {
         if !self.scene.patch(key, opacity.clamp(0., 1.), device) {
             return false;
         }
-        if let Some(matrix) = transform {
-            self.rendered.turn(key, &matrix);
+        if let Some(matrix) = &transform {
+            self.live.turn(key, matrix);
         }
         true
     }
@@ -708,13 +607,13 @@ impl Window {
     pub fn promote(
         &mut self,
         key: u64,
-        start: std::time::Instant,
+        start: Instant,
         step: f32,
         repeat: f32,
         opacities: &[f32],
         transforms: Option<&[[f32; 16]]>,
     ) -> bool {
-        if self.will_draw() || self.drawn_at.elapsed() < std::time::Duration::from_millis(250) {
+        if self.will_draw() || self.drawn_at.elapsed() < Duration::from_millis(250) {
             return false;
         }
         let Some(&(_, index)) = self.scene.keyed.iter().find(|(keyed, _)| *keyed == key) else {
@@ -743,22 +642,22 @@ impl Window {
                 .map(|matrix| {
                     crate::scene::transform_bounds(&device_matrix(*matrix, scale), content)
                 })
-                .reduce(|all, bounds| all.union(&bounds)),
+                .reduce(|all, bounds| all.union(bounds)),
             None => Some(content),
         };
         let region = crate::frame::region(content);
         // Promoted layers bypass window clips. Keep them inside the clip with no overlapping content above.
-        let window = Bounds::new(Point::default(), self.viewport_size.scale(scale));
-        let reach = reach.map(|reach| reach.intersect(&window));
+        let window = Rect::new(Point::default(), self.viewport_size.scale(scale));
+        let reach = reach.map(|reach| reach.intersect(window));
         if reach.is_some_and(|reach| reach.is_empty()) {
             return true;
         }
         let mask = &effect.content_mask;
         if reach.is_none_or(|reach| {
-            mask.bounds.intersect(&reach) != reach
+            mask.bounds.intersect(reach) != reach
                 || round_corners(mask)
                     .iter()
-                    .any(|corner| corner.intersects(&reach))
+                    .any(|corner| corner.intersects(reach))
                 || self.scene.paints_over(index, reach, |_| false)
         }) || region[2] > 2048
             || region[3] > 2048
@@ -767,17 +666,16 @@ impl Window {
         }
         #[cfg(target_os = "macos")]
         {
+            // Core Animation works in window points, so the zoom moves into the matrices.
             let zoom = f64::from(self.zoom);
             let points: Vec<[f64; 16]> = transforms
                 .unwrap_or_default()
                 .iter()
                 .map(|matrix| {
                     let mut matrix = matrix.map(f64::from);
-                    for row in [3, 7, 11] {
-                        matrix[row] /= zoom;
-                    }
-                    for column in [12, 13, 14] {
-                        matrix[column] *= zoom;
+                    for i in 0..3 {
+                        matrix[i * 4 + 3] /= zoom;
+                        matrix[12 + i] *= zoom;
                     }
                     matrix
                 })
@@ -791,10 +689,15 @@ impl Window {
                 opacities,
                 &points,
             );
-            self.tracks.retain(|track| track.0 != key);
+            self.tracks.retain(|track| track.key != key);
             if let Some(transforms) = transforms {
-                self.tracks
-                    .push((key, start, step, repeat, transforms.to_vec()));
+                self.tracks.push(Track {
+                    key,
+                    start,
+                    step,
+                    repeat,
+                    frames: transforms.to_vec(),
+                });
             }
             true
         }
@@ -814,8 +717,8 @@ impl Window {
         true
     }
 
-    pub fn on_next_frame(&mut self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
-        self.next_frame_callbacks.push(Box::new(callback));
+    pub fn next_frame(&mut self, job: impl FnOnce(&mut Window, &mut App) + 'static) {
+        self.frame_callbacks.push(Box::new(job));
         self.platform.request_frame();
     }
 
@@ -824,7 +727,7 @@ impl Window {
     }
 
     pub fn request_animation_frame(&mut self) {
-        self.on_next_frame(|window, _| window.refresh());
+        self.next_frame(|window, _| window.refresh());
     }
 
     pub fn capture(&mut self, done: impl FnOnce(Result<([u32; 2], Vec<u8>)>, &mut App) + 'static) {
@@ -835,20 +738,20 @@ impl Window {
 
     pub fn timer(
         &self,
-        delay: std::time::Duration,
+        delay: Duration,
         f: impl FnOnce(&mut Window, &mut App) + 'static,
     ) -> crate::Timer {
         let id = self.id;
-        crate::app::timer(delay, move |cx| {
-            cx.update_window(id, f);
+        crate::app::timer(delay, move |app| {
+            app.update_window(id, f);
         })
     }
 
-    pub fn remove_window(&mut self) {
-        self.removed = true;
+    pub fn close(&mut self) {
+        self.closed = true;
     }
 
-    pub fn is_window_active(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         self.platform.is_active()
     }
 
@@ -860,35 +763,8 @@ impl Window {
         self.platform.change(change);
     }
 
-    pub fn control(&self) -> WindowControl {
-        #[cfg(target_os = "macos")]
-        return self.platform.control().clone();
-        #[cfg(not(target_os = "macos"))]
-        WindowControl(self.id)
-    }
-
-    pub fn is_fullscreen(&self) -> bool {
-        self.platform.state().fullscreen
-    }
-
-    pub fn toggle_fullscreen(&self) {
-        self.platform.toggle_fullscreen();
-    }
-
-    pub fn zoom_window(&self) {
-        self.platform.zoom();
-    }
-
-    pub fn set_window_title(&mut self, title: &str) {
-        self.platform.set_title(title);
-    }
-
-    pub fn start_window_move(&self) {
-        self.platform.start_window_move();
-    }
-
-    pub fn titlebar_double_click(&self) {
-        self.platform.titlebar_double_click();
+    pub fn control(&self) -> &WindowControl {
+        self.platform.control()
     }
 
     pub(crate) fn mark_resized(&mut self, size: Size<Pixels>, scale_factor: f32) {
@@ -899,33 +775,33 @@ impl Window {
         self.refresh();
     }
 
-    pub(crate) fn take_next_frame_callbacks(&mut self) -> Vec<FrameCallback> {
-        mem::take(&mut self.next_frame_callbacks)
+    pub(crate) fn take_frame_callbacks(&mut self) -> Vec<FrameCallback> {
+        mem::take(&mut self.frame_callbacks)
     }
 
     pub(crate) fn wants_frame(&self) -> bool {
-        self.dirty || !self.next_frame_callbacks.is_empty()
+        self.dirty || !self.frame_callbacks.is_empty()
     }
 
     // Core Animation avoids about 126 MB of Metal memory for caret blinking. Use it only without effects,
     // rounded clips or overlaps.
     pub fn overlay_caret(
         &mut self,
-        bounds: Bounds<Pixels>,
-        color: Rgba,
-        since: std::time::Instant,
+        bounds: Rect,
+        color: Color,
+        since: Instant,
         painted: bool,
     ) -> bool {
         #[cfg(target_os = "macos")]
         {
             let mask = self.snapped_content_mask();
-            let visible = self.snap_bounds(bounds).intersect(&mask.bounds);
+            let visible = self.snap_bounds(bounds).intersect(mask.bounds);
             if !self.scene.at_root()
                 || self.opacity < 1.
                 || !self.captures.is_empty()
                 || round_corners(&mask)
                     .iter()
-                    .any(|corner| corner.intersects(&visible))
+                    .any(|corner| corner.intersects(visible))
             {
                 return false;
             }
@@ -937,7 +813,7 @@ impl Window {
                 bounds: visible,
                 color,
                 since,
-                order: self.scene.probe(visible),
+                order: self.scene.probe(),
                 painted: painted && !overlay,
                 overlay,
             });
@@ -953,41 +829,34 @@ impl Window {
     pub fn native_control(&mut self, control: crate::NativeControl, sink: &crate::ControlSink) {
         #[cfg(target_os = "macos")]
         {
+            // Native views are placed in window points.
             let mut control = control;
-            let zoom = self.zoom;
-            let scale = |bounds: Bounds<Pixels>| {
-                Bounds::new(
-                    point(bounds.origin.x * zoom, bounds.origin.y * zoom),
-                    size(bounds.size.width * zoom, bounds.size.height * zoom),
-                )
-            };
-            control.clip = scale(self.content_mask().bounds);
-            control.bounds = scale(control.bounds);
+            control.clip = self.content_mask().bounds * self.zoom;
+            control.bounds = control.bounds * self.zoom;
             self.controls.0.push(control);
-            if self.controls.1.is_none() {
-                self.controls.1 = Some(sink.clone());
-            }
+            self.controls.1.get_or_insert_with(|| sink.clone());
         }
         #[cfg(not(target_os = "macos"))]
         let _ = (control, sink);
     }
 
-    pub(crate) fn draw(&mut self, cx: &mut App) {
+    pub(crate) fn draw(&mut self, app: &mut App) {
         #[cfg(target_os = "macos")]
         self.platform.demote();
         self.tracks.clear();
-        self.drawn_at = std::time::Instant::now();
+        self.drawn_at = Instant::now();
         self.frames_drawn += 1;
         loop {
             self.dirty = false;
             self.drawing = true;
-            self.next.clear();
+            self.pending.clear();
             self.scene.clear();
             #[cfg(target_os = "macos")]
             {
                 self.caret = None;
             }
-            if self.redraw[1] || self.restart.1 > 0 {
+            // Keyed state survives the passes of one frame. Between frames, state that was not used goes.
+            if self.settling || self.restarts > 0 {
                 let states = mem::take(&mut self.next_states);
                 self.states.extend(states);
             } else {
@@ -995,42 +864,42 @@ impl Window {
             }
             if let Some(mut view) = self.view.take() {
                 let mut tree = self.tree.take().unwrap_or_default();
-                let root = self.build(&mut tree, cx, |tree, window, cx| {
-                    view.render(tree, window, cx)
+                let root = self.build(&mut tree, app, |tree, window, app| {
+                    view.render(tree, window, app)
                 });
                 self.view = Some(view);
                 if let Some(root) = root {
                     tree.layout(root, self.viewport_size, self);
                     tree.prepaint(root, self);
-                    self.hover_count = self.next.hit_test(self.mouse_position, &mut self.hit_test);
-                    let restarting = self.restart.0 && self.restart.1 < 4;
-                    let again = self.redraw[0] || self.restart.0;
-                    if !restarting && (!again || self.redraw[1]) {
+                    self.hovered = self.pending.probe(self.pointer, &mut self.under);
+                    let restarting = self.restart && self.restarts < 4;
+                    let again = self.again || self.restart;
+                    if !restarting && (!again || self.settling) {
                         tree.paint(root, self);
                     }
                 }
                 self.tree = Some(tree);
             }
             self.drawing = false;
-            let restart = mem::take(&mut self.restart.0);
-            if restart && self.restart.1 < 4 {
-                self.restart.1 += 1;
-                self.redraw[0] = false;
+            let restart = mem::take(&mut self.restart);
+            if restart && self.restarts < 4 {
+                self.restarts += 1;
+                self.again = false;
                 continue;
             }
-            let again = mem::take(&mut self.redraw[0]) || restart;
-            if again && !self.redraw[1] {
-                self.redraw[1] = true;
+            let again = mem::take(&mut self.again) || restart;
+            if again && !self.settling {
+                self.settling = true;
                 continue;
             }
-            self.redraw[1] = false;
-            self.restart.1 = 0;
+            self.settling = false;
+            self.restarts = 0;
             if again {
                 self.refresh();
             }
             break;
         }
-        mem::swap(&mut self.rendered, &mut self.next);
+        mem::swap(&mut self.live, &mut self.pending);
         mem::swap(&mut self.states, &mut self.next_states);
         #[cfg(target_os = "macos")]
         {
@@ -1052,7 +921,6 @@ impl Window {
             self.platform
                 .set_controls(controls, self.controls.1.clone());
         }
-        self.scene.finish();
         let captures = mem::take(&mut self.captures);
         #[cfg(target_os = "macos")]
         self.platform
@@ -1061,32 +929,30 @@ impl Window {
         if let Some(tree) = &mut self.tree {
             tree.bury();
         }
-        self.text_system.finish_frame();
+        self.text_system.end_frame();
         self.platform.atlas().finish_frame();
         let last = captures.len().wrapping_sub(1);
         for (index, capture) in captures.into_iter().enumerate() {
-            capture(
-                match &mut frame {
-                    Some(Ok(frame)) if index == last => Ok(mem::take(frame)),
-                    Some(Ok(frame)) => Ok(frame.clone()),
-                    Some(Err(error)) => Err(anyhow::anyhow!("{error:#}")),
-                    None => Err(anyhow::anyhow!("The frame was not drawn")),
-                },
-                cx,
-            );
+            let result = match &mut frame {
+                Some(Ok(frame)) if index == last => Ok(mem::take(frame)),
+                Some(Ok(frame)) => Ok(frame.clone()),
+                Some(Err(error)) => Err(anyhow::anyhow!("{error:#}")),
+                None => Err(anyhow::anyhow!("The frame was not drawn")),
+            };
+            capture(result, app);
         }
-        self.update_cursor(cx);
+        self.update_cursor(app);
     }
 
     fn build(
         &mut self,
         tree: &mut Tree,
-        cx: &mut App,
+        app: &mut App,
         mut render: impl FnMut(&Tree, &mut Self, &mut App) -> Child,
     ) -> Option<taffy::NodeId> {
         loop {
             tree.begin(self.scale_factor, self.text_system.generation());
-            let child = render(tree, self, cx);
+            let child = render(tree, self, app);
             let root = tree.commit_root(child, self.viewport_size, self.scale_factor);
             for node in mem::take(&mut self.patches) {
                 tree.patch(node, self.scale_factor);
@@ -1099,7 +965,7 @@ impl Window {
 
     pub fn layout(
         &mut self,
-        cx: &mut App,
+        app: &mut App,
         mut render: impl FnMut(&Tree, &mut Self, &mut App) -> Child,
     ) -> bool {
         if self.drawing {
@@ -1108,16 +974,16 @@ impl Window {
         self.drawing = true;
         let mut again = false;
         for _ in 0..2 {
-            self.next.clear();
+            self.pending.clear();
             let mut tree = self.tree.take().unwrap_or_default();
-            if let Some(root) = self.build(&mut tree, cx, &mut render) {
+            if let Some(root) = self.build(&mut tree, app, &mut render) {
                 tree.layout(root, self.viewport_size, self);
                 tree.prepaint(root, self);
             }
             self.tree = Some(tree);
             let states = mem::take(&mut self.next_states);
             self.states.extend(states);
-            again = mem::take(&mut self.redraw[0]);
+            again = mem::take(&mut self.again);
             if !again {
                 break;
             }
@@ -1129,326 +995,285 @@ impl Window {
         true
     }
 
-    fn update_cursor(&mut self, cx: &mut App) {
-        let style = self
-            .rendered
+    fn update_cursor(&mut self, app: &mut App) {
+        let hovered = &self.under[..self.hovered];
+        let cursor = self
+            .live
             .cursors
             .iter()
             .rev()
-            .find(|(hitbox, _)| hitbox.is_hovered(self))
-            .map_or(CursorStyle::Arrow, |(_, style)| *style);
-        if self.cursor != Some(style) && self.platform.is_active() {
-            self.cursor = Some(style);
-            cx.platform.set_cursor(style);
+            .find_map(|(key, cursor)| hovered.contains(key).then_some(*cursor))
+            .unwrap_or_default();
+        if self.cursor != Some(cursor) && self.platform.is_active() {
+            self.cursor = Some(cursor);
+            app.platform.set_cursor(cursor);
         }
     }
 
     #[cfg_attr(not(windows), allow(dead_code))]
-    pub(crate) fn in_drag_area(&self) -> bool {
-        self.hit_test
-            .first()
-            .is_some_and(|top| self.rendered.drag_areas.contains(top))
+    pub(crate) fn in_drag_area(&self, at: Point<Pixels>) -> bool {
+        (self.live.regions.iter().rev())
+            .find(|placed| placed.contains(at))
+            .is_some_and(|top| self.live.drag_areas.contains(&top.region.key))
     }
 
-    pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> bool {
-        if let Some(position) = event.mouse_position() {
-            self.mouse_position = position;
-        }
-        match &event {
-            PlatformInput::MouseDown(event) => self.modifiers = event.modifiers,
-            PlatformInput::MouseUp(event) => self.modifiers = event.modifiers,
-            PlatformInput::MouseMove(event) => self.modifiers = event.modifiers,
-            PlatformInput::ScrollWheel(event) => {
-                self.modifiers = event.modifiers;
-                self.scroll_chain = None;
-                self.gesture.edge = None;
-                if let ScrollDelta::Pixels(delta) = event.delta {
-                    let now = std::time::Instant::now();
-                    let elapsed = now - self.rails.1;
-                    let paused = elapsed > std::time::Duration::from_millis(100);
-                    let [x, y] = if paused {
-                        [0.; 2]
-                    } else {
-                        self.rails.0.map(|value| value * 0.8)
-                    };
-                    self.rails = (
-                        [x + f32::from(delta.x).abs(), y + f32::from(delta.y).abs()],
-                        now,
-                    );
-                    if paused {
-                        self.gesture.speed = Point::default();
-                    } else if delta != Point::default() {
-                        let seconds = elapsed.as_secs_f32().max(1. / 120.);
-                        let speed =
-                            |old: f32, delta: Pixels| (old + f32::from(delta) / seconds) / 2.;
-                        self.gesture.speed = point(
-                            speed(self.gesture.speed.x, delta.x),
-                            speed(self.gesture.speed.y, delta.y),
-                        );
-                    }
-                    let phase = event.phase;
-                    if phase == ScrollPhase::Began || phase == ScrollPhase::None && paused {
-                        if let Some(handle) = self.gesture.latch.take() {
-                            handle.release(Point::default(), self);
-                        }
-                        self.gesture.spent = false;
-                    }
-                    if matches!(phase, ScrollPhase::Ended | ScrollPhase::MomentumEnded)
-                        && let Some(handle) = self.gesture.latch.clone()
-                        && handle.release(self.gesture.speed, self)
-                    {
-                        self.gesture.spent = true;
-                    }
-                    if phase == ScrollPhase::MomentumEnded {
-                        self.gesture.latch = None;
-                    }
-                } else if let Some(handle) = self.gesture.latch.take() {
-                    handle.release(Point::default(), self);
-                }
+    fn track_wheel(&mut self, delta: Point<f32>, lines: bool, phase: WheelPhase) {
+        self.scroll_chain = None;
+        self.gesture.edge = None;
+        if lines {
+            if let Some(handle) = self.gesture.latch.take() {
+                handle.release(Point::default(), self);
             }
-            PlatformInput::ModifiersChanged(event) => self.modifiers = event.modifiers,
-            PlatformInput::KeyDown(event) => self.modifiers = event.keystroke.modifiers,
-            PlatformInput::KeyUp(event) => self.modifiers = event.keystroke.modifiers,
-            _ => {}
+            return;
         }
-        cx.propagate_event = true;
-        let mouse = matches!(
-            event,
-            PlatformInput::MouseDown(_)
-                | PlatformInput::MouseUp(_)
-                | PlatformInput::MouseMove(_)
-                | PlatformInput::MouseExited(_)
-                | PlatformInput::ScrollWheel(_)
-        );
-        if mouse {
-            for (key, start, step, repeat, transforms) in &self.tracks {
-                let count = transforms.len().saturating_sub(1).max(1);
-                let end = repeat * count as f32;
-                let at = (start.elapsed().as_secs_f32() / step).min(end).round();
-                let index = match at >= end {
-                    true => (end.round() as usize).saturating_sub(1) % count + 1,
-                    false => at as usize % count,
-                };
-                if let Some(matrix) = transforms.get(index).or(transforms.last()) {
-                    self.rendered.turn(*key, matrix);
-                }
+        let now = Instant::now();
+        let elapsed = now - self.rails.1;
+        let paused = elapsed > Duration::from_millis(100);
+        let kept = if paused { 0. } else { 0.8 };
+        let [x, y] = self.rails.0;
+        self.rails = ([x * kept + delta.x.abs(), y * kept + delta.y.abs()], now);
+        if paused {
+            self.gesture.speed = Point::default();
+        } else if delta != Point::default() {
+            let seconds = elapsed.as_secs_f32().max(1. / 120.);
+            let speed = self.gesture.speed;
+            self.gesture.speed = point(
+                (speed.x + delta.x / seconds) / 2.,
+                (speed.y + delta.y / seconds) / 2.,
+            );
+        }
+        if phase == WheelPhase::Began || phase == WheelPhase::None && paused {
+            if let Some(handle) = self.gesture.latch.take() {
+                handle.release(Point::default(), self);
             }
-            self.hover_count = self
-                .rendered
-                .hit_test(self.mouse_position, &mut self.hit_test);
-            self.update_cursor(cx);
-            let mut listeners = mem::take(&mut self.rendered.mouse_listeners);
-            for listener in listeners.iter_mut().flatten() {
-                listener(&event, DispatchPhase::Capture, self, cx);
-                if !cx.propagate_event {
+            self.gesture.spent = false;
+        }
+        if matches!(phase, WheelPhase::Ended | WheelPhase::MomentumEnded)
+            && let Some(handle) = self.gesture.latch.clone()
+            && handle.release(self.gesture.speed, self)
+        {
+            self.gesture.spent = true;
+        }
+        if phase == WheelPhase::MomentumEnded {
+            self.gesture.latch = None;
+        }
+    }
+
+    pub fn dispatch_event(&mut self, event: Event, app: &mut App) -> bool {
+        if let Some(at) = event.at() {
+            self.pointer = at;
+        }
+        if let Event::Wheel {
+            delta,
+            lines,
+            phase,
+            ..
+        } = &event
+        {
+            self.track_wheel(*delta, *lines, *phase);
+        }
+        app.event_stopped = false;
+        if !event.targets_regions() {
+            if let Some(mut view) = self.view.take() {
+                view.event(&event, self, app);
+                self.view.get_or_insert(view);
+            }
+            return app.event_stopped;
+        }
+        for track in &self.tracks {
+            if let Some(matrix) = track.current() {
+                self.live.turn(track.key, matrix);
+            }
+        }
+        self.hovered = self.live.probe(self.pointer, &mut self.under);
+        self.update_cursor(app);
+        // Capture listeners run in paint order, then bubble listeners in reverse, until one takes the event.
+        let mut listeners = mem::take(&mut self.live.listeners);
+        let count = listeners.len();
+        let order = (0..count).map(|i| (i, true));
+        for (i, capture) in order.chain((0..count).rev().map(|i| (i, false))) {
+            let (phase, listener) = &mut listeners[i];
+            if *phase == capture {
+                listener(&event, self, app);
+                if app.event_stopped {
                     break;
                 }
             }
-            if cx.propagate_event {
-                for listener in listeners.iter_mut().rev().flatten() {
-                    listener(&event, DispatchPhase::Bubble, self, cx);
-                    if !cx.propagate_event {
-                        break;
-                    }
-                }
-            }
-            if self.rendered.mouse_listeners.is_empty() {
-                self.rendered.mouse_listeners = listeners;
-            }
-            if let (PlatformInput::ScrollWheel(event), Some((handle, rest))) =
-                (&event, self.gesture.edge.take())
-            {
-                self.overscroll(handle, rest, event.phase);
-            }
-        } else if let Some(mut view) = self.view.take() {
-            view.event(&event, self, cx);
-            if self.view.is_none() {
-                self.view = Some(view);
-            }
         }
-        !cx.propagate_event
+        // A frame drawn by a listener has its own listeners.
+        if self.live.listeners.is_empty() {
+            self.live.listeners = listeners;
+        }
+        if let Event::Wheel { phase, .. } = event
+            && let Some((handle, rest)) = self.gesture.edge.take()
+        {
+            self.overscroll(handle, rest, phase);
+        }
+        app.event_stopped
     }
 
-    pub(crate) fn overscroll(
-        &mut self,
-        handle: ScrollHandle,
-        rest: Point<Pixels>,
-        phase: ScrollPhase,
-    ) {
+    pub(crate) fn overscroll(&mut self, handle: ScrollRef, rest: Point<Pixels>, phase: WheelPhase) {
         handle.stretch_by(rest);
         self.gesture.edge = None;
         self.gesture.latch = Some(handle.clone());
         match phase {
-            ScrollPhase::Momentum => {
+            WheelPhase::Momentum => {
                 self.gesture.spent = true;
                 handle.release(self.gesture.speed, self);
             }
-            ScrollPhase::None => handle.loosen(self),
+            WheelPhase::None => handle.loosen(self),
             _ => {}
         }
         self.refresh();
     }
 
-    pub fn scroll_only(&mut self, chain: Vec<ScrollHandle>) {
+    pub fn scroll_only(&mut self, chain: Vec<ScrollRef>) {
         self.scroll_chain = Some(chain);
     }
 
     // These keys pass main's key filter like real ones, so this blocks until main answers.
-    pub fn dispatch_keystroke(&mut self, keystroke: Keystroke, cx: &mut App) -> bool {
+    pub fn press_key(&mut self, key: Key, modifiers: Modifiers, app: &mut App) -> bool {
         let id = self.id;
-        let filter = |input: PlatformInput| {
-            crate::native::sync(move || crate::native::key(id, &input, &|| false))
-        };
-        let down = PlatformInput::KeyDown(KeyDownEvent {
-            keystroke: keystroke.clone(),
-            is_held: false,
+        let blocked =
+            |event: Event| crate::native::sync(move || crate::native::key(id, &event, &|| false));
+        let text = key.text.clone();
+        let down = Event::KeyDown {
+            key: key.clone(),
+            modifiers,
+            repeat: false,
             ime: false,
-        });
-        let handled = filter(down.clone()) || self.dispatch_event(down, cx);
-        if !handled && let Some(text) = &keystroke.key_char {
-            self.with_view(cx, |view, window, cx| {
-                view.replace_text_in_range(None, text, window, cx)
+        };
+        let handled = blocked(down.clone()) || self.dispatch_event(down, app);
+        if !handled && let Some(text) = &text {
+            self.with_view(app, |view, window, app| {
+                view.insert(None, text, window, app)
             });
         }
-        let up = PlatformInput::KeyUp(KeyUpEvent {
-            keystroke,
+        let up = Event::KeyUp {
+            key,
+            modifiers,
             ime: false,
-        });
-        if !filter(up.clone()) {
-            self.dispatch_event(up, cx);
+        };
+        if !blocked(up.clone()) {
+            self.dispatch_event(up, app);
         }
         handled
     }
 
     pub(crate) fn with_view<R>(
         &mut self,
-        cx: &mut App,
+        app: &mut App,
         f: impl FnOnce(&mut dyn View, &mut Window, &mut App) -> R,
     ) -> Option<R> {
         let mut view = self.view.take()?;
-        let result = f(view.as_mut(), self, cx);
-        if self.view.is_none() {
-            self.view = Some(view);
-        }
+        let result = f(view.as_mut(), self, app);
+        self.view.get_or_insert(view);
         Some(result)
     }
 
-    pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
-        let id = HitboxId(self.next_hitbox);
-        self.next_hitbox += 1;
-        let hitbox = Hitbox {
-            id,
-            bounds,
-            content_mask: self.content_mask(),
-            behavior,
+    fn place(&mut self, region: Region) -> Region {
+        self.pending.regions.push(Placed {
+            region,
+            clip: self.content_mask(),
             transform: self.hit_transform.clone(),
-        };
-        self.next.hitboxes.push(hitbox.clone());
-        hitbox
+        });
+        region
     }
 
-    pub fn place_hitbox(&mut self, hitbox: &Hitbox, bounds: Bounds<Pixels>) -> Hitbox {
-        let hitbox = Hitbox {
-            bounds,
-            content_mask: self.content_mask(),
-            transform: self.hit_transform.clone(),
-            ..hitbox.clone()
-        };
-        self.next.hitboxes.push(hitbox.clone());
-        hitbox
+    pub fn add_region(&mut self, bounds: Rect, hit: Hit) -> Region {
+        self.next_region += 1;
+        let key = self.next_region;
+        self.place(Region { key, bounds, hit })
     }
 
-    pub(crate) fn placement(&self) -> (Point<Pixels>, ContentMask<Pixels>, usize) {
+    pub fn move_region(&mut self, region: &Region, bounds: Rect) -> Region {
+        self.place(Region { bounds, ..*region })
+    }
+
+    pub fn set_cursor(&mut self, region: &Region, cursor: Cursor) {
+        self.pending.cursors.push((region.key, cursor));
+    }
+
+    pub fn add_drag_area(&mut self, region: &Region) {
+        self.pending.drag_areas.push(region.key);
+    }
+
+    pub fn on_capture(&mut self, listener: impl FnMut(&Event, &mut Window, &mut App) + 'static) {
+        self.pending.listeners.push((true, Box::new(listener)));
+    }
+
+    pub fn on_bubble(&mut self, listener: impl FnMut(&Event, &mut Window, &mut App) + 'static) {
+        self.pending.listeners.push((false, Box::new(listener)));
+    }
+
+    // Kept subtrees reuse their regions only while this is unchanged.
+    pub(crate) fn placement(&self) -> (Point<Pixels>, Clip<Pixels>, usize) {
         let transform = self
             .hit_transform
             .as_ref()
             .map_or(0, |transform| Rc::as_ptr(transform) as usize);
-        (self.element_offset(), self.content_mask(), transform)
+        (self.offset(), self.content_mask(), transform)
     }
 
     #[cfg(debug_assertions)]
-    pub(crate) fn hitbox_places(
-        &self,
-    ) -> Vec<(Bounds<Pixels>, ContentMask<Pixels>, HitboxBehavior, bool)> {
-        let place = |hitbox: &Hitbox| {
+    pub(crate) fn region_places(&self) -> Vec<(Rect, Clip<Pixels>, Hit, bool)> {
+        let place = |placed: &Placed| {
+            let region = placed.region;
             (
-                hitbox.bounds,
-                hitbox.content_mask,
-                hitbox.behavior,
-                hitbox.transform.is_some(),
+                region.bounds,
+                placed.clip,
+                region.hit,
+                placed.transform.is_some(),
             )
         };
-        self.next.hitboxes.iter().map(place).collect()
+        self.pending.regions.iter().map(place).collect()
     }
 
     #[cfg(debug_assertions)]
     pub(crate) fn redraws(&self) -> bool {
-        self.redraw[0]
+        self.again
     }
 
     #[cfg(debug_assertions)]
-    pub(crate) fn truncate_hitboxes(&mut self, len: usize) {
-        self.next.hitboxes.truncate(len);
+    pub(crate) fn truncate_regions(&mut self, len: usize) {
+        self.pending.regions.truncate(len);
     }
 
-    pub fn insert_window_drag_hitbox(&mut self, hitbox: &Hitbox) {
-        self.next.drag_areas.push(hitbox.id);
-    }
-
-    pub fn set_cursor_style(&mut self, style: CursorStyle, hitbox: &Hitbox) {
-        self.next.cursors.push((hitbox.id, style));
-    }
-
-    pub fn on_mouse_event<E: MouseEvent>(
-        &mut self,
-        mut listener: impl FnMut(&E, DispatchPhase, &mut Window, &mut App) + 'static,
-    ) {
-        self.next
-            .mouse_listeners
-            .push(Some(Box::new(move |event, phase, window, cx| {
-                if let Some(event) = E::from_input(event) {
-                    listener(event, phase, window, cx);
-                }
-            })));
-    }
-
-    pub fn with_element_state<S: 'static, R>(
-        &mut self,
-        id: ElementId,
-        f: impl FnOnce(Option<S>, &mut Self) -> (R, S),
-    ) -> R {
-        let key = (id, TypeId::of::<S>());
-        let mut slot = self
-            .next_states
-            .remove(&key)
-            .or_else(|| self.states.remove(&key))
-            .and_then(|state| state.downcast::<Option<S>>().ok())
-            .unwrap_or_default();
-        let (result, state) = f(slot.take(), self);
-        *slot = Some(state);
-        self.next_states.insert(key, slot);
-        result
+    pub fn keyed<S: Default + 'static>(&mut self, key: NodeKey) -> &mut S {
+        let slot = (key, TypeId::of::<S>());
+        let (states, next) = (&mut self.states, &mut self.next_states);
+        next.entry(slot)
+            .or_insert_with(|| {
+                states
+                    .remove(&slot)
+                    .unwrap_or_else(|| Box::new(S::default()))
+            })
+            .downcast_mut()
+            .expect("the slot type matches its key")
     }
 
     pub fn font_smoothing(&self) -> bool {
         self.font_smoothing
     }
 
-    pub fn content_mask(&self) -> ContentMask<Pixels> {
+    pub fn offset(&self) -> Point<Pixels> {
+        self.offsets.last().copied().unwrap_or_default()
+    }
+
+    pub fn content_mask(&self) -> Clip<Pixels> {
         self.content_masks.last().map_or_else(
-            || ContentMask::from(Bounds::new(Point::default(), self.viewport_size)),
+            || Clip::from(Rect::new(Point::default(), self.viewport_size)),
             |(mask, _)| *mask,
         )
     }
 
-    fn push_content_mask(&mut self, mask: ContentMask<Pixels>) {
+    fn push_content_mask(&mut self, mask: Clip<Pixels>) {
         let snapped = self.snap_mask(mask);
         self.content_masks.push((mask, snapped));
     }
 
-    // Use a mask from the containing block's layer: it replaces intermediate clips. Pair with
-    // pop_content_mask.
-    pub(crate) fn push_escaped_content_mask(&mut self, mask: ContentMask<Pixels>) {
+    // The mask from the containing block's layer replaces intermediate clips. Pair with pop_content_mask.
+    pub(crate) fn push_escaped_content_mask(&mut self, mask: Clip<Pixels>) {
         self.push_content_mask(mask);
     }
 
@@ -1456,84 +1281,43 @@ impl Window {
         self.content_masks.pop();
     }
 
-    pub fn with_content_mask<R>(
-        &mut self,
-        mask: Option<ContentMask<Pixels>>,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        let Some(mask) = mask else {
-            return f(self);
-        };
-        self.push_content_mask(mask.intersect(&self.content_mask()));
-        let result = f(self);
-        self.content_masks.pop();
-        result
-    }
-
-    pub fn element_offset(&self) -> Point<Pixels> {
-        self.offsets.last().copied().unwrap_or_default()
-    }
-
-    pub fn with_element_offset<R>(
-        &mut self,
-        offset: Point<Pixels>,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        if offset == Point::default() {
-            return f(self);
+    pub fn scope<R>(&mut self, scope: Scope, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = self.opacity;
+        match scope {
+            Scope::Clip(Some(clip)) => self.push_content_mask(clip.intersect(&self.content_mask())),
+            Scope::Offset(by) if by != Point::default() => self.offsets.push(self.offset() + by),
+            Scope::Opacity(Some(opacity)) => self.opacity *= opacity,
+            _ => return f(self),
         }
-        let offset = self.element_offset() + offset;
-        self.with_absolute_element_offset(offset, f)
-    }
-
-    pub fn with_absolute_element_offset<R>(
-        &mut self,
-        offset: Point<Pixels>,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        self.offsets.push(offset);
         let result = f(self);
-        self.offsets.pop();
+        match scope {
+            Scope::Clip(_) => drop(self.content_masks.pop()),
+            Scope::Offset(_) => drop(self.offsets.pop()),
+            Scope::Opacity(_) => self.opacity = outer,
+        }
         result
     }
 
-    pub(crate) fn with_element_opacity<R>(
-        &mut self,
-        opacity: Option<f32>,
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        let Some(opacity) = opacity else {
-            return f(self);
-        };
-        let previous = self.opacity;
-        self.opacity = previous * opacity;
-        let result = f(self);
-        self.opacity = previous;
-        result
-    }
-
-    pub fn transformed_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    pub fn transformed_bounds(&self, bounds: Rect) -> Rect {
         let Some(transform) = &self.hit_transform else {
             return bounds;
         };
+        let to_window = transform.to_window.get();
         let corners = [
             bounds.origin,
             bounds.top_right(),
             bounds.bottom_left(),
             bounds.bottom_right(),
-        ]
-        .map(|corner| HitTransform::map(&transform.forward.get(), corner));
-        if corners.iter().any(Option::is_none) {
+        ];
+        let mut mapped = corners.iter().map(|corner| project(&to_window, *corner));
+        let Some(Some(first)) = mapped.next() else {
             return bounds;
-        }
-        let corners = corners.map(Option::unwrap);
-        let min = corners.iter().fold(corners[0], |min, p| min.min(*p));
-        let max = corners.iter().fold(corners[0], |max, p| max.max(*p));
-        Bounds::from_corners(min, max)
-    }
-
-    pub fn with_hit_transform<R>(&mut self, m: [f32; 16], f: impl FnOnce(&mut Self) -> R) -> R {
-        self.with_keyed_hit_transform(m, None, f)
+        };
+        mapped
+            .try_fold((first, first), |(min, max), corner| {
+                corner.map(|corner| (min.min(corner), max.max(corner)))
+            })
+            .map_or(bounds, |(min, max)| Rect::between(min, max))
     }
 
     pub fn with_keyed_hit_transform<R>(
@@ -1542,669 +1326,162 @@ impl Window {
         key: Option<u64>,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        let local = plane(&m);
+        let local = plane_of(&m);
         let outer = self.hit_transform.clone();
-        let forward = match &outer {
-            Some(outer) => mul3(&outer.forward.get(), &local),
+        let to_window = match &outer {
+            Some(outer) => compose(&outer.to_window.get(), &local),
             None => local,
         };
-        let Some(inverse) = invert3(&forward) else {
+        let Some(from_window) = invert(&to_window) else {
             return f(self);
         };
-        let window_mask = outer
-            .as_ref()
-            .map_or_else(|| self.content_mask().bounds, |outer| outer.window_mask);
+        let area = match &outer {
+            Some(outer) => outer.area,
+            None => self.content_mask().bounds,
+        };
         self.hit_transform = Some(Rc::new(HitTransform {
-            local: local.into(),
             key,
             outer,
-            forward: forward.into(),
-            inverse: inverse.into(),
-            window_mask,
+            local: Cell::new(local),
+            to_window: Cell::new(to_window),
+            from_window: Cell::new(from_window),
+            area,
         }));
         self.push_content_mask(unbounded_mask());
         let result = f(self);
         self.content_masks.pop();
-        self.hit_transform = self.hit_transform.take().and_then(|own| own.outer.clone());
+        self.hit_transform = self
+            .hit_transform
+            .take()
+            .and_then(|inner| inner.outer.clone());
         result
-    }
-
-    fn snap_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
-        let scale = self.scale_factor;
-        let left = round_to_device_pixel(bounds.left().0, scale);
-        let top = round_to_device_pixel(bounds.top().0, scale);
-        let right = round_to_device_pixel(bounds.right().0, scale).max(left);
-        let bottom = round_to_device_pixel(bounds.bottom().0, scale).max(top);
-        Bounds::from_corners(
-            point(ScaledPixels(left), ScaledPixels(top)),
-            point(ScaledPixels(right), ScaledPixels(bottom)),
-        )
-    }
-
-    fn snap_stroke(&self, value: Pixels) -> ScaledPixels {
-        ScaledPixels(round_stroke_to_device_pixel(value.0, self.scale_factor))
-    }
-
-    fn cover_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
-        let scale = self.scale_factor;
-        let left = (bounds.left().0 * scale).floor();
-        let top = (bounds.top().0 * scale).floor();
-        let right = (bounds.right().0 * scale).ceil().max(left);
-        let bottom = (bounds.bottom().0 * scale).ceil().max(top);
-        Bounds::from_corners(
-            point(ScaledPixels(left), ScaledPixels(top)),
-            point(ScaledPixels(right), ScaledPixels(bottom)),
-        )
-    }
-
-    fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
-        match self.content_masks.last() {
-            Some((_, snapped)) => *snapped,
-            None => self.snap_mask(self.content_mask()),
-        }
-    }
-
-    fn snap_mask(&self, mask: ContentMask<Pixels>) -> ContentMask<ScaledPixels> {
-        ContentMask {
-            bounds: self.cover_bounds(mask.bounds),
-            rounded: mask.rounded.scale(self.scale_factor),
-            corner_radii: mask.corner_radii.scale(self.scale_factor),
-        }
-    }
-
-    pub fn paint_layer<R>(&mut self, bounds: Bounds<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
-        let clipped = bounds.intersect(&self.content_mask().bounds);
-        if !clipped.is_empty() {
-            let bounds = self.cover_bounds(clipped);
-            self.scene.push_layer(bounds);
-        }
-        let result = f(self);
-        if !clipped.is_empty() {
-            self.scene.pop_layer();
-        }
-        result
-    }
-
-    pub fn paint_quad(&mut self, quad: PaintQuad) {
-        if self.opacity <= 0. {
-            return;
-        }
-        let opacity = self.opacity;
-        let quad = Quad {
-            order: 0,
-            border_style: quad.border_style as u32 | u32::from(quad.border_sides) << 8,
-            bounds: self.snap_bounds(quad.bounds),
-            content_mask: self.snapped_content_mask(),
-            background: quad.background.opacity(opacity),
-            border_color: quad.border_color.opacity(opacity),
-            corner_radii: quad.corner_radii.scale(self.scale_factor),
-            border_widths: quad.border_widths.map(|width| self.snap_stroke(width)),
-        };
-        if !quad.background.is_transparent() {
-            self.scene.insert(Primitive::Quad(quad));
-            return;
-        }
-        let outer = quad.bounds;
-        let inner = largest_border_interior(&quad);
-        if inner.is_empty() {
-            self.scene.insert(Primitive::Quad(quad));
-            return;
-        }
-        for strip in [
-            Bounds::from_corners(outer.origin, point(outer.right(), inner.top())),
-            Bounds::from_corners(point(outer.left(), inner.bottom()), outer.bottom_right()),
-            Bounds::from_corners(point(outer.left(), inner.top()), inner.bottom_left()),
-            Bounds::from_corners(inner.top_right(), point(outer.right(), inner.bottom())),
-        ] {
-            let bounds = quad.content_mask.bounds.intersect(&strip);
-            if !bounds.is_empty() {
-                self.scene.insert(Primitive::Quad(Quad {
-                    content_mask: ContentMask {
-                        bounds,
-                        ..quad.content_mask
-                    },
-                    ..quad
-                }));
-            }
-        }
-    }
-
-    pub fn paint_drop_shadows(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        corner_radii: Radii<Pixels>,
-        shadows: &[BoxShadow],
-    ) {
-        self.paint_shadows(bounds, corner_radii, shadows, false);
-    }
-
-    pub fn paint_inset_shadows(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        corner_radii: Radii<Pixels>,
-        shadows: &[BoxShadow],
-    ) {
-        self.paint_shadows(bounds, corner_radii, shadows, true);
-    }
-
-    fn paint_shadows(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        corner_radii: Radii<Pixels>,
-        shadows: &[BoxShadow],
-        inset: bool,
-    ) {
-        if self.opacity <= 0. {
-            return;
-        }
-        let scale = self.scale_factor;
-        let content_mask = self.snapped_content_mask();
-        let element_bounds = self.cover_bounds(bounds);
-        let element_corner_radii = corner_radii.scale(scale);
-        for shadow in shadows.iter().filter(|shadow| shadow.inset == inset) {
-            let (shape, radii) = if inset {
-                let spread = shadow.spread_radius;
-                (
-                    (bounds + shadow.offset).dilate(-spread),
-                    corner_radii.inset(spread, spread, spread, spread),
-                )
-            } else {
-                let spread = f32::from(shadow.spread_radius);
-                let grow = |radius: Pixels| {
-                    let radius = f32::from(radius);
-                    Pixels::from(if radius <= 0. || spread == 0. {
-                        radius
-                    } else if spread < 0. || radius >= spread {
-                        (radius + spread).max(0.)
-                    } else {
-                        radius + spread * (1. + (radius / spread - 1.).powi(3))
-                    })
-                };
-                (
-                    (bounds + shadow.offset).dilate(shadow.spread_radius),
-                    Radii {
-                        x: corner_radii.x.map(grow),
-                        y: corner_radii.y.map(grow),
-                    },
-                )
-            };
-            self.scene.insert(Primitive::Shadow(Shadow {
-                order: 0,
-                blur_radius: shadow.blur_radius.scale(scale),
-                bounds: self.cover_bounds(shape),
-                corner_radii: radii.scale(scale),
-                content_mask,
-                color: shadow.color.opacity(self.opacity),
-                element_bounds,
-                element_corner_radii,
-                inset: inset as u32,
-                pad: 0,
-            }));
-        }
-    }
-
-    pub fn paint_effect<R>(&mut self, effect: PaintEffect, f: impl FnOnce(&mut Self) -> R) -> R {
-        // At opacity 0 nothing inside draws, but `f` still registers hitboxes and listeners.
-        if self.opacity <= 0. {
-            return f(self);
-        }
-        let scale = self.scale_factor;
-        let content_mask = self.content_mask().scale(scale);
-        let mask = effect.mask.and_then(|(image, bounds)| {
-            let tile = self.image_tile(&image)?;
-            Some((tile, bounds.scale(scale)))
-        });
-        let state = EffectState {
-            transform: effect.transform.map(|matrix| device_matrix(matrix, scale)),
-            opacity: effect.opacity.clamp(0., 1.),
-            color_matrix: effect.color_matrix,
-            blur: effect.blur.0 * scale,
-            shadow: effect.shadow.map(|(offset, blur, color)| {
-                (
-                    point(offset.x.0 * scale, offset.y.0 * scale),
-                    blur.0 * scale,
-                    color,
-                )
-            }),
-            blend_mode: effect.blend_mode,
-            clip: effect.clip.map(|(bounds, radii)| {
-                (
-                    bounds.scale(scale),
-                    radii.clamp_radii_for_quad_size(bounds.size).scale(scale),
-                )
-            }),
-            mask,
-            backdrop: effect.backdrop.map(
-                |Backdrop {
-                     bounds,
-                     corner_radii,
-                     blur,
-                     color_matrix,
-                 }| BackdropState {
-                    bounds: bounds.scale(scale),
-                    corner_radii: corner_radii
-                        .clamp_radii_for_quad_size(bounds.size)
-                        .scale(scale),
-                    blur: blur.0 * scale,
-                    color_matrix,
-                },
-            ),
-            glass: effect.glass.map(|glass| crate::scene::GlassState {
-                key: glass.key,
-                bounds: glass.bounds.scale(scale),
-                corner_radius: glass.corner_radius.0 * scale,
-                tint: glass.tint,
-                clear: glass.clear,
-                interactive: glass.interactive,
-            }),
-            content_mask,
-        };
-        self.scene.push_effect(state, effect.key);
-        // Ancestor clips apply after the effect, in window space, so the layer starts unclipped.
-        self.push_content_mask(unbounded_mask());
-        let result = f(self);
-        self.content_masks.pop();
-        self.scene.pop_effect();
-        result
-    }
-
-    pub fn paint_underline(
-        &mut self,
-        origin: Point<Pixels>,
-        width: Pixels,
-        style: &UnderlineStyle,
-    ) {
-        let line = self.underline(origin, width, style);
-        self.paint_decoration(line, style.style);
-    }
-
-    pub fn paint_strikethrough(
-        &mut self,
-        origin: Point<Pixels>,
-        width: Pixels,
-        style: &StrikethroughStyle,
-    ) {
-        let line = self.underline(
-            origin,
-            width,
-            &UnderlineStyle {
-                thickness: style.thickness,
-                color: style.color,
-                style: style.style,
-                offset: None,
-            },
-        );
-        self.paint_decoration(line, style.style);
-    }
-
-    fn underline(&self, origin: Point<Pixels>, width: Pixels, style: &UnderlineStyle) -> Underline {
-        let thickness = self.snap_stroke(style.thickness);
-        let height = match style.style {
-            DecorationStyle::Wavy | DecorationStyle::Double => ScaledPixels(thickness.0 * 3.),
-            _ => thickness,
-        };
-        Underline {
-            order: 0,
-            wavy: (style.style == DecorationStyle::Wavy) as u32,
-            bounds: Bounds {
-                origin: origin
-                    .map(|value| ScaledPixels(round_to_device_pixel(value.0, self.scale_factor))),
-                size: size(self.snap_stroke(width), height),
-            },
-            content_mask: self.snapped_content_mask(),
-            color: style.color.unwrap_or_default().opacity(self.opacity),
-            thickness,
-            pad: 0,
-        }
-    }
-
-    fn paint_decoration(&mut self, line: Underline, style: DecorationStyle) {
-        if self.opacity <= 0. {
-            return;
-        }
-        let thickness = line.thickness.0;
-        let mut second = None;
-        let mut first = line;
-        if style == DecorationStyle::Double {
-            first.bounds.size.height = line.thickness;
-            let mut next = first;
-            next.bounds.origin.y = ScaledPixels(first.bounds.origin.y.0 + thickness * 2.);
-            second = Some(next);
-        }
-        let dash = match style {
-            DecorationStyle::Dotted => thickness,
-            DecorationStyle::Dashed => thickness * 2.,
-            _ => 0.,
-        };
-        for line in [Some(first), second].into_iter().flatten() {
-            let bounds = line.bounds.intersect(&line.content_mask.bounds);
-            if bounds.is_empty() {
-                continue;
-            }
-            if dash <= 0. {
-                self.scene.insert(Primitive::Underline(line));
-                continue;
-            }
-            let mut start = line.bounds.left().0;
-            while start < bounds.right().0 {
-                let end = (start + dash).min(bounds.right().0);
-                let left = start.max(bounds.left().0);
-                if left < end {
-                    self.scene.insert(Primitive::Underline(Underline {
-                        content_mask: ContentMask {
-                            bounds: Bounds::from_corners(
-                                point(ScaledPixels(left), bounds.top()),
-                                point(ScaledPixels(end), bounds.bottom()),
-                            ),
-                            ..line.content_mask
-                        },
-                        ..line
-                    }));
-                }
-                start += dash * 2.;
-            }
-        }
-    }
-
-    pub fn paint_glyph(
-        &mut self,
-        origin: Point<Pixels>,
-        font_id: FontId,
-        glyph_id: GlyphId,
-        font_size: Pixels,
-        color: Rgba,
-        smoothing: bool,
-    ) {
-        if self.opacity <= 0. {
-            return;
-        }
-        let scale = self.scale_factor;
-        let origin = origin.scale(scale);
-        let variants = SUBPIXEL_VARIANTS_X as f32;
-        // Like Skia, halves round up, so a baseline at y.5 draws on the same row as in Chromium.
-        let quantized = point(
-            (origin.x.0 * variants + 0.5).floor() / variants,
-            (origin.y.0 + 0.5).floor(),
-        );
-        let subpixel_variant = point((quantized.x.fract() * variants) as u8, 0);
-        let params = RenderGlyphParams {
-            font_id,
-            glyph_id,
-            font_size,
-            subpixel_variant,
-            scale_factor: scale,
-            is_emoji: false,
-            dilation: if smoothing {
-                self.text_system.platform.glyph_dilation_for_color(color)
-            } else {
-                0
-            },
-        };
-        let Some((tile, shown)) = self.glyph_tile(params) else {
-            return;
-        };
-        let bounds = Bounds {
-            origin: quantized.map(|value| ScaledPixels(value.trunc()))
-                + shown.origin.map(ScaledPixels::from),
-            size: shown.size.map(ScaledPixels::from),
-        };
-        self.scene.insert(Primitive::Mono(MonochromeSprite {
-            order: 0,
-            pad: 0,
-            tile,
-            bounds,
-            content_mask: self.snapped_content_mask(),
-            color: color.opacity(self.opacity),
-        }));
-    }
-
-    pub fn paint_emoji(
-        &mut self,
-        origin: Point<Pixels>,
-        font_id: FontId,
-        glyph_id: GlyphId,
-        font_size: Pixels,
-    ) {
-        if self.opacity <= 0. {
-            return;
-        }
-        let scale = self.scale_factor;
-        let origin = origin
-            .scale(scale)
-            .map(|value| ScaledPixels(round_half_toward_zero(value.0)));
-        let params = RenderGlyphParams {
-            font_id,
-            glyph_id,
-            font_size,
-            subpixel_variant: Point::default(),
-            scale_factor: scale,
-            is_emoji: true,
-            dilation: 0,
-        };
-        let Some((tile, shown)) = self.glyph_tile(params) else {
-            return;
-        };
-        self.scene.insert(Primitive::Poly(PolychromeSprite {
-            order: 0,
-            grayscale: 0,
-            tile,
-            opacity: self.opacity,
-            pad: 0,
-            bounds: Bounds {
-                origin: origin + shown.origin.map(ScaledPixels::from),
-                size: shown.size.map(ScaledPixels::from),
-            },
-            content_mask: self.snapped_content_mask(),
-            corner_radii: Radii::default(),
-        }));
-    }
-
-    fn glyph_tile(
-        &self,
-        params: RenderGlyphParams,
-    ) -> Option<(crate::scene::AtlasTile, Bounds<DevicePixels>)> {
-        let text = &self.text_system;
-        self.platform
-            .atlas()
-            .get_or_insert_with(&AtlasKey::Glyph(params), &mut || {
-                Ok(text
-                    .rasterize_glyph(&params, crate::atlas::MAX_GLYPH_SIDE)?
-                    .map(|(shown, size, bytes)| (shown, size, Cow::Owned(bytes))))
-            })
-    }
-
-    fn image_tile(&self, image: &RenderImage) -> Option<crate::scene::AtlasTile> {
-        self.platform
-            .atlas()
-            .get_or_insert_with(&AtlasKey::Image(image.id), &mut || {
-                let size = image.size();
-                Ok(Some((
-                    Bounds::new(Point::default(), size),
-                    size,
-                    Cow::Borrowed(image.bytes()),
-                )))
-            })
-            .map(|(tile, _)| tile)
-    }
-
-    pub fn paint_symbol(&mut self, name: &str, bounds: Bounds<Pixels>, color: Rgba) {
-        if self.opacity <= 0. {
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            if bounds.is_empty() || color.a <= 0. {
-                return;
-            }
-            let bounds = self.snap_bounds(bounds);
-            let width = bounds.size.width.0;
-            let height = bounds.size.height.0;
-            if !width.is_finite() || !height.is_finite() || width <= 0. || height <= 0. {
-                return;
-            }
-            let scale = (1024. / width.max(height)).min(1.);
-            let size = [
-                (width * scale).ceil() as u16,
-                (height * scale).ceil() as u16,
-            ];
-            let image = self.symbols.get(name, size, self.frames_drawn);
-            for id in self.symbols.retired.drain(..) {
-                self.platform.atlas().remove(&AtlasKey::Symbol(id));
-            }
-            let Some(image) = image else { return };
-            let tile =
-                self.platform
-                    .atlas()
-                    .get_or_insert_with(&AtlasKey::Symbol(image.id), &mut || {
-                        let size = crate::size(
-                            DevicePixels(i32::from(image.size[0])),
-                            DevicePixels(i32::from(image.size[1])),
-                        );
-                        Ok(Some((
-                            Bounds::new(Point::default(), size),
-                            size,
-                            Cow::Borrowed(&image.bytes),
-                        )))
-                    });
-            if let Some((tile, _)) = tile {
-                self.scene.insert(Primitive::Mono(MonochromeSprite {
-                    order: 0,
-                    pad: 0,
-                    tile,
-                    bounds,
-                    content_mask: self.snapped_content_mask(),
-                    color: color.opacity(self.opacity),
-                }));
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = (name, bounds, color);
-    }
-
-    pub fn paint_image(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        image_bounds: Bounds<Pixels>,
-        corner_radii: impl Into<Radii<Pixels>>,
-        image: Arc<RenderImage>,
-        grayscale: bool,
-    ) {
-        if self.opacity <= 0. {
-            return;
-        }
-        let visible = bounds.intersect(&image_bounds);
-        if visible.is_empty() || image_bounds.is_empty() {
-            return;
-        }
-        let Some(tile) = self.image_tile(&image) else {
-            return;
-        };
-        let tile = if visible == image_bounds {
-            tile
-        } else {
-            let ratio = |a: Pixels, b: Pixels| a / b;
-            let [x, y, width, height] = [
-                ratio(
-                    visible.origin.x - image_bounds.origin.x,
-                    image_bounds.size.width,
-                ),
-                ratio(
-                    visible.origin.y - image_bounds.origin.y,
-                    image_bounds.size.height,
-                ),
-                ratio(visible.size.width, image_bounds.size.width),
-                ratio(visible.size.height, image_bounds.size.height),
-            ];
-            let origin = tile.bounds.origin;
-            let full = tile.bounds.size;
-            let left = (origin.x.0 + (x * full.width.0 as f32).round() as i32)
-                .clamp(origin.x.0, origin.x.0 + full.width.0);
-            let top = (origin.y.0 + (y * full.height.0 as f32).round() as i32)
-                .clamp(origin.y.0, origin.y.0 + full.height.0);
-            let width = ((width * full.width.0 as f32).round() as i32)
-                .min(origin.x.0 + full.width.0 - left)
-                .max(0);
-            let height = ((height * full.height.0 as f32).round() as i32)
-                .min(origin.y.0 + full.height.0 - top)
-                .max(0);
-            crate::scene::AtlasTile {
-                bounds: Bounds::new(
-                    point(DevicePixels(left), DevicePixels(top)),
-                    size(DevicePixels(width), DevicePixels(height)),
-                ),
-                ..tile
-            }
-        };
-        let corner_radii = corner_radii
-            .into()
-            .clamp_radii_for_quad_size(visible.size)
-            .scale(self.scale_factor);
-        self.scene.insert(Primitive::Poly(PolychromeSprite {
-            order: 0,
-            grayscale: u32::from(grayscale) | u32::from(image.is_premultiplied()) << 8,
-            tile,
-            opacity: self.opacity,
-            pad: 0,
-            bounds: self.snap_bounds(visible),
-            content_mask: self.snapped_content_mask(),
-            corner_radii,
-        }));
-    }
-
-    pub fn drop_image(&mut self, image: Arc<RenderImage>) {
-        self.platform.atlas().remove(&AtlasKey::Image(image.id));
     }
 }
 
 impl raw_window_handle::HasWindowHandle for Window {
-    fn window_handle(
-        &self,
-    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+    fn window_handle(&self) -> Result<raw_window_handle::WindowHandle<'_>, HandleError> {
         let raw = self
             .platform
             .raw_window_handle()
-            .map_err(|_| raw_window_handle::HandleError::Unavailable)?;
+            .map_err(|_| HandleError::Unavailable)?;
         // SAFETY: the native window lives as long as this window.
         Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw) })
     }
 }
 
-fn unbounded_mask() -> ContentMask<Pixels> {
-    ContentMask::from(Bounds::new(
-        point(px(-1e6), px(-1e6)),
-        size(px(2e6), px(2e6)),
-    ))
+fn unbounded_mask() -> Clip<Pixels> {
+    Clip::from(crate::rect(px(-1e6), px(-1e6), px(2e6), px(2e6)))
 }
 
-fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
-    let radii = &quad.corner_radii;
-    let widths = &quad.border_widths;
-    let edge = Edges {
-        top: radii.y.top_left.max(radii.y.top_right),
-        right: radii.x.top_right.max(radii.x.bottom_right),
-        bottom: radii.y.bottom_left.max(radii.y.bottom_right),
-        left: radii.x.top_left.max(radii.x.bottom_left),
-    };
-    let antialias = point(ScaledPixels(1.), ScaledPixels(1.));
-    let inset = |near: Point<ScaledPixels>, far: Point<ScaledPixels>| {
-        Bounds::from_corners(
-            quad.bounds.origin + near + antialias,
-            quad.bounds.bottom_right() - far - antialias,
-        )
-    };
-    let horizontal = inset(
-        point(widths.left, widths.top.max(edge.top)),
-        point(widths.right, widths.bottom.max(edge.bottom)),
-    );
-    let vertical = inset(
-        point(widths.left.max(edge.left), widths.top),
-        point(widths.right.max(edge.right), widths.bottom),
-    );
-    let area =
-        |bounds: &Bounds<ScaledPixels>| bounds.size.width.0.max(0.) * bounds.size.height.0.max(0.);
-    if area(&horizontal) >= area(&vertical) {
-        horizontal
-    } else {
-        vertical
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn placed(bounds: Rect, hit: Hit, clip: Rect, transform: Option<Rc<HitTransform>>) -> Placed {
+        Placed {
+            region: Region {
+                key: 0,
+                bounds,
+                hit,
+            },
+            clip: Clip::from(clip),
+            transform,
+        }
+    }
+
+    fn transform(m: [f32; 16], outer: Option<Rc<HitTransform>>, area: Rect) -> Rc<HitTransform> {
+        let local = plane_of(&m);
+        let to_window = outer
+            .as_ref()
+            .map_or(local, |outer| compose(&outer.to_window.get(), &local));
+        Rc::new(HitTransform {
+            key: Some(7),
+            outer,
+            local: Cell::new(local),
+            to_window: Cell::new(to_window),
+            from_window: Cell::new(invert(&to_window).unwrap()),
+            area,
+        })
+    }
+
+    fn translate(x: f32, y: f32) -> [f32; 16] {
+        [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., x, y, 0., 1.]
+    }
+
+    fn at(x: f32, y: f32) -> Point<Pixels> {
+        point(px(x), px(y))
+    }
+
+    fn r(x: f32, y: f32, width: f32, height: f32) -> Rect {
+        crate::rect(px(x), px(y), px(width), px(height))
+    }
+
+    #[test]
+    fn regions_hit_inside_their_clip_and_shields_end_the_hover() {
+        let window = r(0., 0., 500., 500.);
+        let mut input = Input::default();
+        for (key, (bounds, hit, clip)) in [
+            (r(0., 0., 100., 100.), Hit::Pass, window),
+            (r(0., 0., 100., 100.), Hit::Shield, window),
+            (r(0., 0., 100., 100.), Hit::Pass, r(0., 0., 50., 50.)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut placed = placed(bounds, hit, clip, None);
+            placed.region.key = key as u64;
+            input.regions.push(placed);
+        }
+        let mut under = Vec::new();
+        assert_eq!(input.probe(at(10., 10.), &mut under), 2);
+        assert_eq!(under, [2, 1, 0]);
+        assert_eq!(input.probe(at(70., 70.), &mut under), 1);
+        assert_eq!(under, [1, 0]);
+        assert_eq!(input.probe(at(170., 70.), &mut under), 0);
+        assert!(under.is_empty());
+    }
+
+    #[test]
+    fn transformed_regions_hit_where_they_are_drawn_and_follow_patches() {
+        let window = r(0., 0., 300., 300.);
+        let bounds = r(0., 0., 20., 20.);
+        let outer = transform(translate(100., 0.), None, window);
+        let mut scale = translate(0., 50.);
+        scale[0] = 2.;
+        scale[5] = 2.;
+        let inner = transform(scale, Some(outer), window);
+        let mut input = Input::default();
+        input
+            .regions
+            .push(placed(bounds, Hit::Pass, window, Some(inner)));
+        let mut under = Vec::new();
+        // Drawn at x 100..140 and y 50..90.
+        assert_eq!(input.probe(at(130., 85.), &mut under), 1);
+        assert_eq!(input.probe(at(30., 85.), &mut under), 0);
+        input.turn(7, &translate(0., 0.));
+        // Both planes have key 7, so the scale is gone and the box is at x 0..20.
+        assert_eq!(input.probe(at(10., 10.), &mut under), 1);
+        assert_eq!(input.probe(at(130., 85.), &mut under), 0);
+        // Points outside the area of the outermost transform miss.
+        assert_eq!(input.probe(at(10., 310.), &mut under), 0);
+    }
+
+    #[test]
+    fn planes_invert_and_compose() {
+        let mut m = translate(3., -4.);
+        m[0] = 2.;
+        m[1] = 1.;
+        m[3] = 0.001;
+        let plane = plane_of(&m);
+        let inverse = invert(&plane).unwrap();
+        let identity = compose(&plane, &inverse);
+        for (i, value) in identity.iter().enumerate() {
+            let expected = if i % 4 == 0 { 1. } else { 0. };
+            assert!((value - expected).abs() < 1e-5, "{identity:?}");
+        }
+        let point = project(&plane, at(5., 6.)).unwrap();
+        let back = project(&inverse, point).unwrap();
+        assert!((back.x.0 - 5.).abs() < 1e-4 && (back.y.0 - 6.).abs() < 1e-4);
+        assert!(invert(&[0.; 9]).is_none());
     }
 }

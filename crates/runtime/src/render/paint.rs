@@ -1,6 +1,6 @@
 use crate::style;
 use crate::style::Prop;
-use renderer::{Bounds, Child, Hooks, NodeCx, Pixels, Point, Window, point, px};
+use renderer::{Child, Hooks, NodeCx, Pixels, Point, Rect, Window, point, px};
 use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 pub(super) struct Turned {
@@ -46,14 +46,14 @@ impl Hooks for Turned {
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let matrix = self.matrix(cx.bounds.origin);
         self.matrix.set(matrix);
-        cx.window.with_hit_transform(matrix, inner);
+        cx.window.with_keyed_hit_transform(matrix, None, inner);
     }
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let effect = renderer::PaintEffect {
             transform: Some(self.matrix.get()),
             ..Default::default()
         };
-        cx.window.paint_effect(effect, inner);
+        cx.window.with_effect(effect, inner);
     }
 }
 
@@ -68,7 +68,7 @@ impl Hooks for Transformed {
         let matrix = super::effects::transform(&self.style, &self.units, cx.bounds, None);
         self.matrix.set(matrix);
         match matrix {
-            Some(matrix) => cx.window.with_hit_transform(matrix, inner),
+            Some(matrix) => cx.window.with_keyed_hit_transform(matrix, None, inner),
             None => inner(cx.window),
         }
     }
@@ -79,7 +79,7 @@ impl Hooks for Transformed {
                     transform: Some(matrix),
                     ..Default::default()
                 };
-                cx.window.paint_effect(effect, inner);
+                cx.window.with_effect(effect, inner);
             }
             None => inner(cx.window),
         }
@@ -104,7 +104,7 @@ impl Hooks for Effected {
             backdrop.bounds = cx.bounds;
             backdrop.corner_radii = radii.resolve(cx.bounds.size);
         }
-        cx.window.paint_effect(effect, inner);
+        cx.window.with_effect(effect, inner);
     }
 }
 
@@ -151,16 +151,16 @@ impl Hooks for Picture {
             }
         });
         if let Some(image) = image
-            && image.size().width.0 > 0
-            && image.size().height.0 > 0
+            && image.size().width > 0
+            && image.size().height > 0
         {
             let bounds = cx.bounds;
-            let fitted = self.fit.get_bounds(bounds, image.size());
+            let fitted = self.fit.place(bounds, image.size());
             match self.cropped {
-                Some(corners) => cx.window.paint_image(bounds, fitted, corners, image, false),
+                Some(corners) => cx.window.draw_image(bounds, fitted, corners, image, false),
                 None => {
                     let radii = cx.style.corner_radii.resolve(bounds.size);
-                    cx.window.paint_image(fitted, bounds, radii, image, false);
+                    cx.window.draw_image(fitted, bounds, radii, image, false);
                 }
             }
         }
@@ -169,7 +169,7 @@ impl Hooks for Picture {
 }
 
 pub(super) struct Sticky {
-    pub(super) scroll: renderer::ScrollHandle,
+    pub(super) scroll: renderer::ScrollRef,
     pub(super) border: [f32; 4],
     pub(super) block: Option<(usize, [f32; 4])>,
 }
@@ -202,7 +202,7 @@ pub(super) struct DomBox {
     pub(super) leading: Option<[f32; 3]>,
     pub(super) boxless: bool,
     pub(super) text: Option<([usize; 2], [f32; 2])>,
-    pub(super) placed: Cell<(Bounds<Pixels>, Option<super::effects::Matrix>)>,
+    pub(super) placed: Cell<(Rect<Pixels>, Option<super::effects::Matrix>)>,
     pub(super) offset: Cell<Point<Pixels>>,
     pub(super) frame: bool,
 }
@@ -211,11 +211,11 @@ pub(super) struct DomBox {
 const _: () = assert!(size_of::<DomBox>() + 16 <= 512);
 
 impl DomBox {
-    fn block(&self, bounds: Bounds<Pixels>, translation: Point<Pixels>) {
+    fn block(&self, bounds: Rect<Pixels>, translation: Point<Pixels>) {
         if let Some([top, right, bottom, left]) = self.block {
             let view = &*self.view;
             let mut host = view.host.borrow_mut();
-            let mut padding = Bounds::new(
+            let mut padding = Rect::new(
                 bounds.origin + point(px(left), px(top)),
                 renderer::size(
                     bounds.size.width - px(left + right),
@@ -231,7 +231,7 @@ impl DomBox {
         }
     }
 
-    fn mirror(&self, mirror: &mut crate::dom::LayoutMirror, window_bounds: Bounds<Pixels>) {
+    fn mirror(&self, mirror: &mut crate::dom::LayoutMirror, window_bounds: Rect<Pixels>) {
         let [mut top, right, mut bottom, left] = self.shared.unwrap_or_default();
         if let Some([line, above, below]) = self.leading
             && (f32::from(window_bounds.size.height) - line).abs() < 0.5
@@ -291,7 +291,7 @@ impl DomBox {
         }
     }
 
-    fn reached(&self, window_bounds: Bounds<Pixels>, flags: u16) {
+    fn reached(&self, window_bounds: Rect<Pixels>, flags: u16) {
         let view = &*self.view;
         let mut reaching = view.reaching.borrow_mut();
         let none = [f32::INFINITY, f32::NEG_INFINITY];
@@ -401,7 +401,7 @@ impl Hooks for DomBox {
                 host.dom.get(&view.id).and_then(|dom| match container {
                     0 => dom.scroll.get(&0).map(|scroll| {
                         let [width, height] = self.units.viewport;
-                        Bounds::new(
+                        Rect::new(
                             scroll.bounds().origin + scroll.offset() + scroll.stretch(),
                             renderer::size(px(width), px(height)),
                         )
@@ -609,7 +609,7 @@ impl Hooks for DomBox {
                     let _ = browser.set_bounds(bounds);
                 }
             }
-            window.with_element_offset(offset, |window| inner(window));
+            window.scope(renderer::Scope::Offset(offset), |window| inner(window));
             self.reached(window_bounds, flags);
             self.unions();
         };
@@ -638,7 +638,7 @@ impl Hooks for DomBox {
     fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let (placed, matrix) = self.placed.get();
         let offset = self.offset.get();
-        let bounds = Bounds::new(cx.exact.origin + offset, cx.exact.size);
+        let bounds = Rect::new(cx.exact.origin + offset, cx.exact.size);
         let moved = bounds != placed;
         if moved && matrix.is_some() {
             return self.prepaint(cx, inner);
@@ -661,7 +661,7 @@ impl Hooks for DomBox {
             view.reaching
                 .borrow_mut()
                 .push(([f32::INFINITY, f32::NEG_INFINITY], self.plans));
-            window.with_element_offset(offset, |window| inner(window));
+            window.scope(renderer::Scope::Offset(offset), |window| inner(window));
             self.reached(window_bounds, flags);
             if moved {
                 self.unions();
@@ -700,7 +700,7 @@ impl Hooks for DomBox {
         }
         let (clip, mut layers) = self.effects(bounds, matrix, window);
         let mut paint = |window: &mut Window| match &clip {
-            Some(clip) => window.with_content_mask(Some(*clip), |window| inner(window)),
+            Some(clip) => window.scope(renderer::Scope::Clip(Some(*clip)), |window| inner(window)),
             None => inner(window),
         };
         nest_effects(&mut layers, window, &mut paint);
@@ -710,13 +710,10 @@ impl Hooks for DomBox {
 impl DomBox {
     fn effects(
         &self,
-        bounds: Bounds<Pixels>,
+        bounds: Rect<Pixels>,
         transform: Option<super::effects::Matrix>,
         window: &mut Window,
-    ) -> (
-        Option<renderer::ContentMask<Pixels>>,
-        Vec<renderer::PaintEffect>,
-    ) {
+    ) -> (Option<renderer::Clip<Pixels>>, Vec<renderer::PaintEffect>) {
         use super::effects::{self, Clip};
         let style = &self.style;
         let units = self.units;
@@ -741,8 +738,8 @@ impl DomBox {
             .and_then(|value| effects::clip(value, &units, size, doc, &self.ids))
         {
             Some(Clip::Rounded(rect, radii)) => {
-                clip = Some(renderer::ContentMask::rounded(
-                    Bounds::new(
+                clip = Some(renderer::Clip::rounded(
+                    Rect::new(
                         bounds.origin + point(px(rect[0]), px(rect[1])),
                         renderer::size(px(rect[2]), px(rect[3])),
                     ),
@@ -784,8 +781,8 @@ impl DomBox {
             if masks.get(&self.id).is_none_or(|(old, image)| {
                 *old != inputs
                     || image.as_ref().is_some_and(|image| {
-                        u32::from(image.size().width) != raster[0]
-                            || u32::from(image.size().height) != raster[1]
+                        (image.size().width as u32) != raster[0]
+                            || (image.size().height as u32) != raster[1]
                     })
             }) {
                 if shapes.is_none()
@@ -803,7 +800,7 @@ impl DomBox {
                         std::sync::Arc::new(renderer::RenderImage::new(raster[0], raster[1], bytes))
                     });
                     if let Some((_, Some(old))) = masks.insert(self.id, (inputs, image)) {
-                        window.drop_image(old);
+                        window.release_image(old);
                     }
                     return masks
                         .get(&self.id)
@@ -824,7 +821,7 @@ impl DomBox {
                 match super::canvas::svg(&source, raster[0], raster[1], None) {
                     Ok(image) => {
                         if let Some((_, Some(old))) = masks.insert(self.id, (inputs, Some(image))) {
-                            window.drop_image(old);
+                            window.release_image(old);
                         }
                     }
                     Err(error) => eprintln!("apps: mask: {error}"),
@@ -870,7 +867,7 @@ impl DomBox {
                         .get(Prop::MACOS_GLASS_TINT_COLOR)
                         .and_then(style::color)
                         .filter(|(_, alpha)| *alpha > 0)
-                        .map(|(color, alpha)| renderer::rgba(color << 8 | u32::from(alpha))),
+                        .map(|(color, alpha)| renderer::Color::hex(color << 8 | u32::from(alpha))),
                     clear: kind == "clear",
                     interactive: style.get(Prop::MACOS_GLASS_INTERACTIVE) == Some("true")
                         && style.get(Prop::POINTER_EVENTS) != Some("none")
@@ -934,7 +931,7 @@ fn nest_effects(
     paint: &mut dyn FnMut(&mut Window),
 ) {
     match layers.pop() {
-        Some(effect) => window.paint_effect(effect, |window| nest_effects(layers, window, paint)),
+        Some(effect) => window.with_effect(effect, |window| nest_effects(layers, window, paint)),
         None => paint(window),
     }
 }

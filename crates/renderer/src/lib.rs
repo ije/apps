@@ -1,10 +1,10 @@
 mod app;
 mod atlas;
-mod bounds_tree;
 mod color;
 mod control;
 mod frame;
 mod geometry;
+mod gpu;
 mod input;
 mod node;
 mod platform;
@@ -20,15 +20,15 @@ pub use control::*;
 pub use geometry::*;
 pub use input::*;
 pub use node::{
-    AvailableSpace, Child, ElementId, Hooks, Node, NodeCx, ScrollHandle, canvas, canvas_within,
-    layers, node, shared, text,
+    AvailableSpace, Child, Hooks, Node, NodeCx, NodeKey, ScrollRef, canvas, canvas_within, layers,
+    node, shared, text,
 };
 pub use scene::{Backdrop, BlendMode, BorderStyle, Glass, PaintEffect, RenderImage, Scene};
 pub use style::*;
 pub use text::{
-    DecorationStyle, Font, FontId, FontStyle, FontWeight, LineLayout, SUBPIXEL_VARIANTS_X,
-    SharedString, StrikethroughStyle, TextAlign, TextLayout, TextRun, TextSystem, TextWrap,
-    UnderlineStyle, WhiteSpace, WordBreak, WrapBoundary, WrappedLineLayout, font, widest_piece,
+    Decoration, DecorationStyle, Font, FontId, FontStyle, FontWeight, Glyph, GlyphId, Line,
+    Paragraph, SUBPIXEL_STEPS, SharedString, TextAlign, TextLine, TextOverrides, TextRun,
+    TextStyle, TextSystem, TextWrap, WhiteSpace, WordBreak, Wrapping, widest_piece,
 };
 pub use tree::Tree;
 pub use window::*;

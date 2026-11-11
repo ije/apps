@@ -1,9 +1,8 @@
 use crate::{
-    AlignItems, App, Baseline, Bounds, Corners, CursorStyle, Display, Edges, FlexDirection,
-    FlexWrap, FontWeight, Hitbox, JustifyContent, Length, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Overflow, Overscroll, Pixels, Point, Position, Rgba, ScrollPhase,
-    ScrollWheelEvent, SharedString, Size, Style, TextAlign, TextRun, TextStyle,
-    TextStyleRefinement, WhiteSpace, Window, input::DispatchPhase, point, px, relative,
+    AlignContent, AlignItems, App, Baseline, Color, Corners, Cursor, Display, Edges, Event,
+    FlexDirection, FlexWrap, FontWeight, Length, Overflow, Overscroll, Pixels, Point, Position,
+    Rect, Region, Scope, SharedString, Size, Style, TextAlign, TextOverrides, TextRun, TextStyle,
+    WheelPhase, WhiteSpace, Window, point, px, relative,
 };
 use std::{
     any::Any,
@@ -37,31 +36,27 @@ impl From<Pixels> for AvailableSpace {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ElementId(pub u64);
+pub struct NodeKey(pub u64);
 
-impl From<usize> for ElementId {
-    fn from(id: usize) -> Self {
-        Self(id as u64)
+impl From<u64> for NodeKey {
+    fn from(key: u64) -> Self {
+        Self(key)
     }
 }
 
-impl From<u64> for ElementId {
-    fn from(id: u64) -> Self {
-        Self(id)
+impl From<usize> for NodeKey {
+    fn from(key: usize) -> Self {
+        Self(key as u64)
     }
 }
 
-impl From<(&'static str, usize)> for ElementId {
-    fn from((name, id): (&'static str, usize)) -> Self {
-        let mut hash = 0xcbf29ce484222325u64;
-        for byte in name.bytes() {
-            hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
-        }
-        Self(hash ^ (id as u64).rotate_left(32))
+impl From<(&'static str, usize)> for NodeKey {
+    fn from((name, index): (&'static str, usize)) -> Self {
+        let mut hasher = rustc_hash::FxHasher::default();
+        std::hash::Hash::hash(name, &mut hasher);
+        Self(std::hash::Hasher::finish(&hasher) ^ (index as u64).rotate_left(32))
     }
 }
-
-type Listener<E> = Box<dyn FnMut(&E, &mut Window, &mut App)>;
 
 pub type MeasureFn = dyn FnMut(
     &TextStyle,
@@ -72,7 +67,7 @@ pub type MeasureFn = dyn FnMut(
 
 #[derive(Default)]
 pub struct Node {
-    pub(crate) id: Option<ElementId>,
+    pub(crate) id: Option<NodeKey>,
     pub(crate) style: NodeStyle,
     pub(crate) children: Vec<Child>,
     pub(crate) events: Option<Box<Events>>,
@@ -106,11 +101,11 @@ impl std::ops::Deref for NodeStyle {
 impl NodeStyle {
     pub(crate) fn make_mut(&mut self) -> &mut Style {
         if let Self::Shared(style) = self {
-            *self = Self::Own(Box::new((**style).clone()));
+            *self = Self::Own(Box::new(Style::clone(style)));
         }
         match self {
             Self::Own(style) => style,
-            Self::Shared(_) => unreachable!(),
+            Self::Shared(_) => unreachable!("the style was copied above"),
         }
     }
 }
@@ -118,8 +113,8 @@ impl NodeStyle {
 // Box children to keep child lists and moves small.
 pub enum Child {
     Node(Box<Node>),
-    Kept(ElementId),
-    Placed(ElementId, Bounds<Pixels>),
+    Kept(NodeKey),
+    Placed(NodeKey, Rect),
 }
 
 impl From<Node> for Child {
@@ -175,20 +170,17 @@ where
         + 'static,
 {
     fn same(&self, old: Option<&Rc<dyn Any>>) -> bool {
-        old.and_then(|old| old.downcast_ref::<S>())
-            .is_some_and(|old| *old == self.0)
+        old.and_then(|old| old.downcast_ref::<S>()) == Some(&self.0)
     }
 
     fn build(self: Box<Self>) -> (Rc<dyn Any>, Box<MeasureFn>) {
-        let Measured(state, mut measure) = *self;
-        let state = Rc::new(state);
-        let kept = state.clone();
-        (
-            state,
-            Box::new(move |style, known, available, window| {
-                measure(&kept, style, known, available, window)
-            }),
-        )
+        let Measured(input, mut measure) = *self;
+        let input = Rc::new(input);
+        let held = input.clone();
+        let measure = move |style: &TextStyle, known, available, window: &mut Window| {
+            measure(&held, style, known, available, window)
+        };
+        (input, Box::new(measure))
     }
 }
 
@@ -216,20 +208,24 @@ pub trait Hooks: 'static {
     }
 }
 
+// Two hooks of one node: the outer one wraps the inner one.
 struct Chain(Rc<dyn Hooks>, Rc<dyn Hooks>);
 
-impl Hooks for Chain {
-    fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        let (bounds, exact, inset, baselines, text, style, state) = (
-            cx.bounds,
-            cx.exact,
-            cx.inset,
-            cx.baselines,
-            cx.text,
-            cx.style,
-            cx.state,
-        );
-        self.0.prepaint(cx, &mut |window| {
+type Step = for<'a, 'b> fn(&'b dyn Hooks, &'b mut NodeCx<'a>, &'b mut dyn FnMut(&mut Window));
+
+impl Chain {
+    fn nest(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window), step: Step) {
+        let NodeCx {
+            bounds,
+            exact,
+            inset,
+            baselines,
+            text,
+            style,
+            state,
+            ..
+        } = *cx;
+        step(&*self.0, cx, &mut |window| {
             let mut cx = NodeCx {
                 window,
                 bounds,
@@ -240,8 +236,22 @@ impl Hooks for Chain {
                 style,
                 state,
             };
-            self.1.prepaint(&mut cx, inner)
+            step(&*self.1, &mut cx, inner)
         })
+    }
+}
+
+impl Hooks for Chain {
+    fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        self.nest(cx, inner, |hooks, cx, inner| hooks.prepaint(cx, inner))
+    }
+
+    fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        self.nest(cx, inner, |hooks, cx, inner| hooks.paint(cx, inner))
+    }
+
+    fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        self.nest(cx, inner, |hooks, cx, inner| hooks.kept(cx, inner))
     }
 
     fn volatile(&self) -> bool {
@@ -255,62 +265,12 @@ impl Hooks for Chain {
     fn paint_content(&self, cx: &mut NodeCx<'_>) -> bool {
         self.0.paint_content(cx) || self.1.paint_content(cx)
     }
-
-    fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        let (bounds, exact, inset, baselines, text, style, state) = (
-            cx.bounds,
-            cx.exact,
-            cx.inset,
-            cx.baselines,
-            cx.text,
-            cx.style,
-            cx.state,
-        );
-        self.0.kept(cx, &mut |window| {
-            let mut cx = NodeCx {
-                window,
-                bounds,
-                exact,
-                inset,
-                baselines,
-                text,
-                style,
-                state,
-            };
-            self.1.kept(&mut cx, inner)
-        })
-    }
-
-    fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        let (bounds, exact, inset, baselines, text, style, state) = (
-            cx.bounds,
-            cx.exact,
-            cx.inset,
-            cx.baselines,
-            cx.text,
-            cx.style,
-            cx.state,
-        );
-        self.0.paint(cx, &mut |window| {
-            let mut cx = NodeCx {
-                window,
-                bounds,
-                exact,
-                inset,
-                baselines,
-                text,
-                style,
-                state,
-            };
-            self.1.paint(&mut cx, inner)
-        })
-    }
 }
 
 pub struct NodeCx<'a> {
     pub window: &'a mut Window,
-    pub bounds: Bounds<Pixels>,
-    pub exact: Bounds<Pixels>,
+    pub bounds: Rect,
+    pub exact: Rect,
     pub inset: [Pixels; 4],
     pub baselines: [Option<Pixels>; 2],
     pub text: &'a TextStyle,
@@ -323,7 +283,7 @@ impl NodeCx<'_> {
         self.state?.downcast_ref()
     }
 
-    pub fn text_layout(&self) -> Option<&crate::TextLayout> {
+    pub fn text_layout(&self) -> Option<&crate::Paragraph> {
         Some(&self.state?.downcast_ref::<crate::text::TextState>()?.layout)
     }
 }
@@ -345,8 +305,8 @@ pub fn shared(style: Rc<Style>) -> Node {
 }
 
 impl Node {
-    pub fn id(mut self, id: impl Into<ElementId>) -> Self {
-        self.id = Some(id.into());
+    pub fn id(mut self, key: impl Into<NodeKey>) -> Self {
+        self.id = Some(key.into());
         self
     }
 
@@ -365,11 +325,11 @@ impl Node {
         }
         match &self.style {
             NodeStyle::Shared(style) => style.clone(),
-            NodeStyle::Own(_) => unreachable!(),
+            NodeStyle::Own(_) => unreachable!("the style was shared above"),
         }
     }
 
-    pub fn element_id(&self) -> Option<ElementId> {
+    pub fn element_id(&self) -> Option<NodeKey> {
         self.id
     }
 
@@ -388,13 +348,26 @@ impl Node {
         matches!(&self.style, NodeStyle::Shared(own) if Rc::ptr_eq(own, style))
     }
 
+    pub fn has_children(&self) -> bool {
+        !self.children.is_empty()
+    }
+
     pub fn child(mut self, child: impl Into<Child>) -> Self {
         self.children.push(child.into());
         self
     }
 
-    pub fn has_children(&self) -> bool {
-        !self.children.is_empty()
+    pub fn children<C: Into<Child>>(mut self, children: impl IntoIterator<Item = C>) -> Self {
+        self.children.extend(children.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn push(&mut self, child: impl Into<Child>) {
+        self.children.push(child.into());
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        self.children.reserve(additional);
     }
 
     pub fn adopt(mut self, text: Node) -> Self {
@@ -409,19 +382,6 @@ impl Node {
         self
     }
 
-    pub fn push(&mut self, child: impl Into<Child>) {
-        self.children.push(child.into());
-    }
-
-    pub fn reserve(&mut self, additional: usize) {
-        self.children.reserve(additional);
-    }
-
-    pub fn children<C: Into<Child>>(mut self, children: impl IntoIterator<Item = C>) -> Self {
-        self.children.extend(children.into_iter().map(Into::into));
-        self
-    }
-
     pub fn hooks(mut self, hooks: impl Hooks) -> Self {
         let outer: Rc<dyn Hooks> = Rc::new(hooks);
         self.hooks = Some(match self.hooks.take() {
@@ -431,19 +391,10 @@ impl Node {
         self
     }
 
-    pub fn z_index(mut self, order: i32) -> Self {
-        self.style().z_index = Some(order);
-        self
-    }
-
-    pub fn stacking(mut self) -> Self {
-        self.style().stacking = true;
-        self
-    }
-
+    /// Sizes the node with `measure`, which layout calls again only when `input` changes.
     pub fn measure<S: PartialEq + 'static>(
         mut self,
-        state: S,
+        input: S,
         measure: impl FnMut(
             &S,
             &TextStyle,
@@ -453,329 +404,42 @@ impl Node {
         ) -> (Size<Pixels>, Option<[Pixels; 2]>)
         + 'static,
     ) -> Self {
-        self.content = Content::Measured(Box::new(Measured(state, measure)));
+        self.content = Content::Measured(Box::new(Measured(input, measure)));
         self
     }
 
-    fn events(&mut self) -> &mut Events {
-        self.events.get_or_insert_default()
-    }
-
-    pub fn on_mouse_down(
+    pub fn on_pointer(
         mut self,
-        button: MouseButton,
-        listener: impl FnMut(&MouseDownEvent, &mut Window, &mut App) + 'static,
+        listener: impl FnMut(&Event, &mut Window, &mut App) + 'static,
     ) -> Self {
-        self.events()
-            .mouse_down
-            .push((button, Rc::new(RefCell::new(Box::new(listener)))));
+        let events = self.events.get_or_insert_default();
+        events.pointer.push(Rc::new(RefCell::new(listener)));
         self
     }
 
-    pub fn on_mouse_move(
-        mut self,
-        listener: impl FnMut(&MouseMoveEvent, &mut Window, &mut App) + 'static,
-    ) -> Self {
-        self.events()
-            .mouse_move
-            .push(Rc::new(RefCell::new(Box::new(listener))));
-        self
-    }
-
-    pub fn track_scroll(mut self, handle: &ScrollHandle) -> Self {
-        self.events().scroll = Some(handle.clone());
+    pub fn track_scroll(mut self, handle: &ScrollRef) -> Self {
+        self.events.get_or_insert_default().scroll = Some(handle.clone());
         self
     }
 
     pub fn window_drag_area(mut self) -> Self {
-        self.events().drag = true;
+        self.events.get_or_insert_default().drag = true;
         self
     }
 
-    pub fn text_style(&mut self) -> &mut TextStyleRefinement {
+    pub fn text_style(&mut self) -> &mut TextOverrides {
         &mut self.style().text
-    }
-
-    pub fn flex(mut self) -> Self {
-        self.style().display = Display::Flex;
-        self
-    }
-    pub fn grid(mut self) -> Self {
-        self.style().display = Display::Grid;
-        self
-    }
-    pub fn hidden(mut self) -> Self {
-        self.style().display = Display::None;
-        self
-    }
-    pub fn flex_row(mut self) -> Self {
-        self.style().flex_direction = FlexDirection::Row;
-        self
-    }
-    pub fn flex_col(mut self) -> Self {
-        self.style().flex_direction = FlexDirection::Column;
-        self
-    }
-    pub fn flex_wrap(mut self) -> Self {
-        self.style().flex_wrap = FlexWrap::Wrap;
-        self
-    }
-    pub fn flex_nowrap(mut self) -> Self {
-        self.style().flex_wrap = FlexWrap::NoWrap;
-        self
-    }
-    pub fn flex_1(mut self) -> Self {
-        let style = self.style();
-        style.flex_grow = 1.;
-        style.flex_shrink = 1.;
-        style.flex_basis = relative(0.);
-        self
-    }
-    pub fn flex_shrink(mut self, value: f32) -> Self {
-        self.style().flex_shrink = value;
-        self
-    }
-    pub fn flex_shrink_0(mut self) -> Self {
-        self.style().flex_shrink = 0.;
-        self
-    }
-    pub fn items_start(mut self) -> Self {
-        self.style().align_items = Some(AlignItems::FlexStart);
-        self
-    }
-    pub fn items_center(mut self) -> Self {
-        self.style().align_items = Some(AlignItems::Center);
-        self
-    }
-    pub fn baseline(mut self, value: Baseline) -> Self {
-        self.style().baseline = value;
-        self
-    }
-    pub fn justify_center(mut self) -> Self {
-        self.style().justify_content = Some(JustifyContent::Center);
-        self
-    }
-    pub fn absolute(mut self) -> Self {
-        self.style().position = Position::Absolute;
-        self
-    }
-    pub fn relative(mut self) -> Self {
-        self.style().position = Position::Relative;
-        self
-    }
-    pub fn top(mut self, value: impl Into<Length>) -> Self {
-        self.style().inset.top = value.into();
-        self
-    }
-    pub fn right(mut self, value: impl Into<Length>) -> Self {
-        self.style().inset.right = value.into();
-        self
-    }
-    pub fn bottom(mut self, value: impl Into<Length>) -> Self {
-        self.style().inset.bottom = value.into();
-        self
-    }
-    pub fn left(mut self, value: impl Into<Length>) -> Self {
-        self.style().inset.left = value.into();
-        self
-    }
-    pub fn top_0(mut self) -> Self {
-        self.style().inset.top = Length::Px(Pixels::ZERO);
-        self
-    }
-    pub fn left_0(mut self) -> Self {
-        self.style().inset.left = Length::Px(Pixels::ZERO);
-        self
-    }
-    pub fn w(mut self, value: impl Into<Length>) -> Self {
-        self.style().size.width = value.into();
-        self
-    }
-    pub fn h(mut self, value: impl Into<Length>) -> Self {
-        self.style().size.height = value.into();
-        self
-    }
-    pub fn size(mut self, value: impl Into<Length>) -> Self {
-        let value = value.into();
-        self.style().size = Size::new(value, value);
-        self
-    }
-    pub fn size_full(mut self) -> Self {
-        self.style().size = Size::new(relative(1.), relative(1.));
-        self
-    }
-    pub fn w_full(mut self) -> Self {
-        self.style().size.width = relative(1.);
-        self
-    }
-    pub fn min_w(mut self, value: impl Into<Length>) -> Self {
-        self.style().min_size.width = value.into();
-        self
-    }
-    pub fn min_h(mut self, value: impl Into<Length>) -> Self {
-        self.style().min_size.height = value.into();
-        self
-    }
-    pub fn max_w(mut self, value: impl Into<Length>) -> Self {
-        self.style().max_size.width = value.into();
-        self
-    }
-    pub fn max_h(mut self, value: impl Into<Length>) -> Self {
-        self.style().max_size.height = value.into();
-        self
-    }
-    pub fn mt(mut self, value: impl Into<Length>) -> Self {
-        self.style().margin.top = value.into();
-        self
-    }
-    pub fn mr(mut self, value: impl Into<Length>) -> Self {
-        self.style().margin.right = value.into();
-        self
-    }
-    pub fn mb(mut self, value: impl Into<Length>) -> Self {
-        self.style().margin.bottom = value.into();
-        self
-    }
-    pub fn ml(mut self, value: impl Into<Length>) -> Self {
-        self.style().margin.left = value.into();
-        self
-    }
-    pub fn mt_auto(mut self) -> Self {
-        self.style().margin.top = Length::Auto;
-        self
-    }
-    pub fn mr_auto(mut self) -> Self {
-        self.style().margin.right = Length::Auto;
-        self
-    }
-    pub fn mb_auto(mut self) -> Self {
-        self.style().margin.bottom = Length::Auto;
-        self
-    }
-    pub fn ml_auto(mut self) -> Self {
-        self.style().margin.left = Length::Auto;
-        self
-    }
-    pub fn pt(mut self, value: impl Into<Length>) -> Self {
-        self.style().padding.top = value.into();
-        self
-    }
-    pub fn pr(mut self, value: impl Into<Length>) -> Self {
-        self.style().padding.right = value.into();
-        self
-    }
-    pub fn pb(mut self, value: impl Into<Length>) -> Self {
-        self.style().padding.bottom = value.into();
-        self
-    }
-    pub fn pl(mut self, value: impl Into<Length>) -> Self {
-        self.style().padding.left = value.into();
-        self
-    }
-    pub fn gap_x(mut self, value: impl Into<Length>) -> Self {
-        self.style().gap.width = value.into();
-        self
-    }
-    pub fn gap_y(mut self, value: impl Into<Length>) -> Self {
-        self.style().gap.height = value.into();
-        self
-    }
-    pub fn border(mut self, value: Pixels) -> Self {
-        self.style().border_widths = Edges::all(value);
-        self
-    }
-    pub fn border_t(mut self, value: Pixels) -> Self {
-        self.style().border_widths.top = value;
-        self
-    }
-    pub fn border_r(mut self, value: Pixels) -> Self {
-        self.style().border_widths.right = value;
-        self
-    }
-    pub fn border_b(mut self, value: Pixels) -> Self {
-        self.style().border_widths.bottom = value;
-        self
-    }
-    pub fn border_l(mut self, value: Pixels) -> Self {
-        self.style().border_widths.left = value;
-        self
-    }
-    pub fn border_color(mut self, color: Rgba) -> Self {
-        self.style().border_color = Some(color);
-        self
-    }
-    pub fn rounded_full(mut self) -> Self {
-        self.style().corner_radii = Corners::all(Length::Px(px(f32::MAX / 4.))).into();
-        self
-    }
-    pub fn bg(mut self, color: Rgba) -> Self {
-        self.style().background = Some(color);
-        self
-    }
-    pub fn opacity(mut self, opacity: f32) -> Self {
-        self.style().opacity = Some(opacity);
-        self
-    }
-    pub fn cursor(mut self, cursor: CursorStyle) -> Self {
-        self.style().mouse_cursor = Some(cursor);
-        self
-    }
-    pub fn overflow_hidden(mut self) -> Self {
-        self.style().overflow = Point::new(Overflow::Hidden, Overflow::Hidden);
-        self
-    }
-    pub fn overflow_y_scroll(mut self) -> Self {
-        self.style().overflow.y = Overflow::Scroll;
-        self
-    }
-    pub fn overflow_y_hidden(mut self) -> Self {
-        self.style().overflow.y = Overflow::Hidden;
-        self
-    }
-    pub fn restrict_scroll_to_axis(mut self) -> Self {
-        self.style().restrict_scroll_to_axis = true;
-        self
-    }
-    pub fn text_color(mut self, color: Rgba) -> Self {
-        self.text_style().color = Some(color);
-        self
-    }
-    pub fn text_size(mut self, size: Pixels) -> Self {
-        self.text_style().font_size = Some(size);
-        self
-    }
-    pub fn line_height(mut self, height: Pixels) -> Self {
-        self.text_style().line_height = Some(height);
-        self
-    }
-    pub fn font_family(mut self, family: impl Into<SharedString>) -> Self {
-        self.text_style().font_family = Some(family.into());
-        self
-    }
-    pub fn font_weight(mut self, weight: FontWeight) -> Self {
-        self.text_style().font_weight = Some(weight);
-        self
-    }
-    pub fn whitespace_nowrap(mut self) -> Self {
-        self.text_style().white_space = Some(WhiteSpace::Nowrap);
-        self
-    }
-    pub fn text_left(mut self) -> Self {
-        self.text_style().text_align = Some(TextAlign::Left);
-        self
-    }
-    pub fn text_center(mut self) -> Self {
-        self.text_style().text_align = Some(TextAlign::Center);
-        self
-    }
-    pub fn text_right(mut self) -> Self {
-        self.text_style().text_align = Some(TextAlign::Right);
-        self
     }
 }
 
 pub fn layers(negative: bool) -> Node {
-    thread_local!(static STYLE: Rc<Style> = node().absolute().w(px(0.)).h(px(0.)).shared_style());
+    thread_local!(static STYLE: Rc<Style> = {
+        let mut node = node();
+        let style = node.style();
+        style.position = crate::Position::Absolute;
+        style.size = Size::new(px(0.).into(), px(0.).into());
+        node.shared_style()
+    });
     let mut node = shared(STYLE.with(Rc::clone));
     node.content = Content::Layers(negative);
     node
@@ -793,26 +457,28 @@ pub fn text(text: impl Into<SharedString>, runs: Option<Vec<TextRun>>) -> Node {
     node
 }
 
+/// It may draw outside its box.
 pub fn canvas<T: 'static>(
-    prepaint: impl Fn(Bounds<Pixels>, &mut Window) -> T + 'static,
-    paint: impl Fn(Bounds<Pixels>, T, &mut Window) + 'static,
+    prepaint: impl Fn(Rect, &mut Window) -> T + 'static,
+    paint: impl Fn(Rect, T, &mut Window) + 'static,
 ) -> Node {
     node().hooks(Canvas {
         prepaint,
         paint,
-        state: Cell::new(None),
+        prepared: Cell::new(None),
         within: false,
     })
 }
 
+/// Drawing must stay inside the box.
 pub fn canvas_within<T: 'static>(
-    prepaint: impl Fn(Bounds<Pixels>, &mut Window) -> T + 'static,
-    paint: impl Fn(Bounds<Pixels>, T, &mut Window) + 'static,
+    prepaint: impl Fn(Rect, &mut Window) -> T + 'static,
+    paint: impl Fn(Rect, T, &mut Window) + 'static,
 ) -> Node {
     node().hooks(Canvas {
         prepaint,
         paint,
-        state: Cell::new(None),
+        prepared: Cell::new(None),
         within: true,
     })
 }
@@ -820,18 +486,19 @@ pub fn canvas_within<T: 'static>(
 struct Canvas<P, F, T> {
     prepaint: P,
     paint: F,
-    state: Cell<Option<T>>,
+    prepared: Cell<Option<T>>,
     within: bool,
 }
 
 impl<T: 'static, P, F> Hooks for Canvas<P, F, T>
 where
-    P: Fn(Bounds<Pixels>, &mut Window) -> T + 'static,
-    F: Fn(Bounds<Pixels>, T, &mut Window) + 'static,
+    P: Fn(Rect, &mut Window) -> T + 'static,
+    F: Fn(Rect, T, &mut Window) + 'static,
 {
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window);
-        self.state.set(Some((self.prepaint)(cx.exact, cx.window)));
+        self.prepared
+            .set(Some((self.prepaint)(cx.exact, cx.window)));
     }
 
     fn bounded(&self) -> bool {
@@ -840,168 +507,197 @@ where
 
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window);
-        if let Some(state) = self.state.take() {
-            let (bounds, window) = (cx.bounds, &mut *cx.window);
-            window.with_content_mask(cx.style.overflow_mask(bounds), |window| {
-                (self.paint)(bounds, state, window)
+        let Some(prepared) = self.prepared.take() else {
+            return;
+        };
+        let bounds = cx.bounds;
+        cx.window
+            .scope(Scope::Clip(cx.style.overflow_mask(bounds)), |window| {
+                (self.paint)(bounds, prepared, window)
             });
-        }
     }
 }
 
+type Listener = Rc<RefCell<dyn FnMut(&Event, &mut Window, &mut App)>>;
+
 #[derive(Default)]
 pub(crate) struct Events {
-    mouse_down: Vec<(MouseButton, Rc<RefCell<Listener<MouseDownEvent>>>)>,
-    mouse_move: Vec<Rc<RefCell<Listener<MouseMoveEvent>>>>,
-    pub(crate) scroll: Option<ScrollHandle>,
+    pointer: Vec<Listener>,
+    pub(crate) scroll: Option<ScrollRef>,
     pub(crate) drag: bool,
 }
 
 impl Events {
-    pub(crate) fn needs_hitbox(events: Option<&Self>, style: &Style) -> bool {
-        style.mouse_cursor.is_some()
+    pub(crate) fn needs_region(events: Option<&Self>, style: &Style) -> bool {
+        style.cursor.is_some()
             || events.is_some_and(|events| {
-                events.scroll.is_some()
-                    || events.drag
-                    || !events.mouse_down.is_empty()
-                    || !events.mouse_move.is_empty()
+                events.scroll.is_some() || events.drag || !events.pointer.is_empty()
             })
     }
 
-    pub(crate) fn paint(
+    pub(crate) fn listen(
         &self,
         style: &Style,
         line_height: Pixels,
-        hitbox: &Hitbox,
+        region: &Region,
         window: &mut Window,
     ) {
-        for (button, listener) in &self.mouse_down {
-            let (button, listener, hitbox) = (*button, listener.clone(), hitbox.clone());
-            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble
-                    && event.button == button
-                    && hitbox.is_hovered(window)
-                {
-                    (listener.borrow_mut())(event, window, cx);
-                }
-            });
-        }
-        for listener in &self.mouse_move {
-            let (listener, hitbox) = (listener.clone(), hitbox.clone());
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                    (listener.borrow_mut())(event, window, cx);
+        for listener in &self.pointer {
+            let (listener, region) = (listener.clone(), *region);
+            window.on_bubble(move |event, window, app| {
+                if region.hovered(window) {
+                    (listener.borrow_mut())(event, window, app);
                 }
             });
         }
         if let Some(handle) = &self.scroll {
-            let (handle, hitbox) = (handle.clone(), hitbox.clone());
-            let (overflow, restrict) = (style.overflow, style.restrict_scroll_to_axis);
-            let overscroll = style.overscroll;
-            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase != DispatchPhase::Bubble {
-                    return;
-                }
-                let latched = window
-                    .gesture
-                    .latch
-                    .as_ref()
-                    .map(|latch| Rc::ptr_eq(&latch.0, &handle.0));
-                if latched == Some(false)
-                    || latched.is_none()
-                        && (!hitbox.should_handle_scroll(window)
-                            || window.scroll_chain.as_ref().is_some_and(|chain| {
-                                !chain.iter().any(|other| Rc::ptr_eq(&other.0, &handle.0))
-                            }))
+            let wheel = Wheel {
+                handle: handle.clone(),
+                region: *region,
+                overflow: style.overflow,
+                overscroll: style.overscroll,
+                one_axis: style.restrict_scroll_to_axis,
+                line_height,
+            };
+            window.on_bubble(move |event, window, app| {
+                if let Event::Wheel {
+                    delta,
+                    lines,
+                    phase,
+                    ..
+                } = *event
                 {
-                    return;
-                }
-                let mut delta = event.delta.pixel_delta(line_height);
-                if event.delta.precise() {
-                    let [x, y] = window.rails.0;
-                    if y >= x {
-                        delta.x = Pixels::ZERO;
-                    } else {
-                        delta.y = Pixels::ZERO;
-                    }
-                }
-                let axis = |own: Overflow, along: Pixels, across: Pixels, other: Overflow| match own
-                {
-                    Overflow::Scroll if !along.is_zero() => along,
-                    Overflow::Scroll if !restrict && other != Overflow::Scroll => across,
-                    _ => Pixels::ZERO,
-                };
-                let mut x = axis(overflow.x, delta.x, delta.y, overflow.y);
-                let mut y = axis(overflow.y, delta.y, delta.x, overflow.x);
-                if !x.is_zero() && !y.is_zero() {
-                    if x.abs() > y.abs() {
-                        y = Pixels::ZERO;
-                    } else {
-                        x = Pixels::ZERO;
-                    }
-                }
-                let max = handle.max_offset();
-                let stops = |own: Overscroll, delta: Pixels| {
-                    !delta.is_zero() && matches!(own, Overscroll::Contain | Overscroll::None)
-                };
-                let stops = stops(overscroll.x, delta.x) || stops(overscroll.y, delta.y);
-                if !event.delta.precise() {
-                    let from = handle.target();
-                    let to = point(
-                        (from.x + x).clamp(-max.x, px(0.)),
-                        (from.y + y).clamp(-max.y, px(0.)),
-                    );
-                    if to != from {
-                        cx.stop_propagation();
-                        handle.animate_to(to, true);
-                        handle.drive(window);
-                    } else if stops {
-                        cx.stop_propagation();
-                    }
-                    return;
-                }
-                let momentum = event.phase == ScrollPhase::Momentum;
-                if momentum && window.gesture.spent {
-                    cx.stop_propagation();
-                    return;
-                }
-                let held = event.phase == ScrollPhase::Began && handle.hold();
-                let (moved, over) = handle.pan(point(x, y));
-                let latched = latched == Some(true) || held || moved;
-                if latched {
-                    window.gesture.latch = Some(handle.clone());
-                    window.gesture.edge = None;
-                }
-                let elastic = |own: Overscroll, max: Pixels, over: Pixels| {
-                    if matches!(own, Overscroll::Auto | Overscroll::Contain) && max > px(0.) {
-                        over
-                    } else {
-                        px(0.)
-                    }
-                };
-                let rest = point(
-                    elastic(overscroll.x, max.x, over.x),
-                    elastic(overscroll.y, max.y, over.y),
-                );
-                if rest != Point::default() {
-                    if !latched && !stops {
-                        window.gesture.edge = Some((handle.clone(), rest));
-                        return;
-                    }
-                    window.overscroll(handle.clone(), rest, event.phase);
-                } else if momentum && latched && over != Point::default() {
-                    window.gesture.spent = true;
-                }
-                if latched || stops {
-                    cx.stop_propagation();
-                }
-                if moved {
-                    if event.phase == ScrollPhase::None {
-                        handle.loosen(window);
-                    }
-                    window.refresh();
+                    wheel.scroll(delta, lines, phase, window, app);
                 }
             });
+        }
+    }
+}
+
+struct Wheel {
+    handle: ScrollRef,
+    region: Region,
+    overflow: Point<Overflow>,
+    overscroll: Point<Overscroll>,
+    one_axis: bool,
+    line_height: Pixels,
+}
+
+impl Wheel {
+    fn scroll(
+        &self,
+        delta: Point<f32>,
+        lines: bool,
+        phase: WheelPhase,
+        window: &mut Window,
+        app: &mut App,
+    ) {
+        let handle = &self.handle;
+        let latched = window
+            .gesture
+            .latch
+            .as_ref()
+            .map(|latch| Rc::ptr_eq(&latch.0, &handle.0));
+        let elsewhere = || {
+            !self.region.under_pointer(window)
+                || window
+                    .scroll_chain
+                    .as_ref()
+                    .is_some_and(|chain| !chain.iter().any(|other| Rc::ptr_eq(&other.0, &handle.0)))
+        };
+        if latched == Some(false) || latched.is_none() && elsewhere() {
+            return;
+        }
+        let mut delta = match lines {
+            true => delta.map(|value| self.line_height * value),
+            false => delta.map(px),
+        };
+        if !lines {
+            match window.rails.0 {
+                [x, y] if y >= x => delta.x = Pixels::ZERO,
+                _ => delta.y = Pixels::ZERO,
+            }
+        }
+        let (overflow, overscroll) = (self.overflow, self.overscroll);
+        let along = |own: Overflow, delta: Pixels, across: Pixels, other: Overflow| {
+            if own != Overflow::Scroll {
+                Pixels::ZERO
+            } else if !delta.is_zero() {
+                delta
+            } else if !self.one_axis && other != Overflow::Scroll {
+                across
+            } else {
+                Pixels::ZERO
+            }
+        };
+        let mut moved = point(
+            along(overflow.x, delta.x, delta.y, overflow.y),
+            along(overflow.y, delta.y, delta.x, overflow.x),
+        );
+        if !moved.x.is_zero() && !moved.y.is_zero() {
+            match moved.x.abs() > moved.y.abs() {
+                true => moved.y = Pixels::ZERO,
+                false => moved.x = Pixels::ZERO,
+            }
+        }
+        let max = handle.max_offset();
+        let stops = [(overscroll.x, delta.x), (overscroll.y, delta.y)]
+            .iter()
+            .any(|(own, delta)| !delta.is_zero() && *own != Overscroll::Auto);
+        if lines {
+            let from = handle.target();
+            let to = point(
+                (from.x + moved.x).clamp(-max.x, px(0.)),
+                (from.y + moved.y).clamp(-max.y, px(0.)),
+            );
+            if to != from {
+                app.stop_event();
+                handle.animate_to(to, true);
+                handle.drive(window);
+            } else if stops {
+                app.stop_event();
+            }
+            return;
+        }
+        let momentum = phase == WheelPhase::Momentum;
+        if momentum && window.gesture.spent {
+            app.stop_event();
+            return;
+        }
+        let held = phase == WheelPhase::Began && handle.hold();
+        let (panned, over) = handle.pan(moved);
+        let latched = latched == Some(true) || held || panned;
+        if latched {
+            window.gesture.latch = Some(handle.clone());
+            window.gesture.edge = None;
+        }
+        let bounce = |own: Overscroll, max: Pixels, over: Pixels| match own {
+            Overscroll::None => px(0.),
+            _ if max > px(0.) => over,
+            _ => px(0.),
+        };
+        let rest = point(
+            bounce(overscroll.x, max.x, over.x),
+            bounce(overscroll.y, max.y, over.y),
+        );
+        if rest != Point::default() {
+            // An outer scroller may take the rest first. It comes back here if none does.
+            if !latched && !stops {
+                window.gesture.edge = Some((handle.clone(), rest));
+                return;
+            }
+            window.overscroll(handle.clone(), rest, phase);
+        } else if momentum && latched && over != Point::default() {
+            window.gesture.spent = true;
+        }
+        if latched || stops {
+            app.stop_event();
+        }
+        if panned {
+            if phase == WheelPhase::None {
+                handle.loosen(window);
+            }
+            window.refresh();
         }
     }
 }
@@ -1010,7 +706,7 @@ impl Events {
 struct ScrollState {
     offset: Point<Pixels>,
     max_offset: Point<Pixels>,
-    bounds: Bounds<Pixels>,
+    bounds: Rect,
     animation: Option<Animation>,
     driven: bool,
     stretch: Point<Pixels>,
@@ -1066,35 +762,8 @@ impl Animation {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct ScrollHandle(Rc<RefCell<ScrollState>>);
-
-impl std::fmt::Debug for ScrollHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ScrollHandle({:?})", self.offset())
-    }
-}
-
-impl ScrollHandle {
-    pub fn offset(&self) -> Point<Pixels> {
-        self.0.borrow().offset
-    }
-
-    pub fn stretch(&self) -> Point<Pixels> {
-        self.0.borrow().stretch
-    }
-
-    pub fn set_offset(&self, offset: Point<Pixels>) {
-        let mut state = self.0.borrow_mut();
-        state.offset = offset;
-        state.animation = None;
-        state.stretch = Point::default();
-        state.spring = None;
-        state.loose = false;
-    }
-
-    fn pan(&self, delta: Point<Pixels>) -> (bool, Point<Pixels>) {
-        let state = &mut *self.0.borrow_mut();
+impl ScrollState {
+    fn pan(&mut self, delta: Point<Pixels>) -> (bool, Point<Pixels>) {
         let axis = |offset: &mut Pixels, stretch: &mut Pixels, max: Pixels, mut delta: Pixels| {
             let mut moved = false;
             if !stretch.is_zero() && !delta.is_zero() {
@@ -1113,80 +782,23 @@ impl ScrollHandle {
             *offset = to;
             (moved, rest)
         };
-        let max = state.max_offset;
-        let (moved_x, x) = axis(&mut state.offset.x, &mut state.stretch.x, max.x, delta.x);
-        let (moved_y, y) = axis(&mut state.offset.y, &mut state.stretch.y, max.y, delta.y);
+        let max = self.max_offset;
+        let (moved_x, x) = axis(&mut self.offset.x, &mut self.stretch.x, max.x, delta.x);
+        let (moved_y, y) = axis(&mut self.offset.y, &mut self.stretch.y, max.y, delta.y);
         if moved_x || moved_y {
-            state.animation = None;
-            state.spring = None;
+            self.animation = None;
+            self.spring = None;
         }
         (moved_x || moved_y, point(x, y))
     }
 
-    pub(crate) fn stretch_by(&self, rest: Point<Pixels>) {
-        let mut state = self.0.borrow_mut();
-        state.stretch += rest.map(|value| value / STIFFNESS);
-        state.spring = None;
-    }
-
-    pub(crate) fn loosen(&self, window: &mut Window) {
-        {
-            let mut state = self.0.borrow_mut();
-            state.loose = state.stretch != Point::default();
-        }
-        self.drive(window);
-    }
-
-    fn hold(&self) -> bool {
-        let mut state = self.0.borrow_mut();
-        state.spring = None;
-        state.stretch != Point::default()
-    }
-
-    pub(crate) fn release(&self, speed: Point<f32>, window: &mut Window) -> bool {
-        {
-            let mut state = self.0.borrow_mut();
-            let stretch = state.stretch;
-            if stretch == Point::default() {
-                return false;
-            }
-            if state.spring.is_some() {
-                return true;
-            }
-            let outward = |stretch: Pixels, speed: f32| {
-                if f32::from(stretch) * speed > 0. {
-                    speed
-                } else {
-                    0.
-                }
-            };
-            state.loose = false;
-            state.spring = Some(Spring {
-                from: stretch,
-                speed: point(outward(stretch.x, speed.x), outward(stretch.y, speed.y)),
-                start: Instant::now(),
-            });
-        }
-        self.drive(window);
-        true
-    }
-
-    pub fn target(&self) -> Point<Pixels> {
-        let state = self.0.borrow();
-        state
-            .animation
-            .as_ref()
-            .map_or(state.offset, |animation| animation.to)
-    }
-
-    pub fn animate_to(&self, offset: Point<Pixels>, wheel: bool) {
+    fn animate_to(&mut self, offset: Point<Pixels>, wheel: bool) {
         let now = Instant::now();
-        let mut state = self.0.borrow_mut();
-        let running = state
+        let running = self
             .animation
             .as_ref()
             .filter(|animation| now < animation.start + animation.duration);
-        let (from, speed) = running.map_or((state.offset, Point::default()), |animation| {
+        let (from, speed) = running.map_or((self.offset, Point::default()), |animation| {
             animation.at(now)
         });
         let distance = f32::from((offset.x - from.x).abs().max((offset.y - from.y).abs()));
@@ -1203,7 +815,7 @@ impl ScrollHandle {
             _ if delta.is_zero() => 0.,
             _ => (speed * seconds / f32::from(delta)).clamp(if wheel { 1.5 } else { 0. }, 3.),
         };
-        let animation = (distance > 0.).then(|| Animation {
+        self.animation = (distance > 0.).then(|| Animation {
             from,
             to: offset,
             slope: point(
@@ -1213,113 +825,194 @@ impl ScrollHandle {
             start: now,
             duration,
         });
-        state.offset = from;
-        state.animation = animation;
+        self.offset = from;
     }
 
-    pub(crate) fn drive(&self, window: &mut Window) {
-        {
-            let mut state = self.0.borrow_mut();
-            if state.driven || state.animation.is_none() && state.spring.is_none() && !state.loose {
-                return;
-            }
-            state.driven = true;
+    fn advance(&mut self, now: Instant, idle: bool) -> bool {
+        self.driven = false;
+        let mut moved = false;
+        if let Some(animation) = &self.animation {
+            let offset = if now < animation.start + animation.duration {
+                animation.at(now).0
+            } else {
+                let to = animation.to;
+                self.animation = None;
+                to
+            };
+            moved = offset != self.offset;
+            self.offset = offset;
         }
-        let handle = self.clone();
-        window.on_next_frame(move |window, _| {
-            let now = Instant::now();
-            {
-                let state = &mut *handle.0.borrow_mut();
-                state.driven = false;
-                if let Some(animation) = &state.animation {
-                    let offset = if now < animation.start + animation.duration {
-                        animation.at(now).0
-                    } else {
-                        let to = animation.to;
-                        state.animation = None;
-                        to
-                    };
-                    if offset != state.offset {
-                        state.offset = offset;
-                        window.refresh();
-                    }
-                }
-                if state.loose && now - window.rails.1 > Duration::from_millis(100) {
-                    state.loose = false;
-                    state.spring = (state.stretch != Point::default()).then_some(Spring {
-                        from: state.stretch,
-                        speed: Point::default(),
-                        start: now,
-                    });
-                }
-                if let Some(spring) = &state.spring {
-                    match spring.at(now) {
-                        Some(stretch) => state.stretch = stretch,
-                        None => {
-                            state.stretch = Point::default();
-                            state.spring = None;
-                        }
-                    }
-                    window.refresh();
-                }
+        if self.loose && idle {
+            self.loose = false;
+            self.spring = (self.stretch != Point::default()).then_some(Spring {
+                from: self.stretch,
+                speed: Point::default(),
+                start: now,
+            });
+        }
+        if let Some(spring) = &self.spring {
+            let stretch = spring.at(now);
+            if stretch.is_none() {
+                self.spring = None;
             }
-            handle.drive(window);
-        });
+            self.stretch = stretch.unwrap_or_default();
+            moved = true;
+        }
+        moved
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ScrollRef(Rc<RefCell<ScrollState>>);
+
+impl std::fmt::Debug for ScrollRef {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_tuple("ScrollRef").field(&self.offset()).finish()
+    }
+}
+
+impl ScrollRef {
+    pub fn offset(&self) -> Point<Pixels> {
+        self.0.borrow().offset
+    }
+
+    pub fn stretch(&self) -> Point<Pixels> {
+        self.0.borrow().stretch
     }
 
     pub fn max_offset(&self) -> Point<Pixels> {
         self.0.borrow().max_offset
     }
 
-    pub fn bounds(&self) -> Bounds<Pixels> {
+    pub fn bounds(&self) -> Rect {
         self.0.borrow().bounds
+    }
+
+    pub fn target(&self) -> Point<Pixels> {
+        let scroll = self.0.borrow();
+        scroll
+            .animation
+            .as_ref()
+            .map_or(scroll.offset, |animation| animation.to)
+    }
+
+    pub fn set_offset(&self, offset: Point<Pixels>) {
+        let scroll = &mut *self.0.borrow_mut();
+        (scroll.offset, scroll.stretch) = (offset, Point::default());
+        (scroll.animation, scroll.spring, scroll.loose) = (None, None, false);
+    }
+
+    pub fn animate_to(&self, offset: Point<Pixels>, wheel: bool) {
+        self.0.borrow_mut().animate_to(offset, wheel);
+    }
+
+    fn pan(&self, delta: Point<Pixels>) -> (bool, Point<Pixels>) {
+        self.0.borrow_mut().pan(delta)
+    }
+
+    pub(crate) fn stretch_by(&self, rest: Point<Pixels>) {
+        let scroll = &mut *self.0.borrow_mut();
+        scroll.stretch += rest.map(|value| value / STIFFNESS);
+        scroll.spring = None;
+    }
+
+    pub(crate) fn loosen(&self, window: &mut Window) {
+        let mut scroll = self.0.borrow_mut();
+        scroll.loose = scroll.stretch != Point::default();
+        drop(scroll);
+        self.drive(window);
+    }
+
+    fn hold(&self) -> bool {
+        let scroll = &mut *self.0.borrow_mut();
+        scroll.spring = None;
+        scroll.stretch != Point::default()
+    }
+
+    pub(crate) fn release(&self, speed: Point<f32>, window: &mut Window) -> bool {
+        let mut scroll = self.0.borrow_mut();
+        let stretch = scroll.stretch;
+        if stretch == Point::default() || scroll.spring.is_some() {
+            return stretch != Point::default();
+        }
+        let outward = |stretch: Pixels, speed: f32| match f32::from(stretch) * speed > 0. {
+            true => speed,
+            false => 0.,
+        };
+        scroll.loose = false;
+        scroll.spring = Some(Spring {
+            from: stretch,
+            speed: point(outward(stretch.x, speed.x), outward(stretch.y, speed.y)),
+            start: Instant::now(),
+        });
+        drop(scroll);
+        self.drive(window);
+        true
+    }
+
+    pub(crate) fn drive(&self, window: &mut Window) {
+        {
+            let scroll = &mut *self.0.borrow_mut();
+            let busy = scroll.animation.is_some() || scroll.spring.is_some() || scroll.loose;
+            if scroll.driven || !busy {
+                return;
+            }
+            scroll.driven = true;
+        }
+        let handle = self.clone();
+        window.next_frame(move |window, _| {
+            let now = Instant::now();
+            let idle = now - window.rails.1 > Duration::from_millis(100);
+            if handle.0.borrow_mut().advance(now, idle) {
+                window.refresh();
+            }
+            handle.drive(window);
+        });
     }
 
     pub(crate) fn clamp(
         &self,
         style: &Style,
-        bounds: Bounds<Pixels>,
-        content: crate::Size<Pixels>,
+        bounds: Rect,
+        content: Size<Pixels>,
         scale: f32,
     ) -> Point<Pixels> {
         // Padding was truncated to layout units, so it is truncated the same way here.
-        let snap = |length: crate::Length| match length {
-            crate::Length::Px(value) => px(crate::geometry::to_layout_unit(value.0, scale) / scale),
-            crate::Length::Fraction(fraction) => bounds.size.width * fraction,
-            crate::Length::Calc(fraction, offset) => {
-                bounds.size.width * fraction
-                    + px(crate::geometry::to_layout_unit(offset.0, scale) / scale)
-            }
-            crate::Length::Auto => Pixels::ZERO,
+        let unit = |value: Pixels| px(crate::geometry::to_layout_unit(value.0, scale) / scale);
+        let side = |length: Length| match length {
+            Length::Px(value) => unit(value),
+            Length::Fraction(fraction) => bounds.size.width * fraction,
+            Length::Calc(fraction, offset) => bounds.size.width * fraction + unit(offset),
+            Length::Auto => Pixels::ZERO,
         };
-        let padding = crate::size(
-            snap(style.padding.left) + snap(style.padding.right),
-            snap(style.padding.top) + snap(style.padding.bottom),
+        let padding = Size::new(
+            side(style.padding.left) + side(style.padding.right),
+            side(style.padding.top) + side(style.padding.bottom),
         );
         // Taffy and these sums differ after a few decimals, so the range rounds to two places.
         let round = |value: Pixels| (value * 100.).round() / 100.;
         let max = Point::from(content + padding - bounds.size)
             .map(round)
             .max(Point::default());
-        let mut state = self.0.borrow_mut();
-        state.offset.x = state.offset.x.clamp(-max.x, px(0.));
-        state.offset.y = state.offset.y.clamp(-max.y, px(0.));
-        state.max_offset = max;
-        state.bounds = bounds;
-        state.offset + state.stretch
+        let scroll = &mut *self.0.borrow_mut();
+        scroll.offset.x = scroll.offset.x.clamp(-max.x, px(0.));
+        scroll.offset.y = scroll.offset.y.clamp(-max.y, px(0.));
+        scroll.max_offset = max;
+        scroll.bounds = bounds;
+        scroll.offset + scroll.stretch
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Animation, ScrollHandle, Spring};
+    use super::{Animation, ScrollRef, Spring};
     use crate::{point, px};
     use std::time::{Duration, Instant};
 
     #[test]
     fn stretch_follows_the_pan_and_gives_way_to_scrolling() {
         let delta = |y: f32| point(px(0.), px(y));
-        let handle = ScrollHandle::default();
+        let handle = ScrollRef::default();
         handle.0.borrow_mut().max_offset = delta(100.);
 
         assert_eq!(handle.pan(delta(-30.)), (true, delta(0.)));
@@ -1386,7 +1079,7 @@ mod tests {
             }
         }
 
-        let handle = ScrollHandle::default();
+        let handle = ScrollRef::default();
         handle.animate_to(point(px(0.), px(-100.)), true);
         assert_eq!(handle.target().y, px(-100.));
         assert_eq!(handle.0.borrow().animation.as_ref().unwrap().slope.y, 3.);
@@ -1410,4 +1103,90 @@ mod tests {
         assert!((f32::from(new.from.y - old.0.y)).abs() < 1e-3);
         assert!((new.at(new.start).1.y - old.1.y).abs() < 1e-2);
     }
+}
+
+macro_rules! setters {
+    ($($name:ident($($arg:ident: $kind:ty),*) => |$style:ident| $set:expr;)*) => {
+        impl Node {$(
+            pub fn $name(mut self, $($arg: $kind),*) -> Self {
+                let $style = self.style();
+                $set;
+                self
+            }
+        )*}
+    };
+}
+
+setters! {
+    flex() => |s| s.display = Display::Flex;
+    grid() => |s| s.display = Display::Grid;
+    hidden() => |s| s.display = Display::None;
+    absolute() => |s| s.position = Position::Absolute;
+    relative() => |s| s.position = Position::Relative;
+    stacking() => |s| s.stacking = true;
+    z_index(order: i32) => |s| s.z_index = Some(order);
+    flex_row() => |s| s.flex_direction = FlexDirection::Row;
+    flex_col() => |s| s.flex_direction = FlexDirection::Column;
+    flex_wrap() => |s| s.flex_wrap = FlexWrap::Wrap;
+    flex_nowrap() => |s| s.flex_wrap = FlexWrap::NoWrap;
+    flex_1() => |s| (s.flex_grow, s.flex_shrink, s.flex_basis) = (1., 1., relative(0.));
+    flex_shrink(by: f32) => |s| s.flex_shrink = by;
+    flex_shrink_0() => |s| s.flex_shrink = 0.;
+    items_start() => |s| s.align_items = Some(AlignItems::FlexStart);
+    items_center() => |s| s.align_items = Some(AlignItems::Center);
+    justify_center() => |s| s.justify_content = Some(AlignContent::Center);
+    baseline(which: Baseline) => |s| s.baseline = which;
+    top(at: impl Into<Length>) => |s| s.inset.top = at.into();
+    right(at: impl Into<Length>) => |s| s.inset.right = at.into();
+    bottom(at: impl Into<Length>) => |s| s.inset.bottom = at.into();
+    left(at: impl Into<Length>) => |s| s.inset.left = at.into();
+    top_0() => |s| s.inset.top = Length::Px(Pixels::ZERO);
+    left_0() => |s| s.inset.left = Length::Px(Pixels::ZERO);
+    w(width: impl Into<Length>) => |s| s.size.width = width.into();
+    h(height: impl Into<Length>) => |s| s.size.height = height.into();
+    size(side: impl Into<Length>) => |s| s.size = { let side = side.into(); Size::new(side, side) };
+    w_full() => |s| s.size.width = relative(1.);
+    size_full() => |s| s.size = Size::new(relative(1.), relative(1.));
+    min_w(width: impl Into<Length>) => |s| s.min_size.width = width.into();
+    min_h(height: impl Into<Length>) => |s| s.min_size.height = height.into();
+    max_w(width: impl Into<Length>) => |s| s.max_size.width = width.into();
+    max_h(height: impl Into<Length>) => |s| s.max_size.height = height.into();
+    mt(margin: impl Into<Length>) => |s| s.margin.top = margin.into();
+    mr(margin: impl Into<Length>) => |s| s.margin.right = margin.into();
+    mb(margin: impl Into<Length>) => |s| s.margin.bottom = margin.into();
+    ml(margin: impl Into<Length>) => |s| s.margin.left = margin.into();
+    mt_auto() => |s| s.margin.top = Length::Auto;
+    mr_auto() => |s| s.margin.right = Length::Auto;
+    mb_auto() => |s| s.margin.bottom = Length::Auto;
+    ml_auto() => |s| s.margin.left = Length::Auto;
+    pt(padding: impl Into<Length>) => |s| s.padding.top = padding.into();
+    pr(padding: impl Into<Length>) => |s| s.padding.right = padding.into();
+    pb(padding: impl Into<Length>) => |s| s.padding.bottom = padding.into();
+    pl(padding: impl Into<Length>) => |s| s.padding.left = padding.into();
+    gap_x(gap: impl Into<Length>) => |s| s.gap.width = gap.into();
+    gap_y(gap: impl Into<Length>) => |s| s.gap.height = gap.into();
+    border(width: Pixels) => |s| s.border_widths = Edges::all(width);
+    border_t(width: Pixels) => |s| s.border_widths.top = width;
+    border_r(width: Pixels) => |s| s.border_widths.right = width;
+    border_b(width: Pixels) => |s| s.border_widths.bottom = width;
+    border_l(width: Pixels) => |s| s.border_widths.left = width;
+    border_color(color: Color) => |s| s.border_color = Some(color);
+    // A radius this large makes the shorter sides round.
+    rounded_full() => |s| s.corner_radii = Corners::all(Length::Px(px(f32::MAX / 4.))).into();
+    bg(color: Color) => |s| s.background = Some(color);
+    opacity(alpha: f32) => |s| s.opacity = Some(alpha);
+    cursor(cursor: Cursor) => |s| s.cursor = Some(cursor);
+    overflow_hidden() => |s| s.overflow = Point::new(Overflow::Hidden, Overflow::Hidden);
+    overflow_y_scroll() => |s| s.overflow.y = Overflow::Scroll;
+    overflow_y_hidden() => |s| s.overflow.y = Overflow::Hidden;
+    restrict_scroll_to_axis() => |s| s.restrict_scroll_to_axis = true;
+    text_color(color: Color) => |s| s.text.set_color(color);
+    text_size(size: Pixels) => |s| s.text.set_font_size(size);
+    line_height(height: Pixels) => |s| s.text.set_line_height(height);
+    font_family(family: impl Into<SharedString>) => |s| s.text.set_font_family(family.into());
+    font_weight(weight: FontWeight) => |s| s.text.set_font_weight(weight);
+    whitespace_nowrap() => |s| s.text.set_white_space(WhiteSpace::Nowrap);
+    text_left() => |s| s.text.set_text_align(TextAlign::Left);
+    text_center() => |s| s.text.set_text_align(TextAlign::Center);
+    text_right() => |s| s.text.set_text_align(TextAlign::Right);
 }

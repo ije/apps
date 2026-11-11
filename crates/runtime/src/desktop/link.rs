@@ -1,9 +1,7 @@
 use crate::{host::Host, jsc::JavaScriptCore, jsc::JsContext, jsc::payload::Payload};
 use anyhow::{Context, Result};
 use raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, WindowHandle};
-use renderer::{
-    Bounds, WindowChange, WindowControl, WindowId, native::WindowEvent, point, px, size,
-};
+use renderer::{Rect, WindowChange, WindowControl, WindowId, native::WindowEvent, point, px, size};
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
@@ -348,18 +346,18 @@ pub(crate) enum Tool {
     DevTools,
 }
 
-pub(crate) fn tool(keystroke: &renderer::Keystroke) -> Option<Tool> {
-    let (key, modifiers) = (keystroke.key.as_str(), &keystroke.modifiers);
+pub(crate) fn tool(key: &str, modifiers: renderer::Modifiers) -> Option<Tool> {
     let primary = if cfg!(target_os = "macos") {
-        modifiers.platform
+        modifiers.command()
     } else {
-        modifiers.control
+        modifiers.ctrl()
     };
-    if key == "f" && modifiers.alt && primary {
+    if key == "f" && modifiers.alt() && primary {
         Some(Tool::Hud)
     } else if key == "f12"
         || (key == "i"
-            && ((modifiers.platform && modifiers.alt) || (modifiers.control && modifiers.shift)))
+            && ((modifiers.command() && modifiers.alt())
+                || (modifiers.ctrl() && modifiers.shift())))
     {
         Some(Tool::DevTools)
     } else {
@@ -368,7 +366,7 @@ pub(crate) fn tool(keystroke: &renderer::Keystroke) -> Option<Tool> {
 }
 
 pub(crate) fn state_json(state: &renderer::WindowState, focused: bool) -> Value {
-    let rect = |bounds: Bounds<renderer::Pixels>| {
+    let rect = |bounds: Rect<renderer::Pixels>| {
         [
             bounds.origin.x,
             bounds.origin.y,
@@ -600,14 +598,21 @@ impl Main {
     pub(crate) fn before_input(
         &self,
         id: u64,
-        input: &renderer::PlatformInput,
+        input: &renderer::Event,
         composing: &dyn Fn() -> bool,
     ) -> bool {
-        let (kind, keystroke, held, ime) = match input {
-            renderer::PlatformInput::KeyDown(down) => {
-                ("keyDown", &down.keystroke, down.is_held, down.ime)
-            }
-            renderer::PlatformInput::KeyUp(up) => ("keyUp", &up.keystroke, false, up.ime),
+        let (kind, key, modifiers, held, ime) = match input {
+            renderer::Event::KeyDown {
+                key,
+                modifiers,
+                repeat,
+                ime,
+            } => ("keyDown", key, *modifiers, *repeat, *ime),
+            renderer::Event::KeyUp {
+                key,
+                modifiers,
+                ime,
+            } => ("keyUp", key, *modifiers, false, *ime),
             _ => return false,
         };
         let Some(engine) = &self.engine else {
@@ -618,25 +623,24 @@ impl Main {
         };
         if !self.inputs.borrow().contains(&id)
             || self.driving.get()
-            || !packaged && tool(keystroke).is_some()
+            || !packaged && tool(&key.name, modifiers).is_some()
         {
             return false;
         }
-        let modifiers = &keystroke.modifiers;
         let input = json!({
             "type": kind,
             "key": if ime {
                 "Process"
             } else {
-                keystroke.key_char.as_deref().unwrap_or(&keystroke.key)
+                key.text.as_deref().unwrap_or(&key.name)
             },
-            "code": keystroke.key,
+            "code": key.name,
             "isAutoRepeat": held,
             "isComposing": composing(),
-            "shift": modifiers.shift,
-            "control": modifiers.control,
-            "alt": modifiers.alt,
-            "meta": modifiers.platform,
+            "shift": modifiers.shift(),
+            "control": modifiers.ctrl(),
+            "alt": modifiers.alt(),
+            "meta": modifiers.command(),
             "location": 0,
             "modifiers": [],
         });
@@ -744,7 +748,7 @@ impl Main {
         let state = || window.state().unwrap_or_default();
         let change = match action {
             "title" => return window.set_title(args[2].as_str().unwrap_or("")),
-            "bounds" if cfg!(target_os = "macos") => WindowChange::Frame(Bounds::new(
+            "bounds" if cfg!(target_os = "macos") => WindowChange::Frame(Rect::new(
                 point(number(2), number(3)),
                 size(number(4), number(5)),
             )),
@@ -1076,7 +1080,7 @@ mod tests {
 
     #[test]
     fn main_filters_the_keys_of_listening_windows_outside_its_scripts() {
-        use renderer::{KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, PlatformInput};
+        use renderer::{Event, Key, Modifiers};
         let api = JavaScriptCore::load().unwrap();
         let host = Rc::new(RefCell::new(Host::default()));
         let engine = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
@@ -1087,22 +1091,23 @@ mod tests {
             )
             .unwrap();
         let main = Main::new(Some(engine), host.clone(), Link::new(), api);
-        let key = |key: &str, modifiers: Modifiers| Keystroke {
+        let key = |key: &str, modifiers: Modifiers| {
+            let text = (key.len() == 1).then(|| key.to_uppercase());
+            (
+                Key {
+                    name: key.into(),
+                    text,
+                },
+                modifiers,
+            )
+        };
+        let down = |(key, modifiers): (Key, Modifiers)| Event::KeyDown {
+            key,
             modifiers,
-            key: key.into(),
-            key_char: (key.len() == 1).then(|| key.to_uppercase()),
+            repeat: true,
+            ime: false,
         };
-        let down = |keystroke: Keystroke| {
-            PlatformInput::KeyDown(KeyDownEvent {
-                keystroke,
-                is_held: true,
-                ime: false,
-            })
-        };
-        let shift = Modifiers {
-            shift: true,
-            ..Modifiers::default()
-        };
+        let shift = Modifiers::SHIFT;
         let keys = || {
             main.engine
                 .as_ref()
@@ -1116,22 +1121,22 @@ mod tests {
         assert!(main.before_input(5, &p, &|| true));
         assert!(!main.before_input(
             5,
-            &PlatformInput::KeyUp(KeyUpEvent {
-                keystroke: key("q", Modifiers::default()),
+            &Event::KeyUp {
+                key: key("q", Modifiers::NONE).0,
+                modifiers: Modifiers::NONE,
                 ime: false,
-            }),
+            },
             &|| false
         ));
         assert_eq!(
             keys(),
             r#"5{"type":"keyDown","key":"P","code":"p","isAutoRepeat":true,"isComposing":true,"shift":true,"control":false,"alt":false,"meta":false,"location":0,"modifiers":[]}|5{"type":"keyUp","key":"Q","code":"q","isAutoRepeat":false,"isComposing":false,"shift":false,"control":false,"alt":false,"meta":false,"location":0,"modifiers":[]}"#
         );
-        let process = |ime| {
-            PlatformInput::KeyDown(KeyDownEvent {
-                keystroke: key("p", Modifiers::default()),
-                is_held: false,
-                ime,
-            })
+        let process = |ime| Event::KeyDown {
+            key: key("p", Modifiers::NONE).0,
+            modifiers: Modifiers::NONE,
+            repeat: false,
+            ime,
         };
         assert!(main.before_input(5, &process(true), &|| true));
         assert!(main.before_input(5, &process(false), &|| false));
@@ -1139,13 +1144,9 @@ mod tests {
             keys(),
             r#"5{"type":"keyDown","key":"Process","code":"p","isAutoRepeat":false,"isComposing":true,"shift":false,"control":false,"alt":false,"meta":false,"location":0,"modifiers":[]}|5{"type":"keyDown","key":"P","code":"p","isAutoRepeat":false,"isComposing":false,"shift":false,"control":false,"alt":false,"meta":false,"location":0,"modifiers":[]}"#
         );
-        let tools = Modifiers {
-            platform: true,
-            alt: true,
-            ..Modifiers::default()
-        };
+        let tools = Modifiers::COMMAND.plus(Modifiers::ALT);
         for tool in [
-            key("f12", Modifiers::default()),
+            key("f12", Modifiers::NONE),
             key("i", tools),
             key("f", tools),
         ] {
@@ -1153,7 +1154,7 @@ mod tests {
         }
         assert_eq!(keys(), "");
         host.borrow_mut().packaged = true;
-        main.before_input(5, &down(key("f12", Modifiers::default())), &|| false);
+        main.before_input(5, &down(key("f12", Modifiers::NONE)), &|| false);
         assert!(keys().contains(r#""code":"f12""#));
         main.driving.set(true);
         assert!(!main.before_input(5, &p, &|| false));

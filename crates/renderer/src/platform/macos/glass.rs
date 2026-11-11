@@ -1,16 +1,16 @@
-use crate::Rgba;
+use crate::Color;
 use objc2::{
-    class, msg_send,
+    DefinedClass, MainThreadOnly, define_class, msg_send,
     rc::Retained,
-    runtime::{AnyClass, AnyObject, Bool, ClassBuilder, MessageReceiver, Sel},
+    runtime::{AnyClass, Bool},
     sel,
 };
-use objc2_app_kit::{NSColor, NSView, NSViewLayerContentsPlacement, NSWindowOrderingMode};
+use objc2_app_kit::{
+    NSColor, NSEvent, NSResponder, NSView, NSViewLayerContentsPlacement, NSWindowOrderingMode,
+};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CAMetalLayer, CATransaction};
-use std::{ffi::CStr, ptr, sync::OnceLock};
-
-const TARGET: &CStr = c"appsInputView";
+use std::sync::OnceLock;
 
 #[derive(Clone)]
 pub(crate) struct GlassSurface {
@@ -18,14 +18,14 @@ pub(crate) struct GlassSurface {
     pub layer: Retained<CAMetalLayer>,
     pub bounds: [f64; 4],
     pub radius: f64,
-    pub tint: Option<Rgba>,
+    pub tint: Option<Color>,
     pub clear: bool,
     pub interactive: bool,
 }
 
 pub(crate) struct GlassView {
     view: Retained<NSView>,
-    content: Retained<NSView>,
+    content: Retained<GlassContent>,
     surface: GlassSurface,
 }
 
@@ -34,65 +34,53 @@ pub(crate) fn available() -> bool {
     *AVAILABLE.get_or_init(|| AnyClass::get(c"NSGlassEffectView").is_some())
 }
 
-fn content_class() -> &'static AnyClass {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    let class = *CLASS.get_or_init(|| {
-        let mut class = ClassBuilder::new(c"AppsGlassContentView", class!(NSView)).unwrap();
-        // The input target belongs to the same window and must outlive these subviews.
-        unsafe {
-            class.add_ivar::<*mut AnyObject>(TARGET);
-            for selector in [
-                sel!(mouseDown:),
-                sel!(mouseUp:),
-                sel!(rightMouseDown:),
-                sel!(rightMouseUp:),
-                sel!(otherMouseDown:),
-                sel!(otherMouseUp:),
-                sel!(mouseMoved:),
-                sel!(mouseExited:),
-                sel!(mouseDragged:),
-                sel!(rightMouseDragged:),
-                sel!(otherMouseDragged:),
-                sel!(scrollWheel:),
-                sel!(swipeWithEvent:),
-                sel!(flagsChanged:),
-            ] {
-                class.add_method(
-                    selector,
-                    forward_event as extern "C" fn(_, Sel, *mut AnyObject),
-                );
-            }
-            class.add_method(
-                sel!(acceptsFirstMouse:),
-                first_mouse as extern "C" fn(_, Sel, *mut AnyObject) -> Bool,
-            );
-        }
-        class.register() as *const AnyClass as usize
-    });
-    unsafe { &*(class as *const AnyClass) }
-}
+define_class!(
+    // SAFETY: NSView has no subclassing rules, and the class has no Drop.
+    #[unsafe(super(NSView, NSResponder))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AppsGlassContentView"]
+    #[ivars = *const NSView]
+    struct GlassContent;
 
-extern "C" fn forward_event(this: &AnyObject, selector: Sel, event: *mut AnyObject) {
-    unsafe {
-        let target = *this
-            .class()
-            .instance_variable(TARGET)
-            .unwrap()
-            .load_ptr::<*mut AnyObject>(this);
-        if !target.is_null() {
-            let (): () = target.send_message(selector, (event,));
-        }
+    // Glass sits over the page view, so its pointer events go on to that view.
+    impl GlassContent {
+        #[unsafe(method(mouseDown:))]
+        fn left_down(&self, event: &NSEvent) { self.page().mouseDown(event) }
+        #[unsafe(method(mouseUp:))]
+        fn left_up(&self, event: &NSEvent) { self.page().mouseUp(event) }
+        #[unsafe(method(rightMouseDown:))]
+        fn right_down(&self, event: &NSEvent) { self.page().rightMouseDown(event) }
+        #[unsafe(method(rightMouseUp:))]
+        fn right_up(&self, event: &NSEvent) { self.page().rightMouseUp(event) }
+        #[unsafe(method(otherMouseDown:))]
+        fn other_down(&self, event: &NSEvent) { self.page().otherMouseDown(event) }
+        #[unsafe(method(otherMouseUp:))]
+        fn other_up(&self, event: &NSEvent) { self.page().otherMouseUp(event) }
+        #[unsafe(method(mouseMoved:))]
+        fn moved(&self, event: &NSEvent) { self.page().mouseMoved(event) }
+        #[unsafe(method(mouseExited:))]
+        fn exited(&self, event: &NSEvent) { self.page().mouseExited(event) }
+        #[unsafe(method(mouseDragged:))]
+        fn left_drag(&self, event: &NSEvent) { self.page().mouseDragged(event) }
+        #[unsafe(method(rightMouseDragged:))]
+        fn right_drag(&self, event: &NSEvent) { self.page().rightMouseDragged(event) }
+        #[unsafe(method(otherMouseDragged:))]
+        fn other_drag(&self, event: &NSEvent) { self.page().otherMouseDragged(event) }
+        #[unsafe(method(scrollWheel:))]
+        fn wheel(&self, event: &NSEvent) { self.page().scrollWheel(event) }
+        #[unsafe(method(swipeWithEvent:))]
+        fn swipe(&self, event: &NSEvent) { self.page().swipeWithEvent(event) }
+        #[unsafe(method(flagsChanged:))]
+        fn flags(&self, event: &NSEvent) { self.page().flagsChanged(event) }
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn first_mouse(&self, event: Option<&NSEvent>) -> bool { self.page().acceptsFirstMouse(event) }
     }
-}
+);
 
-extern "C" fn first_mouse(this: &AnyObject, _: Sel, event: *mut AnyObject) -> Bool {
-    unsafe {
-        let target = *this
-            .class()
-            .instance_variable(TARGET)
-            .unwrap()
-            .load_ptr::<*mut AnyObject>(this);
-        msg_send![target, acceptsFirstMouse: event]
+impl GlassContent {
+    fn page(&self) -> &NSView {
+        // SAFETY: the page view belongs to the same window and outlives its glass subviews.
+        unsafe { &**self.ivars() }
     }
 }
 
@@ -124,13 +112,8 @@ pub(crate) fn update(views: &mut Vec<GlassView>, parent: &NSView, surfaces: Vec<
             let view: *mut NSView = msg_send![class, alloc];
             let view: *mut NSView = msg_send![view, initWithFrame: NSRect::default()];
             let view = Retained::from_raw(view).unwrap();
-            let content: *mut NSView = msg_send![content_class(), alloc];
-            let content: *mut NSView = msg_send![content, initWithFrame: NSRect::default()];
-            let content = Retained::from_raw(content).unwrap();
-            let object: &AnyObject = &content;
-            object.class().instance_variable(TARGET).unwrap()
-                .load_ptr::<*mut AnyObject>(object)
-                .write(ptr::from_ref(parent).cast_mut().cast());
+            let content = GlassContent::alloc(parent.mtm()).set_ivars(std::ptr::from_ref(parent));
+            let content: Retained<GlassContent> = msg_send![super(content), initWithFrame: NSRect::default()];
             let () = msg_send![&*content, setLayer: &*surface.layer];
             let () = msg_send![&*content, setWantsLayer: Bool::YES];
             let () = msg_send![&*content, setLayerContentsPlacement: NSViewLayerContentsPlacement::TopLeft];

@@ -11,29 +11,30 @@ path = "src/main.rs"
 [dependencies]
 apps-runtime = { path = "../runtime" }
 anyhow.workspace = true
-base64 = "0.22"
+base64 = "0.23.1"
 bbtree.workspace = true
-ctrlc = "3"
-libloading = "0.8"
-notify = "8"
-object = { version = "0.39.1", default-features = false, features = ["read_core", "std", "elf", "macho", "pe"] }
-oxc_allocator = "=0.155.0"
-oxc_ast = "=0.155.0"
-oxc_ast_visit = "=0.155.0"
-oxc_codegen = "=0.155.0"
-oxc_minifier = "=0.155.0"
-oxc_parser = { version = "=0.155.0", default-features = false }
+ctrlc = "3.5.2"
+libloading = "0.9.0"
+notify = "8.2.2"
+object = { version = "0.41.0", default-features = false, features = ["read_core", "std", "elf", "macho", "pe"] }
+oxc_allocator = "=0.158.0"
+oxc_ast = "=0.158.0"
+oxc_ast_visit = "=0.158.0"
+oxc_codegen = "=0.158.0"
+oxc_minifier = "=0.158.0"
+oxc_parser = { version = "=0.158.0", default-features = false }
 # Keep this tag in sync with oxc above. crates.io stops at 0.143.0.
-oxc_react_compiler = { git = "https://github.com/oxc-project/oxc", tag = "crates_v0.155.0" }
-oxc_semantic = "=0.155.0"
+oxc_react_compiler = { git = "https://github.com/oxc-project/oxc", tag = "crates_v0.158.0" }
+oxc_semantic = "=0.158.0"
+# Must match the source map type returned by oxc_codegen.
 oxc_sourcemap = "=9.0.0"
-oxc_span = "=0.155.0"
-oxc_transformer = "=0.155.0"
+oxc_span = "=0.158.0"
+oxc_transformer = "=0.158.0"
 serde_json.workspace = true
-sha2 = "0.10"
-tempfile = "3"
+sha2 = "0.11.1"
+tempfile = "3.27.0"
 url.workspace = true
-zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
 apps-media = { path = "../media" }

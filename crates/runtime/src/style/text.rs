@@ -51,7 +51,7 @@ pub(crate) struct InlineText {
     pub ranges: Vec<(usize, std::ops::Range<usize>)>,
     pub boxes: Vec<InlineBox>,
     pub atoms: Vec<Atom>,
-    pub cursors: Vec<(usize, renderer::CursorStyle)>,
+    pub cursors: Vec<(usize, renderer::Cursor)>,
     pub shadows: Vec<(f32, f32, f32, u32)>,
     pub first_line: Option<Box<(renderer::TextRun, renderer::TextRun, Option<String>)>>,
     pub line_heights: Vec<(usize, LineHeight)>,
@@ -169,30 +169,30 @@ pub(crate) fn text_transform(text: &mut String, range: std::ops::Range<usize>, m
     text.replace_range(range, &mapped);
 }
 
-pub(crate) fn cursor(value: &str) -> Option<renderer::CursorStyle> {
-    use renderer::CursorStyle::*;
+pub(crate) fn cursor(value: &str) -> Option<renderer::Cursor> {
+    use renderer::Cursor::*;
     Some(match value {
-        "default" => Arrow,
-        "pointer" => PointingHand,
-        "text" => IBeam,
-        "vertical-text" => IBeamCursorForVerticalLayout,
+        "default" => Default,
+        "pointer" => Pointer,
+        "text" => Text,
+        "vertical-text" => VerticalText,
         "crosshair" => Crosshair,
-        "grab" | "move" | "all-scroll" => OpenHand,
-        "grabbing" => ClosedHand,
-        "not-allowed" | "no-drop" => OperationNotAllowed,
-        "col-resize" => ResizeColumn,
-        "row-resize" => ResizeRow,
-        "ew-resize" => ResizeLeftRight,
-        "ns-resize" => ResizeUpDown,
-        "e-resize" => ResizeRight,
-        "w-resize" => ResizeLeft,
-        "n-resize" => ResizeUp,
-        "s-resize" => ResizeDown,
-        "nwse-resize" | "nw-resize" | "se-resize" => ResizeUpLeftDownRight,
-        "nesw-resize" | "ne-resize" | "sw-resize" => ResizeUpRightDownLeft,
-        "alias" => DragLink,
-        "copy" => DragCopy,
-        "context-menu" => ContextualMenu,
+        "grab" | "move" | "all-scroll" => Grab,
+        "grabbing" => Grabbing,
+        "not-allowed" | "no-drop" => NotAllowed,
+        "col-resize" => ColResize,
+        "row-resize" => RowResize,
+        "ew-resize" => EwResize,
+        "ns-resize" => NsResize,
+        "e-resize" => EResize,
+        "w-resize" => WResize,
+        "n-resize" => NResize,
+        "s-resize" => SResize,
+        "nwse-resize" | "nw-resize" | "se-resize" => NwseResize,
+        "nesw-resize" | "ne-resize" | "sw-resize" => NeswResize,
+        "alias" => Alias,
+        "copy" => Copy,
+        "context-menu" => ContextMenu,
         "none" => None,
         _ => return Option::None,
     })
@@ -241,13 +241,15 @@ fn styled_run(style: &Rc<Style>, units: &Lengths, len: usize) -> renderer::TextR
 
 pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::TextRun {
     let (ink, alpha) = style.get(Prop::COLOR).and_then(color).unwrap_or((0, 255));
-    let ink: renderer::Rgba = renderer::rgba(ink << 8 | alpha as u32);
+    let ink: renderer::Color = renderer::Color::hex(ink << 8 | alpha as u32);
     let lines = style.get(Prop::TEXT_DECORATION_LINE).unwrap_or("");
     let decoration = style
         .get(Prop::TEXT_DECORATION_COLOR)
         .filter(|value| !value.eq_ignore_ascii_case("currentcolor"))
         .and_then(color)
-        .map_or(ink, |(ink, alpha)| renderer::rgba(ink << 8 | alpha as u32));
+        .map_or(ink, |(ink, alpha)| {
+            renderer::Color::hex(ink << 8 | alpha as u32)
+        });
     let length = |prop: Prop| {
         style
             .get(prop)
@@ -267,20 +269,19 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
         font: font(style),
         color: ink,
         background_color: None,
-        underline: lines
-            .contains("underline")
-            .then(|| renderer::UnderlineStyle {
-                thickness,
-                color: Some(decoration),
-                style: decoration_style,
-                offset: length(Prop::TEXT_UNDERLINE_OFFSET),
-            }),
+        underline: lines.contains("underline").then(|| renderer::Decoration {
+            thickness,
+            color: Some(decoration),
+            style: decoration_style,
+            offset: length(Prop::TEXT_UNDERLINE_OFFSET),
+        }),
         strikethrough: lines
             .contains("line-through")
-            .then_some(renderer::StrikethroughStyle {
+            .then_some(renderer::Decoration {
                 thickness,
                 color: Some(decoration),
                 style: decoration_style,
+                offset: None,
             }),
         letter_spacing: spacing(style, units, Prop::LETTER_SPACING),
         word_spacing: spacing(style, units, Prop::WORD_SPACING),
@@ -749,7 +750,7 @@ pub(crate) fn inline_text(
             let mut run = text_run(parent, &styles.lengths[id], '\u{fffc}'.len_utf8());
             run.underline = None;
             run.strikethrough = None;
-            run.color = renderer::transparent_black();
+            run.color = renderer::Color::TRANSPARENT;
             run.nowrap = style.get(Prop::WHITE_SPACE) == Some("nowrap");
             run.font_size = Some(renderer::px(0.01));
             run.inset[0] = renderer::px(opening);
@@ -948,7 +949,7 @@ pub(crate) fn inline_text(
             .get(Prop::BACKGROUND_COLOR)
             .and_then(color)
             .filter(|(_, alpha)| *alpha != 0)
-            .map(|(ink, alpha)| renderer::rgba(ink << 8 | alpha as u32));
+            .map(|(ink, alpha)| renderer::Color::hex(ink << 8 | alpha as u32));
         run
     };
     let pseudos = styles.text_pseudos.get(&id).filter(|_| {
@@ -1116,7 +1117,7 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
         }
         family
     });
-    let mut font = renderer::font(family);
+    let mut font = renderer::Font::new(family);
     let weight = match style.get(Prop::FONT_WEIGHT) {
         Some("bold") => 700.,
         Some(value) => value
@@ -1126,7 +1127,7 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
             .unwrap_or(400.),
         None => 400.,
     };
-    font.weight = renderer::FontWeight(weight.clamp(1., 1000.));
+    font.weight = weight.clamp(1., 1000.);
     font.style = match style.get(Prop::FONT_STYLE) {
         Some("italic") => renderer::FontStyle::Italic,
         Some(value) if value.starts_with("oblique") => renderer::FontStyle::Oblique,
@@ -1179,7 +1180,7 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
         features.push((tag.to_owned(), value));
     }
     if !features.is_empty() {
-        font.features = renderer::text::FontFeatures(features.into());
+        font.features = features.into();
     }
     font
 }

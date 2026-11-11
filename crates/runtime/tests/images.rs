@@ -131,20 +131,26 @@ fn avif_rejects_corrupt_data_and_respects_limits() {
 #[test]
 fn svg_and_bundled_images_load_through_the_host() {
     use apps_runtime::host::{Host, Page, Role};
+    use std::io::Write;
     let mut doc = Document::parse("<body><img></body>");
     let mut state = dom::State::default();
     let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="30" height="12"><rect width="30" height="12"/></svg>"#;
-    dom::call(
-        "dom.image",
-        &json!([1, svg.as_slice()]),
-        &mut doc,
-        &mut state,
-        [640., 480.],
-    )
-    .unwrap()
-    .unwrap();
-    assert_eq!(decoded(&mut doc, &mut state), json!([30., 12.]));
-    assert!(!state.images.contains_key(&1));
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(svg).unwrap();
+    let svgz = gzip.finish().unwrap();
+    for bytes in [svg.as_slice(), svgz.as_slice()] {
+        dom::call(
+            "dom.image",
+            &json!([1, bytes]),
+            &mut doc,
+            &mut state,
+            [640., 480.],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(decoded(&mut doc, &mut state), json!([30., 12.]));
+        assert!(!state.images.contains_key(&1));
+    }
     dom::call(
         "dom.image",
         &json!([1, b"not an image".as_slice()]),

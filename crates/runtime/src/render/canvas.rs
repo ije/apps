@@ -38,13 +38,9 @@ pub struct Canvas {
     glyph_bytes: usize,
 }
 
-type GlyphKey = (usize, u32, u32, u32, u8, bool);
+type GlyphKey = (u32, u16, u32, u32, u8, bool);
 
-type Glyph = (
-    renderer::Point<renderer::DevicePixels>,
-    renderer::Size<renderer::DevicePixels>,
-    Vec<u8>,
-);
+type Glyph = (renderer::Point<i32>, renderer::Size<i32>, Vec<u8>);
 
 pub fn line(
     system: &renderer::TextSystem,
@@ -52,7 +48,7 @@ pub fn line(
     font: &str,
     text: &str,
     [letter, word]: [f32; 2],
-) -> (Rc<renderer::LineLayout>, [f32; 4]) {
+) -> (Rc<renderer::Line>, [f32; 4]) {
     let text = text.replace(['\n', '\r', '\t'], " ");
     let (size, family) = font.split_once("px").unwrap_or(("10", "sans-serif"));
     let mut face = crate::style::font(&crate::style::Style::from_iter([
@@ -82,7 +78,7 @@ pub fn line(
     let run = renderer::TextRun {
         len: text.len(),
         font: face,
-        color: renderer::black(),
+        color: renderer::Color::BLACK,
         background_color: None,
         underline: None,
         strikethrough: None,
@@ -98,31 +94,29 @@ pub fn line(
         .and_then(|v| v.parse::<f32>().ok())
         .filter(|size| size.is_finite() && *size > 0.)
         .unwrap_or(10.);
-    let id = system.resolve_font(&run.font);
+    let id = system.face(&run.font);
     let [ascent, descent, _] = system.line_metrics(id, renderer::px(font_size));
-    let em = f32::from(system.em_ascent(id, renderer::px(font_size)));
+    let em = system.metrics(id).em_ascent * font_size;
     (
-        system.layout_line(&text, renderer::px(font_size), &[run], None),
+        system.shape_line(&text, renderer::px(font_size), &run).line,
         [f32::from(ascent), f32::from(descent), em, font_size - em],
     )
 }
 
-pub fn ink(system: &renderer::TextSystem, line: &renderer::LineLayout) -> [f32; 4] {
+pub fn ink(system: &renderer::TextSystem, line: &renderer::Line) -> [f32; 4] {
     let mut ink: Option<[f32; 4]> = None;
-    for run in &line.runs {
-        for glyph in &run.glyphs {
-            let Some([left, right, top, bottom]) =
-                system.glyph_bounds(run.font_id, glyph.id, run.font_size)
-            else {
-                continue;
-            };
-            let x = f32::from(glyph.position.x);
-            let [l, r, t, b] = ink.get_or_insert([x + left, x + right, top, bottom]);
-            *l = l.min(x + left);
-            *r = r.max(x + right);
-            *t = t.max(top);
-            *b = b.min(bottom);
-        }
+    for glyph in &line.glyphs {
+        let Some([left, right, top, bottom]) =
+            system.glyph_bounds(glyph.font, glyph.id, glyph.size)
+        else {
+            continue;
+        };
+        let x = f32::from(glyph.x);
+        let [l, r, t, b] = ink.get_or_insert([x + left, x + right, top, bottom]);
+        *l = l.min(x + left);
+        *r = r.max(x + right);
+        *t = t.max(top);
+        *b = b.min(bottom);
     }
     ink.map_or([0.; 4], |[left, right, top, bottom]| {
         [left, right, top, -bottom]
@@ -131,19 +125,13 @@ pub fn ink(system: &renderer::TextSystem, line: &renderer::LineLayout) -> [f32; 
 
 fn gradient(spec: &str) -> Option<skia::Shader<'static>> {
     let (shape, stops): (Vec<f32>, Vec<(f32, String)>) = serde_json::from_str(spec).ok()?;
-    // tiny-skia has no start radius, so the stops move out by it. Inside it the first color fills.
-    let start = if shape.len() == 6 {
-        shape[2] / shape[5]
-    } else {
-        0.
-    };
     let stops = stops
         .iter()
         .filter_map(|(offset, color)| {
             let (rgb, alpha) = crate::style::color(color)?;
             let [_, r, g, b] = rgb.to_be_bytes();
             Some(skia::GradientStop::new(
-                start + offset * (1. - start),
+                *offset,
                 skia::Color::from_rgba8(r, g, b, alpha),
             ))
         })
@@ -157,8 +145,9 @@ fn gradient(spec: &str) -> Option<skia::Shader<'static>> {
             skia::SpreadMode::Pad,
             identity,
         ),
-        [x0, y0, _, x1, y1, r1] => skia::RadialGradient::new(
+        [x0, y0, r0, x1, y1, r1] => skia::RadialGradient::new(
             (x0, y0).into(),
+            r0,
             (x1, y1).into(),
             r1,
             stops,
@@ -329,7 +318,7 @@ pub(crate) fn render_image(pixels: &skia::Pixmap) -> Arc<renderer::RenderImage> 
 
 pub(crate) fn pixmap(image: &renderer::RenderImage) -> Option<skia::Pixmap> {
     let size = image.size();
-    let mut pixels = skia::Pixmap::new(size.width.into(), size.height.into())?;
+    let mut pixels = skia::Pixmap::new(size.width as u32, size.height as u32)?;
     let source = image.bytes().as_chunks::<4>().0;
     if image.is_premultiplied() {
         for (out, &[b, g, r, a]) in pixels
@@ -736,55 +725,48 @@ impl Canvas {
                     let mut placed = Vec::new();
                     let [mut left, mut top, mut right, mut bottom] =
                         [i64::MAX, i64::MAX, i64::MIN, i64::MIN];
-                    for run in &line.runs {
-                        for glyph in &run.glyphs {
-                            let x = f32::from(glyph.position.x) * raster + fx;
-                            let variants = f32::from(renderer::SUBPIXEL_VARIANTS_X);
-                            let x = if glyph.is_emoji {
-                                x.round()
-                            } else {
-                                (x * variants).round() / variants
-                            };
-                            let reach = f32::from(run.font_size) * raster * 2.;
-                            if x + reach < visible.left()
-                                || x - reach > visible.right()
-                                || fy + reach < visible.top()
-                                || fy - reach > visible.bottom()
-                            {
-                                continue;
-                            }
-                            let key = (
-                                run.font_id.0,
-                                glyph.id.0,
-                                f32::from(run.font_size).to_bits(),
-                                raster.to_bits(),
-                                ((x - x.floor()) * variants) as u8,
-                                glyph.is_emoji,
+                    for glyph in &line.glyphs {
+                        let x = f32::from(glyph.x) * raster + fx;
+                        let variants = f32::from(renderer::SUBPIXEL_STEPS);
+                        let x = if glyph.emoji {
+                            x.round()
+                        } else {
+                            (x * variants).round() / variants
+                        };
+                        let reach = f32::from(glyph.size) * raster * 2.;
+                        if x + reach < visible.left()
+                            || x - reach > visible.right()
+                            || fy + reach < visible.top()
+                            || fy - reach > visible.bottom()
+                        {
+                            continue;
+                        }
+                        let key = (
+                            glyph.font,
+                            glyph.id,
+                            f32::from(glyph.size).to_bits(),
+                            raster.to_bits(),
+                            ((x - x.floor()) * variants) as u8,
+                            glyph.emoji,
+                        );
+                        if !self.glyphs.contains_key(&key) {
+                            let pixels = system.glyph_pixels(
+                                glyph.font, glyph.id, glyph.size, raster, key.4, key.5,
                             );
-                            if !self.glyphs.contains_key(&key) {
-                                let pixels = system.glyph_pixels(
-                                    run.font_id,
-                                    glyph.id,
-                                    run.font_size,
-                                    raster,
-                                    key.4,
-                                    key.5,
-                                );
-                                self.glyph_bytes +=
-                                    pixels.as_ref().map_or(0, |pixels| pixels.2.len()) + 64;
-                                self.glyphs.insert(key, pixels);
-                            }
-                            if let Some((origin, size, _)) = &self.glyphs[&key] {
-                                let x = x.floor() as i64 + i64::from(origin.x.0);
-                                let y = (fy + f32::from(glyph.position.y) * raster).round() as i64
-                                    + i64::from(origin.y.0);
-                                [left, top] = [left.min(x), top.min(y)];
-                                [right, bottom] = [
-                                    right.max(x + i64::from(size.width.0)),
-                                    bottom.max(y + i64::from(size.height.0)),
-                                ];
-                                placed.push((key, x, y));
-                            }
+                            self.glyph_bytes +=
+                                pixels.as_ref().map_or(0, |pixels| pixels.2.len()) + 64;
+                            self.glyphs.insert(key, pixels);
+                        }
+                        if let Some((origin, size, _)) = &self.glyphs[&key] {
+                            let x = x.floor() as i64 + i64::from(origin.x);
+                            let y = (fy + f32::from(glyph.y) * raster).round() as i64
+                                + i64::from(origin.y);
+                            [left, top] = [left.min(x), top.min(y)];
+                            [right, bottom] = [
+                                right.max(x + i64::from(size.width)),
+                                bottom.max(y + i64::from(size.height)),
+                            ];
+                            placed.push((key, x, y));
                         }
                     }
                     let [left, top, right, bottom] = [
@@ -822,8 +804,8 @@ impl Canvas {
                         let Some((_, size, bytes)) = &self.glyphs[&key] else {
                             continue;
                         };
-                        let columns = size.width.0 as usize;
-                        let depth = bytes.len() / (columns * size.height.0 as usize).max(1);
+                        let columns = size.width as usize;
+                        let depth = bytes.len() / (columns * size.height as usize).max(1);
                         if columns == 0 || !matches!(depth, 1 | 4) {
                             continue;
                         }
@@ -1403,6 +1385,30 @@ mod tests {
     }
 
     #[test]
+    fn radial_gradients_keep_both_circle_radii() {
+        for (shape, red, blue) in [
+            ([20, 20, 10, 20, 20, 20], (20, 20), (39, 20)),
+            ([20, 20, 20, 20, 20, 10], (39, 20), (20, 20)),
+            ([10, 20, 10, 20, 20, 20], (20, 20), (39, 20)),
+        ] {
+            let spec = format!(
+                "gradient:{}",
+                serde_json::json!([shape, [[0, "#ff0000"], [1, "#0000ff"]]])
+            );
+            let mut canvas = Canvas::new(40, 40).unwrap();
+            draw(
+                &mut canvas,
+                &[4., spec.len() as f64, 21., 0., 0., 40., 40.],
+                &spec,
+            );
+            let red = pixel(&canvas, red.0, red.1);
+            let blue = pixel(&canvas, blue.0, blue.1);
+            assert!(red[0] > 235 && red[2] < 20, "{shape:?}: {red:?}");
+            assert!(blue[2] > 235 && blue[0] < 20, "{shape:?}: {blue:?}");
+        }
+    }
+
+    #[test]
     fn composite_modes_that_cover_the_canvas_change_pixels_outside_the_shape() {
         let mut canvas = Canvas::new(20, 10).unwrap();
         let mode = "destination-in";
@@ -1529,7 +1535,7 @@ mod tests {
         assert_eq!(canvas.pixels.pixels()[0].red(), 128);
         assert_eq!(pixmap(&canvas.image).unwrap().data()[..4], [128, 0, 0, 128]);
         let image = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000" opacity="0.5"/></svg>"##, 4, 4, None).unwrap();
-        assert_eq!(u32::from(image.size().width), 4);
+        assert_eq!(image.size().width as u32, 4);
         assert_eq!(image.bytes(), [0, 0, 128, 128].repeat(16));
         let rotated = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000"/><path d="M2 0h2v2H2Z" fill="#0000ff"/></svg>"##, 1, 2, Some(([2., 1.], [0., 1., -1., 0., 1., 0.]))).unwrap();
         assert_eq!(

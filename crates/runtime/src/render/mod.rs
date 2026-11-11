@@ -20,10 +20,7 @@ use crate::style::Prop;
 use crate::{desktop::Desktop, host::Host, style};
 pub(crate) use element::dimension;
 use element::{Build, element};
-use renderer::{
-    App, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent,
-    ScrollWheelEvent, Window, WindowId, rgba,
-};
+use renderer::{App, Color, Event, Window, WindowId};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -84,7 +81,7 @@ pub(crate) struct PageState {
 
 type Clips = Vec<(usize, [bool; 2])>;
 type Mismatches = rustc_hash::FxHashSet<(usize, [u32; 4])>;
-type CompositedTransform = (renderer::Bounds<renderer::Pixels>, Option<(f32, [f32; 2])>);
+type CompositedTransform = (renderer::Rect<renderer::Pixels>, Option<(f32, [f32; 2])>);
 
 // Layout revisions are unique across pages and reloads, so a kept box never matches a node of another page.
 static LAYOUT_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -184,7 +181,7 @@ fn queue_layout(view: Rc<PageState>, window: &mut Window) {
     if view.layout_queued.replace(true) {
         return;
     }
-    window.on_next_frame(move |window, cx| {
+    window.next_frame(move |window, cx| {
         view.layout_queued.set(false);
         let renderer = view
             .runtime
@@ -207,7 +204,7 @@ fn queue_layout(view: Rc<PageState>, window: &mut Window) {
 // Run animation callbacks at most once per frame, or recursive requests accumulate.
 pub(crate) fn queue_animation_frame(view: Rc<PageState>, window: &mut Window) {
     if !view.queued.replace(true) {
-        window.on_next_frame(move |window, cx| animation_frame(view, window, cx));
+        window.next_frame(move |window, cx| animation_frame(view, window, cx));
     }
 }
 
@@ -241,16 +238,6 @@ fn animation_frame(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     }
     let runtime = view.runtime.clone();
     cx.defer(move |cx| Desktop::drive(runtime, cx));
-}
-
-fn button(button: MouseButton) -> u8 {
-    match button {
-        MouseButton::Left => 0,
-        MouseButton::Middle => 1,
-        MouseButton::Right => 2,
-        MouseButton::Navigate(renderer::NavigationDirection::Back) => 3,
-        MouseButton::Navigate(_) => 4,
-    }
 }
 
 impl PageState {
@@ -420,50 +407,55 @@ impl PageView {
                 window.request_animation_frame();
             }
             let view = data.clone();
-            window.on_mouse_event(move |event: &MouseExitEvent, phase, window, cx| {
-                if phase.capture() {
-                    let [x, y] = view.screen(window, event.position);
-                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerexit", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"screenX":x,"screenY":y}), Some(window), cx);
-                }
-            });
-            let view = data.clone();
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
-                if phase.capture() {
-                    if event.pressed_button.is_none() {
-                        view.buttons.set(0);
-                    }
-                    let [x, y] = view.screen(window, event.position);
-                    Desktop::dispatch(view.runtime.clone(), view.id, "pointermove", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"screenX":x,"screenY":y,"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx);
-                }
-            });
-            let view = data.clone();
-            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
-                if phase.bubble() {
-                    let button = button(event.button);
-                    view.buttons.set(view.buttons.get() | 1 << [0, 2, 1, 3, 4][usize::from(button)]);
-                    let [x, y] = view.screen(window, event.position);
-                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerdown", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"screenX":x,"screenY":y,"button":button,"buttons":view.buttons.get(),"detail":event.click_count,"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx);
-                }
-            });
-            let view = data.clone();
-            window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
-                if phase.capture() {
-                    let button = button(event.button);
-                    view.buttons.set(view.buttons.get() & !(1 << [0, 2, 1, 3, 4][usize::from(button)]));
-                    let [x, y] = view.screen(window, event.position);
-                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerup", &[], serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"screenX":x,"screenY":y,"button":button,"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx);
-                }
-            });
-            let view = data.clone();
-            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if !phase.capture() {
+            window.on_capture(move |event, window, cx| {
+                let (Event::PointerLeave { at: position } | Event::PointerMove { at: position, .. } | Event::PointerUp { at: position, .. }) = *event else {
                     return;
+                };
+                let [x, y] = view.screen(window, position);
+                let modifiers = event.modifiers().unwrap_or_default();
+                let (kind, button) = match *event {
+                    Event::PointerLeave { .. } => {
+                        Desktop::dispatch(view.runtime.clone(), view.id, "pointerexit", &[], serde_json::json!({"clientX":f32::from(position.x),"clientY":f32::from(position.y),"screenX":x,"screenY":y}), Some(window), cx);
+                        return;
+                    }
+                    Event::PointerMove { held, .. } => {
+                        if held.is_none() {
+                            view.buttons.set(0);
+                        }
+                        ("pointermove", None)
+                    }
+                    Event::PointerUp { button, .. } => {
+                        let button = button as u8;
+                        view.buttons.set(view.buttons.get() & !(1 << [0, 2, 1, 3, 4][usize::from(button)]));
+                        ("pointerup", Some(button))
+                    }
+                    _ => return,
+                };
+                let mut fields = serde_json::json!({"clientX":f32::from(position.x),"clientY":f32::from(position.y),"screenX":x,"screenY":y,"buttons":view.buttons.get(),"ctrlKey":modifiers.ctrl(),"metaKey":modifiers.command(),"altKey":modifiers.alt(),"shiftKey":modifiers.shift()});
+                if let Some(button) = button {
+                    fields["button"] = button.into();
                 }
-                if let (renderer::ScrollPhase::Began | renderer::ScrollPhase::Ended, Ok(host)) =
-                    (event.phase, view.host.try_borrow())
+                Desktop::dispatch(view.runtime.clone(), view.id, kind, &[], fields, Some(window), cx);
+            });
+            let view = data.clone();
+            window.on_bubble(move |event, window, cx| {
+                if let Event::PointerDown { at, button, modifiers, clicks, .. } = *event {
+                    let button = button as u8;
+                    view.buttons.set(view.buttons.get() | 1 << [0, 2, 1, 3, 4][usize::from(button)]);
+                    let [x, y] = view.screen(window, at);
+                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerdown", &[], serde_json::json!({"clientX":f32::from(at.x),"clientY":f32::from(at.y),"screenX":x,"screenY":y,"button":button,"buttons":view.buttons.get(),"detail":clicks,"ctrlKey":modifiers.ctrl(),"metaKey":modifiers.command(),"altKey":modifiers.alt(),"shiftKey":modifiers.shift()}), Some(window), cx);
+                }
+            });
+            let view = data.clone();
+            window.on_capture(move |event, window, cx| {
+                let Event::Wheel { at: position, delta, lines, phase, modifiers } = *event else {
+                    return;
+                };
+                if let (renderer::WheelPhase::Began | renderer::WheelPhase::Ended, Ok(host)) =
+                    (phase, view.host.try_borrow())
                     && let Some(link) = &host.link
                 {
-                    let kind = if event.phase == renderer::ScrollPhase::Began {
+                    let kind = if phase == renderer::WheelPhase::Began {
                         "gestureScrollBegin"
                     } else {
                         "gestureScrollEnd"
@@ -480,7 +472,7 @@ impl PageView {
                     if let (Some(page), Some(state)) = (host.pages.get(&view.id), host.dom.get(&view.id)) {
                         let seen = state.cull.seen.as_ref().map(|seen| seen.2.clone()).or_else(|| state.computed.clone());
                         target = seen.as_ref().and_then(|computed| {
-                            let at = [event.position.x, event.position.y].map(f32::from);
+                            let at = [position.x, position.y].map(f32::from);
                             crate::dom::hit_test(&page.doc, state, computed, viewport, at, true, false).as_u64()
                         })
                         .map(|id| id as usize);
@@ -497,10 +489,10 @@ impl PageView {
                     }
                 }
                 if wheel {
-                    let delta = event.delta.pixel_delta(renderer::px(16.));
-                    let [x, y] = view.screen(window, event.position);
-                    if !Desktop::dispatch(view.runtime.clone(), view.id, "wheel", target.as_slice(), serde_json::json!({"clientX":f32::from(event.position.x),"clientY":f32::from(event.position.y),"screenX":x,"screenY":y,"deltaX":-f32::from(delta.x),"deltaY":-f32::from(delta.y),"buttons":view.buttons.get(),"ctrlKey":event.modifiers.control,"metaKey":event.modifiers.platform,"altKey":event.modifiers.alt,"shiftKey":event.modifiers.shift}), Some(window), cx) {
-                        cx.stop_propagation();
+                    let delta = if lines { delta.map(|value| value * 16.) } else { delta };
+                    let [x, y] = view.screen(window, position);
+                    if !Desktop::dispatch(view.runtime.clone(), view.id, "wheel", target.as_slice(), serde_json::json!({"clientX":f32::from(position.x),"clientY":f32::from(position.y),"screenX":x,"screenY":y,"deltaX":-delta.x,"deltaY":-delta.y,"buttons":view.buttons.get(),"ctrlKey":modifiers.ctrl(),"metaKey":modifiers.command(),"altKey":modifiers.alt(),"shiftKey":modifiers.shift()}), Some(window), cx) {
+                        cx.stop_event();
                     }
                 }
             });
@@ -566,10 +558,10 @@ impl PageView {
             seen.extend(current.drain());
         }
         for image in dom.retired.drain(..) {
-            window.drop_image(image);
+            window.release_image(image);
         }
         for (node, image) in dom.recycled.drain(..) {
-            window.drop_image(image.clone());
+            window.release_image(image.clone());
             if let Ok(image) = Arc::try_unwrap(image)
                 && let Some(media) = state.media.get_mut(&self.id)
             {
@@ -681,7 +673,7 @@ impl PageView {
                 .get(&id)
                 .is_none_or(|image| image.id != old.id)
             {
-                window.drop_image(old);
+                window.release_image(old);
             }
         }
         if let Some(painted) = dom.motion.painted.take() {
@@ -785,7 +777,7 @@ impl PageView {
         // Clear node-ID caches for hidden or removed nodes here, and freed nodes in dom.release. New nodes
         // can reuse their IDs.
         let shown = |id: usize| visible.get(id) == Some(&true);
-        drop_hidden_images(dom, &visible, &styles, |image| window.drop_image(image));
+        drop_hidden_images(dom, &visible, &styles, |image| window.release_image(image));
         if flipped {
             self.svgs.borrow_mut().retain(|&id, _| shown(id));
             self.kept.borrow_mut().retain(|&id, _| shown(id));
@@ -952,7 +944,7 @@ impl PageView {
                 .is_none_or(|color| color.1 != 0)
             && self.canvas.replace(background) != background
         {
-            window.change_window(renderer::WindowChange::Background(renderer::rgba(
+            window.change_window(renderer::WindowChange::Background(renderer::Color::hex(
                 (background.0 << 8) | 255,
             )));
         }
@@ -1680,7 +1672,7 @@ impl PageView {
                     if let Some((color, alpha)) =
                         backdrop.get(Prop::BACKGROUND_COLOR).and_then(style::color)
                     {
-                        el = el.bg(rgba(color << 8 | alpha as u32));
+                        el = el.bg(Color::hex(color << 8 | alpha as u32));
                     }
                     if backdrop.get(Prop::OPACITY).is_some() {
                         el = el.opacity(effects::opacity(backdrop).clamp(0., 1.));
@@ -1711,7 +1703,7 @@ impl PageView {
                         Some((blur, color_matrix)) => el.hooks(paint::Effected {
                             effect: renderer::PaintEffect {
                                 backdrop: Some(renderer::Backdrop {
-                                    bounds: renderer::Bounds::default(),
+                                    bounds: renderer::Rect::default(),
                                     corner_radii: Default::default(),
                                     blur,
                                     color_matrix,
@@ -1945,12 +1937,15 @@ impl PageView {
             .pr(renderer::px(page_space[1]))
             .restrict_scroll_to_axis()
             .track_scroll(&page_scroll)
-            .bg(rgba((background.0 << 8) | background.1 as u32))
-            .on_mouse_move({
+            .bg(Color::hex((background.0 << 8) | background.1 as u32))
+            .on_pointer({
                 let view = self.0.clone();
-                move |event: &MouseMoveEvent, window, _| {
-                    if view.moving.take() && event.dragging() {
-                        window.start_window_move();
+                move |event, window, _| {
+                    if let Event::PointerMove { held, .. } = event
+                        && view.moving.take()
+                        && *held == Some(renderer::Button::Left)
+                    {
+                        window.control().start_window_move();
                     }
                 }
             })
@@ -2042,7 +2037,7 @@ fn animate(
         Some(at) if at <= now + std::time::Duration::from_millis(8) => {
             dom.motion.wake = None;
             let view = view.clone();
-            window.on_next_frame(move |window, cx| match composite {
+            window.next_frame(move |window, cx| match composite {
                 true => self::composite(view, window, cx),
                 false => window.refresh(),
             });
@@ -2229,7 +2224,7 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
                         let transforms: Option<Vec<_>> =
                             transformed.map(|(bounds, perspective)| {
                                 let bounds = match local {
-                                    true => renderer::Bounds::new(Default::default(), bounds.size),
+                                    true => renderer::Rect::new(Default::default(), bounds.size),
                                     false => *bounds,
                                 };
                                 timeline

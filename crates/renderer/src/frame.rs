@@ -1,77 +1,16 @@
 use crate::{
-    BlendMode, Bounds, Point, ScaledPixels, Size,
-    scene::{
-        AtlasTextureId, Batch, DrawOrder, EffectPrimitive, MonochromeSprite, PolychromeSprite,
-        Quad, Scene, Shadow, SortKey, Underline,
+    BlendMode, Point, Rect, Size,
+    gpu::{
+        BOX, Blur, COMPOSITE_BACKDROP, COMPOSITE_BLEND, COMPOSITE_CLIP, COMPOSITE_MASK,
+        COMPOSITE_MATRIX, COMPOSITE_SHADOW, Composite, Globals, Instance,
     },
+    scene::{Nested, Scene},
 };
-use std::{mem, ops::Range};
+use std::ops::Range;
 
-const IDENTITY: [f32; 16] = [
+pub(crate) const IDENTITY: [f32; 16] = [
     1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
 ];
-const COMPOSITE_MATRIX: u32 = 1;
-const COMPOSITE_CLIP: u32 = 2;
-const COMPOSITE_MASK: u32 = 4;
-const COMPOSITE_SHADOW: u32 = 8;
-const COMPOSITE_BACKDROP: u32 = 16;
-const COMPOSITE_BLEND: u32 = 32;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Globals {
-    pub gamma_ratios: [f32; 4],
-    pub viewport_size: [f32; 2],
-    pub viewport_origin: [f32; 2],
-    pub window_size: [f32; 2],
-    pub grayscale_enhanced_contrast: f32,
-    pub subpixel_enhanced_contrast: f32,
-    pub premultiplied_alpha: u32,
-    pub is_bgr: u32,
-    pub pad: [u32; 2],
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TextParams {
-    pub gamma_ratios: [f32; 4],
-    pub grayscale_enhanced_contrast: f32,
-    pub subpixel_enhanced_contrast: f32,
-    pub is_bgr: bool,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Composite {
-    pub transform: [f32; 16],
-    pub color_matrix: [f32; 16],
-    pub color_offset: [f32; 4],
-    pub shadow_color: [f32; 4],
-    pub bounds: [f32; 4],
-    pub clip: [f32; 4],
-    pub clip_radii: [f32; 8],
-    pub mask_rect: [f32; 4],
-    pub mask_tile: [f32; 4],
-    pub content_mask: [f32; 4],
-    pub rounded_mask: [f32; 4],
-    pub rounded_radii: [f32; 8],
-    pub shadow: [f32; 4],
-    pub source_rect: [f32; 4],
-    pub backdrop_rect: [f32; 4],
-    pub opacity: f32,
-    pub blur: f32,
-    pub flags: u32,
-    pub blend: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Blur {
-    pub region: [f32; 4],
-    pub source_rect: [f32; 4],
-    pub direction: [f32; 2],
-    pub sigma: f32,
-    pub scale: f32,
-}
 
 const HALF_RESOLUTION_SIGMA: f32 = 8.;
 
@@ -95,15 +34,15 @@ struct Shelf {
     row: i32,
 }
 
-type Deferred = (Target, Option<AtlasTextureId>, Composite);
+type Deferred = (Target, Option<u32>, Composite);
 
 pub enum Command {
     Pass(Target, bool),
-    Quads(Range<u32>),
-    Shadows(Range<u32>),
-    Underlines(Range<u32>),
-    Mono(AtlasTextureId, Range<u32>),
-    Poly(AtlasTextureId, Range<u32>),
+    Draw {
+        instances: Range<u32>,
+        mask_page: Option<u32>,
+        color_page: Option<u32>,
+    },
     Blur {
         src: Target,
         dst: Target,
@@ -114,9 +53,10 @@ pub enum Command {
         dst: Target,
         region: [i32; 4],
     },
+    // `mask` is a color atlas page.
     Composite {
         src: Target,
-        mask: Option<AtlasTextureId>,
+        mask: Option<u32>,
         backdrop: Option<Target>,
         index: u32,
     },
@@ -124,11 +64,7 @@ pub enum Command {
 
 #[derive(Default)]
 pub struct RenderFrame {
-    pub quads: Vec<Quad>,
-    pub shadows: Vec<Shadow>,
-    pub underlines: Vec<Underline>,
-    pub mono: Vec<MonochromeSprite>,
-    pub poly: Vec<PolychromeSprite>,
+    pub(crate) instances: Vec<Instance>,
     pub composites: Vec<Composite>,
     pub blurs: Vec<Blur>,
     pub commands: Vec<Command>,
@@ -145,64 +81,18 @@ pub struct RenderFrame {
     pub promoted: Vec<(usize, Target, [i32; 4])>,
 }
 
-fn extend<T: Copy>(
-    items: &mut Vec<T>,
-    primitives: &[T],
-    keys: &[SortKey],
-    mut keep: impl FnMut(&mut T) -> bool,
-) -> Range<u32> {
-    let start = items.len() as u32;
-    items.extend(keys.iter().filter_map(|key| {
-        let mut item = primitives[key[2] as usize];
-        keep(&mut item).then_some(item)
-    }));
-    start..items.len() as u32
-}
-
-pub fn region(bounds: Bounds<ScaledPixels>) -> [i32; 4] {
-    let [x, y] = [bounds.origin.x.0.floor(), bounds.origin.y.0.floor()];
+pub fn region(bounds: Rect<f32>) -> [i32; 4] {
+    let [x, y] = [bounds.origin.x.floor(), bounds.origin.y.floor()];
     let [right, bottom] = [
-        (bounds.origin.x.0 + bounds.size.width.0).ceil(),
-        (bounds.origin.y.0 + bounds.size.height.0).ceil(),
+        (bounds.origin.x + bounds.size.width).ceil(),
+        (bounds.origin.y + bounds.size.height).ceil(),
     ];
     [x as i32, y as i32, (right - x) as i32, (bottom - y) as i32]
 }
 
-fn rect(bounds: Bounds<ScaledPixels>) -> [f32; 4] {
-    [
-        bounds.origin.x.0,
-        bounds.origin.y.0,
-        bounds.size.width.0,
-        bounds.size.height.0,
-    ]
-}
-
-fn radii(radii: &crate::Radii<ScaledPixels>) -> [f32; 8] {
-    let (x, y) = (&radii.x, &radii.y);
-    [
-        x.top_left.0,
-        x.top_right.0,
-        x.bottom_right.0,
-        x.bottom_left.0,
-        y.top_left.0,
-        y.top_right.0,
-        y.bottom_right.0,
-        y.bottom_left.0,
-    ]
-}
-
-pub fn bytes<T>(items: &[T]) -> &[u8] {
-    // SAFETY: the instance types are `repr(C)` plain data that the shaders read as raw bytes.
-    unsafe { std::slice::from_raw_parts(items.as_ptr() as *const u8, mem::size_of_val(items)) }
-}
-
 impl RenderFrame {
     pub fn record(&mut self, scene: &Scene, window: [u32; 2], max_texture: u32, copy: bool) {
-        self.quads.clear();
-        self.shadows.clear();
-        self.underlines.clear();
-        self.mono.clear();
-        self.poly.clear();
+        self.instances.clear();
         self.composites.clear();
         self.blurs.clear();
         self.commands.clear();
@@ -274,18 +164,11 @@ impl RenderFrame {
         }
     }
 
-    pub fn globals(&self, target: Target, text: &TextParams) -> Globals {
-        let rect = self.rect(target);
+    pub fn globals(&self, target: Target, text_contrast: f32) -> Globals {
         Globals {
-            gamma_ratios: text.gamma_ratios,
-            viewport_size: [rect[2], rect[3]],
-            viewport_origin: [rect[0], rect[1]],
-            window_size: [self.window[0] as f32, self.window[1] as f32],
-            grayscale_enhanced_contrast: text.grayscale_enhanced_contrast,
-            subpixel_enhanced_contrast: text.subpixel_enhanced_contrast,
-            premultiplied_alpha: 0,
-            is_bgr: text.is_bgr as u32,
-            pad: [0; 2],
+            viewport: self.rect(target),
+            text_contrast,
+            pad: [0.; 3],
         }
     }
 
@@ -418,12 +301,12 @@ impl RenderFrame {
         depth: usize,
     ) {
         self.commands.push(Command::Pass(target, clear));
-        let primitives = &scene.layers[layer];
+        let content = &scene.layers[layer];
         // Skip what a later opaque box hides, since stacked page backgrounds can fill the window many
         // times. An effect that reads the target could see the hidden pixels, so then nothing is skipped.
-        let mut occluders: Vec<(DrawOrder, Bounds<ScaledPixels>, f32)> = Vec::new();
-        if !primitives.effects.iter().any(|primitive| {
-            scene.layers[primitive.layer]
+        let mut occluders: Vec<(usize, Rect<f32>, f32)> = Vec::new();
+        if !content.nested.iter().any(|nested| {
+            scene.layers[nested.layer]
                 .effect
                 .as_ref()
                 .is_some_and(|effect| {
@@ -432,19 +315,15 @@ impl RenderFrame {
         }) {
             let min = self.window[0] as f32 * self.window[1] as f32 / 64.;
             occluders.extend(
-                primitives
-                    .quads
+                content
+                    .instances
                     .iter()
-                    .filter(|quad| {
-                        quad.background.a >= 1.
-                            && quad.border_widths == Default::default()
-                            && quad.corner_radii == Default::default()
-                            && quad.content_mask.corner_radii == Default::default()
-                    })
-                    .filter_map(|quad| {
-                        let bounds = quad.bounds.intersect(&quad.content_mask.bounds);
-                        let area = bounds.size.width.0 * bounds.size.height.0;
-                        (area >= min).then_some((quad.order, bounds, area))
+                    .enumerate()
+                    .filter(|(_, instance)| instance.is_opaque_rect())
+                    .filter_map(|(at, instance)| {
+                        let bounds = instance.reach();
+                        let area = bounds.size.width * bounds.size.height;
+                        (area >= min).then_some((at, bounds, area))
                     }),
             );
             if occluders.len() > 16 {
@@ -453,9 +332,11 @@ impl RenderFrame {
             }
             occluders.sort_unstable_by_key(|occluder| std::cmp::Reverse(occluder.0));
         }
-        // With `trim`, an occluder that spans the box cuts off the side it covers.
-        let visible = |order: DrawOrder, bounds: &mut Bounds<ScaledPixels>, trim: bool| {
-            for (_, over, _) in occluders.iter().take_while(|occluder| occluder.0 > order) {
+        // With `trim`, an occluder that spans the box cuts off the side it covers. Cuts repeat until none
+        // applies, since one cut can make another occluder span the rest.
+        let visible = |at: usize, bounds: &mut Rect<f32>, trim: bool| loop {
+            let before = *bounds;
+            for (_, over, _) in occluders.iter().take_while(|occluder| occluder.0 > at) {
                 let (left, top, right, bottom) = (
                     bounds.origin.x,
                     bounds.origin.y,
@@ -480,95 +361,88 @@ impl RenderFrame {
                 } else if across && over.bottom() >= bottom && over.origin.y < bottom {
                     y1 = over.origin.y;
                 }
-                *bounds = Bounds::from_corners(Point::new(x0, y0), Point::new(x1, y1));
+                *bounds = Rect::between(Point::new(x0, y0), Point::new(x1, y1));
             }
-            true
+            if *bounds == before {
+                return true;
+            }
         };
-        let shown =
-            |order: DrawOrder, mut bounds: Bounds<ScaledPixels>| visible(order, &mut bounds, false);
-        for batch in scene.batches(layer) {
-            let command = match batch {
-                Batch::Quads(keys) => {
-                    Command::Quads(extend(&mut self.quads, &primitives.quads, keys, |quad| {
-                        let mask = &mut quad.content_mask;
-                        let mut bounds = quad.bounds.intersect(&mask.bounds);
-                        let trim = mask.corner_radii == Default::default();
-                        let shown = visible(quad.order, &mut bounds, trim);
-                        if trim {
-                            mask.bounds = bounds;
-                        }
-                        shown
-                    }))
+        let mut nested = content.nested.iter().peekable();
+        let mut start = self.instances.len() as u32;
+        let mut pages = [None; 2];
+        for (at, instance) in content.instances.iter().enumerate() {
+            if nested.peek().is_some_and(|nested| nested.at as usize <= at) {
+                self.draw(&mut start, &mut pages);
+                while let Some(nested) = nested.next_if(|nested| nested.at as usize <= at) {
+                    self.record_nested(scene, layer, nested, target, depth);
                 }
-                Batch::Shadows(keys) => Command::Shadows(extend(
-                    &mut self.shadows,
-                    &primitives.shadows,
-                    keys,
-                    |shadow| {
-                        let reach = shadow
-                            .bounds
-                            .dilate(ScaledPixels(shadow.blur_radius.0 * 3.));
-                        shown(shadow.order, reach.intersect(&shadow.content_mask.bounds))
-                    },
-                )),
-                Batch::Underlines(keys) => Command::Underlines(extend(
-                    &mut self.underlines,
-                    &primitives.underlines,
-                    keys,
-                    |line| shown(line.order, line.bounds.intersect(&line.content_mask.bounds)),
-                )),
-                Batch::Mono(texture, keys) => Command::Mono(
-                    texture,
-                    extend(&mut self.mono, &primitives.mono, keys, |sprite| {
-                        shown(
-                            sprite.order,
-                            sprite.bounds.intersect(&sprite.content_mask.bounds),
-                        )
-                    }),
-                ),
-                Batch::Poly(texture, keys) => Command::Poly(
-                    texture,
-                    extend(&mut self.poly, &primitives.poly, keys, |sprite| {
-                        shown(
-                            sprite.order,
-                            sprite.bounds.intersect(&sprite.content_mask.bounds),
-                        )
-                    }),
-                ),
-                Batch::Effects(keys) => {
-                    for key in keys {
-                        let primitive = &primitives.effects[key[2] as usize];
-                        if layer == 0 && self.skip.contains(&primitive.layer) {
-                            continue;
-                        }
-                        self.record_effect(scene, primitive, target, depth);
-                    }
-                    self.flush(target, depth);
-                    continue;
-                }
-            };
-            if let Command::Quads(range)
-            | Command::Shadows(range)
-            | Command::Underlines(range)
-            | Command::Mono(_, range)
-            | Command::Poly(_, range) = &command
-                && range.is_empty()
-            {
+                self.flush(target, depth);
+                start = self.instances.len() as u32;
+            }
+            let mut instance = *instance;
+            let mut bounds = instance.reach();
+            let trim = instance.kind() == BOX && instance.round_radii == [0.; 8];
+            if !visible(at, &mut bounds, trim) {
                 continue;
             }
-            self.commands.push(command);
+            if trim {
+                instance.clip = bounds.to_array();
+            }
+            // A draw binds one page of each kind.
+            if let Some((color, page)) = instance.page() {
+                if pages[color as usize].is_some_and(|bound| bound != page) {
+                    let other = pages[!color as usize];
+                    self.draw(&mut start, &mut pages);
+                    pages[!color as usize] = other;
+                }
+                pages[color as usize] = Some(page);
+            }
+            self.instances.push(instance);
+        }
+        self.draw(&mut start, &mut pages);
+        if nested.peek().is_some() {
+            for nested in nested {
+                self.record_nested(scene, layer, nested, target, depth);
+            }
+            self.flush(target, depth);
         }
     }
 
-    fn region(&self, bounds: Bounds<ScaledPixels>, limit: [f32; 4]) -> Option<[i32; 4]> {
+    fn draw(&mut self, start: &mut u32, pages: &mut [Option<u32>; 2]) {
+        let end = self.instances.len() as u32;
+        if end > *start {
+            self.commands.push(Command::Draw {
+                instances: *start..end,
+                mask_page: pages[0],
+                color_page: pages[1],
+            });
+        }
+        *start = end;
+        *pages = [None; 2];
+    }
+
+    fn record_nested(
+        &mut self,
+        scene: &Scene,
+        layer: usize,
+        nested: &Nested,
+        target: Target,
+        depth: usize,
+    ) {
+        if layer != 0 || !self.skip.contains(&nested.layer) {
+            self.record_effect(scene, nested, target, depth);
+        }
+    }
+
+    fn region(&self, bounds: Rect<f32>, limit: [f32; 4]) -> Option<[i32; 4]> {
         let max = self.max_texture - 2.;
-        let x0 = bounds.origin.x.0.floor().max(limit[0]);
-        let y0 = bounds.origin.y.0.floor().max(limit[1]);
-        let x1 = (bounds.origin.x.0 + bounds.size.width.0)
+        let x0 = bounds.origin.x.floor().max(limit[0]);
+        let y0 = bounds.origin.y.floor().max(limit[1]);
+        let x1 = (bounds.origin.x + bounds.size.width)
             .ceil()
             .min(limit[0] + limit[2])
             .min(x0 + max);
-        let y1 = (bounds.origin.y.0 + bounds.size.height.0)
+        let y1 = (bounds.origin.y + bounds.size.height)
             .ceil()
             .min(limit[1] + limit[3])
             .min(y0 + max);
@@ -621,7 +495,7 @@ impl RenderFrame {
         &mut self,
         target: Target,
         src: Target,
-        mask: Option<AtlasTextureId>,
+        mask: Option<u32>,
         backdrop: Option<Target>,
         composite: Composite,
     ) {
@@ -642,18 +516,12 @@ impl RenderFrame {
         self.deferred[depth].push(composite);
     }
 
-    fn record_effect(
-        &mut self,
-        scene: &Scene,
-        primitive: &EffectPrimitive,
-        target: Target,
-        depth: usize,
-    ) {
-        let layer = &scene.layers[primitive.layer];
+    fn record_effect(&mut self, scene: &Scene, nested: &Nested, target: Target, depth: usize) {
+        let layer = &scene.layers[nested.layer];
         let Some(effect) = layer.effect.as_ref() else {
             return;
         };
-        let mask = primitive.content_mask.bounds;
+        let mask = nested.clip.bounds;
         let matrix = |matrix: &Option<[f32; 20]>, composite: &mut Composite| {
             if let Some(m) = matrix {
                 composite.flags |= COMPOSITE_MATRIX;
@@ -674,9 +542,9 @@ impl RenderFrame {
             clip_radii: [0.; 8],
             mask_rect: [0.; 4],
             mask_tile: [0.; 4],
-            content_mask: rect(mask),
-            rounded_mask: rect(primitive.content_mask.rounded),
-            rounded_radii: radii(&primitive.content_mask.corner_radii),
+            content_mask: mask.to_array(),
+            rounded_mask: nested.clip.rounded.to_array(),
+            rounded_radii: nested.clip.radii.to_array(),
             shadow: [0.; 4],
             source_rect: [0.; 4],
             backdrop_rect: [0.; 4],
@@ -689,10 +557,12 @@ impl RenderFrame {
             Target::Frame => self.rect(target),
             Target::Layer(index) => self.layers[index].bounds,
         };
-        let visible = rect(mask.intersect(&Bounds::new(
-            Point::new(ScaledPixels(target_rect[0]), ScaledPixels(target_rect[1])),
-            Size::new(ScaledPixels(target_rect[2]), ScaledPixels(target_rect[3])),
-        )));
+        let visible = mask
+            .intersect(Rect::new(
+                Point::new(target_rect[0], target_rect[1]),
+                Size::new(target_rect[2], target_rect[3]),
+            ))
+            .to_array();
 
         let copies =
             self.copy && (effect.backdrop.is_some() || effect.blend_mode != BlendMode::Normal);
@@ -702,10 +572,7 @@ impl RenderFrame {
         }
         if let Some(backdrop) = &effect.backdrop
             && self.copy
-            && let Some(region) = self.region(
-                backdrop.bounds.dilate(ScaledPixels(backdrop.blur * 3.)),
-                visible,
-            )
+            && let Some(region) = self.region(backdrop.bounds.outset(backdrop.blur * 3.), visible)
         {
             let copy = self.acquire(region);
             self.commands.push(Command::Copy {
@@ -721,9 +588,9 @@ impl RenderFrame {
             let mut composite = base;
             composite.flags = COMPOSITE_BACKDROP | COMPOSITE_CLIP;
             composite.opacity = effect.opacity;
-            composite.bounds = rect(backdrop.bounds);
+            composite.bounds = backdrop.bounds.to_array();
             composite.clip = composite.bounds;
-            composite.clip_radii = radii(&backdrop.corner_radii);
+            composite.clip_radii = backdrop.corner_radii.to_array();
             composite.blur = sigma;
             composite.source_rect = self.rect(src);
             matrix(&backdrop.color_matrix, &mut composite);
@@ -744,7 +611,7 @@ impl RenderFrame {
             .blur
             .max(effect.shadow.map_or(0., |(_, sigma, _)| sigma))
             * 3.;
-        let content = content.dilate(ScaledPixels(spread));
+        let content = content.outset(spread);
         let Some(region) = self.region(content, reach) else {
             return;
         };
@@ -759,13 +626,13 @@ impl RenderFrame {
         }
         let texture = match tile {
             Some((tile, clear)) => {
-                self.record_layer(scene, primitive.layer, tile, clear, depth + 1);
+                self.record_layer(scene, nested.layer, tile, clear, depth + 1);
                 tile
             }
             None => {
                 let texture =
                     self.acquire([region[0] - 1, region[1] - 1, region[2] + 2, region[3] + 2]);
-                self.record_layer(scene, primitive.layer, texture, true, depth + 1);
+                self.record_layer(scene, nested.layer, texture, true, depth + 1);
                 texture
             }
         };
@@ -775,19 +642,14 @@ impl RenderFrame {
         base.opacity = effect.opacity;
         if let Some((bounds, corners)) = &effect.clip {
             base.flags |= COMPOSITE_CLIP;
-            base.clip = rect(*bounds);
-            base.clip_radii = radii(corners);
+            base.clip = bounds.to_array();
+            base.clip_radii = corners.to_array();
         }
         let mask_texture = effect.mask.as_ref().map(|(tile, bounds)| {
             base.flags |= COMPOSITE_MASK;
-            base.mask_rect = rect(*bounds);
-            base.mask_tile = [
-                tile.bounds.origin.x.0 as f32,
-                tile.bounds.origin.y.0 as f32,
-                tile.bounds.size.width.0 as f32,
-                tile.bounds.size.height.0 as f32,
-            ];
-            tile.texture_id
+            base.mask_rect = bounds.to_array();
+            base.mask_tile = tile.rect.map(|value| value as f32).to_array();
+            tile.page
         });
         let region_rect = region.map(|value| value as f32);
 
@@ -826,7 +688,7 @@ impl RenderFrame {
             (texture, 0.)
         };
         let backdrop = (effect.blend_mode != BlendMode::Normal && self.copy)
-            .then(|| self.region(primitive.bounds, visible))
+            .then(|| self.region(nested.bounds, visible))
             .flatten()
             .map(|region| {
                 let copy = self.acquire(region);
@@ -861,33 +723,21 @@ impl RenderFrame {
 
 #[cfg(test)]
 mod tests {
-    use super::{Blur, Command, Composite, Globals, RenderFrame};
+    use super::{Command, RenderFrame};
     use crate::{
-        Bounds, ContentMask, ScaledPixels, Size,
-        scene::{
-            EffectState, MonochromeSprite, PolychromeSprite, Primitive, Quad, Scene, Shadow,
-            Underline,
-        },
+        Clip, Rect, Size,
+        gpu::{BOX, GLYPH, IMAGE, Instance, bytes},
+        scene::{EffectState, Scene},
     };
-    use std::mem::size_of;
 
-    fn record(window: [u32; 2], quad: [f32; 4], scale: f32) -> RenderFrame {
-        let bounds = |[x, y, w, h]: [f32; 4]| {
-            Bounds::new(
-                crate::point(ScaledPixels(x), ScaledPixels(y)),
-                Size::new(ScaledPixels(w), ScaledPixels(h)),
-            )
-        };
-        let mask = ContentMask {
-            bounds: bounds([-1e6, -1e6, 2e6, 2e6]),
-            ..Default::default()
-        };
-        let mut transform = super::IDENTITY;
-        transform[0] = scale;
-        let mut scene = Scene::default();
-        let state = EffectState {
-            transform: (scale != 1.).then_some(transform),
-            opacity: 0.5,
+    fn bounds([x, y, w, h]: [f32; 4]) -> Rect<f32> {
+        Rect::new(crate::point(x, y), Size::new(w, h))
+    }
+
+    fn effect(content_mask: Clip<f32>) -> EffectState {
+        EffectState {
+            transform: None,
+            opacity: 1.,
             color_matrix: None,
             blur: 0.,
             shadow: None,
@@ -896,16 +746,23 @@ mod tests {
             mask: None,
             backdrop: None,
             glass: None,
-            content_mask: mask,
+            content_mask,
+        }
+    }
+
+    fn record(window: [u32; 2], quad: [f32; 4], scale: f32) -> RenderFrame {
+        let mask = Clip::from(bounds([-1e6, -1e6, 2e6, 2e6]));
+        let mut transform = super::IDENTITY;
+        transform[0] = scale;
+        let mut scene = Scene::default();
+        let state = EffectState {
+            transform: (scale != 1.).then_some(transform),
+            opacity: 0.5,
+            ..effect(mask)
         };
         scene.push_effect(state, Some(7));
-        scene.insert(Primitive::Quad(Quad {
-            bounds: bounds(quad),
-            content_mask: mask,
-            ..Default::default()
-        }));
+        scene.push(Instance::new(BOX, bounds(quad), mask));
         scene.pop_effect();
-        scene.finish();
         let mut frame = RenderFrame::default();
         frame.record(&scene, window, 16384, true);
         assert!(scene.patch(7, 0.25, None) && !scene.patch(8, 0.25, None));
@@ -922,39 +779,20 @@ mod tests {
 
     #[test]
     fn opaque_boxes_hide_what_they_cover() {
-        let bounds = |[x, y, w, h]: [f32; 4]| {
-            Bounds::new(
-                crate::point(ScaledPixels(x), ScaledPixels(y)),
-                Size::new(ScaledPixels(w), ScaledPixels(h)),
-            )
-        };
-        let mask = ContentMask {
-            bounds: bounds([0., 0., 100., 100.]),
-            ..Default::default()
-        };
+        let mask = Clip::from(bounds([0., 0., 100., 100.]));
         let quads = |boxes: &[([f32; 4], f32)]| {
             let mut scene = Scene::default();
             for &(rect, alpha) in boxes {
-                scene.insert(Primitive::Quad(Quad {
-                    bounds: bounds(rect),
-                    content_mask: mask,
-                    background: crate::Rgba {
-                        a: alpha,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }));
+                let mut instance = Instance::new(BOX, bounds(rect), mask);
+                instance.color[3] = alpha;
+                scene.push(instance);
             }
-            scene.finish();
             let mut frame = RenderFrame::default();
             frame.record(&scene, [100, 100], 16384, true);
             frame
-                .quads
+                .instances
                 .iter()
-                .map(|quad| {
-                    let b = quad.bounds.intersect(&quad.content_mask.bounds);
-                    [b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0]
-                })
+                .map(|instance| instance.reach().to_array())
                 .collect::<Vec<_>>()
         };
         let page = ([0., 0., 100., 100.], 1.);
@@ -977,35 +815,13 @@ mod tests {
 
     #[test]
     fn glass_foregrounds_keep_the_border_box_and_draw_once() {
-        let bounds = |[x, y, w, h]: [f32; 4]| {
-            Bounds::new(
-                crate::point(ScaledPixels(x), ScaledPixels(y)),
-                Size::new(ScaledPixels(w), ScaledPixels(h)),
-            )
-        };
         let border = bounds([20., 30., 160., 48.]);
-        let mask = ContentMask {
-            bounds: bounds([0., 0., 800., 600.]),
-            ..Default::default()
-        };
+        let mask = Clip::from(bounds([0., 0., 800., 600.]));
         for has_content in [false, true] {
             let mut scene = Scene::default();
-            scene.insert(Primitive::Quad(Quad {
-                bounds: mask.bounds,
-                content_mask: mask,
-                ..Default::default()
-            }));
+            scene.push(Instance::new(BOX, mask.bounds, mask));
             scene.push_effect(
                 EffectState {
-                    transform: None,
-                    opacity: 1.,
-                    color_matrix: None,
-                    blur: 0.,
-                    shadow: None,
-                    blend_mode: Default::default(),
-                    clip: None,
-                    mask: None,
-                    backdrop: None,
                     glass: Some(crate::scene::GlassState {
                         key: 5,
                         bounds: border,
@@ -1014,21 +830,16 @@ mod tests {
                         clear: false,
                         interactive: false,
                     }),
-                    content_mask: mask,
+                    ..effect(mask)
                 },
                 None,
             );
             if has_content {
-                scene.insert(Primitive::Quad(Quad {
-                    bounds: bounds([36., 46., 80., 16.]),
-                    content_mask: mask,
-                    ..Default::default()
-                }));
+                scene.push(Instance::new(BOX, bounds([36., 46., 80., 16.]), mask));
             }
             scene.pop_effect();
-            scene.finish();
             assert_eq!(scene.layers[1].bounds, Some(border));
-            assert_eq!(scene.layers[0].effects[0].bounds, border);
+            assert_eq!(scene.layers[0].nested[0].bounds, border);
             let mut frame = RenderFrame {
                 skip: vec![1],
                 content: vec![1],
@@ -1040,7 +851,7 @@ mod tests {
             };
             assert_eq!((layer, region), (1, [20, 30, 160, 48]));
             assert_eq!(frame.origin(target), [20, 30]);
-            assert_eq!(frame.quads.len(), 1 + usize::from(has_content));
+            assert_eq!(frame.instances.len(), 1 + usize::from(has_content));
             assert!(frame.composites.is_empty());
             assert!(frame.commands.iter().any(|command| {
                 matches!(command, Command::Pass(pass, true) if *pass == target)
@@ -1050,16 +861,7 @@ mod tests {
 
     #[test]
     fn patched_transforms_draw_like_new_frames() {
-        let bounds = |[x, y, w, h]: [f32; 4]| {
-            Bounds::new(
-                crate::point(ScaledPixels(x), ScaledPixels(y)),
-                Size::new(ScaledPixels(w), ScaledPixels(h)),
-            )
-        };
-        let mask = ContentMask {
-            bounds: bounds([0., 0., 800., 600.]),
-            ..Default::default()
-        };
+        let mask = Clip::from(bounds([0., 0., 800., 600.]));
         let turn = |degrees: f32| {
             let (sin, cos) = degrees.to_radians().sin_cos();
             let mut m = super::IDENTITY;
@@ -1079,30 +881,12 @@ mod tests {
             let mut scene = Scene::default();
             let state = EffectState {
                 transform: Some(matrix),
-                opacity: 1.,
-                color_matrix: None,
-                blur: 0.,
-                shadow: None,
-                blend_mode: Default::default(),
-                clip: None,
-                mask: None,
-                backdrop: None,
-                glass: None,
-                content_mask: mask,
+                ..effect(mask)
             };
             scene.push_effect(state, Some(9));
-            scene.insert(Primitive::Quad(Quad {
-                bounds: bounds([100., 100., 100., 100.]),
-                content_mask: mask,
-                ..Default::default()
-            }));
+            scene.push(Instance::new(BOX, bounds([100., 100., 100., 100.]), mask));
             scene.pop_effect();
-            scene.insert(Primitive::Quad(Quad {
-                bounds: bounds([205., 140., 25., 20.]),
-                content_mask: mask,
-                ..Default::default()
-            }));
-            scene.finish();
+            scene.push(Instance::new(BOX, bounds([205., 140., 25., 20.]), mask));
             scene
         };
         let draw = |scene: &Scene| {
@@ -1112,15 +896,15 @@ mod tests {
                 .commands
                 .iter()
                 .filter_map(|command| match command {
-                    Command::Quads(range) => Some(format!("quads {range:?}")),
+                    Command::Draw { instances, .. } => Some(format!("draw {instances:?}")),
                     Command::Composite { index, .. } => Some(format!("composite {index}")),
                     _ => None,
                 })
                 .collect();
             (
                 order,
-                super::bytes(&frame.quads).to_vec(),
-                super::bytes(&frame.composites).to_vec(),
+                bytes(&frame.instances).to_vec(),
+                bytes(&frame.composites).to_vec(),
             )
         };
         for matrix in [turn(30.), shift(100., 40.), shift(-90., 0.)] {
@@ -1133,40 +917,17 @@ mod tests {
     #[test]
     fn wide_blurs_draw_both_passes_at_half_resolution() {
         let blurred = |sigma: f32| {
-            let bounds = |[x, y, w, h]: [f32; 4]| {
-                Bounds::new(
-                    crate::point(ScaledPixels(x), ScaledPixels(y)),
-                    Size::new(ScaledPixels(w), ScaledPixels(h)),
-                )
-            };
-            let mask = ContentMask {
-                bounds: bounds([0., 0., 800., 600.]),
-                ..Default::default()
-            };
+            let mask = Clip::from(bounds([0., 0., 800., 600.]));
             let mut scene = Scene::default();
             scene.push_effect(
                 EffectState {
-                    transform: None,
-                    opacity: 1.,
-                    color_matrix: None,
                     blur: sigma,
-                    shadow: None,
-                    blend_mode: Default::default(),
-                    clip: None,
-                    mask: None,
-                    backdrop: None,
-                    glass: None,
-                    content_mask: mask,
+                    ..effect(mask)
                 },
                 None,
             );
-            scene.insert(Primitive::Quad(Quad {
-                bounds: bounds([100., 100., 200., 100.]),
-                content_mask: mask,
-                ..Default::default()
-            }));
+            scene.push(Instance::new(BOX, bounds([100., 100., 200., 100.]), mask));
             scene.pop_effect();
-            scene.finish();
             let mut frame = RenderFrame::default();
             frame.record(&scene, [800, 600], 16384, true);
             frame
@@ -1211,33 +972,53 @@ mod tests {
     }
 
     #[test]
-    fn shaders_match_instance_layouts() {
-        let module =
-            naga::front::wgsl::parse_str(include_str!("platform/linux/shaders.wgsl")).unwrap();
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .unwrap();
-        let mut layouter = naga::proc::Layouter::default();
-        layouter.update(module.to_ctx()).unwrap();
-        for (name, size) in [
-            ("Globals", size_of::<Globals>()),
-            ("Quad", size_of::<Quad>()),
-            ("Shadow", size_of::<Shadow>()),
-            ("Underline", size_of::<Underline>()),
-            ("MonochromeSprite", size_of::<MonochromeSprite>()),
-            ("PolychromeSprite", size_of::<PolychromeSprite>()),
-            ("Composite", size_of::<Composite>()),
-            ("Blur", size_of::<Blur>()),
-        ] {
-            let (handle, _) = module
-                .types
-                .iter()
-                .find(|(_, ty)| ty.name.as_deref() == Some(name))
-                .unwrap_or_else(|| panic!("missing struct {name}"));
-            assert_eq!(layouter[handle].size as usize, size, "{name}");
-        }
+    fn draws_follow_paint_order_and_split_on_atlas_pages() {
+        let mask = Clip::from(bounds([0., 0., 400., 400.]));
+        let sprite = |kind: u32, x: f32, page: u32| {
+            let mut instance = Instance::new(kind, bounds([x, 0., 10., 10.]), mask);
+            instance.info[3] = page as f32;
+            instance
+        };
+        let mut scene = Scene::default();
+        scene.push(Instance::new(BOX, bounds([0., 0., 10., 10.]), mask));
+        scene.push(sprite(GLYPH, 10., 0));
+        scene.push(sprite(IMAGE, 20., 3));
+        scene.push(sprite(GLYPH, 30., 0));
+        scene.push(sprite(GLYPH, 40., 1));
+        scene.push_effect(effect(mask), None);
+        scene.push(Instance::new(BOX, bounds([300., 300., 10., 10.]), mask));
+        scene.pop_effect();
+        scene.push(sprite(IMAGE, 50., 3));
+        let mut frame = RenderFrame::default();
+        frame.record(&scene, [400, 400], 16384, true);
+        let draws: Vec<_> = frame
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                Command::Draw {
+                    instances,
+                    mask_page,
+                    color_page,
+                } => Some((instances.clone(), *mask_page, *color_page)),
+                Command::Composite { .. } => Some((0..0, None, None)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            draws,
+            [
+                (0..4, Some(0), Some(3)),
+                (4..5, Some(1), Some(3)),
+                (5..6, None, None),
+                (0..0, None, None),
+                (6..7, None, Some(3)),
+            ]
+        );
+        let order: Vec<_> = frame
+            .instances
+            .iter()
+            .map(|instance| instance.rect[0])
+            .collect();
+        assert_eq!(order, [0., 10., 20., 30., 40., 300., 50.]);
     }
 }

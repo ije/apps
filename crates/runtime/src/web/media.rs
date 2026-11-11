@@ -219,8 +219,8 @@ impl Media {
                 raw.as_ptr(),
                 id,
                 pixels.cast(),
-                size.width.0 as u32,
-                size.height.0 as u32,
+                size.width as u32,
+                size.height as u32,
             )
         };
     }

@@ -1,171 +1,96 @@
-use crate::text::{FontFallbacks, FontFeatures};
-use core_foundation::{
-    array::{
-        CFArray, CFArrayAppendValue, CFArrayCreateMutable, CFMutableArrayRef, kCFTypeArrayCallBacks,
-    },
-    base::{CFRelease, TCFType, kCFAllocatorDefault},
-    dictionary::{
-        CFDictionaryCreate, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
-    },
-    number::CFNumber,
-    string::CFString,
+use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
+use objc2_core_text::{
+    CTFont, CTFontDescriptor, CTFontTableOptions, kCTFontFeatureSettingsAttribute,
+    kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue, kCTFontVariationAttribute,
+    kCTFontVariationAxisDefaultValueKey, kCTFontVariationAxisIdentifierKey,
 };
-use core_foundation_sys::locale::CFLocaleCopyPreferredLanguages;
-use core_text::font_descriptor::{
-    TraitAccessors, kCTFontFamilyNameAttribute, kCTFontItalicTrait, kCTFontSlantTrait,
-    kCTFontTraitsAttribute, kCTFontWeightTrait,
-};
-use core_text::{
-    font::{CTFont, cascade_list_for_languages},
-    font_descriptor::{
-        CTFontDescriptor, CTFontDescriptorCreateWithAttributes, kCTFontCascadeListAttribute,
-        kCTFontFeatureSettingsAttribute,
-    },
-};
-use font_kit::font::Font as FontKitFont;
-use objc2_core_text::{kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue};
+use std::ptr;
 
-pub fn apply_features_and_fallbacks(
-    font: &mut FontKitFont,
-    features: &FontFeatures,
-    fallbacks: Option<&FontFallbacks>,
-) -> anyhow::Result<()> {
+const WGHT: i64 = 0x77676874;
+
+fn descriptor(key: &CFString, value: &CFType) -> CFRetained<CTFontDescriptor> {
+    let attributes = CFDictionary::<CFString, CFType>::from_slices(&[key], &[value]);
+    // SAFETY: the dictionary holds a valid font attribute.
+    unsafe { CTFontDescriptor::with_attributes(attributes.as_opaque()) }
+}
+
+pub(super) fn with_features(font: &CTFont, features: &[(String, u32)]) -> CFRetained<CTFont> {
+    let settings: Vec<_> = features
+        .iter()
+        .map(|(tag, value)| {
+            let (tag, value) = (CFString::from_str(tag), CFNumber::new_i32(*value as i32));
+            // SAFETY: the keys are CoreText constants.
+            let keys = unsafe { [kCTFontOpenTypeFeatureTag, kCTFontOpenTypeFeatureValue] };
+            CFDictionary::<CFString, CFType>::from_slices(&keys, &[&tag, &value])
+        })
+        .collect();
+    let settings = CFArray::from_retained_objects(&settings);
+    // SAFETY: a size of 0 keeps the font's size, and the descriptor only adds feature settings.
     unsafe {
-        let mut keys = vec![kCTFontFeatureSettingsAttribute];
-        let mut values = vec![generate_feature_array(features)];
-        if let Some(fallbacks) = fallbacks
-            && !fallbacks.fallback_list().is_empty()
-        {
-            keys.push(kCTFontCascadeListAttribute);
-            values.push(generate_fallback_array(fallbacks, font));
-        }
-        let attrs = CFDictionaryCreate(
-            kCFAllocatorDefault,
-            keys.as_ptr() as _,
-            values.as_ptr() as _,
-            keys.len() as isize,
-            &kCFTypeDictionaryKeyCallBacks,
-            &kCFTypeDictionaryValueCallBacks,
-        );
-
-        for value in &values {
-            CFRelease(*value as _);
-        }
-
-        let new_descriptor = CTFontDescriptorCreateWithAttributes(attrs);
-        CFRelease(attrs as _);
-        let new_descriptor = CTFontDescriptor::wrap_under_create_rule(new_descriptor);
-        // font-kit uses the older core-text wrappers. Borrow the same CF objects
-        // for the generated API, then transfer its create-rule ownership back.
-        let native_font = font.native_font();
-        let generated_font = &*native_font
-            .as_concrete_TypeRef()
-            .cast::<objc2_core_text::CTFont>();
-        let descriptor = &*new_descriptor
-            .as_concrete_TypeRef()
-            .cast::<objc2_core_text::CTFontDescriptor>();
-        let new_font = generated_font.copy_with_attributes(0.0, std::ptr::null(), Some(descriptor));
-        let new_font = CTFont::wrap_under_create_rule(
-            objc2_core_foundation::CFRetained::into_raw(new_font)
-                .as_ptr()
-                .cast(),
-        );
-        *font = font_kit::font::Font::from_native_font(&new_font);
-
-        Ok(())
+        let attributes = descriptor(kCTFontFeatureSettingsAttribute, &settings);
+        font.copy_with_attributes(0., ptr::null(), Some(&attributes))
     }
 }
 
-fn generate_feature_array(features: &FontFeatures) -> CFMutableArrayRef {
+pub(super) fn with_weight(font: &CTFont, weight: f32) -> CFRetained<CTFont> {
+    let axis = CFNumber::new_i64(WGHT);
+    let value = CFNumber::new_f64(f64::from(weight));
+    let variation = CFDictionary::<CFNumber, CFNumber>::from_slices(&[&axis], &[&value]);
+    // SAFETY: the variation dictionary maps an axis identifier to a value, as CoreText expects.
     unsafe {
-        let feature_array = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
-        for (tag, value) in features.tag_value_list() {
-            let keys = [
-                kCTFontOpenTypeFeatureTag as *const _,
-                kCTFontOpenTypeFeatureValue as *const _,
-            ];
-            let tag = CFString::new(tag);
-            let value = CFNumber::from(*value as i32);
-            let values = [tag.as_CFTypeRef(), value.as_CFTypeRef()];
-            let dict = CFDictionaryCreate(
-                kCFAllocatorDefault,
-                &keys as *const _ as _,
-                &values as *const _ as _,
-                2,
-                &kCFTypeDictionaryKeyCallBacks,
-                &kCFTypeDictionaryValueCallBacks,
-            );
-            CFArrayAppendValue(feature_array, dict as _);
-            CFRelease(dict as _);
-        }
-        feature_array
+        let attributes = descriptor(kCTFontVariationAttribute, &variation);
+        font.copy_with_attributes(font.size(), ptr::null(), Some(&attributes))
     }
 }
 
-fn generate_fallback_array(fallbacks: &FontFallbacks, font: &mut FontKitFont) -> CFMutableArrayRef {
-    unsafe {
-        let symbolic_traits = font.native_font().symbolic_traits();
-        let all_traits = font.native_font().all_traits();
-
-        let fallback_array = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
-        for user_fallback in fallbacks.fallback_list() {
-            let name = CFString::from(user_fallback.as_str());
-
-            let traits_keys = [kCTFontWeightTrait, kCTFontSlantTrait];
-            let weight_value = CFNumber::from(all_traits.normalized_weight());
-            let slant_value = CFNumber::from(if (symbolic_traits & kCTFontItalicTrait) != 0 {
-                1.0
-            } else {
-                0.0
-            });
-            let traits_values = [weight_value.as_CFTypeRef(), slant_value.as_CFTypeRef()];
-            let traits = CFDictionaryCreate(
-                kCFAllocatorDefault,
-                &traits_keys as *const _ as _,
-                &traits_values as *const _ as _,
-                traits_keys.len() as isize,
-                &kCFTypeDictionaryKeyCallBacks,
-                &kCFTypeDictionaryValueCallBacks,
-            );
-            drop(weight_value);
-            drop(slant_value);
-
-            let attr_keys = [kCTFontFamilyNameAttribute, kCTFontTraitsAttribute];
-            let attr_values = [name.as_CFTypeRef(), traits as _];
-            let attrs = CFDictionaryCreate(
-                kCFAllocatorDefault,
-                &attr_keys as *const _ as _,
-                &attr_values as *const _ as _,
-                attr_keys.len() as isize,
-                &kCFTypeDictionaryKeyCallBacks,
-                &kCFTypeDictionaryValueCallBacks,
-            );
-            CFRelease(traits as _);
-
-            let fallback_desc = CTFontDescriptorCreateWithAttributes(attrs);
-            CFRelease(attrs as _);
-
-            CFArrayAppendValue(fallback_array, fallback_desc as _);
-            CFRelease(fallback_desc as _);
-        }
-
-        append_system_fallbacks(fallback_array, &font.native_font());
-        fallback_array
-    }
+pub(super) fn weight(font: &CTFont) -> Option<f32> {
+    // SAFETY: CoreText returns a dictionary of numbers or nothing.
+    let variation = unsafe { font.variation()? };
+    let variation = unsafe { variation.cast_unchecked::<CFNumber, CFNumber>() };
+    Some(variation.get(&CFNumber::new_i64(WGHT))?.as_f64()? as f32)
 }
 
-fn append_system_fallbacks(fallback_array: CFMutableArrayRef, font: &CTFont) {
-    unsafe {
-        let preferred_languages: CFArray<CFString> =
-            CFArray::wrap_under_create_rule(CFLocaleCopyPreferredLanguages());
+/// The default of the `wght` axis when it is on the CSS scale. Old Apple fonts like Skia use 0.5 to 3.2 and
+/// keep their named faces.
+pub(super) fn default_weight(font: &CTFont) -> Option<f32> {
+    // SAFETY: CoreText returns an array of axis dictionaries or nothing.
+    let axes = unsafe { font.variation_axes()? };
+    let axes = unsafe { axes.cast_unchecked::<CFDictionary<CFString, CFType>>() };
+    let number = |axis: &CFDictionary<CFString, CFType>, key: &CFString| {
+        axis.get(key)?.downcast::<CFNumber>().ok()
+    };
+    axes.iter()
+        .find_map(|axis| {
+            // SAFETY: the keys are CoreText constants.
+            let (id, default) = unsafe {
+                (
+                    kCTFontVariationAxisIdentifierKey,
+                    kCTFontVariationAxisDefaultValueKey,
+                )
+            };
+            (number(&axis, id)?.as_i64()? == WGHT).then(|| number(&axis, default)?.as_f32())?
+        })
+        .filter(|weight| *weight >= 100.)
+}
 
-        let default_fallbacks = cascade_list_for_languages(font, &preferred_languages);
+fn os2(font: &CTFont, len: usize) -> Option<CFRetained<objc2_core_foundation::CFData>> {
+    let tag = u32::from_be_bytes(*b"OS/2");
+    // SAFETY: the table is copied out of the font. CoreText ignores the option to exclude synthetic tables.
+    let table = unsafe { font.table(tag, CTFontTableOptions::NoOptions)? };
+    (table.len() >= len).then_some(table)
+}
 
-        for desc in default_fallbacks
-            .iter()
-            .filter(|desc| desc.font_path().is_some())
-        {
-            CFArrayAppendValue(fallback_array, desc.as_concrete_TypeRef() as _);
-        }
-    }
+/// `usWeightClass`. CoreText puts fonts loaded from data on another weight scale (0.2 for Medium), so their
+/// matching reads the class.
+pub(super) fn weight_class(font: &CTFont) -> Option<f32> {
+    let table = os2(font, 6)?;
+    let bytes = table.to_vec();
+    Some(f32::from(u16::from_be_bytes([bytes[4], bytes[5]])))
+        .filter(|class| (1. ..=1000.).contains(class))
+}
+
+pub(super) fn typo_metrics(font: &CTFont) -> Option<[f32; 2]> {
+    let bytes = os2(font, 72)?.to_vec();
+    Some([68, 70].map(|at| f32::from(i16::from_be_bytes([bytes[at], bytes[at + 1]]))))
+        .filter(|[ascent, descent]| *ascent > 0. && *descent < 0.)
 }

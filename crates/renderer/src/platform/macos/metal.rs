@@ -1,13 +1,15 @@
 use crate::{
-    Bounds, DevicePixels, Rgba, ScaledPixels, Size,
-    atlas::{Atlas, AtlasBackend, Packer, TextureList, page_size},
-    frame::{Command, Globals, RenderFrame, Target, TextParams, bytes},
-    scene::{AtlasTextureId, AtlasTextureKind, AtlasTile, Scene},
+    Color, Rect, Size,
+    atlas::{self, Packer, PageKind, PageList, PageStore, Tile},
+    frame::{Command, RenderFrame, Target},
+    gpu::{ATTRIBUTES, Globals, Instance, bytes},
+    scene::Scene,
 };
 use anyhow::{Context as _, Result, ensure};
 use block2::RcBlock;
-use objc2::{MainThreadMarker, Message, rc::Retained, runtime::ProtocolObject};
+use objc2::{MainThreadMarker, rc::Retained, runtime::ProtocolObject};
 use objc2_core_foundation::CGSize;
+use objc2_core_graphics::{CGColorSpace, kCGColorSpaceSRGB};
 use objc2_foundation::{NSArray, NSNumber, NSRange, NSString, NSValue, ns_string};
 use objc2_metal::{
     MTLBlendFactor, MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer,
@@ -16,80 +18,103 @@ use objc2_metal::{
     MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
     MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResourceOptions, MTLScissorRect,
     MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
+    MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction,
 };
 use objc2_quartz_core::{
-    CACurrentMediaTime, CAKeyframeAnimation, CALayer, CAMediaTiming, CAMetalDrawable, CAMetalLayer,
-    CATransaction, CATransform3D, NSValueCATransform3DAdditions, kCAAnimationDiscrete,
-    kCAFillModeBoth,
+    CAAutoresizingMask, CACurrentMediaTime, CAKeyframeAnimation, CALayer, CAMediaTiming,
+    CAMetalDrawable, CAMetalLayer, CATransaction, CATransform3D, NSValueCATransform3DAdditions,
+    kCAAnimationDiscrete, kCAFillModeBoth,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     cell::{Cell, RefCell},
     ffi::c_void,
     mem,
-    ops::Range,
     ptr::{self, NonNull},
     rc::Rc,
     slice,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 
 const FORMAT: MTLPixelFormat = MTLPixelFormat::BGRA8Unorm;
 const MAX_TEXTURE_SIZE: u32 = 16384;
-const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
-const MIN_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
-const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+const MIN_INSTANCE_BUFFER: usize = 2 << 20;
+const MAX_INSTANCE_BUFFER: usize = 256 << 20;
 const SHRINK_FRAMES: u32 = 120;
 const SPARE_FRAMES: u8 = 3;
 
-pub(crate) type MetalAtlas = Atlas<AtlasTextures>;
+pub(crate) type Atlas = atlas::Atlas<Pages>;
 
 type Texture = Retained<ProtocolObject<dyn MTLTexture>>;
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Device = Retained<ProtocolObject<dyn MTLDevice>>;
 
-struct BufferPool {
+// Instance buffers are reused only once the GPU is done with them.
+struct Buffers {
     size: usize,
-    buffers: Vec<(Buffer, usize)>,
-    small: u32,
+    spare: Vec<Buffer>,
+    quiet: u32,
 }
 
 thread_local! {
-    static POOL: Rc<RefCell<BufferPool>> = Rc::new(RefCell::new(BufferPool {
-        size: MIN_INSTANCE_BUFFER_SIZE,
-        buffers: Vec::new(),
-        small: 0,
-    }));
+    static BUFFERS: RefCell<Buffers> = const {
+        RefCell::new(Buffers {
+            size: MIN_INSTANCE_BUFFER,
+            spare: Vec::new(),
+            quiet: 0,
+        })
+    };
 }
 
-impl BufferPool {
-    fn acquire(
+impl Buffers {
+    fn reset(&mut self, size: usize) {
+        self.size = size;
+        self.spare.clear();
+        self.quiet = 0;
+    }
+
+    fn fill(
         &mut self,
         device: &ProtocolObject<dyn MTLDevice>,
         unified: bool,
-    ) -> Result<(Buffer, usize)> {
-        if let Some(buffer) = self.buffers.pop() {
-            return Ok(buffer);
-        }
-        let options = if unified {
-            MTLResourceOptions::StorageModeShared | MTLResourceOptions::CPUCacheModeWriteCombined
+        data: &[u8],
+    ) -> Result<Buffer> {
+        ensure!(
+            data.len() <= MAX_INSTANCE_BUFFER,
+            "a frame has more than {MAX_INSTANCE_BUFFER} bytes of instances"
+        );
+        if data.len() > self.size {
+            self.reset(data.len().next_power_of_two());
+        } else if data.len() > self.size / 4 || self.size <= MIN_INSTANCE_BUFFER {
+            self.quiet = 0;
         } else {
-            MTLResourceOptions::StorageModeManaged
-        };
-        let buffer = device
-            .newBufferWithLength_options(self.size, options)
-            .with_context(|| format!("allocating {}-byte instance buffer", self.size))?;
-        Ok((buffer, self.size))
-    }
-
-    fn resize(&mut self, size: usize) {
-        if size != self.size {
-            self.size = size;
-            self.buffers.clear();
+            self.quiet += 1;
+            if self.quiet == SHRINK_FRAMES {
+                self.reset(self.size / 2);
+            }
         }
-        self.small = 0;
+        let buffer = match self.spare.pop() {
+            Some(buffer) => buffer,
+            None => device
+                .newBufferWithLength_options(
+                    self.size,
+                    if unified {
+                        MTLResourceOptions::StorageModeShared
+                            | MTLResourceOptions::CPUCacheModeWriteCombined
+                    } else {
+                        MTLResourceOptions::StorageModeManaged
+                    },
+                )
+                .with_context(|| format!("allocating an instance buffer of {} bytes", self.size))?,
+        };
+        // SAFETY: the GPU doesn't use a spare buffer, and the data fits in it.
+        unsafe {
+            ptr::copy_nonoverlapping(data.as_ptr(), buffer.contents().as_ptr().cast(), data.len());
+        }
+        if !unified {
+            buffer.didModifyRange(NSRange::new(0, data.len()));
+        }
+        Ok(buffer)
     }
 }
 
@@ -119,12 +144,14 @@ pub(crate) struct Renderer {
     overlay: Retained<CALayer>,
     size: CGSize,
     unified: bool,
-    presents_with_transaction: bool,
+    in_transaction: bool,
     present: Option<Present>,
     opaque: bool,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipelines: Pipelines,
-    atlas: Rc<MetalAtlas>,
+    atlas: Rc<Atlas>,
+    // Bound in place of an atlas page that a draw doesn't read.
+    blank: Texture,
     pool: Vec<(Texture, [u32; 2], u8)>,
     targets: Vec<usize>,
     frame: RenderFrame,
@@ -132,12 +159,7 @@ pub(crate) struct Renderer {
     glass: Vec<NativeGlass>,
     glass_update: bool,
     glass_stale: bool,
-    caret: Option<(
-        Retained<CALayer>,
-        Bounds<ScaledPixels>,
-        Rgba,
-        std::time::Instant,
-    )>,
+    caret: Option<(Retained<CALayer>, Rect<f32>, Color, std::time::Instant)>,
     restacked: bool,
     committed: u64,
     completed: Arc<AtomicU64>,
@@ -160,83 +182,80 @@ struct NativeGlass {
     surface: super::glass::GlassSurface,
 }
 
-enum Blend {
-    Over,
-    Premultiplied,
-    Replace,
-}
+type Pipeline = Retained<ProtocolObject<dyn MTLRenderPipelineState>>;
 
 struct Pipelines {
-    quads: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    shadows: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    underlines: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    mono: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    poly: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    composites: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    blurs: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
-    copy: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    draw: Pipeline,
+    composite: Pipeline,
+    blur: Pipeline,
+    copy: Pipeline,
 }
 
 impl Pipelines {
     fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self> {
+        // build.rs translates shaders.wgsl to Metal and compiles it when it can.
         #[cfg(not(renderer_shaders))]
-        let library = device
-            .newLibraryWithSource_options_error(
-                &NSString::from_str(include_str!("shaders.metal")),
-                Some(&objc2_metal::MTLCompileOptions::new()),
-            )
-            .context("building Metal library")?;
+        let library = {
+            let source =
+                NSString::from_str(include_str!(concat!(env!("OUT_DIR"), "/shaders.metal")));
+            device.newLibraryWithSource_options_error(&source, None)
+        };
         #[cfg(renderer_shaders)]
         let library = {
-            let compressed: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.metallib"));
-            let mut data = Vec::with_capacity(compressed.len() * 3);
-            std::io::Read::read_to_end(
-                &mut flate2::read::DeflateDecoder::new(compressed),
-                &mut data,
-            )?;
+            let packed: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/library.deflate"));
+            let mut data = Vec::with_capacity(packed.len() * 3);
+            std::io::Read::read_to_end(&mut flate2::read::DeflateDecoder::new(packed), &mut data)?;
             device.newLibraryWithData_error(&dispatch2::DispatchData::from_boxed(data.into()))
-        }
-        .context("loading Metal library")?;
-        let pipeline = |name: &str, blend: Blend| -> Result<_> {
-            let function = |stage: &str| {
-                let name = format!("{name}_{stage}");
-                library
-                    .newFunctionWithName(&NSString::from_str(&name))
-                    .with_context(|| format!("locating function {name}"))
-            };
-            let descriptor = MTLRenderPipelineDescriptor::new();
-            descriptor.setLabel(Some(&NSString::from_str(name)));
-            descriptor.setVertexFunction(Some(&*function("vertex")?));
-            descriptor.setFragmentFunction(Some(&*function("fragment")?));
-            // SAFETY: index zero is within the color attachment array.
-            let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
-            attachment.setPixelFormat(FORMAT);
-            // Colors are drawn unpremultiplied over targets that hold premultiplied colors.
-            let source = match blend {
-                Blend::Over => Some(MTLBlendFactor::SourceAlpha),
-                Blend::Premultiplied => Some(MTLBlendFactor::One),
-                Blend::Replace => None,
-            };
-            if let Some(source) = source {
-                attachment.setBlendingEnabled(true);
-                attachment.setSourceRGBBlendFactor(source);
-                attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
-                attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-                attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-            }
-            device
-                .newRenderPipelineStateWithDescriptor_error(&descriptor)
-                .with_context(|| format!("creating {name} render pipeline"))
         };
+        let library = library.context("the shaders don't build")?;
+        // Shaders return premultiplied colors. Blurs and copies replace what the target holds.
+        let pipeline =
+            |name: &str, blend: bool, vertex: Option<&MTLVertexDescriptor>| -> Result<_> {
+                let function = |stage: &str| {
+                    let name = format!("{name}_{stage}");
+                    library
+                        .newFunctionWithName(&NSString::from_str(&name))
+                        .with_context(|| format!("locating function {name}"))
+                };
+                let descriptor = MTLRenderPipelineDescriptor::new();
+                descriptor.setVertexFunction(Some(&*function("vertex")?));
+                descriptor.setFragmentFunction(Some(&*function("fragment")?));
+                descriptor.setVertexDescriptor(vertex);
+                // SAFETY: index zero is within the color attachment array.
+                let attachment =
+                    unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+                attachment.setPixelFormat(FORMAT);
+                if blend {
+                    attachment.setBlendingEnabled(true);
+                    attachment.setSourceRGBBlendFactor(MTLBlendFactor::One);
+                    attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+                    attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+                    attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+                }
+                device
+                    .newRenderPipelineStateWithDescriptor_error(&descriptor)
+                    .with_context(|| format!("the {name} pipeline"))
+            };
+        let instances = MTLVertexDescriptor::new();
+        for index in 0..ATTRIBUTES {
+            // SAFETY: Metal has 31 attribute slots, and every vec4 of an instance lies within its stride.
+            unsafe {
+                let attribute = instances.attributes().objectAtIndexedSubscript(index);
+                attribute.setFormat(MTLVertexFormat::Float4);
+                attribute.setOffset(index * 16);
+                attribute.setBufferIndex(0);
+            }
+        }
+        // SAFETY: buffer zero holds the instances, which are packed.
+        let layout = unsafe { instances.layouts().objectAtIndexedSubscript(0) };
+        // SAFETY: the stride is the size of an instance.
+        unsafe { layout.setStride(mem::size_of::<Instance>()) };
+        layout.setStepFunction(MTLVertexStepFunction::PerInstance);
         Ok(Self {
-            quads: pipeline("quad", Blend::Over)?,
-            shadows: pipeline("shadow", Blend::Over)?,
-            underlines: pipeline("underline", Blend::Over)?,
-            mono: pipeline("monochrome_sprite", Blend::Over)?,
-            poly: pipeline("polychrome_sprite", Blend::Over)?,
-            composites: pipeline("composite", Blend::Premultiplied)?,
-            blurs: pipeline("blur", Blend::Replace)?,
-            copy: pipeline("copy", Blend::Replace)?,
+            draw: pipeline("draw", true, Some(&instances))?,
+            composite: pipeline("composite", true, None)?,
+            blur: pipeline("blur", false, None)?,
+            copy: pipeline("copy", false, None)?,
         })
     }
 
@@ -245,7 +264,7 @@ impl Pipelines {
         &self,
         commands: &ProtocolObject<dyn MTLCommandBuffer>,
         source: &ProtocolObject<dyn MTLTexture>,
-        offset: [i32; 2],
+        [dx, dy]: [i32; 2],
         target: &ProtocolObject<dyn MTLTexture>,
         [x, y, width, height]: [i32; 4],
         load: MTLLoadAction,
@@ -258,20 +277,22 @@ impl Pipelines {
         attachment.setStoreAction(MTLStoreAction::Store);
         let encoder = commands
             .renderCommandEncoderWithDescriptor(&descriptor)
-            .context("creating render command encoder")?;
+            .context("no render encoder")?;
         encoder.setRenderPipelineState(&self.copy);
+        let [x, y, width, height] = [x, y, width, height].map(|value| value as usize);
         encoder.setScissorRect(MTLScissorRect {
-            x: x as usize,
-            y: y as usize,
-            width: width as usize,
-            height: height as usize,
+            x,
+            y,
+            width,
+            height,
         });
+        let offset = [dx, dy, 0, 0];
         // SAFETY: Metal copies the offset before this returns, and the command buffer retains the texture.
         unsafe {
             encoder.setFragmentBytes_length_atIndex(
                 NonNull::from(&offset).cast::<c_void>(),
                 mem::size_of_val(&offset),
-                0,
+                2,
             );
             encoder.setFragmentTexture_atIndex(Some(source), 0);
             encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
@@ -283,27 +304,21 @@ impl Pipelines {
 
 impl Renderer {
     pub fn new(transparent: bool) -> Result<Self> {
+        // Built-in GPUs first, and among those the integrated one, which saves power.
+        let rank = |device: &ProtocolObject<dyn MTLDevice>| {
+            2 * u8::from(device.isRemovable()) + u8::from(!device.isLowPower())
+        };
         let device = MTLCopyAllDevices()
             .iter()
-            .min_by_key(|device| (device.isRemovable(), !device.isLowPower()))
+            .min_by_key(|device| rank(device))
             .or_else(|| MTLCreateSystemDefaultDevice())
-            .context("accessing a Metal device")?;
-        let srgb = objc2_core_graphics::CGColorSpace::with_name(Some(unsafe {
-            objc2_core_graphics::kCGColorSpaceSRGB
-        }));
-        let layer = CAMetalLayer::new();
-        layer.setDevice(Some(&device));
-        layer.setPixelFormat(FORMAT);
-        // Set sRGB to prevent wide-gamut displays from oversaturating CSS colors.
-        layer.setColorspace(srgb.as_deref());
-        layer.setOpaque(!transparent);
+            .context("no Metal device")?;
+        let layer = metal_layer(&device, !transparent);
         layer.setMaximumDrawableCount(3);
-        layer.setFramebufferOnly(false);
         layer.setAllowsNextDrawableTimeout(false);
         layer.setNeedsDisplayOnBoundsChange(true);
         layer.setAutoresizingMask(
-            objc2_quartz_core::CAAutoresizingMask::LayerWidthSizable
-                | objc2_quartz_core::CAAutoresizingMask::LayerHeightSizable,
+            CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable,
         );
         // AppKit derives layer orientation from the view. Flip the overlay so layers and the caret use
         // top-left coordinates.
@@ -313,13 +328,21 @@ impl Renderer {
         overlay.setMasksToBounds(true);
         let unified = device.hasUnifiedMemory();
         let shared = device.supportsFamily(MTLGPUFamily::Apple1);
-        let queue = device.newCommandQueue().context("creating command queue")?;
-        let atlas = Rc::new(Atlas::new(AtlasTextures {
+        let queue = device.newCommandQueue().context("no Metal command queue")?;
+        let pages = Pages {
             device: device.clone(),
             shared,
-            mono: TextureList::default(),
-            poly: TextureList::default(),
-        }));
+            mask: PageList::default(),
+            color: PageList::default(),
+        };
+        let blank = page_texture(&device, shared, PageKind::Color, Size::new(1, 1))?;
+        upload(
+            &blank,
+            Rect::new(Default::default(), Size::new(1, 1)),
+            &[0; 4],
+            4,
+        );
+        let atlas = Rc::new(Atlas::new(pages));
         Ok(Self {
             pipelines: Pipelines::new(&device)?,
             device,
@@ -327,11 +350,12 @@ impl Renderer {
             overlay,
             size: CGSize::new(0., 0.),
             unified,
-            presents_with_transaction: false,
+            in_transaction: false,
             present: None,
             opaque: !transparent,
             queue,
             atlas,
+            blank,
             pool: Vec::new(),
             targets: Vec::new(),
             frame: RenderFrame::default(),
@@ -373,12 +397,7 @@ impl Renderer {
         {
             Some(at) => at,
             None => {
-                let sublayer = CAMetalLayer::new();
-                sublayer.setDevice(Some(&self.device));
-                sublayer.setPixelFormat(FORMAT);
-                sublayer.setColorspace(self.layer.colorspace().as_deref());
-                sublayer.setFramebufferOnly(false);
-                sublayer.setOpaque(false);
+                let sublayer = metal_layer(&self.device, false);
                 sublayer.setPresentsWithTransaction(true);
                 sublayer.setContentsScale(scale);
                 sublayer.setDrawableSize(CGSize::new(region[2] as f64, region[3] as f64));
@@ -475,7 +494,7 @@ impl Renderer {
         self.restacked = true;
     }
 
-    pub fn set_caret(&mut self, caret: Option<(Bounds<ScaledPixels>, Rgba, std::time::Instant)>) {
+    pub fn set_caret(&mut self, caret: Option<(Rect<f32>, Color, std::time::Instant)>) {
         if self
             .caret
             .as_ref()
@@ -494,10 +513,10 @@ impl Renderer {
         };
         let scale = self.layer.contentsScale();
         let (x, y, w, h) = (
-            f64::from(bounds.origin.x.0) / scale,
-            f64::from(bounds.origin.y.0) / scale,
-            f64::from(bounds.size.width.0) / scale,
-            f64::from(bounds.size.height.0) / scale,
+            f64::from(bounds.origin.x) / scale,
+            f64::from(bounds.origin.y) / scale,
+            f64::from(bounds.size.width) / scale,
+            f64::from(bounds.size.height) / scale,
         );
         let layer = CALayer::new();
         layer.setAnchorPoint(objc2_core_foundation::CGPoint::new(0., 0.));
@@ -536,7 +555,7 @@ impl Renderer {
         self.caret = Some((layer, bounds, color, since));
     }
 
-    pub fn atlas(&self) -> &Rc<MetalAtlas> {
+    pub fn atlas(&self) -> &Rc<Atlas> {
         &self.atlas
     }
 
@@ -587,7 +606,7 @@ impl Renderer {
                 super::native_post(Box::new(run));
             }
         });
-        if self.presents_with_transaction {
+        if self.in_transaction {
             self.present = Some(update);
             return None;
         }
@@ -600,7 +619,7 @@ impl Renderer {
     }
 
     pub fn set_presents_with_transaction(&mut self, on: bool) {
-        self.presents_with_transaction = on;
+        self.in_transaction = on;
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -625,15 +644,11 @@ impl Renderer {
                 commands.waitUntilCompleted();
             }
         });
-        let textures = &mut *self.atlas.backend.borrow_mut();
-        textures.mono.trim(|texture| texture.packer.is_empty());
-        textures.poly.trim(|texture| texture.packer.is_empty());
+        let pages = &mut *self.atlas.pages.borrow_mut();
+        pages.mask.trim(|page| page.packer.is_empty());
+        pages.color.trim(|page| page.packer.is_empty());
         self.pool.clear();
-        POOL.with(|pool| {
-            let mut pool = pool.borrow_mut();
-            pool.resize(MIN_INSTANCE_BUFFER_SIZE);
-            pool.buffers.clear();
-        });
+        BUFFERS.with(|buffers| buffers.borrow_mut().reset(MIN_INSTANCE_BUFFER));
         // Change size to release spare drawables. The layer keeps its last frame until the next draw restores
         // the size.
         self.layer.setDrawableSize(CGSize::new(1., 1.));
@@ -654,19 +669,9 @@ impl Renderer {
         let scale = self.layer.contentsScale();
         let mut glass: Vec<NativeGlass> = Vec::new();
         if super::glass::available() {
-            let mut candidates: Vec<_> = scene.layers[0]
-                .effects
-                .iter()
-                .filter(|primitive| {
-                    scene.layers[primitive.layer]
-                        .effect
-                        .as_ref()
-                        .is_some_and(|effect| effect.glass.is_some())
-                })
-                .collect();
-            candidates.sort_unstable_by_key(|primitive| (primitive.order, primitive.layer));
-            for primitive in candidates.into_iter().rev() {
-                let index = primitive.layer;
+            // Later glass draws above earlier glass, so it is checked first.
+            for nested in scene.layers[0].nested.iter().rev() {
+                let index = nested.layer;
                 let layer = &scene.layers[index];
                 let Some(effect) = &layer.effect else {
                     continue;
@@ -685,13 +690,13 @@ impl Renderer {
                     || effect.mask.is_some()
                     || effect.backdrop.is_some()
                     || bounds != config.bounds
-                    || bounds.intersect(&mask.bounds) != bounds
-                    || mask.corner_radii != Default::default()
+                    || bounds.intersect(mask.bounds) != bounds
+                    || mask.radii != Default::default()
                     || scene.paints_over(index, bounds, |layer| {
                         glass.iter().any(|native| native.index == layer)
                     })
-                    || bounds.size.width.0 > 4096.
-                    || bounds.size.height.0 > 4096.
+                    || bounds.size.width > 4096.
+                    || bounds.size.height > 4096.
                 {
                     continue;
                 }
@@ -706,12 +711,7 @@ impl Renderer {
                 {
                     Some(at) => self.glass.swap_remove(at).surface.layer,
                     None => {
-                        let sublayer = CAMetalLayer::new();
-                        sublayer.setDevice(Some(&self.device));
-                        sublayer.setPixelFormat(FORMAT);
-                        sublayer.setColorspace(self.layer.colorspace().as_deref());
-                        sublayer.setFramebufferOnly(false);
-                        sublayer.setOpaque(false);
+                        let sublayer = metal_layer(&self.device, false);
                         sublayer.setPresentsWithTransaction(true);
                         // Match the window's drawable count so an uncommitted frame cannot block the next
                         // one.
@@ -745,16 +745,16 @@ impl Renderer {
             self.demote();
         }
         // Present the frame in the same transaction that adds or removes promoted sublayers.
-        let resizing = self.presents_with_transaction;
+        let resizing = self.in_transaction;
         let transact = resizing || mem::take(&mut self.restacked) || native_transaction;
         self.layer.setPresentsWithTransaction(transact);
         let Some(drawable) = self.layer.nextDrawable() else {
             eprintln!("apps: no drawable for a {size:?} window");
             return capture.then(|| Err(anyhow::anyhow!("No drawable")));
         };
-        let texture = drawable.texture();
-        let window = [texture.width() as u32, texture.height() as u32];
-        let (commands, sublayers) = match self.render_frame(scene, &texture, window) {
+        let frame_texture = drawable.texture();
+        let window = [frame_texture.width() as u32, frame_texture.height() as u32];
+        let (commands, sublayers) = match self.render_frame(scene, &frame_texture, window) {
             Ok(commands) => commands,
             Err(error) => {
                 eprintln!("apps: failed to render: {error:#}");
@@ -762,7 +762,7 @@ impl Renderer {
             }
         };
         let readback =
-            (capture && !native_capture).then(|| self.read_back(&commands, &texture, window));
+            (capture && !native_capture).then(|| self.read_back(&commands, &frame_texture, window));
         if transact {
             commands.commit();
             commands.waitUntilScheduled();
@@ -813,7 +813,7 @@ impl Renderer {
     fn read_back(
         &self,
         commands: &ProtocolObject<dyn MTLCommandBuffer>,
-        texture: &ProtocolObject<dyn MTLTexture>,
+        drawn: &ProtocolObject<dyn MTLTexture>,
         window: [u32; 2],
     ) -> Result<Buffer> {
         let row = window[0] as usize * 4;
@@ -824,13 +824,11 @@ impl Renderer {
                 MTLResourceOptions::StorageModeShared,
             )
             .context("allocating capture buffer")?;
-        let blit = commands
-            .blitCommandEncoder()
-            .context("creating blit command encoder")?;
+        let blit = commands.blitCommandEncoder().context("no blit encoder")?;
         // SAFETY: the buffer holds every row of the drawable.
         unsafe {
             blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
-                texture,
+                drawn,
                 0,
                 0,
                 MTLOrigin { x: 0, y: 0, z: 0 },
@@ -882,20 +880,13 @@ impl Renderer {
             {
                 Some(index) => index,
                 None => {
-                    let descriptor = MTLTextureDescriptor::new();
-                    // SAFETY: the dimensions are positive and the texture is 2D.
-                    unsafe {
-                        descriptor.setWidth(size[0] as usize);
-                        descriptor.setHeight(size[1] as usize);
-                    }
-                    descriptor.setPixelFormat(FORMAT);
-                    descriptor.setStorageMode(MTLStorageMode::Private);
-                    descriptor
-                        .setUsage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
-                    let texture = self
-                        .device
-                        .newTextureWithDescriptor(&descriptor)
-                        .context("allocating layer texture")?;
+                    let texture = new_texture(
+                        &self.device,
+                        size.map(|side| side as usize),
+                        FORMAT,
+                        MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead,
+                        MTLStorageMode::Private,
+                    )?;
                     self.pool.push((texture, *size, 0));
                     self.pool.len() - 1
                 }
@@ -903,22 +894,17 @@ impl Renderer {
             self.pool[index].2 = 0;
             self.targets.push(index);
         }
-        let pool = POOL.with(Rc::clone);
-        let mut writer = Writer::new(&self.device, pool.clone(), self.unified)?;
-        let bindings = [
-            writer.write(bytes(&frame.quads))?,
-            writer.write(bytes(&frame.shadows))?,
-            writer.write(bytes(&frame.underlines))?,
-            writer.write(bytes(&frame.mono))?,
-            writer.write(bytes(&frame.poly))?,
-            writer.write(bytes(&frame.composites))?,
-            writer.write(bytes(&frame.blurs))?,
-        ];
-        let commands = self
-            .queue
-            .commandBuffer()
-            .context("creating command buffer")?;
-        let result = self.encode(&frame, &commands, drawable, &bindings);
+        let instances = (!frame.instances.is_empty())
+            .then(|| {
+                BUFFERS.with(|buffers| {
+                    buffers
+                        .borrow_mut()
+                        .fill(&self.device, self.unified, bytes(&frame.instances))
+                })
+            })
+            .transpose()?;
+        let commands = self.queue.commandBuffer().context("no command buffer")?;
+        let result = self.encode(&frame, &commands, drawable, instances.as_deref());
         let mut sublayers = Vec::new();
         if result.is_ok() {
             for &(index, target, region) in &frame.promoted {
@@ -954,8 +940,8 @@ impl Renderer {
         }
         self.frame = frame;
         result?;
-        // Metal completes on its own thread. Return buffers to the pool on the drawing thread.
-        let done = Cell::new(Some(SendBuffer(writer.finish())));
+        // Metal completes on its own thread, while the buffers belong to the drawing thread.
+        let done = Cell::new(instances.map(super::Sendable::new));
         let thread = super::app_thread();
         self.committed += 1;
         let (frame, completed) = (self.committed, self.completed.clone());
@@ -965,17 +951,17 @@ impl Renderer {
                 super::post(
                     thread,
                     Box::new(move || {
-                        let buffer = buffer.into_inner();
-                        let pool = POOL.with(Rc::clone);
-                        let mut pool = pool.borrow_mut();
-                        if buffer.1 == pool.size {
-                            pool.buffers.push(buffer);
-                        }
+                        let buffer = buffer.take();
+                        BUFFERS.with(|buffers| {
+                            let mut buffers = buffers.borrow_mut();
+                            if buffer.length() == buffers.size {
+                                buffers.spare.push(buffer);
+                            }
+                        });
                     }),
                 );
             }
         });
-        drop(pool);
         // SAFETY: Metal copies the block and calls it once, after the frame completes.
         unsafe { commands.addCompletedHandler(RcBlock::as_ptr(&block)) };
         Ok((commands, sublayers))
@@ -986,14 +972,18 @@ impl Renderer {
         frame: &RenderFrame,
         commands: &ProtocolObject<dyn MTLCommandBuffer>,
         drawable: &ProtocolObject<dyn MTLTexture>,
-        bindings: &[Binding; 7],
+        instances: Option<&ProtocolObject<dyn MTLBuffer>>,
     ) -> Result<()> {
         let texture = |target: Target| match target {
             Target::Frame => drawable,
             Target::Layer(index) => &*self.pool[self.targets[frame.layers[index].texture]].0,
         };
-        let text = TextParams::default();
-        let alpha = if self.opaque { 1. } else { 0. };
+        let pages = self.atlas.pages.borrow();
+        let page = |kind, index: Option<u32>| {
+            index
+                .and_then(|index| pages.get(kind, index))
+                .unwrap_or(&self.blank)
+        };
         let begin = |target: Target, clear: bool| -> Result<_> {
             let descriptor = MTLRenderPassDescriptor::new();
             // SAFETY: index zero is within the color attachment array.
@@ -1006,45 +996,25 @@ impl Renderer {
                     red: 0.,
                     green: 0.,
                     blue: 0.,
-                    alpha: if target == Target::Frame { alpha } else { 0. },
+                    alpha: f64::from(u8::from(self.opaque && target == Target::Frame)),
                 });
             } else {
                 attachment.setLoadAction(MTLLoadAction::Load);
             }
             let encoder = commands
                 .renderCommandEncoderWithDescriptor(&descriptor)
-                .context("creating render command encoder")?;
-            set_globals(&encoder, &frame.globals(target, &text));
+                .context("no render encoder")?;
+            set_globals(&encoder, &frame.globals(target, 0.));
             Ok(encoder)
         };
-        let draw = |encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
-                    pipeline: &ProtocolObject<dyn MTLRenderPipelineState>,
-                    kind: usize,
-                    instances: &Range<u32>| {
-            let binding = &bindings[kind];
-            encoder.setRenderPipelineState(pipeline);
-            // SAFETY: the binding holds this frame's instances, which the shaders read by index.
+        let uniforms = |encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, data: &[u8]| {
+            let length = data.len();
+            let data = NonNull::from(data).cast::<c_void>();
+            // SAFETY: Metal copies the bytes before this returns.
             unsafe {
-                encoder.setVertexBuffer_offset_atIndex(Some(&binding.buffer), binding.offset, 0);
-                encoder.setFragmentBuffer_offset_atIndex(Some(&binding.buffer), binding.offset, 0);
-                encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
-                    MTLPrimitiveType::TriangleStrip,
-                    0,
-                    4,
-                    instances.len(),
-                    instances.start as usize,
-                );
+                encoder.setVertexBytes_length_atIndex(data, length, 2);
+                encoder.setFragmentBytes_length_atIndex(data, length, 2);
             }
-        };
-        let atlas_texture = |id: AtlasTextureId| self.atlas.backend.borrow().texture(id);
-        let atlas = |encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, id| {
-            let texture = atlas_texture(id);
-            // SAFETY: the command buffer retains the texture.
-            unsafe {
-                encoder.setVertexTexture_atIndex(texture.as_deref(), 0);
-                encoder.setFragmentTexture_atIndex(texture.as_deref(), 0);
-            }
-            texture.is_some()
         };
         let mut encoder: Option<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> = None;
         let mut current = (Target::Frame, true);
@@ -1071,7 +1041,7 @@ impl Renderer {
                     if let Some(encoder) = &encoder
                         && frame.texture(*target) == frame.texture(current.0) =>
                 {
-                    set_globals(encoder, &frame.globals(*target, &text));
+                    set_globals(encoder, &frame.globals(*target, 0.));
                     current = (*target, false);
                 }
                 // Targets are cleared right away, since a later pass may draw into them.
@@ -1082,27 +1052,46 @@ impl Renderer {
                         pass!();
                     }
                 }
-                Command::Quads(range) => draw(pass!(), &pipelines.quads, 0, range),
-                Command::Shadows(range) => draw(pass!(), &pipelines.shadows, 1, range),
-                Command::Underlines(range) => draw(pass!(), &pipelines.underlines, 2, range),
-                Command::Mono(id, range) => {
+                Command::Draw {
+                    instances: range,
+                    mask_page,
+                    color_page,
+                } => {
                     let encoder = pass!();
-                    if atlas(encoder, *id) {
-                        draw(encoder, &pipelines.mono, 3, range);
-                    }
-                }
-                Command::Poly(id, range) => {
-                    let encoder = pass!();
-                    if atlas(encoder, *id) {
-                        draw(encoder, &pipelines.poly, 4, range);
+                    encoder.setRenderPipelineState(&pipelines.draw);
+                    // SAFETY: the buffer holds this frame's instances, and the command buffer retains the
+                    // buffer and the textures.
+                    unsafe {
+                        encoder.setVertexBuffer_offset_atIndex(instances, 0, 0);
+                        encoder
+                            .setFragmentTexture_atIndex(Some(page(PageKind::Mask, *mask_page)), 0);
+                        encoder.setFragmentTexture_atIndex(
+                            Some(page(PageKind::Color, *color_page)),
+                            1,
+                        );
+                        encoder.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                            MTLPrimitiveType::TriangleStrip,
+                            0,
+                            4,
+                            range.len(),
+                            range.start as usize,
+                        );
                     }
                 }
                 Command::Blur { src, dst, index } => {
                     end!();
                     let blur = begin(*dst, true)?;
+                    blur.setRenderPipelineState(&pipelines.blur);
+                    uniforms(&blur, bytes(&frame.blurs[*index as usize..][..1]));
                     // SAFETY: the layer textures live until the command buffer completes.
-                    unsafe { blur.setFragmentTexture_atIndex(Some(texture(*src)), 0) };
-                    draw(&blur, &pipelines.blurs, 6, &(*index..*index + 1));
+                    unsafe {
+                        blur.setFragmentTexture_atIndex(Some(texture(*src)), 0);
+                        blur.drawPrimitives_vertexStart_vertexCount(
+                            MTLPrimitiveType::TriangleStrip,
+                            0,
+                            4,
+                        );
+                    }
                     blur.endEncoding();
                     current.1 = false;
                 }
@@ -1127,20 +1116,24 @@ impl Renderer {
                     index,
                 } => {
                     let encoder = pass!();
-                    let mask = mask.and_then(atlas_texture);
+                    encoder.setRenderPipelineState(&pipelines.composite);
+                    uniforms(encoder, bytes(&frame.composites[*index as usize..][..1]));
+                    let source = texture(*src);
                     // SAFETY: the textures live until the command buffer completes.
                     unsafe {
-                        encoder.setFragmentTexture_atIndex(Some(texture(*src)), 0);
+                        encoder.setFragmentTexture_atIndex(Some(source), 0);
                         encoder.setFragmentTexture_atIndex(
-                            Some(mask.as_deref().unwrap_or(texture(*src))),
+                            Some(mask.map_or(source, |mask| page(PageKind::Color, Some(mask)))),
                             1,
                         );
-                        encoder.setFragmentTexture_atIndex(
-                            Some(backdrop.map_or(texture(*src), texture)),
-                            2,
+                        encoder
+                            .setFragmentTexture_atIndex(Some(backdrop.map_or(source, texture)), 2);
+                        encoder.drawPrimitives_vertexStart_vertexCount(
+                            MTLPrimitiveType::TriangleStrip,
+                            0,
+                            4,
                         );
                     }
-                    draw(encoder, &pipelines.composites, 5, &(*index..*index + 1));
                 }
             }
         }
@@ -1158,288 +1151,180 @@ fn set_globals(encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, globals: &
     }
 }
 
-struct SendBuffer((Buffer, usize));
-
-// SAFETY: the buffer is only moved to the main thread, where the pool lives.
-unsafe impl Send for SendBuffer {}
-// SAFETY: as above.
-unsafe impl Sync for SendBuffer {}
-
-impl SendBuffer {
-    fn into_inner(self) -> (Buffer, usize) {
-        self.0
-    }
+// Every Metal layer draws in sRGB, so wide-gamut displays don't oversaturate CSS colors.
+fn metal_layer(device: &ProtocolObject<dyn MTLDevice>, opaque: bool) -> Retained<CAMetalLayer> {
+    let surface = CAMetalLayer::new();
+    surface.setDevice(Some(device));
+    surface.setPixelFormat(FORMAT);
+    // SAFETY: a constant of Core Graphics.
+    let srgb = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }));
+    surface.setColorspace(srgb.as_deref());
+    surface.setFramebufferOnly(false);
+    surface.setOpaque(opaque);
+    surface
 }
 
-struct Binding {
-    buffer: Buffer,
-    offset: usize,
+// Sides must be within 1..=16384.
+fn new_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+    [width, height]: [usize; 2],
+    format: MTLPixelFormat,
+    usage: MTLTextureUsage,
+    storage: MTLStorageMode,
+) -> Result<Texture> {
+    let spec = MTLTextureDescriptor::new();
+    // SAFETY: callers keep both sides within the limits of a 2D texture.
+    unsafe {
+        spec.setWidth(width);
+        spec.setHeight(height);
+    }
+    spec.setPixelFormat(format);
+    spec.setUsage(usage);
+    spec.setStorageMode(storage);
+    device
+        .newTextureWithDescriptor(&spec)
+        .with_context(|| format!("no {width}x{height} texture"))
 }
 
-struct Writer {
-    device: Device,
-    pool: Rc<RefCell<BufferPool>>,
-    unified: bool,
-    filled: Vec<((Buffer, usize), usize)>,
-    current: (Buffer, usize),
-    offset: usize,
-}
-
-impl Writer {
-    fn new(
-        device: &ProtocolObject<dyn MTLDevice>,
-        pool: Rc<RefCell<BufferPool>>,
-        unified: bool,
-    ) -> Result<Self> {
-        let current = pool.borrow_mut().acquire(device, unified)?;
-        Ok(Self {
-            device: device.retain(),
-            pool,
-            unified,
-            filled: Vec::new(),
-            current,
-            offset: 0,
-        })
-    }
-
-    fn write(&mut self, data: &[u8]) -> Result<Binding> {
-        let mut offset = self.offset.next_multiple_of(INSTANCE_BUFFER_ALIGNMENT);
-        if offset + data.len() > self.current.1 {
-            self.grow(data.len())?;
-            offset = 0;
-        }
-        self.offset = offset + data.len();
-        // SAFETY: the range lies within this frame's own buffer and after earlier writes.
-        unsafe {
-            ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                self.current.0.contents().as_ptr().cast::<u8>().add(offset),
-                data.len(),
-            );
-        }
-        Ok(Binding {
-            buffer: self.current.0.clone(),
-            offset,
-        })
-    }
-
-    fn grow(&mut self, required: usize) -> Result<()> {
-        let mut pool = self.pool.borrow_mut();
-        let size = (pool.size * 2)
-            .max(required.next_power_of_two())
-            .min(MAX_INSTANCE_BUFFER_SIZE);
-        ensure!(
-            size >= required && size > self.current.1,
-            "frame instance data exceeds {MAX_INSTANCE_BUFFER_SIZE} bytes"
+fn upload(texture: &ProtocolObject<dyn MTLTexture>, rect: Rect<i32>, bytes: &[u8], row: usize) {
+    let at = |value: i32| value as usize;
+    // SAFETY: callers pass bytes that cover the rectangle, which lies within the CPU-accessible texture.
+    unsafe {
+        texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+            MTLRegion {
+                origin: MTLOrigin {
+                    x: at(rect.origin.x),
+                    y: at(rect.origin.y),
+                    z: 0,
+                },
+                size: MTLSize {
+                    width: at(rect.size.width),
+                    height: at(rect.size.height),
+                    depth: 1,
+                },
+            },
+            0,
+            NonNull::from(bytes).cast(),
+            row,
         );
-        pool.resize(size);
-        let buffer = pool.acquire(&self.device, self.unified)?;
-        drop(pool);
-        let filled = mem::replace(&mut self.current, buffer);
-        self.filled.push((filled, self.offset));
-        self.offset = 0;
-        Ok(())
-    }
-
-    fn finish(self) -> (Buffer, usize) {
-        let used = self.offset
-            + self
-                .filled
-                .iter()
-                .map(|(_, written)| written)
-                .sum::<usize>();
-        let mut pool = self.pool.borrow_mut();
-        if used > pool.size / 4 || pool.size <= MIN_INSTANCE_BUFFER_SIZE {
-            pool.small = 0;
-        } else if pool.small + 1 < SHRINK_FRAMES {
-            pool.small += 1;
-        } else {
-            let size = pool.size / 2;
-            pool.resize(size);
-        }
-        drop(pool);
-        if !self.unified {
-            for ((buffer, _), written) in &self.filled {
-                if *written > 0 {
-                    buffer.didModifyRange(NSRange::new(0, *written));
-                }
-            }
-            if self.offset > 0 {
-                self.current.0.didModifyRange(NSRange::new(0, self.offset));
-            }
-        }
-        self.current
     }
 }
 
-pub(crate) struct AtlasTextures {
+pub(crate) struct Pages {
     device: Device,
     shared: bool,
-    mono: TextureList<AtlasTexture>,
-    poly: TextureList<AtlasTexture>,
+    mask: PageList<Page>,
+    color: PageList<Page>,
 }
 
-struct AtlasTexture {
-    id: AtlasTextureId,
+struct Page {
     packer: Packer,
     texture: Texture,
 }
 
-impl AtlasTextures {
-    fn list(&mut self, kind: AtlasTextureKind) -> &mut TextureList<AtlasTexture> {
+impl Pages {
+    fn list(&mut self, kind: PageKind) -> &mut PageList<Page> {
         match kind {
-            AtlasTextureKind::Monochrome => &mut self.mono,
-            AtlasTextureKind::Polychrome => &mut self.poly,
+            PageKind::Mask => &mut self.mask,
+            PageKind::Color => &mut self.color,
         }
     }
 
-    pub fn texture(&self, id: AtlasTextureId) -> Option<Texture> {
-        let list = match id.kind {
-            AtlasTextureKind::Monochrome => &self.mono,
-            AtlasTextureKind::Polychrome => &self.poly,
+    fn get(&self, kind: PageKind, index: u32) -> Option<&ProtocolObject<dyn MTLTexture>> {
+        let list = match kind {
+            PageKind::Mask => &self.mask,
+            PageKind::Color => &self.color,
         };
-        Some(list.get(id.index as usize)?.texture.clone())
-    }
-
-    fn allocate(
-        &mut self,
-        kind: AtlasTextureKind,
-        size: Size<DevicePixels>,
-    ) -> Result<(AtlasTile, &AtlasTexture)> {
-        let list = self.list(kind);
-        let mut hit = None;
-        for (index, texture) in list.textures.iter_mut().enumerate().rev() {
-            if let Some(texture) = texture
-                && let Some(tile) = texture.packer.allocate(size)
-            {
-                hit = Some((index, tile));
-                break;
-            }
-        }
-        let (index, (bounds, tile_id)) = match hit {
-            Some(hit) => hit,
-            None => {
-                let texture_size = page_size(size);
-                let descriptor = MTLTextureDescriptor::new();
-                // SAFETY: the atlas keeps both sides within 1..=16384.
-                unsafe {
-                    descriptor.setWidth(texture_size.width.0 as usize);
-                    descriptor.setHeight(texture_size.height.0 as usize);
-                }
-                descriptor.setPixelFormat(match kind {
-                    AtlasTextureKind::Monochrome => MTLPixelFormat::A8Unorm,
-                    AtlasTextureKind::Polychrome => MTLPixelFormat::BGRA8Unorm,
-                });
-                descriptor.setUsage(MTLTextureUsage::ShaderRead);
-                descriptor.setStorageMode(if self.shared {
-                    MTLStorageMode::Shared
-                } else {
-                    MTLStorageMode::Managed
-                });
-                let texture = self
-                    .device
-                    .newTextureWithDescriptor(&descriptor)
-                    .context("allocating atlas texture")?;
-                let list = self.list(kind);
-                let index = list.push(|index| AtlasTexture {
-                    id: AtlasTextureId {
-                        index: index as u32,
-                        kind,
-                    },
-                    packer: Packer::new(texture_size),
-                    texture,
-                });
-                let tile = list.textures[index]
-                    .as_mut()
-                    .and_then(|texture| texture.packer.allocate(size))
-                    .context("allocating atlas tile")?;
-                (index, tile)
-            }
-        };
-        let texture = self.list(kind).textures[index]
-            .as_ref()
-            .context("atlas texture")?;
-        Ok((
-            AtlasTile {
-                texture_id: texture.id,
-                tile_id,
-                padding: 0,
-                bounds,
-            },
-            texture,
-        ))
+        Some(&list.get(index as usize)?.texture)
     }
 }
 
-impl AtlasBackend for AtlasTextures {
-    fn insert(
-        &mut self,
-        kind: AtlasTextureKind,
-        size: Size<DevicePixels>,
-        bytes: &[u8],
-    ) -> Result<AtlasTile> {
+// Mask pages keep coverage in red, which all backends sample alike.
+fn page_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+    shared: bool,
+    kind: PageKind,
+    size: Size<i32>,
+) -> Result<Texture> {
+    new_texture(
+        device,
+        [size.width as usize, size.height as usize],
+        match kind {
+            PageKind::Mask => MTLPixelFormat::R8Unorm,
+            PageKind::Color => FORMAT,
+        },
+        MTLTextureUsage::ShaderRead,
+        if shared {
+            MTLStorageMode::Shared
+        } else {
+            MTLStorageMode::Managed
+        },
+    )
+}
+
+impl PageStore for Pages {
+    fn insert(&mut self, kind: PageKind, size: Size<i32>, bytes: &[u8]) -> Result<Tile> {
         ensure!(
-            size.width.0 > 0 && size.height.0 > 0,
+            size.width > 0 && size.height > 0,
             "atlas tiles must have a size"
         );
-        let row = size.width.0 as usize
-            * if kind == AtlasTextureKind::Monochrome {
-                1
-            } else {
-                4
+        let row = size.width as usize
+            * match kind {
+                PageKind::Mask => 1,
+                PageKind::Color => 4,
             };
         ensure!(
-            bytes.len() >= row * size.height.0 as usize,
+            bytes.len() >= row * size.height as usize,
             "atlas upload is too short"
         );
-        let (tile, texture) = self.allocate(kind, size)?;
-        let region = MTLRegion {
-            origin: MTLOrigin {
-                x: tile.bounds.origin.x.0 as usize,
-                y: tile.bounds.origin.y.0 as usize,
-                z: 0,
-            },
-            size: MTLSize {
-                width: size.width.0 as usize,
-                height: size.height.0 as usize,
-                depth: 1,
-            },
+        let (device, shared) = (&self.device, self.shared);
+        let list = match kind {
+            PageKind::Mask => &mut self.mask,
+            PageKind::Color => &mut self.color,
         };
-        // SAFETY: the bytes cover the region, which lies within the CPU-accessible texture.
-        unsafe {
-            texture
-                .texture
-                .replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                    region,
-                    0,
-                    NonNull::from(bytes).cast(),
-                    row,
-                );
-        }
-        Ok(tile)
+        let (index, rect, id) = list.allocate(
+            size,
+            |page| &mut page.packer,
+            |size| {
+                Ok(Page {
+                    packer: Packer::new(size),
+                    texture: page_texture(device, shared, kind, size)?,
+                })
+            },
+        )?;
+        let page = self.list(kind).pages[index]
+            .as_ref()
+            .context("atlas page")?;
+        upload(&page.texture, rect, bytes, row);
+        Ok(Tile {
+            page: index as u32,
+            kind,
+            id,
+            rect,
+        })
     }
 
     fn max_side(&self) -> i32 {
         MAX_TEXTURE_SIZE as i32
     }
 
-    fn remove(&mut self, tile: AtlasTile) {
-        let list = self.list(tile.texture_id.kind);
-        let index = tile.texture_id.index as usize;
-        let empty = list
-            .textures
+    fn remove(&mut self, tile: Tile) {
+        let list = self.list(tile.kind);
+        let index = tile.page as usize;
+        if list
+            .pages
             .get_mut(index)
             .and_then(Option::as_mut)
-            .is_some_and(|texture| texture.packer.free(tile.tile_id));
-        if empty {
-            list.emptied(index, |texture| texture.packer.is_empty());
+            .is_some_and(|page| page.packer.free(tile.id))
+        {
+            list.emptied(index, |page| page.packer.is_empty());
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Bounds, Rgba, ScaledPixels, point, size};
+    use crate::{Color, Rect, point, size};
     use objc2::rc::Retained;
     use objc2_quartz_core::{CALayer, CAMediaTiming};
 
@@ -1464,11 +1349,11 @@ mod tests {
             &[1., 0.5],
             &[turn, turn],
         );
-        let caret = Bounds {
-            origin: point(ScaledPixels(4.), ScaledPixels(6.)),
-            size: size(ScaledPixels(2.), ScaledPixels(16.)),
+        let caret = Rect {
+            origin: point(4., 6.),
+            size: size(2., 16.),
         };
-        let black = Rgba {
+        let black = Color {
             r: 0.,
             g: 0.,
             b: 0.,

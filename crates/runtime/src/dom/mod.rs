@@ -370,14 +370,14 @@ pub struct State {
     pub(crate) text_layouts: rustc_hash::FxHashMap<
         usize,
         (
-            renderer::TextLayout,
+            renderer::Paragraph,
             Rc<str>,
             std::ops::Range<usize>,
             Rows,
             [renderer::Pixels; 2],
         ),
     >,
-    pub scroll: rustc_hash::FxHashMap<usize, renderer::ScrollHandle>,
+    pub scroll: rustc_hash::FxHashMap<usize, renderer::ScrollRef>,
     scroll_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
     pub(crate) computed: Option<Rc<style::ComputedStyles>>,
     previous: Option<Rc<style::ComputedStyles>>,
@@ -467,8 +467,8 @@ pub struct State {
     pub(crate) containers: rustc_hash::FxHashMap<usize, [f32; 2]>,
     pub(crate) atoms: rustc_hash::FxHashMap<usize, [f32; 3]>,
     pub(crate) container_pass: bool,
-    pub(crate) anchors: rustc_hash::FxHashMap<usize, renderer::Bounds<renderer::Pixels>>,
-    pub(crate) blocks: rustc_hash::FxHashMap<usize, renderer::Bounds<renderer::Pixels>>,
+    pub(crate) anchors: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
+    pub(crate) blocks: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
     pub(crate) cull: crate::render::cull::Cull,
     pub top_layer: Vec<usize>,
 }
@@ -753,10 +753,10 @@ pub(crate) fn show_frame(
     state.decoding.remove(&id);
     let size = image.as_ref().map(|image| image.size());
     match size {
-        Some(size) => state.measurements.naturals.insert(
-            id,
-            [u32::from(size.width) as f32, u32::from(size.height) as f32],
-        ),
+        Some(size) => state
+            .measurements
+            .naturals
+            .insert(id, [size.width as u32 as f32, size.height as u32 as f32]),
         None => state.measurements.naturals.remove(&id),
     };
     let old = match image {
@@ -951,15 +951,15 @@ pub fn call(
                     match result {
                         Ok(Ok(image)) => {
                             let size = image.size();
-                            state.measurements.naturals.insert(
-                                id,
-                                [u32::from(size.width) as f32, u32::from(size.height) as f32],
-                            );
+                            state
+                                .measurements
+                                .naturals
+                                .insert(id, [size.width as u32 as f32, size.height as u32 as f32]);
                             state.svg_images.remove(&id);
                             state
                                 .retired
                                 .extend(state.images.insert(id, Arc::new(image)));
-                            json!([u32::from(size.width), u32::from(size.height)])
+                            json!([size.width as u32, size.height as u32])
                         }
                         Ok(Err((text, size))) => {
                             state.measurements.naturals.insert(id, size);
@@ -982,7 +982,7 @@ pub fn call(
             }
             for (node, image) in frames {
                 let size = image.size();
-                results.push(json!([node, u32::from(size.width), u32::from(size.height)]));
+                results.push(json!([node, size.width as u32, size.height as u32]));
                 if let Some(old) = state.images.insert(node, image)
                     && state.retired_canvases.insert(node)
                 {
@@ -2035,8 +2035,8 @@ pub fn call(
             "dom.canvasURL" => {
                 use base64::Engine as _;
                 let bytes = match source_pixels(state, id, None) {
-                    Some(pixels) => pixels.encode_png()?,
-                    None => new_canvas(&doc.nodes[id])?.pixels.encode_png()?,
+                    Some(pixels) => crate::render::image::encode_png(&pixels)?,
+                    None => crate::render::image::encode_png(&new_canvas(&doc.nodes[id])?.pixels)?,
                 };
                 Ok(if args[1] == true {
                     crate::jsc::payload::write(bytes)
@@ -2351,7 +2351,7 @@ pub fn call(
                 let run = renderer::TextRun {
                     len: text.len(),
                     font: style::font(style),
-                    color: renderer::black(),
+                    color: renderer::Color::BLACK,
                     background_color: None,
                     underline: None,
                     strikethrough: None,
@@ -2367,27 +2367,27 @@ pub fn call(
                         .is_some_and(|s| matches!(s, "pre" | "nowrap")))
                 .then_some(renderer::px(bounds[2]));
                 let lines = system.shape_text(
-                    text.clone().into(),
+                    &text,
                     renderer::px(font_size),
                     &[run],
-                    wrap,
-                    None,
-                    crate::style::word_break(style),
-                )?;
+                    &renderer::Wrapping {
+                        width: wrap,
+                        word_break: crate::style::word_break(style),
+                        ..Default::default()
+                    },
+                );
                 let mut top = 0.;
                 let mut offset = 0;
                 let mut rects: Vec<[f32; 4]> = Vec::new();
                 for line in lines {
-                    let rows = line.wrap_boundaries.len() + 1;
+                    let rows = line.rows();
                     if op == "dom.textIndex" {
                         let y = args[2].as_f64().unwrap_or(0.) as f32 - bounds[1];
                         if y < top + rows as f32 * height {
-                            let index = line.closest_index_for_position(
-                                renderer::point(
-                                    renderer::px(args[1].as_f64().unwrap_or(0.) as f32 - bounds[0]),
-                                    renderer::px(y - top),
-                                ),
-                                renderer::px(height),
+                            let index = line.hit(
+                                ((y - top) / height) as usize,
+                                renderer::px(args[1].as_f64().unwrap_or(0.) as f32 - bounds[0]),
+                                true,
                             );
                             let index = index.unwrap_or_else(|index| index);
                             return Ok(json!(real(
@@ -2406,11 +2406,9 @@ pub fn call(
                                 .chain(std::iter::once(line.text.len()))
                                 .filter(|i| *i >= a && *i <= b)
                             {
-                                if let Some(point) =
-                                    line.position_for_index(byte, renderer::px(height))
-                                {
-                                    let x = bounds[0] + f32::from(point.x);
-                                    let y = bounds[1] + top + f32::from(point.y);
+                                if let Some((row, x)) = line.caret(byte) {
+                                    let x = bounds[0] + f32::from(x);
+                                    let y = bounds[1] + top + f32::from(renderer::px(height) * row);
                                     if let Some(rect) = rects.last_mut().filter(|rect| rect[1] == y)
                                     {
                                         rect[2] = x - rect[0];
@@ -2726,7 +2724,7 @@ fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
 }
 
 fn scroll_offset(
-    handle: &renderer::ScrollHandle,
+    handle: &renderer::ScrollRef,
     mut offset: renderer::Point<renderer::Pixels>,
 ) -> renderer::Point<renderer::Pixels> {
     let bounds = handle.bounds();
@@ -2802,7 +2800,7 @@ pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Resul
         .context("Font has no family name")?
         .0
         .clone();
-    system.add_fonts(vec![std::borrow::Cow::Owned(bytes)])?;
+    system.add_font(bytes)?;
     use_font(state, family, &name, true);
     Ok(name)
 }

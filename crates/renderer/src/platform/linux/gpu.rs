@@ -1,945 +1,865 @@
-use crate::{
-    DevicePixels, Size,
-    atlas::{Atlas, AtlasBackend, Packer, TextureList, page_size},
-    frame::{Command, Globals, RenderFrame, Target, TextParams, bytes},
-    scene::{AtlasTextureId, AtlasTextureKind, AtlasTile, Scene},
-};
+use crate::Size;
+use crate::atlas::{self, Packer, PageKind, PageList, PageStore, Tile};
+use crate::frame::{Command, RenderFrame, Target};
+use crate::gpu::{ATTRIBUTES, Blur, Composite, Globals, Instance, Plain, bytes};
+use crate::scene::Scene;
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
-use raw_window_handle as rwh;
-use std::{
-    cell::RefCell,
-    mem,
-    num::NonZeroU64,
-    ops::Range,
-    rc::Rc,
-    slice,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use raw_window_handle::{DisplayHandle, HandleError, HasDisplayHandle};
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::{cell::RefCell, mem::size_of, num::NonZeroU64, rc::Rc, sync::Arc};
+use wgpu::{BindGroup, BindGroupLayout, BindGroupLayoutEntry, BindingResource, BindingType};
+use wgpu::{Buffer, BufferUsages, Color, CurrentSurfaceTexture as Next, Device, Queue};
+use wgpu::{Extent3d, Origin3d, RenderPipeline, ShaderStages, Surface, SurfaceConfiguration};
+use wgpu::{Texture, TextureFormat, TextureUsages, TextureView};
 
-const SHADERS: &str = include_str!("shaders.wgsl");
-const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
-const TEXT: TextParams = TextParams {
-    gamma_ratios: [
-        0.1469 * 65536. / 65025.,
-        -0.8911 * 256. / 255.,
-        1.4644 * 65536. / 65025.,
-        -0.3234 * 256. / 255.,
-    ],
-    grayscale_enhanced_contrast: 1.,
-    subpixel_enhanced_contrast: 0.,
-    is_bgr: false,
-};
+// Glyph masks blend in sRGB here, which makes dark text look too heavy. Needs a visual check on a real display.
+const TEXT_CONTRAST: f32 = 0.3;
+const MAX_INSTANCE_BYTES: u64 = 256 << 20;
+// Layer textures that no frame used for this many frames are dropped.
+const IDLE_FRAMES: u8 = 3;
 
-pub(crate) type GpuAtlas = Atlas<AtlasTextures>;
-pub(crate) type Capture = Option<Result<([u32; 2], Vec<u8>)>>;
+pub(crate) type Atlas = atlas::Atlas<Pages>;
+pub(super) type Capture = Option<Result<([u32; 2], Vec<u8>)>>;
 
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Drawn {
+    Shown,
+    Again,
+    Skipped,
+}
+
+// wgpu needs the display connection for GL on Wayland.
 #[derive(Debug)]
-struct Display(rwh::RawDisplayHandle);
+struct Connection(RawDisplayHandle);
 
-// SAFETY: the connection outlives every GPU object, and wgpu only reads the handle.
-unsafe impl Send for Display {}
+// SAFETY: the connection outlives the GPU, and wgpu only reads the handle.
+unsafe impl Send for Connection {}
 // SAFETY: as above.
-unsafe impl Sync for Display {}
+unsafe impl Sync for Connection {}
 
-impl rwh::HasDisplayHandle for Display {
-    fn display_handle(&self) -> Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
-        // SAFETY: see `Send` above.
-        Ok(unsafe { rwh::DisplayHandle::borrow_raw(self.0) })
+impl HasDisplayHandle for Connection {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        // SAFETY: see `Send`.
+        Ok(unsafe { DisplayHandle::borrow_raw(self.0) })
     }
 }
 
-struct Layouts {
-    globals: wgpu::BindGroupLayout,
-    instances: wgpu::BindGroupLayout,
-    texture: wgpu::BindGroupLayout,
-    composite: wgpu::BindGroupLayout,
-}
-
 struct Pipelines {
-    quads: wgpu::RenderPipeline,
-    shadows: wgpu::RenderPipeline,
-    underlines: wgpu::RenderPipeline,
-    mono: wgpu::RenderPipeline,
-    poly: wgpu::RenderPipeline,
-    composites: wgpu::RenderPipeline,
-    blurs: wgpu::RenderPipeline,
+    draw: RenderPipeline,
+    composite: RenderPipeline,
+    blur: RenderPipeline,
 }
 
+// Made again after the device is lost.
 struct Gpu {
-    instance: wgpu::Instance,
+    api: wgpu::Instance,
     adapter: wgpu::Adapter,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Device,
+    queue: Queue,
     lost: Arc<AtomicBool>,
-    color_format: wgpu::TextureFormat,
-    layouts: Layouts,
-    sampler: wgpu::Sampler,
+    // Color atlas pages hold BGRA, swizzled to RGBA where the adapter can't sample BGRA.
+    color: TextureFormat,
     module: wgpu::ShaderModule,
-    pipelines: RefCell<Vec<(wgpu::TextureFormat, Rc<Pipelines>)>>,
+    sampler: wgpu::Sampler,
+    groups: [BindGroupLayout; 3],
+    blank: TextureView,
+    pipelines: RefCell<Vec<(TextureFormat, Rc<Pipelines>)>>,
 }
 
 thread_local! {
     static GPU: RefCell<Option<Rc<Gpu>>> = const { RefCell::new(None) };
 }
 
+fn texture(
+    device: &Device,
+    side: [u32; 2],
+    format: TextureFormat,
+    usage: TextureUsages,
+) -> Texture {
+    let [width, height] = side;
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: Extent3d {
+            width,
+            height,
+            ..Default::default()
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    })
+}
+
+fn extent(width: i32, height: i32) -> Extent3d {
+    Extent3d {
+        width: width as u32,
+        height: height as u32,
+        ..Default::default()
+    }
+}
+
+fn slot(binding: u32, size: Option<usize>) -> BindGroupLayoutEntry {
+    let ty = match size {
+        Some(size) => BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: true,
+            min_binding_size: NonZeroU64::new(size as u64),
+        },
+        None => BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+    };
+    let visibility = ShaderStages::VERTEX_FRAGMENT;
+    BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty,
+        count: None,
+    }
+}
+
 impl Gpu {
-    fn get(
-        display: rwh::RawDisplayHandle,
-        window: rwh::RawWindowHandle,
-    ) -> Result<(Rc<Self>, wgpu::Surface<'static>)> {
-        let current = GPU
+    // A new device must be able to draw to this window.
+    fn surface(
+        display: RawDisplayHandle,
+        window: RawWindowHandle,
+    ) -> Result<(Rc<Self>, Surface<'static>)> {
+        let kept = GPU
             .with_borrow(Clone::clone)
-            .filter(|gpu| !gpu.lost.load(Ordering::Relaxed));
-        let instance = match &current {
-            Some(gpu) => gpu.instance.clone(),
-            None => wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
-                flags: wgpu::InstanceFlags::default(),
-                backend_options: wgpu::BackendOptions::default(),
-                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-                display: Some(Box::new(Display(display))),
-            }),
+            .filter(|gpu| !gpu.lost.load(Relaxed));
+        let api = match &kept {
+            Some(gpu) => gpu.api.clone(),
+            None => {
+                let connection = Box::new(Connection(display));
+                let mut options = wgpu::InstanceDescriptor::new_with_display_handle(connection);
+                options.backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
+                wgpu::Instance::new(options)
+            }
         };
-        // SAFETY: the platform window owns the renderer, which drops the surface before the window.
-        let surface = unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: None,
-                raw_window_handle: window,
-            })
-        }
-        .map_err(|error| anyhow!("creating the window surface: {error}"))?;
-        if let Some(gpu) = current {
-            ensure!(
-                !surface.get_capabilities(&gpu.adapter).formats.is_empty(),
-                "the GPU cannot draw to this window"
-            );
+        let raw_window_handle = window;
+        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: None,
+            raw_window_handle,
+        };
+        // SAFETY: the window owns the renderer, which drops the surface first.
+        let surface = unsafe { api.create_surface_unsafe(target) }
+            .map_err(|error| anyhow!("making the window surface: {error}"))?;
+        if let Some(gpu) = kept {
+            let formats = surface.get_capabilities(&gpu.adapter).formats;
+            ensure!(!formats.is_empty(), "the GPU can't draw to this window");
             return Ok((gpu, surface));
         }
-        let gpu = Rc::new(Self::new(instance, &surface)?);
-        GPU.with_borrow_mut(|slot| *slot = Some(gpu.clone()));
-        Ok((gpu, surface))
-    }
-
-    fn new(instance: wgpu::Instance, surface: &wgpu::Surface<'_>) -> Result<Self> {
-        let mut adapters = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
-        adapters.sort_by_key(|adapter| {
-            let info = adapter.get_info();
-            let kind = match info.device_type {
-                wgpu::DeviceType::IntegratedGpu => 0,
-                wgpu::DeviceType::DiscreteGpu => 1,
-                wgpu::DeviceType::Other => 2,
-                wgpu::DeviceType::VirtualGpu => 3,
-                wgpu::DeviceType::Cpu => 4,
-            };
+        // Integrated GPUs first, as they save power, and Vulkan before GL.
+        let rank = |info: wgpu::AdapterInfo| {
+            use wgpu::DeviceType::*;
+            let order = [IntegratedGpu, DiscreteGpu, Other];
+            let kind = order
+                .iter()
+                .position(|kind| *kind == info.device_type)
+                .unwrap_or(3);
             (kind, info.backend != wgpu::Backend::Vulkan)
-        });
-        let mut errors = Vec::new();
-        // Hybrid GPUs can report a surface they fail to configure, so each one is tried.
-        for adapter in adapters {
-            let caps = surface.get_capabilities(&adapter);
-            if caps.formats.is_empty() || caps.alpha_modes.is_empty() {
+        };
+        let mut found = pollster::block_on(api.enumerate_adapters(wgpu::Backends::all()));
+        found.sort_by_cached_key(|candidate| rank(candidate.get_info()));
+        let mut refusals = Vec::new();
+        for adapter in found {
+            let name = adapter.get_info().name;
+            let Some(probe) = surface.get_default_config(&adapter, 64, 64) else {
                 continue;
-            }
-            let result = pollster::block_on(
-                adapter.request_device(&wgpu::DeviceDescriptor {
-                    label: None,
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults()
-                        .using_resolution(adapter.limits())
-                        .using_alignment(adapter.limits()),
-                    memory_hints: wgpu::MemoryHints::MemoryUsage,
-                    trace: wgpu::Trace::Off,
-                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                }),
-            );
-            let (device, queue) = match result {
-                Ok(device) => device,
+            };
+            // GL ES 3 has no storage buffers, so the limits stay at what WebGL 2 has.
+            let limits = adapter.limits();
+            let wanted = wgpu::DeviceDescriptor {
+                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                    .using_resolution(limits.clone())
+                    .using_alignment(limits),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                ..Default::default()
+            };
+            let (device, queue) = match pollster::block_on(adapter.request_device(&wanted)) {
+                Ok(pair) => pair,
                 Err(error) => {
-                    errors.push(format!("{}: {error}", adapter.get_info().name));
+                    refusals.push(format!("{name}: {error}"));
                     continue;
                 }
             };
+            // Hybrid GPUs can list a surface that they then fail to configure.
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-            surface.configure(
-                &device,
-                &wgpu::SurfaceConfiguration {
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    format: caps.formats[0],
-                    color_space: wgpu::SurfaceColorSpace::Auto,
-                    width: 64,
-                    height: 64,
-                    present_mode: wgpu::PresentMode::Fifo,
-                    desired_maximum_frame_latency: 2,
-                    alpha_mode: caps.alpha_modes[0],
-                    view_formats: vec![],
-                },
-            );
+            surface.configure(&device, &probe);
             if let Some(error) = pollster::block_on(scope.pop()) {
-                errors.push(format!("{}: {error}", adapter.get_info().name));
+                refusals.push(format!("{name}: {error}"));
                 continue;
             }
-            return Ok(Self::with_device(instance, adapter, device, queue));
+            let gpu = Rc::new(Self::build(api, adapter, device, queue));
+            GPU.with_borrow_mut(|slot| *slot = Some(gpu.clone()));
+            return Ok((gpu, surface));
         }
-        bail!("No GPU can draw to the window: {}", errors.join("; "))
+        bail!("no GPU can draw to the window: {}", refusals.join("; "))
     }
 
-    fn with_device(
-        instance: wgpu::Instance,
-        adapter: wgpu::Adapter,
-        device: wgpu::Device,
-        queue: wgpu::Queue,
-    ) -> Self {
+    fn build(api: wgpu::Instance, adapter: wgpu::Adapter, device: Device, queue: Queue) -> Self {
         let lost = Arc::new(AtomicBool::new(false));
-        device.set_device_lost_callback({
-            let lost = lost.clone();
-            move |reason, message| {
-                if reason != wgpu::DeviceLostReason::Destroyed {
-                    eprintln!("apps: GPU lost: {message}");
-                    lost.store(true, Ordering::Relaxed);
-                }
+        let flag = lost.clone();
+        device.set_device_lost_callback(move |why, message| {
+            if why != wgpu::DeviceLostReason::Destroyed {
+                eprintln!("apps: the GPU was lost: {message}");
+                flag.store(true, Relaxed);
             }
         });
         device.on_uncaptured_error(Arc::new(|error| eprintln!("apps: GPU error: {error}")));
-        let usages = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
-        let color_format = if adapter
-            .get_texture_format_features(wgpu::TextureFormat::Bgra8Unorm)
-            .allowed_usages
-            .contains(usages)
-        {
-            wgpu::TextureFormat::Bgra8Unorm
-        } else {
-            wgpu::TextureFormat::Rgba8Unorm
-        };
-        let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty,
-            count: None,
-        };
-        let texture = |binding| {
-            entry(
-                binding,
-                wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-            )
-        };
-        let sampler = entry(
-            1,
-            wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-        );
-        let layout = |entries: &[wgpu::BindGroupLayoutEntry]| {
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let sampled = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+        let bgra = adapter.get_texture_format_features(TextureFormat::Bgra8Unorm);
+        let layout = |entries: &[BindGroupLayoutEntry]| {
+            let described = wgpu::BindGroupLayoutDescriptor {
                 label: None,
                 entries,
-            })
+            };
+            device.create_bind_group_layout(&described)
         };
-        let layouts = Layouts {
-            globals: layout(&[entry(
-                0,
-                wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: NonZeroU64::new(mem::size_of::<Globals>() as u64),
-                },
-            )]),
-            instances: layout(&[entry(
-                0,
-                wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-            )]),
-            texture: layout(&[texture(0), sampler]),
-            composite: layout(&[texture(0), sampler, texture(2), texture(3)]),
+        let filtering = BindingType::Sampler(wgpu::SamplerBindingType::Filtering);
+        let visibility = ShaderStages::VERTEX_FRAGMENT;
+        let sampler = BindGroupLayoutEntry {
+            binding: 1,
+            visibility,
+            ty: filtering,
+            count: None,
         };
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(SHADERS.into()),
-        });
+        let groups = [
+            layout(&[slot(0, Some(size_of::<Globals>())), sampler]),
+            layout(&[slot(0, None), slot(1, None), slot(2, None)]),
+            layout(&[
+                slot(0, Some(size_of::<Composite>())),
+                slot(1, Some(size_of::<Blur>())),
+            ]),
+        ];
+        let blank = texture(
+            &device,
+            [1, 1],
+            TextureFormat::Rgba8Unorm,
+            TextureUsages::TEXTURE_BINDING,
+        );
+        let source = wgpu::ShaderSource::Wgsl(include_str!("../../shaders.wgsl").into());
+        let linear = wgpu::FilterMode::Linear;
         Self {
+            module: device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None,
+                source,
+            }),
             sampler: device.create_sampler(&wgpu::SamplerDescriptor {
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
+                mag_filter: linear,
+                min_filter: linear,
                 ..Default::default()
             }),
-            instance,
+            color: match bgra.allowed_usages.contains(sampled) {
+                true => TextureFormat::Bgra8Unorm,
+                false => TextureFormat::Rgba8Unorm,
+            },
+            blank: blank.create_view(&Default::default()),
+            api,
             adapter,
             device,
             queue,
             lost,
-            color_format,
-            layouts,
-            module,
+            groups,
             pipelines: RefCell::default(),
         }
     }
 
-    fn pipelines(&self, format: wgpu::TextureFormat) -> Rc<Pipelines> {
-        if let Some((_, pipelines)) = self
+    fn pipelines(&self, format: TextureFormat) -> Rc<Pipelines> {
+        if let Some((_, made)) = self
             .pipelines
             .borrow()
             .iter()
-            .find(|(entry, _)| *entry == format)
+            .find(|(kept, _)| *kept == format)
         {
-            return pipelines.clone();
+            return made.clone();
         }
-        let layouts = &self.layouts;
-        let pipeline = |name: &str,
-                        texture: Option<&wgpu::BindGroupLayout>,
-                        blend: Option<wgpu::BlendState>| {
-            let groups = [Some(&layouts.globals), Some(&layouts.instances), texture];
-            let layout = self
-                .device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: None,
-                    bind_group_layouts: &groups[..if texture.is_some() { 3 } else { 2 }],
-                    immediate_size: 0,
-                });
+        // An instance is one step of 13 vec4 attributes.
+        let attributes: [wgpu::VertexAttribute; ATTRIBUTES] = std::array::from_fn(|at| {
+            let (offset, shader_location) = (at as u64 * 16, at as u32);
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset,
+                shader_location,
+            }
+        });
+        let steps = [Some(wgpu::VertexBufferLayout {
+            array_stride: size_of::<Instance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &attributes,
+        })];
+        let groups = self.groups.each_ref().map(Some);
+        let make = |stage: &str, blend| {
+            let (groups, buffers) = match stage {
+                "draw" => (&groups[..2], &steps[..]),
+                _ => (&groups[..], &[][..]),
+            };
+            let shape = wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: groups,
+                immediate_size: 0,
+            };
+            let layout = self.device.create_pipeline_layout(&shape);
+            let (vertex, fragment) = (format!("{stage}_vertex"), format!("{stage}_fragment"));
+            let module = &self.module;
+            let target = wgpu::ColorTargetState {
+                format,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            };
+            let compilation_options = wgpu::PipelineCompilationOptions::default();
             self.device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(name),
+                    label: Some(stage),
                     layout: Some(&layout),
                     vertex: wgpu::VertexState {
-                        module: &self.module,
-                        entry_point: Some(&format!("vs_{name}")),
-                        buffers: &[],
-                        compilation_options: Default::default(),
+                        module,
+                        entry_point: Some(&vertex),
+                        buffers,
+                        compilation_options: compilation_options.clone(),
                     },
                     fragment: Some(wgpu::FragmentState {
-                        module: &self.module,
-                        entry_point: Some(&format!("fs_{name}")),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
+                        module,
+                        entry_point: Some(&fragment),
+                        targets: &[Some(target)],
+                        compilation_options,
                     }),
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleStrip,
                         ..Default::default()
                     },
                     depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
+                    multisample: Default::default(),
                     multiview_mask: None,
                     cache: None,
                 })
         };
-        // Colors are drawn unpremultiplied over targets that hold premultiplied colors.
-        let over = Some(wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::SrcAlpha,
-                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent::OVER,
+        // Fragments are premultiplied. Blurs replace what the target holds.
+        let over = Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+        let (draw, composite) = (make("draw", over), make("composite", over));
+        let made = Rc::new(Pipelines {
+            draw,
+            composite,
+            blur: make("blur", None),
         });
-        let texture = Some(&layouts.texture);
-        let pipelines = Rc::new(Pipelines {
-            quads: pipeline("quad", None, over),
-            shadows: pipeline("shadow", None, over),
-            underlines: pipeline("underline", None, over),
-            mono: pipeline("mono_sprite", texture, over),
-            poly: pipeline("poly_sprite", texture, over),
-            composites: pipeline(
-                "composite",
-                Some(&layouts.composite),
-                Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-            ),
-            blurs: pipeline("blur", texture, None),
-        });
-        self.pipelines
-            .borrow_mut()
-            .push((format, pipelines.clone()));
-        pipelines
+        self.pipelines.borrow_mut().push((format, made.clone()));
+        made
     }
 
-    fn texture_group(&self, view: &wgpu::TextureView) -> wgpu::BindGroup {
-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.layouts.texture,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        })
-    }
-
-    fn buffer(&self, size: u64, usage: wgpu::BufferUsages) -> wgpu::Buffer {
-        self.device.create_buffer(&wgpu::BufferDescriptor {
+    fn buffer(&self, size: u64, usage: BufferUsages) -> Buffer {
+        let usage = usage | BufferUsages::COPY_DST;
+        let described = wgpu::BufferDescriptor {
             label: None,
             size,
-            usage: usage | wgpu::BufferUsages::COPY_DST,
+            usage,
             mapped_at_creation: false,
-        })
+        };
+        self.device.create_buffer(&described)
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Drawn {
-    Presented,
-    Repaint,
-    Skipped,
+fn slots<T: Plain>(items: &[T], stride: usize, out: &mut Vec<u8>) {
+    for item in items {
+        let start = out.len();
+        out.extend_from_slice(bytes(std::slice::from_ref(item)));
+        out.resize(start + stride, 0);
+    }
 }
 
-pub(crate) struct Renderer {
+fn configure(
+    gpu: &Gpu,
+    surface: &Surface<'static>,
+    size: [u32; 2],
+    transparent: bool,
+    mailbox: bool,
+) -> Result<SurfaceConfiguration> {
+    let caps = surface.get_capabilities(&gpu.adapter);
+    let max = gpu.device.limits().max_texture_dimension_2d;
+    let [width, height] = size.map(|side| side.clamp(1, max));
+    let mut config = surface
+        .get_default_config(&gpu.adapter, width, height)
+        .context("the window surface has no formats")?;
+    // The shaders write sRGB values, which an sRGB surface would convert again.
+    let unconverted = caps
+        .formats
+        .iter()
+        .copied()
+        .filter(|format| !format.is_srgb());
+    let format = [TextureFormat::Bgra8Unorm, TextureFormat::Rgba8Unorm]
+        .into_iter()
+        .chain(unconverted)
+        .find(|format| caps.formats.contains(format));
+    config.format = format.unwrap_or(config.format);
+    let alpha = match transparent {
+        true => wgpu::CompositeAlphaMode::PreMultiplied,
+        false => wgpu::CompositeAlphaMode::Opaque,
+    };
+    let modes = &caps.alpha_modes;
+    let alpha = [alpha, wgpu::CompositeAlphaMode::Inherit]
+        .into_iter()
+        .find(|mode| modes.contains(mode));
+    config.alpha_mode = alpha
+        .or(modes.first().copied())
+        .unwrap_or(config.alpha_mode);
+    // A hidden Wayland window gets no frame callbacks, which blocks FIFO presents, so mailbox is used there.
+    let mailbox = mailbox && caps.present_modes.contains(&wgpu::PresentMode::Mailbox);
+    config.present_mode = match mailbox {
+        true => wgpu::PresentMode::Mailbox,
+        false => wgpu::PresentMode::Fifo,
+    };
+    config.usage |= caps.usages & TextureUsages::COPY_SRC;
+    surface.configure(&gpu.device, &config);
+    Ok(config)
+}
+
+pub(super) struct Renderer {
     gpu: Rc<Gpu>,
-    display: rwh::RawDisplayHandle,
-    window: rwh::RawWindowHandle,
-    surface: Option<wgpu::Surface<'static>>,
-    config: wgpu::SurfaceConfiguration,
-    alpha_modes: [wgpu::CompositeAlphaMode; 2],
+    display: RawDisplayHandle,
+    window: RawWindowHandle,
+    surface: Option<Surface<'static>>,
+    config: SurfaceConfiguration,
+    transparent: bool,
+    mailbox: bool,
     pipelines: Rc<Pipelines>,
-    atlas: Rc<GpuAtlas>,
-    globals: wgpu::Buffer,
-    globals_group: wgpu::BindGroup,
-    globals_stride: u64,
-    instances: wgpu::Buffer,
-    empty: wgpu::TextureView,
-    pool: Vec<(wgpu::Texture, wgpu::TextureView)>,
+    atlas: Rc<Atlas>,
+    instances: Option<Buffer>,
+    uniforms: Option<(Buffer, BindGroup, BindGroup)>,
+    pool: Vec<(Texture, TextureView, u8)>,
+    targets: Vec<usize>,
+    sources: (u64, FxHashMap<[Option<u32>; 2], BindGroup>),
+    staging: Vec<u8>,
     frame: RenderFrame,
 }
 
 impl Renderer {
     pub fn new(
-        display: rwh::RawDisplayHandle,
-        window: rwh::RawWindowHandle,
-        size: Size<DevicePixels>,
+        display: RawDisplayHandle,
+        window: RawWindowHandle,
+        size: [u32; 2],
         transparent: bool,
         mailbox: bool,
     ) -> Result<Self> {
-        let (gpu, surface) = Gpu::get(display, window)?;
-        let atlas = Rc::new(Atlas::new(AtlasTextures::new(gpu.clone())));
-        Self::with_surface(
-            gpu,
-            surface,
-            display,
-            window,
-            size,
-            transparent,
-            mailbox,
-            atlas,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn with_surface(
-        gpu: Rc<Gpu>,
-        surface: wgpu::Surface<'static>,
-        display: rwh::RawDisplayHandle,
-        window: rwh::RawWindowHandle,
-        size: Size<DevicePixels>,
-        transparent: bool,
-        mailbox: bool,
-        atlas: Rc<GpuAtlas>,
-    ) -> Result<Self> {
-        let caps = surface.get_capabilities(&gpu.adapter);
-        // An sRGB surface would convert the colors the shaders already write in sRGB.
-        let format = [
-            wgpu::TextureFormat::Bgra8Unorm,
-            wgpu::TextureFormat::Rgba8Unorm,
-        ]
-        .into_iter()
-        .find(|format| caps.formats.contains(format))
-        .or_else(|| {
-            caps.formats
-                .iter()
-                .copied()
-                .find(|format| !format.is_srgb())
-        })
-        .or_else(|| caps.formats.first().copied())
-        .context("the window surface has no formats")?;
-        let alpha = |modes: &[wgpu::CompositeAlphaMode]| {
-            modes
-                .iter()
-                .copied()
-                .find(|mode| caps.alpha_modes.contains(mode))
-                .unwrap_or(caps.alpha_modes[0])
-        };
-        let alpha_modes = [
-            alpha(&[
-                wgpu::CompositeAlphaMode::Opaque,
-                wgpu::CompositeAlphaMode::Inherit,
-            ]),
-            alpha(&[
-                wgpu::CompositeAlphaMode::PreMultiplied,
-                wgpu::CompositeAlphaMode::Inherit,
-            ]),
-        ];
-        let max = gpu.device.limits().max_texture_dimension_2d;
-        let present_mode = if mailbox && caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-            wgpu::PresentMode::Mailbox
-        } else {
-            wgpu::PresentMode::Fifo
-        };
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | (caps.usages & wgpu::TextureUsages::COPY_SRC),
-            format,
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width: (size.width.0 as u32).clamp(1, max),
-            height: (size.height.0 as u32).clamp(1, max),
-            present_mode,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: alpha_modes[transparent as usize],
-            view_formats: vec![],
-        };
-        surface.configure(&gpu.device, &config);
-        let limits = gpu.device.limits();
-        let globals_stride = (mem::size_of::<Globals>() as u64)
-            .next_multiple_of(u64::from(limits.min_uniform_buffer_offset_alignment));
-        let globals = gpu.buffer(globals_stride * 8, wgpu::BufferUsages::UNIFORM);
-        let empty = gpu
-            .device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            })
-            .create_view(&Default::default());
+        let (gpu, surface) = Gpu::surface(display, window)?;
+        let config = configure(&gpu, &surface, size, transparent, mailbox)?;
         Ok(Self {
-            pipelines: gpu.pipelines(format),
-            globals_group: globals_group(&gpu, &globals),
-            instances: gpu.buffer(2 * 1024 * 1024, wgpu::BufferUsages::STORAGE),
-            globals,
-            globals_stride,
-            empty,
+            pipelines: gpu.pipelines(config.format),
+            atlas: Rc::new(Atlas::new(Pages::new(gpu.clone()))),
             gpu,
             display,
             window,
             surface: Some(surface),
             config,
-            alpha_modes,
-            atlas,
+            transparent,
+            mailbox,
+            instances: None,
+            uniforms: None,
             pool: Vec::new(),
+            targets: Vec::new(),
+            sources: (u64::MAX, FxHashMap::default()),
+            staging: Vec::new(),
             frame: RenderFrame::default(),
         })
     }
 
-    pub fn atlas(&self) -> &Rc<GpuAtlas> {
+    pub fn atlas(&self) -> &Rc<Atlas> {
         &self.atlas
     }
 
-    pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
-        let max = self.gpu.device.limits().max_texture_dimension_2d;
-        let (width, height) = (
-            (size.width.0 as u32).clamp(1, max),
-            (size.height.0 as u32).clamp(1, max),
-        );
-        if (width, height) != (self.config.width, self.config.height) {
-            self.config.width = width;
-            self.config.height = height;
+    pub fn max_side(&self) -> u32 {
+        self.gpu.device.limits().max_texture_dimension_2d
+    }
+
+    pub fn resize(&mut self, size: [u32; 2]) {
+        let max = self.max_side();
+        let [width, height] = size.map(|side| side.clamp(1, max));
+        if [width, height] != [self.config.width, self.config.height] {
+            (self.config.width, self.config.height) = (width, height);
             if let Some(surface) = &self.surface {
                 surface.configure(&self.gpu.device, &self.config);
             }
         }
     }
 
-    pub fn max_texture_size(&self) -> u32 {
-        self.gpu.device.limits().max_texture_dimension_2d
+    // The atlas stays, since the last frame still reads it.
+    pub fn release(&mut self) {
+        self.pool.clear();
+        self.instances = None;
+        self.uniforms = None;
+        self.staging = Vec::new();
     }
 
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> (Drawn, Capture) {
-        if self.gpu.lost.load(Ordering::Relaxed) || self.surface.is_none() {
-            let result = self.recover();
-            if let Err(error) = &result {
-                eprintln!("apps: GPU recovery failed: {error:#}");
+        let failed = |message: &str| capture.then(|| Err(anyhow!("{message}")));
+        if self.gpu.lost.load(Relaxed) || self.surface.is_none() {
+            if let Err(error) = self.recover() {
+                eprintln!("apps: the GPU can't recover: {error:#}");
             }
-            return (
-                Drawn::Repaint,
-                capture.then(|| result.and(Err(anyhow!("The GPU was lost")))),
-            );
+            return (Drawn::Again, failed("The GPU was lost"));
         }
         let Some(surface) = &self.surface else {
             return (Drawn::Skipped, None);
         };
         let output = match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(output) => output,
-            wgpu::CurrentSurfaceTexture::Suboptimal(output) => {
-                // Textures must go before the surface can be configured again.
-                drop(output);
+            Next::Success(output) => output,
+            Next::Suboptimal(stale) => {
+                // The texture must go before the surface can be configured again.
+                drop(stale);
                 surface.configure(&self.gpu.device, &self.config);
-                return (
-                    Drawn::Repaint,
-                    capture.then(|| Err(anyhow!("The window surface changed"))),
-                );
+                return (Drawn::Again, failed("The window surface changed"));
             }
-            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
+            Next::Outdated => {
                 surface.configure(&self.gpu.device, &self.config);
-                return (
-                    Drawn::Repaint,
-                    capture.then(|| Err(anyhow!("The window surface changed"))),
-                );
+                return (Drawn::Again, failed("The window surface changed"));
             }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return (
-                    Drawn::Skipped,
-                    capture.then(|| Err(anyhow!("The window can't be seen"))),
-                );
+            Next::Lost => {
+                self.surface = None;
+                return (Drawn::Again, failed("The window surface was lost"));
             }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return (
-                    Drawn::Skipped,
-                    capture.then(|| Err(anyhow!("The window surface is not valid"))),
-                );
+            Next::Timeout | Next::Occluded => {
+                return (Drawn::Skipped, failed("The window can't be seen"));
             }
-        };
-        let readback = match self.render_frame(scene, &output.texture, capture) {
-            Ok(readback) => readback,
-            Err(error) => {
-                eprintln!("apps: failed to render: {error:#}");
-                // Queue writes are staged before encoding, so they are flushed even when the frame fails.
-                self.gpu.queue.submit(std::iter::empty());
-                return (Drawn::Repaint, capture.then(|| Err(error)));
-            }
+            Next::Validation => return (Drawn::Skipped, failed("The window surface is not valid")),
         };
         let size = [output.texture.width(), output.texture.height()];
+        let read = match self.encode(scene, &output.texture, capture) {
+            Ok(read) => read,
+            Err(error) => {
+                eprintln!("apps: drawing failed: {error:#}");
+                // Queue writes wait for a submit, which also releases them when the frame fails.
+                self.gpu.queue.submit(None);
+                return (Drawn::Again, capture.then_some(Err(error)));
+            }
+        };
         self.gpu.queue.present(output);
-        (
-            Drawn::Presented,
-            readback.map(|buffer| self.read_back(buffer?, size)),
-        )
+        (Drawn::Shown, read.map(|buffer| self.read(buffer?, size)))
     }
 
     fn recover(&mut self) -> Result<()> {
-        // A window has one swapchain at a time, so the old surface goes first.
+        // A window has one swapchain, so the old surface goes first.
         self.surface = None;
-        let (gpu, surface) = Gpu::get(self.display, self.window)?;
-        let transparent = self.config.alpha_mode == self.alpha_modes[1];
-        let mailbox = self.config.present_mode == wgpu::PresentMode::Mailbox;
-        let size = Size::new(
-            DevicePixels(self.config.width as i32),
-            DevicePixels(self.config.height as i32),
-        );
-        let atlas = self.atlas.clone();
-        atlas.clear(|textures| *textures = AtlasTextures::new(gpu.clone()));
-        *self = Self::with_surface(
-            gpu,
-            surface,
-            self.display,
-            self.window,
-            size,
-            transparent,
-            mailbox,
-            atlas,
-        )?;
+        let (gpu, surface) = Gpu::surface(self.display, self.window)?;
+        if !Rc::ptr_eq(&gpu, &self.gpu) {
+            self.atlas.clear(|pages| *pages = Pages::new(gpu.clone()));
+            self.release();
+            self.sources = (u64::MAX, FxHashMap::default());
+            self.gpu = gpu;
+        }
+        let size = [self.config.width, self.config.height];
+        self.config = configure(&self.gpu, &surface, size, self.transparent, self.mailbox)?;
+        self.pipelines = self.gpu.pipelines(self.config.format);
+        self.surface = Some(surface);
         Ok(())
     }
 
-    fn read_back(&self, buffer: wgpu::Buffer, size: [u32; 2]) -> Result<([u32; 2], Vec<u8>)> {
-        let slice = buffer.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.gpu
-            .device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|error| anyhow!("reading the frame: {error}"))?;
-        let padded = (size[0] * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) as usize;
-        let mut pixels = Vec::with_capacity(size[0] as usize * 4 * size[1] as usize);
-        let mapped = slice
+    fn read(&self, buffer: Buffer, [width, height]: [u32; 2]) -> Result<([u32; 2], Vec<u8>)> {
+        let whole = buffer.slice(..);
+        whole.map_async(wgpu::MapMode::Read, |_| {});
+        let waited = self.gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        waited.map_err(|error| anyhow!("reading the frame: {error}"))?;
+        let mapped = whole
             .get_mapped_range()
             .map_err(|error| anyhow!("reading the frame: {error}"))?;
-        for row in mapped.chunks_exact(padded) {
-            pixels.extend_from_slice(&row[..size[0] as usize * 4]);
-        }
-        if self.config.format == wgpu::TextureFormat::Bgra8Unorm {
+        let row = width as usize * 4;
+        let stride = row.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
+        let lines = mapped.chunks_exact(stride).take(height as usize);
+        let mut pixels: Vec<u8> = lines.flat_map(|line| &line[..row]).copied().collect();
+        if self.config.format == TextureFormat::Bgra8Unorm {
             for pixel in pixels.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }
         }
-        Ok((size, pixels))
+        Ok(([width, height], pixels))
     }
 
-    fn render_frame(
-        &mut self,
-        scene: &Scene,
-        output: &wgpu::Texture,
-        capture: bool,
-    ) -> Result<Option<Result<wgpu::Buffer>>> {
-        let copy = self.config.usage.contains(wgpu::TextureUsages::COPY_SRC);
-        let mut frame = mem::take(&mut self.frame);
-        frame.record(
-            scene,
-            [output.width(), output.height()],
-            self.max_texture_size(),
-            copy,
-        );
-        let result = self.encode(&frame, output, capture);
-        self.frame = frame;
-        result
-    }
-
-    fn prepare(&mut self, frame: &RenderFrame) -> Result<[wgpu::BindGroup; 7]> {
+    fn prepare(&mut self, frame: &RenderFrame) -> Result<[u64; 3]> {
         let gpu = &self.gpu;
-        for (index, size) in frame.textures.iter().enumerate() {
-            if let Some(found) = self.pool[index..]
-                .iter()
-                .position(|(texture, _)| [texture.width(), texture.height()] == *size)
+        for (.., idle) in &mut self.pool {
+            *idle = idle.saturating_add(1);
+        }
+        self.pool.retain(|(.., idle)| *idle <= IDLE_FRAMES);
+        self.targets.clear();
+        let usage = TextureUsages::RENDER_ATTACHMENT
+            | TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_SRC
+            | TextureUsages::COPY_DST;
+        for &size in &frame.textures {
+            let free = |(made, _, idle): &(Texture, TextureView, u8)| {
+                *idle > 0 && [made.width(), made.height()] == size
+            };
+            let at = match self.pool.iter().position(free) {
+                Some(at) => at,
+                None => {
+                    let made = texture(&gpu.device, size, self.config.format, usage);
+                    let view = made.create_view(&Default::default());
+                    self.pool.push((made, view, 0));
+                    self.pool.len() - 1
+                }
+            };
+            self.pool[at].2 = 0;
+            self.targets.push(at);
+        }
+
+        let data = bytes(&frame.instances);
+        let length = data.len() as u64;
+        if length > 0 {
+            if self
+                .instances
+                .as_ref()
+                .is_none_or(|kept| kept.size() < length)
             {
-                self.pool.swap(index, index + found);
-                continue;
+                ensure!(
+                    length <= MAX_INSTANCE_BYTES,
+                    "a frame has too many instances"
+                );
+                let grown = gpu.buffer(length.next_power_of_two(), BufferUsages::VERTEX);
+                self.instances = Some(grown);
             }
-            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d {
-                    width: size[0],
-                    height: size[1],
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: self.config.format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC
-                    | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            let view = texture.create_view(&Default::default());
-            self.pool.push((texture, view));
-            let last = self.pool.len() - 1;
-            self.pool.swap(index, last);
+            if let Some(buffer) = &self.instances {
+                gpu.queue.write_buffer(buffer, 0, data);
+            }
         }
-        self.pool.truncate(frame.textures.len());
 
-        let stride = self.globals_stride as usize;
-        let mut globals = vec![0; stride * (frame.layers.len() + 1)];
-        for (index, target) in std::iter::once(Target::Frame)
-            .chain((0..frame.layers.len()).map(Target::Layer))
-            .enumerate()
-        {
-            globals[index * stride..][..mem::size_of::<Globals>()]
-                .copy_from_slice(bytes(slice::from_ref(&frame.globals(target, &TEXT))));
-        }
-        if globals.len() as u64 > self.globals.size() {
-            self.globals = gpu.buffer(
-                (globals.len() as u64).next_power_of_two(),
-                wgpu::BufferUsages::UNIFORM,
-            );
-            self.globals_group = globals_group(gpu, &self.globals);
-        }
-        gpu.queue.write_buffer(&self.globals, 0, &globals);
-
-        let arrays: [&[u8]; 7] = [
-            bytes(&frame.quads),
-            bytes(&frame.shadows),
-            bytes(&frame.underlines),
-            bytes(&frame.mono),
-            bytes(&frame.poly),
-            bytes(&frame.composites),
-            bytes(&frame.blurs),
+        // One buffer holds the globals of each target, then the composites, then the blurs.
+        let align = gpu.device.limits().min_uniform_buffer_offset_alignment as usize;
+        let sizes = [
+            size_of::<Globals>(),
+            size_of::<Composite>(),
+            size_of::<Blur>(),
         ];
-        // wgpu rejects empty bindings, so empty arrays still take 16 bytes.
-        let limits = gpu.device.limits();
-        let alignment = u64::from(limits.min_storage_buffer_offset_alignment);
-        let mut offsets = [0; 7];
-        let mut total = 0;
-        for (offset, data) in offsets.iter_mut().zip(arrays) {
-            *offset = total;
-            total = (total + (data.len() as u64).max(16)).next_multiple_of(alignment);
+        let strides = sizes.map(|size| size.next_multiple_of(align));
+        let targets =
+            std::iter::once(Target::Frame).chain((0..frame.layers.len()).map(Target::Layer));
+        let globals: Vec<Globals> = targets
+            .map(|target| frame.globals(target, TEXT_CONTRAST))
+            .collect();
+        let staging = &mut self.staging;
+        staging.clear();
+        slots(&globals, strides[0], staging);
+        slots(&frame.composites, strides[1], staging);
+        slots(&frame.blurs, strides[2], staging);
+        // Every binding reads a whole block, also at offset 0.
+        staging.resize(staging.len().max(strides[1]), 0);
+        let length = staging.len() as u64;
+        if self
+            .uniforms
+            .as_ref()
+            .is_none_or(|(kept, ..)| kept.size() < length)
+        {
+            let buffer = gpu.buffer(length.next_power_of_two(), BufferUsages::UNIFORM);
+            let block = |size: usize| {
+                let size = NonZeroU64::new(size as u64);
+                BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &buffer,
+                    offset: 0,
+                    size,
+                })
+            };
+            let group = |layout, [first, second]: [BindingResource; 2]| {
+                let entries = [
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: first,
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: second,
+                    },
+                ];
+                let described = wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout,
+                    entries: &entries,
+                };
+                gpu.device.create_bind_group(&described)
+            };
+            let sampler = BindingResource::Sampler(&gpu.sampler);
+            let shared = group(&gpu.groups[0], [block(sizes[0]), sampler]);
+            let params = group(&gpu.groups[2], [block(sizes[1]), block(sizes[2])]);
+            self.uniforms = Some((buffer, shared, params));
         }
-        if total > self.instances.size() {
-            let max = limits
-                .max_buffer_size
-                .min(limits.max_storage_buffer_binding_size)
-                .min(MAX_INSTANCE_BUFFER_SIZE);
-            ensure!(total <= max, "frame instance data exceeds {max} bytes");
-            self.instances = gpu.buffer(
-                total.next_power_of_two().min(max),
-                wgpu::BufferUsages::STORAGE,
-            );
+        if let Some((buffer, ..)) = &self.uniforms {
+            gpu.queue.write_buffer(buffer, 0, staging);
         }
-        for (offset, data) in offsets.iter().zip(arrays) {
-            if !data.is_empty() {
-                gpu.queue.write_buffer(&self.instances, *offset, data);
-            }
-        }
-        Ok(std::array::from_fn(|index| {
-            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &gpu.layouts.instances,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &self.instances,
-                        offset: offsets[index],
-                        size: NonZeroU64::new((arrays[index].len() as u64).max(16)),
-                    }),
-                }],
-            })
-        }))
+        Ok(strides.map(|stride| stride as u64))
     }
 
     fn encode(
         &mut self,
-        frame: &RenderFrame,
-        output: &wgpu::Texture,
+        scene: &Scene,
+        output: &Texture,
         capture: bool,
-    ) -> Result<Option<Result<wgpu::Buffer>>> {
-        let instances = self.prepare(frame)?;
-        let gpu = &self.gpu;
-        let frame_view = output.create_view(&Default::default());
-        let view = |target: Target| match target {
-            Target::Frame => &frame_view,
-            Target::Layer(index) => &self.pool[frame.layers[index].texture].1,
+    ) -> Result<Option<Result<Buffer>>> {
+        // Copies read the frame, which needs a surface that allows them.
+        let copies = self.config.usage.contains(TextureUsages::COPY_SRC);
+        let mut frame = std::mem::take(&mut self.frame);
+        frame.record(
+            scene,
+            [output.width(), output.height()],
+            self.max_side(),
+            copies,
+        );
+        let strides = self.prepare(&frame);
+        let result = strides.and_then(|strides| self.commands(&frame, output, strides, capture));
+        self.frame = frame;
+        result
+    }
+
+    fn commands(
+        &mut self,
+        frame: &RenderFrame,
+        output: &Texture,
+        strides: [u64; 3],
+        capture: bool,
+    ) -> Result<Option<Result<Buffer>>> {
+        let gpu = self.gpu.clone();
+        let pages = self.atlas.pages.borrow();
+        if self.sources.0 != pages.generation {
+            self.sources = (pages.generation, FxHashMap::default());
+        }
+        let Some((_, shared, params)) = &self.uniforms else {
+            bail!("the frame has no uniforms");
         };
-        let texture = |target: Target| match target {
-            Target::Frame => output,
-            Target::Layer(index) => &self.pool[frame.layers[index].texture].0,
-        };
-        let globals_offset = |target: Target| match target {
-            Target::Frame => 0,
-            Target::Layer(index) => (index as u64 + 1) * self.globals_stride,
-        } as u32;
-        let atlas = self.atlas.backend.borrow();
         let pipelines = &self.pipelines;
+        let composites = strides[0] * (frame.layers.len() as u64 + 1);
+        let blurs = composites + strides[1] * frame.composites.len() as u64;
+        let globals_of = |target: Target| match target {
+            Target::Frame => 0,
+            Target::Layer(index) => (index as u64 + 1) * strides[0],
+        } as u32;
+        let frame_view = output.create_view(&Default::default());
+        let (pool, targets) = (&self.pool, &self.targets);
+        let pooled = |target: Target| match target {
+            Target::Frame => None,
+            Target::Layer(index) => Some(&pool[targets[frame.layers[index].texture]]),
+        };
+        let view = |target: Target| pooled(target).map_or(&frame_view, |(_, view, _)| view);
+        let raw = |target: Target| pooled(target).map_or(output, |(made, ..)| made);
+        let bind = |views: [&TextureView; 3]| {
+            let entries: [_; 3] = std::array::from_fn(|at| {
+                let resource = BindingResource::TextureView(views[at]);
+                wgpu::BindGroupEntry {
+                    binding: at as u32,
+                    resource,
+                }
+            });
+            let described = wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &gpu.groups[1],
+                entries: &entries,
+            };
+            gpu.device.create_bind_group(&described)
+        };
+        let page = |color: bool, index: Option<u32>| {
+            index
+                .and_then(|index| pages.view(color, index))
+                .unwrap_or(&gpu.blank)
+        };
+        let background = if self.transparent {
+            Color::TRANSPARENT
+        } else {
+            Color::BLACK
+        };
+        let open = |encoder: &mut wgpu::CommandEncoder, target: Target, wipe: bool| {
+            let load = match (wipe, target) {
+                (false, _) => wgpu::LoadOp::Load,
+                (true, Target::Frame) => wgpu::LoadOp::Clear(background),
+                (true, Target::Layer(_)) => wgpu::LoadOp::Clear(Color::TRANSPARENT),
+            };
+            let ops = wgpu::Operations {
+                load,
+                store: wgpu::StoreOp::Store,
+            };
+            let attachment = wgpu::RenderPassColorAttachment {
+                view: view(target),
+                depth_slice: None,
+                resolve_target: None,
+                ops,
+            };
+            let colors = [Some(attachment)];
+            let described = wgpu::RenderPassDescriptor {
+                color_attachments: &colors,
+                ..Default::default()
+            };
+            let mut pass = encoder.begin_render_pass(&described).forget_lifetime();
+            pass.set_bind_group(0, shared, &[globals_of(target)]);
+            pass
+        };
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         let mut pass: Option<wgpu::RenderPass<'static>> = None;
         let mut current = (Target::Frame, true);
-        macro_rules! pass {
-            () => {{
-                if pass.is_none() {
-                    let (target, clear) = current;
-                    current.1 = false;
-                    let mut begun = encoder
-                        .begin_render_pass(&wgpu::RenderPassDescriptor {
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: view(target),
-                                depth_slice: None,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: if clear {
-                                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
-                                    } else {
-                                        wgpu::LoadOp::Load
-                                    },
-                                    store: wgpu::StoreOp::Store,
-                                },
-                            })],
-                            ..Default::default()
-                        })
-                        .forget_lifetime();
-                    begun.set_bind_group(0, &self.globals_group, &[globals_offset(target)]);
-                    pass = Some(begun);
-                }
-                pass.as_mut().unwrap()
-            }};
-        }
         for command in &frame.commands {
-            match command {
+            match *command {
                 Command::Pass(target, false)
-                    if let Some(pass) = &mut pass
-                        && frame.texture(*target) == frame.texture(current.0) =>
+                    if let Some(into) = &mut pass
+                        && frame.texture(target) == frame.texture(current.0) =>
                 {
-                    pass.set_bind_group(0, &self.globals_group, &[globals_offset(*target)]);
-                    current = (*target, false);
+                    into.set_bind_group(0, shared, &[globals_of(target)]);
+                    current = (target, false);
                 }
-                // Targets are cleared right away, since a later pass may draw into them.
-                Command::Pass(target, clear) => {
-                    pass = None;
-                    current = (*target, *clear);
-                    if *clear {
-                        pass!();
-                    }
+                // A target is cleared at once, since a later pass can draw into it.
+                Command::Pass(target, wipe) => {
+                    // WARNING: end the old pass first. Two open passes put the encoder in an error state.
+                    drop(pass.take());
+                    pass = wipe.then(|| open(&mut encoder, target, true));
+                    current = (target, false);
                 }
-                Command::Quads(range) => {
-                    draw(pass!(), &pipelines.quads, &instances[0], None, range)
-                }
-                Command::Shadows(range) => {
-                    draw(pass!(), &pipelines.shadows, &instances[1], None, range)
-                }
-                Command::Underlines(range) => {
-                    draw(pass!(), &pipelines.underlines, &instances[2], None, range)
-                }
-                Command::Mono(id, range) => {
-                    if let Some(texture) = atlas.get(*id) {
-                        draw(
-                            pass!(),
-                            &pipelines.mono,
-                            &instances[3],
-                            Some(&texture.group),
-                            range,
-                        );
-                    }
-                }
-                Command::Poly(id, range) => {
-                    if let Some(texture) = atlas.get(*id) {
-                        draw(
-                            pass!(),
-                            &pipelines.poly,
-                            &instances[4],
-                            Some(&texture.group),
-                            range,
-                        );
-                    }
+                Command::Draw {
+                    ref instances,
+                    mask_page,
+                    color_page,
+                } => {
+                    let Some(buffer) = &self.instances else {
+                        continue;
+                    };
+                    let wipe = std::mem::take(&mut current.1);
+                    let into = pass.get_or_insert_with(|| open(&mut encoder, current.0, wipe));
+                    let sources = self
+                        .sources
+                        .1
+                        .entry([mask_page, color_page])
+                        .or_insert_with(|| {
+                            bind([page(false, mask_page), page(true, color_page), &gpu.blank])
+                        });
+                    into.set_pipeline(&pipelines.draw);
+                    into.set_bind_group(1, &*sources, &[]);
+                    into.set_vertex_buffer(0, buffer.slice(..));
+                    into.draw(0..4, instances.clone());
                 }
                 Command::Blur { src, dst, index } => {
                     pass = None;
-                    let saved = current.0;
-                    current = (*dst, true);
-                    let source = gpu.texture_group(view(*src));
-                    draw(
-                        pass!(),
-                        &pipelines.blurs,
-                        &instances[6],
-                        Some(&source),
-                        &(*index..*index + 1),
-                    );
-                    pass = None;
-                    current.0 = saved;
+                    let mut blur = open(&mut encoder, dst, true);
+                    blur.set_pipeline(&pipelines.blur);
+                    blur.set_bind_group(1, &bind([view(src); 3]), &[]);
+                    let offset = blurs + u64::from(index) * strides[2];
+                    blur.set_bind_group(2, params, &[0, offset as u32]);
+                    blur.draw(0..4, 0..1);
                 }
                 Command::Copy { src, dst, region } => {
                     pass = None;
-                    let (from, to) = (frame.origin(*src), frame.origin(*dst));
-                    encoder.copy_texture_to_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: texture(*src),
-                            mip_level: 0,
-                            origin: wgpu::Origin3d {
-                                x: (region[0] - from[0]) as u32,
-                                y: (region[1] - from[1]) as u32,
-                                z: 0,
-                            },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::TexelCopyTextureInfo {
-                            texture: texture(*dst),
-                            mip_level: 0,
-                            origin: wgpu::Origin3d {
-                                x: (region[0] - to[0]) as u32,
-                                y: (region[1] - to[1]) as u32,
-                                z: 0,
-                            },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::Extent3d {
-                            width: region[2] as u32,
-                            height: region[3] as u32,
-                            depth_or_array_layers: 1,
-                        },
-                    );
+                    let place = |target: Target| {
+                        let [x, y] = frame.origin(target);
+                        Origin3d {
+                            x: (region[0] - x) as u32,
+                            y: (region[1] - y) as u32,
+                            z: 0,
+                        }
+                    };
+                    let from = wgpu::TexelCopyTextureInfo {
+                        origin: place(src),
+                        ..raw(src).as_image_copy()
+                    };
+                    let to = wgpu::TexelCopyTextureInfo {
+                        origin: place(dst),
+                        ..raw(dst).as_image_copy()
+                    };
+                    encoder.copy_texture_to_texture(from, to, extent(region[2], region[3]));
                 }
                 Command::Composite {
                     src,
@@ -947,292 +867,168 @@ impl Renderer {
                     backdrop,
                     index,
                 } => {
-                    let views = [
-                        view(*src),
-                        mask.and_then(|id| atlas.get(id))
-                            .map_or(&self.empty, |texture| &texture.view),
-                        backdrop.map_or(&self.empty, view),
-                    ];
-                    let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &gpu.layouts.composite,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(views[0]),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::Sampler(&gpu.sampler),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::TextureView(views[1]),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 3,
-                                resource: wgpu::BindingResource::TextureView(views[2]),
-                            },
-                        ],
-                    });
-                    draw(
-                        pass!(),
-                        &pipelines.composites,
-                        &instances[5],
-                        Some(&group),
-                        &(*index..*index + 1),
+                    let wipe = std::mem::take(&mut current.1);
+                    let into = pass.get_or_insert_with(|| open(&mut encoder, current.0, wipe));
+                    let source = view(src);
+                    let mask = mask.map_or(source, |mask| page(true, Some(mask)));
+                    into.set_pipeline(&pipelines.composite);
+                    into.set_bind_group(
+                        1,
+                        &bind([source, mask, backdrop.map_or(source, view)]),
+                        &[],
                     );
+                    let offset = composites + u64::from(index) * strides[1];
+                    into.set_bind_group(2, params, &[offset as u32, 0]);
+                    into.draw(0..4, 0..1);
                 }
             }
         }
         drop(pass);
-        let readback = capture.then(|| {
-            ensure!(
-                self.config.usage.contains(wgpu::TextureUsages::COPY_SRC),
-                "The window surface can't be read"
-            );
+        let read = capture.then(|| {
+            let readable = self.config.usage.contains(TextureUsages::COPY_SRC);
+            ensure!(readable, "The window surface can't be read");
             let row = (output.width() * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-            let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: u64::from(row) * u64::from(output.height()),
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            encoder.copy_texture_to_buffer(
-                output.as_image_copy(),
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(row),
-                        rows_per_image: None,
-                    },
-                },
-                output.size(),
+            let buffer = gpu.buffer(
+                u64::from(row) * u64::from(output.height()),
+                BufferUsages::MAP_READ,
             );
+            let layout = wgpu::TexelCopyBufferLayout {
+                bytes_per_row: Some(row),
+                ..Default::default()
+            };
+            let into = wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout,
+            };
+            encoder.copy_texture_to_buffer(output.as_image_copy(), into, output.size());
             Ok(buffer)
         });
         gpu.queue.submit([encoder.finish()]);
-        Ok(readback)
+        Ok(read)
     }
 }
 
-fn globals_group(gpu: &Gpu, buffer: &wgpu::Buffer) -> wgpu::BindGroup {
-    gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &gpu.layouts.globals,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer,
-                offset: 0,
-                size: NonZeroU64::new(mem::size_of::<Globals>() as u64),
-            }),
-        }],
-    })
-}
-
-fn draw(
-    pass: &mut wgpu::RenderPass<'static>,
-    pipeline: &wgpu::RenderPipeline,
-    instances: &wgpu::BindGroup,
-    texture: Option<&wgpu::BindGroup>,
-    range: &Range<u32>,
-) {
-    if range.is_empty() {
-        return;
-    }
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(1, instances, &[]);
-    if let Some(texture) = texture {
-        pass.set_bind_group(2, texture, &[]);
-    }
-    pass.draw(0..4, range.clone());
-}
-
-pub(crate) struct AtlasTextures {
+pub(crate) struct Pages {
     gpu: Rc<Gpu>,
-    mono: TextureList<AtlasTexture>,
-    poly: TextureList<AtlasTexture>,
+    mask: PageList<Page>,
+    color: PageList<Page>,
+    // Changes whenever a page comes or goes, so cached bind groups never read a dropped texture.
+    generation: u64,
 }
 
-struct AtlasTexture {
-    id: AtlasTextureId,
+struct Page {
     packer: Packer,
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    group: wgpu::BindGroup,
+    texture: Texture,
+    view: TextureView,
 }
 
-impl AtlasTextures {
+impl Pages {
     fn new(gpu: Rc<Gpu>) -> Self {
         Self {
             gpu,
-            mono: TextureList::default(),
-            poly: TextureList::default(),
+            mask: PageList::default(),
+            color: PageList::default(),
+            generation: 0,
         }
     }
 
-    fn list(&mut self, kind: AtlasTextureKind) -> &mut TextureList<AtlasTexture> {
-        match kind {
-            AtlasTextureKind::Monochrome => &mut self.mono,
-            AtlasTextureKind::Polychrome => &mut self.poly,
-        }
-    }
-
-    fn get(&self, id: AtlasTextureId) -> Option<&AtlasTexture> {
-        match id.kind {
-            AtlasTextureKind::Monochrome => &self.mono,
-            AtlasTextureKind::Polychrome => &self.poly,
-        }
-        .get(id.index as usize)
-    }
-
-    fn allocate(
-        &mut self,
-        kind: AtlasTextureKind,
-        size: Size<DevicePixels>,
-    ) -> Result<(AtlasTile, &AtlasTexture)> {
-        let list = self.list(kind);
-        let mut hit = None;
-        for (index, texture) in list.textures.iter_mut().enumerate().rev() {
-            if let Some(texture) = texture
-                && let Some(tile) = texture.packer.allocate(size)
-            {
-                hit = Some((index, tile));
-                break;
-            }
-        }
-        let (index, (bounds, tile_id)) = match hit {
-            Some(hit) => hit,
-            None => {
-                let texture_size = page_size(size);
-                let texture = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
-                    label: None,
-                    size: wgpu::Extent3d {
-                        width: texture_size.width.0 as u32,
-                        height: texture_size.height.0 as u32,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: match kind {
-                        AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
-                        AtlasTextureKind::Polychrome => self.gpu.color_format,
-                    },
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                });
-                let view = texture.create_view(&Default::default());
-                let group = self.gpu.texture_group(&view);
-                let list = self.list(kind);
-                let index = list.push(|index| AtlasTexture {
-                    id: AtlasTextureId {
-                        index: index as u32,
-                        kind,
-                    },
-                    packer: Packer::new(texture_size),
-                    texture,
-                    view,
-                    group,
-                });
-                let tile = list.textures[index]
-                    .as_mut()
-                    .and_then(|texture| texture.packer.allocate(size))
-                    .context("allocating atlas tile")?;
-                (index, tile)
-            }
-        };
-        let texture = self.list(kind).textures[index]
-            .as_ref()
-            .context("atlas texture")?;
-        Ok((
-            AtlasTile {
-                texture_id: texture.id,
-                tile_id,
-                padding: 0,
-                bounds,
-            },
-            texture,
-        ))
+    fn view(&self, color: bool, index: u32) -> Option<&TextureView> {
+        let list = if color { &self.color } else { &self.mask };
+        Some(&list.get(index as usize)?.view)
     }
 }
 
-impl AtlasBackend for AtlasTextures {
-    fn insert(
-        &mut self,
-        kind: AtlasTextureKind,
-        size: Size<DevicePixels>,
-        bytes: &[u8],
-    ) -> Result<AtlasTile> {
+impl PageStore for Pages {
+    fn insert(&mut self, kind: PageKind, size: Size<i32>, data: &[u8]) -> Result<Tile> {
         ensure!(
-            size.width.0 > 0 && size.height.0 > 0,
+            size.width > 0 && size.height > 0,
             "atlas tiles must have a size"
         );
-        let pixel = if kind == AtlasTextureKind::Monochrome {
-            1
+        let color = matches!(kind, PageKind::Color);
+        let row = size.width as usize * if color { 4 } else { 1 };
+        let data = data
+            .get(..row * size.height as usize)
+            .context("atlas upload is too short")?;
+        let gpu = self.gpu.clone();
+        let format = if color {
+            gpu.color
         } else {
-            4
+            TextureFormat::R8Unorm
         };
-        let row = size.width.0 as u32 * pixel;
-        let bytes = &bytes[..(row * size.height.0 as u32) as usize];
-        let rgba;
-        let bytes = if kind == AtlasTextureKind::Polychrome
-            && self.gpu.color_format == wgpu::TextureFormat::Rgba8Unorm
-        {
-            rgba = bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .flat_map(|&[b, g, r, a]| [r, g, b, a])
-                .collect::<Vec<_>>();
-            &rgba[..]
+        let list = if color {
+            &mut self.color
         } else {
-            bytes
+            &mut self.mask
         };
-        let queue = self.gpu.queue.clone();
-        let (tile, texture) = self.allocate(kind, size)?;
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: tile.bounds.origin.x.0 as u32,
-                    y: tile.bounds.origin.y.0 as u32,
-                    z: 0,
-                },
-                aspect: wgpu::TextureAspect::All,
+        let mut grew = false;
+        let (index, rect, id) = list.allocate(
+            size,
+            |page| &mut page.packer,
+            |size| {
+                grew = true;
+                let side = [size.width as u32, size.height as u32];
+                let usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+                let made = texture(&gpu.device, side, format, usage);
+                let view = made.create_view(&Default::default());
+                Ok(Page {
+                    packer: Packer::new(size),
+                    texture: made,
+                    view,
+                })
             },
-            bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(row),
-                rows_per_image: None,
-            },
-            wgpu::Extent3d {
-                width: size.width.0 as u32,
-                height: size.height.0 as u32,
-                depth_or_array_layers: 1,
-            },
-        );
-        Ok(tile)
+        )?;
+        self.generation += u64::from(grew);
+        let page = list.get(index).context("atlas page")?;
+        let swizzled: Vec<u8>;
+        let data = match color && format == TextureFormat::Rgba8Unorm {
+            true => {
+                swizzled = data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|&[b, g, r, a]| [r, g, b, a])
+                    .collect();
+                &swizzled
+            }
+            false => data,
+        };
+        let origin = Origin3d {
+            x: rect.origin.x as u32,
+            y: rect.origin.y as u32,
+            z: 0,
+        };
+        let target = wgpu::TexelCopyTextureInfo {
+            origin,
+            ..page.texture.as_image_copy()
+        };
+        let layout = wgpu::TexelCopyBufferLayout {
+            bytes_per_row: Some(row as u32),
+            ..Default::default()
+        };
+        gpu.queue
+            .write_texture(target, data, layout, extent(size.width, size.height));
+        Ok(Tile {
+            page: index as u32,
+            kind,
+            id,
+            rect,
+        })
     }
 
     fn max_side(&self) -> i32 {
         self.gpu.device.limits().max_texture_dimension_2d as i32
     }
 
-    fn remove(&mut self, tile: AtlasTile) {
-        let list = self.list(tile.texture_id.kind);
-        let index = tile.texture_id.index as usize;
-        let empty = list
-            .textures
-            .get_mut(index)
-            .and_then(Option::as_mut)
-            .is_some_and(|texture| texture.packer.free(tile.tile_id));
-        if empty {
-            list.emptied(index, |texture| texture.packer.is_empty());
+    fn remove(&mut self, tile: Tile) {
+        let list = match tile.kind {
+            PageKind::Mask => &mut self.mask,
+            PageKind::Color => &mut self.color,
+        };
+        let index = tile.page as usize;
+        let page = list.pages.get_mut(index).and_then(Option::as_mut);
+        if page.is_some_and(|page| page.packer.free(tile.id)) {
+            list.emptied(index, |page| page.packer.is_empty());
+            self.generation += 1;
         }
     }
 }

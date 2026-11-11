@@ -9,5 +9,5 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow.workspace = true
-base64 = "0.22"
+base64 = "0.23.1"
 serde_json.workspace = true

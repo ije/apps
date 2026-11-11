@@ -1,7 +1,7 @@
 use super::paint::Effected;
 use crate::style;
 use crate::style::Prop;
-use renderer::{Child, px, rgba};
+use renderer::{Child, Color, px};
 use std::{
     collections::{HashMap, VecDeque},
     rc::Rc,
@@ -25,7 +25,7 @@ fn redraw_when_decoded(
         {
             window.refresh();
         } else {
-            window.on_next_frame(redraw_when_decoded(decoding));
+            window.next_frame(redraw_when_decoded(decoding));
         }
     }
 }
@@ -161,7 +161,8 @@ pub(super) fn css_background(
                             if backgrounds.get(&key).is_none_or(|(old, image)| {
                                 *old != source
                                     || !fixed(backgrounds, image)
-                                        && [image.size().width, image.size().height].map(u32::from)
+                                        && [image.size().width, image.size().height]
+                                            .map(|side| side as u32)
                                             != cell
                             }) {
                                 // Take a decoded bitmap only where a layer holds it at once, since `retire`
@@ -225,7 +226,7 @@ pub(super) fn css_background(
                                                 {
                                                     jobs.1 += 1;
                                                 }
-                                                window.on_next_frame(redraw_when_decoded(slot));
+                                                window.next_frame(redraw_when_decoded(slot));
                                             }
                                             return;
                                         };
@@ -235,7 +236,7 @@ pub(super) fn css_background(
                                         image
                                     }
                                 };
-                                let image = if u32::from(bitmap.size().width) > 0 {
+                                let image = if (bitmap.size().width as u32) > 0 {
                                     bitmap
                                 } else {
                                     let svg = std::fs::read_to_string(&path)
@@ -244,15 +245,14 @@ pub(super) fn css_background(
                                             let natural =
                                                 usvg::Tree::from_str(&text, &Default::default())?
                                                     .size();
-                                            let fitted = fit.get_bounds(
-                                                renderer::Bounds::new(
+                                            let fitted = fit.place(
+                                                renderer::Rect::new(
                                                     renderer::point(px(0.), px(0.)),
                                                     renderer::size(px(width), px(height)),
                                                 ),
                                                 renderer::size(
-                                                    (natural.width().round().max(1.) as u32).into(),
-                                                    (natural.height().round().max(1.) as u32)
-                                                        .into(),
+                                                    natural.width().round().max(1.) as u32 as i32,
+                                                    natural.height().round().max(1.) as u32 as i32,
                                                 ),
                                             );
                                             super::canvas::svg(
@@ -315,20 +315,20 @@ pub(super) fn css_background(
                                     backgrounds.insert(key, (source.clone(), image))
                                     && Arc::strong_count(&old) == 1
                                 {
-                                    window.drop_image(old);
+                                    window.release_image(old);
                                 }
                             }
                             let Some((_, image)) = backgrounds.get(&key) else {
                                 return;
                             };
                             let natural = image.size();
-                            if u32::from(natural.width) == 0 || u32::from(natural.height) == 0 {
+                            if (natural.width as u32) == 0 || (natural.height as u32) == 0 {
                                 return;
                             }
                             if tiled {
                                 // Calculate visible tile indices directly. Iteration from distant origins or
                                 // across tiny tiles can run indefinitely.
-                                let visible = window.content_mask().bounds.intersect(&bounds);
+                                let visible = window.content_mask().bounds.intersect(bounds);
                                 let [width, height] = [width * nx, height * ny];
                                 let origin = [
                                     f32::from(bounds.origin.x) + tile_x,
@@ -358,9 +358,9 @@ pub(super) fn css_background(
                                 }
                                 for row in rows {
                                     for column in columns.clone() {
-                                        window.paint_image(
+                                        window.draw_image(
                                             bounds,
-                                            renderer::Bounds::new(
+                                            renderer::Rect::new(
                                                 renderer::point(
                                                     px(origin[0] + column as f32 * width),
                                                     px(origin[1] + row as f32 * height),
@@ -376,11 +376,11 @@ pub(super) fn css_background(
                                 return;
                             }
                             let target = if fixed(backgrounds, image) {
-                                fit.get_bounds(bounds, natural)
+                                fit.place(bounds, natural)
                             } else {
                                 bounds
                             };
-                            window.paint_image(
+                            window.draw_image(
                                 bounds,
                                 target,
                                 renderer::Corners::default(),
@@ -480,7 +480,8 @@ pub(super) fn css_background(
                     let dom = host.dom.entry(view.id).or_default();
                     let key = (id, slot * 64 + index);
                     let fits = |image: &renderer::RenderImage| {
-                        [image.size().width, image.size().height].map(u32::from) == [rw, rh]
+                        [image.size().width, image.size().height].map(|side| side as u32)
+                            == [rw, rh]
                     };
                     let entry = dom.backgrounds.get(&key);
                     if entry.is_none_or(|(old, image)| old != &inputs || !fits(image)) {
@@ -506,9 +507,7 @@ pub(super) fn css_background(
                             if new && rw * rh * 4 <= LIMIT / 4 {
                                 dom.gradients.push((inputs.clone(), image.clone()));
                                 let bytes = |image: &renderer::RenderImage| {
-                                    u32::from(image.size().width)
-                                        * u32::from(image.size().height)
-                                        * 4
+                                    image.size().width as u32 * (image.size().height as u32) * 4
                                 };
                                 let mut total: u32 =
                                     dom.gradients.iter().map(|(_, image)| bytes(image)).sum();
@@ -516,7 +515,7 @@ pub(super) fn css_background(
                                     let (_, old) = dom.gradients.remove(0);
                                     total -= bytes(&old);
                                     if Arc::strong_count(&old) == 1 {
-                                        window.drop_image(old);
+                                        window.release_image(old);
                                     }
                                 }
                             }
@@ -529,14 +528,14 @@ pub(super) fn css_background(
                         if let Some((_, old)) = old
                             && Arc::strong_count(&old) == 1
                         {
-                            window.drop_image(old);
+                            window.release_image(old);
                         }
                     }
                     if let Some((_, image)) = dom.backgrounds.get(&key)
                         && let Some([x, y]) = tiled
                     {
                         // Tiles snap to device pixels, so their edges never sample other atlas tiles.
-                        let visible = window.content_mask().bounds.intersect(&bounds);
+                        let visible = window.content_mask().bounds.intersect(bounds);
                         let start = |edge, at: f32, side: f32, cell: f32, low| {
                             let at = f32::from(edge) + at - if at > 0. { side } else { 0. };
                             let at = (at * scale).round() / scale;
@@ -546,11 +545,11 @@ pub(super) fn css_background(
                         while top < visible.bottom() {
                             let mut left = start(bounds.left(), x, tw, cw, visible.left());
                             while left < visible.right() {
-                                let target = renderer::Bounds::new(
+                                let target = renderer::Rect::new(
                                     renderer::point(left, top),
                                     renderer::size(px(cw), px(ch)),
                                 );
-                                window.paint_image(bounds, target, radii, image.clone(), false);
+                                window.draw_image(bounds, target, radii, image.clone(), false);
                                 left += px(cw);
                             }
                             top += px(ch);
@@ -558,17 +557,17 @@ pub(super) fn css_background(
                     } else if let Some((_, image)) = dom.backgrounds.get(&key) {
                         let (origin, size) = (bounds.origin, bounds.size);
                         let target = match axis {
-                            Some(1) => renderer::Bounds::new(
+                            Some(1) => renderer::Rect::new(
                                 renderer::point(origin.x - size.width, origin.y),
                                 renderer::size(size.width * 3., size.height),
                             ),
-                            Some(_) => renderer::Bounds::new(
+                            Some(_) => renderer::Rect::new(
                                 renderer::point(origin.x, origin.y - size.height),
                                 renderer::size(size.width, size.height * 3.),
                             ),
                             None => bounds,
                         };
-                        window.paint_image(
+                        window.draw_image(
                             bounds,
                             target,
                             radius.resolve(bounds.size),
@@ -597,7 +596,7 @@ pub(super) fn css_background(
         let mut color = renderer::node()
             .absolute()
             .size_full()
-            .bg(rgba(ink << 8 | alpha as u32));
+            .bg(Color::hex(ink << 8 | alpha as u32));
         color.style().corner_radii = radius;
         group = group.child(color);
     }

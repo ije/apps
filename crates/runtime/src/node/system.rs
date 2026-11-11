@@ -509,7 +509,8 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                     #[cfg_attr(target_os = "macos", link_name = "res_9_ninit")]
                     #[cfg_attr(target_os = "linux", link_name = "__res_ninit")]
                     fn res_ninit(state: *mut u64) -> i32;
-                    #[cfg_attr(target_os = "macos", link_name = "res_9_nsend")]
+                    #[cfg(target_os = "macos")]
+                    #[link_name = "res_9_nsend"]
                     fn res_nsend(
                         state: *mut u64,
                         query: *const u8,
@@ -521,6 +522,24 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                     #[cfg_attr(target_os = "linux", link_name = "__res_nclose")]
                     fn res_ndestroy(state: *mut u64);
                 }
+                // WARNING: glibc 2.34 moved `__res_nsend` into libc as `res_nsend`, so neither name links on
+                // every glibc. Look it up once at run time.
+                #[cfg(target_os = "linux")]
+                let res_nsend = {
+                    type Nsend =
+                        unsafe extern "C" fn(*mut u64, *const u8, i32, *mut u8, i32) -> i32;
+                    static NSEND: std::sync::OnceLock<Option<Nsend>> = std::sync::OnceLock::new();
+                    (*NSEND.get_or_init(|| unsafe {
+                        // A null handle searches the libraries of the process.
+                        let library = libc::dlopen(c"libresolv.so.2".as_ptr(), libc::RTLD_NOW);
+                        [c"res_nsend", c"__res_nsend"]
+                            .into_iter()
+                            .map(|name| libc::dlsym(library, name.as_ptr()))
+                            .find(|symbol| !symbol.is_null())
+                            .map(|symbol| std::mem::transmute::<*mut libc::c_void, Nsend>(symbol))
+                    }))
+                    .context("ENOTINITIALIZED")?
+                };
                 let kind = args[1].as_u64().context("Expected record type")? as u16;
                 let mut name = args[0]
                     .as_str()

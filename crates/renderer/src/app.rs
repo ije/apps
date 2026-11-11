@@ -1,6 +1,6 @@
 use crate::{
-    Bounds, FileDropEvent, Pixels, PlatformInput, Point, ScrollDelta, Size, TextSystem,
-    Utf16Selection, View, Window, WindowId, WindowOptions, platform,
+    Event, Pixels, Point, Rect, Size, TextSystem, Utf16Selection, View, Window, WindowId,
+    WindowOptions, platform,
 };
 use anyhow::Result;
 use std::{
@@ -10,78 +10,72 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
-type Callback = Box<dyn FnOnce(&mut App)>;
-type WakeCallback = Rc<RefCell<dyn FnMut(&mut App)>>;
+type Job = Box<dyn FnOnce(&mut App)>;
+type Wake = Rc<RefCell<dyn FnMut(&mut App)>>;
 
 pub struct App {
     pub(crate) platform: Rc<platform::Platform>,
     text_system: Rc<TextSystem>,
+    // A window is `None` while `update_window` lends it out.
     windows: BTreeMap<WindowId, Option<Box<Window>>>,
-    deferred: Vec<Callback>,
-    pub(crate) propagate_event: bool,
-    on_wake: Option<WakeCallback>,
-    waker: Arc<AtomicBool>,
+    deferred: Vec<Job>,
+    pub(crate) event_stopped: bool,
+    on_wake: Option<Wake>,
+    wake_pending: Arc<AtomicBool>,
 }
 
-struct AppCell {
+struct Home {
     app: RefCell<App>,
-    queue: RefCell<VecDeque<Callback>>,
+    backlog: RefCell<VecDeque<Job>>,
 }
 
 thread_local! {
-    static APP: RefCell<Option<Rc<AppCell>>> = const { RefCell::new(None) };
+    static HOME: RefCell<Option<Rc<Home>>> = const { RefCell::new(None) };
 }
 
-fn cell() -> Option<Rc<AppCell>> {
-    APP.with_borrow(Clone::clone)
+fn home() -> Option<Rc<Home>> {
+    HOME.with_borrow(Option::clone)
 }
 
-pub(crate) fn update(f: impl FnOnce(&mut App) + 'static) {
-    let Some(cell) = cell() else {
-        return;
-    };
-    match cell.app.try_borrow_mut() {
-        Ok(mut app) => {
-            f(&mut app);
+impl Home {
+    fn enter<R, F: FnOnce(&mut App) -> R>(&self, job: F) -> Result<R, F> {
+        let Ok(mut app) = self.app.try_borrow_mut() else {
+            return Err(job);
+        };
+        let result = job(&mut app);
+        app.flush();
+        drop(app);
+        loop {
+            let job = self.backlog.borrow_mut().pop_front();
+            let Some(job) = job else {
+                break;
+            };
+            let Ok(mut app) = self.app.try_borrow_mut() else {
+                self.backlog.borrow_mut().push_front(job);
+                break;
+            };
+            job(&mut app);
             app.flush();
         }
-        Err(_) => {
-            cell.queue.borrow_mut().push_back(Box::new(f));
-            return;
-        }
+        Ok(result)
     }
-    drain(&cell);
 }
 
-pub(crate) fn try_update<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
-    let cell = cell()?;
-    let result = {
-        let mut app = cell.app.try_borrow_mut().ok()?;
-        let result = f(&mut app);
-        app.flush();
-        result
-    };
-    drain(&cell);
-    Some(result)
+pub(crate) fn update(job: impl FnOnce(&mut App) + 'static) {
+    if let Some(home) = home()
+        && let Err(job) = home.enter(job)
+    {
+        home.backlog.borrow_mut().push_back(Box::new(job));
+    }
 }
 
-fn drain(cell: &AppCell) {
-    loop {
-        let Some(next) = cell.queue.borrow_mut().pop_front() else {
-            return;
-        };
-        let Ok(mut app) = cell.app.try_borrow_mut() else {
-            cell.queue.borrow_mut().push_front(next);
-            return;
-        };
-        next(&mut app);
-        app.flush();
-    }
+pub(crate) fn try_update<R>(job: impl FnOnce(&mut App) -> R) -> Option<R> {
+    home()?.enter(job).ok()
 }
 
 fn install(platform: Rc<platform::Platform>) {
@@ -90,84 +84,75 @@ fn install(platform: Rc<platform::Platform>) {
         text_system: Rc::new(TextSystem::new()),
         windows: BTreeMap::new(),
         deferred: Vec::new(),
-        propagate_event: true,
+        event_stopped: false,
         on_wake: None,
-        waker: Arc::default(),
+        wake_pending: Arc::default(),
     };
-    APP.with_borrow_mut(|slot| {
-        *slot = Some(Rc::new(AppCell {
-            app: RefCell::new(app),
-            queue: RefCell::default(),
-        }))
-    });
+    let home = Home {
+        app: RefCell::new(app),
+        backlog: RefCell::default(),
+    };
+    HOME.with_borrow_mut(|slot| *slot = Some(Rc::new(home)));
 }
 
 pub const THREAD_PER_APP: bool = cfg!(target_os = "macos");
 
 pub fn spawn(init: impl FnOnce(&mut App) + Send + 'static) {
-    #[cfg(target_os = "macos")]
     platform::spawn_render(
         move || {
-            install(Rc::new(platform::Platform::new()));
+            if home().is_none() {
+                install(Rc::new(platform::Platform::new()));
+            }
             update(init);
         },
         // Drop windows before thread-local teardown: their destructors need other thread locals.
-        || {
-            APP.with_borrow_mut(|slot| *slot = None);
-        },
+        || HOME.with_borrow_mut(|slot| *slot = None),
     );
-    #[cfg(not(target_os = "macos"))]
-    update(init);
 }
 
 pub fn run(native: impl FnOnce() + 'static) {
     let platform = Rc::new(platform::Platform::new());
-    #[cfg(target_os = "macos")]
-    platform.run(Box::new(native));
-    #[cfg(not(target_os = "macos"))]
-    {
+    if !THREAD_PER_APP {
         install(platform.clone());
-        platform.run(Box::new(native));
-        // Close native views before the app: their callbacks can still access it.
-        let windows = cell().map(|cell| std::mem::take(&mut cell.app.borrow_mut().windows));
-        drop(windows);
-        APP.with_borrow_mut(|slot| *slot = None);
     }
+    platform.run(Box::new(native));
+    // Close native views before the app: their callbacks can still access it.
+    let windows = home().map(|home| std::mem::take(&mut home.app.borrow_mut().windows));
+    drop(windows);
+    HOME.with_borrow_mut(|slot| *slot = None);
 }
 
+/// Wakes that arrive before the app runs merge into one.
 #[derive(Clone)]
 pub struct Waker {
     pending: Arc<AtomicBool>,
-    #[cfg(target_os = "macos")]
     thread: platform::AppThread,
 }
 
 impl Waker {
     pub fn wake(&self) {
-        if !self.pending.swap(true, Ordering::AcqRel) {
-            let pending = self.pending.clone();
-            let wake = Box::new(move || {
-                pending.store(false, Ordering::Release);
-                update(|app| {
-                    if let Some(callback) = app.on_wake.clone() {
-                        (callback.borrow_mut())(app);
-                    }
-                });
-            });
-            #[cfg(target_os = "macos")]
-            platform::post(self.thread, wake);
-            #[cfg(not(target_os = "macos"))]
-            platform::post(wake);
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return;
         }
+        let pending = self.pending.clone();
+        let wake = Box::new(move || {
+            pending.store(false, Ordering::Release);
+            update(|app| {
+                if let Some(on_wake) = app.on_wake.clone() {
+                    (on_wake.borrow_mut())(app);
+                }
+            });
+        });
+        platform::post(self.thread, wake);
     }
 }
 
-pub(crate) fn timer(delay: Duration, f: impl FnOnce(&mut App) + 'static) -> Timer {
+pub(crate) fn timer(delay: Duration, job: impl FnOnce(&mut App) + 'static) -> Timer {
     let cancelled = Rc::new(Cell::new(false));
-    let flag = cancelled.clone();
+    let seen = cancelled.clone();
     platform::run_after(delay, move || {
-        if !flag.get() {
-            update(f);
+        if !seen.get() {
+            update(job);
         }
     });
     Timer {
@@ -176,6 +161,7 @@ pub(crate) fn timer(delay: Duration, f: impl FnOnce(&mut App) + 'static) -> Time
     }
 }
 
+/// Cancels its callback when dropped, unless detached.
 pub struct Timer {
     cancelled: Rc<Cell<bool>>,
     detached: bool,
@@ -196,41 +182,39 @@ impl Drop for Timer {
 }
 
 impl App {
-    pub fn stop_propagation(&mut self) {
-        self.propagate_event = false;
+    pub fn stop_event(&mut self) {
+        self.event_stopped = true;
     }
 
-    pub fn defer(&mut self, f: impl FnOnce(&mut App) + 'static) {
-        self.deferred.push(Box::new(f));
+    pub fn defer(&mut self, job: impl FnOnce(&mut App) + 'static) {
+        self.deferred.push(Box::new(job));
     }
 
-    pub fn timer(&mut self, delay: Duration, f: impl FnOnce(&mut App) + 'static) -> Timer {
-        timer(delay, f)
+    pub fn timer(&mut self, delay: Duration, job: impl FnOnce(&mut App) + 'static) -> Timer {
+        timer(delay, job)
     }
 
     pub fn waker(&self) -> Waker {
         Waker {
-            pending: self.waker.clone(),
-            #[cfg(target_os = "macos")]
+            pending: self.wake_pending.clone(),
             thread: platform::app_thread(),
         }
     }
 
     pub fn end_thread(&self) {
-        #[cfg(target_os = "macos")]
         platform::end_thread();
     }
 
-    pub fn on_wake(&mut self, f: impl FnMut(&mut App) + 'static) {
-        self.on_wake = Some(Rc::new(RefCell::new(f)));
+    pub fn on_wake(&mut self, handler: impl FnMut(&mut App) + 'static) {
+        self.on_wake = Some(Rc::new(RefCell::new(handler)));
     }
 
     pub fn quit(&mut self) {
         self.platform.quit();
     }
 
-    pub fn activate(&self, ignoring_other_apps: bool) {
-        self.platform.activate(ignoring_other_apps);
+    pub fn activate(&self, force: bool) {
+        self.platform.activate(force);
     }
 
     pub fn read_clipboard(&self) -> Option<String> {
@@ -241,17 +225,15 @@ impl App {
         self.platform.write_clipboard(&text);
     }
 
-    pub fn primary_display_bounds(&self) -> Option<Bounds<Pixels>> {
+    pub fn primary_display_bounds(&self) -> Option<Rect> {
         self.platform.primary_display_bounds()
     }
 
-    pub fn centered(&self, size: Size<Pixels>) -> Bounds<Pixels> {
+    pub fn centered(&self, size: Size<Pixels>) -> Rect {
         let display = self.primary_display_bounds().unwrap_or_default();
-        Bounds::new(
-            Point::new(
-                display.origin.x + (display.size.width - size.width) / 2.,
-                display.origin.y + (display.size.height - size.height) / 2.,
-            ),
+        let room = display.size - size;
+        Rect::new(
+            display.origin + Point::new(room.width / 2., room.height / 2.),
             size,
         )
     }
@@ -261,23 +243,16 @@ impl App {
         options: WindowOptions,
         build: impl FnOnce(&mut Window, &mut App) -> Box<dyn View>,
     ) -> Result<WindowId> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let id = WindowId(NEXT.fetch_add(1, Ordering::Relaxed));
-        let platform = self.platform.open_window(
-            &options,
-            Callbacks {
-                id,
-                #[cfg(target_os = "macos")]
-                thread: platform::app_thread(),
-            },
-        )?;
-        let mut window = Box::new(Window::new(
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let id = WindowId(LAST.fetch_add(1, Ordering::Relaxed) + 1);
+        let callbacks = Callbacks {
             id,
-            platform,
-            Rc::new(self.text_system.for_window()),
-        ));
-        let view = build(&mut window, self);
-        window.view = Some(view);
+            thread: platform::app_thread(),
+        };
+        let native = self.platform.open_window(&options, callbacks)?;
+        let text_system = Rc::new(self.text_system.for_window());
+        let mut window = Box::new(Window::new(id, native, text_system));
+        window.view = Some(build(&mut window, self));
         window.refresh();
         self.windows.insert(id, Some(window));
         Ok(id)
@@ -287,13 +262,14 @@ impl App {
         self.windows.keys().copied().collect()
     }
 
+    /// `None` when the window is closed or already lent.
     pub fn update_window<R>(
         &mut self,
         id: WindowId,
-        f: impl FnOnce(&mut Window, &mut App) -> R,
+        lend: impl FnOnce(&mut Window, &mut App) -> R,
     ) -> Option<R> {
         let mut window = self.windows.get_mut(&id)?.take()?;
-        let result = f(&mut window, self);
+        let result = lend(&mut window, self);
         if let Some(slot) = self.windows.get_mut(&id) {
             *slot = Some(window);
         }
@@ -304,16 +280,17 @@ impl App {
         self.update_window(id, |window, _| window.refresh());
     }
 
+    // At most 1024 rounds of deferred work.
     fn flush(&mut self) {
         for _ in 0..1024 {
-            let deferred = std::mem::take(&mut self.deferred);
             self.windows
-                .retain(|_, window| !window.as_ref().is_some_and(|window| window.removed));
+                .retain(|_, window| window.as_ref().is_none_or(|window| !window.closed));
+            let deferred = std::mem::take(&mut self.deferred);
             if deferred.is_empty() {
                 return;
             }
-            for callback in deferred {
-                callback(self);
+            for job in deferred {
+                job(self);
             }
         }
     }
@@ -322,104 +299,85 @@ impl App {
 #[derive(Clone, Copy)]
 pub(crate) struct Callbacks {
     pub id: WindowId,
-    #[cfg(target_os = "macos")]
     pub thread: platform::AppThread,
 }
 
-pub(crate) fn dispatch(window: &mut Window, app: &mut App, mut input: PlatformInput) -> bool {
-    let zoom = window.zoom;
-    if zoom != 1. {
-        match &mut input {
-            PlatformInput::MouseDown(event) => event.position = event.position / zoom,
-            PlatformInput::MouseUp(event) => event.position = event.position / zoom,
-            PlatformInput::MouseMove(event) => event.position = event.position / zoom,
-            PlatformInput::MouseExited(event) => event.position = event.position / zoom,
-            PlatformInput::ScrollWheel(event) => {
-                event.position = event.position / zoom;
-                if let ScrollDelta::Pixels(delta) = &mut event.delta {
-                    *delta = *delta / zoom;
-                }
-            }
-            PlatformInput::FileDrop(
-                FileDropEvent::Entered { position, .. }
-                | FileDropEvent::Pending { position }
-                | FileDropEvent::Submit { position },
-            ) => *position = *position / zoom,
-            _ => {}
-        }
+pub(crate) fn dispatch(window: &mut Window, app: &mut App, mut event: Event) -> bool {
+    if window.zoom != 1. {
+        event.unzoom(window.zoom);
     }
-    window.dispatch_event(input, app)
+    window.dispatch_event(event, app)
 }
 
-pub(crate) fn send_ime_key(window: &mut Window, app: &mut App, ime: bool) -> bool {
-    let Some((mut down, composing)) = window.ime_key.take() else {
+// `ime` is set when the key typed more than one character or composes, and then the page ignores it.
+pub(crate) fn send_ime_key(window: &mut Window, app: &mut App, typed: bool) -> bool {
+    let Some((mut key, composing)) = window.ime_key.take() else {
         return false;
     };
-    down.ime = ime || composing;
-    let ime = down.ime;
-    dispatch(window, app, PlatformInput::KeyDown(down)) && !ime
+    let ime = typed || composing;
+    if let Event::KeyDown { ime: held, .. } = &mut key {
+        *held = ime;
+    }
+    dispatch(window, app, key) && !ime
 }
 
+// Each backend uses the calls it needs.
+#[allow(dead_code)]
 impl Callbacks {
+    // Runs on the app thread and waits for the answer, at most 100 ms from the main thread on macOS.
     pub(crate) fn with<R: Send + 'static>(
         &self,
-        f: impl FnOnce(&mut Window, &mut App) -> R + Send + 'static,
+        job: impl FnOnce(&mut Window, &mut App) -> R + Send + 'static,
     ) -> Option<R> {
         let id = self.id;
-        let run = move || try_update(|app| app.update_window(id, f)).flatten();
-        #[cfg(target_os = "macos")]
-        if cell().is_none() {
-            return platform::ask(self.thread, run).flatten();
+        let run = move || try_update(|app| app.update_window(id, job)).flatten();
+        match home() {
+            Some(_) => run(),
+            None => platform::ask(self.thread, run).flatten(),
         }
-        run()
     }
 
-    pub(crate) fn queue(&self, f: impl FnOnce(&mut Window, &mut App) + Send + 'static) {
+    pub(crate) fn queue(&self, job: impl FnOnce(&mut Window, &mut App) + Send + 'static) {
         let id = self.id;
         let run = move || {
             update(move |app| {
-                app.update_window(id, f);
+                app.update_window(id, job);
             })
         };
-        #[cfg(target_os = "macos")]
-        if cell().is_none() {
-            return platform::post(self.thread, Box::new(run));
+        match home() {
+            Some(_) => run(),
+            None => platform::post(self.thread, Box::new(run)),
         }
-        run();
     }
 
-    pub fn input(&self, input: PlatformInput) -> bool {
+    pub fn input(&self, event: Event) -> bool {
         self.with(move |window, app| {
             window.ime_key = None;
-            dispatch(window, app, input)
+            dispatch(window, app, event)
         })
         .unwrap_or(false)
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn input_later(&self, input: PlatformInput) {
+    pub fn input_later(&self, event: Event) {
         self.queue(move |window, app| {
-            dispatch(window, app, input);
+            dispatch(window, app, event);
         });
     }
 
+    // Frames stop when this returns `Some(false)`, so an idle window gets no calls.
     pub fn frame(&self) -> Option<bool> {
         self.with(|window, app| {
-            for callback in window.take_next_frame_callbacks() {
+            for callback in window.take_frame_callbacks() {
                 callback(window, app);
             }
             if window.dirty || !window.captures.is_empty() {
                 window.draw(app);
             }
         })?;
-        let cell = cell()?;
-        let app = cell.app.borrow();
-        Some(
-            app.windows
-                .get(&self.id)
-                .and_then(Option::as_deref)
-                .is_some_and(Window::wants_frame),
-        )
+        let home = home()?;
+        let app = home.app.borrow();
+        let window = app.windows.get(&self.id)?.as_deref();
+        Some(window.is_some_and(Window::wants_frame))
     }
 
     pub fn resized(&self, size: Size<Pixels>, scale_factor: f32) {
@@ -438,6 +396,7 @@ impl Callbacks {
         });
     }
 
+    // Main decides, and closes the window itself.
     pub fn should_close(&self) -> bool {
         native::window_event(self.id, native::WindowEvent::CloseRequested);
         false
@@ -447,118 +406,94 @@ impl Callbacks {
         self.queue(|window, _| window.refresh());
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn release(&self) {
-        #[cfg(target_os = "macos")]
         self.queue(|window, _| window.platform.release());
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub fn in_drag_area(&self) -> bool {
-        self.with(|window, _| window.in_drag_area())
+    pub fn in_drag_area(&self, at: Point<Pixels>) -> bool {
+        self.with(move |window, _| window.in_drag_area(at / window.zoom))
             .unwrap_or(false)
     }
 
     pub fn accepts_text_input(&self) -> bool {
-        self.with(|window, app| window.with_view(app, |_, _, _| true))
-            .flatten()
+        self.with(|window, app| window.with_view(app, |_, _, _| ()).is_some())
             .unwrap_or(false)
     }
 
-    pub fn selected_text_range(&self) -> Option<Utf16Selection> {
+    pub fn selection(&self) -> Option<Utf16Selection> {
         self.with(|window, app| {
-            window.with_view(app, |view, window, app| {
-                view.selected_text_range(window, app)
-            })
+            window.with_view(app, |view, window, app| view.selection(window, app))
         })
         .flatten()
         .flatten()
     }
 
-    pub fn marked_text_range(&self) -> Option<Range<usize>> {
+    pub fn composition(&self) -> Option<Range<usize>> {
         self.with(|window, app| {
-            window.with_view(app, |view, window, app| view.marked_text_range(window, app))
+            window.with_view(app, |view, window, app| view.composition(window, app))
         })
         .flatten()
         .flatten()
     }
 
-    #[cfg(not(target_os = "macos"))]
-    pub fn clear_marked_text(&self) {
-        if let Some(marked) = self.marked_text_range() {
-            self.replace_text_in_range(Some(marked), "");
+    pub fn clear_composition(&self) {
+        if let Some(composed) = self.composition() {
+            self.insert(Some(composed), "");
         }
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn text_for_range(&self, range: Range<usize>) -> Option<(String, Option<Range<usize>>)> {
+    pub fn text_in(&self, range: Range<usize>) -> Option<(String, Option<Range<usize>>)> {
         self.with(move |window, app| {
-            let mut adjusted = None;
-            window
-                .with_view(app, |view, window, app| {
-                    view.text_for_range(range, &mut adjusted, window, app)
-                })
-                .flatten()
-                .map(|text| (text, adjusted))
+            let mut actual = None;
+            let text = window.with_view(app, |view, window, app| {
+                view.text_in(range, &mut actual, window, app)
+            });
+            Some((text.flatten()?, actual))
         })
         .flatten()
     }
 
-    pub fn replace_text_in_range(&self, range: Option<Range<usize>>, text: &str) {
+    pub fn insert(&self, range: Option<Range<usize>>, text: &str) {
         let text = text.to_owned();
         self.queue(move |window, app| {
-            if send_ime_key(window, app, text.encode_utf16().count() > 1) {
-                return;
+            if !send_ime_key(window, app, text.encode_utf16().count() > 1) {
+                window.with_view(app, |view, window, app| {
+                    view.insert(range, &text, window, app)
+                });
             }
-            window.with_view(app, |view, window, app| {
-                view.replace_text_in_range(range, &text, window, app)
-            });
         });
     }
 
-    pub fn replace_and_mark_text_in_range(
-        &self,
-        range: Option<Range<usize>>,
-        text: &str,
-        selected: Option<Range<usize>>,
-    ) {
+    pub fn compose(&self, range: Option<Range<usize>>, text: &str, selected: Option<Range<usize>>) {
         let text = text.to_owned();
         self.queue(move |window, app| {
             send_ime_key(window, app, true);
             window.with_view(app, |view, window, app| {
-                view.replace_and_mark_text_in_range(range, &text, selected, window, app)
+                view.compose(range, &text, selected, window, app)
             });
         });
     }
 
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
-    pub fn unmark_text(&self) {
+    pub fn end_composition(&self) {
         self.queue(|window, app| {
             send_ime_key(window, app, false);
-            window.with_view(app, |view, window, app| view.unmark_text(window, app));
+            window.with_view(app, |view, window, app| view.end_composition(window, app));
         });
     }
 
-    pub fn bounds_for_range(&self, range: Range<usize>) -> Option<Bounds<Pixels>> {
+    pub fn rect_of(&self, range: Range<usize>) -> Option<Rect> {
         self.with(move |window, app| {
             let zoom = window.zoom;
-            window
-                .with_view(app, |view, window, app| {
-                    view.bounds_for_range(range, window, app)
-                })
-                .flatten()
-                .map(|bounds| bounds * zoom)
+            let rect = window.with_view(app, |view, window, app| view.rect_of(range, window, app));
+            Some(rect.flatten()? * zoom)
         })
         .flatten()
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn character_index_for_point(&self, point: Point<Pixels>) -> Option<usize> {
+    pub fn index_at(&self, at: Point<Pixels>) -> Option<usize> {
         self.with(move |window, app| {
-            let point = point / window.zoom;
-            window.with_view(app, |view, window, app| {
-                view.character_index_for_point(point, window, app)
-            })
+            let at = at / window.zoom;
+            window.with_view(app, |view, window, app| view.index_at(at, window, app))
         })
         .flatten()
         .flatten()
@@ -574,49 +509,60 @@ pub mod native {
         CloseRequested,
     }
 
-    type KeyFilter = Box<dyn FnMut(WindowId, &PlatformInput, &dyn Fn() -> bool) -> bool>;
+    // A handler, missing while it runs.
+    type Slot<H> = Option<Box<H>>;
+    type KeyFilter = dyn FnMut(WindowId, &Event, &dyn Fn() -> bool) -> bool;
 
     #[derive(Default)]
     struct Handlers {
-        window: Option<Box<dyn FnMut(WindowId, WindowEvent)>>,
-        key: Option<KeyFilter>,
-        reopen: Option<Box<dyn FnMut(bool)>>,
-        should_quit: Option<Box<dyn FnMut() -> bool>>,
-        open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
+        window: Slot<dyn FnMut(WindowId, WindowEvent)>,
+        key: Slot<KeyFilter>,
+        reopen: Slot<dyn FnMut(bool)>,
+        should_quit: Slot<dyn FnMut() -> bool>,
+        open_urls: Slot<dyn FnMut(Vec<String>)>,
         pending_urls: Vec<String>,
-        quit: Option<Box<dyn FnOnce()>>,
+        quit: Slot<dyn FnOnce()>,
     }
 
     thread_local! { static HANDLERS: RefCell<Handlers> = RefCell::default(); }
+
+    // Calls a handler outside the borrow, so it can set handlers. A call from inside the same handler finds
+    // none.
+    fn call<H: ?Sized, R>(
+        slot: fn(&mut Handlers) -> &mut Slot<H>,
+        run: impl FnOnce(&mut H) -> R,
+    ) -> Option<R> {
+        let mut handler = HANDLERS.with_borrow_mut(|handlers| slot(handlers).take())?;
+        let result = run(&mut handler);
+        HANDLERS.with_borrow_mut(|handlers| {
+            slot(handlers).get_or_insert(handler);
+        });
+        Some(result)
+    }
 
     pub fn on_window_event(f: impl FnMut(WindowId, WindowEvent) + 'static) {
         HANDLERS.with_borrow_mut(|handlers| handlers.window = Some(Box::new(f)));
     }
 
     pub(crate) fn window_event(id: WindowId, event: WindowEvent) {
-        if let Some(mut callback) = HANDLERS.with_borrow_mut(|handlers| handlers.window.take()) {
-            callback(id, event);
-            HANDLERS.with_borrow_mut(|handlers| {
-                handlers.window.get_or_insert(callback);
-            });
-        }
+        call(
+            |handlers| &mut handlers.window,
+            |handler| handler(id, event),
+        );
     }
 
-    // Call `composing` only when needed: it blocks on the page thread.
-    pub fn on_key(f: impl FnMut(WindowId, &PlatformInput, &dyn Fn() -> bool) -> bool + 'static) {
+    // Return true to keep the key from the page. Call `composing` only when needed: it blocks on the page thread.
+    pub fn on_key(f: impl FnMut(WindowId, &Event, &dyn Fn() -> bool) -> bool + 'static) {
         HANDLERS.with_borrow_mut(|handlers| handlers.key = Some(Box::new(f)));
     }
 
     // Keys from nested loops bypass a filter already in progress.
-    pub(crate) fn key(id: WindowId, input: &PlatformInput, composing: &dyn Fn() -> bool) -> bool {
-        let Some(mut callback) = HANDLERS.with_borrow_mut(|handlers| handlers.key.take()) else {
-            return false;
-        };
-        let blocked = callback(id, input, composing);
-        HANDLERS.with_borrow_mut(|handlers| {
-            handlers.key.get_or_insert(callback);
-        });
-        blocked
+    pub(crate) fn key(id: WindowId, event: &Event, composing: &dyn Fn() -> bool) -> bool {
+        call(
+            |handlers| &mut handlers.key,
+            |filter| filter(id, event, composing),
+        )
+        .unwrap_or(false)
     }
 
     pub fn on_reopen(f: impl FnMut(bool) + 'static) {
@@ -640,112 +586,92 @@ pub mod native {
     }
 
     pub fn post(f: Box<dyn FnOnce() + Send>) {
-        #[cfg(target_os = "macos")]
         platform::native_post(f);
-        #[cfg(not(target_os = "macos"))]
-        platform::post(f);
     }
 
     pub fn after(delay: Duration, f: impl FnOnce() + 'static) {
-        #[cfg(target_os = "macos")]
         platform::native_after(delay, f);
-        #[cfg(not(target_os = "macos"))]
-        platform::run_after(delay, f);
     }
 
     pub fn sync<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-        #[cfg(target_os = "macos")]
-        return platform::native_sync(f);
-        #[cfg(not(target_os = "macos"))]
-        f()
+        platform::native_sync(f)
     }
 
     pub fn before_exit() {
-        #[cfg(target_os = "macos")]
         platform::park_render();
     }
 
-    pub fn activate(ignoring_other_apps: bool) {
-        #[cfg(target_os = "macos")]
-        platform::Platform::new().activate(ignoring_other_apps);
-        #[cfg(not(target_os = "macos"))]
-        update(move |app| app.activate(ignoring_other_apps));
+    pub fn activate(force: bool) {
+        match THREAD_PER_APP {
+            true => platform::Platform::new().activate(force),
+            false => update(move |app| app.activate(force)),
+        }
     }
 
     pub fn quit() {
-        #[cfg(target_os = "macos")]
-        platform::Platform::new().quit();
-        #[cfg(not(target_os = "macos"))]
-        update(|app| app.quit());
+        match THREAD_PER_APP {
+            true => platform::Platform::new().quit(),
+            false => update(|app| app.quit()),
+        }
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn reopen(visible: bool) {
-        if let Some(mut callback) = HANDLERS.with_borrow_mut(|handlers| handlers.reopen.take()) {
-            callback(visible);
-            HANDLERS.with_borrow_mut(|handlers| {
-                handlers.reopen.get_or_insert(callback);
-            });
-        }
+        call(|handlers| &mut handlers.reopen, |handler| handler(visible));
     }
 
     pub(crate) fn should_quit() -> bool {
-        match HANDLERS.with_borrow_mut(|handlers| handlers.should_quit.take()) {
-            Some(mut callback) => {
-                let quit = callback();
-                HANDLERS.with_borrow_mut(|handlers| {
-                    handlers.should_quit.get_or_insert(callback);
-                });
-                quit
-            }
-            None => true,
-        }
+        call(|handlers| &mut handlers.should_quit, |handler| handler()).unwrap_or(true)
     }
 
     pub(crate) fn quit_handler() {
-        if let Some(callback) = HANDLERS.with_borrow_mut(|handlers| handlers.quit.take()) {
-            callback();
+        if let Some(handler) = HANDLERS.with_borrow_mut(|handlers| handlers.quit.take()) {
+            handler();
         }
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn open_urls(urls: Vec<String>) {
-        match HANDLERS.with_borrow_mut(|handlers| handlers.open_urls.take()) {
-            Some(mut callback) => {
-                callback(urls);
-                HANDLERS.with_borrow_mut(|handlers| {
-                    handlers.open_urls.get_or_insert(callback);
-                });
-            }
-            None => HANDLERS.with_borrow_mut(|handlers| handlers.pending_urls.extend(urls)),
+        let mut urls = Some(urls);
+        call(
+            |handlers| &mut handlers.open_urls,
+            |handler| handler(urls.take().unwrap_or_default()),
+        );
+        if let Some(urls) = urls {
+            HANDLERS.with_borrow_mut(|handlers| handlers.pending_urls.extend(urls));
         }
-    }
-}
-
-pub(crate) mod events {
-    pub(crate) use super::native::should_quit;
-    #[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
-    pub(crate) use super::native::{open_urls, reopen};
-    pub fn quit() {
-        super::native::quit_handler();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::native;
-    use crate::{KeyUpEvent, PlatformInput, WindowId};
+    use crate::{Event, Key, Modifiers, WindowId};
 
     #[test]
     fn the_key_filter_blocks_keys_but_not_the_ones_of_a_loop_nested_in_it() {
-        let input = PlatformInput::KeyUp(KeyUpEvent::default());
-        assert!(!native::key(WindowId(1), &input, &|| true));
-        native::on_key(|id, input, composing| {
-            assert!(!native::key(id, input, composing));
+        let event = Event::KeyUp {
+            key: Key::default(),
+            modifiers: Modifiers::NONE,
+            ime: false,
+        };
+        assert!(!native::key(WindowId(1), &event, &|| true));
+        native::on_key(|id, event, composing| {
+            assert!(!native::key(id, event, composing));
             id == WindowId(1) && composing()
         });
-        assert!(native::key(WindowId(1), &input, &|| true));
-        assert!(!native::key(WindowId(1), &input, &|| false));
-        assert!(!native::key(WindowId(2), &input, &|| true));
+        assert!(native::key(WindowId(1), &event, &|| true));
+        assert!(!native::key(WindowId(1), &event, &|| false));
+        assert!(!native::key(WindowId(2), &event, &|| true));
+    }
+
+    #[test]
+    fn urls_wait_for_their_handler() {
+        native::open_urls(vec!["apps://a".into()]);
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = seen.clone();
+        native::on_open_urls(move |urls| log.borrow_mut().extend(urls));
+        native::open_urls(vec!["apps://b".into()]);
+        assert_eq!(*seen.borrow(), ["apps://a", "apps://b"]);
     }
 }

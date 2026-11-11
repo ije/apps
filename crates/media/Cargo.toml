@@ -8,7 +8,7 @@ license.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-cpal = "0.18"
+cpal = "0.18.2"
 
 [build-dependencies]
-cc = "1"
+cc = "1.11.1"

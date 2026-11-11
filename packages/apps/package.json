@@ -2,7 +2,7 @@
   "name": "@pierre/apps",
   "version": "0.0.0",
   "description": "A tiny, fast, memory-safe Electron alternative with a compatible API",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "main": "index.mjs",
   "types": "types/index.d.ts",

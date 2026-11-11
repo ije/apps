@@ -1,8 +1,8 @@
 use super::{
-    SharedString, TextAlign, TextRun, TextWrap, WhiteSpace, WordBreak, WrapBoundary, WrappedLine,
-    WrappedLineLayout,
+    SharedString, TextAlign, TextLine, TextRun, TextStyle, TextWrap, WhiteSpace, WordBreak,
+    Wrapping, breaks::breaks,
 };
-use crate::{AvailableSpace, Bounds, Pixels, Point, Size, TextStyle, Window, px};
+use crate::{AvailableSpace, Pixels, Point, Rect, Size, Window, px};
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
@@ -14,18 +14,18 @@ macro_rules! same {
 }
 
 #[derive(Default, Clone)]
-pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
+pub struct Paragraph(Rc<RefCell<Option<ParagraphState>>>);
 
-struct TextLayoutInner {
+struct ParagraphState {
     shaped_width: Option<Pixels>,
-    lines: Rc<[WrappedLine]>,
+    lines: Rc<[TextLine]>,
     line_height: Pixels,
     top: Pixels,
     wrap_width: Option<Pixels>,
     truncated: bool,
     size: Size<Pixels>,
     baselines: [Pixels; 2],
-    bounds: Option<Bounds<Pixels>>,
+    bounds: Option<Rect<Pixels>>,
 }
 
 pub(crate) struct TextState {
@@ -33,7 +33,7 @@ pub(crate) struct TextState {
     runs: RefCell<Vec<TextRun>>,
     style: RefCell<TextStyle>,
     scale: f32,
-    pub(crate) layout: TextLayout,
+    pub(crate) layout: Paragraph,
     probes: Cell<[Option<Probe>; 2]>,
     repaint: Cell<bool>,
     base: RefCell<Option<Base>>,
@@ -41,7 +41,7 @@ pub(crate) struct TextState {
 
 type Probe = (Size<Pixels>, [Pixels; 2]);
 
-type Base = (Rc<[WrappedLine]>, [Pixels; 2]);
+type Base = (Rc<[TextLine]>, [Pixels; 2]);
 
 impl TextState {
     pub(crate) fn new(
@@ -51,11 +51,11 @@ impl TextState {
         scale: f32,
     ) -> Self {
         Self {
-            runs: RefCell::new(runs.unwrap_or_else(|| vec![style.to_run(text.len())])),
+            runs: RefCell::new(runs.unwrap_or_else(|| vec![style.run(text.len())])),
             text,
             style: RefCell::new(style.clone()),
             scale,
-            layout: TextLayout::default(),
+            layout: Paragraph::default(),
             probes: Cell::default(),
             repaint: Cell::new(false),
             base: RefCell::default(),
@@ -158,27 +158,13 @@ impl TextState {
         };
         let float = style.float;
         let base = || {
-            let lines: Rc<[WrappedLine]> = system
-                .shape_text_indented(
-                    text.clone(),
-                    style.font_size,
-                    runs,
-                    None,
-                    None,
-                    px(0.),
-                    TextWrap::Wrap,
-                    WordBreak::Normal,
-                )
-                .unwrap_or_default()
+            let lines: Rc<[TextLine]> = system
+                .shape_text(text, style.font_size, runs, &Wrapping::default())
                 .into();
             let mut reach = [px(0.); 2];
             for (index, line) in lines.iter().enumerate() {
-                let layout = &line.unwrapped_layout;
-                let end = layout
-                    .runs
-                    .iter()
-                    .flat_map(|run| &run.glyphs)
-                    .fold(layout.width, |end, glyph| end.max(glyph.position.x));
+                let end =
+                    (line.line.glyphs.iter()).fold(line.line.width, |end, glyph| end.max(glyph.x));
                 reach[(index > 0) as usize] = reach[(index > 0) as usize].max(end);
             }
             (lines, reach)
@@ -192,7 +178,7 @@ impl TextState {
                 && {
                     let mut kept = self.base.borrow_mut();
                     let (lines, _) = kept.get_or_insert_with(base);
-                    lines.len() == 1 && lines[0].unwrapped_layout.width <= *width
+                    lines.len() == 1 && lines[0].line.width <= *width
                 }
         });
         let (lines, top, truncated) = if (truncate.is_none() || fits) && float == px(0.) {
@@ -228,28 +214,23 @@ impl TextState {
                                     at += run.len;
                                 }
                             }
-                            let boundaries = line.unwrapped_layout.compute_wrap_boundaries(
-                                &line.text,
-                                width,
-                                clamp.map(|max: usize| max.saturating_sub(wrapped)),
-                                if index == 0 {
+                            let wrapping = Wrapping {
+                                width: Some(width),
+                                max_lines: clamp.map(|max: usize| max.saturating_sub(wrapped)),
+                                indent: if index == 0 {
                                     style.text_indent
                                 } else {
                                     px(0.)
                                 },
                                 wrap,
                                 word_break,
-                                &ranges,
-                            );
-                            (start, wrapped) = (end + 1, wrapped + boundaries.len());
-                            WrappedLine {
-                                layout: Rc::new(WrappedLineLayout {
-                                    unwrapped_layout: line.unwrapped_layout.clone(),
-                                    wrap_boundaries: boundaries,
-                                    wrap_width: Some(width),
-                                }),
-                                text: line.text.clone(),
-                                decoration_runs: line.decoration_runs.clone(),
+                            };
+                            let boundaries = breaks(&line.line, &line.text, &wrapping, &ranges);
+                            (start, wrapped) = (end + 1, wrapped + boundaries.len() + 1);
+                            TextLine {
+                                breaks: boundaries.into(),
+                                wrap: Some(width),
+                                ..line.clone()
                             }
                         })
                         .collect()
@@ -265,28 +246,23 @@ impl TextState {
                 }
                 None => (text.clone(), Cow::Borrowed(runs), false),
             };
-            let shape = |runs: &[TextRun]| {
-                system
-                    .shape_text_indented(
-                        text.clone(),
-                        style.font_size,
-                        runs,
-                        if min_content && wraps {
-                            Some(px(0.))
-                        } else {
-                            wrap_width
-                        },
-                        style.line_clamp.filter(|_| !min_content),
-                        style.text_indent,
-                        if min_content {
-                            TextWrap::Wrap
-                        } else {
-                            style.text_wrap
-                        },
-                        word_break,
-                    )
-                    .unwrap_or_default()
+            let wrapping = Wrapping {
+                width: if min_content && wraps {
+                    Some(px(0.))
+                } else {
+                    wrap_width
+                },
+                max_lines: style.line_clamp.filter(|_| !min_content),
+                indent: style.text_indent,
+                wrap: if min_content {
+                    TextWrap::Wrap
+                } else {
+                    style.text_wrap
+                },
+                word_break,
             };
+            let shape =
+                |runs: &[TextRun]| system.shape_text(&text, style.font_size, runs, &wrapping);
             let beside = (float > px(0.) && !(min_content && wraps))
                 .then(|| {
                     let mut runs = runs.to_vec();
@@ -308,8 +284,8 @@ impl TextState {
         };
         let mut size = Size::<Pixels>::default();
         for (index, line) in lines.iter().enumerate() {
-            let mut line_size = line.size(line_height);
-            if index == 0 && line.wrap_boundaries.is_empty() {
+            let mut line_size = line.extent(line_height);
+            if index == 0 && line.breaks.is_empty() {
                 line_size.width = (line_size.width + style.text_indent).max(px(0.));
             }
             size.height += line_size.height;
@@ -321,7 +297,7 @@ impl TextState {
         size.width = size.width.max(float);
         size.height += top;
         let baseline = system.baseline(
-            system.resolve_font(&style.font()),
+            system.face(&style.font()),
             style.font_size,
             line_height,
             window.scale_factor(),
@@ -335,7 +311,7 @@ impl TextState {
         // taffy can take the final size from its cache, so a probe keeps the painted layout.
         if probe.is_none() || layout.0.borrow().is_none() {
             self.repaint.set(false);
-            *layout.0.borrow_mut() = Some(TextLayoutInner {
+            *layout.0.borrow_mut() = Some(ParagraphState {
                 shaped_width: if min_content { Some(px(0.)) } else { width },
                 lines,
                 line_height,
@@ -351,39 +327,17 @@ impl TextState {
     }
 }
 
-/// The widest piece between the wrap boundaries of `lines`, without spaces. The first piece starts at `start`.
-pub fn widest_piece(lines: &[WrappedLine], mut start: Pixels) -> Pixels {
+pub fn widest_piece(lines: &[TextLine], mut start: Pixels) -> Pixels {
     let mut width = px(0.);
     for line in lines {
-        let unwrapped = &line.unwrapped_layout;
-        let mut breaks = line.wrap_boundaries.iter().peekable();
-        let mut glyphs = unwrapped
-            .runs
-            .iter()
-            .enumerate()
-            .flat_map(|(run_index, run)| {
-                run.glyphs
-                    .iter()
-                    .enumerate()
-                    .map(move |(glyph_index, glyph)| {
-                        (
-                            WrapBoundary {
-                                run_index,
-                                glyph_index,
-                            },
-                            glyph,
-                        )
-                    })
-            })
-            .peekable();
-        while let Some((boundary, glyph)) = glyphs.next() {
-            if breaks.next_if(|next| **next == boundary).is_some() {
-                start = glyph.position.x;
+        let glyphs = &line.line.glyphs;
+        let mut breaks = line.breaks.iter().peekable();
+        for (at, glyph) in glyphs.iter().enumerate() {
+            if breaks.next_if(|&&next| next as usize == at).is_some() {
+                start = glyph.x;
             }
-            let end = glyphs
-                .peek()
-                .map_or(unwrapped.width, |(_, next)| next.position.x);
-            if line.text.as_bytes().get(glyph.index) != Some(&b' ') {
+            let end = glyphs.get(at + 1).map_or(line.line.width, |next| next.x);
+            if line.text.as_bytes().get(glyph.index as usize) != Some(&b' ') {
                 width = width.max(end - start);
             }
         }
@@ -417,7 +371,7 @@ impl TextState {
     }
 }
 
-impl TextLayout {
+impl Paragraph {
     pub fn paint(&self, align: TextAlign, window: &mut Window) {
         let inner = self.0.borrow();
         let Some(inner) = inner.as_ref() else {
@@ -428,13 +382,14 @@ impl TextLayout {
         };
         let mut origin = bounds.origin + Point::new(px(0.), inner.top);
         for line in inner.lines.iter() {
-            line.paint_background(origin, inner.line_height, align, Some(bounds), window);
-            line.paint(origin, inner.line_height, align, Some(bounds), window);
-            origin.y += line.size(inner.line_height).height;
+            let width = Some(bounds.size.width);
+            line.paint_background(origin, inner.line_height, align, width, window);
+            line.paint(origin, inner.line_height, align, width, window);
+            origin.y += line.extent(inner.line_height).height;
         }
     }
 
-    pub fn index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
+    pub fn index_at(&self, position: Point<Pixels>) -> Result<usize, usize> {
         let inner = self.0.borrow();
         let Some((inner, bounds)) = inner
             .as_ref()
@@ -448,12 +403,13 @@ impl TextLayout {
         let mut origin = bounds.origin + Point::new(px(0.), inner.top);
         let mut start = 0;
         for line in inner.lines.iter() {
-            let bottom = origin.y + line.size(inner.line_height).height;
+            let bottom = origin.y + line.extent(inner.line_height).height;
             if position.y > bottom {
                 origin.y = bottom;
                 start += line.len() + 1;
             } else {
-                return match line.index_for_position(position - origin, inner.line_height) {
+                let at = position - origin;
+                return match line.hit((at.y / inner.line_height) as usize, at.x, false) {
                     Ok(index) => Ok(start + index),
                     Err(index) => Err(start + index),
                 };
@@ -462,7 +418,7 @@ impl TextLayout {
         Err(start.saturating_sub(1))
     }
 
-    pub fn position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
+    pub fn point_at(&self, index: usize) -> Option<Point<Pixels>> {
         let inner = self.0.borrow();
         let inner = inner.as_ref()?;
         let mut origin = inner.bounds?.origin + Point::new(px(0.), inner.top);
@@ -472,24 +428,24 @@ impl TextLayout {
             if index < start {
                 break;
             } else if index > end {
-                origin.y += line.size(inner.line_height).height;
+                origin.y += line.extent(inner.line_height).height;
                 start = end + 1;
             } else {
-                return Some(origin + line.position_for_index(index - start, inner.line_height)?);
+                let (row, x) = line.caret(index - start)?;
+                return Some(origin + Point::new(x, inner.line_height * row));
             }
         }
         None
     }
 
-    pub fn line_layouts(&self) -> Vec<Rc<WrappedLineLayout>> {
-        self.0
-            .borrow()
-            .as_ref()
-            .map(|inner| inner.lines.iter().map(|line| line.layout.clone()).collect())
-            .unwrap_or_default()
+    pub fn lines(&self) -> Rc<[TextLine]> {
+        self.0.borrow().as_ref().map_or_else(
+            || Rc::new([]) as Rc<[TextLine]>,
+            |inner| inner.lines.clone(),
+        )
     }
 
-    pub fn bounds(&self) -> Bounds<Pixels> {
+    pub fn bounds(&self) -> Rect<Pixels> {
         self.0
             .borrow()
             .as_ref()
@@ -502,7 +458,7 @@ impl TextLayout {
         runs: Vec<TextRun>,
         style: &TextStyle,
         width: Pixels,
-        bounds: Bounds<Pixels>,
+        bounds: Rect<Pixels>,
         window: &mut Window,
     ) -> Self {
         let state = TextState::new(text, Some(runs), style, window.scale_factor());
@@ -515,7 +471,7 @@ impl TextLayout {
         state.layout
     }
 
-    pub(crate) fn place(&self, bounds: Bounds<Pixels>) {
+    pub(crate) fn place(&self, bounds: Rect<Pixels>) {
         if let Some(inner) = self.0.borrow_mut().as_mut() {
             inner.bounds = Some(bounds);
         }
@@ -530,7 +486,7 @@ impl TextLayout {
 }
 
 pub(crate) fn same_shaping(a: &TextStyle, b: &TextStyle) -> bool {
-    same!(a, b; font_family, font_features, font_fallbacks, font_size, line_height, font_weight, font_style,
+    same!(a, b; font_family, font_features, font_size, line_height, font_weight, font_style,
         white_space, text_overflow, line_clamp, letter_spacing, word_spacing, text_indent, float, text_wrap, word_break)
 }
 
@@ -546,29 +502,25 @@ fn truncate_text(
     let unchanged = || (text.clone(), runs.to_vec(), false);
     let font_size = style.font_size;
     let clamp = style.line_clamp.zip(wrap_width);
-    let Ok(lines) = system.shape_text(
-        text.clone(),
+    let lines = system.shape_text(
+        text,
         font_size,
         runs,
-        clamp.map(|(_, width)| width),
-        None,
-        style.word_break,
-    ) else {
-        return unchanged();
-    };
+        &Wrapping {
+            width: clamp.map(|(_, width)| width),
+            word_break: style.word_break,
+            ..Wrapping::default()
+        },
+    );
     let cut = match clamp {
         Some((max, wrap)) => {
             let mut rows = 0;
             let mut start = 0;
             let mut found = None;
             for line in &lines {
-                let layout = &line.layout.unwrapped_layout;
-                let ends = line
-                    .wrap_boundaries
-                    .iter()
-                    .map(|boundary| {
-                        layout.runs[boundary.run_index].glyphs[boundary.glyph_index].index
-                    })
+                let layout = &line.line;
+                let ends = (line.breaks.iter())
+                    .map(|&at| layout.glyphs[at as usize].index as usize)
                     .chain([layout.len]);
                 let mut row_start = 0;
                 for end in ends {
@@ -588,16 +540,8 @@ fn truncate_text(
         }
         None => lines
             .first()
-            .filter(|line| lines.len() > 1 || line.layout.unwrapped_layout.width > width)
-            .map(|line| {
-                (
-                    0,
-                    line.layout.unwrapped_layout.clone(),
-                    0,
-                    line.len(),
-                    width,
-                )
-            }),
+            .filter(|line| lines.len() > 1 || line.line.width > width)
+            .map(|line| (0, line.line.clone(), 0, line.len(), width)),
     };
     let Some((offset, layout, row_start, row_end, room)) = cut else {
         return unchanged();
@@ -611,13 +555,11 @@ fn truncate_text(
             nowrap: false,
             ..run
         })
-        .unwrap_or_else(|| style.to_run(affix.len()));
-    let affix_width = system
-        .layout_line(affix, font_size, &[affix_run], None)
-        .width;
-    let left = layout.x_for_index(row_start);
+        .unwrap_or_else(|| style.run(affix.len()));
+    let affix_width = system.shape_line(affix, font_size, &affix_run).line.width;
+    let left = layout.x_at(row_start);
     let index = layout
-        .index_for_x(left + (room - affix_width).max(px(0.)))
+        .index_at(left + (room - affix_width).max(px(0.)))
         .unwrap_or(row_end)
         .clamp(row_start, row_end);
     let end = offset + index;
@@ -637,7 +579,7 @@ fn truncate_text(
     }
     match new_runs.last_mut() {
         Some(last) => last.len += affix.len(),
-        None => new_runs.push(style.to_run(affix.len())),
+        None => new_runs.push(style.run(affix.len())),
     }
     (kept.into(), new_runs, true)
 }
@@ -645,18 +587,18 @@ fn truncate_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rgba;
+    use crate::Color;
 
     #[test]
     fn paint_changes_keep_the_measure() {
         let style = TextStyle::default();
         let run = |len: usize, color: u32| TextRun {
-            color: rgba(color),
-            ..style.to_run(len)
+            color: Color::hex(color),
+            ..style.run(len)
         };
         let state = |runs: Vec<TextRun>| TextState::new("ab cd".into(), Some(runs), &style, 1.);
         let old = state(vec![run(2, 0xff0000ff), run(3, 0x0000ffff)]);
-        *old.layout.0.borrow_mut() = Some(TextLayoutInner {
+        *old.layout.0.borrow_mut() = Some(ParagraphState {
             shaped_width: None,
             lines: Rc::new([]),
             line_height: px(0.),
@@ -670,19 +612,19 @@ mod tests {
         assert!(old.keep(&state(vec![run(2, 0xff0000ff), run(3, 0x0000ffff)])));
         assert!(old.layout.0.borrow().is_some() && !old.repaint.get());
         assert!(old.keep(&state(vec![run(2, 0x00ff00ff), run(3, 0x0000ffff)])));
-        assert_eq!(old.runs.borrow()[0].color, rgba(0x00ff00ff));
+        assert_eq!(old.runs.borrow()[0].color, Color::hex(0x00ff00ff));
         assert!(old.layout.0.borrow().is_none() && old.repaint.get());
         assert!(!old.keep(&state(vec![run(2, 0x0000ffff), run(3, 0x0000ffff)])));
         assert!(!old.keep(&state(vec![run(3, 0x00ff00ff), run(2, 0x0000ffff)])));
         let wide = TextStyle {
             letter_spacing: px(1.),
-            color: rgba(0xff0000ff),
+            color: Color::hex(0xff0000ff),
             ..style.clone()
         };
         assert!(same_shaping(
             &style,
             &TextStyle {
-                color: rgba(0xff0000ff),
+                color: Color::hex(0xff0000ff),
                 ..style.clone()
             }
         ));

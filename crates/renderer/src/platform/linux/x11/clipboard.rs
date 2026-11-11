@@ -1,430 +1,379 @@
-//! The X11 clipboard, on its own connection and served by a thread. Adapted from the x11 module of
-//! arboard (Apache-2.0 OR MIT), through Zed.
-//!
-//! See <https://tronche.com/gui/x/icccm/sec-2.html#s-2.6> and
-//! <https://freedesktop.org/wiki/ClipboardManager/>.
-
 use anyhow::{Context as _, Result, bail};
-use std::{
-    sync::{Arc, Condvar, Mutex},
-    thread::JoinHandle,
-    time::{Duration, Instant},
-};
-use x11rb::{
-    COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, NONE,
-    connection::Connection as _,
-    protocol::{
-        Event,
-        xproto::{
-            Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, Property,
-            SELECTION_NOTIFY_EVENT, SelectionNotifyEvent, SelectionRequestEvent, Time, WindowClass,
-        },
-    },
-    rust_connection::RustConnection,
-    wrapper::ConnectionExt as _,
-};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::{cell::RefCell, thread::JoinHandle, time::Duration, time::Instant};
+use x11rb::connection::Connection as _;
+use x11rb::protocol::Event;
+use x11rb::protocol::xproto::{self, Atom, AtomEnum, ConnectionExt as _, EventMask};
+use x11rb::{NONE, rust_connection::RustConnection, wrapper::ConnectionExt as _};
 
 x11rb::atom_manager! {
-    Atoms: AtomCookies {
+    Names: NamesCookie {
         CLIPBOARD,
-        CLIPBOARD_MANAGER,
-        SAVE_TARGETS,
-        TARGETS,
-        ATOM,
-        INCR,
-        UTF8_STRING,
-        UTF8_MIME_0: b"text/plain;charset=utf-8",
-        UTF8_MIME_1: b"text/plain;charset=UTF-8",
-        STRING,
-        TEXT,
-        TEXT_MIME_UNKNOWN: b"text/plain",
-        APPS_CLIPBOARD,
+        Manager: b"CLIPBOARD_MANAGER",
+        Save: b"SAVE_TARGETS",
+        Targets: b"TARGETS",
+        AtomList: b"ATOM",
+        Parts: b"INCR",
+        Utf8: b"UTF8_STRING",
+        Latin1: b"STRING",
+        Text: b"TEXT",
+        PlainUtf8: b"text/plain;charset=utf-8",
+        PlainUtf8Upper: b"text/plain;charset=UTF-8",
+        Plain: b"text/plain",
+        Landing: b"APPS_SELECTION",
     }
 }
 
-const TIMEOUT: Duration = Duration::from_millis(4000);
-const SEGMENT_TIMEOUT: Duration = Duration::from_millis(10);
+// How long a paste waits for the owner, and for each part of a large paste.
+const WAIT: Duration = Duration::from_secs(4);
 
-struct Connection {
+struct Port {
     conn: RustConnection,
     window: u32,
 }
 
-impl Connection {
-    fn new() -> Result<Self> {
-        let (conn, screen) =
-            RustConnection::connect(None).context("connecting the clipboard to the X server")?;
+impl Port {
+    fn open() -> Result<Self> {
+        let (conn, screen) = RustConnection::connect(None).context("connecting the clipboard")?;
         let root = conn.setup().roots.get(screen).context("no X screen")?.root;
         let window = conn.generate_id()?;
-        conn.create_window(
-            COPY_DEPTH_FROM_PARENT,
-            window,
-            root,
-            0,
-            0,
-            1,
-            1,
-            0,
-            WindowClass::COPY_FROM_PARENT,
-            COPY_FROM_PARENT,
-            &CreateWindowAux::new()
-                .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
-        )?;
+        let heard = EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY;
+        let aux = xproto::CreateWindowAux::new().event_mask(heard);
+        let class = xproto::WindowClass::INPUT_ONLY;
+        conn.create_window(0, window, root, 0, 0, 1, 1, 0, class, 0, &aux)?;
         conn.flush()?;
         Ok(Self { conn, window })
     }
 }
 
-#[derive(PartialEq, Eq)]
-enum Handover {
-    Idle,
-    InProgress { written: bool, notified: bool },
-    Finished,
+// Steps of a handover to the clipboard manager. It can say that it is done before it reads, so it needs both.
+#[derive(Default)]
+struct Handover {
+    finished: Option<mpsc::SyncSender<()>>,
+    read: bool,
+    done: bool,
 }
 
-struct Inner {
-    server: Connection,
-    atoms: Atoms,
+// A lock that a panic on the other thread doesn't spoil: the data stays whole.
+fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+struct Owner {
+    port: Port,
+    names: Names,
     text: Mutex<Option<Vec<u8>>>,
     handover: Mutex<Handover>,
-    handover_done: Condvar,
 }
 
-pub(crate) struct Clipboard {
-    inner: Arc<Inner>,
-    thread: Option<JoinHandle<()>>,
+pub(super) struct Selection {
+    owner: Arc<Owner>,
+    server: Option<JoinHandle<()>>,
+    reader: RefCell<Option<Port>>,
 }
 
-impl Clipboard {
-    pub fn new() -> Result<Self> {
-        let server = Connection::new()?;
-        let atoms = Atoms::new(&server.conn)?.reply()?;
-        let inner = Arc::new(Inner {
-            server,
-            atoms,
-            text: Mutex::new(None),
-            handover: Mutex::new(Handover::Idle),
-            handover_done: Condvar::new(),
+impl Selection {
+    pub fn open() -> Result<Self> {
+        let port = Port::open()?;
+        let names = Names::new(&port.conn)?.reply()?;
+        let (text, handover) = (Mutex::new(None), Mutex::default());
+        let owner = Arc::new(Owner {
+            port,
+            names,
+            text,
+            handover,
         });
-        let thread = std::thread::Builder::new()
-            .name("clipboard".into())
-            .spawn({
-                let inner = inner.clone();
-                move || {
-                    if let Err(error) = inner.serve() {
-                        eprintln!("apps: clipboard: {error:#}");
-                    }
-                }
-            })?;
+        let serving = owner.clone();
+        let server = std::thread::spawn(move || {
+            let _ = serving
+                .serve()
+                .inspect_err(|error| eprintln!("apps: clipboard: {error:#}"));
+        });
         Ok(Self {
-            inner,
-            thread: Some(thread),
+            owner,
+            server: Some(server),
+            reader: RefCell::new(None),
         })
     }
 
-    pub fn write(&self, text: &str) -> Result<()> {
-        let inner = &self.inner;
-        inner.server.conn.set_selection_owner(
-            inner.server.window,
-            inner.atoms.CLIPBOARD,
-            Time::CURRENT_TIME,
-        )?;
-        inner.server.conn.flush()?;
-        *inner.text.lock().unwrap() = Some(text.as_bytes().to_vec());
-        Ok(())
+    pub fn copy(&self, text: &str) {
+        let owner = &self.owner;
+        *hold(&owner.text) = Some(text.as_bytes().to_vec());
+        let (conn, port) = (&owner.port.conn, owner.port.window);
+        let taken = conn.set_selection_owner(port, owner.names.CLIPBOARD, x11rb::CURRENT_TIME);
+        if let Err(error) = taken
+            .map_err(anyhow::Error::from)
+            .and_then(|_| Ok(conn.flush()?))
+        {
+            eprintln!("apps: clipboard: {error:#}");
+        }
     }
 
-    pub fn read(&self) -> Result<String> {
-        let inner = &self.inner;
-        let atoms = &inner.atoms;
-        if inner.is_owner()? {
-            let text = inner
-                .text
-                .lock()
-                .unwrap()
-                .clone()
-                .context("the clipboard is empty")?;
-            return Ok(String::from_utf8(text)?);
-        }
-        let formats = [
-            atoms.UTF8_STRING,
-            atoms.UTF8_MIME_0,
-            atoms.UTF8_MIME_1,
-            atoms.STRING,
-            atoms.TEXT,
-            atoms.TEXT_MIME_UNKNOWN,
-        ];
-        let reader = Connection::new()?;
-        let available = inner
-            .read_single(&reader, atoms.TARGETS)
+    pub fn paste(&self) -> Option<String> {
+        self.text()
+            .inspect_err(|error| eprintln!("apps: clipboard: {error:#}"))
             .ok()
-            .filter(|(_, format)| *format == atoms.ATOM)
-            .map(|(bytes, _)| {
-                bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|chunk| u32::from_le_bytes(*chunk))
-                    .collect::<Vec<_>>()
-            });
-        let candidates: Vec<Atom> = match available {
-            Some(available) => formats
-                .into_iter()
-                .filter(|format| available.contains(format))
-                .take(1)
-                .collect(),
-            None => formats.to_vec(),
+    }
+
+    fn text(&self) -> Result<String> {
+        let names = &self.owner.names;
+        if self.owner.owns()? {
+            let text = hold(&self.owner.text).clone();
+            return Ok(String::from_utf8(text.context("the clipboard is empty")?)?);
+        }
+        let mut reader = self.reader.borrow_mut();
+        let port = match &mut *reader {
+            Some(port) => port,
+            empty => empty.insert(Port::open()?),
         };
-        for format in candidates {
-            let Ok((bytes, actual)) = inner.read_single(&reader, format) else {
+        let kinds = [
+            names.Utf8,
+            names.PlainUtf8,
+            names.PlainUtf8Upper,
+            names.Latin1,
+            names.Text,
+            names.Plain,
+        ];
+        let listed = self
+            .fetch(port, names.Targets)
+            .ok()
+            .filter(|(_, kind)| *kind == names.AtomList);
+        let offered: Option<Vec<Atom>> = listed.map(|(data, _)| {
+            data.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| u32::from_ne_bytes(*word))
+                .collect()
+        });
+        let shared = |kind: &Atom| {
+            offered
+                .as_ref()
+                .is_none_or(|offered| offered.contains(kind))
+        };
+        // With a target list, only the best target is asked for.
+        let tries = if offered.is_some() { 1 } else { kinds.len() };
+        for kind in kinds.into_iter().filter(shared).take(tries) {
+            let Ok((data, got)) = self.fetch(port, kind) else {
                 continue;
             };
-            if actual == atoms.STRING {
-                return Ok(bytes.into_iter().map(char::from).collect());
+            match got {
+                _ if got == names.Latin1 => return Ok(data.into_iter().map(char::from).collect()),
+                _ if kinds.contains(&got) => return Ok(String::from_utf8(data)?),
+                _ => {}
             }
-            if formats.contains(&actual) {
-                return Ok(String::from_utf8(bytes)?);
-            }
         }
-        bail!("the clipboard has no text")
-    }
-}
-
-impl Drop for Clipboard {
-    fn drop(&mut self) {
-        let inner = &self.inner;
-        if let Err(error) = inner.hand_over() {
-            eprintln!("apps: clipboard manager: {error:#}");
-        }
-        let _ = inner.server.conn.destroy_window(inner.server.window);
-        let _ = inner.server.conn.flush();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl Inner {
-    fn is_owner(&self) -> Result<bool> {
-        let owner = self
-            .server
-            .conn
-            .get_selection_owner(self.atoms.CLIPBOARD)?
-            .reply()?
-            .owner;
-        Ok(owner == self.server.window)
+        bail!("the clipboard holds no text")
     }
 
-    fn read_single(&self, reader: &Connection, target: Atom) -> Result<(Vec<u8>, Atom)> {
-        let atoms = &self.atoms;
-        // Deleted first, so the property notification shows when the owner got the request.
-        reader
-            .conn
-            .delete_property(reader.window, atoms.APPS_CLIPBOARD)?;
-        reader.conn.convert_selection(
-            reader.window,
-            atoms.CLIPBOARD,
+    fn fetch(&self, port: &Port, target: Atom) -> Result<(Vec<u8>, Atom)> {
+        let names = &self.owner.names;
+        let (conn, window) = (&port.conn, port.window);
+        // A fresh property shows which change answers this request.
+        conn.delete_property(window, names.Landing)?;
+        conn.convert_selection(
+            window,
+            names.CLIPBOARD,
             target,
-            atoms.APPS_CLIPBOARD,
-            Time::CURRENT_TIME,
+            names.Landing,
+            x11rb::CURRENT_TIME,
         )?;
-        reader.conn.sync()?;
-        let mut incremental: Option<Vec<u8>> = None;
-        let mut deadline = Instant::now() + TIMEOUT;
+        conn.sync()?;
+        let mut parts: Option<Vec<u8>> = None;
+        let mut deadline = Instant::now() + WAIT;
         while Instant::now() < deadline {
-            let Some(event) = reader.conn.poll_for_event()? else {
-                std::thread::sleep(Duration::from_millis(1));
+            // The owner answers on its own time, so this looks for events every millisecond.
+            let Some(event) = conn.poll_for_event()? else {
+                std::thread::sleep(Duration::from_micros(1000));
                 continue;
             };
             match event {
-                Event::SelectionNotify(event) => {
-                    if event.property == NONE || event.target != target {
-                        bail!("the clipboard can't be converted");
+                Event::SelectionNotify(answer) if parts.is_none() => {
+                    if answer.property == NONE || answer.target != target {
+                        bail!("the clipboard can't give {target}");
                     }
-                    if incremental.is_some() {
-                        continue;
+                    let whole = conn.get_property(
+                        true,
+                        window,
+                        answer.property,
+                        AtomEnum::ANY,
+                        0,
+                        u32::MAX / 4,
+                    )?;
+                    let whole = whole.reply()?;
+                    if whole.type_ != names.Parts {
+                        return Ok((whole.value, whole.type_));
                     }
-                    let reply = reader
-                        .conn
-                        .get_property(
-                            true,
-                            event.requestor,
-                            event.property,
-                            AtomEnum::ANY,
-                            0,
-                            u32::MAX / 4,
-                        )?
+                    // Deleting the INCR property, which only a read with its own type does, starts the parts.
+                    let start = conn
+                        .get_property(true, window, answer.property, names.Parts, 0, 1)?
                         .reply()?;
-                    if reply.type_ != atoms.INCR {
-                        return Ok((reply.value, reply.type_));
-                    }
-                    // The property is deleted only with its own type, which says the segments may come.
-                    let reply = reader
-                        .conn
-                        .get_property(
-                            true,
-                            event.requestor,
-                            event.property,
-                            atoms.INCR,
-                            0,
-                            u32::MAX / 4,
-                        )?
-                        .reply()?;
-                    let size = reply
+                    let size = start
                         .value32()
-                        .and_then(|mut values| values.next())
+                        .and_then(|mut words| words.next())
                         .unwrap_or(0);
-                    incremental = Some(Vec::with_capacity(size as usize));
-                    deadline += SEGMENT_TIMEOUT;
+                    parts = Some(Vec::with_capacity(size as usize));
+                    deadline = Instant::now() + WAIT;
                 }
-                Event::PropertyNotify(event)
-                    if event.atom == atoms.APPS_CLIPBOARD && event.state == Property::NEW_VALUE =>
+                Event::PropertyNotify(change)
+                    if change.atom == names.Landing
+                        && change.state == xproto::Property::NEW_VALUE =>
                 {
-                    let Some(data) = &mut incremental else {
+                    let Some(data) = &mut parts else {
                         continue;
                     };
-                    let kind = if target == atoms.TARGETS {
-                        atoms.ATOM
+                    let kind = if target == names.Targets {
+                        names.AtomList
                     } else {
                         target
                     };
-                    let reply = reader
-                        .conn
-                        .get_property(true, event.window, event.atom, kind, 0, u32::MAX / 4)?
+                    let part = conn
+                        .get_property(true, window, change.atom, kind, 0, u32::MAX / 4)?
                         .reply()?;
-                    if reply.value_len == 0 {
-                        return Ok((incremental.unwrap_or_default(), target));
+                    // An empty part ends the transfer.
+                    if part.value.is_empty() {
+                        return Ok((parts.unwrap_or_default(), target));
                     }
-                    data.extend(reply.value);
-                    deadline = Instant::now() + SEGMENT_TIMEOUT;
+                    data.extend_from_slice(&part.value);
+                    deadline = Instant::now() + WAIT;
                 }
                 _ => {}
             }
         }
-        bail!("timed out reading the clipboard")
+        bail!("the clipboard did not answer in time")
+    }
+}
+
+impl Drop for Selection {
+    fn drop(&mut self) {
+        let handed = self.owner.hand_over();
+        let _ = handed.inspect_err(|error| eprintln!("apps: clipboard manager: {error:#}"));
+        let port = &self.owner.port;
+        let _ = port.conn.destroy_window(port.window);
+        let _ = port.conn.flush();
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
+    }
+}
+
+impl Owner {
+    fn owns(&self) -> Result<bool> {
+        let owner = self
+            .port
+            .conn
+            .get_selection_owner(self.names.CLIPBOARD)?
+            .reply()?
+            .owner;
+        Ok(owner == self.port.window)
     }
 
     fn serve(&self) -> Result<()> {
+        let names = &self.names;
         loop {
-            match self.server.conn.wait_for_event()? {
-                Event::DestroyNotify(_) => return Ok(()),
-                Event::SelectionClear(event) if event.selection == self.atoms.CLIPBOARD => {
-                    *self.text.lock().unwrap() = None;
+            match self.port.conn.wait_for_event()? {
+                Event::DestroyNotify(gone) if gone.window == self.port.window => return Ok(()),
+                Event::SelectionClear(lost) if lost.selection == names.CLIPBOARD => {
+                    *hold(&self.text) = None;
                 }
-                Event::SelectionRequest(event) => {
-                    self.answer(event)?;
-                    let mut handover = self.handover.lock().unwrap();
-                    if let Handover::InProgress { written, notified } = &mut *handover
-                        && event.target != self.atoms.TARGETS
-                    {
-                        *written = true;
-                        if *notified {
-                            *handover = Handover::Finished;
-                            self.handover_done.notify_all();
-                        }
+                Event::SelectionRequest(request) => {
+                    self.answer(&request)?;
+                    if request.target != names.Targets {
+                        self.progress(|handover| handover.read = true);
                     }
                 }
-                // Some clipboard managers say they are done before they ask for the contents.
-                Event::SelectionNotify(event)
-                    if event.selection == self.atoms.CLIPBOARD_MANAGER =>
-                {
-                    let mut handover = self.handover.lock().unwrap();
-                    if let Handover::InProgress { written, notified } = &mut *handover {
-                        *notified = true;
-                        if *written {
-                            *handover = Handover::Finished;
-                            self.handover_done.notify_all();
-                        }
-                    }
+                Event::SelectionNotify(note) if note.selection == names.Manager => {
+                    self.progress(|handover| handover.done = true);
                 }
                 _ => {}
             }
         }
     }
 
-    fn answer(&self, event: SelectionRequestEvent) -> Result<()> {
-        let atoms = &self.atoms;
-        let conn = &self.server.conn;
-        let text = self.text.lock().unwrap().clone();
-        let utf8 = [atoms.UTF8_STRING, atoms.UTF8_MIME_0, atoms.UTF8_MIME_1];
-        let answered = match &text {
-            Some(_) if event.selection == atoms.CLIPBOARD && event.target == atoms.TARGETS => {
-                let targets = [
-                    atoms.TARGETS,
-                    atoms.SAVE_TARGETS,
-                    atoms.UTF8_STRING,
-                    atoms.UTF8_MIME_0,
-                    atoms.UTF8_MIME_1,
-                ];
+    fn progress(&self, step: impl FnOnce(&mut Handover)) {
+        let mut handover = hold(&self.handover);
+        if handover.finished.is_some() {
+            step(&mut handover);
+            if handover.read && handover.done {
+                let _ = handover
+                    .finished
+                    .take()
+                    .map(|finished| finished.try_send(()));
+            }
+        }
+    }
+
+    fn answer(&self, request: &xproto::SelectionRequestEvent) -> Result<()> {
+        let names = &self.names;
+        let conn = &self.port.conn;
+        // Obsolete clients name no property, and then the target is the property.
+        let property = if request.property == NONE {
+            request.target
+        } else {
+            request.property
+        };
+        let text = hold(&self.text).clone();
+        let utf8 = [names.Utf8, names.PlainUtf8, names.PlainUtf8Upper];
+        let (to, ours) = (request.requestor, request.selection == names.CLIPBOARD);
+        let given = match text {
+            Some(_) if ours && request.target == names.Targets => {
+                let targets = [names.Targets, names.Save, utf8[0], utf8[1], utf8[2]];
                 conn.change_property32(
-                    PropMode::REPLACE,
-                    event.requestor,
-                    event.property,
-                    atoms.ATOM,
+                    xproto::PropMode::REPLACE,
+                    to,
+                    property,
+                    names.AtomList,
                     &targets,
                 )?;
                 true
             }
-            Some(text) if event.selection == atoms.CLIPBOARD && utf8.contains(&event.target) => {
+            Some(text) if ours && utf8.contains(&request.target) => {
                 conn.change_property8(
-                    PropMode::REPLACE,
-                    event.requestor,
-                    event.property,
-                    event.target,
-                    text,
+                    xproto::PropMode::REPLACE,
+                    to,
+                    property,
+                    request.target,
+                    &text,
                 )?;
                 true
             }
             _ => false,
         };
-        conn.send_event(
-            false,
-            event.requestor,
-            EventMask::NO_EVENT,
-            SelectionNotifyEvent {
-                response_type: SELECTION_NOTIFY_EVENT,
-                sequence: event.sequence,
-                time: event.time,
-                requestor: event.requestor,
-                selection: event.selection,
-                target: event.target,
-                property: if answered {
-                    event.property
-                } else {
-                    AtomEnum::NONE.into()
-                },
-            },
-        )?;
+        let note = xproto::SelectionNotifyEvent {
+            response_type: xproto::SELECTION_NOTIFY_EVENT,
+            property: if given { property } else { NONE },
+            sequence: request.sequence,
+            time: request.time,
+            requestor: to,
+            selection: request.selection,
+            target: request.target,
+        };
+        conn.send_event(false, to, EventMask::NO_EVENT, note)?;
         conn.flush()?;
         Ok(())
     }
 
+    // Waits for the clipboard manager at most 100 ms.
     fn hand_over(&self) -> Result<()> {
-        if self.text.lock().unwrap().is_none() || !self.is_owner()? {
+        let empty = hold(&self.text).is_none();
+        if empty || !self.owns()? {
             return Ok(());
         }
-        // Locked before the request, so the server thread can't finish before this waits.
-        let mut handover = self.handover.lock().unwrap();
-        self.server.conn.convert_selection(
-            self.server.window,
-            self.atoms.CLIPBOARD_MANAGER,
-            self.atoms.SAVE_TARGETS,
-            self.atoms.APPS_CLIPBOARD,
-            Time::CURRENT_TIME,
-        )?;
-        self.server.conn.flush()?;
-        *handover = Handover::InProgress {
-            written: false,
-            notified: false,
+        let (finished, wait) = mpsc::sync_channel(1);
+        *hold(&self.handover) = Handover {
+            finished: Some(finished),
+            ..Handover::default()
         };
-        let (_handover, timeout) = self
-            .handover_done
-            .wait_timeout_while(handover, Duration::from_millis(100), |handover| {
-                *handover != Handover::Finished
-            })
-            .unwrap();
-        if timeout.timed_out() {
-            bail!("the clipboard manager did not take the clipboard in time");
+        let (conn, window, names) = (&self.port.conn, self.port.window, &self.names);
+        conn.convert_selection(
+            window,
+            names.Manager,
+            names.Save,
+            names.Landing,
+            x11rb::CURRENT_TIME,
+        )?;
+        conn.flush()?;
+        if wait.recv_timeout(Duration::from_millis(100)).is_err() {
+            bail!("the clipboard manager did not take the text in time");
         }
         Ok(())
     }

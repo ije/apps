@@ -126,10 +126,10 @@ pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> Child 
                 && let Some((_, old)) = backgrounds.insert(key, (source, image))
                 && std::sync::Arc::strong_count(&old) == 1
             {
-                window.drop_image(old);
+                window.release_image(old);
             }
             if let Some((_, image)) = backgrounds.get(&key) {
-                window.paint_image(
+                window.draw_image(
                     bounds,
                     bounds,
                     renderer::Radii::default(),

@@ -14,7 +14,7 @@ use crate::{
 use anyhow::{Context as _, Result, bail, ensure};
 use bbtree::unsync::BBTreeMap;
 use link::{Link, Main, PageQueue, ToMain, ToPage, state_json};
-use renderer::{App, Bounds, WindowChange, WindowId, WindowOptions, point, px, size};
+use renderer::{App, Rect, WindowChange, WindowId, WindowOptions, point, px, size};
 use std::{
     borrow::Cow,
     cell::RefCell,
@@ -202,7 +202,7 @@ impl Desktop {
             let _ = std::thread::Builder::new()
                 .name("apps-warm".into())
                 .spawn(|| {
-                    use renderer::text::{TextRun, TextSystem, font};
+                    use renderer::text::{Font, TextRun, TextSystem};
                     #[link(name = "CoreGraphics", kind = "framework")]
                     unsafe extern "C" {
                         fn CGMainDisplayID() -> u32;
@@ -219,21 +219,19 @@ impl Desktop {
                     let text = TextSystem::new();
                     let run = TextRun {
                         len: 2,
-                        font: font(".SystemUIFont"),
+                        font: Font::new(".SystemUIFont"),
                         ..Default::default()
                     };
-                    let line = text.layout_line("Ag", renderer::px(13.), &[run], None);
-                    if let Some(run) = line.runs.first()
-                        && let Some(glyph) = run.glyphs.first()
-                    {
-                        text.glyph_pixels(run.font_id, glyph.id, run.font_size, 2., 0, false);
+                    let line = text.shape_line("Ag", renderer::px(13.), &run);
+                    if let Some(glyph) = line.line.glyphs.first() {
+                        text.glyph_pixels(glyph.font, glyph.id, glyph.size, 2., 0, false);
                     }
-                    text.resolve_font(&renderer::Font {
-                        weight: renderer::FontWeight(600.),
-                        ..font(".SystemUIFont")
+                    text.face(&Font {
+                        weight: 600.,
+                        ..Font::new(".SystemUIFont")
                     });
-                    text.resolve_font(&font("Menlo"));
-                    text.resolve_font(&font("Helvetica"));
+                    text.face(&Font::new("Menlo"));
+                    text.face(&Font::new("Helvetica"));
                     let devices = unsafe { MTLCopyAllDevices() };
                     if !devices.is_null() {
                         unsafe { CFRelease(devices) };
@@ -452,11 +450,11 @@ impl Desktop {
                             let later = child || options["focusable"] == false;
                             let show = options["show"] != false;
                             let window_options = WindowOptions {
-                                bounds: Bounds::new(origin, outer),
+                                bounds: Rect::new(origin, outer),
                                 outer_size: options["useContentSize"] != true,
                                 title: options["title"].as_str().unwrap_or("apps").to_owned(),
                                 titlebar_hidden: hidden,
-                                traffic_light_position,
+                                buttons_at: traffic_light_position,
                                 frameless: !frame,
                                 transparent,
                                 show: show && !later,
@@ -470,8 +468,11 @@ impl Desktop {
                                 Box::new(view)
                             })?;
                             cx.update_window(handle, |window, _| {
-                                self.link
-                                    .main(ToMain::Window(id, window.id(), window.control()));
+                                self.link.main(ToMain::Window(
+                                    id,
+                                    window.id(),
+                                    window.control().clone(),
+                                ));
                                 for (apply, change) in [
                                     (
                                         min != [0.; 2] || max != [0.; 2],
@@ -491,7 +492,7 @@ impl Desktop {
                                     (options["closable"] == false, WindowChange::Closable(false)),
                                     (
                                         true,
-                                        WindowChange::Background(renderer::rgba(
+                                        WindowChange::Background(renderer::Color::hex(
                                             (background.0 << 8) | background.1 as u32,
                                         )),
                                     ),
@@ -521,7 +522,7 @@ impl Desktop {
                                     }
                                 }
                                 if options["fullscreen"] == true {
-                                    window.toggle_fullscreen();
+                                    window.control().toggle_fullscreen();
                                 }
                                 let size = window.viewport_size();
                                 self.host
@@ -706,7 +707,7 @@ impl Desktop {
                                 state.pixel_ratio = window.scale_factor();
                                 state.window = window.window_state();
                                 // Like Playwright, pages count as focused while the devtools MCP server runs, so tests in hidden windows get focus events.
-                                view.focused = window.is_window_active() || mcp::enabled();
+                                view.focused = window.is_active() || mcp::enabled();
                             });
                         }
                         view.preload = None;
@@ -883,7 +884,7 @@ impl Desktop {
                                 data.browsers.borrow_mut().clear();
                             }
                             if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
-                                cx.update_window(handle, |window, _| window.remove_window());
+                                cx.update_window(handle, |window, _| window.close());
                             }
                             self.host.borrow_mut().pages.remove(&id);
                             self.host.borrow_mut().graphics.remove(&id);
@@ -907,8 +908,8 @@ impl Desktop {
                         {
                             let link = self.link.clone();
                             cx.update_window(handle, |window, _| {
-                                window.on_next_frame(|window, _| {
-                                    window.on_next_frame(move |_, _| {
+                                window.next_frame(|window, _| {
+                                    window.next_frame(move |_, _| {
                                         link.event("__appsInitMenu()".into(), "apps:menu")
                                     })
                                 })
@@ -976,9 +977,9 @@ impl Desktop {
                         let mut was = false;
                         if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
                             cx.update_window(handle, |window, _| {
-                                was = window.is_fullscreen();
+                                was = window.window_state().fullscreen;
                                 if on && !was || before == Some(false) && was {
-                                    window.toggle_fullscreen();
+                                    window.control().toggle_fullscreen();
                                 }
                             });
                         }
@@ -1003,9 +1004,9 @@ impl Desktop {
                             (self.views[&id].handle, cx.as_deref_mut())
                         {
                             cx.update_window(handle, |window, _| {
-                                window.change_window(WindowChange::Background(renderer::rgba(
-                                    (color.0 << 8) | color.1 as u32,
-                                )));
+                                window.change_window(WindowChange::Background(
+                                    renderer::Color::hex((color.0 << 8) | color.1 as u32),
+                                ));
                                 window.refresh();
                             });
                         }
@@ -1061,7 +1062,7 @@ impl Desktop {
                     "apps:title",
                 );
             } else if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
-                cx.update_window(handle, |window, _| window.set_window_title(text));
+                cx.update_window(handle, |window, _| window.control().set_title(text));
             }
         }
         Ok(())
@@ -1888,7 +1889,7 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
 }
 
 fn window_state(window: &renderer::Window) -> serde_json::Value {
-    state_json(&window.window_state(), window.is_window_active())
+    state_json(&window.window_state(), window.is_active())
 }
 
 fn png(
@@ -1937,7 +1938,10 @@ fn png(
         );
         image = scaled;
     }
-    Ok(([image.width(), image.height()], image.encode_png()?))
+    Ok((
+        [image.width(), image.height()],
+        crate::render::image::encode_png(&image)?,
+    ))
 }
 
 #[cfg(test)]
@@ -2791,7 +2795,12 @@ mod tests {
         let code = "__apps.app.whenReady().then(()=>{globalThis.win=new __apps.BrowserWindow();globalThis.contents=win.webContents;globalThis.f=e=>e.preventDefault();globalThis.calls=0;const real=__appsBeforeInput;globalThis.__appsBeforeInput=(...args)=>(calls++,real(...args));win.load('<body></body>')})";
         let mut desktop = app(code, &[], std::path::PathBuf::new());
         let main = desktop.main.clone().unwrap();
-        let down = renderer::PlatformInput::KeyDown(renderer::KeyDownEvent::default());
+        let down = renderer::Event::KeyDown {
+            key: renderer::Key::default(),
+            modifiers: renderer::Modifiers::NONE,
+            repeat: false,
+            ime: false,
+        };
         let mut key = |script: &str| {
             desktop.js().eval(script, "test").unwrap();
             desktop.pump(None, None).unwrap();

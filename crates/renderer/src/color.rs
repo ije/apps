@@ -1,80 +1,74 @@
+// Straight alpha. All channels go from 0 to 1.
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 #[repr(C)]
-pub struct Rgba {
+pub struct Color {
     pub r: f32,
     pub g: f32,
     pub b: f32,
     pub a: f32,
 }
 
-pub fn rgba(hex: u32) -> Rgba {
-    let channel = |shift: u32| ((hex >> shift) & 0xff) as f32 / 255.;
-    Rgba {
-        r: channel(24),
-        g: channel(16),
-        b: channel(8),
-        a: channel(0),
-    }
-}
+impl Color {
+    pub const TRANSPARENT: Self = Self::new(0., 0., 0., 0.);
+    pub const BLACK: Self = Self::new(0., 0., 0., 1.);
+    pub const WHITE: Self = Self::new(1., 1., 1., 1.);
 
-pub const fn black() -> Rgba {
-    Rgba {
-        r: 0.,
-        g: 0.,
-        b: 0.,
-        a: 1.,
+    pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
+        Self { r, g, b, a }
     }
-}
 
-pub const fn transparent_black() -> Rgba {
-    Rgba {
-        r: 0.,
-        g: 0.,
-        b: 0.,
-        a: 0.,
+    pub fn hex(rgba: u32) -> Self {
+        let [r, g, b, a] = rgba.to_be_bytes().map(|byte| byte as f32 / 255.);
+        Self { r, g, b, a }
     }
-}
 
-impl Rgba {
-    pub fn opacity(self, factor: f32) -> Self {
+    pub fn to_hex(self) -> u32 {
+        u32::from_be_bytes(
+            self.to_array()
+                .map(|channel| (channel.clamp(0., 1.) * 255.).round() as u8),
+        )
+    }
+
+    pub fn to_array(self) -> [f32; 4] {
+        [self.r, self.g, self.b, self.a]
+    }
+
+    pub fn fade(self, factor: f32) -> Self {
         Self {
             a: self.a * factor.clamp(0., 1.),
             ..self
         }
     }
-    pub fn alpha(self, a: f32) -> Self {
+
+    pub fn with_alpha(self, alpha: f32) -> Self {
         Self {
-            a: a.clamp(0., 1.),
+            a: alpha.clamp(0., 1.),
             ..self
         }
     }
-    pub fn is_transparent(&self) -> bool {
+
+    pub fn is_transparent(self) -> bool {
         self.a == 0.
     }
-    pub fn is_opaque(&self) -> bool {
+
+    pub fn is_opaque(self) -> bool {
         self.a >= 1.
     }
-    pub fn blend(self, other: Self) -> Self {
-        if other.a >= 1. {
-            return other;
+
+    pub fn under(self, top: Self) -> Self {
+        if top.a >= 1. {
+            return top;
         }
-        let a = other.a + self.a * (1. - other.a);
+        let rest = self.a * (1. - top.a);
+        let a = top.a + rest;
         if a <= 0. {
-            return transparent_black();
+            return Self::TRANSPARENT;
         }
-        let mix = |top: f32, bottom: f32| (top * other.a + bottom * self.a * (1. - other.a)) / a;
         Self {
-            r: mix(other.r, self.r),
-            g: mix(other.g, self.g),
-            b: mix(other.b, self.b),
+            r: (top.r * top.a + self.r * rest) / a,
+            g: (top.g * top.a + self.g * rest) / a,
+            b: (top.b * top.a + self.b * rest) / a,
             a,
         }
-    }
-}
-
-impl From<Rgba> for u32 {
-    fn from(color: Rgba) -> Self {
-        let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u32;
-        channel(color.r) << 24 | channel(color.g) << 16 | channel(color.b) << 8 | channel(color.a)
     }
 }

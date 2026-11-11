@@ -1274,7 +1274,7 @@ fn bitmaps_and_canvases_move_between_threads() {
     let node = |name: &str| -> usize { engine.eval(name, "test").unwrap().parse().unwrap() };
     let host = host.borrow();
     let dom = &host.dom[&1];
-    assert_eq!(u32::from(dom.images[&node("placeholder")].size().width), 16);
+    assert_eq!(dom.images[&node("placeholder")].size().width as u32, 16);
     assert!(host.pages[&1].dirty);
     let local = &dom.canvases[&node("local")];
     assert_eq!(local.image.bytes()[..4], [255, 0, 255, 255]);

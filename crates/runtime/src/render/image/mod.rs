@@ -67,13 +67,13 @@ pub(crate) fn pixels(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize, usize)> {
             (if ycbcr { pixels } else { bgra(pixels, 3) }, width, height)
         }
         [0x89, b'P', b'N', b'G', ..] => {
-            let mut decoder = png::Decoder::new(bytes);
+            let mut decoder = png::Decoder::new(Cursor::new(bytes));
             decoder.set_transformations(png::Transformations::normalize_to_color8());
             let mut reader = decoder.read_info()?;
             let (width, height) = reader.info().size();
             let (width, height) = (width as usize, height as usize);
             anyhow::ensure!(fits(width, height), "Image is too large");
-            let mut pixels = vec![0; reader.output_buffer_size()];
+            let mut pixels = vec![0; reader.output_buffer_size().context("Image is too large")?];
             let frame = reader.next_frame(&mut pixels)?;
             pixels.truncate(frame.buffer_size());
             (bgra(pixels, frame.color_type.samples()), width, height)
@@ -150,6 +150,26 @@ pub(crate) fn pixels(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize, usize)> {
             (bgra(image.into_raw(), 4), width as usize, height as usize)
         }
     })
+}
+
+// WARNING: png's default level and its adaptive filter are several times slower than these, and
+// `capturePage()` and `toDataURL()` encode a whole frame per call.
+pub(crate) fn encode_png(image: &tiny_skia::Pixmap) -> anyhow::Result<Vec<u8>> {
+    let mut straight = image.data().to_vec();
+    for (pixel, out) in (image.pixels().iter()).zip(straight.as_chunks_mut::<4>().0) {
+        if pixel.alpha() != 255 {
+            let color = pixel.demultiply();
+            *out = [color.red(), color.green(), color.blue(), color.alpha()];
+        }
+    }
+    let mut bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut bytes, image.width(), image.height());
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    encoder.set_filter(png::Filter::Sub);
+    encoder.write_header()?.write_image_data(&straight)?;
+    Ok(bytes)
 }
 
 pub(crate) fn data_file(url: &str) -> Option<std::path::PathBuf> {

@@ -1,5 +1,5 @@
 use super::native_sync;
-use crate::{Bounds, ControlEvent, ControlKind, ControlSink, NativeControl, Pixels};
+use crate::{ControlEvent, ControlKind, ControlSink, NativeControl, Pixels, Rect};
 use objc2::{
     class, msg_send,
     rc::Retained,
@@ -408,7 +408,7 @@ fn rect([x, y, width, height]: [f64; 4]) -> NSRect {
     NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
 }
 
-fn edges(bounds: Bounds<Pixels>) -> [f64; 4] {
+fn edges(bounds: Rect<Pixels>) -> [f64; 4] {
     [
         bounds.origin.x,
         bounds.origin.y,

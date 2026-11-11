@@ -134,7 +134,7 @@ The custom page pipeline has four stages:
 3. [Render](crates/runtime/src/render) converts styled DOM nodes into renderer nodes, text, controls, images, and effects.
 4. [Renderer](crates/renderer/src) retains the box tree, computes Taffy layout, shapes text, and submits GPU commands.
 
-The runtime owns HTML and CSS behavior. The renderer owns windows and the lower-level box, text, and graphics APIs. Parts of the renderer derive from Zed's GPUI.
+The runtime owns HTML and CSS behavior. The renderer owns windows and the lower-level box, text, and graphics APIs.
 
 ### Incremental work
 

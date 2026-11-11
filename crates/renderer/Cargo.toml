@@ -3,8 +3,7 @@ name = "apps-renderer"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
-# Parts are derived from Zed's GPUI.
-license = "Apache-2.0"
+license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -18,16 +17,30 @@ libc.workspace = true
 block2.workspace = true
 core-foundation.workspace = true
 core-foundation-sys.workspace = true
-core-graphics.workspace = true
-core-text.workspace = true
 dispatch2 = { workspace = true, features = ["block2", "objc2"] }
-flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
-font-kit = { workspace = true, features = ["source"] }
-foreign-types.workspace = true
+flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
 objc2.workspace = true
-objc2-app-kit.workspace = true
-objc2-core-foundation = { workspace = true, features = ["std", "CFCGTypes"] }
-objc2-core-text.workspace = true
+objc2-app-kit = { workspace = true, features = ["NSTextInputContext", "NSVisualEffectView"] }
+objc2-core-foundation = { workspace = true, features = [
+    "std",
+    "CFArray",
+    "CFAttributedString",
+    "CFCGTypes",
+    "CFData",
+    "CFDictionary",
+    "CFNumber",
+    "CFPreferences",
+    "CFString",
+] }
+objc2-core-text = { workspace = true, features = [
+    "CTFontCollection",
+    "CTFontManager",
+    "CTFontTraits",
+    "CTLine",
+    "CTRun",
+    "CTStringAttributes",
+    "objc2-core-graphics",
+] }
 objc2-foundation.workspace = true
 objc2-metal = { version = "0.3.2", default-features = false, features = [
     "std",
@@ -49,8 +62,24 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
     "MTLResource",
     "MTLTexture",
     "MTLTypes",
+    "MTLVertexDescriptor",
 ] }
-objc2-core-graphics.workspace = true
+objc2-core-video = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2",
+    "objc2-core-graphics",
+    "CVBase",
+    "CVDisplayLink",
+    "CVReturn",
+] }
+objc2-core-graphics = { workspace = true, features = [
+    "CGBitmapContext",
+    "CGColorSpace",
+    "CGContext",
+    "CGFont",
+    "CGImage",
+] }
 objc2-quartz-core = { workspace = true, features = [
     "objc2-core-foundation",
     "objc2-core-graphics",
@@ -62,8 +91,6 @@ objc2-quartz-core = { workspace = true, features = [
     "CATransaction",
     "CATransform3D",
 ] }
-pathfinder_geometry.workspace = true
-smallvec.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = [
@@ -88,25 +115,23 @@ windows = { workspace = true, features = [
 windows-core.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-as-raw-xcb-connection = "1"
-calloop = "0.14.3"
-calloop-wayland-source = "0.4.1"
 cosmic-text = "0.19.0"
 libc.workspace = true
 pollster.workspace = true
 swash.workspace = true
-unicode-bidi.workspace = true
-wayland-backend = { version = "0.3.15", features = ["client_system", "dlopen"] }
-wayland-client = "0.31.11"
-wayland-cursor = "0.31.11"
-wayland-protocols = { version = "0.32.9", features = ["client", "staging", "unstable"] }
+wayland-backend = { version = "0.3.17", features = ["client_system", "dlopen"] }
+wayland-client = "0.31.15"
+wayland-cursor = "0.31.14"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging", "unstable"] }
 wgpu = { workspace = true, features = ["std", "parking_lot", "gles", "vulkan", "wgsl"] }
-x11rb = { version = "0.13.1", features = ["allow-unsafe-code", "xkb", "randr", "xinput", "cursor", "resource_manager", "sync"] }
-xim = { git = "https://github.com/zed-industries/xim-rs.git", rev = "16f35a2c881b815a2b6cdfd6687988e84f8447d8", package = "zed-xim", version = "0.4.0-zed", features = ["x11rb-xcb", "x11rb-client"] }
+x11rb = { version = "0.14.0", features = ["allow-unsafe-code", "xkb", "randr", "xinput", "cursor", "resource_manager", "sync"] }
+xim = { version = "0.6.0", default-features = false, features = ["x11rb-xcb", "x11rb-client"] }
 xkbcommon = { workspace = true, features = ["x11", "wayland"] }
 
 [dev-dependencies]
-naga = { version = "30", features = ["wgsl-in"] }
+naga = { version = "30.0.1", features = ["wgsl-in"] }
 
-[build-dependencies]
-miniz_oxide = "0.8"
+# The build script runs on the host, and only a macOS host builds Metal shaders.
+[target.'cfg(target_os = "macos")'.build-dependencies]
+miniz_oxide = "0.9.1"
+naga = { version = "30.0.1", features = ["wgsl-in", "msl-out"] }

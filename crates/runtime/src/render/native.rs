@@ -2,7 +2,7 @@ use crate::{
     dom::{Document, Node},
     style::{self, Prop},
 };
-use renderer::{Bounds, ControlEvent, ControlKind, ControlSink, NativeControl, Pixels};
+use renderer::{ControlEvent, ControlKind, ControlSink, NativeControl, Pixels, Rect};
 use std::sync::{Arc, Mutex, PoisonError};
 
 const FALLBACKS: [(&str, &str); 7] = [
@@ -95,7 +95,7 @@ pub(super) fn sync(controls: &std::cell::RefCell<Controls>, doc: &Document) {
 pub(super) fn paint(
     view: &super::PageState,
     id: usize,
-    bounds: Bounds<Pixels>,
+    bounds: Rect<Pixels>,
     style: &style::Style,
     window: &mut renderer::Window,
 ) {

@@ -1,7 +1,6 @@
-use crate::{Bounds, Pixels};
-use std::sync::Arc;
+use crate::{Pixels, Rect};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ControlKind {
     Button,
     Switch,
@@ -13,12 +12,13 @@ pub enum ControlKind {
     Date,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+/// `seen` is the last page change that the view took, so a value the page did not see yet is not overwritten.
+#[derive(Clone, PartialEq)]
 pub struct NativeControl {
     pub key: u64,
     pub kind: ControlKind,
-    pub bounds: Bounds<Pixels>,
-    pub clip: Bounds<Pixels>,
+    pub bounds: Rect<Pixels>,
+    pub clip: Rect<Pixels>,
     pub enabled: bool,
     pub editable: bool,
     pub checked: bool,
@@ -31,7 +31,6 @@ pub struct NativeControl {
     pub seen: u64,
 }
 
-#[derive(Clone, Debug)]
 pub struct ControlEvent {
     pub key: u64,
     pub seq: u64,
@@ -39,16 +38,9 @@ pub struct ControlEvent {
     pub done: bool,
 }
 
-pub type ControlSink = Arc<dyn Fn(ControlEvent) + Send + Sync>;
+/// Called on the main thread.
+pub type ControlSink = std::sync::Arc<dyn Fn(ControlEvent) + Send + Sync>;
 
 pub fn control_size(kind: ControlKind) -> [f32; 2] {
-    #[cfg(target_os = "macos")]
-    {
-        crate::platform::control_size(kind)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = kind;
-        [0., 0.]
-    }
+    crate::platform::control_size(kind)
 }

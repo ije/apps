@@ -259,7 +259,7 @@ impl Lengths {
                 break 'parse;
             }
             shadows.push(renderer::BoxShadow {
-                color: renderer::rgba((ink.0 << 8) | u32::from(ink.1)),
+                color: renderer::Color::hex((ink.0 << 8) | u32::from(ink.1)),
                 offset: renderer::point(renderer::px(lengths[0]), renderer::px(lengths[1])),
                 // The renderer uses the blur radius as the Gaussian sigma, which is half the CSS blur radius.
                 blur_radius: renderer::px(lengths.get(2).copied().unwrap_or(0.).max(0.) / 2.),
@@ -413,9 +413,9 @@ impl Filter {
         (r << 16 | g << 8 | b, alpha)
     }
 
-    pub fn hsla(&self, color: renderer::Rgba) -> renderer::Rgba {
+    pub fn hsla(&self, color: renderer::Color) -> renderer::Color {
         let [r, g, b] = self.rgb([color.r, color.g, color.b]);
-        renderer::Rgba {
+        renderer::Color {
             r,
             g,
             b,
