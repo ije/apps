@@ -665,7 +665,7 @@ impl Wheel {
             return;
         }
         let held = phase == WheelPhase::Began && handle.hold();
-        let (panned, over) = handle.pan(moved);
+        let (panned, over) = handle.pan(moved, window.event_at);
         let latched = latched == Some(true) || held || panned;
         if latched {
             window.gesture.latch = Some(handle.clone());
@@ -697,6 +697,7 @@ impl Wheel {
             if phase == WheelPhase::None {
                 handle.loosen(window);
             }
+            handle.drive(window);
             window.refresh();
         }
     }
@@ -712,9 +713,23 @@ struct ScrollState {
     stretch: Point<Pixels>,
     spring: Option<Spring>,
     loose: bool,
+    glide: Option<Glide>,
 }
 
 const STIFFNESS: f32 = 20.;
+
+// A trackpad delta that carries the time its device sent it reaches the offset spread over the time to
+// the next event. Each frame then moves by its share of time, whatever the rate of the events and
+// wherever they fall between frames.
+struct Glide {
+    to: Point<Pixels>,
+    from: Instant,
+    until: Instant,
+    event: Instant,
+    pace: Duration,
+}
+
+const PACE: Duration = Duration::from_micros(16_667);
 
 struct Spring {
     from: Point<Pixels>,
@@ -763,7 +778,7 @@ impl Animation {
 }
 
 impl ScrollState {
-    fn pan(&mut self, delta: Point<Pixels>) -> (bool, Point<Pixels>) {
+    fn pan(&mut self, delta: Point<Pixels>, sent: Option<Instant>) -> (bool, Point<Pixels>) {
         let axis = |offset: &mut Pixels, stretch: &mut Pixels, max: Pixels, mut delta: Pixels| {
             let mut moved = false;
             if !stretch.is_zero() && !delta.is_zero() {
@@ -783,13 +798,41 @@ impl ScrollState {
             (moved, rest)
         };
         let max = self.max_offset;
-        let (moved_x, x) = axis(&mut self.offset.x, &mut self.stretch.x, max.x, delta.x);
-        let (moved_y, y) = axis(&mut self.offset.y, &mut self.stretch.y, max.y, delta.y);
-        if moved_x || moved_y {
+        let mut aim = self.glide.as_ref().map_or(self.offset, |glide| glide.to);
+        let resting = aim == self.offset;
+        let (moved_x, x) = axis(&mut aim.x, &mut self.stretch.x, max.x, delta.x);
+        let (moved_y, y) = axis(&mut aim.y, &mut self.stretch.y, max.y, delta.y);
+        let moved = moved_x || moved_y;
+        if moved {
             self.animation = None;
             self.spring = None;
         }
-        (moved_x || moved_y, point(x, y))
+        match sent {
+            _ if !moved => {}
+            Some(now) => {
+                let last = self.glide.as_ref().map(|glide| (now - glide.event, glide));
+                let (from, pace) = match last {
+                    Some((gap, glide)) if gap < Duration::from_millis(100) => {
+                        let gap = gap.clamp(PACE / 2, PACE * 6 / 5);
+                        (
+                            if resting { now } else { glide.from },
+                            // Slower events count at once, or the scroll would run ahead and then stop.
+                            gap.max((glide.pace + gap) / 2),
+                        )
+                    }
+                    _ => (now, PACE),
+                };
+                self.glide = Some(Glide {
+                    to: aim,
+                    from,
+                    until: now + pace,
+                    event: now,
+                    pace,
+                });
+            }
+            None => (self.offset, self.glide) = (aim, None),
+        }
+        (moved, point(x, y))
     }
 
     fn animate_to(&mut self, offset: Point<Pixels>, wheel: bool) {
@@ -826,6 +869,7 @@ impl ScrollState {
             duration,
         });
         self.offset = from;
+        self.glide = None;
     }
 
     fn advance(&mut self, now: Instant, idle: bool) -> bool {
@@ -841,6 +885,22 @@ impl ScrollState {
             };
             moved = offset != self.offset;
             self.offset = offset;
+        }
+        if let Some(glide) = &mut self.glide
+            && glide.to != self.offset
+        {
+            let span = (glide.until - glide.from).as_secs_f32();
+            let done = now.saturating_duration_since(glide.from).as_secs_f32();
+            let (from, to) = (self.offset, glide.to);
+            self.offset = match done < span {
+                true => point(
+                    from.x + (to.x - from.x) * (done / span),
+                    from.y + (to.y - from.y) * (done / span),
+                ),
+                false => to,
+            };
+            glide.from = glide.from.max(now);
+            moved |= self.offset != from;
         }
         if self.loose && idle {
             self.loose = false;
@@ -900,14 +960,15 @@ impl ScrollRef {
         let scroll = &mut *self.0.borrow_mut();
         (scroll.offset, scroll.stretch) = (offset, Point::default());
         (scroll.animation, scroll.spring, scroll.loose) = (None, None, false);
+        scroll.glide = None;
     }
 
     pub fn animate_to(&self, offset: Point<Pixels>, wheel: bool) {
         self.0.borrow_mut().animate_to(offset, wheel);
     }
 
-    fn pan(&self, delta: Point<Pixels>) -> (bool, Point<Pixels>) {
-        self.0.borrow_mut().pan(delta)
+    fn pan(&self, delta: Point<Pixels>, sent: Option<Instant>) -> (bool, Point<Pixels>) {
+        self.0.borrow_mut().pan(delta, sent)
     }
 
     pub(crate) fn stretch_by(&self, rest: Point<Pixels>) {
@@ -953,7 +1014,9 @@ impl ScrollRef {
     pub(crate) fn drive(&self, window: &mut Window) {
         {
             let scroll = &mut *self.0.borrow_mut();
-            let busy = scroll.animation.is_some() || scroll.spring.is_some() || scroll.loose;
+            let gliding = (scroll.glide.as_ref()).is_some_and(|glide| glide.to != scroll.offset);
+            let busy =
+                scroll.animation.is_some() || scroll.spring.is_some() || scroll.loose || gliding;
             if scroll.driven || !busy {
                 return;
             }
@@ -961,8 +1024,8 @@ impl ScrollRef {
         }
         let handle = self.clone();
         window.next_frame(move |window, _| {
-            let now = Instant::now();
-            let idle = now - window.rails.1 > Duration::from_millis(100);
+            let now = window.frame_at.unwrap_or_else(Instant::now);
+            let idle = now.saturating_duration_since(window.rails.1) > Duration::from_millis(100);
             if handle.0.borrow_mut().advance(now, idle) {
                 window.refresh();
             }
@@ -995,8 +1058,12 @@ impl ScrollRef {
             .map(round)
             .max(Point::default());
         let scroll = &mut *self.0.borrow_mut();
-        scroll.offset.x = scroll.offset.x.clamp(-max.x, px(0.));
-        scroll.offset.y = scroll.offset.y.clamp(-max.y, px(0.));
+        let within =
+            |at: Point<Pixels>| point(at.x.clamp(-max.x, px(0.)), at.y.clamp(-max.y, px(0.)));
+        scroll.offset = within(scroll.offset);
+        if let Some(glide) = &mut scroll.glide {
+            glide.to = within(glide.to);
+        }
         scroll.max_offset = max;
         scroll.bounds = bounds;
         scroll.offset + scroll.stretch
@@ -1006,7 +1073,7 @@ impl ScrollRef {
 #[cfg(test)]
 mod tests {
     use super::{Animation, ScrollRef, Spring};
-    use crate::{point, px};
+    use crate::{Pixels, Point, point, px};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1015,24 +1082,61 @@ mod tests {
         let handle = ScrollRef::default();
         handle.0.borrow_mut().max_offset = delta(100.);
 
-        assert_eq!(handle.pan(delta(-30.)), (true, delta(0.)));
-        assert_eq!(handle.pan(delta(50.)), (true, delta(20.)));
+        let pan = |by: Point<Pixels>| handle.pan(by, None);
+        assert_eq!(pan(delta(-30.)), (true, delta(0.)));
+        assert_eq!(pan(delta(50.)), (true, delta(20.)));
         assert_eq!(handle.offset().y, px(0.));
-        assert_eq!(handle.pan(delta(10.)), (false, delta(10.)));
+        assert_eq!(pan(delta(10.)), (false, delta(10.)));
 
         handle.stretch_by(delta(40.));
         assert_eq!(handle.stretch().y, px(2.));
-        assert_eq!(handle.pan(delta(20.)), (true, delta(0.)));
+        assert_eq!(pan(delta(20.)), (true, delta(0.)));
         assert_eq!(handle.stretch().y, px(3.));
-        assert_eq!(handle.pan(delta(-80.)), (true, delta(0.)));
+        assert_eq!(pan(delta(-80.)), (true, delta(0.)));
         assert_eq!(handle.stretch().y, px(0.));
         assert_eq!(handle.offset().y, px(-20.));
 
-        assert_eq!(handle.pan(delta(-100.)), (true, delta(-20.)));
+        assert_eq!(pan(delta(-100.)), (true, delta(-20.)));
         handle.stretch_by(delta(-20.));
         assert_eq!(handle.stretch().y, px(-1.));
         handle.set_offset(delta(-50.));
         assert_eq!(handle.stretch(), Default::default());
+    }
+
+    #[test]
+    fn pans_move_evenly_between_events() {
+        let delta = |y: f32| point(px(0.), px(y));
+        let handle = ScrollRef::default();
+        handle.0.borrow_mut().max_offset = delta(1000.);
+        let (start, frame) = (Instant::now(), Duration::from_micros(8_333));
+        let mut last = 0.;
+        let mut steps = Vec::new();
+        // Events at 60 Hz, frames at 120 Hz, 3 ms after the events.
+        for tick in 0..24 {
+            let now = start + frame * tick;
+            if tick % 2 == 0 && tick < 16 {
+                handle.pan(delta(-10.), Some(now));
+                // An event that moves nothing, like the end of a gesture, leaves the rest to come.
+                handle.pan(delta(0.), Some(now));
+            }
+            handle
+                .0
+                .borrow_mut()
+                .advance(now + Duration::from_millis(3), false);
+            let y = f32::from(handle.offset().y);
+            steps.push(last - y);
+            last = y;
+        }
+        assert!(
+            steps[4..16].iter().all(|step| (step - 5.).abs() < 0.01),
+            "{steps:?}"
+        );
+        assert_eq!(handle.offset().y, px(-80.));
+
+        handle.pan(delta(-10.), Some(start + frame * 30));
+        handle.set_offset(delta(-50.));
+        assert!(!handle.0.borrow_mut().advance(start + frame * 40, false));
+        assert_eq!(handle.offset().y, px(-50.));
     }
 
     #[test]

@@ -156,6 +156,8 @@ The renderer caches text layout, glyphs, images, and intermediate surfaces. It p
 
 The backend implementations live in [renderer/src/platform](crates/renderer/src/platform). On macOS, display links deliver frame requests directly to render threads. Ordinary page frames do not require main JavaScript to return.
 
+A display link stays on for 30 ticks after the last frame, because a start takes several milliseconds. A trackpad scroll delta reaches the scroll offset spread over the time between two events, so a 60 Hz scroll moves on each frame of a 120 Hz display. Draws that wait for a drawable twice in a row skip one tick, which drains the queue of frames and its delay.
+
 ### Native content
 
 System web views sit above the GPU page. Their engines are WKWebView on macOS, WebView2 on Windows, and WebKitGTK on Linux. The Windows and Linux implementations use Wry. CSS effects from the custom renderer cannot clip or blend these views.

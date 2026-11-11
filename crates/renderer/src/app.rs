@@ -373,6 +373,7 @@ impl Callbacks {
             if window.dirty || !window.captures.is_empty() {
                 window.draw(app);
             }
+            window.frame_at = None;
         })?;
         let home = home()?;
         let app = home.app.borrow();

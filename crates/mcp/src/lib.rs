@@ -418,7 +418,7 @@ const TOOLS: &str = r#"[
     "delta_x": {"type": "number"},
     "delta_y": {"type": "number"},
     "lines": {"type": "boolean", "description": "Scroll deltas are mouse wheel lines instead of trackpad pixels."},
-    "phase": {"type": "string", "enum": ["began", "changed", "ended", "momentum", "momentum_ended"], "description": "Where a trackpad scroll is in its gesture. Without it, the box bounces back 100 ms after the last scroll."}
+    "phase": {"type": "string", "enum": ["began", "changed", "ended", "momentum", "momentum_ended"], "description": "Where a trackpad scroll is in its gesture. With it, the scroll reaches its offset over the next frames. Without it, the box bounces back 100 ms after the last scroll."}
   }, "required": ["action"]}},
   {"name": "console", "description": "Returns console messages and uncaught errors from all contexts since the last call.", "inputSchema": {"type": "object", "properties": {
     "keep": {"type": "boolean", "description": "Keep the messages for the next call."}

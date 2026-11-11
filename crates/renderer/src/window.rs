@@ -450,6 +450,9 @@ pub struct Window {
     frames_drawn: u64,
     tracks: Vec<Track>,
     pub(crate) rails: ([f32; 2], Instant),
+    // The time of a frame that a display tick started, and when its device sent the event in dispatch.
+    pub(crate) frame_at: Option<Instant>,
+    pub(crate) event_at: Option<Instant>,
     pub(crate) scroll_chain: Option<Vec<ScrollRef>>,
     pub(crate) gesture: ScrollGesture,
 }
@@ -510,6 +513,8 @@ impl Window {
             frames_drawn: 0,
             tracks: Vec::new(),
             rails: ([0.; 2], Instant::now()),
+            frame_at: None,
+            event_at: None,
             scroll_chain: None,
             gesture: ScrollGesture::default(),
         }
@@ -1057,6 +1062,14 @@ impl Window {
         if phase == WheelPhase::MomentumEnded {
             self.gesture.latch = None;
         }
+    }
+
+    // A trackpad scroll with the time its device sent it moves evenly between events.
+    pub fn dispatch_event_at(&mut self, event: Event, sent: Instant, app: &mut App) -> bool {
+        self.event_at = Some(sent);
+        let stopped = self.dispatch_event(event, app);
+        self.event_at = None;
+        stopped
     }
 
     pub fn dispatch_event(&mut self, event: Event, app: &mut App) -> bool {

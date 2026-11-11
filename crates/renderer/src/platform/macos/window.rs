@@ -17,6 +17,7 @@ use objc2_core_foundation::CGSize;
 use objc2_foundation::NSRect;
 use raw_window_handle as rwh;
 use std::{
+    cell::Cell,
     ptr::NonNull,
     rc::Rc,
     sync::{
@@ -28,6 +29,10 @@ use std::{
 
 // After this long without frames, the window gives back its spare GPU memory.
 const QUIET: Duration = Duration::from_secs(1);
+
+// The display link stays on for this many ticks after the last frame. A start takes 4 to 11 ms, so
+// frames that come one by one, like a 60 Hz scroll on a 120 Hz display, would land unevenly.
+const LINGER: u32 = 30;
 
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Snapshot {
@@ -234,6 +239,7 @@ pub(crate) struct Window {
     renderer: Renderer,
     atlas: Rc<Atlas>,
     pacer: Shared<Pacer>,
+    idle: Cell<u32>,
     quiet: Option<crate::app::Timer>,
     presents: Arc<Latest<Present>>,
     controls_sent: Vec<crate::NativeControl>,
@@ -285,6 +291,7 @@ impl Window {
             atlas: renderer.atlas().clone(),
             renderer,
             pacer,
+            idle: Cell::new(0),
             quiet: None,
             presents: Arc::default(),
             controls_sent: Vec::new(),
@@ -314,6 +321,7 @@ impl Window {
     }
 
     pub fn request_frame(&self) {
+        self.idle.set(0);
         let mut pacer = lock(&self.pacer);
         pacer.wants = true;
         pacer.sync();
@@ -324,7 +332,11 @@ impl Window {
         post(callbacks.thread, Box::new(move || step(callbacks)));
     }
 
-    pub(crate) fn stop_frames(&mut self) {
+    pub(crate) fn rest(&mut self) {
+        self.idle.set(self.idle.get() + 1);
+        if self.idle.get() < LINGER {
+            return;
+        }
         {
             let mut pacer = lock(&self.pacer);
             pacer.wants = false;
@@ -344,6 +356,10 @@ impl Window {
         let pixels = size.to_device(scale);
         let pixels = CGSize::new(pixels.width.into(), pixels.height.into());
         self.renderer.set_drawable_size(pixels);
+    }
+
+    pub(crate) fn take_congested(&mut self) -> bool {
+        self.renderer.take_congested()
     }
 
     pub(crate) fn take_present(&mut self) -> Option<Present> {

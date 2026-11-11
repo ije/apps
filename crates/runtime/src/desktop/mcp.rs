@@ -429,13 +429,18 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
         }
         _ => bail!("Unknown input action: {action}"),
     }
+    // A scroll with a phase moves like a trackpad gesture, spread over frames.
+    let gesture = action == "scroll" && args["phase"].is_string();
     let reply = reply.clone();
     let sent = format!("Sent {action} to window {window}");
     // Input handlers borrow the desktop, which `Desktop::drive` holds now.
     cx.defer(move |cx| {
         let result = cx.update_window(handle, |window, cx| {
             for event in events {
-                window.dispatch_event(event, cx);
+                match gesture {
+                    true => window.dispatch_event_at(event, Instant::now(), cx),
+                    false => window.dispatch_event(event, cx),
+                };
             }
             for (key, modifiers) in keys {
                 window.press_key(key, modifiers, cx);

@@ -34,6 +34,7 @@ use std::{
     rc::Rc,
     slice,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 const FORMAT: MTLPixelFormat = MTLPixelFormat::BGRA8Unorm;
@@ -159,6 +160,7 @@ pub(crate) struct Renderer {
     glass: Vec<NativeGlass>,
     glass_update: bool,
     glass_stale: bool,
+    waits: u8,
     caret: Option<(Retained<CALayer>, Rect<f32>, Color, std::time::Instant)>,
     restacked: bool,
     committed: u64,
@@ -363,6 +365,7 @@ impl Renderer {
             glass: Vec::new(),
             glass_update: false,
             glass_stale: false,
+            waits: 0,
             caret: None,
             restacked: false,
             committed: 0,
@@ -572,6 +575,16 @@ impl Renderer {
         self.size = size;
     }
 
+    // Frames queue when they are drawn faster than the display shows them: after a late frame, or
+    // while a ProMotion display still speeds up. Each queued frame delays all later ones by a
+    // refresh. Draws that wait for a drawable in a row tell that the queue is full, a single one
+    // does not.
+    pub fn take_congested(&mut self) -> bool {
+        let congested = self.waits >= 2;
+        self.waits = self.waits.min(1);
+        congested
+    }
+
     pub fn take_present(&mut self) -> Option<Present> {
         self.present.take()
     }
@@ -748,7 +761,13 @@ impl Renderer {
         let resizing = self.in_transaction;
         let transact = resizing || mem::take(&mut self.restacked) || native_transaction;
         self.layer.setPresentsWithTransaction(transact);
-        let Some(drawable) = self.layer.nextDrawable() else {
+        let asked = Instant::now();
+        let next = self.layer.nextDrawable();
+        self.waits = match asked.elapsed() > Duration::from_millis(1) {
+            true => self.waits.saturating_add(1),
+            false => 0,
+        };
+        let Some(drawable) = next else {
             eprintln!("apps: no drawable for a {size:?} window");
             return capture.then(|| Err(anyhow::anyhow!("No drawable")));
         };

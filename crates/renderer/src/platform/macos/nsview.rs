@@ -27,7 +27,8 @@ use objc2_app_kit::{
 };
 use objc2_core_foundation::{CGPoint, CGSize};
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSNotFound, NSRange, NSRect, NSString, NSUInteger, NSUserDefaults,
+    NSArray, NSAttributedString, NSNotFound, NSProcessInfo, NSRange, NSRect, NSString, NSUInteger,
+    NSUserDefaults,
 };
 use objc2_quartz_core::{CALayer, CALayerDelegate, CAMetalLayer};
 use std::{
@@ -35,7 +36,7 @@ use std::{
     ffi::c_void,
     ops::Range,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[link(name = "Carbon", kind = "framework")]
@@ -50,6 +51,10 @@ unsafe extern "C" {
 const RESIZE_WAIT: Duration = Duration::from_millis(8);
 const DRAG_REPEAT: Duration = Duration::from_millis(16);
 
+// The newest pointer move or wheel the app thread has not taken yet, to merge more into it, and
+// when its device sent it.
+type Motion = Arc<Mutex<Option<(Event, Instant)>>>;
+
 pub(crate) struct Input {
     callbacks: Callbacks,
     pub layer: Retained<CAMetalLayer>,
@@ -57,8 +62,7 @@ pub(crate) struct Input {
     glass: RefCell<Vec<glass::GlassView>>,
     controls: RefCell<controls::Controls>,
     cursor: Cell<Cursor>,
-    // The newest pointer move or wheel the app thread has not taken yet, to merge more into it.
-    motion: RefCell<Option<Arc<Mutex<Option<Event>>>>>,
+    motion: RefCell<Option<Motion>>,
     first_mouse: Cell<bool>,
     press: RefCell<Option<Retained<NSEvent>>>,
     pub files_over: Cell<bool>,
@@ -455,7 +459,7 @@ fn repeat_drag(view: Weak<AppsView>, serial: usize, event: Event) {
             ivars.drag_serial.set(serial + 1);
             return;
         }
-        view.send_pointer(event.clone());
+        view.send_pointer(event.clone(), Instant::now());
         repeat_drag(Weak::from_retained(&view), serial, event);
     });
 }
@@ -729,10 +733,15 @@ impl AppsView {
             }
             _ => {}
         }
-        self.send_pointer(input);
+        // When the device sent the event. The page gets it later, after waits on two threads, and
+        // a scroll needs the even times of the device.
+        let age = NSProcessInfo::processInfo().systemUptime() - event.timestamp();
+        let age = Duration::try_from_secs_f64(age).unwrap_or_default();
+        let now = Instant::now();
+        self.send_pointer(input, now.checked_sub(age).unwrap_or(now));
     }
 
-    fn send_pointer(&self, input: Event) {
+    fn send_pointer(&self, input: Event, sent: Instant) {
         let ivars = self.ivars();
         let callbacks = ivars.callbacks;
         if !matches!(input, Event::PointerMove { .. } | Event::Wheel { .. }) {
@@ -740,18 +749,24 @@ impl AppsView {
             return callbacks.input_later(input);
         }
         let merged = ivars.motion.borrow().as_ref().is_some_and(|slot| {
-            lock(slot)
-                .as_mut()
-                .is_some_and(|waiting| merge(waiting, &input))
+            lock(slot).as_mut().is_some_and(|(waiting, at)| {
+                let merged = merge(waiting, &input);
+                if merged {
+                    *at = sent;
+                }
+                merged
+            })
         });
         if merged {
             return;
         }
-        let slot = Arc::new(Mutex::new(Some(input)));
+        let slot = Arc::new(Mutex::new(Some((input, sent))));
         ivars.motion.replace(Some(slot.clone()));
         callbacks.queue(move |window, app| {
-            if let Some(input) = lock(&slot).take() {
+            if let Some((input, sent)) = lock(&slot).take() {
+                window.event_at = Some(sent);
                 dispatch(window, app, input);
+                window.event_at = None;
             }
         });
     }

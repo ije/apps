@@ -8,10 +8,12 @@ use super::{lock, threads::post};
 use crate::app::Callbacks;
 use block2::RcBlock;
 use objc2_core_foundation::CFRetained;
-use objc2_core_video::{CVDisplayLink, kCVReturnSuccess};
+use objc2_core_video::{CVDisplayLink, CVTimeStamp, kCVReturnSuccess};
 use std::{
+    cell::Cell,
     ptr::NonNull,
     sync::{Arc, Mutex, atomic},
+    time::{Duration, Instant},
 };
 
 // One per display that ever had a window, never freed: CVDisplayLinkStop can return while the output
@@ -60,8 +62,23 @@ impl Screen {
                 .map(|raw| CFRetained::from_raw(raw))
         };
         let display = display.ok_or_else(|| format!("no display link for display {}", self.id))?;
-        let handler = RcBlock::new(move |_, _, _, _, _| {
-            lock(&self.windows).iter().for_each(|pulse| pulse.beat());
+        let last = Cell::new(None::<Instant>);
+        let handler = RcBlock::new(move |_, _, out: NonNull<CVTimeStamp>, _, _| {
+            // Ticks come up to 1 ms early or late. Frame times follow them in even steps of one refresh.
+            // SAFETY: CoreVideo passes a live timestamp.
+            let out = unsafe { out.as_ref() };
+            let period = out.videoRefreshPeriod as f64 / f64::from(out.videoTimeScale);
+            let period = Duration::try_from_secs_f64(period).unwrap_or_default();
+            let now = Instant::now();
+            let at = match last.get().map(|last| last + period) {
+                Some(even) if now.max(even) - now.min(even) < period / 2 => {
+                    even + now.saturating_duration_since(even) / 8
+                        - even.saturating_duration_since(now) / 8
+                }
+                _ => now,
+            };
+            last.set(Some(at));
+            lock(&self.windows).iter().for_each(|pulse| pulse.beat(at));
             kCVReturnSuccess
         });
         // SAFETY: CoreVideo copies the block, which only reads a screen that lives for good.
@@ -119,7 +136,7 @@ struct Pulse {
 }
 
 impl Pulse {
-    fn beat(self: &Arc<Self>) {
+    fn beat(self: &Arc<Self>, at: Instant) {
         if self.waiting.swap(true, atomic::Ordering::AcqRel) {
             return;
         }
@@ -128,7 +145,16 @@ impl Pulse {
             self.callbacks.thread,
             Box::new(move || {
                 pulse.waiting.store(false, atomic::Ordering::Release);
-                step(pulse.callbacks);
+                let callbacks = pulse.callbacks;
+                // A tick without a frame takes one frame out of a queue that is too long.
+                let free = callbacks.with(move |window, _| {
+                    let free = !window.platform.take_congested();
+                    window.frame_at = free.then_some(at);
+                    free
+                });
+                if free == Some(true) {
+                    step(callbacks);
+                }
             }),
         );
     }
@@ -136,7 +162,7 @@ impl Pulse {
 
 pub(crate) fn step(callbacks: Callbacks) {
     if callbacks.frame() == Some(false) {
-        callbacks.with(|window, _| window.platform.stop_frames());
+        callbacks.with(|window, _| window.platform.rest());
     }
 }
 
