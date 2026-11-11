@@ -89,7 +89,7 @@ impl Window {
             r[0].max(r[3]),
         ];
         // One side alone draws inside its own band.
-        if false {
+        if border.sides.is_power_of_two() {
             let side = border.sides.trailing_zeros() as usize;
             if instance.aux[side] <= 0. {
                 return;
@@ -112,7 +112,7 @@ impl Window {
             return;
         }
         // A side with no border and no corner needs no strip, so the hole reaches the edge there.
-        let pad = |edge: f32| edge + 1.;
+        let pad = |edge: f32| if edge > 0. { edge + 1. } else { 0. };
         let inset = |top: f32, right: f32, bottom: f32, left: f32| {
             Rect::between(
                 point(rect.left() + pad(left), rect.top() + pad(top)),
@@ -318,7 +318,7 @@ impl Window {
                 continue;
             }
             let period = dash * 2.;
-            let skipped = 0.;
+            let skipped = ((shown.left() - line.rect[0]) / period).floor().max(0.);
             let mut start = line.rect[0] + skipped * period;
             while start < shown.right() {
                 let left = start.max(shown.left());
