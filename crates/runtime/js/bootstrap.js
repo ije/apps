@@ -642,13 +642,21 @@
   // Results go to the page as data for a fixed page function, never as code.
   const deliver = (win, name, ...args) => { if (!win.isDestroyed()) call('window', 'deliver', win.id, name, args); };
   const webviews = new Map();
+  // A page must not show a local file in a guest: it could read the file back with executeJavaScript().
+  const guestLoad = (guest, url) => {
+    let local = false;
+    try { local = new URL(String(url)).protocol === 'file:'; } catch {}
+    if (!local) return guest.loadURL(url);
+    guest.emit('did-fail-load', event(), -10, 'ERR_ACCESS_DENIED', String(url), true, -1, -1);
+    return Promise.reject(new Error('A <webview> cannot load file: URLs'));
+  };
   const webview = (win, op, guestId, data) => {
     const entry = webviews.get(guestId), contents = win.webContents;
     if (op === 'attach') {
       const preferences = { partition: data.partition || undefined }, attach = event();
       contents.emit('will-attach-webview', attach, preferences, { ...data });
       if (attach.defaultPrevented) return null;
-      const view = new browsers.WebContentsView({ webPreferences: { partition: data.partition || undefined } }), guest = view.webContents;
+      const view = new browsers.WebContentsView({ webPreferences: { partition: preferences.partition || undefined } }), guest = view.webContents;
       guest.hostWebContents = contents;
       win.contentView.addChildView(view);
       const emit = guest.emit;
@@ -661,7 +669,7 @@
       contents.once('did-start-loading', drop);
       win.once('closed', drop);
       contents.emit('did-attach-webview', event(), guest);
-      if (data.src) guest.loadURL(data.src).catch(() => {});
+      if (data.src) guestLoad(guest, data.src).catch(() => {});
       return guest.id;
     }
     if (entry?.win !== win) return null;
@@ -669,7 +677,7 @@
     if (op === 'bounds') { view.setBounds(data.bounds); view.setVisible(data.visible); return null; }
     if (op === 'detach') { contents.off('did-start-loading', drop); win.off('closed', drop); win.contentView.removeChildView(view); drop(); return null; }
     if (op === 'call') {
-      const result = guest[data.method](...data.args);
+      const result = data.method === 'loadURL' ? guestLoad(guest, data.args[0]) : guest[data.method](...data.args);
       if (typeof result?.then !== 'function') return result ?? null;
       const reply = (value, error) => deliver(win, 'webviewReply', data.reply ?? null, value ?? null, error ?? null);
       result.then(value => reply(value), error => reply(null, String(error?.message ?? error)));
@@ -899,7 +907,7 @@
   }
   if (info.platform !== 'darwin') {
     const win32 = info.platform === 'win32';
-    for (const method of ['center', 'unmaximize', 'showInactive', 'hide', 'blur', 'setMinimumSize', 'setMaximumSize', 'setResizable', 'setMovable', 'setMinimizable', 'setMaximizable', 'setClosable', 'setAlwaysOnTop',
+    for (const method of ['center', 'unmaximize', 'showInactive', 'moveTop', 'hide', 'blur', 'setMinimumSize', 'setMaximumSize', 'setResizable', 'setMovable', 'setMinimizable', 'setMaximizable', 'setClosable', 'setAlwaysOnTop',
       'setHasShadow', 'setIgnoreMouseEvents', 'setFocusable', 'setAspectRatio', 'setProgressBar', 'flashFrame', 'setSkipTaskbar', 'setIcon', 'setMenu', 'removeMenu', win32 ? 'setOpacity' : 'setVisibleOnAllWorkspaces'])
       BrowserWindow.prototype[method] = () => { throw Error(`BrowserWindow.${method}() is not supported on ${info.platform}`); };
     Object.assign(BrowserWindow.prototype, { setVibrancy() { state(this); } }, win32

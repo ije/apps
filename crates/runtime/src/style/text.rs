@@ -485,7 +485,6 @@ fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
                 && !matches!(
                     key,
                     Prop::WHITE_SPACE
-                        | Prop::PADDING
                         | Prop::PADDING_TOP
                         | Prop::PADDING_RIGHT
                         | Prop::PADDING_BOTTOM

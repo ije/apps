@@ -192,6 +192,10 @@ pub(crate) struct SelectorCache {
     pub(crate) attributes: Named,
     nodes: Vec<Snapshot>,
     seen: Vec<u64>,
+    // The walk and document revision of the last update, and the nodes forgotten since.
+    walked: u64,
+    latest: u64,
+    forgotten: Vec<usize>,
     values: Matches,
     size: usize,
     positions: rustc_hash::FxHashMap<usize, (u32, Positions)>,
@@ -268,6 +272,7 @@ impl SelectorCache {
         if let Some(snapshot) = self.nodes.get_mut(id) {
             *snapshot = Snapshot::default();
             self.seen[id] = 0;
+            self.forgotten.push(id);
             self.mark(id, false);
             // Clear the lists of a forgotten node, or a node that reuses its id marks them again.
             self.dependents[id] = Default::default();
@@ -349,7 +354,7 @@ impl SelectorCache {
         self.children.shrink_to_fit();
     }
 
-    pub fn update(&mut self, doc: &Document, order: &[(u32, u32)]) {
+    pub(crate) fn update(&mut self, doc: &Document, walk: &super::Walk) {
         self.pass = self.pass.wrapping_add(1).max(1);
         if self.values.len() > 131072 {
             self.values.clear();
@@ -372,13 +377,37 @@ impl SelectorCache {
         let mut quieted = Vec::new();
         let mut retagged = Vec::new();
         let start = self.revision;
-        for &(id, _) in order {
-            let id = id as usize;
+        // Since the last update, only a node with a newer revision, a forgotten one or one that a patched walk
+        // touched can have another snapshot. Debug builds check all nodes against that.
+        let touched = match self.walked == walk.serial {
+            true => Some(&[][..]),
+            false => walk.since(self.walked),
+        };
+        let listed: Option<Vec<usize>> = touched.map(|touched| {
+            let newer = doc.nodes.changed_since(self.latest);
+            let touched = touched.iter().map(|&id| id as usize);
+            let nodes = newer.chain(touched).chain(self.forgotten.iter().copied());
+            nodes.filter(|&id| walk.contains(id)).collect()
+        });
+        (self.walked, self.latest) = (walk.serial, doc.nodes.latest());
+        self.forgotten.clear();
+        let mut every = walk.nodes.iter().map(|node| node.0 as usize);
+        let mut some = listed.iter().flatten().copied();
+        let nodes: &mut dyn Iterator<Item = usize> = match &listed {
+            Some(_) if !cfg!(debug_assertions) => &mut some,
+            _ => &mut every,
+        };
+        for id in nodes {
             let revision = doc.nodes.revision(id);
-            let fresh = std::mem::replace(&mut self.seen[id], revision) != revision;
+            let fresh = self.seen[id] != revision;
             if !fresh && !cfg!(debug_assertions) {
                 continue;
             }
+            debug_assert!(
+                !fresh || listed.as_ref().is_none_or(|listed| listed.contains(&id)),
+                "node {id} changed outside the list"
+            );
+            self.seen[id] = revision;
             let node = &doc.nodes[id];
             let Snapshot { values, revisions } = &mut self.nodes[id];
             let hash = rustc_hash::FxBuildHasher;
@@ -2148,16 +2177,7 @@ mod tests {
         let mut doc = Document::parse("<ul><li>a</li><li>b</li><li>c</li></ul>");
         let [ul, li] =
             ["ul", "li"].map(|tag| doc.nodes.iter().position(|node| node.tag == tag).unwrap());
-        let order = |doc: &Document| -> Vec<(u32, u32)> {
-            (0..doc.nodes.len())
-                .map(|id| {
-                    (
-                        id as u32,
-                        doc.nodes[id].parent.map_or(u32::MAX, |up| up as u32),
-                    )
-                })
-                .collect()
-        };
+        let mut walk = crate::dom::Walk::default();
         let parent = |cache: &SelectorCache| {
             cache.changes.back().map_or(0, |(_, changes)| {
                 changes
@@ -2167,10 +2187,12 @@ mod tests {
             })
         };
         let mut cache = SelectorCache::default();
-        cache.update(&doc, &order(&doc));
+        walk.update(&doc, &Default::default(), None);
+        cache.update(&doc, &walk);
         assert_eq!(parent(&cache), 1);
         doc.nodes[li].tag = "p".into();
-        cache.update(&doc, &order(&doc));
+        walk.update(&doc, &Default::default(), None);
+        cache.update(&doc, &walk);
         assert_eq!(parent(&cache), 1);
     }
 
@@ -2182,18 +2204,12 @@ mod tests {
             .iter()
             .position(|node| node.tag == "span")
             .unwrap();
-        let order: Vec<(u32, u32)> = (0..doc.nodes.len())
-            .map(|id| {
-                (
-                    id as u32,
-                    doc.nodes[id].parent.map_or(u32::MAX, |up| up as u32),
-                )
-            })
-            .collect();
+        let mut walk = crate::dom::Walk::default();
+        walk.update(&doc, &Default::default(), None);
         let above: Vec<usize> =
             std::iter::successors(doc.nodes[x].parent, |&id| doc.nodes[id].parent).collect();
         let mut cache = SelectorCache::default();
-        cache.update(&doc, &order);
+        cache.update(&doc, &walk);
         let bloom = cache.ancestors(&doc, x);
         for (source, steps, rest) in [
             ("[data-k] > .x", &[&[0, 1][..]][..], &[][..]),

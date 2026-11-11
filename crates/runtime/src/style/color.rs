@@ -396,8 +396,13 @@ fn parse(value: &str, depth: u8) -> Option<(Space, [f64; 3], f64)> {
                 _ => return None,
             };
             let weight = match weight {
-                Some(weight) => match units.math(weight, 100., &[])? {
-                    (weight, Kind::Length) if (0. ..=100.).contains(&weight) => Some(weight),
+                // A weight is a percentage. Lengths resolve the same way, so they are refused by their text.
+                Some(text) => match units.math(text, 100., &[])? {
+                    (weight, Kind::Length)
+                        if text.contains('%') && (0. ..=100.).contains(&weight) =>
+                    {
+                        Some(weight)
+                    }
                     _ => return None,
                 },
                 None => None,
@@ -823,6 +828,11 @@ mod tests {
                 Some((0xff0000, 102)),
             ),
             ("color-mix(in srgb, red 0%, blue 0%)", None),
+            ("color-mix(in srgb, red 50px, blue)", None),
+            (
+                "color-mix(in srgb, red calc(20% + 5%), blue)",
+                Some((0x4000bf, 255)),
+            ),
             ("color-mix(in srgb, red 120%, blue)", None),
             (
                 "color-mix(in srgb-linear, red, blue)",

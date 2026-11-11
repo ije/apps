@@ -570,9 +570,13 @@ impl Files {
                 let file = self.file(&args[0])?;
                 match op {
                     "read" => {
-                        let size = args[1].as_u64().context("Expected read size")?;
-                        ensure!(size <= 64 * 1024 * 1024, "Read exceeds 64 MiB");
-                        let mut data = vec![0; size as usize];
+                        let size = args[1].as_u64().context("Expected read size")? as usize;
+                        // The caller owns a buffer of this size already. A size that can't be had is an
+                        // error for the caller, and must not end the app.
+                        let mut data = Vec::new();
+                        data.try_reserve_exact(size)
+                            .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
+                        data.resize(size, 0);
                         let count = if let Some(position) = args[2].as_u64() {
                             #[cfg(unix)]
                             {

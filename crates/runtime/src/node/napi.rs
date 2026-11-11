@@ -116,6 +116,8 @@ pub(crate) struct State {
     modules: RefCell<HashMap<std::path::PathBuf, Ptr>>,
     ready: Arc<Mutex<Vec<Ready>>>,
     active: Cell<usize>,
+    // The states of the work that the pool has, or had.
+    works: RefCell<Vec<Arc<AtomicU8>>>,
     threadsafe: Cell<usize>,
     threadsafe_live: RefCell<HashMap<usize, Arc<Threadsafe>>>,
     external: Cell<i64>,
@@ -209,6 +211,7 @@ impl State {
             modules: RefCell::default(),
             ready: Default::default(),
             active: Cell::new(0),
+            works: RefCell::default(),
             threadsafe: Cell::new(0),
             threadsafe_live: RefCell::default(),
             external: Cell::new(0),
@@ -486,10 +489,31 @@ impl State {
         self.js("function", &[native, self.text(name)])
     }
 
-    pub(crate) fn close(&self) {
+    // Returns false if addon work still runs on the pool. Nothing of the addon is freed then, and the caller must
+    // keep this state alive, because the work has its address.
+    pub(crate) fn close(&self) -> bool {
         let environments = self.environments.borrow().clone();
         for environment in environments.iter().rev() {
-            environment.close();
+            if !environment.close() {
+                std::mem::forget(environment.clone());
+            }
+        }
+        // The hooks and finalizers below free addon state that work on the pool uses. Work that has not started
+        // never starts, and running work gets a moment to end.
+        let works = self.works.take();
+        for state in &works {
+            let _ = state.compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while works
+            .iter()
+            .any(|state| state.load(Ordering::Acquire) == RUNNING)
+        {
+            if std::time::Instant::now() >= deadline {
+                self.unregister();
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         loop {
             let hook = self.async_cleanup.borrow_mut().pop();
@@ -561,6 +585,11 @@ impl State {
                 (self.api.unprotect)(self.ctx, pending);
             }
         }
+        self.unregister();
+        true
+    }
+
+    fn unregister(&self) {
         FUNCTIONS.with(|functions| {
             let mut functions = functions.borrow_mut();
             for key in self.callbacks.borrow().keys() {
@@ -654,13 +683,15 @@ impl State {
         .into();
         #[cfg(not(unix))]
         let library = unsafe { Library::new(&path)? };
-        // Older addons register from a static constructor, which ran when the library opened.
+        // Older addons register from a static constructor, which ran when the library opened. Take it in
+        // every case, or the next addon without one would run this addon's.
+        let legacy = LEGACY_MODULE.take();
         let register = match unsafe {
             library
                 .get::<unsafe extern "C" fn(*const State, Ptr) -> Ptr>(b"napi_register_module_v1\0")
         } {
             Ok(register) => *register,
-            Err(_) => LEGACY_MODULE.take().context(
+            Err(_) => legacy.context(
                 "Addon must use Node-API (napi_register_module_v1); V8 addons are unsupported",
             )?,
         };
@@ -2240,10 +2271,9 @@ api!(napi_get_value_bigint_words(
         for (index, word) in list.iter().take(*count).enumerate() {
             *words.add(index) = *word;
         }
-        *count = list.len().min(*count);
-    } else {
-        *count = list.len();
     }
+    // The count is the words the value needs, also when the buffer was shorter.
+    *count = list.len();
     Ok(())
 });
 api!(napi_type_tag_object(env, object: Ptr, tag: *const [u64; 2]) {
@@ -2458,6 +2488,8 @@ const IDLE: u8 = 0;
 const QUEUED: u8 = 1;
 const RUNNING: u8 = 2;
 const CANCELLED: u8 = 3;
+// `execute` has returned, and `complete` has not run yet.
+const DONE: u8 = 4;
 
 struct AsyncWork {
     execute: AsyncExecute,
@@ -2501,6 +2533,7 @@ api!(napi_queue_async_work(env, work: Ptr) {
         let run = state.compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire).is_ok();
         if run {
             unsafe { execute(raw as *const State, data as Ptr) };
+            state.store(DONE, Ordering::Release);
         }
         ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Ready::Work(work, if run { 0 } else { 11 }));
         wake.wake();
@@ -2510,6 +2543,9 @@ api!(napi_queue_async_work(env, work: Ptr) {
         9
     })?;
     env.active.set(env.active.get() + 1);
+    let mut works = env.works.borrow_mut();
+    works.retain(|state| state.load(Ordering::Acquire) != IDLE);
+    works.push(item.state.clone());
     Ok(())
 });
 api!(napi_cancel_async_work(env, work: Ptr) {

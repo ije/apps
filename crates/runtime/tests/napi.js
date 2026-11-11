@@ -35,6 +35,7 @@ const node8 = addon.node8({ b: 1, 2: 2, [Symbol('s')]: 3, __proto__: { inherited
 assert(node8.major === 24 && node8.noLoop === 1 && node8.detached === 1 && node8.mismatch === 1 && node8.memory === 1, 'Node-API 8 helpers');
 assert(node8.keys.length === 2 && node8.keys[0] === 2 && node8.keys[1] === 'b', 'all property names');
 assert(node8.words === -(2n ** 64n + 1n), 'bigint words');
+assert(node8.needed === 1, 'a short buffer still reports the words a bigint needs');
 assert(node8.called === '1:fixture', 'make callback');
 assert(node8.status === 6 && node8.message === 'A number was expected', 'last error info');
 globalThis.threadsafeValues = [];

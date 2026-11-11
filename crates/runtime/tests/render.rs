@@ -238,6 +238,149 @@ fn stretched_images_keep_their_size_when_they_restyle_in_place() {
     );
 }
 
+// Debug builds compare each patched frame with a full one: tree walks, visibility, boxes and layout.
+#[test]
+#[ignore = "requires the macOS window server"]
+fn random_tree_changes_draw_like_full_frames() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        for (let frame = 0; frame < 80; frame++) {
+            await run('change()');
+            await win.webContents.capturePage();
+        }
+        const state = JSON.parse(await run(`JSON.stringify([...document.querySelectorAll('li')].map(li => {
+            const boxed = !li.closest('.hide') && !li.classList.contains('flat');
+            return boxed === li.getBoundingClientRect().height > 0;
+        }))`));
+        if (!state.length || state.includes(false)) fail('rows and boxes disagree: ' + state.join());
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0'><style>.hide{display:none} .flat{display:contents} li{height:12px} #pane{height:80px;overflow:auto}</style>\
+             <div id=pane><ul id=list></ul></div><table><tbody id=rows></tbody></table><div id=box></div>\
+             <script>\
+             let seed = 4321;\
+             const random = below => (seed = Math.imul(seed, 1103515245) + 12345 >>> 0, (seed >>> 8) % below);\
+             const list = document.getElementById('list'), rows = document.getElementById('rows'), box = document.getElementById('box');\
+             const make = (tag, text) => { const el = document.createElement(tag); if (text) el.textContent = text; return el; };\
+             const item = () => { const li = make('li'); li.append(make('span', 'item'), make('b', 'bold')); return li; };\
+             const any = () => { const all = document.body.querySelectorAll('li, li *, #box *, td'); return all[random(all.length)]; };\
+             for (let i = 0; i < 40; i++) list.append(item());\
+             const steps = [\
+               () => list.insertBefore(item(), list.children[random(list.children.length + 1)] ?? null),\
+               () => list.children.length > 5 && list.children[random(list.children.length)].remove(),\
+               () => list.insertBefore(list.children[random(list.children.length)], list.children[random(list.children.length)]),\
+               () => { const el = list.querySelectorAll('span, b')[random(60)]; if (el) el.textContent = 'text ' + random(9); },\
+               () => any()?.classList.toggle(['hide', 'flat'][random(2)]),\
+               () => { const row = make('tr'); for (let i = 1 + random(3); i--;) row.append(make('td', 'cell')); rows.insertBefore(row, rows.children[random(rows.children.length + 1)] ?? null); },\
+               () => rows.children[random(rows.children.length)]?.remove(),\
+               () => any()?.toggleAttribute('inert'),\
+               () => box.append(make(['div', 'p', 'canvas'][random(3)], random(2) ? 'more' : '')),\
+               () => box.children[random(box.children.length)]?.remove(),\
+               () => { const el = box.children[random(box.children.length)]; if (el) { const wrap = make('div'); el.replaceWith(wrap); wrap.append(el); } },\
+               () => { const el = list.children[random(list.children.length)]; if (el.parentNode === list) box.append(el); },\
+               () => { const el = box.querySelector('li'); if (el) list.append(el); },\
+             ];\
+             globalThis.change = () => { for (let count = 1 + random(3); count--;) steps[random(steps.length)](); };\
+             </script></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn pages_reach_no_local_files_through_webviews_and_no_devtools() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        // A guest attaches when its box is laid out, so frames must go on while the page waits.
+        const attach = src => run(`new Promise(resolve => {
+            const view = document.createElement('webview');
+            view.addEventListener('did-fail-load', event => resolve('failed ' + event.errorDescription));
+            view.addEventListener('did-finish-load', async () => resolve('loaded ' + await view.executeJavaScript('document.body.innerText')));
+            view.src = ${JSON.stringify(src)};
+            document.body.append(view);
+            setTimeout(() => resolve('nothing'), 4000);
+        })`);
+        const settle = async pending => { let result; pending.then(value => result = value); while (result === undefined) await win.webContents.capturePage(); return result; };
+        const control = await settle(attach('data:text/html,<p>guest</p>'));
+        if (control !== 'loaded guest') fail('webview with a data URL: ' + control);
+        const file = await run("'file://' + document.body.dataset.file");
+        const guest = await settle(attach(file));
+        if (guest !== 'failed ERR_ACCESS_DENIED') fail('webview with a local file: ' + guest);
+        const later = await settle(run(`new Promise(resolve => {
+            const view = document.querySelector('webview');
+            view.loadURL('file://' + document.body.dataset.file).then(() => resolve('loaded'), error => resolve('refused'));
+            setTimeout(() => resolve('nothing'), 4000);
+        })`));
+        if (later !== 'refused') fail('loadURL with a local file: ' + later);
+        // A page in a browser always names its origin when it posts. Tool clients don't.
+        const post = headers => fetch(MCP + '/input', { method: 'POST', headers, body: JSON.stringify({ window: win.id, action: 'move', x: 1, y: 1 }) }).then(response => response.status);
+        const statuses = [await post({}), await post({ Origin: 'http://localhost:3000' }), await post({ Origin: 'null' })].join();
+        if (statuses !== '200,403,403') fail('devtools answered ' + statuses);
+        "#,
+        &[(
+            "page.html",
+            concat!(
+                "<body style='margin:0' data-file='",
+                env!("CARGO_MANIFEST_DIR"),
+                "/Cargo.toml'><p>page</p></body>"
+            ),
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn webviews_report_one_event_for_a_navigation_inside_a_page() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const pending = run(`new Promise(resolve => {
+            const view = document.createElement('webview');
+            let count = 0;
+            view.addEventListener('did-navigate-in-page', () => count++);
+            view.addEventListener('did-finish-load', async () => {
+                await view.executeJavaScript("location.hash = 'a'");
+                setTimeout(() => resolve(count), 500);
+            });
+            view.src = 'data:text/html,<p>guest</p>';
+            document.body.append(view);
+        })`);
+        let count;
+        pending.then(value => count = value);
+        while (count === undefined) await win.webContents.capturePage();
+        if (count !== 1) fail('did-navigate-in-page fired ' + count + ' times');
+        "#,
+        &[("page.html", "<body style='margin:0'><p>page</p></body>")],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn svg_text_takes_its_decoration_from_css() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        await win.webContents.capturePage();
+        // Counts the dark device pixels of each 60 px row: plain text, an attribute, CSS, and text in a link,
+        // whose underline stops at the edge of the image as in browsers.
+        const ink = async top => (await win.webContents.capturePage({ x: 0, y: top, width: 300, height: 60 })).toBitmap().filter((value, index) => index % 4 === 0 && value < 128).length;
+        const [plain, attribute, css, linked] = [await ink(0), await ink(60), await ink(120), await ink(180)];
+        if (!(attribute > plain) || css !== attribute || linked !== plain) fail('underline ink: ' + [plain, attribute, css, linked].join());
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0;background:#fff'><style>svg{display:block}.u{text-decoration:underline}</style>\
+             <svg width=300 height=60><text x=10 y=40 font-size=30>mmmm</text></svg>\
+             <svg width=300 height=60><text x=10 y=40 font-size=30 text-decoration=underline>mmmm</text></svg>\
+             <svg width=300 height=60><text x=10 y=40 font-size=30 class=u>mmmm</text></svg>\
+             <a href='#x' style='text-decoration:underline;color:#000'><svg width=300 height=60><text x=10 y=40 font-size=30>mmmm</text></svg></a></body>",
+        )],
+    );
+}
+
 #[test]
 #[ignore = "requires the macOS window server"]
 fn boxes_that_stop_scrolling_report_their_content_extent() {

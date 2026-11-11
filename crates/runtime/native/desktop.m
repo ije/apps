@@ -245,6 +245,7 @@ static void AppsLater(dispatch_block_t block) {
     AppsNativeEmit(@{ @"type": @"menu", @"id": @(item.tag), @"checked": @(item.state == NSControlStateValueOn), @"shift": @((flags & NSEventModifierFlagShift) != 0), @"control": @((flags & NSEventModifierFlagControl) != 0), @"alt": @((flags & NSEventModifierFlagOption) != 0), @"meta": @((flags & NSEventModifierFlagCommand) != 0), @"accelerator": @(NSApp.currentEvent.type == NSEventTypeKeyDown) });
 }
 - (void)screensChanged:(NSNotification *)notification {
+    atomic_store_explicit(&AppsDisplayP3, [NSScreen.mainScreen canRepresentDisplayGamut:NSDisplayGamutP3], memory_order_relaxed);
     AppsNativeEmit(@{ @"type": @"screen" });
 }
 - (void)keyAction:(NSMenuItem *)item {

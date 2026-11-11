@@ -2411,8 +2411,11 @@ impl JsContext {
 
 impl Drop for JsContext {
     fn drop(&mut self) {
-        if let Some(napi) = &self.napi {
-            napi.close();
+        // Addon work that still runs has the address of this state, so the state stays if it could not close.
+        if let Some(napi) = &self.napi
+            && !napi.close()
+        {
+            std::mem::forget(napi.clone());
         }
         if !self.scope.is_null() {
             unsafe { (self.api.unprotect)(self.ctx, self.scope) };

@@ -125,8 +125,9 @@ fn iframe_delivers_load_after_native_layout() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    // The size includes the default 2px border of an iframe.
     assert!(
-        String::from_utf8_lossy(&result.stdout).contains("IFRAME_NATIVE_LOAD 600 150"),
+        String::from_utf8_lossy(&result.stdout).contains("IFRAME_NATIVE_LOAD 604 154"),
         "{}",
         String::from_utf8_lossy(&result.stdout)
     );

@@ -4,7 +4,7 @@ use std::{
     fmt::Write as _,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering::*, fence},
+        atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering::*, fence},
         mpsc,
     },
     time::{Duration, Instant},
@@ -183,6 +183,8 @@ struct Sound {
     skip: AtomicUsize,
     gain: AtomicU32,
     played: [AtomicU64; 3],
+    // Set for good when the mixer had no slot. The sound's player then reads the ring in place of the output.
+    unmixed: AtomicBool,
     clock: Mutex<Clock>,
 }
 
@@ -203,6 +205,7 @@ impl Sound {
             skip: AtomicUsize::new(0),
             gain: AtomicU32::new(1f32.to_bits()),
             played: Default::default(),
+            unmixed: AtomicBool::new(false),
             clock: Mutex::new(Clock {
                 time: 0.,
                 at: Instant::now(),
@@ -318,7 +321,7 @@ impl Sound {
         count
     }
 
-    // Call only without audio output. Otherwise, the audio callback owns `read`.
+    // Call only without audio output or for an unmixed sound. Otherwise, the audio callback owns `read`.
     fn drop_played(&self) {
         let Some((_, channels)) = self.ring.get() else {
             return;
@@ -355,11 +358,16 @@ impl Mixer {
                 slot.store(std::ptr::null_mut(), SeqCst);
                 retired.push((unsafe { Arc::from_raw(pointer) }, MIXING.load(SeqCst)));
             }
-            None if on => {
-                if let Some(slot) = PLAYING.iter().find(|slot| slot.load(Relaxed).is_null()) {
-                    slot.store(Arc::into_raw(sound.clone()).cast_mut(), SeqCst);
-                }
-            }
+            // Without a slot the sound plays silently and still ends. It never takes a slot later, because
+            // only one side may read its ring.
+            None if on => match PLAYING
+                .iter()
+                .find(|slot| slot.load(Relaxed).is_null())
+                .filter(|_| !sound.unmixed.load(Relaxed))
+            {
+                Some(slot) => slot.store(Arc::into_raw(sound.clone()).cast_mut(), SeqCst),
+                None => sound.unmixed.store(true, Relaxed),
+            },
             _ => {}
         }
         let mixing = MIXING.load(SeqCst);
@@ -615,7 +623,7 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
             speed = value;
             unsafe { apps_ffmpeg_speed(media, value) };
         }
-        if output.is_none() {
+        if output.is_none() || sound.unmixed.load(Relaxed) {
             sound.drop_played();
         }
         if !pending.is_empty() && state.generation == generation {
@@ -1079,6 +1087,31 @@ mod tests {
         let text = json("a\"b\\c\n\u{1b}é\u{2028}");
         assert_eq!(text, "\"a\\\"b\\\\c\\u000a\\u001bé\u{2028}\"");
         assert!(text.starts_with('"') && text.ends_with('"'));
+    }
+
+    #[test]
+    fn sounds_beyond_the_mixer_slots_play_silently() {
+        let (control, _events) = mpsc::channel();
+        let mixer = Mixer {
+            rate: 48000,
+            channels: 2,
+            retired: Mutex::new(Vec::new()),
+            control,
+        };
+        let sounds: Vec<_> = (0..=PLAYING.len())
+            .map(|_| Arc::new(Sound::new()))
+            .collect();
+        for sound in &sounds {
+            mixer.set(sound, true);
+        }
+        let (extra, mixed) = sounds.split_last().unwrap();
+        assert!(mixed.iter().all(|sound| !sound.unmixed.load(Relaxed)));
+        assert!(extra.unmixed.load(Relaxed));
+        for sound in &sounds {
+            mixer.set(sound, false);
+        }
+        mixer.set(extra, true);
+        assert!(PLAYING.iter().all(|slot| slot.load(Relaxed).is_null()));
     }
 
     #[test]

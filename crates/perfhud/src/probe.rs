@@ -234,11 +234,28 @@ fn gpu_time() -> Option<Duration> {
     None
 }
 
+// The HUD paints on a render thread, where AppKit can't be asked. CoreGraphics answers on any thread.
 #[cfg(target_os = "macos")]
 pub fn refresh_period() -> Option<f32> {
-    let rate = objc2_app_kit::NSScreen::mainScreen(objc2::MainThreadMarker::new()?)?
-        .maximumFramesPerSecond();
-    (rate > 0).then(|| 1. / rate as f32)
+    use std::ffi::c_void;
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayCopyDisplayMode(display: u32) -> *mut c_void;
+        fn CGDisplayModeGetRefreshRate(mode: *mut c_void) -> f64;
+        fn CGDisplayModeRelease(mode: *mut c_void);
+    }
+    let rate = unsafe {
+        let mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
+        if mode.is_null() {
+            return None;
+        }
+        let rate = CGDisplayModeGetRefreshRate(mode);
+        CGDisplayModeRelease(mode);
+        rate
+    };
+    // Displays without a fixed rate report 0.
+    (rate > 0.).then(|| 1. / rate as f32)
 }
 
 #[cfg(not(target_os = "macos"))]

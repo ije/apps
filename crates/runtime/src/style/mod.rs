@@ -1013,6 +1013,7 @@ struct Environment {
 // `scopes` must stay sorted by root, and a tree that the stored pass styled must use the same scope again.
 struct Styled {
     nodes: Rc<Vec<(u32, u32)>>,
+    serial: u64,
     tree: Rc<Vec<u32>>,
     trees: Rc<Vec<(usize, usize)>>,
     environment: Environment,
@@ -1060,38 +1061,66 @@ impl StyleCache {
             special: Vec::new(),
             tables: Vec::new(),
         });
+        let serial = walk.walk.serial;
         // This skip relies on a new shadow map whenever the tree or its shadow roots change.
         if !(walk.built.0 == doc.nodes.tree() && Rc::ptr_eq(&walk.built.1, shadows))
             && walk.walk.update(doc, &shadows.composed, None)
         {
-            let mut tree = vec![u32::MAX; doc.nodes.len()];
-            let mut trees = vec![(0, usize::MAX)];
-            walk.special.clear();
-            walk.special.push(Vec::new());
-            walk.tables.clear();
-            for &(id, _) in walk.walk.nodes.iter() {
-                let id = id as usize;
-                let node = &doc.nodes[id];
-                let index = match node.parent {
-                    Some(parent) => tree[parent].min(trees.len() as u32 - 1) as usize,
-                    None => match shadows.hosts.get(&id) {
-                        Some(&host) => {
-                            trees.push((id, host));
-                            walk.special.push(Vec::new());
-                            trees.len() - 1
-                        }
-                        None => 0,
-                    },
-                };
-                tree[id] = index as u32;
-                match node.tag.as_str() {
-                    "meta" | "style" | "link" | "html" => walk.special[index].push(id),
-                    "table" => walk.tables.push(id),
-                    _ => {}
+            let special = |id: usize| {
+                matches!(
+                    doc.nodes[id].tag.as_str(),
+                    "meta" | "style" | "link" | "html" | "table"
+                )
+            };
+            // A patched walk keeps the lists when no node in them, and no node for them, moved or changed.
+            // `tree` then stays as it is: without shadow trees, every node is in the first tree.
+            let patched = shadows.hosts.is_empty()
+                && walk.trees.len() == 1
+                && walk.walk.since(serial).is_some_and(|touched| {
+                    let mut listed = walk.special[0].iter().chain(&walk.tables);
+                    touched.len() <= 256
+                        && !listed.any(|&id| touched.contains(&(id as u32)))
+                        && touched
+                            .iter()
+                            .all(|&id| !(walk.walk.contains(id as usize) && special(id as usize)))
+                });
+            if !patched || cfg!(debug_assertions) {
+                let mut tree = vec![u32::MAX; doc.nodes.len()];
+                let mut trees = vec![(0, usize::MAX)];
+                let mut lists = vec![Vec::new()];
+                let mut tables = Vec::new();
+                for &(id, _) in walk.walk.nodes.iter() {
+                    let id = id as usize;
+                    let node = &doc.nodes[id];
+                    let index = match node.parent {
+                        Some(parent) => tree[parent].min(trees.len() as u32 - 1) as usize,
+                        None => match shadows.hosts.get(&id) {
+                            Some(&host) => {
+                                trees.push((id, host));
+                                lists.push(Vec::new());
+                                trees.len() - 1
+                            }
+                            None => 0,
+                        },
+                    };
+                    tree[id] = index as u32;
+                    match node.tag.as_str() {
+                        "table" => tables.push(id),
+                        _ if special(id) => lists[index].push(id),
+                        _ => {}
+                    }
+                }
+                assert!(
+                    !patched
+                        || (&trees, &lists, &tables) == (&*walk.trees, &walk.special, &walk.tables),
+                    "patched style walk lists differ"
+                );
+                if !patched {
+                    walk.tree = Rc::new(tree);
+                    walk.trees = Rc::new(trees);
+                    (walk.special, walk.tables) = (lists, tables);
                 }
             }
-            walk.tree = Rc::new(tree);
-            walk.trees = Rc::new(trees);
         }
         walk.built = (doc.nodes.tree(), shadows.clone());
         walk.used.set(self.pass);
@@ -2831,7 +2860,6 @@ pub(crate) fn resolved(
             let [padding, border] = [
                 PADDING,
                 [
-                    Prop::BORDER,
                     Prop::BORDER_TOP_WIDTH,
                     Prop::BORDER_RIGHT_WIDTH,
                     Prop::BORDER_BOTTOM_WIDTH,
@@ -3779,7 +3807,7 @@ pub(crate) struct SpareStyles {
     vars: Chunked<Vars>,
     flags: Chunked<u8>,
     lengths: NodeLengths,
-    user_select: Vec<(UserSelect, usize)>,
+    user_select: Chunked<(UserSelect, usize)>,
 }
 
 impl From<ComputedStyles> for SpareStyles {
@@ -3815,7 +3843,7 @@ pub(crate) struct ComputedStyles {
     pub backdrop_starts: FxHashMap<usize, Rc<Style>>,
     pub scrollbars: FxHashMap<usize, Rc<[Option<Style>; 5]>>,
     pub selections: FxHashMap<usize, Rc<Style>>,
-    pub user_select: Vec<(UserSelect, usize)>,
+    pub user_select: Chunked<(UserSelect, usize)>,
     pub animations: FxHashMap<usize, Vec<Animation>>,
     pub children: FxHashMap<usize, Vec<usize>>,
     pub slotted: FxHashMap<usize, Shadowed>,
@@ -3872,7 +3900,6 @@ pub(crate) fn compute_styles(
     style_cache: &mut StyleCache,
     context: Option<&StyleContext>,
 ) -> ComputedStyles {
-    let count = doc.nodes.len();
     let spare = style_cache.spare.take().unwrap_or_default();
     let mut out = ComputedStyles {
         values: spare.values,
@@ -3886,7 +3913,6 @@ pub(crate) fn compute_styles(
     out.vars.clear();
     out.flags.clear();
     out.user_select.clear();
-    out.user_select.resize(count, (UserSelect::None, 0));
     cascade(
         doc,
         [width, height],
@@ -4716,7 +4742,7 @@ pub(crate) fn cascade(
     let (unstyled, empty) = empty();
     let matches = &mut style_cache.matches;
     matches.set_hosts(&shadows.hosts);
-    matches.update(doc, order);
+    matches.update(doc, &walk.walk);
     let mut candidates: Vec<usize> = Vec::new();
     let mut shares: FxHashMap<(usize, [u32; 7]), Share> = FxHashMap::default();
     let no_pseudos: Rc<[usize]> = Rc::new([]);
@@ -4793,33 +4819,79 @@ pub(crate) fn cascade(
                     .and_then(|&index| trees.get(index as usize))
                     .map(|tree| tree.0)
             };
-            let mut placed = vec![GONE; doc.nodes.len()];
-            for &(id, up) in old.nodes.iter() {
-                if let Some(slot) = placed.get_mut(id as usize) {
-                    *slot = up;
-                }
+            macro_rules! leave {
+                ($id:expr) => {
+                    styles[$id] = unstyled.clone();
+                    custom[$id] = empty.clone();
+                    style_flags[$id] = 0;
+                    lengths.unset($id);
+                    containers[$id] = None;
+                    unstyle!($id);
+                };
             }
-            for &(id, up) in order {
-                let id = id as usize;
-                if placed[id] != up
-                    || root(&old.tree, &old.trees, id) != root(&walk.tree, &walk.trees, id)
-                {
-                    matches.dirty[id] = true;
-                    if let Some(&host) = shadows.hosts.get(&id) {
-                        matches.dirty[host] = true;
+            // Without shadow trees, only the nodes that a patched walk touched can have another place.
+            let touched = walk
+                .walk
+                .since(old.serial)
+                .filter(|_| shadows.hosts.is_empty() && old.trees.len() == 1);
+            let mut placed = Vec::new();
+            if touched.is_none() || cfg!(debug_assertions) {
+                placed.resize(doc.nodes.len(), GONE);
+                for &(id, up) in old.nodes.iter() {
+                    if let Some(slot) = placed.get_mut(id as usize) {
+                        *slot = up;
                     }
                 }
-                placed[id] = KEPT;
             }
-            for &(id, _) in old.nodes.iter() {
-                let id = id as usize;
-                if placed.get(id).is_some_and(|&slot| slot != KEPT) {
-                    styles[id] = unstyled.clone();
-                    custom[id] = empty.clone();
-                    style_flags[id] = 0;
-                    lengths.unset(id);
-                    containers[id] = None;
-                    unstyle!(id);
+            match touched {
+                Some(touched) => {
+                    // A node with another parent is dirty by its snapshot. A node that joins has no style.
+                    for &id in touched {
+                        let id = id as usize;
+                        if !walk.walk.contains(id) {
+                            leave!(id);
+                        } else if Rc::ptr_eq(&styles[id], &unstyled) {
+                            matches.dirty[id] = true;
+                        }
+                    }
+                    #[cfg(debug_assertions)]
+                    for (nodes, kept) in [(order, true), (&old.nodes[..], false)] {
+                        for &(id, up) in nodes {
+                            let slot = &mut placed[id as usize];
+                            assert!(
+                                *slot == if kept { up } else { KEPT } || touched.contains(&id),
+                                "node {id} moved outside the patched walk"
+                            );
+                            assert!(
+                                !kept
+                                    || *slot == up
+                                    || matches.dirty[id as usize]
+                                    || doc.nodes[id as usize].parent != Some(up as usize),
+                                "node {id} moved without a dirty mark"
+                            );
+                            *slot = if kept { KEPT } else { *slot };
+                        }
+                    }
+                }
+                None => {
+                    for &(id, up) in order {
+                        let id = id as usize;
+                        if placed[id] != up
+                            || root(&old.tree, &old.trees, id) != root(&walk.tree, &walk.trees, id)
+                        {
+                            matches.dirty[id] = true;
+                            if let Some(&host) = shadows.hosts.get(&id) {
+                                matches.dirty[host] = true;
+                            }
+                        }
+                        placed[id] = KEPT;
+                    }
+                    for &(id, _) in old.nodes.iter() {
+                        let id = id as usize;
+                        if placed.get(id).is_some_and(|&slot| slot != KEPT) {
+                            leave!(id);
+                        }
+                    }
                 }
             }
         }
@@ -4900,7 +4972,50 @@ pub(crate) fn cascade(
             }
         }
     }
-    for &(id, up) in order {
+    // A fast pass visits only the dirty and moving nodes and the nodes below a changed one. The document and
+    // the root elements are in the list because they set the root font size.
+    let mut seeds: Vec<u32> = Vec::new();
+    if fast {
+        let dirty = matches.dirty.chunks(64).enumerate();
+        let dirty = dirty.filter(|(_, chunk)| chunk.contains(&true));
+        let dirty = dirty.flat_map(|(index, chunk)| {
+            let set = chunk.iter().enumerate().filter(|(_, dirty)| **dirty);
+            set.map(move |(bit, _)| index * 64 + bit)
+        });
+        let animated = context.filter(|_| !stored);
+        let animated = animated
+            .into_iter()
+            .flat_map(|context| context.animated.keys().copied());
+        let roots = std::iter::once(0).chain(html.iter().copied());
+        let places = roots.chain(dirty).chain(animated);
+        seeds = places.filter_map(|id| walk.walk.place(id)).collect();
+        seeds.sort_unstable();
+    }
+    let (mut next, mut seed, mut scan) = (0, 0, 0);
+    let mut visited: Option<(usize, usize)> = None;
+    loop {
+        if let Some((at, id)) = visited.take()
+            && changed!(id) != 0
+        {
+            scan = scan.max(at + walk.walk.span(id));
+        }
+        let mut reached = true;
+        if fast && !all && next >= scan {
+            while seeds.get(seed).is_some_and(|&at| (at as usize) < next) {
+                seed += 1;
+            }
+            // Debug builds visit every node, to check that the skipped ones need no new style.
+            match seeds.get(seed) {
+                _ if cfg!(debug_assertions) => reached = seeds.get(seed) == Some(&(next as u32)),
+                Some(&at) => next = at as usize,
+                None => break,
+            }
+        }
+        let Some(&(id, up)) = order.get(next) else {
+            break;
+        };
+        let at = next;
+        next += 1;
         let id = id as usize;
         if fast {
             if !all
@@ -4913,13 +5028,22 @@ pub(crate) fn cascade(
                 }
                 continue;
             }
+            assert!(
+                reached || all,
+                "node {id} needs a style outside the dirty list"
+            );
+            visited = Some((at, id));
             if stored {
                 matches.dirty[id] = false;
             }
             unstyle!(id);
         }
         let up = (up != u32::MAX).then_some(up as usize);
-        let tree = walk.tree[id] as usize;
+        // A patched walk without shadow trees leaves `tree` as it was.
+        let tree = match walk.trees.len() {
+            1 => 0,
+            _ => walk.tree[id] as usize,
+        };
         let node = &doc.nodes[id];
         if tree != 0 && walk.trees[tree].0 == id {
             let host = walk.trees[tree].1;
@@ -6653,6 +6777,7 @@ pub(crate) fn cascade(
         style_cache.full = false;
         style_cache.styled = Some(Styled {
             nodes: walk.walk.nodes.clone(),
+            serial: walk.walk.serial,
             tree: walk.tree.clone(),
             trees: walk.trees.clone(),
             environment,

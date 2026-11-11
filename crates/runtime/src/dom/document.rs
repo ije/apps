@@ -101,7 +101,7 @@ pub struct Document {
 
 static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn stamp() -> u64 {
+pub(super) fn stamp() -> u64 {
     REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -111,9 +111,24 @@ pub struct Nodes {
     revisions: Vec<u64>,
     latest: u64,
     tree: u64,
+    // The nodes that got a revision after `logged`, with duplicates, so readers need no scan of all nodes.
+    log: Vec<u32>,
+    logged: u64,
 }
 
 impl Nodes {
+    // Call this before a node gets its new revision.
+    fn note(&mut self, id: usize) {
+        if self.log.last() == Some(&(id as u32)) {
+            return;
+        }
+        if self.log.len() == 4096 {
+            self.log.clear();
+            self.logged = self.latest;
+        }
+        self.log.push(id as u32);
+    }
+
     pub(crate) fn truncate(&mut self, len: usize) {
         self.list.truncate(len);
         self.list.shrink_to_fit();
@@ -121,9 +136,12 @@ impl Nodes {
         self.revisions.shrink_to_fit();
         self.latest = stamp();
         self.tree = self.latest;
+        self.log.clear();
+        self.logged = self.latest;
     }
 
     pub fn push(&mut self, node: Node) {
+        self.note(self.list.len());
         self.list.push(node);
         self.latest = stamp();
         self.tree = self.latest;
@@ -131,26 +149,30 @@ impl Nodes {
     }
 
     pub fn get_mut(&mut self, id: usize) -> Option<&mut Node> {
-        let node = self.list.get_mut(id)?;
+        self.list.get(id)?;
+        self.note(id);
         self.latest = stamp();
         self.tree = self.latest;
         self.revisions[id] = self.latest;
-        Some(node)
+        self.list.get_mut(id)
     }
 
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Node> {
         self.revisions.fill_with(stamp);
         self.latest = stamp();
         self.tree = self.latest;
+        self.log.clear();
+        self.logged = self.latest;
         self.list.iter_mut()
     }
 
     // Never change parent or children through edit: it does not invalidate cached tree walks.
     pub(crate) fn edit(&mut self, id: usize) -> Option<&mut Node> {
-        let node = self.list.get_mut(id)?;
+        self.list.get(id)?;
+        self.note(id);
         self.latest = stamp();
         self.revisions[id] = self.latest;
-        Some(node)
+        self.list.get_mut(id)
     }
 
     pub(crate) fn tree(&self) -> u64 {
@@ -178,6 +200,22 @@ impl Nodes {
     pub fn revision(&self, id: usize) -> u64 {
         self.revisions[id]
     }
+
+    // The nodes with a newer revision. A node can come more than once.
+    pub(crate) fn changed_since(&self, revision: u64) -> impl Iterator<Item = usize> + '_ {
+        let newer = move |&id: &usize| {
+            self.revisions
+                .get(id)
+                .is_some_and(|&stamp| stamp > revision)
+        };
+        let logged = (revision >= self.logged).then(|| self.log.iter().map(|&id| id as usize));
+        let every = (revision < self.logged).then_some(0..self.revisions.len());
+        logged
+            .into_iter()
+            .flatten()
+            .chain(every.into_iter().flatten())
+            .filter(newer)
+    }
 }
 
 impl std::ops::Deref for Nodes {
@@ -198,6 +236,7 @@ impl std::ops::Index<usize> for Nodes {
 
 impl std::ops::IndexMut<usize> for Nodes {
     fn index_mut(&mut self, id: usize) -> &mut Node {
+        self.note(id);
         self.latest = stamp();
         self.tree = self.latest;
         self.revisions[id] = self.latest;
@@ -214,6 +253,8 @@ impl From<Vec<Node>> for Nodes {
             revisions,
             latest,
             tree: latest,
+            log: Vec::new(),
+            logged: latest,
         }
     }
 }

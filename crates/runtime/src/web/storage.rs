@@ -629,7 +629,8 @@ impl State {
             }
             "begin"=>{
                 let name=args[0].as_str().context("Expected database name")?.to_owned();let writable=args[1]!="readonly";
-                let busy=||{if let Ok(mut waiting)=WAITING.lock(){waiting.push(crate::host::Waker::current());}Ok(json!({"busy":true}))};
+                // Pages also retry on a timer, so a waker is only a shortcut. The list is capped, because another process can hold the lock for as long as it likes.
+                let busy=||{if let Ok(mut waiting)=WAITING.lock()&&waiting.len()<64{waiting.push(crate::host::Waker::current());}Ok(json!({"busy":true}))};
                 if self.transactions.values().any(|transaction| transaction.name == name) { return busy(); }
                 let database=match self.idle.pop(){Some(database)=>database,None=>{let database=Database::open(&self.path)?;database.query("PRAGMA synchronous=NORMAL",&[])?;database}};
                 match database.query(if writable {"BEGIN IMMEDIATE"}else{"BEGIN"},&[]) {Ok(_)=>{},Err(error) => {

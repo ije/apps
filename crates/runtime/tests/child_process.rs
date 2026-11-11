@@ -355,6 +355,20 @@ fn closing_terminals_does_not_block_on_kill() {
 
 #[cfg(unix)]
 #[test]
+fn terminals_start_in_the_current_directory_with_the_current_environment() {
+    // The test must not change the directory of the process: other tests run in it at the same time. Cargo
+    // runs tests in the crate folder, which is not the home folder that a terminal used to start in.
+    run(r#"
+        process.env.APPS_PTY_TEST = 'set later';
+        const terminal = __apps.pty.spawn('/bin/sh', ['-c', 'pwd; echo "[$APPS_PTY_TEST]"']);
+        let output = '';
+        await new Promise(resolve => terminal.onData(data => { output += data; if (output.includes(']')) resolve(); }));
+        if (!output.includes(process.cwd() + '\r\n[set later]')) throw Error('Terminal started with ' + JSON.stringify(output));
+    "#);
+}
+
+#[cfg(unix)]
+#[test]
 fn child_output_applies_backpressure() {
     run(r#"
         const { spawn, spawnSync } = __apps.child_process;

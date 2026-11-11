@@ -3712,6 +3712,8 @@ fn animated_passes_start_from_the_stored_pass() {
         previous: Some(base.clone()),
         ..Default::default()
     };
+    // Only debug builds count the incremental passes.
+    #[cfg(debug_assertions)]
     let passes = cache.incremental;
     let out = compute_styles(
         &doc,
@@ -3723,6 +3725,7 @@ fn animated_passes_start_from_the_stored_pass() {
         Some(&context),
     );
     cache.finish();
+    #[cfg(debug_assertions)]
     assert_eq!(cache.incremental, passes + 1);
     assert_eq!(out.values[a].get(Prop::WIDTH), Some("5px"));
     assert_eq!(out.values[p].get(Prop::COLOR), Some("blue"));

@@ -290,8 +290,15 @@ impl State {
                             };
                             ensure!(raised >= 0, "Cannot create a stdio pipe");
                             ends.push((index as i32, unsafe { OwnedFd::from_raw_fd(raised) }));
-                            pipes
-                                .push((&*Box::leak(format!("fd{index}").into_boxed_str()), parent));
+                            // Stream names live as long as the process, so each index gets one name.
+                            static NAMES: std::sync::Mutex<Vec<&'static str>> =
+                                std::sync::Mutex::new(Vec::new());
+                            let mut names = NAMES.lock().unwrap_or_else(|error| error.into_inner());
+                            while names.len() <= index {
+                                let name = format!("fd{}", names.len());
+                                names.push(Box::leak(name.into_boxed_str()));
+                            }
+                            pipes.push((names[index], parent));
                         }
                     }
                     if !ends.is_empty() {

@@ -128,9 +128,11 @@ impl State {
                     .collect::<Vec<_>>()
             )),
             "close" => {
-                PARENT.with(|p| {
-                    if let Some(p) = p.borrow().as_ref() {
-                        p.stop.store(true, Ordering::Release);
+                PARENT.with(|parent| {
+                    if let Some(parent) = parent.borrow_mut().as_mut() {
+                        // A worker that closes itself ends cleanly.
+                        parent.code.get_or_insert(0);
+                        parent.stop.store(true, Ordering::Release);
                     }
                 });
                 Ok(Value::Null)
@@ -174,14 +176,17 @@ impl State {
                         .context("Expected channel message")?
                         .split_off(2),
                 ));
-                CHANNELS.lock().unwrap().retain(|other, subscriber| {
+                for (other, subscriber) in CHANNELS.lock().unwrap().iter_mut() {
                     if *other == id || !subscriber.names.contains(&name) {
-                        return true;
+                        continue;
                     }
-                    subscriber.queue.push((name.clone(), message.clone()));
+                    // A reader that fell this far behind misses new messages until it reads. It stays
+                    // subscribed: only its own end removes it.
+                    if subscriber.queue.len() < 4096 {
+                        subscriber.queue.push((name.clone(), message.clone()));
+                    }
                     subscriber.wake.wake();
-                    subscriber.queue.len() < 4096
-                });
+                }
                 Ok(Value::Null)
             }
             "channel.poll" => {

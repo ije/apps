@@ -69,6 +69,8 @@ pub(crate) struct Cull {
     pub(crate) marked: Vec<bool>,
     pub(crate) cascaded: bool,
     pub(crate) cells: Vec<usize>,
+    // 1 for a node in `cells`, 2 in `canvases`, 3 in `iframes`.
+    pub(crate) kinds: Vec<u8>,
     pub(crate) canvases: Vec<usize>,
     pub(crate) iframes: Vec<usize>,
     pub(crate) seen: Option<(u64, Option<usize>, Rc<crate::style::ComputedStyles>)>,
@@ -85,6 +87,7 @@ impl Cull {
         self.walk = Default::default();
         self.parents = Vec::new();
         self.cells = Vec::new();
+        self.kinds = Vec::new();
         self.marked = Vec::new();
         if self.info.len() > len {
             self.info.truncate(len);

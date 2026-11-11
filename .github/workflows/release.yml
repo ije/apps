@@ -80,6 +80,14 @@ jobs:
         run: bash scripts/build-ffmpeg.sh ${{ matrix.configure }}
 
       - run: bash scripts/build-npm.sh "$([[ $GITHUB_REF_TYPE == tag ]] && echo "${GITHUB_REF_NAME#v}" || echo 0.0.0)"
+      # A broken package must not reach npm: the packed CLI must start and build an app from the packed files.
+      - run: |
+          bin=packages/apps-${{ matrix.target }}/bin
+          "$bin/apps" --version
+          "$bin/apps" build examples/serve/main.ts --out-dir target/smoke
+      # The packed runtime must also start that app. CI doesn't run --check on Windows yet, so it is left out there.
+      - if: runner.os != 'Windows'
+        run: packages/apps-${{ matrix.target }}/bin/apps-runtime "$(dirname "$(find target/smoke -name app.bundle)")" --check
       - run: npm pack ./packages/apps-${{ matrix.target }} --pack-destination npm
       - if: matrix.target == 'linux-x64'
         run: npm pack ./packages/apps --pack-destination npm

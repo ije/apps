@@ -980,8 +980,13 @@ fn node_fs_descriptors_handles_and_streams() {
         assert.throws(()=>fs.write(fd,Buffer.alloc(4),1,4,()=>{{}}),{{code:'ERR_OUT_OF_RANGE',message:'The value of "length" is out of range. It must be <= 3. Received 4'}});
         assert.strictEqual(fs.readSync(fd,Buffer.alloc(4),{{offset:1,length:3,position:1}}),3);
         assert.strictEqual(fs.readSync(fd,Buffer.alloc(4),0,3,1n),3);
+        assert.strictEqual(fs.readSync(fd,Buffer.alloc(65<<20),0,65<<20,0),17);
         fs.closeSync(fd);
+        const moded=path.join(root,'moded.txt'),written=path.join(root,'written.txt');
+        fs.closeSync(fs.openSync(moded,'w','600'));fs.writeFileSync(written,'x',{{mode:'640'}});
+        assert.deepStrictEqual([moded,written].map(file=>(fs.statSync(file).mode&0o777).toString(8)),['600','640']);
         assert.throws(()=>fs.closeSync(fd),{{code:'EBADF',syscall:'close',message:'EBADF: bad file descriptor, close'}});
+        assert.throws(()=>fs.watch(path.join(root,'missing')),{{code:'ENOENT'}});
         assert.throws(()=>fs.readSync(fd,Buffer.alloc(1)),{{code:'EBADF',syscall:'read'}});
         const handle=await fsp.open(file,'r+');
         await assert.rejects(handle.read(Buffer.alloc(4),0,10),{{code:'ERR_OUT_OF_RANGE'}});
@@ -1423,6 +1428,8 @@ fn node_process_env_constants_and_worker_exit() {
         const messages=[];worker.on('message',message=>messages.push(message));
         assert.strictEqual(await new Promise(resolve=>worker.on('exit',resolve)),7);
         assert.deepStrictEqual(messages,['exit 7']);
+        const closing=new worker_threads.Worker(`require('node:worker_threads').parentPort.close();`,{eval:true});
+        assert.strictEqual(await new Promise(resolve=>closing.on('exit',resolve)),0);
     "#);
 }
 
@@ -1453,6 +1460,13 @@ fn node_perf_hooks_and_worker_thread_helpers() {
         const reply=new Promise(resolve=>{main.onmessage=event=>resolve(event.data);});main.postMessage(new Uint8Array([7]));
         assert.deepStrictEqual(await reply,{pong:new Uint8Array([7])});main.close();
         assert.strictEqual(await exited,0);
+        const flood=new worker_threads.BroadcastChannel('flood');
+        const busy=new worker_threads.Worker(`const{BroadcastChannel,parentPort}=require('node:worker_threads');const channel=new BroadcastChannel('flood');let count=0;channel.onmessage=event=>{count++;if(event.data==='last'){parentPort.postMessage(count);channel.close();}};parentPort.postMessage('ready');const end=Date.now()+300;while(Date.now()<end);`,{eval:true});
+        await new Promise(resolve=>busy.once('message',resolve));
+        for(let n=0;n<5000;n++)flood.postMessage('x');
+        await new Promise(resolve=>setTimeout(resolve,500));
+        const counted=new Promise(resolve=>busy.once('message',resolve));flood.postMessage('last');
+        const received=await counted;assert.ok(received>=4097&&received<=5001,'a reader that fell behind still gets later messages: '+received);flood.close();
         assert.strictEqual(typeof worker_threads.SHARE_ENV,'symbol');
     "#);
 }

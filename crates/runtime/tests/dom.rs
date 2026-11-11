@@ -389,6 +389,10 @@ fn canvas_pixels_survive_partial_updates_and_clipping() {
       if(ctx.getImageData(7,7,1,1).data[1]!==255)throw Error('putImageData failed');
       const copy=document.createElement('canvas');copy.width=8;copy.height=8;copy.getContext('2d').drawImage(canvas,0,0);
       if(copy.getContext('2d').getImageData(7,7,1,1).data[1]!==255)throw Error('drawImage failed');
+      const target=copy.getContext('2d');target.globalCompositeOperation='copy';
+      target.drawImage(canvas,NaN,0);
+      if(target.getImageData(7,7,1,1).data[1]!==255)throw Error('drawImage at no place cleared the canvas');
+      target.globalCompositeOperation='source-over';
       if(!canvas.toDataURL().startsWith('data:image/png;base64,iVBOR'))throw Error('PNG encoding failed');
       canvas.width=8;if(ctx.getImageData(0,0,1,1).data[3]!==0)throw Error('Canvas resize did not clear pixels');
       ctx.translate(-1e8,0);ctx.fillRect(1e8+3,0,1,1);ctx.resetTransform();
@@ -705,6 +709,62 @@ fn scrolling_snaps_to_device_pixels_and_respects_scroll_margins() {
         box.scrollLeft = 0;
         document.getElementById('caret').scrollIntoView({ block: 'nearest', inline: 'nearest' });
         if (box.scrollLeft !== 120) throw Error(`Scroll margin and padding: ${box.scrollLeft}`);
+    "#, "test").unwrap();
+}
+
+// Debug builds also compare each patched tree walk, list and mark with a full pass. Shadow trees, which take
+// the full pass, come late.
+#[test]
+fn computed_styles_follow_random_tree_changes() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><head><style>body{color:rgb(1, 1, 1)} p + p{color:rgb(6, 6, 6)} .a{color:rgb(2, 2, 2)} li:first-child{color:rgb(4, 4, 4)} li:nth-child(3n){color:rgb(5, 5, 5)} div:empty{color:rgb(7, 7, 7)} [inert] span{color:rgb(8, 8, 8)} td:last-child{color:rgb(9, 9, 9)} .a > .b{color:rgb(3, 3, 3)} .flat{display:contents}</style></head><body><ul id='list'></ul><table><tbody id='rows'></tbody></table><div id='box' class='a'></div></body></html>"),
+        dirty: false,
+    });
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
+    engine.eval(r#"
+        const rules = [['body', 'rgb(1, 1, 1)'], ['p + p', 'rgb(6, 6, 6)'], ['.a', 'rgb(2, 2, 2)'], ['li:first-child', 'rgb(4, 4, 4)'], ['li:nth-child(3n)', 'rgb(5, 5, 5)'], ['div:empty', 'rgb(7, 7, 7)'], ['[inert] span', 'rgb(8, 8, 8)'], ['td:last-child', 'rgb(9, 9, 9)'], ['.a > .b', 'rgb(3, 3, 3)']];
+        const expected = el => { for (let i = rules.length; i--;) if (el.matches(rules[i][0])) return rules[i][1]; return el.parentElement ? expected(el.parentElement) : 'rgb(0, 0, 0)'; };
+        let seed = 12345, step = 0;
+        const random = below => (seed = Math.imul(seed, 1103515245) + 12345 >>> 0, (seed >>> 8) % below);
+        const list = document.getElementById('list'), rows = document.getElementById('rows'), box = document.getElementById('box');
+        const make = (tag, text) => { const el = document.createElement(tag); if (random(3) === 0) el.className = ['a', 'b', 'flat'][random(3)]; if (text) el.textContent = text; return el; };
+        const item = () => { const li = make('li'); li.append(make('span', 'item'), make('p', 'one'), make('p', 'two')); return li; };
+        const any = () => { const all = document.body.querySelectorAll('*'); return all[random(all.length)]; };
+        const holder = () => { for (;;) { const el = any(); if (!['TABLE', 'TBODY', 'TR', 'STYLE'].includes(el.tagName)) return el; } };
+        for (let i = 0; i < 12; i++) list.append(item());
+        const steps = [
+            () => list.insertBefore(item(), list.children[random(list.children.length + 1)] ?? null),
+            () => list.children[random(list.children.length)]?.remove(),
+            () => list.children.length && list.insertBefore(list.children[random(list.children.length)], list.children[random(list.children.length)]),
+            () => { const el = list.querySelectorAll('span, p')[random(40)]; if (el) el.textContent = 'text ' + random(9); },
+            () => any().classList.toggle(['a', 'b', 'flat'][random(3)]),
+            () => { const row = document.createElement('tr'); for (let i = 1 + random(3); i--;) row.append(make('td', 'cell')); rows.insertBefore(row, rows.children[random(rows.children.length + 1)] ?? null); },
+            () => rows.children[random(rows.children.length)]?.remove(),
+            () => any().toggleAttribute(['inert', 'contenteditable'][random(2)]),
+            () => holder().append(make(['div', 'p', 'span'][random(3)], random(2) ? 'more' : '')),
+            () => box.replaceChildren(make('div'), make('p', 'x'), make('p', 'y')),
+            () => { const el = holder(); if (el !== box && !el.contains(box)) box.append(el); },
+            () => { const style = document.head.querySelector('style + style'); style ? style.remove() : document.head.append(make('style', '.none{color:rgb(10, 10, 10)}')); },
+            () => { const el = holder(); if (el.id || el.children.length > 20) return; const wrap = make('div'); el.replaceWith(wrap); wrap.append(el); },
+            () => { if (step < 120) return; const el = make('div'); el.attachShadow({ mode: 'open' }).append(make('span', 'shadow'), document.createElement('slot')); el.append(make('p', 'light')); box.append(el); },
+            () => { const el = box.children[random(box.children.length)]; if (el) el.remove(); },
+            () => { const el = holder(); if (!el.id) el.remove(); },
+        ];
+        for (; step < 200; step++) {
+            for (let count = 1 + random(3); count--;) steps[random(steps.length)]();
+            if (list.children.length > 30) list.replaceChildren(...Array.from(list.children).slice(0, 8));
+            if (document.body.querySelectorAll('*').length > 400) box.replaceChildren();
+            for (const el of document.body.querySelectorAll('*')) {
+                const color = getComputedStyle(el).color;
+                if (color !== expected(el)) throw Error(`step ${step}: <${el.tagName} class="${el.className}"> is ${color}, not ${expected(el)}`);
+            }
+        }
     "#, "test").unwrap();
 }
 

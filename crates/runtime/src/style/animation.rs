@@ -1685,7 +1685,9 @@ impl Motion {
                 if !key.inherited() {
                     continue;
                 }
-                let base = styles.values[id].get(key);
+                // An inherited value is the parent's own string. An equal value that the child declares is
+                // another one, and must not follow the parent.
+                let base = styles.values[id].value(key);
                 let mut pending = vec![id];
                 while let Some(parent) = pending.pop() {
                     for &child in styles
@@ -1693,7 +1695,8 @@ impl Motion {
                         .get(&parent)
                         .unwrap_or(&doc.nodes[parent].children)
                     {
-                        if styles.values[child].get(key) == base
+                        let own = styles.values[child].value(key);
+                        if own.map(Rc::as_ptr) == base.map(Rc::as_ptr)
                             && animated
                                 .get(&child)
                                 .is_none_or(|values| !values.contains(key))
@@ -3543,6 +3546,42 @@ mod tests {
             animated
                 .iter()
                 .any(|(id, _, layout)| *id == span && *layout)
+        );
+    }
+
+    #[test]
+    fn inherited_transitions_skip_children_that_declare_the_value() {
+        let mut doc = Document::parse(
+            "<html><style>body{color:blue;transition:color 1s linear}body.on{color:red}p{color:red}</style><body><i>a</i><p>b</p></body></html>",
+        );
+        let find =
+            |doc: &Document, tag: &str| doc.nodes.iter().position(|node| node.tag == tag).unwrap();
+        let (body, i, p) = (find(&doc, "body"), find(&doc, "i"), find(&doc, "p"));
+        let visible = vec![true; doc.nodes.len()];
+        let start = Instant::now();
+        let mut motion = Motion::default();
+        let mut update = |doc: &Document, time: u64| {
+            motion
+                .update(
+                    doc,
+                    &computed_styles(doc),
+                    &visible,
+                    &|_| true,
+                    start + Duration::from_millis(time),
+                    false,
+                    &mut Vec::new(),
+                )
+                .0
+        };
+        update(&doc, 0);
+        doc.nodes[body].attrs.insert("class".into(), "on".into());
+        update(&doc, 0);
+        let animated = update(&doc, 500);
+        let moving = |id: usize| animated.iter().any(|(node, ..)| *node == id);
+        assert!(moving(body) && moving(i));
+        assert!(
+            !moving(p),
+            "a paragraph that is always red must not animate"
         );
     }
 

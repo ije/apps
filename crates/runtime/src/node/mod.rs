@@ -339,14 +339,23 @@ impl State {
                         }
                     },
                 )?;
-                watcher.watch(
-                    root,
-                    if args[1]["recursive"] == true {
-                        RecursiveMode::Recursive
-                    } else {
-                        RecursiveMode::NonRecursive
-                    },
-                )?;
+                // Errors reach JavaScript with a code only as I/O errors.
+                watcher
+                    .watch(
+                        root,
+                        if args[1]["recursive"] == true {
+                            RecursiveMode::Recursive
+                        } else {
+                            RecursiveMode::NonRecursive
+                        },
+                    )
+                    .map_err(|error| match error.kind {
+                        notify::ErrorKind::PathNotFound => {
+                            std::io::Error::from(std::io::ErrorKind::NotFound).into()
+                        }
+                        notify::ErrorKind::Io(error) => anyhow::Error::from(error),
+                        kind => notify::Error::new(kind).into(),
+                    })?;
                 self.watchers.insert(id, watcher);
                 Ok(json!(id))
             }

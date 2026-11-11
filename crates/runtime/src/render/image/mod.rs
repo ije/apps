@@ -199,7 +199,16 @@ pub(crate) fn data_file(url: &str) -> Option<std::path::PathBuf> {
     let path = directory.join(format!("{:016x}.{extension}", hasher.finish()));
     if !path.exists() {
         std::fs::create_dir_all(&directory).ok()?;
-        std::fs::write(&path, bytes).ok()?;
+        // Other windows and other apps read this file, so it must appear complete.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let count = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let partial = path.with_extension(format!("{}-{count}.tmp", std::process::id()));
+        if std::fs::write(&partial, bytes).is_err() || std::fs::rename(&partial, &path).is_err() {
+            let _ = std::fs::remove_file(&partial);
+            if !path.exists() {
+                return None;
+            }
+        }
     }
     Some(path)
 }

@@ -83,6 +83,7 @@ extern napi_status napi_get_all_property_names(napi_env, napi_value, int, int, i
 extern napi_status napi_detach_arraybuffer(napi_env, napi_value);
 extern napi_status napi_is_detached_arraybuffer(napi_env, napi_value, bool *);
 extern napi_status napi_create_bigint_words(napi_env, int, size_t, const uint64_t *, napi_value *);
+extern napi_status napi_get_value_bigint_words(napi_env, napi_value, int *, size_t *, uint64_t *);
 extern napi_status napi_async_init(napi_env, napi_value, napi_value, void **);
 extern napi_status napi_async_destroy(napi_env, void *);
 extern napi_status napi_make_callback(napi_env, void *, napi_value, napi_value, size_t, const napi_value *, napi_value *);
@@ -333,6 +334,11 @@ static napi_value node8(napi_env env, napi_callback_info info) {
   uint64_t words[2] = {1, 1};
   OK(napi_create_bigint_words(env, 1, 2, words, &value));
   OK(napi_set_named_property(env, result, "words", value));
+  uint64_t low[1] = {0};
+  size_t needed = 1;
+  int negative = 0;
+  OK(napi_get_value_bigint_words(env, value, &negative, &needed, low));
+  put(env, result, "needed", needed == 2 && negative == 1 && low[0] == 1);
   void *context, *scope;
   OK(napi_create_string_utf8(env, "fixture", SIZE_MAX, &name));
   OK(napi_async_init(env, NULL, name, &context));
@@ -439,6 +445,36 @@ static napi_value work_state(napi_env env, napi_callback_info info) {
   return result;
 }
 
+// Work that outlives its environment: the environment must not free addon state under it.
+static int slow_freed, slow_late, slow_ran;
+static void slow_release(napi_env env, void *data, void *hint) {
+  (void)env; (void)data; (void)hint;
+  pthread_mutex_lock(&work_lock); slow_freed = 1; pthread_mutex_unlock(&work_lock);
+}
+static void slow_execute(napi_env env, void *data) {
+  (void)env; (void)data;
+  usleep(300000);
+  pthread_mutex_lock(&work_lock); slow_ran++; if (slow_freed) slow_late++; pthread_mutex_unlock(&work_lock);
+}
+static napi_value slow(napi_env env, napi_callback_info info) {
+  (void)info; napi_value object, name; napi_async_work item;
+  slow_freed = slow_late = slow_ran = 0;
+  OK(napi_create_object(env, &object));
+  OK(napi_add_finalizer(env, object, NULL, slow_release, NULL, NULL));
+  OK(napi_create_string_utf8(env, "slow", SIZE_MAX, &name));
+  for (int i = 0; i < 6; i++) {
+    OK(napi_create_async_work(env, NULL, name, slow_execute, NULL, NULL, &item));
+    OK(napi_queue_async_work(env, item));
+  }
+  return object;
+}
+static napi_value slow_state(napi_env env, napi_callback_info info) {
+  (void)info; napi_value result;
+  OK(napi_create_object(env, &result));
+  put(env, result, "ran", slow_ran); put(env, result, "late", slow_late);
+  return result;
+}
+
 static void throwing_release(napi_env env, void *data, void *hint) { (void)data; (void)hint; napi_throw_error(env, NULL, "finalizer failed"); }
 static napi_value throwing(napi_env env, napi_callback_info info) {
   (void)info; napi_value object;
@@ -464,6 +500,8 @@ napi_value napi_register_module_v1(napi_env env, napi_value exports) {
     {"threadsafeCount", NULL, threadsafe_count, NULL, NULL, NULL, 7, NULL},
     {"work", NULL, work, NULL, NULL, NULL, 7, NULL},
     {"workState", NULL, work_state, NULL, NULL, NULL, 7, NULL},
+    {"slow", NULL, slow, NULL, NULL, NULL, 7, NULL},
+    {"slowState", NULL, slow_state, NULL, NULL, NULL, 7, NULL},
     {"throwing", NULL, throwing, NULL, NULL, NULL, 7, NULL},
     {"stable", NULL, stable, NULL, NULL, NULL, 7, NULL},
     {"garbage", NULL, garbage, NULL, NULL, NULL, 7, NULL},

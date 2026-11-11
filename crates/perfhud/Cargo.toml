@@ -12,8 +12,6 @@ libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation.workspace = true
-objc2.workspace = true
-objc2-app-kit.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_System_ProcessStatus"] }

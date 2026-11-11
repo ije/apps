@@ -276,7 +276,12 @@ impl Owner {
                     *hold(&self.text) = None;
                 }
                 Event::SelectionRequest(request) => {
-                    self.answer(&request)?;
+                    // One refused answer, like a text past the request size limit, must not end the server.
+                    // A lost connection ends it at the next wait.
+                    if let Err(error) = self.answer(&request) {
+                        eprintln!("apps: clipboard: {error:#}");
+                        continue;
+                    }
                     if request.target != names.Targets {
                         self.progress(|handover| handover.read = true);
                     }

@@ -1076,9 +1076,8 @@ pub(crate) fn intrinsic(
             } else {
                 width / ratio
             };
-            let clips = [Prop::OVERFLOW_Y, Prop::OVERFLOW]
-                .into_iter()
-                .find_map(|prop| style.get(prop))
+            let clips = style
+                .get(Prop::OVERFLOW_Y)
                 .is_some_and(|value| value != "visible");
             if clips || matches!(node.tag.as_str(), "svg" | "img" | "canvas" | "video") {
                 height.max(0.)
@@ -1213,16 +1212,9 @@ pub(crate) fn layout(
                         .is_some_and(|v| v.starts_with("subgrid"))
             })
     });
-    let pair = |prop, axis: usize| {
-        let parts = style::components(get(prop)?, ' ');
-        parts.get(axis ^ 1).or(parts.first()).copied()
-    };
     let gap = [0, 1].map(|axis| {
         match (
-            get([Prop::COLUMN_GAP, Prop::ROW_GAP][axis])
-                .filter(|v| *v != "normal")
-                .or_else(|| get([Prop::GRID_COLUMN_GAP, Prop::GRID_ROW_GAP][axis]))
-                .or_else(|| pair(Prop::GRID_GAP, axis)),
+            get([Prop::COLUMN_GAP, Prop::ROW_GAP][axis]).filter(|v| *v != "normal"),
             shared[axis],
         ) {
             (None, Some(_)) => inherited.map_or(0., |grid| grid.gap[axis]),
@@ -1306,26 +1298,11 @@ pub(crate) fn layout(
         ][axis]
             .map(|name| own.get(name).is_some_and(|v| v == "auto"));
         let mut value = "normal";
-        for (style, name, shorthand) in [
-            (
-                own,
-                [Prop::JUSTIFY_SELF, Prop::ALIGN_SELF][axis],
-                Prop::PLACE_SELF,
-            ),
-            (
-                style,
-                [Prop::JUSTIFY_ITEMS, Prop::ALIGN_ITEMS][axis],
-                Prop::PLACE_ITEMS,
-            ),
+        for (style, name) in [
+            (own, [Prop::JUSTIFY_SELF, Prop::ALIGN_SELF][axis]),
+            (style, [Prop::JUSTIFY_ITEMS, Prop::ALIGN_ITEMS][axis]),
         ] {
-            let parts: Vec<&str> = style
-                .get(shorthand)
-                .map_or(Vec::new(), |v| v.split_whitespace().collect());
-            if let Some(found) = style
-                .get(name)
-                .or(parts.get(axis ^ 1).or(parts.first()).copied())
-                .filter(|v| *v != "auto")
-            {
+            if let Some(found) = style.get(name).filter(|v| *v != "auto") {
                 value = found;
                 break;
             }
@@ -1425,7 +1402,6 @@ pub(crate) fn layout(
                 let shrink = [0, 1].map(|axis| {
                     style
                         .get([Prop::OVERFLOW_X, Prop::OVERFLOW_Y][axis])
-                        .or_else(|| style.get(Prop::OVERFLOW))
                         .is_some_and(|v| !matches!(v, "visible" | "clip"))
                         || style
                             .get([Prop::MIN_WIDTH, Prop::MIN_HEIGHT][axis])
@@ -1640,7 +1616,6 @@ pub(crate) fn layout(
         let style = &styles.values[child];
         if style
             .get([Prop::OVERFLOW_X, Prop::OVERFLOW_Y][axis])
-            .or_else(|| style.get(Prop::OVERFLOW))
             .is_some_and(|v| !matches!(v, "visible" | "clip"))
             || style
                 .get([Prop::MIN_WIDTH, Prop::MIN_HEIGHT][axis])
@@ -1795,9 +1770,7 @@ pub(crate) fn layout(
                 offset += span;
             }
         }
-        let content = get([Prop::JUSTIFY_CONTENT, Prop::ALIGN_CONTENT][axis])
-            .or_else(|| pair(Prop::PLACE_CONTENT, axis))
-            .unwrap_or("normal");
+        let content = get([Prop::JUSTIFY_CONTENT, Prop::ALIGN_CONTENT][axis]).unwrap_or("normal");
         let sizes = size(
             &definitions[axis],
             &contributions,

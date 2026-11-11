@@ -1022,12 +1022,21 @@ pub(crate) fn local_file(
     url: &str,
 ) -> Result<Option<PathBuf>> {
     let base = state.base.as_ref().context("Missing page URL")?;
-    let url = base.join(url)?;
-    Ok(match url.scheme() {
+    Ok(local_path(assets, base, &base.join(url)?))
+}
+
+// The files a page may name: its bundled assets, and local files only for a page that is a local file itself.
+// A file URL with a host is a network share, which is never read.
+pub(crate) fn local_path(
+    assets: &HashMap<String, PathBuf>,
+    base: &url::Url,
+    url: &url::Url,
+) -> Option<PathBuf> {
+    match url.scheme() {
         "apps" => assets.get(url.path().trim_start_matches('/')).cloned(),
         "file" if base.scheme() == "file" && url.host_str().is_none_or(str::is_empty) => {
             url.to_file_path().ok()
         }
         _ => None,
-    })
+    }
 }

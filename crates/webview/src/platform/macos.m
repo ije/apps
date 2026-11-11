@@ -87,10 +87,11 @@ static WKWebsiteDataStore *AppsDataStore(NSString *partition) {
 - (void)observeValueForKeyPath:(NSString *)path ofObject:(WKWebView *)view change:(NSDictionary *)change context:(void *)context {
     if ([path isEqual:@"title"]) { if (view.title.length) AppsEmit(self, @{ @"type": @"page-title-updated", @"title": view.title }); }
     else if ([path hasPrefix:@"can"]) AppsEmit(self, @{ @"type": @"history", @"canGoBack": @(view.canGoBack), @"canGoForward": @(view.canGoForward) });
-    // Defer the check until URL and history updates settle. `loading` also changes for same-document history.
+    // Defer the check until URL and history updates settle. A load that the app started sets the URL before
+    // the navigation begins, and that is no navigation inside a page.
     else dispatch_async(dispatch_get_main_queue(), ^{
         NSString *url = view.URL.absoluteString;
-        if (self.provisional || !url || [url isEqual:self.committedURL]) return;
+        if (self.provisional || self.programmatic || !url || [url isEqual:self.committedURL]) return;
         self.committedURL = url;
         AppsEmit(self, @{ @"type": @"did-navigate-in-page", @"url": url, @"canGoBack": @(view.canGoBack), @"canGoForward": @(view.canGoForward) });
     });
@@ -268,7 +269,8 @@ char *apps_browser_command(void *handle, const char *operation, const char *argu
                 for (NSHTTPCookie *cookie in cookies) {
                     NSString *domain = [cookie.domain hasPrefix:@"."] ? [cookie.domain substringFromIndex:1] : cookie.domain;
                     if (filter[@"name"] && ![cookie.name isEqual:filter[@"name"]]) continue;
-                    if (filter[@"domain"] && ![cookie.domain isEqual:filter[@"domain"]]) continue;
+                    NSString *wanted = filter[@"domain"];
+                    if (wanted && ![domain isEqual:[wanted hasPrefix:@"."] ? [wanted substringFromIndex:1] : wanted]) continue;
                     if (filter[@"path"] && ![cookie.path isEqual:filter[@"path"]]) continue;
                     if (url && ![url.host isEqual:domain] && !([cookie.domain hasPrefix:@"."] && [url.host hasSuffix:[@"." stringByAppendingString:domain]])) continue;
                     NSString *requestPath = url.path.length ? url.path : @"/";

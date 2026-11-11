@@ -74,13 +74,27 @@ fn svg_raster_images_decode_through_the_runtime() {
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"><image href="data:image/{kind};base64,{}" width="4" height="3"/></svg>"#,
             base64::engine::general_purpose::STANDARD.encode(bytes)
         );
-        let pixels = svg_pixels(&svg_tree(&source).unwrap(), 4, 3, None).unwrap();
+        let pixels = svg_pixels(&svg_tree(&source, false).unwrap(), 4, 3, None).unwrap();
         for pixel in pixels.data().as_chunks::<4>().0 {
             for (value, expected) in pixel.iter().zip([32, 128, 224, 255]) {
                 assert!(value.abs_diff(expected) <= 3, "{kind} {pixel:?}");
             }
         }
     }
+    // An image that names a file is read only in SVG that the runtime wrote itself, never in page content.
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sample.png");
+    std::fs::write(&path, include_bytes!("images/sample.png")).unwrap();
+    let source = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="3"><image href="{}" width="4" height="3"/></svg>"#,
+        path.display()
+    );
+    let drawn = |files| {
+        let pixels = svg_pixels(&svg_tree(&source, files).unwrap(), 4, 3, None).unwrap();
+        pixels.data().iter().any(|byte| *byte != 0)
+    };
+    assert!(drawn(true));
+    assert!(!drawn(false));
 }
 
 #[cfg(not(target_os = "macos"))]

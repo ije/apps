@@ -69,12 +69,8 @@ pub(super) fn css_background(
         if let Some(source) = image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
             let source = source.trim().trim_matches(['"', '\'']);
             if let Some(path) = super::image::data_file(source).or_else(|| {
-                base.and_then(|base| Some((base, base.join(source).ok()?)))
-                    .and_then(|(base, url)| match url.scheme() {
-                        "file" if base.scheme() == "file" => url.to_file_path().ok(),
-                        "apps" => assets.get(url.path().trim_start_matches('/')).cloned(),
-                        _ => None,
-                    })
+                let base = base?;
+                crate::host::local_path(assets, base, &base.join(source).ok()?)
             }) {
                 let fit = match size.as_str() {
                     "cover" => renderer::ObjectFit::Cover,
@@ -242,7 +238,7 @@ pub(super) fn css_background(
                                     let svg = std::fs::read_to_string(&path)
                                         .map_err(anyhow::Error::from)
                                         .and_then(|text| {
-                                            let tree = super::canvas::svg_tree(&text)?;
+                                            let tree = super::canvas::svg_tree(&text, false)?;
                                             let natural = tree.size();
                                             let fitted = fit.place(
                                                 renderer::Rect::new(

@@ -25,6 +25,19 @@ impl JavaScriptCore {
         })
     }
 
+    // For bytes that are only read. Two arguments can be the same buffer, and two `&mut` to it are not allowed.
+    pub(crate) fn view<'a>(&self, ctx: Ptr, value: Ptr) -> Option<&'a [u8]> {
+        let (mut pointer, mut length) = (ptr::null_mut(), 0);
+        if !unsafe { (self.get_bytes)(ctx, value, &mut pointer, &mut length) } {
+            return None;
+        }
+        Some(if length == 0 || pointer.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(pointer.cast(), length) }
+        })
+    }
+
     pub(crate) fn bytes<'a>(&self, ctx: Ptr, value: Ptr) -> Option<&'a mut [u8]> {
         let (mut pointer, mut length) = (ptr::null_mut(), 0);
         if !unsafe { (self.get_bytes)(ctx, value, &mut pointer, &mut length) } {
@@ -326,8 +339,8 @@ unsafe extern "C" fn decode(
     exception: *mut Ptr,
 ) -> Ptr {
     native(ctx, count, args, exception, |api, arg| {
-        let bytes = &*api
-            .bytes(ctx, arg(0))
+        let bytes = api
+            .view(ctx, arg(0))
             .context("Expected an ArrayBuffer or a view")?;
         let kind = number(api, ctx, arg(1)) as u32;
         let (fatal, stream) =
@@ -443,8 +456,8 @@ unsafe extern "C" fn index_of(
     exception: *mut Ptr,
 ) -> Ptr {
     native(ctx, count, args, exception, |api, arg| {
-        let haystack = &*api.bytes(ctx, arg(0)).context("Expected bytes")?;
-        let needle = &*api.bytes(ctx, arg(1)).context("Expected bytes")?;
+        let haystack = api.view(ctx, arg(0)).context("Expected bytes")?;
+        let needle = api.view(ctx, arg(1)).context("Expected bytes")?;
         let from = (number(api, ctx, arg(2)).max(0.) as usize).min(haystack.len());
         let found = if unsafe { (api.to_boolean)(ctx, arg(3)) } {
             memchr::memmem::rfind(
@@ -467,8 +480,8 @@ unsafe extern "C" fn compare(
     exception: *mut Ptr,
 ) -> Ptr {
     native(ctx, count, args, exception, |api, arg| {
-        let a = &*api.bytes(ctx, arg(0)).context("Expected bytes")?;
-        let b = &*api.bytes(ctx, arg(1)).context("Expected bytes")?;
+        let a = api.view(ctx, arg(0)).context("Expected bytes")?;
+        let b = api.view(ctx, arg(1)).context("Expected bytes")?;
         Ok(unsafe { (api.number)(ctx, a.cmp(b) as i8 as f64) })
     })
 }
@@ -517,8 +530,8 @@ unsafe extern "C" fn equal(
     exception: *mut Ptr,
 ) -> Ptr {
     native(ctx, count, args, exception, |api, arg| {
-        let a = &*api.bytes(ctx, arg(0)).context("Expected bytes")?;
-        let b = &*api.bytes(ctx, arg(1)).context("Expected bytes")?;
+        let a = api.view(ctx, arg(0)).context("Expected bytes")?;
+        let b = api.view(ctx, arg(1)).context("Expected bytes")?;
         #[allow(deprecated)]
         let same = ring::constant_time::verify_slices_are_equal(a, b).is_ok();
         Ok(unsafe { (api.boolean)(ctx, same) })
@@ -539,9 +552,9 @@ unsafe extern "C" fn digest(
             _ => None,
         }
         .context("Expected a digest name")?;
-        let key = api.bytes(ctx, arg(2));
-        let mut hasher = crate::node::system::Hasher::new(name, key.as_deref())?;
-        hasher.update(api.bytes(ctx, arg(1)).context("Expected bytes")?);
+        let key = api.view(ctx, arg(2));
+        let mut hasher = crate::node::system::Hasher::new(name, key)?;
+        hasher.update(api.view(ctx, arg(1)).context("Expected bytes")?);
         let digest = hasher.digest();
         let (array, out) = api.uint8_array(ctx, digest.len())?;
         out.copy_from_slice(&digest);

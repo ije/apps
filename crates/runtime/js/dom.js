@@ -1,7 +1,8 @@
 (() => {
   const host = globalThis.__appsDOM, eventState = globalThis.__appsEventState, droppedFiles = globalThis.__appsFiles, microtask = queueMicrotask, json = JSON.parse;
   delete globalThis.__appsDOM; delete globalThis.__appsEventState; delete globalThis.__appsFiles;
-  // Flush dom.batch before any other host call. Replace shared noAttrs and noKids. Never mutate them.
+  // Flush dom.batch before any other host call that reads or changes the page. Replace shared noAttrs and noKids.
+  // Never mutate them.
   class Attrs {
     constructor(list = []) { this.list = list; }
     get size() { return this.list.length / 2; }
@@ -631,7 +632,7 @@
   const cssProperty = name => (cssProperties ??= new Set(call('dom.properties'))).has(name) || name === 'float';
   const cssKeys = () => { const names = [...(cssProperties ??= new Set(call('dom.properties')))]; return [...new Set([...names, ...names.map(name => name.replace(/^-(webkit|moz|ms)-/, '$1-').replace(/-([a-z])/g, (_, c) => c.toUpperCase()))])]; };
   const declared = new Map();
-  const declare = text => { let list = declared.get(text); if (!list) { if (declared.size > 1023) declared.clear(); const flat = /\S/.test(text) ? call('dom.declare', text) : []; list = []; for (let i = 0; i < flat.length; i += 3) list.push([flat[i], flat[i + 1], flat[i + 2]]); declared.set(text, list); } return list.map(entry => entry.slice()); };
+  const declare = text => { let list = declared.get(text); if (!list) { if (declared.size > 1023) declared.clear(); const flat = /\S/.test(text) ? host('dom.declare', text) : []; list = []; for (let i = 0; i < flat.length; i += 3) list.push([flat[i], flat[i + 1], flat[i + 2]]); declared.set(text, list); } return list.map(entry => entry.slice()); };
   const sides = (prefix, suffix = '') => ['top', 'right', 'bottom', 'left'].map(side => prefix + side + suffix);
   const shorthands = Object.entries({
     border: [...sides('border-', '-width'), ...sides('border-', '-style'), ...sides('border-', '-color')], 'border-width': sides('border-', '-width'), 'border-style': sides('border-', '-style'), 'border-color': sides('border-', '-color'),

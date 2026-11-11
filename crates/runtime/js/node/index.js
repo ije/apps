@@ -529,7 +529,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const flag = value => { if (value == null || Number.isInteger(value) || flags.has(value)) return value; throw Object.assign(new TypeError(`The argument 'flags' is invalid. Received ${inspect(value)}`), { code: 'ERR_INVALID_ARG_VALUE' }); };
   const prepare = (name, args) => {
     args = [...args];
-    if (name === 'open') args[1] = flag(args[1]);
+    if (name === 'open') { args[1] = flag(args[1]); if (typeof args[2] === 'string') args[2] = parseInt(args[2], 8); }
     if (typeof args[0] !== 'number') args[0] = pathArg(args[0]);
     if (['rename', 'copyFile', 'symlink', 'link'].includes(name)) args[1] = pathArg(args[1]);
     if (['readFile', 'readdir', 'mkdir', 'rm', 'rmdir'].includes(name)) args[1] = options(args[1]);
@@ -538,6 +538,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     if (name === 'truncate' || name === 'ftruncate') args[1] ??= 0;
     if (name === 'chmod' || name === 'fchmod') { const mode = typeof args[1] === 'string' && /^[0-7]+$/.test(args[1]) ? parseInt(args[1], 8) : args[1]; if (!Number.isInteger(mode) || mode < 0 || mode > 0xFFFFFFFF) throw Object.assign(new TypeError(`The argument 'mode' must be a 32-bit unsigned integer or an octal string. Received ${inspect(args[1])}`), { code: 'ERR_INVALID_ARG_VALUE' }); args[1] = mode; }
     if (name === 'mkdir' && typeof args[1].mode === 'string') args[1].mode = parseInt(args[1].mode, 8);
+    if ((name === 'writeFile' || name === 'appendFile') && typeof args[2].mode === 'string') args[2] = { ...args[2], mode: parseInt(args[2].mode, 8) };
     return args;
   };
   for (const name of ['readFile', 'writeFile', 'appendFile', 'mkdir', 'readdir', 'stat', 'lstat', 'fstat', 'statfs', 'rename', 'copyFile', 'realpath', 'readlink', 'symlink', 'link', 'chmod', 'chown', 'lchown', 'utimes', 'lutimes', 'truncate', 'access', 'unlink', 'rm', 'rmdir', 'mkdtemp', 'open', 'close', 'fsync', 'fdatasync', 'ftruncate', 'fchmod', 'fchown', 'futimes']) {

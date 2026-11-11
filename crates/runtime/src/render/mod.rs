@@ -594,19 +594,21 @@ impl PageView {
         let seen = (doc.nodes.latest(), dom.focus);
         // Remove cull.seen's extra Rc during the frame so animated styles can swap values without copying.
         let last = dom.cull.seen.take();
-        let walked = dom.cull.walk.nodes.clone();
+        let (walked, serial) = (dom.cull.walk.nodes.clone(), dom.cull.walk.serial);
         let same = last.as_ref().is_some_and(|(latest, focus, computed)| {
             (*latest, *focus) == seen && Rc::ptr_eq(computed, &styles)
         });
         let mut visible = std::mem::take(&mut dom.cull.visible);
         let mut previous = None;
-        if !same {
-            walk(&doc, dom, &styles);
-        }
+        let patched = !same && walk(&doc, dom, &styles);
         let none = |style: &Rc<style::Style>| style.get(Prop::DISPLAY) == Some("none");
+        let rewalked = !Rc::ptr_eq(&dom.cull.walk.nodes, &walked);
+        // A patched walk changes the visibility of the nodes it touched only. Table cells also show their rows,
+        // so their lists must be the same.
+        let touched = dom.cull.walk.since(serial).filter(|_| patched);
         let steady = same
             || dom.cull.cascaded
-                && Rc::ptr_eq(&dom.cull.walk.nodes, &walked)
+                && (!rewalked || touched.is_some())
                 && last.as_ref().is_some_and(|(.., computed)| {
                     styles
                         .values
@@ -621,11 +623,43 @@ impl PageView {
                             })
                         })
                 });
+        // The nodes that a patched walk showed or hid.
+        let mut flips = Vec::new();
         if steady {
             let start = visible.len();
             if start < doc.nodes.len() {
                 visible.resize(doc.nodes.len(), false);
                 dom.bounds.hide(&visible, &[], start..visible.len());
+            }
+            let walk = &dom.cull.walk;
+            let mut placed: Vec<(u32, u32)> = Vec::new();
+            for &id in touched.into_iter().flatten() {
+                match walk.place(id as usize) {
+                    Some(at) => placed.push((at, id)),
+                    None if visible[id as usize] => {
+                        visible[id as usize] = false;
+                        flips.push(id as usize);
+                    }
+                    None => {}
+                }
+            }
+            placed.sort_unstable();
+            placed.dedup();
+            for (at, id) in placed {
+                let (id, parent) = (id as usize, walk.nodes[at as usize].1);
+                let style = &styles.values[id];
+                let shown = (parent == u32::MAX || visible[parent as usize])
+                    && !match dom.layout_nodes.get(id).and_then(Option::as_ref) {
+                        Some(old) if Rc::ptr_eq(&old.style, style) => old.flags & cull::HIDDEN != 0,
+                        _ => none(style),
+                    };
+                if visible[id] != shown {
+                    visible[id] = shown;
+                    flips.push(id);
+                }
+            }
+            for &id in &flips {
+                dom.bounds.show(id, visible[id]);
             }
         } else {
             previous = Some(std::mem::replace(
@@ -778,6 +812,21 @@ impl PageView {
         // can reuse their IDs.
         let shown = |id: usize| visible.get(id) == Some(&true);
         drop_hidden_images(dom, &visible, &styles, |image| window.release_image(image));
+        for id in flips.into_iter().filter(|&id| !shown(id)) {
+            self.svgs.borrow_mut().remove(&id);
+            self.kept.borrow_mut().remove(&id);
+            self.patches.borrow_mut().remove(&id);
+            self.walked.borrow_mut().remove(&id);
+            self.adjoined.borrow_mut().remove(&id);
+            self.fields.borrow_mut().remove(&id);
+            self.decoding
+                .borrow_mut()
+                .retain(|_, (node, _)| *node != id);
+            dom.containers.remove(&id);
+            dom.flexed_grids.remove(&id);
+            dom.grid_widest.remove(&id);
+            dom.anchors.remove(&id);
+        }
         if flipped {
             self.svgs.borrow_mut().retain(|&id, _| shown(id));
             self.kept.borrow_mut().retain(|&id, _| shown(id));
@@ -992,22 +1041,37 @@ impl PageView {
             let mut marked = std::mem::take(&mut dom.cull.marked);
             let (mut partial, mut list, mut placing) = (false, Vec::new(), false);
             let rewalked = !Rc::ptr_eq(&walk.nodes, &walked);
+            // Composed children can change the walk of a node without a new revision. A patched walk lists
+            // those nodes, another new walk doesn't.
+            let touched = walk.since(serial);
             if let Some((latest, focus, computed)) = last.as_ref().filter(|(.., computed)| {
-                (!rewalked || styles.children.is_empty() && computed.children.is_empty())
+                (!rewalked
+                    || touched.is_some()
+                    || styles.children.is_empty() && computed.children.is_empty())
                     && dom.cull.frame == frame
-                    && info.len() == doc.nodes.len()
+                    && info.len() <= doc.nodes.len()
                     && dom.cull.parents.len() == doc.nodes.len()
             }) {
-                if rewalked {
-                    let mut present = vec![false; doc.nodes.len()];
-                    for &(id, _) in walk.nodes.iter() {
-                        present[id as usize] = true;
-                    }
-                    for &(id, _) in walked.iter() {
-                        if present.get(id as usize) == Some(&false) {
+                // New nodes have a newer revision, so they get their flags below.
+                info.resize(doc.nodes.len(), cull::Info::default());
+                match touched {
+                    Some(touched) => {
+                        for &id in touched.iter().filter(|&&id| !walk.contains(id as usize)) {
                             info[id as usize] = cull::Info::default();
                         }
                     }
+                    None if rewalked => {
+                        let mut present = vec![false; doc.nodes.len()];
+                        for &(id, _) in walk.nodes.iter() {
+                            present[id as usize] = true;
+                        }
+                        for &(id, _) in walked.iter() {
+                            if present.get(id as usize) == Some(&false) {
+                                info[id as usize] = cull::Info::default();
+                            }
+                        }
+                    }
+                    None => {}
                 }
                 partial = true;
                 marked.resize(doc.nodes.len(), false);
@@ -1023,10 +1087,14 @@ impl PageView {
                     }
                 };
                 // Relies on a node getting a new revision when it leaves or joins the tree.
-                for &(id, _) in walk.nodes.iter() {
-                    if doc.nodes.revision(id as usize) > *latest {
-                        mark(id as usize);
-                    }
+                // A node that moved keeps its flags. One that joined has none yet.
+                let changed = walk.changed_since(serial).into_iter().flatten();
+                let joined = touched.into_iter().flatten();
+                let joined = joined.filter(|&&id| info[id as usize].subtree == 0);
+                let patched = changed.chain(joined).map(|&id| id as usize);
+                let newer = doc.nodes.changed_since(*latest);
+                for id in newer.chain(patched).filter(|&id| walk.contains(id)) {
+                    mark(id);
                 }
                 for id in styles.values.differing(&computed.values).flatten() {
                     if id < doc.nodes.len()
@@ -1097,11 +1165,23 @@ impl PageView {
                 info[*id].flags = own_flags(&doc.nodes[*id].tag, style, *id)
                     & (cull::MOVES_CONTENT | cull::UNCULLABLE);
             }
-            for &(id, _) in walk.nodes.iter().rev() {
-                let id = id as usize;
-                if partial && !marked[id] {
-                    continue;
-                }
+            // Children come before their parents. A partial pass visits the marked nodes only.
+            let mut order: Vec<(u32, usize)> = list
+                .iter()
+                .filter_map(|&id| Some((walk.place(id)?, id)))
+                .collect();
+            order.sort_unstable_by(|a, b| b.cmp(a));
+            let mut some = order.iter().map(|place| place.1);
+            let mut every = walk.nodes.iter().rev().map(|node| node.0 as usize);
+            debug_assert!(
+                !partial || some.clone().eq(every.clone().filter(|&id| marked[id])),
+                "marked nodes differ"
+            );
+            let nodes: &mut dyn Iterator<Item = usize> = match partial {
+                true => &mut some,
+                false => &mut every,
+            };
+            for id in nodes {
                 let node = &doc.nodes[id];
                 let style = &styles.values[id];
                 let revision = doc.nodes.revision(id);
@@ -2381,32 +2461,76 @@ fn clips<'a>(
     })
 }
 
-fn walk(doc: &crate::dom::Document, dom: &mut crate::dom::State, styles: &style::ComputedStyles) {
-    if dom
-        .cull
+// Returns whether the walk changed by a patch that kept the lists of cells, canvases and iframes.
+fn walk(
+    doc: &crate::dom::Document,
+    dom: &mut crate::dom::State,
+    styles: &style::ComputedStyles,
+) -> bool {
+    let serial = dom.cull.walk.serial;
+    let cull = &mut dom.cull;
+    if !cull
         .walk
         .update(doc, &styles.children, Some(&dom.style_walk))
     {
-        let parents = &mut dom.cull.parents;
-        parents.clear();
-        parents.resize(doc.nodes.len(), u32::MAX);
-        for &(id, parent) in dom.cull.walk.nodes.iter() {
-            parents[id as usize] = parent;
+        if cull.parents.len() < doc.nodes.len() {
+            cull.parents.resize(doc.nodes.len(), u32::MAX);
+            cull.kinds.resize(doc.nodes.len(), 0);
         }
-        let cull = &mut dom.cull;
-        cull.cells.clear();
-        cull.canvases.clear();
-        cull.iframes.clear();
-        for &(id, _) in cull.walk.nodes.iter() {
-            let id = id as usize;
-            match doc.nodes[id].tag.as_str() {
-                "td" | "th" => cull.cells.push(id),
-                "canvas" => cull.canvases.push(id),
-                "iframe" => cull.iframes.push(id),
-                _ => {}
-            }
+        return false;
+    }
+    let kind = |id: usize| match doc.nodes[id].tag.as_str() {
+        "td" | "th" => 1,
+        "canvas" => 2,
+        "iframe" => 3,
+        _ => 0,
+    };
+    let patched = cull.parents.len() == cull.kinds.len()
+        && cull.kinds.len() <= doc.nodes.len()
+        && cull.walk.since(serial).is_some_and(|touched| {
+            touched.iter().all(|&id| {
+                let id = id as usize;
+                cull.kinds.get(id).is_none_or(|&old| old == 0)
+                    && (!cull.walk.contains(id) || kind(id) == 0)
+            })
+        });
+    if patched {
+        cull.parents.resize(doc.nodes.len(), u32::MAX);
+        cull.kinds.resize(doc.nodes.len(), 0);
+        for &id in cull.walk.since(serial).into_iter().flatten() {
+            cull.parents[id as usize] = cull.walk.parent(id as usize).unwrap_or(u32::MAX);
         }
     }
+    if patched && !cfg!(debug_assertions) {
+        return true;
+    }
+    let mut parents = vec![u32::MAX; doc.nodes.len()];
+    let mut kinds = vec![0; doc.nodes.len()];
+    let mut lists = [const { Vec::new() }; 3];
+    for &(id, parent) in cull.walk.nodes.iter() {
+        let id = id as usize;
+        parents[id] = parent;
+        kinds[id] = kind(id);
+        if kinds[id] != 0 {
+            lists[usize::from(kinds[id]) - 1].push(id);
+        }
+    }
+    let [cells, canvases, iframes] = lists;
+    assert!(
+        !patched
+            || (&parents, &kinds, &cells, &canvases, &iframes)
+                == (
+                    &cull.parents,
+                    &cull.kinds,
+                    &cull.cells,
+                    &cull.canvases,
+                    &cull.iframes
+                ),
+        "patched walk lists differ"
+    );
+    (cull.parents, cull.kinds) = (parents, kinds);
+    (cull.cells, cull.canvases, cull.iframes) = (cells, canvases, iframes);
+    patched
 }
 
 fn visibility(

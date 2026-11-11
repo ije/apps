@@ -1,7 +1,9 @@
 globalThis.__appsPty = call => {
   const sessions=new Map();
   const spawn=(file,args=[],options={})=>{
-    const state=call('pty.spawn',file,args,options),listeners={data:new Set(),exit:new Set()};
+    // Like node-pty, a terminal starts where the app is now, with the environment it has now.
+    const env=Object.fromEntries(Object.entries(options.env??process.env).filter(([,value])=>value!==undefined).map(([name,value])=>[name,String(value)]));
+    const state=call('pty.spawn',file,args,{...options,cwd:options.cwd??process.cwd(),env}),listeners={data:new Set(),exit:new Set()};
     const terminal={pid:state.pid,cols:options.cols??80,rows:options.rows??24,process:file,
       write:data=>call('pty.write',state.id,data),
       resize(cols,rows){call('pty.resize',state.id,cols,rows);this.cols=cols;this.rows=rows;},

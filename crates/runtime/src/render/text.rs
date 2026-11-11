@@ -1205,7 +1205,6 @@ impl renderer::Hooks for InlineText {
                         .map(|corner| {
                             px(style
                                 .get(corner)
-                                .or_else(|| style.get(Prop::BORDER_RADIUS))
                                 .and_then(|v| units.resolve(v, (b.x - a.x).into()))
                                 .unwrap_or(0.))
                         });

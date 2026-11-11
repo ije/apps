@@ -188,11 +188,11 @@ fn serve(mut stream: TcpStream) -> Result<()> {
             let value = value.trim();
             match name.to_ascii_lowercase().as_str() {
                 "content-length" => length = value.parse()?,
-                // Web pages can reach localhost, so only local hosts and origins may call tools.
+                // Web pages can reach localhost, so the host must be local. A browser names the page's origin
+                // with every POST, and tool clients send none, so a request with an origin is from a page:
+                // also a page of another local server, which must not call tools either.
                 "host" => allowed &= local(value),
-                "origin" => {
-                    allowed &= local(value.split_once("://").map_or(value, |(_, host)| host))
-                }
+                "origin" => allowed = false,
                 "connection" => close = value.eq_ignore_ascii_case("close"),
                 "expect" => expect = value.eq_ignore_ascii_case("100-continue"),
                 _ => {}

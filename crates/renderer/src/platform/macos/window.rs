@@ -147,29 +147,33 @@ unsafe impl Sync for Handles {}
 /// The app thread waits for it before it draws or hands out the view.
 struct Native {
     opener: Mutex<Option<Opener>>,
-    handles: OnceLock<Handles>,
+    // Unset until the opener has run or was dropped, then `None` for a window that did not open.
+    handles: OnceLock<Option<Handles>>,
 }
 
 impl Native {
     // Main only.
     fn get(&self) -> Option<&AppsWindow> {
         let opener = lock(&self.opener).take();
-        if let Some(opened) = opener.and_then(|open| open()) {
-            let (window, view) = opened;
-            let handles = Handles {
+        if let Some(open) = opener {
+            let handles = open().map(|(window, view)| Handles {
                 window: NonNull::new(Retained::into_raw(window)).unwrap(),
                 view: NonNull::from(&*view),
-            };
+            });
             let _ = self.handles.set(handles);
         }
         // SAFETY: the window stays retained until `Drop` releases it on main.
-        self.handles
-            .get()
+        self.opened()
             .map(|handles| unsafe { handles.window.as_ref() })
     }
 
+    fn opened(&self) -> Option<&Handles> {
+        self.handles.get().and_then(Option::as_ref)
+    }
+
     fn wait(self: &Arc<Self>) {
-        if lock(&self.opener).is_some() {
+        // Also while main runs the opener: it has taken it by then, but the handles are not there yet.
+        if self.handles.get().is_none() {
             let native = self.clone();
             native_sync(move || {
                 native.get();
@@ -187,7 +191,7 @@ impl Native {
 
 impl Drop for Native {
     fn drop(&mut self) {
-        if let Some(handles) = self.handles.take() {
+        if let Some(handles) = self.handles.take().flatten() {
             let window = Sendable::new(handles.window);
             // SAFETY: balances `into_raw` in `get`.
             native_post(Box::new(move || {
@@ -456,8 +460,10 @@ impl Drop for Window {
         }
         let native = self.control.native.clone();
         native_post(Box::new(move || {
-            drop(lock(&native.opener).take());
-            let Some(handles) = native.handles.get() else {
+            if lock(&native.opener).take().is_some() {
+                let _ = native.handles.set(None);
+            }
+            let Some(handles) = native.opened() else {
                 return;
             };
             // SAFETY: `native` keeps the window retained until the close below ran.
@@ -467,7 +473,7 @@ impl Drop for Window {
             // End a sheet now: it can block its parent, the next sheet and a quit already on its way.
             nswindow::detach(window);
             post_local(move || {
-                if let Some(handles) = native.handles.get() {
+                if let Some(handles) = native.opened() {
                     // SAFETY: as above.
                     unsafe { handles.window.as_ref() }.close();
                 }
@@ -554,8 +560,7 @@ impl WindowControl {
         self.native.wait();
         let view = self
             .native
-            .handles
-            .get()
+            .opened()
             .context("The window did not open")?
             .view;
         Ok(rwh::AppKitWindowHandle::new(view.cast()).into())

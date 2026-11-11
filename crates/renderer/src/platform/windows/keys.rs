@@ -100,8 +100,20 @@ pub(super) fn key(seen: &Seen, wparam: WPARAM, lparam: LPARAM, pressed: bool) ->
     })
 }
 
-const MODIFIER_KEYS: [VIRTUAL_KEY; 8] = [
-    VK_SHIFT, VK_CONTROL, VK_MENU, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN, VK_CAPITAL,
+// A key that the input method takes maps to the left or right code, so both forms are listed.
+const MODIFIER_KEYS: [VIRTUAL_KEY; 12] = [
+    VK_SHIFT,
+    VK_LSHIFT,
+    VK_RSHIFT,
+    VK_CONTROL,
+    VK_LCONTROL,
+    VK_RCONTROL,
+    VK_MENU,
+    VK_LMENU,
+    VK_RMENU,
+    VK_LWIN,
+    VK_RWIN,
+    VK_CAPITAL,
 ];
 
 const NAMES: [(VIRTUAL_KEY, &str); 18] = [

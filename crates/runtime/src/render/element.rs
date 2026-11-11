@@ -752,7 +752,14 @@ impl SvgSource<'_> {
                 .unwrap_or(1.);
         let mut result = String::new();
         for prop in style::SVG {
-            let Some(value) = own.get(prop) else { continue };
+            // A style holds the lines of a text decoration, and SVG reads the short form. The lines include the
+            // ones of ancestors, which don't reach into an image, so only a change from the parent counts.
+            let value = own.get(prop).or_else(|| {
+                let outer = parent.and_then(|parent| parent.get(Prop::TEXT_DECORATION_LINE));
+                own.get(Prop::TEXT_DECORATION_LINE)
+                    .filter(|line| prop == Prop::TEXT_DECORATION && outer != Some(*line))
+            });
+            let Some(value) = value else { continue };
             let factor = match prop {
                 Prop::TRANSFORM | Prop::TRANSFORM_ORIGIN => continue,
                 Prop::STROKE_WIDTH => width,
@@ -1683,7 +1690,10 @@ fn create(
             node.children.iter().rev().copied().collect()
         };
     while let Some(child) = pending.pop() {
-        if styles.values[child]
+        // A plain block is an element with a box, and its flags are closer than its node.
+        if info[child].flags & cull::PLAIN_BLOCK != 0 {
+            flat.push(child);
+        } else if styles.values[child]
             .get(Prop::DISPLAY)
             .is_some_and(|value| value == "contents")
         {
@@ -2685,7 +2695,7 @@ fn create(
                 [3];
         el = el.absolute().top(px(-height)).left(px(left));
     }
-    for (side, prop) in style::MARGIN[1..].iter().enumerate() {
+    for (side, prop) in style::MARGIN.iter().enumerate() {
         if hit.is_none() && style.get(*prop).is_some_and(|s| s == "auto") {
             el = match side {
                 0 => el.mt_auto(),
@@ -5192,12 +5202,15 @@ fn create(
                     .unwrap_or(0)
             });
         } else if flexbox {
-            children.sort_by_key(|child| {
+            let order = |child: &usize| {
                 styles.values[*child]
                     .get(Prop::ORDER)
                     .and_then(|v| v.parse::<i32>().ok())
                     .unwrap_or(0)
-            });
+            };
+            if children.iter().any(|child| order(child) != 0) {
+                children.sort_by_key(order);
+            }
         }
         let inline_element = |child: Option<&usize>| {
             child.is_some_and(|&child| {
@@ -5215,6 +5228,10 @@ fn create(
         let columns = multicol.filter(|_| flow && grid.is_none() && !all_inline);
         let mut collected: Vec<(Option<usize>, Child)> = Vec::new();
         let shown = |index: usize| {
+            // A plain block is an element, and its flags are closer than its node.
+            if info[children[index]].flags & cull::PLAIN_BLOCK != 0 {
+                return true;
+            }
             let child = &doc.nodes[children[index]];
             preserve
                 || !(child.tag == "#text" && child.text.trim_ascii().is_empty())
@@ -6819,8 +6836,10 @@ fn flow(build: &Build<'_>, id: usize) -> Vec<usize> {
         .iter()
         .copied()
         .filter(|&child| {
-            in_flow(build.doc, build.info, child)
-                && float_side(&build.styles.values[child]).is_none()
+            // A plain block is an element in the flow that doesn't float.
+            build.info[child].flags & cull::PLAIN_BLOCK != 0
+                || in_flow(build.doc, build.info, child)
+                    && float_side(&build.styles.values[child]).is_none()
         })
         .collect()
 }
@@ -6943,13 +6962,17 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> ([f32; 2], [f32; 2], b
         [value.max(0.), value.min(0.)]
     };
     let (mut top, mut bottom) = (own(Prop::MARGIN_TOP), own(Prop::MARGIN_BOTTOM));
-    let children = flow(build, id);
     // This recurses into first and last children, so margins stop collapsing past the stack budget.
     let marker = 0u8;
     let deep = (&raw const marker as usize) < STACK_LIMIT.with(|limit| *limit);
     let blocks = container(build, id) && !deep;
     let [first, last] =
         [0, 2].map(|side| margin_collapses_through(build, id, side, width) && blocks);
+    let children = if first || last {
+        flow(build, id)
+    } else {
+        Vec::new()
+    };
     for (open, set, order) in [(first, &mut top, false), (last, &mut bottom, true)] {
         if !open {
             continue;
@@ -7398,7 +7421,7 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                     let (size, content, boxes) = match state.svg_cache.get(source) {
                         Some((geometry, _)) => geometry.clone(),
                         None => {
-                            let tree = super::canvas::svg_tree(source).ok();
+                            let tree = super::canvas::svg_tree(source, false).ok();
                             let geometry = tree
                                 .as_ref()
                                 .map(super::canvas::svg_boxes)

@@ -1,14 +1,13 @@
 use super::{Lengths, Prop, Style, color, parser};
 
-pub(crate) const PADDING: [Prop; 5] = [
-    Prop::PADDING,
+// A style holds longhands only: the cascade expands every shorthand.
+pub(crate) const PADDING: [Prop; 4] = [
     Prop::PADDING_TOP,
     Prop::PADDING_RIGHT,
     Prop::PADDING_BOTTOM,
     Prop::PADDING_LEFT,
 ];
-pub(crate) const MARGIN: [Prop; 5] = [
-    Prop::MARGIN,
+pub(crate) const MARGIN: [Prop; 4] = [
     Prop::MARGIN_TOP,
     Prop::MARGIN_RIGHT,
     Prop::MARGIN_BOTTOM,
@@ -39,27 +38,12 @@ pub(crate) const BORDERS: [[Prop; 3]; 4] = [
 ];
 
 impl Lengths {
-    pub fn edges(&self, style: &Style, [shorthand, sides @ ..]: [Prop; 5], base: f32) -> [f32; 4] {
-        let mut result = [0.; 4];
-        if let Some(value) = style.get(shorthand) {
-            let values: Vec<_> = components(value, ' ')
-                .into_iter()
-                .map(|v| self.resolve(v, base).unwrap_or(0.))
-                .collect();
-            let first = values.first().copied().unwrap_or(0.);
-            result = [
-                first,
-                values.get(1).copied().unwrap_or(first),
-                values.get(2).copied().unwrap_or(first),
-                values.get(3).or(values.get(1)).copied().unwrap_or(first),
-            ];
-        }
-        for (edge, side) in result.iter_mut().zip(sides) {
-            if let Some(value) = style.get(side) {
-                *edge = self.resolve(value, base).unwrap_or(0.);
-            }
-        }
-        result
+    pub fn edges(&self, style: &Style, sides: [Prop; 4], base: f32) -> [f32; 4] {
+        sides.map(|side| {
+            style
+                .get(side)
+                .map_or(0., |value| self.resolve(value, base).unwrap_or(0.))
+        })
     }
 }
 

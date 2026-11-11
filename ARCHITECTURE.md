@@ -140,6 +140,8 @@ The runtime owns HTML and CSS behavior. The renderer owns windows and the lower-
 
 DOM revisions and selector dependencies limit style updates to affected nodes. Computed styles use chunks with copy-on-write storage. A viewport or stylesheet change can require a full style pass.
 
+The document keeps a short log of the nodes that changed. A tree change patches the list of nodes in document order, and reports the nodes that moved, joined or left. The style, visibility and culling passes then visit only these nodes and the nodes with a new style. A change to most of the tree uses the full passes, and so do the style lists of a page with shadow trees. Debug builds compare each patched result with a full pass.
+
 Each render subtree records its inputs: styles, dimensions, ancestor data, scroll state, and resource sizes. If those inputs match, `Child::Kept` reuses the previous subtree. Changed boxes invalidate their layout caches and the caches of their ancestors. Debug builds compare incremental results with fresh results.
 
 Eligible blocks far outside the viewport become spacers with the same dimensions. They return when they approach the visible area. Images, canvas pixels, and video frames can change at paint time without a new box tree.

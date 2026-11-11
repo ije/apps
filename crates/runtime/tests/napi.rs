@@ -139,6 +139,38 @@ fn native_addons_values_callbacks_and_contexts() {
                 .contains("not in the bundle")
         );
     }
+    // An environment that ends must not free addon state under work that still runs on the pool. Work that
+    // has not started must never start.
+    let load = || {
+        let mut host = Host::default();
+        host.native_modules
+            .insert("fixture/addon.node".into(), library.clone());
+        JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            Rc::new(RefCell::new(host)),
+            Role::Main,
+        )
+        .unwrap()
+    };
+    let engine = load();
+    engine
+        .eval(
+            "globalThis.kept=__appsLoadAddon('fixture/addon.node').slow()",
+            "test",
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    drop(engine);
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    assert_eq!(
+        load()
+            .eval(
+                "JSON.stringify(__appsLoadAddon('fixture/addon.node').slowState())",
+                "test"
+            )
+            .unwrap(),
+        r#"{"ran":4,"late":0}"#
+    );
     let mut host = Host::default();
     host.pages.insert(
         1,

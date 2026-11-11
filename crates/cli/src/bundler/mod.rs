@@ -2212,9 +2212,17 @@ impl Builder {
                         local: None,
                         name: "*".into(),
                     });
+                    let source = specifier;
                     for specifier in &export.specifiers {
                         let local = format!("$appsRe{}", imports.len());
                         let name = specifier.local.name().to_string();
+                        ensure!(
+                            !matches!(source, "electron" | "@pierre/apps")
+                                || name == "default"
+                                || ELECTRON.contains(&name.as_str()),
+                            "{source}.{name} is not supported (exported in {})",
+                            path.display()
+                        );
                         let value = if linked {
                             Export::Reexport(dep, name.clone())
                         } else {
@@ -2885,7 +2893,14 @@ fn bundle(
                         || available[import.dep].contains(&import.name),
                     "Missing export {} from {}",
                     import.name,
-                    import.dep
+                    builder
+                        .ids
+                        .iter()
+                        .find(|(_, id)| **id == import.dep)
+                        .map_or_else(
+                            || import.dep.to_string(),
+                            |(path, _)| path.display().to_string()
+                        )
                 );
             }
         }
@@ -4104,6 +4119,15 @@ fn html(
             "src".into(),
             format!("apps:///script-{}.js", scripts.len() - 1),
         );
+    }
+    // The runtime parses this text again, and the parser drops one newline at the start of these elements.
+    let starts: Vec<usize> = (0..doc.nodes.len())
+        .filter(|&id| matches!(doc.nodes[id].tag.as_str(), "pre" | "textarea" | "listing"))
+        .filter_map(|id| doc.nodes[id].children.first().copied())
+        .filter(|&child| doc.nodes[child].tag == "#text" && doc.nodes[child].text.starts_with('\n'))
+        .collect();
+    for child in starts {
+        doc.nodes[child].text.insert(0, '\n');
     }
     Ok(doc.serialize(0))
 }

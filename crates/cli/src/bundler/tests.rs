@@ -837,11 +837,13 @@ fn production_minifies_and_shakes_modules() {
         );
     }
     fs::write(&entry, "import {missing} from './counter';").unwrap();
+    let error = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap_err();
     assert!(
-        compile(&entry, Realm::Main, None, Rc::default(), true, None)
-            .unwrap_err()
-            .chain()
-            .any(|error| error.to_string().contains("Missing export"))
+        error.chain().any(|error| {
+            let text = error.to_string();
+            text.contains("Missing export missing from") && text.contains("counter")
+        }),
+        "{error:#}"
     );
 }
 
@@ -1728,6 +1730,10 @@ fn unsupported_electron_exports_fail_at_build_time() {
         (
             "import {utilityProcess} from '@pierre/apps';",
             "@pierre/apps.utilityProcess is not supported",
+        ),
+        (
+            "export {app, crashReporter} from 'electron';",
+            "electron.crashReporter is not supported",
         ),
     ] {
         fs::write(&entry, source).unwrap();
@@ -3142,6 +3148,29 @@ fn dynamic_imports_set_up_on_first_use_and_share_static_modules() {
             "production={production}"
         );
     }
+}
+
+#[test]
+fn pages_keep_a_leading_newline_in_pre_and_textarea() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("index.html"),
+        "<html><body><pre id=a>\n\ncode</pre><textarea id=b>\n\ntext</textarea><pre id=c>\nplain</pre></body></html>",
+    )
+    .unwrap();
+    let entry = dir.path().join("app.ts");
+    fs::write(&entry, "import {app, BrowserWindow} from '@pierre/apps'; app.whenReady().then(() => new BrowserWindow().loadFile(import.meta.resolve('./index.html')));").unwrap();
+    let files = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap();
+    let page = Document::parse(&files["page-0.html"]);
+    let text = |id: &str| {
+        let node = (0..page.nodes.len())
+            .find(|&node| page.nodes[node].attrs.get("id").map(String::as_str) == Some(id))
+            .unwrap();
+        page.text(node)
+    };
+    assert_eq!(text("a"), "\ncode");
+    assert_eq!(text("b"), "\ntext");
+    assert_eq!(text("c"), "plain");
 }
 
 #[test]

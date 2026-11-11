@@ -450,7 +450,7 @@ impl Hooks for DomBox {
             let viewport = window.viewport_size();
             for axis in 0..2 {
                 let [start, end] = if axis == 0 { [3, 1] } else { [0, 2] };
-                let auto = |side: usize| self.style.get(style::MARGIN[side + 1]) == Some("auto");
+                let auto = |side: usize| self.style.get(style::MARGIN[side]) == Some("auto");
                 let margin = |side: usize| {
                     if auto(side) {
                         px(0.)
@@ -819,13 +819,23 @@ impl DomBox {
                     ),
                     (None, None) => return None,
                 };
-                match super::canvas::svg(&source, raster[0], raster[1], None) {
+                // The mask names the image files itself, so they may be read.
+                let mask = super::canvas::svg_tree(&source, true).and_then(|tree| {
+                    super::canvas::render_svg(&tree, raster[0], raster[1], None)
+                });
+                match mask {
                     Ok(image) => {
                         if let Some((_, Some(old))) = masks.insert(self.id, (inputs, Some(image))) {
                             window.release_image(old);
                         }
                     }
-                    Err(error) => eprintln!("apps: mask: {error}"),
+                    // Keep the failure too, or every paint builds and reports the same mask again.
+                    Err(error) => {
+                        eprintln!("apps: mask: {error}");
+                        if let Some((_, Some(old))) = masks.insert(self.id, (inputs, None)) {
+                            window.release_image(old);
+                        }
+                    }
                 }
             }
             masks
@@ -973,12 +983,8 @@ fn mask_svg(
         if let Some(source) = image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
             let source = source.trim().trim_matches(['"', '\'']);
             let Some(path) = super::image::data_file(source).or_else(|| {
-                base.and_then(|base| base.join(source).ok())
-                    .and_then(|url| match url.scheme() {
-                        "file" => url.to_file_path().ok(),
-                        "apps" => assets.get(url.path().trim_start_matches('/')).cloned(),
-                        _ => None,
-                    })
+                let base = base?;
+                crate::host::local_path(assets, base, &base.join(source).ok()?)
             }) else {
                 continue;
             };

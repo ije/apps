@@ -152,7 +152,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
       else if (event.type === 'did-fail-load') this.emit(event.type, eventOf(), event.code ?? -2, event.error ?? 'Navigation failed', event.url ?? this.#url, true, -1, -1);
       else if (event.type === 'page-title-updated') this.emit(event.type, eventOf(), this.#title, true);
       else if (event.type === 'did-navigate') this.emit(event.type, eventOf(), this.#url, -1, '');
-      else if (event.type === 'did-navigate-in-page' || (event.type === 'history' && !this.#loading)) this.emit('did-navigate-in-page', eventOf({ url: this.#url, isMainFrame: true }), this.#url, true, -1, -1);
+      else if (event.type === 'did-navigate-in-page') this.emit('did-navigate-in-page', eventOf({ url: this.#url, isMainFrame: true }), this.#url, true, -1, -1);
       else if (event.type === 'did-start-loading') {
         this.emit('did-start-navigation', eventOf({ url: event.url ?? this.#url, isMainFrame: true, isSameDocument: false }), event.url ?? this.#url, false, true, -1, -1);
         this.emit(event.type, eventOf());
