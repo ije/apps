@@ -93,7 +93,8 @@ fn resolves_default_entries_with_build_options() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert!(apps_runtime::bundle::read(&out).unwrap().files["app.js"].contains("42"));
+        let main = apps_runtime::bundle::read(&out).unwrap().main.unwrap();
+        assert!(std::str::from_utf8(&main).unwrap().contains("42"));
         fs::remove_file(dir.path().join(entry)).unwrap();
     }
 }
@@ -131,8 +132,13 @@ fn bundles_electron_pages_and_rejects_unsupported_exports() {
         String::from_utf8_lossy(&result.stderr)
     );
     let bundle = apps_runtime::bundle::read(&out).unwrap();
-    assert!(bundle.files["app.js"].contains("apps:///page-0.html"));
-    let doc = &bundle.pages["page-0.html"];
+    let main = bundle.main.unwrap();
+    assert!(
+        std::str::from_utf8(&main)
+            .unwrap()
+            .contains("apps:///page-0.html")
+    );
+    let doc = &apps_runtime::bundle::unpack_page(&bundle.pages["page-0.html"]).unwrap();
     let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
     assert_eq!(
         apps_runtime::style::styles(doc, 800., 600.)[p]["color"],
@@ -204,12 +210,7 @@ fn packages_every_platform_and_arch_with_matching_jsc() {
                 b"asset"
             );
             assert!(out.join(format!("{resources}app.bundle")).is_file());
-            assert!(
-                apps_runtime::bundle::read(&out)
-                    .unwrap()
-                    .files
-                    .contains_key("app.js")
-            );
+            assert!(apps_runtime::bundle::read(&out).unwrap().main.is_some());
             assert_eq!(
                 out.join("Tea App.app/Contents/Info.plist").is_file(),
                 platform == "macos"

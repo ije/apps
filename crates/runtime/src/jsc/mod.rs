@@ -573,6 +573,36 @@ fn bundled(source: &[u8]) -> Option<&'static [u8]> {
     script.2.filter(|bytecode| !bytecode.is_empty())
 }
 
+static MAPPED: std::sync::Mutex<Vec<std::sync::Weak<memmap2::Mmap>>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn add_mapped(bundle: std::sync::Weak<memmap2::Mmap>) {
+    let mut mapped = MAPPED.lock().unwrap();
+    mapped.retain(|bundle| bundle.strong_count() > 0);
+    mapped.push(bundle);
+}
+
+// JSC reads an ASCII script of a mapped bundle in place, so that mapping stays for the rest of the process.
+fn in_place(source: &[u8]) -> bool {
+    let range = source.as_ptr_range();
+    let bundle = MAPPED
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .find(|bundle| {
+            let bundle = bundle.as_ptr_range();
+            bundle.start <= range.start && range.end <= bundle.end
+        });
+    match bundle {
+        Some(bundle) if source.is_ascii() => {
+            std::mem::forget(bundle);
+            true
+        }
+        _ => false,
+    }
+}
+
 type Binding = (
     Rc<JavaScriptCore>,
     Rc<RefCell<Host>>,
@@ -2228,22 +2258,22 @@ impl JsContext {
         let source_url = self.api.string(url);
         let mut exception = ptr::null_mut();
         let start = std::time::Instant::now();
-        let result = match (
-            compiled,
-            self.api.evaluate_latin1,
-            bundled(source.as_bytes()),
-        ) {
-            (Some((aot, module)), ..) => {
-                aot.call(&self.api, self.ctx, module, this, &mut exception)
-            }
-            (None, Some(evaluate), Some(bytecode)) => unsafe {
+        let bytecode = bundled(source.as_bytes());
+        let result = match (compiled, self.api.evaluate_latin1) {
+            (Some((aot, module)), _) => aot.call(&self.api, self.ctx, module, this, &mut exception),
+            (None, Some(evaluate)) if bytecode.is_some() || in_place(source.as_bytes()) => unsafe {
+                let bytecode = bytecode.unwrap_or_default();
                 evaluate(
                     self.ctx,
                     source.as_ptr().cast(),
                     source.len(),
                     this,
                     source_url,
-                    bytecode.as_ptr(),
+                    if bytecode.is_empty() {
+                        ptr::null()
+                    } else {
+                        bytecode.as_ptr()
+                    },
                     bytecode.len(),
                     &mut exception,
                 )
@@ -2375,21 +2405,18 @@ impl JsContext {
     }
 
     pub fn load_bundle(&self, files: &BBTreeMap<String, String>, entry: &str) -> Result<()> {
+        self.load_main(files, &crate::bundle::script_source(files, true), entry)
+    }
+
+    // `source` is a main script from `script_source`. A built app keeps it in its mapped bundle.
+    pub fn load_main(
+        &self,
+        files: &BBTreeMap<String, String>,
+        source: &str,
+        entry: &str,
+    ) -> Result<()> {
         self.install(files)?;
-        let mut source: std::borrow::Cow<str> =
-            std::borrow::Cow::Owned(crate::bundle::script_source(files, true));
-        if let Some(script) = SCRIPTS
-            .lock()
-            .unwrap()
-            .0
-            .iter_mut()
-            .find(|script| script.0 == entry)
-        {
-            // JSC reads the main script in place, from its bytecode, so it stays for the rest of the process.
-            script.1 = Box::leak(source.into_owned().into_boxed_str());
-            source = std::borrow::Cow::Borrowed(script.1);
-        }
-        self.eval_page(&source, entry)
+        self.eval_page(source, entry)
             .context("Cannot execute the app bundle")?;
         while self.eval_page(NEXT, entry)? == "true" {}
         Ok(())
@@ -2495,6 +2522,27 @@ mod tests {
             main.eval(script, "test").unwrap(),
             "3|function f() { return 1 }|2|20320"
         );
+    }
+
+    #[test]
+    fn mapped_scripts_run_in_place_and_keep_their_mapping() {
+        let map = |source: &[u8]| {
+            let mut map = memmap2::MmapMut::map_anon(source.len()).unwrap();
+            map.copy_from_slice(source);
+            let map = std::sync::Arc::new(map.make_read_only().unwrap());
+            add_mapped(std::sync::Arc::downgrade(&map));
+            map
+        };
+        let ascii = map(b"globalThis.f = function f() { return 'in place' }; f.toString()");
+        let wide = map("globalThis.b = '\u{4f60}\u{597d}'; b.length".as_bytes());
+        let main =
+            JsContext::new(JavaScriptCore::load().unwrap(), Rc::default(), Role::Main).unwrap();
+        let run = |source: &[u8]| main.eval(std::str::from_utf8(source).unwrap(), "test");
+        assert_eq!(run(&ascii).unwrap(), "function f() { return 'in place' }");
+        assert_eq!(run(&wide).unwrap(), "2");
+        assert_eq!(std::sync::Arc::strong_count(&ascii), 2);
+        assert_eq!(std::sync::Arc::strong_count(&wide), 1);
+        assert!(!in_place(b"heap"));
     }
 
     #[test]

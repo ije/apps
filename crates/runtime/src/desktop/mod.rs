@@ -47,8 +47,7 @@ pub struct Desktop {
     devtools: HashMap<u64, devtools::DevTools>,
     main_logs: Vec<serde_json::Value>,
     files: Arc<HashMap<String, String>>,
-    pages: BBTreeMap<String, Document>,
-    packed: Arc<HashMap<String, Vec<u8>>>,
+    packed: Arc<HashMap<String, bytes::Bytes>>,
     owner: Option<u64>,
     ended: bool,
     quit: bool,
@@ -79,23 +78,16 @@ struct Template {
     assets: HashMap<String, std::path::PathBuf>,
     native_modules: HashMap<String, std::path::PathBuf>,
     files: Arc<HashMap<String, String>>,
-    packed: Arc<HashMap<String, Vec<u8>>>,
+    packed: Arc<HashMap<String, bytes::Bytes>>,
 }
 
 impl Desktop {
     pub fn from_bundle(bundle: crate::bundle::Bundle) -> Result<Self> {
         ensure!(
-            bundle.files.contains_key("app.js"),
+            bundle.main.is_some() || bundle.files.contains_key("app.js"),
             "Start a Rust app with its Cargo executable"
         );
-        Self::create(
-            &bundle.files,
-            bundle.pages,
-            bundle.scripts,
-            bundle.packaged,
-            bundle.root,
-            false,
-        )
+        Self::create(bundle, false)
     }
 
     pub fn reload_from(&self, mut input: impl std::io::BufRead + Send + 'static) {
@@ -176,24 +168,26 @@ impl Desktop {
     }
 
     pub fn new(files: &BBTreeMap<String, String>) -> Result<Self> {
+        let files = files.clone();
         Self::create(
-            files,
-            BBTreeMap::new(),
-            HashMap::new(),
-            false,
-            std::path::PathBuf::new(),
+            crate::bundle::Bundle {
+                files,
+                ..Default::default()
+            },
             false,
         )
     }
 
-    fn create(
-        files: &BBTreeMap<String, String>,
-        pages: BBTreeMap<String, Document>,
-        scripts: HashMap<String, bytes::Bytes>,
-        packaged: bool,
-        root: std::path::PathBuf,
-        rust: bool,
-    ) -> Result<Self> {
+    pub(crate) fn create(bundle: crate::bundle::Bundle, rust: bool) -> Result<Self> {
+        let crate::bundle::Bundle {
+            packaged,
+            root,
+            files,
+            pages,
+            scripts,
+            main,
+        } = bundle;
+        let files = &files;
         let api = JavaScriptCore::load()?;
         let windows = !pages.is_empty() || files.keys().any(|name| name.ends_with(".html"));
         // Preload the window server, Metal and CoreText here to avoid delays at launch and the first frame.
@@ -299,11 +293,17 @@ impl Desktop {
             None
         } else {
             let engine = JsContext::new(api.clone(), main_host.clone(), Role::Main)?;
-            engine.load_bundle(files, "app.js")?;
+            match &main {
+                Some(main) => engine.load_main(
+                    files,
+                    std::str::from_utf8(main).context("Invalid app.bundle data")?,
+                    "app.js",
+                )?,
+                None => engine.load_bundle(files, "app.js")?,
+            }
             Some(engine)
         };
         Ok(Self {
-            pages,
             main: Some(Main::new(engine, main_host, link.clone(), api.clone())),
             api,
             host,
@@ -319,7 +319,7 @@ impl Desktop {
                     .map(|(name, source)| (name.clone(), source.clone()))
                     .collect(),
             ),
-            packed: Arc::default(),
+            packed: Arc::new(pages),
             owner: None,
             ended: false,
             quit: false,
@@ -593,10 +593,9 @@ impl Desktop {
                                     return crate::bundle::unpack_page(bytes)
                                         .map_err(|_| (-2, "ERR_FAILED"));
                                 }
-                                return match (self.pages.get(name), self.files.get(name)) {
-                                    (Some(doc), _) => Ok(doc.clone()),
-                                    (_, Some(source)) => Ok(crate::bundle::page(source)),
-                                    _ => Err(missing),
+                                return match self.files.get(name) {
+                                    Some(source) => Ok(crate::bundle::page(source)),
+                                    None => Err(missing),
                                 };
                             }
                             let path = file.as_deref().unwrap();
@@ -1537,7 +1536,7 @@ impl Desktop {
             main,
             link,
             files,
-            pages,
+            packed,
             ..
         } = self;
         drop(api);
@@ -1546,10 +1545,6 @@ impl Desktop {
         if let Some(port) = mcp {
             mcp::start(port, link.clone())?;
         }
-        let packed = pages
-            .iter()
-            .map(|(name, doc)| Ok((name.clone(), crate::bundle::pack_page(doc)?)))
-            .collect::<Result<HashMap<_, _>>>()?;
         let template = {
             let host = host.borrow();
             Arc::new(Template {
@@ -1563,10 +1558,10 @@ impl Desktop {
                 assets: host.assets.clone(),
                 native_modules: host.native_modules.clone(),
                 files,
-                packed: Arc::new(packed),
+                packed,
             })
         };
-        drop((host, pages));
+        drop(host);
         if renderer::THREAD_PER_APP {
             link.set_per_window();
             let (template, link) = (template.clone(), link.clone());
@@ -1778,7 +1773,6 @@ impl Desktop {
             devtools: HashMap::new(),
             main_logs: Vec::new(),
             files: template.files.clone(),
-            pages: BBTreeMap::new(),
             packed: template.packed.clone(),
             owner,
             ended: false,
@@ -2070,8 +2064,15 @@ mod tests {
         for (name, source) in extra {
             files.insert((*name).into(), (*source).into());
         }
-        let mut desktop =
-            Desktop::create(&files, BBTreeMap::new(), HashMap::new(), false, root, false).unwrap();
+        let mut desktop = Desktop::create(
+            crate::bundle::Bundle {
+                files,
+                root,
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
         desktop.js().eval("__appsEvent('ready')", "test").unwrap();
         desktop.pump(None, None).unwrap();
         desktop

@@ -358,8 +358,13 @@ setTimeout(async () => {
         serde_json::to_string(&assets).unwrap(),
     );
     for (name, page) in bundle.pages {
+        let page = apps_runtime::bundle::unpack_page(&page).unwrap();
         files.insert(name, page.serialize(0));
     }
+    files.insert(
+        "app.js".into(),
+        String::from_utf8(bundle.main.unwrap().to_vec()).unwrap(),
+    );
     for (name, bytes) in bundle.scripts {
         files.insert(name, String::from_utf8(bytes.to_vec()).unwrap());
     }
@@ -397,8 +402,11 @@ setTimeout(async () => {
     );
     assert!(!dylib.exists());
     assert!(
-        !apps_runtime::bundle::read(&resources).unwrap().files["app.js"]
-            .starts_with(apps_runtime::bundle::AOT_PREFIX)
+        !apps_runtime::bundle::read(&resources)
+            .unwrap()
+            .main
+            .unwrap()
+            .starts_with(apps_runtime::bundle::AOT_PREFIX.as_bytes())
     );
     let output = run(&executable);
     assert!(

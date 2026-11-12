@@ -1777,7 +1777,7 @@ fn resolved_html_survives_relocation() {
             apps_runtime::host::Role::Main,
         )
         .unwrap();
-        engine.validate_bundle(&bundle.files).unwrap();
+        engine.validate_bundle(&files).unwrap();
         assert_eq!(
             apps_runtime::desktop::Desktop::from_bundle(bundle)
                 .unwrap()

@@ -54,10 +54,10 @@ Modules with cycles, CommonJS, top-level await, or other incompatible constructs
 [bundle.rs](crates/runtime/src/bundle.rs) defines `app.bundle`. It starts with an eight-byte header: `APP\0` and a format version. Postcard data follows the header:
 
 - Files: main code, script chunks, package metadata, asset maps, and native addons.
-- Pages: parsed HTML documents, stylesheets, and inline style declarations.
+- Pages: one packed block for each page, with its parsed HTML document, stylesheets, and inline style declarations.
 - Optional bytecode: an index followed by blocks at eight-byte aligned offsets.
 
-Asset files remain beside the bundle. The runtime maps `app.bundle` into memory and retains script chunks as slices of that mapping. JavaScriptCore can read ASCII sources and bytecode in place. New builds replace the bundle file because an active app can still hold its mapping.
+Asset files remain beside the bundle. The runtime maps `app.bundle` into memory and retains the main script, script chunks, and pages as slices of that mapping. The main script is stored together with its module loader, in the form that runs. JavaScriptCore reads ASCII sources and bytecode in place, so the app makes no copy of them. A window unpacks its page when it loads the page. New builds replace the bundle file because an active app can still hold its mapping.
 
 On macOS, the package uses `Contents/MacOS`, `Contents/Resources`, and `Contents/Frameworks`. Windows and Linux packages keep the executable, bundle, and required libraries in the output directory. [packaging.rs](crates/cli/src/packaging.rs) selects the libraries from the app features and build mode.
 

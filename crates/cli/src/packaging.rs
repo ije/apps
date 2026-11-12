@@ -183,7 +183,7 @@ pub fn package_app(
             stage.path().join(&executable_name),
         )?;
     }
-    fs::copy(app_binary.unwrap_or(runtime), &executable).context("Cannot copy the runtime. Build the workspace first with cargo build --workspace --release.")?;
+    bytes += fs::copy(app_binary.unwrap_or(runtime), &executable).context("Cannot copy the runtime. Build the workspace first with cargo build --workspace --release.")? as usize;
     #[cfg(unix)]
     if target.platform != "windows" {
         use std::os::unix::fs::PermissionsExt;
