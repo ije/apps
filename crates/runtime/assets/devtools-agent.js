@@ -13,7 +13,8 @@
   };
   let state = 2;
   // The main process has no document.
-  if (globalThis.document) new MutationObserver(() => { state ||= 1; }).observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+  const observer = globalThis.document && new MutationObserver(() => { state ||= 1; });
+  observer?.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
   // Console values. An object goes to the panel as a short text and a handle, which gives its properties.
   const held = new Map(), logged = new Map();
   let handles = 0, logs = 0;
@@ -65,6 +66,8 @@
       return list;
     },
     clear() { held.clear(); logged.clear(); },
+    // The tools closed: the page stops paying for them.
+    close() { observer?.disconnect(); api.clear(); delete globalThis.__appsLogged; },
     poll() { const value = state; state = 0; return value; },
     // The children of each node. A null id gives the root element.
     tree: ({ ids }) => Object.fromEntries(ids.map(id => [id ?? 'root', id == null ? [entry(document.documentElement)] : get(id)?.isConnected ? kids(get(id)).map(entry) : []])),

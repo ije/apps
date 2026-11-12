@@ -1008,7 +1008,10 @@ impl Main {
                 delay = delay.min(next.ceil() as i64);
             }
         }
-        self.tools.borrow_mut().take_if(|tools| tools.is_closed());
+        let closed = self.tools.borrow_mut().take_if(|tools| tools.is_closed());
+        if let (Some(_), Some(engine)) = (closed, &self.engine) {
+            super::devtools::release(engine)?;
+        }
         if self.link.main_pending() {
             delay = delay.min(0);
         }

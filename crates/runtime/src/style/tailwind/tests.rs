@@ -1553,7 +1553,14 @@ fn standalone_pages_get_their_theme_base_and_classes() {
         "<p class=\"flex bg-box\">const flex = `hover:text-red-500 px-[3px]`</p>",
     );
     println!("{css}");
-    for part in ["--color-box:#1d1d20", ".flex{display:flex", ".bg-box{", "px-\\[3px\\]", "box-sizing:border-box", ".caret{rotate:90deg"] {
+    for part in [
+        "--color-box:#1d1d20",
+        ".flex{display:flex",
+        ".bg-box{",
+        "px-\\[3px\\]",
+        "box-sizing:border-box",
+        ".caret{rotate:90deg",
+    ] {
         assert!(css.contains(part), "{part}");
     }
     assert!(!css.contains("const"));

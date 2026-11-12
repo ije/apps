@@ -891,6 +891,9 @@ impl Desktop {
                                     devtools::DevTools::new(&title, Role::Renderer(id), None)
                                 })?;
                             self.devtools.insert(id, tools);
+                        } else if let Some(engine) = view.and_then(|view| view.renderer.as_deref())
+                        {
+                            devtools::release(engine)?;
                         }
                         if let Some(data) = view.and_then(|view| view.data.upgrade()) {
                             data.inspect.set(crate::render::Inspect {
@@ -1287,7 +1290,11 @@ impl Desktop {
                     for command in &commands {
                         tools.answer(command, engine, &app.host, data.as_deref())?;
                     }
-                    tools.poll(engine)
+                    tools.poll(engine)?;
+                    if tools.is_closed() {
+                        devtools::release(engine)?;
+                    }
+                    Ok(())
                 })?;
                 if let Some(handle) = view.handle.filter(|_| !commands.is_empty()) {
                     cx.refresh_window(handle);

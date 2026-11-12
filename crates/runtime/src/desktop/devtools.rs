@@ -21,7 +21,10 @@ fn page() -> &'static str {
         let html = include_str!("../../assets/devtools.html");
         let (head, rest) = html.split_once("<style>").unwrap_or((html, ""));
         let (css, body) = rest.split_once("</style>").unwrap_or_default();
-        format!("{head}<style>{}</style>{body}", crate::style::tailwind(css, body))
+        format!(
+            "{head}<style>{}</style>{body}",
+            crate::style::tailwind(css, body)
+        )
     })
 }
 
@@ -220,7 +223,15 @@ pub(crate) fn agent(engine: &JsContext, method: &str, params: &Value) -> Result<
         json!(method),
         params
     );
-    Ok(serde_json::from_str(&engine.eval_page(&call, "apps:devtools")?)?)
+    Ok(serde_json::from_str(
+        &engine.eval_page(&call, "apps:devtools")?,
+    )?)
+}
+
+// Takes the agent out of the page when its tools close, with its observer and the logged values.
+pub(crate) fn release(engine: &JsContext) -> Result<()> {
+    let script = "this.__appsAgent?.('close');delete this.__appsAgent";
+    engine.eval_page(script, "apps:devtools").map(drop)
 }
 
 pub fn dispatch(command: &Value, engine: &JsContext, host: &Rc<RefCell<Host>>) -> Result<Value> {
@@ -371,16 +382,28 @@ mod tests {
         };
         assert_eq!(agent(&engine, "poll", &Value::Null).unwrap(), 2);
         let tree = call("DOM.tree", json!({"ids":[null]}));
-        assert_eq!((&tree["root"][0]["tag"], &tree["root"][0]["kids"]), (&json!("html"), &json!(1)));
+        assert_eq!(
+            (&tree["root"][0]["tag"], &tree["root"][0]["kids"]),
+            (&json!("html"), &json!(1))
+        );
         let html = tree["root"][0]["id"].clone();
         let body = call("DOM.tree", json!({"ids":[html]}))[html.to_string()][0]["id"].clone();
         let kids = call("DOM.tree", json!({"ids":[body]}))[body.to_string()].clone();
         assert_eq!(kids[0]["text"], "before");
         assert_eq!(kids.as_array().unwrap().len(), 1);
-        assert_eq!(call("DOM.path", json!({"id":kids[0]["id"]})), json!([html, body, kids[0]["id"]]));
-        engine.eval_page("document.querySelector('p').className = 'c'", "page").unwrap();
+        assert_eq!(
+            call("DOM.path", json!({"id":kids[0]["id"]})),
+            json!([html, body, kids[0]["id"]])
+        );
+        engine
+            .eval_page("document.querySelector('p').className = 'c'", "page")
+            .unwrap();
         assert_eq!(agent(&engine, "poll", &Value::Null).unwrap(), 1);
         assert_eq!(agent(&engine, "poll", &Value::Null).unwrap(), 0);
+        release(&engine).unwrap();
+        let left = engine.eval_page("typeof this.__appsAgent + typeof __appsLogged", "page");
+        assert_eq!(left.unwrap(), "undefinedundefined");
+        release(&engine).unwrap();
 
         let page = page();
         assert!(page.contains(".bg-panel{") && page.contains("box-sizing:border-box"));
