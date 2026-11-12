@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-revision=ee59053d32ace3b79efd73f5e46a8576ca52f53c
-bun_revision=98cda0d8b1243fc3dbf6963f0a12e708efb20d80
+revision=6fc709c298409fe433a60f6aff328a45a8974532
+bun_revision=ccb3611f2ade6226369384e0f14b5e8f16207710
 
 aot=0
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)

@@ -136,7 +136,7 @@ extern constinit const AOT::ModuleHost appsAOTModuleHost {
     .createModuleNotFoundError = [](JSGlobalObject* global, const String& specifier, const String&, bool) -> JSValue {
         return createTypeError(global, makeString("Cannot find AOT module: "_s, specifier));
     },
-    .decompressText = [](std::span<uint8_t> text, std::span<const uint8_t> compressed) {
+    .decompressSource = [](std::span<uint8_t> text, std::span<const uint8_t> compressed) {
         return compression_decode_buffer(text.data(), text.size(), compressed.data(), compressed.size(), nullptr, COMPRESSION_ZLIB) == text.size();
     },
 };
@@ -146,7 +146,7 @@ extern constinit const AOT::ModuleHost appsAOTModuleHost {
 // Match build-jsc.sh's bun_revision: Bun's IR and built-in table must match this compiler.
 extern "C" JS_EXPORT const char* JSGetAOTCompilerRevision()
 {
-    return "98cda0d8b1243fc3dbf6963f0a12e708efb20d80";
+    return "ccb3611f2ade6226369384e0f14b5e8f16207710";
 }
 
 extern "C" JS_EXPORT bool JSCompileAOT(const uint8_t* bytes, size_t size, const char* path, uint32_t* entries, size_t count, size_t* layout, char* error, size_t capacity)
@@ -159,8 +159,8 @@ extern "C" JS_EXPORT bool JSCompileAOT(const uint8_t* bytes, size_t size, const 
     // stress test).
     options.target.referenceWidth = AOT::Wire::ReferenceWidth::Wide;
     AOT::ProgramOwner owner;
-    owner.functionTexts.mostBytesCompressed = [](size_t size) { return size + size / 8 + 64; };
-    owner.functionTexts.compress = [](std::span<uint8_t> compressed, std::span<const uint8_t> text) {
+    owner.functionSources.maxCompressedSize = [](size_t size) { return size + size / 8 + 64; };
+    owner.functionSources.compress = [](std::span<uint8_t> compressed, std::span<const uint8_t> text) {
         return compression_encode_buffer(compressed.data(), compressed.size(), text.data(), text.size(), nullptr, COMPRESSION_ZLIB);
     };
     auto output = AOT::compileProgram({ bytes, size }, options, nullptr, owner);
