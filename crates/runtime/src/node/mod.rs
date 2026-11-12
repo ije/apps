@@ -384,11 +384,12 @@ impl State {
                     .update(bytes(&args[1])?);
                 Ok(Value::Null)
             }
-            "hash.digest" => Ok(self
-                .hashers
-                .remove(&args[0].as_u64().context("Expected hash ID")?)
-                .context("Hash is finalized")?
-                .finish()),
+            "hash.digest" => Ok(crate::jsc::payload::write(
+                self.hashers
+                    .remove(&args[0].as_u64().context("Expected hash ID")?)
+                    .context("Hash is finalized")?
+                    .digest(),
+            )),
             "hash.free" => {
                 self.hashers
                     .remove(&args[0].as_u64().context("Expected hash ID")?);

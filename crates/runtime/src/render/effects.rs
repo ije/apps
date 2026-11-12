@@ -835,7 +835,6 @@ pub(crate) fn tile(
     [[tw, th], at]
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gradient_stops<S: AsRef<str>>(
     parts: &[S],
     prelude: bool,

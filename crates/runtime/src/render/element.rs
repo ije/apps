@@ -1041,7 +1041,6 @@ pub(super) fn element(
         if record.culled {
             build.culls.set(build.culls.get() + 1);
         }
-        let depth = build.ancestors.len();
         build
             .reads
             .borrow_mut()
@@ -1082,8 +1081,7 @@ pub(super) fn element(
         perspective: build.perspective.clone(),
         value: hashed(&build.doc.nodes[id].value),
     });
-    #[cfg_attr(not(debug_assertions), allow(unused_mut))]
-    let mut child = create(build, id, containing, container, slot);
+    let child = create(build, id, containing, container, slot);
     #[cfg(debug_assertions)]
     let plan = build.plan.take();
     #[cfg(debug_assertions)]
@@ -1094,7 +1092,6 @@ pub(super) fn element(
         eprintln!("BUILT {name}");
     }
     let reads = {
-        let depth = build.ancestors.len();
         let below = |read: &Read| usize::from(read.reader) > depth;
         let mut log = build.reads.borrow_mut();
         let mut end = mark;
@@ -1126,7 +1123,7 @@ pub(super) fn element(
         })
     };
     #[cfg(debug_assertions)]
-    let print = print(build, printed, &mut child);
+    let print = print(build, printed, &child);
     if let Some(patch) = patch.filter(|_| !checking) {
         build.view.patches.borrow_mut().insert(id, patch);
     }
@@ -1258,35 +1255,17 @@ fn check(
 ) {
     let culls = std::cell::Cell::new(0);
     let shadow = Build {
-        doc: build.doc,
-        styles: build.styles,
-        text: build.text,
-        pixel_ratio: build.pixel_ratio,
-        view: build.view,
         ancestors: build.ancestors.clone(),
-        flex_parent: build.flex_parent,
-        measured: build.measured,
         perspective: build.perspective.clone(),
-        siblings: build.siblings,
-        margins: build.margins,
-        blocks: build.blocks,
-        ids: build.ids,
-        info: build.info,
         zone: None,
-        top_layer: build.top_layer,
-        tree: build.tree,
         culls: &culls,
-        resized: build.resized,
-        settled: build.settled,
-        reads: build.reads,
-        epoch: build.epoch,
-        prints: build.prints,
         checking: true,
         extra: Default::default(),
         plan: Default::default(),
+        ..*build
     };
     let start = build.reads.borrow().len();
-    let mut fresh = create(&shadow, id, containing, container, slot);
+    let fresh = create(&shadow, id, containing, container, slot);
     let depth = build.ancestors.len();
     let set = |reads: &[Read]| {
         let mut set: Vec<_> = reads
@@ -1309,7 +1288,7 @@ fn check(
         now.iter().map(|read| read.0).collect::<Vec<_>>(),
         kept.iter().map(|read| read.0).collect::<Vec<_>>()
     );
-    let print = print(&shadow, printed + 1, &mut fresh);
+    let print = print(&shadow, printed + 1, &fresh);
     let mut prints = build.prints.borrow_mut();
     assert_eq!(
         prints[printed], print,
@@ -1319,7 +1298,7 @@ fn check(
 }
 
 #[cfg(debug_assertions)]
-fn print(build: &Build<'_>, from: usize, child: &mut Child) -> u64 {
+fn print(build: &Build<'_>, from: usize, child: &Child) -> u64 {
     use std::hash::Hasher;
     struct Hashed(rustc_hash::FxHasher);
     impl std::fmt::Write for Hashed {
@@ -1399,17 +1378,12 @@ fn create(
         measured,
         perspective: ref parent_perspective,
         siblings,
-        margins: margin_cache,
         ids,
         info,
         ref zone,
         top_layer,
-        tree,
         culls,
-        resized,
-        settled,
         reads,
-        epoch,
         ..
     } = *build;
     let depth = ancestors.len();
@@ -1463,28 +1437,6 @@ fn create(
     let stacking = id == 0 || composited || made.stacking || layered;
     let chain: Rc<[usize]> = ancestors.iter().copied().chain([id]).collect();
     let child_build = Build {
-        doc,
-        styles,
-        text,
-        pixel_ratio,
-        view,
-        measured,
-        siblings,
-        margins: margin_cache,
-        blocks,
-        ids,
-        info,
-        top_layer,
-        tree,
-        culls,
-        resized,
-        settled,
-        reads,
-        epoch,
-        #[cfg(debug_assertions)]
-        prints: build.prints,
-        #[cfg(debug_assertions)]
-        checking: build.checking,
         #[cfg(debug_assertions)]
         extra: Default::default(),
         #[cfg(debug_assertions)]
@@ -1525,6 +1477,7 @@ fn create(
                         .unwrap_or_else(|| "50% 50%".into()),
                 )
             }),
+        ..*reader
     };
     let build = &child_build;
     let position = style.get(Prop::POSITION).unwrap_or("static");
@@ -2688,7 +2641,9 @@ fn create(
             .mb(px(margin[2]))
             .ml(px(margin[3]));
     }
-    if let Some(fieldset) = node.parent
+    if node.tag == "legend"
+        && let Some(fieldset) = node.parent
+        && doc.nodes[fieldset].tag == "fieldset"
         && let Some((legend, height, _)) = legend(doc, styles, fieldset)
         && legend == id
     {
@@ -3067,32 +3022,31 @@ fn create(
             .border_b(px(borders[2]))
             .border_l(px(borders[3]));
     }
-    let visible = (0..4)
-        .filter(|&side| borders[side] > 0.)
-        .collect::<Vec<_>>();
+    let visible = (0..4).filter(|&side| borders[side] > 0.);
+    let first = visible.clone().next();
     let shaded = visible
-        .iter()
-        .any(|&side| matches!(border_kinds[side], "groove" | "ridge" | "inset" | "outset"));
+        .clone()
+        .any(|side| matches!(border_kinds[side], "groove" | "ridge" | "inset" | "outset"));
     if hit.is_none()
-        && let Some(&first) = visible.first()
+        && let Some(first) = first
     {
         if !shaded
             && visible
-                .iter()
-                .all(|&side| border_colors[side] == border_colors[first])
+                .clone()
+                .all(|side| border_colors[side] == border_colors[first])
         {
             el = el.border_color(border_colors[first]);
         } else {
             el = el.border_color(renderer::Color::TRANSPARENT);
         }
         if visible
-            .iter()
-            .all(|&side| border_kinds[side] == border_kinds[first])
+            .clone()
+            .all(|side| border_kinds[side] == border_kinds[first])
         {
             el.style().border_style = border_style(border_kinds[first]);
         } else if visible
-            .iter()
-            .any(|&side| matches!(border_kinds[side], "dashed" | "dotted"))
+            .clone()
+            .any(|side| matches!(border_kinds[side], "dashed" | "dotted"))
         {
             el.style().border_style = renderer::BorderStyle::Dashed;
         }
@@ -3946,9 +3900,11 @@ fn create(
         el = el.child(outline);
     }
     if shaded
-        || visible
-            .iter()
-            .any(|&side| border_colors[side] != border_colors[visible[0]])
+        || first.is_some_and(|first| {
+            visible
+                .clone()
+                .any(|side| border_colors[side] != border_colors[first])
+        })
     {
         let mut bands = vec![([0.; 4], borders, [renderer::Color::TRANSPARENT; 4])];
         let split = (0..4).any(|side| matches!(border_kinds[side], "groove" | "ridge"));
@@ -4467,9 +4423,9 @@ fn create(
                     .and_then(style::color)
                     .map_or(ink, |(ink, alpha)| Color::hex(ink << 8 | alpha as u32))
             });
-            let shown: Vec<usize> = (0..4).filter(|&side| pseudo_borders[side] > 0.).collect();
-            if let Some(&first) = shown.first() {
-                if shown.iter().all(|&side| colors[side] == colors[first]) {
+            let mut shown = (0..4).filter(|&side| pseudo_borders[side] > 0.);
+            if let Some(first) = shown.next() {
+                if shown.all(|side| colors[side] == colors[first]) {
                     decoration = decoration.border_color(colors[first]);
                 } else {
                     decoration = decoration.border_color(renderer::Color::TRANSPARENT);
@@ -6979,11 +6935,12 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> ([f32; 2], [f32; 2], b
         if !open {
             continue;
         }
-        let mut list: Vec<usize> = children.clone();
-        if order {
-            list.reverse();
-        }
-        for child in list {
+        for index in 0..children.len() {
+            let child = children[if order {
+                children.len() - 1 - index
+            } else {
+                index
+            }];
             if !block(build, child) {
                 break;
             }

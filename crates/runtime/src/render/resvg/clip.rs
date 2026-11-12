@@ -117,8 +117,10 @@ fn clip_group(
     );
     apply(clip, transform, &mut clip_pixmap);
 
-    let mut paint = tiny_skia::PixmapPaint::default();
-    paint.blend_mode = tiny_skia::BlendMode::Xor;
+    let paint = tiny_skia::PixmapPaint {
+        blend_mode: tiny_skia::BlendMode::Xor,
+        ..Default::default()
+    };
     pixmap.draw_pixmap(
         0,
         0,

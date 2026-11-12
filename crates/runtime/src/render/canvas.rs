@@ -593,8 +593,12 @@ pub fn fonts(system: bool) -> MutexGuard<'static, (Arc<usvg::fontdb::Database>, 
     fonts
 }
 
-pub(crate) fn render_image(pixels: &skia::Pixmap) -> Arc<renderer::RenderImage> {
-    let mut bytes = vec![0; pixels.data().len()];
+// A new buffer costs page faults, about 0.5 ms at 1080p, so `spare` is used when it has the right size.
+pub(crate) fn render_image(pixels: &skia::Pixmap, spare: Vec<u8>) -> Arc<renderer::RenderImage> {
+    let mut bytes = match spare.len() == pixels.data().len() {
+        true => spare,
+        false => vec![0; pixels.data().len()],
+    };
     for (out, &[r, g, b, a]) in bytes
         .as_chunks_mut::<4>()
         .0
@@ -703,7 +707,7 @@ impl Canvas {
             &renderer::TextSystem,
             &std::collections::HashMap<String, String>,
         )>,
-    ) -> Result<()> {
+    ) -> Result<Option<Arc<renderer::RenderImage>>> {
         let stroke = |state: &State| skia::Stroke {
             width: state.width,
             miter_limit: state.miter,
@@ -1358,10 +1362,13 @@ impl Canvas {
         if let Some(saved) = covered.take() {
             finish(&mut self.pixels, saved, &self.state);
         }
-        if self.present {
-            self.image = render_image(&self.pixels);
-        }
-        Ok(())
+        // The page holds the last image only while it paints, so the new one mostly gets its buffer. The caller
+        // releases the tile of the last image.
+        Ok(self.present.then(|| {
+            let spare = Arc::get_mut(&mut self.image).map(renderer::RenderImage::take_bytes);
+            let image = render_image(&self.pixels, spare.unwrap_or_default());
+            std::mem::replace(&mut self.image, image)
+        }))
     }
 
     pub fn hit(&self, x: f32, y: f32, even_odd: bool, stroke: bool, path: Option<u64>) -> bool {
@@ -1486,7 +1493,10 @@ pub fn render_svg(
     height: u32,
     transform: Option<([f32; 2], [f32; 6])>,
 ) -> Result<Arc<renderer::RenderImage>> {
-    Ok(render_image(&svg_pixels(tree, width, height, transform)?))
+    Ok(render_image(
+        &svg_pixels(tree, width, height, transform)?,
+        Vec::new(),
+    ))
 }
 
 // Route all SVG rasterization here to enforce RASTER_MAX. Keep transforms in requested-size pixels.
@@ -1846,6 +1856,18 @@ mod tests {
         assert_eq!(&canvas.image.bytes()[..4], &[0, 0, 128, 128]);
         assert_eq!(canvas.pixels.pixels()[0].red(), 128);
         assert_eq!(pixmap(&canvas.image).unwrap().data()[..4], [128, 0, 0, 128]);
+        let (id, buffer) = (canvas.image.id, canvas.image.bytes().as_ptr());
+        let old = canvas.draw(&[23., 0., 0., 1., 1.], "", &[], &|_| None, None);
+        let old = old.unwrap().unwrap();
+        assert_eq!((old.id, old.bytes().len()), (id, 0));
+        assert_eq!(canvas.image.bytes().as_ptr(), buffer);
+        assert_eq!(canvas.image.bytes()[..8], [0, 0, 0, 0, 0, 0, 128, 128]);
+        let held = canvas.image.clone();
+        canvas
+            .draw(&[23., 0., 0., 2., 2.], "", &[], &|_| None, None)
+            .unwrap();
+        assert_eq!(held.bytes()[4..8], [0, 0, 128, 128]);
+        assert_eq!(canvas.image.bytes(), [0; 16]);
         let image = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000" opacity="0.5"/></svg>"##, 4, 4, None).unwrap();
         assert_eq!(image.size().width as u32, 4);
         assert_eq!(image.bytes(), [0, 0, 128, 128].repeat(16));

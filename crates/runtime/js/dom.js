@@ -201,9 +201,10 @@
       const node = ancestors[index], listeners = events.get(node), list = listeners?.get(event.type);
       if (!list?.length) return;
       state.currentTarget = node; state.target = targets?.[index] ?? target; state.eventPhase = state.target === node ? 2 : capture ? 1 : 3;
-      for (const item of [...list]) {
-        if (state.immediate) break;
-        if (item.capture !== capture || !listeners.get(event.type).includes(item)) continue;
+      // Removal replaces the list and adding appends to it, so the first `length` items are the snapshot.
+      for (let i = 0, length = list.length; i < length && !state.immediate; i++) {
+        const item = list[i], current = listeners.get(event.type);
+        if (item.capture !== capture || current !== list && !current.includes(item)) continue;
         if (item.once) node.removeEventListener(event.type, item.fn, item.capture);
         state.passive = item.passive;
         try { if (typeof item.fn === 'function') item.fn.call(node, event); else item.fn.handleEvent(event); } catch (error) { console.error(error); }
@@ -634,13 +635,13 @@
   const declared = new Map();
   const declare = text => { let list = declared.get(text); if (!list) { if (declared.size > 1023) declared.clear(); const flat = /\S/.test(text) ? host('dom.declare', text) : []; list = []; for (let i = 0; i < flat.length; i += 3) list.push([flat[i], flat[i + 1], flat[i + 2]]); declared.set(text, list); } return list.map(entry => entry.slice()); };
   const sides = (prefix, suffix = '') => ['top', 'right', 'bottom', 'left'].map(side => prefix + side + suffix);
-  const shorthands = Object.entries({
+  const shorthands = new Map(Object.entries({
     border: [...sides('border-', '-width'), ...sides('border-', '-style'), ...sides('border-', '-color')], 'border-width': sides('border-', '-width'), 'border-style': sides('border-', '-style'), 'border-color': sides('border-', '-color'),
     'border-top': ['border-top-width', 'border-top-style', 'border-top-color'], 'border-right': ['border-right-width', 'border-right-style', 'border-right-color'], 'border-bottom': ['border-bottom-width', 'border-bottom-style', 'border-bottom-color'], 'border-left': ['border-left-width', 'border-left-style', 'border-left-color'],
     margin: sides('margin-'), padding: sides('padding-'), inset: sides(''), 'scroll-margin': sides('scroll-margin-'), 'scroll-padding': sides('scroll-padding-'), 'border-radius': ['border-top-left-radius', 'border-top-right-radius', 'border-bottom-right-radius', 'border-bottom-left-radius'],
     gap: ['row-gap', 'column-gap'], overflow: ['overflow-x', 'overflow-y'], 'overscroll-behavior': ['overscroll-behavior-x', 'overscroll-behavior-y'], 'flex-flow': ['flex-direction', 'flex-wrap'], flex: ['flex-grow', 'flex-shrink', 'flex-basis'], 'place-content': ['align-content', 'justify-content'], 'place-items': ['align-items', 'justify-items'], 'place-self': ['align-self', 'justify-self'],
     'text-decoration': ['text-decoration-line', 'text-decoration-style', 'text-decoration-color', 'text-decoration-thickness'], 'list-style': ['list-style-type', 'list-style-position', 'list-style-image'], outline: ['outline-width', 'outline-style', 'outline-color'], container: ['container-name', 'container-type'],
-  });
+  }));
   const shorthandsOf = new Map();
   for (const entry of shorthands) for (const part of entry[1]) shorthandsOf.set(part, [...shorthandsOf.get(part) ?? [], entry]);
   const shorthandValue = (name, values) => {
@@ -685,13 +686,13 @@
       if (this._owner.computed) return this._owner.computed(name);
       const list = this._list, found = list.findLast(entry => entry[0] === name);
       if (found) return found[1];
-      const parts = shorthands.find(([shorthand]) => shorthand === name)?.[1], entries = parts?.map(part => list.findLast(entry => entry[0] === part));
+      const parts = shorthands.get(name), entries = parts?.map(part => list.findLast(entry => entry[0] === part));
       return entries && entries.every(entry => entry && entry[2] === entries[0][2]) ? shorthandValue(name, entries.map(entry => entry[1])) : '';
     }
     getPropertyPriority(name) {
       name = String(name); if (!name.startsWith('--')) name = name.toLowerCase();
       if (this._owner.computed) return '';
-      const list = this._list, parts = shorthands.find(([shorthand]) => shorthand === name)?.[1] ?? [name];
+      const list = this._list, parts = shorthands.get(name) ?? [name];
       return parts.every(part => list.findLast(entry => entry[0] === part)?.[2] === 'important') ? 'important' : '';
     }
     setProperty(name, value, priority = '') {
@@ -711,7 +712,7 @@
     removeProperty(name) {
       if (this._owner.computed) readOnly();
       name = String(name); if (!name.startsWith('--')) name = name.toLowerCase();
-      const old = this.getPropertyValue(name), parts = new Set(shorthands.find(([shorthand]) => shorthand === name)?.[1] ?? [name]), list = this._list, kept = list.filter(entry => !parts.has(entry[0]));
+      const old = this.getPropertyValue(name), parts = new Set(shorthands.get(name) ?? [name]), list = this._list, kept = list.filter(entry => !parts.has(entry[0]));
       if (kept.length !== list.length) this._owner.write(kept);
       return old;
     }
@@ -2436,9 +2437,9 @@
     let names = null;
     return declaration({ computed: name => { if (/^(width|height|min-|max-|margin|padding|inset|top|right|bottom|left|transform|perspective-origin)/.test(name)) layout(); return call('dom.computed', id, name, kind); }, names: () => names ??= call('dom.computed', id, null, kind) });
   };
-  const animationFrames = new Map(); let animationFrameId = 0, animationTimer;
+  const animationFrames = new Map(); let animationFrameId = 0, animationTimer, frameRequested = false;
   globalThis.__appsAnimationFrame = () => {
-    animationTimer = undefined;
+    animationTimer = undefined; frameRequested = false;
     const now = performance.now(), callbacks = [...animationFrames];
     timelineTime = now; microtask(() => { timelineTime = null; });
     if (pendingAnimations.size) { const ready = [...pendingAnimations]; pendingAnimations.clear(); for (const animation of ready) readyAnimation(animation); }
@@ -2447,10 +2448,12 @@
       try { callback(now); } catch (error) { console.error(error); }
     }
   };
+  // One request covers every callback until the next frame runs.
+  const requestFrame = () => { if (!frameRequested) { frameRequested = true; if (!host('dom.requestFrame') && animationTimer === undefined) animationTimer = setTimeout(__appsAnimationFrame, 16); } };
   globalThis.requestAnimationFrame = fn => {
     if (typeof fn !== 'function') throw new TypeError('Expected an animation callback');
     const id = ++animationFrameId; animationFrames.set(id, fn);
-    if (!host('dom.requestFrame') && animationTimer === undefined) animationTimer = setTimeout(__appsAnimationFrame, 16);
+    requestFrame();
     return id;
   };
   globalThis.cancelAnimationFrame = id => animationFrames.delete(id);
@@ -2601,7 +2604,7 @@
     #reset() { this.#done = false; this.#finished = new Promise((resolve, reject) => { this.#settle = resolve; this.#fail = reject; }); this.#finished.catch(() => {}); }
     #wait() { this.#ready = new Promise((resolve, reject) => { this.#readyResolve = resolve; this.#readyReject = reject; }); this.#ready.catch(() => {}); }
     #resolve() { this.#readyResolve?.(this); this.#readyResolve = this.#readyReject = null; }
-    #schedule() { pendingAnimations.add(this); if (!host('dom.requestFrame') && animationTimer === undefined) animationTimer = setTimeout(__appsAnimationFrame, 16); }
+    #schedule() { pendingAnimations.add(this); requestFrame(); }
     #now() { return this.#timeline?.currentTime ?? null; }
     #current() { if (this.#hold !== null) return this.#hold; const now = this.#now(); return this.#start === null || now === null ? null : (now - this.#start) * this.#rate; }
     #effective() { return this.#pendingRate ?? this.#rate; }

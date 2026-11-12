@@ -72,7 +72,6 @@ pub(super) fn paint(view: &PageState, window: &mut Window) {
         let line = window.text_system().shape_line(&text, px(11.), &run);
         let label = size(line.line.width + px(10.), px(18.));
         let limit = window.viewport_size();
-        // Above the box, or inside its top edge when there is no room.
         let top = if y >= 18. { y - 18. } else { y.max(0.) };
         let left = x.clamp(
             0.,

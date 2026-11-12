@@ -22,6 +22,9 @@ use std::{rc::Rc, rc::Weak, time::Duration, time::Instant};
 
 pub(crate) use text::TextSystem;
 
+// A window that stops drawing releases its spare GPU resources after this.
+const QUIET: Duration = Duration::from_secs(1);
+
 type Task = Box<dyn FnOnce() + Send>;
 type Watcher = Box<dyn FnMut() -> bool>;
 
@@ -93,9 +96,7 @@ pub(crate) fn post(_: AppThread, task: Task) {
     native_post(task);
 }
 
-pub(crate) fn native_after(delay: Duration, f: impl FnOnce() + 'static) {
-    run_after(delay, f);
-}
+pub(crate) use run_after as native_after;
 
 pub(crate) fn ask<R: Send + 'static>(
     _: AppThread,
@@ -367,6 +368,7 @@ impl Platform {
             atlas,
             control: WindowControl(key),
             calls,
+            quiet: Cell::new(None),
         })
     }
 }
@@ -376,6 +378,8 @@ pub(crate) struct Window {
     atlas: Rc<Atlas>,
     control: WindowControl,
     calls: Callbacks,
+    // `None` without a timer, else whether a frame came since the timer started.
+    quiet: Cell<Option<bool>>,
 }
 
 // The control's calls work on the window too, as on macOS.
@@ -420,10 +424,23 @@ impl Window {
     }
 
     pub fn draw(&self, scene: &Scene, capture: bool) -> Capture {
+        if self.quiet.replace(Some(true)).is_none() {
+            self.wait();
+        }
         self.native.draw(scene, capture)
     }
 
+    fn wait(&self) {
+        let calls = self.calls;
+        crate::app::timer(QUIET, move |_| calls.release()).detach();
+    }
+
     pub fn release(&self) {
+        // Frames came since the timer started, so the quiet second starts again.
+        if self.quiet.replace(Some(false)) == Some(true) {
+            return self.wait();
+        }
+        self.quiet.set(None);
         self.native.release();
     }
 }

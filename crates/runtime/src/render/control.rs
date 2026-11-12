@@ -91,7 +91,7 @@ pub(super) fn kind(
     (boxed || control == Control::Menu).then_some((control, boxed))
 }
 
-#[derive(Clone, PartialEq, Default)]
+#[derive(Default)]
 pub(super) struct Look {
     pub control: Control,
     pub boxed: bool,

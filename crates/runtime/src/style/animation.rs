@@ -497,7 +497,6 @@ fn show(
 
 type Events = Vec<(usize, &'static str, String, f64)>;
 
-#[allow(clippy::too_many_arguments)]
 fn retarget(
     old: &Style,
     new: &Style,
@@ -506,8 +505,8 @@ fn retarget(
     now: Instant,
     serial: &mut u32,
     (id, pseudo): (usize, &str),
-    runs: &mut Events,
-) -> Vec<Transition> {
+) -> (Vec<Transition>, Events) {
+    let mut runs = Vec::new();
     let mut properties: Vec<(Prop, f64, f64, String, bool)> = Vec::new();
     for (name, duration, delay, timing, discrete) in transitions(new) {
         let names: Vec<Prop> = match name.as_str() {
@@ -602,7 +601,7 @@ fn retarget(
             (-delay).max(0.),
         ));
     }
-    next
+    (next, runs)
 }
 
 fn cancel(
@@ -804,7 +803,10 @@ impl Motion {
         id: usize,
         styles: &'a ComputedStyles,
     ) -> impl Iterator<Item = (&'a Animation, &'a Clock)> {
-        let effects = styles.animations.get(&id).map_or(&[][..], Vec::as_slice);
+        let effects = styles
+            .animations
+            .get(&id)
+            .map_or(&[][..], |effects| effects);
         effects
             .iter()
             .zip(self.clocks.get(&id).into_iter().flatten())
@@ -1370,8 +1372,7 @@ impl Motion {
                 cancel(&[], events);
                 continue;
             }
-            let mut runs = Vec::new();
-            let mut next = retarget(
+            let (mut next, mut runs) = retarget(
                 &old,
                 new,
                 &running,
@@ -1379,7 +1380,6 @@ impl Motion {
                 now,
                 &mut self.serial,
                 (id, ""),
-                &mut runs,
             );
             if !shown
                 && !next
@@ -1413,8 +1413,7 @@ impl Motion {
             };
             let next = match old {
                 Some(old) if !repass && !Rc::ptr_eq(&old, new) => {
-                    let mut runs = Vec::new();
-                    let next = retarget(
+                    let (next, mut runs) = retarget(
                         &old,
                         new,
                         &running,
@@ -1422,7 +1421,6 @@ impl Motion {
                         now,
                         &mut self.serial,
                         (id, "::backdrop\0"),
-                        &mut runs,
                     );
                     cancel(&running, &next, (id, "::backdrop\0"), now, events);
                     events.append(&mut runs);
@@ -1480,7 +1478,7 @@ impl Motion {
             if clocks.len() != effects.len()
                 || clocks
                     .iter()
-                    .zip(effects)
+                    .zip(effects.iter())
                     .any(|(clock, effect)| clock.name != effect.name)
             {
                 let mut old = std::mem::take(clocks);
@@ -2106,7 +2104,6 @@ fn interpolate(property: &str, from: &str, to: &str, t: f64) -> Option<Rc<str>> 
 
 type Lerps = rustc_hash::FxHashMap<u64, (String, String, String, Option<Lerp>)>;
 
-#[derive(Clone, Debug)]
 enum Lerp {
     Same(String),
     Between(String, String, String),

@@ -280,7 +280,6 @@ impl App {
         self.update_window(id, |window, _| window.refresh());
     }
 
-    // At most 1024 rounds of deferred work.
     fn flush(&mut self) {
         for _ in 0..1024 {
             self.windows
@@ -321,8 +320,6 @@ pub(crate) fn send_ime_key(window: &mut Window, app: &mut App, typed: bool) -> b
     dispatch(window, app, key) && !ime
 }
 
-// Each backend uses the calls it needs.
-#[allow(dead_code)]
 impl Callbacks {
     // Runs on the app thread and waits for the answer, at most 100 ms from the main thread on macOS.
     pub(crate) fn with<R: Send + 'static>(
@@ -358,6 +355,7 @@ impl Callbacks {
         .unwrap_or(false)
     }
 
+    #[cfg(target_os = "macos")]
     pub fn input_later(&self, event: Event) {
         self.queue(move |window, app| {
             dispatch(window, app, event);
@@ -397,6 +395,7 @@ impl Callbacks {
         });
     }
 
+    #[cfg(target_os = "macos")]
     pub fn will_change(&self, kind: &str, bounds: Rect) -> bool {
         native::will_change(self.id, kind, bounds)
     }
@@ -415,6 +414,7 @@ impl Callbacks {
         self.queue(|window, _| window.platform.release());
     }
 
+    #[cfg(windows)]
     pub fn in_drag_area(&self, at: Point<Pixels>) -> bool {
         self.with(move |window, _| window.in_drag_area(at / window.zoom))
             .unwrap_or(false)
@@ -441,12 +441,14 @@ impl Callbacks {
         .flatten()
     }
 
+    #[cfg(not(target_os = "macos"))]
     pub fn clear_composition(&self) {
         if let Some(composed) = self.composition() {
             self.insert(Some(composed), "");
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub fn text_in(&self, range: Range<usize>) -> Option<(String, Option<Range<usize>>)> {
         self.with(move |window, app| {
             let mut actual = None;
@@ -479,6 +481,7 @@ impl Callbacks {
         });
     }
 
+    #[cfg(not(windows))]
     pub fn end_composition(&self) {
         self.queue(|window, app| {
             send_ime_key(window, app, false);
@@ -495,6 +498,7 @@ impl Callbacks {
         .flatten()
     }
 
+    #[cfg(target_os = "macos")]
     pub fn index_at(&self, at: Point<Pixels>) -> Option<usize> {
         self.with(move |window, app| {
             let at = at / window.zoom;
@@ -577,6 +581,7 @@ pub mod native {
         HANDLERS.with_borrow_mut(|handlers| handlers.will_change = Some(Box::new(f)));
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn will_change(id: WindowId, kind: &str, bounds: Rect) -> bool {
         call(
             |handlers| &mut handlers.will_change,
@@ -635,7 +640,7 @@ pub mod native {
         }
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn reopen(visible: bool) {
         call(|handlers| &mut handlers.reopen, |handler| handler(visible));
     }
@@ -650,7 +655,7 @@ pub mod native {
         }
     }
 
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn open_urls(urls: Vec<String>) {
         let mut urls = Some(urls);
         call(
@@ -685,6 +690,7 @@ mod tests {
         assert!(!native::key(WindowId(2), &event, &|| true));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn urls_wait_for_their_handler() {
         native::open_urls(vec!["apps://a".into()]);

@@ -20,7 +20,6 @@ const define = definition => {
   definition.stars ??= [];
   if (definition.source !== undefined) { definition.factory = compile(`(${definition.source})`, ''); delete definition.source; }
   if (definition.code === undefined) return;
-  if (definition.map && devtools) { const sources = globalThis.__appsSources ??= new Map(); definition.map.sources.forEach((name, index) => sources.set(name, definition.map.sourcesContent[index])); }
   // JSC ignores a sourceMappingURL that contains a quote, and encodeURIComponent keeps `'`.
   const debug = definition.map && devtools ? `\n//# sourceURL=${definition.url}\n//# sourceMappingURL=data:application/json;charset=utf-8,${encodeURIComponent(JSON.stringify(definition.map)).replaceAll("'", '%27')}\n` : '';
   // Pages compile only while their own script runs, so development modules compile here, before any of them runs.
@@ -60,7 +59,28 @@ const run = iterator => new Promise((resolve, reject) => {
   };
   step('next');
 });
-const $appsImport = id => Promise.resolve().then(() => load(id)).then(() => namespaceOf(modules.get(id)));
+// `import defer`: the namespace runs its module on the first read of an export.
+const deferred = new Map(), exported = key => typeof key === 'string' && key !== 'then', refuse = () => false;
+const evaluated = id => {
+  if (load(id) instanceof Promise && modules.get(id).state !== 2) throw new TypeError('A deferred module is read before its asynchronous dependencies ran: ' + id);
+  return namespaceOf(modules.get(id));
+};
+// A module with top-level await can't run on a read, so it runs before the module that defers it.
+const loadAsync = (ids, visiting, seen = new Set()) => ids.flatMap(id => {
+  if (id === null || seen.has(id)) return [];
+  seen.add(id);
+  if (!modules.has(id)) setup(id);
+  const { definition } = modules.get(id);
+  return definition.async ? [load(id, visiting)] : loadAsync([...definition.deps, ...definition.defers ?? []], visiting, seen);
+});
+const $appsImport = (id, defer) => Promise.resolve().then(() => defer ? Promise.all(loadAsync([id])) : load(id)).then(() => defer ? $appsImport.defer(id) : namespaceOf(modules.get(id)));
+$appsImport.defer = id => deferred.get(id) ?? deferred.set(id, new Proxy(Object.create(null), {
+  get: (_, key) => exported(key) ? evaluated(id)[key] : key === Symbol.toStringTag ? 'Deferred Module' : undefined,
+  has: (_, key) => exported(key) ? key in evaluated(id) : key === Symbol.toStringTag,
+  ownKeys: () => Reflect.ownKeys(evaluated(id)),
+  getOwnPropertyDescriptor: (_, key) => exported(key) && key in evaluated(id) ? { value: evaluated(id)[key], writable: true, enumerable: true, configurable: true } : undefined,
+  set: refuse, defineProperty: refuse, deleteProperty: refuse,
+})).get(id);
 const $appsRequire = target => {
   if (load(target) instanceof Promise) throw Error('Cannot require an asynchronous module');
   const commonjs = modules.get(target).commonjs;
@@ -193,8 +213,9 @@ const load = (id, ancestors = new Set()) => {
     for (const dependency of module.definition.deps) {
       if (dependency === null) continue;
       const loading = load(dependency, visiting);
-      if (loading instanceof Promise) pending.push(loading);
+      if (loading instanceof Promise && modules.get(dependency).state !== 2) pending.push(loading);
     }
+    if (module.definition.defers) for (const loading of loadAsync(module.definition.defers, visiting)) if (loading instanceof Promise) pending.push(loading);
     result = pending.length ? Promise.all(pending).then(execute) : execute();
   } catch (error) { failed(error); }
   if (result instanceof Promise) module.promise = result.catch(failed);

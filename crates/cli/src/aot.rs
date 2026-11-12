@@ -128,6 +128,35 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
             skipped.push(name);
             continue;
         }
+        // WARNING: the front end is built without Bun's built-in sources, which hold the helper of its own
+        // `using`. So `using` becomes try and finally blocks here, with the helper in using.js.
+        let mut lowered = String::new();
+        if source.contains("using ") {
+            let allocator = oxc_allocator::Allocator::default();
+            let mut program =
+                oxc_parser::Parser::new(&allocator, source, oxc_span::SourceType::cjs())
+                    .parse()
+                    .program;
+            let scoping = oxc_semantic::SemanticBuilder::new()
+                .build(&program)
+                .semantic
+                .into_scoping();
+            let mut options = oxc_transformer::TransformOptions::default();
+            options.env.es2026.explicit_resource_management = true;
+            options.helper_loader.mode = oxc_transformer::HelperLoaderMode::External;
+            oxc_transformer::Transformer::new(&allocator, Path::new(name), &options)
+                .build_with_scoping(scoping, &mut program);
+            lowered = oxc_codegen::Codegen::new()
+                .with_options(oxc_codegen::CodegenOptions {
+                    minify: true,
+                    ascii_only: true,
+                    ..Default::default()
+                })
+                .build(&program)
+                .code;
+        }
+        let using = lowered.contains("babelHelpers.usingCtx(");
+        let source = if using { lowered.as_str() } else { source };
         let allocator = oxc_allocator::Allocator::default();
         let parsed =
             oxc_parser::Parser::new(&allocator, source, oxc_span::SourceType::cjs()).parse();
@@ -207,6 +236,9 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
             .map_or(result, |statement| statement.span().start as usize);
         let mut text = String::with_capacity(end - at + edits.len() * 16 + 64);
         text.push_str("module.exports=function(globalThis){");
+        if using {
+            text.push_str(include_str!("using.js"));
+        }
         let mut returned = false;
         for (from, to, shorthand) in edits.into_iter().chain([(end, end, false)]) {
             if !returned && from >= result {

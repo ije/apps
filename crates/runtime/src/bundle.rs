@@ -345,9 +345,7 @@ pub fn from_stdin() -> Result<(Bundle, impl std::io::BufRead + Send + 'static)> 
 pub fn read(directory: &Path) -> Result<Bundle> {
     let directory = if directory.join("Contents/Resources").is_dir() {
         directory.join("Contents/Resources")
-    } else if !directory.join("app.bundle").try_exists()?
-        && !directory.join("app.js").try_exists()?
-    {
+    } else if !directory.join("app.bundle").try_exists()? {
         let mut resources = None;
         for entry in fs::read_dir(directory).context("Cannot read bundle directory")? {
             let path = entry?.path();
@@ -369,126 +367,102 @@ pub fn read(directory: &Path) -> Result<Bundle> {
         .canonicalize()
         .context("Cannot resolve bundle directory")?;
     let path = directory.join("app.bundle");
-    let mut bundle = if path.try_exists()? {
-        #[derive(Deserialize)]
-        struct Mapped<'a> {
-            #[serde(borrow)]
-            files: Vec<(String, &'a [u8])>,
-            #[serde(with = "map")]
-            pages: BBTreeMap<String, Document>,
-        }
-        let file = fs::File::open(&path).context("Cannot read app.bundle")?;
-        // Do not modify app.bundle while it runs: script chunks reference the mapped file.
-        let bytes = bytes::Bytes::from_owner(
-            unsafe { memmap2::Mmap::map(&file) }.context("Cannot read app.bundle")?,
-        );
-        ensure!(
-            bytes.starts_with(HEADER),
-            "Invalid or unsupported app.bundle format"
-        );
-        let (mapped, rest): (Mapped, _) =
-            postcard::take_from_bytes(&bytes[HEADER.len()..]).context("Invalid app.bundle data")?;
-        let mut bytecode = Vec::new();
-        if !rest.is_empty() {
-            let (index, rest): (Vec<(&str, usize)>, _) =
-                postcard::take_from_bytes(rest).context("Invalid app.bundle data")?;
-            ensure!(!index.is_empty(), "Trailing app.bundle data");
-            let mut at = bytes.len() - rest.len();
-            for (name, size) in index {
-                at = at.next_multiple_of(8);
-                let data = bytes.get(at..).and_then(|data| data.get(..size));
-                let data = data.context("Invalid app.bundle data")?;
-                ensure!(
-                    data.as_ptr().cast::<u64>().is_aligned(),
-                    "Invalid app.bundle data"
-                );
-                bytecode.push((name, at..at + size));
-                at += size;
-            }
-            ensure!(at == bytes.len(), "Trailing app.bundle data");
-        }
-        let mut bundle = Bundle {
-            pages: mapped.pages,
-            ..Bundle::default()
-        };
-        for (name, source) in mapped.files {
-            let duplicate = if name.starts_with("script-") || name.ends_with(".node") {
-                bundle
-                    .scripts
-                    .insert(name, bytes.slice_ref(source))
-                    .is_some()
-            } else {
-                let source =
-                    String::from_utf8(source.to_vec()).context("Invalid app.bundle data")?;
-                bundle.files.insert(name, source).is_some()
-            };
-            ensure!(!duplicate, "Duplicate bundle key");
-        }
-        // JSC reads bytecode and script chunks in place, so the mapping stays for the rest of the process.
-        let mapped = |data: &[u8]| unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
-        for (name, range) in bytecode {
-            let source = bundle.scripts.get(name).map(|source| mapped(source));
-            let source = source.and_then(|source| std::str::from_utf8(source).ok());
-            crate::jsc::add_bytecode(
-                Box::leak(name.into()),
-                source.unwrap_or(""),
-                mapped(&bytes[range]),
-            );
-            std::mem::forget(bytes.clone());
-        }
-        for (_, doc) in &mut bundle.pages {
-            ensure!(!doc.nodes.is_empty(), "Missing document root");
+    #[derive(Deserialize)]
+    struct Mapped<'a> {
+        #[serde(borrow)]
+        files: Vec<(String, &'a [u8])>,
+        #[serde(with = "map")]
+        pages: BBTreeMap<String, Document>,
+    }
+    let file = fs::File::open(&path).context("Cannot read app.bundle")?;
+    // Do not modify app.bundle while it runs: script chunks reference the mapped file.
+    let bytes = bytes::Bytes::from_owner(
+        unsafe { memmap2::Mmap::map(&file) }.context("Cannot read app.bundle")?,
+    );
+    ensure!(
+        bytes.starts_with(HEADER),
+        "Invalid or unsupported app.bundle format"
+    );
+    let (mapped, rest): (Mapped, _) =
+        postcard::take_from_bytes(&bytes[HEADER.len()..]).context("Invalid app.bundle data")?;
+    let mut bytecode = Vec::new();
+    if !rest.is_empty() {
+        let (index, rest): (Vec<(&str, usize)>, _) =
+            postcard::take_from_bytes(rest).context("Invalid app.bundle data")?;
+        ensure!(!index.is_empty(), "Trailing app.bundle data");
+        let mut at = bytes.len() - rest.len();
+        for (name, size) in index {
+            at = at.next_multiple_of(8);
+            let data = bytes.get(at..).and_then(|data| data.get(..size));
+            let data = data.context("Invalid app.bundle data")?;
             ensure!(
-                doc.nodes[0].tag == "#document" && doc.nodes[0].parent.is_none(),
-                "Invalid document root"
+                data.as_ptr().cast::<u64>().is_aligned(),
+                "Invalid app.bundle data"
             );
-            let mut seen = vec![false; doc.nodes.len()];
-            seen[0] = true;
-            for (id, node) in doc.nodes.iter().enumerate() {
-                for &child in &node.children {
-                    ensure!(
-                        child > id && child < doc.nodes.len(),
-                        "Invalid document child"
-                    );
-                    ensure!(
-                        !seen[child] && doc.nodes[child].parent == Some(id),
-                        "Invalid document parent"
-                    );
-                    seen[child] = true;
-                }
-            }
-            ensure!(
-                seen.into_iter().all(|value| value),
-                "Detached document node"
-            );
-            for node in &mut doc.nodes {
-                if let Some(sheet) = &mut node.stylesheet {
-                    std::rc::Rc::make_mut(sheet).bind_parents()?;
-                }
-            }
+            bytecode.push((name, at..at + size));
+            at += size;
         }
-        bundle
-    } else {
-        let mut bundle = Bundle::default();
-        for entry in fs::read_dir(&directory).context("Cannot read bundle directory")? {
-            let entry = entry?;
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| anyhow::anyhow!("Invalid bundle filename"))?;
-            if (name.ends_with(".html")
-                || name.starts_with("script-") && name.ends_with(".js")
-                || matches!(
-                    name.as_str(),
-                    "app.js" | "native.json" | "package.json" | "assets.json"
-                ))
-                && entry.file_type()?.is_file()
-            {
-                bundle.files.insert(name, fs::read_to_string(entry.path())?);
-            }
-        }
-        bundle
+        ensure!(at == bytes.len(), "Trailing app.bundle data");
+    }
+    let mut bundle = Bundle {
+        pages: mapped.pages,
+        ..Bundle::default()
     };
+    for (name, source) in mapped.files {
+        let duplicate = if name.starts_with("script-") || name.ends_with(".node") {
+            bundle
+                .scripts
+                .insert(name, bytes.slice_ref(source))
+                .is_some()
+        } else {
+            let source = String::from_utf8(source.to_vec()).context("Invalid app.bundle data")?;
+            bundle.files.insert(name, source).is_some()
+        };
+        ensure!(!duplicate, "Duplicate bundle key");
+    }
+    // JSC reads bytecode and script chunks in place, so the mapping stays for the rest of the process.
+    let mapped = |data: &[u8]| unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+    for (name, range) in bytecode {
+        let source = bundle.scripts.get(name).map(|source| mapped(source));
+        let source = source.and_then(|source| std::str::from_utf8(source).ok());
+        crate::jsc::add_bytecode(
+            Box::leak(name.into()),
+            source.unwrap_or(""),
+            mapped(&bytes[range]),
+        );
+        std::mem::forget(bytes.clone());
+    }
+    for (_, doc) in &mut bundle.pages {
+        ensure!(!doc.nodes.is_empty(), "Missing document root");
+        ensure!(
+            doc.nodes[0].tag == "#document" && doc.nodes[0].parent.is_none(),
+            "Invalid document root"
+        );
+        let mut seen = vec![false; doc.nodes.len()];
+        seen[0] = true;
+        for (id, node) in doc.nodes.iter().enumerate() {
+            for &child in &node.children {
+                ensure!(
+                    child > id && child < doc.nodes.len(),
+                    "Invalid document child"
+                );
+                ensure!(
+                    !seen[child] && doc.nodes[child].parent == Some(id),
+                    "Invalid document parent"
+                );
+                seen[child] = true;
+            }
+        }
+        ensure!(
+            seen.into_iter().all(|value| value),
+            "Detached document node"
+        );
+        for node in &mut doc.nodes {
+            if let Some(sheet) = &mut node.stylesheet {
+                std::rc::Rc::make_mut(sheet).bind_parents()?;
+            }
+        }
+    }
     if let Some(source) = bundle.files.get_mut("native.json") {
         let mut paths: std::collections::BTreeMap<String, std::path::PathBuf> =
             serde_json::from_str(source)?;
@@ -512,7 +486,7 @@ pub fn read(directory: &Path) -> Result<Bundle> {
         }
         *source = serde_json::to_string(&paths)?;
     }
-    bundle.packaged = path.is_file();
+    bundle.packaged = true;
     bundle.root = directory;
     check_entry(&bundle.files)?;
     Ok(bundle)
@@ -549,7 +523,7 @@ fn validate_asset_path(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn copy_assets(directory: &Path, source: &str) -> Result<String> {
+fn copy_assets(directory: &Path, source: &str) -> Result<String> {
     let paths: std::collections::BTreeMap<String, std::path::PathBuf> =
         serde_json::from_str(source)?;
     let mut output = std::collections::BTreeMap::new();
@@ -560,22 +534,6 @@ pub fn copy_assets(directory: &Path, source: &str) -> Result<String> {
         fs::copy(&source, &destination)
             .with_context(|| format!("Cannot copy asset {}", source.display()))?;
         output.insert(name.clone(), name);
-    }
-    Ok(serde_json::to_string(&output)?)
-}
-
-pub fn copy_native(directory: &Path, source: &str) -> Result<String> {
-    let paths: std::collections::BTreeMap<String, std::path::PathBuf> =
-        serde_json::from_str(source)?;
-    let mut output = std::collections::BTreeMap::new();
-    for (name, source) in paths {
-        let relative = format!("node_modules/{name}");
-        validate_native_path(&relative)?;
-        let destination = directory.join(&relative);
-        fs::create_dir_all(destination.parent().unwrap())?;
-        fs::copy(&source, &destination)
-            .with_context(|| format!("Cannot copy native addon {}", source.display()))?;
-        output.insert(name, relative);
     }
     Ok(serde_json::to_string(&output)?)
 }

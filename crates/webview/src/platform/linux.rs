@@ -182,7 +182,7 @@ impl Window {
         operation: &str,
         arguments: &Value,
         events: &Arc<Events>,
-    ) -> Result<Value> {
+    ) -> Result<()> {
         let webkit = view.webview();
         match operation {
             "loadHTML" => webkit.load_html(
@@ -240,14 +240,9 @@ impl Window {
                     },
                 );
             }
-            "state" => {
-                return Ok(
-                    json!({"url":webkit.uri().unwrap_or_default().as_str(),"title":webkit.title().unwrap_or_default().as_str(),"loading":webkit.is_loading(),"canGoBack":webkit.can_go_back(),"canGoForward":webkit.can_go_forward(),"zoomFactor":webkit.zoom_level(),"closed":self.closed.get()}),
-                );
-            }
             _ => bail!("Unknown browser operation: {operation}"),
         }
-        Ok(Value::Null)
+        Ok(())
     }
 }
 

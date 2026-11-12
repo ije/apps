@@ -93,7 +93,6 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   // Events, invoke handlers and replies of one peer keep their send order, as they do over one Electron IPC channel.
   const drain=()=>{for(const message of queue.splice(0)){try{if(typeof message==='function')message();else emit(message.channel,event(message.sender),...decode(message.args,message.sender));}catch(error){report(error);}}};
   const enqueue=task=>{queue.push(task);};
-  globalThis.__appsBridgeDrain=()=>{if(!queue.length)return false;drain();return true;};
   const settle=(message,request=pending.get(message.id))=>{if(!request||request.recipient!==peer(message.sender))return;pending.delete(message.id);try{if(message.error)request.reject(decode(message.error,message.sender));else request.resolve(decode(message.value,message.sender));}catch(error){request.reject(error);}};
   const invoke=message=>{
     const fail=(error,log=true)=>{if(log)console.error(`Error occurred in handler for '${message.channel}':`,error);return{thrown:encode(new Error(`Error invoking remote method '${message.channel}': ${error}`),message.sender)};};
@@ -162,6 +161,6 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     Object.defineProperty(globalThis,'document',{get:()=>facade(0),configurable:true});
   }
   const webUtils=Object.freeze({getPathForFile(file){if(!(file instanceof File))throw new TypeError('Expected a File');const index=files.get(file);return index===undefined?'':call('bridge.file',index);}});
-  const poll=()=>{if(queue.length)drain();};poll.pending=()=>pending.size>0||queue.length>0;poll.queued=()=>queue.length>0;
+  const poll=globalThis.__appsBridgeDrain=()=>{if(queue.length)drain();};poll.pending=()=>pending.size>0||queue.length>0;poll.queued=()=>queue.length>0;
   return{contextBridge,ipcMain,ipcRenderer,webUtils,rpc,send:(id,channel,...args)=>send({preload:id},{kind:'event',channel,args:encode(args,{preload:id})}),poll};
 };

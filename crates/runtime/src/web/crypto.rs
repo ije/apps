@@ -193,13 +193,14 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
             if op == "encrypt" {
                 key.seal_in_place_append_tag(nonce, aad, &mut data)
                     .map_err(|_| anyhow::anyhow!("Encryption failed"))?;
-                Ok(base64(&data))
             } else {
-                let value = key
+                let size = key
                     .open_in_place(nonce, aad, &mut data)
-                    .map_err(|_| anyhow::anyhow!("Authentication failed"))?;
-                Ok(base64(value))
+                    .map_err(|_| anyhow::anyhow!("Authentication failed"))?
+                    .len();
+                data.truncate(size);
             }
+            Ok(crate::jsc::payload::write(data))
         }
         "pbkdf2" | "hkdf" => crate::node::system::call(op, args),
         _ => bail!("Unsupported crypto operation: {op}"),

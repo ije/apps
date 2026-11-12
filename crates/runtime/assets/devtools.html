@@ -51,7 +51,7 @@ body { -webkit-user-select: none; }
 <script>
 (() => {
   'use strict';
-  const $ = (selector, root = document) => root.querySelector(selector);
+  const $ = selector => document.querySelector(selector);
   const h = (tag, props, ...kids) => {
     const el = document.createElement(tag);
     for (const [key, value] of Object.entries(props ?? {})) {
@@ -66,13 +66,10 @@ body { -webkit-user-select: none; }
     return el;
   };
   const pending = new Map();
-  let next = 0, mode = '', selected = null, picking = false;
+  let next = 0, selected = null, picking = false;
   const request = (method, params = {}) => new Promise((resolve, reject) => { const id = ++next; pending.set(id, { resolve, reject }); window.apps.postMessage({ id, method, params }); });
-  const quiet = promise => promise.catch(() => null);
-  // A small arrow that turns when its row opens.
   const caret = (shown, open, more = '') => h('i', { class: 'caret grid size-3 flex-none place-items-center text-dim transition-transform' + more + (shown ? '' : ' invisible') + (open ? ' rotate-90' : ''), innerHTML: '<svg viewBox="0 0 12 12" class="size-3"><path d="M4.5 2.5l4 3.5-4 3.5z" fill="currentColor"/></svg>' });
 
-  // Console
   const messages = [], history = [];
   let historyAt = 0, drawing = false;
   const marks = {
@@ -126,7 +123,7 @@ body { -webkit-user-select: none; }
     if (!drawing) { drawing = true; requestAnimationFrame(drawConsole); }
   };
   const expression = $('#expression');
-  $('#clear').onclick = () => { messages.length = 0; drawConsole(); quiet(request('Console.clear')); };
+  $('#clear').onclick = () => { messages.length = 0; drawConsole(); request('Console.clear').catch(() => {}); };
   $('#filter').oninput = drawConsole;
   $('#prompt').onsubmit = async event => {
     event.preventDefault();
@@ -150,7 +147,6 @@ body { -webkit-user-select: none; }
     else if (event.key === 'ArrowDown' && single) { event.preventDefault(); expression.value = history[historyAt = Math.min(history.length, historyAt + 1)] ?? ''; }
   };
 
-  // Layers
   const tree = { root: [], kids: new Map(), open: new Set(), stamp: '' };
   const glyphs = { img: '▣', svg: '◇', button: '▭', input: '▭', a: '↗', p: 'T', span: 'T', h1: 'T', h2: 'T', h3: 'T', h4: 'T', h5: 'T', h6: 'T', label: 'T' };
   const layers = $('#layers');
@@ -233,7 +229,6 @@ body { -webkit-user-select: none; }
     }
   };
 
-  // Panel
   const tabs = [...document.querySelectorAll('[data-tab]')];
   const show = name => {
     for (const tab of tabs) {
@@ -261,9 +256,8 @@ body { -webkit-user-select: none; }
   });
   const events = {
     // `docked` is a panel at the side of the page with tabs, `window` shows the layers beside the console, and `main` is the console of the main process.
-    init(message) {
-      mode = message.mode;
-      document.body.style.paddingTop = message.titlebar + 'px';
+    init({ mode, titlebar }) {
+      document.body.style.paddingTop = titlebar + 'px';
       drawPick();
       show('layers');
       if (mode === 'docked') { $('#grip').hidden = false; document.body.classList.add('border-r', 'border-line'); }
@@ -287,7 +281,7 @@ body { -webkit-user-select: none; }
       return startTree();
     },
   };
-  window.appsDevTools = { request, receive(message) {
+  window.appsDevTools = { receive(message) {
     if (!message.id) return void Promise.resolve(events[message.type]?.(message)).catch(error => log('error', error.message));
     const item = pending.get(message.id);
     pending.delete(message.id);

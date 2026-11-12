@@ -179,7 +179,7 @@
     promise.then(() => { modulesPending--; }, error => { modulesPending--; moduleErrors.push(error); });
   };
   let children, servers, node, pty, browsers, net, nativeShell, uncaught = () => false;
-  const workers = globalThis.__appsWorkers(call, !(typeof role === "object" && "renderer" in role), task);
+  const workers = globalThis.__appsWorkers(call, nodeRole, task);
   delete globalThis.__appsWorkers;
   globalThis.__appsBrowserEnvironment(call, task);
   delete globalThis.__appsBrowserEnvironment;

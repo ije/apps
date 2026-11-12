@@ -8,11 +8,22 @@ use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 const AGENT: &str = include_str!("../../assets/devtools-agent.js");
+const POLL: Duration = Duration::from_millis(250);
+
+// The open tools of pages. Main sends its logs to the pages only while some are open.
+static PAGE_TOOLS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn pages_open() -> bool {
+    PAGE_TOOLS.load(Ordering::Relaxed) > 0
+}
 
 // The page of the panel. Its style is Tailwind, compiled for the classes that the page has.
 fn page() -> &'static str {
@@ -61,6 +72,9 @@ impl DevTools {
             }
         };
         browser.load_html(page(), "about:blank")?;
+        if role != Role::Main {
+            PAGE_TOOLS.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(Self {
             browser,
             mode,
@@ -137,7 +151,6 @@ impl DevTools {
         Ok(())
     }
 
-    // Runs a command of the panel and sends the answer back to it.
     pub(crate) fn answer(
         &self,
         command: &Value,
@@ -194,21 +207,31 @@ impl DevTools {
         self.events(&[json!({"type":"inspect","pick":inspect.pick,"selected":inspect.selected})])
     }
 
-    // Tells the panel when the document changed or a new page loaded. At most four times a second.
-    pub(crate) fn poll(&self, engine: &JsContext) -> Result<()> {
-        if self.polled.get().elapsed() < Duration::from_millis(250) {
-            return Ok(());
+    // Tells the panel when the document changed or a new page loaded, at most four times a second. Returns the
+    // milliseconds until the next check.
+    pub(crate) fn poll(&self, engine: &JsContext) -> Result<i64> {
+        let wait = POLL.saturating_sub(self.polled.get().elapsed());
+        if !wait.is_zero() {
+            return Ok(wait.as_micros().div_ceil(1000) as i64);
         }
         self.polled.set(Instant::now());
         let state = agent(engine, "poll", &Value::Null)?.as_u64();
         // A new panel reads the page by itself.
-        if self.fresh.replace(false) {
-            return Ok(());
+        if !self.fresh.replace(false) {
+            match state {
+                Some(2) => self.events(&[json!({"type":"reset"})])?,
+                Some(1) => self.events(&[json!({"type":"dom"})])?,
+                _ => {}
+            }
         }
-        match state {
-            Some(2) => self.events(&[json!({"type":"reset"})]),
-            Some(1) => self.events(&[json!({"type":"dom"})]),
-            _ => Ok(()),
+        Ok(POLL.as_millis() as i64)
+    }
+}
+
+impl Drop for DevTools {
+    fn drop(&mut self) {
+        if self.context != "main" {
+            PAGE_TOOLS.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -234,7 +257,7 @@ pub(crate) fn release(engine: &JsContext) -> Result<()> {
     engine.eval_page(script, "apps:devtools").map(drop)
 }
 
-pub fn dispatch(command: &Value, engine: &JsContext, host: &Rc<RefCell<Host>>) -> Result<Value> {
+fn dispatch(command: &Value, engine: &JsContext, host: &Rc<RefCell<Host>>) -> Result<Value> {
     ensure!(
         !host.borrow().packaged,
         "Developer tools are unavailable in packaged apps"
@@ -277,8 +300,7 @@ mod tests {
         let engine =
             JsContext::new(JavaScriptCore::load().unwrap(), host.clone(), Role::Main).unwrap();
         engine.eval("globalThis.answer = 42", "app.js").unwrap();
-        assert!(engine.sources().is_empty());
-        assert!(dispatch(&json!({"method":"Theme.get"}), &engine, &host).is_err());
+        assert!(dispatch(&json!({"method":"Console.clear"}), &engine, &host).is_err());
         assert!(
             dispatch(
                 &json!({"method":"Runtime.evaluate","params":{"expression":"answer = 0"}}),

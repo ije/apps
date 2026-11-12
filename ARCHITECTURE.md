@@ -47,6 +47,8 @@ Development bundles use module factories, namespace objects, and export getters.
 
 Modules with cycles, CommonJS, top-level await, or other incompatible constructs retain the general module loader. [modules.js](crates/runtime/js/modules.js) executes the bundle and loads script chunks.
 
+`import defer` and `import.defer()` give a proxy of the module namespace. The module runs when code first reads one of its exports. A module with top-level await can't run inside a read, so such modules of a deferred graph run before the module that defers them.
+
 ### App bundle
 
 [bundle.rs](crates/runtime/src/bundle.rs) defines `app.bundle`. It starts with an eight-byte header: `APP\0` and a format version. Postcard data follows the header:
@@ -73,7 +75,7 @@ AOT currently requires a native macOS arm64 build and a JavaScript or TypeScript
 
 The [AOT path](crates/cli/src/aot.rs) uses Bun's Rust frontend and the JavaScriptCore compiler library. The CLI checks that both come from the same Bun revision. Build identifiers and a hash of runtime scripts connect the compiled image to the correct runtime.
 
-The AOT JavaScriptCore has no JIT, so code outside the image runs in the interpreter: classic page scripts, `eval()` in main code, `executeJavaScript()`, and Wasm that is not an asset or an `atob()` literal. The build prints the scripts that it does not compile. Bun's frontend assumes that `process`, `Bun` and the CommonJS names like `require` always exist. Apps have no global `Bun`, and a page has none of these names. So compiled code reads these names from the global object of its realm, and a name that is missing reads as `undefined`.
+The AOT JavaScriptCore has no JIT, so code outside the image runs in the interpreter: classic page scripts, `eval()` in main code, `executeJavaScript()`, and Wasm that is not an asset or an `atob()` literal. The build prints the scripts that it does not compile. The front end has no built-in sources of Bun, and these hold the helper for its `using` declarations. So the CLI turns `using` into `try` and `finally` blocks before it compiles. Bun's frontend assumes that `process`, `Bun` and the CommonJS names like `require` always exist. Apps have no global `Bun`, and a page has none of these names. So compiled code reads these names from the global object of its realm, and a name that is missing reads as `undefined`.
 
 ## Threads and ownership
 
@@ -189,7 +191,7 @@ The runtime reuses data across frames and releases temporary resources after act
 - Detached DOM nodes remain alive while JavaScript wrappers retain them. The runtime releases unreferenced nodes during event loop cleanup.
 - Each VM schedules heap cleanup after quiet periods because JavaScriptCore's generic event loop does not drive its GC timers. Cleanup also discards compiled code.
 - macOS startup sets `MallocSpaceEfficient=1`. A global allocator caches small blocks per thread and returns them during idle cleanup.
-- After one second without frames, or when hidden, a macOS window releases spare GPU resources. Its last frame remains visible.
+- After about one second without frames, a window releases spare GPU resources. Its last frame remains visible.
 
 The allocator belongs to `apps-runtime`, so a Rust app cannot define another global allocator. Memory policy lives in [malloc.rs](crates/runtime/src/malloc.rs), [jsc/mod.rs](crates/runtime/src/jsc/mod.rs), and the platform renderer.
 

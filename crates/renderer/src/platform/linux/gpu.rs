@@ -365,10 +365,10 @@ impl Gpu {
     }
 }
 
-fn slots<T: Plain>(items: &[T], stride: usize, out: &mut Vec<u8>) {
+fn slots<T: Plain>(items: impl IntoIterator<Item = T>, stride: usize, out: &mut Vec<u8>) {
     for item in items {
         let start = out.len();
-        out.extend_from_slice(bytes(std::slice::from_ref(item)));
+        out.extend_from_slice(bytes(std::slice::from_ref(&item)));
         out.resize(start + stride, 0);
     }
 }
@@ -636,14 +636,12 @@ impl Renderer {
         let strides = sizes.map(|size| size.next_multiple_of(align));
         let targets =
             std::iter::once(Target::Frame).chain((0..frame.layers.len()).map(Target::Layer));
-        let globals: Vec<Globals> = targets
-            .map(|target| frame.globals(target, TEXT_CONTRAST))
-            .collect();
         let staging = &mut self.staging;
         staging.clear();
-        slots(&globals, strides[0], staging);
-        slots(&frame.composites, strides[1], staging);
-        slots(&frame.blurs, strides[2], staging);
+        let globals = targets.map(|target| frame.globals(target, TEXT_CONTRAST));
+        slots(globals, strides[0], staging);
+        slots(frame.composites.iter().copied(), strides[1], staging);
+        slots(frame.blurs.iter().copied(), strides[2], staging);
         // Every binding reads a whole block, also at offset 0.
         staging.resize(staging.len().max(strides[1]), 0);
         let length = staging.len() as u64;

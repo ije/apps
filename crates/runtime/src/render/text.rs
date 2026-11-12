@@ -279,8 +279,11 @@ fn row_extents<'a>(
         for glyph in &layout.glyphs {
             let row = first + ends.partition_point(|&end| end <= glyph.index as usize);
             let at = offset + glyph.index as usize;
-            if let Some((_, [_, height, baseline], align)) =
-                atoms.iter().find(|(place, ..)| *place == at)
+            // Atoms are in text order.
+            if let Some((_, [_, height, baseline], align)) = atoms
+                .binary_search_by_key(&at, |(place, ..)| *place)
+                .ok()
+                .map(|atom| &atoms[atom])
             {
                 if let Some(align @ (AlignItems::FlexStart | AlignItems::FlexEnd)) = align {
                     edges.push((row, height * scale, *align == AlignItems::FlexEnd));
@@ -500,10 +503,10 @@ fn first_line(
     font_size: Pixels,
     text_system: &renderer::TextSystem,
 ) -> (SharedString, Vec<renderer::TextRun>) {
-    let mut text = data.text.to_string();
     let Some((base, pseudo, mode)) = data.first_line.as_deref() else {
-        return (text.into(), data.runs.to_vec());
+        return (data.text.clone(), data.runs.to_vec());
     };
+    let mut text = data.text.to_string();
     let len = text.find('\n').unwrap_or(text.len());
     let mut first = text[..len].to_owned();
     if let Some(mode) = mode {
@@ -835,6 +838,7 @@ impl renderer::Hooks for InlineText {
         };
         let mut rows = Vec::new();
         let indent = style.text_indent;
+        let strut = window.text_system().face(&style.font());
         let extents = row_extents(
             layout.lines().iter(),
             runs,
@@ -846,11 +850,7 @@ impl renderer::Hooks for InlineText {
                 .zip(self.atoms.iter())
                 .map(|(atom, slot)| (atom.at, slot.size, slot.align))
                 .collect::<Vec<_>>(),
-            (
-                window.text_system().face(&style.font()),
-                style.font_size,
-                layout.line_height(),
-            ),
+            (strut, style.font_size, layout.line_height()),
             window.text_system(),
             window.scale_factor(),
         );
@@ -933,7 +933,6 @@ impl renderer::Hooks for InlineText {
         }
         let rows: crate::dom::Rows = rows.into();
         for (atom, slot) in self.data.atoms.iter().zip(self.atoms.iter()) {
-            let strut = window.text_system().face(&style.font());
             let base = window.text_system().baseline(
                 strut,
                 style.font_size,

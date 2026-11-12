@@ -1,4 +1,8 @@
-use super::{Desktop, link::Link, png, window_state};
+use super::{
+    Desktop,
+    link::{Link, state_json},
+    png,
+};
 use crate::{host::Role, jsc};
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use renderer::{App, Button, Event, Key, Modifiers, WheelPhase, WindowId, point, px};
@@ -273,9 +277,11 @@ fn windows(desktop: &Desktop, cx: &mut App) -> Result<Value> {
     let mut list = Vec::new();
     for id in ids {
         let view = &desktop.views[&id];
-        let state = view
-            .handle
-            .and_then(|handle| cx.update_window(handle, |window, _| window_state(window)));
+        let state = view.handle.and_then(|handle| {
+            cx.update_window(handle, |window, _| {
+                state_json(&window.window_state(), window.is_active())
+            })
+        });
         list.push(json!({
             "id": id,
             "title": view.title,

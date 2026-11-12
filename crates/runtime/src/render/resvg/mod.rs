@@ -4,12 +4,7 @@
 // A copy of resvg 0.46.0, adapted to usvg 0.49.0, whose raster images decode through
 // `render::image`, so it must stay in step with the usvg version.
 
-#![allow(clippy::field_reassign_with_default)]
-#![allow(clippy::identity_op)]
 #![allow(clippy::too_many_arguments)]
-#![allow(clippy::uninlined_format_args)]
-#![allow(clippy::upper_case_acronyms)]
-#![allow(clippy::wrong_self_convention)]
 
 mod clip;
 mod filter;

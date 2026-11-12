@@ -1,6 +1,6 @@
 pub mod app;
-pub mod browser;
-pub mod devtools;
+pub(crate) mod browser;
+pub(crate) mod devtools;
 pub(crate) mod link;
 pub(crate) mod mcp;
 pub(crate) mod native;
@@ -13,7 +13,7 @@ use crate::{
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use bbtree::unsync::BBTreeMap;
-use link::{Link, Main, PageQueue, ToMain, ToPage, state_json};
+use link::{Link, Main, PageQueue, ToMain, ToPage};
 use renderer::{App, Rect, WindowChange, WindowId, WindowOptions, point, px, size};
 use std::{
     borrow::Cow,
@@ -1192,18 +1192,22 @@ impl Desktop {
             }
             let changed = std::mem::take(&mut app.host.borrow_mut().window_changes);
             for id in changed {
-                let Some(state) = app
+                let Some((focused, fullscreen)) = app
                     .views
                     .get(&id)
                     .and_then(|view| view.handle)
-                    .and_then(|handle| cx.update_window(handle, |window, _| window_state(window)))
+                    .and_then(|handle| {
+                        cx.update_window(handle, |window, _| {
+                            (window.is_active(), window.window_state().fullscreen)
+                        })
+                    })
                 else {
                     continue;
                 };
                 let Some(view) = app.views.get_mut(&id) else {
                     continue;
                 };
-                let focused = state["focused"] == true || mcp::enabled();
+                let focused = focused || mcp::enabled();
                 if view.focused != focused
                     && let Some(renderer) = &view.renderer
                 {
@@ -1220,7 +1224,7 @@ impl Desktop {
                     }
                 }
                 match &mut view.fullscreen {
-                    Some([_, seen]) if state["fullscreen"] == true => *seen = true,
+                    Some([_, seen]) if fullscreen => *seen = true,
                     Some([_, true]) => {
                         view.fullscreen = None;
                         if let Some(renderer) = &view.renderer
@@ -1290,7 +1294,7 @@ impl Desktop {
                     for command in &commands {
                         tools.answer(command, engine, &app.host, data.as_deref())?;
                     }
-                    tools.poll(engine)?;
+                    delay = delay.min(tools.poll(engine)?);
                     if tools.is_closed() {
                         devtools::release(engine)?;
                     }
@@ -1313,9 +1317,6 @@ impl Desktop {
                     tools.events(&main_logs)?;
                 }
                 mcp::logs(&logs);
-                if !app.devtools.is_empty() {
-                    delay = delay.min(16);
-                }
             }
             if mcp && mcp::poll(&app, cx) {
                 delay = delay.min(0);
@@ -1973,10 +1974,6 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
         _ => {}
     }
     Ok(())
-}
-
-fn window_state(window: &renderer::Window) -> serde_json::Value {
-    state_json(&window.window_state(), window.is_active())
 }
 
 fn png(

@@ -131,7 +131,7 @@ impl Platform {
     }
 
     pub fn run(&self, on_launch: Box<dyn FnOnce()>) {
-        threads::start_main();
+        threads::main_source();
         let mtm = MainThreadMarker::new().expect("the app must start on the main thread");
         let delegate = Delegate::alloc(mtm).set_ivars(RefCell::new(Some(on_launch)));
         // SAFETY: a plain NSObject init.

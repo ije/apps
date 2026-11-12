@@ -70,11 +70,12 @@ globalThis.__appsWeb = (call, codec) => {
       const state = eventStates.get(event);
       if (state.dispatching) throw new DOMException('Event is already in dispatch', 'InvalidStateError');
       Object.assign(state, { target: this, currentTarget: this, eventPhase: 2, dispatching: true });
-      const target = eventTargets.get(this), list = [...(target.get(event.type) ?? [])];
+      // Removal replaces the list and adding appends to it, so the first `length` items are the snapshot.
+      const target = eventTargets.get(this), list = target.get(event.type) ?? [];
       try {
-        for (const item of list) {
-          if (state.immediate) break;
-          if (!(target.get(event.type) ?? []).includes(item)) continue;
+        for (let i = 0, length = list.length; i < length && !state.immediate; i++) {
+          const item = list[i], current = target.get(event.type) ?? [];
+          if (current !== list && !current.includes(item)) continue;
           if (item.once) this.removeEventListener(event.type, item.callback, item.capture);
           state.passive = item.passive;
           try { if (typeof item.callback === 'function') item.callback.call(this, event); else item.callback.handleEvent(event); }

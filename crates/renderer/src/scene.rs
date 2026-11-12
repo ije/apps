@@ -147,9 +147,13 @@ impl Scene {
         };
         let clip = effect.content_mask;
         // A keyed transform can move anywhere within its clip without a repaint.
+        // `keyed` is sorted by layer, since layers are pushed in order.
         let moves = self.active.is_empty()
             && effect.transform.is_some()
-            && self.keyed.iter().any(|(_, layer)| *layer == index);
+            && self
+                .keyed
+                .binary_search_by_key(&index, |&(_, layer)| layer)
+                .is_ok();
         let reach = if moves { clip.bounds } else { bounds }.intersect(clip.bounds);
         if reach.is_empty() {
             return;
@@ -409,6 +413,11 @@ impl RenderImage {
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
+    /// Takes the pixels for the next image. The empty image keeps its id, so its tile can still be released.
+    pub fn take_bytes(&mut self) -> Vec<u8> {
+        (self.width, self.height) = (0, 0);
+        std::mem::take(&mut self.bytes)
+    }
 }
 
 impl std::fmt::Debug for RenderImage {
@@ -417,7 +426,6 @@ impl std::fmt::Debug for RenderImage {
     }
 }
 
-// Images are the same when they have the same id.
 impl PartialEq for RenderImage {
     fn eq(&self, image: &RenderImage) -> bool {
         image.id == self.id

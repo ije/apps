@@ -38,8 +38,7 @@ pub(crate) struct PageState {
     pub(crate) host: Rc<RefCell<Host>>,
     pub(crate) images: RefCell<HashMap<usize, Arc<renderer::RenderImage>>>,
     pub(crate) browsers: RefCell<HashMap<usize, (crate::desktop::browser::Browser, String)>>,
-    #[allow(clippy::type_complexity)]
-    pub(crate) frames: RefCell<HashMap<usize, ([f64; 4], u64, bool)>>,
+    pub(crate) frames: RefCell<HashMap<usize, Frame>>,
     pub(crate) controls: RefCell<native::Controls>,
     ids: RefCell<(u64, Rc<effects::Ids>)>,
     svgs: RefCell<HashMap<usize, element::Svg>>,
@@ -83,6 +82,7 @@ pub(crate) struct PageState {
 }
 
 type Clips = Vec<(usize, [bool; 2])>;
+type Frame = ([f64; 4], u64, bool);
 type Mismatches = rustc_hash::FxHashSet<(usize, [u32; 4])>;
 type CompositedTransform = (renderer::Rect<renderer::Pixels>, Option<(f32, [f32; 2])>);
 
@@ -971,31 +971,33 @@ impl PageView {
             }
         }
         drop((browsers, frames));
-        let root = doc.nodes[0]
+        let html = doc.nodes[0]
             .children
             .iter()
             .copied()
             .find(|&id| doc.nodes[id].tag == "html");
+        let body = html.and_then(|html| {
+            doc.nodes[html]
+                .children
+                .iter()
+                .copied()
+                .find(|&id| doc.nodes[id].tag == "body")
+        });
         let canvas = |id: usize| {
             styles.values[id]
                 .get(Prop::BACKGROUND_COLOR)
                 .and_then(style::color)
                 .filter(|color| color.1 > 0)
         };
-        let dark = root
+        let dark = html
             .and_then(|id| styles.values[id].get(Prop::COLOR_SCHEME))
             .is_some_and(|scheme| {
                 scheme.contains("dark")
                     && (!scheme.contains("light") || crate::desktop::native::theme_state() & 1 != 0)
             });
-        let background = root
+        let background = html
             .and_then(canvas)
-            .or_else(|| {
-                doc.nodes
-                    .iter()
-                    .position(|n| n.tag == "body")
-                    .and_then(canvas)
-            })
+            .or_else(|| body.and_then(canvas))
             .or_else(|| match state.backgrounds.get(&self.id).copied() {
                 Some(color) if color.1 == 0 => Some(color),
                 _ if dark => Some((0x121212, 255)),
@@ -1578,18 +1580,6 @@ impl PageView {
             }
         }
         let page_scroll = dom.scroll.entry(0).or_default().clone();
-        let html = doc.nodes[0]
-            .children
-            .iter()
-            .copied()
-            .find(|&id| doc.nodes[id].tag == "html");
-        let body = html.and_then(|html| {
-            doc.nodes[html]
-                .children
-                .iter()
-                .copied()
-                .find(|&id| doc.nodes[id].tag == "body")
-        });
         let source = html
             .filter(|&id| {
                 [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]

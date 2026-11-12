@@ -1,16 +1,5 @@
 use super::components;
 
-fn expand_border(key: &str, value: &str, out: &mut Vec<(String, String)>) -> bool {
-    let mut parts = Vec::new();
-    expand("border-top", value, &mut parts);
-    out.extend(
-        parts
-            .into_iter()
-            .map(|(name, value)| (name.replacen("border-top", key, 1), value)),
-    );
-    true
-}
-
 pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) -> bool {
     let alias = match key {
         "inline-size" => "width",
@@ -47,7 +36,14 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
     {
         if key.contains("-inline-") && !property.starts_with("scroll") {
             if property == "border" && rest.is_empty() {
-                return expand_border(key, value, out);
+                let mut parts = Vec::new();
+                expand("border-top", value, &mut parts);
+                out.extend(
+                    parts
+                        .into_iter()
+                        .map(|(name, value)| (name.replacen("border-top", key, 1), value)),
+                );
+                return true;
             }
             out.push((key.into(), value.into()));
             return true;

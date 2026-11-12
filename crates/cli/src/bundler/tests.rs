@@ -295,10 +295,9 @@ fn development_maps_runtime_locations_to_original_sources() {
     let source = "import mapped from 'mapped';\ninterface Value { count: number }\nfunction esmProbe(value: Value) {\n  const text: string = '😀'; throw new Error(text);\n}\nglobalThis.esmProbe = esmProbe;\nglobalThis.cjsProbe = mapped.probe;\n";
     fs::write(&entry, source).unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
-    let host = Rc::default();
     let engine = apps_runtime::jsc::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
-        Rc::clone(&host),
+        Rc::default(),
         apps_runtime::host::Role::Main,
     )
     .unwrap();
@@ -353,20 +352,6 @@ fn development_maps_runtime_locations_to_original_sources() {
             "{frame}"
         );
     }
-    let sources = apps_runtime::desktop::devtools::dispatch(
-        &json!({"method":"Sources.list"}),
-        &engine,
-        &host,
-        0,
-    )
-    .unwrap();
-    assert!(
-        sources
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["source"] == source)
-    );
 }
 
 #[test]
@@ -1783,13 +1768,7 @@ fn resolved_html_survives_relocation() {
         );
         assert!(files["page-0.html"].contains("#123456"));
         let output = tempfile::tempdir().unwrap();
-        if production {
-            apps_runtime::bundle::write(&output.path().join("app.bundle"), &files, &[]).unwrap();
-        } else {
-            for (name, source) in &files {
-                fs::write(output.path().join(name), source).unwrap();
-            }
-        }
+        apps_runtime::bundle::write(&output.path().join("app.bundle"), &files, &[]).unwrap();
         dir.close().unwrap();
         let bundle = apps_runtime::bundle::read(output.path()).unwrap();
         let engine = apps_runtime::jsc::JsContext::new(
@@ -2434,6 +2413,47 @@ fn top_level_await_reports_rejections() {
         }
     }
 }
+
+#[test]
+fn text_imports_deferred_modules_and_top_level_await_using() {
+    for production in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("note.txt"), "plain `text`\n").unwrap();
+        fs::write(
+            dir.path().join("slow.js"),
+            "await Promise.resolve(); (globalThis.order ??= []).push('slow');",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("lazy.js"),
+            "import './slow.js'; globalThis.order.push('lazy'); export const value = 42;",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("later.js"),
+            "globalThis.order.push('later'); export const value = 7;",
+        )
+        .unwrap();
+        let entry = dir.path().join("app.ts");
+        fs::write(&entry, r#"import note from './note.txt' with { type: 'text' };
+import defer * as lazy from './lazy.js';
+const order: string[] = globalThis.order;
+{ await using resource = { async [Symbol.asyncDispose]() { order.push('disposed'); } }; }
+const dynamic = await import('./note.txt', { with: { type: 'text' } });
+const later = await import.defer('./later.js');
+const before = order.join();
+const result = [note === 'plain `text`\n', dynamic.default === note, before, lazy.value, later.value, order.join(), Object.keys(lazy).join()].join(':');
+if (result !== 'true:true:slow,disposed:42:7:slow,disposed,lazy,later:value') throw Error(result);"#).unwrap();
+        let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+        assert_eq!(
+            apps_runtime::desktop::Desktop::new(&files)
+                .unwrap()
+                .check()
+                .unwrap(),
+            0
+        );
+    }
+}
 #[cfg(unix)]
 #[test]
 fn native_addons_copy_package_paths_and_survive_relocation() {
@@ -2504,7 +2524,6 @@ fn native_addons_copy_package_paths_and_survive_relocation() {
             &files,
             &entry,
             &input,
-            production,
             crate::build_target::BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH)
                 .unwrap(),
             None,
@@ -2530,13 +2549,8 @@ fn native_addons_copy_package_paths_and_survive_relocation() {
             "local_app/local/build/own.node",
         ] {
             let path = assets.join("node_modules").join(name);
-            if production {
-                assert!(!path.exists(), "Copied packed addon: {name}");
-                assert!(bundle.scripts.contains_key(&format!("node_modules/{name}")));
-            } else {
-                assert!(path.is_file(), "Missing copied addon: {name}");
-                assert_eq!(native[name], path.canonicalize().unwrap());
-            }
+            assert!(!path.exists(), "Copied packed addon: {name}");
+            assert!(bundle.scripts.contains_key(&format!("node_modules/{name}")));
         }
         assert_eq!(
             apps_runtime::desktop::Desktop::from_bundle(bundle)

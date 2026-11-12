@@ -9,7 +9,7 @@ description: Debug a running @pierre/apps app over local HTTP with curl. Screens
 
 ## Start the app
 
-Start the app as a background command. Port `0` picks a free port, so each session has its own app and port:
+Start the app in the background. Port `0` picks a free port:
 
 ```sh
 apps run --enable-devtools-mcp --devtools-mcp-port 0
@@ -31,7 +31,7 @@ curl -s $D/evaluate -d '{"expression":"document.title","window":1}'
 curl -s $D/screenshot -d '{"window":1}' -o /tmp/shot.png    # then read the PNG
 ```
 
-Omit `window` to use the main process. Window ids come from `windows`. Lines and columns are 1-based and refer to your source files. Like Playwright, pages count as focused while this server runs, so hidden windows get focus events and `:focus` styles, and pages get no `focus` or `blur` on `window`.
+Window ids come from `windows`. Without `window`, `evaluate` and `debugger` use the main process, and the other tools use the first window. Lines and columns are 1-based and refer to your source files. Like Playwright, pages count as focused while this server runs, so hidden windows get focus events and `:focus` styles, and pages get no `focus` or `blur` on `window`.
 
 | Tool | Use |
 |---|---|

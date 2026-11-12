@@ -15,7 +15,7 @@ fn main() {
         if home.ends_with("Contents/MacOS") {
             home = home.parent().unwrap().join("Resources");
         }
-        let packaged = home.join("app.bundle").is_file() || home.join("app.js").is_file();
+        let packaged = home.join("app.bundle").is_file();
         if std::env::var_os("ELECTRON_RUN_AS_NODE")
             .is_some_and(|value| !value.is_empty() && value != "0")
         {
@@ -68,9 +68,7 @@ fn main() {
             (bundle, Some(input))
         } else {
             let directory = directory.unwrap_or(home);
-            let mut bundle = apps_runtime::bundle::read(&directory)?;
-            bundle.packaged |= packaged;
-            (bundle, None)
+            (apps_runtime::bundle::read(&directory)?, None)
         };
         let app = apps_runtime::desktop::Desktop::from_bundle(bundle)?;
         if let Some(input) = input {

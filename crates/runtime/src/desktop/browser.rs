@@ -90,10 +90,13 @@ impl State {
                         browser.set_bounds(serde_json::from_value(arguments[1].clone())?)?;
                         Ok(Value::Null)
                     }
-                    "command" => browser.command(
-                        arguments[1].as_str().context("Expected browser command")?,
-                        &arguments[2],
-                    ),
+                    "command" => {
+                        browser.command(
+                            arguments[1].as_str().context("Expected browser command")?,
+                            &arguments[2],
+                        )?;
+                        Ok(Value::Null)
+                    }
                     _ => bail!("Unknown browser operation: {operation}"),
                 }
             }

@@ -2247,11 +2247,20 @@ impl Document {
 }
 
 pub fn escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    let mut escaped = String::with_capacity(value.len());
+    let mut last = 0;
+    for (at, found) in value.match_indices(['&', '<', '>', '"']) {
+        escaped.push_str(&value[last..at]);
+        escaped.push_str(match found {
+            "&" => "&amp;",
+            "<" => "&lt;",
+            ">" => "&gt;",
+            _ => "&quot;",
+        });
+        last = at + 1;
+    }
+    escaped.push_str(&value[last..]);
+    escaped
 }
 
 pub fn decode(value: &str, attribute: bool) -> String {

@@ -144,7 +144,6 @@ pub(crate) fn translate(native: &NSEvent, left: Pixels, height: Pixels) -> Optio
 
 // Names keys by the character they type without modifiers, so shortcuts work across layouts. Shift stays held
 // only on letters: `cmd-shift-7` on a US layout becomes `cmd-&`.
-#[allow(non_upper_case_globals)]
 fn key(native: &NSEvent, flags: Flags) -> (Key, Modifiers) {
     let mut modifiers = held(flags);
     let typed = native

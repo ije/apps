@@ -80,8 +80,10 @@ fn render_raster(
         1.0,
         tiny_skia::Transform::default(),
     );
-    let mut paint = tiny_skia::Paint::default();
-    paint.shader = pattern;
+    let paint = tiny_skia::Paint {
+        shader: pattern,
+        ..Default::default()
+    };
 
     pixmap.fill_rect(rect, &paint, transform, None);
 

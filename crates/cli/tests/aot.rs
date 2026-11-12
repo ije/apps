@@ -138,6 +138,12 @@ setTimeout(async () => {
         assert.equal(unhandled.status, 1);
         assert.match(unhandled.stderr, /aot-unhandled-microtask/);
         assert.throws(() => { throw Error('aot exception'); }, /aot exception/);
+        const disposed = [];
+        {
+            using first = {[Symbol.dispose]() {disposed.push('first')}};
+            await using second = {async [Symbol.asyncDispose]() {disposed.push('second')}};
+        }
+        assert.equal(disposed.join(), 'second,first');
         app.on('window-all-closed', () => {});
         await app.whenReady();
         app.setActivationPolicy('prohibited');

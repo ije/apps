@@ -149,7 +149,7 @@ impl RenderFrame {
         }
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg(any(windows, test))]
     pub fn pixels(&self, target: Target) -> [f32; 2] {
         match target {
             Target::Frame => self.window.map(|value| value as f32),

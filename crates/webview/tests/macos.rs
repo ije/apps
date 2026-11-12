@@ -7,7 +7,7 @@ fn native_webkit_loads_html_and_evaluates_javascript() {
     let output = tempfile::tempdir().unwrap();
     let binary = output.path().join("browser-smoke");
     let result = Command::new("xcrun")
-        .args(["clang", "-fobjc-arc", "-Wno-incompatible-pointer-types"])
+        .args(["clang", "-fobjc-arc"])
         .arg(root.join("src/platform/macos.m"))
         .arg(root.join("tests/macos.m"))
         .args([
@@ -17,8 +17,6 @@ fn native_webkit_loads_html_and_evaluates_javascript() {
             "WebKit",
             "-framework",
             "Foundation",
-            "-framework",
-            "CoreGraphics",
             "-o",
         ])
         .arg(&binary)

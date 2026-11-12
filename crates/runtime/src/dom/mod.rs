@@ -33,6 +33,14 @@ pub(crate) struct Row {
 
 pub(crate) type Rows = Rc<[Row]>;
 
+pub(crate) type TextLayout = (
+    renderer::Paragraph,
+    Rc<str>,
+    std::ops::Range<usize>,
+    Rows,
+    [renderer::Pixels; 2],
+);
+
 pub(crate) type SvgBoxes = (
     String,
     Vec<(String, usize)>,
@@ -686,17 +694,7 @@ pub struct State {
     pub(crate) detached: Vec<usize>,
     live: rustc_hash::FxHashSet<usize>,
     pub bounds: LayoutMirror,
-    #[allow(clippy::type_complexity)]
-    pub(crate) text_layouts: rustc_hash::FxHashMap<
-        usize,
-        (
-            renderer::Paragraph,
-            Rc<str>,
-            std::ops::Range<usize>,
-            Rows,
-            [renderer::Pixels; 2],
-        ),
-    >,
+    pub(crate) text_layouts: rustc_hash::FxHashMap<usize, TextLayout>,
     pub scroll: rustc_hash::FxHashMap<usize, renderer::ScrollRef>,
     scroll_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
     pub(crate) computed: Option<Rc<style::ComputedStyles>>,
@@ -750,6 +748,7 @@ pub struct State {
     pub(crate) hosts: rustc_hash::FxHashMap<usize, usize>,
     pub retired: Vec<Arc<renderer::RenderImage>>,
     pub(crate) retired_canvases: HashSet<usize>,
+    queries: rustc_hash::FxHashMap<Box<str>, Rc<[Selector]>>,
     pub(crate) recycled: Vec<(usize, Arc<renderer::RenderImage>)>,
     decoded: Arc<Mutex<Vec<(usize, u64, Decoded)>>>,
     frames: Frames,
@@ -1164,6 +1163,20 @@ pub(crate) fn load_image(
         jobs.1 += 1;
     }
     json!(request)
+}
+
+fn parsed(state: &mut State, source: &Value) -> Result<Rc<[Selector]>> {
+    let source = source.as_str().context("Expected selector")?;
+    if let Some(found) = state.queries.get(source) {
+        return Ok(found.clone());
+    }
+    let parsed: Rc<[Selector]> = Selector::try_parse(source)?.into();
+    // Scripts repeat a few selectors, so a full cache holds generated ones.
+    if state.queries.len() == 256 {
+        state.queries.clear();
+    }
+    state.queries.insert(source.into(), parsed.clone());
+    Ok(parsed)
 }
 
 pub fn call(
@@ -1888,14 +1901,11 @@ pub fn call(
                     _ => node.text.clone(),
                 }))
             }
-            "dom.matches" => Ok(json!(
-                Selector::try_parse(args[1].as_str().context("Expected selector")?)?
-                    .iter()
-                    .any(|s| s.matches_cached(doc, id, Some(id), &mut SelectorCache::default()))
-            )),
+            "dom.matches" => Ok(json!(parsed(state, &args[1])?.iter().any(|s| {
+                s.matches_cached(doc, id, Some(id), &mut SelectorCache::default())
+            }))),
             "dom.closest" => {
-                let selectors =
-                    Selector::try_parse(args[1].as_str().context("Expected selector")?)?;
+                let selectors = parsed(state, &args[1])?;
                 let mut memo = SelectorCache::default();
                 let mut current = Some(id);
                 while let Some(node) = current.filter(|&node| !doc.nodes[node].tag.starts_with('#'))
@@ -1911,8 +1921,7 @@ pub fn call(
                 Ok(Value::Null)
             }
             "dom.queryWithin" => {
-                let selectors =
-                    Selector::try_parse(args[1].as_str().context("Expected selector")?)?;
+                let selectors = parsed(state, &args[1])?;
                 let first = args[2].as_bool().unwrap_or(false);
                 let mut pending: Vec<_> = doc.nodes[id].children.iter().rev().copied().collect();
                 let mut found = Vec::new();
@@ -2329,7 +2338,6 @@ pub fn call(
                             canvas
                         }
                     };
-                    let old = canvas.image.clone();
                     let result = canvas.draw(
                         &ops,
                         args[2].as_str().unwrap_or(""),
@@ -2340,14 +2348,16 @@ pub fn call(
                             .as_deref()
                             .map(|system| (system, &state.font_aliases)),
                     );
-                    let canvas = state.canvases.entry(id).insert_entry(canvas).into_mut();
-                    result?;
+                    state.canvases.insert(id, canvas);
+                    let old = result?;
                     if state.retired.is_empty() {
                         state.retired_canvases.clear();
                     }
                     // Only the first replaced image can be on the GPU. Drop later images immediately to bound
                     // memory in unrendered windows.
-                    if !Arc::ptr_eq(&old, &canvas.image) && state.retired_canvases.insert(id) {
+                    if let Some(old) = old
+                        && state.retired_canvases.insert(id)
+                    {
                         state.retired.push(old);
                     }
                 } else {
@@ -2460,7 +2470,7 @@ pub fn call(
                 };
                 taken.present = doc.nodes[to].tag == "canvas";
                 if taken.present {
-                    taken.image = crate::render::canvas::render_image(&taken.pixels);
+                    taken.image = crate::render::canvas::render_image(&taken.pixels, Vec::new());
                 }
                 state.created += taken.pixels.data().len() >> 16;
                 state.dirty |= taken.present;
@@ -3345,7 +3355,7 @@ pub(crate) fn hit_test(
             );
         }
     }
-    hits.sort_by_key(|&id| {
+    hits.sort_by_cached_key(|&id| {
         std::cmp::Reverse(
             std::iter::successors(Some(id), |&id| doc.nodes[id].parent)
                 .find_map(|id| state.painted.get(id).copied().filter(|&order| order > 0))

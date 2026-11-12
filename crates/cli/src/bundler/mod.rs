@@ -294,6 +294,7 @@ struct Module {
     live: BTreeSet<String>,
     imported: Vec<usize>,
     required: Vec<usize>,
+    defers: Vec<usize>,
     file: Option<String>,
     resolved: serde_json::Map<String, Value>,
     map: Option<Value>,
@@ -347,6 +348,9 @@ impl Module {
         });
         if self.preload {
             module["preload"] = true.into();
+        }
+        if !self.defers.is_empty() {
+            module["defers"] = json!(self.defers);
         }
         if let Some(file) = &self.file {
             module["file"] = file.as_str().into();
@@ -471,6 +475,38 @@ impl<'a> VisitMut<'a> for Imports<'a, '_> {
     }
 }
 
+// `with { type: 'text' }` loads the file like `?raw`. An HTML import is the text of its bundled page already.
+fn attributed(specifier: &str, clause: Option<&WithClause>) -> String {
+    let text = clause.is_some_and(|clause| {
+        clause.with_entries.iter().any(|entry| {
+            entry.key.as_js_str().as_str() == Some("type")
+                && entry.value.value.as_str() == Some("text")
+        })
+    });
+    if text && !specifier.ends_with(".html") {
+        format!("{specifier}?raw")
+    } else {
+        specifier.to_owned()
+    }
+}
+
+fn property<'e, 'a>(object: Option<&'e Expression<'a>>, name: &str) -> Option<&'e Expression<'a>> {
+    let Expression::ObjectExpression(object) = object? else {
+        return None;
+    };
+    object
+        .properties
+        .iter()
+        .find_map(|property| match property {
+            ObjectPropertyKind::ObjectProperty(property)
+                if property.key.is_specific_static_name(name) =>
+            {
+                Some(&property.value)
+            }
+            _ => None,
+        })
+}
+
 struct TopLevelAwait(bool, bool);
 
 impl<'a> Visit<'a> for TopLevelAwait {
@@ -484,6 +520,10 @@ impl<'a> Visit<'a> for TopLevelAwait {
     fn visit_for_of_statement(&mut self, statement: &ForOfStatement<'a>) {
         self.1 |= statement.r#await;
         walk::walk_for_of_statement(self, statement);
+    }
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        self.1 |= declaration.kind == VariableDeclarationKind::AwaitUsing;
+        walk::walk_variable_declaration(self, declaration);
     }
 }
 
@@ -1322,15 +1362,27 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 walk_mut::walk_expression(self, expression);
                 return Ok(());
             }
+            let defer = matches!(expression, Expression::ImportExpression(import) if import.phase == Some(ImportPhase::Defer));
             let import = match expression {
                 Expression::ImportExpression(import) => {
                     match import.source.get_inner_expression() {
                         Expression::StringLiteral(specifier)
                             if !specifier.value.starts_with("data:") =>
                         {
+                            let specifier =
+                                specifier.value.as_str().context("Invalid module path")?;
+                            let kind = property(property(import.options.as_ref(), "with"), "type");
                             Some((
                                 "$appsImport",
-                                specifier.value.as_str().context("Invalid module path")?,
+                                match kind {
+                                    Some(Expression::StringLiteral(kind))
+                                        if kind.value.as_str() == Some("text")
+                                            && !specifier.ends_with(".html") =>
+                                    {
+                                        self.allocator.alloc_str(&format!("{specifier}?raw"))
+                                    }
+                                    _ => specifier,
+                                },
                             ))
                         }
                         source => {
@@ -1458,21 +1510,25 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                     &mut self.imported
                 }
                 .push(dep);
+                let number = |value| {
+                    Expression::new_numeric_literal(
+                        span,
+                        value,
+                        None,
+                        NumberBase::Decimal,
+                        &self.ast,
+                    )
+                    .into()
+                };
+                let mut arguments = ArenaVec::from_array_in([number(dep as f64)], &self.ast);
+                if defer {
+                    arguments.push(number(1.));
+                }
                 *expression = Expression::new_call_expression(
                     span,
                     Expression::new_identifier(span, name, &self.ast),
                     None,
-                    ArenaVec::from_array_in(
-                        [Expression::new_numeric_literal(
-                            span,
-                            dep as f64,
-                            None,
-                            NumberBase::Decimal,
-                            &self.ast,
-                        )
-                        .into()],
-                        &self.ast,
-                    ),
+                    arguments,
                     false,
                     &self.ast,
                 );
@@ -2203,7 +2259,7 @@ impl Builder {
         if let Some(error) = linker.error {
             return Err(error);
         }
-        let (cacheable, imported, required, resolved) = (
+        let (cacheable, imported, mut required, resolved) = (
             linker.cacheable,
             linker.imported,
             linker.required,
@@ -2215,19 +2271,38 @@ impl Builder {
         let mut stars = Vec::new();
         let mut bindings = HashMap::new();
         let mut aliases = Vec::new();
+        let mut defers = Vec::new();
         let mut body = ArenaVec::new_in(&ast);
         for statement in program.body {
             match statement {
                 Statement::ImportDeclaration(import) => {
                     let base = path.parent().unwrap_or(Path::new("."));
-                    let specifier = import
-                        .source
-                        .value
-                        .as_str()
-                        .context("Invalid module path")?;
+                    let specifier = &attributed(
+                        import
+                            .source
+                            .value
+                            .as_str()
+                            .context("Invalid module path")?,
+                        import.with_clause.as_deref(),
+                    );
                     let dep = self.resolve(base, specifier, false)?;
                     self.requests
                         .push((base.to_owned(), specifier.to_owned(), false, dep));
+                    // A deferred module runs when its namespace is first read, so it is no dependency.
+                    if import.phase == Some(ImportPhase::Defer) {
+                        self.dynamic.insert(dep);
+                        required.push(dep);
+                        defers.push(dep);
+                        for specifier in import.unbox().specifiers.into_iter().flatten() {
+                            let code = allocator.alloc_str(&format!(
+                                "const {}=$appsImport.defer({dep});",
+                                specifier.local().name
+                            ));
+                            let parsed = Parser::new(&allocator, code, SourceType::mjs()).parse();
+                            body.splice(0..0, parsed.program.body);
+                        }
+                        continue;
+                    }
                     imports.push(Import {
                         dep,
                         local: None,
@@ -2313,11 +2388,14 @@ impl Builder {
                 }
                 Statement::ExportFromDeclaration(export) => {
                     let base = path.parent().unwrap_or(Path::new("."));
-                    let specifier = export
-                        .source
-                        .value
-                        .as_str()
-                        .context("Invalid module path")?;
+                    let specifier = &attributed(
+                        export
+                            .source
+                            .value
+                            .as_str()
+                            .context("Invalid module path")?,
+                        export.with_clause.as_deref(),
+                    );
                     let dep = self.resolve(base, specifier, false)?;
                     self.requests
                         .push((base.to_owned(), specifier.to_owned(), false, dep));
@@ -2326,7 +2404,7 @@ impl Builder {
                         local: None,
                         name: "*".into(),
                     });
-                    let source = specifier;
+                    let source = specifier.as_str();
                     for specifier in &export.specifiers {
                         let local = format!("$appsRe{}", imports.len());
                         let name = specifier.local.name().to_string();
@@ -2352,11 +2430,14 @@ impl Builder {
                 }
                 Statement::ExportAllDeclaration(export) => {
                     let base = path.parent().unwrap_or(Path::new("."));
-                    let specifier = export
-                        .source
-                        .value
-                        .as_str()
-                        .context("Invalid module path")?;
+                    let specifier = &attributed(
+                        export
+                            .source
+                            .value
+                            .as_str()
+                            .context("Invalid module path")?,
+                        export.with_clause.as_deref(),
+                    );
                     let dep = self.resolve(base, specifier, false)?;
                     self.requests
                         .push((base.to_owned(), specifier.to_owned(), false, dep));
@@ -2498,6 +2579,7 @@ impl Builder {
             live,
             imported,
             required,
+            defers,
             commonjs,
             linked,
             asynchronous,
@@ -3469,6 +3551,9 @@ fn bundle(
             }
             if module.preload {
                 line.push_str(",preload:1");
+            }
+            if !module.defers.is_empty() {
+                let _ = write!(line, ",defers:{}", json!(module.defers));
             }
             if module.commonjs {
                 line.push_str(",commonjs:1");

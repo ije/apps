@@ -22,7 +22,6 @@ use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 struct WindowState {
     events: Arc<Events>,
     closed: AtomicBool,
-    loading: Arc<AtomicBool>,
 }
 
 pub(super) struct Window {
@@ -102,7 +101,6 @@ impl Window {
         let mut state = Box::new(WindowState {
             events,
             closed: AtomicBool::new(false),
-            loading: Arc::new(AtomicBool::new(false)),
         });
         let handle = unsafe {
             let instance = GetModuleHandleW(None)?;
@@ -158,11 +156,9 @@ impl Window {
         let native = view.webview();
         let mut token = 0;
         let started = events.clone();
-        let loading = self.state.loading.clone();
         unsafe {
             native.add_NavigationStarting(
                 &NavigationStartingEventHandler::create(Box::new(move |view, _| {
-                    loading.store(true, Ordering::Relaxed);
                     if let Some(view) = view {
                         let mut event = navigation(&view)?;
                         event["type"] = json!("did-start-loading");
@@ -173,10 +169,8 @@ impl Window {
                 &mut token,
             )?;
             let completed = events.clone();
-            let loading = self.state.loading.clone();
             native.add_NavigationCompleted(
                 &NavigationCompletedEventHandler::create(Box::new(move |view, args| {
-                    loading.store(false, Ordering::Relaxed);
                     if let (Some(view), Some(args)) = (view, args) {
                         let mut success = BOOL::default();
                         args.IsSuccess(&mut success)?;
@@ -313,7 +307,7 @@ impl Window {
         operation: &str,
         arguments: &Value,
         events: &Arc<Events>,
-    ) -> anyhow::Result<Value> {
+    ) -> anyhow::Result<()> {
         let native = view.webview();
         unsafe {
             match operation {
@@ -396,19 +390,10 @@ impl Window {
                         })),
                     )?;
                 }
-                "state" => {
-                    let mut state = navigation(&native)?;
-                    let mut zoom = 1.;
-                    view.controller().ZoomFactor(&mut zoom)?;
-                    state["zoomFactor"] = json!(zoom);
-                    state["loading"] = json!(self.state.loading.load(Ordering::Relaxed));
-                    state["closed"] = json!(self.state.closed.load(Ordering::Relaxed));
-                    return Ok(state);
-                }
                 _ => bail!("Unknown browser operation: {operation}"),
             }
         }
-        Ok(Value::Null)
+        Ok(())
     }
 }
 

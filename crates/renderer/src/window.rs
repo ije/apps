@@ -284,6 +284,8 @@ impl Placed {
     }
 }
 
+pub(crate) type Placement = (Point<Pixels>, Clip<Pixels>, usize);
+
 type Listener = Box<dyn FnMut(&Event, &mut Window, &mut App)>;
 pub(crate) type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 pub(crate) type CaptureCallback = Box<dyn FnOnce(Result<([u32; 2], Vec<u8>)>, &mut App)>;
@@ -1015,7 +1017,7 @@ impl Window {
         }
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg(windows)]
     pub(crate) fn in_drag_area(&self, at: Point<Pixels>) -> bool {
         (self.live.regions.iter().rev())
             .find(|placed| placed.contains(at))
@@ -1220,7 +1222,7 @@ impl Window {
     }
 
     // Kept subtrees reuse their regions only while this is unchanged.
-    pub(crate) fn placement(&self) -> (Point<Pixels>, Clip<Pixels>, usize) {
+    pub(crate) fn placement(&self) -> Placement {
         let transform = self
             .hit_transform
             .as_ref()
@@ -1263,10 +1265,6 @@ impl Window {
             })
             .downcast_mut()
             .expect("the slot type matches its key")
-    }
-
-    pub fn font_smoothing(&self) -> bool {
-        self.font_smoothing
     }
 
     pub fn offset(&self) -> Point<Pixels> {

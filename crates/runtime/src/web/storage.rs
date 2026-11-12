@@ -69,35 +69,6 @@ mod tests {
     }
 
     #[test]
-    fn json_keys_move_to_ordered_keys() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("browser.sqlite");
-        let old = Database::open(&path).unwrap();
-        old.query("CREATE TABLE records (db TEXT, store TEXT, key TEXT, value TEXT NOT NULL, PRIMARY KEY(db,store,key))", &[]).unwrap();
-        for key in [r#"[2,"b"]"#, "[0,10]", "[0,2]"] {
-            old.query("INSERT INTO records VALUES('db','items',?,'1')", &[key])
-                .unwrap();
-        }
-        drop(old);
-        let mut state = State {
-            path,
-            ..State::default()
-        };
-        let id = state.call("begin", &json!(["db", "readonly"])).unwrap()["id"]
-            .as_u64()
-            .unwrap();
-        assert_eq!(
-            state
-                .call(
-                    "scan",
-                    &json!([id, "items", null, null, false, false, false, 0, "keys"])
-                )
-                .unwrap(),
-            json!([[0, 2.0], [0, 10.0], [2, "b"]])
-        );
-    }
-
-    #[test]
     fn transactions_reuse_connections_after_commit_and_abort() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = State {
@@ -512,21 +483,6 @@ impl State {
             database.query("CREATE TABLE IF NOT EXISTS databases (name TEXT PRIMARY KEY, version INTEGER NOT NULL)",&[])?;
             database.query("CREATE TABLE IF NOT EXISTS stores (db TEXT, name TEXT, options TEXT NOT NULL, PRIMARY KEY(db,name))",&[])?;
             database.query("CREATE TABLE IF NOT EXISTS entries (db TEXT, store TEXT, key TEXT, value TEXT NOT NULL, PRIMARY KEY(db,store,key))",&[])?;
-            if !database
-                .query("SELECT 1 FROM sqlite_master WHERE name='records'", &[])?
-                .is_empty()
-            {
-                database.query("BEGIN IMMEDIATE", &[])?;
-                let moved = database.query("SELECT db,store,key,value FROM records", &[]).and_then(|rows| {
-                    for row in rows {
-                        let [db, store, key, value] = [0, 1, 2, 3].map(|index| row[index].as_deref().unwrap_or_default());
-                        database.query("INSERT OR REPLACE INTO entries(db,store,key,value) VALUES(?,?,?,?)", &[db, store, &hex_key(key)?, value])?;
-                    }
-                    database.query("DROP TABLE records", &[])
-                });
-                database.query(if moved.is_ok() { "COMMIT" } else { "ROLLBACK" }, &[])?;
-                moved?;
-            }
             self.database = Some(database);
         }
         let db = self.database.as_ref().unwrap();

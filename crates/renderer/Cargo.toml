@@ -16,7 +16,7 @@ taffy = { workspace = true, features = ["std", "flexbox", "grid", "block_layout"
 libc.workspace = true
 block2.workspace = true
 core-foundation-sys.workspace = true
-dispatch2 = { workspace = true, features = ["block2", "objc2"] }
+dispatch2 = { workspace = true, features = ["block2"] }
 flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
 objc2.workspace = true
 objc2-app-kit = { workspace = true, features = ["NSTextInputContext", "NSVisualEffectView"] }
@@ -45,7 +45,6 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
     "std",
     "block2",
     "dispatch2",
-    "MTLAllocation",
     "MTLBlitCommandEncoder",
     "MTLBuffer",
     "MTLCommandBuffer",
@@ -77,7 +76,6 @@ objc2-core-graphics = { workspace = true, features = [
     "CGColorSpace",
     "CGContext",
     "CGFont",
-    "CGImage",
 ] }
 objc2-quartz-core = { workspace = true, features = [
     "objc2-core-foundation",

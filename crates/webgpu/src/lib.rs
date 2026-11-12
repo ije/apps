@@ -3,6 +3,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     ffi::c_void,
     sync::{
@@ -268,17 +269,20 @@ fn decode<T: DeserializeOwned>(value: &Value, default: Value) -> Result<T> {
     })?)
 }
 
-fn bytes(value: &Value) -> Result<Vec<u8>> {
+// Host bytes stay valid only until the current call returns.
+fn bytes(value: &Value) -> Result<Cow<'_, [u8]>> {
     if let Some(index) = value.get("$appsBytes").and_then(Value::as_u64) {
         let mut length = 0;
         let data = (host().read)(index as usize, &mut length);
         ensure!(!data.is_null(), "Invalid binary argument");
-        return Ok(unsafe { std::slice::from_raw_parts(data, length) }.to_vec());
+        return Ok(Cow::Borrowed(unsafe {
+            std::slice::from_raw_parts(data, length)
+        }));
     }
-    Ok(match value.as_str() {
+    Ok(Cow::Owned(match value.as_str() {
         Some(text) => STANDARD.decode(text)?,
         None => Vec::deserialize(value)?,
-    })
+    }))
 }
 
 fn unmap(device: &Device, buffer: &Buffer) {

@@ -987,12 +987,13 @@ impl Main {
                     tools.answer(&command, engine, &self.host, None)?;
                 }
                 tools.events(&logs)?;
-                delay = delay.min(16);
             }
             if !logs.is_empty() {
                 super::mcp::logs(&logs);
-                self.link
-                    .page(ToPage::All(json!({"op":"logs","args":logs})));
+                if super::devtools::pages_open() {
+                    self.link
+                        .page(ToPage::All(json!({"op":"logs","args":logs})));
+                }
             }
         }
         if super::mcp::poll_main() {

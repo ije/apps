@@ -190,9 +190,13 @@ thread_local! {
     #[cfg(target_os = "macos")]
     static GLASS_SHEET: Rc<Stylesheet> = Rc::new(Stylesheet::parse(include_str!("tailwind/liquid-glass.css")));
     // Retain font-family values used as pointer keys to prevent address reuse.
-    #[allow(clippy::type_complexity)]
-    pub(crate) static FONT_NAMES: std::cell::RefCell<(HashMap<String, String>, FxHashMap<*const u8, (Option<Rc<str>>, renderer::SharedString)>)> = Default::default();
+    pub(crate) static FONT_NAMES: std::cell::RefCell<FontNames> = Default::default();
 }
+
+type FontNames = (
+    HashMap<String, String>,
+    FxHashMap<*const u8, (Option<Rc<str>>, renderer::SharedString)>,
+);
 
 struct StyleRef<T: ?Sized = Style>(Rc<T>);
 
@@ -265,7 +269,7 @@ pub(crate) fn presentation(name: &str) -> Option<Prop> {
     })
 }
 
-pub(crate) fn svg_transform(value: &str) -> Option<String> {
+fn svg_transform(value: &str) -> Option<String> {
     let mut result = Vec::new();
     for part in value.split_inclusive(')') {
         let part = part.trim_matches(|c: char| c == ',' || c.is_ascii_whitespace());
@@ -360,7 +364,7 @@ fn exported_parts(
     })
 }
 
-fn merged(vars: Vars, own: &[(Prop, Option<Rc<str>>)]) -> Vars {
+fn merged(vars: Vars, own: &[Read]) -> Vars {
     if own
         .iter()
         .all(|(prop, value)| var(&vars, *prop) == value.as_ref())
@@ -499,7 +503,7 @@ struct ShadowRule {
     layer: Layer,
     specificity: [usize; 3],
     order: u128,
-    declarations: Vec<Declared>,
+    declarations: Rc<[Declared]>,
     query: Option<(usize, usize, bool)>,
 }
 
@@ -595,14 +599,15 @@ impl CachedNode {
     }
 }
 
+type Read = (Prop, Option<Rc<str>>);
+
 struct CachedStyle {
     used: std::cell::Cell<u64>,
     inline: Option<Box<str>>,
     style: Rc<Style>,
     vars: std::cell::RefCell<(Option<Vars>, Vars)>,
-    #[allow(clippy::type_complexity)]
-    reads: Option<Box<[(Prop, Option<Rc<str>>)]>>,
-    own: Box<[(Prop, Option<Rc<str>>)]>,
+    reads: Option<Box<[Read]>>,
+    own: Box<[Read]>,
     missing: Box<[Box<str>]>,
     flags: u8,
     lengths: Lengths,
@@ -612,7 +617,7 @@ struct CachedStyle {
     backdrop_start: Option<Rc<Style>>,
     scrollbars: Option<Rc<[Option<Style>; 5]>>,
     selection: Option<Rc<Style>>,
-    animations: Option<Vec<Animation>>,
+    animations: Option<Rc<[Animation]>>,
     shadowed: [Option<Shadowed>; 2],
     starting: Option<Rc<Style>>,
     viewport: bool,
@@ -635,7 +640,7 @@ struct StyleScope {
     used: u64,
     fullscreen: bool,
     sheets: Vec<Rc<Stylesheet>>,
-    rules: Vec<(SelectorList, Vec<Declared>, Layer)>,
+    rules: Vec<(SelectorList, Rc<[Declared]>, Layer)>,
     layers: Vec<(String, Vec<u32>)>,
     pseudos: Vec<(usize, Selector, usize, Key)>,
     arguments: FxHashMap<usize, (Rc<str>, SelectorList, usize)>,
@@ -649,7 +654,6 @@ struct StyleScope {
     properties: Registry,
     states: u16,
     nodes: Vec<Option<MatchedRules>>,
-    #[allow(clippy::type_complexity)]
     lists: RuleLists,
     keys: Vec<u128>,
     block: Option<u64>,
@@ -961,8 +965,7 @@ pub(crate) struct StyleCache {
     next: usize,
     pass: u64,
     pub(crate) states: u16,
-    #[allow(clippy::type_complexity)]
-    sheets: HashMap<usize, (u64, Option<u64>, Rc<str>, Rc<Stylesheet>)>,
+    sheets: HashMap<usize, Sheet>,
     pub(crate) cssom: HashMap<usize, Cssom>,
     pub(crate) constructed: FxHashMap<u32, Rc<Stylesheet>>,
     derived: Derived,
@@ -982,8 +985,7 @@ pub(crate) struct StyleCache {
     tailwind: tailwind::Compiler,
     registry: Rc<Registry>,
     // Retain source lists used as pointer keys to prevent address reuse.
-    #[allow(clippy::type_complexity)]
-    inheritable: FxHashMap<*const Vec<(Prop, Rc<str>)>, (Vars, Option<Vars>)>,
+    inheritable: FxHashMap<*const Vec<(Prop, Rc<str>)>, Inheritable>,
     pub(crate) scripted: Registry,
     scheme: Option<Rc<str>>,
     pub(crate) spare: Option<SpareStyles>,
@@ -1029,6 +1031,8 @@ struct MediaBlock {
     fixed: bool,
 }
 type Cssom = (u64, Rc<str>, bool, bool, Rc<Stylesheet>);
+type Sheet = (u64, Option<u64>, Rc<str>, Rc<Stylesheet>);
+type Inheritable = (Vars, Option<Vars>);
 type QueryCache = HashMap<(usize, usize, usize, usize), (bool, bool, FontUnits)>;
 type CellKey = (StyleRef, [(u32, Option<[Option<Rc<str>>; 2]>); 4]);
 
@@ -2562,26 +2566,14 @@ pub(crate) fn resolved(
                     .collect()
             })
             .collect();
-            let axis = |index: usize| -> String {
-                let values: Vec<&str> = corners
-                    .iter()
-                    .map(|corner| {
-                        corner
-                            .get(index)
-                            .or(corner.first())
-                            .map_or("0px", String::as_str)
-                    })
-                    .collect();
-                let [top, right, bottom, left] = [values[0], values[1], values[2], values[3]];
-                if left != right {
-                    values.join(" ")
-                } else if top != bottom {
-                    format!("{top} {right} {bottom}")
-                } else if top != right {
-                    format!("{top} {right}")
-                } else {
-                    top.to_owned()
-                }
+            let axis = |index: usize| {
+                shortest(std::array::from_fn(|corner| {
+                    let corner = &corners[corner];
+                    corner
+                        .get(index)
+                        .or(corner.first())
+                        .map_or("0px", String::as_str)
+                }))
             };
             let (horizontal, vertical) = (axis(0), axis(1));
             return if horizontal == vertical {
@@ -2684,17 +2676,7 @@ pub(crate) fn resolved(
             .map(|longhand| resolved(style, units, longhand, size, container, registry))
             .collect();
         return match values.as_slice() {
-            [top, right, bottom, left] => {
-                if left != right {
-                    values.join(" ")
-                } else if top != bottom {
-                    format!("{top} {right} {bottom}")
-                } else if top != right {
-                    format!("{top} {right}")
-                } else {
-                    top.clone()
-                }
-            }
+            [top, right, bottom, left] => shortest([top, right, bottom, left].map(String::as_str)),
             [a, b] if a == b => a.clone(),
             _ => values.join(" "),
         };
@@ -3051,16 +3033,7 @@ pub(crate) fn resolved(
                 [a, b, c, d] => [a, b, c, d],
                 _ => return value,
             };
-            let count = if sides[3] != sides[1] {
-                4
-            } else if sides[2] != sides[0] {
-                3
-            } else if sides[1] != sides[0] {
-                2
-            } else {
-                1
-            };
-            let mut result = format!("inset({}", sides[..count].join(" "));
+            let mut result = format!("inset({}", shortest(sides));
             if let Some(round) = round {
                 result.push_str(" round ");
                 result.push_str(round);
@@ -3150,6 +3123,19 @@ pub(crate) fn resolved(
         }
         _ => value,
     }
+}
+
+fn shortest(sides: [&str; 4]) -> String {
+    let count = if sides[3] != sides[1] {
+        4
+    } else if sides[2] != sides[0] {
+        3
+    } else if sides[1] != sides[0] {
+        2
+    } else {
+        1
+    };
+    sides[..count].join(" ")
 }
 
 pub(crate) fn declare(source: &str) -> Vec<[String; 3]> {
@@ -3864,7 +3850,7 @@ pub(crate) struct ComputedStyles {
     pub scrollbars: FxHashMap<usize, Rc<[Option<Style>; 5]>>,
     pub selections: FxHashMap<usize, Rc<Style>>,
     pub user_select: Chunked<(UserSelect, usize)>,
-    pub animations: FxHashMap<usize, Vec<Animation>>,
+    pub animations: FxHashMap<usize, Rc<[Animation]>>,
     pub children: FxHashMap<usize, Vec<usize>>,
     pub slotted: FxHashMap<usize, Shadowed>,
     pub parts: FxHashMap<usize, Shadowed>,
@@ -4225,19 +4211,7 @@ pub(crate) fn cascade(
             && !(update.replaced.is_empty() && update.added.is_empty())
         {
             fast = false;
-            let mut added = Collect {
-                width,
-                height,
-                reduced_motion,
-                native_theme,
-                rules: Vec::new(),
-                container: None,
-                media: None,
-                blocks: Vec::new(),
-                layers: Vec::new(),
-                keyframes: HashMap::new(),
-                properties: Registry::default(),
-            };
+            let mut added = blank();
             for rule in &update.rules {
                 rule.collect(None, "", &mut added);
             }
@@ -4349,19 +4323,7 @@ pub(crate) fn cascade(
                     }
                 }
                 collected.rank();
-                let mut removed = Collect {
-                    width,
-                    height,
-                    reduced_motion,
-                    native_theme,
-                    rules: Vec::new(),
-                    container: None,
-                    media: None,
-                    blocks: Vec::new(),
-                    layers: Vec::new(),
-                    keyframes: HashMap::new(),
-                    properties: Registry::default(),
-                };
+                let mut removed = blank();
                 for (sheet, index) in &gone {
                     if let Some(rule) = sheet.0.get(*index) {
                         rule.collect(None, "", &mut removed);
@@ -4469,25 +4431,10 @@ pub(crate) fn cascade(
                         properties,
                         blocks,
                         ..
-                    } = std::mem::replace(
-                        &mut collected,
-                        Collect {
-                            width,
-                            height,
-                            reduced_motion,
-                            native_theme,
-                            rules: Vec::new(),
-                            container: None,
-                            media: None,
-                            blocks: Vec::new(),
-                            layers: Vec::new(),
-                            keyframes: HashMap::new(),
-                            properties: Registry::default(),
-                        },
-                    );
+                    } = std::mem::replace(&mut collected, blank());
                     if !deleted.is_empty() {
                         for &order in &deleted {
-                            cached.rules[order].1.clear();
+                            cached.rules[order].1 = Rc::new([]);
                             cached.rules[order].2.origin = DELETED;
                             cached.elements[order].clear();
                         }
@@ -5790,7 +5737,7 @@ pub(crate) fn cascade(
         let mut cascade: BBTreeMap<Prop, (CascadeRank, Rc<str>)> = BBTreeMap::new();
         for &(order, specificity) in key.rules.0.iter() {
             let (_, declarations, layer) = &rules[order];
-            for &(prop, ref value, important) in declarations {
+            for &(prop, ref value, important) in declarations.iter() {
                 let rank = CascadeRank::rule(*layer, important, specificity, keys[order]);
                 if cascade.get(&prop).is_none_or(|(old, _)| rank >= *old) {
                     cascade.insert(prop, (rank, value.clone()));
@@ -5976,8 +5923,9 @@ pub(crate) fn cascade(
                     style.remove(prop);
                 }
             }
-            match declared(Prop::TEXT_DECORATION_LINE)
-                .map(str::to_owned)
+            match cascade
+                .get(&Prop::TEXT_DECORATION_LINE)
+                .map(|(_, value)| value.clone())
                 .as_deref()
             {
                 Some("none") if style.contains(Prop::TEXT_DECORATION_LINE) => {
@@ -6369,7 +6317,7 @@ pub(crate) fn cascade(
                 }
                 continue;
             }
-            for &(prop, ref value, important) in declarations {
+            for &(prop, ref value, important) in declarations.iter() {
                 let rank = CascadeRank::rule(*layer, important, selector.specificity, keys[*order]);
                 if pseudo_cascade[*pseudo]
                     .get(&prop)
@@ -6395,7 +6343,7 @@ pub(crate) fn cascade(
             {
                 continue;
             }
-            for (prop, value, important) in &rule.declarations {
+            for (prop, value, important) in rule.declarations.iter() {
                 let rank = ranked(rule, *important);
                 if pseudo_cascade[rule.kind]
                     .get(prop)
@@ -6649,34 +6597,38 @@ pub(crate) fn cascade(
         };
         let shadowed = [store(inner, false), store(outer, true)];
         let kept = previous.filter(|_| animated.is_some());
-        let mut effects = match kept {
-            Some(previous) => previous.animations.get(&id).cloned().unwrap_or_default(),
-            None if style.contains(Prop::ANIMATION) || style.contains(Prop::ANIMATION_NAME) => {
-                Animation::parse(&style, &scoped.keyframes, &registry)
+        if let Some(previous) = kept {
+            if let Some(effects) = previous.animations.get(&id) {
+                animations.insert(id, effects.clone());
             }
-            None => Vec::new(),
-        };
-        for (slot, pseudo) in pseudos
-            .get(&id)
-            .into_iter()
-            .filter(|_| kept.is_none())
-            .flat_map(|pair| pair.iter().enumerate())
-        {
-            if pseudo.contains(Prop::ANIMATION) || pseudo.contains(Prop::ANIMATION_NAME) {
-                effects.extend(
-                    Animation::parse(pseudo, &scoped.keyframes, &registry)
-                        .into_iter()
-                        .map(|mut effect| {
-                            effect.pseudo = slot as u8 + 1;
-                            effect.name =
-                                format!("{}\0{}", ["::before", "::after"][slot], effect.name);
-                            effect
-                        }),
-                );
+        } else {
+            let mut effects =
+                if style.contains(Prop::ANIMATION) || style.contains(Prop::ANIMATION_NAME) {
+                    Animation::parse(&style, &scoped.keyframes, &registry)
+                } else {
+                    Vec::new()
+                };
+            for (slot, pseudo) in pseudos
+                .get(&id)
+                .into_iter()
+                .flat_map(|pair| pair.iter().enumerate())
+            {
+                if pseudo.contains(Prop::ANIMATION) || pseudo.contains(Prop::ANIMATION_NAME) {
+                    effects.extend(
+                        Animation::parse(pseudo, &scoped.keyframes, &registry)
+                            .into_iter()
+                            .map(|mut effect| {
+                                effect.pseudo = slot as u8 + 1;
+                                effect.name =
+                                    format!("{}\0{}", ["::before", "::after"][slot], effect.name);
+                                effect
+                            }),
+                    );
+                }
             }
-        }
-        if !effects.is_empty() {
-            animations.insert(id, effects);
+            if !effects.is_empty() {
+                animations.insert(id, effects.into());
+            }
         }
         // Reuse equal styles from the previous frame. Pointer changes invalidate layout caches.
         let units_bits = |units: &Lengths| {

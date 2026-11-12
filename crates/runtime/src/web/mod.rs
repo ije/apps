@@ -256,7 +256,7 @@ pub(crate) async fn connect(
     Ok(stream)
 }
 
-pub(crate) fn private_address(ip: std::net::IpAddr) -> bool {
+fn private_address(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => {
             let [a, b, _, _] = ip.octets();
@@ -428,7 +428,7 @@ impl State {
                 let name = url.path().trim_start_matches('/');
                 let path = ASSETS.get().and_then(|assets| assets.get(name));
                 Ok(match path.map(std::fs::read) {
-                    Some(Ok(data)) => base64(&data),
+                    Some(Ok(data)) => crate::jsc::payload::write(data),
                     _ => Value::Null,
                 })
             }

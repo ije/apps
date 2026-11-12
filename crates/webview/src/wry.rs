@@ -217,7 +217,7 @@ impl Browser {
         self.window.detach()
     }
 
-    pub fn command(&self, operation: &str, arguments: &Value) -> Result<Value> {
+    pub fn command(&self, operation: &str, arguments: &Value) -> Result<()> {
         match operation {
             "visible" => self.window.set_visible(arguments.as_bool().unwrap())?,
             "decide" => {}
@@ -313,13 +313,11 @@ impl Browser {
             "zoom" => self.view.zoom(arguments.as_f64().unwrap())?,
             // wry has no per-view color scheme, so guests follow the system.
             "appearance" => {}
-            _ => {
-                return self
-                    .window
-                    .command(&self.view, operation, arguments, &self.events);
-            }
+            _ => self
+                .window
+                .command(&self.view, operation, arguments, &self.events)?,
         }
-        Ok(Value::Null)
+        Ok(())
     }
 
     pub fn poll(&self) -> Vec<Value> {

@@ -76,32 +76,21 @@ pub(crate) enum Error {
 
 trait PixmapExt: Sized {
     fn try_create(width: u32, height: u32) -> Result<tiny_skia::Pixmap, Error>;
-    fn clear(&mut self);
-    fn into_srgb(&mut self);
-    fn into_linear_rgb(&mut self);
 }
 
 impl PixmapExt for tiny_skia::Pixmap {
     fn try_create(width: u32, height: u32) -> Result<tiny_skia::Pixmap, Error> {
         tiny_skia::Pixmap::new(width, height).ok_or(Error::InvalidRegion)
     }
-
-    fn clear(&mut self) {
-        self.fill(tiny_skia::Color::TRANSPARENT);
-    }
-
-    fn into_srgb(&mut self) {
-        convert(self.data_mut().as_rgba_mut(), LINEAR_RGB_TO_SRGB_TABLE);
-    }
-
-    fn into_linear_rgb(&mut self) {
-        convert(self.data_mut().as_rgba_mut(), SRGB_TO_LINEAR_RGB_TABLE);
-    }
 }
 
 // Preserve resvg's f32 rounding across demultiply, map and multiply. Alpha 0 stays zero. Alpha 255 only maps.
-fn convert(data: &mut [RGBA8], table: &[u8; 256]) {
-    for p in data {
+fn convert(pixmap: &mut tiny_skia::Pixmap, to: usvg::filter::ColorInterpolation) {
+    let table = match to {
+        usvg::filter::ColorInterpolation::SRGB => LINEAR_RGB_TO_SRGB_TABLE,
+        usvg::filter::ColorInterpolation::LinearRGB => SRGB_TO_LINEAR_RGB_TABLE,
+    };
+    for p in pixmap.data_mut().as_rgba_mut() {
         match p.a {
             0 => (p.r, p.g, p.b) = (0, 0, 0),
             255 => {
@@ -226,10 +215,7 @@ impl Image {
 
             let mut image = self.take();
 
-            match color_space {
-                usvg::filter::ColorInterpolation::SRGB => image.into_srgb(),
-                usvg::filter::ColorInterpolation::LinearRGB => image.into_linear_rgb(),
-            }
+            convert(&mut image, color_space);
 
             Ok(Image {
                 image: Rc::new(image),
@@ -546,10 +532,7 @@ fn apply_drop_shadow(
         color.apply_opacity(alpha as f32 / 255.0);
         *p = color.premultiply().to_color_u8();
     }
-    match cs {
-        usvg::filter::ColorInterpolation::SRGB => table.into_srgb(),
-        usvg::filter::ColorInterpolation::LinearRGB => table.into_linear_rgb(),
-    }
+    convert(&mut table, cs);
     let table = table.pixels();
     for p in shadow_pixmap.pixels_mut() {
         *p = table[p.alpha() as usize];
@@ -747,14 +730,16 @@ fn apply_tile(input: Image, region: IntRect) -> Result<Image, Error> {
         .image
         .clone_rect(subregion)
         .ok_or(Error::InvalidRegion)?;
-    let mut paint = tiny_skia::Paint::default();
-    paint.shader = tiny_skia::Pattern::new(
-        tile_pixmap.as_ref(),
-        tiny_skia::SpreadMode::Repeat,
-        tiny_skia::FilterQuality::Bicubic,
-        1.0,
-        tiny_skia::Transform::from_translate(subregion.x() as f32, subregion.y() as f32),
-    );
+    let paint = tiny_skia::Paint {
+        shader: tiny_skia::Pattern::new(
+            tile_pixmap.as_ref(),
+            tiny_skia::SpreadMode::Repeat,
+            tiny_skia::FilterQuality::Bicubic,
+            1.0,
+            tiny_skia::Transform::from_translate(subregion.x() as f32, subregion.y() as f32),
+        ),
+        ..Default::default()
+    };
 
     let mut pixmap = tiny_skia::Pixmap::try_create(region.width(), region.height())?;
     let rect = tiny_skia::Rect::from_xywh(0.0, 0.0, region.width() as f32, region.height() as f32)
@@ -852,7 +837,7 @@ fn apply_morphology(
     let (rx, ry) = scale_coordinates(fe.radius_x().get(), fe.radius_y().get(), ts);
 
     if !(rx > 0.0 && ry > 0.0) {
-        pixmap.clear();
+        pixmap.fill(tiny_skia::Color::TRANSPARENT);
         return Ok(Image::from_image(pixmap, cs));
     }
 

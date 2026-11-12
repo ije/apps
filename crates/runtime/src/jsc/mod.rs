@@ -8,7 +8,6 @@ use bbtree::unsync::BBTreeMap;
 use libloading::Library;
 use std::{
     cell::RefCell,
-    collections::HashMap,
     ffi::{c_char, c_void},
     path::{Path, PathBuf},
     ptr,
@@ -1891,8 +1890,6 @@ pub struct JsContext {
     ctx: Ptr,
     napi: Option<Rc<crate::node::napi::State>>,
     interrupt: Option<Box<Interrupt>>,
-    sources: RefCell<HashMap<String, String>>,
-    devtools: bool,
     scope: Ptr,
 }
 
@@ -1955,8 +1952,6 @@ impl JsContext {
             ctx,
             napi,
             interrupt: None,
-            sources: RefCell::default(),
-            devtools,
             scope: ptr::null_mut(),
         };
         if let Some(interrupt) = interrupt {
@@ -2008,7 +2003,19 @@ impl JsContext {
                 )
         });
         encoding::install(&engine.api, ctx);
-        for (name, callback) in [("__appsNative", call as Callback), ("__appsNow", now)] {
+        let natives = [
+            ("__appsNative", call as Callback),
+            ("__appsNow", now),
+            ("__appsLoadAddon", crate::node::napi::load),
+            ("__appsFFINative", ffi_call),
+            ("__appsIsProxy", is_proxy),
+        ];
+        let count = if matches!(role, Role::Renderer(_)) {
+            2
+        } else {
+            natives.len()
+        };
+        for &(name, callback) in &natives[..count] {
             let name = engine.api.string(name);
             unsafe {
                 let callback = (engine.api.function)(ctx, name, callback);
@@ -2078,25 +2085,6 @@ impl JsContext {
             aot.attach(ctx);
         }
         if !matches!(role, Role::Renderer(_)) {
-            for (name, callback) in [
-                ("__appsLoadAddon", crate::node::napi::load as Callback),
-                ("__appsFFINative", ffi_call),
-                ("__appsIsProxy", is_proxy),
-            ] {
-                let name = engine.api.string(name);
-                unsafe {
-                    let callback = (engine.api.function)(ctx, name, callback);
-                    (engine.api.set)(
-                        ctx,
-                        (engine.api.global)(ctx),
-                        name,
-                        callback,
-                        0,
-                        ptr::null_mut(),
-                    );
-                    (engine.api.string_release)(name);
-                }
-            }
             for (url, source) in NODE_SCRIPTS {
                 engine.run(source(), url)?;
             }
@@ -2233,13 +2221,6 @@ impl JsContext {
     }
 
     fn evaluate(&self, source: &str, url: &str, this: Ptr) -> Result<String> {
-        // `NEXT` runs under the URL of the script it continues, so it must not replace that script's source.
-        if self.devtools
-            && source != NEXT
-            && (matches!(url, "app.js" | "apps:page" | "apps:preload") || !url.starts_with("apps:"))
-        {
-            self.sources.borrow_mut().insert(url.into(), source.into());
-        }
         let compiled = match self.api.aot {
             Some(aot) => aot.find(source.as_bytes())?.map(|module| (aot, module)),
             None => None,
@@ -2305,21 +2286,6 @@ impl JsContext {
 
     pub(crate) fn deliver(&self, payload: payload::Payload) -> Result<()> {
         bridge(&self.api, self.ctx, "__appsBridgeDeliver", payload).map(|_| ())
-    }
-
-    pub fn sources(&self) -> HashMap<String, String> {
-        if !self.devtools {
-            return HashMap::new();
-        }
-        let mut sources = self.sources.borrow().clone();
-        if let Ok(value) = self.eval(
-            "JSON.stringify(Array.from(globalThis.__appsSources ?? []))",
-            "apps:sources",
-        ) && let Ok(originals) = serde_json::from_str::<Vec<(String, String)>>(&value)
-        {
-            sources.extend(originals);
-        }
-        sources
     }
 
     pub fn set_interrupt(
@@ -2510,7 +2476,7 @@ mod tests {
     #[test]
     fn bundled_chunks_keep_nul_bytes_and_non_ascii_text() {
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().scripts = std::sync::Arc::new(HashMap::from([
+        host.borrow_mut().scripts = std::sync::Arc::new(std::collections::HashMap::from([
             (
                 "script-1.js".to_owned(),
                 bytes::Bytes::from_static(

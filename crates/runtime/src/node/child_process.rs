@@ -119,8 +119,10 @@ fn attach(
     sender: &SyncSender<Event>,
     wake: &Waker,
     #[cfg(unix)] pipes: Vec<(&'static str, std::os::unix::net::UnixStream)>,
-    #[allow(unused_mut)] mut outputs: Vec<(&'static str, Box<dyn Read + Send>)>,
+    outputs: Vec<(&'static str, Box<dyn Read + Send>)>,
 ) -> io::Result<()> {
+    #[cfg(unix)]
+    let mut outputs = outputs;
     #[cfg(unix)]
     for (name, pipe) in pipes {
         let mut writer = pipe.try_clone()?;
@@ -279,14 +281,14 @@ impl State {
                 }
                 let process = state.children.get(&id).context("Child process is closed")?;
                 let (status, signal) = (process.code(), process.signal.clone());
-                let output = |data: &[u8], index: usize| {
+                let output = |data: Vec<u8>, index: usize| {
                     if config["stdio"][index] == "pipe" {
-                        crate::web::base64(data)
+                        crate::jsc::payload::write(data)
                     } else {
                         Value::Null
                     }
                 };
-                let mut result = json!({"pid":spawned["pid"],"stdout":output(&stdout, 1),"stderr":output(&stderr, 2),"status":status,"signal":signal});
+                let mut result = json!({"pid":spawned["pid"],"stdout":output(stdout, 1),"stderr":output(stderr, 2),"status":status,"signal":signal});
                 if let Some((code, errno)) = error {
                     result["error"] = json!({"code":code,"errno":cfg!(unix).then_some(-errno)});
                 }

@@ -91,7 +91,7 @@ pub(crate) fn post(thread: AppThread, task: Task) {
 }
 
 // A source in the common modes: AppKit does not drain the main dispatch queue in menus and modal panels.
-fn main_source() -> usize {
+pub(crate) fn main_source() -> usize {
     static SOURCE: OnceLock<usize> = OnceLock::new();
     extern "C" fn drain(_: *const c_void) {
         MAIN_SIGNALED.store(false, Ordering::Release);
@@ -122,10 +122,6 @@ fn main_source() -> usize {
             source as usize
         }
     })
-}
-
-pub(crate) fn start_main() {
-    main_source();
 }
 
 pub(crate) fn native_post(task: Task) {

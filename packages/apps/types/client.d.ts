@@ -64,6 +64,12 @@ declare module '*.html' {
   export default html
 }
 
+/** Needs `with { type: 'text' }`. */
+declare module '*.txt' {
+  const text: string
+  export default text
+}
+
 declare module '*.node' {
   const addon: any
   export default addon

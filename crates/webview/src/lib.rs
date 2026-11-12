@@ -129,11 +129,6 @@ impl Browser {
                 backend: wry::Browser::new(Some(window.window_handle()?.as_raw()), options)?,
             })
         }
-        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-        {
-            let _ = (window, options);
-            bail!("Embedded browsers require macOS, Windows, or Linux");
-        }
     }
 
     pub fn detached(options: &Value) -> Result<Self> {
@@ -146,11 +141,6 @@ impl Browser {
             Ok(Self {
                 backend: wry::Browser::new(None, options)?,
             })
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-        {
-            let _ = options;
-            bail!("Embedded browsers require macOS, Windows, or Linux");
         }
     }
 
@@ -193,11 +183,6 @@ impl Browser {
         {
             self.backend.attach(window.window_handle()?.as_raw())
         }
-        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-        {
-            let _ = window;
-            bail!("Embedded browsers require macOS, Windows, or Linux");
-        }
     }
 
     pub fn set_bounds(&self, bounds: [f64; 4]) -> Result<()> {
@@ -211,8 +196,7 @@ impl Browser {
             let set = move || unsafe {
                 apps_browser_bounds(browser.get(), bounds[0], bounds[1], bounds[2], bounds[3]);
             };
-            // Do not wait for main during paint. Schedule removal before Drop waits for it. On main, remove
-            // immediately.
+            // Do not wait for main during paint. On main, set them now.
             match MAIN_THREAD
                 .get()
                 .filter(|_| unsafe { pthread_main_np() } == 0)
@@ -252,7 +236,7 @@ impl Browser {
         Ok(())
     }
 
-    pub fn command(&self, operation: &str, arguments: &Value) -> Result<Value> {
+    pub fn command(&self, operation: &str, arguments: &Value) -> Result<()> {
         match operation {
             "loadURL" => {
                 ensure!(arguments.is_string(), "Expected browser URL");
@@ -342,7 +326,7 @@ impl Browser {
                 arguments["id"].is_u64() && arguments["allow"].is_boolean(),
                 "Expected navigation decision"
             ),
-            "back" | "forward" | "reload" | "stop" | "focus" | "inspect" | "state" => {}
+            "back" | "forward" | "reload" | "stop" | "focus" | "inspect" => {}
             _ => bail!("Unknown browser command: {operation}"),
         }
         #[cfg(target_os = "macos")]
@@ -350,46 +334,39 @@ impl Browser {
             let operation = CString::new(operation)?;
             let arguments = CString::new(arguments.to_string())?;
             let browser = Native(self.handle.as_ptr());
-            let value = sync_main(move || -> Result<Value> {
+            let error = sync_main(move || {
                 let pointer = unsafe {
                     apps_browser_command(browser.get(), operation.as_ptr(), arguments.as_ptr())
                 };
-                ensure!(!pointer.is_null(), "Browser operation returned no response");
-                let result =
-                    serde_json::from_slice::<Value>(unsafe { CStr::from_ptr(pointer) }.to_bytes());
+                if pointer.is_null() {
+                    return None;
+                }
+                let error = unsafe { CStr::from_ptr(pointer) }
+                    .to_string_lossy()
+                    .into_owned();
                 unsafe { apps_browser_free(pointer) };
-                Ok(result?)
-            })?;
-            if let Some(error) = value["error"].as_str() {
+                Some(error)
+            });
+            if let Some(error) = error {
                 bail!("{error}");
             }
-            Ok(value["value"].clone())
         }
         #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            self.backend.command(operation, arguments)
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-        {
-            let _ = (operation, arguments);
-            bail!("Embedded browsers require macOS, Windows, or Linux");
-        }
+        self.backend.command(operation, arguments)?;
+        Ok(())
     }
 
     pub fn load_url(&self, url: &str) -> Result<()> {
         self.command("loadURL", &Value::String(url.into()))
-            .map(|_| ())
     }
     pub fn load_html(&self, html: &str, base_url: &str) -> Result<()> {
         self.command(
             "loadHTML",
             &serde_json::json!({"html":html,"baseURL":base_url}),
         )
-        .map(|_| ())
     }
     pub fn evaluate(&self, id: u64, script: &str) -> Result<()> {
         self.command("evaluate", &serde_json::json!({"id":id,"script":script}))
-            .map(|_| ())
     }
     pub fn poll(&self) -> Vec<Value> {
         #[cfg(target_os = "macos")]
@@ -403,10 +380,6 @@ impl Browser {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             self.backend.poll()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-        {
-            Vec::new()
         }
     }
 }

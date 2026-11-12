@@ -47,7 +47,6 @@ struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     /// `None` while `index` stays in the current look. Past it, the look that holds `index` with
     /// its start, or `None` after the last one.
-    #[allow(clippy::option_option)]
     fn step(&mut self, index: usize) -> Option<Option<(usize, &'a Look)>> {
         if index < self.end {
             return None;
@@ -262,6 +261,9 @@ impl TextLine {
         width: Option<Pixels>,
         window: &mut Window,
     ) {
+        if self.looks.iter().all(|look| look.background.is_none()) {
+            return;
+        }
         let rows = self.placed(origin, align, width);
         let line = &*self.line;
         let quad = |window: &mut Window, origin: Point<Pixels>, width: Pixels, color: Color| {

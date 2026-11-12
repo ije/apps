@@ -302,7 +302,7 @@ pub(super) fn css_background(
                                                 None,
                                             );
                                         }
-                                        super::canvas::render_image(&pixels)
+                                        super::canvas::render_image(&pixels, Vec::new())
                                     }
                                     None => image,
                                 };

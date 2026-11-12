@@ -162,9 +162,6 @@ impl Hasher {
             }
         }
     }
-    pub(super) fn finish(self) -> Value {
-        crate::jsc::payload::write(self.digest())
-    }
 }
 
 pub(crate) enum Codec {

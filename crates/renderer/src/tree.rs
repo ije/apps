@@ -5,6 +5,7 @@ use crate::{
     node::{Child, Content, Events, MeasureFn, Measurement, Node, NodeCx, NodeKey, NodeStyle},
     point, px, size,
     text::{TextState, same_shaping},
+    window::Placement,
 };
 use rustc_hash::{FxHashMap, FxHasher};
 use std::{
@@ -51,8 +52,7 @@ struct Slot {
     hitbox: u32,
     listed: bool,
     free: [bool; 2],
-    #[allow(clippy::type_complexity)]
-    placed: Option<(u32, Point<f32>, (Point<Pixels>, Clip<Pixels>, usize))>,
+    placed: Option<(u32, Point<f32>, Placement)>,
     below: bool,
     volatile: bool,
     reach: Option<Rect<Pixels>>,
@@ -1164,8 +1164,7 @@ impl Tree {
                     }
                 }
                 let painted = matches!(slot.kind, Kind::Text(..) | Kind::Measured)
-                    && slot.hooks.clone().is_some_and(|hooks| {
-                        let (text, state) = (slot.text.clone(), slot.state.clone());
+                    && slot.hooks.as_ref().is_some_and(|hooks| {
                         let [bounds, _, exact] = slot.bounds;
                         let scale = window.scale_factor();
                         let mut cx = NodeCx {
@@ -1174,9 +1173,9 @@ impl Tree {
                             exact,
                             inset: inset(&slot.layout, scale),
                             baselines: self.baselines(index, scale),
-                            text: &text,
+                            text: &slot.text,
                             style,
-                            state: state.as_ref(),
+                            state: slot.state.as_ref(),
                         };
                         hooks.paint_content(&mut cx)
                     });

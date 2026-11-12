@@ -1,10 +1,7 @@
 use crate::build_target::BuildTarget;
 use anyhow::{Context, Result, ensure};
 use bbtree::unsync::BBTreeMap;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::Path};
 
 #[allow(clippy::too_many_arguments)]
 pub fn package_app(
@@ -12,12 +9,11 @@ pub fn package_app(
     files: &BBTreeMap<String, String>,
     runtime: &Path,
     root: &Path,
-    production: bool,
     target: BuildTarget,
     app_binary: Option<&Path>,
     bytecode: bool,
     aot: Option<&Path>,
-) -> Result<(usize, PathBuf)> {
+) -> Result<usize> {
     let package = files.get("package.json").map(String::as_str);
     let (name, product_name, version, identifier) =
         apps_runtime::bundle::package_metadata(package)?;
@@ -156,26 +152,7 @@ pub fn package_app(
     } else {
         Vec::new()
     };
-    let mut bytes = if production {
-        apps_runtime::bundle::write(&assets.join("app.bundle"), files, &bytecode)?
-    } else {
-        for (name, source) in files {
-            if name == "native.json" {
-                fs::write(
-                    assets.join(name),
-                    apps_runtime::bundle::copy_native(&assets, source)?,
-                )?;
-            } else if name == "assets.json" {
-                fs::write(
-                    assets.join(name),
-                    apps_runtime::bundle::copy_assets(&assets, source)?,
-                )?;
-            } else {
-                fs::write(assets.join(name), source)?;
-            }
-        }
-        files.values().map(String::len).sum()
-    };
+    let mut bytes = apps_runtime::bundle::write(&assets.join("app.bundle"), files, &bytecode)?;
     if let Some(aot) = aot {
         target
             .validate_binary(aot)
@@ -320,53 +297,51 @@ pub fn package_app(
             }
         }
     }
-    if production {
-        let archive = stage.path().join(format!("{product_name}.zip"));
-        ensure!(!archive.exists(), "ZIP name conflicts with a build file");
-        let mut zip = zip::ZipWriter::new(fs::File::create(&archive)?);
-        let mut directories = vec![if target.platform == "macos" {
-            app_directory
-        } else {
-            stage.path().to_owned()
-        }];
-        while let Some(directory) = directories.pop() {
-            let mut entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
-            entries.sort_by_key(fs::DirEntry::file_name);
-            for entry in entries {
-                let path = entry.path();
-                if path == archive || path == stage.path().join(".apps-build") {
-                    continue;
-                }
-                let relative = path
-                    .strip_prefix(stage.path())?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let metadata = entry.metadata()?;
-                let options = zip::write::SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Deflated)
-                    .large_file(metadata.len() >= u32::MAX as u64);
-                #[cfg(unix)]
-                let options = {
-                    use std::os::unix::fs::PermissionsExt;
-                    options.unix_permissions(metadata.permissions().mode())
-                };
-                let options =
-                    if metadata.is_dir() || (target.platform != "windows" && path == executable) {
-                        options.unix_permissions(0o755)
-                    } else {
-                        options
-                    };
-                if metadata.is_dir() {
-                    zip.add_directory(format!("{relative}/"), options)?;
-                    directories.push(path);
+    let archive = stage.path().join(format!("{product_name}.zip"));
+    ensure!(!archive.exists(), "ZIP name conflicts with a build file");
+    let mut zip = zip::ZipWriter::new(fs::File::create(&archive)?);
+    let mut directories = vec![if target.platform == "macos" {
+        app_directory
+    } else {
+        stage.path().to_owned()
+    }];
+    while let Some(directory) = directories.pop() {
+        let mut entries = fs::read_dir(directory)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            if path == archive || path == stage.path().join(".apps-build") {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(stage.path())?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let metadata = entry.metadata()?;
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .large_file(metadata.len() >= u32::MAX as u64);
+            #[cfg(unix)]
+            let options = {
+                use std::os::unix::fs::PermissionsExt;
+                options.unix_permissions(metadata.permissions().mode())
+            };
+            let options =
+                if metadata.is_dir() || (target.platform != "windows" && path == executable) {
+                    options.unix_permissions(0o755)
                 } else {
-                    zip.start_file(relative, options)?;
-                    std::io::copy(&mut fs::File::open(path)?, &mut zip)?;
-                }
+                    options
+                };
+            if metadata.is_dir() {
+                zip.add_directory(format!("{relative}/"), options)?;
+                directories.push(path);
+            } else {
+                zip.start_file(relative, options)?;
+                std::io::copy(&mut fs::File::open(path)?, &mut zip)?;
             }
         }
-        zip.finish()?;
     }
+    zip.finish()?;
     let backup = tempfile::Builder::new()
         .prefix(".apps-build-")
         .tempdir_in(out.parent().unwrap())?;
@@ -380,11 +355,7 @@ pub fn package_app(
         }
         return Err(error.into());
     }
-    #[cfg(windows)]
-    if target.platform == "macos" {
-        return Ok((bytes, out.join(executable.strip_prefix(stage.path())?)));
-    }
-    Ok((bytes, out.join(executable_name)))
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -424,86 +395,77 @@ mod tests {
                 ("app.js".into(), String::new()),
                 ("package.json".into(), package.to_string()),
             ]);
-            for production in [false, true] {
-                let (_, executable) = package_app(
-                    &out,
-                    &files,
-                    &runtime,
-                    dir.path(),
-                    production,
-                    BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
-                    None,
-                    false,
-                    None,
+            package_app(
+                &out,
+                &files,
+                &runtime,
+                dir.path(),
+                BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            let filename = if cfg!(windows) {
+                format!("{name}.exe")
+            } else {
+                name.into()
+            };
+            assert_eq!(fs::read(out.join(&filename)).unwrap(), b"runtime");
+            let archive = out.join(format!("{product_name}.zip"));
+            let mut zip = zip::ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
+            let binary = if cfg!(target_os = "macos") {
+                format!("{product_name}.app/Contents/MacOS/{filename}")
+            } else {
+                filename.clone()
+            };
+            assert!(zip.file_names().all(|name| {
+                let name = name.unwrap();
+                name != ".apps-build" && !name.ends_with(".zip")
+            }));
+            let mut binary = zip.by_name(&binary).unwrap();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut binary, &mut bytes).unwrap();
+            assert_eq!(bytes, b"runtime");
+            #[cfg(unix)]
+            assert_eq!(binary.unix_mode().unwrap() & 0o777, 0o755);
+            let bundle = apps_runtime::bundle::read(&out).unwrap();
+            assert_eq!(
+                apps_runtime::bundle::package_metadata(Some(&bundle.files["package.json"]))
+                    .unwrap(),
+                (
+                    name.into(),
+                    product_name.into(),
+                    version.into(),
+                    identifier.into()
                 )
-                .unwrap();
-                let filename = if cfg!(windows) {
-                    format!("{name}.exe")
-                } else {
-                    name.into()
-                };
-                assert_eq!(executable, out.join(&filename));
-                assert_eq!(fs::read(executable).unwrap(), b"runtime");
-                let archive = out.join(format!("{product_name}.zip"));
-                assert_eq!(archive.is_file(), production);
-                if production {
-                    let mut zip = zip::ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
-                    let binary = if cfg!(target_os = "macos") {
-                        format!("{product_name}.app/Contents/MacOS/{filename}")
-                    } else {
-                        filename.clone()
-                    };
-                    assert!(zip.file_names().all(|name| {
-                        let name = name.unwrap();
-                        name != ".apps-build" && !name.ends_with(".zip")
-                    }));
-                    let mut binary = zip.by_name(&binary).unwrap();
-                    let mut bytes = Vec::new();
-                    std::io::Read::read_to_end(&mut binary, &mut bytes).unwrap();
-                    assert_eq!(bytes, b"runtime");
-                    #[cfg(unix)]
-                    assert_eq!(binary.unix_mode().unwrap() & 0o777, 0o755);
+            );
+            #[cfg(target_os = "macos")]
+            {
+                let app = out.join(format!("{product_name}.app"));
+                let plist = fs::read_to_string(app.join("Contents/Info.plist")).unwrap();
+                let escaped = apps_runtime::dom::escape(name);
+                assert!(plist.contains(&format!(
+                    "<key>CFBundleExecutable</key><string>{escaped}</string>"
+                )));
+                assert!(plist.contains(&format!(
+                    "<key>CFBundleIdentifier</key><string>{identifier}</string>"
+                )));
+                let escaped = apps_runtime::dom::escape(product_name);
+                for key in ["CFBundleName", "CFBundleDisplayName"] {
+                    assert!(plist.contains(&format!("<key>{key}</key><string>{escaped}</string>")));
                 }
-                let bundle = apps_runtime::bundle::read(&out).unwrap();
-                assert_eq!(
-                    apps_runtime::bundle::package_metadata(Some(&bundle.files["package.json"]))
-                        .unwrap(),
-                    (
-                        name.into(),
-                        product_name.into(),
-                        version.into(),
-                        identifier.into()
-                    )
-                );
-                #[cfg(target_os = "macos")]
-                {
-                    let app = out.join(format!("{product_name}.app"));
-                    let plist = fs::read_to_string(app.join("Contents/Info.plist")).unwrap();
-                    let escaped = apps_runtime::dom::escape(name);
-                    assert!(plist.contains(&format!(
-                        "<key>CFBundleExecutable</key><string>{escaped}</string>"
-                    )));
-                    assert!(plist.contains(&format!(
-                        "<key>CFBundleIdentifier</key><string>{identifier}</string>"
-                    )));
-                    let escaped = apps_runtime::dom::escape(product_name);
-                    for key in ["CFBundleName", "CFBundleDisplayName"] {
-                        assert!(
-                            plist.contains(&format!("<key>{key}</key><string>{escaped}</string>"))
-                        );
-                    }
-                    assert!(plist.contains(&format!(
-                        "<key>CFBundleShortVersionString</key><string>{version}</string>"
-                    )));
-                    assert!(plist.contains(&format!(
-                        "<key>CFBundleVersion</key><string>{}</string>",
-                        version.split('-').next().unwrap()
-                    )));
-                    assert!(apps_runtime::bundle::read(&app).is_ok());
-                    let resources = app.join("Contents/Resources");
-                    assert_eq!(resources.join("app.bundle").is_file(), production);
-                    assert_eq!(resources.join("package.json").is_file(), !production);
-                }
+                assert!(plist.contains(&format!(
+                    "<key>CFBundleShortVersionString</key><string>{version}</string>"
+                )));
+                assert!(plist.contains(&format!(
+                    "<key>CFBundleVersion</key><string>{}</string>",
+                    version.split('-').next().unwrap()
+                )));
+                assert!(apps_runtime::bundle::read(&app).is_ok());
+                let resources = app.join("Contents/Resources");
+                assert!(resources.join("app.bundle").is_file());
+                assert!(!resources.join("package.json").exists());
             }
         }
     }
@@ -586,19 +548,22 @@ mod tests {
                     None,
                 )
                 .unwrap();
-                let (_, executable) = package_app(
+                package_app(
                     &out,
                     &files,
                     &runtime,
                     dir.path(),
-                    production,
                     BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                     None,
                     false,
                     None,
                 )
                 .unwrap();
-                assert_eq!(executable.file_stem().unwrap(), name);
+                assert!(
+                    out.join(name)
+                        .with_extension(std::env::consts::EXE_EXTENSION)
+                        .is_file()
+                );
                 let bundle = apps_runtime::bundle::read(&out).unwrap();
                 assert_eq!(
                     apps_runtime::desktop::Desktop::from_bundle(bundle)
@@ -636,7 +601,6 @@ mod tests {
                 &files,
                 &runtime,
                 dir.path(),
-                true,
                 target,
                 None,
                 false,
@@ -698,7 +662,6 @@ mod tests {
                 &files,
                 &runtime,
                 dir.path(),
-                true,
                 target,
                 None,
                 false,
@@ -745,24 +708,18 @@ mod tests {
             &files,
             &runtime,
             dir.path(),
-            false,
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             None,
             false,
             None,
         )
         .unwrap();
-        assert!(assets.join("app.js").is_file());
-        assert!(assets.join("page-0.html").is_file());
-        assert!(!assets.join("apps.json").exists());
-        assert!(apps_runtime::bundle::read(&out).unwrap().pages.is_empty());
         fs::write(assets.join("apps.json"), b"old manifest").unwrap();
         package_app(
             &out,
             &files,
             &runtime,
             dir.path(),
-            true,
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             None,
             false,
@@ -774,20 +731,6 @@ mod tests {
         assert!(!assets.join("page-0.html").exists());
         assert!(!assets.join("apps.json").exists());
         assert_eq!(apps_runtime::bundle::read(&out).unwrap().pages.len(), 1);
-        package_app(
-            &out,
-            &files,
-            &runtime,
-            dir.path(),
-            false,
-            BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
-            None,
-            false,
-            None,
-        )
-        .unwrap();
-        assert!(!assets.join("app.bundle").exists());
-        assert!(assets.join("app.js").is_file());
     }
 
     #[test]
@@ -820,58 +763,54 @@ mod tests {
         } else {
             out.clone()
         };
-        for production in [false, true] {
-            fs::write(data.join("message.txt"), "first").unwrap();
-            package_app(
-                &out,
-                &files,
-                &runtime,
-                dir.path(),
-                production,
-                BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
-                None,
-                false,
-                None,
-            )
-            .unwrap();
-            assert_eq!(
-                fs::read(assets.join("data/nested/data.bin")).unwrap(),
-                [0, 255, 128]
-            );
-            assert!(assets.join("data/nested/empty").is_dir());
-            assert_eq!(fs::read(assets.join("lib/math.bin")).unwrap(), [1, 2]);
-            assert!(!assets.join("lib/skipped.bin").exists());
-            assert!(!assets.join("public").exists());
-            assert!(!assets.join("skipped.txt").exists());
-            assert_eq!(fs::read(assets.join("data/message.txt")).unwrap(), b"first");
-            assert_eq!(
-                fs::read(assets.join("data/static.js")).unwrap(),
-                fs::read(data.join("static.js")).unwrap()
-            );
-            assert!(
-                !apps_runtime::bundle::read(&out)
-                    .unwrap()
-                    .files
-                    .contains_key("data/static.js")
-            );
+        fs::write(data.join("message.txt"), "first").unwrap();
+        package_app(
+            &out,
+            &files,
+            &runtime,
+            dir.path(),
+            BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(assets.join("data/nested/data.bin")).unwrap(),
+            [0, 255, 128]
+        );
+        assert!(assets.join("data/nested/empty").is_dir());
+        assert_eq!(fs::read(assets.join("lib/math.bin")).unwrap(), [1, 2]);
+        assert!(!assets.join("lib/skipped.bin").exists());
+        assert!(!assets.join("public").exists());
+        assert!(!assets.join("skipped.txt").exists());
+        assert_eq!(fs::read(assets.join("data/message.txt")).unwrap(), b"first");
+        assert_eq!(
+            fs::read(assets.join("data/static.js")).unwrap(),
+            fs::read(data.join("static.js")).unwrap()
+        );
+        assert!(
+            !apps_runtime::bundle::read(&out)
+                .unwrap()
+                .files
+                .contains_key("data/static.js")
+        );
 
-            fs::remove_file(data.join("message.txt")).unwrap();
-            fs::write(data.join("new.txt"), "second").unwrap();
-            package_app(
-                &out,
-                &files,
-                &runtime,
-                dir.path(),
-                production,
-                BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
-                None,
-                false,
-                None,
-            )
-            .unwrap();
-            assert!(!assets.join("data/message.txt").exists());
-            assert_eq!(fs::read(assets.join("data/new.txt")).unwrap(), b"second");
-        }
+        fs::remove_file(data.join("message.txt")).unwrap();
+        fs::write(data.join("new.txt"), "second").unwrap();
+        package_app(
+            &out,
+            &files,
+            &runtime,
+            dir.path(),
+            BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(!assets.join("data/message.txt").exists());
+        assert_eq!(fs::read(assets.join("data/new.txt")).unwrap(), b"second");
     }
 
     #[test]
@@ -884,83 +823,78 @@ mod tests {
         fs::write(&runtime, b"runtime").unwrap();
         let out = dir.path().join("dist");
         let files = BBTreeMap::from([("app.js".into(), String::new())]);
-        for production in [false, true] {
-            fs::write(&manifest, r#"{"files":["data"]}"#).unwrap();
-            let (_, executable) = package_app(
+        let executable = if cfg!(windows) { "App.exe" } else { "App" };
+        fs::write(&manifest, r#"{"files":["data"]}"#).unwrap();
+        package_app(
+            &out,
+            &files,
+            &runtime,
+            dir.path(),
+            BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        for name in [
+            "app.js",
+            "app.bundle",
+            "native.json",
+            "package.json",
+            ".apps-build",
+            executable,
+        ] {
+            let source = dir.path().join(name);
+            fs::write(&source, "conflict").unwrap();
+            fs::write(&manifest, format!(r#"{{"files":["{name}"]}}"#)).unwrap();
+            let error = package_app(
                 &out,
                 &files,
                 &runtime,
                 dir.path(),
-                production,
                 BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
                 None,
                 false,
                 None,
             )
-            .unwrap();
-            for name in [
-                "app.js",
-                "app.bundle",
-                "native.json",
-                "package.json",
-                ".apps-build",
-                if cfg!(windows) { "App.exe" } else { "App" },
-            ] {
-                let source = dir.path().join(name);
-                fs::write(&source, "conflict").unwrap();
-                fs::write(&manifest, format!(r#"{{"files":["{name}"]}}"#)).unwrap();
-                let error = package_app(
-                    &out,
-                    &files,
-                    &runtime,
-                    dir.path(),
-                    production,
-                    BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
-                    None,
-                    false,
-                    None,
-                )
-                .unwrap_err();
-                assert!(
-                    error.to_string().contains("conflicts with a build file"),
-                    "{error}"
-                );
-                assert_eq!(fs::read(&executable).unwrap(), b"runtime");
-                assert!(apps_runtime::bundle::read(&out).is_ok());
-                fs::remove_file(source).unwrap();
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("conflicts with a build file"),
+                "{error}"
+            );
+            assert_eq!(fs::read(out.join(executable)).unwrap(), b"runtime");
+            assert!(apps_runtime::bundle::read(&out).is_ok());
+            fs::remove_file(source).unwrap();
+        }
+        fs::write(&manifest, r#"{"files":["data"]}"#).unwrap();
+        #[cfg(unix)]
+        for name in [
+            std::ffi::OsStr::new("..\\..\\escape.txt"),
+            std::os::unix::ffi::OsStrExt::from_bytes(b"invalid-\xff.txt"),
+        ] {
+            let source = data.join(name);
+            if fs::write(&source, "escape").is_err() {
+                continue;
             }
-            fs::write(&manifest, r#"{"files":["data"]}"#).unwrap();
-            #[cfg(unix)]
-            for name in [
-                std::ffi::OsStr::new("..\\..\\escape.txt"),
-                std::os::unix::ffi::OsStrExt::from_bytes(b"invalid-\xff.txt"),
-            ] {
-                let source = data.join(name);
-                if fs::write(&source, "escape").is_err() {
-                    continue;
-                }
-                let error = package_app(
-                    &out,
-                    &files,
-                    &runtime,
-                    dir.path(),
-                    production,
-                    BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
-                    None,
-                    false,
-                    None,
-                )
-                .unwrap_err();
-                assert!(error.to_string().contains("without backslashes"), "{error}");
-                fs::remove_file(source).unwrap();
-            }
+            let error = package_app(
+                &out,
+                &files,
+                &runtime,
+                dir.path(),
+                BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
+                None,
+                false,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("without backslashes"), "{error}");
+            fs::remove_file(source).unwrap();
         }
         let error = package_app(
             &data.join("dist"),
             &files,
             &runtime,
             dir.path(),
-            true,
             BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap(),
             None,
             false,

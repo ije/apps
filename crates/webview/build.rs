@@ -3,10 +3,9 @@ fn main() {
         cc::Build::new()
             .file("src/platform/macos.m")
             .flag("-fobjc-arc")
-            .flag("-Wno-incompatible-pointer-types")
             .compile("apps_webview");
         println!("cargo:rerun-if-changed=src/platform/macos.m");
-        for framework in ["AppKit", "WebKit", "Foundation", "CoreGraphics"] {
+        for framework in ["AppKit", "WebKit", "Foundation"] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }
     }

@@ -1512,6 +1512,8 @@ struct Variant {
 
 type Rank = (u16, String);
 
+type Expansion = (usize, Option<String>, Option<String>);
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Sort {
     variants: Vec<Rank>,
@@ -1545,8 +1547,7 @@ struct Config {
     expanding: std::cell::RefCell<Vec<usize>>,
     // Do not cache expansions cut short by cycles or depth limits: their result depends on the starting
     // point.
-    #[allow(clippy::type_complexity)]
-    expanded: std::cell::RefCell<FxHashMap<(usize, Option<String>, Option<String>), Option<Body>>>,
+    expanded: std::cell::RefCell<FxHashMap<Expansion, Option<Body>>>,
     cut: std::cell::Cell<bool>,
     import: Option<bool>,
     classes: FxHashMap<String, bool>,
@@ -3422,12 +3423,6 @@ impl Config {
                 if root == "translate" && bare == Some("none") {
                     return Body::new(&[("translate", "none".into())]);
                 }
-                if root == "translate" && bare == Some("3d") {
-                    return Body::new(&[(
-                        "translate",
-                        "var(--tw-translate-x) var(--tw-translate-y) var(--tw-translate-z)".into(),
-                    )]);
-                }
                 let resolved = match (&raw, modifier) {
                     (Some(raw), None) => negate(raw.clone()),
                     (_, Some(_)) => negate(fraction(true)?),
@@ -3460,20 +3455,10 @@ impl Config {
             }
             "scale" | "scale-x" | "scale-y" | "scale-z" => {
                 let value = value?;
-                if root == "scale" {
-                    match bare {
-                        Some("none") => return Body::new(&[("scale", "none".into())]),
-                        Some("3d") => {
-                            return Body::new(&[(
-                                "scale",
-                                "var(--tw-scale-x) var(--tw-scale-y) var(--tw-scale-z)".into(),
-                            )]);
-                        }
-                        _ => {}
-                    }
-                    if let Some(raw) = &raw {
-                        return Body::new(&[("scale", negate(raw.clone()))]);
-                    }
+                if root == "scale"
+                    && let Some(raw) = &raw
+                {
+                    return Body::new(&[("scale", negate(raw.clone()))]);
                 }
                 let resolved = negate(match &raw {
                     Some(raw) => raw.clone(),
@@ -3504,9 +3489,6 @@ impl Config {
                 })
             }
             "rotate" | "rotate-x" | "rotate-y" | "rotate-z" | "skew" | "skew-x" | "skew-y" => {
-                if root == "rotate" && bare == Some("none") {
-                    return Body::new(&[("rotate", "none".into())]);
-                }
                 let resolved = negate(match &raw {
                     Some(raw) => raw.clone(),
                     None => number("deg")?,
@@ -3879,9 +3861,6 @@ impl Config {
                 if let Some(position) = position {
                     return Body::new(&[(&format!("--tw-gradient-{root}-position"), position)]);
                 }
-                if root == "via" && bare == Some("none") {
-                    return Body::new(&[("--tw-gradient-via-stops", "initial".into())]);
-                }
                 let color = self.color(value, modifier)?;
                 if root == "via" {
                     return Body::new(&[
@@ -4115,7 +4094,7 @@ impl Config {
             }
             "shadow" | "inset-shadow" | "text-shadow" | "drop-shadow" => {
                 let shadow = match (bare, &raw) {
-                    (None, None) if value.is_none() => match root {
+                    (None, None) => match root {
                         "shadow" => self.raw("--shadow"),
                         "drop-shadow" => self.raw("--drop-shadow"),
                         _ => None,

@@ -47,6 +47,7 @@ struct Reference {
     weak: Ptr,
     count: u32,
 }
+#[derive(Default)]
 struct Scope {
     kept: HashSet<usize>,
     values: Vec<Ptr>,
@@ -708,12 +709,7 @@ impl State {
         self.environments.borrow_mut().push(environment.clone());
         // Like Node.js, never unload an addon. Its threads and static destructors may still run.
         std::mem::forget(library);
-        environment.scopes.borrow_mut().push(Box::new(Scope {
-            kept: HashSet::new(),
-            values: Vec::new(),
-            escaped: false,
-            escapable: false,
-        }));
+        environment.scopes.borrow_mut().push(Box::default());
         let exports = environment
             .js("object", &[])
             .map_err(|_| anyhow::anyhow!("Cannot create addon exports"))?;
@@ -770,12 +766,7 @@ unsafe extern "C" fn invoke(
             data: callback.data,
         };
         let depth = env.scopes.borrow().len();
-        env.scopes.borrow_mut().push(Box::new(Scope {
-            kept: HashSet::new(),
-            values: Vec::new(),
-            escaped: false,
-            escapable: false,
-        }));
+        env.scopes.borrow_mut().push(Box::default());
         let value = unsafe { (callback.callback)(Rc::as_ptr(&env), &info) };
         unsafe {
             *exception = env.take_exception();
@@ -1514,12 +1505,7 @@ api!(napi_get_and_clear_last_exception(env, result: *mut Ptr) {
 });
 api!(napi_open_handle_scope(env, result: *mut Ptr) {
     check(!result.is_null(), 1)?;
-    let mut scope = Box::new(Scope {
-        kept: HashSet::new(),
-        values: Vec::new(),
-        escaped: false,
-        escapable: false,
-    });
+    let mut scope = Box::<Scope>::default();
     *result = (&mut *scope as *mut Scope).cast();
     env.scopes.borrow_mut().push(scope);
     Ok(())
@@ -1539,10 +1525,8 @@ api!(napi_close_handle_scope(env, scope: Ptr) {
 api!(napi_open_escapable_handle_scope(env, result: *mut Ptr) {
     check(!result.is_null(), 1)?;
     let mut scope = Box::new(Scope {
-        kept: HashSet::new(),
-        values: Vec::new(),
-        escaped: false,
         escapable: true,
+        ..Scope::default()
     });
     *result = (&mut *scope as *mut Scope).cast();
     env.scopes.borrow_mut().push(scope);
@@ -2727,12 +2711,7 @@ api!(napi_ref_threadsafe_function(env, function: Ptr) {
 impl State {
     fn scoped(&self, run: impl FnOnce()) {
         let depth = self.scopes.borrow().len();
-        self.scopes.borrow_mut().push(Box::new(Scope {
-            kept: HashSet::new(),
-            values: Vec::new(),
-            escaped: false,
-            escapable: false,
-        }));
+        self.scopes.borrow_mut().push(Box::default());
         run();
         self.report();
         while self.scopes.borrow().len() > depth {

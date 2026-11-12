@@ -1,8 +1,6 @@
 // Copyright 2020 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-#![allow(clippy::needless_range_loop)]
-
 use super::{ImageRefMut, f32_bound};
 use usvg::ApproxZeroUlps;
 
@@ -82,7 +80,7 @@ pub fn apply(
 type Gradient = [[[f64; 2]; 4]];
 
 fn init(mut seed: i32) -> (Vec<usize>, Vec<[[f64; 2]; 4]>) {
-    let mut lattice_selector = vec![0; B_LEN];
+    let mut lattice_selector: Vec<usize> = (0..B_LEN).collect();
     let mut gradient = vec![[[0.0; 2]; 4]; B_LEN];
 
     if seed <= 0 {
@@ -94,19 +92,15 @@ fn init(mut seed: i32) -> (Vec<usize>, Vec<[[f64; 2]; 4]>) {
     }
 
     for k in 0..4 {
-        for i in 0..B_SIZE {
-            lattice_selector[i] = i;
-            for j in 0..2 {
+        for cell in &mut gradient[..B_SIZE] {
+            let v = &mut cell[k];
+            for c in v.iter_mut() {
                 seed = random(seed);
-                gradient[i][k][j] =
-                    ((seed % (B_SIZE_32 + B_SIZE_32)) - B_SIZE_32) as f64 / B_SIZE_32 as f64;
+                *c = ((seed % (B_SIZE_32 + B_SIZE_32)) - B_SIZE_32) as f64 / B_SIZE_32 as f64;
             }
-
-            let s = (gradient[i][k][0] * gradient[i][k][0] + gradient[i][k][1] * gradient[i][k][1])
-                .sqrt();
-
-            gradient[i][k][0] /= s;
-            gradient[i][k][1] /= s;
+            let s = (v[0] * v[0] + v[1] * v[1]).sqrt();
+            v[0] /= s;
+            v[1] /= s;
         }
     }
 

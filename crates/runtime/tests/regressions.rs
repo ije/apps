@@ -80,21 +80,6 @@ return [[3,0,2]];
         .eval_page(&apps_runtime::bundle::script_source(&files, true), "app.js")
         .unwrap_err();
     assert!(error.to_string().contains("boom"), "{error}");
-    files.insert(
-        "app.js".to_owned(),
-        "$appsDefine({id:9,code:'globalThis.ninth=9',exports:[]});return [[9]];".to_owned(),
-    );
-    let page = JsContext::new(
-        JavaScriptCore::load().unwrap(),
-        Rc::new(RefCell::new(Host::default())),
-        Role::Main,
-    )
-    .unwrap();
-    page.load_bundle(&files, "app.js").unwrap();
-    assert!(
-        page.sources()["app.js"].contains("globalThis.ninth"),
-        "A runtime helper replaced the devtools source of app.js"
-    );
     engine.tick().unwrap();
     assert_eq!(
         engine

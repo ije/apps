@@ -11,7 +11,6 @@ typedef void (*AppsCallback)(void *, const char *);
 @property(nonatomic, strong) NSWindow *window;
 @property(nonatomic) AppsCallback callback;
 @property(nonatomic) void *context;
-@property(nonatomic) BOOL closed;
 @property(nonatomic) BOOL visible;
 @property(nonatomic) BOOL gated;
 @property(nonatomic) BOOL programmatic;
@@ -23,11 +22,6 @@ typedef void (*AppsCallback)(void *, const char *);
 @end
 
 static NSString *AppsString(const char *text) { return text ? [NSString stringWithUTF8String:text] : @""; }
-static NSString *AppsJSON(id value) {
-    if (!value) value = [NSNull null];
-    NSData *data = [NSJSONSerialization dataWithJSONObject:value options:NSJSONWritingFragmentsAllowed error:nil];
-    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : @"null";
-}
 static id AppsValue(const char *text) {
     NSData *data = [AppsString(text) dataUsingEncoding:NSUTF8StringEncoding];
     return [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingFragmentsAllowed error:nil];
@@ -63,7 +57,7 @@ static WKWebsiteDataStore *AppsDataStore(NSString *partition) {
 }
 
 @implementation AppsBrowser
-- (void)windowWillClose:(NSNotification *)notification { self.closed = YES; AppsEmit(self, @{ @"type": @"closed" }); }
+- (void)windowWillClose:(NSNotification *)notification { AppsEmit(self, @{ @"type": @"closed" }); }
 - (void)userContentController:(WKUserContentController *)controller didReceiveScriptMessage:(WKScriptMessage *)message {
     if (![message.body isKindOfClass:[NSDictionary class]]) return;
     if ([message.body[@"kind"] isEqual:@"dom-ready"]) { if (message.frameInfo.mainFrame) AppsEmit(self, @{ @"type": @"dom-ready" }); return; }
@@ -216,16 +210,16 @@ void apps_browser_bounds(void *handle, double x, double y, double width, double 
     owner.view.frame = NSMakeRect(x, parent && !parent.isFlipped ? parent.bounds.size.height - y - height : y, MAX(0, width), MAX(0, height));
 }
 
+// Returns NULL, or an error message for apps_browser_free.
 char *apps_browser_command(void *handle, const char *operation, const char *argumentsJSON) {
     // Do not retain the owner: WebKit can keep pending callbacks and leak the view and web process.
     __weak AppsBrowser *owner = (__bridge AppsBrowser *)handle;
     NSString *op = AppsString(operation);
     id args = AppsValue(argumentsJSON);
     WKWebView *view = owner.view;
-    id result = [NSNull null];
     if ([op isEqualToString:@"loadURL"]) {
         NSURL *url = [NSURL URLWithString:args];
-        if (!url || ![@[@"https", @"http", @"file", @"about", @"data"] containsObject:url.scheme.lowercaseString]) return strdup("{\"error\":\"Unsupported browser URL scheme\"}");
+        if (!url || ![@[@"https", @"http", @"file", @"about", @"data"] containsObject:url.scheme.lowercaseString]) return strdup("Unsupported browser URL scheme");
         owner.programmatic = YES;
         if (url.isFileURL) [view loadFileURL:url allowingReadAccessToURL:[url URLByDeletingLastPathComponent]];
         else [view loadRequest:[NSURLRequest requestWithURL:url]];
@@ -250,7 +244,7 @@ char *apps_browser_command(void *handle, const char *operation, const char *argu
     }
     else if ([op isEqualToString:@"zoom"]) {
         double zoom = [args doubleValue];
-        if (zoom < 0.25 || zoom > 5) return strdup("{\"error\":\"Zoom must be between 0.25 and 5\"}");
+        if (zoom < 0.25 || zoom > 5) return strdup("Zoom must be between 0.25 and 5");
         view.pageZoom = zoom;
     } else if ([op isEqualToString:@"evaluate"]) {
         NSNumber *request = args[@"id"];
@@ -278,7 +272,7 @@ char *apps_browser_command(void *handle, const char *operation, const char *argu
             if ([details[@"httpOnly"] boolValue]) properties[@"HttpOnly"] = @"TRUE";
             if (details[@"expirationDate"]) properties[NSHTTPCookieExpires] = [NSDate dateWithTimeIntervalSince1970:[details[@"expirationDate"] doubleValue]];
             NSHTTPCookie *cookie = [NSHTTPCookie cookieWithProperties:properties];
-            if (!cookie) return strdup("{\"error\":\"Invalid cookie properties\"}");
+            if (!cookie) return strdup("Invalid cookie properties");
             [store setCookie:cookie completionHandler:^{ AppsEmit(owner, @{ @"type": @"evaluation", @"id": request, @"value": [NSNull null] }); }];
         } else {
             [store getAllCookies:^(NSArray<NSHTTPCookie *> *cookies) {
@@ -324,18 +318,16 @@ char *apps_browser_command(void *handle, const char *operation, const char *argu
         if (@available(macOS 13.3, *)) view.inspectable = YES;
         // WebKit has no public API for opening its inspector window.
         SEL inspectorSelector = NSSelectorFromString(@"_inspector");
-        if (![view respondsToSelector:inspectorSelector]) return strdup("{\"error\":\"Use Safari Develop to inspect this view\"}");
+        if (![view respondsToSelector:inspectorSelector]) return strdup("Use Safari Develop to inspect this view");
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
         id inspector = [view performSelector:inspectorSelector];
         SEL show = NSSelectorFromString(@"show");
-        if (![inspector respondsToSelector:show]) return strdup("{\"error\":\"Use Safari Develop to inspect this view\"}");
+        if (![inspector respondsToSelector:show]) return strdup("Use Safari Develop to inspect this view");
         [inspector performSelector:show];
 #pragma clang diagnostic pop
-    } else if ([op isEqualToString:@"state"]) {
-        result = @{ @"url": view.URL.absoluteString ?: @"", @"title": view.title ?: @"", @"loading": @(view.loading), @"canGoBack": @(view.canGoBack), @"canGoForward": @(view.canGoForward), @"zoomFactor": @(view.pageZoom), @"closed": @(owner.closed) };
-    } else return strdup("{\"error\":\"Unknown browser operation\"}");
-    return strdup(AppsJSON(@{ @"value": result }).UTF8String);
+    } else return strdup("Unknown browser operation");
+    return NULL;
 }
 
 void apps_browser_free(char *text) { free(text); }

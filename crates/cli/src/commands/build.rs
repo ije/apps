@@ -72,12 +72,11 @@ pub fn run(
     let compiled = (aot && dynamic.is_none())
         .then(|| crate::aot::compile(&mut files, runtime))
         .transpose()?;
-    let (bytes, _) = packaging::package_app(
+    let bytes = packaging::package_app(
         out,
         &files,
         runtime,
         root,
-        true,
         target,
         binary.as_deref(),
         bytecode,

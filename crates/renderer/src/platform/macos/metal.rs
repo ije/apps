@@ -1308,9 +1308,7 @@ impl PageStore for Pages {
                 })
             },
         )?;
-        let page = self.list(kind).pages[index]
-            .as_ref()
-            .context("atlas page")?;
+        let page = list.pages[index].as_ref().context("atlas page")?;
         upload(&page.texture, rect, bytes, row);
         Ok(Tile {
             page: index as u32,
