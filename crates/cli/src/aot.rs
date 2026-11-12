@@ -56,12 +56,25 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         *mut usize,
     ) -> bool;
     type Free = unsafe extern "C" fn(*mut u8, usize);
+    type Revision = unsafe extern "C" fn() -> *const c_char;
     let (front_end, free) = unsafe {
         (
             *front.get::<FrontEnd>(b"apps_aot_front_end\0")?,
             *front.get::<Free>(b"apps_aot_free\0")?,
         )
     };
+    // WARNING: the front end writes Bun's IR and built-in IDs. The compiler reads them without a version check.
+    let revisions = unsafe {
+        [
+            compiler.get::<Revision>(b"JSGetAOTCompilerRevision\0"),
+            front.get::<Revision>(b"apps_aot_revision\0"),
+        ]
+        .map(|revision| revision.map(|revision| CStr::from_ptr(revision()).to_owned()))
+    };
+    ensure!(
+        matches!(&revisions, [Ok(compiler), Ok(front)] if compiler == front),
+        "libapps_aot.dylib and libJavaScriptCoreCompiler.dylib are from different Bun revisions; run bash scripts/build-jsc.sh --aot"
+    );
     let directory = tempfile::Builder::new().prefix("apps-aot-").tempdir()?;
     fs::write(
         directory.path().join("package.json"),
@@ -105,12 +118,14 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
     let mut names = Vec::new();
     let mut paths = Vec::new();
     let mut globals = BTreeSet::new();
+    let mut skipped = Vec::new();
     for (name, source) in scripts {
         // Do not wrap classic scripts: wrappers change their global declarations.
         if name.starts_with("script-")
             && !source.starts_with(loader)
             && !source.starts_with("(($appsDefine)=>{\n")
         {
+            skipped.push(name);
             continue;
         }
         let allocator = oxc_allocator::Allocator::default();
@@ -120,16 +135,18 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         let Some((Statement::ExpressionStatement(expression), before)) =
             parsed.program.body.split_last()
         else {
+            skipped.push(name);
             continue;
         };
         if before
             .iter()
             .any(|statement| !matches!(statement, Statement::ExpressionStatement(_)))
         {
+            skipped.push(name);
             continue;
         }
         let semantic = oxc_semantic::SemanticBuilder::new()
-            .with_build_nodes(source.contains("AGFzbQEAAA") && source.contains("atob"))
+            .with_build_nodes(true)
             .build(&parsed.program);
         // Wrappers can hide Wasm from Bun's scan. Supply its bytes separately so JSC can match them by
         // digest.
@@ -157,27 +174,60 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
                 wasm.insert(bytes);
             }
         }
-        globals.extend(
-            semantic
-                .semantic
-                .scoping()
-                .root_unresolved_references()
-                .keys()
-                .map(|name| name.to_string()),
-        );
+        let (scoping, nodes) = (semantic.semantic.scoping(), semantic.semantic.nodes());
+        // WARNING: Bun's front end takes `process` and `Bun` for objects that always exist, also on `globalThis`,
+        // and a .cjs entry binds the other names. apps has no global `Bun`, and a page has none of these names.
+        // So the runtime passes the global object of the realm as the `globalThis` parameter, and each free
+        // reference reads from it: `typeof Bun` is `undefined`.
+        let mut edits = Vec::new();
+        for (name, references) in scoping.root_unresolved_references() {
+            globals.insert(name.to_string());
+            if !matches!(
+                name.as_str(),
+                "process" | "Bun" | "require" | "module" | "exports" | "__filename" | "__dirname"
+            ) {
+                continue;
+            }
+            for &reference in references {
+                let node = scoping.get_reference(reference).node_id();
+                let shorthand = match nodes.parent_kind(node) {
+                    AstKind::ObjectProperty(property) => property.shorthand,
+                    AstKind::AssignmentTargetPropertyIdentifier(_) => true,
+                    _ => false,
+                };
+                let span = nodes.kind(node).span();
+                edits.push((span.start as usize, span.end as usize, shorthand));
+            }
+        }
+        edits.sort_unstable();
         let span = expression.expression.span();
-        let start = before
+        let (result, end) = (span.start as usize, span.end as usize);
+        let mut at = before
             .first()
-            .map_or(span.start, |statement| statement.span().start);
+            .map_or(result, |statement| statement.span().start as usize);
+        let mut text = String::with_capacity(end - at + edits.len() * 16 + 64);
+        text.push_str("module.exports=function(globalThis){");
+        let mut returned = false;
+        for (from, to, shorthand) in edits.into_iter().chain([(end, end, false)]) {
+            if !returned && from >= result {
+                text.push_str(&source[at..result]);
+                text.push_str("return (\n");
+                (at, returned) = (result, true);
+            }
+            text.push_str(&source[at..from]);
+            at = from;
+            if from == end {
+                break;
+            }
+            if shorthand {
+                text.push_str(&source[from..to]);
+                text.push(':');
+            }
+            text.push_str("globalThis.");
+        }
+        text.push_str("\n);};\n");
         let path = directory.path().join(format!("entry-{}.cjs", names.len()));
-        fs::write(
-            &path,
-            format!(
-                "module.exports=function(){{{}return (\n{}\n);}};\n",
-                &source[start as usize..span.start as usize],
-                &source[span.start as usize..span.end as usize]
-            ),
-        )?;
+        fs::write(&path, text)?;
         paths.push(path);
         names.push(name.to_owned());
     }
@@ -185,6 +235,12 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         !names.is_empty(),
         "No bundled modules to compile with --aot"
     );
+    if !skipped.is_empty() {
+        eprintln!(
+            "apps: warning: --aot cannot compile these scripts, so they run in the interpreter: {}",
+            skipped.join(", ")
+        );
+    }
     // This entry only declares host globals for Bun. It never runs.
     let mut host = "const unknown=JSON.parse('{}',function(){return this;});\n".to_owned();
     if !wasm.is_empty() {

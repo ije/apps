@@ -174,6 +174,10 @@ fi
 mv -f "$output/.$name" "$output/$name"
 
 if ((aot)); then
+  if ! grep -q "\"$bun_revision\"" "$root/scripts/jsc-aot.cpp"; then
+    printf '%s\n' 'JSGetAOTCompilerRevision in scripts/jsc-aot.cpp must return bun_revision' >&2
+    exit 1
+  fi
   bun_source=$root/target/bun-aot/source
   if [[ ! -d $bun_source ]]; then
     git init "$bun_source"
@@ -220,11 +224,12 @@ if ((aot)); then
   codegen=$(PATH="$(dirname "$bun"):$PATH" "$bun" "$root/scripts/jsc-aot-front-end.ts" "$bun_source" "$source_dir/Source/JavaScriptCore")
   # Bun's release profile adds 4 MB without a speed gain. `z` saves 3.5 MB but takes 2.5x longer. -S removes 5
   # MB of debug maps.
-  (cd "$bun_source" && BUN_CODEGEN_DIR=$codegen cargo build --release -p apps_aot \
+  (cd "$bun_source" && BUN_CODEGEN_DIR=$codegen APPS_BUN_REVISION=$bun_revision cargo build --release -p apps_aot \
     --config 'profile.release.opt-level="s"' --config 'profile.release.lto="fat"')
   name=libapps_aot.dylib
   xcrun clang -dynamiclib -arch arm64 -mmacosx-version-min=13.0 -o "$output/.$name" -Wl,-install_name,"@rpath/$name" \
     -Wl,-dead_strip -Wl,-x -Wl,-S -Wl,-exported_symbol,_apps_aot_front_end -Wl,-exported_symbol,_apps_aot_free \
+    -Wl,-exported_symbol,_apps_aot_revision \
     "$bun_source/target/release/libapps_aot.a" -liconv -lc -lm
   mv -f "$output/.$name" "$output/$name"
 fi

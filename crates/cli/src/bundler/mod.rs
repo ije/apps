@@ -822,8 +822,8 @@ impl<'a> Linker<'a, '_> {
             .alloc_str(&format!("apps:///{}", self.builder.assets[&target].0)))
     }
 
-    fn local_path(&self, expression: &Expression<'a>) -> Option<PathBuf> {
-        let folder = self.path.parent().unwrap_or(Path::new("."));
+    fn local_path(&mut self, expression: &Expression<'a>) -> Option<PathBuf> {
+        let folder = self.path.parent().unwrap_or(Path::new(".")).to_owned();
         let meta = |object: &Expression<'a>| {
             matches!(object.get_inner_expression(), Expression::ImportMeta(_))
         };
@@ -844,13 +844,13 @@ impl<'a> Linker<'a, '_> {
             {
                 match name.name.as_str() {
                     "__filename" => Some(self.path.to_owned()),
-                    "__dirname" => Some(folder.to_owned()),
+                    "__dirname" => Some(folder),
                     _ => None,
                 }
             }
             Expression::StaticMemberExpression(member) => match member.property.name.as_str() {
                 "url" | "filename" if meta(&member.object) => Some(self.path.to_owned()),
-                "dirname" if meta(&member.object) => Some(folder.to_owned()),
+                "dirname" if meta(&member.object) => Some(folder),
                 "href" | "pathname" => self.local_path(&member.object),
                 _ => None,
             },
@@ -903,7 +903,15 @@ impl<'a> Linker<'a, '_> {
                             meta(object) || object.is_specific_id("require")
                         }) =>
                     {
-                        Some(folder.join(literal(first?)?))
+                        let specifier = literal(first?)?;
+                        if specifier.starts_with('.') {
+                            return Some(folder.join(specifier));
+                        }
+                        // WARNING: other names are packages, not files next to this one.
+                        match self.builder.locate(&folder, specifier, true) {
+                            Ok((path, None)) if path.is_file() => Some(path),
+                            _ => None,
+                        }
                     }
                     ("toString", 0) => self.local_path(object?),
                     ("String" | "fileURLToPath", 1) => self.local_path(first?.as_expression()?),

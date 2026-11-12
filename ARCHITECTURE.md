@@ -71,7 +71,9 @@ The runtime loads its own JavaScriptCore library from Bun's WebKit fork. [build-
 
 AOT currently requires a native macOS arm64 build and a JavaScript or TypeScript main entry. The CLI rejects `--aot` and `--bytecode` together. If `jsExecute` or `httpImport` is enabled, the CLI warns and uses the default build mode.
 
-The [AOT path](crates/cli/src/aot.rs) uses Bun's Rust frontend and the JavaScriptCore compiler library. Build identifiers and a hash of runtime scripts connect the compiled image to the correct runtime.
+The [AOT path](crates/cli/src/aot.rs) uses Bun's Rust frontend and the JavaScriptCore compiler library. The CLI checks that both come from the same Bun revision. Build identifiers and a hash of runtime scripts connect the compiled image to the correct runtime.
+
+The AOT JavaScriptCore has no JIT, so code outside the image runs in the interpreter: classic page scripts, `eval()` in main code, `executeJavaScript()`, and Wasm that is not an asset or an `atob()` literal. The build prints the scripts that it does not compile. Bun's frontend assumes that `process`, `Bun` and the CommonJS names like `require` always exist. Apps have no global `Bun`, and a page has none of these names. So compiled code reads these names from the global object of its realm, and a name that is missing reads as `undefined`.
 
 ## Threads and ownership
 

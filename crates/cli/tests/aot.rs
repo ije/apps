@@ -75,7 +75,7 @@ fn packages_and_runs_native_modules() {
     .unwrap();
     fs::write(root.join("worker.js"), "import {parentPort} from 'node:worker_threads'; globalThis.workerAotMarker='worker-aot-sentinel'; parentPort.postMessage([1,2,3].map(x => x * 7).join(','));").unwrap();
     fs::write(root.join("web-worker.js"), "import {basename} from 'node:path'; globalThis.webAotMarker='web-aot-sentinel'; onmessage = event => postMessage(basename(event.data));").unwrap();
-    fs::write(root.join("page-worker.js"), "globalThis.pageAotMarker='page-aot-sentinel'; postMessage(typeof globalThis.require + typeof globalThis.__apps);").unwrap();
+    fs::write(root.join("page-worker.js"), "globalThis.pageAotMarker='page-aot-sentinel'; postMessage(typeof require + typeof process + typeof globalThis.__apps);").unwrap();
     fs::write(root.join("page.html"), r#"<h1>AOT</h1><script>(()=>{globalThis.classicArguments=typeof arguments;})();</script><script type="preload" src="./preload.js"></script><script type="module" src="./page.js"></script>"#).unwrap();
     fs::write(root.join("preload.js"), "import {contextBridge,ipcRenderer} from 'electron'; contextBridge.exposeInMainWorld('bridge',{done:value=>ipcRenderer.invoke('aot-page',value)});").unwrap();
     fs::write(root.join("page.js"), r#"const {answer}=await import('./page-lazy.js');
@@ -86,7 +86,8 @@ for (const call of [()=>eval('1'),()=>Function('return 1')(),()=> (function(){})
 const worker=new Worker(new URL('./page-worker.js',import.meta.url).href);
 const reply=await new Promise((resolve,reject)=>{worker.onmessage=event=>resolve(event.data);worker.onerror=event=>reject(event.error??Error(event.message))});
 worker.terminate();
-await bridge.done([answer(),document.querySelector('h1').textContent,globalThis.classicArguments,blocked,reply].join(','));"#).unwrap();
+const isNode=typeof process !== 'undefined' && process.versions != null && process.versions.node != null;
+await bridge.done([answer(),document.querySelector('h1').textContent,globalThis.classicArguments,blocked,reply,isNode,typeof require+typeof module+typeof exports+typeof __dirname+typeof Bun].join(','));"#).unwrap();
     fs::write(root.join("page-lazy.js"), "export const answer=()=>42;").unwrap();
     fs::write(
         root.join("server.js"),
@@ -103,6 +104,7 @@ import {join} from 'node:path';
 import sloppy from 'sloppy';
 import wasmURL from './sum.wasm';
 assert.equal(sloppy(), true);
+assert.equal(typeof Bun !== 'undefined' ? Bun.version : typeof process + typeof require + typeof module, 'objectundefinedundefined');
 function aotSource(value) { return 918273645 + value; }
 assert.ok(aotSource.toString().includes(aotSource(0)));
 assert.throws(() => globalThis.aotMissing.call918(), /evaluating 'globalThis\.aotMissing\.call918'/);
@@ -146,7 +148,7 @@ setTimeout(async () => {
             ipcMain.handle('aot-page', (_event,value) => {done(value)});
             const window = new BrowserWindow({show:false, focusable:false});
             await window.loadFile(import.meta.resolve('./page.html'));
-            assert.equal(await result, '42,AOT,undefined,6,undefinedundefined');
+            assert.equal(await result, '42,AOT,undefined,6,undefinedundefinedundefined,false,undefinedundefinedundefinedundefinedundefined');
             window.destroy();
         }
         console.log('aot-ok');
@@ -167,16 +169,20 @@ setTimeout(async () => {
     );
     let baseline =
         apps_runtime::bundle::read(&root.join("dist/AotTest.app/Contents/Resources")).unwrap();
-    let [worker, web, page] = ["worker-aot-sentinel", "web-aot-sentinel", "page-aot-sentinel"]
-        .map(|marker| {
-            baseline
-                .scripts
-                .iter()
-                .find(|(_, source)| String::from_utf8_lossy(source).contains(marker))
-                .unwrap()
-                .0
-                .clone()
-        });
+    let [worker, web, page] = [
+        "worker-aot-sentinel",
+        "web-aot-sentinel",
+        "page-aot-sentinel",
+    ]
+    .map(|marker| {
+        baseline
+            .scripts
+            .iter()
+            .find(|(_, source)| String::from_utf8_lossy(source).contains(marker))
+            .unwrap()
+            .0
+            .clone()
+    });
     drop(baseline);
     let output = build.arg("--aot").output().unwrap();
     assert!(

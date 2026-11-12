@@ -95,6 +95,12 @@ pub unsafe extern "C" fn apps_aot_front_end(
     built
 }
 
+/// Bun's revision. The CLI compares it with the compiler's.
+#[unsafe(no_mangle)]
+pub extern "C" fn apps_aot_revision() -> *const c_char {
+    concat!(env!("APPS_BUN_REVISION"), "\0").as_ptr().cast()
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_aot_free(bytes: *mut u8, length: usize) {
     drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(bytes, length)) });

@@ -3693,6 +3693,21 @@ if (threads.isMainThread) {
     fs::write(&entry, "new Worker(__dirname + '/missing.ts');").unwrap();
     let error = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap_err();
     assert!(format!("{error:#}").contains("Cannot find the worker"));
+    fs::create_dir_all(dir.path().join("node_modules/package")).unwrap();
+    fs::write(dir.path().join("node_modules/package/package.json"), "{}").unwrap();
+    fs::write(dir.path().join("node_modules/package/worker.js"), "").unwrap();
+    for source in [
+        "require.resolve('package/worker.js')",
+        "require.resolve('missing/worker.js')",
+    ] {
+        fs::write(&entry, format!("new Worker({source});")).unwrap();
+        let files = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap();
+        assert_eq!(
+            files.keys().any(|name| name.starts_with("script-")),
+            source.contains("package"),
+            "{source}"
+        );
+    }
 }
 
 #[test]
