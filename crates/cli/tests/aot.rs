@@ -74,6 +74,8 @@ fn packages_and_runs_native_modules() {
     )
     .unwrap();
     fs::write(root.join("worker.js"), "import {parentPort} from 'node:worker_threads'; globalThis.workerAotMarker='worker-aot-sentinel'; parentPort.postMessage([1,2,3].map(x => x * 7).join(','));").unwrap();
+    fs::write(root.join("web-worker.js"), "import {basename} from 'node:path'; globalThis.webAotMarker='web-aot-sentinel'; onmessage = event => postMessage(basename(event.data));").unwrap();
+    fs::write(root.join("page-worker.js"), "globalThis.pageAotMarker='page-aot-sentinel'; postMessage(typeof globalThis.require + typeof globalThis.__apps);").unwrap();
     fs::write(root.join("page.html"), r#"<h1>AOT</h1><script>(()=>{globalThis.classicArguments=typeof arguments;})();</script><script type="preload" src="./preload.js"></script><script type="module" src="./page.js"></script>"#).unwrap();
     fs::write(root.join("preload.js"), "import {contextBridge,ipcRenderer} from 'electron'; contextBridge.exposeInMainWorld('bridge',{done:value=>ipcRenderer.invoke('aot-page',value)});").unwrap();
     fs::write(root.join("page.js"), r#"const {answer}=await import('./page-lazy.js');
@@ -81,7 +83,10 @@ let blocked=0;
 for (const call of [()=>eval('1'),()=>Function('return 1')(),()=> (function(){}).constructor('return 1')(),()=> (async function(){}).constructor('return 1')(),()=> (function*(){}).constructor('yield 1')(),()=> (async function*(){}).constructor('yield 1')()]) {
     try { call(); } catch(error) { if(error instanceof EvalError) blocked++; else throw error; }
 }
-await bridge.done([answer(),document.querySelector('h1').textContent,globalThis.classicArguments,blocked].join(','));"#).unwrap();
+const worker=new Worker(new URL('./page-worker.js',import.meta.url).href);
+const reply=await new Promise((resolve,reject)=>{worker.onmessage=event=>resolve(event.data);worker.onerror=event=>reject(event.error??Error(event.message))});
+worker.terminate();
+await bridge.done([answer(),document.querySelector('h1').textContent,globalThis.classicArguments,blocked,reply].join(','));"#).unwrap();
     fs::write(root.join("page-lazy.js"), "export const answer=()=>42;").unwrap();
     fs::write(
         root.join("server.js"),
@@ -94,6 +99,7 @@ import assert from 'node:assert/strict';
 import {app,BrowserWindow,ipcMain} from 'electron';
 import {Worker} from 'node:worker_threads';
 import {execFileSync,spawnSync} from 'node:child_process';
+import {join} from 'node:path';
 import sloppy from 'sloppy';
 import wasmURL from './sum.wasm';
 assert.equal(sloppy(), true);
@@ -121,6 +127,10 @@ setTimeout(async () => {
         const worker = new Worker(new URL('./worker.js', import.meta.url));
         assert.equal(await new Promise((resolve, reject) => {worker.on('message', resolve);worker.on('error', reject)}), '7,14,21');
         await worker.terminate();
+        const web = new globalThis.Worker(join(__dirname, 'web-worker.js'));
+        web.postMessage('/folder/aot.txt');
+        assert.equal(await new Promise((resolve, reject) => {web.onmessage = event => resolve(event.data);web.onerror = event => reject(event.error)}), 'aot.txt');
+        await web.terminate();
         assert.equal(execFileSync(process.execPath, [import.meta.resolve('./server.js')], {env:{...process.env,ELECTRON_RUN_AS_NODE:'1'},encoding:'utf8'}).trim(), 'headless-aot');
         const unhandled = spawnSync(process.execPath, [import.meta.resolve('./unhandled.js')], {env:{...process.env,ELECTRON_RUN_AS_NODE:'1'},encoding:'utf8'});
         assert.equal(unhandled.status, 1);
@@ -136,7 +146,7 @@ setTimeout(async () => {
             ipcMain.handle('aot-page', (_event,value) => {done(value)});
             const window = new BrowserWindow({show:false, focusable:false});
             await window.loadFile(import.meta.resolve('./page.html'));
-            assert.equal(await result, '42,AOT,undefined,6');
+            assert.equal(await result, '42,AOT,undefined,6,undefinedundefined');
             window.destroy();
         }
         console.log('aot-ok');
@@ -157,13 +167,16 @@ setTimeout(async () => {
     );
     let baseline =
         apps_runtime::bundle::read(&root.join("dist/AotTest.app/Contents/Resources")).unwrap();
-    let worker = baseline
-        .scripts
-        .iter()
-        .find(|(_, source)| String::from_utf8_lossy(source).contains("worker-aot-sentinel"))
-        .unwrap()
-        .0
-        .clone();
+    let [worker, web, page] = ["worker-aot-sentinel", "web-aot-sentinel", "page-aot-sentinel"]
+        .map(|marker| {
+            baseline
+                .scripts
+                .iter()
+                .find(|(_, source)| String::from_utf8_lossy(source).contains(marker))
+                .unwrap()
+                .0
+                .clone()
+        });
     drop(baseline);
     let output = build.arg("--aot").output().unwrap();
     assert!(
@@ -270,7 +283,7 @@ setTimeout(async () => {
     for (name, _) in apps_runtime::jsc::runtime_scripts() {
         assert_eq!(scripts.contains_key(name), name != "apps:gpu", "{name}");
     }
-    for name in ["app.js", worker.as_str()] {
+    for name in ["app.js", &worker, &web, &page] {
         assert!(scripts[name].as_u64().unwrap() > 0, "{name} must compile");
     }
     for name in scripts.keys().filter(|name| !name.starts_with("apps:")) {

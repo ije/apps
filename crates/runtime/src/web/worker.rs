@@ -218,6 +218,8 @@ impl State {
                     source.to_owned().into()
                 };
                 let native = args[1] == true;
+                // Web workers must not end when idle: they wait for messages.
+                let ends = native && args[4] == true;
                 let data = args[2].take();
                 let namespace = self.namespace.clone();
                 let packaged = self.packaged;
@@ -246,14 +248,14 @@ impl State {
                         let api = JavaScriptCore::load()?;
                         let engine = JsContext::new_interruptible(api.clone(), host, role, Some(cancelled.clone()))?;
                         engine.eval("delete globalThis.document; delete globalThis.window; delete globalThis.screen; delete globalThis.localStorage; delete globalThis.sessionStorage; globalThis.self=globalThis;", "apps:worker-scope")?;
-                        if native { engine.eval("globalThis.require = globalThis.__apps.module.createRequire();", "apps:worker-modules")?; }
+                        if native { engine.eval("globalThis.require = globalThis.__apps.module.createRequire(); globalThis.onmessage = null;", "apps:worker-modules")?; }
                         let _ = output.send(json!({"kind":"online"}).into());
                         wake.wake();
                         engine.eval_page(std::str::from_utf8(&source)?, "apps:worker")?;
                         while engine.eval_page(crate::jsc::NEXT, "apps:worker")? == "true" {}
                         while !cancelled.load(Ordering::Acquire) {
                             let delay = engine.tick()?;
-                            if native && delay != 0 && engine.call("__appsAlive", &[])? != "true" { break; }
+                            if ends && delay != 0 && engine.call("__appsAlive", &[])? != "true" { break; }
                             crate::host::idle(true);
                             let wait = if api.shrink_pending() && !(0..1000).contains(&delay) { 1000 } else { delay };
                             let message = if wait < 0 { inbox.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected) } else { inbox.recv_timeout(Duration::from_millis(wait as u64)) };

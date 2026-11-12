@@ -821,6 +821,109 @@ impl<'a> Linker<'a, '_> {
             .allocator
             .alloc_str(&format!("apps:///{}", self.builder.assets[&target].0)))
     }
+
+    fn local_path(&self, expression: &Expression<'a>) -> Option<PathBuf> {
+        let folder = self.path.parent().unwrap_or(Path::new("."));
+        let meta = |object: &Expression<'a>| {
+            matches!(object.get_inner_expression(), Expression::ImportMeta(_))
+        };
+        let relative = |text: Option<&'a str>| {
+            text.filter(|text| !text.contains(':') && !text.starts_with(['/', '\\']))
+        };
+        let literal = |argument: &Argument<'a>| match argument {
+            Argument::StringLiteral(text) => relative(text.value.as_str()),
+            _ => None,
+        };
+        match expression.get_inner_expression() {
+            Expression::Identifier(name)
+                if self
+                    .scoping
+                    .get_reference(name.reference_id())
+                    .symbol_id()
+                    .is_none() =>
+            {
+                match name.name.as_str() {
+                    "__filename" => Some(self.path.to_owned()),
+                    "__dirname" => Some(folder.to_owned()),
+                    _ => None,
+                }
+            }
+            Expression::StaticMemberExpression(member) => match member.property.name.as_str() {
+                "url" | "filename" if meta(&member.object) => Some(self.path.to_owned()),
+                "dirname" if meta(&member.object) => Some(folder.to_owned()),
+                "href" | "pathname" => self.local_path(&member.object),
+                _ => None,
+            },
+            Expression::NewExpression(url) if url.callee.is_specific_id("URL") => {
+                match url.arguments.as_slice() {
+                    [file] => self.local_path(file.as_expression()?),
+                    [specifier, base] => Some(
+                        self.local_path(base.as_expression()?)
+                            .filter(|base| base.is_file())?
+                            .parent()?
+                            .join(literal(specifier)?),
+                    ),
+                    _ => None,
+                }
+            }
+            Expression::BinaryExpression(sum) if sum.operator == BinaryOperator::Addition => {
+                let Expression::StringLiteral(tail) = &sum.right else {
+                    return None;
+                };
+                Some(
+                    self.local_path(&sum.left)?
+                        .join(relative(tail.value.as_str()?.strip_prefix('/'))?),
+                )
+            }
+            Expression::TemplateLiteral(template) => {
+                let ([folder], [head, tail]) =
+                    (template.expressions.as_slice(), template.quasis.as_slice())
+                else {
+                    return None;
+                };
+                let tail = tail.value.cooked.as_ref()?.as_str()?.strip_prefix('/');
+                Some(
+                    self.local_path(folder)
+                        .filter(|_| head.value.raw.is_empty())?
+                        .join(relative(tail)?),
+                )
+            }
+            Expression::CallExpression(call) => {
+                let (name, object) = match call.callee.get_inner_expression() {
+                    Expression::Identifier(name) => (name.name.as_str(), None),
+                    Expression::StaticMemberExpression(member) => {
+                        (member.property.name.as_str(), Some(&member.object))
+                    }
+                    _ => return None,
+                };
+                let first = call.arguments.first();
+                match (name, call.arguments.len()) {
+                    ("resolve", 1)
+                        if object.is_some_and(|object| {
+                            meta(object) || object.is_specific_id("require")
+                        }) =>
+                    {
+                        Some(folder.join(literal(first?)?))
+                    }
+                    ("toString", 0) => self.local_path(object?),
+                    ("String" | "fileURLToPath", 1) => self.local_path(first?.as_expression()?),
+                    ("dirname", 1) => self
+                        .local_path(first?.as_expression()?)?
+                        .parent()
+                        .map(Path::to_owned),
+                    ("join" | "resolve", _) => {
+                        let mut path = self.local_path(first?.as_expression()?)?;
+                        for argument in &call.arguments[1..] {
+                            path.push(literal(argument)?);
+                        }
+                        Some(path)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 impl<'a> VisitMut<'a> for Linker<'a, '_> {
@@ -848,33 +951,23 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
         let result = (|| -> Result<()> {
             let span = expression.span();
             if let Expression::NewExpression(worker) = expression
-                && worker.callee.is_specific_id("Worker")
-                && let Some(Argument::NewExpression(url)) = worker.arguments.first_mut()
-                && url.callee.is_specific_id("URL")
-                && let [
-                    Argument::StringLiteral(specifier),
-                    Argument::StaticMemberExpression(base),
-                ] = url.arguments.as_slice()
-                && base.property.name == "url"
-                && matches!(
-                    base.object.get_inner_expression(),
-                    Expression::ImportMeta(_)
-                )
+                && match worker.callee.get_inner_expression() {
+                    Expression::Identifier(name) => name.name == "Worker",
+                    Expression::StaticMemberExpression(member) => member.property.name == "Worker",
+                    _ => false,
+                }
+                && let Some(source) = worker.arguments.first().and_then(Argument::as_expression)
+                && let Some(path) = self.local_path(source)
             {
-                let specifier = specifier.value.as_str().context("Invalid worker path")?;
-                ensure!(
-                    specifier.starts_with('.'),
-                    "Worker URL must be a relative path"
-                );
-                let path =
-                    resolve_file(&self.path.parent().unwrap_or(Path::new(".")).join(specifier))?;
+                let path = resolve_file(&path)
+                    .with_context(|| format!("Cannot find the worker {}", path.display()))?;
                 self.cacheable = false;
                 let index = self.builder.script_chunk(path)?;
                 let value = self
                     .allocator
                     .alloc_str(&format!("apps:///script-{index}.js"));
                 worker.arguments[0] =
-                    Expression::new_string_literal(url.span, value, None, &self.ast).into();
+                    Expression::new_string_literal(source.span(), value, None, &self.ast).into();
             }
             if let Expression::NewExpression(url) = expression
                 && url.callee.is_specific_id("URL")

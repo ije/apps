@@ -37,7 +37,7 @@ flowchart LR
 
 The [bundler](crates/cli/src/bundler/mod.rs) uses Oxc to parse, transform, and minify JavaScript, TypeScript, and JSX. It resolves dependencies separately for main, preload, and page code. It also processes HTML, CSS, assets, workers, native addons, and custom loaders.
 
-The bundler maps `electron` and `@pierre/apps` imports to runtime APIs. Literal `import.meta.resolve()` calls identify pages or script chunks. Literal `loadFile()` calls in main code also include the target HTML and its dependencies in the bundle.
+The bundler maps `electron` and `@pierre/apps` imports to runtime APIs. Literal `import.meta.resolve()` calls identify pages or script chunks. A `new Worker()` call with a path that the bundler can read from the code makes that file a script chunk. Literal `loadFile()` calls in main code also include the target HTML and its dependencies in the bundle.
 
 JavaScript apps use `apps-runtime` as their executable and `app.js` as their main entry. Apps with `"type": "rust"` use a Cargo binary linked to `apps-runtime`. Their entry calls `app::run()`, creates windows, and registers native handlers through the [Rust app API](crates/runtime/src/desktop/app.rs).
 
@@ -109,6 +109,7 @@ The runtime defines three [roles](crates/runtime/src/host.rs): main, preload, an
 - Main code can use desktop APIs and the supported Node APIs.
 - Preloads can use the supported Node APIs and a limited Electron API. Their `document` proxy accesses the page through the context bridge.
 - Page code gets Web APIs and APIs that its preload explicitly exposes. It has no direct Node or native bridge access.
+- A worker gets the access of the context that creates it. Workers of main and preload code get the Node APIs, and the bundler builds their chunks for main. Page workers get Web APIs only, and the native bridge rejects a page's request for more.
 
 Preloads run only for bundled pages and files inside the app directory. HTML strings and external files receive no preload. A page reaches its preload through the context bridge, and the preload reaches main through IPC.
 

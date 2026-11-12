@@ -3617,14 +3617,98 @@ fn production_drops_unused_modules_of_side_effect_free_packages() {
 }
 
 #[test]
+fn main_workers_from_paths_known_at_build_time_get_node_apis() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("lib")).unwrap();
+    fs::write(
+        dir.path().join("lib/worker.ts"),
+        "import {basename} from 'node:path'; onmessage = event => postMessage(basename(event.data) + typeof require);",
+    )
+    .unwrap();
+    let entry = dir.path().join("app.ts");
+    fs::write(&entry, r#"import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+import * as threads from 'node:worker_threads';
+if (threads.isMainThread) {
+    const workers = [
+        new Worker(new URL('./lib/worker.ts', import.meta.url).href),
+        new Worker(String(new URL('./worker.ts', new URL('./lib/worker.ts', import.meta.url)))),
+        new Worker(fileURLToPath(new URL('./lib/worker.ts', import.meta.url))),
+        new Worker(import.meta.resolve('./lib/worker.ts')),
+        new Worker(path.join(__dirname, 'lib', 'worker.ts')),
+        new Worker(path.resolve(path.dirname(__filename), './lib/worker')),
+        new Worker(import.meta.dirname + '/lib/worker.ts'),
+        new Worker(`${__dirname}/lib/worker.ts`),
+        new threads.Worker(new URL(import.meta.url)),
+        new threads.Worker(__filename),
+    ];
+    const replies = await Promise.all(workers.map((worker, index) => new Promise((resolve, reject) => {
+        worker.onmessage = event => resolve(event.data);
+        worker.onerror = event => reject(event.error);
+        worker.postMessage('/folder/file-' + index);
+    })));
+    await Promise.all(workers.map(worker => worker.terminate()));
+    globalThis.result = replies.join();
+} else threads.parentPort.on('message', value => threads.parentPort.postMessage(path.basename(value) + 'function'));
+"#).unwrap();
+    for production in [false, true] {
+        let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .filter(|(name, _)| name.starts_with("script-"))
+                .count(),
+            2,
+            "production={production}"
+        );
+        let engine = apps_runtime::jsc::JsContext::new(
+            apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+            Rc::default(),
+            apps_runtime::host::Role::Main,
+        )
+        .unwrap();
+        engine.load_bundle(&files, "app.js").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while engine
+            .eval("globalThis.result ?? 'pending'", "test")
+            .unwrap()
+            == "pending"
+        {
+            engine.tick().unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "production={production}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            engine.eval("result", "test").unwrap(),
+            (0..10)
+                .map(|index| format!("file-{index}function"))
+                .collect::<Vec<_>>()
+                .join(","),
+            "production={production}"
+        );
+    }
+    fs::write(&entry, "new Worker(__dirname + '/missing.ts');").unwrap();
+    let error = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap_err();
+    assert!(format!("{error:#}").contains("Cannot find the worker"));
+}
+
+#[test]
 fn page_workers_and_chunks_load_from_bundled_scripts() {
     use apps_runtime::host::{Host, Page, Role};
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("worker.ts"),
-        "const {value} = await import('./value.ts'); postMessage(value);",
+        "const {value} = await import('./value.ts'); postMessage(typeof require === 'undefined' && typeof process === 'undefined' && !globalThis.__apps ? value : 0);",
     )
     .unwrap();
+    fs::write(dir.path().join("node.ts"), "import 'node:fs';").unwrap();
+    let node = dir.path().join("node-page.ts");
+    fs::write(&node, "new Worker(new URL('./node.ts', import.meta.url));").unwrap();
+    let error = compile(&node, Realm::Renderer, None, Rc::default(), true, None).unwrap_err();
+    assert!(format!("{error:#}").contains("node:fs is unavailable in page scripts"));
     fs::write(
         dir.path().join("value.ts"),
         "export const value: number = 42;",
