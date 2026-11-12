@@ -31,12 +31,12 @@ pub struct Frame {
     pub height: u32,
 }
 
-pub const PLAY: u32 = 0;
-pub const PAUSE: u32 = 1;
-pub const SEEK: u32 = 2;
-pub const VOLUME: u32 = 3;
-pub const MUTED: u32 = 4;
-pub const SPEED: u32 = 5;
+const PLAY: u32 = 0;
+const PAUSE: u32 = 1;
+const SEEK: u32 = 2;
+const VOLUME: u32 = 3;
+const MUTED: u32 = 4;
+const SPEED: u32 = 5;
 
 const AHEAD: f64 = 0.3;
 const FRAMES: usize = 3;

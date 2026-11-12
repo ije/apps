@@ -1,5 +1,5 @@
-use super::{FontId, Line, Wrapping, breaks::breaks};
-use crate::{Pixels, platform, px};
+use super::{FontId, Fonts, Line, Wrapping, breaks::breaks};
+use crate::{Pixels, px};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::{
     cell::{Cell, RefCell},
@@ -45,72 +45,49 @@ struct Entry {
 
 type Found = (Rc<str>, Rc<Line>, Rc<[u32]>);
 
-impl State {
-    fn evict(&mut self) {
-        let frame = self.frame;
-        let keep = if self.bytes > BUDGET { 1 } else { KEEP_FRAMES };
-        let mut freed = 0;
-        self.entries.retain(|_, entry| {
-            let kept = frame.wrapping_sub(entry.used.get()) < keep;
-            freed += if kept { 0 } else { entry.bytes };
-            kept
-        });
-        self.bytes -= freed;
-        self.frame = frame.wrapping_add(1);
-    }
-
-    fn find(
-        &self,
-        hash: u64,
-        text: &str,
-        font_size: Pixels,
-        spans: &[Span],
-        wrap: Option<&Wrapping>,
-    ) -> Option<Found> {
-        let entry = self.entries.get(&hash)?;
-        let same = *entry.text == *text
-            && entry.font_size == font_size
-            && *entry.spans == *spans
-            && entry.wrap.as_ref() == wrap;
-        same.then(|| {
-            entry.used.set(self.frame);
-            (entry.text.clone(), entry.line.clone(), entry.breaks.clone())
-        })
-    }
-
-    fn keep(&mut self, hash: u64, entry: Entry) {
-        entry.used.set(self.frame);
-        self.bytes += entry.bytes;
-        if let Some(old) = self.entries.insert(hash, entry) {
-            self.bytes -= old.bytes;
-        }
-    }
-}
-
 impl Cache {
     pub(super) fn clear(&self) {
         self.0.take();
     }
 
     pub(super) fn end_frame(&self) {
-        self.0.borrow_mut().evict();
+        let state = &mut *self.0.borrow_mut();
+        let frame = state.frame;
+        let keep = if state.bytes > BUDGET { 1 } else { KEEP_FRAMES };
+        let mut freed = 0;
+        state.entries.retain(|_, entry| {
+            let kept = frame.wrapping_sub(entry.used.get()) < keep;
+            freed += if kept { 0 } else { entry.bytes };
+            kept
+        });
+        state.bytes -= freed;
+        state.frame = frame.wrapping_add(1);
     }
 
     pub(super) fn get(
         &self,
-        platform: &platform::TextSystem,
+        fonts: &Fonts,
         text: &str,
         font_size: Pixels,
         spans: &[Span],
         wrap: Option<&Wrapping>,
     ) -> Found {
         let hash = FxBuildHasher.hash_one((text, font_size, spans, wrap));
-        if let Some(found) = self.0.borrow().find(hash, text, font_size, spans, wrap) {
-            return found;
+        {
+            let state = self.0.borrow();
+            if let Some(entry) = state.entries.get(&hash)
+                && *entry.text == *text
+                && entry.font_size == font_size
+                && *entry.spans == *spans
+                && entry.wrap.as_ref() == wrap
+            {
+                entry.used.set(state.frame);
+                return (entry.text.clone(), entry.line.clone(), entry.breaks.clone());
+            }
         }
         let (text, line, breaks) = match wrap {
             Some(wrap) => {
-                let (text, line, _) = self.get(platform, text, font_size, spans, None);
+                let (text, line, _) = self.get(fonts, text, font_size, spans, None);
                 let mut end = 0;
                 let nowrap: Vec<_> = spans
                     .iter()
@@ -124,7 +101,12 @@ impl Cache {
                 (text, line, breaks)
             }
             None => {
-                let mut line = platform.shape(text, font_size, spans);
+                let mut line = fonts.platform.shape(text, font_size, spans);
+                for span in spans {
+                    let metrics = fonts.metrics(span.font);
+                    line.ascent = line.ascent.max(span.size * metrics.ascent);
+                    line.descent = line.descent.max(span.size * -metrics.descent);
+                }
                 if spans.iter().any(|span| {
                     span.letter_spacing != px(0.)
                         || span.word_spacing != px(0.)
@@ -139,6 +121,7 @@ impl Cache {
         let bytes = text.len()
             + line.glyphs.len() * mem::size_of::<super::Glyph>()
             + breaks.len() * mem::size_of::<u32>();
+        let state = &mut *self.0.borrow_mut();
         let entry = Entry {
             text: text.clone(),
             font_size,
@@ -146,10 +129,13 @@ impl Cache {
             wrap: wrap.copied(),
             line: line.clone(),
             breaks: breaks.clone(),
-            used: Cell::new(0),
+            used: Cell::new(state.frame),
             bytes,
         };
-        self.0.borrow_mut().keep(hash, entry);
+        state.bytes += bytes;
+        if let Some(old) = state.entries.insert(hash, entry) {
+            state.bytes -= old.bytes;
+        }
         (text, line, breaks)
     }
 }
@@ -247,7 +233,7 @@ mod tests {
     #[test]
     fn unused_lines_leave_the_cache() {
         let text = crate::TextSystem::new();
-        let (cache, platform) = (&text.cache, &text.platform);
+        let (cache, fonts) = (&text.cache, &*text.fonts);
         let font = text.face(&crate::Font::new("Helvetica"));
         let spans = [Span {
             len: 5,
@@ -258,14 +244,14 @@ mod tests {
             inset: [px(0.); 2],
             nowrap: false,
         }];
-        let (_, first, _) = cache.get(platform, "hello", px(16.), &spans, None);
-        let (_, again, _) = cache.get(platform, "hello", px(16.), &spans, None);
+        let (_, first, _) = cache.get(fonts, "hello", px(16.), &spans, None);
+        let (_, again, _) = cache.get(fonts, "hello", px(16.), &spans, None);
         assert!(Rc::ptr_eq(&first, &again));
         let wrap = Wrapping {
             width: Some(px(1.)),
             ..Default::default()
         };
-        cache.get(platform, "hello", px(16.), &spans, Some(&wrap));
+        cache.get(fonts, "hello", px(16.), &spans, Some(&wrap));
         assert_eq!(cache.0.borrow().entries.len(), 2);
         for _ in 0..=KEEP_FRAMES {
             cache.end_frame();
@@ -326,7 +312,7 @@ mod tests {
             assert!((line.looks[0].len, line.looks[0].color) == look);
         }
         // Spans split where paint changes, even at an empty run, so no ligature forms across.
-        let spans = text.spans(runs.iter().map(|run| (run.len, run)), px(16.), true);
+        let spans = text.spans(runs.iter().map(|run| (run.len, run)), px(16.));
         assert!(spans.len() == 3 && spans[0].len == 3 && spans[2].len == 9);
         let wrapped = text.shape_text(
             "one two three four",

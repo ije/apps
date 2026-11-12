@@ -1,11 +1,9 @@
 // Copyright 2019 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use super::render::Context;
-
 pub fn render(
     path: &usvg::Path,
-    ctx: &Context,
+    max_bbox: tiny_skia::IntRect,
     transform: tiny_skia::Transform,
     pixmap: &mut tiny_skia::PixmapMut,
 ) {
@@ -15,18 +13,18 @@ pub fn render(
 
     let blend_mode = tiny_skia::BlendMode::SourceOver;
     if path.paint_order() == usvg::PaintOrder::FillAndStroke {
-        fill_path(path, blend_mode, ctx, transform, pixmap);
-        stroke_path(path, ctx, transform, pixmap);
+        fill_path(path, blend_mode, max_bbox, transform, pixmap);
+        stroke_path(path, max_bbox, transform, pixmap);
     } else {
-        stroke_path(path, ctx, transform, pixmap);
-        fill_path(path, blend_mode, ctx, transform, pixmap);
+        stroke_path(path, max_bbox, transform, pixmap);
+        fill_path(path, blend_mode, max_bbox, transform, pixmap);
     }
 }
 
 pub fn fill_path(
     path: &usvg::Path,
     blend_mode: tiny_skia::BlendMode,
-    ctx: &Context,
+    max_bbox: tiny_skia::IntRect,
     transform: tiny_skia::Transform,
     pixmap: &mut tiny_skia::PixmapMut,
 ) -> Option<()> {
@@ -41,31 +39,14 @@ pub fn fill_path(
         usvg::FillRule::EvenOdd => tiny_skia::FillRule::EvenOdd,
     };
 
-    let pattern_pixmap;
-    let mut paint = tiny_skia::Paint::default();
-    match fill.paint() {
-        usvg::Paint::Color(c) => {
-            paint.set_color_rgba8(c.red, c.green, c.blue, fill.opacity().to_u8());
-        }
-        usvg::Paint::LinearGradient(lg) => {
-            paint.shader = convert_linear_gradient(lg, fill.opacity())?;
-        }
-        usvg::Paint::RadialGradient(rg) => {
-            paint.shader = convert_radial_gradient(rg, fill.opacity())?;
-        }
-        usvg::Paint::Pattern(pattern) => {
-            let (patt_pix, patt_ts) = render_pattern_pixmap(pattern, ctx, transform)?;
-
-            pattern_pixmap = patt_pix;
-            paint.shader = tiny_skia::Pattern::new(
-                pattern_pixmap.as_ref(),
-                tiny_skia::SpreadMode::Repeat,
-                tiny_skia::FilterQuality::Bicubic,
-                fill.opacity().get(),
-                patt_ts,
-            );
-        }
-    }
+    let mut pattern = None;
+    let mut paint = convert_paint(
+        fill.paint(),
+        fill.opacity(),
+        max_bbox,
+        transform,
+        &mut pattern,
+    )?;
     paint.anti_alias = path.rendering_mode().use_shape_antialiasing();
     paint.blend_mode = blend_mode;
 
@@ -75,36 +56,19 @@ pub fn fill_path(
 
 fn stroke_path(
     path: &usvg::Path,
-    ctx: &Context,
+    max_bbox: tiny_skia::IntRect,
     transform: tiny_skia::Transform,
     pixmap: &mut tiny_skia::PixmapMut,
 ) -> Option<()> {
     let stroke = path.stroke()?;
-    let pattern_pixmap;
-    let mut paint = tiny_skia::Paint::default();
-    match stroke.paint() {
-        usvg::Paint::Color(c) => {
-            paint.set_color_rgba8(c.red, c.green, c.blue, stroke.opacity().to_u8());
-        }
-        usvg::Paint::LinearGradient(lg) => {
-            paint.shader = convert_linear_gradient(lg, stroke.opacity())?;
-        }
-        usvg::Paint::RadialGradient(rg) => {
-            paint.shader = convert_radial_gradient(rg, stroke.opacity())?;
-        }
-        usvg::Paint::Pattern(pattern) => {
-            let (patt_pix, patt_ts) = render_pattern_pixmap(pattern, ctx, transform)?;
-
-            pattern_pixmap = patt_pix;
-            paint.shader = tiny_skia::Pattern::new(
-                pattern_pixmap.as_ref(),
-                tiny_skia::SpreadMode::Repeat,
-                tiny_skia::FilterQuality::Bicubic,
-                stroke.opacity().get(),
-                patt_ts,
-            );
-        }
-    }
+    let mut pattern = None;
+    let mut paint = convert_paint(
+        stroke.paint(),
+        stroke.opacity(),
+        max_bbox,
+        transform,
+        &mut pattern,
+    )?;
     paint.anti_alias = path.rendering_mode().use_shape_antialiasing();
 
     pixmap.stroke_path(path.data(), &paint, &stroke.to_tiny_skia(), transform, None);
@@ -112,11 +76,43 @@ fn stroke_path(
     Some(())
 }
 
+fn convert_paint<'a>(
+    paint: &'a usvg::Paint,
+    opacity: usvg::Opacity,
+    max_bbox: tiny_skia::IntRect,
+    transform: tiny_skia::Transform,
+    pattern_pixmap: &'a mut Option<tiny_skia::Pixmap>,
+) -> Option<tiny_skia::Paint<'a>> {
+    let mut result = tiny_skia::Paint::default();
+    match paint {
+        usvg::Paint::Color(c) => {
+            result.set_color_rgba8(c.red, c.green, c.blue, opacity.to_u8());
+        }
+        usvg::Paint::LinearGradient(lg) => {
+            result.shader = convert_linear_gradient(lg, opacity)?;
+        }
+        usvg::Paint::RadialGradient(rg) => {
+            result.shader = convert_radial_gradient(rg, opacity)?;
+        }
+        usvg::Paint::Pattern(pattern) => {
+            let (patt_pix, patt_ts) = render_pattern_pixmap(pattern, max_bbox, transform)?;
+            result.shader = tiny_skia::Pattern::new(
+                pattern_pixmap.insert(patt_pix).as_ref(),
+                tiny_skia::SpreadMode::Repeat,
+                tiny_skia::FilterQuality::Bicubic,
+                opacity.get(),
+                patt_ts,
+            );
+        }
+    }
+    Some(result)
+}
+
 fn convert_linear_gradient(
     gradient: &usvg::LinearGradient,
     opacity: usvg::Opacity,
 ) -> Option<tiny_skia::Shader<'_>> {
-    let (mode, points) = convert_base_gradient(gradient, opacity)?;
+    let (mode, points) = convert_base_gradient(gradient, opacity);
 
     let shader = tiny_skia::LinearGradient::new(
         (gradient.x1(), gradient.y1()).into(),
@@ -133,7 +129,7 @@ fn convert_radial_gradient(
     gradient: &usvg::RadialGradient,
     opacity: usvg::Opacity,
 ) -> Option<tiny_skia::Shader<'_>> {
-    let (mode, points) = convert_base_gradient(gradient, opacity)?;
+    let (mode, points) = convert_base_gradient(gradient, opacity);
 
     let shader = tiny_skia::RadialGradient::new(
         (gradient.fx(), gradient.fy()).into(),
@@ -151,7 +147,7 @@ fn convert_radial_gradient(
 fn convert_base_gradient(
     gradient: &usvg::BaseGradient,
     opacity: usvg::Opacity,
-) -> Option<(tiny_skia::SpreadMode, Vec<tiny_skia::GradientStop>)> {
+) -> (tiny_skia::SpreadMode, Vec<tiny_skia::GradientStop>) {
     let mode = match gradient.spread_method() {
         usvg::SpreadMethod::Pad => tiny_skia::SpreadMode::Pad,
         usvg::SpreadMethod::Reflect => tiny_skia::SpreadMode::Reflect,
@@ -170,12 +166,12 @@ fn convert_base_gradient(
         points.push(tiny_skia::GradientStop::new(stop.offset().get(), color));
     }
 
-    Some((mode, points))
+    (mode, points)
 }
 
 fn render_pattern_pixmap(
     pattern: &usvg::Pattern,
-    ctx: &Context,
+    max_bbox: tiny_skia::IntRect,
     transform: tiny_skia::Transform,
 ) -> Option<(tiny_skia::Pixmap, tiny_skia::Transform)> {
     let (sx, sy) = {
@@ -191,7 +187,7 @@ fn render_pattern_pixmap(
     let mut pixmap = tiny_skia::Pixmap::new(img_size.width(), img_size.height())?;
 
     let transform = tiny_skia::Transform::from_scale(sx, sy);
-    super::render::render_nodes(pattern.root(), ctx, transform, &mut pixmap.as_mut());
+    super::render::render_nodes(pattern.root(), max_bbox, transform, &mut pixmap.as_mut());
 
     let mut ts = tiny_skia::Transform::default();
     ts = ts.pre_concat(pattern.transform());

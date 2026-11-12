@@ -59,14 +59,9 @@ impl Drop for Protected<'_> {
 }
 
 struct NativeLibrary {
+    callbacks: RefCell<HashMap<usize, Callback>>,
     handle: Library,
     active: Cell<usize>,
-    callbacks: RefCell<HashMap<usize, Callback>>,
-}
-impl Drop for NativeLibrary {
-    fn drop(&mut self) {
-        self.callbacks.get_mut().clear();
-    }
 }
 struct Function {
     owner: Rc<NativeLibrary>,

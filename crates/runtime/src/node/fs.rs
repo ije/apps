@@ -175,6 +175,22 @@ impl Files {
     pub(super) fn call(&self, op: &str, args: &Value) -> Result<Value> {
         let path =
             || -> Result<PathBuf> { Ok(PathBuf::from(args[0].as_str().context("Expected path")?)) };
+        #[cfg(unix)]
+        let cpath = || -> Result<std::ffi::CString> {
+            Ok(std::ffi::CString::new(
+                args[0].as_str().context("Expected path")?,
+            )?)
+        };
+        let time = |value: &Value| -> Result<SystemTime> {
+            let seconds = value.as_f64().context("Expected time")?;
+            let offset = std::time::Duration::try_from_secs_f64(seconds.abs())?;
+            if seconds < 0. {
+                UNIX_EPOCH.checked_sub(offset)
+            } else {
+                UNIX_EPOCH.checked_add(offset)
+            }
+            .context("Time is out of range")
+        };
         match op {
             "constants" => {
                 #[cfg(unix)]
@@ -275,8 +291,7 @@ impl Files {
             "statfs" => {
                 #[cfg(unix)]
                 {
-                    use std::os::unix::ffi::OsStrExt;
-                    let file = std::ffi::CString::new(path()?.as_os_str().as_bytes())?;
+                    let file = cpath()?;
                     let mut info: libc::statfs = unsafe { std::mem::zeroed() };
                     if unsafe { libc::statfs(file.as_ptr(), &mut info) } != 0 {
                         return Err(std::io::Error::last_os_error().into());
@@ -342,7 +357,6 @@ impl Files {
             "utimes" | "lutimes" => {
                 #[cfg(unix)]
                 {
-                    use std::os::unix::ffi::OsStrExt;
                     let time = |value: &Value| -> Result<libc::timespec> {
                         let seconds = value.as_f64().context("Expected time")?;
                         Ok(libc::timespec {
@@ -351,7 +365,7 @@ impl Files {
                         })
                     };
                     let times = [time(&args[1])?, time(&args[2])?];
-                    let file = std::ffi::CString::new(path()?.as_os_str().as_bytes())?;
+                    let file = cpath()?;
                     let flags = if op == "lutimes" {
                         libc::AT_SYMLINK_NOFOLLOW
                     } else {
@@ -367,16 +381,6 @@ impl Files {
                 #[cfg(windows)]
                 {
                     use std::os::windows::fs::OpenOptionsExt;
-                    let time = |value: &Value| -> Result<SystemTime> {
-                        let seconds = value.as_f64().context("Expected time")?;
-                        let offset = std::time::Duration::try_from_secs_f64(seconds.abs())?;
-                        let time = if seconds < 0. {
-                            UNIX_EPOCH.checked_sub(offset)
-                        } else {
-                            UNIX_EPOCH.checked_add(offset)
-                        };
-                        time.context("Time is out of range")
-                    };
                     // FILE_WRITE_ATTRIBUTES and FILE_FLAG_BACKUP_SEMANTICS permit timestamp changes on
                     // directories and read-only files.
                     OpenOptions::new()
@@ -394,8 +398,7 @@ impl Files {
             "chown" | "lchown" => {
                 #[cfg(unix)]
                 {
-                    use std::os::unix::ffi::OsStrExt;
-                    let file = std::ffi::CString::new(path()?.as_os_str().as_bytes())?;
+                    let file = cpath()?;
                     let id = |value: &Value| value.as_i64().map_or(u32::MAX, |id| id as u32);
                     let chown = if op == "lchown" {
                         libc::lchown
@@ -457,8 +460,7 @@ impl Files {
                 // Like Node, this asks access() rather than stat(), which costs a third more.
                 #[cfg(unix)]
                 {
-                    use std::os::unix::ffi::OsStrExt;
-                    let path = std::ffi::CString::new(path()?.as_os_str().as_bytes())?;
+                    let path = cpath()?;
                     Ok(Value::Bool(
                         unsafe { libc::access(path.as_ptr(), libc::F_OK) } == 0,
                     ))
@@ -469,9 +471,7 @@ impl Files {
             "access" => {
                 #[cfg(unix)]
                 {
-                    use std::os::unix::ffi::OsStrExt;
-                    let p = path()?;
-                    let p = std::ffi::CString::new(p.as_os_str().as_bytes())?;
+                    let p = cpath()?;
                     let mode = args[1].as_i64().unwrap_or(0) as i32;
                     ensure!(mode & !7 == 0, "Invalid access mode");
                     if unsafe { libc::access(p.as_ptr(), mode) } != 0 {
@@ -528,7 +528,7 @@ impl Files {
                     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
                 for _ in 0..100 {
                     let mut random = [0u8; 6];
-                    getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    getrandom::fill(&mut random)?;
                     let p = format!(
                         "{}{}",
                         path()?.display(),
@@ -647,16 +647,6 @@ impl Files {
                         Ok(Value::Null)
                     }
                     "futimes" => {
-                        let time = |value: &Value| -> Result<SystemTime> {
-                            let seconds = value.as_f64().context("Expected time")?;
-                            let offset = std::time::Duration::try_from_secs_f64(seconds.abs())?;
-                            if seconds < 0. {
-                                UNIX_EPOCH.checked_sub(offset)
-                            } else {
-                                UNIX_EPOCH.checked_add(offset)
-                            }
-                            .context("Time is out of range")
-                        };
                         file.set_times(
                             fs::FileTimes::new()
                                 .set_accessed(time(&args[1])?)

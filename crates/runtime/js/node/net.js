@@ -1,4 +1,4 @@
-globalThis.__appsNet = (call, EventEmitter, streams, Buffer, { encode, decode }) => {
+globalThis.__appsNet = (call, EventEmitter, streams, Buffer, { decode }) => {
   const sockets = new Map(), servers = new Map();
   const fail = (code, message, Type = TypeError) => Object.assign(new Type(message), { code });
   const port = (value, name = 'Port') => {
@@ -29,7 +29,7 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer, { encode, decode })
       this._write = (chunk, _encoding, callback) => {
         if (this._socket === undefined) { callback(fail('ERR_SOCKET_CLOSED', 'Socket is closed', Error)); return; }
         this._written = callback;
-        try { call('web.tcp.write', this._socket, encode(chunk)); } catch (error) { this._written = null; callback(error); }
+        try { call('web.tcp.write', this._socket, chunk); } catch (error) { this._written = null; callback(error); }
       };
       this._final = callback => { this._finished = callback; if (this._socket === undefined) callback(); else call('web.tcp.end', this._socket); };
       if (options.fd !== undefined) { this._socket = call('web.tcp.open', options.fd); sockets.set(this._socket, this); this.pending = false; }

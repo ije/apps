@@ -38,7 +38,6 @@ pub(super) struct Toplevel {
     client: Weak<Client>,
     // Taken first when the window closes: GPU objects must not outlive the X window.
     renderer: RefCell<Option<Renderer>>,
-    atlas: Rc<Atlas>,
     shape: RefCell<Shape>,
     mapped: Cell<bool>,
     obscured: Cell<bool>,
@@ -60,7 +59,7 @@ impl Toplevel {
         client: &Rc<Client>,
         options: &WindowOptions,
         calls: Callbacks,
-    ) -> Result<Rc<Self>> {
+    ) -> Result<(Rc<Self>, Rc<Atlas>)> {
         let xcb = &*client.xcb;
         let atoms = &client.atoms;
         let screen = &xcb.setup().roots[client.screen];
@@ -214,6 +213,7 @@ impl Toplevel {
             counter,
             synced: None,
         };
+        let atlas = renderer.atlas().clone();
         let made = Rc::new_cyclic(|me| Self {
             me: me.clone(),
             id: window,
@@ -221,7 +221,6 @@ impl Toplevel {
             colormap: own_colormap,
             calls,
             client: Rc::downgrade(client),
-            atlas: renderer.atlas().clone(),
             renderer: RefCell::new(Some(renderer)),
             shape: RefCell::new(shape),
             mapped: Cell::new(false),
@@ -249,7 +248,7 @@ impl Toplevel {
             let _ = xcb.map_window(window);
         }
         let _ = xcb.flush();
-        Ok(made)
+        Ok((made, atlas))
     }
 
     fn visible(&self) -> bool {
@@ -420,10 +419,6 @@ impl Native for Toplevel {
 
     fn active(&self) -> bool {
         self.shape.borrow().active
-    }
-
-    fn atlas(&self) -> Rc<Atlas> {
-        self.atlas.clone()
     }
 
     fn want_frames(&self) {

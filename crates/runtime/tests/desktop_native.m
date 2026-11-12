@@ -202,7 +202,12 @@ int main(int argc, const char *argv[]) {
         }
         [task waitUntilExit];
         native("app.releaseInstance","null");
-        if (!received || task.terminationStatus || [native("app.hasInstance","null") boolValue]) return 9;
+        NSTask *again=[NSTask new];
+        again.executableURL=task.executableURL;
+        again.arguments=task.arguments;
+        if (!received || task.terminationStatus || ![again launchAndReturnError:&failure]) return 9;
+        [again waitUntilExit];
+        if (again.terminationStatus!=5) return 9;
         native("app.badge","\"3\"");
         if (![NSApp.dockTile.badgeLabel isEqual:@"3"]) return 10;
         native("app.badge","\"\"");

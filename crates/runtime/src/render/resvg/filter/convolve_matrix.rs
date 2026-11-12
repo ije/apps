@@ -6,15 +6,10 @@ use rgb::RGBA8;
 use usvg::filter::{ConvolveMatrix, EdgeMode};
 
 pub fn apply(matrix: &ConvolveMatrix, src: ImageRefMut) {
-    fn bound(min: i32, val: i32, max: i32) -> i32 {
-        core::cmp::max(min, core::cmp::min(max, val))
-    }
-
     let width_max = src.width as i32 - 1;
     let height_max = src.height as i32 - 1;
 
     let mut buf = vec![RGBA8::default(); src.data.len()];
-    let mut buf = ImageRefMut::new(src.width, src.height, &mut buf);
     let mut x = 0;
     let mut y = 0;
     for in_p in src.data.iter() {
@@ -34,8 +29,8 @@ pub fn apply(matrix: &ConvolveMatrix, src: ImageRefMut) {
                         }
                     }
                     EdgeMode::Duplicate => {
-                        tx = bound(0, tx, width_max);
-                        ty = bound(0, ty, height_max);
+                        tx = tx.clamp(0, width_max);
+                        ty = ty.clamp(0, height_max);
                     }
                     EdgeMode::Wrap => {
                         while tx < 0 {
@@ -86,7 +81,7 @@ pub fn apply(matrix: &ConvolveMatrix, src: ImageRefMut) {
             (x * 255.0 + 0.5) as u8
         };
 
-        let out_p = buf.pixel_at_mut(x, y);
+        let out_p = &mut buf[(src.width * y + x) as usize];
         out_p.r = calc(new_r);
         out_p.g = calc(new_g);
         out_p.b = calc(new_b);
@@ -99,5 +94,5 @@ pub fn apply(matrix: &ConvolveMatrix, src: ImageRefMut) {
         }
     }
 
-    src.data.copy_from_slice(buf.data);
+    src.data.copy_from_slice(&buf);
 }

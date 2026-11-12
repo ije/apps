@@ -260,7 +260,6 @@ fn native_ranges_respect_element_boundaries_and_utf16_offsets() {
             &mut state,
             [800., 600.],
         )
-        .unwrap()
         .unwrap();
         assert_eq!(actual, expected);
     }
@@ -303,7 +302,6 @@ fn caret_hit_testing_uses_the_nearest_visible_text() {
             &mut state,
             [800., 600.],
         )
-        .unwrap()
         .unwrap();
         assert_eq!(
             actual

@@ -438,8 +438,9 @@ const TOOLS: &str = r#"[
   }, "required": ["action"]}}
 ]"#;
 
-fn tools() -> Value {
-    serde_json::from_str(TOOLS).unwrap()
+fn tools() -> &'static Value {
+    static PARSED: OnceLock<Value> = OnceLock::new();
+    PARSED.get_or_init(|| serde_json::from_str(TOOLS).unwrap())
 }
 
 fn help() -> String {

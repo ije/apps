@@ -1,76 +1,59 @@
 // Copyright 2018 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-pub struct Context {
-    pub max_bbox: tiny_skia::IntRect,
-}
-
 pub fn render_nodes(
     parent: &usvg::Group,
-    ctx: &Context,
+    max_bbox: tiny_skia::IntRect,
     transform: tiny_skia::Transform,
     pixmap: &mut tiny_skia::PixmapMut,
 ) {
     for node in parent.children() {
-        render_node(node, ctx, transform, pixmap);
-    }
-}
-
-pub fn render_node(
-    node: &usvg::Node,
-    ctx: &Context,
-    transform: tiny_skia::Transform,
-    pixmap: &mut tiny_skia::PixmapMut,
-) {
-    match node {
-        usvg::Node::Group(group) => {
-            render_group(group, ctx, transform, pixmap);
-        }
-        usvg::Node::Path(path) => {
-            super::path::render(path, ctx, transform, pixmap);
-        }
-        usvg::Node::Image(image) => {
-            super::image::render(image, transform, pixmap);
-        }
-        usvg::Node::Text(text) => {
-            render_group(text.flattened(), ctx, transform, pixmap);
+        match node {
+            usvg::Node::Group(group) => {
+                render_group(group, max_bbox, transform, pixmap);
+            }
+            usvg::Node::Path(path) => {
+                super::path::render(path, max_bbox, transform, pixmap);
+            }
+            usvg::Node::Image(image) => {
+                super::image::render(image, transform, pixmap);
+            }
+            usvg::Node::Text(text) => {
+                render_group(text.flattened(), max_bbox, transform, pixmap);
+            }
         }
     }
 }
 
 fn render_group(
     group: &usvg::Group,
-    ctx: &Context,
+    max_bbox: tiny_skia::IntRect,
     transform: tiny_skia::Transform,
     pixmap: &mut tiny_skia::PixmapMut,
 ) -> Option<()> {
     let transform = transform.pre_concat(group.transform());
 
     if !group.should_isolate() {
-        render_nodes(group, ctx, transform, pixmap);
+        render_nodes(group, max_bbox, transform, pixmap);
         return Some(());
     }
 
     let bbox = group.layer_bounding_box().transform(transform)?;
 
-    let mut ibbox = if group.filters().is_empty() {
+    let ibbox = if group.filters().is_empty() {
+        // Limit unfiltered layers to parent bounds. Per-pixel effects need no extra area.
+        let parent = tiny_skia::IntRect::from_xywh(0, 0, pixmap.width(), pixmap.height())?;
         tiny_skia::IntRect::from_xywh(
             (bbox.x().floor() as i32).checked_sub(2)?,
             (bbox.y().floor() as i32).checked_sub(2)?,
             (bbox.width().ceil() as u32).checked_add(4)?,
             (bbox.height().ceil() as u32).checked_add(4)?,
         )?
+        .intersect(&parent)?
     } else {
         // Don't expand the box of a group with filters by 2px, since it already acts as the clipping region.
-        let bbox = bbox.to_int_rect();
-        bbox.intersect(&ctx.max_bbox)?
+        bbox.to_int_rect().intersect(&max_bbox)?
     };
-
-    if group.filters().is_empty() {
-        // Limit unfiltered layers to parent bounds. Per-pixel effects need no extra area.
-        let parent = tiny_skia::IntRect::from_xywh(0, 0, pixmap.width(), pixmap.height())?;
-        ibbox = ibbox.intersect(&parent)?;
-    }
 
     let transform = tiny_skia::Transform::from_translate(-ibbox.x() as f32, -ibbox.y() as f32)
         .pre_concat(transform);
@@ -80,7 +63,7 @@ fn render_group(
         return None;
     };
 
-    render_nodes(group, ctx, transform, &mut sub_pixmap.as_mut());
+    render_nodes(group, max_bbox, transform, &mut sub_pixmap.as_mut());
 
     for filter in group.filters() {
         super::filter::apply(filter, transform, &mut sub_pixmap);
@@ -91,7 +74,7 @@ fn render_group(
     }
 
     if let Some(mask) = group.mask() {
-        super::mask::apply(mask, ctx, transform, &mut sub_pixmap);
+        super::mask::apply(mask, max_bbox, transform, &mut sub_pixmap);
     }
 
     let blend_mode = convert_blend_mode(group.blend_mode());

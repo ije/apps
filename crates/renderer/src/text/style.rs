@@ -54,7 +54,7 @@ macro_rules! text_style {
 
         #[derive(Clone, Debug, Default, PartialEq)]
         pub struct TextOverrides {
-            $($field: Option<$type>,)*
+            $(pub(crate) $field: Option<$type>,)*
         }
 
         impl TextOverrides {
@@ -66,10 +66,6 @@ macro_rules! text_style {
                 pub fn $set(&mut self, value: $type) -> &mut Self {
                     self.$field = Some(value);
                     self
-                }
-
-                pub fn $field(&self) -> Option<&$type> {
-                    self.$field.as_ref()
                 }
             )*
         }
@@ -165,7 +161,7 @@ mod tests {
         overrides
             .set_letter_spacing(px(2.))
             .set_text_overflow(Some("…".into()));
-        assert!(overrides.font_size() == Some(&px(14.)) && overrides.line_clamp().is_none());
+        assert!(overrides.font_size == Some(px(14.)) && overrides.line_clamp.is_none());
         let mut text = TextStyle::default();
         let initial = text.clone();
         text.refine(&overrides);

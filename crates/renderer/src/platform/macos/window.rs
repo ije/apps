@@ -17,7 +17,6 @@ use objc2_core_foundation::CGSize;
 use objc2_foundation::NSRect;
 use raw_window_handle as rwh;
 use std::{
-    cell::Cell,
     ptr::NonNull,
     rc::Rc,
     sync::{
@@ -37,7 +36,6 @@ const LINGER: u32 = 30;
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Snapshot {
     pub scale: f32,
-    pub content: Size<Pixels>,
     pub active: bool,
     pub state: WindowState,
 }
@@ -120,7 +118,6 @@ fn guess(options: &WindowOptions) -> Snapshot {
     );
     Snapshot {
         scale: display.scale,
-        content: content.size,
         active: false,
         state: WindowState {
             frame,
@@ -225,6 +222,10 @@ impl<T> Default for Latest<T> {
 impl<T: Send + 'static> Latest<T> {
     fn send(self: &Arc<Self>, value: T, apply: impl FnOnce(&Arc<Self>) + Send + 'static) {
         *lock(&self.value) = Some(value);
+        self.post(apply);
+    }
+
+    fn post(self: &Arc<Self>, apply: impl FnOnce(&Arc<Self>) + Send + 'static) {
         if !self.posted.swap(true, Ordering::AcqRel) {
             let latest = self.clone();
             native_post(Box::new(move || {
@@ -240,9 +241,9 @@ type Controls = (Vec<crate::NativeControl>, Option<crate::ControlSink>);
 pub(crate) struct Window {
     control: WindowControl,
     callbacks: Callbacks,
-    renderer: Renderer,
+    pub(crate) renderer: Renderer,
     pacer: Shared<Pacer>,
-    idle: Cell<u32>,
+    idle: u32,
     quiet: Option<crate::app::Timer>,
     presents: Arc<Latest<Present>>,
     controls_sent: Vec<crate::NativeControl>,
@@ -290,7 +291,7 @@ impl Window {
             callbacks,
             renderer,
             pacer,
-            idle: Cell::new(0),
+            idle: 0,
             quiet: None,
             presents: Arc::default(),
             controls_sent: Vec::new(),
@@ -312,15 +313,15 @@ impl Window {
     }
 
     pub fn content_size(&self) -> Size<Pixels> {
-        self.control.snapshot().content
+        self.control.snapshot().state.content.size
     }
 
     pub fn state(&self) -> WindowState {
         self.control.snapshot().state
     }
 
-    pub fn request_frame(&self) {
-        self.idle.set(0);
+    pub fn request_frame(&mut self) {
+        self.idle = 0;
         let mut pacer = lock(&self.pacer);
         pacer.wants = true;
         pacer.sync();
@@ -332,8 +333,8 @@ impl Window {
     }
 
     pub(crate) fn rest(&mut self) {
-        self.idle.set(self.idle.get() + 1);
-        if self.idle.get() < LINGER {
+        self.idle += 1;
+        if self.idle < LINGER {
             return;
         }
         {
@@ -357,18 +358,6 @@ impl Window {
         self.renderer.set_drawable_size(pixels);
     }
 
-    pub(crate) fn take_congested(&mut self) -> bool {
-        self.renderer.take_congested()
-    }
-
-    pub(crate) fn take_present(&mut self) -> Option<Present> {
-        self.renderer.take_present()
-    }
-
-    pub(crate) fn set_presents_with_transaction(&mut self, on: bool) {
-        self.renderer.set_presents_with_transaction(on);
-    }
-
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
         self.control.native.wait();
         self.quiet = None;
@@ -388,27 +377,6 @@ impl Window {
                 .send(present, |latest| drop(lock(&latest.value).take()));
         }
         frame
-    }
-
-    pub fn promote(
-        &mut self,
-        key: u64,
-        index: usize,
-        region: [i32; 4],
-        timing: [f64; 3],
-        opacities: &[f32],
-        transforms: &[[f64; 16]],
-    ) {
-        self.renderer
-            .promote(key, index, region, timing, opacities, transforms);
-    }
-
-    pub fn demote(&mut self) {
-        self.renderer.demote();
-    }
-
-    pub fn set_caret(&mut self, caret: Option<(Rect<f32>, crate::Color, std::time::Instant)>) {
-        self.renderer.set_caret(caret);
     }
 
     pub fn set_controls(
@@ -438,15 +406,9 @@ impl Window {
 fn show_controls(native: Arc<Native>, latest: Arc<Latest<Controls>>) {
     native.with(|window| {
         // Code up the stack can be using the controls: try again in the next pass.
-        if !window.view().update_controls(|| lock(&latest.value).take())
-            && !latest.posted.swap(true, Ordering::AcqRel)
-        {
+        if !window.view().update_controls(|| lock(&latest.value).take()) {
             let native = native.clone();
-            let latest = latest.clone();
-            native_post(Box::new(move || {
-                latest.posted.store(false, Ordering::Release);
-                show_controls(native, latest);
-            }));
+            latest.post(move |latest| show_controls(native, latest.clone()));
         }
     });
 }

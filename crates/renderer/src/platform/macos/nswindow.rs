@@ -33,8 +33,6 @@ use std::{
     path::PathBuf,
 };
 
-const LEVEL_NORMAL: isize = 0;
-
 // Title bar container, then the close, minimize and zoom buttons.
 type ButtonFrames = [NSRect; 4];
 
@@ -393,8 +391,6 @@ pub(crate) fn open(
     view.addSubview(&cover);
     content.addSubview(&view);
     window.makeFirstResponder(Some(&view));
-    window.setLevel(LEVEL_NORMAL);
-    window.setAcceptsMouseMovedEvents(false);
     let tracking = NSTrackingAreaOptions::MouseEnteredAndExited
         | NSTrackingAreaOptions::MouseMoved
         | NSTrackingAreaOptions::ActiveAlways
@@ -418,7 +414,6 @@ pub(crate) fn open(
     if options.frameless {
         window.show_buttons(false);
     }
-    window.refresh();
     window.locate();
     window.place_buttons();
     Ok((window, view))
@@ -440,13 +435,7 @@ impl AppsWindow {
 
     // The frame of the page view in the content view. Panels docked at its sides make it narrower.
     fn page_frame(&self) -> NSRect {
-        match self.ivars().view.get() {
-            Some(view) => view.frame(),
-            None => self
-                .contentView()
-                .map(|view| view.bounds())
-                .unwrap_or_default(),
-        }
+        self.view().frame()
     }
 
     pub fn content_size(&self) -> Size<Pixels> {
@@ -513,7 +502,6 @@ impl AppsWindow {
         };
         *lock(&self.ivars().snapshot) = Snapshot {
             scale: self.scale(),
-            content: self.content_size(),
             active: self.isKeyWindow(),
             state,
         };
@@ -544,9 +532,7 @@ impl AppsWindow {
 
     pub fn update_size(&self) {
         let (scale, content) = (self.scale(), self.content_size());
-        if let Some(view) = self.ivars().view.get() {
-            view.ivars().layer.setContentsScale(scale as f64);
-        }
+        self.view().ivars().layer.setContentsScale(scale as f64);
         self.refresh();
         self.ivars().callbacks.resized(content, scale);
     }
@@ -585,10 +571,11 @@ impl AppsWindow {
         let Some((buttons, bar)) = self.buttons() else {
             return;
         };
-        let [close, next, _] = buttons.each_ref().map(|button| button.frame());
+        let [close, next, last] = buttons.each_ref().map(|button| button.frame());
         if ivars.buttons_home.get().is_none() {
-            let [a, b, c] = buttons.each_ref().map(|button| button.frame());
-            ivars.buttons_home.set(Some([bar.frame(), a, b, c]));
+            ivars
+                .buttons_home
+                .set(Some([bar.frame(), close, next, last]));
         }
         let step = next.origin.x - close.origin.x;
         let (x, y) = (at.x.0 as f64, at.y.0 as f64);

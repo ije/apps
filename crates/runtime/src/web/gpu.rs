@@ -100,6 +100,34 @@ pub fn library_name(platform: &str) -> Option<&'static str> {
     }
 }
 
+// Like JavaScriptCore, the library only loads from the app, never from the environment. It is never unloaded,
+// because its threads may outlive every page and device.
+pub(crate) fn library(
+    name: &str,
+    what: &str,
+    abi_symbol: &[u8],
+    abi: u32,
+) -> Result<&'static libloading::Library> {
+    let executable = crate::desktop::app::library_exe()?;
+    let directory = executable
+        .parent()
+        .context("Missing executable directory")?;
+    let path = ["../Frameworks", "."]
+        .iter()
+        .map(|folder| directory.join(folder).join(name))
+        .find(|path| path.is_file())
+        .with_context(|| format!("The {what} library {name} is missing next to the runtime"))?;
+    let library = unsafe { libloading::Library::new(&path) }
+        .with_context(|| format!("Cannot load the {what} library from {}", path.display()))?;
+    let version: libloading::Symbol<extern "C" fn() -> u32> = unsafe { library.get(abi_symbol)? };
+    ensure!(
+        version() == abi,
+        "{} does not match this runtime",
+        path.display()
+    );
+    Ok(Box::leak(Box::new(library)))
+}
+
 #[cfg(target_os = "linux")]
 fn load() -> Result<Library> {
     use apps_webgpu as webgpu;
@@ -116,38 +144,18 @@ fn load() -> Result<Library> {
 
 #[cfg(not(target_os = "linux"))]
 fn load() -> Result<Library> {
-    let executable = crate::desktop::app::library_exe()?;
-    let directory = executable
-        .parent()
-        .context("Missing executable directory")?;
     let name =
         library_name(std::env::consts::OS).context("WebGPU is unavailable on this platform")?;
-    // Like JavaScriptCore, the library only loads from the app, never from the environment.
-    let path = ["../Frameworks", "."]
-        .iter()
-        .map(|folder| directory.join(folder).join(name))
-        .find(|path| path.is_file())
-        .with_context(|| format!("The WebGPU library {name} is missing next to the runtime"))?;
+    let library = library(name, "WebGPU", b"apps_webgpu_abi\0", ABI)?;
     unsafe {
-        let library = libloading::Library::new(&path)
-            .with_context(|| format!("Cannot load WebGPU from {}", path.display()))?;
-        let abi: libloading::Symbol<extern "C" fn() -> u32> = library.get(b"apps_webgpu_abi\0")?;
-        ensure!(
-            abi() == ABI,
-            "{} does not match this runtime",
-            path.display()
-        );
-        let functions = Library {
+        Ok(Library {
             new: *library.get(b"apps_webgpu_new\0")?,
             free: *library.get(b"apps_webgpu_free\0")?,
             call: *library.get(b"apps_webgpu_call\0")?,
             image: *library.get(b"apps_webgpu_image\0")?,
             presented: *library.get(b"apps_webgpu_presented\0")?,
             allocated: *library.get(b"apps_webgpu_allocated\0")?,
-        };
-        // wgpu threads may outlive every device, so the library is never unloaded.
-        std::mem::forget(library);
-        Ok(functions)
+        })
     }
 }
 

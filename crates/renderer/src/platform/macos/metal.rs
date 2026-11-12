@@ -1,8 +1,8 @@
 use crate::{
     Color, Rect, Size,
-    atlas::{self, Packer, PageKind, PageList, PageStore, Tile},
-    frame::{Command, RenderFrame, Target},
-    gpu::{ATTRIBUTES, Globals, Instance, bytes},
+    atlas::{self, PageKind, PageList, PageStore, Tile},
+    frame::{Command, Pool, RenderFrame, Target},
+    gpu::{ATTRIBUTES, Instance, bytes},
     scene::Scene,
 };
 use anyhow::{Context as _, Result, ensure};
@@ -33,7 +33,7 @@ use std::{
     ptr::{self, NonNull},
     rc::Rc,
     slice,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -42,7 +42,6 @@ const MAX_TEXTURE_SIZE: u32 = 16384;
 const MIN_INSTANCE_BUFFER: usize = 2 << 20;
 const MAX_INSTANCE_BUFFER: usize = 256 << 20;
 const SHRINK_FRAMES: u32 = 120;
-const SPARE_FRAMES: u8 = 3;
 
 pub(crate) type Atlas = atlas::Atlas<Pages>;
 
@@ -149,12 +148,11 @@ pub(crate) struct Renderer {
     present: Option<Present>,
     opaque: bool,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    pipelines: Pipelines,
+    pipelines: &'static Pipelines,
     atlas: Rc<Atlas>,
     // Bound in place of an atlas page that a draw doesn't read.
     blank: Texture,
-    pool: Vec<(Texture, [u32; 2], u8)>,
-    targets: Vec<usize>,
+    pool: Pool<Texture>,
     frame: RenderFrame,
     promoted: Vec<Promoted>,
     glass: Vec<NativeGlass>,
@@ -306,15 +304,25 @@ impl Pipelines {
 
 impl Renderer {
     pub fn new(transparent: bool) -> Result<Self> {
-        // Built-in GPUs first, and among those the integrated one, which saves power.
-        let rank = |device: &ProtocolObject<dyn MTLDevice>| {
-            2 * u8::from(device.isRemovable()) + u8::from(!device.isLowPower())
+        // All windows share the device and the pipelines. Metal objects are thread-safe.
+        static SHARED: OnceLock<(Device, Pipelines)> = OnceLock::new();
+        let (device, pipelines) = match SHARED.get() {
+            Some(shared) => shared,
+            None => {
+                // Built-in GPUs first, and among those the integrated one, which saves power.
+                let rank = |device: &ProtocolObject<dyn MTLDevice>| {
+                    2 * u8::from(device.isRemovable()) + u8::from(!device.isLowPower())
+                };
+                let device = MTLCopyAllDevices()
+                    .iter()
+                    .min_by_key(|device| rank(device))
+                    .or_else(|| MTLCreateSystemDefaultDevice())
+                    .context("no Metal device")?;
+                let pipelines = Pipelines::new(&device)?;
+                SHARED.get_or_init(|| (device, pipelines))
+            }
         };
-        let device = MTLCopyAllDevices()
-            .iter()
-            .min_by_key(|device| rank(device))
-            .or_else(|| MTLCreateSystemDefaultDevice())
-            .context("no Metal device")?;
+        let device = device.clone();
         let layer = metal_layer(&device, !transparent);
         layer.setMaximumDrawableCount(3);
         layer.setAllowsNextDrawableTimeout(false);
@@ -334,8 +342,7 @@ impl Renderer {
         let pages = Pages {
             device: device.clone(),
             shared,
-            mask: PageList::default(),
-            color: PageList::default(),
+            pages: Default::default(),
         };
         let blank = page_texture(&device, shared, PageKind::Color, Size::new(1, 1))?;
         upload(
@@ -346,7 +353,7 @@ impl Renderer {
         );
         let atlas = Rc::new(Atlas::new(pages));
         Ok(Self {
-            pipelines: Pipelines::new(&device)?,
+            pipelines,
             device,
             layer,
             overlay,
@@ -358,8 +365,7 @@ impl Renderer {
             queue,
             atlas,
             blank,
-            pool: Vec::new(),
-            targets: Vec::new(),
+            pool: Pool::default(),
             frame: RenderFrame::default(),
             promoted: Vec::new(),
             glass: Vec::new(),
@@ -654,9 +660,9 @@ impl Renderer {
                 commands.waitUntilCompleted();
             }
         });
-        let pages = &mut *self.atlas.pages.borrow_mut();
-        pages.mask.trim(|page| page.packer.is_empty());
-        pages.color.trim(|page| page.packer.is_empty());
+        for list in &mut self.atlas.pages.borrow_mut().pages {
+            list.trim();
+        }
         self.pool.clear();
         BUFFERS.with(|buffers| buffers.borrow_mut().reset(MIN_INSTANCE_BUFFER));
         // Change size to release spare drawables. The layer keeps its last frame until the next draw restores
@@ -809,11 +815,9 @@ impl Renderer {
                 let bgra = unsafe {
                     slice::from_raw_parts(buffer.contents().as_ptr().cast::<u8>(), buffer.length())
                 };
-                let mut pixels = vec![0; bgra.len()];
-                for (rgba, &[b, g, r, a]) in
-                    pixels.as_chunks_mut().0.iter_mut().zip(bgra.as_chunks().0)
-                {
-                    *rgba = [r, g, b, a];
+                let mut pixels = bgra.to_vec();
+                for pixel in pixels.as_chunks_mut::<4>().0 {
+                    pixel.swap(0, 2);
                 }
                 Ok((window, pixels))
             })
@@ -883,33 +887,16 @@ impl Renderer {
             frame.content.push(glass.index);
         }
         frame.record(scene, window, MAX_TEXTURE_SIZE, true);
-        for (_, _, idle) in &mut self.pool {
-            *idle = idle.saturating_add(1);
-        }
-        self.pool.retain(|(_, _, idle)| *idle <= SPARE_FRAMES);
-        self.targets.clear();
-        for size in &frame.textures {
-            let index = match self
-                .pool
-                .iter()
-                .position(|(_, pooled, idle)| *idle > 0 && pooled == size)
-            {
-                Some(index) => index,
-                None => {
-                    let texture = new_texture(
-                        &self.device,
-                        size.map(|side| side as usize),
-                        FORMAT,
-                        MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead,
-                        MTLStorageMode::Private,
-                    )?;
-                    self.pool.push((texture, *size, 0));
-                    self.pool.len() - 1
-                }
-            };
-            self.pool[index].2 = 0;
-            self.targets.push(index);
-        }
+        let device = &self.device;
+        self.pool.fill(&frame, |size| {
+            new_texture(
+                device,
+                size.map(|side| side as usize),
+                FORMAT,
+                MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead,
+                MTLStorageMode::Private,
+            )
+        })?;
         let instances = (!frame.instances.is_empty())
             .then(|| {
                 BUFFERS.with(|buffers| {
@@ -924,7 +911,7 @@ impl Renderer {
         let mut sublayers = Vec::new();
         if result.is_ok() {
             for &(index, target, region) in &frame.promoted {
-                let Target::Layer(layer) = target else {
+                let Some(source) = self.pool.get(&frame, target) else {
                     continue;
                 };
                 let promoted = self.promoted.iter_mut().find(|p| p.index == index);
@@ -939,7 +926,6 @@ impl Renderer {
                 let Some(sublayer) = output.nextDrawable() else {
                     continue;
                 };
-                let source = &self.pool[self.targets[frame.layers[layer].texture]].0;
                 self.pipelines.copy(
                     &commands,
                     source,
@@ -990,9 +976,10 @@ impl Renderer {
         drawable: &ProtocolObject<dyn MTLTexture>,
         instances: Option<&ProtocolObject<dyn MTLBuffer>>,
     ) -> Result<()> {
-        let texture = |target: Target| match target {
-            Target::Frame => drawable,
-            Target::Layer(index) => &*self.pool[self.targets[frame.layers[index].texture]].0,
+        let texture = |target: Target| {
+            self.pool
+                .get(frame, target)
+                .map_or(drawable, |texture| texture)
         };
         let pages = self.atlas.pages.borrow();
         let page = |kind, index: Option<u32>| {
@@ -1000,6 +987,18 @@ impl Renderer {
                 .and_then(|index| pages.get(kind, index))
                 .unwrap_or(&self.blank)
         };
+        // Slot 1 holds the globals, slot 2 the composite or blur.
+        let uniforms =
+            |encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, data: &[u8], slot| {
+                let length = data.len();
+                let data = NonNull::from(data).cast::<c_void>();
+                // SAFETY: Metal copies the bytes before this returns.
+                unsafe {
+                    encoder.setVertexBytes_length_atIndex(data, length, slot);
+                    encoder.setFragmentBytes_length_atIndex(data, length, slot);
+                }
+            };
+        let globals = |target: Target| frame.globals(target, 0.);
         let begin = |target: Target, clear: bool| -> Result<_> {
             let descriptor = MTLRenderPassDescriptor::new();
             // SAFETY: index zero is within the color attachment array.
@@ -1020,17 +1019,8 @@ impl Renderer {
             let encoder = commands
                 .renderCommandEncoderWithDescriptor(&descriptor)
                 .context("no render encoder")?;
-            set_globals(&encoder, &frame.globals(target, 0.));
+            uniforms(&encoder, bytes(&[globals(target)]), 1);
             Ok(encoder)
-        };
-        let uniforms = |encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, data: &[u8]| {
-            let length = data.len();
-            let data = NonNull::from(data).cast::<c_void>();
-            // SAFETY: Metal copies the bytes before this returns.
-            unsafe {
-                encoder.setVertexBytes_length_atIndex(data, length, 2);
-                encoder.setFragmentBytes_length_atIndex(data, length, 2);
-            }
         };
         let mut encoder: Option<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> = None;
         let mut current = (Target::Frame, true);
@@ -1050,14 +1040,14 @@ impl Renderer {
                 }
             };
         }
-        let pipelines = &self.pipelines;
+        let pipelines = self.pipelines;
         for command in &frame.commands {
             match command {
                 Command::Pass(target, false)
                     if let Some(encoder) = &encoder
                         && frame.texture(*target) == frame.texture(current.0) =>
                 {
-                    set_globals(encoder, &frame.globals(*target, 0.));
+                    uniforms(encoder, bytes(&[globals(*target)]), 1);
                     current = (*target, false);
                 }
                 // Targets are cleared right away, since a later pass may draw into them.
@@ -1098,7 +1088,7 @@ impl Renderer {
                     end!();
                     let blur = begin(*dst, true)?;
                     blur.setRenderPipelineState(&pipelines.blur);
-                    uniforms(&blur, bytes(&frame.blurs[*index as usize..][..1]));
+                    uniforms(&blur, bytes(&frame.blurs[*index as usize..][..1]), 2);
                     // SAFETY: the layer textures live until the command buffer completes.
                     unsafe {
                         blur.setFragmentTexture_atIndex(Some(texture(*src)), 0);
@@ -1133,7 +1123,7 @@ impl Renderer {
                 } => {
                     let encoder = pass!();
                     encoder.setRenderPipelineState(&pipelines.composite);
-                    uniforms(encoder, bytes(&frame.composites[*index as usize..][..1]));
+                    uniforms(encoder, bytes(&frame.composites[*index as usize..][..1]), 2);
                     let source = texture(*src);
                     // SAFETY: the textures live until the command buffer completes.
                     unsafe {
@@ -1155,15 +1145,6 @@ impl Renderer {
         }
         end!();
         Ok(())
-    }
-}
-
-fn set_globals(encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, globals: &Globals) {
-    let data = NonNull::from(globals).cast::<c_void>();
-    // SAFETY: Metal copies the globals before this returns.
-    unsafe {
-        encoder.setVertexBytes_length_atIndex(data, mem::size_of::<Globals>(), 1);
-        encoder.setFragmentBytes_length_atIndex(data, mem::size_of::<Globals>(), 1);
     }
 }
 
@@ -1229,29 +1210,15 @@ fn upload(texture: &ProtocolObject<dyn MTLTexture>, rect: Rect<i32>, bytes: &[u8
 pub(crate) struct Pages {
     device: Device,
     shared: bool,
-    mask: PageList<Page>,
-    color: PageList<Page>,
-}
-
-struct Page {
-    packer: Packer,
-    texture: Texture,
+    // Indexed by `PageKind`.
+    pages: [PageList<Texture>; 2],
 }
 
 impl Pages {
-    fn list(&mut self, kind: PageKind) -> &mut PageList<Page> {
-        match kind {
-            PageKind::Mask => &mut self.mask,
-            PageKind::Color => &mut self.color,
-        }
-    }
-
     fn get(&self, kind: PageKind, index: u32) -> Option<&ProtocolObject<dyn MTLTexture>> {
-        let list = match kind {
-            PageKind::Mask => &self.mask,
-            PageKind::Color => &self.color,
-        };
-        Some(&list.get(index as usize)?.texture)
+        self.pages[kind as usize]
+            .get(index as usize)
+            .map(|page| &**page)
     }
 }
 
@@ -1279,43 +1246,17 @@ fn page_texture(
 }
 
 impl PageStore for Pages {
-    fn insert(&mut self, kind: PageKind, size: Size<i32>, bytes: &[u8]) -> Result<Tile> {
-        ensure!(
-            size.width > 0 && size.height > 0,
-            "atlas tiles must have a size"
-        );
-        let row = size.width as usize
-            * match kind {
-                PageKind::Mask => 1,
-                PageKind::Color => 4,
-            };
-        ensure!(
-            bytes.len() >= row * size.height as usize,
-            "atlas upload is too short"
-        );
+    fn insert(
+        &mut self,
+        kind: PageKind,
+        size: Size<i32>,
+        bytes: &[u8],
+    ) -> Result<(usize, Rect<i32>, u32)> {
         let (device, shared) = (&self.device, self.shared);
-        let list = match kind {
-            PageKind::Mask => &mut self.mask,
-            PageKind::Color => &mut self.color,
-        };
-        let (index, rect, id) = list.allocate(
-            size,
-            |page| &mut page.packer,
-            |size| {
-                Ok(Page {
-                    packer: Packer::new(size),
-                    texture: page_texture(device, shared, kind, size)?,
-                })
-            },
-        )?;
-        let page = list.pages[index].as_ref().context("atlas page")?;
-        upload(&page.texture, rect, bytes, row);
-        Ok(Tile {
-            page: index as u32,
-            kind,
-            id,
-            rect,
-        })
+        let (index, page, rect, id) = self.pages[kind as usize]
+            .allocate(size, |size| page_texture(device, shared, kind, size))?;
+        upload(page, rect, bytes, bytes.len() / size.height as usize);
+        Ok((index, rect, id))
     }
 
     fn max_side(&self) -> i32 {
@@ -1323,16 +1264,7 @@ impl PageStore for Pages {
     }
 
     fn remove(&mut self, tile: Tile) {
-        let list = self.list(tile.kind);
-        let index = tile.page as usize;
-        if list
-            .pages
-            .get_mut(index)
-            .and_then(Option::as_mut)
-            .is_some_and(|page| page.packer.free(tile.id))
-        {
-            list.emptied(index, |page| page.packer.is_empty());
-        }
+        self.pages[tile.kind as usize].free(tile.page as usize, tile.id);
     }
 }
 

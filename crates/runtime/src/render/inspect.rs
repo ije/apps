@@ -60,14 +60,7 @@ pub(super) fn paint(view: &PageState, window: &mut Window) {
                 "DejaVu Sans"
             }),
             color: Color::hex(0xffffffff),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-            letter_spacing: px(0.),
-            word_spacing: px(0.),
-            font_size: None,
-            inset: Default::default(),
-            nowrap: false,
+            ..Default::default()
         };
         let line = window.text_system().shape_line(&text, px(11.), &run);
         let label = size(line.line.width + px(10.), px(18.));

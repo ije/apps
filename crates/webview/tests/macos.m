@@ -2,7 +2,7 @@
 #import <WebKit/WebKit.h>
 #include <stdio.h>
 #include <stdlib.h>
-void *apps_browser_create(void *,const char *,void (*)(void *,const char *),void *);
+void *apps_browser_create(void *,const char *,const char *,void (*)(void *,const char *),void *);
 void apps_browser_destroy(void *);
 void apps_browser_attach(void *, void *);
 void apps_browser_bounds(void *, double, double, double, double);
@@ -40,7 +40,7 @@ int main(int argc, const char *argv[]) {
         [NSApp setActivationPolicy:NSApplicationActivationPolicyProhibited];
         __weak id owner;
         @autoreleasepool {
-        browser=apps_browser_create(NULL,"{\"show\":false,\"inspectable\":true}",event,NULL);
+        browser=apps_browser_create(NULL,"{\"show\":false,\"inspectable\":true}",NULL,event,NULL);
         if (!browser) return 3;
         owner=(__bridge id)browser;
         NSWindow *parent=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,1000,800) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];

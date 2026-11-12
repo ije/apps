@@ -1,5 +1,5 @@
 globalThis.__appsServe = call => {
-  const servers = new Map(), requests = new WeakMap(), uploads = new Map(), signals = new Map(), drains = new Map(), { encode, decode, memory } = globalThis.__appsBytes;
+  const servers = new Map(), requests = new WeakMap(), uploads = new Map(), signals = new Map(), drains = new Map(), { decode, memory } = globalThis.__appsBytes;
   return {
     serve(options) {
       if (!options || typeof options.fetch !== 'function') throw new TypeError('Expected a fetch handler');
@@ -72,7 +72,7 @@ globalThis.__appsServe = call => {
             const data = response.body && memory(response.body), stream = !data && event.method !== 'HEAD' && response.body !== null;
             if (event.method === 'HEAD') await response.body?.cancel();
             call('web.serve.respond', event.server, event.id, {
-              status: response.status, statusText: response.statusText, headers: [...response.headers], body: event.method === 'HEAD' || !data ? [] : encode(data), stream,
+              status: response.status, statusText: response.statusText, headers: [...response.headers], body: event.method === 'HEAD' || !data ? [] : data, stream,
             });
             if (stream) {
               const reader = response.body.getReader();
@@ -82,7 +82,7 @@ globalThis.__appsServe = call => {
                   const { value, done } = await reader.read();
                   if (signal.signal.aborted) break;
                   if (!done && !(value instanceof Uint8Array)) throw new TypeError('Response chunks must be Uint8Array');
-                  const chunk = done ? null : encode(value);
+                  const chunk = done ? null : value;
                   while (!signal.signal.aborted && !call('web.serve.write', event.server, event.id, chunk)) await new Promise(resolve => drains.set(key, resolve));
                   if (done) break;
                 }

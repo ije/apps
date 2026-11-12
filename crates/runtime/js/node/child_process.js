@@ -129,8 +129,8 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
     }
     const stdio = options.stdio ?? 'pipe', list = typeof stdio === 'string' ? [stdio, stdio, stdio] : Array.isArray(stdio) ? stdio : null;
     if (!list) throw Object.assign(new TypeError(`The argument 'stdio' is invalid. Received ${stdio}`), { code: 'ERR_INVALID_ARG_VALUE' });
-    result.stdio = Array.from({ length: Math.max(3, list.length) }, (_, index) => stdioOf(list[index], index));
-    for (let index = 0; index < Math.max(3, list.length); index++) if (stdioOf(list[index], index) === null) throw Object.assign(new TypeError(`Unsupported stdio option at index ${index}: ${String(list[index])}`), { code: 'ERR_INVALID_ARG_VALUE' });
+    result.stdio = [];
+    for (let index = 0; index < Math.max(3, list.length); index++) { const value = stdioOf(list[index], index); if (value === null) throw Object.assign(new TypeError(`Unsupported stdio option at index ${index}: ${String(list[index])}`), { code: 'ERR_INVALID_ARG_VALUE' }); result.stdio.push(value); }
     const ipc = list.indexOf('ipc');
     if (ipc !== -1) {
       if (list.includes('ipc', ipc + 1)) throw Object.assign(new Error('Child process can have only one IPC pipe'), { code: 'ERR_IPC_ONE_PIPE' });

@@ -94,7 +94,6 @@ pub(super) struct Surface {
     // Fields drop in order: GPU objects must go before the surface.
     renderer: RefCell<Option<Renderer>>,
     roles: Roles,
-    atlas: Rc<Atlas>,
     shape: RefCell<Shape>,
     pace: Pace,
 }
@@ -109,7 +108,7 @@ impl Surface {
         client: &Rc<Client>,
         options: &WindowOptions,
         calls: Callbacks,
-    ) -> Result<Rc<Self>> {
+    ) -> Result<(Rc<Self>, Rc<Atlas>)> {
         let (qh, globals) = (&client.qh, &client.globals);
         let surface = globals.compositor.create_surface(qh, ());
         let id = surface.id();
@@ -182,11 +181,11 @@ impl Surface {
             suspended: false,
             active: false,
         };
+        let atlas = renderer.atlas().clone();
         let window = Rc::new_cyclic(|me| Self {
             me: me.clone(),
             calls,
             client: Rc::downgrade(client),
-            atlas: renderer.atlas().clone(),
             renderer: RefCell::new(Some(renderer)),
             roles,
             transparent: options.transparent,
@@ -201,7 +200,7 @@ impl Surface {
             .insert(id, Rc::downgrade(&window));
         // The first commit has no buffer and asks for the first configure.
         window.roles.surface.commit();
-        Ok(window)
+        Ok((window, atlas))
     }
 
     pub fn surface(&self) -> &WlSurface {
@@ -360,10 +359,6 @@ impl Native for Surface {
         self.shape.borrow().active
     }
 
-    fn atlas(&self) -> Rc<Atlas> {
-        self.atlas.clone()
-    }
-
     fn want_frames(&self) {
         self.pace.wants.set(true);
         self.kick();
@@ -442,9 +437,10 @@ impl Native for Surface {
             Action::Resize(extent) => self.set_size(Some(extent), None),
             Action::Move => {
                 if let Some(client) = client
-                    && let Some(serial) = client.press_serial()
+                    && let live = client.live.borrow()
+                    && let Some((serial, _)) = &live.press
                 {
-                    role._move(&client.live.borrow().seat, serial);
+                    role._move(&live.seat, *serial);
                 }
             }
             // A Wayland toplevel gets no parent here.

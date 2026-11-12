@@ -302,6 +302,8 @@ setTimeout(async () => {
         let expected = apps_runtime::bundle::aot_source(id, name);
         if let Some(source) = bundle.files.get(name) {
             assert_eq!(source, &expected);
+        } else if name == "app.js" {
+            assert_eq!(bundle.main.as_deref(), Some(expected.as_bytes()));
         } else {
             assert_eq!(&*bundle.scripts[name], expected.as_bytes());
         }

@@ -1,8 +1,8 @@
-use crate::Size;
-use crate::atlas::{self, Packer, PageKind, PageList, PageStore, Tile};
-use crate::frame::{Command, RenderFrame, Target};
+use crate::atlas::{self, PageKind, PageList, PageStore, Tile};
+use crate::frame::{Command, Pool, RenderFrame, Target};
 use crate::gpu::{ATTRIBUTES, Blur, Composite, Globals, Instance, Plain, bytes};
 use crate::scene::Scene;
+use crate::{Rect, Size};
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use raw_window_handle::{DisplayHandle, HandleError, HasDisplayHandle};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
@@ -17,8 +17,6 @@ use wgpu::{Texture, TextureFormat, TextureUsages, TextureView};
 // Glyph masks blend in sRGB here, which makes dark text look too heavy. Needs a visual check on a real display.
 const TEXT_CONTRAST: f32 = 0.3;
 const MAX_INSTANCE_BYTES: u64 = 256 << 20;
-// Layer textures that no frame used for this many frames are dropped.
-const IDLE_FRAMES: u8 = 3;
 
 pub(crate) type Atlas = atlas::Atlas<Pages>;
 pub(super) type Capture = Option<Result<([u32; 2], Vec<u8>)>>;
@@ -431,8 +429,7 @@ pub(super) struct Renderer {
     atlas: Rc<Atlas>,
     instances: Option<Buffer>,
     uniforms: Option<(Buffer, BindGroup, BindGroup)>,
-    pool: Vec<(Texture, TextureView, u8)>,
-    targets: Vec<usize>,
+    pool: Pool<(Texture, TextureView)>,
     sources: (u64, FxHashMap<[Option<u32>; 2], BindGroup>),
     staging: Vec<u8>,
     frame: RenderFrame,
@@ -460,8 +457,7 @@ impl Renderer {
             mailbox,
             instances: None,
             uniforms: None,
-            pool: Vec::new(),
-            targets: Vec::new(),
+            pool: Pool::default(),
             sources: (u64::MAX, FxHashMap::default()),
             staging: Vec::new(),
             frame: RenderFrame::default(),
@@ -546,7 +542,7 @@ impl Renderer {
         self.surface = None;
         let (gpu, surface) = Gpu::surface(self.display, self.window)?;
         if !Rc::ptr_eq(&gpu, &self.gpu) {
-            self.atlas.clear(|pages| *pages = Pages::new(gpu.clone()));
+            self.atlas.clear(Pages::new(gpu.clone()));
             self.release();
             self.sources = (u64::MAX, FxHashMap::default());
             self.gpu = gpu;
@@ -580,31 +576,16 @@ impl Renderer {
 
     fn prepare(&mut self, frame: &RenderFrame) -> Result<[u64; 3]> {
         let gpu = &self.gpu;
-        for (.., idle) in &mut self.pool {
-            *idle = idle.saturating_add(1);
-        }
-        self.pool.retain(|(.., idle)| *idle <= IDLE_FRAMES);
-        self.targets.clear();
         let usage = TextureUsages::RENDER_ATTACHMENT
             | TextureUsages::TEXTURE_BINDING
             | TextureUsages::COPY_SRC
             | TextureUsages::COPY_DST;
-        for &size in &frame.textures {
-            let free = |(made, _, idle): &(Texture, TextureView, u8)| {
-                *idle > 0 && [made.width(), made.height()] == size
-            };
-            let at = match self.pool.iter().position(free) {
-                Some(at) => at,
-                None => {
-                    let made = texture(&gpu.device, size, self.config.format, usage);
-                    let view = made.create_view(&Default::default());
-                    self.pool.push((made, view, 0));
-                    self.pool.len() - 1
-                }
-            };
-            self.pool[at].2 = 0;
-            self.targets.push(at);
-        }
+        let format = self.config.format;
+        self.pool.fill(frame, |size| {
+            let made = texture(&gpu.device, size, format, usage);
+            let view = made.create_view(&Default::default());
+            Ok((made, view))
+        })?;
 
         let data = bytes(&frame.instances);
         let length = data.len() as u64;
@@ -732,13 +713,12 @@ impl Renderer {
             Target::Layer(index) => (index as u64 + 1) * strides[0],
         } as u32;
         let frame_view = output.create_view(&Default::default());
-        let (pool, targets) = (&self.pool, &self.targets);
-        let pooled = |target: Target| match target {
-            Target::Frame => None,
-            Target::Layer(index) => Some(&pool[targets[frame.layers[index].texture]]),
+        let pool = &self.pool;
+        let view = |target: Target| {
+            pool.get(frame, target)
+                .map_or(&frame_view, |(_, view)| view)
         };
-        let view = |target: Target| pooled(target).map_or(&frame_view, |(_, view, _)| view);
-        let raw = |target: Target| pooled(target).map_or(output, |(made, ..)| made);
+        let raw = |target: Target| pool.get(frame, target).map_or(output, |(made, _)| made);
         let bind = |views: [&TextureView; 3]| {
             let entries: [_; 3] = std::array::from_fn(|at| {
                 let resource = BindingResource::TextureView(views[at]);
@@ -908,75 +888,50 @@ impl Renderer {
 
 pub(crate) struct Pages {
     gpu: Rc<Gpu>,
-    mask: PageList<Page>,
-    color: PageList<Page>,
+    // Indexed by `PageKind`.
+    pages: [PageList<(Texture, TextureView)>; 2],
     // Changes whenever a page comes or goes, so cached bind groups never read a dropped texture.
     generation: u64,
-}
-
-struct Page {
-    packer: Packer,
-    texture: Texture,
-    view: TextureView,
 }
 
 impl Pages {
     fn new(gpu: Rc<Gpu>) -> Self {
         Self {
             gpu,
-            mask: PageList::default(),
-            color: PageList::default(),
+            pages: Default::default(),
             generation: 0,
         }
     }
 
     fn view(&self, color: bool, index: u32) -> Option<&TextureView> {
-        let list = if color { &self.color } else { &self.mask };
-        Some(&list.get(index as usize)?.view)
+        Some(&self.pages[usize::from(color)].get(index as usize)?.1)
     }
 }
 
 impl PageStore for Pages {
-    fn insert(&mut self, kind: PageKind, size: Size<i32>, data: &[u8]) -> Result<Tile> {
-        ensure!(
-            size.width > 0 && size.height > 0,
-            "atlas tiles must have a size"
-        );
+    fn insert(
+        &mut self,
+        kind: PageKind,
+        size: Size<i32>,
+        data: &[u8],
+    ) -> Result<(usize, Rect<i32>, u32)> {
         let color = matches!(kind, PageKind::Color);
-        let row = size.width as usize * if color { 4 } else { 1 };
-        let data = data
-            .get(..row * size.height as usize)
-            .context("atlas upload is too short")?;
+        let row = data.len() / size.height as usize;
         let gpu = self.gpu.clone();
         let format = if color {
             gpu.color
         } else {
             TextureFormat::R8Unorm
         };
-        let list = if color {
-            &mut self.color
-        } else {
-            &mut self.mask
-        };
         let mut grew = false;
-        let (index, rect, id) = list.allocate(
-            size,
-            |page| &mut page.packer,
-            |size| {
-                grew = true;
-                let side = [size.width as u32, size.height as u32];
-                let usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
-                let made = texture(&gpu.device, side, format, usage);
-                let view = made.create_view(&Default::default());
-                Ok(Page {
-                    packer: Packer::new(size),
-                    texture: made,
-                    view,
-                })
-            },
-        )?;
-        self.generation += u64::from(grew);
-        let page = list.get(index).context("atlas page")?;
+        let (index, (page, _), rect, id) = self.pages[kind as usize].allocate(size, |size| {
+            grew = true;
+            let side = [size.width as u32, size.height as u32];
+            let usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+            let made = texture(&gpu.device, side, format, usage);
+            let view = made.create_view(&Default::default());
+            Ok((made, view))
+        })?;
         let swizzled: Vec<u8>;
         let data = match color && format == TextureFormat::Rgba8Unorm {
             true => {
@@ -997,7 +952,7 @@ impl PageStore for Pages {
         };
         let target = wgpu::TexelCopyTextureInfo {
             origin,
-            ..page.texture.as_image_copy()
+            ..page.as_image_copy()
         };
         let layout = wgpu::TexelCopyBufferLayout {
             bytes_per_row: Some(row as u32),
@@ -1005,12 +960,8 @@ impl PageStore for Pages {
         };
         gpu.queue
             .write_texture(target, data, layout, extent(size.width, size.height));
-        Ok(Tile {
-            page: index as u32,
-            kind,
-            id,
-            rect,
-        })
+        self.generation += u64::from(grew);
+        Ok((index, rect, id))
     }
 
     fn max_side(&self) -> i32 {
@@ -1018,14 +969,7 @@ impl PageStore for Pages {
     }
 
     fn remove(&mut self, tile: Tile) {
-        let list = match tile.kind {
-            PageKind::Mask => &mut self.mask,
-            PageKind::Color => &mut self.color,
-        };
-        let index = tile.page as usize;
-        let page = list.pages.get_mut(index).and_then(Option::as_mut);
-        if page.is_some_and(|page| page.packer.free(tile.id)) {
-            list.emptied(index, |page| page.packer.is_empty());
+        if self.pages[tile.kind as usize].free(tile.page as usize, tile.id) {
             self.generation += 1;
         }
     }

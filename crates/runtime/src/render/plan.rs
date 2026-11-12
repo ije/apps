@@ -33,21 +33,9 @@ impl Plan {
         };
         let ink = style.get(Prop::COLOR).and_then(style::color);
         let text = ink.map_or(Color::hex(0x000000ff), |(ink, alpha)| {
-            Color::hex(ink << 8 | alpha as u32)
+            crate::style::rgba((ink, alpha))
         });
-        let borders = style::BORDERS.map(|[width, kind, _]| {
-            if style
-                .get(kind)
-                .is_none_or(|kind| matches!(kind, "none" | "hidden"))
-            {
-                return 0.;
-            }
-            style
-                .get(width)
-                .map_or(Some(3.), |width| units.resolve(width, 0.))
-                .unwrap_or(0.)
-                .max(0.)
-        });
+        let borders = units.borders(style, 0.);
         let corners = [
             Prop::BORDER_TOP_LEFT_RADIUS,
             Prop::BORDER_TOP_RIGHT_RADIUS,
@@ -91,7 +79,7 @@ impl Plan {
                 style
                     .get(name)
                     .and_then(style::color)
-                    .map_or(text, |(ink, alpha)| Color::hex(ink << 8 | alpha as u32))
+                    .map_or(text, crate::style::rgba)
             }),
             radii: (!relative(&corners)).then(|| effects::radii(style, units, || [0.; 2])),
             shareable: matches!(

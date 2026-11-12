@@ -237,21 +237,17 @@ fn apply(
         _ => Vector3::new(1.0, 1.0, 1.0),
     };
 
+    let origin = match light_source {
+        LightSource::DistantLight(_) => None,
+        LightSource::PointLight(light) => Some(Vector3::new(light.x, light.y, light.z)),
+        LightSource::SpotLight(light) => Some(Vector3::new(light.x, light.y, light.z)),
+    };
+
     let mut calc = |nx, ny, normal: Normal| {
-        match light_source {
-            LightSource::DistantLight(_) => {}
-            LightSource::PointLight(ref light) => {
-                let nz = src.alpha_at(nx, ny) as f32 / 255.0 * surface_scale;
-                let origin = Vector3::new(light.x, light.y, light.z);
-                let v = origin - Vector3::new(nx as f32, ny as f32, nz);
-                light_vector = v.normalized().unwrap_or(v);
-            }
-            LightSource::SpotLight(ref light) => {
-                let nz = src.alpha_at(nx, ny) as f32 / 255.0 * surface_scale;
-                let origin = Vector3::new(light.x, light.y, light.z);
-                let v = origin - Vector3::new(nx as f32, ny as f32, nz);
-                light_vector = v.normalized().unwrap_or(v);
-            }
+        if let Some(origin) = origin {
+            let nz = src.alpha_at(nx, ny) as f32 / 255.0 * surface_scale;
+            let v = origin - Vector3::new(nx as f32, ny as f32, nz);
+            light_vector = v.normalized().unwrap_or(v);
         }
 
         let light_color = light_color(&light_source, lighting_color, light_vector);

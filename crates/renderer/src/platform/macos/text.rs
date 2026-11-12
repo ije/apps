@@ -3,7 +3,7 @@ use crate::{
     Color, Pixels, Rect, Size, point, px, size,
     text::{
         FaceMetrics, Features, Font, FontId, FontStyle, Glyph, GlyphId, GlyphRaster, Line,
-        SUBPIXEL_STEPS, SharedString, Span,
+        SUBPIXEL_STEPS, SharedString, Span, best,
     },
 };
 use anyhow::{Context as _, Result, bail};
@@ -241,50 +241,6 @@ fn find_index(value: f32, knots: &[f32]) -> f32 {
     }
     let (low, high) = (knots[above - 1], knots[above]);
     (above - 1) as f32 + (value - low) / (high - low)
-}
-
-fn nearest_value(
-    values: impl Iterator<Item = f32> + Clone,
-    wanted: f32,
-    down: bool,
-) -> Option<f32> {
-    let below = values
-        .clone()
-        .filter(|&value| value <= wanted)
-        .reduce(f32::max);
-    let above = values.filter(|&value| value > wanted).reduce(f32::min);
-    if down {
-        below.or(above)
-    } else {
-        above.or(below)
-    }
-}
-
-fn best(faces: &[(f32, FontStyle, f32)], weight: f32, style: FontStyle) -> Option<usize> {
-    let mut set: Vec<usize> = (0..faces.len()).collect();
-    let stretch = nearest_value(set.iter().map(|&at| faces[at].2), 1., true)?;
-    set.retain(|&at| faces[at].2 == stretch);
-    let order = match style {
-        FontStyle::Italic => [FontStyle::Italic, FontStyle::Oblique, FontStyle::Normal],
-        FontStyle::Oblique => [FontStyle::Oblique, FontStyle::Italic, FontStyle::Normal],
-        FontStyle::Normal => [FontStyle::Normal, FontStyle::Oblique, FontStyle::Italic],
-    };
-    let style = order
-        .into_iter()
-        .find(|style| set.iter().any(|&at| faces[at].1 == *style))?;
-    set.retain(|&at| faces[at].1 == style);
-    let weights = set.iter().map(|&at| faces[at].0);
-    let has = |value: f32| weights.clone().any(|weight| weight == value);
-    let chosen = if has(weight) {
-        weight
-    } else if (400. ..450.).contains(&weight) && has(500.) {
-        500.
-    } else if (450. ..=500.).contains(&weight) && has(400.) {
-        400.
-    } else {
-        nearest_value(weights.clone(), weight, weight <= 500.)?
-    };
-    set.into_iter().find(|&at| faces[at].0 == chosen)
 }
 
 struct Added {
@@ -772,7 +728,7 @@ impl Book {
     fn shape_pieces(&mut self, text: &str, font_size: Pixels, spans: &[Span]) -> Line {
         self.words.trim(true);
         let mut glyphs = Vec::with_capacity(text.len());
-        let (mut x, mut ascent, mut descent) = (0f32, px(0.), px(0.));
+        let mut x = 0f32;
         let mut start = 0;
         for span in spans {
             let key = (span.font, span.size.0.to_bits());
@@ -793,8 +749,6 @@ impl Book {
                         let shaped = Rc::new(
                             match self.digits(span.font, span.size, piece, 0..piece.len()) {
                                 Some(word) => {
-                                    let units = self.face(span.font).units();
-                                    let scale = span.size.0 / units.per_em as f32;
                                     let line = Line {
                                         glyphs: word
                                             .glyphs
@@ -802,11 +756,9 @@ impl Book {
                                             .map(|piece| piece.glyph(span.size, 0., 0))
                                             .collect(),
                                         width: px(word.width as f32),
-                                        ascent: px(0f32.max(units.ascent * scale)),
-                                        descent: px(0f32.max(-units.descent * scale)),
                                         len: piece.len(),
                                         font_size: span.size,
-                                        sorted: false,
+                                        ..Default::default()
                                     };
                                     debug_assert!(
                                         same(
@@ -836,19 +788,15 @@ impl Book {
                     ..*glyph
                 }));
                 x += shaped.width.0;
-                ascent = ascent.max(shaped.ascent);
-                descent = descent.max(shaped.descent);
             }
             start += span.len;
         }
         Line {
             glyphs,
             width: px(x),
-            ascent,
-            descent,
             len: text.len(),
             font_size,
-            sorted: false,
+            ..Default::default()
         }
     }
 
@@ -966,21 +914,12 @@ impl Book {
             );
             x += word.width;
         }
-        let (mut ascent, mut descent) = (0f32, 0f32);
-        for span in spans {
-            let units = self.face(span.font).units();
-            let scale = span.size.0 / units.per_em as f32;
-            ascent = ascent.max(units.ascent * scale);
-            descent = descent.max(-units.descent * scale);
-        }
         Some(Line {
             glyphs,
             width: px(x as f32),
-            ascent: px(ascent),
-            descent: px(descent),
             len: text.len(),
             font_size,
-            sorted: false,
+            ..Default::default()
         })
     }
 
@@ -1291,7 +1230,6 @@ impl Book {
     ) -> Line {
         let string =
             CFMutableAttributedString::new(None, 0).expect("CFAttributedStringCreateMutable");
-        let (mut ascent, mut descent) = (0f32, 0f32);
         let (mut rest, mut nudge) = (text, false);
         for span in spans {
             let piece;
@@ -1307,10 +1245,6 @@ impl Book {
                 )
             };
             let range = CFRange::new(start, string.length() - start);
-            let units = self.face(span.font).units();
-            let scale = span.size.0 / units.per_em as f32;
-            ascent = ascent.max(units.ascent * scale);
-            descent = descent.max(-units.descent * scale);
             // Alternate spans shape a hair larger so CoreText keeps them apart and forms no ligatures across
             // them. The first stays exact for the tracking of SF.
             let size = if nudge {
@@ -1445,11 +1379,9 @@ impl Book {
         Line {
             glyphs,
             width: px(emoji_end.unwrap_or(width as f32 + shift)),
-            ascent: px(ascent),
-            descent: px(descent),
             len: text.len(),
             font_size,
-            sorted: false,
+            ..Default::default()
         }
     }
 }
@@ -1647,7 +1579,6 @@ struct Part {
 
 fn same(a: &Line, b: &Line) -> bool {
     (a.width - b.width).abs() < px(1e-3)
-        && (a.ascent, a.descent) == (b.ascent, b.descent)
         && a.glyphs.len() == b.glyphs.len()
         && a.glyphs.iter().zip(&b.glyphs).all(|(a, b)| {
             (a.font, a.size, a.id, a.index, a.emoji, a.y)

@@ -133,7 +133,7 @@ globalThis.__appsPlatform = (call, node, codec) => {
       try {
         while (true) {
           const end = Math.min(offset + 65536, input.length);
-          const result = call('web.platform.compression.write', state.id, codecBytes.encode(input.subarray(offset, end)), finish && end === input.length);
+          const result = call('web.platform.compression.write', state.id, input.subarray(offset, end), finish && end === input.length);
           offset += result.read;
           const output = codecBytes.decode(result.bytes);
           if (output.length) controller.enqueue(output);

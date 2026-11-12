@@ -37,18 +37,17 @@ pub(crate) struct PageState {
     queued: Cell<bool>,
     pub(crate) runtime: Rc<RefCell<Desktop>>,
     pub(crate) host: Rc<RefCell<Host>>,
-    pub(crate) images: RefCell<HashMap<usize, Arc<renderer::RenderImage>>>,
-    pub(crate) browsers: RefCell<HashMap<usize, (crate::desktop::browser::Browser, String)>>,
+    images: RefCell<HashMap<usize, Arc<renderer::RenderImage>>>,
     pub(crate) frames: RefCell<HashMap<usize, Frame>>,
-    pub(crate) controls: RefCell<native::Controls>,
+    controls: RefCell<native::Controls>,
     ids: RefCell<(u64, Rc<effects::Ids>)>,
     svgs: RefCell<HashMap<usize, element::Svg>>,
     fields: RefCell<HashMap<usize, input::Caret>>,
     decoding: RefCell<HashMap<String, (usize, background::Decoding)>>,
-    pub(crate) moving: Cell<bool>,
-    pub(crate) dropped: RefCell<Vec<PathBuf>>,
+    moving: Cell<bool>,
+    dropped: RefCell<Vec<PathBuf>>,
     buttons: Cell<u8>,
-    pub(crate) origin: Cell<Option<renderer::Point<renderer::Pixels>>>,
+    origin: Cell<Option<renderer::Point<renderer::Pixels>>>,
     window: WindowId,
     reflowing: Cell<bool>,
     parked: RefCell<Vec<(usize, Clips)>>,
@@ -79,11 +78,18 @@ pub(crate) struct PageState {
     mismatched: RefCell<[Mismatches; 2]>,
     layout_queued: Cell<bool>,
     #[cfg(target_os = "macos")]
-    canvas: std::cell::Cell<(u32, u8)>,
+    canvas: Cell<(u32, u8)>,
+}
+
+pub(crate) struct Frame {
+    pub(crate) browser: crate::desktop::browser::Browser,
+    loaded: String,
+    pub(crate) bounds: [f64; 4],
+    revision: u64,
+    shown: bool,
 }
 
 type Clips = Vec<(usize, [bool; 2])>;
-type Frame = ([f64; 4], u64, bool);
 type Mismatches = rustc_hash::FxHashSet<(usize, [u32; 4])>;
 type CompositedTransform = (renderer::Rect<renderer::Pixels>, Option<(f32, [f32; 2])>);
 
@@ -148,7 +154,7 @@ pub(crate) fn edit(
     }
 }
 
-pub(crate) fn reflow(id: u64) {
+fn reflow(id: u64) {
     let Some((cx, window)) = SCRIPTS.get() else {
         return;
     };
@@ -306,6 +312,16 @@ impl PageState {
         let at = origin + at * window.zoom();
         [f32::from(at.x), f32::from(at.y)]
     }
+
+    fn pointer(
+        &self,
+        window: &Window,
+        at: renderer::Point<renderer::Pixels>,
+        modifiers: renderer::Modifiers,
+    ) -> serde_json::Value {
+        let [x, y] = self.screen(window, at);
+        serde_json::json!({"clientX":f32::from(at.x),"clientY":f32::from(at.y),"screenX":x,"screenY":y,"buttons":self.buttons.get(),"ctrlKey":modifiers.ctrl(),"metaKey":modifiers.command(),"altKey":modifiers.alt(),"shiftKey":modifiers.shift()})
+    }
 }
 
 pub(crate) struct PageView(pub(crate) Rc<PageState>);
@@ -330,7 +346,6 @@ impl PageView {
             runtime,
             host,
             images: RefCell::default(),
-            browsers: RefCell::default(),
             frames: RefCell::default(),
             controls: RefCell::default(),
             ids: RefCell::default(),
@@ -367,7 +382,7 @@ impl PageView {
             walked: RefCell::default(),
             adjoined: RefCell::default(),
             #[cfg(target_os = "macos")]
-            canvas: Default::default(),
+            canvas: Cell::default(),
             kept_frame: RefCell::default(),
             mismatched: RefCell::default(),
             layout_queued: Cell::default(),
@@ -435,10 +450,9 @@ impl PageView {
                 let (Event::PointerLeave { at: position } | Event::PointerMove { at: position, .. } | Event::PointerUp { at: position, .. }) = *event else {
                     return;
                 };
-                let [x, y] = view.screen(window, position);
-                let modifiers = event.modifiers().unwrap_or_default();
                 let (kind, button) = match *event {
                     Event::PointerLeave { .. } => {
+                        let [x, y] = view.screen(window, position);
                         Desktop::dispatch(view.runtime.clone(), view.id, "pointerexit", &[], serde_json::json!({"clientX":f32::from(position.x),"clientY":f32::from(position.y),"screenX":x,"screenY":y}), Some(window), cx);
                         return;
                     }
@@ -450,12 +464,12 @@ impl PageView {
                     }
                     Event::PointerUp { button, .. } => {
                         let button = button as u8;
-                        view.buttons.set(view.buttons.get() & !(1 << [0, 2, 1, 3, 4][usize::from(button)]));
+                        view.buttons.set(view.buttons.get() & !BUTTONS[usize::from(button)]);
                         ("pointerup", Some(button))
                     }
                     _ => return,
                 };
-                let mut fields = serde_json::json!({"clientX":f32::from(position.x),"clientY":f32::from(position.y),"screenX":x,"screenY":y,"buttons":view.buttons.get(),"ctrlKey":modifiers.ctrl(),"metaKey":modifiers.command(),"altKey":modifiers.alt(),"shiftKey":modifiers.shift()});
+                let mut fields = view.pointer(window, position, event.modifiers().unwrap_or_default());
                 if let Some(button) = button {
                     fields["button"] = button.into();
                 }
@@ -465,9 +479,10 @@ impl PageView {
             window.on_bubble(move |event, window, cx| {
                 if let Event::PointerDown { at, button, modifiers, clicks, .. } = *event {
                     let button = button as u8;
-                    view.buttons.set(view.buttons.get() | 1 << [0, 2, 1, 3, 4][usize::from(button)]);
-                    let [x, y] = view.screen(window, at);
-                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerdown", &[], serde_json::json!({"clientX":f32::from(at.x),"clientY":f32::from(at.y),"screenX":x,"screenY":y,"button":button,"buttons":view.buttons.get(),"detail":clicks,"ctrlKey":modifiers.ctrl(),"metaKey":modifiers.command(),"altKey":modifiers.alt(),"shiftKey":modifiers.shift()}), Some(window), cx);
+                    view.buttons.set(view.buttons.get() | BUTTONS[usize::from(button)]);
+                    let mut fields = view.pointer(window, at, modifiers);
+                    (fields["button"], fields["detail"]) = (button.into(), clicks.into());
+                    Desktop::dispatch(view.runtime.clone(), view.id, "pointerdown", &[], fields, Some(window), cx);
                 }
             });
             let view = data.clone();
@@ -514,8 +529,9 @@ impl PageView {
                 }
                 if wheel {
                     let delta = if lines { delta.map(|value| value * 16.) } else { delta };
-                    let [x, y] = view.screen(window, position);
-                    if !Desktop::dispatch(view.runtime.clone(), view.id, "wheel", target.as_slice(), serde_json::json!({"clientX":f32::from(position.x),"clientY":f32::from(position.y),"screenX":x,"screenY":y,"deltaX":-delta.x,"deltaY":-delta.y,"buttons":view.buttons.get(),"ctrlKey":modifiers.ctrl(),"metaKey":modifiers.command(),"altKey":modifiers.alt(),"shiftKey":modifiers.shift()}), Some(window), cx) {
+                    let mut fields = view.pointer(window, position, modifiers);
+                    (fields["deltaX"], fields["deltaY"]) = ((-delta.x).into(), (-delta.y).into());
+                    if !Desktop::dispatch(view.runtime.clone(), view.id, "wheel", target.as_slice(), fields, Some(window), cx) {
                         cx.stop_event();
                     }
                 }
@@ -532,19 +548,6 @@ impl PageView {
             host.resized.push(self.id);
             let runtime = self.runtime.clone();
             cx.defer(move |cx| Desktop::drive(runtime, cx));
-        }
-        if let Some((browser, _)) = self.browsers.borrow().get(&usize::MAX) {
-            let zoom = window.zoom() as f64;
-            let bounds = [0., 0., width as f64 * zoom, height as f64 * zoom];
-            let mut frames = self.frames.borrow_mut();
-            let set = &mut frames
-                .entry(usize::MAX)
-                .or_insert(([f64::NAN; 4], 0, true))
-                .0;
-            if *set != bounds {
-                *set = bounds;
-                let _ = browser.set_bounds(bounds);
-            }
         }
         let inspectable = !host.packaged;
         let Some(page) = host.pages.get_mut(&self.id) else {
@@ -569,8 +572,7 @@ impl PageView {
             self.parked.take();
             self.caret.take();
             self.mismatched.take();
-            self.browsers.borrow_mut().retain(|&id, _| id == usize::MAX);
-            self.frames.borrow_mut().retain(|&id, _| id == usize::MAX);
+            self.frames.take();
         }
         {
             // Redraw once per mismatch until a pass has none, to stop alternating sizes from causing endless
@@ -594,21 +596,11 @@ impl PageView {
         }
         dom.retired_canvases.clear();
         let cached = dom.computed.clone();
-        let mut styles = crate::dom::styles(
-            &mut doc,
-            dom,
-            [width, height],
-            Some((window.text_system(), window.scale_factor())),
-        );
+        let mut styles = crate::dom::styles(&mut doc, dom, [width, height]);
         if cached.is_none_or(|cached| !std::rc::Rc::ptr_eq(&cached, &styles))
             && fonts::load(&doc, dom, &state.assets).0
         {
-            styles = crate::dom::styles(
-                &mut doc,
-                dom,
-                [width, height],
-                Some((window.text_system(), window.scale_factor())),
-            );
+            styles = crate::dom::styles(&mut doc, dom, [width, height]);
         }
         let children: Vec<_> = styles
             .children
@@ -759,12 +751,7 @@ impl PageView {
             .collect();
         if !dom.motion.custom.is_empty() {
             dom.animated = std::mem::take(&mut dom.motion.custom);
-            let restyled = crate::dom::styles(
-                &mut doc,
-                dom,
-                [width, height],
-                Some((window.text_system(), window.scale_factor())),
-            );
+            let restyled = crate::dom::styles(&mut doc, dom, [width, height]);
             animated = restyled
                 .values
                 .differing(&styles.values)
@@ -779,7 +766,11 @@ impl PageView {
                 .collect();
         }
         let mut flat = self.flat.borrow_mut();
-        flat.retain(|id| animated.iter().any(|(animated, ..)| animated == id));
+        *flat = animated
+            .iter()
+            .map(|(id, ..)| *id)
+            .filter(|id| flat.contains(id))
+            .collect();
         let composited: Vec<(usize, bool)> = animated
             .iter()
             .filter(|(id, style, layout)| {
@@ -830,7 +821,11 @@ impl PageView {
                     paint.push((id, style));
                 }
             }
+            paint.sort_unstable_by_key(|(id, _)| *id);
         }
+        let painting = |paint: &[(usize, Rc<style::Style>)], id: usize| {
+            paint.binary_search_by_key(&id, |(id, _)| *id).ok()
+        };
         let relaid = !restore.is_empty();
         // Clear node-ID caches for hidden or removed nodes here, and freed nodes in dom.release. New nodes
         // can reuse their IDs.
@@ -907,33 +902,32 @@ impl PageView {
             }
         }
         native::sync(&self.controls, &doc);
-        let iframes = dom.cull.iframes.clone();
+        let iframes = &dom.cull.iframes;
         let frame_nodes = || iframes.iter().copied().filter(|&id| visible[id]);
-        let mut browsers = self.browsers.borrow_mut();
         let mut frames = self.frames.borrow_mut();
-        browsers.retain(|id, _| *id == usize::MAX || frame_nodes().any(|node| node == *id));
-        frames.retain(|id, _| browsers.contains_key(id));
+        frames.retain(|id, _| frame_nodes().any(|node| node == *id));
         for node in frame_nodes() {
             let (attrs, revision) = (&doc.nodes[node].attrs, doc.nodes.revision(node));
-            if let std::collections::hash_map::Entry::Vacant(entry) = browsers.entry(node) {
-                match crate::desktop::browser::Browser::new(
-                    window,
-                    &serde_json::json!({"javascript":attrs.get("sandbox").is_none_or(|s|s.split_whitespace().any(|s|s=="allow-scripts")),"inspectable":inspectable}),
-                ) {
-                    Ok(browser) => {
-                        entry.insert((browser, String::new()));
-                        frames.insert(node, ([f64::NAN; 4], 0, true));
-                    }
-                    Err(error) => {
-                        eprintln!("apps: iframe: {error}");
-                        continue;
+            let frame = match frames.entry(node) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    match crate::desktop::browser::Browser::new(
+                        window,
+                        &serde_json::json!({"javascript":attrs.get("sandbox").is_none_or(|s|s.split_whitespace().any(|s|s=="allow-scripts")),"inspectable":inspectable}),
+                    ) {
+                        Ok(browser) => entry.insert(Frame {
+                            browser,
+                            loaded: String::new(),
+                            bounds: [f64::NAN; 4],
+                            revision: 0,
+                            shown: true,
+                        }),
+                        Err(error) => {
+                            eprintln!("apps: iframe: {error}");
+                            continue;
+                        }
                     }
                 }
-            }
-            let (Some((browser, loaded)), Some(frame)) =
-                (browsers.get_mut(&node), frames.get_mut(&node))
-            else {
-                continue;
             };
             let mut shown = styles.values[node]
                 .get(Prop::VISIBILITY)
@@ -942,36 +936,33 @@ impl PageView {
             while let Some(id) = current
                 && shown
             {
-                let style = paint
-                    .iter()
-                    .find(|(painted, _)| *painted == id)
-                    .map_or(&styles.values[id], |(_, style)| style);
+                let style = painting(&paint, id).map_or(&styles.values[id], |at| &paint[at].1);
                 shown = effects::opacity(style) > 0.;
                 current = doc.nodes[id].parent;
             }
-            if frame.2 != shown {
-                frame.2 = shown;
-                let _ = browser.command("visible", &serde_json::json!(shown));
+            if frame.shown != shown {
+                frame.shown = shown;
+                let _ = frame.browser.command("visible", &serde_json::json!(shown));
             }
-            if frame.1 == revision {
+            if frame.revision == revision {
                 continue;
             }
-            frame.1 = revision;
+            frame.revision = revision;
             let html = attrs.get("srcdoc");
             let url = attrs.get("src").map_or("about:blank", String::as_str);
             let source = html.map_or(url, String::as_str);
-            if source != loaded {
+            if source != frame.loaded {
                 let result = match html {
-                    Some(html) => browser.load_html(html, "about:blank"),
-                    None => browser.load_url(url),
+                    Some(html) => frame.browser.load_html(html, "about:blank"),
+                    None => frame.browser.load_url(url),
                 };
                 if let Err(error) = result {
                     eprintln!("apps: iframe: {error}");
                 }
-                *loaded = source.to_owned();
+                frame.loaded = source.to_owned();
             }
         }
-        drop((browsers, frames));
+        drop(frames);
         let html = doc.nodes[0]
             .children
             .iter()
@@ -1173,10 +1164,7 @@ impl PageView {
                 let kind = if tag.starts_with('#') {
                     1
                 } else {
-                    u8::from(matches!(
-                        tag,
-                        "iframe" | "webview" | "canvas" | "video" | "embed" | "object"
-                    )) * 2
+                    u8::from(cull::replaced(tag)) * 2
                 };
                 memo.entry((Rc::as_ptr(style), kind))
                     .or_insert_with(|| {
@@ -1387,7 +1375,7 @@ impl PageView {
         let mut placed = std::mem::take(&mut *self.animated.borrow_mut());
         placed.retain(|&id| {
             id < doc.nodes.len()
-                && !paint.iter().any(|(node, _)| *node == id)
+                && painting(&paint, id).is_none()
                 && self.place(
                     &doc,
                     &styles,
@@ -1432,7 +1420,8 @@ impl PageView {
                 .retain(|&id, _| shown(id) && effects::establishes(&styles.values[id]).absolute);
         }
         recolored.extend(&dom.recolored);
-        recolored.retain(|id| !placed.contains(id));
+        placed.sort_unstable();
+        recolored.retain(|id| placed.binary_search(id).is_err());
         for &id in &recolored {
             animate(&mut info, id);
         }
@@ -1670,10 +1659,7 @@ impl PageView {
         let measured = RefCell::new(std::mem::take(&mut dom.measurements));
         let walk = dom.style_walk.nodes.clone();
         for text in warnings {
-            if host.logs.len() == 500 {
-                host.logs.pop_front();
-            }
-            host.logs.push_back(serde_json::json!({"method":"Runtime.consoleAPICalled","params":{"type":"error","text":text,"context":crate::host::Role::Renderer(self.id)}}));
+            host.log(serde_json::json!({"method":"Runtime.consoleAPICalled","params":{"type":"error","text":text,"context":crate::host::Role::Renderer(self.id)}}));
         }
         drop(host);
         let text_system = window.text_system().clone();
@@ -1696,7 +1682,8 @@ impl PageView {
             measured: &measured,
             perspective: None,
             siblings: &RefCell::default(),
-            margins: &RefCell::default(),
+            walks: &RefCell::default(),
+            adjoins: &RefCell::default(),
             blocks: &RefCell::default(),
             ids: &ids,
             info: &info,
@@ -1767,10 +1754,10 @@ impl PageView {
                     if let Some((color, alpha)) =
                         backdrop.get(Prop::BACKGROUND_COLOR).and_then(style::color)
                     {
-                        el = el.bg(Color::hex(color << 8 | alpha as u32));
+                        el = el.bg(crate::style::rgba((color, alpha)));
                     }
                     if backdrop.get(Prop::OPACITY).is_some() {
-                        el = el.opacity(effects::opacity(backdrop).clamp(0., 1.));
+                        el = el.opacity(effects::opacity(backdrop));
                     }
                     if backdrop
                         .get(Prop::BACKGROUND_IMAGE)
@@ -2110,6 +2097,7 @@ impl PageView {
     }
 }
 
+const BUTTONS: [u8; 5] = [1, 4, 2, 8, 16];
 const TRANSFORM_PROPS: [Prop; 4] = [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE];
 // Must list every property that `effects::opacity` and `effects::transform` read.
 const COMPOSITED_PROPS: [Prop; 6] = [
@@ -2625,12 +2613,9 @@ fn drop_hidden_images(
             release(canvas.image.clone());
         }
     }
-    // Match cache-key producers: shared URL images use ID usize::MAX. Control rasters use layer usize::MAX
-    // minus control kind.
+    // Control rasters use layer usize::MAX minus control kind.
     dom.backgrounds.retain(|&(id, layer), (_, image)| {
-        let keep = if id == usize::MAX {
-            Arc::strong_count(image) > 1
-        } else if layer > usize::MAX - 64 {
+        let keep = if layer > usize::MAX - 64 {
             visible.get(id) == Some(&true)
         } else {
             visible.get(id) == Some(&true)
@@ -2650,6 +2635,12 @@ fn drop_hidden_images(
         }
         keep
     });
+    dom.bitmaps.retain(|_, image| {
+        Arc::strong_count(image) > 1 || {
+            release(image.clone());
+            false
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2661,7 +2652,7 @@ mod tests {
         let mut doc = crate::dom::Document::parse(
             "<div id=panel style='height:0;overflow:hidden'><i id=a></i><i id=b style='position:absolute'></i></div><b id=c></b><span style='overflow:hidden'><b id=d></b></span>",
         );
-        let styles = crate::dom::styles(&mut doc, &mut Default::default(), [800., 600.], None);
+        let styles = crate::dom::styles(&mut doc, &mut Default::default(), [800., 600.]);
         let id = |name: &str| {
             (0..doc.nodes.len())
                 .find(|&id| {
@@ -2712,7 +2703,7 @@ mod tests {
             .filter(|&id| doc.nodes[id].tag == "p")
             .collect();
         let [first, second] = [paragraphs[0], paragraphs[1]];
-        let styles = crate::dom::styles(&mut doc, &mut dom, [800., 600.], None);
+        let styles = crate::dom::styles(&mut doc, &mut dom, [800., 600.]);
         let mut drawn = canvas::Canvas::new(2, 2).unwrap();
         drawn
             .draw(
@@ -2736,8 +2727,7 @@ mod tests {
             .insert((first, 0), ("a".into(), shared.clone()));
         dom.backgrounds
             .insert((second, 0), ("a".into(), shared.clone()));
-        dom.backgrounds
-            .insert((usize::MAX, 7), ("a".into(), shared));
+        dom.bitmaps.insert("a".into(), shared);
         dom.backgrounds.insert((second, 64), ("b".into(), image(2)));
         let mut released = Vec::new();
         let mut visible = vec![false; doc.nodes.len()];
@@ -2753,7 +2743,7 @@ mod tests {
         for _ in 0..2 {
             drop_hidden_images(&mut dom, &[], &styles, |image| released.push(image.id));
         }
-        assert!(dom.backgrounds.is_empty());
+        assert!(dom.backgrounds.is_empty() && dom.bitmaps.is_empty());
         assert!(dom.canvases.contains_key(&canvas));
     }
 
@@ -2777,8 +2767,7 @@ mod tests {
         dom.masks.insert(span, ("m.svg".into(), Some(image(8))));
         dom.backgrounds
             .insert((span, 0), ("b.png".into(), decoded.clone()));
-        dom.backgrounds
-            .insert((usize::MAX, 0), ("b.png".into(), decoded));
+        dom.bitmaps.insert("b.png".into(), decoded);
         let ids = |dom: &crate::dom::State| {
             [
                 dom.svgs[&img].1.id,
@@ -2791,7 +2780,7 @@ mod tests {
         let mut released = Vec::new();
         let mut frame =
             |doc: &mut crate::dom::Document, dom: &mut crate::dom::State, seconds: f64| {
-                let styles = crate::dom::styles(doc, dom, [800., 600.], None);
+                let styles = crate::dom::styles(doc, dom, [800., 600.]);
                 let mut visible = vec![false; doc.nodes.len()];
                 for id in 0..doc.nodes.len() {
                     visible[id] = doc.nodes[id].parent.is_none_or(|parent| visible[parent])
@@ -2820,7 +2809,12 @@ mod tests {
         }
         assert!(!frame(&mut doc, &mut dom, 1.2));
         frame(&mut doc, &mut dom, 1.3);
-        assert!(dom.svgs.is_empty() && dom.masks.is_empty() && dom.backgrounds.is_empty());
+        assert!(
+            dom.svgs.is_empty()
+                && dom.masks.is_empty()
+                && dom.backgrounds.is_empty()
+                && dom.bitmaps.is_empty()
+        );
         released.sort_unstable();
         kept.sort_unstable();
         assert_eq!(released, kept);

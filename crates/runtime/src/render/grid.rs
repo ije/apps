@@ -551,19 +551,7 @@ pub(crate) fn intrinsic(
         [
             units.edges(style, style::PADDING, base),
             units.edges(style, style::MARGIN, base),
-            style::BORDERS.map(|[width, kind, _]| {
-                if style
-                    .get(kind)
-                    .is_none_or(|kind| matches!(kind, "none" | "hidden"))
-                {
-                    return 0.;
-                }
-                style
-                    .get(width)
-                    .map_or(Some(3.), |v| units.resolve(v, base))
-                    .unwrap_or(0.)
-                    .max(0.)
-            }),
+            units.borders(style, base),
         ]
     };
     let [padding, margin, border] = match &mut measured.edges {
@@ -973,19 +961,7 @@ pub(crate) fn intrinsic(
             }
             let [padding, margin] =
                 [style::PADDING, style::MARGIN].map(|edges| units.edges(pseudo, edges, base));
-            let border = style::BORDERS.map(|[width, kind, _]| {
-                if pseudo
-                    .get(kind)
-                    .is_none_or(|kind| matches!(kind, "none" | "hidden"))
-                {
-                    return 0.;
-                }
-                pseudo
-                    .get(width)
-                    .map_or(Some(3.), |value| units.resolve(value, base))
-                    .unwrap_or(0.)
-                    .max(0.)
-            });
+            let border = units.borders(pseudo, base);
             let sides = |axis: usize| {
                 let inner =
                     padding[1 - axis] + padding[3 - axis] + border[1 - axis] + border[3 - axis];
@@ -1122,20 +1098,16 @@ pub(crate) fn layout(
     let template = [
         get(Prop::GRID_TEMPLATE_COLUMNS),
         get(Prop::GRID_TEMPLATE_ROWS),
-    ]
-    .map(|v| v.map(str::to_owned));
-    let areas = get(Prop::GRID_TEMPLATE_AREAS).map(str::to_owned);
-    let flow = get(Prop::GRID_AUTO_FLOW).unwrap_or("row").to_owned();
-    let implicit = [get(Prop::GRID_AUTO_COLUMNS), get(Prop::GRID_AUTO_ROWS)]
-        .map(|v| v.unwrap_or("auto").to_owned());
+    ];
+    let areas = get(Prop::GRID_TEMPLATE_AREAS);
+    let flow = get(Prop::GRID_AUTO_FLOW).unwrap_or("row");
+    let implicit =
+        [get(Prop::GRID_AUTO_COLUMNS), get(Prop::GRID_AUTO_ROWS)].map(|v| v.unwrap_or("auto"));
     let shared = [0, 1].map(|axis| {
         inherited
             .map(|grid| if axis == 0 { &grid.columns } else { &grid.rows })
             .filter(|sizes| {
-                !sizes.is_empty()
-                    && template[axis]
-                        .as_deref()
-                        .is_some_and(|v| v.starts_with("subgrid"))
+                !sizes.is_empty() && template[axis].is_some_and(|v| v.starts_with("subgrid"))
             })
     });
     let gap = [0, 1].map(|axis| {
@@ -1152,7 +1124,6 @@ pub(crate) fn layout(
         }
     });
     let area_rows: Vec<Vec<&str>> = areas
-        .as_deref()
         .unwrap_or_default()
         .split(['"', '\''])
         .skip(1)
@@ -1197,7 +1168,7 @@ pub(crate) fn layout(
             continue;
         }
         let (list, lines, collapse) = tracks(
-            template[axis].as_deref().unwrap_or("none"),
+            template[axis].unwrap_or("none"),
             units,
             available[axis],
             gap[axis],
@@ -1212,7 +1183,15 @@ pub(crate) fn layout(
         defined[axis] = list;
         fit[axis] = collapse;
     }
-    let automatic = [0, 1].map(|axis| tracks(&implicit[axis], units, available[axis], 0.).0);
+    let automatic = [0, 1].map(|axis| tracks(implicit[axis], units, available[axis], 0.).0);
+    let shrinks = |style: &style::Style, axis: usize| {
+        style
+            .get([Prop::OVERFLOW_X, Prop::OVERFLOW_Y][axis])
+            .is_some_and(|v| !matches!(v, "visible" | "clip"))
+            || style
+                .get([Prop::MIN_WIDTH, Prop::MIN_HEIGHT][axis])
+                .is_some_and(|v| v == "0" || v == "0px")
+    };
     let alignment = |child: usize, axis: usize, replaced: bool| {
         let own = &styles.values[child];
         let margins = [
@@ -1298,14 +1277,7 @@ pub(crate) fn layout(
                     }
                     (position, span)
                 };
-                let shrink = [0, 1].map(|axis| {
-                    style
-                        .get([Prop::OVERFLOW_X, Prop::OVERFLOW_Y][axis])
-                        .is_some_and(|v| !matches!(v, "visible" | "clip"))
-                        || style
-                            .get([Prop::MIN_WIDTH, Prop::MIN_HEIGHT][axis])
-                            .is_some_and(|v| v == "0" || v == "0px")
-                });
+                let shrink = [0, 1].map(|axis| shrinks(style, axis));
                 let subgrid = [0, 1].map(|axis| {
                     style
                         .get([Prop::GRID_TEMPLATE_COLUMNS, Prop::GRID_TEMPLATE_ROWS][axis])
@@ -1511,20 +1483,6 @@ pub(crate) fn layout(
             .map(|(track, _)| *track)
             .collect();
     }
-    let minimum = |child: usize, axis: usize, value: f32| {
-        let style = &styles.values[child];
-        if style
-            .get([Prop::OVERFLOW_X, Prop::OVERFLOW_Y][axis])
-            .is_some_and(|v| !matches!(v, "visible" | "clip"))
-            || style
-                .get([Prop::MIN_WIDTH, Prop::MIN_HEIGHT][axis])
-                .is_some_and(|v| v == "0" || v == "0px")
-        {
-            0.
-        } else {
-            value
-        }
-    };
     let starts = |sizes: &[f32]| {
         let mut sum = 0f32;
         std::iter::once(0.)
@@ -1675,7 +1633,8 @@ pub(crate) fn layout(
                 } else {
                     [value[3]; 2]
                 };
-                contributions.push((start, span, [minimum(grandchild, axis, min), min, max]));
+                let least = if shrinks(style, axis) { 0. } else { min };
+                contributions.push((start, span, [least, min, max]));
                 offset += span;
             }
         }
@@ -1992,7 +1951,7 @@ mod tests {
             "<style>main{display:grid;grid-template-columns:repeat(4,auto);grid-template-areas:'t f m n''.r a.'}div{display:flex;width:200px}input{width:100%;line-height:24px;padding:0 6px;border:1px solid}</style><main><b style='grid-area:t'></b><div style='grid-area:f'><input></div><div style='grid-area:r'><input></div><b style='grid-area:a'></b></main>",
         );
         let mut state = crate::dom::State::default();
-        let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.], None);
+        let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.]);
         let main = doc
             .nodes
             .iter()
@@ -2021,7 +1980,7 @@ mod tests {
             "<style>main{display:grid;grid-template-columns:100px 300px}i{display:block;padding:10% 0 0;height:0}</style><main><i></i><i></i></main>",
         );
         let mut state = crate::dom::State::default();
-        let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.], None);
+        let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.]);
         let main = doc
             .nodes
             .iter()
@@ -2050,7 +2009,7 @@ mod tests {
             "<style>main{display:grid;grid-template-columns:300px 200px}i{display:block;aspect-ratio:5/4}.b{box-sizing:border-box;padding:10px}.c{overflow:hidden}</style><main><div><i style='width:100%'></i></div><div><i class=b></i><p style='height:20px;margin:0'></p></div></main><main><div><i class=c style='aspect-ratio:10'><p style='height:90px;margin:0'></p></i></div><div><i style='aspect-ratio:10'><p style='height:90px;margin:0'></p></i></div></main>",
         );
         let mut state = crate::dom::State::default();
-        let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.], None);
+        let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.]);
         let rows: Vec<_> = (0..doc.nodes.len())
             .filter(|&id| doc.nodes[id].tag == "main")
             .map(|main| {
@@ -2077,7 +2036,7 @@ mod tests {
         let place = |html: &str| {
             let mut doc = Document::parse(html);
             let mut state = crate::dom::State::default();
-            let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.], None);
+            let styles = crate::dom::styles(&mut doc, &mut state, [800., 600.]);
             let grid = doc
                 .nodes
                 .iter()

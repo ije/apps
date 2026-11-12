@@ -29,9 +29,13 @@ pub(crate) struct GlassView {
     surface: GlassSurface,
 }
 
+fn class() -> Option<&'static AnyClass> {
+    static CLASS: OnceLock<Option<&'static AnyClass>> = OnceLock::new();
+    *CLASS.get_or_init(|| AnyClass::get(c"NSGlassEffectView"))
+}
+
 pub(crate) fn available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| AnyClass::get(c"NSGlassEffectView").is_some())
+    class().is_some()
 }
 
 define_class!(
@@ -85,7 +89,7 @@ impl GlassContent {
 }
 
 pub(crate) fn update(views: &mut Vec<GlassView>, parent: &NSView, surfaces: Vec<GlassSurface>) {
-    let Some(class) = AnyClass::get(c"NSGlassEffectView") else {
+    let Some(class) = class() else {
         return;
     };
     CATransaction::setDisableActions(true);

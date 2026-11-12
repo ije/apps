@@ -265,23 +265,8 @@ impl State {
                     if written > 0 {
                         events.push(json!({"id":id,"kind":"written","bytes":written}));
                     }
-                    for _ in 0..64 {
-                        match socket.events.try_recv() {
-                            Ok(event) => {
-                                let mut event = event.into_value();
-                                let done =
-                                    matches!(event["kind"].as_str(), Some("close" | "error"));
-                                event["id"] = json!(id);
-                                events.push(event);
-                                if done {
-                                    return false;
-                                }
-                            }
-                            Err(mpsc::error::TryRecvError::Empty) => break,
-                            Err(mpsc::error::TryRecvError::Disconnected) => return false,
-                        }
-                    }
-                    true
+                    crate::web::drain(&mut events, *id, &mut socket.events, &["close", "error"])
+                        .is_none()
                 });
                 Ok(json!(events))
             }

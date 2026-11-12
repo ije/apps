@@ -2,7 +2,7 @@ mod clipboard;
 mod window;
 
 use super::input::{self, Clicks, Composer, Ime, NOTCH_LINES};
-use super::{Display, Native};
+use super::{Display, Opened};
 use crate::{Button, Cursor, Event, Modifiers, Pixels, Point, Rect, WindowOptions};
 use crate::{app::Callbacks, point, px, size};
 use anyhow::{Context as _, Result, ensure};
@@ -754,11 +754,9 @@ impl Client {
                 }
                 let focus = live.focus?;
                 drop(live);
-                let (modifiers, caps_lock) = now;
-                self.window(focus)?.calls.input(Event::ModifiersChanged {
-                    modifiers,
-                    caps_lock,
-                });
+                self.window(focus)?
+                    .calls
+                    .input(Event::ModifiersChanged { modifiers: now.0 });
             }
             XEvent::KeyPress(press) => {
                 let window = self.window(press.event)?;
@@ -1169,7 +1167,8 @@ impl Display for Client {
         Some(Rect::new(point(px(0.), px(0.)), size(width, height)))
     }
 
-    fn open(self: Rc<Self>, options: &WindowOptions, calls: Callbacks) -> Result<Rc<dyn Native>> {
-        Ok(Toplevel::open(&self, options, calls)?)
+    fn open(self: Rc<Self>, options: &WindowOptions, calls: Callbacks) -> Result<Opened> {
+        let (window, atlas) = Toplevel::open(&self, options, calls)?;
+        Ok((window, atlas))
     }
 }

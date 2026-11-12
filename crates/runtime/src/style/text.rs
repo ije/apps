@@ -5,39 +5,23 @@ use std::rc::Rc;
 
 pub(crate) fn selection_colors(style: &Style, selection: Option<&Rc<Style>>) -> (Option<u32>, u32) {
     let normal = style.get(Prop::COLOR).and_then(color).unwrap_or((0, 255));
-    let foreground = selection
-        .and_then(|style| style.get(Prop::COLOR))
-        .and_then(|value| {
-            if value.eq_ignore_ascii_case("currentcolor") {
-                Some(normal)
-            } else {
-                color(value)
-            }
-        });
-    let background = selection
-        .and_then(|style| style.get(Prop::BACKGROUND_COLOR))
-        .and_then(|value| {
-            if value.eq_ignore_ascii_case("currentcolor") {
-                Some(foreground.unwrap_or(normal))
-            } else {
-                color(value)
-            }
-        })
-        .unwrap_or(if foreground.is_some() {
+    let pick = |prop: Prop, current: (u32, u8)| {
+        let value = selection?.get(prop)?;
+        if value.eq_ignore_ascii_case("currentcolor") {
+            Some(current)
+        } else {
+            color(value)
+        }
+    };
+    let foreground = pick(Prop::COLOR, normal);
+    let background = pick(Prop::BACKGROUND_COLOR, foreground.unwrap_or(normal)).unwrap_or(
+        if foreground.is_some() {
             (0, 0)
         } else {
             (0x4488ff, 85)
-        });
-    let fill = selection
-        .and_then(|style| style.get(Prop::WEBKIT_TEXT_FILL_COLOR))
-        .and_then(|value| {
-            if value.eq_ignore_ascii_case("currentcolor") {
-                Some(foreground.unwrap_or(normal))
-            } else {
-                color(value)
-            }
-        })
-        .or(foreground);
+        },
+    );
+    let fill = pick(Prop::WEBKIT_TEXT_FILL_COLOR, foreground.unwrap_or(normal)).or(foreground);
     (
         fill.map(|(color, alpha)| color << 8 | alpha as u32),
         background.0 << 8 | background.1 as u32,
@@ -155,18 +139,33 @@ pub(crate) fn text_transform(text: &mut String, range: std::ops::Range<usize>, m
     let mapped: String = source
         .chars()
         .map(|c| {
-            let (mut upper, mut lower) = (c.to_uppercase(), c.to_lowercase());
-            let mapped = match mode {
-                "uppercase" => upper.next().filter(|_| upper.len() == 0),
-                "capitalize" if word => upper.next().filter(|_| upper.len() == 0),
-                "lowercase" => lower.next().filter(|_| lower.len() == 0),
-                _ => None,
-            };
+            let mapped = case(c, mode, word);
             word = !c.is_alphanumeric();
-            mapped.filter(|m| m.len_utf8() == c.len_utf8()).unwrap_or(c)
+            mapped
         })
         .collect();
     text.replace_range(range, &mapped);
+}
+
+// Only mappings to one char of the same UTF-8 length apply, so text ranges stay valid.
+fn case(c: char, mode: &str, word: bool) -> char {
+    match mode {
+        "uppercase" => {
+            let mut upper = c.to_uppercase();
+            upper.next().filter(|_| upper.len() == 0)
+        }
+        "capitalize" if word => {
+            let mut upper = c.to_uppercase();
+            upper.next().filter(|_| upper.len() == 0)
+        }
+        "lowercase" => {
+            let mut lower = c.to_lowercase();
+            lower.next().filter(|_| lower.len() == 0)
+        }
+        _ => return c,
+    }
+    .filter(|m| m.len_utf8() == c.len_utf8())
+    .unwrap_or(c)
 }
 
 pub(crate) fn cursor(value: &str) -> Option<renderer::Cursor> {
@@ -241,15 +240,13 @@ fn styled_run(style: &Rc<Style>, units: &Lengths, len: usize) -> renderer::TextR
 
 pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::TextRun {
     let (ink, alpha) = style.get(Prop::COLOR).and_then(color).unwrap_or((0, 255));
-    let ink: renderer::Color = renderer::Color::hex(ink << 8 | alpha as u32);
+    let ink: renderer::Color = super::rgba((ink, alpha));
     let lines = style.get(Prop::TEXT_DECORATION_LINE).unwrap_or("");
     let decoration = style
         .get(Prop::TEXT_DECORATION_COLOR)
         .filter(|value| !value.eq_ignore_ascii_case("currentcolor"))
         .and_then(color)
-        .map_or(ink, |(ink, alpha)| {
-            renderer::Color::hex(ink << 8 | alpha as u32)
-        });
+        .map_or(ink, |(ink, alpha)| super::rgba((ink, alpha)));
     let length = |prop: Prop| {
         style
             .get(prop)
@@ -330,10 +327,9 @@ pub(crate) fn makes_no_line(doc: &Document, styles: &ComputedStyles, id: usize) 
         .get(Prop::DISPLAY)
         .is_none_or(|value| value == "inline")
         && !styles.pseudos.contains_key(&id)
-        && [super::PADDING, super::MARGIN].iter().all(|edges| {
-            [1, 3]
-                .iter()
-                .all(|&side| units.edges(style, *edges, 0.)[side] == 0.)
+        && [super::PADDING, super::MARGIN].into_iter().all(|edges| {
+            let [_, right, _, left] = units.edges(style, edges, 0.);
+            right == 0. && left == 0.
         })
         && super::BORDERS
             .iter()
@@ -644,6 +640,7 @@ pub(crate) fn inline_text(
             .is_some_and(|value| value.ends_with("flex") || value.ends_with("grid"));
     let mut opening = 0f32;
     let mut marks: Vec<(f32, Option<(usize, f32)>)> = Vec::new();
+    let mut led = 0;
     let mut cursors = Vec::new();
     let [before, after] = [0, 1].map(|index| {
         !own && styles.pseudos.get(&id).is_some_and(|pseudos| {
@@ -681,7 +678,7 @@ pub(crate) fn inline_text(
             let (_, range): &mut (usize, std::ops::Range<usize>) = &mut ranges[index];
             range.end = text.len();
             let empty = range.start == range.end;
-            if let Some(at) = boxes.iter().position(|inline| inline.index == index) {
+            if let Ok(at) = boxes.binary_search_by_key(&index, |inline| inline.index) {
                 let inline = &boxes[at];
                 let right = inline.edges[1];
                 let margin =
@@ -754,11 +751,10 @@ pub(crate) fn inline_text(
             run.nowrap = style.get(Prop::WHITE_SPACE) == Some("nowrap");
             run.font_size = Some(renderer::px(0.01));
             run.inset[0] = renderer::px(opening);
-            for (inline, (mark, _)) in boxes.iter_mut().zip(&marks) {
-                if inline.lead.is_nan() {
-                    inline.lead = opening - mark;
-                }
+            for (inline, (mark, _)) in boxes[led..].iter_mut().zip(&marks[led..]) {
+                inline.lead = opening - mark;
             }
+            led = boxes.len();
             opening = 0.;
             atoms.push(Atom {
                 node: child,
@@ -818,20 +814,7 @@ pub(crate) fn inline_text(
             let units = &styles.lengths[child];
             let padding = units.edges(style, super::PADDING, 0.);
             let margin = units.edges(style, super::MARGIN, 0.);
-            let borders: [f32; 4] = std::array::from_fn(|side| {
-                let [width, kind, _] = super::BORDERS[side];
-                if style
-                    .get(kind)
-                    .is_none_or(|kind| matches!(kind, "none" | "hidden"))
-                {
-                    return 0.;
-                }
-                style
-                    .get(width)
-                    .map_or(Some(3.), |width| units.resolve(width, 0.))
-                    .unwrap_or(0.)
-                    .max(0.)
-            });
+            let borders = units.borders(style, 0.);
             let fill = (background != inherited_background)
                 .then_some(background)
                 .flatten()
@@ -868,7 +851,7 @@ pub(crate) fn inline_text(
             let start = text.len();
             let mode = style.get(Prop::WHITE_SPACE).unwrap_or("normal");
             let preserve = matches!(mode, "pre" | "pre-wrap" | "break-spaces");
-            let transform = style.get(Prop::TEXT_TRANSFORM);
+            let transform = style.get(Prop::TEXT_TRANSFORM).unwrap_or("");
             let mut word = true;
             text.reserve(node.text.len());
             for c in node.text.chars() {
@@ -880,22 +863,7 @@ pub(crate) fn inline_text(
                     word = true;
                     continue;
                 }
-                let mapped = match transform {
-                    Some("uppercase") => {
-                        let mut mapped = c.to_uppercase();
-                        mapped.next().filter(|_| mapped.next().is_none())
-                    }
-                    Some("capitalize") if word => {
-                        let mut mapped = c.to_uppercase();
-                        mapped.next().filter(|_| mapped.next().is_none())
-                    }
-                    Some("lowercase") => {
-                        let mut mapped = c.to_lowercase();
-                        mapped.next().filter(|_| mapped.next().is_none())
-                    }
-                    _ => None,
-                };
-                let c = mapped.filter(|m| m.len_utf8() == c.len_utf8()).unwrap_or(c);
+                let c = case(c, transform, word);
                 text.push(c);
                 space = c == '\n';
                 word = !c.is_alphanumeric();
@@ -908,11 +876,10 @@ pub(crate) fn inline_text(
                 }
                 run.nowrap = mode == "nowrap";
                 run.inset[0] = renderer::px(opening);
-                for (inline, (mark, _)) in boxes.iter_mut().zip(&marks) {
-                    if inline.lead.is_nan() {
-                        inline.lead = opening - mark;
-                    }
+                for (inline, (mark, _)) in boxes[led..].iter_mut().zip(&marks[led..]) {
+                    inline.lead = opening - mark;
                 }
+                led = boxes.len();
                 opening = 0.;
                 runs.push(run);
                 line_heights.push((text.len(), line_height(style)));
@@ -949,7 +916,7 @@ pub(crate) fn inline_text(
             .get(Prop::BACKGROUND_COLOR)
             .and_then(color)
             .filter(|(_, alpha)| *alpha != 0)
-            .map(|(ink, alpha)| renderer::Color::hex(ink << 8 | alpha as u32));
+            .map(super::rgba);
         run
     };
     let pseudos = styles.text_pseudos.get(&id).filter(|_| {

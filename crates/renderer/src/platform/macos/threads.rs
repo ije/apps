@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) type Task = Box<dyn FnOnce() + Send>;
+type Task = Box<dyn FnOnce() + Send>;
 
 struct Inbox {
     tasks: VecDeque<Task>,

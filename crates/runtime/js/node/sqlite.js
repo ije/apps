@@ -230,6 +230,8 @@ globalThis.__appsSQLite = native => {
     DatabaseSync.prototype[Symbol.dispose] = function () { if (this.isOpen) this.close(); };
     StatementSync.prototype[Symbol.dispose] = StatementSync.prototype.close;
   }
+  const constants = { SQLITE_OK: 0, SQLITE_DENY: 1, SQLITE_IGNORE: 2 };
+  'CREATE_INDEX CREATE_TABLE CREATE_TEMP_INDEX CREATE_TEMP_TABLE CREATE_TEMP_TRIGGER CREATE_TEMP_VIEW CREATE_TRIGGER CREATE_VIEW DELETE DROP_INDEX DROP_TABLE DROP_TEMP_INDEX DROP_TEMP_TABLE DROP_TEMP_TRIGGER DROP_TEMP_VIEW DROP_TRIGGER DROP_VIEW INSERT PRAGMA READ SELECT TRANSACTION UPDATE ATTACH DETACH ALTER_TABLE REINDEX ANALYZE CREATE_VTABLE DROP_VTABLE FUNCTION SAVEPOINT RECURSIVE'.split(' ').forEach((name, index) => { constants['SQLITE_' + name] = index + 1; });
   const backup = async (database, path, options = {}) => {
     const source = databases.get(database);
     if (source === undefined) throw new TypeError('Expected an open database');
@@ -247,5 +249,5 @@ globalThis.__appsSQLite = native => {
       }
     } finally { call('sqlite.backup.finish', id); }
   };
-  return Object.freeze({ DatabaseSync, StatementSync, Database: DatabaseSync, Statement: StatementSync, backup, constants: Object.freeze(call('sqlite.constants')) });
+  return Object.freeze({ DatabaseSync, StatementSync, Database: DatabaseSync, Statement: StatementSync, backup, constants: Object.freeze(constants) });
 };

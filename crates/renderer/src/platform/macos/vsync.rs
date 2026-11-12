@@ -148,7 +148,7 @@ impl Pulse {
                 let callbacks = pulse.callbacks;
                 // A tick without a frame takes one frame out of a queue that is too long.
                 let free = callbacks.with(move |window, _| {
-                    let free = !window.platform.take_congested();
+                    let free = !window.platform.renderer.take_congested();
                     window.frame_at = free.then_some(at);
                     free
                 });

@@ -106,6 +106,7 @@ pub(super) struct Look {
 }
 
 pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> Child {
+    let drawn = std::cell::Cell::new([0u32; 3]);
     renderer::canvas(
         |_, _| (),
         move |bounds, _, window| {
@@ -113,22 +114,28 @@ pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> Child 
             if width <= 0. || height <= 0. {
                 return;
             }
-            let Some(source) = svg(&look, width, height) else {
-                return;
-            };
             let scale = window.scale_factor();
             let mut host = view.host.borrow_mut();
             let backgrounds = &mut host.dom.entry(view.id).or_default().backgrounds;
             let key = (id, usize::MAX - look.control as usize);
-            let [rw, rh] = [width, height].map(|side| (side * scale).ceil() as u32);
-            if backgrounds.get(&key).is_none_or(|(old, image)| {
-                old != &source
-                    || [image.size().width, image.size().height].map(|side| side as u32) != [rw, rh]
-            }) && let Ok(image) = super::canvas::svg(&source, rw, rh, None)
-                && let Some((_, old)) = backgrounds.insert(key, (source, image))
-                && std::sync::Arc::strong_count(&old) == 1
-            {
-                window.release_image(old);
+            let seen = [width, height, scale].map(f32::to_bits);
+            if drawn.replace(seen) != seen || !backgrounds.contains_key(&key) {
+                let Some(source) = svg(&look, width, height) else {
+                    return;
+                };
+                let limit = super::canvas::RASTER_MAX as f32;
+                let [rw, rh] =
+                    [width, height].map(|side| (side * scale).ceil().clamp(1., limit) as u32);
+                if backgrounds.get(&key).is_none_or(|(old, image)| {
+                    old != &source
+                        || [image.size().width, image.size().height].map(|side| side as u32)
+                            != [rw, rh]
+                }) && let Ok(image) = super::canvas::svg(&source, rw, rh)
+                    && let Some((_, old)) = backgrounds.insert(key, (source, image))
+                    && std::sync::Arc::strong_count(&old) == 1
+                {
+                    window.release_image(old);
+                }
             }
             if let Some((_, image)) = backgrounds.get(&key) {
                 window.draw_image(

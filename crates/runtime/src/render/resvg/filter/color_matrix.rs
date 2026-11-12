@@ -6,7 +6,7 @@ use rgb::RGBA8;
 use usvg::filter::ColorMatrixKind as ColorMatrix;
 
 pub fn apply(matrix: &ColorMatrix, src: ImageRefMut) {
-    match matrix {
+    let m = match matrix {
         ColorMatrix::Matrix(m) => {
             for pixel in src.data {
                 let (r, g, b, a) = to_normalized_components(*pixel);
@@ -21,60 +21,7 @@ pub fn apply(matrix: &ColorMatrix, src: ImageRefMut) {
                 pixel.b = from_normalized(new_b);
                 pixel.a = from_normalized(new_a);
             }
-        }
-        ColorMatrix::Saturate(v) => {
-            let v = v.get().max(0.0);
-            let m = [
-                0.213 + 0.787 * v,
-                0.715 - 0.715 * v,
-                0.072 - 0.072 * v,
-                0.213 - 0.213 * v,
-                0.715 + 0.285 * v,
-                0.072 - 0.072 * v,
-                0.213 - 0.213 * v,
-                0.715 - 0.715 * v,
-                0.072 + 0.928 * v,
-            ];
-
-            for pixel in src.data {
-                let (r, g, b, _) = to_normalized_components(*pixel);
-
-                let new_r = r * m[0] + g * m[1] + b * m[2];
-                let new_g = r * m[3] + g * m[4] + b * m[5];
-                let new_b = r * m[6] + g * m[7] + b * m[8];
-
-                pixel.r = from_normalized(new_r);
-                pixel.g = from_normalized(new_g);
-                pixel.b = from_normalized(new_b);
-            }
-        }
-        ColorMatrix::HueRotate(angle) => {
-            let angle = angle.to_radians();
-            let a1 = angle.cos();
-            let a2 = angle.sin();
-            let m = [
-                0.213 + 0.787 * a1 - 0.213 * a2,
-                0.715 - 0.715 * a1 - 0.715 * a2,
-                0.072 - 0.072 * a1 + 0.928 * a2,
-                0.213 - 0.213 * a1 + 0.143 * a2,
-                0.715 + 0.285 * a1 + 0.140 * a2,
-                0.072 - 0.072 * a1 - 0.283 * a2,
-                0.213 - 0.213 * a1 - 0.787 * a2,
-                0.715 - 0.715 * a1 + 0.715 * a2,
-                0.072 + 0.928 * a1 + 0.072 * a2,
-            ];
-
-            for pixel in src.data {
-                let (r, g, b, _) = to_normalized_components(*pixel);
-
-                let new_r = r * m[0] + g * m[1] + b * m[2];
-                let new_g = r * m[3] + g * m[4] + b * m[5];
-                let new_b = r * m[6] + g * m[7] + b * m[8];
-
-                pixel.r = from_normalized(new_r);
-                pixel.g = from_normalized(new_g);
-                pixel.b = from_normalized(new_b);
-            }
+            return;
         }
         ColorMatrix::LuminanceToAlpha => {
             for pixel in src.data {
@@ -87,7 +34,50 @@ pub fn apply(matrix: &ColorMatrix, src: ImageRefMut) {
                 pixel.b = 0;
                 pixel.a = from_normalized(new_a);
             }
+            return;
         }
+        ColorMatrix::Saturate(v) => {
+            let v = v.get().max(0.0);
+            [
+                0.213 + 0.787 * v,
+                0.715 - 0.715 * v,
+                0.072 - 0.072 * v,
+                0.213 - 0.213 * v,
+                0.715 + 0.285 * v,
+                0.072 - 0.072 * v,
+                0.213 - 0.213 * v,
+                0.715 - 0.715 * v,
+                0.072 + 0.928 * v,
+            ]
+        }
+        ColorMatrix::HueRotate(angle) => {
+            let angle = angle.to_radians();
+            let a1 = angle.cos();
+            let a2 = angle.sin();
+            [
+                0.213 + 0.787 * a1 - 0.213 * a2,
+                0.715 - 0.715 * a1 - 0.715 * a2,
+                0.072 - 0.072 * a1 + 0.928 * a2,
+                0.213 - 0.213 * a1 + 0.143 * a2,
+                0.715 + 0.285 * a1 + 0.140 * a2,
+                0.072 - 0.072 * a1 - 0.283 * a2,
+                0.213 - 0.213 * a1 - 0.787 * a2,
+                0.715 - 0.715 * a1 + 0.715 * a2,
+                0.072 + 0.928 * a1 + 0.072 * a2,
+            ]
+        }
+    };
+
+    for pixel in src.data {
+        let (r, g, b, _) = to_normalized_components(*pixel);
+
+        let new_r = r * m[0] + g * m[1] + b * m[2];
+        let new_g = r * m[3] + g * m[4] + b * m[5];
+        let new_b = r * m[6] + g * m[7] + b * m[8];
+
+        pixel.r = from_normalized(new_r);
+        pixel.g = from_normalized(new_g);
+        pixel.b = from_normalized(new_b);
     }
 }
 

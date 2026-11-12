@@ -13,10 +13,8 @@ static const uint BOX = 0u;
 static const uint SHADOW = 1u;
 static const uint LINE = 2u;
 static const uint GLYPH = 3u;
-static const uint IMAGE = 4u;
 static const uint FILL = 5u;
 
-static const uint SOLID = 0u;
 static const uint DASHED = 1u;
 static const uint DOTTED = 2u;
 static const uint DOUBLE = 3u;

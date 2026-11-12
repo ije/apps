@@ -1,27 +1,22 @@
 use super::native_sync;
 use crate::{ControlEvent, ControlKind, ControlSink, NativeControl, Pixels, Rect};
 use objc2::{
-    class, msg_send,
+    DefinedClass, MainThreadOnly, class, define_class, msg_send,
     rc::Retained,
-    runtime::{AnyClass, AnyObject, Bool, ClassBuilder, MessageReceiver, Sel},
+    runtime::{AnyObject, Bool, NSObject, Sel},
     sel,
 };
-use objc2_app_kit::NSView;
+use objc2_app_kit::{NSApp, NSEventType, NSView};
 use objc2_foundation::{NSEdgeInsets, NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::CATransaction;
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    ffi::{CStr, c_void},
-    ptr,
-    sync::OnceLock,
-};
+use std::{cell::RefCell, ptr, sync::OnceLock};
 
-const SHARED: &CStr = c"appsControls";
 const RING: f64 = 8.;
 
-struct Entry {
-    kind: ControlKind,
+struct View {
+    clip: Retained<NSView>,
+    control: Retained<AnyObject>,
+    state: NativeControl,
     sent: u64,
     dirty: bool,
 }
@@ -29,29 +24,136 @@ struct Entry {
 #[derive(Default)]
 struct Shared {
     sink: Option<ControlSink>,
-    entries: HashMap<u64, Entry>,
-}
-
-struct View {
-    clip: Retained<NSView>,
-    control: Retained<AnyObject>,
-    state: NativeControl,
-}
-
-#[derive(Default)]
-pub(crate) struct Controls {
-    target: Option<Retained<AnyObject>>,
-    shared: Box<RefCell<Shared>>,
     views: Vec<View>,
 }
 
+define_class!(
+    // SAFETY: NSObject has no subclassing rules, and the class has no Drop.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AppsControlTarget"]
+    #[ivars = RefCell<Shared>]
+    struct Target;
+
+    impl Target {
+        #[unsafe(method(controlAction:))]
+        fn action(&self, sender: Option<&AnyObject>) {
+            let Some(sender) = sender else {
+                return;
+            };
+            let key = tag(sender);
+            let Some(kind) = self.view(key, |view| view.state.kind) else {
+                return;
+            };
+            let (value, done) = match kind {
+                ControlKind::Button | ControlKind::Switch => (None, true),
+                ControlKind::Slider => {
+                    let event = NSApp(self.mtm()).currentEvent().map(|event| event.r#type());
+                    let held = matches!(event, Some(NSEventType::LeftMouseDown | NSEventType::LeftMouseDragged));
+                    (Some(number(sender)), !held)
+                }
+                ControlKind::Stepper => (Some(number(sender)), true),
+                ControlKind::Text | ControlKind::Search => (Some(string(sender)), true),
+                ControlKind::Color => match color(sender) {
+                    Some(value) => (Some(value), true),
+                    None => return,
+                },
+                ControlKind::Date => (Some(date(sender)), true),
+            };
+            if done {
+                self.view(key, |view| view.dirty = false);
+            }
+            self.send(key, value, done);
+        }
+
+        #[unsafe(method(controlTextDidChange:))]
+        fn text_changed(&self, notification: Option<&AnyObject>) {
+            let Some(field) = field(notification) else {
+                return;
+            };
+            let key = tag(&field);
+            self.view(key, |view| view.dirty = true);
+            self.send(key, Some(string(&field)), false);
+        }
+
+        #[unsafe(method(controlTextDidEndEditing:))]
+        fn text_ended(&self, notification: Option<&AnyObject>) {
+            let Some(field) = field(notification) else {
+                return;
+            };
+            let key = tag(&field);
+            if self.view(key, |view| std::mem::take(&mut view.dirty)) == Some(true) {
+                self.send(key, Some(string(&field)), true);
+            }
+        }
+    }
+);
+
+impl Target {
+    fn view<R>(&self, key: u64, job: impl FnOnce(&mut View) -> R) -> Option<R> {
+        let mut shared = self.ivars().borrow_mut();
+        shared
+            .views
+            .iter_mut()
+            .find(|view| view.state.key == key)
+            .map(job)
+    }
+
+    fn send(&self, key: u64, value: Option<String>, done: bool) {
+        let Some(seq) = self.view(key, |view| {
+            view.sent += 1;
+            view.sent
+        }) else {
+            return;
+        };
+        let sink = self.ivars().borrow().sink.clone();
+        if let Some(sink) = sink {
+            sink(ControlEvent {
+                key,
+                seq,
+                value,
+                done,
+            });
+        }
+    }
+}
+
+define_class!(
+    // SAFETY: NSView has no subclassing rules, and the class has no Drop.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AppsControlClip"]
+    struct Clip;
+
+    impl Clip {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        // The clip is wider than its control, and that margin belongs to the page below.
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, point: NSPoint) -> *mut NSView {
+            // SAFETY: the NSView implementation.
+            let hit: *mut NSView = unsafe { msg_send![super(self), hitTest: point] };
+            if ptr::eq(hit.cast_const(), ptr::from_ref(self).cast()) {
+                ptr::null_mut()
+            } else {
+                hit
+            }
+        }
+    }
+);
+
+#[derive(Default)]
+pub(crate) struct Controls(Option<Retained<Target>>);
+
 impl Drop for Controls {
     fn drop(&mut self) {
-        if let Some(target) = &self.target {
-            set_shared(target, ptr::null());
-        }
-        for view in self.views.drain(..) {
-            detach(&view);
+        if let Some(target) = &self.0 {
+            for view in target.ivars().borrow_mut().views.drain(..) {
+                detach(&view);
+            }
         }
     }
 }
@@ -66,172 +168,13 @@ fn detach(view: &View) {
     view.clip.removeFromSuperview();
 }
 
-fn clip_class() -> &'static AnyClass {
-    static CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
-    CLASS.get_or_init(|| {
-        let mut class = ClassBuilder::new(c"AppsControlClip", class!(NSView)).unwrap();
-        unsafe {
-            class.add_method(sel!(isFlipped), flipped as extern "C" fn(_, _) -> Bool);
-            class.add_method(
-                sel!(hitTest:),
-                hit_test as extern "C" fn(_, _, NSPoint) -> *mut AnyObject,
-            );
-        }
-        class.register()
-    })
-}
-
-fn target_class() -> &'static AnyClass {
-    static CLASS: OnceLock<&'static AnyClass> = OnceLock::new();
-    CLASS.get_or_init(|| {
-        let mut class = ClassBuilder::new(c"AppsControlTarget", class!(NSObject)).unwrap();
-        unsafe {
-            class.add_ivar::<*const c_void>(SHARED);
-            class.add_method(
-                sel!(controlAction:),
-                action as extern "C" fn(_, _, *mut AnyObject),
-            );
-            class.add_method(
-                sel!(controlTextDidChange:),
-                text_changed as extern "C" fn(_, _, *mut AnyObject),
-            );
-            class.add_method(
-                sel!(controlTextDidEndEditing:),
-                text_ended as extern "C" fn(_, _, *mut AnyObject),
-            );
-        }
-        class.register()
-    })
-}
-
-extern "C" fn flipped(_: &AnyObject, _: Sel) -> Bool {
-    Bool::YES
-}
-
-// The clip is wider than its control, and that margin belongs to the page below.
-extern "C" fn hit_test(this: &AnyObject, _: Sel, point: NSPoint) -> *mut AnyObject {
-    let hit: *mut AnyObject = unsafe { msg_send![super(this, class!(NSView)), hitTest: point] };
-    if ptr::eq(hit, this) {
-        ptr::null_mut()
-    } else {
-        hit
-    }
-}
-
-fn set_shared(target: &AnyObject, shared: *const RefCell<Shared>) {
-    unsafe {
-        target
-            .class()
-            .instance_variable(SHARED)
-            .unwrap()
-            .load_ptr::<*const c_void>(target)
-            .write(shared.cast());
-    }
-}
-
-fn shared(target: &AnyObject) -> Option<&RefCell<Shared>> {
-    let shared = unsafe {
-        *target
-            .class()
-            .instance_variable(SHARED)
-            .unwrap()
-            .load_ptr::<*const c_void>(target)
-    };
-    // SAFETY: `Controls` clears the pointer before it frees the box.
-    (!shared.is_null()).then(|| unsafe { &*shared.cast::<RefCell<Shared>>() })
-}
-
-fn send(shared: &RefCell<Shared>, key: u64, value: Option<String>, done: bool) {
-    let mut state = shared.borrow_mut();
-    let Some(entry) = state.entries.get_mut(&key) else {
-        return;
-    };
-    entry.sent += 1;
-    let seq = entry.sent;
-    let sink = state.sink.clone();
-    drop(state);
-    if let Some(sink) = sink {
-        sink(ControlEvent {
-            key,
-            seq,
-            value,
-            done,
-        });
-    }
-}
-
 fn tag(control: &AnyObject) -> u64 {
     let tag: isize = unsafe { msg_send![control, tag] };
     tag as u64
 }
 
-extern "C" fn action(this: &AnyObject, _: Sel, sender: *mut AnyObject) {
-    let (Some(shared), Some(sender)) = (shared(this), unsafe { sender.as_ref() }) else {
-        return;
-    };
-    let key = tag(sender);
-    let Some(kind) = shared.borrow().entries.get(&key).map(|entry| entry.kind) else {
-        return;
-    };
-    let (value, done) = match kind {
-        ControlKind::Button | ControlKind::Switch => (None, true),
-        ControlKind::Slider => {
-            let app: *mut AnyObject =
-                unsafe { msg_send![class!(NSApplication), sharedApplication] };
-            let event: *mut AnyObject = unsafe { msg_send![app, currentEvent] };
-            let kind: usize = if event.is_null() {
-                0
-            } else {
-                unsafe { event.send_message(Sel::register(c"type"), ()) }
-            };
-            (Some(number(sender)), !matches!(kind, 1 | 6))
-        }
-        ControlKind::Stepper => (Some(number(sender)), true),
-        ControlKind::Text | ControlKind::Search => (Some(string(sender)), true),
-        ControlKind::Color => match color(sender) {
-            Some(value) => (Some(value), true),
-            None => return,
-        },
-        ControlKind::Date => (Some(date(sender)), true),
-    };
-    if done && let Some(entry) = shared.borrow_mut().entries.get_mut(&key) {
-        entry.dirty = false;
-    }
-    send(shared, key, value, done);
-}
-
-fn field(notification: *mut AnyObject) -> Option<&'static AnyObject> {
-    if notification.is_null() {
-        return None;
-    }
-    let field: *mut AnyObject = unsafe { msg_send![notification, object] };
-    unsafe { field.as_ref() }
-}
-
-extern "C" fn text_changed(this: &AnyObject, _: Sel, notification: *mut AnyObject) {
-    let (Some(shared), Some(field)) = (shared(this), field(notification)) else {
-        return;
-    };
-    let key = tag(field);
-    if let Some(entry) = shared.borrow_mut().entries.get_mut(&key) {
-        entry.dirty = true;
-    }
-    send(shared, key, Some(string(field)), false);
-}
-
-extern "C" fn text_ended(this: &AnyObject, _: Sel, notification: *mut AnyObject) {
-    let (Some(shared), Some(field)) = (shared(this), field(notification)) else {
-        return;
-    };
-    let key = tag(field);
-    let dirty = shared
-        .borrow_mut()
-        .entries
-        .get_mut(&key)
-        .is_some_and(|entry| std::mem::take(&mut entry.dirty));
-    if dirty {
-        send(shared, key, Some(string(field)), true);
-    }
+fn field(notification: Option<&AnyObject>) -> Option<Retained<AnyObject>> {
+    unsafe { msg_send![notification?, object] }
 }
 
 fn number(control: &AnyObject) -> String {
@@ -418,63 +361,56 @@ pub(crate) fn update(
     sink: Option<ControlSink>,
 ) {
     CATransaction::setDisableActions(true);
-    let target = controls
-        .target
-        .get_or_insert_with(|| unsafe {
-            let target: Retained<AnyObject> = msg_send![target_class(), new];
-            set_shared(&target, &*controls.shared);
-            target
-        })
-        .clone();
-    let mut shared = controls.shared.borrow_mut();
+    let target: &Target = controls.0.get_or_insert_with(|| {
+        let target = Target::alloc(parent.mtm()).set_ivars(RefCell::default());
+        // SAFETY: a plain NSObject init.
+        unsafe { msg_send![super(target), init] }
+    });
+    let mut shared = target.ivars().borrow_mut();
+    let shared = &mut *shared;
     shared.sink = sink;
-    controls.views.retain(|view| {
+    shared.views.retain(|view| {
         let keep = list
             .iter()
             .any(|state| state.key == view.state.key && state.kind == view.state.kind);
         if !keep {
             detach(view);
-            shared.entries.remove(&view.state.key);
         }
         keep
     });
     let height = parent.bounds().size.height;
     for state in list {
-        let index = controls
+        let index = shared
             .views
             .iter()
             .position(|view| view.state.key == state.key);
         let fresh = index.is_none();
         let index = index.unwrap_or_else(|| unsafe {
             let control = create(state.kind);
-            let () = msg_send![&*control, setTarget: &*target];
+            let () = msg_send![&*control, setTarget: target];
             let () = msg_send![&*control, setAction: sel!(controlAction:)];
             let () = msg_send![&*control, setTag: state.key as isize];
             if matches!(state.kind, ControlKind::Text | ControlKind::Search) {
-                let () = msg_send![&*control, setDelegate: &*target];
+                let () = msg_send![&*control, setDelegate: target];
             }
-            let clip: Retained<NSView> = msg_send![clip_class(), new];
+            let clip: Retained<Clip> =
+                msg_send![super(Clip::alloc(parent.mtm()).set_ivars(())), initWithFrame: NSRect::ZERO];
+            let clip = Retained::into_super(clip);
             let () = msg_send![&*clip, setWantsLayer: Bool::YES];
             let layer: *mut AnyObject = msg_send![&*clip, layer];
             let () = msg_send![layer, setMasksToBounds: Bool::YES];
             let () = msg_send![&*clip, addSubview: &*control];
             parent.addSubview(&clip);
-            shared.entries.insert(
-                state.key,
-                Entry {
-                    kind: state.kind,
-                    sent: 0,
-                    dirty: false,
-                },
-            );
-            controls.views.push(View {
+            shared.views.push(View {
                 clip,
                 control,
                 state: state.clone(),
+                sent: 0,
+                dirty: false,
             });
-            controls.views.len() - 1
+            shared.views.len() - 1
         });
-        let view = &mut controls.views[index];
+        let view = &mut shared.views[index];
         let old = &view.state;
         let control = &*view.control;
         unsafe {
@@ -524,10 +460,7 @@ pub(crate) fn update(
                 let () = msg_send![control, setEnabled: Bool::new(state.enabled)];
             }
             // Apply page values only after it acknowledges all native edits, or stale values can undo them.
-            let current = shared
-                .entries
-                .get(&state.key)
-                .is_none_or(|entry| state.seen >= entry.sent);
+            let current = state.seen >= view.sent;
             let changed = |old: &NativeControl| {
                 fresh
                     || old.value != state.value

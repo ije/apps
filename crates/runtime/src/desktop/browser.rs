@@ -5,7 +5,6 @@ use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct State {
-    pub(crate) application: String,
     views: HashMap<u64, Browser>,
     next_id: u64,
     attaches: Vec<(u64, u64)>,
@@ -13,20 +12,14 @@ pub struct State {
 }
 
 impl State {
-    pub fn call(&mut self, operation: &str, arguments: &Value) -> Result<Value> {
+    pub fn call(&mut self, operation: &str, arguments: &Value, application: &str) -> Result<Value> {
         match operation {
             "create" => {
                 let mut options = arguments[0]
                     .as_object()
                     .cloned()
                     .context("Expected browser options")?;
-                for name in [
-                    "persistent",
-                    "inspectable",
-                    "javascript",
-                    "show",
-                    "navigation",
-                ] {
+                for name in ["inspectable", "javascript", "show", "navigation"] {
                     ensure!(
                         options.get(name).is_none_or(Value::is_boolean),
                         "Expected boolean browser option: {name}"
@@ -41,7 +34,7 @@ impl State {
                     "Expected browser title"
                 );
                 options.entry("show").or_insert(Value::Bool(false));
-                options.insert("application".into(), self.application.clone().into());
+                options.insert("application".into(), application.into());
                 let browser = Browser::detached(&Value::Object(options))?;
                 self.next_id += 1;
                 self.views.insert(self.next_id, browser);
@@ -136,21 +129,21 @@ mod tests {
     #[test]
     fn closing_parent_detaches_and_destroy_is_idempotent() {
         let mut state = State::default();
-        assert_eq!(state.call("reserve", &Value::Null).unwrap(), 1);
-        assert_eq!(state.call("reserve", &Value::Null).unwrap(), 2);
+        assert_eq!(state.call("reserve", &Value::Null, "").unwrap(), 1);
+        assert_eq!(state.call("reserve", &Value::Null, "").unwrap(), 2);
         state.parents.insert(2, 1);
         state.attaches.push((2, 1));
         state.close_window(1).unwrap();
         assert!(state.parents.is_empty());
         assert!(state.attaches.is_empty());
-        let events = state.call("poll", &Value::Null).unwrap();
+        let events = state.call("poll", &Value::Null, "").unwrap();
         assert_eq!(events, serde_json::json!([]));
         assert_eq!(
-            state.call("destroy", &serde_json::json!([2])).unwrap(),
+            state.call("destroy", &serde_json::json!([2]), "").unwrap(),
             Value::Null
         );
         assert_eq!(
-            state.call("poll", &Value::Null).unwrap(),
+            state.call("poll", &Value::Null, "").unwrap(),
             serde_json::json!([])
         );
     }

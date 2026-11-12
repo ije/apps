@@ -24,10 +24,6 @@ impl<T: Clone> Chunked<T> {
         self.len
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     pub(crate) fn get(&self, index: usize) -> Option<&T> {
         (index < self.len).then(|| &self.chunks[index >> BITS][index & MASK])
     }
@@ -60,7 +56,7 @@ impl<T: Clone> Chunked<T> {
         self.len = 0;
     }
 
-    pub(crate) fn truncate(&mut self, len: usize) {
+    fn truncate(&mut self, len: usize) {
         if len >= self.len {
             return;
         }
@@ -73,11 +69,15 @@ impl<T: Clone> Chunked<T> {
         self.len = len;
     }
 
-    pub(crate) fn resize(&mut self, len: usize, value: T) {
-        self.resize_with(len, || value.clone());
+    // A write copies a shared chunk and makes `differing` report it, so a value that is already there is not
+    // written again.
+    pub(crate) fn set(&mut self, index: usize, value: T, same: impl FnOnce(&T, &T) -> bool) {
+        if !same(&self[index], &value) {
+            self[index] = value;
+        }
     }
 
-    pub(crate) fn resize_with(&mut self, len: usize, mut value: impl FnMut() -> T) {
+    pub(crate) fn resize(&mut self, len: usize, value: T) {
         if len <= self.len {
             self.truncate(len);
             return;
@@ -88,7 +88,7 @@ impl<T: Clone> Chunked<T> {
             }
             let chunk = Rc::make_mut(self.chunks.last_mut().expect("a chunk for the next entry"));
             let count = (SIZE - (self.len & MASK)).min(len - self.len);
-            chunk.extend(std::iter::repeat_with(&mut value).take(count));
+            chunk.extend(std::iter::repeat_n(value.clone(), count));
             self.len += count;
         }
     }

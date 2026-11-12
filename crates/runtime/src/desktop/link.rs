@@ -41,7 +41,6 @@ pub(crate) enum ToMain {
     OpenTools,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Target {
     Window(u64),
     All,
@@ -229,12 +228,6 @@ impl Link {
         }
     }
 
-    fn forget_page(&self, window: u64) {
-        if let Some(pages) = &mut *self.pages() {
-            pages.remove(&window);
-        }
-    }
-
     pub(crate) fn main_pending(&self) -> bool {
         !self
             .0
@@ -383,6 +376,13 @@ pub(crate) fn state_json(state: &renderer::WindowState, focused: bool) -> Value 
     json!({"frame":rect(state.frame),"content":rect(state.content),"minimized":state.minimized,"maximized":state.maximized,"fullscreen":state.fullscreen,"visible":state.visible,"focused":focused,"resizing":state.resizing})
 }
 
+#[derive(Default)]
+struct Window {
+    native: Option<(WindowId, WindowControl)>,
+    input: bool,
+    frames: bool,
+}
+
 pub(crate) struct Main {
     pub(crate) engine: Option<JsContext>,
     pub(crate) host: Rc<RefCell<Host>>,
@@ -390,10 +390,7 @@ pub(crate) struct Main {
     api: Rc<JavaScriptCore>,
     link: Link,
     pool: RefCell<Option<mpsc::Sender<Job>>>,
-    windows: RefCell<HashMap<u64, (WindowId, WindowControl)>>,
-    opened: RefCell<std::collections::BTreeSet<u64>>,
-    inputs: RefCell<std::collections::BTreeSet<u64>>,
-    frames: RefCell<std::collections::BTreeSet<u64>>,
+    windows: RefCell<HashMap<u64, Window>>,
     spawner: RefCell<Option<Spawner>>,
     waiting: RefCell<Vec<Value>>,
     changed: RefCell<Vec<u64>>,
@@ -419,9 +416,6 @@ impl Main {
             link,
             pool: RefCell::default(),
             windows: RefCell::default(),
-            opened: RefCell::default(),
-            inputs: RefCell::default(),
-            frames: RefCell::default(),
             spawner: RefCell::default(),
             waiting: RefCell::default(),
             changed: RefCell::default(),
@@ -444,11 +438,11 @@ impl Main {
     }
 
     pub(crate) fn first_window(&self) -> Option<u64> {
-        self.opened.borrow().first().copied()
+        self.windows.borrow().keys().min().copied()
     }
 
-    pub(crate) fn receive(&self) -> bool {
-        self.receive_with(!self.driving.get())
+    pub(crate) fn receive(&self) {
+        self.receive_with(!self.driving.get());
     }
 
     // Nested AppKit loops must defer script messages until the outer script returns. Other messages can run.
@@ -471,7 +465,7 @@ impl Main {
                 ToMain::Open(id, ..) => Some(*id),
                 _ => None,
             };
-            if sender.is_some_and(|id| !self.opened.borrow().contains(&id)) {
+            if sender.is_some_and(|id| !self.windows.borrow().contains_key(&id)) {
                 continue;
             }
             if !scripts
@@ -506,7 +500,7 @@ impl Main {
                     let _ = answer.send(result);
                 }
                 (ToMain::Spawn(id), _) => {
-                    self.opened.borrow_mut().insert(id);
+                    self.windows.borrow_mut().entry(id).or_default();
                     if let (Some(spawner), Some(queue)) =
                         (&*self.spawner.borrow(), self.link.queue_of(id))
                     {
@@ -515,8 +509,8 @@ impl Main {
                 }
                 (ToMain::Window(id, window, control), _) => {
                     // A window that closed on its way here must not stay retained.
-                    if self.opened.borrow().contains(&id) {
-                        self.windows.borrow_mut().insert(id, (window, control));
+                    if let Some(entry) = self.windows.borrow_mut().get_mut(&id) {
+                        entry.native = Some((window, control));
                         let mut changed = self.changed.borrow_mut();
                         if !changed.contains(&id) {
                             changed.push(id);
@@ -558,6 +552,7 @@ impl Main {
                     .windows
                     .borrow()
                     .get(&parent)
+                    .and_then(|window| window.native.as_ref())
                     .and_then(|(_, control)| control.raw_window_handle().ok());
                 match window {
                     Some(window) => {
@@ -579,6 +574,7 @@ impl Main {
                     .windows
                     .borrow()
                     .get(&id)
+                    .and_then(|window| window.native.as_ref())
                     .map(|(_, control)| (control.state(), control.is_active()));
                 match state {
                     Some((Some(state), focused)) => {
@@ -600,7 +596,7 @@ impl Main {
         self.windows
             .borrow()
             .iter()
-            .find_map(|(&id, (other, _))| (*other == window).then_some(id))
+            .find_map(|(&id, entry)| (entry.native.as_ref()?.0 == window).then_some(id))
     }
 
     // Do not reenter a main script from a nested loop or host call. Let the key pass.
@@ -630,7 +626,11 @@ impl Main {
         let Ok(packaged) = self.host.try_borrow().map(|host| host.packaged) else {
             return false;
         };
-        if !self.inputs.borrow().contains(&id)
+        if !self
+            .windows
+            .borrow()
+            .get(&id)
+            .is_some_and(|window| window.input)
             || self.driving.get()
             || !packaged && tool(&key.name, modifiers).is_some()
         {
@@ -668,7 +668,11 @@ impl Main {
         let Some(engine) = &self.engine else {
             return false;
         };
-        if !self.frames.borrow().contains(&id)
+        if !self
+            .windows
+            .borrow()
+            .get(&id)
+            .is_some_and(|window| window.frames)
             || self.driving.get()
             || self.host.try_borrow().is_err()
         {
@@ -727,14 +731,11 @@ impl Main {
             return;
         };
         if action == "input" || action == "willChange" {
-            let mut ids = match action {
-                "input" => self.inputs.borrow_mut(),
-                _ => self.frames.borrow_mut(),
-            };
-            if args[2] == true {
-                ids.insert(id);
-            } else {
-                ids.remove(&id);
+            if let Some(window) = self.windows.borrow_mut().get_mut(&id) {
+                *match action {
+                    "input" => &mut window.input,
+                    _ => &mut window.frames,
+                } = args[2] == true;
             }
             return;
         }
@@ -744,7 +745,11 @@ impl Main {
                 return self.link.main(ToMain::Native(command));
             }
             // On Windows a hide calls `window_event` at once, so the `windows` borrow must end first.
-            let removed = self.windows.borrow_mut().remove(&id);
+            let removed = self
+                .windows
+                .borrow_mut()
+                .get_mut(&id)
+                .and_then(|window| window.native.take());
             if let Some((_, control)) = removed {
                 control.change(WindowChange::Hide);
             }
@@ -758,14 +763,14 @@ impl Main {
                 eprintln!("apps: {error:#}");
             }
             self.link.page(ToPage::Window(id, command));
-            self.link.forget_page(id);
+            if let Some(pages) = &mut *self.link.pages() {
+                pages.remove(&id);
+            }
             self.link
                 .event(format!("__appsEvent('closed',{id})"), "apps:closed");
-            self.inputs.borrow_mut().remove(&id);
-            self.frames.borrow_mut().remove(&id);
-            let mut opened = self.opened.borrow_mut();
-            opened.remove(&id);
-            if self.engine.is_none() && opened.is_empty() {
+            let mut windows = self.windows.borrow_mut();
+            windows.remove(&id);
+            if self.engine.is_none() && windows.is_empty() {
                 self.link.quit(0);
             }
             return;
@@ -773,7 +778,8 @@ impl Main {
         // AppKit can run a nested loop in these calls, which runs main tasks, so no borrow lasts across them.
         let (window, parent) = {
             let windows = self.windows.borrow();
-            let Some((_, window)) = windows.get(&id) else {
+            let Some((_, window)) = windows.get(&id).and_then(|window| window.native.as_ref())
+            else {
                 drop(windows);
                 self.waiting.borrow_mut().push(command);
                 return;
@@ -782,10 +788,8 @@ impl Main {
                 .as_u64()
                 .filter(|_| action == "parent")
                 .map(|parent| {
-                    (
-                        parent,
-                        windows.get(&parent).map(|(_, control)| control.clone()),
-                    )
+                    let parent = windows.get(&parent);
+                    parent.map(|window| window.native.as_ref().map(|(_, control)| control.clone()))
                 });
             (window.clone(), parent)
         };
@@ -835,14 +839,15 @@ impl Main {
             "aspectRatio" => WindowChange::AspectRatio(number(2).0, size(number(3), number(4))),
             "parent" => {
                 // Windows start on their own threads, so the parent can arrive after its child.
-                if let Some((parent, None)) = &parent
-                    && self.opened.borrow().contains(parent)
-                {
+                if let Some(Some(None)) = &parent {
                     self.waiting.borrow_mut().push(command);
                     return;
                 }
                 window.change(WindowChange::Parent(
-                    parent.and_then(|(_, control)| control?.raw_window_handle().ok()),
+                    parent
+                        .flatten()
+                        .flatten()
+                        .and_then(|control| control.raw_window_handle().ok()),
                     args[3] == true,
                 ));
                 if args[4] != true {
@@ -1106,7 +1111,7 @@ mod tests {
                 .eval("runs.join()", "test")
                 .unwrap()
         };
-        assert!(main.opened.borrow().contains(&902) && link.main_pending());
+        assert!(main.windows.borrow().contains_key(&902) && link.main_pending());
         assert_eq!(runs(), "");
         main.driving.set(false);
         main.receive();
@@ -1136,6 +1141,7 @@ mod tests {
             )
             .unwrap();
         let main = Main::new(Some(engine), host.clone(), Link::new(), api);
+        main.windows.borrow_mut().insert(5, Window::default());
         let key = |key: &str, modifiers: Modifiers| {
             let text = (key.len() == 1).then(|| key.to_uppercase());
             (

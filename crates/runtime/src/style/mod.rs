@@ -17,7 +17,7 @@ mod value;
 pub(crate) use chunked::Chunked;
 
 pub(crate) use animation::{Animation, Easing, Motion, Scripted};
-pub use color::color;
+pub use color::{color, rgba};
 pub(crate) use parser::{DROPPED, FontUnits, Lengths, NodeLengths};
 use shorthand::expand;
 pub(crate) use text::{
@@ -38,33 +38,6 @@ pub(crate) const SELECT_ALL: u8 = 16;
 pub(crate) const SELECT_TEXT: u8 = 32;
 const COUNTED: u8 = 64;
 pub(crate) const AGENT_DISPLAY: u8 = 128;
-
-fn flags(style: &Style) -> u8 {
-    let get = |prop| style.get(prop).unwrap_or("");
-    let flag = |set, value| if set { value } else { 0 };
-    flag(get(Prop::DISPLAY) == "none", DISPLAY_NONE)
-        | flag(get(Prop::DISPLAY) == "contents", DISPLAY_CONTENTS)
-        | flag(
-            matches!(get(Prop::VISIBILITY), "hidden" | "collapse"),
-            INVISIBLE,
-        )
-        | match get(Prop::USER_SELECT) {
-            "none" => SELECT_NONE,
-            "all" => SELECT_ALL,
-            "text" => SELECT_TEXT,
-            _ => 0,
-        }
-        | flag(
-            [
-                Prop::COUNTER_RESET,
-                Prop::COUNTER_INCREMENT,
-                Prop::COUNTER_SET,
-            ]
-            .into_iter()
-            .any(|prop| style.contains(prop)),
-            COUNTED,
-        )
-}
 
 const UA: &str = "
 html,body,address,blockquote,center,dialog,div,figure,figcaption,footer,form,header,hr,legend,main,p,pre,search,article,aside,h1,h2,h3,h4,h5,h6,hgroup,nav,section,dd,dl,dt,menu,ol,ul,details,summary,fieldset,optgroup,option,caption,td,th{display:block}
@@ -364,27 +337,6 @@ fn exported_parts(
     })
 }
 
-fn merged(vars: Vars, own: &[Read]) -> Vars {
-    if own
-        .iter()
-        .all(|(prop, value)| var(&vars, *prop) == value.as_ref())
-    {
-        return vars;
-    }
-    let mut list = (*vars).clone();
-    for (prop, value) in own {
-        match (list.binary_search_by_key(prop, |entry| entry.0), value) {
-            (Ok(index), Some(value)) => list[index].1 = value.clone(),
-            (Err(index), Some(value)) => list.insert(index, (*prop, value.clone())),
-            (Ok(index), None) => {
-                list.remove(index);
-            }
-            (Err(_), None) => {}
-        }
-    }
-    Rc::new(list)
-}
-
 // The next `var(` outside quoted strings.
 fn next_var(value: &str) -> Option<usize> {
     let bytes = value.as_bytes();
@@ -431,17 +383,8 @@ struct Inputs {
 impl Inputs {
     fn new(font: FontUnits, root: FontUnits) -> Self {
         let mut units = [0; 14];
-        for (slot, font) in units.as_chunks_mut::<7>().0.iter_mut().zip([font, root]) {
-            *slot = [
-                font.em.to_bits(),
-                font.ch.to_bits(),
-                font.ex.to_bits(),
-                font.cap.to_bits(),
-                font.ic.to_bits(),
-                font.lh.to_bits(),
-                u32::from(font.absolute),
-            ];
-        }
+        units[..7].copy_from_slice(&font.bits());
+        units[7..].copy_from_slice(&root.bits());
         Self {
             parent: None,
             units,
@@ -533,6 +476,10 @@ struct ShadowRule {
 }
 
 const ELEMENT: usize = usize::MAX;
+// Pseudo-element kinds of `Selector::without_pseudo_element`.
+const SLOTTED: usize = 12;
+const PART: usize = 13;
+const STARTING: usize = 14;
 
 #[derive(Clone)]
 pub(crate) struct Passed {
@@ -661,6 +608,7 @@ struct Share {
 }
 const PSEUDO: usize = 1 << (usize::BITS - 1);
 const SELECTOR: usize = 32;
+#[derive(Default)]
 struct StyleScope {
     id: usize,
     used: u64,
@@ -729,15 +677,15 @@ impl StyleScope {
                 .enumerate()
                 .filter_map(|(index, selector)| {
                     if let Some((kind, mut pseudo)) = selector.without_pseudo_element() {
-                        if matches!(kind, 12 | 13) {
+                        if matches!(kind, SLOTTED | PART) {
                             let (target, classes) = selector.shadow_target()?;
                             let argument = selector.pseudo_argument().unwrap_or_default().trim();
-                            let compound = Rc::new(if kind == 12 {
+                            let compound = Rc::new(if kind == SLOTTED {
                                 Selector::parse(argument, None)
                             } else {
                                 vec![classes]
                             });
-                            if kind == 12
+                            if kind == SLOTTED
                                 && let Some(own) =
                                     compound.iter().map(|selector| selector.specificity).max()
                             {
@@ -838,7 +786,9 @@ impl StyleScope {
     // means that the rules can also reach other nodes, so only a full pass finds them all.
     fn rematch(&mut self, start: usize, doc: &Document, dirty: &mut [bool]) -> bool {
         let added = self.pseudos.iter().filter(|pseudo| pseudo.2 >= start);
-        let passed = added.clone().any(|pseudo| matches!(pseudo.0, 12 | 13));
+        let passed = added
+            .clone()
+            .any(|pseudo| matches!(pseudo.0, SLOTTED | PART));
         let keys = self.elements[start..].iter().flatten().map(|(_, key)| key);
         let mut names: [rustc_hash::FxHashSet<&str>; 4] = Default::default();
         for key in keys.chain(added.map(|pseudo| &pseudo.3)) {
@@ -892,17 +842,6 @@ fn intern(lists: &mut RuleLists, list: &[(usize, [usize; 3])]) -> Rc<[(usize, [u
     let list: Rc<[_]> = list.into();
     lists.insert(list.clone());
     list
-}
-
-fn inline_source(node: &crate::dom::Node) -> Option<Cow<'_, str>> {
-    node.attrs
-        .get("style")
-        .map(|source| Cow::Borrowed(source.as_str()))
-        .or_else(|| {
-            node.inline
-                .as_ref()
-                .map(|inline| Cow::Owned(inline.source()))
-        })
 }
 
 struct MatchedRules {
@@ -987,16 +926,13 @@ fn derive<R, E>(
 
 #[derive(Default)]
 pub(crate) struct StyleCache {
-    viewport: [f32; 2],
-    pub(crate) metrics: Option<f32>,
-    reduced_motion: bool,
-    native_theme: u32,
+    pub(crate) environment: Environment,
     scopes: Vec<StyleScope>,
     next: usize,
     pass: u64,
     pub(crate) states: u16,
     sheets: HashMap<usize, Sheet>,
-    pub(crate) cssom: HashMap<usize, Cssom>,
+    cssom: HashMap<usize, Cssom>,
     pub(crate) constructed: FxHashMap<u32, Rc<Stylesheet>>,
     derived: Derived,
     pub(crate) adopted: FxHashMap<usize, Vec<u32>>,
@@ -1013,12 +949,9 @@ pub(crate) struct StyleCache {
     stamp: u64,
     tables: FxHashMap<usize, CollapsedTable>,
     tailwind: tailwind::Compiler,
-    registry: Rc<Registry>,
     // Retain source lists used as pointer keys to prevent address reuse.
     inheritable: FxHashMap<*const Vec<(Prop, Rc<str>)>, Inheritable>,
     pub(crate) scripted: Registry,
-    scheme: Option<Rc<str>>,
-    pub(crate) spare: Option<SpareStyles>,
     walk: Option<Rc<TreeWalk>>,
     shadows: Rc<Shadows>,
     matches: SelectorCache,
@@ -1032,10 +965,10 @@ pub(crate) struct StyleCache {
 }
 
 // An incremental pass may start only from a stored pass that styled with the same environment.
-#[derive(PartialEq)]
-struct Environment {
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct Environment {
     viewport: [f32; 2],
-    metrics: Option<f32>,
+    pub(crate) metrics: Option<f32>,
     reduced_motion: bool,
     native_theme: u32,
     registry: Rc<Registry>,
@@ -1060,7 +993,14 @@ struct MediaBlock {
     matched: std::cell::Cell<bool>,
     fixed: bool,
 }
-type Cssom = (u64, Rc<str>, bool, bool, Rc<Stylesheet>);
+#[derive(Clone)]
+struct Cssom {
+    used: u64,
+    text: Rc<str>,
+    bundled: bool,
+    disabled: bool,
+    sheet: Rc<Stylesheet>,
+}
 type Sheet = (u64, Option<u64>, Rc<str>, Rc<Stylesheet>);
 type Inheritable = (Vars, Option<Vars>);
 type QueryCache = HashMap<(usize, usize, usize, usize), (bool, bool, Lengths)>;
@@ -1106,15 +1046,7 @@ pub(crate) fn tailwind(css: &str, text: &str) -> String {
 impl StyleCache {
     fn walk(&mut self, doc: &Document, shadows: &Rc<Shadows>) -> Rc<TreeWalk> {
         let walk = self.walk.take().and_then(|walk| Rc::try_unwrap(walk).ok());
-        let mut walk = walk.unwrap_or_else(|| TreeWalk {
-            walk: Default::default(),
-            built: (0, Rc::default()),
-            used: Default::default(),
-            tree: Default::default(),
-            trees: Default::default(),
-            special: Vec::new(),
-            tables: Vec::new(),
-        });
+        let mut walk = walk.unwrap_or_default();
         let serial = walk.walk.serial;
         // This skip relies on a new shadow map whenever the tree or its shadow roots change.
         if !(walk.built.0 == doc.nodes.tree() && Rc::ptr_eq(&walk.built.1, shadows))
@@ -1200,7 +1132,6 @@ impl StyleCache {
 
     pub(crate) fn trim(&mut self, len: usize) {
         self.values = Default::default();
-        self.spare = None;
         self.walk = None;
         for scope in &mut self.scopes {
             scope.nodes.truncate(len);
@@ -1208,6 +1139,15 @@ impl StyleCache {
             scope.lists = Default::default();
         }
         self.matches.trim(len);
+    }
+
+    fn uncache(&mut self) {
+        self.values.clear();
+        for scope in &mut self.scopes {
+            for node in scope.nodes.iter_mut().flatten() {
+                node.cached = None;
+            }
+        }
     }
 
     pub(crate) fn set_containers(
@@ -1227,13 +1167,8 @@ impl StyleCache {
             self.units = true;
             self.full = true;
             self.sized.clear();
-            self.values.clear();
             self.queries.clear();
-            for scope in &mut self.scopes {
-                for node in scope.nodes.iter_mut().flatten() {
-                    node.cached = None;
-                }
-            }
+            self.uncache();
             self.containers = sizes.clone();
             return true;
         }
@@ -1318,13 +1253,11 @@ impl StyleCache {
             }
             rest.is_empty()
         };
-        if let Some((used, _, _, disabled, sheet)) =
-            self.cssom.get_mut(&id).filter(|(_, text, was, ..)| {
-                *was == bundled.is_some() && (bundled.is_some() || same(text))
-            })
-        {
-            *used = pass;
-            return (!*disabled).then(|| sheet.clone());
+        if let Some(edited) = self.cssom.get_mut(&id).filter(|edited| {
+            edited.bundled == bundled.is_some() && (bundled.is_some() || same(&edited.text))
+        }) {
+            edited.used = pass;
+            return (!edited.disabled).then(|| edited.sheet.clone());
         }
         self.cssom.remove(&id);
         if let Some(sheet) = bundled {
@@ -1422,7 +1355,7 @@ impl StyleCache {
     }
 
     pub(crate) fn registry(&self) -> Rc<Registry> {
-        self.registry.clone()
+        self.environment.registry.clone()
     }
 
     pub(crate) fn edit_sheet(
@@ -1436,7 +1369,7 @@ impl StyleCache {
         let current = self.sheet(doc, id, cache);
         let (mut sheet, mut disabled) = self.cssom.remove(&id).map_or_else(
             || (current.unwrap_or_default(), false),
-            |(.., disabled, sheet)| (sheet, disabled),
+            |edited| (edited.sheet, edited.disabled),
         );
         let result = derive(&mut self.derived, &mut sheet, top, |sheet| {
             change(sheet, &mut disabled)
@@ -1452,8 +1385,16 @@ impl StyleCache {
         }
         let bundled = doc.nodes[id].stylesheet.is_some()
             || matches!(doc.nodes[id].children[..], [child] if doc.nodes[child].stylesheet.is_some());
-        self.cssom
-            .insert(id, (self.pass, text.into(), bundled, disabled, sheet));
+        self.cssom.insert(
+            id,
+            Cssom {
+                used: self.pass,
+                text: text.into(),
+                bundled,
+                disabled,
+                sheet,
+            },
+        );
         result
     }
 
@@ -1489,7 +1430,7 @@ impl StyleCache {
         self.heritage
             .retain(|_, (style, _)| Rc::strong_count(style) > 1);
         self.inherited.retain(|style| Rc::strong_count(style) > 1);
-        self.cssom.retain(|_, (used, ..)| *used >= pass);
+        self.cssom.retain(|_, edited| edited.used >= pass);
         // Incremental passes don't visit clean nodes, so values that nodes still hold stay.
         if self.values.len() > 4096 {
             self.values.retain(|_, values| {
@@ -1619,631 +1560,19 @@ enum MediaQuery {
     Typed(String, Box<MediaQuery>),
 }
 
-// Keep sorted and list only supported properties. CSS queries, style APIs and devtools share this list.
-const SUPPORTED_PROPERTIES: &[(&str, &str)] = &[
-    ("-macos-glass", "none|regular|clear"),
-    ("-macos-glass-interactive", "false|true"),
-    ("-macos-glass-tint-color", "<color>"),
-    ("-moz-osx-font-smoothing", "auto|grayscale"),
-    ("-webkit-app-region", "none|drag|no-drag"),
-    (
-        "-webkit-backdrop-filter",
-        "none|[blur(|brightness(|contrast(|drop-shadow(|grayscale(|hue-rotate(|invert(|opacity(|saturate(|sepia(|url(]+",
-    ),
-    (
-        "-webkit-background-clip",
-        "[border-box|padding-box|content-box|text]#",
-    ),
-    (
-        "-webkit-box-orient",
-        "horizontal|vertical|inline-axis|block-axis",
-    ),
-    (
-        "-webkit-clip-path",
-        "none|[inset(|circle(|ellipse(|polygon(|path(|url(|border-box|padding-box|content-box|margin-box|fill-box|stroke-box|view-box]+",
-    ),
-    (
-        "-webkit-filter",
-        "none|[blur(|brightness(|contrast(|drop-shadow(|grayscale(|hue-rotate(|invert(|opacity(|saturate(|sepia(|url(]+",
-    ),
-    (
-        "-webkit-font-smoothing",
-        "auto|none|antialiased|subpixel-antialiased",
-    ),
-    ("-webkit-line-clamp", "none|<integer>"),
-    ("-webkit-mask", "*"),
-    ("-webkit-mask-image", "[none|<image>]#"),
-    ("-webkit-mask-position", "*"),
-    (
-        "-webkit-mask-repeat",
-        "[repeat|repeat-x|repeat-y|no-repeat|space|round]#",
-    ),
-    ("-webkit-mask-size", "*"),
-    ("-webkit-tap-highlight-color", "<color>"),
-    ("-webkit-text-decoration", "*"),
-    ("-webkit-text-fill-color", "<color>"),
-    ("-webkit-user-select", "auto|none|text|all|contain"),
-    ("accent-color", "auto|<color>"),
-    (
-        "align-content",
-        "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    ),
-    (
-        "align-items",
-        "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    ),
-    (
-        "align-self",
-        "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    ),
-    ("all", "*"),
-    ("animation", "*"),
-    ("animation-delay", "[<time>]#"),
-    (
-        "animation-direction",
-        "[normal|reverse|alternate|alternate-reverse]#",
-    ),
-    ("animation-duration", "[auto|<time>]#"),
-    ("animation-fill-mode", "[none|forwards|backwards|both]#"),
-    ("animation-iteration-count", "[infinite|<number>]#"),
-    ("animation-name", "[none|<custom-ident>|<string>]#"),
-    ("animation-play-state", "[running|paused]#"),
-    ("animation-timing-function", "[<easing-function>]#"),
-    ("app-region", "none|drag|no-drag"),
-    (
-        "appearance",
-        "none|auto|menulist-button|textfield|button|checkbox|radio|searchfield|textarea|menulist|listbox|meter|progress-bar|push-button|square-button|slider-horizontal|base-select",
-    ),
-    ("aspect-ratio", "*"),
-    (
-        "backdrop-filter",
-        "none|[blur(|brightness(|contrast(|drop-shadow(|grayscale(|hue-rotate(|invert(|opacity(|saturate(|sepia(|url(]+",
-    ),
-    ("backface-visibility", "visible|hidden"),
-    ("background", "*"),
-    (
-        "background-blend-mode",
-        "[normal|multiply|screen|overlay|darken|lighten|color-dodge|color-burn|hard-light|soft-light|difference|exclusion|hue|saturation|color|luminosity|plus-lighter]#",
-    ),
-    (
-        "background-clip",
-        "[border-box|padding-box|content-box|text]#",
-    ),
-    ("background-color", "<color>"),
-    ("background-image", "[none|<image>]#"),
-    ("background-position", "*"),
-    ("background-repeat", "*"),
-    ("background-size", "*"),
-    (
-        "block-size",
-        "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
-    ),
-    (
-        "border",
-        "[thin|medium|thick|<non-negative-length>|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
-    ),
-    (
-        "border-block",
-        "[thin|medium|thick|<non-negative-length>|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
-    ),
-    ("border-block-color", "[<color>]{1,2}"),
-    (
-        "border-block-end",
-        "[thin|medium|thick|<non-negative-length>|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
-    ),
-    ("border-block-end-color", "<color>"),
-    (
-        "border-block-end-style",
-        "none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset",
-    ),
-    (
-        "border-block-end-width",
-        "thin|medium|thick|<non-negative-length>",
-    ),
-    (
-        "border-block-start",
-        "[thin|medium|thick|<non-negative-length>|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
-    ),
-    ("border-block-start-color", "<color>"),
-    (
-        "border-block-start-style",
-        "none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset",
-    ),
-    (
-        "border-block-start-width",
-        "thin|medium|thick|<non-negative-length>",
-    ),
-    (
-        "border-block-style",
-        "[none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset]{1,2}",
-    ),
-    (
-        "border-block-width",
-        "[thin|medium|thick|<non-negative-length>]{1,2}",
-    ),
-    (
-        "border-bottom",
-        "[thin|medium|thick|<non-negative-length>|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
-    ),
-    ("border-bottom-color", "<color>"),
-    (
-        "border-bottom-left-radius",
-        "[<non-negative-length-percentage>]{1,2}",
-    ),
-    (
-        "border-bottom-right-radius",
-        "[<non-negative-length-percentage>]{1,2}",
-    ),
-    (
-        "border-bottom-style",
-        "none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset",
-    ),
-    (
-        "border-bottom-width",
-        "thin|medium|thick|<non-negative-length>",
-    ),
-    ("border-collapse", "separate|collapse"),
-    ("border-color", "[<color>]{1,4}"),
-    (
-        "border-end-end-radius",
-        "[<non-negative-length-percentage>]{1,2}",
-    ),
-    (
-        "border-end-start-radius",
-        "[<non-negative-length-percentage>]{1,2}",
-    ),
-    (
-        "border-inline",
-        "[thin|medium|thick|<non-negative-length>|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
-    ),
-    ("border-inline-color", "[<color>]{1,2}"),
-    (
-        "border-inline-end",
-        "[thin|medium|thick|<non-negative-length>|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
-    ),
-    ("border-inline-end-color", "<color>"),
-    (
-        "border-inline-end-style",
-        "none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset",
-    ),
-    (
-        "border-inline-end-width",
-        "thin|medium|thick|<non-negative-length>",
-    ),
-    (
-        "border-inline-start",
-        "[thin|medium|thick|<non-negative-length>|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
-    ),
-    ("border-inline-start-color", "<color>"),
-    (
-        "border-inline-start-style",
-        "none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset",
-    ),
-    (
-        "border-inline-start-width",
-        "thin|medium|thick|<non-negative-length>",
-    ),
-    (
-        "border-inline-style",
-        "[none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset]{1,2}",
-    ),
-    (
-        "border-inline-width",
-        "[thin|medium|thick|<non-negative-length>]{1,2}",
-    ),
-    (
-        "border-left",
-        "[thin|medium|thick|<non-negative-length>|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
-    ),
-    ("border-left-color", "<color>"),
-    (
-        "border-left-style",
-        "none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset",
-    ),
-    (
-        "border-left-width",
-        "thin|medium|thick|<non-negative-length>",
-    ),
-    ("border-radius", "*"),
-    (
-        "border-right",
-        "[thin|medium|thick|<non-negative-length>|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
-    ),
-    ("border-right-color", "<color>"),
-    (
-        "border-right-style",
-        "none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset",
-    ),
-    (
-        "border-right-width",
-        "thin|medium|thick|<non-negative-length>",
-    ),
-    ("border-spacing", "[<non-negative-length>]{1,2}"),
-    (
-        "border-start-end-radius",
-        "[<non-negative-length-percentage>]{1,2}",
-    ),
-    (
-        "border-start-start-radius",
-        "[<non-negative-length-percentage>]{1,2}",
-    ),
-    (
-        "border-style",
-        "[none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset]{1,4}",
-    ),
-    (
-        "border-top",
-        "[thin|medium|thick|<non-negative-length>|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
-    ),
-    ("border-top-color", "<color>"),
-    (
-        "border-top-left-radius",
-        "[<non-negative-length-percentage>]{1,2}",
-    ),
-    (
-        "border-top-right-radius",
-        "[<non-negative-length-percentage>]{1,2}",
-    ),
-    (
-        "border-top-style",
-        "none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset",
-    ),
-    (
-        "border-top-width",
-        "thin|medium|thick|<non-negative-length>",
-    ),
-    (
-        "border-width",
-        "[thin|medium|thick|<non-negative-length>]{1,4}",
-    ),
-    ("bottom", "auto|<length-percentage>"),
-    ("box-decoration-break", "slice|clone"),
-    ("box-shadow", "*"),
-    ("box-sizing", "content-box|border-box"),
-    ("caret-color", "auto|<color>"),
-    ("clear", "none|left|right|both|inline-start|inline-end"),
-    (
-        "clip-path",
-        "none|[inset(|circle(|ellipse(|polygon(|path(|url(|border-box|padding-box|content-box|margin-box|fill-box|stroke-box|view-box]+",
-    ),
-    ("color", "<color>"),
-    ("color-scheme", "normal|[light|dark|only]+"),
-    ("column-count", "auto|<integer>"),
-    ("column-gap", "normal|<non-negative-length-percentage>"),
-    ("column-rule", "*"),
-    ("column-rule-color", "<color>"),
-    (
-        "column-rule-style",
-        "none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset",
-    ),
-    (
-        "column-rule-width",
-        "thin|medium|thick|<non-negative-length>",
-    ),
-    ("column-width", "auto|<non-negative-length>"),
-    ("columns", "*"),
-    ("container", "*"),
-    ("container-name", "none|[<custom-ident>]+"),
-    ("container-type", "normal|size|inline-size"),
-    ("content", "*"),
-    ("counter-increment", "*"),
-    ("counter-reset", "*"),
-    ("counter-set", "*"),
-    ("cursor", "*"),
-    ("direction", "ltr|rtl"),
-    (
-        "display",
-        "none|block|inline|inline-block|flex|inline-flex|grid|inline-grid|contents|list-item|flow-root|table|inline-table|table-row-group|table-header-group|table-footer-group|table-row|table-cell|table-column-group|table-column|table-caption|ruby|ruby-text|-webkit-box|-webkit-inline-box",
-    ),
-    ("field-sizing", "fixed|content"),
-    ("fill", "*"),
-    ("fill-opacity", "<number>|<percentage>"),
-    ("fill-rule", "nonzero|evenodd"),
-    (
-        "filter",
-        "none|[blur(|brightness(|contrast(|drop-shadow(|grayscale(|hue-rotate(|invert(|opacity(|saturate(|sepia(|url(]+",
-    ),
-    (
-        "flex",
-        "none|[<non-negative-number>|content|auto|<length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available]{1,3}",
-    ),
-    (
-        "flex-basis",
-        "content|auto|<length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
-    ),
-    ("flex-direction", "row|row-reverse|column|column-reverse"),
-    (
-        "flex-flow",
-        "[row|row-reverse|column|column-reverse|nowrap|wrap|wrap-reverse]+",
-    ),
-    ("flex-grow", "<non-negative-number>"),
-    ("flex-shrink", "<non-negative-number>"),
-    ("flex-wrap", "nowrap|wrap|wrap-reverse"),
-    ("float", "none|left|right|inline-start|inline-end"),
-    ("font", "*"),
-    ("font-family", "*"),
-    ("font-feature-settings", "*"),
-    (
-        "font-size",
-        "xx-small|x-small|small|medium|large|x-large|xx-large|xxx-large|larger|smaller|<non-negative-length-percentage>",
-    ),
-    (
-        "font-stretch",
-        "normal|ultra-condensed|extra-condensed|condensed|semi-condensed|semi-expanded|expanded|extra-expanded|ultra-expanded|<percentage>",
-    ),
-    ("font-style", "normal|italic|oblique|*"),
-    ("font-variant", "normal"),
-    ("font-variation-settings", "*"),
-    ("font-weight", "normal|bold|bolder|lighter|<number>"),
-    ("gap", "[normal|<non-negative-length-percentage>]{1,2}"),
-    ("grid", "*"),
-    ("grid-area", "*"),
-    ("grid-auto-columns", "*"),
-    ("grid-auto-flow", "[row|column|dense]+"),
-    ("grid-auto-rows", "*"),
-    ("grid-column", "*"),
-    ("grid-column-end", "*"),
-    ("grid-column-gap", "normal|<non-negative-length-percentage>"),
-    ("grid-column-start", "*"),
-    ("grid-gap", "[normal|<non-negative-length-percentage>]{1,2}"),
-    ("grid-row", "*"),
-    ("grid-row-end", "*"),
-    ("grid-row-gap", "normal|<non-negative-length-percentage>"),
-    ("grid-row-start", "*"),
-    ("grid-template", "*"),
-    ("grid-template-areas", "*"),
-    ("grid-template-columns", "*"),
-    ("grid-template-rows", "*"),
-    (
-        "height",
-        "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
-    ),
-    (
-        "inline-size",
-        "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
-    ),
-    ("inset", "[auto|<length-percentage>]{1,4}"),
-    ("inset-block", "[auto|<length-percentage>]{1,2}"),
-    ("inset-block-end", "auto|<length-percentage>"),
-    ("inset-block-start", "auto|<length-percentage>"),
-    ("inset-inline", "[auto|<length-percentage>]{1,2}"),
-    ("inset-inline-end", "auto|<length-percentage>"),
-    ("inset-inline-start", "auto|<length-percentage>"),
-    ("isolation", "auto|isolate"),
-    (
-        "justify-content",
-        "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    ),
-    (
-        "justify-items",
-        "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    ),
-    (
-        "justify-self",
-        "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    ),
-    ("left", "auto|<length-percentage>"),
-    ("letter-spacing", "normal|<length-percentage>"),
-    ("line-clamp", "none|<integer>|*"),
-    (
-        "line-height",
-        "normal|<non-negative-number>|<non-negative-length-percentage>",
-    ),
-    ("list-style", "*"),
-    ("list-style-image", "none"),
-    ("list-style-position", "inside|outside"),
-    ("list-style-type", "*"),
-    ("margin", "[auto|<length-percentage>]{1,4}"),
-    ("margin-block", "[auto|<length-percentage>]{1,2}"),
-    ("margin-block-end", "auto|<length-percentage>"),
-    ("margin-block-start", "auto|<length-percentage>"),
-    ("margin-bottom", "auto|<length-percentage>"),
-    ("margin-inline", "[auto|<length-percentage>]{1,2}"),
-    ("margin-inline-end", "auto|<length-percentage>"),
-    ("margin-inline-start", "auto|<length-percentage>"),
-    ("margin-left", "auto|<length-percentage>"),
-    ("margin-right", "auto|<length-percentage>"),
-    ("margin-top", "auto|<length-percentage>"),
-    ("mask", "*"),
-    ("mask-image", "[none|<image>]#"),
-    ("mask-position", "*"),
-    (
-        "mask-repeat",
-        "[repeat|repeat-x|repeat-y|no-repeat|space|round]#",
-    ),
-    ("mask-size", "*"),
-    (
-        "max-block-size",
-        "none|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available",
-    ),
-    (
-        "max-height",
-        "none|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available",
-    ),
-    (
-        "max-inline-size",
-        "none|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available",
-    ),
-    (
-        "max-width",
-        "none|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available",
-    ),
-    (
-        "min-block-size",
-        "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
-    ),
-    (
-        "min-height",
-        "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
-    ),
-    (
-        "min-inline-size",
-        "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
-    ),
-    (
-        "min-width",
-        "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
-    ),
-    (
-        "mix-blend-mode",
-        "[normal|multiply|screen|overlay|darken|lighten|color-dodge|color-burn|hard-light|soft-light|difference|exclusion|hue|saturation|color|luminosity|plus-lighter]#",
-    ),
-    ("object-fit", "fill|contain|cover|none|scale-down"),
-    ("opacity", "<number>|<percentage>"),
-    ("order", "<integer>"),
-    (
-        "outline",
-        "[thin|medium|thick|<non-negative-length>|auto|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset|<color>]{1,3}",
-    ),
-    ("outline-color", "auto|<color>"),
-    ("outline-offset", "<length>"),
-    (
-        "outline-style",
-        "auto|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset",
-    ),
-    ("outline-width", "thin|medium|thick|<non-negative-length>"),
-    ("overflow", "[visible|hidden|clip|scroll|auto|overlay]{1,2}"),
-    ("overflow-wrap", "normal|break-word|anywhere"),
-    ("overflow-x", "visible|hidden|clip|scroll|auto|overlay"),
-    ("overflow-y", "visible|hidden|clip|scroll|auto|overlay"),
-    ("overlay", "none|auto"),
-    ("overscroll-behavior", "[auto|contain|none]{1,2}"),
-    ("overscroll-behavior-block", "auto|contain|none"),
-    ("overscroll-behavior-inline", "auto|contain|none"),
-    ("overscroll-behavior-x", "auto|contain|none"),
-    ("overscroll-behavior-y", "auto|contain|none"),
-    ("padding", "[<non-negative-length-percentage>]{1,4}"),
-    ("padding-block", "[<non-negative-length-percentage>]{1,2}"),
-    ("padding-block-end", "<non-negative-length-percentage>"),
-    ("padding-block-start", "<non-negative-length-percentage>"),
-    ("padding-bottom", "<non-negative-length-percentage>"),
-    ("padding-inline", "[<non-negative-length-percentage>]{1,2}"),
-    ("padding-inline-end", "<non-negative-length-percentage>"),
-    ("padding-inline-start", "<non-negative-length-percentage>"),
-    ("padding-left", "<non-negative-length-percentage>"),
-    ("padding-right", "<non-negative-length-percentage>"),
-    ("padding-top", "<non-negative-length-percentage>"),
-    ("perspective", "none|<non-negative-length>"),
-    ("perspective-origin", "*"),
-    (
-        "place-content",
-        "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    ),
-    (
-        "place-items",
-        "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    ),
-    (
-        "place-self",
-        "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
-    ),
-    (
-        "pointer-events",
-        "auto|none|visiblepainted|visiblefill|visiblestroke|visible|painted|fill|stroke|all",
-    ),
-    ("position", "static|relative|absolute|fixed|sticky"),
-    ("resize", "none|both|horizontal|vertical|block|inline"),
-    ("right", "auto|<length-percentage>"),
-    ("rotate", "*"),
-    ("row-gap", "normal|<non-negative-length-percentage>"),
-    ("scale", "*"),
-    ("scroll-behavior", "auto|smooth"),
-    ("scroll-margin", "[<length>]{1,4}"),
-    (
-        "scroll-padding",
-        "[auto|<non-negative-length-percentage>]{1,4}",
-    ),
-    ("scrollbar-color", "auto|[<color>]+"),
-    ("scrollbar-gutter", "auto|stable|[stable|both-edges]+"),
-    ("scrollbar-width", "auto|thin|none"),
-    ("stroke", "*"),
-    ("stroke-linecap", "butt|round|square"),
-    ("stroke-linejoin", "miter|round|bevel|miter-clip|arcs"),
-    ("stroke-opacity", "<number>|<percentage>"),
-    ("stroke-width", "<length-percentage>|<number>"),
-    (
-        "text-align",
-        "start|end|left|right|center|justify|match-parent|-webkit-left|-webkit-right|-webkit-center|-internal-center",
-    ),
-    (
-        "text-align-last",
-        "auto|start|end|left|right|center|justify|match-parent",
-    ),
-    ("text-box", "*"),
-    ("text-box-edge", "*"),
-    ("text-box-trim", "none|trim-start|trim-end|trim-both"),
-    ("text-decoration", "*"),
-    ("text-decoration-color", "<color>"),
-    (
-        "text-decoration-line",
-        "none|[underline|overline|line-through|blink]+",
-    ),
-    ("text-decoration-style", "solid|double|dotted|dashed|wavy"),
-    (
-        "text-decoration-thickness",
-        "auto|from-font|<length-percentage>",
-    ),
-    ("text-indent", "*"),
-    ("text-overflow", "clip|ellipsis"),
-    ("text-shadow", "*"),
-    (
-        "text-transform",
-        "none|capitalize|uppercase|lowercase|full-width|full-size-kana",
-    ),
-    ("text-underline-offset", "auto|<length-percentage>"),
-    ("text-wrap", "[wrap|nowrap|balance|pretty|stable|auto]+"),
-    ("top", "auto|<length-percentage>"),
-    (
-        "transform",
-        "none|[matrix(|matrix3d(|translate(|translate3d(|translatex(|translatey(|translatez(|scale(|scale3d(|scalex(|scaley(|scalez(|rotate(|rotate3d(|rotatex(|rotatey(|rotatez(|skew(|skewx(|skewy(|perspective(]+",
-    ),
-    ("transform-origin", "*"),
-    ("transform-style", "flat|preserve-3d"),
-    ("transition", "*"),
-    ("transition-behavior", "[normal|allow-discrete]#"),
-    ("transition-delay", "[<time>]#"),
-    ("transition-duration", "[<time>]#"),
-    ("transition-property", "*"),
-    ("transition-timing-function", "[<easing-function>]#"),
-    ("translate", "*"),
-    (
-        "unicode-bidi",
-        "normal|embed|isolate|bidi-override|isolate-override|plaintext",
-    ),
-    ("user-select", "auto|none|text|all|contain"),
-    (
-        "vertical-align",
-        "baseline|sub|super|text-top|text-bottom|middle|top|bottom|<length-percentage>",
-    ),
-    ("visibility", "visible|hidden|collapse"),
-    (
-        "white-space",
-        "normal|pre|nowrap|pre-wrap|pre-line|break-spaces",
-    ),
-    (
-        "width",
-        "auto|<non-negative-length-percentage>|min-content|max-content|fit-content|fit-content(|stretch|-webkit-fill-available|-webkit-min-content|-webkit-max-content|-webkit-fit-content",
-    ),
-    ("will-change", "*"),
-    ("word-break", "normal|break-all|break-word"),
-    ("word-spacing", "normal|<length>"),
-    ("word-wrap", "normal|break-word|anywhere"),
-    (
-        "writing-mode",
-        "horizontal-tb|vertical-rl|vertical-lr|sideways-rl|sideways-lr",
-    ),
-    ("z-index", "auto|<integer>"),
-];
+fn grammar(name: &str) -> Option<&'static str> {
+    match name {
+        "-webkit-text-decoration" => Some("*"),
+        _ => Prop::find(name)?.grammar(),
+    }
+}
 
 pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
     let value = value.trim();
     if name.starts_with("--") {
         return Some(true);
     }
-    let grammar = SUPPORTED_PROPERTIES
-        .binary_search_by(|(property, _)| (*property).cmp(name))
-        .ok()
-        .map(|index| SUPPORTED_PROPERTIES[index].1)?;
+    let grammar = grammar(name)?;
     let lower = value.to_ascii_lowercase();
     Some(
         !value.is_empty()
@@ -2261,10 +1590,7 @@ fn fold(name: &str, value: &str) -> Option<String> {
     if !value.ends_with(')') {
         return None;
     }
-    let grammar = SUPPORTED_PROPERTIES
-        .binary_search_by(|(property, _)| (*property).cmp(name))
-        .ok()
-        .map(|index| SUPPORTED_PROPERTIES[index].1)?;
+    let grammar = grammar(name)?;
     let integer = grammar.contains("integer>");
     if !integer && !grammar.contains("number>") {
         return None;
@@ -2645,17 +1971,7 @@ pub(crate) fn resolved(
             let images = list("background", "image", "image");
             let layers: Vec<String> = (0..images.len())
                 .map(|index| {
-                    let pick = |key: &str| {
-                        let values = components(&get(&format!("background-{key}")), ',')
-                            .into_iter()
-                            .map(str::trim)
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>();
-                        values
-                            .get(index % values.len().max(1))
-                            .cloned()
-                            .unwrap_or_default()
-                    };
+                    let pick = |key: &str| list("background", key, "image").swap_remove(index);
                     let mut layer = format!(
                         "{} {} {} {} / {} {} {}",
                         images[index],
@@ -3402,20 +2718,18 @@ pub(crate) fn supports_condition(condition: &str) -> bool {
 }
 
 pub(crate) fn reduced_motion() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe extern "C" {
-            fn apps_reduce_motion() -> bool;
-        }
-        unsafe { apps_reduce_motion() }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
+    crate::desktop::native::theme_state() & 32 != 0
 }
 
 impl MediaQuery {
+    fn list(queries: &[Self], [width, height]: [f32; 2], reduced_motion: bool, theme: u32) -> bool {
+        queries.is_empty()
+            || queries.iter().any(|query| {
+                let lengths = Lengths::new(16., width, height);
+                query.matches(width, height, reduced_motion, theme, lengths) == Some(true)
+            })
+    }
+
     fn matches(
         &self,
         width: f32,
@@ -3622,21 +2936,6 @@ impl MediaQuery {
     }
 }
 
-impl Collect<'_> {
-    fn media(&self, queries: &[MediaQuery]) -> bool {
-        queries.is_empty()
-            || queries.iter().any(|query| {
-                query.matches(
-                    self.width,
-                    self.height,
-                    self.reduced_motion,
-                    self.native_theme,
-                    Lengths::new(16., self.width, self.height),
-                ) == Some(true)
-            })
-    }
-}
-
 struct Collect<'a> {
     width: f32,
     height: f32,
@@ -3654,6 +2953,15 @@ struct Collect<'a> {
 }
 
 impl Collect<'_> {
+    fn media(&self, queries: &[MediaQuery]) -> bool {
+        MediaQuery::list(
+            queries,
+            [self.width, self.height],
+            self.reduced_motion,
+            self.native_theme,
+        )
+    }
+
     // A new layer moves the ranks of others, so this runs once, after every sheet is collected.
     fn rank(&mut self) {
         let mut sorted: Vec<usize> = (0..self.layers.len()).collect();
@@ -3702,17 +3010,13 @@ impl Rule {
     fn collect<'a>(
         &'a self,
         parent: Option<&'a SelectorList>,
-        layer: &str,
+        layer: Option<usize>,
         collected: &mut Collect<'a>,
     ) {
         match self {
             Self::Declarations(values) => {
                 if let Some(parent) = parent {
-                    let rank = collected
-                        .layers
-                        .iter()
-                        .position(|(name, _)| name == layer)
-                        .map_or(UNLAYERED, |index| index as u32);
+                    let rank = layer.map_or(UNLAYERED, |index| index as u32);
                     collected.rules.push((
                         parent,
                         values,
@@ -3734,7 +3038,6 @@ impl Rule {
             }
             Self::Variant(..) | Self::Utility(..) | Self::FontFace(_) | Self::Tailwind(_) => {}
             Self::Property(name, ..) | Self::Keyframes(name, _) => {
-                let index = collected.layers.iter().position(|(name, _)| name == layer);
                 let path = |index: Option<usize>| {
                     index
                         .map_or(&[][..], |index| &collected.layers[index].1[..])
@@ -3746,11 +3049,11 @@ impl Rule {
                 if collected
                     .layered
                     .get(&key)
-                    .is_some_and(|&old| path(old).gt(path(index)))
+                    .is_some_and(|&old| path(old).gt(path(layer)))
                 {
                     return;
                 }
-                collected.layered.insert(key, index);
+                collected.layered.insert(key, layer);
                 match self {
                     Self::Property(name, syntax, inherits, initial) => {
                         collected.properties.insert(
@@ -3780,17 +3083,18 @@ impl Rule {
                     names.clone()
                 };
                 for name in names {
-                    let name = if layer.is_empty() {
-                        name
-                    } else {
-                        format!("{layer}.{name}")
+                    let name = match layer {
+                        Some(outer) => format!("{}.{name}", collected.layers[outer].0),
+                        None => name,
                     };
-                    let mut route = Vec::new();
+                    let (mut route, mut index) = (Vec::new(), 0);
                     for (end, _) in name.match_indices('.').chain([(name.len(), "")]) {
                         let path = &name[..end];
                         let owner = path.rsplit_once('.').map_or("", |(owner, _)| owner);
-                        route = match collected.layers.iter().find(|(name, _)| name == path) {
-                            Some((_, route)) => route.clone(),
+                        let found = collected.layers.iter().position(|(name, _)| name == path);
+                        index = found.unwrap_or(collected.layers.len());
+                        route = match found {
+                            Some(found) => collected.layers[found].1.clone(),
                             None => {
                                 let siblings = collected
                                     .layers
@@ -3807,7 +3111,7 @@ impl Rule {
                         };
                     }
                     for rule in children {
-                        rule.collect(parent, &name, collected);
+                        rule.collect(parent, Some(index), collected);
                     }
                 }
             }
@@ -3978,6 +3282,7 @@ pub(crate) struct Shadows {
     pub composed: FxHashMap<usize, Vec<usize>>,
 }
 
+#[derive(Default)]
 struct TreeWalk {
     walk: crate::dom::Walk,
     built: (u64, Rc<Shadows>),
@@ -3986,27 +3291,6 @@ struct TreeWalk {
     trees: Rc<Vec<(usize, usize)>>,
     special: Vec<Vec<usize>>,
     tables: Vec<usize>,
-}
-
-#[derive(Default)]
-pub(crate) struct SpareStyles {
-    values: Chunked<Rc<Style>>,
-    vars: Chunked<Vars>,
-    flags: Chunked<u8>,
-    lengths: NodeLengths,
-    user_select: Chunked<(UserSelect, usize)>,
-}
-
-impl From<ComputedStyles> for SpareStyles {
-    fn from(styles: ComputedStyles) -> Self {
-        Self {
-            values: styles.values,
-            vars: styles.vars,
-            flags: styles.flags,
-            lengths: styles.lengths,
-            user_select: styles.user_select,
-        }
-    }
 }
 
 thread_local! {
@@ -4083,40 +3367,6 @@ pub fn styles(doc: &Document, width: f32, height: f32) -> Vec<BBTreeMap<String, 
         .collect()
 }
 
-pub(crate) fn compute_styles(
-    doc: &Document,
-    width: f32,
-    height: f32,
-    text_system: Option<&renderer::TextSystem>,
-    cache: &mut HashMap<Rc<str>, Rc<Stylesheet>>,
-    style_cache: &mut StyleCache,
-    context: Option<&StyleContext>,
-) -> ComputedStyles {
-    let spare = style_cache.spare.take().unwrap_or_default();
-    let mut out = ComputedStyles {
-        values: spare.values,
-        vars: spare.vars,
-        flags: spare.flags,
-        lengths: spare.lengths,
-        user_select: spare.user_select,
-        ..Default::default()
-    };
-    out.values.clear();
-    out.vars.clear();
-    out.flags.clear();
-    out.user_select.clear();
-    cascade(
-        doc,
-        [width, height],
-        text_system,
-        cache,
-        style_cache,
-        context,
-        &mut out,
-    );
-    out
-}
-
 pub(crate) fn font_lists(doc: &Document) -> Vec<Vec<String>> {
     let mut lists = Vec::new();
     let mut pending: Vec<&Rule> = doc
@@ -4173,15 +3423,16 @@ pub(crate) fn font_names(system: &renderer::TextSystem, aliases: &HashMap<String
     });
 }
 
-pub(crate) fn cascade(
+pub(crate) fn compute_styles(
     doc: &Document,
-    [width, height]: [f32; 2],
+    width: f32,
+    height: f32,
     text_system: Option<&renderer::TextSystem>,
     cache: &mut HashMap<Rc<str>, Rc<Stylesheet>>,
     style_cache: &mut StyleCache,
     context: Option<&StyleContext>,
-    out: &mut ComputedStyles,
-) {
+) -> ComputedStyles {
+    let mut out = ComputedStyles::default();
     let (reduced_motion, native_theme) = context.map_or_else(
         || (reduced_motion(), crate::desktop::native::theme_state()),
         |context| (context.reduced_motion, context.theme),
@@ -4216,7 +3467,7 @@ pub(crate) fn cascade(
         .filter(|previous| {
             previous.values.len() <= doc.nodes.len() && previous.lengths.list_len() <= 4096
         });
-    let mut fast = out.values.is_empty() && previous.is_some() && !style_cache.full;
+    let mut fast = previous.is_some() && !style_cache.full;
     // This scan relies on the page setting `top_layer` whenever a node is fullscreen.
     let fullscreen = context.is_none_or(|context| context.top_layer)
         && order
@@ -4230,20 +3481,21 @@ pub(crate) fn cascade(
     };
     let scale = context.map_or(1., |context| context.scale);
     let metrics = text_system.map(|_| scale);
-    if style_cache.viewport != [width, height]
-        || style_cache.metrics != metrics
-        || style_cache.reduced_motion != reduced_motion
-        || style_cache.native_theme != native_theme
+    let old = &mut style_cache.environment;
+    if old.viewport != [width, height]
+        || old.metrics != metrics
+        || old.reduced_motion != reduced_motion
+        || old.native_theme != native_theme
     {
         fast = false;
         style_cache.full = true;
-        let resized = style_cache.metrics == metrics
-            && style_cache.reduced_motion == reduced_motion
-            && style_cache.native_theme == native_theme;
-        style_cache.viewport = [width, height];
-        style_cache.metrics = metrics;
-        style_cache.reduced_motion = reduced_motion;
-        style_cache.native_theme = native_theme;
+        let resized = old.metrics == metrics
+            && old.reduced_motion == reduced_motion
+            && old.native_theme == native_theme;
+        old.viewport = [width, height];
+        old.metrics = metrics;
+        old.reduced_motion = reduced_motion;
+        old.native_theme = native_theme;
         style_cache.values.retain(|_, values| {
             values.retain(|value| resized && !value.viewport);
             !values.is_empty()
@@ -4397,7 +3649,7 @@ pub(crate) fn cascade(
         {
             let mut added = blank();
             for rule in &update.rules {
-                rule.collect(None, "", &mut added);
+                rule.collect(None, None, &mut added);
             }
             let old: Vec<_> = update
                 .replaced
@@ -4506,7 +3758,7 @@ pub(crate) fn cascade(
                     let first = collected.rules.len();
                     for (rule, &flag) in sheet.0.iter().zip(flags) {
                         let start = collected.rules.len();
-                        rule.collect(None, "", &mut collected);
+                        rule.collect(None, None, &mut collected);
                         new.extend(std::iter::repeat_n(flag, collected.rules.len() - start));
                     }
                     if builtin != 0 && index == 0 {
@@ -4524,7 +3776,7 @@ pub(crate) fn cascade(
                 let mut removed = blank();
                 for (sheet, index) in &gone {
                     if let Some(rule) = sheet.0.get(*index) {
-                        rule.collect(None, "", &mut removed);
+                        rule.collect(None, None, &mut removed);
                     }
                 }
                 let cached = &mut style_cache.scopes[index];
@@ -4698,7 +3950,7 @@ pub(crate) fn cascade(
                 let sheet = &sheets[index];
                 let first = collected.rules.len();
                 for rule in &sheet.0 {
-                    rule.collect(None, "", &mut collected);
+                    rule.collect(None, None, &mut collected);
                 }
                 if builtin != 0 && index == 0 {
                     let count = collected.rules.len() - first;
@@ -4718,7 +3970,7 @@ pub(crate) fn cascade(
             }
             .with(Clone::clone);
             for rule in &ua.0 {
-                rule.collect(None, "", &mut collected);
+                rule.collect(None, None, &mut collected);
             }
             for rule in &mut collected.rules {
                 rule.2.origin = AGENT;
@@ -4736,27 +3988,13 @@ pub(crate) fn cascade(
             style_cache.next += 1;
             let mut scope = StyleScope {
                 id: style_cache.next,
-                used: 0,
                 fullscreen,
                 sheets: sheets.clone(),
-                rules: Vec::new(),
                 layers,
-                pseudos: Vec::new(),
-                arguments: FxHashMap::default(),
-                elements: Vec::new(),
-                buckets: Default::default(),
-                universal: Vec::new(),
-                containers: Vec::new(),
                 blocks,
-                medias: Vec::new(),
                 keyframes,
                 properties,
-                states: 0,
-                nodes: Vec::new(),
-                lists: Default::default(),
-                keys: Vec::new(),
-                block: None,
-                sequence: 0,
+                ..Default::default()
             };
             scope.push(
                 rules,
@@ -4792,35 +4030,18 @@ pub(crate) fn cascade(
                 .iter()
                 .map(|(&prop, value)| (prop, value.clone())),
         );
-        if registry != *style_cache.registry {
-            style_cache.registry = Rc::new(registry);
-            style_cache.values.clear();
+        if registry != *style_cache.environment.registry {
+            style_cache.environment.registry = Rc::new(registry);
             style_cache.inheritable.clear();
-            for scope in &mut style_cache.scopes {
-                for node in scope.nodes.iter_mut().flatten() {
-                    node.cached = None;
-                }
-            }
+            style_cache.uncache();
         }
     }
-    if scheme != style_cache.scheme {
-        style_cache.scheme = scheme.clone();
-        style_cache.values.clear();
-        for scope in &mut style_cache.scopes {
-            for node in scope.nodes.iter_mut().flatten() {
-                node.cached = None;
-            }
-        }
+    if scheme != style_cache.environment.scheme {
+        style_cache.environment.scheme = scheme.clone();
+        style_cache.uncache();
     }
-    let registry = style_cache.registry.clone();
-    let environment = Environment {
-        viewport: [width, height],
-        metrics,
-        reduced_motion,
-        native_theme,
-        registry: registry.clone(),
-        scheme: style_cache.scheme.clone(),
-    };
+    let environment = style_cache.environment.clone();
+    let registry = environment.registry.clone();
     let mut used: Vec<(usize, usize, usize)> = walk
         .trees
         .iter()
@@ -4842,38 +4063,36 @@ pub(crate) fn cascade(
             })
     });
     out.registry = registry.clone();
-    if out.values.is_empty() {
-        let count = doc.nodes.len();
-        match previous.filter(|_| fast) {
-            Some(previous) => {
-                out.values.clone_from(&previous.values);
-                out.vars.clone_from(&previous.vars);
-                out.flags.clone_from(&previous.flags);
-                out.lengths.clone_from(&previous.lengths);
-                out.lengths.grow(count);
-                out.pseudos.clone_from(&previous.pseudos);
-                out.text_pseudos.clone_from(&previous.text_pseudos);
-                out.backdrops.clone_from(&previous.backdrops);
-                out.backdrop_starts.clone_from(&previous.backdrop_starts);
-                out.counting.clone_from(&previous.counting);
-                out.scrollbars.clone_from(&previous.scrollbars);
-                out.selections.clone_from(&previous.selections);
-                out.animations.clone_from(&previous.animations);
-                out.important.clone_from(&previous.important);
-                out.starting.clone_from(&previous.starting);
-                out.containers.clone_from(&previous.containers);
-                out.slotted.clone_from(&previous.slotted);
-                out.parts.clone_from(&previous.parts);
-                out.exported.clone_from(&previous.exported);
-            }
-            None => out.lengths.reset(count, Lengths::new(16., width, height)),
+    let count = doc.nodes.len();
+    match previous.filter(|_| fast) {
+        Some(previous) => {
+            out.values.clone_from(&previous.values);
+            out.vars.clone_from(&previous.vars);
+            out.flags.clone_from(&previous.flags);
+            out.lengths.clone_from(&previous.lengths);
+            out.lengths.grow(count);
+            out.pseudos.clone_from(&previous.pseudos);
+            out.text_pseudos.clone_from(&previous.text_pseudos);
+            out.backdrops.clone_from(&previous.backdrops);
+            out.backdrop_starts.clone_from(&previous.backdrop_starts);
+            out.counting.clone_from(&previous.counting);
+            out.scrollbars.clone_from(&previous.scrollbars);
+            out.selections.clone_from(&previous.selections);
+            out.animations.clone_from(&previous.animations);
+            out.important.clone_from(&previous.important);
+            out.starting.clone_from(&previous.starting);
+            out.containers.clone_from(&previous.containers);
+            out.slotted.clone_from(&previous.slotted);
+            out.parts.clone_from(&previous.parts);
+            out.exported.clone_from(&previous.exported);
         }
-        let (style, vars) = empty();
-        out.values.resize(count, style);
-        out.vars.resize(count, vars);
-        out.flags.resize(count, 0);
-        out.containers.resize(count, None);
+        None => out.lengths.reset(count, Lengths::new(16., width, height)),
     }
+    let (style, vars) = empty();
+    out.values.resize(count, style);
+    out.vars.resize(count, vars);
+    out.flags.resize(count, 0);
+    out.containers.resize(count, None);
     let mut inheritable = std::mem::take(&mut style_cache.inheritable);
     let mut local: Vec<Prop> = registry
         .iter()
@@ -4937,7 +4156,7 @@ pub(crate) fn cascade(
         containers,
         counted,
         ..
-    } = &mut *out;
+    } = &mut out;
     macro_rules! unstyle {
         ($id:expr) => {
             pseudos.remove(&$id);
@@ -5120,13 +4339,14 @@ pub(crate) fn cascade(
         };
         ($id:expr, $up:expr, $seen:expr) => {
             let id = $id;
-            containers[id] = match Container::of(id, &styles[id], $seen.clone()) {
+            let link = match Container::of(id, &styles[id], $seen.clone()) {
                 Some(link) => match last.and_then(|last| last.containers.get(id)?.as_ref()) {
                     Some(old) if **old == link => Some(old.clone()),
                     _ => Some(Rc::new(link)),
                 },
                 None => $seen,
             };
+            containers.set(id, link, |a, b| address(Some(a)) == address(Some(b)));
             settle!(@changed id, $up);
         };
     }
@@ -5219,11 +4439,13 @@ pub(crate) fn cascade(
         let node = &doc.nodes[id];
         if tree != 0 && walk.trees[tree].0 == id {
             let host = walk.trees[tree].1;
-            styles[id] = styles[host].clone();
-            custom[id] = custom[host].clone();
-            style_flags[id] = style_flags[host];
+            styles.set(id, styles[host].clone(), Rc::ptr_eq);
+            custom.set(id, custom[host].clone(), Rc::ptr_eq);
+            style_flags.set(id, style_flags[host], u8::eq);
             lengths.set(id, lengths[host]);
-            containers[id] = containers[host].clone();
+            containers.set(id, containers[host].clone(), |a, b| {
+                address(Some(a)) == address(Some(b))
+            });
             if let Some(selection) = selections.get(&host).cloned() {
                 selections.insert(id, selection);
             }
@@ -5257,6 +4479,23 @@ pub(crate) fn cascade(
         let inputs = Inputs::new(parent, root);
         let mut waiting: Vec<(usize, usize, ContainerQuery)> = Vec::new();
         let mut shadow: Vec<ShadowRule> = Vec::new();
+        let mut contained =
+            |rule: &mut ShadowRule, key: (usize, usize), conditions: &ContainerQuery| {
+                let applies = query_containers(
+                    conditions,
+                    seen.as_deref(),
+                    key,
+                    &style_cache.containers,
+                    |container| lengths[container],
+                    &mut style_cache.queries,
+                );
+                if matches!(rule.kind, ELEMENT | STARTING) {
+                    return applies;
+                }
+                waiting.push((key.0, key.1, conditions.clone()));
+                rule.query = Some((key.0, key.1, applies));
+                true
+            };
         hosted.clear();
         if let Some(&root) = shadows.roots.get(&id)
             && let Some(&index) = walk
@@ -5275,7 +4514,7 @@ pub(crate) fn cascade(
                 for &entry in inner.universal.iter().filter(|&&entry| entry < PSEUDO) {
                     let (order, index) = (entry >> SELECTOR, entry & ((1 << SELECTOR) - 1));
                     let selector = &inner.rules[order].0[index];
-                    if selector.matches_reusing(doc, root, matches) {
+                    if selector.matches_cached(doc, root, None, matches) {
                         match matched.last_mut() {
                             Some(last) if last.0 == order => {
                                 last.1 = last.1.max(selector.specificity)
@@ -5291,7 +4530,9 @@ pub(crate) fn cascade(
                     .map(|&index| index & !PSEUDO)
                     .filter(|&index| {
                         let (kind, selector, _, key) = &inner.pseudos[index];
-                        key.is_none() && *kind != 12 && selector.matches_reusing(doc, root, matches)
+                        key.is_none()
+                            && *kind != 12
+                            && selector.matches_cached(doc, root, None, matches)
                     })
                     .collect();
                 matches.dependencies.sort_unstable();
@@ -5333,7 +4574,7 @@ pub(crate) fn cascade(
                     declarations: declarations.clone(),
                     query: None,
                 };
-                if kind == 13 {
+                if kind == PART {
                     if let Some((name, compound, target)) = inner.arguments.get(&pseudo) {
                         rule.kind = *target;
                         rule.context = 0;
@@ -5348,23 +4589,10 @@ pub(crate) fn cascade(
                     }
                     continue;
                 }
-                if let Some(conditions) = &inner.containers[order] {
-                    let applies = query_containers(
-                        conditions,
-                        seen.as_deref(),
-                        (inner.id, order),
-                        &style_cache.containers,
-                        |container| lengths[container],
-                        &mut style_cache.queries,
-                    );
-                    if matches!(kind, ELEMENT | 14) {
-                        if !applies {
-                            continue;
-                        }
-                    } else {
-                        waiting.push((inner.id, order, conditions.clone()));
-                        rule.query = Some((inner.id, order, applies));
-                    }
+                if let Some(conditions) = &inner.containers[order]
+                    && !contained(&mut rule, (inner.id, order), conditions)
+                {
+                    continue;
                 }
                 shadow.push(rule);
             }
@@ -5393,28 +4621,15 @@ pub(crate) fn cascade(
                 if !passed
                     .compound
                     .iter()
-                    .any(|selector| selector.matches_reusing(doc, id, matches))
+                    .any(|selector| selector.matches_cached(doc, id, None, matches))
                 {
                     continue;
                 }
                 let mut rule = passed.rule.clone();
-                if let Some((scope, order, conditions)) = &passed.conditions {
-                    let applies = query_containers(
-                        conditions,
-                        seen.as_deref(),
-                        (*scope, *order),
-                        &style_cache.containers,
-                        |container| lengths[container],
-                        &mut style_cache.queries,
-                    );
-                    if matches!(rule.kind, ELEMENT | 14) {
-                        if !applies {
-                            continue;
-                        }
-                    } else {
-                        waiting.push((*scope, *order, conditions.clone()));
-                        rule.query = Some((*scope, *order, applies));
-                    }
+                if let Some((scope, order, conditions)) = &passed.conditions
+                    && !contained(&mut rule, (*scope, *order), conditions)
+                {
+                    continue;
                 }
                 shadow.push(rule);
             }
@@ -5438,9 +4653,9 @@ pub(crate) fn cascade(
                 )
             });
         if let Some((style, vars, flags, units)) = text.as_ref().and_then(|text| texts.get(text)) {
-            styles[id] = style.clone();
-            custom[id] = vars.clone();
-            style_flags[id] = *flags;
+            styles.set(id, style.clone(), Rc::ptr_eq);
+            custom.set(id, vars.clone(), Rc::ptr_eq);
+            style_flags.set(id, *flags, u8::eq);
             lengths.set(id, *units);
             settle!(id, up, seen);
             continue;
@@ -5449,6 +4664,7 @@ pub(crate) fn cascade(
         let (rules, keys, scope) = (&scoped.rules, &scoped.keys, scoped.id);
         let mut key = None;
         let mut passed = None;
+        let mut written = None;
         let mut moved = false;
         let mut contained = false;
         let mut reuse =
@@ -5471,7 +4687,30 @@ pub(crate) fn cascade(
                         // Nodes with one style and one parent list must share the new list, or the
                         // nodes below them cannot share their styles.
                         let key = (Rc::as_ptr(new), value.own.as_ptr());
-                        let merge = || merged(inherit(new), &value.own);
+                        let merge = || {
+                            let vars = inherit(new);
+                            if value
+                                .own
+                                .iter()
+                                .all(|(prop, own)| var(&vars, *prop) == own.as_ref())
+                            {
+                                return vars;
+                            }
+                            let mut list = (*vars).clone();
+                            for (prop, own) in &value.own {
+                                match (list.binary_search_by_key(prop, |entry| entry.0), own) {
+                                    (Ok(index), Some(own)) => list[index].1 = own.clone(),
+                                    (Err(index), Some(own)) => {
+                                        list.insert(index, (*prop, own.clone()))
+                                    }
+                                    (Ok(index), None) => {
+                                        list.remove(index);
+                                    }
+                                    (Err(_), None) => {}
+                                }
+                            }
+                            Rc::new(list)
+                        };
                         (merges.entry(key).or_insert_with(merge).clone(), true)
                     })
                 }
@@ -5598,7 +4837,7 @@ pub(crate) fn cascade(
                                 && if fresh {
                                     selector.matches_fresh(doc, id, matches)
                                 } else {
-                                    selector.matches_reusing(doc, id, matches)
+                                    selector.matches_cached(doc, id, None, matches)
                                 }
                     };
                     let (mut matched, mut matched_pseudos) = (Vec::new(), Vec::new());
@@ -5729,7 +4968,7 @@ pub(crate) fn cascade(
                         .copied()
                         .filter(|&index| {
                             let (kind, _, order, _) = &scoped.pseudos[index];
-                            applies(*order, matches!(kind, 12 | 13))
+                            applies(*order, matches!(*kind, SLOTTED | PART))
                         })
                         .collect(),
                     false => matched_pseudos,
@@ -5823,7 +5062,15 @@ pub(crate) fn cascade(
                         });
                     StyleRef(passed.clone())
                 });
-                let source = inline_source(node);
+                let source = node
+                    .attrs
+                    .get("style")
+                    .map(|source| Cow::Borrowed(source.as_str()))
+                    .or_else(|| {
+                        node.inline
+                            .as_ref()
+                            .map(|inline| Cow::Owned(inline.source()))
+                    });
                 let mut resolved = StyleKey {
                     scope,
                     tag: match style_cache.tags.get(node.tag.as_str()) {
@@ -5871,6 +5118,7 @@ pub(crate) fn cascade(
                     })
                 });
                 key = Some(resolved);
+                written = source;
                 value
             });
         if let Some((cached, vars)) = cached {
@@ -5896,9 +5144,9 @@ pub(crate) fn cascade(
                     }
                 }
             }
-            styles[id] = cached.style.clone();
-            custom[id] = vars;
-            style_flags[id] = cached.flags;
+            styles.set(id, cached.style.clone(), Rc::ptr_eq);
+            custom.set(id, vars, Rc::ptr_eq);
+            style_flags.set(id, cached.flags, u8::eq);
             lengths.set(
                 id,
                 Lengths {
@@ -5974,16 +5222,12 @@ pub(crate) fn cascade(
             let (_, declarations, layer) = &rules[order];
             for &(prop, ref value, important, position) in declarations.iter() {
                 let rank = CascadeRank::rule(*layer, important, specificity, keys[order], position);
-                if cascade.get(&prop).is_none_or(|(old, _)| rank >= *old) {
-                    cascade.insert(prop, (rank, value.clone()));
-                }
+                put(&mut cascade, prop, rank, value.clone());
             }
         }
         for (prop, value) in &key.hints {
             let rank = CascadeRank::new(HINT, false, 0, [0; 3], 0);
-            if cascade.get(prop).is_none_or(|(old, _)| rank >= *old) {
-                cascade.insert(*prop, (rank, value.clone()));
-            }
+            put(&mut cascade, *prop, rank, value.clone());
         }
         let inline = node.inline.as_ref().map(Cow::Borrowed).or_else(|| {
             node.attrs
@@ -5997,9 +5241,7 @@ pub(crate) fn cascade(
                     position,
                     ..CascadeRank::new(AUTHOR, important, UNLAYERED, [0; 3], u128::MAX)
                 };
-                if cascade.get(&prop).is_none_or(|(old, _)| rank >= *old) {
-                    cascade.insert(prop, (rank, value));
-                }
+                put(&mut cascade, prop, rank, value);
             }
         }
         let ranked = |rule: &ShadowRule, important: bool, position: u16| CascadeRank {
@@ -6040,12 +5282,10 @@ pub(crate) fn cascade(
                     }),
             );
         for (prop, value, rank) in foreign {
-            if cascade.get(&prop).is_none_or(|(old, _)| rank >= *old) {
-                cascade.insert(prop, (rank, value));
-            }
+            put(&mut cascade, prop, rank, value);
         }
         if node.tag == "html"
-            && let Some(scheme) = &style_cache.scheme
+            && let Some(scheme) = &style_cache.environment.scheme
         {
             cascade
                 .entry(Prop::COLOR_SCHEME)
@@ -6533,7 +5773,7 @@ pub(crate) fn cascade(
                 .filter(|&index| {
                     let (kind, _, order, _) = &scoped.pseudos[index];
                     match &scoped.containers[*order] {
-                        Some(conditions) if !matches!(kind, 12..=14) => {
+                        Some(conditions) if !matches!(kind, SLOTTED..=STARTING) => {
                             !scoped.medias[*order]
                                 .as_ref()
                                 .is_some_and(|stack| stack.iter().any(|block| !block.matched.get()))
@@ -6547,9 +5787,9 @@ pub(crate) fn cascade(
         for &index in again.as_deref().unwrap_or(&key.pseudos) {
             let (pseudo, selector, order, _) = &scoped.pseudos[index];
             let (_, declarations, layer) = &rules[*order];
-            if matches!(*pseudo, 12 | 13) {
+            if matches!(*pseudo, SLOTTED | PART) {
                 if let Some((name, compound, target)) = scoped.arguments.get(&index) {
-                    groups[usize::from(*pseudo == 13)].push(Passed {
+                    groups[usize::from(*pseudo == PART)].push(Passed {
                         name: name.clone(),
                         compound: compound.clone(),
                         conditions: scoped.containers[*order]
@@ -6557,7 +5797,7 @@ pub(crate) fn cascade(
                             .map(|conditions| (scope, *order, conditions)),
                         rule: ShadowRule {
                             kind: *target,
-                            context: if *pseudo == 13 { 1 } else { -1 },
+                            context: if *pseudo == PART { 1 } else { -1 },
                             layer: *layer,
                             specificity: selector.specificity,
                             order: keys[*order],
@@ -6576,12 +5816,7 @@ pub(crate) fn cascade(
                     keys[*order],
                     position,
                 );
-                if pseudo_cascade[*pseudo]
-                    .get(&prop)
-                    .is_none_or(|(old, _)| rank >= *old)
-                {
-                    pseudo_cascade[*pseudo].insert(prop, (rank, value));
-                }
+                put(&mut pseudo_cascade[*pseudo], prop, rank, value);
             }
         }
         for rule in shadow
@@ -6602,12 +5837,7 @@ pub(crate) fn cascade(
             }
             for (prop, value, important, position) in rule.declarations.iter() {
                 let rank = ranked(rule, *important, *position);
-                if pseudo_cascade[rule.kind]
-                    .get(prop)
-                    .is_none_or(|(old, _)| rank >= *old)
-                {
-                    pseudo_cascade[rule.kind].insert(*prop, (rank, value));
-                }
+                put(&mut pseudo_cascade[rule.kind], *prop, rank, value);
             }
         }
         for (prop, (_, value)) in pseudo_cascade.iter().flatten() {
@@ -6709,9 +5939,7 @@ pub(crate) fn cascade(
         if layered && !backdrop_starting.is_empty() {
             let mut first = backdrop.clone();
             for (prop, (rank, value)) in backdrop_starting {
-                if first.get(&prop).is_none_or(|(old, _)| rank >= *old) {
-                    first.insert(prop, (rank, value));
-                }
+                put(&mut first, prop, rank, value);
             }
             if let Some(values) = derive(first) {
                 backdrop_starts.insert(id, Rc::new(values));
@@ -6905,13 +6133,7 @@ pub(crate) fn cascade(
             }
         }
         // Reuse equal styles from the previous frame. Pointer changes invalidate layout caches.
-        let units_bits = |units: &Lengths| {
-            [units.font, units.root].map(|font| {
-                [font.em, font.ch, font.ex, font.cap, font.ic, font.lh]
-                    .map(f32::to_bits)
-                    .map(|bits| (bits, font.absolute))
-            })
-        };
+        let units_bits = |units: &Lengths| [units.font.bits(), units.root.bits()];
         let vars = match context
             .and_then(|context| context.previous.as_deref())
             .and_then(|previous| previous.vars.get(id))
@@ -6934,7 +6156,39 @@ pub(crate) fn cascade(
             .map(|prop| (prop, var(&vars, prop).cloned()))
             .collect();
         style.set_vars(if keep { vars.clone() } else { empty.clone() });
-        style_flags[id] = flags(&style) | (u8::from(agent_display) * AGENT_DISPLAY);
+        let get = |prop| style.get(prop).unwrap_or("");
+        let flag = |set, value| if set { value } else { 0 };
+        let counted = [
+            Prop::COUNTER_RESET,
+            Prop::COUNTER_INCREMENT,
+            Prop::COUNTER_SET,
+        ]
+        .into_iter()
+        .any(|prop| style.contains(prop))
+            || pseudos.get(&id).is_some_and(|pseudos| {
+                pseudos.iter().any(|pseudo| {
+                    pseudo
+                        .get(Prop::CONTENT)
+                        .is_some_and(|content| content.contains("counter"))
+                        || pseudo.contains(Prop::COUNTER_INCREMENT)
+                        || pseudo.contains(Prop::COUNTER_RESET)
+                })
+            });
+        let bits = flag(get(Prop::DISPLAY) == "none", DISPLAY_NONE)
+            | flag(get(Prop::DISPLAY) == "contents", DISPLAY_CONTENTS)
+            | flag(
+                matches!(get(Prop::VISIBILITY), "hidden" | "collapse"),
+                INVISIBLE,
+            )
+            | match get(Prop::USER_SELECT) {
+                "none" => SELECT_NONE,
+                "all" => SELECT_ALL,
+                "text" => SELECT_TEXT,
+                _ => 0,
+            }
+            | flag(counted, COUNTED)
+            | flag(agent_display, AGENT_DISPLAY);
+        style_flags.set(id, bits, u8::eq);
         let style = match context
             .and_then(|context| context.previous.as_deref())
             .and_then(|previous| {
@@ -6969,7 +6223,7 @@ pub(crate) fn cascade(
         };
         let cached = Rc::new(CachedStyle {
             used: std::cell::Cell::new(style_cache.pass),
-            inline: inline_source(node).map(|source| source.into()),
+            inline: written.map(Into::into),
             style: style.clone(),
             vars: std::cell::RefCell::new((parent_vars.cloned(), vars.clone())),
             reads,
@@ -7017,8 +6271,8 @@ pub(crate) fn cascade(
                 values.push(cached);
             }
         }
-        styles[id] = style;
-        custom[id] = vars;
+        styles.set(id, style, Rc::ptr_eq);
+        custom.set(id, vars, Rc::ptr_eq);
         lengths.set(id, units);
         settle!(id, up, seen);
     }
@@ -7038,18 +6292,7 @@ pub(crate) fn cascade(
             scopes: used,
         });
     }
-    if counters
-        || previous.is_some_and(|previous| fast && previous.counted)
-        || pseudos.values().any(|pseudos| {
-            pseudos.iter().any(|pseudo| {
-                pseudo
-                    .get(Prop::CONTENT)
-                    .is_some_and(|content| content.contains("counter"))
-                    || pseudo.contains(Prop::COUNTER_INCREMENT)
-                    || pseudo.contains(Prop::COUNTER_RESET)
-            })
-        })
-    {
+    if counters || previous.is_some_and(|previous| fast && previous.counted) {
         *counted = true;
         let list = |value: Option<&str>, default: i64| -> Vec<(String, i64)> {
             let parts = value.map_or_else(Vec::new, |value| components(value, ' '));
@@ -7682,9 +6925,29 @@ pub(crate) fn cascade(
             );
         }
     }
+    out
 }
 
 pub(crate) type Registry = FxHashMap<Prop, (Rc<str>, bool, Option<Rc<str>>)>;
+
+// On equal ranks the later declaration wins.
+fn put<V>(
+    cascade: &mut BBTreeMap<Prop, (CascadeRank, V)>,
+    prop: Prop,
+    rank: CascadeRank,
+    value: V,
+) {
+    match cascade.entry(prop) {
+        bbtree::unsync::bbtree_map::Entry::Occupied(mut old) => {
+            if rank >= old.get().0 {
+                old.insert((rank, value));
+            }
+        }
+        bbtree::unsync::bbtree_map::Entry::Vacant(slot) => {
+            slot.insert((rank, value));
+        }
+    }
+}
 
 fn physical<V: AsRef<str>>(cascade: &mut BBTreeMap<Prop, (CascadeRank, V)>, parent: &Style) {
     if !LOGICAL
@@ -7704,9 +6967,7 @@ fn physical<V: AsRef<str>>(cascade: &mut BBTreeMap<Prop, (CascadeRank, V)>, pare
     for (logical, ltr, rtl_side) in LOGICAL {
         if let Some((rank, value)) = cascade.remove(&logical) {
             let physical = if rtl { rtl_side } else { ltr };
-            if cascade.get(&physical).is_none_or(|(old, _)| rank >= *old) {
-                cascade.insert(physical, (rank, value));
-            }
+            put(cascade, physical, rank, value);
         }
     }
 }
@@ -8185,55 +7446,66 @@ fn resolve_style(
             style.set_vars(Rc::new(vars));
         }
     }
+    // The longhands of a `var()` shorthand share one pending value, so it is substituted and expanded once.
+    let mut values: Vec<(Rc<str>, Option<String>, Option<Vec<_>>)> = Vec::new();
     let resolved: Vec<_> = style
         .own()
         .filter(|(_, value)| next_var(value).is_some())
         .map(|(prop, value)| {
-            let mut out = String::new();
-            let ok = substitute(
-                value,
-                &mut |name| {
-                    style
-                        .value(name)
-                        .cloned()
-                        .or_else(|| registry.get(&name)?.2.clone())
-                },
-                &mut out,
-                0,
-            );
-            (prop, ok.then_some(out))
+            let shared = value
+                .starts_with('\u{1}')
+                .then(|| values.iter().position(|(raw, ..)| raw == value))
+                .flatten();
+            let index = shared.unwrap_or_else(|| {
+                let mut out = String::new();
+                let ok = substitute(
+                    value,
+                    &mut |name| {
+                        style
+                            .value(name)
+                            .cloned()
+                            .or_else(|| registry.get(&name)?.2.clone())
+                    },
+                    &mut out,
+                    0,
+                );
+                values.push((value.clone(), ok.then_some(out), None));
+                values.len() - 1
+            });
+            (prop, index)
         })
         .collect();
-    for (prop, value) in resolved {
-        let value = value
-            .and_then(|value| {
-                match value
-                    .strip_prefix('\u{1}')
-                    .and_then(|value| value.split_once('\u{1}'))
-                {
-                    Some((shorthand, value)) => {
-                        if parser::invalid(shorthand, value) {
-                            return None;
-                        }
+    for (prop, index) in resolved {
+        let (raw, substituted, expanded) = &mut values[index];
+        let value = match substituted
+            .as_deref()
+            .and_then(|value| value.strip_prefix('\u{1}')?.split_once('\u{1}'))
+        {
+            Some((shorthand, value)) => {
+                let rtl = style.get(Prop::DIRECTION) == Some("rtl");
+                expanded
+                    .get_or_insert_with(|| {
                         let mut expanded = Vec::new();
-                        expand(shorthand, value.trim(), &mut expanded);
-                        let rtl = style.get(Prop::DIRECTION) == Some("rtl");
+                        if !parser::invalid(shorthand, value) {
+                            expand(shorthand, value.trim(), &mut expanded);
+                        }
                         expanded
-                            .into_iter()
-                            .find(|(name, _)| {
-                                name == prop.name()
-                                    || LOGICAL.iter().any(|(logical, ltr, rtl_side)| {
-                                        logical.name() == name
-                                            && *if rtl { rtl_side } else { ltr } == prop
-                                    })
+                    })
+                    .iter()
+                    .find(|(name, _)| {
+                        name == prop.name()
+                            || LOGICAL.iter().any(|(logical, ltr, rtl_side)| {
+                                logical.name() == name && *if rtl { rtl_side } else { ltr } == prop
                             })
-                            .map(|(_, value)| value)
-                    }
-                    None => Some(value),
-                }
-            })
-            .filter(|value| !parser::invalid(prop.name(), value))
-            .map(|value| fold(prop.name(), &value).unwrap_or(value));
+                    })
+                    .map(|(_, value)| value.clone())
+            }
+            // Values that start with U+0001 can be shared by other properties.
+            None if raw.starts_with('\u{1}') => substituted.clone(),
+            None => substituted.take(),
+        }
+        .filter(|value| !parser::invalid(prop.name(), value))
+        .map(|value| fold(prop.name(), &value).unwrap_or(value));
         match value.map(Rc::from).or_else(|| {
             parent
                 .filter(|_| prop.inherited())
@@ -8502,7 +7774,7 @@ fn resolve_keywords(style: &mut Style, parent: Option<&Style>, units: Option<&Le
     keyword
 }
 
-pub fn declarations(source: &str) -> Style {
+pub(crate) fn declarations(source: &str) -> Style {
     Declarations::parse(source).resolve()
 }
 
@@ -8723,14 +7995,11 @@ impl Stylesheet {
     }
 
     pub(crate) fn matches_media(&self, width: f32, height: f32, theme: u32) -> bool {
-        let reduced_motion = reduced_motion();
         let [rule] = self.0.as_slice() else {
             return false;
         };
-        matches!(&**rule, Rule::Media(queries, _) if queries.is_empty() || queries.iter().any(|query| {
-            query.matches(width, height, reduced_motion, theme, Lengths::new(16., width, height))
-                == Some(true)
-        }))
+        matches!(&**rule, Rule::Media(queries, _)
+            if MediaQuery::list(queries, [width, height], reduced_motion(), theme))
     }
 
     pub(crate) fn bind_parents(&mut self) -> anyhow::Result<()> {

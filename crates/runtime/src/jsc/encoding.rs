@@ -223,7 +223,7 @@ fn native(
         hosts
             .borrow()
             .get(&(ctx as usize))
-            .map(|binding| binding.0.clone())
+            .map(|binding| binding.api.clone())
     }) else {
         return ptr::null_mut();
     };
@@ -624,9 +624,7 @@ unsafe extern "C" fn drain(
     exception: *mut Ptr,
 ) -> Ptr {
     native(ctx, count, args, exception, |api, _| unsafe {
-        if let Some(drain) = api.drain {
-            drain(ctx);
-        }
+        (api.drain)(ctx);
         Ok((api.undefined)(ctx))
     })
 }
@@ -647,9 +645,6 @@ pub(crate) fn install(api: &JavaScriptCore, ctx: Ptr) {
             ("drain", drain),
             ("url", url),
         ] {
-            if name == "drain" && api.drain.is_none() {
-                continue;
-            }
             let name = api.string(name);
             (api.set)(
                 ctx,

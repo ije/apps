@@ -32,7 +32,25 @@
     size = 0; texts.length = 0;
     if (!errors) return;
     for (const error of errors) console.error('DOM: ' + error);
-    resync();
+    // Reload after failed batches: Rust can skip invalid writes. Preserve record identities because wrappers
+    // reference them.
+    const lists = [], seen = new Set();
+    for (const rec of records) if (rec && !rec.up) try { lists.push(json(host('dom.tree', rec.id))); } catch {}
+    if (!lists.length) return;
+    version++;
+    for (const rec of records) if (rec) { touch(rec); if (rec.kids.length) rec.kids = []; }
+    ids.clear();
+    for (const list of lists) {
+      for (let i = 0; i < list.length;) {
+        const id = list[i], tag = list[i + 2], end = i + 5 + 2 * list[i + 4], up = i ? records[list[i + 1]] : null;
+        let rec = records[id];
+        if (rec?.tag !== tag) rec = records[id] = new Record(id, tag, list[i + 3]); else rec.text = list[i + 3];
+        if (rec.attrs) { rec.attrs = end > i + 5 ? new Attrs(list.slice(i + 5, end)) : noAttrs; const value = rec.attrs.get('id'); if (value) idAdd(value, rec); }
+        if (up) { rec.up = up; rec.i = up.kids.push(rec) - 1; seen.add(rec); }
+        i = end;
+      }
+    }
+    for (const rec of records) if (rec?.up && !seen.has(rec)) rec.up = null;
   };
   const drain = () => { scheduled = false; flush(); };
   // Replace trailing lone high surrogates with U+FFFD before concatenation, or adjacent strings can pair them
@@ -107,27 +125,6 @@
     if (controls) for (const rec of controls) revalidate(of(rec));
     return media;
   };
-  // Reload after failed batches: Rust can skip invalid writes. Preserve record identities because wrappers
-  // reference them.
-  const resync = () => {
-    const lists = [], seen = new Set();
-    for (const rec of records) if (rec && !rec.up) try { lists.push(json(host('dom.tree', rec.id))); } catch {}
-    if (!lists.length) return;
-    version++;
-    for (const rec of records) if (rec) { touch(rec); if (rec.kids.length) rec.kids = []; }
-    ids.clear();
-    for (const list of lists) {
-      for (let i = 0; i < list.length;) {
-        const id = list[i], tag = list[i + 2], end = i + 5 + 2 * list[i + 4], up = i ? records[list[i + 1]] : null;
-        let rec = records[id];
-        if (rec?.tag !== tag) rec = records[id] = new Record(id, tag, list[i + 3]); else rec.text = list[i + 3];
-        if (rec.attrs) { rec.attrs = end > i + 5 ? new Attrs(list.slice(i + 5, end)) : noAttrs; const value = rec.attrs.get('id'); if (value) idAdd(value, rec); }
-        if (up) { rec.up = up; rec.i = up.kids.push(rec) - 1; seen.add(rec); }
-        i = end;
-      }
-    }
-    for (const rec of records) if (rec?.up && !seen.has(rec)) rec.up = null;
-  };
   const of = rec => rec ? rec.ref?.deref() ?? wrap(rec.id) : null;
   // A cached list holds the wrappers of its nodes, so drop it whenever the children change, or it keeps removed
   // nodes alive.
@@ -167,11 +164,6 @@
   const watch = (observer, target, value, set) => { observer.targets.set(target._m.ref, value); (target._observers ??= new Set()).add(observer); set.add(observer._ref ??= new WeakRef(observer)); };
   const unwatch = (observer, target, set) => { observer.targets.delete(target._m.ref); target._observers?.delete(observer); if (!observer.targets.size) set.delete(observer._ref); };
   const unwatchAll = (observer, set) => { for (const ref of observer.targets.keys()) ref.deref()?._observers?.delete(observer); observer.targets.clear(); set.delete(observer._ref); };
-  const watched = node => {
-    if (!observers.size || quiet) return false;
-    for (const ref of observers) for (const [key, options] of ref.deref()?.targets ?? []) { const target = key.deref(); if (target && options.childList && (target === node || options.subtree && target.contains(node))) return true; }
-    return false;
-  };
   const change = record => {
     if (!observers.size || quiet) return;
     for (const ref of observers) {
@@ -205,12 +197,13 @@
   const hitAt = (x, y) => wrap(call('dom.hitTest', x, y, true));
   const rootOf = (root, node) => { for (let up = node.getRootNode?.(); up; up = up.host?.getRootNode()) if (up === root) return true; return false; };
   const hidden = (node, from) => { const root = node.getRootNode?.(); return root instanceof ShadowRoot && !rootOf(root, from) && (root.mode === 'closed' || hidden(root.host, from)); };
+  const within = (node, root) => { while (node && node.getRootNode() !== root) node = node.getRootNode().host ?? null; return node ?? null; };
   const retarget = (node, against) => { for (let root = node.getRootNode?.(); root instanceof ShadowRoot && !rootOf(root, against); root = node.getRootNode()) node = root.host; return node; };
   const dispatch = (target, event, ancestors = path(target)) => {
     const state = eventState(event);
     if (state.dispatching) throw new DOMException('Event is already in dispatch', 'InvalidStateError');
     state.trusted ??= true;
-    const shadow = ancestors.some(node => node instanceof ShadowRoot);
+    const shadow = shadows > 0 && ancestors.some(node => node instanceof ShadowRoot);
     if (shadow && !event.composed) { const root = target.getRootNode(); if (root instanceof ShadowRoot) ancestors.length = ancestors.indexOf(root) + 1; }
     if (ancestors.at(-1) === document) ancestors.push(window);
     let seen = target;
@@ -422,8 +415,6 @@
   };
   const always = () => true;
   const rangesRemove = (parent, child, index) => { if (iterators.size) iteratorsRemove(child); if (!anchors.size) return; inside(child._m, (range, rec) => shift(range, rec, always, parent, () => index)); each(parent._m, range => shift(range, parent._m, at => at > index, parent, at => at - 1)); };
-  const rangesInsert = (parent, index, count) => { if (anchors.size) each(parent._m, range => shift(range, parent._m, at => at > index, parent, at => at + count)); };
-  const rangesClear = node => { if (iterators.size) iteratorsRemove(node, true); if (anchors.size) inside(node._m, (range, rec) => shift(range, rec, rec === node._m ? at => at > 0 : always, node, () => 0)); };
   const forgetRemoved = () => {
     if (topLayer.length || dialogs.length) {
       if (fullscreens.some(node => !node.isConnected)) exitFullscreen(true);
@@ -438,11 +429,13 @@
   // Call removed after both trees detach the old children, before reinserted children run connected
   // callbacks.
   const replaceAll = scoped((node, replace) => {
-    const rec = node._m, observed = watched(node);
+    const rec = node._m;
+    let observed = false;
+    if (observers.size && !quiet) scan: for (const ref of observers) for (const [key, options] of ref.deref()?.targets ?? []) { const target = key.deref(); if (target && options.childList && (target === node || options.subtree && target.contains(node))) { observed = true; break scan; } }
     if (!rec.kids.length && !observed && !shadows) { replace(ignore); return; }
     // A wrapper keeps its removed subtree in the arena until a GC, so only an observer's record wraps the old children.
     const kids = definitions.size > 0 && node.isConnected ? rec.kids.slice() : [], old = observed ? rec.kids.map(of) : [];
-    if (rec.kids.length) { if (node._shadow) for (const kid of rec.kids) signal(node, of(kid)); rangesClear(node); }
+    if (rec.kids.length) { if (node._shadow) for (const kid of rec.kids) signal(node, of(kid)); if (iterators.size) iteratorsRemove(node, true); if (anchors.size) inside(rec, (range, at) => shift(range, at, at === rec ? offset => offset > 0 : always, node, () => 0)); }
     let pending = kids.length > 0;
     const removed = () => { if (pending) { pending = false; for (const kid of kids) reactions(kid, 'disconnectedCallback'); } };
     replace(removed); removed();
@@ -466,7 +459,7 @@
     try { for (const node of nodes) parent.insertBefore(node, before); if (removed.length) parent.removeChild(replaced); } finally { quiet--; }
     if (nodes.length || removed.length) change({ type: 'childList', target: parent, addedNodes: listOf(NodeList, nodes), removedNodes: listOf(NodeList, removed), previousSibling, nextSibling: before });
   });
-  const contextTag = node => !node ? 'body' : node.namespaceURI === SVG ? /^(foreignObject|desc|title)$/.test(node.localName) ? 'body' : 'svg' : node.localName === 'svg' ? 'body' : node.localName;
+  const contextTag = node => !node ? 'body' : node.namespaceURI === SVG ? integration.test(node.localName) ? 'body' : 'svg' : node.localName === 'svg' ? 'body' : node.localName;
   const parseFragment = scoped((source, context) => {
     const fragment = document.createDocumentFragment(), tag = contextTag(context);
     if (tag === 'svg') fragment._svg = true;
@@ -582,7 +575,7 @@
       if (ref !== kid) { touch(rec); if (kid.up) { touch(kid.up); kid.up.kids.splice(index(kid), 1); } kid.up = rec; if (ref) rec.kids.splice(kid.i = index(ref), 0, kid); else kid.i = rec.kids.push(kid) - 1; }
       hold(this, child);
       if (rec.tag === 'select' || rec.tag === 'optgroup') revalidate(rec.tag === 'select' ? this : this.parentElement);
-      if (ref) rangesInsert(this, index(kid), 1);
+      if (ref && anchors.size) { const at = index(kid); each(rec, range => shift(range, rec, offset => offset > at, this, offset => offset + 1)); }
       if (connected && moving && child.isConnected) reactions(kid, 'connectedMoveCallback');
       else { if (connected) reactions(kid, 'disconnectedCallback'); if (definitions.size && child.isConnected) reactions(kid, 'connectedCallback'); }
       if (shadows) { if (this._shadow) signal(this, child); slotsIn(this.getRootNode(), kid, true); }
@@ -620,7 +613,7 @@
     remove() { this.parentNode?.removeChild(this); }
     hasChildNodes() { return this._m.kids.length > 0; }
     contains(node) { for (let rec = node?._m; rec; rec = rec.up) if (rec === this._m) return true; return false; }
-    getRootNode(options = {}) { let rec = this._m; while (rec.up ?? (options.composed ? rec.host : null)) rec = rec.up ?? rec.host; return of(rec); }
+    getRootNode(options) { const composed = options?.composed; let rec = this._m; while (rec.up ?? (composed ? rec.host : null)) rec = rec.up ?? rec.host; return of(rec); }
     cloneNode(deep = false) {
       const cloned = this.nodeType === 3 ? document.createTextNode(this.data) : this.nodeType === 8 ? document.createComment(this.data) : this.nodeType === 11 ? document.createDocumentFragment() : this.namespaceURI === XHTML ? wrap(create(this.localName)) : document.createElementNS(this.namespaceURI, this.localName);
       if (this.nodeType === 1) { for (const [name, value] of this._m.attrs) cloned.setAttribute(name, value); if (this._value !== undefined) setValue(cloned, this._value); if (this._checked !== undefined) { setChecked(cloned, this._checked); cloned._dirty = this._dirty; } if (this._selected !== undefined) cloned._selected = this._selected; }
@@ -703,13 +696,13 @@
     return css;
   };
   let cssProperties = null;
-  const cssProperty = name => (cssProperties ??= new Set(call('dom.properties'))).has(name) || name === 'float';
-  const cssKeys = () => { const names = [...(cssProperties ??= new Set(call('dom.properties')))]; return [...new Set([...names, ...names.map(name => name.replace(/^-(webkit|moz|ms)-/, '$1-').replace(/-([a-z])/g, (_, c) => c.toUpperCase()))])]; };
+  const properties = () => cssProperties ??= new Set(call('dom.properties'));
+  const cssProperty = name => properties().has(name) || name === 'float';
   const declared = new Map();
-  const declare = text => { let list = declared.get(text); if (!list) { if (declared.size > 1023) declared.clear(); const flat = /\S/.test(text) ? host('dom.declare', text) : []; list = []; for (let i = 0; i < flat.length; i += 3) list.push([flat[i], flat[i + 1], flat[i + 2]]); declared.set(text, list); } return list.map(entry => entry.slice()); };
+  const declare = text => { let list = declared.get(text); if (!list) { if (declared.size > 1023) declared.clear(); const flat = /\S/.test(text) ? host('dom.declare', text) : []; list = []; for (let i = 0; i < flat.length; i += 3) list.push([flat[i], flat[i + 1], flat[i + 2]]); declared.set(text, list); } return list; };
   let shorthands = null, shorthandsOf = null;
   const loadShorthands = () => {
-    const names = [...(cssProperties ??= new Set(call('dom.properties')))], flat = host('dom.declare', names.map((name, i) => `--i:${i};${name}:initial`).join(';'));
+    const names = [...properties()], flat = host('dom.declare', names.map((name, i) => `--i:${i};${name}:initial`).join(';'));
     shorthands = new Map(); shorthandsOf = new Map();
     for (let i = 0, parts; i < flat.length; i += 3) if (flat[i] === '--i') shorthands.set(names[flat[i + 1]], parts = []); else parts.push(flat[i]);
     for (const [name, parts] of shorthands) if (parts.length === 1 && parts[0] === name) shorthands.delete(name);
@@ -762,7 +755,6 @@
   };
   const readOnly = () => { throw new DOMException('Computed styles are read-only', 'NoModificationAllowedError'); };
   let keyboardFocus = true, windowFocused = true, ring = false;
-  const focusVisible = node => keyboardFocus || node.isContentEditable || node.localName === 'textarea' || node.localName === 'input' && !/^(button|submit|reset|checkbox|radio|range|color|file|image)$/i.test(node.getAttribute('type') ?? '');
   class CSSStyleDeclaration {
     constructor(owner) { this._owner = owner; }
     get _list() { return this._owner.read(); }
@@ -812,7 +804,7 @@
     get: (target, key) => typeof key !== 'string' || key in target ? Reflect.get(target, key) : /^\d+$/.test(key) ? target.item(Number(key)) : target.getPropertyValue(styleName(key)),
     set: (target, key, value) => { if (typeof key !== 'string' || key in target) return Reflect.set(target, key, value); if (styleKey(key)) target.setProperty(styleName(key), value); return true; },
     has: (target, key) => key in target || typeof key === 'string' && (styleKey(key) ? cssProperty(styleName(key)) : Number(key) < target.length),
-    ownKeys: target => [...new Set([...Reflect.ownKeys(target), ...Array.from({ length: target.length }, (_, index) => String(index)), ...cssKeys()])],
+    ownKeys: target => { const names = [...properties()]; return [...new Set([...Reflect.ownKeys(target), ...Array.from({ length: target.length }, (_, index) => String(index)), ...names, ...names.map(name => name.replace(/^-(webkit|moz|ms)-/, '$1-').replace(/-([a-z])/g, (_, c) => c.toUpperCase()))])]; },
     getOwnPropertyDescriptor: (target, key) => Reflect.getOwnPropertyDescriptor(target, key) ?? (typeof key === 'string' && (styleKey(key) ? cssProperty(styleName(key)) : Number(key) < target.length) ? { value: styleKey(key) ? target.getPropertyValue(styleName(key)) : target.item(Number(key)), writable: true, enumerable: true, configurable: true } : undefined),
   });
   const attrName = (element, name) => element.namespaceURI === XHTML ? String(name).toLowerCase() : String(name);
@@ -832,9 +824,9 @@
     getAttributeNS(_, name) { return this.getAttribute(name); }
     hasAttribute(name) { return this._m.attrs.has(attrName(this, name)); }
     hasAttributeNS(_, name) { return this.hasAttribute(name); }
-    setAttribute(name, value) { name = attrName(this, name); value = String(value); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) badAttr(name); if (value !== oldValue) op(4, this._id, name, value); (attrs === noAttrs ? this._m.attrs = new Attrs() : attrs).set(name, value); if (name === 'id' && value !== oldValue) { if (oldValue !== null) idDrop(oldValue, this._m); idAdd(value, this._m); } if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (definitions.size) attributeReaction(this, name, oldValue, value); if (value !== oldValue && (name === 'slot' || name === 'name' || name === 'open' || name === 'popover' || name === 'checked' || validated.test(name))) attributeChanged(this, name, oldValue, value); }
+    setAttribute(name, value) { name = attrName(this, name); value = String(value); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) badAttr(name); if (value !== oldValue) op(4, this._id, name, value); (attrs === noAttrs ? this._m.attrs = new Attrs() : attrs).set(name, value); if (name === 'id' && value !== oldValue) { if (oldValue !== null) idDrop(oldValue, this._m); idAdd(value, this._m); } if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (definitions.size) attributeReaction(this, name, oldValue, value); if (value !== oldValue) attributeChanged(this, name, oldValue, value); }
     setAttributeNS(_, name, value) { this.setAttribute(name, value); }
-    removeAttribute(name) { name = attrName(this, name); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) return; attrs.delete(name); op(5, this._id, name); if (name === 'id') idDrop(oldValue, this._m); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (definitions.size) attributeReaction(this, name, oldValue, null); if (name === 'slot' || name === 'name' || name === 'open' || name === 'popover' || name === 'checked' || validated.test(name)) attributeChanged(this, name, oldValue, null); }
+    removeAttribute(name) { name = attrName(this, name); const attrs = this._m.attrs, oldValue = attrs.get(name) ?? null; if (oldValue === null) return; attrs.delete(name); op(5, this._id, name); if (name === 'id') idDrop(oldValue, this._m); if (observers.size) change({ type: 'attributes', target: this, attributeName: name, oldValue }); if (definitions.size) attributeReaction(this, name, oldValue, null); attributeChanged(this, name, oldValue, null); }
     removeAttributeNS(_, name) { this.removeAttribute(name); }
     toggleAttribute(name, force) { const present = this.hasAttribute(name); if (!present) badAttr(attrName(this, name)); const wanted = force === undefined ? !present : !!force; if (wanted !== present) { if (wanted) this.setAttribute(name, ''); else this.removeAttribute(name); } return wanted; }
     getAttributeNode(name) { name = attrName(this, name); return this._m.attrs.has(name) ? attrNode(this, name) : null; }
@@ -894,7 +886,7 @@
     focus() {
       if (active === this || !focusable(this)) return;
       finishComposition();
-      const previous = active; active = this; call('dom.focus', path(this).map(node => node._id), ring = focusVisible(this), !windowFocused);
+      const previous = active; active = this; call('dom.focus', path(this).map(node => node._id), ring = keyboardFocus || this.isContentEditable || this.localName === 'textarea' || this.localName === 'input' && !/^(button|submit|reset|checkbox|radio|range|color|file|image)$/i.test(this.getAttribute('type') ?? ''), !windowFocused);
       if (this.isContentEditable && selection.isCollapsed) selection._send();
       // Defer focus events while the window lacks focus. On window focus, emit them for the current element.
       if (!windowFocused) return;
@@ -961,7 +953,6 @@
   // User edits must change internal state, not value or checked properties: frameworks intercept those
   // properties to detect script writes.
   const setChecked = (node, value) => { node._checked = value; formState(node, node._bits & ~3 | (value ? 3 : 2)); if (value && node.type === 'radio') for (const other of group(node)) if (other !== node && (other._checked ?? other.hasAttribute('checked'))) { other._checked = false; formState(other, other._bits & ~3 | 2); } revalidate(node); };
-  const formOf = node => { const id = node.getAttribute('form'); if (id !== null) { const form = id && node.getRootNode().getElementById?.(id); return form?.localName === 'form' ? form : null; } for (let rec = node._m.up; rec && rec.tag[0] !== '#'; rec = rec.up) if (rec.tag === 'form') return of(rec); return null; };
   const listed = /^(button|fieldset|input|object|output|select|textarea)$/;
   const candidate = node => !disabled(node) && !node.hasAttribute('readonly') && !node._m.up?.tag?.startsWith('datalist') && (node.localName === 'input' ? !/^(hidden|reset|button)$/.test(node.type) : node.localName === 'button' ? node.type === 'submit' : /^(select|textarea)$/.test(node.localName));
   const emailPattern = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
@@ -1009,7 +1000,7 @@
     setCustomValidity(message) { this._custom = String(message); revalidate(this); },
     checkValidity() { if (!candidate(this) || validity(this).valid) return true; dispatch(this, new Event('invalid', { cancelable: true })); return false; },
     reportValidity() { if (this.checkValidity()) return true; this.focus(); return false; },
-    get form() { return formOf(this); },
+    get form() { const id = this.getAttribute('form'); if (id !== null) { const form = id && this.getRootNode().getElementById?.(id); return form?.localName === 'form' ? form : null; } for (let rec = this._m.up; rec && rec.tag[0] !== '#'; rec = rec.up) if (rec.tag === 'form') return of(rec); return null; },
     get labels() {
       const result = [], root = this.getRootNode(), id = this.getAttribute('id');
       if (id && root.querySelectorAll) for (const label of root.querySelectorAll('label[for=' + quote(id) + ']')) if (labelControl(label) === this) result.push(label);
@@ -1077,11 +1068,10 @@
     for (const option of list) formState(option, option._current ? 3 : 2);
     return list;
   };
-  class HTMLOptionsCollection extends List {
+  class HTMLOptionsCollection extends HTMLCollection {
     get selectedIndex() { return this._select.selectedIndex; } set selectedIndex(value) { this._select.selectedIndex = value; }
     add(element, before) { this._select.add(element, before); }
     remove(index) { this._select.remove(index); }
-    namedItem(name) { return this.find(option => option.id === name || option.getAttribute('name') === name) ?? null; }
   }
   class HTMLSelectElement extends HTMLElement {
     get type() { return this.multiple ? 'select-multiple' : 'select-one'; }
@@ -1141,7 +1131,7 @@
     get action() { const value = this.getAttribute('action'); return value ? resolved(value) : document.URL; } set action(value) { this.setAttribute('action', value); }
     get enctype() { return this.getAttribute('enctype') ?? 'application/x-www-form-urlencoded'; } set enctype(value) { this.setAttribute('enctype', value); }
     get target() { return this.getAttribute('target') ?? ''; } set target(value) { this.setAttribute('target', value); }
-    submit() { if ((this.method) === 'dialog') this.closest('dialog')?.close(); }
+    submit() { if (this.method === 'dialog') this.closest('dialog')?.close(); }
     requestSubmit(submitter = null) { if (submitter !== null && (!(submitter instanceof HTMLElement) || submitter.form !== this || !(submitter.localName === 'button' ? submitter.type === 'submit' : /^(submit|image)$/.test(submitter.type)))) throw submitter?.form !== this ? new DOMException('The submitter is not owned by this form', 'NotFoundError') : new TypeError('The submitter is not a submit button'); submitForm(this, submitter); }
     reset() {
       if (!dispatch(this, new Event('reset', { bubbles: true, cancelable: true }))) return;
@@ -1249,13 +1239,6 @@
     }
     requestClose(result) { if (this.open && dispatch(this, new Event('cancel', { cancelable: true }))) this.close(result); }
   }
-  const closeRequest = () => {
-    const top = watchers.at(-1);
-    if (!top) return false;
-    if (top._popover) hidePopover(top, true, true);
-    else if (top.closedBy !== 'none' && dispatch(top, trusted(new Event('cancel', { cancelable: true })))) top.close();
-    return true;
-  };
   const referenced = (node, name, key) => { const set = node[key]?.deref(); if (set && node.hasAttribute(name)) return set; const id = node.getAttribute(name); return id ? node.getRootNode().getElementById?.(id) ?? null : null; };
   const reference = (node, name, key, value) => { if (value === null || value === undefined) { node[key] = null; node.removeAttribute(name); } else { if (!(value instanceof Element)) throw new TypeError('Expected an Element'); node[key] = new WeakRef(value); node.setAttribute(name, ''); } };
   const commands = /^(toggle-popover|show-popover|hide-popover|show-modal|close|request-close)$/;
@@ -1309,19 +1292,6 @@
     },
   });
   let pressedPopover = null, pressedDialog = null;
-  const lightDismiss = (down, target, x, y) => {
-    if (autos.length || hints.length) {
-      const clicked = nearestPopover(target, [...autos, ...hints]), button = path(target).map(node => node.nodeType === 1 && invoked(node)).find(popover => popover?._popover && popover._popover !== 'manual') ?? null;
-      const ancestor = position(clicked) > position(button) ? clicked : button;
-      if (down) pressedPopover = ancestor; else { const same = ancestor === pressedPopover; pressedPopover = null; if (same) hideUntil(ancestor ?? document); }
-    }
-    if (dialogs.length) {
-      let clicked = path(target).find(node => node.localName === 'dialog' && dialogs.includes(node)) ?? null;
-      if (clicked === target && clicked._modal) { const box = clicked.getBoundingClientRect(); if (x < box.left || y < box.top || x >= box.right || y >= box.bottom) clicked = null; }
-      if (down) pressedDialog = clicked;
-      else { const same = clicked === pressedDialog, top = dialogs.at(-1); pressedDialog = null; if (same && top && top !== clicked && top.closedBy === 'any') top.requestClose(); }
-    }
-  };
   const exitFullscreen = (all, native = false) => {
     const exited = all ? fullscreens.splice(0) : fullscreens.splice(-1);
     for (const node of exited.reverse()) { flag(node, 16, false); layer(node, false); }
@@ -1651,7 +1621,6 @@
     replaceSync(value) { if (this._node) throw new DOMException('Only constructed sheets can be replaced', 'NotAllowedError'); value = String(value).replace(/@import\s[^;]*;?/g, ''); this._data = call('dom.constructed', this._live ? this._id : 0, this._live ? 'replace' : 'parse', value); if (this._rules) this._rules.splice(0, this._rules.length, ...this._data.map(data => makeRule(this, this, data))); }
     replace(value) { try { this.replaceSync(value); return Promise.resolve(this); } catch (error) { return Promise.reject(error); } }
   }
-  const sheetText = sheet => sheet._data.map(ruleText).join('\n');
   const adopt = root => call('dom.adopt', root === document ? 0 : root._id, (root._adopted ?? []).filter(sheet => {
     if (sheet._disabled) return false;
     if (!sheet._mediaText.trim()) return true;
@@ -1664,7 +1633,7 @@
       const previous = root._adopted ?? [];
       root._adopted = list;
       for (const sheet of previous) if (!list.includes(sheet)) sheet._owners.delete(root);
-      for (const sheet of list) { sheet._owners.add(root); if (!sheet._live) { sheet._live = true; call('dom.constructed', sheet._id, 'replace', sheetText(sheet)); } }
+      for (const sheet of list) { sheet._owners.add(root); if (!sheet._live) { sheet._live = true; call('dom.constructed', sheet._id, 'replace', sheet._data.map(ruleText).join('\n')); } }
       for (const sheet of previous) if (!sheet._owners.size && sheet._live) { sheet._live = false; call('dom.constructed', sheet._id, 'drop'); }
       adopt(root);
     };
@@ -1677,21 +1646,20 @@
     while (stack.length) { const rec = stack.pop(); if (rec.tag === 'style' || rec.tag === 'link') { const sheet = of(rec).sheet; if (sheet) sheets.push(sheet); } if (rec.tag !== 'template' && rec.tag !== 'noscript') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); }
     return sheets;
   };
-  const cssEscape = value => {
-    value = String(value); let out = '';
-    for (let i = 0; i < value.length; i++) {
-      const c = value.charCodeAt(i);
-      if (c === 0) out += '�';
-      else if (c <= 31 || c === 127 || (i === 0 || i === 1 && value.charCodeAt(0) === 45) && c >= 48 && c <= 57) out += '\\' + c.toString(16) + ' ';
-      else if (i === 0 && c === 45 && value.length === 1) out += '\\-';
-      else if (c >= 128 || c === 45 || c === 95 || c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122) out += value[i];
-      else out += '\\' + value[i];
-    }
-    return out;
-  };
   const CSS = {
     supports(name, value) { return call('dom.supports', String(name), arguments.length > 1 ? String(value) : null); },
-    escape: cssEscape,
+    escape(value) {
+      value = String(value); let out = '';
+      for (let i = 0; i < value.length; i++) {
+        const c = value.charCodeAt(i);
+        if (c === 0) out += '�';
+        else if (c <= 31 || c === 127 || (i === 0 || i === 1 && value.charCodeAt(0) === 45) && c >= 48 && c <= 57) out += '\\' + c.toString(16) + ' ';
+        else if (i === 0 && c === 45 && value.length === 1) out += '\\-';
+        else if (c >= 128 || c === 45 || c === 95 || c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122) out += value[i];
+        else out += '\\' + value[i];
+      }
+      return out;
+    },
     registerProperty(definition) {
       if (definition?.name === undefined || definition.inherits === undefined) throw new TypeError('Expected a name and inherits');
       const result = call('dom.registerProperty', String(definition.name), String(definition.syntax ?? '*'), !!definition.inherits, definition.initialValue === undefined ? null : String(definition.initialValue));
@@ -1700,8 +1668,8 @@
   };
   class ShadowRoot extends DocumentFragment {
     get innerHTML(){return serialize(this._m,true);} set innerHTML(value){setHTML(this,value);}
-    get activeElement() { for (let node = active; node;) { const root = node.getRootNode(); if (root === this) return node; node = root.host ?? null; } return null; }
-    get fullscreenElement() { for (let node = fullscreens.at(-1); node;) { const root = node.getRootNode(); if (root === this) return node; node = root.host ?? null; } return null; }
+    get activeElement() { return within(active, this); }
+    get fullscreenElement() { return within(fullscreens.at(-1), this); }
     get styleSheets() { return styleSheetsOf(this); }
     elementFromPoint(x, y) { return Document.prototype.elementFromPoint.call(this, x, y); }
     elementsFromPoint(x, y) { return Document.prototype.elementsFromPoint.call(this, x, y); }
@@ -1842,7 +1810,7 @@
     get body() { const html = this._m.kids.find(rec => rec.tag[0] !== '#'); return html?.tag === 'html' ? of(html.kids.find(rec => rec.tag === 'body' || rec.tag === 'frameset')) : null; }
     get head() { const html = this._m.kids.find(rec => rec.tag[0] !== '#'); return html?.tag === 'html' ? of(html.kids.find(rec => rec.tag === 'head')) : null; }
     get documentElement() { return of(this._m.kids.find(rec => rec.tag[0] !== '#')); }
-    get activeElement() { let node = active; while (node && node.getRootNode() !== this) node = node.getRootNode().host ?? null; return node ?? this.body ?? this.documentElement; } get defaultView() { return globalThis; }
+    get activeElement() { return within(active, this) ?? this.body ?? this.documentElement; } get defaultView() { return globalThis; }
     get baseURI() {
       const href = location.href;
       if (!rare.base) return href;
@@ -1876,7 +1844,7 @@
     caretPositionFromPoint(x,y){const range=this.caretRangeFromPoint(x,y);return range?{offsetNode:range.startContainer,offset:range.startOffset}:null;}
     elementFromPoint(x, y) { const node = hitAt(x, y); return node && retarget(node, this); }
     elementsFromPoint(x, y) { return [...new Set(call('dom.hitTest', x, y).map(id => retarget(wrap(id), this)))]; }
-    get fullscreenElement() { let node = fullscreens.at(-1) ?? null; while (node && node.getRootNode() !== this) node = node.getRootNode().host ?? null; return node; }
+    get fullscreenElement() { return within(fullscreens.at(-1), this); }
     get fullscreenEnabled() { return true; } get fullscreen() { return !!this.fullscreenElement; }
     exitFullscreen() { return fullscreens.length ? exitFullscreen(false) : Promise.reject(new TypeError('The document is not in fullscreen')); }
     get webkitFullscreenElement() { return this.fullscreenElement; } get webkitCurrentFullScreenElement() { return this.fullscreenElement; } get webkitFullscreenEnabled() { return true; } get webkitIsFullScreen() { return this.fullscreen; }
@@ -2075,7 +2043,6 @@
     }
     get collapsed() { return this.startContainer === this.endContainer && this.startOffset === this.endOffset; }
   }
-  globalThis.StaticRange = StaticRange;
   class Selection {
     constructor() { this.ranges = []; this.direction = 'none'; }
     get anchorNode() { return this.ranges[0]?.[this.direction === 'backward' ? 'endContainer' : 'startContainer'] ?? null; }
@@ -2164,7 +2131,7 @@
     const chain = [];
     for (; rec && !(node = rec.ref?.deref()); rec = rec.up) chain.push(rec);
     for (let i = chain.length; i--;) {
-      const { id, tag, attrs } = chain[i], above = node, svg = tag === 'svg' || (above instanceof SVGElement ? !/^(foreignObject|desc|title)$/.test(above.localName) : !!above?._svg && !breakout.test(tag) && !(tag === 'font' && (attrs.has('color') || attrs.has('face') || attrs.has('size'))));
+      const { id, tag, attrs } = chain[i], above = node, svg = tag === 'svg' || (above instanceof SVGElement ? !integration.test(above.localName) : !!above?._svg && !breakout.test(tag) && !(tag === 'font' && (attrs.has('color') || attrs.has('face') || attrs.has('size'))));
       const Type = tag === '#document' ? Document : tag === '#fragment' ? DocumentFragment : tag === '#text' ? Text : tag === '#comment' ? Comment : tag === '#doctype' ? DocumentType : svg ? (tag === 'svg' ? SVGSVGElement : SVGElement) : htmlTypes.get(tag) ?? HTMLElement;
       node = new Type(id, tag); if (above) hold(above, node);
     }
@@ -2173,6 +2140,7 @@
   let sweepAt = 0, cursor = 0, canary = new WeakRef({});
   globalThis.__appsDomSweep = (force = false) => {
     scheduled = false; flush();
+    if (force && !size && codes.length > 1024) codes = new Int32Array(1024);
     // Release removed, unwrapped trees next turn so row churn cannot fill the arena between sweeps.
     const collected = !canary.deref(), timed = force || collected || performance.now() >= sweepAt, dead = [];
     if (!timed && !detached) return;
@@ -2560,9 +2528,7 @@
   globalThis.window = globalThis; globalThis.self = globalThis;
   selection = new Selection();
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) globalThis[name] = Node.prototype[name].bind(globalThis);
-  Object.assign(globalThis, { ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, AudioNode, GainNode, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent });
-  Object.assign(globalThis,{customElements,ShadowRoot,CSSStyleSheet,DOMParser});
-  Object.assign(globalThis, { CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration });
+  Object.assign(globalThis, { ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, AudioNode, GainNode, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent, StaticRange, customElements, ShadowRoot, CSSStyleSheet, DOMParser, CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration });
   Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'styleSheets', { configurable: true, get() { return styleSheetsOf(this); } });
@@ -3023,27 +2989,6 @@
     if (!done || !['forwards', 'both'].includes(effects.get(data.effect).timing.fill)) cssAnimations.delete(data.serial);
     return true;
   };
-  const cssEntry = ([serial, id, kind, name, time, state, timing, direction, fill, easing, frames, pseudo]) => {
-    let animation = cssAnimations.get(serial);
-    if (!animation) {
-      animation = new (kind === 'animation' ? CSSAnimation : CSSTransition)(cssToken);
-      const keyframes = [];
-      for (const [offset, property, value, ease] of frames) {
-        let frame = keyframes.find(frame => frame.offset === offset && frame.easing === ease);
-        if (!frame) keyframes.push(frame = { offset, easing: ease });
-        frame[camelName(property)] = value;
-      }
-      keyframes.sort((a, b) => a.offset - b.offset);
-      const effect = new KeyframeEffect(wrap(id), keyframes, { delay: timing[0], endDelay: timing[1], duration: timing[2], iterations: timing[3] < 0 ? Infinity : timing[3], iterationStart: timing[4], direction, fill, easing, pseudoElement: pseudo || null });
-      effects.get(effect).animation = animation;
-      const data = { serial, kind, name, effect };
-      cssReset(data);
-      cssData.set(animation, data);
-      cssAnimations.set(serial, animation);
-    }
-    Object.assign(cssData.get(animation), { time, state });
-    return animation;
-  };
   const cssState = animation => {
     const data = cssData.get(animation), target = data.effect.target;
     if (data.state !== 'idle') {
@@ -3084,7 +3029,27 @@
     commitStyles: { value() { const target = cssData.get(this).effect.target, computed = getComputedStyle(target); for (const frame of effects.get(cssData.get(this).effect).frames) for (const [name] of frame.props) target.style.setProperty(name, computed.getPropertyValue(name)); }, writable: true, configurable: true },
   });
   const cssOf = (node, subtree) => {
-    const list = call('dom.cssAnimations', node._id, subtree, subtree).map(cssEntry);
+    const list = call('dom.cssAnimations', node._id, subtree, subtree).map(([serial, id, kind, name, time, state, timing, direction, fill, easing, frames, pseudo]) => {
+      let animation = cssAnimations.get(serial);
+      if (!animation) {
+        animation = new (kind === 'animation' ? CSSAnimation : CSSTransition)(cssToken);
+        const keyframes = [];
+        for (const [offset, property, value, ease] of frames) {
+          let frame = keyframes.find(frame => frame.offset === offset && frame.easing === ease);
+          if (!frame) keyframes.push(frame = { offset, easing: ease });
+          frame[camelName(property)] = value;
+        }
+        keyframes.sort((a, b) => a.offset - b.offset);
+        const effect = new KeyframeEffect(wrap(id), keyframes, { delay: timing[0], endDelay: timing[1], duration: timing[2], iterations: timing[3] < 0 ? Infinity : timing[3], iterationStart: timing[4], direction, fill, easing, pseudoElement: pseudo || null });
+        effects.get(effect).animation = animation;
+        const data = { serial, kind, name, effect };
+        cssReset(data);
+        cssData.set(animation, data);
+        cssAnimations.set(serial, animation);
+      }
+      Object.assign(cssData.get(animation), { time, state });
+      return animation;
+    });
     if (node._id === 0) { const live = new Set(list); for (const [serial, animation] of cssAnimations) if (!live.has(animation)) cssAnimations.delete(serial); }
     return list;
   };
@@ -3153,7 +3118,25 @@
   }
   globalThis.HTMLWebViewElement = HTMLWebViewElement;
   htmlTypes.set('webview', HTMLWebViewElement);
-  const syncWebviews = () => {
+  globalThis.__appsWebviewEvent = (id, name, detail) => attachedWebviews.get(id)?.dispatchEvent(Object.assign(new Event(name), detail));
+  globalThis.__appsWebviewReply = (id, value, error) => { const reply = webviewReplies.get(id); webviewReplies.delete(id); if (error === null) reply?.[0](value); else reply?.[1](new Error(error)); };
+  globalThis.__appsMediaChanged=()=>{
+    if (!mediaQueries.size) return;
+    const viewport = host('dom.viewport').join(':');
+    if (viewport === mediaViewport) return;
+    mediaViewport = viewport;
+    for (const reference of mediaQueries) {
+      const query = reference.deref();
+      if (!query) { mediaQueries.delete(reference); continue; }
+      const matches = query.matches;
+      if (matches === query._matches) continue;
+      query._matches = matches;
+      query.dispatchEvent(new MediaQueryListEvent('change', { media: query.media, matches }));
+    }
+  };
+  // Use the last frame's observer flags. A forced layout here adds work every frame.
+  globalThis.__appsLayout = () => {
+    if (active) { observing = true; const lost = !focusable(active); observing = false; if (lost) active.blur(); }
     if (webviewScan) { webviewScan = false; document.querySelectorAll('webview'); }
     for (const ref of webviewRefs) {
       const view = ref.deref();
@@ -3174,31 +3157,10 @@
       const visible = bounds.width > 0 && bounds.height > 0 && getComputedStyle(view).visibility !== 'hidden', key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height},${visible}`;
       if (key !== view._bounds) { view._bounds = key; call('dom.open', 'webview', 'bounds', view._guest, { bounds, visible }); }
     }
-  };
-  globalThis.__appsWebviewEvent = (id, name, detail) => attachedWebviews.get(id)?.dispatchEvent(Object.assign(new Event(name), detail));
-  globalThis.__appsWebviewReply = (id, value, error) => { const reply = webviewReplies.get(id); webviewReplies.delete(id); if (error === null) reply?.[0](value); else reply?.[1](new Error(error)); };
-  // Use the last frame's observer flags. A forced layout here adds work every frame.
-  globalThis.__appsLayout = () => { if (active) { observing = true; const lost = !focusable(active); observing = false; if (lost) active.blur(); } syncWebviews(); for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(), at = geometry[2]; if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === at) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) observer.callback(entries, observer); } };
-  const resizeLayout=globalThis.__appsLayout;
-  globalThis.__appsMediaChanged=()=>{
-    if (!mediaQueries.size) return;
-    const viewport = host('dom.viewport').join(':');
-    if (viewport === mediaViewport) return;
-    mediaViewport = viewport;
-    for (const reference of mediaQueries) {
-      const query = reference.deref();
-      if (!query) { mediaQueries.delete(reference); continue; }
-      const matches = query.matches;
-      if (matches === query._matches) continue;
-      query._matches = matches;
-      query.dispatchEvent(new MediaQueryListEvent('change', { media: query.media, matches }));
-    }
-  };
-  // Resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
-  globalThis.__appsLayout=()=>{resizeLayout();for(const id of call('dom.scrollEvents'))wrap(id)?.dispatchEvent(new Event('scroll',{bubbles:!id}));__appsMediaChanged();};
-  const mediaLayout=globalThis.__appsLayout;
-  globalThis.__appsLayout=()=>{
-    mediaLayout();
+    for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(), at = geometry[2]; if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === at) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) try { observer.callback(entries, observer); } catch (error) { report(error); } }
+    // Resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
+    for (const id of call('dom.scrollEvents')) wrap(id)?.dispatchEvent(new Event('scroll', { bubbles: !id }));
+    __appsMediaChanged();
     if(!intersectionObservers.size)return;
     call('dom.layout',false,true);
     let viewport;
@@ -3228,9 +3190,10 @@
   };
 
   globalThis.__appsEditing = () => editable(active) ? { id: active._id, text: active.value, start: active.selectionDirection === 'backward' ? active.selectionEnd : active.selectionStart, end: active.selectionDirection === 'backward' ? active.selectionStart : active.selectionEnd, marked: composing } : active?.isContentEditable ? { id: active._id, text: active.textContent, start: textOffset(active,selection.anchorNode,selection.anchorOffset), end: textOffset(active,selection.focusNode,selection.focusOffset), node: selection.focusNode?._id, offset: selection.focusOffset, marked: composing } : null;
-  const blockOf = (host, node) => { let block = node.nodeType === 3 ? node.parentNode : node; while (block !== host && !/^(div|p|li|h[1-6]|blockquote|pre)$/.test(block.localName)) block = block.parentNode; return block; };
   const paragraph = (host, range) => {
-    const block = blockOf(host, range.startContainer), tail = document.createRange();
+    let block = range.startContainer.nodeType === 3 ? range.startContainer.parentNode : range.startContainer;
+    while (block !== host && !/^(div|p|li|h[1-6]|blockquote|pre)$/.test(block.localName)) block = block.parentNode;
+    const tail = document.createRange();
     tail.setStart(range.startContainer, range.startOffset);
     if (block === host) {
       let top = range.startContainer; while (top.parentNode !== host) top = top.parentNode;
@@ -3498,11 +3461,6 @@
       for (let index = to.length; index--;) if (to[index].nodeType !== 11 && !from.includes(to[index])) fire(to[index], 'enter', to.slice(index), previous, false);
     }
   };
-  const tabOrder = () => {
-    const list = [], stack = [document];
-    while (stack.length) { const node = stack.pop(); if (node.nodeType === 1 && node.tabIndex >= 0 && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable)) list.push(node); const assigned = node instanceof HTMLSlotElement ? node.assignedNodes() : null, kids = assigned?.length ? assigned : (node._shadow ?? node).childNodes; for (let index = kids.length; index--;) stack.push(kids[index]); }
-    return list.map((node, order) => [node.tabIndex > 0 ? node.tabIndex : Infinity, order, node]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(entry => entry[2]);
-  };
   let press = null, last = null, sliding = null;
   const slide = (node, x) => { const rect = node.getBoundingClientRect(), thumb = Math.min(rect.height, 16), [min, max] = rangeBounds(node); setRange(node, min + Math.min(1, Math.max(0, (x - rect.left - thumb / 2) / (rect.width - thumb || 1))) * (max - min)); };
   const mouseInit = (data, extra) => ({ bubbles: true, cancelable: true, composed: true, view: window, clientX: data.clientX, clientY: data.clientY, screenX: data.screenX ?? data.clientX, screenY: data.screenY ?? data.clientY, ctrlKey: !!data.ctrlKey, metaKey: !!data.metaKey, altKey: !!data.altKey, shiftKey: !!data.shiftKey, button: data.button ?? 0, buttons: data.buttons ?? 0, detail: data.detail ?? 0, movementX: last ? data.clientX - last[0] : 0, movementY: last ? data.clientY - last[1] : 0, pointerId: 1, pointerType: 'mouse', isPrimary: true, ...extra });
@@ -3599,7 +3557,12 @@
         return false;
       }
       if (event.key === 'Enter' && plain && (tag === 'button' || /^(button|submit|reset|image)$/.test(type) || (tag === 'a' || tag === 'area') && target.hasAttribute('href') || tag === 'summary') && !disabled(target)) { fireClick(target, { detail: 0 }, true); return false; }
-      if (event.key === 'Escape' && closeRequest()) return false;
+      if (event.key === 'Escape' && watchers.length) {
+        const top = watchers.at(-1);
+        if (top._popover) hidePopover(top, true, true);
+        else if (top.closedBy !== 'none' && dispatch(top, trusted(new Event('cancel', { cancelable: true })))) top.close();
+        return false;
+      }
       if (tag === 'select' && plain && event.key === ' ') { openSelect(target); return false; }
       if (tag === 'select' && plain && !disabled(target) && /^(ArrowUp|ArrowDown|Home|End|PageUp|PageDown)$/.test(event.key) || tag === 'select' && plain && event.key.length === 1 && event.key !== ' ') {
         const list = options(target).filter(option => !disabled(option)), index = list.indexOf(target.selectedOptions[0]);
@@ -3614,7 +3577,15 @@
         return false;
       }
       if (event.key === 'Tab' && !event.metaKey && !event.ctrlKey && !event.altKey) {
-        const list = tabOrder(), index = list.indexOf(active), next = index < 0 ? (event.shiftKey ? list.length - 1 : 0) : (index + (event.shiftKey ? -1 : 1) + list.length) % list.length;
+        // Wrap only records whose tabIndex can be 0 or more: wrappers live until their nodes leave the page.
+        const found = [], stack = [records[0]];
+        while (stack.length) {
+          const rec = stack.pop(), tag = rec.tag;
+          if (tag[0] !== '#' && (rec.attrs.has('tabindex') || tag.includes('-') || /^(input|textarea|button|select|iframe|summary)$/.test(tag) || (tag === 'a' || tag === 'area') && rec.attrs.has('href'))) { const node = of(rec); if (node.tabIndex >= 0 && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable)) found.push(node); }
+          const assigned = tag === 'slot' && of(rec) instanceof HTMLSlotElement ? call('dom.assignedNodes', rec.id, false) : null, kids = assigned?.length ? assigned.map(id => records[id]) : (rec.shadow ?? rec).kids;
+          for (let index = kids.length; index--;) stack.push(kids[index]);
+        }
+        const list = found.map((node, order) => [node.tabIndex > 0 ? node.tabIndex : Infinity, order, node]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(entry => entry[2]), index = list.indexOf(active), next = index < 0 ? (event.shiftKey ? list.length - 1 : 0) : (index + (event.shiftKey ? -1 : 1) + list.length) % list.length;
         list[next]?.focus();
         return false;
       }
@@ -3641,7 +3612,19 @@
     const first = name === 'pointerdown' && (!press || press.button === button), ended = name === 'pointerup' && !data.buttons;
     if (first) { pointers.add(1); press = { target, button, detail: data.detail ?? 1, mouse: true }; }
     if (name === 'pointerdown') keyboardFocus = false;
-    if (first || ended) lightDismiss(first, target, data.clientX, data.clientY);
+    if (first || ended) {
+      if (autos.length || hints.length) {
+        const clicked = nearestPopover(target, [...autos, ...hints]), invoker = path(target).map(node => node.nodeType === 1 && invoked(node)).find(popover => popover?._popover && popover._popover !== 'manual') ?? null;
+        const ancestor = position(clicked) > position(invoker) ? clicked : invoker;
+        if (first) pressedPopover = ancestor; else { const same = ancestor === pressedPopover; pressedPopover = null; if (same) hideUntil(ancestor ?? document); }
+      }
+      if (dialogs.length) {
+        let clicked = path(target).find(node => node.localName === 'dialog' && dialogs.includes(node)) ?? null;
+        if (clicked === target && clicked._modal) { const box = clicked.getBoundingClientRect(); if (data.clientX < box.left || data.clientY < box.top || data.clientX >= box.right || data.clientY >= box.bottom) clicked = null; }
+        if (first) pressedDialog = clicked;
+        else { const same = clicked === pressedDialog, top = dialogs.at(-1); pressedDialog = null; if (same && top && top !== clicked && top.closedBy === 'any') top.requestClose(); }
+      }
+    }
     const result = dispatch(target, trusted(new PointerEvent(first ? 'pointerdown' : ended ? 'pointerup' : 'pointermove', init)));
     if (first && !result) press.mouse = false;
     const blocked = path(target).some(node => node.nodeType === 1 && /^(button|input|select|textarea)$/.test(node.localName) && disabled(node));

@@ -529,7 +529,11 @@ impl<'i> AtRuleParser<'i> for Rules {
             return Ok(Item::Rule(Rule::Media(queries, Vec::new())));
         }
         if !name.eq_ignore_ascii_case("charset") {
-            DROPPED.with_borrow_mut(|dropped| dropped.insert(name.to_ascii_lowercase()));
+            DROPPED.with_borrow_mut(|dropped| {
+                if dropped.len() < 256 {
+                    dropped.insert(name.to_ascii_lowercase());
+                }
+            });
         }
         Err(ParseError::unexpected_token())
     }
@@ -548,6 +552,15 @@ impl<'i> AtRuleParser<'i> for Rules {
         _: &ParserState,
         input: &mut Parser<'i>,
     ) -> Result<Item, ParseError<()>> {
+        let nested = |input: &mut Parser<'i>| {
+            Rules {
+                parent: self.parent.clone(),
+                scope: self.scope,
+                suffix: self.suffix.clone(),
+                ..Rules::default()
+            }
+            .body(input)
+        };
         Ok(Item::Rule(match item {
             Item::Scope(start, end) => {
                 let root = Rc::new(Selector::parse(
@@ -585,27 +598,10 @@ impl<'i> AtRuleParser<'i> for Rules {
                 }
                 .body(input),
             }),
-            Item::Rule(Rule::Layer(names, _)) => Rule::Layer(
-                names,
-                Rules {
-                    parent: self.parent.clone(),
-                    scope: self.scope,
-                    suffix: self.suffix.clone(),
-                    ..Rules::default()
-                }
-                .body(input),
-            ),
-            Item::Rule(Rule::Supports(condition, supported, _)) => Rule::Supports(
-                condition,
-                supported,
-                Rules {
-                    parent: self.parent.clone(),
-                    scope: self.scope,
-                    suffix: self.suffix.clone(),
-                    ..Rules::default()
-                }
-                .body(input),
-            ),
+            Item::Rule(Rule::Layer(names, _)) => Rule::Layer(names, nested(input)),
+            Item::Rule(Rule::Supports(condition, supported, _)) => {
+                Rule::Supports(condition, supported, nested(input))
+            }
             Item::Rule(Rule::Theme(inline, _)) => Rule::Theme(
                 inline,
                 Rules {
@@ -668,28 +664,10 @@ impl<'i> AtRuleParser<'i> for Rules {
                     .flatten()
                     .collect(),
             ),
-            Item::Rule(Rule::Media(queries, _)) => Rule::Media(
-                queries,
-                Rules {
-                    parent: self.parent.clone(),
-                    scope: self.scope,
-                    suffix: self.suffix.clone(),
-                    ..Rules::default()
-                }
-                .body(input),
-            ),
-            Item::Rule(Rule::Container(name, block, query, _)) => Rule::Container(
-                name,
-                block,
-                query,
-                Rules {
-                    parent: self.parent.clone(),
-                    scope: self.scope,
-                    suffix: self.suffix.clone(),
-                    ..Rules::default()
-                }
-                .body(input),
-            ),
+            Item::Rule(Rule::Media(queries, _)) => Rule::Media(queries, nested(input)),
+            Item::Rule(Rule::Container(name, block, query, _)) => {
+                Rule::Container(name, block, query, nested(input))
+            }
             _ => return Err(ParseError::unexpected_token()),
         }))
     }
@@ -1009,6 +987,12 @@ impl FontUnits {
             absolute: false,
         }
     }
+
+    pub fn bits(self) -> [u32; 7] {
+        let [em, ch, ex, cap, ic, lh] =
+            [self.em, self.ch, self.ex, self.cap, self.ic, self.lh].map(f32::to_bits);
+        [em, ch, ex, cap, ic, lh, u32::from(self.absolute)]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1047,7 +1031,7 @@ impl NodeLengths {
                 }
             };
         }
-        self.ids[id] = self.last;
+        self.ids.set(id, self.last, u32::eq);
     }
 
     pub(crate) fn get(&self, id: usize) -> Option<&Lengths> {

@@ -136,7 +136,7 @@ globalThis.__appsHTTP = (serve, stream, EventEmitter, net) => {
   const request=(input,options,callback)=>new ClientRequest(input,options,callback);
   const get=(...args)=>{const req=request(...args);req.end();return req;};
   class WebSocket extends EventEmitter {
-    constructor(url,protocols,options){super();this._socket=url instanceof globalThis.WebSocket?url:new globalThis.WebSocket(url,protocols);this._socket.binaryType='arraybuffer';for(const type of ['open','error','close','message'])this._socket.addEventListener(type,event=>{if(type==='message')this.emit(type,typeof event.data==='string'?Buffer.from(event.data):Buffer.from(event.data),typeof event.data!=='string');else if(type==='close')this.emit(type,event.code,Buffer.from(event.reason));else this.emit(type,event);});}
+    constructor(url,protocols,options){super();this._socket=url instanceof globalThis.WebSocket?url:new globalThis.WebSocket(url,protocols);this._socket.binaryType='arraybuffer';for(const type of ['open','error','close','message'])this._socket.addEventListener(type,event=>{if(type==='message')this.emit(type,Buffer.from(event.data),typeof event.data!=='string');else if(type==='close')this.emit(type,event.code,Buffer.from(event.reason));else this.emit(type,event);});}
     get readyState(){return this._socket.readyState;}get bufferedAmount(){return this._socket.bufferedAmount;}get protocol(){return this._socket.protocol;}
     send(data,options,callback){if(typeof options==='function')callback=options;try{this._socket.send(data);callback?.();}catch(error){if(callback)callback(error);else throw error;}}
     close(code,reason){this._socket.close(code,reason);}terminate(){this._socket.close();}
@@ -148,7 +148,7 @@ globalThis.__appsHTTP = (serve, stream, EventEmitter, net) => {
     handleUpgrade(request,socket,_head,callback){if(!socket._upgrade)throw new Error('WebSocket upgrade requires an apps HTTP server');const protocols=new Set((request.headers['sec-websocket-protocol']??'').split(',').map(v=>v.trim()).filter(Boolean));const ws=new WebSocket(socket._upgrade({protocol:protocols.values().next().value??''}));this.clients.add(ws);ws.once('close',()=>this.clients.delete(ws));callback(ws,request);}
     close(callback){for(const ws of this.clients)ws.close();queueMicrotask(()=>{this.emit('close');callback?.();});}
   }
-  const secure=(input,options)=>{if(typeof input==='string'||input instanceof URL){if(new URL(input).protocol!=='https:')throw fail(TypeError,'ERR_INVALID_PROTOCOL',`Protocol "${new URL(input).protocol}" not supported. Expected "https:"`);return[input,options];}return[{...input,protocol:'https:'},options];};
+  const secure=(input,options)=>{if(typeof input==='string'||input instanceof URL){const{protocol}=new URL(input);if(protocol!=='https:')throw fail(TypeError,'ERR_INVALID_PROTOCOL',`Protocol "${protocol}" not supported. Expected "https:"`);return[input,options];}return[{...input,protocol:'https:'},options];};
   const secureRequest=(input,options,callback)=>{if(typeof options==='function'){callback=options;options=undefined;}return request(...secure(input,options),callback);};
   const tls=()=>{throw fail(Error,'ERR_NOT_SUPPORTED','HTTPS servers are not supported. Serve HTTP and put TLS in front of it');};
   class SecureServer extends Server { constructor(){tls();super();} }

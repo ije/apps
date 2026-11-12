@@ -182,8 +182,7 @@ impl renderer::Hooks for FieldText {
             }
             if origin.y + height > mask.top() {
                 super::text::paint_text(
-                    &line.line,
-                    &line.breaks,
+                    line,
                     origin,
                     line_height,
                     std::slice::from_ref(&self.run),
@@ -215,7 +214,7 @@ impl renderer::Hooks for FieldText {
 }
 
 impl PageState {
-    pub(super) fn evaluate(&self, script: &str) -> Result<String> {
+    fn evaluate(&self, script: &str) -> Result<String> {
         let renderer = self
             .runtime
             .borrow()
@@ -252,7 +251,11 @@ impl PageState {
             marked,
             serde_json::json!(selected)
         );
-        if let Err(error) = super::scripted(cx, Some(window), || self.evaluate(&script)) {
+        self.run(&script, window, cx);
+    }
+
+    fn run(&self, script: &str, window: &mut Window, cx: &mut App) {
+        if let Err(error) = super::scripted(cx, Some(window), || self.evaluate(script)) {
             eprintln!("apps: {error}");
         }
         self.drive(cx);
@@ -283,11 +286,7 @@ impl PageState {
             f32::from(position.y),
             serde_json::json!(names),
         );
-        if let Err(error) = super::scripted(cx, Some(window), || self.evaluate(&script)) {
-            eprintln!("apps: {error}");
-        }
-        self.drive(cx);
-        window.refresh();
+        self.run(&script, window, cx);
     }
 
     fn drop_files(&self, position: Point<Pixels>, window: &mut Window, cx: &mut App) {
@@ -328,11 +327,7 @@ impl PageState {
             f32::from(position.x),
             f32::from(position.y)
         );
-        if let Err(error) = super::scripted(cx, Some(window), || self.evaluate(&script)) {
-            eprintln!("apps: {error}");
-        }
-        self.drive(cx);
-        window.refresh();
+        self.run(&script, window, cx);
     }
 }
 

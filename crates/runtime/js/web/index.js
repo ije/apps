@@ -6,9 +6,8 @@ globalThis.__appsWeb = (call, codec) => {
     if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
     throw new TypeError('Expected an ArrayBuffer or a view');
   };
-  const encodeBytes = value => value;
   const decodeBytes = value => typeof value === 'string' ? Uint8Array.fromBase64(value) : value instanceof Uint8Array ? value : new Uint8Array(value);
-  globalThis.__appsBytes = { encode: encodeBytes, decode: decodeBytes, memory: body => memoryBodies.get(body) };
+  globalThis.__appsBytes = { decode: decodeBytes, memory: body => memoryBodies.get(body) };
   const retries = globalThis.__appsRetries = new Set();
   class DOMException extends Error {
     constructor(message = '', name = 'Error') { super(String(message)); this.name = String(name); }
@@ -283,7 +282,7 @@ globalThis.__appsWeb = (call, codec) => {
     set(value) { const state = urls.get(this); state.data = parseURL(state.data[0], null, key, String(value)); if ((key === 'search' || key === 'href') && state.searchParams) params.get(state.searchParams).list = query(parts.search(state.data).slice(1)); },
   });
   const uuid = new Uint8Array(16);
-  const crypto = globalThis.__appsCrypto(call, encodeBytes, decodeBytes, {
+  const crypto = globalThis.__appsCrypto(call, decodeBytes, {
     getRandomValues(array) {
       if (!ArrayBuffer.isView(array) || array instanceof DataView || array instanceof Float32Array || array instanceof Float64Array || (typeof Float16Array !== 'undefined' && array instanceof Float16Array)) throw new DOMException('Expected an integer typed array', 'TypeMismatchError');
       if (array.byteLength > 65536) throw new DOMException('Random byte quota exceeded', 'QuotaExceededError');
@@ -299,7 +298,7 @@ globalThis.__appsWeb = (call, codec) => {
         const name = String(typeof algorithm === 'string' ? algorithm : algorithm?.name).toUpperCase();
         const data = bytes(input);
         if (!['SHA-1', 'SHA-256', 'SHA-384', 'SHA-512'].includes(name)) throw new DOMException('Unsupported digest algorithm', 'NotSupportedError');
-        return decodeBytes(call('web.digest', name, encodeBytes(data))).buffer;
+        return decodeBytes(call('web.digest', name, data)).buffer;
       },
     }),
   });
@@ -534,7 +533,7 @@ globalThis.__appsWeb = (call, codec) => {
       if (this.readyState === 0) throw new DOMException('WebSocket is connecting', 'InvalidStateError');
       if (this.readyState !== 1) return;
       const binary = data instanceof Blob || data instanceof ArrayBuffer || ArrayBuffer.isView(data);
-      this.bufferedAmount += call('web.socket.send', this._socket, data instanceof Blob ? encodeBytes(blobs.get(data)) : binary ? encodeBytes(bytes(data)) : String(data), binary);
+      this.bufferedAmount += call('web.socket.send', this._socket, data instanceof Blob ? blobs.get(data) : binary ? bytes(data) : String(data), binary);
     }
     close(code = 1000, reason = '') {
       if (code !== 1000 && !(code >= 3000 && code <= 4999)) throw new DOMException('Invalid close code', 'InvalidAccessError');
@@ -562,16 +561,17 @@ globalThis.__appsWeb = (call, codec) => {
     let request;
     try {
       request = new Request(input, init); request.signal.throwIfAborted();
-      if (new URL(request.url).protocol === 'apps:') {
+      const url = new URL(request.url), protocol = url.protocol;
+      if (protocol === 'apps:') {
         if (!['GET', 'HEAD'].includes(request.method)) throw new TypeError('Bundled assets require GET');
         const data = call('web.asset', request.url);
         if (data === null) throw new TypeError('Failed to fetch');
         const type = { wasm: 'application/wasm', svg: 'image/svg+xml', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', woff2: 'font/woff2', woff: 'font/woff', ttf: 'font/ttf', otf: 'font/otf', mp3: 'audio/mpeg', wav: 'audio/wav', mp4: 'video/mp4', glb: 'model/gltf-binary' }[request.url.split('.').pop()] ?? 'application/octet-stream';
         resolve(new Response(request.method === 'HEAD' ? null : decodeBytes(data), { headers: { 'content-type': type } })); return;
       }
-      if (new URL(request.url).protocol === 'data:') {
+      if (protocol === 'data:') {
         if (request.method !== 'GET') throw new TypeError('Data URLs require GET');
-        const url=new URL(request.url), source=url.href.slice(5,url.hash?-url.hash.length:undefined), comma=source.indexOf(',');
+        const source=url.href.slice(5,url.hash?-url.hash.length:undefined), comma=source.indexOf(',');
         if(comma<0)throw new TypeError('Invalid data URL');
         let type=source.slice(0,comma), bytes=[];
         const raw=source.slice(comma+1);
@@ -581,11 +581,11 @@ globalThis.__appsWeb = (call, codec) => {
         if(!type)type='text/plain;charset=US-ASCII';else if(type.startsWith(';'))type='text/plain'+type;
         resolve(new Response(new Uint8Array(bytes),{headers:{'content-type':type}}));return;
       }
-      if (new URL(request.url).protocol === 'blob:') {
+      if (protocol === 'blob:') {
         const blob = objectURLs.get(request.url); if (!blob || request.method !== 'GET') throw new TypeError('Invalid Blob URL request');
         resolve(new Response(blob, { headers: { 'content-type': blob.type, 'content-length': String(blob.size) } })); return;
       }
-      if (!['http:', 'https:'].includes(new URL(request.url).protocol)) throw new TypeError('Fetch supports HTTP, HTTPS, Blob, and data URLs');
+      if (!['http:', 'https:'].includes(protocol)) throw new TypeError('Fetch supports HTTP, HTTPS, Blob, and data URLs');
     }
     catch (error) { reject(error); return; }
     const signal = request.signal;
@@ -601,8 +601,7 @@ globalThis.__appsWeb = (call, codec) => {
       if (connecting >= 64 || pending.size >= 256) { queued.push(() => start(data)); return; }
       try {
         signal.throwIfAborted();
-        const fields = [...request.headers].filter(([name]) => !['host', 'content-length', 'connection', 'transfer-encoding', 'upgrade'].includes(name));
-        id = call('web.fetch.start', { url: request.url, method: request.method, headers: fields, redirect: request.redirect, body: encodeBytes(data), stream: !!state.uploadReader });
+        id = call('web.fetch.start', { url: request.url, method: request.method, headers: [...request.headers], redirect: request.redirect, body: data, stream: !!state.uploadReader });
         pending.set(id, state);
       } catch (error) { if (state.uploadReader) { const reader = state.uploadReader; reader.cancel(error).catch(() => {}).finally(() => reader.releaseLock()); } signal.removeEventListener('abort', state.onAbort); reject(signal.aborted ? signal.reason : new TypeError(error.message)); queued.shift()?.(); }
     };
@@ -648,7 +647,7 @@ globalThis.__appsWeb = (call, codec) => {
         reader.read().then(({ value, done }) => {
           if (!pending.has(event.id) || state.uploadReader !== reader) return;
           if (!done && !(value instanceof Uint8Array)) throw new TypeError('Body chunks must be Uint8Array');
-          call('web.fetch.upload', event.id, done ? null : encodeBytes(value));
+          call('web.fetch.upload', event.id, done ? null : value);
           if (done) { reader.releaseLock(); state.uploadReader = null; }
         }).catch(error => { state.reject(error); cleanup(event.id, state); });
       } else if (event.kind === 'headers') {

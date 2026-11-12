@@ -5,7 +5,7 @@ pub struct Scene {
     pub(crate) layers: Vec<SceneLayer>,
     active: Vec<usize>,
     spare: Vec<SceneLayer>,
-    pub(crate) keyed: Vec<(u64, usize)>,
+    keyed: Vec<(u64, usize)>,
 }
 
 #[derive(Default)]
@@ -168,8 +168,13 @@ impl Scene {
         });
     }
 
+    pub(crate) fn keyed(&self, key: u64) -> Option<usize> {
+        let &(_, index) = self.keyed.iter().find(|(keyed, _)| *keyed == key)?;
+        Some(index)
+    }
+
     pub(crate) fn patch(&mut self, key: u64, opacity: f32, transform: Option<[f32; 16]>) -> bool {
-        let Some(&(_, index)) = self.keyed.iter().find(|(keyed, _)| *keyed == key) else {
+        let Some(index) = self.keyed(key) else {
             return false;
         };
         let Some(effect) = self.layers[index].effect.as_mut() else {
@@ -433,29 +438,26 @@ impl PartialEq for RenderImage {
 }
 
 #[cfg(test)]
+pub(crate) fn effect(content_mask: Clip<f32>) -> EffectState {
+    EffectState {
+        transform: None,
+        opacity: 1.,
+        color_matrix: None,
+        blur: 0.,
+        shadow: None,
+        blend_mode: BlendMode::Normal,
+        clip: None,
+        mask: None,
+        backdrop: None,
+        glass: None,
+        content_mask,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu::BOX;
-
-    fn effect(content_mask: Clip<f32>) -> EffectState {
-        EffectState {
-            transform: None,
-            opacity: 1.,
-            color_matrix: None,
-            blur: 0.,
-            shadow: None,
-            blend_mode: BlendMode::Normal,
-            clip: None,
-            mask: None,
-            backdrop: None,
-            glass: None,
-            content_mask,
-        }
-    }
-
-    fn bounds([x, y, width, height]: [f32; 4]) -> Rect<f32> {
-        Rect::new(point(x, y), Size::new(width, height))
-    }
+    use crate::gpu::{BOX, rect as bounds};
 
     #[test]
     fn native_glass_can_overlap_but_cannot_cover_gpu_overlays() {

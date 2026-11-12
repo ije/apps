@@ -1,4 +1,4 @@
-globalThis.__appsNodeCompat = (EventEmitter, stream, tls) => {
+globalThis.__appsNodeCompat = (EventEmitter, stream) => {
   // JSC cannot hook await. Stores cover synchronous run() calls and functions from bind() or snapshot().
   let current = new Map();
   const within = (context, fn, self, args) => { const saved = current; current = context; try { return Reflect.apply(fn, self, args); } finally { current = saved; } };
@@ -77,7 +77,7 @@ globalThis.__appsNodeCompat = (EventEmitter, stream, tls) => {
   const sea = { isSea: () => false, getAssetKeys: () => [], getAsset(name) { throw absent(name); }, getAssetAsBlob(name) { throw absent(name); }, getRawAsset(name) { throw absent(name); } };
 
   const body = response => {
-    const output = response.body ? stream.Readable.fromWeb(response.body) : stream.Readable.from([]);
+    const { Readable } = stream(), output = response.body ? Readable.fromWeb(response.body) : Readable.from([]);
     const read = () => new Promise((resolve, reject) => { const chunks = []; output.on('data', chunk => chunks.push(chunk)).once('end', () => resolve(Buffer.concat(chunks))).once('error', reject); });
     return Object.assign(output, {
       text: async () => (await read()).toString(), json: async () => JSON.parse((await read()).toString()), bytes: async () => new Uint8Array(await read()),
@@ -101,7 +101,7 @@ globalThis.__appsNodeCompat = (EventEmitter, stream, tls) => {
       const init = { method, headers: list, signal, redirect: 'manual' };
       if (options.body != null && method !== 'GET' && method !== 'HEAD') {
         const source = options.body;
-        init.body = typeof source.pipe === 'function' || typeof source[Symbol.asyncIterator] === 'function' ? stream.Readable.toWeb(stream.Readable.from(source)) : source;
+        init.body = typeof source.pipe === 'function' || typeof source[Symbol.asyncIterator] === 'function' ? stream().Readable.toWeb(stream().Readable.from(source)) : source;
         if (init.body instanceof ReadableStream) init.duplex = 'half';
       }
       const response = await fetch(url, init), result = {};
@@ -130,5 +130,5 @@ globalThis.__appsNodeCompat = (EventEmitter, stream, tls) => {
     serialize: value => Buffer.from(JSON.stringify(value)),
     deserialize: bytes => JSON.parse(Buffer.from(bytes).toString()),
   };
-  return { async_hooks, diagnostics_channel, sea, tls, undici, v8, EventEmitterAsyncResource };
+  return { async_hooks, diagnostics_channel, sea, undici, v8, EventEmitterAsyncResource };
 };

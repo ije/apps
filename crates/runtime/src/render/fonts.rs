@@ -87,8 +87,9 @@ pub(crate) fn load(
         if chars.is_empty() {
             (*last, *chars) = (0, vec![0; 0x110000 / 64]);
         }
-        for (id, node) in doc.nodes.iter().enumerate() {
-            if node.tag == "#text" && doc.nodes.revision(id) > *last {
+        for id in doc.nodes.changed_since(*last) {
+            let node = &doc.nodes[id];
+            if node.tag == "#text" {
                 for code in node.text.chars().map(|code| code as usize) {
                     chars[code / 64] |= 1 << (code % 64);
                 }
@@ -243,9 +244,10 @@ mod tests {
         );
         let mut state = State::default();
         state.text_system = Some(system.clone());
+        state.pixel_ratio = 1.;
         state.base = url::Url::parse("apps:///index.html").ok();
         let load = |doc: &mut Document, state: &mut State| {
-            crate::dom::styles(doc, state, [800., 600.], Some((&system, 1.)));
+            crate::dom::styles(doc, state, [800., 600.]);
             load(doc, state, &assets)
         };
         let (added, faces) = load(&mut doc, &mut state);
@@ -318,8 +320,9 @@ mod tests {
         );
         let mut state = State::default();
         state.text_system = Some(system.clone());
+        state.pixel_ratio = 1.;
         state.base = url::Url::parse("apps:///index.html").ok();
-        crate::dom::styles(&mut doc, &mut state, [800., 600.], Some((&system, 1.)));
+        crate::dom::styles(&mut doc, &mut state, [800., 600.]);
         load(&doc, &mut state, &assets);
         for (weight, width) in [(400, 15.), (500, 7.5), (600, 7.5)] {
             let font = format!("{weight} 10px Brand");

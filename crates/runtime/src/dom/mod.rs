@@ -13,7 +13,7 @@ use crate::style::Prop;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     rc::Rc,
     sync::{
         Arc, LazyLock, Mutex, PoisonError,
@@ -42,7 +42,7 @@ pub(crate) type TextLayout = (
 );
 
 pub(crate) type SvgBoxes = (
-    String,
+    Rc<str>,
     Vec<(String, usize)>,
     [f32; 2],
     Vec<(usize, [f32; 4], [f32; 4])>,
@@ -502,13 +502,13 @@ impl Node {
     }
 }
 
-pub(crate) const MIRROR_BOUNDS: u8 = 1;
-pub(crate) const MIRROR_SCROLLER: u8 = 2;
-pub(crate) const MIRROR_CLIP: u8 = 4;
-pub(crate) const MIRROR_POSITIONED: u8 = 8;
-pub(crate) const MIRROR_HIDDEN: u8 = 16;
-pub(crate) const MIRROR_FIXED: u8 = 32;
-pub(crate) const MIRROR_INERT: u8 = 64;
+const MIRROR_BOUNDS: u8 = 1;
+const MIRROR_SCROLLER: u8 = 2;
+const MIRROR_CLIP: u8 = 4;
+const MIRROR_POSITIONED: u8 = 8;
+const MIRROR_HIDDEN: u8 = 16;
+const MIRROR_FIXED: u8 = 32;
+const MIRROR_INERT: u8 = 64;
 const HIDDEN: u8 = 1;
 const EDITABLE: u8 = 2;
 const INERT: u8 = 4;
@@ -565,12 +565,12 @@ impl LayoutMirror {
         self.capacity = capacity;
     }
 
-    pub fn get(&self, id: &usize) -> Option<&[f32; 4]> {
+    pub(crate) fn get(&self, id: &usize) -> Option<&[f32; 4]> {
         (*id < self.capacity && unsafe { *self.flags(*id) } & MIRROR_BOUNDS != 0)
             .then(|| unsafe { &*self.slot(*id).cast::<[f32; 4]>() })
     }
 
-    pub fn get_mut(&mut self, id: &usize) -> Option<&mut [f32; 4]> {
+    pub(crate) fn get_mut(&mut self, id: &usize) -> Option<&mut [f32; 4]> {
         (*id < self.capacity && unsafe { *self.flags(*id) } & MIRROR_BOUNDS != 0)
             .then(|| unsafe { &mut *self.slot(*id).cast::<[f32; 4]>() })
     }
@@ -583,7 +583,7 @@ impl LayoutMirror {
         }
     }
 
-    pub fn remove(&mut self, id: &usize) {
+    pub(crate) fn remove(&mut self, id: &usize) {
         if *id < self.capacity {
             unsafe {
                 *self.slot(*id).cast::<[f32; 8]>() = [0.; 8];
@@ -688,13 +688,6 @@ impl Extend<(usize, [f32; 4])> for LayoutMirror {
     }
 }
 
-impl std::ops::Index<&usize> for LayoutMirror {
-    type Output = [f32; 4];
-    fn index(&self, id: &usize) -> &[f32; 4] {
-        self.get(id).expect("Missing bounds")
-    }
-}
-
 #[derive(Default)]
 pub struct State {
     pub base: Option<url::Url>,
@@ -709,8 +702,6 @@ pub struct State {
     scroll_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
     pub(crate) computed: Option<Rc<style::ComputedStyles>>,
     previous: Option<Rc<style::ComputedStyles>>,
-    // Reuse per-node lists to avoid megabytes of allocations and page faults each pass.
-    old_styles: Option<Rc<style::ComputedStyles>>,
     pub(crate) style_walk: Walk,
     editable: Vec<usize>,
     inert: Vec<usize>,
@@ -740,15 +731,12 @@ pub struct State {
     pub(crate) sheets: HashMap<Rc<str>, Rc<style::Stylesheet>>,
     pub(crate) inserted: Vec<(String, Rc<style::Stylesheet>, bool)>,
     pub(crate) style_cache: style::StyleCache,
-    style_viewport: [f32; 2],
-    style_metrics: Option<f32>,
-    style_reduced_motion: bool,
-    style_theme: u32,
-    pub focus: Option<usize>,
+    style_key: ([f32; 2], Option<f32>, bool, u32),
+    pub(crate) focus: Option<usize>,
     interaction: [Vec<usize>; 3],
     pub selection: rustc_hash::FxHashMap<usize, [usize; 2]>,
     pub selection_caret: Option<usize>,
-    pub dirty: bool,
+    pub(crate) dirty: bool,
     pub frame_requested: bool,
     pub(crate) wheel: bool,
     pub canvases: rustc_hash::FxHashMap<usize, crate::render::canvas::Canvas>,
@@ -765,26 +753,27 @@ pub struct State {
     pub(crate) placeholders: rustc_hash::FxHashMap<usize, Placeholder>,
     decoding: rustc_hash::FxHashMap<usize, u64>,
     pub(crate) reserved: rustc_hash::FxHashSet<usize>,
-    pub(crate) svg_sources: rustc_hash::FxHashMap<usize, String>,
+    pub(crate) svg_sources: rustc_hash::FxHashMap<usize, Rc<str>>,
     pub(crate) svg_boxes: rustc_hash::FxHashMap<usize, SvgBoxes>,
     pub(crate) svg_trees: rustc_hash::FxHashMap<usize, usvg::Tree>,
     pub(crate) svg_images: rustc_hash::FxHashMap<usize, (Rc<str>, [f32; 2])>,
     pub(crate) masks: rustc_hash::FxHashMap<usize, (String, Option<Arc<renderer::RenderImage>>)>,
-    pub svgs: rustc_hash::FxHashMap<usize, (String, Arc<renderer::RenderImage>)>,
+    pub(crate) svgs: rustc_hash::FxHashMap<usize, (Rc<str>, Arc<renderer::RenderImage>)>,
     pub(crate) svg_cache: HashMap<
-        String,
+        Rc<str>,
         (
             crate::render::canvas::SvgGeometry,
             Vec<Arc<renderer::RenderImage>>,
         ),
     >,
-    pub backgrounds: HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>,
+    pub(crate) backgrounds: HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>,
+    pub(crate) bitmaps: HashMap<String, Arc<renderer::RenderImage>>,
     pub(crate) gradients: Vec<(String, Arc<renderer::RenderImage>)>,
-    pub font_aliases: HashMap<String, String>,
+    pub(crate) font_aliases: HashMap<String, String>,
     pub(crate) fonts: HashMap<String, Option<String>>,
     pub(crate) font_loads: u32,
     pub(crate) font_text: (u64, Vec<u64>),
-    pub text_system: Option<std::rc::Rc<renderer::TextSystem>>,
+    pub(crate) text_system: Option<std::rc::Rc<renderer::TextSystem>>,
     pub(crate) window: renderer::WindowState,
     pub pixel_ratio: f32,
     pub(crate) linted: bool,
@@ -805,6 +794,24 @@ pub struct State {
 }
 
 impl State {
+    // Only the first replaced image can be on the GPU. Drop later images at once to bound memory in unrendered
+    // windows.
+    fn retire(&mut self, id: usize, old: Option<Arc<renderer::RenderImage>>) {
+        if self.retired.is_empty() {
+            self.retired_canvases.clear();
+        }
+        if let Some(old) = old
+            && self.retired_canvases.insert(id)
+        {
+            self.retired.push(old);
+        }
+    }
+
+    fn theme(&self) -> u32 {
+        crate::desktop::native::theme_state()
+            | ((self.pixel_ratio.clamp(0., 600.) * 100.).round() as u32) << 16
+    }
+
     pub(crate) fn sync_scroll(&mut self) {
         for (&id, handle) in &self.scroll {
             let (offset, max) = (scroll_offset(handle, handle.offset()), handle.max_offset());
@@ -865,7 +872,6 @@ impl State {
         free.drain(..cut);
         free.shrink_to_fit();
         self.free = free.into();
-        self.old_styles = None;
         self.style_walk = Default::default();
         self.select_marks = Vec::new();
         self.measurements.texts = Default::default();
@@ -1003,19 +1009,14 @@ impl Placeholder {
 
 static PLACEHOLDERS: LazyLock<Mutex<HashMap<u64, Placeholder>>> = LazyLock::new(Default::default);
 
-fn canvas_size(node: &Node) -> (u32, u32) {
+fn new_canvas(node: &Node) -> Result<crate::render::canvas::Canvas> {
     let size = |name, default| {
         node.attrs
             .get(name)
             .and_then(|value| crate::render::dimension(value, true))
             .map_or(default, |value| value as u32)
     };
-    (size("width", 300), size("height", 150))
-}
-
-fn new_canvas(node: &Node) -> Result<crate::render::canvas::Canvas> {
-    let (width, height) = canvas_size(node);
-    let mut canvas = crate::render::canvas::Canvas::new(width, height)?;
+    let mut canvas = crate::render::canvas::Canvas::new(size("width", 300), size("height", 150))?;
     canvas.present = node.tag == "canvas";
     Ok(canvas)
 }
@@ -1124,14 +1125,11 @@ pub(crate) fn load_image(
     id: usize,
     read: impl FnOnce() -> Result<Vec<u8>> + Send + 'static,
 ) -> Value {
-    type Job = Box<dyn FnOnce() + Send>;
-    static JOBS: Mutex<(VecDeque<Job>, usize)> = Mutex::new((VecDeque::new(), 0));
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let request = NEXT.fetch_add(1, Ordering::Relaxed);
     state.decoding.insert(id, request);
     let (decoded, wake) = (state.decoded.clone(), crate::host::Waker::current());
-    let mut jobs = JOBS.lock().unwrap_or_else(PoisonError::into_inner);
-    jobs.0.push_back(Box::new(move || {
+    crate::render::image::decode_later(Box::new(move || {
         let result = read().and_then(|bytes| {
             ensure!(bytes.len() <= 64 * 1024 * 1024, "Image is too large");
             crate::render::image::decode(&bytes)
@@ -1158,23 +1156,6 @@ pub(crate) fn load_image(
             .push((id, request, result));
         wake.wake();
     }));
-    if jobs.1 < 2
-        && std::thread::Builder::new()
-            .name("apps-image".into())
-            .spawn(|| {
-                while let Some(job) = {
-                    let mut jobs = JOBS.lock().unwrap_or_else(PoisonError::into_inner);
-                    let job = jobs.0.pop_front();
-                    jobs.1 -= usize::from(job.is_none());
-                    job
-                } {
-                    job();
-                }
-            })
-            .is_ok()
-    {
-        jobs.1 += 1;
-    }
     json!(request)
 }
 
@@ -1198,1697 +1179,1530 @@ pub fn call(
     doc: &mut Document,
     state: &mut State,
     viewport: [f32; 2],
-) -> Option<Result<Value>> {
-    if !matches!(
-        op,
-        "dom.requestFrame"
-            | "dom.rangeNodes"
-            | "dom.release"
-            | "dom.tree"
-            | "dom.source"
-            | "dom.reserve"
-            | "dom.matches"
-            | "dom.closest"
-            | "dom.mediaMatches"
-            | "dom.assignedNodes"
-            | "dom.queryWithin"
-            | "dom.html"
-            | "dom.focus"
-            | "dom.hover"
-            | "dom.active"
-            | "dom.selection"
-            | "dom.selectionText"
-            | "dom.userSelect"
-            | "dom.scroll"
-            | "dom.scrollEvents"
-            | "dom.canvas"
-            | "dom.canvasPixels"
-            | "dom.canvasURL"
-            | "dom.canvasTake"
-            | "dom.canvasAdopt"
-            | "dom.canvasLink"
-            | "dom.canvasBind"
-            | "dom.frames"
-            | "dom.image"
-            | "dom.decoded"
-            | "dom.measureText"
-            | "dom.canvasQuery"
-            | "dom.textRect"
-            | "dom.textIndex"
-            | "dom.svgBox"
-            | "dom.textOffset"
-            | "dom.textPoint"
-            | "dom.font"
-            | "dom.fontCheck"
-            | "dom.fontSources"
-            | "dom.hitTest"
-            | "dom.css"
-            | "dom.sheet"
-            | "dom.constructed"
-            | "dom.adopt"
-            | "dom.supports"
-            | "dom.registerProperty"
-            | "dom.computed"
-            | "dom.animation"
-            | "dom.animated"
-            | "dom.easing"
-            | "dom.cssAnimations"
-            | "dom.cssControl"
-            | "dom.declare"
-            | "dom.properties"
-            | "dom.client"
-            | "dom.innerText"
-            | "dom.wheel"
-            | "dom.iterations"
-            | "dom.path"
-    ) {
-        return None;
+) -> Result<Value> {
+    if op == "dom.scrollEvents" {
+        let mut changed = Vec::new();
+        for (&id, handle) in &state.scroll {
+            let offset = scroll_offset(handle, handle.offset());
+            // `set_offset` stops a smooth scroll, so it only runs when the range clamps the offset.
+            if offset != handle.offset() {
+                handle.set_offset(offset);
+            }
+            let previous = state.scroll_offsets.entry(id).or_default();
+            if *previous != offset {
+                *previous = offset;
+                changed.push(id);
+            }
+        }
+        changed.sort_unstable();
+        state.sync_scroll();
+        return Ok(json!(changed));
     }
-    Some((|| {
-        if op == "dom.scrollEvents" {
-            let mut changed = Vec::new();
-            for (&id, handle) in &state.scroll {
-                let offset = scroll_offset(handle, handle.offset());
-                // `set_offset` stops a smooth scroll, so it only runs when the range clamps the offset.
-                if offset != handle.offset() {
-                    handle.set_offset(offset);
-                }
-                let previous = state.scroll_offsets.entry(id).or_default();
-                if *previous != offset {
-                    *previous = offset;
-                    changed.push(id);
-                }
+    if op == "dom.decoded" {
+        let decoded =
+            std::mem::take(&mut *state.decoded.lock().unwrap_or_else(PoisonError::into_inner));
+        let mut results = Vec::with_capacity(decoded.len());
+        for (id, request, result) in decoded {
+            if state.decoding.get(&id) != Some(&request) {
+                results.push(json!([request, null]));
+                continue;
             }
-            changed.sort_unstable();
-            state.sync_scroll();
-            return Ok(json!(changed));
-        }
-        if op == "dom.decoded" {
-            let decoded =
-                std::mem::take(&mut *state.decoded.lock().unwrap_or_else(PoisonError::into_inner));
-            let mut results = Vec::with_capacity(decoded.len());
-            for (id, request, result) in decoded {
-                if state.decoding.get(&id) != Some(&request) {
-                    results.push(json!([request, null]));
-                    continue;
-                }
-                state.decoding.remove(&id);
-                state.dirty |= result.is_ok();
-                if result.is_ok()
-                    && let Some(node) = state.layout_nodes.get_mut(id)
-                {
-                    *node = None;
-                    state.cull.seen = None;
-                }
-                results.push(json!([
-                    request,
-                    match result {
-                        Ok(Ok(image)) => {
-                            let size = image.size();
-                            state
-                                .measurements
-                                .naturals
-                                .insert(id, [size.width as u32 as f32, size.height as u32 as f32]);
-                            state.svg_images.remove(&id);
-                            state
-                                .retired
-                                .extend(state.images.insert(id, Arc::new(image)));
-                            json!([size.width as u32, size.height as u32])
-                        }
-                        Ok(Err((text, size))) => {
-                            state.measurements.naturals.insert(id, size);
-                            state.retired.extend(state.images.remove(&id));
-                            state.svg_images.insert(id, (text.into(), size));
-                            json!(size)
-                        }
-                        Err(error) => json!(error.to_string()),
+            state.decoding.remove(&id);
+            state.dirty |= result.is_ok();
+            if result.is_ok()
+                && let Some(node) = state.layout_nodes.get_mut(id)
+            {
+                *node = None;
+                state.cull.seen = None;
+            }
+            results.push(json!([
+                request,
+                match result {
+                    Ok(Ok(image)) => {
+                        let size = image.size();
+                        state
+                            .measurements
+                            .naturals
+                            .insert(id, [size.width as u32 as f32, size.height as u32 as f32]);
+                        state.svg_images.remove(&id);
+                        state
+                            .retired
+                            .extend(state.images.insert(id, Arc::new(image)));
+                        json!([size.width as u32, size.height as u32])
                     }
-                ]));
-            }
-            return Ok(json!(results));
-        }
-        if op == "dom.frames" {
-            let frames =
-                std::mem::take(&mut *state.frames.lock().unwrap_or_else(PoisonError::into_inner));
-            let mut results = Vec::with_capacity(frames.len());
-            if state.retired.is_empty() {
-                state.retired_canvases.clear();
-            }
-            for (node, image) in frames {
-                let size = image.size();
-                results.push(json!([node, size.width as u32, size.height as u32]));
-                if let Some(old) = state.images.insert(node, image)
-                    && state.retired_canvases.insert(node)
-                {
-                    state.retired.push(old);
+                    Ok(Err((text, size))) => {
+                        state.measurements.naturals.insert(id, size);
+                        state.retired.extend(state.images.remove(&id));
+                        state.svg_images.insert(id, (text.into(), size));
+                        json!(size)
+                    }
+                    Err(error) => json!(error.to_string()),
                 }
-                state.dirty = true;
-            }
-            return Ok(json!(results));
+            ]));
         }
-        if op == "dom.wheel" {
-            state.wheel = true;
-            return Ok(Value::Null);
+        return Ok(json!(results));
+    }
+    if op == "dom.frames" {
+        let frames =
+            std::mem::take(&mut *state.frames.lock().unwrap_or_else(PoisonError::into_inner));
+        let mut results = Vec::with_capacity(frames.len());
+        if state.retired.is_empty() {
+            state.retired_canvases.clear();
         }
-        if op == "dom.iterations" {
-            state.motion.iterations = true;
-            return Ok(Value::Null);
-        }
-        if op == "dom.cssControl" {
-            let time = args[2].as_f64().unwrap_or(0.);
-            if !time.is_finite() {
-                return Ok(json!(false));
-            }
-            let system = state.text_system.clone();
-            let styles = styles(
-                doc,
-                state,
-                viewport,
-                system.as_deref().map(|system| (system, state.pixel_ratio)),
-            );
+        for (node, image) in frames {
+            let size = image.size();
+            results.push(json!([node, size.width as u32, size.height as u32]));
+            let old = state.images.insert(node, image);
+            state.retire(node, old);
             state.dirty = true;
-            return Ok(json!(state.motion.css_control(
-                args[0].as_u64().unwrap_or(0) as u32,
-                args[1].as_str().unwrap_or_default(),
-                time,
-                &styles,
-            )));
         }
-        if op == "dom.easing" {
-            let progress = args[1].as_f64().unwrap_or(0.);
-            return Ok(json!(
-                style::Easing::parse(args[0].as_str().unwrap_or("linear"))
-                    .map_or(progress, |easing| easing.at(progress, args[2] == true))
-            ));
+        return Ok(json!(results));
+    }
+    if op == "dom.wheel" {
+        state.wheel = true;
+        return Ok(Value::Null);
+    }
+    if op == "dom.iterations" {
+        state.motion.iterations = true;
+        return Ok(Value::Null);
+    }
+    if op == "dom.cssControl" {
+        let time = args[2].as_f64().unwrap_or(0.);
+        if !time.is_finite() {
+            return Ok(json!(false));
         }
-        if op == "dom.animation" {
-            let id = args[0].as_u64().context("Expected an animation")? as u32;
-            state.dirty = true;
-            let old = state.motion.unscript(id);
-            if let Some((node, _)) = &old {
-                state.animating.remove(node);
-                state.animating_pseudos.remove(node);
-            }
-            let spec = &args[2];
-            let Some(node) = args[1]
-                .as_u64()
-                .map(|node| node as usize)
-                .filter(|&node| spec.is_object() && node < doc.nodes.len())
-            else {
-                return Ok(Value::Null);
-            };
-            state.animating.remove(&node);
-            state.animating_pseudos.remove(&node);
-            let frames: Vec<(f64, &str, &str)> = spec["frames"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|frame| {
-                    Some((
-                        frame[0].as_f64()?,
-                        frame[1].as_str()?,
-                        frame[2].as_str().unwrap_or("linear"),
-                    ))
-                })
-                .collect();
-            let number = |index: usize| spec["timing"][index].as_f64().unwrap_or(0.);
-            let iterations = number(3);
-            let animation = style::Scripted::new(
-                id,
-                &frames,
-                [
-                    number(0) / 1000.,
-                    number(1) / 1000.,
-                    number(2) / 1000.,
-                    if iterations < 0. {
-                        f64::INFINITY
-                    } else {
-                        iterations
-                    },
-                    number(4),
-                ],
-                [
-                    spec["direction"].as_str().unwrap_or("normal"),
-                    spec["fill"].as_str().unwrap_or("none"),
-                    spec["easing"].as_str().unwrap_or("linear"),
-                    spec["composite"].as_str().unwrap_or("replace"),
-                ],
-                match spec["pseudo"].as_str() {
-                    Some("::before") => 1,
-                    Some("::after") => 2,
-                    _ => 0,
+        let styles = styles(doc, state, viewport);
+        state.dirty = true;
+        return Ok(json!(state.motion.css_control(
+            args[0].as_u64().unwrap_or(0) as u32,
+            args[1].as_str().unwrap_or_default(),
+            time,
+            &styles,
+        )));
+    }
+    if op == "dom.easing" {
+        let progress = args[1].as_f64().unwrap_or(0.);
+        return Ok(json!(
+            style::Easing::parse(args[0].as_str().unwrap_or("linear"))
+                .map_or(progress, |easing| easing.at(progress, args[2] == true))
+        ));
+    }
+    if op == "dom.animation" {
+        let id = args[0].as_u64().context("Expected an animation")? as u32;
+        state.dirty = true;
+        let old = state.motion.unscript(id);
+        if let Some((node, _)) = &old {
+            state.animating.remove(node);
+            state.animating_pseudos.remove(node);
+        }
+        let spec = &args[2];
+        let Some(node) = args[1]
+            .as_u64()
+            .map(|node| node as usize)
+            .filter(|&node| spec.is_object() && node < doc.nodes.len())
+        else {
+            return Ok(Value::Null);
+        };
+        state.animating.remove(&node);
+        state.animating_pseudos.remove(&node);
+        let frames: Vec<(f64, &str, &str)> = spec["frames"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|frame| {
+                Some((
+                    frame[0].as_f64()?,
+                    frame[1].as_str()?,
+                    frame[2].as_str().unwrap_or("linear"),
+                ))
+            })
+            .collect();
+        let number = |index: usize| spec["timing"][index].as_f64().unwrap_or(0.);
+        let iterations = number(3);
+        let animation = style::Scripted::new(
+            id,
+            &frames,
+            [
+                number(0) / 1000.,
+                number(1) / 1000.,
+                number(2) / 1000.,
+                if iterations < 0. {
+                    f64::INFINITY
+                } else {
+                    iterations
                 },
-            );
-            state.motion.script(
-                node,
-                animation,
-                spec["time"].as_f64().unwrap_or(0.) / 1000.,
-                spec["rate"].as_f64(),
-                old.map(|(_, old)| old)
-                    .filter(|_| !spec["frames"].is_array()),
-            );
-            return Ok(Value::Null);
-        }
-        if op == "dom.requestFrame" {
-            state.frame_requested = true;
-            state.dirty = true;
-            return Ok(json!(state.text_system.is_some()));
-        }
-        if op == "dom.mediaMatches" {
-            let query = args[0].as_str().context("Expected a media query")?;
-            let source = format!("@media {query} {{}}");
-            let sheet = state
-                .sheets
-                .entry(source.as_str().into())
-                .or_insert_with(|| Rc::new(style::Stylesheet::parse(&source)));
-            let theme = crate::desktop::native::theme_state()
-                | ((state.pixel_ratio.clamp(0., 600.) * 100.).round() as u32) << 16;
-            return Ok(sheet.matches_media(viewport[0], viewport[1], theme).into());
-        }
-        if op == "dom.properties" {
-            return Ok(json!(style::Prop::names()));
-        }
-        if op == "dom.path" {
-            return Ok(json!(crate::render::canvas::svg_path(
-                args[0].as_str().unwrap_or_default()
-            )));
-        }
-        if op == "dom.declare" {
-            return Ok(json!(
-                style::declare(args[0].as_str().unwrap_or_default()).concat()
-            ));
-        }
-        if matches!(
-            op,
-            "dom.constructed" | "dom.adopt" | "dom.supports" | "dom.registerProperty"
-        ) {
-            let text = args[2].as_str().unwrap_or_default();
-            let result = match op {
-                "dom.supports" => {
-                    let name = args[0].as_str().context("Expected CSS text")?;
-                    return Ok(json!(match args[1].as_str() {
-                        Some(value) =>
-                            style::supports(&name.to_ascii_lowercase(), value) == Some(true),
-                        None => style::supports_condition(name),
-                    }));
-                }
-                "dom.registerProperty" => {
-                    let name = args[0].as_str().context("Expected a name")?;
-                    let syntax = args[1].as_str().unwrap_or("*");
-                    let initial = args[3].as_str();
-                    let rule = format!(
-                        "@property {name}{{syntax:{};inherits:{};{}}}",
-                        json!(syntax),
-                        args[2].as_bool().unwrap_or(false),
-                        initial.map_or(String::new(), |value| format!("initial-value:{value}"))
-                    );
-                    let registered = style::Stylesheet::parse(&rule).property();
-                    // `Prop::new` leaks the names it interns, so only a valid new registration interns one.
-                    match registered {
-                        _ if !name.starts_with("--") => Err("SyntaxError"),
-                        _ if style::Prop::find(name)
-                            .is_some_and(|prop| state.style_cache.scripted.contains_key(&prop)) =>
-                        {
-                            Err("InvalidModificationError")
-                        }
-                        Some(value) => {
-                            state
-                                .style_cache
-                                .scripted
-                                .insert(style::Prop::new(name), value);
-                            Ok(Value::Null)
-                        }
-                        None => Err("SyntaxError"),
-                    }
-                }
-                "dom.adopt" => {
-                    let root = args[0].as_u64().context("Expected a root")? as usize;
-                    let ids = args[1]
-                        .as_array()
-                        .context("Expected sheets")?
-                        .iter()
-                        .filter_map(|id| Some(id.as_u64()? as u32))
-                        .collect::<Vec<_>>();
-                    if ids.is_empty() {
-                        state.style_cache.adopted.remove(&root);
-                    } else {
-                        state.style_cache.adopted.insert(root, ids);
-                    }
-                    Ok(Value::Null)
-                }
-                _ => {
-                    let id = args[0].as_u64().context("Expected a sheet")? as u32;
-                    match args[1].as_str().unwrap_or_default() {
-                        "parse" => return Ok(style::Stylesheet::parse(text).cssom()),
-                        "replace" => {
-                            let sheet = style::Stylesheet::parse(text);
-                            let tree = sheet.cssom();
-                            state.style_cache.constructed.insert(id, Rc::new(sheet));
-                            Ok(tree)
-                        }
-                        "drop" => {
-                            state.style_cache.constructed.remove(&id);
-                            Ok(Value::Null)
-                        }
-                        kind => {
-                            let path = path(&args[3]);
-                            let top = (matches!(kind, "insert" | "delete") && path.len() == 1)
-                                .then(|| (path[0], kind == "insert"));
-                            state.style_cache.edit_constructed(id, top, |sheet| {
-                                sheet.edit(&path, edit(kind, text))
-                            })
-                        }
-                    }
-                }
-            };
-            state.invalidate();
-            state.dirty = true;
-            return Ok(result.unwrap_or_else(|error| json!({ "error": error })));
-        }
-        if op == "dom.release" {
-            let wrapped = args[1].as_array().context("Expected live nodes")?;
-            state.created += wrapped.len();
-            for value in wrapped {
-                if let Some(id) = value.as_u64().map(|id| id as usize)
-                    && doc.nodes.get(id).is_some_and(|node| !node.tag.is_empty())
-                {
-                    state.live.insert(id);
-                }
+                number(4),
+            ],
+            [
+                spec["direction"].as_str().unwrap_or("normal"),
+                spec["fill"].as_str().unwrap_or("none"),
+                spec["easing"].as_str().unwrap_or("linear"),
+                spec["composite"].as_str().unwrap_or("replace"),
+            ],
+            match spec["pseudo"].as_str() {
+                Some("::before") => 1,
+                Some("::after") => 2,
+                _ => 0,
+            },
+        );
+        state.motion.script(
+            node,
+            animation,
+            spec["time"].as_f64().unwrap_or(0.) / 1000.,
+            spec["rate"].as_f64(),
+            old.map(|(_, old)| old)
+                .filter(|_| !spec["frames"].is_array()),
+        );
+        return Ok(Value::Null);
+    }
+    if op == "dom.requestFrame" {
+        state.frame_requested = true;
+        state.dirty = true;
+        return Ok(json!(state.text_system.is_some()));
+    }
+    if op == "dom.mediaMatches" {
+        let query = args[0].as_str().context("Expected a media query")?;
+        let source = format!("@media {query} {{}}");
+        let theme = state.theme();
+        let sheet = state
+            .sheets
+            .entry(source.as_str().into())
+            .or_insert_with(|| Rc::new(style::Stylesheet::parse(&source)));
+        return Ok(sheet.matches_media(viewport[0], viewport[1], theme).into());
+    }
+    if op == "dom.properties" {
+        return Ok(json!(style::Prop::names()));
+    }
+    if op == "dom.path" {
+        return Ok(json!(crate::render::canvas::svg_path(
+            args[0].as_str().unwrap_or_default()
+        )));
+    }
+    if op == "dom.declare" {
+        return Ok(json!(
+            style::declare(args[0].as_str().unwrap_or_default()).concat()
+        ));
+    }
+    if matches!(
+        op,
+        "dom.constructed" | "dom.adopt" | "dom.supports" | "dom.registerProperty"
+    ) {
+        let text = args[2].as_str().unwrap_or_default();
+        let result = match op {
+            "dom.supports" => {
+                let name = args[0].as_str().context("Expected CSS text")?;
+                return Ok(json!(match args[1].as_str() {
+                    Some(value) => style::supports(&name.to_ascii_lowercase(), value) == Some(true),
+                    None => style::supports_condition(name),
+                }));
             }
-            for value in args[0].as_array().context("Expected dead nodes")? {
-                if let Some(id) = value.as_u64() {
-                    state.live.remove(&(id as usize));
-                }
-            }
-            state.drop_removed(doc);
-            let mut roots = std::mem::take(&mut state.detached);
-            roots.sort_unstable();
-            roots.dedup();
-            let mut freed = Vec::new();
-            let mut canvases = Vec::new();
-            let retired = state.retired.len();
-            for root in roots {
-                if root == 0
-                    || doc
-                        .nodes
-                        .get(root)
-                        .is_none_or(|node| node.parent.is_some() || node.tag.is_empty())
-                    || state.hosts.contains_key(&root)
-                {
-                    continue;
-                }
-                let mut pending = vec![root];
-                let mut subtree = Vec::new();
-                let mut live = false;
-                while let Some(id) = pending.pop() {
-                    if state.live.contains(&id) {
-                        live = true;
-                        break;
-                    }
-                    subtree.push(id);
-                    pending.extend(&doc.nodes[id].children);
-                    if let Some(root) = state.shadows.get(&id) {
-                        pending.push(*root);
-                    }
-                }
-                if live {
-                    state.detached.push(root);
-                    continue;
-                }
-                for id in subtree {
-                    if matches!(
-                        doc.nodes[id].tag.as_str(),
-                        "canvas" | "apps-canvas" | "video" | "audio"
-                    ) {
-                        canvases.push(id);
-                    }
-                    doc.nodes[id] = Node::default();
-                    state.bounds.remove(&id);
-                    state.cull.widths.remove(&id);
-                    state.text_layouts.remove(&id);
-                    state.scroll.remove(&id);
-                    state.scroll_offsets.remove(&id);
-                    state.cull.offsets.remove(&id);
-                    state.grids.remove(&id);
-                    state.baselines.remove(&id);
-                    if let Some(node) = state.layout_nodes.get_mut(id) {
-                        *node = None;
-                    }
-                    state.measurements.texts.remove(&id);
-                    state.retired.extend(state.images.remove(&id));
-                    state.retired.extend(
-                        state
-                            .canvases
-                            .remove(&id)
-                            .filter(|canvas| canvas.present)
-                            .map(|canvas| canvas.image),
-                    );
-                    state.placeholders.remove(&id);
-                    state.retired.extend(
-                        state
-                            .svgs
-                            .remove(&id)
-                            .map(|(_, image)| image)
-                            .filter(|image| Arc::strong_count(image) == 1),
-                    );
-                    state
-                        .retired
-                        .extend(state.masks.remove(&id).and_then(|(_, image)| image));
-                    state.svg_sources.remove(&id);
-                    state.svg_boxes.remove(&id);
-                    state.svg_trees.remove(&id);
-                    state.svg_images.remove(&id);
-                    state.measurements.naturals.remove(&id);
-                    state.sources.get_mut().remove(&id);
-                    state.decoding.remove(&id);
-                    if let Some(root) = state.shadows.remove(&id) {
-                        state.hosts.remove(&root);
-                    }
-                    state.hosts.remove(&id);
-                    state.style_cache.adopted.remove(&id);
-                    state.motion.forget(id);
-                    state.anchors.remove(&id);
-                    state.blocks.remove(&id);
-                    state.containers.remove(&id);
-                    state.flexed_grids.remove(&id);
-                    state.grid_widest.remove(&id);
-                    if state.focus == Some(id) {
-                        state.focus = None;
-                    }
-                    state.selection.remove(&id);
-                    state.atoms.remove(&id);
-                    if state.selection_caret == Some(id) {
-                        state.selection_caret = None;
-                    }
-                    if let Some(order) = state.painted.get_mut(id) {
-                        *order = 0;
-                    }
-                    state.free.push(std::cmp::Reverse(id));
-                    freed.push(id);
-                }
-            }
-            let list = json!([canvases, freed]);
-            if !freed.is_empty() {
-                state.style_cache.forget(&freed);
-                let freed: rustc_hash::FxHashSet<usize> = freed.into_iter().collect();
-                state.top_layer.retain(|node| !freed.contains(node));
-                state
-                    .measurements
-                    .sizes
-                    .retain(|(node, ..), _| !freed.contains(node));
-                state.backgrounds.retain(|(node, _), (_, image)| {
-                    let keep = !freed.contains(node);
-                    if !keep {
-                        state.retired.push(image.clone());
-                    }
-                    keep
-                });
-                state.dirty |= state.retired.len() > retired;
-            }
-            return Ok(list);
-        }
-        if op == "dom.rangeNodes" {
-            let start = args[0].as_u64().context("Expected start node")? as usize;
-            let end = args[2].as_u64().context("Expected end node")? as usize;
-            ensure!(
-                start < doc.nodes.len() && end < doc.nodes.len(),
-                "Invalid range node"
-            );
-            let from = args[1].as_u64().context("Expected start offset")? as usize;
-            let to = args[3].as_u64().context("Expected end offset")? as usize;
-            let mut positions = HashMap::new();
-            let mut following = |mut id: usize| {
-                loop {
-                    let parent = doc.nodes[id].parent?;
-                    let children = &doc.nodes[parent].children;
-                    if !positions.contains_key(&id) {
-                        positions.extend(
-                            children
-                                .iter()
-                                .enumerate()
-                                .map(|(index, &child)| (child, index)),
-                        );
-                    }
-                    if let Some(&next) = children.get(*positions.get(&id)? + 1) {
-                        return Some(next);
-                    }
-                    id = parent;
-                }
-            };
-            let mut current = if doc.nodes[start].tag == "#text" {
-                Some(start)
-            } else {
-                doc.nodes[start]
-                    .children
-                    .get(from)
-                    .copied()
-                    .or_else(|| following(start))
-            };
-            let stop = if doc.nodes[end].tag == "#text" {
-                following(end)
-            } else {
-                doc.nodes[end]
-                    .children
-                    .get(to)
-                    .copied()
-                    .or_else(|| following(end))
-            };
-            let mut ranges = Vec::new();
-            while let Some(id) = current.filter(|id| Some(*id) != stop) {
-                let node = &doc.nodes[id];
-                if node.tag == "#text" {
-                    ranges.push([
-                        id,
-                        if id == start { from } else { 0 },
-                        if id == end {
-                            to
-                        } else {
-                            node.text.encode_utf16().count()
-                        },
-                    ]);
-                }
-                current = node.children.first().copied().or_else(|| following(id));
-            }
-            return Ok(json!(ranges));
-        }
-        if op == "dom.hitTest" {
-            ensure!(!doc.nodes.is_empty(), "Document is unavailable");
-            let x = args[0].as_f64().context("Expected x")? as f32;
-            let y = args[1].as_f64().context("Expected y")? as f32;
-            let system = state.text_system.clone();
-            let computed = styles(
-                doc,
-                state,
-                viewport,
-                system.as_deref().map(|system| (system, state.pixel_ratio)),
-            );
-            let (first, caret) = (args[2].as_bool(), args[3].as_bool());
-            return Ok(hit_test(
-                doc,
-                state,
-                &computed,
-                viewport,
-                [x, y],
-                first.unwrap_or(false),
-                caret.unwrap_or(false),
-            ));
-        }
-        if matches!(op, "dom.focus" | "dom.hover" | "dom.active") {
-            let ids = args[0]
-                .as_array()
-                .context("Expected nodes")?
-                .iter()
-                .map(|id| {
-                    id.as_u64()
-                        .map(|id| id as usize)
-                        .filter(|&id| id < doc.nodes.len())
-                        .context("Invalid node id")
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let (index, flag) = match op {
-                "dom.focus" => (0, FOCUS_WITHIN),
-                "dom.hover" => (1, HOVER),
-                _ => (2, ACTIVE),
-            };
-            let focus = if op == "dom.focus" { FOCUS } else { 0 };
-            let shown = args[2].as_bool() != Some(true);
-            let used = state.style_cache.states & (flag | focus) != 0;
-            let control = |id: &usize| {
-                doc.nodes.get(*id).is_some_and(|node| {
-                    matches!(
-                        node.tag.as_str(),
-                        "button" | "input" | "select" | "textarea"
-                    )
-                })
-            };
-            let repaint = focus == 0
-                && (ids.iter().any(control) || state.interaction[index].iter().any(control));
-            if op == "dom.focus" {
-                if let Some(node) = state.focus.and_then(|id| doc.nodes.edit(id)) {
-                    node.state &= !(FOCUS | FOCUS_VISIBLE);
-                }
-                state.focus = ids.first().copied();
-                if let Some(node) = state
-                    .focus
-                    .filter(|_| shown)
-                    .and_then(|id| doc.nodes.edit(id))
-                {
-                    node.state |= if args[1].as_bool() == Some(false) {
-                        FOCUS
-                    } else {
-                        FOCUS | FOCUS_VISIBLE
-                    };
-                }
-            }
-            for &id in &state.interaction[index] {
-                if let Some(node) = doc.nodes.edit(id) {
-                    node.state &= !flag;
-                }
-            }
-            for &id in ids.iter().filter(|_| shown) {
-                if let Some(node) = doc.nodes.edit(id) {
-                    node.state |= flag;
-                }
-            }
-            state.interaction[index] = ids;
-            if used {
-                state.invalidate();
-            }
-            state.dirty |= used || focus != 0 || repaint;
-            return Ok(Value::Null);
-        }
-        if op == "dom.reserve" {
-            let ids: Vec<_> = (0..args[0].as_u64().context("Expected count")?.min(4096))
-                .map(|_| state.allocate(doc, Node::default()))
-                .collect();
-            state.reserved.extend(&ids);
-            return Ok(json!(ids));
-        }
-        let id = args[0].as_u64().context("Expected node id")? as usize;
-        ensure!(id < doc.nodes.len(), "Invalid node id");
-        let page = doc.nodes[id].parent == Some(0)
-            && doc.nodes[id].tag == "html"
-            && !state.scroll.contains_key(&id);
-        match op {
-            "dom.assignedNodes" => {
-                let mut roots = HashSet::new();
-                let mut slotted = HashMap::new();
-                let mut add = |slot: usize, slotted: &mut HashMap<usize, Vec<usize>>| {
-                    let mut top = slot;
-                    while let Some(parent) = doc.nodes[top].parent {
-                        top = parent;
-                    }
-                    if let Some(&host) = state.hosts.get(&top)
-                        && roots.insert(top)
+            "dom.registerProperty" => {
+                let name = args[0].as_str().context("Expected a name")?;
+                let syntax = args[1].as_str().unwrap_or("*");
+                let initial = args[3].as_str();
+                let rule = format!(
+                    "@property {name}{{syntax:{};inherits:{};{}}}",
+                    json!(syntax),
+                    args[2].as_bool().unwrap_or(false),
+                    initial.map_or(String::new(), |value| format!("initial-value:{value}"))
+                );
+                let registered = style::Stylesheet::parse(&rule).property();
+                // `Prop::new` leaks the names it interns, so only a valid new registration interns one.
+                match registered {
+                    _ if !name.starts_with("--") => Err("SyntaxError"),
+                    _ if style::Prop::find(name)
+                        .is_some_and(|prop| state.style_cache.scripted.contains_key(&prop)) =>
                     {
-                        slotted.extend(slots(doc, [(host, top)]));
+                        Err("InvalidModificationError")
                     }
-                };
-                add(id, &mut slotted);
-                let mut nodes = slotted.get(&id).cloned().unwrap_or_default();
-                if args[1].as_bool() == Some(true) && slotted.contains_key(&id) {
-                    if nodes.is_empty() {
-                        nodes = doc.nodes[id].children.clone();
+                    Some(value) => {
+                        state
+                            .style_cache
+                            .scripted
+                            .insert(style::Prop::new(name), value);
+                        Ok(Value::Null)
                     }
-                    let mut pending: Vec<_> = nodes.into_iter().rev().collect();
-                    nodes = Vec::new();
-                    while let Some(child) = pending.pop() {
-                        if doc.nodes[child].tag == "slot" {
-                            add(child, &mut slotted);
-                        }
-                        if let Some(assigned) = slotted.get(&child) {
-                            pending.extend(
-                                if assigned.is_empty() {
-                                    &doc.nodes[child].children
-                                } else {
-                                    assigned
-                                }
-                                .iter()
-                                .rev(),
-                            );
-                        } else if doc.nodes[child].tag != "#comment" {
-                            nodes.push(child);
-                        }
-                    }
+                    None => Err("SyntaxError"),
                 }
-                Ok(json!(nodes))
             }
-            "dom.tree" => Ok(tree(doc, id, true)),
-            "dom.source" => {
-                let node = &doc.nodes[id];
-                Ok(json!(match &node.stylesheet {
-                    Some(sheet) if node.tag == "#text" => sheet.source(),
-                    _ => node.text.clone(),
-                }))
-            }
-            "dom.matches" => Ok(json!(parsed(state, &args[1])?.iter().any(|s| {
-                s.matches_cached(doc, id, Some(id), &mut SelectorCache::default())
-            }))),
-            "dom.closest" => {
-                let selectors = parsed(state, &args[1])?;
-                let mut memo = SelectorCache::default();
-                let mut current = Some(id);
-                while let Some(node) = current.filter(|&node| !doc.nodes[node].tag.starts_with('#'))
-                {
-                    if selectors
-                        .iter()
-                        .any(|s| s.matches_cached(doc, node, Some(id), &mut memo))
-                    {
-                        return Ok(json!(node));
-                    }
-                    current = doc.nodes[node].parent;
+            "dom.adopt" => {
+                let root = args[0].as_u64().context("Expected a root")? as usize;
+                let ids = args[1]
+                    .as_array()
+                    .context("Expected sheets")?
+                    .iter()
+                    .filter_map(|id| Some(id.as_u64()? as u32))
+                    .collect::<Vec<_>>();
+                if ids.is_empty() {
+                    state.style_cache.adopted.remove(&root);
+                } else {
+                    state.style_cache.adopted.insert(root, ids);
                 }
                 Ok(Value::Null)
             }
-            "dom.queryWithin" => {
-                let selectors = parsed(state, &args[1])?;
-                let first = args[2].as_bool().unwrap_or(false);
-                let mut pending: Vec<_> = doc.nodes[id].children.iter().rev().copied().collect();
-                let mut found = Vec::new();
-                let mut memo = SelectorCache::default();
-                while let Some(node) = pending.pop() {
-                    if selectors
-                        .iter()
-                        .any(|s| s.matches_cached(doc, node, Some(id), &mut memo))
-                    {
-                        if first {
-                            return Ok(json!(node));
-                        }
-                        found.push(node);
+            _ => {
+                let id = args[0].as_u64().context("Expected a sheet")? as u32;
+                match args[1].as_str().unwrap_or_default() {
+                    "parse" => return Ok(style::Stylesheet::parse(text).cssom()),
+                    "replace" => {
+                        let sheet = style::Stylesheet::parse(text);
+                        let tree = sheet.cssom();
+                        state.style_cache.constructed.insert(id, Rc::new(sheet));
+                        Ok(tree)
                     }
-                    if doc.nodes[node].tag != "template" {
-                        pending.extend(doc.nodes[node].children.iter().rev());
+                    "drop" => {
+                        state.style_cache.constructed.remove(&id);
+                        Ok(Value::Null)
+                    }
+                    kind => {
+                        let (path, top) = path(kind, &args[3]);
+                        state
+                            .style_cache
+                            .edit_constructed(id, top, |sheet| sheet.edit(&path, edit(kind, text)))
                     }
                 }
-                Ok(if first { Value::Null } else { json!(found) })
             }
-            "dom.html" => {
-                let source = args[1].as_str().context("Expected HTML")?;
-                let tag = doc.nodes[id].tag.as_str();
-                let form = || {
-                    std::iter::successors(Some(id), |&at| doc.nodes[at].parent)
-                        .any(|at| doc.nodes[at].tag == "form")
-                };
-                let parsed = match args[2].as_str() {
-                    _ if tag == "#document" => Document::parse(source),
-                    Some(context) => Document::build(source, Some(context), form()),
-                    // Shadow roots and template contents parse in `template` context, so the `<tr>` rows that
-                    // Lit renders are kept.
-                    None if tag.starts_with('#') => Document::fragment(source, "template"),
-                    None => Document::build(source, Some(tag), form()),
-                };
-                for child in std::mem::take(&mut doc.nodes[id].children) {
-                    doc.nodes[child].parent = None;
-                    state.detached.push(child);
-                    state.removed.push(child);
-                }
-                doc.nodes[id].text.clear();
-                let mut ids = Vec::with_capacity(parsed.nodes.len());
-                ids.push(id);
-                for _ in 1..parsed.nodes.len() {
-                    ids.push(state.slot(doc));
-                }
-                doc.nodes[id].children = parsed.nodes[0]
-                    .children
-                    .iter()
-                    .map(|&child| ids[child])
-                    .collect();
-                let detached = state.detached.len();
-                for (index, mut node) in parsed.nodes.into_iter().enumerate().skip(1) {
-                    node.parent = node.parent.map(|parent| ids[parent]);
-                    for child in &mut node.children {
-                        *child = ids[*child];
-                    }
-                    state.place(doc, ids[index], node);
-                }
-                state.detached.truncate(detached);
-                state.dirty = true;
-                Ok(tree(doc, id, false))
+        };
+        state.invalidate();
+        state.dirty = true;
+        return Ok(result.unwrap_or_else(|error| json!({ "error": error })));
+    }
+    if op == "dom.release" {
+        let wrapped = args[1].as_array().context("Expected live nodes")?;
+        state.created += wrapped.len();
+        for value in wrapped {
+            if let Some(id) = value.as_u64().map(|id| id as usize)
+                && doc.nodes.get(id).is_some_and(|node| !node.tag.is_empty())
+            {
+                state.live.insert(id);
             }
-            "dom.cssAnimations" => {
-                let system = state.text_system.clone();
-                let styles = styles(
-                    doc,
-                    state,
-                    viewport,
-                    system.as_deref().map(|system| (system, state.pixel_ratio)),
+        }
+        for value in args[0].as_array().context("Expected dead nodes")? {
+            if let Some(id) = value.as_u64() {
+                state.live.remove(&(id as usize));
+            }
+        }
+        state.drop_removed(doc);
+        let mut roots = std::mem::take(&mut state.detached);
+        roots.sort_unstable();
+        roots.dedup();
+        let mut freed = Vec::new();
+        let mut canvases = Vec::new();
+        let retired = state.retired.len();
+        for root in roots {
+            if root == 0
+                || doc
+                    .nodes
+                    .get(root)
+                    .is_none_or(|node| node.parent.is_some() || node.tag.is_empty())
+                || state.hosts.contains_key(&root)
+            {
+                continue;
+            }
+            let mut pending = vec![root];
+            let mut subtree = Vec::new();
+            let mut live = false;
+            while let Some(id) = pending.pop() {
+                if state.live.contains(&id) {
+                    live = true;
+                    break;
+                }
+                subtree.push(id);
+                pending.extend(&doc.nodes[id].children);
+                if let Some(root) = state.shadows.get(&id) {
+                    pending.push(*root);
+                }
+            }
+            if live {
+                state.detached.push(root);
+                continue;
+            }
+            for id in subtree {
+                if matches!(
+                    doc.nodes[id].tag.as_str(),
+                    "canvas" | "apps-canvas" | "video" | "audio"
+                ) {
+                    canvases.push(id);
+                }
+                doc.nodes[id] = Node::default();
+                state.bounds.remove(&id);
+                state.cull.widths.remove(&id);
+                state.text_layouts.remove(&id);
+                state.scroll.remove(&id);
+                state.scroll_offsets.remove(&id);
+                state.cull.offsets.remove(&id);
+                state.grids.remove(&id);
+                state.baselines.remove(&id);
+                if let Some(node) = state.layout_nodes.get_mut(id) {
+                    *node = None;
+                }
+                state.measurements.texts.remove(&id);
+                state.retired.extend(state.images.remove(&id));
+                state.retired.extend(
+                    state
+                        .canvases
+                        .remove(&id)
+                        .filter(|canvas| canvas.present)
+                        .map(|canvas| canvas.image),
                 );
-                let mut nodes = Vec::new();
-                let mut pending = vec![id];
-                while let Some(node) = pending.pop() {
-                    nodes.push(node);
-                    if args[1].as_bool() == Some(true) {
-                        pending.extend(doc.nodes[node].children.iter().rev());
-                        pending.extend(state.shadows.get(&node));
-                    }
-                }
-                Ok(json!(state.motion.css(
-                    &nodes,
-                    args[2].as_bool() == Some(true),
-                    &styles
-                )))
-            }
-            "dom.animated" => {
-                let system = state.text_system.clone();
-                let styles = styles(
-                    doc,
-                    state,
-                    viewport,
-                    system.as_deref().map(|system| (system, state.pixel_ratio)),
+                state.placeholders.remove(&id);
+                state.retired.extend(
+                    state
+                        .svgs
+                        .remove(&id)
+                        .map(|(_, image)| image)
+                        .filter(|image| Arc::strong_count(image) == 1),
                 );
-                Ok(state
-                    .motion
-                    .scripted(id, 0, &styles, args[1].as_u64().unwrap_or(0) as u32)
-                    .map_or(Value::Null, |values| {
-                        values
+                state
+                    .retired
+                    .extend(state.masks.remove(&id).and_then(|(_, image)| image));
+                state.svg_sources.remove(&id);
+                state.svg_boxes.remove(&id);
+                state.svg_trees.remove(&id);
+                state.svg_images.remove(&id);
+                state.measurements.naturals.remove(&id);
+                state.sources.get_mut().remove(&id);
+                state.decoding.remove(&id);
+                if let Some(root) = state.shadows.remove(&id) {
+                    state.hosts.remove(&root);
+                }
+                state.hosts.remove(&id);
+                state.style_cache.adopted.remove(&id);
+                state.motion.forget(id);
+                state.anchors.remove(&id);
+                state.blocks.remove(&id);
+                state.containers.remove(&id);
+                state.flexed_grids.remove(&id);
+                state.grid_widest.remove(&id);
+                if state.focus == Some(id) {
+                    state.focus = None;
+                }
+                state.selection.remove(&id);
+                state.atoms.remove(&id);
+                if state.selection_caret == Some(id) {
+                    state.selection_caret = None;
+                }
+                if let Some(order) = state.painted.get_mut(id) {
+                    *order = 0;
+                }
+                state.free.push(std::cmp::Reverse(id));
+                freed.push(id);
+            }
+        }
+        let list = json!([canvases, freed]);
+        if !freed.is_empty() {
+            state.style_cache.forget(&freed);
+            let freed: rustc_hash::FxHashSet<usize> = freed.into_iter().collect();
+            state.top_layer.retain(|node| !freed.contains(node));
+            for ids in &mut state.interaction {
+                ids.retain(|node| !freed.contains(node));
+            }
+            state
+                .measurements
+                .sizes
+                .retain(|(node, ..), _| !freed.contains(node));
+            state.backgrounds.retain(|(node, _), (_, image)| {
+                let keep = !freed.contains(node);
+                if !keep {
+                    state.retired.push(image.clone());
+                }
+                keep
+            });
+            state.dirty |= state.retired.len() > retired;
+        }
+        return Ok(list);
+    }
+    if op == "dom.rangeNodes" {
+        let start = args[0].as_u64().context("Expected start node")? as usize;
+        let end = args[2].as_u64().context("Expected end node")? as usize;
+        ensure!(
+            start < doc.nodes.len() && end < doc.nodes.len(),
+            "Invalid range node"
+        );
+        let from = args[1].as_u64().context("Expected start offset")? as usize;
+        let to = args[3].as_u64().context("Expected end offset")? as usize;
+        let mut positions = HashMap::new();
+        let mut following = |mut id: usize| {
+            loop {
+                let parent = doc.nodes[id].parent?;
+                let children = &doc.nodes[parent].children;
+                if !positions.contains_key(&id) {
+                    positions.extend(
+                        children
                             .iter()
-                            .map(|(key, value)| (key.name().to_owned(), json!(&**value)))
-                            .collect::<serde_json::Map<_, _>>()
-                            .into()
-                    }))
-            }
-            "dom.computed" => {
-                let system = state.text_system.clone();
-                let styles = styles(
-                    doc,
-                    state,
-                    viewport,
-                    system.as_deref().map(|system| (system, state.pixel_ratio)),
-                );
-                let pseudo = args[2].as_str().unwrap_or_default().trim_start_matches(':');
-                if let Some(style) = styles.values.get(id) {
-                    state.motion.read(id, style);
+                            .enumerate()
+                            .map(|(index, &child)| (child, index)),
+                    );
                 }
-                let slot = match pseudo {
-                    "" => Some(0),
-                    "before" => Some(1),
-                    "after" => Some(2),
-                    _ => None,
-                };
-                let scripted =
-                    slot.and_then(|slot| state.motion.scripted(id, slot, &styles, u32::MAX));
-                // The compositor can play animations between frames, so they are sampled now.
-                let current = state
-                    .animating
-                    .contains_key(&id)
-                    .then(|| {
-                        let now = std::time::Instant::now();
-                        state.motion.timeline(id, &styles, &[now], &[]).pop()
-                    })
-                    .flatten();
-                let mut sampled = None;
-                let backdrop = (pseudo == "backdrop")
-                    .then(|| state.motion.backdrop(id, styles.backdrops.get(&id)?))
-                    .flatten();
-                let style = match pseudo {
-                    "" => Some(current.as_ref().unwrap_or_else(|| {
-                        &**state
-                            .animating
-                            .get(&id)
-                            .or_else(|| styles.authored.get(&id))
-                            .unwrap_or(&styles.values[id])
-                    })),
-                    "before" | "after" => state
-                        .animating_pseudos
-                        .get(&id)
-                        .or_else(|| styles.pseudos.get(&id))
-                        .map(|values| &values[usize::from(pseudo == "after")]),
-                    "backdrop" => backdrop
-                        .as_ref()
-                        .or_else(|| styles.backdrops.get(&id).map(|style| &**style)),
-                    _ => None,
-                };
-                let style = match (style, scripted) {
-                    (Some(style), Some(values)) => {
-                        let mut style = style.clone();
-                        style.extend(values.iter().map(|(key, value)| (key, value.clone())));
-                        Some(&*sampled.insert(style))
-                    }
-                    (style, _) => style,
-                };
-                let mut full = None;
-                let style = match style {
-                    Some(style)
-                        if style.vars().is_empty()
-                            && !styles.vars[id].is_empty()
-                            && args[1].as_str().is_none_or(|name| name.starts_with("--")) =>
-                    {
-                        let mut copy = style.clone();
-                        copy.set_vars(styles.vars[id].clone());
-                        Some(&*full.insert(copy))
-                    }
-                    style => style,
-                };
-                let Some(style) = style.filter(|style| !style.is_empty()) else {
-                    return Ok(json!(if args[1].is_string() {
-                        json!("")
-                    } else {
-                        json!([])
-                    }));
-                };
-                let units = styles.lengths[id];
-                let size = (pseudo.is_empty())
-                    .then(|| state.bounds.get(&id).map(|rect| [rect[2], rect[3]]))
-                    .flatten();
-                let container = || {
-                    doc.nodes[id]
-                        .parent
-                        .and_then(|parent| {
-                            let rect = state.bounds.get(&parent)?;
-                            let (style, units) = (&styles.values[parent], styles.lengths[parent]);
-                            let padding = units.edges(style, style::PADDING, rect[2]);
-                            Some([
-                                rect[2] - padding[1] - padding[3],
-                                rect[3] - padding[0] - padding[2],
-                            ])
-                        })
-                        .unwrap_or(viewport)
-                };
-                let registry = state.style_cache.registry();
-                let parent = doc.nodes[id].parent.map(|parent| &*styles.values[parent]);
-                Ok(match args[1].as_str() {
-                    Some(name) => {
-                        let value =
-                            style::resolved(style, &units, name, size, &container, &registry);
-                        let tag = doc.nodes[id].tag.as_str();
-                        json!(match (name, value.as_str()) {
-                            ("display", display_value) if pseudo.is_empty() => {
-                                display(&styles, tag, id, display_value).to_owned()
-                            }
-                            ("gap" | "row-gap" | "column-gap", _) if tag == "table" =>
-                                "normal".to_owned(),
-                            ("min-width" | "min-height", "auto")
-                                if parent.is_none_or(|parent| {
-                                    parent.get(Prop::DISPLAY).is_none_or(|display| {
-                                        !display.ends_with("flex") && !display.ends_with("grid")
-                                    })
-                                }) =>
-                            {
-                                "0px".to_owned()
-                            }
-                            ("top" | "right" | "bottom" | "left", "auto")
-                                if style.get(Prop::POSITION) == Some("relative") =>
-                            {
-                                "0px".to_owned()
-                            }
-                            _ => value,
-                        })
-                    }
-                    None => json!(
-                        style::computed_names()
-                            .chain(style.vars().iter().map(|(prop, _)| prop.name()))
-                            .collect::<Vec<_>>()
-                    ),
-                })
-            }
-            "dom.css" => {
-                if doc.nodes[id].tag == "link" && doc.nodes[id].stylesheet.is_none() {
-                    return Ok(Value::Null);
+                if let Some(&next) = children.get(*positions.get(&id)? + 1) {
+                    return Some(next);
                 }
-                let sheet = state.style_cache.sheet(doc, id, &mut state.sheets);
-                Ok(sheet.map_or_else(|| json!([]), |sheet| sheet.cssom()))
+                id = parent;
             }
-            "dom.sheet" => {
-                let kind = args[1].as_str().unwrap_or_default();
-                let text = args[2].as_str().unwrap_or_default();
-                let path = path(&args[3]);
-                let top = (matches!(kind, "insert" | "delete") && path.len() == 1)
-                    .then(|| (path[0], kind == "insert"));
-                let result = state.style_cache.edit_sheet(
-                    doc,
+        };
+        let mut current = if doc.nodes[start].tag == "#text" {
+            Some(start)
+        } else {
+            doc.nodes[start]
+                .children
+                .get(from)
+                .copied()
+                .or_else(|| following(start))
+        };
+        let stop = if doc.nodes[end].tag == "#text" {
+            following(end)
+        } else {
+            doc.nodes[end]
+                .children
+                .get(to)
+                .copied()
+                .or_else(|| following(end))
+        };
+        let mut ranges = Vec::new();
+        while let Some(id) = current.filter(|id| Some(*id) != stop) {
+            let node = &doc.nodes[id];
+            if node.tag == "#text" {
+                ranges.push([
                     id,
-                    &mut state.sheets,
-                    top,
-                    |sheet, disabled| {
+                    if id == start { from } else { 0 },
+                    if id == end {
+                        to
+                    } else {
+                        node.text.encode_utf16().count()
+                    },
+                ]);
+            }
+            current = node.children.first().copied().or_else(|| following(id));
+        }
+        return Ok(json!(ranges));
+    }
+    if op == "dom.hitTest" {
+        ensure!(!doc.nodes.is_empty(), "Document is unavailable");
+        let x = args[0].as_f64().context("Expected x")? as f32;
+        let y = args[1].as_f64().context("Expected y")? as f32;
+        let computed = styles(doc, state, viewport);
+        let (first, caret) = (args[2].as_bool(), args[3].as_bool());
+        return Ok(hit_test(
+            doc,
+            state,
+            &computed,
+            viewport,
+            [x, y],
+            first.unwrap_or(false),
+            caret.unwrap_or(false),
+        ));
+    }
+    if matches!(op, "dom.focus" | "dom.hover" | "dom.active") {
+        let ids = args[0]
+            .as_array()
+            .context("Expected nodes")?
+            .iter()
+            .map(|id| {
+                id.as_u64()
+                    .map(|id| id as usize)
+                    .filter(|&id| id < doc.nodes.len())
+                    .context("Invalid node id")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (index, flag) = match op {
+            "dom.focus" => (0, FOCUS_WITHIN),
+            "dom.hover" => (1, HOVER),
+            _ => (2, ACTIVE),
+        };
+        let focus = if op == "dom.focus" { FOCUS } else { 0 };
+        let shown = args[2].as_bool() != Some(true);
+        let used = state.style_cache.states & (flag | focus) != 0;
+        let control = |id: &usize| {
+            doc.nodes.get(*id).is_some_and(|node| {
+                matches!(
+                    node.tag.as_str(),
+                    "button" | "input" | "select" | "textarea"
+                )
+            })
+        };
+        let repaint =
+            focus == 0 && (ids.iter().any(control) || state.interaction[index].iter().any(control));
+        if op == "dom.focus" {
+            if let Some(node) = state.focus.and_then(|id| doc.nodes.edit(id)) {
+                node.state &= !(FOCUS | FOCUS_VISIBLE);
+            }
+            state.focus = ids.first().copied();
+            if let Some(node) = state
+                .focus
+                .filter(|_| shown)
+                .and_then(|id| doc.nodes.edit(id))
+            {
+                node.state |= if args[1].as_bool() == Some(false) {
+                    FOCUS
+                } else {
+                    FOCUS | FOCUS_VISIBLE
+                };
+            }
+        }
+        for &id in &state.interaction[index] {
+            if let Some(node) = doc.nodes.edit(id) {
+                node.state &= !flag;
+            }
+        }
+        for &id in ids.iter().filter(|_| shown) {
+            if let Some(node) = doc.nodes.edit(id) {
+                node.state |= flag;
+            }
+        }
+        state.interaction[index] = ids;
+        if used {
+            state.invalidate();
+        }
+        state.dirty |= used || focus != 0 || repaint;
+        return Ok(Value::Null);
+    }
+    if op == "dom.reserve" {
+        let ids: Vec<_> = (0..args[0].as_u64().context("Expected count")?.min(4096))
+            .map(|_| state.allocate(doc, Node::default()))
+            .collect();
+        state.reserved.extend(&ids);
+        return Ok(json!(ids));
+    }
+    let id = args[0].as_u64().context("Expected node id")? as usize;
+    ensure!(id < doc.nodes.len(), "Invalid node id");
+    match op {
+        "dom.assignedNodes" => {
+            let mut roots = HashSet::new();
+            let mut slotted = HashMap::new();
+            let mut add = |slot: usize, slotted: &mut HashMap<usize, Vec<usize>>| {
+                let mut top = slot;
+                while let Some(parent) = doc.nodes[top].parent {
+                    top = parent;
+                }
+                if let Some(&host) = state.hosts.get(&top)
+                    && roots.insert(top)
+                {
+                    slotted.extend(slots(doc, [(host, top)]));
+                }
+            };
+            add(id, &mut slotted);
+            let mut nodes = slotted.get(&id).cloned().unwrap_or_default();
+            if args[1].as_bool() == Some(true) && slotted.contains_key(&id) {
+                if nodes.is_empty() {
+                    nodes = doc.nodes[id].children.clone();
+                }
+                let mut pending: Vec<_> = nodes.into_iter().rev().collect();
+                nodes = Vec::new();
+                while let Some(child) = pending.pop() {
+                    if doc.nodes[child].tag == "slot" {
+                        add(child, &mut slotted);
+                    }
+                    if let Some(assigned) = slotted.get(&child) {
+                        pending.extend(
+                            if assigned.is_empty() {
+                                &doc.nodes[child].children
+                            } else {
+                                assigned
+                            }
+                            .iter()
+                            .rev(),
+                        );
+                    } else if doc.nodes[child].tag != "#comment" {
+                        nodes.push(child);
+                    }
+                }
+            }
+            Ok(json!(nodes))
+        }
+        "dom.tree" => Ok(tree(doc, id, true)),
+        "dom.source" => {
+            let node = &doc.nodes[id];
+            Ok(json!(match &node.stylesheet {
+                Some(sheet) if node.tag == "#text" => sheet.source(),
+                _ => node.text.clone(),
+            }))
+        }
+        "dom.matches" => Ok(json!(parsed(state, &args[1])?.iter().any(|s| {
+            s.matches_cached(doc, id, Some(id), &mut SelectorCache::default())
+        }))),
+        "dom.closest" => {
+            let selectors = parsed(state, &args[1])?;
+            let mut memo = SelectorCache::default();
+            let mut current = Some(id);
+            while let Some(node) = current.filter(|&node| !doc.nodes[node].tag.starts_with('#')) {
+                if selectors
+                    .iter()
+                    .any(|s| s.matches_cached(doc, node, Some(id), &mut memo))
+                {
+                    return Ok(json!(node));
+                }
+                current = doc.nodes[node].parent;
+            }
+            Ok(Value::Null)
+        }
+        "dom.queryWithin" => {
+            let selectors = parsed(state, &args[1])?;
+            let first = args[2].as_bool().unwrap_or(false);
+            let mut pending: Vec<_> = doc.nodes[id].children.iter().rev().copied().collect();
+            let mut found = Vec::new();
+            let mut memo = SelectorCache::default();
+            while let Some(node) = pending.pop() {
+                if selectors
+                    .iter()
+                    .any(|s| s.matches_cached(doc, node, Some(id), &mut memo))
+                {
+                    if first {
+                        return Ok(json!(node));
+                    }
+                    found.push(node);
+                }
+                if doc.nodes[node].tag != "template" {
+                    pending.extend(doc.nodes[node].children.iter().rev());
+                }
+            }
+            Ok(if first { Value::Null } else { json!(found) })
+        }
+        "dom.html" => {
+            let source = args[1].as_str().context("Expected HTML")?;
+            let tag = doc.nodes[id].tag.as_str();
+            let form = || {
+                std::iter::successors(Some(id), |&at| doc.nodes[at].parent)
+                    .any(|at| doc.nodes[at].tag == "form")
+            };
+            let parsed = match args[2].as_str() {
+                _ if tag == "#document" => Document::parse(source),
+                Some(context) => Document::build(source, Some(context), form()),
+                // Shadow roots and template contents parse in `template` context, so the `<tr>` rows that
+                // Lit renders are kept.
+                None if tag.starts_with('#') => Document::fragment(source, "template"),
+                None => Document::build(source, Some(tag), form()),
+            };
+            for child in std::mem::take(&mut doc.nodes[id].children) {
+                doc.nodes[child].parent = None;
+                state.detached.push(child);
+                state.removed.push(child);
+            }
+            doc.nodes[id].text.clear();
+            let mut ids = Vec::with_capacity(parsed.nodes.len());
+            ids.push(id);
+            for _ in 1..parsed.nodes.len() {
+                ids.push(state.slot(doc));
+            }
+            doc.nodes[id].children = parsed.nodes[0]
+                .children
+                .iter()
+                .map(|&child| ids[child])
+                .collect();
+            let detached = state.detached.len();
+            for (index, mut node) in parsed.nodes.into_iter().enumerate().skip(1) {
+                node.parent = node.parent.map(|parent| ids[parent]);
+                for child in &mut node.children {
+                    *child = ids[*child];
+                }
+                state.place(doc, ids[index], node);
+            }
+            state.detached.truncate(detached);
+            state.dirty = true;
+            Ok(tree(doc, id, false))
+        }
+        "dom.cssAnimations" => {
+            let styles = styles(doc, state, viewport);
+            let mut nodes = Vec::new();
+            let mut pending = vec![id];
+            while let Some(node) = pending.pop() {
+                nodes.push(node);
+                if args[1].as_bool() == Some(true) {
+                    pending.extend(doc.nodes[node].children.iter().rev());
+                    pending.extend(state.shadows.get(&node));
+                }
+            }
+            Ok(json!(state.motion.css(
+                &nodes,
+                args[2].as_bool() == Some(true),
+                &styles
+            )))
+        }
+        "dom.animated" => {
+            let styles = styles(doc, state, viewport);
+            Ok(state
+                .motion
+                .scripted(id, 0, &styles, args[1].as_u64().unwrap_or(0) as u32)
+                .map_or(Value::Null, |values| {
+                    values
+                        .iter()
+                        .map(|(key, value)| (key.name().to_owned(), json!(&**value)))
+                        .collect::<serde_json::Map<_, _>>()
+                        .into()
+                }))
+        }
+        "dom.computed" => {
+            let styles = styles(doc, state, viewport);
+            let pseudo = args[2].as_str().unwrap_or_default().trim_start_matches(':');
+            if let Some(style) = styles.values.get(id) {
+                state.motion.read(id, style);
+            }
+            let slot = match pseudo {
+                "" => Some(0),
+                "before" => Some(1),
+                "after" => Some(2),
+                _ => None,
+            };
+            let scripted = slot.and_then(|slot| state.motion.scripted(id, slot, &styles, u32::MAX));
+            // The compositor can play animations between frames, so they are sampled now.
+            let current = state
+                .animating
+                .contains_key(&id)
+                .then(|| {
+                    let now = std::time::Instant::now();
+                    state.motion.timeline(id, &styles, &[now], &[]).pop()
+                })
+                .flatten();
+            let mut sampled = None;
+            let backdrop = (pseudo == "backdrop")
+                .then(|| state.motion.backdrop(id, styles.backdrops.get(&id)?))
+                .flatten();
+            let style = match pseudo {
+                "" => Some(current.as_ref().unwrap_or_else(|| {
+                    &**state
+                        .animating
+                        .get(&id)
+                        .or_else(|| styles.authored.get(&id))
+                        .unwrap_or(&styles.values[id])
+                })),
+                "before" | "after" => state
+                    .animating_pseudos
+                    .get(&id)
+                    .or_else(|| styles.pseudos.get(&id))
+                    .map(|values| &values[usize::from(pseudo == "after")]),
+                "backdrop" => backdrop
+                    .as_ref()
+                    .or_else(|| styles.backdrops.get(&id).map(|style| &**style)),
+                _ => None,
+            };
+            let style = match (style, scripted) {
+                (Some(style), Some(values)) => {
+                    let mut style = style.clone();
+                    style.extend(values.iter().map(|(key, value)| (key, value.clone())));
+                    Some(&*sampled.insert(style))
+                }
+                (style, _) => style,
+            };
+            let mut full = None;
+            let style = match style {
+                Some(style)
+                    if style.vars().is_empty()
+                        && !styles.vars[id].is_empty()
+                        && args[1].as_str().is_none_or(|name| name.starts_with("--")) =>
+                {
+                    let mut copy = style.clone();
+                    copy.set_vars(styles.vars[id].clone());
+                    Some(&*full.insert(copy))
+                }
+                style => style,
+            };
+            let Some(style) = style.filter(|style| !style.is_empty()) else {
+                return Ok(json!(if args[1].is_string() {
+                    json!("")
+                } else {
+                    json!([])
+                }));
+            };
+            let units = styles.lengths[id];
+            let size = (pseudo.is_empty())
+                .then(|| state.bounds.get(&id).map(|rect| [rect[2], rect[3]]))
+                .flatten();
+            let container = || {
+                doc.nodes[id]
+                    .parent
+                    .and_then(|parent| {
+                        let rect = state.bounds.get(&parent)?;
+                        let (style, units) = (&styles.values[parent], styles.lengths[parent]);
+                        let padding = units.edges(style, style::PADDING, rect[2]);
+                        Some([
+                            rect[2] - padding[1] - padding[3],
+                            rect[3] - padding[0] - padding[2],
+                        ])
+                    })
+                    .unwrap_or(viewport)
+            };
+            let registry = state.style_cache.registry();
+            let parent = doc.nodes[id].parent.map(|parent| &*styles.values[parent]);
+            Ok(match args[1].as_str() {
+                Some(name) => {
+                    let value = style::resolved(style, &units, name, size, &container, &registry);
+                    let tag = doc.nodes[id].tag.as_str();
+                    json!(match (name, value.as_str()) {
+                        ("display", display_value) if pseudo.is_empty() => {
+                            display(&styles, tag, id, display_value).to_owned()
+                        }
+                        ("gap" | "row-gap" | "column-gap", _) if tag == "table" =>
+                            "normal".to_owned(),
+                        ("min-width" | "min-height", "auto")
+                            if parent.is_none_or(|parent| {
+                                parent.get(Prop::DISPLAY).is_none_or(|display| {
+                                    !display.ends_with("flex") && !display.ends_with("grid")
+                                })
+                            }) =>
+                        {
+                            "0px".to_owned()
+                        }
+                        ("top" | "right" | "bottom" | "left", "auto")
+                            if style.get(Prop::POSITION) == Some("relative") =>
+                        {
+                            "0px".to_owned()
+                        }
+                        _ => value,
+                    })
+                }
+                None => json!(
+                    style::computed_names()
+                        .chain(style.vars().iter().map(|(prop, _)| prop.name()))
+                        .collect::<Vec<_>>()
+                ),
+            })
+        }
+        "dom.css" => {
+            if doc.nodes[id].tag == "link" && doc.nodes[id].stylesheet.is_none() {
+                return Ok(Value::Null);
+            }
+            let sheet = state.style_cache.sheet(doc, id, &mut state.sheets);
+            Ok(sheet.map_or_else(|| json!([]), |sheet| sheet.cssom()))
+        }
+        "dom.sheet" => {
+            let kind = args[1].as_str().unwrap_or_default();
+            let text = args[2].as_str().unwrap_or_default();
+            let (path, top) = path(kind, &args[3]);
+            let result =
+                state
+                    .style_cache
+                    .edit_sheet(doc, id, &mut state.sheets, top, |sheet, disabled| {
                         if kind == "disabled" {
                             *disabled = args[2].as_bool().unwrap_or(false);
                             return Ok(Value::Null);
                         }
                         sheet.edit(&path, edit(kind, text))
-                    },
-                );
-                state.invalidate();
-                state.dirty = true;
-                Ok(result.unwrap_or_else(|error| json!({ "error": error })))
-            }
-            "dom.selection" => {
-                state.selection.clear();
-                state.selection_caret = None;
-                if let Some(ranges) = args[1].as_array() {
-                    for range in ranges {
-                        let node = range[0].as_u64().context("Expected selection node")? as usize;
-                        ensure!(node < doc.nodes.len(), "Invalid selection node");
-                        state.selection.insert(
-                            node,
-                            [
-                                range[1].as_u64().unwrap_or(0) as usize,
-                                range[2].as_u64().unwrap_or(0) as usize,
-                            ],
-                        );
-                        if args[2].as_bool() == Some(true) {
-                            state.selection_caret = Some(node);
-                        }
-                    }
-                } else if id != 0 {
+                    });
+            state.invalidate();
+            state.dirty = true;
+            Ok(result.unwrap_or_else(|error| json!({ "error": error })))
+        }
+        "dom.selection" => {
+            state.selection.clear();
+            state.selection_caret = None;
+            if let Some(ranges) = args[1].as_array() {
+                for range in ranges {
+                    let node = range[0].as_u64().context("Expected selection node")? as usize;
+                    ensure!(node < doc.nodes.len(), "Invalid selection node");
                     state.selection.insert(
-                        id,
+                        node,
                         [
-                            args[1].as_u64().unwrap_or(0) as usize,
-                            args[2].as_u64().unwrap_or(0) as usize,
+                            range[1].as_u64().unwrap_or(0) as usize,
+                            range[2].as_u64().unwrap_or(0) as usize,
                         ],
                     );
-                    if args[1] == args[2] {
-                        state.selection_caret = Some(id);
+                    if args[2].as_bool() == Some(true) {
+                        state.selection_caret = Some(node);
                     }
                 }
-                state.dirty = true;
-                Ok(Value::Null)
-            }
-            "dom.userSelect" | "dom.selectionText" => {
-                let system = state.text_system.clone();
-                let computed = styles(
-                    doc,
-                    state,
-                    viewport,
-                    system.as_deref().map(|system| (system, state.pixel_ratio)),
+            } else if id != 0 {
+                state.selection.insert(
+                    id,
+                    [
+                        args[1].as_u64().unwrap_or(0) as usize,
+                        args[2].as_u64().unwrap_or(0) as usize,
+                    ],
                 );
-                if op == "dom.userSelect" {
-                    return Ok(if state.inert(id) {
-                        json!((style::UserSelect::None, id))
-                    } else {
-                        json!(computed.user_select[id])
-                    });
+                if args[1] == args[2] {
+                    state.selection_caret = Some(id);
                 }
-                let mut range = rustc_hash::FxHashMap::default();
-                let (mut first, mut last) = (None, 0);
-                for item in args[1].as_array().into_iter().flatten() {
-                    let node = item[0].as_u64().context("Expected selection node")? as usize;
-                    ensure!(node < doc.nodes.len(), "Invalid selection node");
-                    let [start, end] =
-                        [1, 2].map(|index| item[index].as_u64().unwrap_or(0) as usize);
-                    range.insert(node, [start, end]);
-                    first.get_or_insert(node);
-                    last = node;
-                }
-                let Some(mut root) = first else {
-                    return Ok(json!(""));
-                };
-                while !std::iter::successors(Some(last), |&id| doc.nodes[id].parent)
-                    .any(|id| id == root)
-                    && let Some(parent) = doc.nodes[root].parent
-                {
-                    root = parent;
-                }
-                Ok(json!(rendered_text(
-                    doc,
-                    state,
-                    &computed,
-                    root,
-                    Some(&range)
-                )))
             }
-            "dom.scroll" => {
-                let handle = state
-                    .scroll
-                    .entry(if page { 0 } else { id })
-                    .or_default()
-                    .clone();
-                let previous = handle.offset();
-                let ratio = state.pixel_ratio.max(1.);
-                let axis = |value: &Value, current: renderer::Pixels| {
-                    renderer::px(
-                        value
-                            .as_f64()
-                            .map_or(f32::from(current), |v| -(v as f32 * ratio).round() / ratio),
-                    )
-                };
-                let target = scroll_offset(
-                    &handle,
-                    renderer::point(axis(&args[1], previous.x), axis(&args[2], previous.y)),
-                );
-                if target != handle.target() {
-                    let smooth = handle.max_offset() != renderer::Point::default()
-                        && match args[3].as_str() {
-                            Some("smooth") => true,
-                            Some("instant") => false,
-                            _ => {
-                                let system = state.text_system.clone();
-                                styles(
-                                    doc,
-                                    state,
-                                    viewport,
-                                    system.as_deref().map(|system| (system, state.pixel_ratio)),
-                                )
-                                .values[id]
-                                    .get(Prop::SCROLL_BEHAVIOR)
-                                    == Some("smooth")
-                            }
-                        };
-                    if smooth {
-                        handle.animate_to(target, false);
-                    } else {
-                        handle.set_offset(target);
-                    }
-                }
-                state.dirty |= target != previous;
-                state.sync_scroll();
-                Ok(json!([-f32::from(target.x), -f32::from(target.y)]))
+            state.dirty = true;
+            Ok(Value::Null)
+        }
+        "dom.userSelect" | "dom.selectionText" => {
+            let computed = styles(doc, state, viewport);
+            if op == "dom.userSelect" {
+                return Ok(if state.inert(id) {
+                    json!((style::UserSelect::None, id))
+                } else {
+                    json!(computed.user_select[id])
+                });
             }
-            "dom.canvas" => {
-                if let Some(ops) = crate::jsc::payload::slice(&args[1]) {
-                    let ops: Vec<f64> = ops?
-                        .as_chunks::<8>()
-                        .0
-                        .iter()
-                        .map(|bytes| f64::from_ne_bytes(*bytes))
-                        .collect();
-                    let data = args
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .skip(3)
-                        .map(|value| {
-                            crate::jsc::payload::slice(value).context("Expected image data")?
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let mut canvas = match state.canvases.remove(&id) {
-                        Some(canvas) => canvas,
-                        None => {
-                            let canvas = new_canvas(&doc.nodes[id])?;
-                            state.created += canvas.pixels.data().len() >> 16;
-                            canvas
+            let mut range = rustc_hash::FxHashMap::default();
+            let (mut first, mut last) = (None, 0);
+            for item in args[1].as_array().into_iter().flatten() {
+                let node = item[0].as_u64().context("Expected selection node")? as usize;
+                ensure!(node < doc.nodes.len(), "Invalid selection node");
+                let [start, end] = [1, 2].map(|index| item[index].as_u64().unwrap_or(0) as usize);
+                range.insert(node, [start, end]);
+                first.get_or_insert(node);
+                last = node;
+            }
+            let Some(mut root) = first else {
+                return Ok(json!(""));
+            };
+            while !std::iter::successors(Some(last), |&id| doc.nodes[id].parent)
+                .any(|id| id == root)
+                && let Some(parent) = doc.nodes[root].parent
+            {
+                root = parent;
+            }
+            Ok(json!(rendered_text(
+                doc,
+                state,
+                &computed,
+                root,
+                Some(&range)
+            )))
+        }
+        "dom.scroll" => {
+            let page = doc.nodes[id].parent == Some(0)
+                && doc.nodes[id].tag == "html"
+                && !state.scroll.contains_key(&id);
+            let handle = state
+                .scroll
+                .entry(if page { 0 } else { id })
+                .or_default()
+                .clone();
+            let previous = handle.offset();
+            let ratio = state.pixel_ratio.max(1.);
+            let axis = |value: &Value, current: renderer::Pixels| {
+                renderer::px(
+                    value
+                        .as_f64()
+                        .map_or(f32::from(current), |v| -(v as f32 * ratio).round() / ratio),
+                )
+            };
+            let target = scroll_offset(
+                &handle,
+                renderer::point(axis(&args[1], previous.x), axis(&args[2], previous.y)),
+            );
+            if target != handle.target() {
+                let smooth = handle.max_offset() != renderer::Point::default()
+                    && match args[3].as_str() {
+                        Some("smooth") => true,
+                        Some("instant") => false,
+                        _ => {
+                            styles(doc, state, viewport).values[id].get(Prop::SCROLL_BEHAVIOR)
+                                == Some("smooth")
                         }
                     };
-                    let result = canvas.draw(
-                        &ops,
-                        args[2].as_str().unwrap_or(""),
-                        &data,
-                        &|(source, size)| source_pixels(state, source, Some(size)),
-                        state
-                            .text_system
-                            .as_deref()
-                            .map(|system| (system, &state.font_aliases)),
-                    );
-                    state.canvases.insert(id, canvas);
-                    let old = result?;
-                    if state.retired.is_empty() {
-                        state.retired_canvases.clear();
-                    }
-                    // Only the first replaced image can be on the GPU. Drop later images immediately to bound
-                    // memory in unrendered windows.
-                    if let Some(old) = old
-                        && state.retired_canvases.insert(id)
-                    {
-                        state.retired.push(old);
-                    }
+                if smooth {
+                    handle.animate_to(target, false);
                 } else {
-                    state.retired.extend(
-                        state
-                            .canvases
-                            .remove(&id)
-                            .filter(|canvas| canvas.present)
-                            .map(|canvas| canvas.image),
-                    );
-                    state.retired.extend(state.images.remove(&id));
-                    state.sources.get_mut().remove(&id);
+                    handle.set_offset(target);
                 }
-                // Offscreen drawing changes nothing on the page, so it must not cost page frames.
-                state.dirty |= doc.nodes[id].tag == "canvas";
-                Ok(Value::Null)
             }
-            "dom.canvasURL" => {
-                use base64::Engine as _;
-                let base64 = base64::engine::general_purpose::STANDARD;
-                let png = match source_pixels(state, id, None) {
-                    Some(pixels) => crate::render::image::encode_png(&pixels)?,
-                    None => crate::render::image::encode_png(&new_canvas(&doc.nodes[id])?.pixels)?,
-                };
-                let (bytes, mime) = match args[2].as_str() {
-                    #[cfg(target_os = "macos")]
-                    Some("image/jpeg") => {
-                        let quality = args[3].as_f64().filter(|q| (0. ..=1.).contains(q));
-                        let jpeg = crate::desktop::native::native_call(
-                            "image",
-                            &json!({"op": "jpeg", "data": base64.encode(&png), "quality": quality.unwrap_or(0.92) * 100.}),
-                        )?;
-                        (
-                            base64.decode(jpeg["png"].as_str().unwrap_or_default())?,
-                            "image/jpeg",
-                        )
-                    }
-                    _ => (png, "image/png"),
-                };
-                Ok(if args[1] == true {
-                    json!([crate::jsc::payload::write(bytes), mime])
-                } else {
-                    json!(format!("data:{mime};base64,{}", base64.encode(bytes)))
-                })
-            }
-            "dom.canvasPixels" => {
-                let pixels = match source_pixels(state, id, None) {
-                    Some(pixels) => pixels,
-                    None => crate::render::canvas::Source::Shared(Rc::new(
-                        new_canvas(&doc.nodes[id])?.pixels,
-                    )),
-                };
-                let x = args[1].as_i64().unwrap_or(0);
-                let y = args[2].as_i64().unwrap_or(0);
-                let width = args[3].as_u64().context("Expected width")? as usize;
-                let height = args[4].as_u64().context("Expected height")? as usize;
-                ensure!(
-                    width > 0
-                        && height > 0
-                        && width <= 16384
-                        && height <= 16384
-                        && width * height <= 16_777_216,
-                    "Invalid pixel region"
-                );
-                let mut bytes = vec![0u8; width * height * 4];
-                let premultiplied = args[5] == true;
-                for row in 0..height {
-                    for col in 0..width {
-                        let sx = x + col as i64;
-                        let sy = y + row as i64;
-                        if sx < 0
-                            || sy < 0
-                            || sx >= i64::from(pixels.width())
-                            || sy >= i64::from(pixels.height())
-                        {
-                            continue;
-                        }
-                        let pixel =
-                            pixels.pixels()[sy as usize * pixels.width() as usize + sx as usize];
-                        let color = pixel.demultiply();
-                        let at = (row * width + col) * 4;
-                        bytes[at..at + 4].copy_from_slice(&if premultiplied {
-                            [pixel.red(), pixel.green(), pixel.blue(), pixel.alpha()]
-                        } else {
-                            [color.red(), color.green(), color.blue(), color.alpha()]
-                        });
-                    }
-                }
-                Ok(crate::web::base64(&bytes))
-            }
-            "dom.canvasTake" => {
-                let to = args[1].as_u64().context("Expected node id")? as usize;
-                ensure!(to < doc.nodes.len(), "Invalid node id");
-                let mut taken = match state.canvases.get_mut(&id) {
-                    Some(canvas) => {
-                        let mut taken = crate::render::canvas::Canvas::new(
-                            canvas.pixels.width(),
-                            canvas.pixels.height(),
-                        )?;
-                        std::mem::swap(&mut canvas.pixels, &mut taken.pixels);
-                        taken
-                    }
+            state.dirty |= target != previous;
+            state.sync_scroll();
+            Ok(json!([-f32::from(target.x), -f32::from(target.y)]))
+        }
+        "dom.canvas" => {
+            if let Some(ops) = crate::jsc::payload::slice(&args[1]) {
+                let ops: Vec<f64> = ops?
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|bytes| f64::from_ne_bytes(*bytes))
+                    .collect();
+                let data = args
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .skip(3)
+                    .map(|value| {
+                        crate::jsc::payload::slice(value).context("Expected image data")?
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut canvas = match state.canvases.remove(&id) {
+                    Some(canvas) => canvas,
                     None => {
-                        let mut taken = new_canvas(&doc.nodes[id])?;
-                        if let Some(pixels) = source_pixels(state, id, None) {
-                            taken.pixels = (*pixels).clone();
-                        }
-                        taken
+                        let canvas = new_canvas(&doc.nodes[id])?;
+                        state.created += canvas.pixels.data().len() >> 16;
+                        canvas
                     }
                 };
-                taken.present = doc.nodes[to].tag == "canvas";
-                if taken.present {
-                    taken.image = crate::render::canvas::render_image(&taken.pixels, Vec::new());
-                }
-                state.created += taken.pixels.data().len() >> 16;
-                state.dirty |= taken.present;
-                if state.retired.is_empty() {
-                    state.retired_canvases.clear();
-                }
-                if let Some(old) = state.canvases.insert(to, taken)
-                    && old.present
-                    && state.retired_canvases.insert(to)
-                {
-                    state.retired.push(old.image);
-                }
-                Ok(Value::Null)
-            }
-            "dom.canvasAdopt" => {
-                let mut canvas = new_canvas(&doc.nodes[id])?;
-                canvas.pixels = tiny_skia::Pixmap::from_vec(
-                    crate::web::bytes(&args[1])?,
-                    tiny_skia::IntSize::from_wh(canvas.pixels.width(), canvas.pixels.height())
-                        .context("Invalid canvas size")?,
-                )
-                .context("Invalid canvas pixels")?;
-                state.created += canvas.pixels.data().len() >> 16;
+                let result = canvas.draw(
+                    &ops,
+                    args[2].as_str().unwrap_or(""),
+                    &data,
+                    &|(source, size)| source_pixels(state, source, Some(size)),
+                    state
+                        .text_system
+                        .as_deref()
+                        .map(|system| (system, &state.font_aliases)),
+                );
                 state.canvases.insert(id, canvas);
-                Ok(Value::Null)
-            }
-            "dom.canvasLink" => {
-                static NEXT: AtomicU64 = AtomicU64::new(0);
-                let token = NEXT.fetch_add(1, Ordering::Relaxed);
-                let placeholder = state
-                    .placeholders
-                    .remove(&id)
-                    .unwrap_or_else(|| Placeholder {
-                        frames: state.frames.clone(),
-                        node: id,
-                        wake: crate::host::Waker::current(),
-                    });
-                PLACEHOLDERS
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(token, placeholder);
-                Ok(json!(token))
-            }
-            "dom.canvasBind" => {
-                let token = args[1].as_u64().context("Expected a token")?;
-                let placeholder = PLACEHOLDERS
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&token)
-                    .context("The canvas was already transferred")?;
-                state.placeholders.insert(id, placeholder);
-                Ok(Value::Null)
-            }
-            "dom.image" => {
-                let bytes = crate::web::bytes(&args[1])?;
-                Ok(load_image(state, id, move || Ok(bytes)))
-            }
-            "dom.font" => {
-                let family = args[1].as_str().context("Expected font family")?;
-                Ok(match args[2].as_str() {
-                    Some(name) => json!(local_font(state, family, name)),
-                    None => json!(add_font(state, family, crate::web::bytes(&args[2])?)?),
-                })
-            }
-            "dom.fontSources" => Ok(json!(crate::render::fonts::sources(
-                args[1].as_str().context("Expected font sources")?
-            ))),
-            "dom.fontCheck" => {
-                let family = args[1].as_str().context("Expected font family")?;
-                let family = state
-                    .font_aliases
-                    .get(family)
-                    .map(String::as_str)
-                    .unwrap_or(family);
-                Ok(json!(
-                    matches!(family, "serif" | "sans-serif" | "monospace" | "system-ui")
-                        || crate::render::canvas::fonts(true).0.faces().any(|face| face
-                            .families
-                            .iter()
-                            .any(|(name, _)| name.eq_ignore_ascii_case(family)))
-                ))
-            }
-            "dom.textOffset" | "dom.textPoint" => {
-                let target = args[1].as_u64().unwrap_or(0) as usize;
-                let mut offset = 0;
-                let mut pending = vec![id];
-                while let Some(node) = pending.pop() {
-                    let current = &doc.nodes[node];
-                    if op == "dom.textOffset" && node == target {
-                        let index = args[2].as_u64().unwrap_or(0) as usize;
-                        if current.tag == "#text" {
-                            return Ok(json!(offset + index));
-                        }
-                        pending.clear();
-                        pending.extend(current.children.iter().take(index));
-                        while let Some(node) = pending.pop() {
-                            let current = &doc.nodes[node];
-                            if current.tag == "#text" {
-                                offset += current.text.encode_utf16().count();
-                            } else {
-                                pending.extend(&current.children);
-                            }
-                        }
-                        return Ok(json!(offset));
-                    }
-                    if current.tag == "#text" {
-                        let length = current.text.encode_utf16().count();
-                        if op == "dom.textPoint" && target <= offset + length {
-                            return Ok(json!([node, target.saturating_sub(offset)]));
-                        }
-                        offset += length;
-                    } else {
-                        pending.extend(current.children.iter().rev());
-                    }
-                }
-                Ok(if op == "dom.textOffset" {
-                    json!(offset)
-                } else {
-                    let mut node = id;
-                    while let Some(&child) = doc.nodes[node].children.first()
-                        && !doc.nodes[child].children.is_empty()
-                    {
-                        node = child;
-                    }
-                    json!([node, 0])
-                })
-            }
-            "dom.svgBox" => {
-                let boxes = std::iter::successors(Some(id), |&node| doc.nodes[node].parent)
-                    .find_map(|node| state.svg_boxes.get(&node).map(|boxes| (node, boxes)));
-                Ok(json!(
-                    boxes
-                        .and_then(|(root, (.., boxes, content))| if root == id {
-                            Some(*content)
-                        } else {
-                            boxes
-                                .iter()
-                                .find(|(node, ..)| *node == id)
-                                .map(|(.., object)| *object)
-                        })
-                        .unwrap_or_default()
-                ))
-            }
-            "dom.textRect" | "dom.textIndex" => {
-                let Some(bounds) = state.bounds.get(&id) else {
-                    return Ok(if op == "dom.textRect" {
-                        json!([])
-                    } else {
-                        json!(0)
-                    });
-                };
-                let password = doc.nodes[id]
-                    .password()
-                    .then(|| doc.nodes[id].current_value().unwrap_or("").to_owned());
-                let shown = |offset| {
-                    password
-                        .as_deref()
-                        .map_or(offset, |value| bullets(value, offset))
-                };
-                let real = |index| {
-                    password
-                        .as_deref()
-                        .map_or(index, |value| unbullet(value, index))
-                };
-                let start = shown(args[1].as_u64().unwrap_or(0) as usize);
-                let end = args[2].as_u64().map_or(start, |end| shown(end as usize));
-                if let Some((layout, text, range, rows, font)) = state.text_layouts.get(&id) {
-                    let content = &text[range.clone()];
-                    let source = doc.nodes[id].text.as_str();
-                    if op == "dom.textIndex" {
-                        let position = renderer::point(
-                            renderer::px(args[1].as_f64().unwrap_or(0.) as f32),
-                            renderer::px(args[2].as_f64().unwrap_or(0.) as f32),
-                        );
-                        let index = crate::render::text::text_index(layout, text, rows, position)
-                            .unwrap_or_else(|index| index)
-                            .clamp(range.start, range.end);
-                        return Ok(json!(real(source_offset(
-                            source,
-                            content,
-                            index - range.start
-                        ))));
-                    }
-                    return Ok(json!(crate::render::text::text_rects(
-                        layout,
-                        text,
-                        rows,
-                        [start, end].map(|index| range.start + shown_index(source, content, index)),
-                        *font,
-                    )));
-                }
-                let system = state
-                    .text_system
-                    .clone()
-                    .context("Text geometry requires a displayed window")?;
-                let [x, y, width, full] = *bounds;
-                // A focus change just before a click can drop the cached styles, so they are computed again here.
-                let computed = styles(doc, state, viewport, Some((&system, state.pixel_ratio)));
-                let (style, units) = (&computed.values[id], &computed.lengths[id]);
-                let node = &doc.nodes[id];
-                let text = node.shown_text(
-                    node.current_value()
-                        .map_or_else(|| doc.text(id), str::to_owned),
+                state.retire(id, result?);
+            } else {
+                state.retired.extend(
+                    state
+                        .canvases
+                        .remove(&id)
+                        .filter(|canvas| canvas.present)
+                        .map(|canvas| canvas.image),
                 );
-                let (font_size, height) = (units.font.em, units.font.lh.max(1.));
-                let padding = units.edges(style, style::PADDING, width);
-                let [top, right, bottom, left] = [0, 1, 2, 3].map(|side| {
-                    let [size, kind, _] = style::BORDERS[side];
-                    padding[side].max(0.)
-                        + if style
-                            .get(kind)
-                            .is_none_or(|kind| matches!(kind, "none" | "hidden"))
-                        {
-                            0.
-                        } else {
-                            style
-                                .get(size)
-                                .map_or(Some(3.), |size| units.resolve(size, width))
-                                .unwrap_or(0.)
-                                .max(0.)
-                        }
+                state.retired.extend(state.images.remove(&id));
+                state.sources.get_mut().remove(&id);
+            }
+            // Offscreen drawing changes nothing on the page, so it must not cost page frames.
+            state.dirty |= doc.nodes[id].tag == "canvas";
+            Ok(Value::Null)
+        }
+        "dom.canvasURL" => {
+            use base64::Engine as _;
+            let base64 = base64::engine::general_purpose::STANDARD;
+            let png = match source_pixels(state, id, None) {
+                Some(pixels) => crate::render::image::encode_png(&pixels)?,
+                None => crate::render::image::encode_png(&new_canvas(&doc.nodes[id])?.pixels)?,
+            };
+            let (bytes, mime) = match args[2].as_str() {
+                #[cfg(target_os = "macos")]
+                Some("image/jpeg") => {
+                    let quality = args[3].as_f64().filter(|q| (0. ..=1.).contains(q));
+                    let jpeg = crate::desktop::native::native_call(
+                        "image",
+                        &json!({"op": "jpeg", "data": base64.encode(&png), "quality": quality.unwrap_or(0.92) * 100.}),
+                    )?;
+                    (
+                        base64.decode(jpeg["png"].as_str().unwrap_or_default())?,
+                        "image/jpeg",
+                    )
+                }
+                _ => (png, "image/png"),
+            };
+            Ok(if args[1] == true {
+                json!([crate::jsc::payload::write(bytes), mime])
+            } else {
+                json!(format!("data:{mime};base64,{}", base64.encode(bytes)))
+            })
+        }
+        "dom.canvasPixels" => {
+            let pixels = match source_pixels(state, id, None) {
+                Some(pixels) => pixels,
+                None => crate::render::canvas::Source::Shared(Rc::new(
+                    new_canvas(&doc.nodes[id])?.pixels,
+                )),
+            };
+            let x = args[1].as_i64().unwrap_or(0);
+            let y = args[2].as_i64().unwrap_or(0);
+            let width = args[3].as_u64().context("Expected width")? as usize;
+            let height = args[4].as_u64().context("Expected height")? as usize;
+            ensure!(
+                width > 0
+                    && height > 0
+                    && width <= 16384
+                    && height <= 16384
+                    && width * height <= 16_777_216,
+                "Invalid pixel region"
+            );
+            let mut bytes = vec![0u8; width * height * 4];
+            let (w, h) = (i64::from(pixels.width()), i64::from(pixels.height()));
+            let [left, right] = [x, x.saturating_add(width as i64)].map(|edge| edge.clamp(0, w));
+            for sy in (y.max(0)..y.saturating_add(height as i64).min(h)).filter(|_| left < right) {
+                let from = (sy * w + left) as usize..(sy * w + right) as usize;
+                let at = (((sy - y) * width as i64 + left - x) * 4) as usize;
+                let out = &mut bytes[at..at + from.len() * 4];
+                if args[5] == true {
+                    out.copy_from_slice(&pixels.data()[from.start * 4..from.end * 4]);
+                    continue;
+                }
+                for (out, pixel) in out
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(&pixels.pixels()[from])
+                {
+                    let color = pixel.demultiply();
+                    *out = [color.red(), color.green(), color.blue(), color.alpha()];
+                }
+            }
+            Ok(crate::jsc::payload::write(bytes))
+        }
+        "dom.canvasTake" => {
+            let to = args[1].as_u64().context("Expected node id")? as usize;
+            ensure!(to < doc.nodes.len(), "Invalid node id");
+            let mut taken = match state.canvases.get_mut(&id) {
+                Some(canvas) => {
+                    let mut taken = crate::render::canvas::Canvas::new(
+                        canvas.pixels.width(),
+                        canvas.pixels.height(),
+                    )?;
+                    std::mem::swap(&mut canvas.pixels, &mut taken.pixels);
+                    taken
+                }
+                None => {
+                    let mut taken = new_canvas(&doc.nodes[id])?;
+                    if let Some(pixels) = source_pixels(state, id, None) {
+                        taken.pixels = (*pixels).clone();
+                    }
+                    taken
+                }
+            };
+            taken.present = doc.nodes[to].tag == "canvas";
+            if taken.present {
+                taken.image = crate::render::canvas::render_image(&taken.pixels, Vec::new());
+            }
+            state.created += taken.pixels.data().len() >> 16;
+            state.dirty |= taken.present;
+            let old = state.canvases.insert(to, taken);
+            state.retire(to, old.filter(|old| old.present).map(|old| old.image));
+            Ok(Value::Null)
+        }
+        "dom.canvasAdopt" => {
+            let mut canvas = new_canvas(&doc.nodes[id])?;
+            canvas.pixels = tiny_skia::Pixmap::from_vec(
+                crate::web::bytes(&args[1])?,
+                tiny_skia::IntSize::from_wh(canvas.pixels.width(), canvas.pixels.height())
+                    .context("Invalid canvas size")?,
+            )
+            .context("Invalid canvas pixels")?;
+            state.created += canvas.pixels.data().len() >> 16;
+            state.canvases.insert(id, canvas);
+            Ok(Value::Null)
+        }
+        "dom.canvasLink" => {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let token = NEXT.fetch_add(1, Ordering::Relaxed);
+            let placeholder = state
+                .placeholders
+                .remove(&id)
+                .unwrap_or_else(|| Placeholder {
+                    frames: state.frames.clone(),
+                    node: id,
+                    wake: crate::host::Waker::current(),
                 });
-                let single = node.tag == "input";
-                let bounds = [
-                    x + left,
-                    y + top
-                        + if single {
-                            (full - top - bottom - height) / 2.
+            PLACEHOLDERS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(token, placeholder);
+            Ok(json!(token))
+        }
+        "dom.canvasBind" => {
+            let token = args[1].as_u64().context("Expected a token")?;
+            let placeholder = PLACEHOLDERS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&token)
+                .context("The canvas was already transferred")?;
+            state.placeholders.insert(id, placeholder);
+            Ok(Value::Null)
+        }
+        "dom.image" => {
+            let bytes = crate::web::bytes(&args[1])?;
+            Ok(load_image(state, id, move || Ok(bytes)))
+        }
+        "dom.font" => {
+            let family = args[1].as_str().context("Expected font family")?;
+            Ok(match args[2].as_str() {
+                Some(name) => json!(local_font(state, family, name)),
+                None => json!(add_font(state, family, crate::web::bytes(&args[2])?)?),
+            })
+        }
+        "dom.fontSources" => Ok(json!(crate::render::fonts::sources(
+            args[1].as_str().context("Expected font sources")?
+        ))),
+        "dom.fontCheck" => {
+            let family = args[1].as_str().context("Expected font family")?;
+            let family = state
+                .font_aliases
+                .get(family)
+                .map(String::as_str)
+                .unwrap_or(family);
+            Ok(json!(
+                matches!(family, "serif" | "sans-serif" | "monospace" | "system-ui")
+                    || crate::render::canvas::fonts(true).0.faces().any(|face| face
+                        .families
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case(family)))
+            ))
+        }
+        "dom.textOffset" | "dom.textPoint" => {
+            let target = args[1].as_u64().unwrap_or(0) as usize;
+            let mut offset = 0;
+            let mut pending = vec![id];
+            while let Some(node) = pending.pop() {
+                let current = &doc.nodes[node];
+                if op == "dom.textOffset" && node == target {
+                    let index = args[2].as_u64().unwrap_or(0) as usize;
+                    if current.tag == "#text" {
+                        return Ok(json!(offset + index));
+                    }
+                    pending.clear();
+                    pending.extend(current.children.iter().take(index));
+                    while let Some(node) = pending.pop() {
+                        let current = &doc.nodes[node];
+                        if current.tag == "#text" {
+                            offset += current.text.encode_utf16().count();
                         } else {
-                            0.
-                        },
-                    width - left - right,
-                ];
-                let run = renderer::TextRun {
-                    len: text.len(),
-                    font: style::font(style),
-                    color: renderer::Color::BLACK,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                    letter_spacing: renderer::px(0.),
-                    word_spacing: renderer::px(0.),
-                    font_size: None,
-                    inset: Default::default(),
-                    nowrap: false,
-                };
-                let wrap = (!single
-                    && !style
-                        .get(Prop::WHITE_SPACE)
-                        .is_some_and(|s| matches!(s, "pre" | "nowrap")))
-                .then_some(renderer::px(bounds[2]));
-                let lines = system.shape_text(
-                    &text,
-                    renderer::px(font_size),
-                    &[run],
-                    &renderer::Wrapping {
-                        width: wrap,
-                        word_break: crate::style::word_break(style),
-                        ..Default::default()
-                    },
-                );
-                let mut top = 0.;
-                let mut offset = 0;
-                let mut rects: Vec<[f32; 4]> = Vec::new();
-                for line in lines {
-                    let rows = line.rows();
-                    if op == "dom.textIndex" {
-                        let y = args[2].as_f64().unwrap_or(0.) as f32 - bounds[1];
-                        if y < top + rows as f32 * height {
-                            let index = line.hit(
-                                ((y - top) / height) as usize,
-                                renderer::px(args[1].as_f64().unwrap_or(0.) as f32 - bounds[0]),
-                                true,
-                            );
-                            let index = index.unwrap_or_else(|index| index);
-                            return Ok(json!(real(
-                                offset + line.text[..index].encode_utf16().count()
-                            )));
+                            pending.extend(&current.children);
                         }
+                    }
+                    return Ok(json!(offset));
+                }
+                if current.tag == "#text" {
+                    let length = current.text.encode_utf16().count();
+                    if op == "dom.textPoint" && target <= offset + length {
+                        return Ok(json!([node, target.saturating_sub(offset)]));
+                    }
+                    offset += length;
+                } else {
+                    pending.extend(current.children.iter().rev());
+                }
+            }
+            Ok(if op == "dom.textOffset" {
+                json!(offset)
+            } else {
+                let mut node = id;
+                while let Some(&child) = doc.nodes[node].children.first()
+                    && !doc.nodes[child].children.is_empty()
+                {
+                    node = child;
+                }
+                json!([node, 0])
+            })
+        }
+        "dom.svgBox" => {
+            let boxes = std::iter::successors(Some(id), |&node| doc.nodes[node].parent)
+                .find_map(|node| state.svg_boxes.get(&node).map(|boxes| (node, boxes)));
+            Ok(json!(
+                boxes
+                    .and_then(|(root, (.., boxes, content))| if root == id {
+                        Some(*content)
                     } else {
-                        let length = line.text.encode_utf16().count();
-                        if end >= offset && start <= offset + length {
-                            let a = utf16_index(&line.text, start.saturating_sub(offset));
-                            let b = utf16_index(&line.text, end.saturating_sub(offset));
-                            for byte in line
-                                .text
-                                .char_indices()
-                                .map(|(i, _)| i)
-                                .chain(std::iter::once(line.text.len()))
-                                .filter(|i| *i >= a && *i <= b)
-                            {
-                                if let Some((row, x)) = line.caret(byte) {
-                                    let x = bounds[0] + f32::from(x);
-                                    let y = bounds[1] + top + f32::from(renderer::px(height) * row);
-                                    if let Some(rect) = rects.last_mut().filter(|rect| rect[1] == y)
-                                    {
-                                        rect[2] = x - rect[0];
-                                    } else {
-                                        rects.push([x, y, 0., height]);
-                                    }
+                        boxes
+                            .iter()
+                            .find(|(node, ..)| *node == id)
+                            .map(|(.., object)| *object)
+                    })
+                    .unwrap_or_default()
+            ))
+        }
+        "dom.textRect" | "dom.textIndex" => {
+            let Some(bounds) = state.bounds.get(&id) else {
+                return Ok(if op == "dom.textRect" {
+                    json!([])
+                } else {
+                    json!(0)
+                });
+            };
+            let password = doc.nodes[id]
+                .password()
+                .then(|| doc.nodes[id].current_value().unwrap_or("").to_owned());
+            let shown = |offset| {
+                password
+                    .as_deref()
+                    .map_or(offset, |value| bullets(value, offset))
+            };
+            let real = |index| {
+                password
+                    .as_deref()
+                    .map_or(index, |value| unbullet(value, index))
+            };
+            let start = shown(args[1].as_u64().unwrap_or(0) as usize);
+            let end = args[2].as_u64().map_or(start, |end| shown(end as usize));
+            if let Some((layout, text, range, rows, font)) = state.text_layouts.get(&id) {
+                let content = &text[range.clone()];
+                let source = doc.nodes[id].text.as_str();
+                if op == "dom.textIndex" {
+                    let position = renderer::point(
+                        renderer::px(args[1].as_f64().unwrap_or(0.) as f32),
+                        renderer::px(args[2].as_f64().unwrap_or(0.) as f32),
+                    );
+                    let index = crate::render::text::text_index(layout, text, rows, position)
+                        .unwrap_or_else(|index| index)
+                        .clamp(range.start, range.end);
+                    return Ok(json!(real(source_offset(
+                        source,
+                        content,
+                        index - range.start
+                    ))));
+                }
+                return Ok(json!(crate::render::text::text_rects(
+                    layout,
+                    text,
+                    rows,
+                    [start, end].map(|index| range.start + shown_index(source, content, index)),
+                    *font,
+                )));
+            }
+            let system = state
+                .text_system
+                .clone()
+                .context("Text geometry requires a displayed window")?;
+            let [x, y, width, full] = *bounds;
+            // A focus change just before a click can drop the cached styles, so they are computed again here.
+            let computed = styles(doc, state, viewport);
+            let (style, units) = (&computed.values[id], &computed.lengths[id]);
+            let node = &doc.nodes[id];
+            let text = node.shown_text(
+                node.current_value()
+                    .map_or_else(|| doc.text(id), str::to_owned),
+            );
+            let (font_size, height) = (units.font.em, units.font.lh.max(1.));
+            let padding = units.edges(style, style::PADDING, width);
+            let borders = units.borders(style, width);
+            let [top, right, bottom, left] =
+                [0, 1, 2, 3].map(|side| padding[side].max(0.) + borders[side]);
+            let single = node.tag == "input";
+            let bounds = [
+                x + left,
+                y + top
+                    + if single {
+                        (full - top - bottom - height) / 2.
+                    } else {
+                        0.
+                    },
+                width - left - right,
+            ];
+            let run = renderer::TextRun {
+                len: text.len(),
+                font: style::font(style),
+                color: renderer::Color::BLACK,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+                letter_spacing: renderer::px(0.),
+                word_spacing: renderer::px(0.),
+                font_size: None,
+                inset: Default::default(),
+                nowrap: false,
+            };
+            let wrap = (!single
+                && !style
+                    .get(Prop::WHITE_SPACE)
+                    .is_some_and(|s| matches!(s, "pre" | "nowrap")))
+            .then_some(renderer::px(bounds[2]));
+            let lines = system.shape_text(
+                &text,
+                renderer::px(font_size),
+                &[run],
+                &renderer::Wrapping {
+                    width: wrap,
+                    word_break: crate::style::word_break(style),
+                    ..Default::default()
+                },
+            );
+            let mut top = 0.;
+            let mut offset = 0;
+            let mut rects: Vec<[f32; 4]> = Vec::new();
+            for line in lines {
+                let rows = line.rows();
+                if op == "dom.textIndex" {
+                    let y = args[2].as_f64().unwrap_or(0.) as f32 - bounds[1];
+                    if y < top + rows as f32 * height {
+                        let index = line.hit(
+                            ((y - top) / height) as usize,
+                            renderer::px(args[1].as_f64().unwrap_or(0.) as f32 - bounds[0]),
+                            true,
+                        );
+                        let index = index.unwrap_or_else(|index| index);
+                        return Ok(json!(real(
+                            offset + line.text[..index].encode_utf16().count()
+                        )));
+                    }
+                } else {
+                    let length = line.text.encode_utf16().count();
+                    if end >= offset && start <= offset + length {
+                        let a = utf16_index(&line.text, start.saturating_sub(offset));
+                        let b = utf16_index(&line.text, end.saturating_sub(offset));
+                        for byte in line
+                            .text
+                            .char_indices()
+                            .map(|(i, _)| i)
+                            .chain(std::iter::once(line.text.len()))
+                            .filter(|i| *i >= a && *i <= b)
+                        {
+                            if let Some((row, x)) = line.caret(byte) {
+                                let x = bounds[0] + f32::from(x);
+                                let y = bounds[1] + top + f32::from(renderer::px(height) * row);
+                                if let Some(rect) = rects.last_mut().filter(|rect| rect[1] == y) {
+                                    rect[2] = x - rect[0];
+                                } else {
+                                    rects.push([x, y, 0., height]);
                                 }
                             }
                         }
                     }
-                    offset += line.text.encode_utf16().count() + 1;
-                    top += rows as f32 * height;
                 }
-                Ok(if op == "dom.textRect" {
-                    json!(rects)
+                offset += line.text.encode_utf16().count() + 1;
+                top += rows as f32 * height;
+            }
+            Ok(if op == "dom.textRect" {
+                json!(rects)
+            } else {
+                json!(real(text.encode_utf16().count()))
+            })
+        }
+        "dom.measureText" => {
+            let system = state
+                .text_system
+                .as_ref()
+                .context("Text measurement requires a displayed window")?;
+            let (line, [ascent, descent, em_ascent, em_descent]) = crate::render::canvas::line(
+                system,
+                &state.font_aliases,
+                args[2].as_str().unwrap_or("10px sans-serif"),
+                args[1].as_str().context("Expected text")?,
+                [
+                    args[3].as_f64().unwrap_or(0.) as f32,
+                    args[4].as_f64().unwrap_or(0.) as f32,
+                ],
+            );
+            let [left, right, top, bottom] = crate::render::canvas::ink(system, &line);
+            Ok(json!([
+                f32::from(line.width),
+                left,
+                right,
+                top,
+                bottom,
+                ascent,
+                descent,
+                em_ascent,
+                em_descent
+            ]))
+        }
+        "dom.canvasQuery" => {
+            let Some(canvas) = state.canvases.get(&id) else {
+                return Ok(json!(if args[1].is_number() {
+                    json!(false)
                 } else {
-                    json!(real(text.encode_utf16().count()))
-                })
+                    json!([1, 0, 0, 1, 0, 0])
+                }));
+            };
+            Ok(match args[1].as_f64() {
+                Some(x) => json!(canvas.hit(
+                    x as f32,
+                    args[2].as_f64().unwrap_or(0.) as f32,
+                    args[3].as_bool().unwrap_or(false),
+                    args[4].as_bool().unwrap_or(false),
+                    args[5].as_u64(),
+                )),
+                None => json!(canvas.transform()),
+            })
+        }
+        "dom.client" => {
+            let rect = state.bounds.get(&id).copied().unwrap_or_default();
+            // Reuse the last frame's styles for resize observers to avoid a style pass per callback.
+            let last = (args[1].as_bool() == Some(true))
+                .then(|| state.computed.clone().or_else(|| state.previous.clone()))
+                .flatten()
+                .filter(|last| id < last.values.len() && last.lengths.get(id).is_some());
+            let computed = match last {
+                Some(last) => last,
+                None => styles(doc, state, viewport),
+            };
+            let (style, units) = (&computed.values[id], &computed.lengths[id]);
+            let tag = doc.nodes[id].tag.as_str();
+            if matches!(tag, "tr" | "thead" | "tbody" | "tfoot")
+                && style.get(Prop::DISPLAY) == Some("contents")
+            {
+                return Ok(json!([0., 0., rect[2], rect[3], 0., 0., 0., 0.]));
             }
-            "dom.measureText" => {
-                let system = state
-                    .text_system
-                    .as_ref()
-                    .context("Text measurement requires a displayed window")?;
-                let (line, [ascent, descent, em_ascent, em_descent]) = crate::render::canvas::line(
-                    system,
-                    &state.font_aliases,
-                    args[2].as_str().unwrap_or("10px sans-serif"),
-                    args[1].as_str().context("Expected text")?,
-                    [
-                        args[3].as_f64().unwrap_or(0.) as f32,
-                        args[4].as_f64().unwrap_or(0.) as f32,
-                    ],
-                );
-                let [left, right, top, bottom] = crate::render::canvas::ink(system, &line);
-                Ok(json!([
-                    f32::from(line.width),
-                    left,
-                    right,
-                    top,
-                    bottom,
-                    ascent,
-                    descent,
-                    em_ascent,
-                    em_descent
-                ]))
+            if tag.starts_with('#')
+                || style
+                    .get(Prop::DISPLAY)
+                    .is_none_or(|value| matches!(value, "inline" | "contents"))
+            {
+                return Ok(json!([0.; 8].as_slice()));
             }
-            "dom.canvasQuery" => {
-                let Some(canvas) = state.canvases.get(&id) else {
-                    return Ok(json!(if args[1].is_number() {
-                        json!(false)
-                    } else {
-                        json!([1, 0, 0, 1, 0, 0])
-                    }));
-                };
-                Ok(match args[1].as_f64() {
-                    Some(x) => json!(canvas.hit(
-                        x as f32,
-                        args[2].as_f64().unwrap_or(0.) as f32,
-                        args[3].as_bool().unwrap_or(false),
-                        args[4].as_bool().unwrap_or(false),
-                        args[5].as_u64(),
-                    )),
-                    None => json!(canvas.transform()),
-                })
-            }
-            "dom.client" => {
-                let rect = state.bounds.get(&id).copied().unwrap_or_default();
-                // Reuse the last frame's styles for resize observers to avoid a style pass per callback.
-                let last = (args[1].as_bool() == Some(true))
-                    .then(|| state.computed.clone().or_else(|| state.previous.clone()))
-                    .flatten()
-                    .filter(|last| id < last.values.len() && last.lengths.get(id).is_some());
-                let computed = match last {
-                    Some(last) => last,
-                    None => {
-                        let system = state.text_system.clone();
-                        styles(
-                            doc,
-                            state,
-                            viewport,
-                            system.as_deref().map(|system| (system, state.pixel_ratio)),
-                        )
-                    }
-                };
-                let (style, units) = (&computed.values[id], &computed.lengths[id]);
-                let tag = doc.nodes[id].tag.as_str();
-                if matches!(tag, "tr" | "thead" | "tbody" | "tfoot")
-                    && style.get(Prop::DISPLAY) == Some("contents")
-                {
-                    return Ok(json!([0., 0., rect[2], rect[3], 0., 0., 0., 0.]));
-                }
-                if tag.starts_with('#')
-                    || style
-                        .get(Prop::DISPLAY)
-                        .is_none_or(|value| matches!(value, "inline" | "contents"))
-                {
-                    return Ok(json!([0.; 8].as_slice()));
-                }
-                let shared = matches!(tag, "td" | "th")
-                    && std::iter::successors(doc.nodes[id].parent, |&parent| {
-                        doc.nodes[parent].parent
-                    })
+            let shared = matches!(tag, "td" | "th")
+                && std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent)
                     .find(|&parent| doc.nodes[parent].tag == "table")
                     .is_some_and(|table| {
                         computed
@@ -2897,77 +2711,59 @@ pub fn call(
                             .and_then(|style| style.get(Prop::BORDER_COLLAPSE))
                             == Some("collapse")
                     });
-                let base = doc.nodes[id]
-                    .parent
-                    .and_then(|parent| state.bounds.get(&parent))
-                    .map_or(viewport[0], |rect| rect[2]);
-                let borders = style::BORDERS.map(|[width, kind, _]| {
-                    if style
-                        .get(kind)
-                        .is_none_or(|kind| matches!(kind, "none" | "hidden"))
-                    {
-                        return 0.;
-                    }
-                    style
-                        .get(width)
-                        .map_or(Some(3.), |width| units.resolve(width, base))
-                        .unwrap_or(0.)
-                        .max(0.)
-                        / if shared { 2. } else { 1. }
-                });
-                let padding = units
-                    .edges(style, style::PADDING, base)
-                    .map(|value| value.max(0.));
-                let bars = state
-                    .scroll
-                    .get(&id)
-                    .and_then(|handle| {
-                        let look = crate::render::scrollbar::Look::new(
-                            style,
-                            computed.scrollbars.get(&id).map(|parts| &**parts),
-                            units,
-                            None,
-                        )?;
-                        let scrolls = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y].map(|prop| {
-                            style
-                                .get(prop)
-                                .is_some_and(|value| matches!(value, "auto" | "scroll"))
-                        });
-                        Some(look.space(look.shown(scrolls, handle.max_offset())))
-                    })
-                    .unwrap_or_default();
-                let gutters = if style
-                    .get(Prop::SCROLLBAR_GUTTER)
-                    .is_some_and(|value| value.contains("both-edges"))
-                {
-                    2.
-                } else {
-                    1.
-                };
-                Ok(json!([
-                    borders[3],
-                    borders[0],
-                    (rect[2] - borders[1] - borders[3] - bars[1] * gutters).max(0.),
-                    (rect[3] - borders[0] - borders[2] - bars[0]).max(0.),
-                    padding[0],
-                    padding[1],
-                    padding[2],
-                    padding[3]
-                ]))
-            }
-            "dom.innerText" => {
-                let system = state.text_system.clone();
-                let computed = styles(
-                    doc,
-                    state,
-                    viewport,
-                    system.as_deref().map(|system| (system, state.pixel_ratio)),
-                );
-                Ok(json!(rendered_text(doc, state, &computed, id, None)))
-            }
-            _ => unreachable!(),
+            let base = doc.nodes[id]
+                .parent
+                .and_then(|parent| state.bounds.get(&parent))
+                .map_or(viewport[0], |rect| rect[2]);
+            let borders = units
+                .borders(style, base)
+                .map(|width| width / if shared { 2. } else { 1. });
+            let padding = units
+                .edges(style, style::PADDING, base)
+                .map(|value| value.max(0.));
+            let bars = state
+                .scroll
+                .get(&id)
+                .and_then(|handle| {
+                    let look = crate::render::scrollbar::Look::new(
+                        style,
+                        computed.scrollbars.get(&id).map(|parts| &**parts),
+                        units,
+                        None,
+                    )?;
+                    let scrolls = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y].map(|prop| {
+                        style
+                            .get(prop)
+                            .is_some_and(|value| matches!(value, "auto" | "scroll"))
+                    });
+                    Some(look.space(look.shown(scrolls, handle.max_offset())))
+                })
+                .unwrap_or_default();
+            let gutters = if style
+                .get(Prop::SCROLLBAR_GUTTER)
+                .is_some_and(|value| value.contains("both-edges"))
+            {
+                2.
+            } else {
+                1.
+            };
+            Ok(json!([
+                borders[3],
+                borders[0],
+                (rect[2] - borders[1] - borders[3] - bars[1] * gutters).max(0.),
+                (rect[3] - borders[0] - borders[2] - bars[0]).max(0.),
+                padding[0],
+                padding[1],
+                padding[2],
+                padding[3]
+            ]))
         }
-    })())
+        "dom.innerText" => {
+            let computed = styles(doc, state, viewport);
+            Ok(json!(rendered_text(doc, state, &computed, id, None)))
+        }
+        _ => anyhow::bail!("Unknown DOM operation: {op}"),
+    }
 }
 
 fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
@@ -3111,7 +2907,7 @@ pub(crate) fn use_font(state: &mut State, family: &str, name: &str, added: bool)
     state.font_loads += 1;
     style::FONT_NAMES.with(|names| *names.borrow_mut() = Default::default());
     // Invalidate only font-dependent values. A new style cache loses constructed and CSSOM-edited sheets.
-    state.style_cache.metrics = None;
+    state.style_cache.environment.metrics = None;
     state.invalidate();
     if !same {
         state
@@ -3122,13 +2918,7 @@ pub(crate) fn use_font(state: &mut State, family: &str, name: &str, added: bool)
 }
 
 pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32; 2]) {
-    let system = state.text_system.clone();
-    let computed = styles(
-        doc,
-        state,
-        viewport,
-        system.as_deref().map(|system| (system, state.pixel_ratio)),
-    );
+    let computed = styles(doc, state, viewport);
     if state.layout_epoch == state.style_epoch {
         return;
     }
@@ -3517,14 +3307,8 @@ pub(crate) fn hit_test(
         let text = nearest
             .into_iter()
             .filter(|(id, _)| {
-                let mut parent = doc.nodes[*id].parent;
-                while let Some(id) = parent {
-                    if Some(id) == target {
-                        return true;
-                    }
-                    parent = doc.nodes[id].parent;
-                }
-                false
+                std::iter::successors(doc.nodes[*id].parent, |&id| doc.nodes[id].parent)
+                    .any(|id| Some(id) == target)
             })
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(id, _)| id);
@@ -3548,32 +3332,25 @@ pub(crate) fn styles(
     doc: &mut Document,
     state: &mut State,
     viewport: [f32; 2],
-    system: Option<(&renderer::TextSystem, f32)>,
 ) -> Rc<style::ComputedStyles> {
-    let (system, scale) = (system.map(|system| system.0), system.map(|system| system.1));
+    let text_system = state.text_system.clone();
+    let (system, scale) = (
+        text_system.as_deref(),
+        text_system.is_some().then_some(state.pixel_ratio),
+    );
     let reduced_motion = style::reduced_motion();
-    let theme = crate::desktop::native::theme_state()
-        | ((state.pixel_ratio.clamp(0., 600.) * 100.).round() as u32) << 16;
+    let theme = state.theme();
+    let key = (viewport, scale, reduced_motion, theme);
     let animated = std::mem::take(&mut state.animated);
     let animating = !animated.is_empty();
     if !animating
-        && state.style_viewport == viewport
-        && state.style_reduced_motion == reduced_motion
-        && state.style_theme == theme
-        && state.style_metrics == scale
+        && state.style_key == key
         && let Some(computed) = &state.computed
         && computed.values.len() == doc.nodes.len()
     {
         return computed.clone();
     }
     state.drop_removed(doc);
-    if let Some(styles) = state
-        .old_styles
-        .take()
-        .and_then(|styles| Rc::try_unwrap(styles).ok())
-    {
-        state.style_cache.spare = Some(styles.into());
-    }
     if state.shadow_walk.tree != doc.nodes.tree() || state.shadow_walk.count != state.shadows.len()
     {
         let slots = slots(doc, state.shadows.iter().map(|(&host, &root)| (host, root)));
@@ -3634,7 +3411,7 @@ pub(crate) fn styles(
         });
     }
     let shadow_walk = state.shadow_walk.clone();
-    let mut context = style::StyleContext {
+    let context = style::StyleContext {
         shadows: shadow_walk.shadows.clone(),
         reduced_motion,
         theme,
@@ -3915,22 +3692,18 @@ pub(crate) fn styles(
     state.animating.clear();
     state.animating_pseudos.clear();
     state.style_epoch += 1;
-    state.style_viewport = viewport;
-    state.style_metrics = scale;
-    state.style_reduced_motion = reduced_motion;
-    state.style_theme = theme;
+    state.style_key = key;
     let result = Rc::new(result);
     state.select_base = (Rc::as_ptr(&result) as usize, subject, serial, flatten);
     state.linted = false;
     state.computed = Some(result.clone());
     state.previous = None;
-    state.old_styles = context.previous.take();
     result
 }
 
 // A path with a bad item is empty, so the edit fails with IndexSizeError instead of reaching another rule.
-fn path(value: &Value) -> Vec<usize> {
-    value
+fn path(kind: &str, value: &Value) -> (Vec<usize>, Option<(usize, bool)>) {
+    let path: Vec<usize> = value
         .as_array()
         .and_then(|items| {
             items
@@ -3938,7 +3711,10 @@ fn path(value: &Value) -> Vec<usize> {
                 .map(|item| Some(item.as_u64()? as usize))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let top = (matches!(kind, "insert" | "delete") && path.len() == 1)
+        .then(|| (path[0], kind == "insert"));
+    (path, top)
 }
 
 fn edit<'a>(kind: &str, text: &'a str) -> style::Edit<'a> {
@@ -4013,6 +3789,29 @@ pub(crate) fn utf16_index(text: &str, index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::{
+        host::{Host, Page, Role},
+        jsc::{JavaScriptCore, JsContext},
+    };
+    use std::cell::RefCell;
+
+    fn engine(html: &str) -> (Rc<RefCell<Host>>, JsContext) {
+        let host = Rc::new(RefCell::new(Host::default()));
+        let page = Page {
+            doc: Document::parse(html),
+            dirty: false,
+        };
+        host.borrow_mut().pages.insert(1, page);
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
+        (host, engine)
+    }
+
     // `Walk::update` compares each patched walk with a fresh one in debug builds.
     #[test]
     fn patched_walks_match_fresh_walks() {
@@ -4200,33 +3999,14 @@ mod tests {
 
     #[test]
     fn font_faces_load_woff_and_list_css_faces() {
-        use crate::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
-        };
-        use std::cell::RefCell;
-
         let fixtures = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fonts"));
-        let host = Rc::new(RefCell::new(Host::default()));
+        let (host, engine) = engine(
+            r#"<style>@font-face{font-family:Css;src:url(test.woff) format("woff")}
+                    @font-face{font-family:Later;src:url(later.woff);unicode-range:U+0400-04FF}</style><p>AB</p>"#,
+        );
         host.borrow_mut()
             .assets
             .insert("test.woff".into(), fixtures.join("test.woff"));
-        host.borrow_mut().pages.insert(
-            1,
-            Page {
-                doc: Document::parse(
-                    r#"<style>@font-face{font-family:Css;src:url(test.woff) format("woff")}
-                    @font-face{font-family:Later;src:url(later.woff);unicode-range:U+0400-04FF}</style><p>AB</p>"#,
-                ),
-                dirty: false,
-            },
-        );
-        let engine = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(1),
-        )
-        .unwrap();
         {
             let mut host = host.borrow_mut();
             let state = host.dom.entry(1).or_default();
@@ -4269,26 +4049,7 @@ mod tests {
 
     #[test]
     fn detached_nodes_keep_styles_that_a_frame_holds() {
-        use crate::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
-        };
-        use std::cell::RefCell;
-
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            Page {
-                doc: Document::parse("<html><body><div id='editor'></div></body></html>"),
-                dirty: false,
-            },
-        );
-        let engine = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(1),
-        )
-        .unwrap();
+        let (host, engine) = engine("<html><body><div id='editor'></div></body></html>");
         engine
             .eval(
                 "const editor=document.getElementById('editor');document.createElement('i');getComputedStyle(editor).color;",
@@ -4307,32 +4068,10 @@ mod tests {
             host.borrow().dom[&1].computed.as_ref().unwrap()
         ));
     }
-    use super::*;
-
     #[test]
     fn detached_editor_overlays_preserve_connected_styles() {
-        use crate::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
-        };
-        use std::cell::RefCell;
-
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            Page {
-                doc: Document::parse(
-                    "<html><body><div id='editor' style='color:red'></div></body></html>",
-                ),
-                dirty: false,
-            },
-        );
-        let engine = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(1),
-        )
-        .unwrap();
+        let (host, engine) =
+            engine("<html><body><div id='editor' style='color:red'></div></body></html>");
         engine
             .eval(
                 "const editor=document.getElementById('editor');getComputedStyle(editor).color;",
@@ -4387,28 +4126,9 @@ mod tests {
 
     #[test]
     fn invalidation_skips_text_edits_and_unused_states() {
-        use crate::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
-        };
-        use std::cell::RefCell;
-
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            Page {
-                doc: Document::parse(
-                    "<html><head><style id=s>p:empty{color:red}</style></head><body><p id=p>text</p><svg><text>a</text></svg></body></html>",
-                ),
-                dirty: false,
-            },
+        let (host, engine) = engine(
+            "<html><head><style id=s>p:empty{color:red}</style></head><body><p id=p>text</p><svg><text>a</text></svg></body></html>",
         );
-        let engine = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(1),
-        )
-        .unwrap();
         let computed = || host.borrow().dom[&1].computed.as_ref().map(Rc::as_ptr);
         let p = host.borrow().pages[&1]
             .doc
@@ -4482,18 +4202,7 @@ mod tests {
 
     #[test]
     fn incremental_styles_match_full_passes() {
-        use crate::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
-        };
-        use std::cell::RefCell;
-
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            Page {
-                doc: Document::parse(
-                    "<html><head><style>
+        let (host, engine) = engine("<html><head><style>
                     html{font-size:16px} .on{color:red} .dark .leaf{color:blue} .a+.b{color:green}
                     .box:has(.on){background-color:yellow} li:nth-child(2n){color:purple} p:empty{color:teal}
                     .rem{padding-left:2rem} .em{padding-top:2em} .vars{color:var(--c,gray)} .x::before{content:'a'}
@@ -4502,17 +4211,7 @@ mod tests {
                     <i class=a id=a></i><i class=b></i><ul id=list><li>1</li><li>2</li><li>3</li></ul>
                     <p id=p>t</p><div id=sized class=em><b class=rem>r</b><b class=em>e</b></div>
                     <div id=vars class=vars><span class=vars>v</span></div><div id=hover class='h s'>h</div>
-                    <div id=k>k</div></div></body></html>",
-                ),
-                dirty: false,
-            },
-        );
-        let engine = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(1),
-        )
-        .unwrap();
+                    <div id=k>k</div></div></body></html>");
         let hover = host.borrow().pages[&1]
             .doc
             .nodes
@@ -4561,35 +4260,14 @@ mod tests {
 
     #[test]
     fn incremental_styles_follow_class_changes() {
-        use crate::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
-        };
-        use std::cell::RefCell;
-
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            Page {
-                doc: Document::parse(
-                    "<html><head><style>
+        let (host, engine) = engine("<html><head><style>
                     .on{color:red} .dark .leaf{color:blue} .a+.b{color:green} .box:has(.hit){background-color:yellow}
                     li:nth-child(1 of .pick){color:purple} .wrap:not(.off) .inner{color:teal} .nest{& .deep{color:navy}}
                     .row.sel{color:olive} .row b{padding-left:1px}
                     </style></head><body><div id=root class=box><div id=wrap class=wrap><span id=inner class=inner>i</span></div>
                     <span id=leaf class=leaf>x</span><i id=a></i><i class=b></i><ul><li id=l1>1</li><li id=l2>2</li></ul>
                     <div id=nest><b class=deep>d</b></div>
-                    <div id=row class=row><b>r</b></div><em id=hit>h</em></div></body></html>",
-                ),
-                dirty: false,
-            },
-        );
-        let engine = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(1),
-        )
-        .unwrap();
+                    <div id=row class=row><b>r</b></div><em id=hit>h</em></div></body></html>");
         let read = "for(const e of document.querySelectorAll('*'))getComputedStyle(e).color;";
         engine
             .eval(&format!("for(const id of ['root','wrap','leaf','a','l1','l2','nest','row','hit'])globalThis[id]=document.getElementById(id);{read}"), "test")
@@ -4620,31 +4298,10 @@ mod tests {
 
     #[test]
     fn incremental_styles_follow_added_rules_and_places() {
-        use crate::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
-        };
-        use std::cell::RefCell;
-
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            Page {
-                doc: Document::parse(
-                    "<html><head><style>li:last-child{padding-left:1px} li:nth-child(odd){padding-right:2px}
+        let (host, engine) = engine("<html><head><style>li:last-child{padding-left:1px} li:nth-child(odd){padding-right:2px}
                     li+li{padding-top:3px} ul:has(.hit) b{color:red}</style><style>@import 'tailwindcss';</style></head>
                     <body><ul id=list><li id=one class=late><b>1</b></li><li><b>2</b></li><li><b>3</b></li></ul>
-                    <p id=leaf class='flex late'>x</p></body></html>",
-                ),
-                dirty: false,
-            },
-        );
-        let engine = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(1),
-        )
-        .unwrap();
+                    <p id=leaf class='flex late'>x</p></body></html>");
         let read = "for(const e of document.querySelectorAll('*'))getComputedStyle(e).color;";
         engine
             .eval(&format!("for(const id of ['list','one','leaf'])globalThis[id]=document.getElementById(id);globalThis.sheet=document.styleSheets[0];globalThis.css=(e,p)=>getComputedStyle(e)[p];{read}"), "test")
@@ -4705,31 +4362,10 @@ mod tests {
 
     #[test]
     fn incremental_styles_renumber_counters() {
-        use crate::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
-        };
-        use std::cell::RefCell;
-
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            Page {
-                doc: Document::parse(
-                    "<html><head><style>main{counter-reset:sec} h2{counter-increment:sec}
+        let (host, engine) = engine("<html><head><style>main{counter-reset:sec} h2{counter-increment:sec}
                     h2::before{content:counter(sec) \". \"} h2::after{content:\"counter \" counters(sec, \"-\")}
                     .big{font-size:20px}</style></head><body><main id=main><h2 id=a>a</h2><p id=p>p</p><h2 id=b>b</h2>
-                    <section id=s><h2 id=c>c</h2></section></main></body></html>",
-                ),
-                dirty: false,
-            },
-        );
-        let engine = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(1),
-        )
-        .unwrap();
+                    <section id=s><h2 id=c>c</h2></section></main></body></html>");
         let read = "[...document.querySelectorAll('h2')].map(h=>getComputedStyle(h,'::before').content+getComputedStyle(h,'::after').content).join('|')";
         let numbers = |list: &[&str]| -> String {
             let text = |n: &&str| {
@@ -4765,31 +4401,12 @@ mod tests {
 
     #[test]
     fn cousins_that_share_matches_restyle_with_their_own_ancestors() {
-        use crate::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
-        };
-        use std::cell::RefCell;
-
         let rows = "<div class=row><span class=x>1</span></div><div class=row><span class=x>2</span></div>".repeat(2);
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            Page {
-                doc: Document::parse(&format!(
+        let (host, engine) = engine(&format!(
                     "<html><head><style>.a .x{{color:red}} .g[data-k=v] .x{{padding-left:1px}} .row.on .x{{color:blue}}
                     .g:hover .x{{color:green}}</style></head><body><div id=list><div id=g1 class=g>{rows}</div>
                     <div id=g2 class=g>{rows}</div><div id=g3 class=g>{rows}</div></div></body></html>"
-                )),
-                dirty: false,
-            },
-        );
-        let engine = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(1),
-        )
-        .unwrap();
+                ));
         let read = "for(const e of document.querySelectorAll('*'))getComputedStyle(e).color;";
         engine
             .eval(&format!("for(const id of ['g1','g2','g3'])globalThis[id]=document.getElementById(id);{read}"), "test")
@@ -4821,32 +4438,13 @@ mod tests {
 
     #[test]
     fn incremental_styles_adjust_collapsed_tables_again() {
-        use crate::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
-        };
-        use std::cell::RefCell;
-
         let rows = "<tr><td>a</td><td>b</td></tr>".repeat(4);
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            Page {
-                doc: Document::parse(&format!(
+        let (host, engine) = engine(&format!(
                     "<html><head><style>table{{border-collapse:collapse}} td{{border:1px solid #ccc}}
                     tr.danger td{{background-color:#fdd}} tr.thick td{{border-bottom:3px solid red}} tr.wide{{border-top:4px solid blue}}
                     .x{{border-left:5px double green}} .blocky{{display:block}}</style></head><body><table id=t><thead><tr><th>h</th><th>i</th></tr></thead>
                     <tbody id=b>{rows}</tbody></table><table id=u style='border:2px solid'><tr><td>c</td></tr></table></body></html>"
-                )),
-                dirty: false,
-            },
-        );
-        let engine = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(1),
-        )
-        .unwrap();
+                ));
         let read = "for(const e of document.querySelectorAll('*'))getComputedStyle(e).color;";
         engine
             .eval(&format!("for(const id of ['t','b','u'])globalThis[id]=document.getElementById(id);{read}"), "test")
@@ -4877,34 +4475,13 @@ mod tests {
 
     #[test]
     fn incremental_styles_match_full_passes_in_shadow_trees() {
-        use crate::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
-        };
-        use std::cell::RefCell;
-
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            Page {
-                doc: Document::parse(
-                    "<html><head><style>
+        let (host, engine) = engine("<html><head><style>
                     :root{--ink:navy} x-card.big{font-size:20px} x-card::part(title){color:green}
                     x-card.alt::part(title){color:olive} x-card::part(deep){padding-left:3px}
                     #b{margin-top:1px} .late{color:maroon}
                     </style></head><body><x-card id=card class=c><span id=a class=on>a<s id=s></s></span>
                     <b id=b slot=side>b</b><i id=i>i</i></x-card><x-card id=other></x-card>
-                    <x-card id=third></x-card><div id=late class=late><p id=lp>late</p></div></body></html>",
-                ),
-                dirty: false,
-            },
-        );
-        let engine = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(1),
-        )
-        .unwrap();
+                    <x-card id=third></x-card><div id=late class=late><p id=lp>late</p></div></body></html>");
         let card = host.borrow().pages[&1]
             .doc
             .nodes
@@ -5005,11 +4582,11 @@ mod tests {
                 .collect::<String>(),
         );
         let mut state = State::default();
-        styles(&mut doc, &mut state, [800., 600.], None);
+        styles(&mut doc, &mut state, [800., 600.]);
         let sheets = state.sheets.clone();
         assert_eq!(sheets.len(), 200);
         state.computed = None;
-        styles(&mut doc, &mut state, [800., 600.], None);
+        styles(&mut doc, &mut state, [800., 600.]);
         for (source, sheet) in sheets {
             assert!(Rc::ptr_eq(&sheet, &state.sheets[&source]));
         }
@@ -5021,14 +4598,14 @@ mod tests {
         let text = doc.nodes[sheet].children[0];
         doc.nodes[text].text = ".replacement{color:blue}".into();
         state.computed = None;
-        styles(&mut doc, &mut state, [800., 600.], None);
+        styles(&mut doc, &mut state, [800., 600.]);
         assert_eq!(state.sheets.len(), 200);
         assert!(!state.sheets.contains_key(".item0{color:red}"));
         let head = doc.nodes[sheet].parent.unwrap();
         doc.nodes[head].children.retain(|id| *id != sheet);
         doc.nodes[sheet].parent = None;
         state.computed = None;
-        styles(&mut doc, &mut state, [800., 600.], None);
+        styles(&mut doc, &mut state, [800., 600.]);
         assert_eq!(state.sheets.len(), 199);
         assert!(!state.sheets.contains_key(".replacement{color:blue}"));
     }
@@ -5043,18 +4620,18 @@ mod tests {
         let on = doc.nodes[p].parent.unwrap();
         let mut state = State::default();
         let viewport = [800., 600.];
-        styles(&mut doc, &mut state, viewport, None);
+        styles(&mut doc, &mut state, viewport);
         doc.nodes[on].children.retain(|&id| id != p);
         doc.nodes[p].parent = None;
         state.removed.push(p);
         state.invalidate();
-        styles(&mut doc, &mut state, viewport, None);
+        styles(&mut doc, &mut state, viewport);
         assert!(state.removed.is_empty());
         doc.nodes[on].children.push(p);
         doc.nodes[p].parent = Some(on);
         state.invalidate();
-        let returned = styles(&mut doc, &mut state, viewport, None);
-        let fresh = styles(&mut doc, &mut State::default(), viewport, None);
+        let returned = styles(&mut doc, &mut state, viewport);
+        let fresh = styles(&mut doc, &mut State::default(), viewport);
         assert_eq!(returned.values[p], fresh.values[p]);
         assert_eq!(returned.values[p].get(Prop::COLOR), Some("red"));
     }
@@ -5064,7 +4641,7 @@ mod tests {
         let mut doc = Document::parse("<p style='font-size:30px;--x:1'>a</p>");
         let mut state = State::default();
         let viewport = [800., 600.];
-        styles(&mut doc, &mut state, viewport, None);
+        styles(&mut doc, &mut state, viewport);
         let id = state.allocate(
             &mut doc,
             Node {
@@ -5081,11 +4658,10 @@ mod tests {
                 viewport,
             )
             .unwrap()
-            .unwrap()
         };
         assert_eq!(read(&mut doc, &mut state), json!(""));
-        let cached = styles(&mut doc, &mut state, viewport, None);
-        let fresh = styles(&mut doc, &mut State::default(), viewport, None);
+        let cached = styles(&mut doc, &mut state, viewport);
+        let fresh = styles(&mut doc, &mut State::default(), viewport);
         assert_eq!(cached.vars.len(), doc.nodes.len());
         for node in 0..doc.nodes.len() {
             assert!(cached.lengths[node] == fresh.lengths[node], "{node}");
@@ -5095,7 +4671,7 @@ mod tests {
             .unwrap();
         doc.nodes[p].attrs.insert("class".into(), "x".into());
         state.invalidate();
-        styles(&mut doc, &mut state, viewport, None);
+        styles(&mut doc, &mut state, viewport);
     }
 
     #[test]
@@ -5108,7 +4684,7 @@ mod tests {
             ..Default::default()
         };
         let ids: Vec<usize> = (0..4).map(|_| state.allocate(&mut doc, node())).collect();
-        styles(&mut doc, &mut state, viewport, None);
+        styles(&mut doc, &mut state, viewport);
         for id in [ids[3], ids[1], ids[2]] {
             doc.nodes[id] = Node::default();
             state.free.push(std::cmp::Reverse(id));
@@ -5117,7 +4693,7 @@ mod tests {
         assert_eq!(doc.nodes.len(), ids[1]);
         assert_eq!(state.free.len(), 0);
         assert!(!state.trim(&mut doc));
-        styles(&mut doc, &mut state, viewport, None);
+        styles(&mut doc, &mut state, viewport);
         assert_eq!(state.allocate(&mut doc, node()), ids[1]);
         assert_eq!(state.allocate(&mut doc, node()), ids[1] + 1);
         doc.nodes[ids[1]] = Node::default();
@@ -5135,12 +4711,12 @@ mod tests {
         let viewport = [800., 600.];
         let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
         let div = doc.nodes[p].parent.unwrap();
-        styles(&mut doc, &mut state, viewport, None);
+        styles(&mut doc, &mut state, viewport);
         let body = doc.nodes[div].parent.unwrap();
         doc.nodes[body].children.clear();
         doc.nodes[div].parent = None;
         state.invalidate();
-        let shared = styles(&mut doc, &mut state, viewport, None);
+        let shared = styles(&mut doc, &mut state, viewport);
         assert_eq!(shared.values[p].get(Prop::COLOR), None);
         for id in [p, div] {
             doc.nodes[id] = Node::default();
@@ -5153,31 +4729,20 @@ mod tests {
         assert_eq!(state.allocate(&mut doc, node.clone()), div);
         assert_eq!(state.allocate(&mut doc, node), p);
         assert_eq!(
-            styles(&mut doc, &mut state, viewport, None).values[p].get(Prop::COLOR),
+            styles(&mut doc, &mut state, viewport).values[p].get(Prop::COLOR),
             None
         );
     }
 
     #[test]
     fn trim_shrinks_the_layout_mirror_under_a_page_that_holds_it() {
-        use crate::{
-            host::{Host, Page, Role},
-            jsc::{JavaScriptCore, JsContext},
-        };
-        use std::cell::RefCell;
-
-        let host = Rc::new(RefCell::new(Host::default()));
-        let doc = Document::parse("<html><body><p id='a'></p></body></html>");
-        let a = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
-        host.borrow_mut()
-            .pages
-            .insert(1, Page { doc, dirty: false });
-        let engine = JsContext::new(
-            JavaScriptCore::load().unwrap(),
-            host.clone(),
-            Role::Renderer(1),
-        )
-        .unwrap();
+        let (host, engine) = engine("<html><body><p id='a'></p></body></html>");
+        let a = host.borrow().pages[&1]
+            .doc
+            .nodes
+            .iter()
+            .position(|node| node.tag == "p")
+            .unwrap();
         let grow = |rect| {
             let mut host = host.borrow_mut();
             let host = &mut *host;

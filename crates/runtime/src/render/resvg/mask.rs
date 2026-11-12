@@ -1,11 +1,9 @@
 // Copyright 2019 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use super::render::Context;
-
 pub fn apply(
     mask: &usvg::Mask,
-    ctx: &Context,
+    max_bbox: tiny_skia::IntRect,
     transform: tiny_skia::Transform,
     pixmap: &mut tiny_skia::Pixmap,
 ) {
@@ -25,13 +23,13 @@ pub fn apply(
             transform,
         );
 
-        super::render::render_nodes(mask.root(), ctx, transform, &mut mask_pixmap.as_mut());
+        super::render::render_nodes(mask.root(), max_bbox, transform, &mut mask_pixmap.as_mut());
 
         super::render::apply_mask(&mut mask_pixmap, &alpha_mask);
     }
 
     if let Some(mask) = mask.mask() {
-        self::apply(mask, ctx, transform, pixmap);
+        self::apply(mask, max_bbox, transform, pixmap);
     }
 
     let mask_type = match mask.kind() {

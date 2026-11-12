@@ -708,16 +708,9 @@ impl Canvas {
             &std::collections::HashMap<String, String>,
         )>,
     ) -> Result<Option<Arc<renderer::RenderImage>>> {
-        let stroke = |state: &State| skia::Stroke {
-            width: state.width,
-            miter_limit: state.miter,
-            line_cap: state.cap,
-            line_join: state.join,
-            dash: skia::StrokeDash::new(state.dash.clone(), state.dash_offset),
-        };
         // Shadows and modes that change pixels outside the shape draw the shape into a layer that covers the
-        // canvas.
-        let mut covered: Option<skia::Pixmap> = None;
+        // canvas. A new canvas-sized buffer costs page faults, so one batch reuses its layer through `spare`.
+        let (mut covered, mut spare): (Option<skia::Pixmap>, Option<skia::Pixmap>) = (None, None);
         let finish = |pixels: &mut skia::Pixmap, saved: skia::Pixmap, state: &State| {
             let layer = std::mem::replace(pixels, saved);
             if let Some((shadow, x, y)) = shadow(&layer, state.shadow).filter(|_| state.shadowed())
@@ -745,6 +738,7 @@ impl Canvas {
                 skia::Transform::identity(),
                 state.clip.as_deref(),
             );
+            layer
         };
         let mut string = |units: f64| {
             let (part, rest) = strings.split_at(crate::dom::utf16_index(strings, units as usize));
@@ -757,7 +751,7 @@ impl Canvas {
         let mut rest = ops;
         while let [code, tail @ ..] = rest {
             if let Some(saved) = covered.take() {
-                finish(&mut self.pixels, saved, &self.state);
+                spare = Some(finish(&mut self.pixels, saved, &self.state));
             }
             let count = *ARGS
                 .get(*code as usize)
@@ -790,10 +784,16 @@ impl Canvas {
                             | skia::BlendMode::DestinationAtop
                             | skia::BlendMode::Source
                     )) {
-                covered = Some(std::mem::replace(
-                    &mut self.pixels,
-                    skia::Pixmap::new(width, height).context("Cannot allocate canvas layer")?,
-                ));
+                let layer = match spare.take() {
+                    Some(mut layer) => {
+                        layer.fill(skia::Color::TRANSPARENT);
+                        layer
+                    }
+                    None => {
+                        skia::Pixmap::new(width, height).context("Cannot allocate canvas layer")?
+                    }
+                };
+                covered = Some(std::mem::replace(&mut self.pixels, layer));
                 skia::BlendMode::SourceOver
             } else {
                 self.state.blend
@@ -936,7 +936,13 @@ impl Canvas {
                         self.pixels.stroke_path(
                             &path,
                             &paint(&state.stroke, state.smoothing, state.alpha, blend, shift),
-                            &stroke(state),
+                            &skia::Stroke {
+                                width: state.width,
+                                miter_limit: state.miter,
+                                line_cap: state.cap,
+                                line_join: state.join,
+                                dash: skia::StrokeDash::new(state.dash.clone(), state.dash_offset),
+                            },
                             linear,
                             strip(&state.stroke, state.clip.as_deref(), t, [width, height])
                                 .as_deref(),
@@ -1021,9 +1027,9 @@ impl Canvas {
                     let mut placed = Vec::new();
                     let [mut left, mut top, mut right, mut bottom] =
                         [i64::MAX, i64::MAX, i64::MIN, i64::MIN];
+                    let variants = f32::from(renderer::SUBPIXEL_STEPS);
                     for glyph in &line.glyphs {
                         let x = f32::from(glyph.x) * raster + fx;
-                        let variants = f32::from(renderer::SUBPIXEL_STEPS);
                         let x = if glyph.emoji {
                             x.round()
                         } else {
@@ -1081,7 +1087,7 @@ impl Canvas {
                         // A covering mode moved the canvas into `covered`, so it must be put back before
                         // skipping.
                         if let Some(saved) = covered.take() {
-                            self.pixels = saved;
+                            spare = Some(std::mem::replace(&mut self.pixels, saved));
                         }
                         continue;
                     };
@@ -1211,7 +1217,7 @@ impl Canvas {
                         let Some(fetched) = sources.entry(key).or_insert_with(|| image(key)) else {
                             // No image is no draw, so a covering mode must not clear the canvas.
                             if let Some(saved) = covered.take() {
-                                self.pixels = saved;
+                                spare = Some(std::mem::replace(&mut self.pixels, saved));
                             }
                             continue;
                         };
@@ -1253,7 +1259,7 @@ impl Canvas {
                 }
                 25 => {
                     if let Some(saved) = covered.take() {
-                        self.pixels = saved;
+                        spare = Some(std::mem::replace(&mut self.pixels, saved));
                     }
                 }
                 32 => {
@@ -1362,6 +1368,7 @@ impl Canvas {
         if let Some(saved) = covered.take() {
             finish(&mut self.pixels, saved, &self.state);
         }
+        drop(spare);
         // The page holds the last image only while it paints, so the new one mostly gets its buffer. The caller
         // releases the tile of the last image.
         Ok(self.present.then(|| {
@@ -1425,13 +1432,8 @@ impl Canvas {
     }
 }
 
-pub fn svg(
-    source: &str,
-    width: u32,
-    height: u32,
-    transform: Option<([f32; 2], [f32; 6])>,
-) -> Result<Arc<renderer::RenderImage>> {
-    render_svg(&svg_tree(source, false)?, width, height, transform)
+pub fn svg(source: &str, width: u32, height: u32) -> Result<Arc<renderer::RenderImage>> {
+    render_svg(&svg_tree(source, false)?, width, height, None)
 }
 
 // usvg reads any file that an SVG names in an image. Page content must not reach files this way: a canvas
@@ -1868,10 +1870,11 @@ mod tests {
             .unwrap();
         assert_eq!(held.bytes()[4..8], [0, 0, 128, 128]);
         assert_eq!(canvas.image.bytes(), [0; 16]);
-        let image = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000" opacity="0.5"/></svg>"##, 4, 4, None).unwrap();
+        let image = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000" opacity="0.5"/></svg>"##, 4, 4).unwrap();
         assert_eq!(image.size().width as u32, 4);
         assert_eq!(image.bytes(), [0, 0, 128, 128].repeat(16));
-        let rotated = svg(r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000"/><path d="M2 0h2v2H2Z" fill="#0000ff"/></svg>"##, 1, 2, Some(([2., 1.], [0., 1., -1., 0., 1., 0.]))).unwrap();
+        let tree = svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><path d="M0 0h2v2H0Z" fill="#ff0000"/><path d="M2 0h2v2H2Z" fill="#0000ff"/></svg>"##, false).unwrap();
+        let rotated = render_svg(&tree, 1, 2, Some(([2., 1.], [0., 1., -1., 0., 1., 0.]))).unwrap();
         assert_eq!(
             rotated.bytes(),
             [[0, 0, 255, 255], [255, 0, 0, 255]].concat()

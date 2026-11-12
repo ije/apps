@@ -1,4 +1,4 @@
-use crate::{Button, Event, Key, Modifiers, Pixels, WheelPhase, point, px};
+use crate::{Button, Event, Key, Modifiers, WheelPhase, point, px};
 use core_foundation_sys::{
     data::{CFDataGetBytePtr, CFDataRef},
     string::CFStringRef,
@@ -7,6 +7,7 @@ use objc2::{msg_send, runtime::AnyObject};
 use objc2_app_kit::{
     self as kit, NSEvent, NSEventModifierFlags as Flags, NSEventPhase as Phase, NSEventType as Kind,
 };
+use objc2_foundation::NSRect;
 use std::ffi::c_void;
 
 // Modifier bits of UCKeyTranslate: the Carbon modifier mask shifted right by 8.
@@ -29,32 +30,34 @@ fn held(flags: Flags) -> Modifiers {
 }
 
 // AppKit numbers buttons left, right, middle, back, forward.
+pub(super) const BUTTONS: [Button; 5] = [
+    Button::Left,
+    Button::Right,
+    Button::Middle,
+    Button::Back,
+    Button::Forward,
+];
+
 fn button(number: isize) -> Option<Button> {
-    [
-        Button::Left,
-        Button::Right,
-        Button::Middle,
-        Button::Back,
-        Button::Forward,
-    ]
-    .get(usize::try_from(number).ok()?)
-    .copied()
+    BUTTONS.get(usize::try_from(number).ok()?).copied()
 }
 
-/// Positions are from the top of a page view `height` points tall, `left` points from the window's left edge.
-pub(crate) fn translate(native: &NSEvent, left: Pixels, height: Pixels) -> Option<Event> {
+/// Positions are from the top left of the page view, whose `frame` is in window coordinates.
+pub(crate) fn translate(native: &NSEvent, frame: NSRect) -> Option<Event> {
     let kind = native.r#type();
     // Read flags and locations only for the kinds below.
     let flags = || native.modifierFlags();
     let modifiers = || held(flags());
     let at = || {
         let location = native.locationInWindow();
-        point(px(location.x as f32) - left, height - px(location.y as f32))
+        point(
+            px(location.x as f32) - px(frame.origin.x as f32),
+            px(frame.size.height as f32) - px(location.y as f32),
+        )
     };
     Some(match kind {
         Kind::FlagsChanged => Event::ModifiersChanged {
             modifiers: modifiers(),
-            caps_lock: flags().contains(Flags::CapsLock),
         },
         Kind::KeyDown | Kind::KeyUp => {
             let (key, modifiers) = key(native, flags());
@@ -235,6 +238,10 @@ fn by_layout(code: u16, mut modifiers: Modifiers) -> (Key, Modifiers) {
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
     fn TISCopyCurrentKeyboardLayoutInputSource() -> *mut AnyObject;
+    pub(super) fn TISCopyCurrentKeyboardInputSource() -> *mut AnyObject;
+    pub(super) static kTISPropertyInputSourceType: CFStringRef;
+    pub(super) static kTISTypeKeyboardInputMode: CFStringRef;
+    pub(super) static kTISPropertyInputSourceIsASCIICapable: CFStringRef;
     pub(super) fn TISGetInputSourceProperty(
         source: *mut AnyObject,
         key: *const c_void,

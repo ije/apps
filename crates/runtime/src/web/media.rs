@@ -1,5 +1,5 @@
 use super::gpu::{Alloc, Output, alloc, drop_waker, wake, waker};
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow};
 use std::{ffi::c_void, mem::MaybeUninit, path::Path, ptr::NonNull, sync::OnceLock};
 
 const ABI: u32 = 2;
@@ -80,27 +80,14 @@ pub fn ffmpeg_name(platform: &str) -> &'static str {
 }
 
 fn load(ffmpeg: bool) -> Result<Library> {
-    let executable = crate::desktop::app::library_exe()?;
-    let directory = executable
-        .parent()
-        .context("Missing executable directory")?;
-    let name = library_name(std::env::consts::OS, ffmpeg);
-    // Like JavaScriptCore, the library only loads from the app, never from the environment.
-    let path = ["../Frameworks", "."]
-        .iter()
-        .map(|folder| directory.join(folder).join(name))
-        .find(|path| path.is_file())
-        .with_context(|| format!("The media library {name} is missing next to the runtime"))?;
+    let library = super::gpu::library(
+        library_name(std::env::consts::OS, ffmpeg),
+        "media",
+        b"apps_media_abi\0",
+        ABI,
+    )?;
     unsafe {
-        let library = libloading::Library::new(&path)
-            .with_context(|| format!("Cannot load the media library from {}", path.display()))?;
-        let abi: libloading::Symbol<extern "C" fn() -> u32> = library.get(b"apps_media_abi\0")?;
-        ensure!(
-            abi() == ABI,
-            "{} does not match this runtime",
-            path.display()
-        );
-        let functions = Library {
+        Ok(Library {
             new: *library.get(b"apps_media_new\0")?,
             free: *library.get(b"apps_media_free\0")?,
             open: *library.get(b"apps_media_open\0")?,
@@ -110,10 +97,7 @@ fn load(ffmpeg: bool) -> Result<Library> {
             poll: *library.get(b"apps_media_poll\0")?,
             frame: *library.get(b"apps_media_frame\0")?,
             recycle: *library.get(b"apps_media_recycle\0")?,
-        };
-        // Player and audio threads may outlive every page, so the library is never unloaded.
-        std::mem::forget(library);
-        Ok(functions)
+        })
     }
 }
 

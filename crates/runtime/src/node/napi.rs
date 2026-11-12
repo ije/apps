@@ -72,8 +72,21 @@ struct Property {
     data: Ptr,
 }
 
+#[derive(Clone, Copy)]
+enum Kind {
+    Finalizer,
+    Wrap(Ptr),
+    External,
+    Function,
+}
+struct Tracked {
+    object: usize,
+    kind: Kind,
+    finalizer: Option<Finalizer>,
+}
+
 struct Holder {
-    queue: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    queue: Arc<Mutex<Vec<u64>>>,
     id: u64,
     byte: u8,
 }
@@ -89,11 +102,8 @@ unsafe extern "C" fn release_holder(_: Ptr, holder: Ptr) {
 pub(crate) struct State {
     api: Rc<JavaScriptCore>,
     ctx: Ptr,
-    host: Weak<RefCell<Host>>,
     owner: Weak<State>,
     thread: std::thread::ThreadId,
-    environments: RefCell<Vec<Rc<State>>>,
-    wrap_finalizers: RefCell<HashMap<u64, Finalizer>>,
     helpers: HashMap<String, Ptr>,
     callbacks: RefCell<HashMap<usize, Function>>,
     // Scope addresses cross the C ABI and must remain stable.
@@ -101,100 +111,90 @@ pub(crate) struct State {
     scopes: RefCell<Vec<Box<Scope>>>,
     references: RefCell<HashMap<usize, Box<Reference>>>,
     // GC can reuse an object address before its holder is finalized, so address maps keep the holder ID.
-    wraps: RefCell<HashMap<u64, Ptr>>,
     externals: RefCell<HashMap<usize, (u64, Ptr)>>,
     held: RefCell<Vec<Ptr>>,
-    finalizers: RefCell<HashMap<u64, Finalizer>>,
     next_holder: Cell<u64>,
-    holders: RefCell<HashMap<u64, (usize, u8)>>,
-    finalized: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    holders: RefCell<HashMap<u64, Tracked>>,
+    finalized: Arc<Mutex<Vec<u64>>>,
     cleanup: RefCell<Vec<(Cleanup, Ptr)>>,
     async_cleanup: RefCell<Vec<usize>>,
     instance: Cell<Ptr>,
     instance_finalizer: Cell<Option<Finalizer>>,
     pending: Cell<Ptr>,
     error: Cell<ErrorInfo>,
-    modules: RefCell<HashMap<std::path::PathBuf, Ptr>>,
     ready: Arc<Mutex<Vec<Ready>>>,
-    active: Cell<usize>,
     // The states of the work that the pool has, or had.
     works: RefCell<Vec<Arc<AtomicU8>>>,
-    threadsafe: Cell<usize>,
     threadsafe_live: RefCell<HashMap<usize, Arc<Threadsafe>>>,
     external: Cell<i64>,
     callback_scopes: Cell<usize>,
 }
 thread_local! { static FUNCTIONS: RefCell<HashMap<usize, Weak<State>>> = RefCell::new(HashMap::new()); }
-thread_local! { static CONTEXTS: RefCell<HashMap<usize, Weak<State>>> = RefCell::new(HashMap::new()); }
+thread_local! { static CONTEXTS: RefCell<HashMap<usize, Weak<Root>>> = RefCell::new(HashMap::new()); }
+
+pub(crate) struct Root {
+    api: Rc<JavaScriptCore>,
+    ctx: Ptr,
+    host: Weak<RefCell<Host>>,
+    environments: RefCell<Vec<Rc<State>>>,
+    modules: RefCell<HashMap<std::path::PathBuf, Ptr>>,
+}
 
 impl State {
-    pub(crate) fn new(
-        api: Rc<JavaScriptCore>,
-        ctx: Ptr,
-        host: &Rc<RefCell<Host>>,
-        addon: bool,
-    ) -> Result<Rc<Self>> {
+    fn new(api: Rc<JavaScriptCore>, ctx: Ptr) -> Result<Rc<Self>> {
         let mut helpers = HashMap::new();
-        if addon {
-            let napi = js!("node/napi.js");
-            let source = api.string(napi);
-            let mut exception = ptr::null_mut();
-            let object = unsafe {
-                (api.evaluate)(
-                    ctx,
-                    source,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    1,
-                    &mut exception,
-                )
-            };
+        let source = api.string(js!("node/napi.js"));
+        let mut exception = ptr::null_mut();
+        let object = unsafe {
+            (api.evaluate)(
+                ctx,
+                source,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                1,
+                &mut exception,
+            )
+        };
+        unsafe {
+            (api.string_release)(source);
+        }
+        ensure!(
+            exception.is_null(),
+            "Cannot initialize Node-API: {}",
+            api.text(ctx, exception)
+        );
+        unsafe {
+            (api.protect)(ctx, object);
+        }
+        let key = api.string("keys");
+        let names = unsafe {
+            let keys = (api.get)(ctx, object, key, &mut exception);
+            (api.string_release)(key);
+            (api.invoke)(ctx, keys, ptr::null_mut(), 1, &object, &mut exception)
+        };
+        for name in api.text(ctx, names).split(',') {
+            let key = api.string(name);
+            let value = unsafe { (api.get)(ctx, object, key, &mut exception) };
             unsafe {
-                (api.string_release)(source);
+                (api.string_release)(key);
+                (api.protect)(ctx, value);
             }
-            ensure!(
-                exception.is_null(),
-                "Cannot initialize Node-API: {}",
-                api.text(ctx, exception)
-            );
-            unsafe {
-                (api.protect)(ctx, object);
-            }
-            for line in napi.lines() {
-                if let Some((name, _)) = line
-                    .strip_prefix("  ")
-                    .and_then(|line| line.split_once(':'))
-                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                {
-                    let key = api.string(name);
-                    let value = unsafe { (api.get)(ctx, object, key, &mut exception) };
-                    unsafe {
-                        (api.string_release)(key);
-                        (api.protect)(ctx, value);
-                    }
-                    helpers.insert(name.into(), value);
-                }
-            }
-            unsafe {
-                (api.unprotect)(ctx, object);
-            }
+            helpers.insert(name.into(), value);
+        }
+        unsafe {
+            (api.unprotect)(ctx, object);
         }
         let state = Rc::new_cyclic(|owner| Self {
             api,
             ctx,
-            host: Rc::downgrade(host),
             owner: owner.clone(),
             thread: std::thread::current().id(),
-            environments: RefCell::default(),
-            wrap_finalizers: RefCell::default(),
             helpers,
             callbacks: RefCell::default(),
             scopes: RefCell::default(),
             references: RefCell::default(),
-            wraps: RefCell::default(),
             externals: RefCell::default(),
             held: RefCell::default(),
-            finalizers: RefCell::default(),
             next_holder: Cell::new(0),
             holders: RefCell::default(),
             finalized: Default::default(),
@@ -209,20 +209,11 @@ impl State {
                 engine_code: 0,
                 code: 0,
             }),
-            modules: RefCell::default(),
             ready: Default::default(),
-            active: Cell::new(0),
             works: RefCell::default(),
-            threadsafe: Cell::new(0),
             threadsafe_live: RefCell::default(),
             external: Cell::new(0),
             callback_scopes: Cell::new(0),
-        });
-        CONTEXTS.with(|contexts| {
-            contexts
-                .borrow_mut()
-                .entry(ctx as usize)
-                .or_insert_with(|| Rc::downgrade(&state));
         });
         Ok(state)
     }
@@ -254,7 +245,7 @@ impl State {
     fn track(
         &self,
         object: Ptr,
-        kind: u8,
+        kind: Kind,
         finalizer: Option<Finalizer>,
     ) -> std::result::Result<u64, i32> {
         let (id, holder) = self.holder();
@@ -272,12 +263,14 @@ impl State {
         check(!holder.is_null() && exception.is_null(), 9)?;
         self.keep(holder);
         self.js("holder", &[object, holder])?;
-        self.holders
-            .borrow_mut()
-            .insert(id, (object as usize, kind));
-        if let Some(finalizer) = finalizer {
-            self.finalizers.borrow_mut().insert(id, finalizer);
-        }
+        self.holders.borrow_mut().insert(
+            id,
+            Tracked {
+                object: object as usize,
+                kind,
+                finalizer,
+            },
+        );
         Ok(id)
     }
 
@@ -292,13 +285,7 @@ impl State {
         (id, Box::into_raw(Box::new(holder)))
     }
 
-    // Finalizers call into the addon and may run JavaScript, so only `tick` runs them, never a Node-API call.
-    pub(crate) fn sweep(&self) {
-        // Finalizers can load addons, which pushes to `environments`.
-        let environments = self.environments.borrow().clone();
-        for environment in &environments {
-            environment.sweep();
-        }
+    fn sweep(&self) {
         let ids = self
             .finalized
             .lock()
@@ -306,42 +293,43 @@ impl State {
             .unwrap_or_default();
         for id in ids {
             let entry = self.holders.borrow_mut().remove(&id);
-            let mut finalizer = self.finalizers.borrow_mut().remove(&id);
-            if let Some((object, kind)) = entry {
-                match kind {
-                    1 => {
-                        self.wraps.borrow_mut().remove(&id);
-                        finalizer = self.wrap_finalizers.borrow_mut().remove(&id);
+            let Some(Tracked {
+                object,
+                kind,
+                finalizer,
+            }) = entry
+            else {
+                continue;
+            };
+            match kind {
+                Kind::External => {
+                    let mut externals = self.externals.borrow_mut();
+                    if externals
+                        .get(&object)
+                        .is_some_and(|external| external.0 == id)
+                    {
+                        externals.remove(&object);
                     }
-                    2 => {
-                        let mut externals = self.externals.borrow_mut();
-                        if externals
-                            .get(&object)
-                            .is_some_and(|external| external.0 == id)
-                        {
-                            externals.remove(&object);
-                        }
-                    }
-                    3 => {
-                        let mut callbacks = self.callbacks.borrow_mut();
-                        if callbacks
-                            .get(&object)
-                            .is_some_and(|function| function.id == id)
-                        {
-                            callbacks.remove(&object);
-                            FUNCTIONS.with(|functions| {
-                                let mut functions = functions.borrow_mut();
-                                if functions
-                                    .get(&object)
-                                    .is_some_and(|owner| owner.ptr_eq(&self.owner))
-                                {
-                                    functions.remove(&object);
-                                }
-                            });
-                        }
-                    }
-                    _ => {}
                 }
+                Kind::Function => {
+                    let mut callbacks = self.callbacks.borrow_mut();
+                    if callbacks
+                        .get(&object)
+                        .is_some_and(|function| function.id == id)
+                    {
+                        callbacks.remove(&object);
+                        FUNCTIONS.with(|functions| {
+                            let mut functions = functions.borrow_mut();
+                            if functions
+                                .get(&object)
+                                .is_some_and(|owner| owner.ptr_eq(&self.owner))
+                            {
+                                functions.remove(&object);
+                            }
+                        });
+                    }
+                }
+                Kind::Finalizer | Kind::Wrap(_) => {}
             }
             if let Some(finalizer) = finalizer {
                 self.scoped(|| unsafe {
@@ -410,6 +398,24 @@ impl State {
         Ok(self.keep(result))
     }
 
+    fn truthy(&self, name: &str, args: &[Ptr]) -> std::result::Result<bool, i32> {
+        let value = self.js(name, args)?;
+        Ok(unsafe { (self.api.to_boolean)(self.ctx, value) })
+    }
+
+    fn error(&self, kind: &str, code: Ptr, message: Ptr) -> std::result::Result<Ptr, i32> {
+        let code = if code.is_null() {
+            self.undefined()
+        } else {
+            code
+        };
+        self.js("error", &[self.text(kind), code, message])
+    }
+
+    unsafe fn c_text(&self, value: *const c_char) -> Ptr {
+        self.text(&unsafe { CStr::from_ptr(value) }.to_string_lossy())
+    }
+
     fn external(&self, value: Ptr) -> std::result::Result<Option<Ptr>, i32> {
         let entry = self.externals.borrow().get(&(value as usize)).copied();
         let Some((id, data)) = entry else {
@@ -429,6 +435,13 @@ impl State {
             (self.api.string_release)(string);
         }
         self.keep(value)
+    }
+
+    fn utf16(&self, units: &[u16]) -> Ptr {
+        let string = unsafe { (self.api.string_create)(units.as_ptr(), units.len()) };
+        let value = unsafe { (self.api.make_string)(self.ctx, string) };
+        unsafe { (self.api.string_release)(string) };
+        value
     }
 
     fn number(&self, value: f64) -> Ptr {
@@ -461,6 +474,30 @@ impl State {
         check(matches!(self.kind(value)?, 6 | 7), 2)
     }
 
+    fn open_scope(&self, escapable: bool, result: *mut Ptr) -> Status {
+        check(!result.is_null(), 1)?;
+        let mut scope = Box::new(Scope {
+            escapable,
+            ..Scope::default()
+        });
+        unsafe { *result = (&mut *scope as *mut Scope).cast() };
+        self.scopes.borrow_mut().push(scope);
+        Ok(())
+    }
+
+    fn close_scope(&self, scope: Ptr) -> Status {
+        check(!scope.is_null(), 1)?;
+        check(
+            self.scopes
+                .borrow()
+                .last()
+                .is_some_and(|last| ptr::eq(&**last, scope.cast::<Scope>())),
+            13,
+        )?;
+        self.pop();
+        Ok(())
+    }
+
     fn pop(&self) {
         if let Some(scope) = self.scopes.borrow_mut().pop() {
             for value in scope.values {
@@ -478,7 +515,7 @@ impl State {
             (self.api.string_release)(string);
         }
         self.keep(native);
-        let id = self.track(native, 3, None)?;
+        let id = self.track(native, Kind::Function, None)?;
         FUNCTIONS.with(|functions| {
             functions
                 .borrow_mut()
@@ -490,15 +527,7 @@ impl State {
         self.js("function", &[native, self.text(name)])
     }
 
-    // Returns false if addon work still runs on the pool. Nothing of the addon is freed then, and the caller must
-    // keep this state alive, because the work has its address.
-    pub(crate) fn close(&self) -> bool {
-        let environments = self.environments.borrow().clone();
-        for environment in environments.iter().rev() {
-            if !environment.close() {
-                std::mem::forget(environment.clone());
-            }
-        }
+    fn close(&self) -> bool {
         // The hooks and finalizers below free addon state that work on the pool uses. Work that has not started
         // never starts, and running work gets a moment to end.
         let works = self.works.take();
@@ -538,20 +567,30 @@ impl State {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        // Wraps finalize first. A finalizer can remove other entries, which then do not run, or add new ones.
         loop {
-            let key = self.wrap_finalizers.borrow().keys().next().copied();
-            let Some(key) = key else { break };
-            let finalizer = self.wrap_finalizers.borrow_mut().remove(&key).unwrap();
-            unsafe {
-                (finalizer.callback)(self, finalizer.data, finalizer.hint);
+            let mut ids: Vec<(bool, u64)> = self
+                .holders
+                .borrow()
+                .iter()
+                .filter(|(_, tracked)| tracked.finalizer.is_some())
+                .map(|(id, tracked)| (!matches!(tracked.kind, Kind::Wrap(_)), *id))
+                .collect();
+            if ids.is_empty() {
+                break;
             }
-        }
-        loop {
-            let key = self.finalizers.borrow().keys().next().copied();
-            let finalizer = key.and_then(|key| self.finalizers.borrow_mut().remove(&key));
-            let Some(finalizer) = finalizer else { break };
-            unsafe {
-                (finalizer.callback)(self, finalizer.data, finalizer.hint);
+            ids.sort_unstable();
+            for (_, id) in ids {
+                let finalizer = self
+                    .holders
+                    .borrow_mut()
+                    .remove(&id)
+                    .and_then(|tracked| tracked.finalizer);
+                if let Some(finalizer) = finalizer {
+                    unsafe {
+                        (finalizer.callback)(self, finalizer.data, finalizer.hint);
+                    }
+                }
             }
         }
         if let Some(finalizer) = self.instance_finalizer.take() {
@@ -602,15 +641,57 @@ impl State {
                 }
             }
         });
-        CONTEXTS.with(|contexts| {
-            let mut contexts = contexts.borrow_mut();
-            if contexts
-                .get(&(self.ctx as usize))
-                .is_some_and(|owner| owner.ptr_eq(&self.owner))
-            {
-                contexts.remove(&(self.ctx as usize));
-            }
+    }
+}
+
+impl Root {
+    pub(crate) fn new(api: Rc<JavaScriptCore>, ctx: Ptr, host: &Rc<RefCell<Host>>) -> Rc<Self> {
+        let root = Rc::new(Self {
+            api,
+            ctx,
+            host: Rc::downgrade(host),
+            environments: RefCell::default(),
+            modules: RefCell::default(),
         });
+        CONTEXTS.with(|contexts| {
+            contexts
+                .borrow_mut()
+                .insert(ctx as usize, Rc::downgrade(&root))
+        });
+        root
+    }
+
+    // Finalizers call into the addon and may run JavaScript, so only `tick` runs them, never a Node-API call.
+    pub(crate) fn sweep(&self) {
+        // Finalizers can load addons, which pushes to `environments`.
+        let environments = self.environments.borrow().clone();
+        for environment in environments {
+            environment.sweep();
+        }
+    }
+
+    pub(crate) fn drain(&self) {
+        for environment in self.environments.borrow().clone() {
+            environment.drain();
+        }
+    }
+
+    pub(crate) fn pending(&self) -> bool {
+        self.environments
+            .borrow()
+            .iter()
+            .any(|environment| environment.pending())
+    }
+
+    pub(crate) fn close(&self) {
+        let environments = self.environments.borrow().clone();
+        for environment in environments.iter().rev() {
+            // Addon work that still runs has the address of this environment, so it stays if it could not close.
+            if !environment.close() {
+                std::mem::forget(environment.clone());
+            }
+        }
+        CONTEXTS.with(|contexts| contexts.borrow_mut().remove(&(self.ctx as usize)));
     }
 
     pub(crate) fn load(&self, name: &str) -> Result<Ptr> {
@@ -705,7 +786,7 @@ impl State {
                 "Unsupported Node-API version {version}; supported subset is based on version 8"
             );
         }
-        let environment = State::new(self.api.clone(), self.ctx, &host, true)?;
+        let environment = State::new(self.api.clone(), self.ctx)?;
         self.environments.borrow_mut().push(environment.clone());
         // Like Node.js, never unload an addon. Its threads and static destructors may still run.
         std::mem::forget(library);
@@ -730,6 +811,51 @@ impl State {
 
 fn check(condition: bool, status: i32) -> Status {
     if condition { Ok(()) } else { Err(status) }
+}
+
+unsafe fn chars<'a>(value: *const c_char, length: usize) -> &'a [u8] {
+    if value.is_null() || length == 0 {
+        &[]
+    } else if length == usize::MAX {
+        unsafe { CStr::from_ptr(value) }.to_bytes()
+    } else {
+        unsafe { std::slice::from_raw_parts(value.cast(), length) }
+    }
+}
+
+unsafe fn copy_units<T>(
+    env: &State,
+    value: Ptr,
+    buffer: *mut T,
+    size: usize,
+    result: *mut usize,
+    convert: fn(u16) -> T,
+) -> Status {
+    check(!buffer.is_null() || !result.is_null(), 1)?;
+    check(env.kind(value)? == 4, 3)?;
+    unsafe {
+        let string = (env.api.to_string)(env.ctx, value, ptr::null_mut());
+        let length = (env.api.string_length)(string);
+        let units = (env.api.string_chars)(string);
+        let count = length.min(size.saturating_sub(1));
+        if !buffer.is_null() && size > 0 {
+            for index in 0..count {
+                buffer.add(index).write(convert(*units.add(index)));
+            }
+            buffer.add(count).write(convert(0));
+        }
+        (env.api.string_release)(string);
+        if !result.is_null() {
+            *result = if buffer.is_null() {
+                length
+            } else if size == 0 {
+                0
+            } else {
+                count
+            };
+        }
+    }
+    Ok(())
 }
 
 unsafe extern "C" fn invoke(
@@ -890,7 +1016,7 @@ api!(napi_create_symbol(env, description: Ptr, result: *mut Ptr) {
     )
 });
 api!(napi_create_double(env, value: f64, result: *mut Ptr) {
-    env.value(result, env.number(value as f64))
+    env.value(result, env.number(value))
 });
 api!(napi_get_value_double(env, value: Ptr, result: *mut f64) {
     check(!result.is_null(), 1)?;
@@ -936,17 +1062,7 @@ api!(napi_create_string_utf8(
     result: *mut Ptr,
 ) {
     check(!value.is_null() || length == 0, 1)?;
-    let length = if length == usize::MAX {
-        CStr::from_ptr(value).to_bytes().len()
-    } else {
-        length
-    };
-    let bytes = if length == 0 {
-        &[]
-    } else {
-        std::slice::from_raw_parts(value.cast::<u8>(), length)
-    };
-    env.value(result, env.text(&String::from_utf8_lossy(bytes)))
+    env.value(result, env.text(&String::from_utf8_lossy(chars(value, length))))
 });
 api!(napi_get_value_string_utf8(
     env,
@@ -984,23 +1100,8 @@ api!(napi_create_string_latin1(
     result: *mut Ptr,
 ) {
     check(!value.is_null() || length == 0, 1)?;
-    let length = if length == usize::MAX {
-        CStr::from_ptr(value).to_bytes().len()
-    } else {
-        length
-    };
-    let bytes = if length == 0 {
-        &[]
-    } else {
-        std::slice::from_raw_parts(value.cast::<u8>(), length)
-    };
-    env.value(result, {
-        let chars: Vec<u16> = bytes.iter().map(|b| *b as u16).collect();
-        let string = (env.api.string_create)(chars.as_ptr(), chars.len());
-        let value = (env.api.make_string)(env.ctx, string);
-        (env.api.string_release)(string);
-        value
-    })
+    let units: Vec<u16> = chars(value, length).iter().map(|b| *b as u16).collect();
+    env.value(result, env.utf16(&units))
 });
 api!(napi_get_value_string_latin1(
     env,
@@ -1009,29 +1110,7 @@ api!(napi_get_value_string_latin1(
     size: usize,
     result: *mut usize,
 ) {
-    check(!buffer.is_null() || !result.is_null(), 1)?;
-    check(env.kind(value)? == 4, 3)?;
-    let string = (env.api.to_string)(env.ctx, value, ptr::null_mut());
-    let length = (env.api.string_length)(string);
-    let chars = (env.api.string_chars)(string);
-    let count = length.min(size.saturating_sub(1));
-    if !buffer.is_null() && size > 0 {
-        for index in 0..count {
-            *buffer.add(index) = *chars.add(index) as c_char;
-        }
-        *buffer.add(count) = 0;
-    }
-    (env.api.string_release)(string);
-    if !result.is_null() {
-        *result = if buffer.is_null() {
-            length
-        } else if size == 0 {
-            0
-        } else {
-            count
-        };
-    }
-    Ok(())
+    copy_units(env, value, buffer, size, result, |unit| unit as c_char)
 });
 api!(napi_create_string_utf16(
     env,
@@ -1041,27 +1120,16 @@ api!(napi_create_string_utf16(
 ) {
     check(!value.is_null() || length == 0, 1)?;
     let length = if length == usize::MAX {
-        {
-            let mut size = 0;
-            while *value.add(size) != 0 {
-                size += 1;
-            }
-            size
+        let mut size = 0;
+        while *value.add(size) != 0 {
+            size += 1;
         }
+        size
     } else {
         length
     };
-    let bytes = if length == 0 {
-        &[]
-    } else {
-        std::slice::from_raw_parts(value.cast::<u16>(), length)
-    };
-    env.value(result, {
-        let string = (env.api.string_create)(bytes.as_ptr(), bytes.len());
-        let value = (env.api.make_string)(env.ctx, string);
-        (env.api.string_release)(string);
-        value
-    })
+    let units = if length == 0 { &[] } else { std::slice::from_raw_parts(value, length) };
+    env.value(result, env.utf16(units))
 });
 api!(napi_get_value_string_utf16(
     env,
@@ -1070,58 +1138,31 @@ api!(napi_get_value_string_utf16(
     size: usize,
     result: *mut usize,
 ) {
-    check(!buffer.is_null() || !result.is_null(), 1)?;
-    check(env.kind(value)? == 4, 3)?;
-    let string = (env.api.to_string)(env.ctx, value, ptr::null_mut());
-    let length = (env.api.string_length)(string);
-    let chars = (env.api.string_chars)(string);
-    let count = length.min(size.saturating_sub(1));
-    if !buffer.is_null() && size > 0 {
-        for index in 0..count {
-            *buffer.add(index) = *chars.add(index) as u16;
-        }
-        *buffer.add(count) = 0;
-    }
-    (env.api.string_release)(string);
-    if !result.is_null() {
-        *result = if buffer.is_null() {
-            length
-        } else if size == 0 {
-            0
-        } else {
-            count
-        };
-    }
-    Ok(())
+    copy_units(env, value, buffer, size, result, |unit| unit)
 });
 api!(napi_is_array(env, value: Ptr, result: *mut bool) {
     check(!result.is_null(), 1)?;
-    let value = env.js("is_array", &[value])?;
-    *result = (env.api.to_boolean)(env.ctx, value);
+    *result = env.truthy("is_array", &[value])?;
     Ok(())
 });
 api!(napi_is_error(env, value: Ptr, result: *mut bool) {
     check(!result.is_null(), 1)?;
-    let value = env.js("is_error", &[value])?;
-    *result = (env.api.to_boolean)(env.ctx, value);
+    *result = env.truthy("is_error", &[value])?;
     Ok(())
 });
 api!(napi_is_promise(env, value: Ptr, result: *mut bool) {
     check(!result.is_null(), 1)?;
-    let value = env.js("is_promise", &[value])?;
-    *result = (env.api.to_boolean)(env.ctx, value);
+    *result = env.truthy("is_promise", &[value])?;
     Ok(())
 });
 api!(napi_is_date(env, value: Ptr, result: *mut bool) {
     check(!result.is_null(), 1)?;
-    let value = env.js("is_date", &[value])?;
-    *result = (env.api.to_boolean)(env.ctx, value);
+    *result = env.truthy("is_date", &[value])?;
     Ok(())
 });
 api!(napi_is_dataview(env, value: Ptr, result: *mut bool) {
     check(!result.is_null(), 1)?;
-    let value = env.js("is_dataview", &[value])?;
-    *result = (env.api.to_boolean)(env.ctx, value);
+    *result = env.truthy("is_dataview", &[value])?;
     Ok(())
 });
 api!(napi_coerce_to_number(env, value: Ptr, result: *mut Ptr) {
@@ -1153,8 +1194,7 @@ api!(napi_set_property(env, object: Ptr, key: Ptr, value: Ptr) {
 api!(napi_has_property(env, object: Ptr, key: Ptr, result: *mut bool) {
     env.object(object)?;
     check(!result.is_null(), 1)?;
-    let value = env.js("has", &[object, key])?;
-    *result = (env.api.to_boolean)(env.ctx, value);
+    *result = env.truthy("has", &[object, key])?;
     Ok(())
 });
 api!(napi_delete_property(env, object: Ptr, key: Ptr, result: *mut bool) {
@@ -1172,18 +1212,14 @@ api!(napi_get_named_property(
     result: *mut Ptr,
 ) {
     env.object(object)?;
-    let key = {
-        check(!name.is_null(), 1)?;
-        env.text(&CStr::from_ptr(name).to_string_lossy())
-    };
+    check(!name.is_null(), 1)?;
+    let key = env.c_text(name);
     env.value(result, env.js("get", &[object, key])?)
 });
 api!(napi_set_named_property(env, object: Ptr, name: *const c_char, value: Ptr) {
     env.object(object)?;
-    let key = {
-        check(!name.is_null(), 1)?;
-        env.text(&CStr::from_ptr(name).to_string_lossy())
-    };
+    check(!name.is_null(), 1)?;
+    let key = env.c_text(name);
     env.js("set", &[object, key, value])?;
     Ok(())
 });
@@ -1195,12 +1231,9 @@ api!(napi_has_named_property(
 ) {
     env.object(object)?;
     check(!result.is_null(), 1)?;
-    let key = {
-        check(!name.is_null(), 1)?;
-        env.text(&CStr::from_ptr(name).to_string_lossy())
-    };
-    let value = env.js("has", &[object, key])?;
-    *result = (env.api.to_boolean)(env.ctx, value);
+    check(!name.is_null(), 1)?;
+    let key = env.c_text(name);
+    *result = env.truthy("has", &[object, key])?;
     Ok(())
 });
 api!(napi_get_element(env, object: Ptr, index: u32, result: *mut Ptr) {
@@ -1218,8 +1251,7 @@ api!(napi_has_element(env, object: Ptr, index: u32, result: *mut bool) {
     env.object(object)?;
     check(!result.is_null(), 1)?;
     let key = env.number(index as f64);
-    let value = env.js("has", &[object, key])?;
-    *result = (env.api.to_boolean)(env.ctx, value);
+    *result = env.truthy("has", &[object, key])?;
     Ok(())
 });
 api!(napi_delete_element(env, object: Ptr, index: u32, result: *mut bool) {
@@ -1234,28 +1266,24 @@ api!(napi_delete_element(env, object: Ptr, index: u32, result: *mut bool) {
 api!(napi_has_own_property(env, object: Ptr, key: Ptr, result: *mut bool) {
     env.object(object)?;
     check(!result.is_null(), 1)?;
-    let value = env.js("own", &[object, key])?;
-    *result = (env.api.to_boolean)(env.ctx, value);
+    *result = env.truthy("own", &[object, key])?;
     Ok(())
 });
 api!(napi_get_array_length(env, value: Ptr, result: *mut u32) {
     check(!result.is_null(), 1)?;
-    let array = env.js("is_array", &[value])?;
-    check((env.api.to_boolean)(env.ctx, array), 8)?;
+    check(env.truthy("is_array", &[value])?, 8)?;
     let length = env.js("get", &[value, env.text("length")])?;
     *result = (env.api.to_number)(env.ctx, length, ptr::null_mut()) as u32;
     Ok(())
 });
 api!(napi_strict_equals(env, a: Ptr, b: Ptr, result: *mut bool) {
     check(!result.is_null(), 1)?;
-    let value = env.js("equal", &[a, b])?;
-    *result = (env.api.to_boolean)(env.ctx, value);
+    *result = env.truthy("equal", &[a, b])?;
     Ok(())
 });
 api!(napi_instanceof(env, a: Ptr, b: Ptr, result: *mut bool) {
     check(!result.is_null(), 1)?;
-    let value = env.js("instanceof", &[a, b])?;
-    *result = (env.api.to_boolean)(env.ctx, value);
+    *result = env.truthy("instanceof", &[a, b])?;
     Ok(())
 });
 api!(napi_object_freeze(env, object: Ptr) {
@@ -1277,13 +1305,7 @@ api!(napi_create_function(
     result: *mut Ptr,
 ) {
     let callback = callback.ok_or(1)?;
-    let name = if name.is_null() {
-        String::new()
-    } else if length == usize::MAX {
-        CStr::from_ptr(name).to_string_lossy().into_owned()
-    } else {
-        String::from_utf8_lossy(std::slice::from_raw_parts(name.cast::<u8>(), length)).into_owned()
-    };
+    let name = String::from_utf8_lossy(chars(name, length));
     env.value(result, env.function(&name, callback, data)?)
 });
 api!(napi_get_cb_info(
@@ -1375,110 +1397,32 @@ api!(napi_run_script(env, script: Ptr, result: *mut Ptr) {
 });
 api!(napi_create_error(env, code: Ptr, message: Ptr, result: *mut Ptr) {
     check(env.kind(message)? == 4, 3)?;
-    env.value(
-        result,
-        env.js(
-            "error",
-            &[
-                env.text("Error"),
-                if code.is_null() {
-                    env.undefined()
-                } else {
-                    code
-                },
-                message,
-            ],
-        )?,
-    )
+    env.value(result, env.error("Error", code, message)?)
 });
 api!(napi_throw_error(env, code: *const c_char, message: *const c_char) {
     check(!message.is_null(), 1)?;
-    let code = if code.is_null() {
-        env.undefined()
-    } else {
-        env.text(&CStr::from_ptr(code).to_string_lossy())
-    };
-    let error = env.js(
-        "error",
-        &[
-            env.text("Error"),
-            code,
-            env.text(&CStr::from_ptr(message).to_string_lossy()),
-        ],
-    )?;
-    env.exception(error);
+    let code = if code.is_null() { ptr::null_mut() } else { env.c_text(code) };
+    env.exception(env.error("Error", code, env.c_text(message))?);
     Ok(())
 });
 api!(napi_create_type_error(env, code: Ptr, message: Ptr, result: *mut Ptr) {
     check(env.kind(message)? == 4, 3)?;
-    env.value(
-        result,
-        env.js(
-            "error",
-            &[
-                env.text("TypeError"),
-                if code.is_null() {
-                    env.undefined()
-                } else {
-                    code
-                },
-                message,
-            ],
-        )?,
-    )
+    env.value(result, env.error("TypeError", code, message)?)
 });
 api!(napi_throw_type_error(env, code: *const c_char, message: *const c_char) {
     check(!message.is_null(), 1)?;
-    let code = if code.is_null() {
-        env.undefined()
-    } else {
-        env.text(&CStr::from_ptr(code).to_string_lossy())
-    };
-    let error = env.js(
-        "error",
-        &[
-            env.text("TypeError"),
-            code,
-            env.text(&CStr::from_ptr(message).to_string_lossy()),
-        ],
-    )?;
-    env.exception(error);
+    let code = if code.is_null() { ptr::null_mut() } else { env.c_text(code) };
+    env.exception(env.error("TypeError", code, env.c_text(message))?);
     Ok(())
 });
 api!(napi_create_range_error(env, code: Ptr, message: Ptr, result: *mut Ptr) {
     check(env.kind(message)? == 4, 3)?;
-    env.value(
-        result,
-        env.js(
-            "error",
-            &[
-                env.text("RangeError"),
-                if code.is_null() {
-                    env.undefined()
-                } else {
-                    code
-                },
-                message,
-            ],
-        )?,
-    )
+    env.value(result, env.error("RangeError", code, message)?)
 });
 api!(napi_throw_range_error(env, code: *const c_char, message: *const c_char) {
     check(!message.is_null(), 1)?;
-    let code = if code.is_null() {
-        env.undefined()
-    } else {
-        env.text(&CStr::from_ptr(code).to_string_lossy())
-    };
-    let error = env.js(
-        "error",
-        &[
-            env.text("RangeError"),
-            code,
-            env.text(&CStr::from_ptr(message).to_string_lossy()),
-        ],
-    )?;
-    env.exception(error);
+    let code = if code.is_null() { ptr::null_mut() } else { env.c_text(code) };
+    env.exception(env.error("RangeError", code, env.c_text(message))?);
     Ok(())
 });
 api!(napi_throw(env, value: Ptr) {
@@ -1504,45 +1448,16 @@ api!(napi_get_and_clear_last_exception(env, result: *mut Ptr) {
     )
 });
 api!(napi_open_handle_scope(env, result: *mut Ptr) {
-    check(!result.is_null(), 1)?;
-    let mut scope = Box::<Scope>::default();
-    *result = (&mut *scope as *mut Scope).cast();
-    env.scopes.borrow_mut().push(scope);
-    Ok(())
+    env.open_scope(false, result)
 });
 api!(napi_close_handle_scope(env, scope: Ptr) {
-    check(!scope.is_null(), 1)?;
-    check(
-        env.scopes
-            .borrow()
-            .last()
-            .is_some_and(|last| ptr::eq(&**last, scope.cast::<Scope>())),
-        13,
-    )?;
-    env.pop();
-    Ok(())
+    env.close_scope(scope)
 });
 api!(napi_open_escapable_handle_scope(env, result: *mut Ptr) {
-    check(!result.is_null(), 1)?;
-    let mut scope = Box::new(Scope {
-        escapable: true,
-        ..Scope::default()
-    });
-    *result = (&mut *scope as *mut Scope).cast();
-    env.scopes.borrow_mut().push(scope);
-    Ok(())
+    env.open_scope(true, result)
 });
 api!(napi_close_escapable_handle_scope(env, scope: Ptr) {
-    check(!scope.is_null(), 1)?;
-    check(
-        env.scopes
-            .borrow()
-            .last()
-            .is_some_and(|last| ptr::eq(&**last, scope.cast::<Scope>())),
-        13,
-    )?;
-    env.pop();
-    Ok(())
+    env.close_scope(scope)
 });
 api!(napi_escape_handle(env, scope: Ptr, value: Ptr, result: *mut Ptr) {
     check(!scope.is_null() && !value.is_null() && !result.is_null(), 1)?;
@@ -1685,7 +1600,7 @@ api!(napi_create_date(env, value: f64, result: *mut Ptr) {
 });
 api!(napi_get_date_value(env, value: Ptr, result: *mut f64) {
     check(!result.is_null(), 1)?;
-    check((env.api.to_boolean)(env.ctx, env.js("is_date", &[value])?), 18)?;
+    check(env.truthy("is_date", &[value])?, 18)?;
     let value = env.js("date_value", &[value])?;
     *result = (env.api.to_number)(env.ctx, value, ptr::null_mut());
     Ok(())
@@ -1703,8 +1618,7 @@ api!(napi_get_value_bigint_int64(
     check(env.kind(value)? == 9, 17)?;
     let text = env.js("bigint_i64", &[value])?;
     *result = env.api.text(env.ctx, text).parse().map_err(|_| 9)?;
-    let exact = env.js("bigint_lossless", &[value, env.boolean(true)])?;
-    *lossless = (env.api.to_boolean)(env.ctx, exact);
+    *lossless = env.truthy("bigint_lossless", &[value, env.boolean(true)])?;
     Ok(())
 });
 api!(napi_create_bigint_uint64(env, value: u64, result: *mut Ptr) {
@@ -1720,8 +1634,7 @@ api!(napi_get_value_bigint_uint64(
     check(env.kind(value)? == 9, 17)?;
     let text = env.js("bigint_u64", &[value])?;
     *result = env.api.text(env.ctx, text).parse().map_err(|_| 9)?;
-    let exact = env.js("bigint_lossless", &[value, env.boolean(false)])?;
-    *lossless = (env.api.to_boolean)(env.ctx, exact);
+    *lossless = env.truthy("bigint_lossless", &[value, env.boolean(false)])?;
     Ok(())
 });
 api!(napi_create_promise(env, deferred: *mut Ptr, result: *mut Ptr) {
@@ -1731,25 +1644,24 @@ api!(napi_create_promise(env, deferred: *mut Ptr, result: *mut Ptr) {
     env.value(result, env.js("get", &[state, env.text("promise")])?)
 });
 api!(napi_resolve_deferred(env, deferred: Ptr, value: Ptr) {
-    let mut state = ptr::null_mut();
-    check(napi_get_reference_value(env, deferred, &mut state) == 0, 1)?;
-    let callback = env.js("get", &[state, env.text("resolve")])?;
-    check(
-        napi_call_function(env, state, callback, 1, &value, ptr::null_mut()) == 0,
-        10,
-    )?;
-    check(napi_delete_reference(env, deferred) == 0, 1)
+    settle(env, deferred, value, "resolve")
 });
 api!(napi_reject_deferred(env, deferred: Ptr, value: Ptr) {
+    settle(env, deferred, value, "reject")
+});
+unsafe fn settle(env: &State, deferred: Ptr, value: Ptr, name: &str) -> Status {
     let mut state = ptr::null_mut();
-    check(napi_get_reference_value(env, deferred, &mut state) == 0, 1)?;
-    let callback = env.js("get", &[state, env.text("reject")])?;
     check(
-        napi_call_function(env, state, callback, 1, &value, ptr::null_mut()) == 0,
+        unsafe { napi_get_reference_value(env, deferred, &mut state) } == 0,
+        1,
+    )?;
+    let callback = env.js("get", &[state, env.text(name)])?;
+    check(
+        unsafe { napi_call_function(env, state, callback, 1, &value, ptr::null_mut()) } == 0,
         10,
     )?;
-    check(napi_delete_reference(env, deferred) == 0, 1)
-});
+    check(unsafe { napi_delete_reference(env, deferred) } == 0, 1)
+}
 
 api!(napi_define_properties(
     env,
@@ -1764,7 +1676,7 @@ api!(napi_define_properties(
         let key = if property.name.is_null() {
             property.key
         } else {
-            env.text(&CStr::from_ptr(property.name).to_string_lossy())
+            env.c_text(property.name)
         };
         check(!key.is_null(), 1)?;
         let name = env.api.text(env.ctx, key);
@@ -1837,21 +1749,13 @@ api!(napi_wrap(
     result: *mut Ptr,
 ) {
     env.object(object)?;
-    let wrapped = env.js("wrap", &[object])?;
-    check(!(env.api.to_boolean)(env.ctx, wrapped), 1)?;
+    check(!env.truthy("wrap", &[object])?, 1)?;
     check(result.is_null() || callback.is_some(), 1)?;
-    let id = env.track(object, 1, None)?;
+    let id = env.track(object, Kind::Finalizer, None)?;
     env.js("wrap", &[object, env.number(id as f64)])?;
-    env.wraps.borrow_mut().insert(id, data);
-    if let Some(callback) = callback {
-        env.wrap_finalizers.borrow_mut().insert(
-            id,
-            Finalizer {
-                callback,
-                data,
-                hint,
-            },
-        );
+    if let Some(tracked) = env.holders.borrow_mut().get_mut(&id) {
+        tracked.kind = Kind::Wrap(data);
+        tracked.finalizer = callback.map(|callback| Finalizer { callback, data, hint });
     }
     if !result.is_null() {
         check(napi_create_reference(env, object, 0, result) == 0, 9)?;
@@ -1863,7 +1767,10 @@ api!(napi_unwrap(env, object: Ptr, result: *mut Ptr) {
     env.object(object)?;
     let id = env.js("wrap", &[object])?;
     let id = (env.api.to_number)(env.ctx, id, ptr::null_mut()) as u64;
-    *result = *env.wraps.borrow().get(&id).ok_or(1)?;
+    *result = match env.holders.borrow().get(&id) {
+        Some(Tracked { kind: Kind::Wrap(data), .. }) => *data,
+        _ => return Err(1),
+    };
     Ok(())
 });
 api!(napi_remove_wrap(env, object: Ptr, result: *mut Ptr) {
@@ -1871,9 +1778,12 @@ api!(napi_remove_wrap(env, object: Ptr, result: *mut Ptr) {
     env.object(object)?;
     let id = env.js("wrap", &[object, env.number(0.0)])?;
     let id = (env.api.to_number)(env.ctx, id, ptr::null_mut()) as u64;
-    let data = env.wraps.borrow_mut().remove(&id).ok_or(1)?;
-    env.wrap_finalizers.borrow_mut().remove(&id);
-    *result = data;
+    let mut holders = env.holders.borrow_mut();
+    let Some(Tracked { kind: Kind::Wrap(data), .. }) = holders.get(&id) else {
+        return Err(1);
+    };
+    *result = *data;
+    holders.remove(&id);
     Ok(())
 });
 api!(napi_add_finalizer(
@@ -1886,7 +1796,7 @@ api!(napi_add_finalizer(
 ) {
     env.object(object)?;
     let callback = callback.ok_or(1)?;
-    env.track(object, 0, Some(Finalizer { callback, data, hint }))?;
+    env.track(object, Kind::Finalizer, Some(Finalizer { callback, data, hint }))?;
     if !result.is_null() {
         check(napi_create_reference(env, object, 0, result) == 0, 9)?;
     }
@@ -1900,7 +1810,7 @@ api!(napi_create_external(
     result: *mut Ptr,
 ) {
     let value = env.js("object", &[])?;
-    let id = env.track(value, 2, callback.map(|callback| Finalizer { callback, data, hint }))?;
+    let id = env.track(value, Kind::External, callback.map(|callback| Finalizer { callback, data, hint }))?;
     env.js("external", &[value, env.number(id as f64)])?;
     env.externals.borrow_mut().insert(value as usize, (id, data));
     env.value(result, value)
@@ -1959,7 +1869,7 @@ api!(napi_create_external_arraybuffer(
         return Err(10);
     }
     if let Some(callback) = callback {
-        env.finalizers.borrow_mut().insert(id, Finalizer { callback, data, hint });
+        env.holders.borrow_mut().insert(id, Tracked { object: 0, kind: Kind::Finalizer, finalizer: Some(Finalizer { callback, data, hint }) });
     }
     env.value(result, value)
 });
@@ -2144,8 +2054,7 @@ api!(napi_get_dataview_info(
     buffer: *mut Ptr,
     offset: *mut usize,
 ) {
-    let valid = env.js("is_dataview", &[value])?;
-    check((env.api.to_boolean)(env.ctx, valid), 1)?;
+    check(env.truthy("is_dataview", &[value])?, 1)?;
     let array = env.js("get", &[value, env.text("buffer")])?;
     check((env.api.typed_kind)(env.ctx, array, ptr::null_mut()) == 9, 1)?;
     let start = env.js("get", &[value, env.text("byteOffset")])?;
@@ -2190,12 +2099,12 @@ pub(crate) unsafe extern "C" fn load(
             .get(&(ctx as usize))
             .and_then(Weak::upgrade)
     });
-    let Some(env) = state else {
+    let Some(root) = state else {
         return ptr::null_mut();
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Ptr> {
         ensure!(count == 1, "Native addon loading needs one path");
-        env.load(&env.api.text(ctx, unsafe { *args }))
+        root.load(&root.api.text(ctx, unsafe { *args }))
     }));
     match outcome {
         Ok(Ok(value)) => value,
@@ -2204,10 +2113,12 @@ pub(crate) unsafe extern "C" fn load(
                 Ok(Err(error)) => format!("{error:#}"),
                 _ => "Native addon loading failed".into(),
             };
+            let string = root.api.string(&message);
             unsafe {
-                *exception = env.text(&message);
+                *exception = (root.api.make_string)(ctx, string);
+                (root.api.string_release)(string);
+                (root.api.undefined)(ctx)
             }
-            env.undefined()
         }
     }
 }
@@ -2223,10 +2134,8 @@ macro_rules! raw_api {
 api!(napi_adjust_external_memory(env, change: i64, result: *mut i64) {
     check(!result.is_null(), 1)?;
     // Report addon memory so GC can account for it. JSC does not accept decreases.
-    if change > 0
-        && let Some(report) = env.api.extra_memory
-    {
-        report(env.ctx, change as usize);
+    if change > 0 {
+        (env.api.extra_memory)(env.ctx, change as usize);
     }
     env.external.set(env.external.get().saturating_add(change).max(0));
     *result = env.external.get();
@@ -2286,19 +2195,10 @@ raw_api!(napi_fatal_error(
     message: *const c_char,
     message_length: usize,
 ) {
-    let text = |pointer: *const c_char, length: usize| unsafe {
-        if pointer.is_null() {
-            String::new()
-        } else if length == usize::MAX {
-            CStr::from_ptr(pointer).to_string_lossy().into_owned()
-        } else {
-            String::from_utf8_lossy(std::slice::from_raw_parts(pointer.cast(), length)).into_owned()
-        }
-    };
     eprintln!(
         "FATAL ERROR: {} {}",
-        text(location, location_length),
-        text(message, message_length)
+        String::from_utf8_lossy(unsafe { chars(location, location_length) }),
+        String::from_utf8_lossy(unsafe { chars(message, message_length) })
     );
     std::process::abort()
 });
@@ -2335,26 +2235,22 @@ static NODE_VERSION: Version = Version(NodeVersion {
 });
 
 api!(napi_get_node_version(env, result: *mut *const NodeVersion) {
-    let _ = env;
     check(!result.is_null(), 1)?;
     *result = &NODE_VERSION.0;
     Ok(())
 });
 api!(napi_get_uv_event_loop(env, result: *mut Ptr) {
-    let _ = env;
     check(!result.is_null(), 1)?;
     // Fail without libuv: a fake loop pointer can crash the addon.
     *result = ptr::null_mut();
     Err(9)
 });
 api!(napi_async_init(env, _resource: Ptr, name: Ptr, result: *mut Ptr) {
-    let _ = env;
     check(!name.is_null() && !result.is_null(), 1)?;
     *result = ptr::NonNull::<u8>::dangling().as_ptr().cast();
     Ok(())
 });
 api!(napi_async_destroy(env, context: Ptr) {
-    let _ = env;
     check(!context.is_null(), 1)
 });
 api!(napi_make_callback(
@@ -2408,12 +2304,12 @@ api!(napi_get_all_property_names(
 api!(napi_detach_arraybuffer(env, value: Ptr) {
     check(!value.is_null(), 1)?;
     check((env.api.typed_kind)(env.ctx, value, ptr::null_mut()) == 9, 19)?;
-    check((env.api.to_boolean)(env.ctx, env.js("detach", &[value])?), 20)
+    check(env.truthy("detach", &[value])?, 20)
 });
 api!(napi_is_detached_arraybuffer(env, value: Ptr, result: *mut bool) {
     check(!value.is_null() && !result.is_null(), 1)?;
     *result = (env.api.typed_kind)(env.ctx, value, ptr::null_mut()) == 9
-        && (env.api.to_boolean)(env.ctx, env.js("get", &[value, env.text("detached")])?);
+        && env.truthy("get", &[value, env.text("detached")])?;
     Ok(())
 });
 api!(napi_create_bigint_words(
@@ -2490,7 +2386,6 @@ api!(napi_create_async_work(
     data: Ptr,
     result: *mut Ptr,
 ) {
-    let _ = env;
     check(!result.is_null(), 1)?;
     *result = Box::into_raw(Box::new(AsyncWork {
         execute: execute.ok_or(1)?,
@@ -2502,7 +2397,6 @@ api!(napi_create_async_work(
     Ok(())
 });
 api!(napi_delete_async_work(env, work: Ptr) {
-    let _ = env;
     check(!work.is_null(), 1)?;
     drop(Box::from_raw(work.cast::<AsyncWork>()));
     Ok(())
@@ -2526,14 +2420,12 @@ api!(napi_queue_async_work(env, work: Ptr) {
         item.state.store(IDLE, Ordering::Release);
         9
     })?;
-    env.active.set(env.active.get() + 1);
     let mut works = env.works.borrow_mut();
     works.retain(|state| state.load(Ordering::Acquire) != IDLE);
     works.push(item.state.clone());
     Ok(())
 });
 api!(napi_cancel_async_work(env, work: Ptr) {
-    let _ = env;
     check(!work.is_null(), 1)?;
     check((*work.cast::<AsyncWork>()).state.compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire).is_ok(), 9)
 });
@@ -2597,7 +2489,6 @@ api!(napi_create_threadsafe_function(
         check(env.kind(function)? == 7, 5)?;
         (env.api.protect)(env.ctx, function);
     }
-    env.threadsafe.set(env.threadsafe.get() + 1);
     let function = Arc::new(Threadsafe {
         thread: env.thread,
         function: function as usize,
@@ -2695,16 +2586,12 @@ raw_api!(napi_release_threadsafe_function(function: *const Threadsafe, mode: i32
 });
 api!(napi_unref_threadsafe_function(env, function: Ptr) {
     check(!function.is_null(), 1)?;
-    if (*function.cast::<Threadsafe>()).referenced.swap(false, Ordering::AcqRel) {
-        env.threadsafe.set(env.threadsafe.get().saturating_sub(1));
-    }
+    (*function.cast::<Threadsafe>()).referenced.store(false, Ordering::Release);
     Ok(())
 });
 api!(napi_ref_threadsafe_function(env, function: Ptr) {
     check(!function.is_null(), 1)?;
-    if !(*function.cast::<Threadsafe>()).referenced.swap(true, Ordering::AcqRel) {
-        env.threadsafe.set(env.threadsafe.get() + 1);
-    }
+    (*function.cast::<Threadsafe>()).referenced.store(true, Ordering::Release);
     Ok(())
 });
 
@@ -2719,10 +2606,7 @@ impl State {
         }
     }
 
-    pub(crate) fn drain(self: &Rc<Self>) {
-        for environment in self.environments.borrow().clone() {
-            environment.drain();
-        }
+    fn drain(self: &Rc<Self>) {
         let items = std::mem::take(
             &mut *self
                 .ready
@@ -2732,7 +2616,6 @@ impl State {
         for item in items {
             match item {
                 Ready::Work(work, status) => {
-                    self.active.set(self.active.get().saturating_sub(1));
                     let (complete, data) = unsafe {
                         let work = &*(work as *const AsyncWork);
                         work.state.store(IDLE, Ordering::Release);
@@ -2784,9 +2667,6 @@ impl State {
     // Pass queued values to the callback with a null environment at shutdown so it can free them.
     fn end_threadsafe(&self, function: &Threadsafe) {
         function.finalized.store(true, Ordering::Release);
-        if function.referenced.load(Ordering::Acquire) {
-            self.threadsafe.set(self.threadsafe.get().saturating_sub(1));
-        }
         if let Some(finalize) = function.finalize {
             unsafe { finalize(self, function.finalize_data as Ptr, function.context as Ptr) };
         }
@@ -2813,14 +2693,16 @@ impl State {
         }
     }
 
-    pub(crate) fn pending(&self) -> bool {
-        self.active.get() > 0
-            || self.threadsafe.get() > 0
+    fn pending(&self) -> bool {
+        self.works
+            .borrow()
+            .iter()
+            .any(|state| state.load(Ordering::Acquire) != IDLE)
             || self
-                .environments
+                .threadsafe_live
                 .borrow()
-                .iter()
-                .any(|environment| environment.pending())
+                .values()
+                .any(|function| function.referenced.load(Ordering::Acquire))
     }
 }
 
@@ -2841,7 +2723,7 @@ mod tests {
         let root = CONTEXTS
             .with(|contexts| contexts.borrow().values().find_map(Weak::upgrade))
             .unwrap();
-        let env = State::new(api, root.ctx, &host, true).unwrap();
+        let env = State::new(api, root.ctx).unwrap();
         let raw = Rc::as_ptr(&env);
         let object = env.js("object", &[]).unwrap();
         env.externals
@@ -2856,7 +2738,14 @@ mod tests {
         );
         env.function("live", callback, ptr::null_mut()).unwrap();
         let native = *env.callbacks.borrow().keys().next().unwrap();
-        env.holders.borrow_mut().insert(u64::MAX, (native, 3));
+        env.holders.borrow_mut().insert(
+            u64::MAX,
+            Tracked {
+                object: native,
+                kind: Kind::Function,
+                finalizer: None,
+            },
+        );
         env.finalized.lock().unwrap().push(u64::MAX);
         env.sweep();
         assert!(

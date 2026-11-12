@@ -24,10 +24,6 @@
 #include <dlfcn.h>
 #include <pwd.h>
 
-uint32_t apps_theme_state(void);
-
-bool apps_reduce_motion(void) { return apps_theme_state() & 32; }
-
 static NSString *AppsThemeSource = @"system";
 static NSDictionary *AppsAboutOptions;
 static void (*AppsWake)(void);
@@ -540,7 +536,7 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
     } else if ([op isEqualToString:@"app.releaseInstance"]) {
         AppsNative *owner = AppsNativeOwner();
         if (owner.lockFD >= 0) { flock(owner.lockFD, LOCK_UN); close(owner.lockFD); owner.lockFD = -1; }
-    } else if ([op isEqualToString:@"app.hasInstance"]) result = @(AppsNativeOwner().lockFD >= 0);
+    }
     else if ([op isEqualToString:@"power.init"]) AppsNativeOwner();
     else if ([op isEqualToString:@"power.idle"]) result = @(CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState, kCGAnyInputEventType));
     else if ([op isEqualToString:@"power.thermal"]) result = @[@"nominal", @"fair", @"serious", @"critical"][MIN(3, MAX(0, NSProcessInfo.processInfo.thermalState))];

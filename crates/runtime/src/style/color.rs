@@ -30,48 +30,26 @@ const SPACES: [(&str, Space); 12] = [
     ("hwb", Space::Hwb),
 ];
 
-const SYSTEM_COLORS: [(&str, u32); 19] = [
-    ("canvas", 0xffffff),
-    ("canvastext", 0x000000),
-    ("linktext", 0x0000ee),
-    ("visitedtext", 0x551a8b),
-    ("activetext", 0xff0000),
-    ("buttonface", 0xefefef),
-    ("buttontext", 0x000000),
-    ("buttonborder", 0x000000),
-    ("field", 0xffffff),
-    ("fieldtext", 0x000000),
-    ("highlight", 0xb3d7ff),
-    ("highlighttext", 0x000000),
-    ("selecteditem", 0xe0e0e0),
-    ("selecteditemtext", 0x000000),
-    ("mark", 0xffff00),
-    ("marktext", 0x000000),
-    ("graytext", 0x808080),
-    ("accentcolor", 0x0075ff),
-    ("accentcolortext", 0xffffff),
-];
-
-const DARK_SYSTEM_COLORS: [(&str, &str); 19] = [
-    ("canvas", "#121212"),
-    ("canvastext", "#ffffff"),
-    ("linktext", "#9e9eff"),
-    ("visitedtext", "#d0adf0"),
-    ("activetext", "#ff0000"),
-    ("buttonface", "#6b6b6b"),
-    ("buttontext", "#ffffff"),
-    ("buttonborder", "#ffffff"),
-    ("field", "#3b3b3b"),
-    ("fieldtext", "#ffffff"),
-    ("highlight", "#b3d7ffcc"),
-    ("highlighttext", "#000000"),
-    ("selecteditem", "#99c8ff"),
-    ("selecteditemtext", "#3b3b3b"),
-    ("mark", "#ffff00"),
-    ("marktext", "#000000"),
-    ("graytext", "#808080"),
-    ("accentcolor", "#0075ff"),
-    ("accentcolortext", "#ffffff"),
+const SYSTEM_COLORS: [(&str, u32, &str); 19] = [
+    ("canvas", 0xffffff, "#121212"),
+    ("canvastext", 0x000000, "#ffffff"),
+    ("linktext", 0x0000ee, "#9e9eff"),
+    ("visitedtext", 0x551a8b, "#d0adf0"),
+    ("activetext", 0xff0000, "#ff0000"),
+    ("buttonface", 0xefefef, "#6b6b6b"),
+    ("buttontext", 0x000000, "#ffffff"),
+    ("buttonborder", 0x000000, "#ffffff"),
+    ("field", 0xffffff, "#3b3b3b"),
+    ("fieldtext", 0x000000, "#ffffff"),
+    ("highlight", 0xb3d7ff, "#b3d7ffcc"),
+    ("highlighttext", 0x000000, "#000000"),
+    ("selecteditem", 0xe0e0e0, "#99c8ff"),
+    ("selecteditemtext", 0x000000, "#3b3b3b"),
+    ("mark", 0xffff00, "#ffff00"),
+    ("marktext", 0x000000, "#000000"),
+    ("graytext", 0x808080, "#808080"),
+    ("accentcolor", 0x0075ff, "#0075ff"),
+    ("accentcolortext", 0xffffff, "#ffffff"),
 ];
 
 pub(crate) fn serialize(value: &str) -> Option<String> {
@@ -149,16 +127,14 @@ pub(crate) fn serialize(value: &str) -> Option<String> {
 }
 
 pub(crate) fn system(name: &str, dark: bool) -> Option<String> {
-    if dark {
-        return DARK_SYSTEM_COLORS
-            .iter()
-            .find(|(system, _)| system.eq_ignore_ascii_case(name))
-            .map(|(_, value)| (*value).to_owned());
-    }
-    SYSTEM_COLORS
+    let (_, light, night) = SYSTEM_COLORS
         .iter()
-        .find(|(system, _)| system.eq_ignore_ascii_case(name))
-        .map(|(_, value)| format!("#{value:06x}"))
+        .find(|(system, ..)| system.eq_ignore_ascii_case(name))?;
+    Some(if dark {
+        (*night).to_owned()
+    } else {
+        format!("#{light:06x}")
+    })
 }
 
 const SRGB_TO_XYZ: [[f64; 3]; 3] = [
@@ -253,6 +229,10 @@ thread_local! {
     static COLORS: std::cell::RefCell<rustc_hash::FxHashMap<Box<str>, Rgb>> = Default::default();
 }
 
+pub fn rgba((rgb, alpha): (u32, u8)) -> renderer::Color {
+    renderer::Color::hex(rgb << 8 | alpha as u32)
+}
+
 pub fn color(value: &str) -> Option<(u32, u8)> {
     let value = value.trim();
     if let Some(color) = COLORS.with_borrow(|colors| colors.get(value).copied()) {
@@ -329,7 +309,7 @@ fn parse(value: &str, depth: u8) -> Option<(Space, [f64; 3], f64)> {
             Err(()) => {
                 SYSTEM_COLORS
                     .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(value))?
+                    .find(|(name, ..)| name.eq_ignore_ascii_case(value))?
                     .1
             }
         };

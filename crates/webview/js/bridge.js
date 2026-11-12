@@ -1,5 +1,4 @@
-(() => {
-  const send = data => window.ipc.postMessage(JSON.stringify({ message: data, url: location.href, mainFrame: window === window.top }));
+send => {
   Object.defineProperty(window, 'apps', { value: Object.freeze({ postMessage: data => send({ kind: 'message', data }) }) });
   if (window === window.top) addEventListener('DOMContentLoaded', () => send({ kind: 'dom-ready' }), { once: true });
   for (const level of ['log', 'info', 'warn', 'error', 'debug']) {
@@ -11,4 +10,4 @@
   }
   addEventListener('error', event => send({ kind: 'error', message: event.message, source: event.filename, line: event.lineno }));
   addEventListener('unhandledrejection', event => send({ kind: 'error', message: String(event.reason) }));
-})();
+}

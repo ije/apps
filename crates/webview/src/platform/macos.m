@@ -114,7 +114,7 @@ static WKWebsiteDataStore *AppsDataStore(NSString *partition) {
 }
 @end
 
-void *apps_browser_create(void *parent, const char *optionsJSON, AppsCallback callback, void *context) {
+void *apps_browser_create(void *parent, const char *optionsJSON, const char *script, AppsCallback callback, void *context) {
     if (!NSApp || ![NSThread isMainThread]) return NULL;
     NSDictionary *options = AppsValue(optionsJSON) ?: @{};
     AppsBrowser *owner = [AppsBrowser new];
@@ -124,19 +124,17 @@ void *apps_browser_create(void *parent, const char *optionsJSON, AppsCallback ca
     owner.callback = callback;
     owner.context = context;
     WKWebViewConfiguration *configuration = [WKWebViewConfiguration new];
-    WKWebsiteDataStore *store = AppsDataStore(options[@"partition"] ?: ([options[@"persistent"] boolValue] ? @"persist:default" : @""));
+    WKWebsiteDataStore *store = AppsDataStore(options[@"partition"] ?: @"");
     if (!store) return NULL;
     configuration.websiteDataStore = store;
     WKWebpagePreferences *preferences = [WKWebpagePreferences new];
     preferences.allowsContentJavaScript = options[@"javascript"] ? [options[@"javascript"] boolValue] : YES;
     configuration.defaultWebpagePreferences = preferences;
     [configuration.userContentController addScriptMessageHandler:owner name:@"apps"];
-    NSString *source = @"(()=>{const send=data=>window.webkit.messageHandlers.apps.postMessage(data);if(window===window.top)addEventListener('DOMContentLoaded',()=>send({kind:'dom-ready'}),{once:true});Object.defineProperty(window,'apps',{value:Object.freeze({postMessage:data=>send({kind:'message',data})})});for(const level of ['log','info','warn','error','debug']){const original=console[level];console[level]=(...args)=>{original.apply(console,args);send({kind:'console',level,args:args.map(v=>{try{return typeof v==='string'?v:JSON.stringify(v)}catch{return String(v)}})})}};addEventListener('error',e=>send({kind:'error',message:e.message,source:e.filename,line:e.lineno}));addEventListener('unhandledrejection',e=>send({kind:'error',message:String(e.reason)}));})();";
-    [configuration.userContentController addUserScript:[[WKUserScript alloc] initWithSource:source injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
+    if (script) [configuration.userContentController addUserScript:[[WKUserScript alloc] initWithSource:@(script) injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO]];
     owner.view = [[WKWebView alloc] initWithFrame:NSMakeRect(0, 0, 800, 600) configuration:configuration];
     owner.view.navigationDelegate = owner;
-    [owner.view addObserver:owner forKeyPath:@"title" options:0 context:NULL];
-    for (NSString *path in @[ @"URL", @"canGoBack", @"canGoForward" ]) [owner.view addObserver:owner forKeyPath:path options:0 context:NULL];
+    for (NSString *path in @[ @"title", @"URL", @"canGoBack", @"canGoForward" ]) [owner.view addObserver:owner forKeyPath:path options:0 context:NULL];
     owner.view.UIDelegate = owner;
     if (@available(macOS 13.3, *)) owner.view.inspectable = [options[@"inspectable"] boolValue];
     if (parent) {
@@ -180,8 +178,7 @@ void apps_browser_destroy(void *handle) {
     for (void (^decide)(WKNavigationActionPolicy) in owner.decisions.allValues) decide(WKNavigationActionPolicyCancel);
     [owner.decisions removeAllObjects];
     [owner.view stopLoading];
-    [owner.view removeObserver:owner forKeyPath:@"title"];
-    for (NSString *path in @[ @"URL", @"canGoBack", @"canGoForward" ]) [owner.view removeObserver:owner forKeyPath:path];
+    for (NSString *path in @[ @"title", @"URL", @"canGoBack", @"canGoForward" ]) [owner.view removeObserver:owner forKeyPath:path];
     owner.view.navigationDelegate = nil;
     owner.view.UIDelegate = nil;
     [owner.view.configuration.userContentController removeScriptMessageHandlerForName:@"apps"];
@@ -242,11 +239,8 @@ char *apps_browser_command(void *handle, const char *operation, const char *argu
     else if ([op isEqualToString:@"appearance"]) {
         view.appearance = [args isEqual:@"dark"] ? [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua] : [args isEqual:@"light"] ? [NSAppearance appearanceNamed:NSAppearanceNameAqua] : nil;
     }
-    else if ([op isEqualToString:@"zoom"]) {
-        double zoom = [args doubleValue];
-        if (zoom < 0.25 || zoom > 5) return strdup("Zoom must be between 0.25 and 5");
-        view.pageZoom = zoom;
-    } else if ([op isEqualToString:@"evaluate"]) {
+    else if ([op isEqualToString:@"zoom"]) view.pageZoom = [args doubleValue];
+    else if ([op isEqualToString:@"evaluate"]) {
         NSNumber *request = args[@"id"];
         NSDictionary *arguments = @{ @"source": args[@"script"] };
         void (^done)(id, NSError *) = ^(id value, NSError *error) {

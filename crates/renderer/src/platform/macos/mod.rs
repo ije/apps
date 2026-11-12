@@ -28,7 +28,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSArray, NSString, NSURL, NSUserDefaults};
 use std::{
     cell::RefCell,
-    sync::{Mutex, MutexGuard},
+    sync::{Mutex, MutexGuard, PoisonError},
 };
 
 pub(crate) use controls::control_size;
@@ -58,10 +58,7 @@ impl<T> Sendable<T> {
 
 // A panic while a lock is held leaves its data usable here.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 define_class!(

@@ -65,9 +65,14 @@ impl Drop for WakeOnDrop {
     }
 }
 
-fn connected(doc: &Document, hosts: &rustc_hash::FxHashMap<usize, usize>, mut id: usize) -> bool {
+fn reaches(
+    doc: &Document,
+    hosts: &rustc_hash::FxHashMap<usize, usize>,
+    mut id: usize,
+    to: usize,
+) -> bool {
     loop {
-        if id == 0 {
+        if id == to {
             return true;
         }
         match doc
@@ -150,6 +155,13 @@ impl Host {
             Target::Window(id) if command["args"][0] == "create" => link.create_window(id, command),
             Target::Window(id) => link.page(ToPage::Window(id, command)),
         }
+    }
+
+    pub(crate) fn log(&mut self, entry: Value) {
+        if self.logs.len() == 500 {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(entry);
     }
 
     pub fn enabled(&self, feature: &str) -> bool {
@@ -306,7 +318,7 @@ impl Host {
                                 .parent
                                 .is_none_or(|parent| doc.nodes[parent].tag != "style"))
                             && state.computed.is_some()
-                            && connected(doc, &state.hosts, id)
+                            && reaches(doc, &state.hosts, id, 0)
                         {
                             state.invalidate();
                         }
@@ -342,16 +354,13 @@ impl Host {
                                 .is_some_and(|node| node.parent == Some(parent))),
                             "Reference is not a child"
                         );
-                        let mut ancestor = Some(parent);
-                        while let Some(id) = ancestor {
-                            ensure!(id != child, "Cannot create a DOM cycle");
-                            ancestor = doc.nodes[id]
-                                .parent
-                                .or_else(|| state.hosts.get(&id).copied());
-                        }
+                        ensure!(
+                            !reaches(doc, &state.hosts, parent, child),
+                            "Cannot create a DOM cycle"
+                        );
                         if state.computed.is_some()
-                            && (connected(doc, &state.hosts, parent)
-                                || connected(doc, &state.hosts, child))
+                            && (reaches(doc, &state.hosts, parent, 0)
+                                || reaches(doc, &state.hosts, child, 0))
                         {
                             state.invalidate();
                         }
@@ -411,7 +420,7 @@ impl Host {
                         {
                             prune(doc, previous);
                         }
-                        if state.computed.is_some() && connected(doc, &state.hosts, parent) {
+                        if state.computed.is_some() && reaches(doc, &state.hosts, parent, 0) {
                             state.invalidate();
                         }
                         doc.nodes[child].parent = None;
@@ -425,7 +434,7 @@ impl Host {
                         if doc.nodes[id].attrs.get(key).map(String::as_str) == value {
                             return Ok(false);
                         }
-                        if state.computed.is_some() && connected(doc, &state.hosts, id) {
+                        if state.computed.is_some() && reaches(doc, &state.hosts, id, 0) {
                             state.invalidate();
                         }
                         // Kept walks of the tree read these attributes, so their edits must use `get_mut` and
@@ -459,14 +468,11 @@ impl Host {
                             !state.shadows.contains_key(&host) && !state.hosts.contains_key(&root),
                             "Shadow root already exists"
                         );
-                        let mut current = Some(host);
-                        while let Some(id) = current {
-                            ensure!(id != root, "Cannot create a DOM cycle");
-                            current = doc.nodes[id]
-                                .parent
-                                .or_else(|| state.hosts.get(&id).copied());
-                        }
-                        if state.computed.is_some() && connected(doc, &state.hosts, host) {
+                        ensure!(
+                            !reaches(doc, &state.hosts, host, root),
+                            "Cannot create a DOM cycle"
+                        );
+                        if state.computed.is_some() && reaches(doc, &state.hosts, host, 0) {
                             state.invalidate();
                         }
                         state.shadows.insert(host, root);
@@ -489,7 +495,7 @@ impl Host {
                         };
                         if state.computed.is_some()
                             && empty(current.value.as_ref()) != empty(value.as_ref())
-                            && connected(doc, &state.hosts, id)
+                            && reaches(doc, &state.hosts, id, 0)
                         {
                             state.invalidate();
                         }
@@ -539,7 +545,7 @@ impl Host {
                         } else {
                             0
                         };
-                        if state.computed.is_some() && connected(doc, &state.hosts, id) {
+                        if state.computed.is_some() && reaches(doc, &state.hosts, id, 0) {
                             state.invalidate();
                         }
                         if let Some(node) = doc.nodes.edit(id) {
@@ -674,11 +680,8 @@ impl Host {
                 writeln!(std::io::stdout(), "{text}")
             };
             if !self.packaged {
-                if self.logs.len() == 500 {
-                    self.logs.pop_front();
-                }
                 let text: String = text.chars().take(16384).collect();
-                self.logs.push_back(json!({"method":"Runtime.consoleAPICalled","params":{"type":args[1].as_str().unwrap_or("log"),"text":text,"context":role,"ref":args[2]}}));
+                self.log(json!({"method":"Runtime.consoleAPICalled","params":{"type":args[1].as_str().unwrap_or("log"),"text":text,"context":role,"ref":args[2]}}));
             }
             return Ok(Value::Null);
         }
@@ -819,12 +822,10 @@ impl Host {
                 });
             }
             if op == "dom.fonts" {
-                let system = state.text_system.clone();
                 crate::dom::styles(
                     &mut page.doc,
                     state,
                     *self.viewports.get(&id).unwrap_or(&[800., 600.]),
-                    system.as_deref().map(|system| (system, state.pixel_ratio)),
                 );
                 let loaded = crate::render::fonts::load(&page.doc, state, &self.assets);
                 page.dirty |= std::mem::take(&mut state.dirty);
@@ -852,7 +853,7 @@ impl Host {
                 || op == "dom.html"
                     && args[0]
                         .as_u64()
-                        .is_some_and(|id| connected(&page.doc, &state.hosts, id as usize))
+                        .is_some_and(|id| reaches(&page.doc, &state.hosts, id as usize, 0))
             {
                 state.invalidate();
             }
@@ -862,8 +863,7 @@ impl Host {
                 &mut page.doc,
                 state,
                 *self.viewports.get(&id).unwrap_or(&[800., 600.]),
-            )
-            .unwrap_or_else(|| Err(anyhow::anyhow!("Unknown DOM operation: {op}")));
+            );
             page.dirty |= std::mem::take(&mut state.dirty);
             // Clear retired worker images here: workers have no renderer to release them.
             if id == WORKER_PAGE {

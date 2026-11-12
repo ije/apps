@@ -14,7 +14,7 @@ pub(crate) const IDENTITY: [f32; 16] = [
 
 const HALF_RESOLUTION_SIGMA: f32 = 8.;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum Target {
     Frame,
     Layer(usize),
@@ -81,6 +81,65 @@ pub struct RenderFrame {
     pub promoted: Vec<(usize, Target, [i32; 4])>,
 }
 
+// The layer textures of a backend. A texture that no frame used for this many frames is dropped.
+const SPARE_FRAMES: u8 = 3;
+
+pub(crate) struct Pool<T> {
+    textures: Vec<(T, [u32; 2], u8)>,
+    slots: Vec<usize>,
+}
+
+impl<T> Default for Pool<T> {
+    fn default() -> Self {
+        Self {
+            textures: Vec::new(),
+            slots: Vec::new(),
+        }
+    }
+}
+
+impl<T> Pool<T> {
+    pub fn fill(
+        &mut self,
+        frame: &RenderFrame,
+        mut make: impl FnMut([u32; 2]) -> anyhow::Result<T>,
+    ) -> anyhow::Result<()> {
+        for (.., idle) in &mut self.textures {
+            *idle = idle.saturating_add(1);
+        }
+        self.textures.retain(|(.., idle)| *idle <= SPARE_FRAMES);
+        self.slots.clear();
+        for &size in &frame.textures {
+            let index = match self
+                .textures
+                .iter()
+                .position(|(_, kept, idle)| *idle > 0 && *kept == size)
+            {
+                Some(index) => index,
+                None => {
+                    self.textures.push((make(size)?, size, 0));
+                    self.textures.len() - 1
+                }
+            };
+            self.textures[index].2 = 0;
+            self.slots.push(index);
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, frame: &RenderFrame, target: Target) -> Option<&T> {
+        let Target::Layer(index) = target else {
+            return None;
+        };
+        Some(&self.textures[self.slots[frame.layers[index].texture]].0)
+    }
+
+    pub fn clear(&mut self) {
+        self.textures.clear();
+        self.slots.clear();
+    }
+}
+
 pub fn region(bounds: Rect<f32>) -> [i32; 4] {
     let [x, y] = [bounds.origin.x.floor(), bounds.origin.y.floor()];
     let [right, bottom] = [
@@ -111,7 +170,7 @@ impl RenderFrame {
                 continue;
             };
             let region = region(bounds);
-            let target = self.acquire(region);
+            let target = self.acquire(region, 1);
             self.record_layer(scene, layer, target, true, 1);
             self.promoted.push((layer, target, region));
         }
@@ -172,11 +231,7 @@ impl RenderFrame {
         }
     }
 
-    fn acquire(&mut self, region: [i32; 4]) -> Target {
-        self.acquire_scaled(region, 1)
-    }
-
-    fn acquire_scaled(&mut self, region: [i32; 4], scale: i32) -> Target {
+    fn acquire(&mut self, region: [i32; 4], scale: i32) -> Target {
         let size = [region[2], region[3]].map(|side| (side.max(1) as u32).div_ceil(scale as u32));
         let fit = self
             .free
@@ -319,7 +374,13 @@ impl RenderFrame {
                     .instances
                     .iter()
                     .enumerate()
-                    .filter(|(_, instance)| instance.is_opaque_rect())
+                    .filter(|(_, instance)| {
+                        instance.kind() == BOX
+                            && instance.color[3] >= 1.
+                            && instance.aux == [0.; 4]
+                            && instance.radii == [0.; 8]
+                            && instance.round_radii == [0.; 8]
+                    })
                     .filter_map(|(at, instance)| {
                         let bounds = instance.reach();
                         let area = bounds.size.width * bounds.size.height;
@@ -455,7 +516,7 @@ impl RenderFrame {
             Target::Frame => region,
         };
         let scale = if sigma >= HALF_RESOLUTION_SIGMA { 2 } else { 1 };
-        let horizontal = self.acquire_scaled(covered, scale);
+        let horizontal = self.acquire(covered, scale);
         self.blur_pass(src, horizontal, region, sigma, [1., 0.]);
         if release {
             self.release(src);
@@ -463,7 +524,7 @@ impl RenderFrame {
         if scale == 1 {
             return (horizontal, sigma);
         }
-        let both = self.acquire_scaled(covered, scale);
+        let both = self.acquire(covered, scale);
         self.blur_pass(horizontal, both, region, sigma, [0., 1.]);
         self.release(horizontal);
         (both, 0.)
@@ -574,7 +635,7 @@ impl RenderFrame {
             && self.copy
             && let Some(region) = self.region(backdrop.bounds.outset(backdrop.blur * 3.), visible)
         {
-            let copy = self.acquire(region);
+            let copy = self.acquire(region, 1);
             self.commands.push(Command::Copy {
                 src: target,
                 dst: copy,
@@ -630,8 +691,10 @@ impl RenderFrame {
                 tile
             }
             None => {
-                let texture =
-                    self.acquire([region[0] - 1, region[1] - 1, region[2] + 2, region[3] + 2]);
+                let texture = self.acquire(
+                    [region[0] - 1, region[1] - 1, region[2] + 2, region[3] + 2],
+                    1,
+                );
                 self.record_layer(scene, nested.layer, texture, true, depth + 1);
                 texture
             }
@@ -659,12 +722,16 @@ impl RenderFrame {
             } else {
                 (texture, 0.)
             };
-            let rgba = color;
             let mut composite = base;
             composite.flags |= COMPOSITE_SHADOW;
             composite.blur = left;
-            composite.shadow = [offset.x, offset.y, sigma, 0.];
-            composite.shadow_color = [rgba.r * rgba.a, rgba.g * rgba.a, rgba.b * rgba.a, rgba.a];
+            composite.shadow = [offset.x, offset.y, 0., 0.];
+            composite.shadow_color = [
+                color.r * color.a,
+                color.g * color.a,
+                color.b * color.a,
+                color.a,
+            ];
             composite.bounds = [
                 region_rect[0] + offset.x,
                 region_rect[1] + offset.y,
@@ -691,7 +758,7 @@ impl RenderFrame {
             .then(|| self.region(nested.bounds, visible))
             .flatten()
             .map(|region| {
-                let copy = self.acquire(region);
+                let copy = self.acquire(region, 1);
                 self.commands.push(Command::Copy {
                     src: target,
                     dst: copy,
@@ -725,30 +792,10 @@ impl RenderFrame {
 mod tests {
     use super::{Command, RenderFrame};
     use crate::{
-        Clip, Rect, Size,
-        gpu::{BOX, GLYPH, IMAGE, Instance, bytes},
-        scene::{EffectState, Scene},
+        Clip,
+        gpu::{BOX, GLYPH, IMAGE, Instance, bytes, rect as bounds},
+        scene::{EffectState, Scene, effect},
     };
-
-    fn bounds([x, y, w, h]: [f32; 4]) -> Rect<f32> {
-        Rect::new(crate::point(x, y), Size::new(w, h))
-    }
-
-    fn effect(content_mask: Clip<f32>) -> EffectState {
-        EffectState {
-            transform: None,
-            opacity: 1.,
-            color_matrix: None,
-            blur: 0.,
-            shadow: None,
-            blend_mode: Default::default(),
-            clip: None,
-            mask: None,
-            backdrop: None,
-            glass: None,
-            content_mask,
-        }
-    }
 
     fn record(window: [u32; 2], quad: [f32; 4], scale: f32) -> RenderFrame {
         let mask = Clip::from(bounds([-1e6, -1e6, 2e6, 2e6]));
@@ -962,6 +1009,33 @@ mod tests {
             _ => None,
         });
         assert_eq!(source.map(|rect| [rect[2], rect[3]]), Some([256., 256.]));
+    }
+
+    #[test]
+    fn pooled_textures_outlive_two_idle_frames() {
+        let used = record([800, 600], [100., 100., 24., 24.], 1.);
+        let (idle, mut pool, mut made) = (RenderFrame::default(), super::Pool::default(), 0);
+        let mut fill = |pool: &mut super::Pool<usize>, frame: &RenderFrame| {
+            pool.fill(frame, |_| {
+                made += 1;
+                Ok(made)
+            })
+            .unwrap();
+        };
+        fill(&mut pool, &used);
+        let target = super::Target::Layer(0);
+        assert_eq!(pool.get(&used, target), Some(&1));
+        assert_eq!(pool.get(&used, super::Target::Frame), None);
+        for _ in 0..2 {
+            fill(&mut pool, &idle);
+        }
+        fill(&mut pool, &used);
+        assert_eq!(pool.get(&used, target), Some(&1));
+        for _ in 0..3 {
+            fill(&mut pool, &idle);
+        }
+        fill(&mut pool, &used);
+        assert_eq!(pool.get(&used, target), Some(&2));
     }
 
     #[test]

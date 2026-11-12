@@ -235,6 +235,30 @@ fn scrollbars_fade_after_a_drag_that_ends_outside_the_window() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn background_images_decode_and_draw() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const red = async () => {
+            const bytes = (await win.webContents.capturePage({ x: 10, y: 10, width: 40, height: 40 })).toBitmap();
+            let count = 0;
+            for (let i = 0; i < bytes.length; i += 4) if (bytes[i + 2] > 200 && bytes[i + 1] < 60 && bytes[i] < 60) count++;
+            return count;
+        };
+        let count = 0;
+        for (let n = 0; n < 40 && count < 1600; n++) count = await red();
+        if (count < 1600) fail('background image did not draw: ' + count);
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0;background:white'><div style='width:60px;height:60px;background-size:100% 100%;\
+             background-image:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==)'></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn stretched_images_keep_their_size_when_they_restyle_in_place() {
     run_hidden(
         r#"
@@ -2077,4 +2101,35 @@ fn scroll_sizes_count_overflowing_content_like_chrome() {
         &[("page.html", "<!doctype html><body style='margin:0'></body>")],
     );
     assert!(text.contains("SIZES 34,42,34,0,50,80"), "{text}");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn lines_pushed_down_by_tall_rows_paint_below_the_clip_top() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        await win.webContents.capturePage();
+        // Counts the dark device pixels of the text. Each hard line holds a 100 px inline-block, so the
+        // lines in the window are far below where their line height alone would put them. The last line is
+        // below the window, so only lines in the middle can paint.
+        const ink = (await win.webContents.capturePage({ x: 0, y: 0, width: 400, height: 300 })).toBitmap().filter((value, index) => index % 4 === 0 && value < 128).length;
+        if (ink < 50) fail('no text in view: ' + ink);
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0;background:#fff'>\
+             <p style='margin:0;position:relative;top:-250px;font-size:20px;line-height:20px;color:#000'>\
+             XX<span style='display:inline-block;width:10px;height:100px'></span><br>\
+             XX<span style='display:inline-block;width:10px;height:100px'></span><br>\
+             XX<span style='display:inline-block;width:10px;height:100px'></span><br>\
+             XX<span style='display:inline-block;width:10px;height:100px'></span><br>\
+             XX<span style='display:inline-block;width:10px;height:100px'></span><br>\
+             XX<span style='display:inline-block;width:10px;height:100px'></span><br>\
+             XX<span style='display:inline-block;width:10px;height:100px'></span><br>\
+             XX<span style='display:inline-block;width:10px;height:100px'></span><br>\
+             XX<span style='display:inline-block;width:10px;height:100px'></span><br>\
+             XX<span style='display:inline-block;width:10px;height:100px'></span></p></body>",
+        )],
+    );
 }

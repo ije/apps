@@ -14,9 +14,9 @@ use std::{
     rc::Rc,
 };
 
-type Script = (&'static str, fn() -> &'static str);
+type Source = (&'static str, fn() -> &'static str);
 
-const NODE_SCRIPTS: [Script; 12] = [
+const NODE_SCRIPTS: [Source; 14] = [
     ("apps:ffi", || js!("node/ffi.js")),
     ("apps:sqlite", || js!("node/sqlite.js")),
     ("apps:events", || js!("events.js")),
@@ -29,15 +29,15 @@ const NODE_SCRIPTS: [Script; 12] = [
     ("apps:net", || js!("node/net.js")),
     ("apps:pty", || js!("node/pty.js")),
     ("apps:node-compat", || js!("node/compat.js")),
+    ("apps:browser", || js!("browser.js")),
+    ("apps:electron", || js!("electron.js")),
 ];
-const WEB_SCRIPTS: [Script; 13] = [
+const WEB_SCRIPTS: [Source; 11] = [
     ("apps:streams", || js!("web/streams.js")),
     ("apps:crypto", || js!("web/crypto.js")),
     ("apps:web", || js!("web/index.js")),
     ("apps:platform", || js!("web/platform.js")),
     ("apps:bridge", || js!("bridge.js")),
-    ("apps:browser", || js!("browser.js")),
-    ("apps:electron", || js!("electron.js")),
     ("apps:worker", || js!("web/worker.js")),
     ("apps:browser-environment", || js!("web/environment.js")),
     ("apps:inspect", || js!("inspect.js")),
@@ -45,7 +45,7 @@ const WEB_SCRIPTS: [Script; 13] = [
     ("apps:wasm", || js!("web/wasm.js")),
     ("apps:file-system", || js!("web/file_system.js")),
 ];
-const PAGE_SCRIPTS: [Script; 2] = [
+const PAGE_SCRIPTS: [Source; 2] = [
     ("apps:gpu", || js!("web/gpu.js")),
     ("apps:dom", || js!("dom.js")),
 ];
@@ -63,11 +63,19 @@ pub fn runtime_scripts() -> impl Iterator<Item = (&'static str, &'static str)> {
 pub(crate) type Ptr = *mut c_void;
 type Callback = unsafe extern "C" fn(Ptr, Ptr, Ptr, usize, *const Ptr, *mut Ptr) -> Ptr;
 
-type Scripts = (
-    Vec<(&'static str, &'static str, Option<&'static [u8]>)>,
-    bool,
-);
-static SCRIPTS: std::sync::Mutex<Scripts> = std::sync::Mutex::new((Vec::new(), false));
+struct Script {
+    url: &'static str,
+    source: &'static str,
+    bytecode: Option<&'static [u8]>,
+}
+struct Scripts {
+    list: Vec<Script>,
+    building: bool,
+}
+static SCRIPTS: std::sync::Mutex<Scripts> = std::sync::Mutex::new(Scripts {
+    list: Vec::new(),
+    building: false,
+});
 
 pub struct JavaScriptCore {
     aot: Option<&'static aot::Image>,
@@ -75,34 +83,29 @@ pub struct JavaScriptCore {
     group: Ptr,
     group_release: unsafe extern "C" fn(Ptr),
     garbage_collect: unsafe extern "C" fn(Ptr),
-    shrink: Option<unsafe extern "C" fn(Ptr)>,
-    pub(crate) drain: Option<unsafe extern "C" fn(Ptr)>,
-    evaluate_latin1: Option<
-        unsafe extern "C" fn(
-            Ptr,
-            *const c_char,
-            usize,
-            Ptr,
-            Ptr,
-            *const u8,
-            usize,
-            *mut Ptr,
-        ) -> Ptr,
-    >,
-    create_bytecode:
-        Option<unsafe extern "C" fn(Ptr, *const c_char, usize, Ptr, *mut usize) -> *mut u8>,
-    pub(crate) busy: std::cell::Cell<std::time::Duration>,
+    shrink: unsafe extern "C" fn(Ptr),
+    drain: unsafe extern "C" fn(Ptr),
+    evaluate_latin1: unsafe extern "C" fn(
+        Ptr,
+        *const c_char,
+        usize,
+        Ptr,
+        Ptr,
+        *const u8,
+        usize,
+        *mut Ptr,
+    ) -> Ptr,
+    create_bytecode: unsafe extern "C" fn(Ptr, *const c_char, usize, Ptr, *mut usize) -> *mut u8,
+    busy: std::cell::Cell<std::time::Duration>,
     busy_mark: std::cell::Cell<(std::time::Instant, std::time::Duration)>,
     burst: std::cell::Cell<bool>,
     quiet: std::cell::Cell<u32>,
     shrunk: std::cell::Cell<std::time::Instant>,
     pub(crate) idle: std::cell::Cell<bool>,
-    inspectable: Option<unsafe extern "C" fn(Ptr, bool)>,
-    pub(crate) extra_memory: Option<unsafe extern "C" fn(Ptr, usize)>,
-    set_name: Option<unsafe extern "C" fn(Ptr, Ptr)>,
-    context_group: unsafe extern "C" fn(Ptr) -> Ptr,
-    execution_limit:
-        Option<unsafe extern "C" fn(Ptr, f64, Option<unsafe extern "C" fn(Ptr, Ptr) -> bool>, Ptr)>,
+    inspectable: unsafe extern "C" fn(Ptr, bool),
+    pub(crate) extra_memory: unsafe extern "C" fn(Ptr, usize),
+    set_name: unsafe extern "C" fn(Ptr, Ptr),
+    execution_limit: Limit,
     create: unsafe extern "C" fn(Ptr, Ptr) -> Ptr,
     release: unsafe extern "C" fn(Ptr),
     pub(crate) string_create: unsafe extern "C" fn(*const u16, usize) -> Ptr,
@@ -126,13 +129,13 @@ pub struct JavaScriptCore {
     pub(crate) invoke: unsafe extern "C" fn(Ptr, Ptr, Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
     pub(crate) protect: unsafe extern "C" fn(Ptr, Ptr),
     pub(crate) unprotect: unsafe extern "C" fn(Ptr, Ptr),
-    pub(crate) object_make: unsafe extern "C" fn(Ptr, Ptr, Ptr) -> Ptr,
+    object_make: unsafe extern "C" fn(Ptr, Ptr, Ptr) -> Ptr,
     pub(crate) global: unsafe extern "C" fn(Ptr) -> Ptr,
     pub(crate) function: unsafe extern "C" fn(Ptr, Ptr, Callback) -> Ptr,
     pub(crate) get: unsafe extern "C" fn(Ptr, Ptr, Ptr, *mut Ptr) -> Ptr,
     rejection_callback: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr),
-    module_loader: Option<unsafe extern "C" fn(Ptr, Ptr)>,
-    pub(crate) set: unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, u32, *mut Ptr),
+    module_loader: unsafe extern "C" fn(Ptr, Ptr),
+    set: unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, u32, *mut Ptr),
     pub(crate) undefined: unsafe extern "C" fn(Ptr) -> Ptr,
     pub(crate) null: unsafe extern "C" fn(Ptr) -> Ptr,
     pub(crate) boolean: unsafe extern "C" fn(Ptr, bool) -> Ptr,
@@ -147,13 +150,13 @@ pub struct JavaScriptCore {
     pub(crate) typed_buffer: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr) -> Ptr,
     pub(crate) buffer_bytes: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr) -> Ptr,
     pub(crate) buffer_length: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr) -> usize,
-    pub(crate) get_index: unsafe extern "C" fn(Ptr, Ptr, u32, *mut Ptr) -> Ptr,
+    get_index: unsafe extern "C" fn(Ptr, Ptr, u32, *mut Ptr) -> Ptr,
     set_index: unsafe extern "C" fn(Ptr, Ptr, u32, Ptr, *mut Ptr),
     make_error: unsafe extern "C" fn(Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
     make_array: unsafe extern "C" fn(Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
     typed_from_buffer: unsafe extern "C" fn(Ptr, u32, Ptr, *mut Ptr) -> Ptr,
-    memory: Option<unsafe extern "C" fn(Ptr) -> Ptr>,
-    proxy_target: Option<unsafe extern "C" fn(Ptr) -> Ptr>,
+    memory: unsafe extern "C" fn(Ptr) -> Ptr,
+    proxy_target: unsafe extern "C" fn(Ptr) -> Ptr,
     json_string: unsafe extern "C" fn(Ptr, Ptr, u32, *mut Ptr) -> Ptr,
     get_chars: unsafe extern "C" fn(Ptr, Ptr, *mut usize, *mut bool) -> *const c_void,
     get_bytes: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr, *mut usize) -> bool,
@@ -166,6 +169,7 @@ pub struct JavaScriptCore {
     inspector: Option<Inspector>,
 }
 
+type Limit = unsafe extern "C" fn(Ptr, f64, Option<unsafe extern "C" fn(Ptr, Ptr) -> bool>, Ptr);
 type InspectorMessage = unsafe extern "C" fn(Ptr, *const c_char, usize);
 type InspectorPause = unsafe extern "C" fn(Ptr, *mut bool);
 
@@ -270,32 +274,16 @@ impl JavaScriptCore {
             Ok(Rc::new(Self {
                 aot: aot::load(&library, &image)?,
                 group: group.unwrap_or_else(|| group_create()),
-                inspectable: library
-                    .get(b"JSGlobalContextSetInspectable\0")
-                    .ok()
-                    .map(|s| *s),
-                extra_memory: library.get(b"JSReportExtraMemoryCost\0").ok().map(|s| *s),
-                set_name: library.get(b"JSGlobalContextSetName\0").ok().map(|s| *s),
-                context_group: *library.get(b"JSContextGetGroup\0")?,
-                execution_limit: library
-                    .get(b"JSContextGroupSetExecutionTimeLimit\0")
-                    .ok()
-                    .map(|s| *s),
+                inspectable: *library.get(b"JSGlobalContextSetInspectable\0")?,
+                extra_memory: *library.get(b"JSReportExtraMemoryCost\0")?,
+                set_name: *library.get(b"JSGlobalContextSetName\0")?,
+                execution_limit: *library.get(b"JSContextGroupSetExecutionTimeLimit\0")?,
                 group_release: *library.get(b"JSContextGroupRelease\0")?,
                 garbage_collect: *library.get(b"JSSynchronousGarbageCollectForDebugging\0")?,
-                shrink: library
-                    .get(b"JSContextGroupShrinkFootprint\0")
-                    .ok()
-                    .map(|s| *s),
-                drain: library
-                    .get(b"JSGlobalContextDrainMicrotasks\0")
-                    .ok()
-                    .map(|s| *s),
-                evaluate_latin1: library.get(b"JSEvaluateScriptLatin1\0").ok().map(|s| *s),
-                create_bytecode: library
-                    .get(b"JSScriptCreateBytecodeLatin1\0")
-                    .ok()
-                    .map(|s| *s),
+                shrink: *library.get(b"JSContextGroupShrinkFootprint\0")?,
+                drain: *library.get(b"JSGlobalContextDrainMicrotasks\0")?,
+                evaluate_latin1: *library.get(b"JSEvaluateScriptLatin1\0")?,
+                create_bytecode: *library.get(b"JSScriptCreateBytecodeLatin1\0")?,
                 busy: Default::default(),
                 busy_mark: std::cell::Cell::new((std::time::Instant::now(), Default::default())),
                 burst: Default::default(),
@@ -324,10 +312,7 @@ impl JavaScriptCore {
                 get: *library.get(b"JSObjectGetProperty\0")?,
                 rejection_callback: *library
                     .get(b"JSGlobalContextSetUnhandledRejectionCallback\0")?,
-                module_loader: library
-                    .get(b"JSGlobalContextSetModuleLoader\0")
-                    .ok()
-                    .map(|s| *s),
+                module_loader: *library.get(b"JSGlobalContextSetModuleLoader\0")?,
                 set: *library.get(b"JSObjectSetProperty\0")?,
                 undefined: *library.get(b"JSValueMakeUndefined\0")?,
                 null: *library.get(b"JSValueMakeNull\0")?,
@@ -348,11 +333,8 @@ impl JavaScriptCore {
                 make_error: *library.get(b"JSObjectMakeError\0")?,
                 make_array: *library.get(b"JSObjectMakeArray\0")?,
                 typed_from_buffer: *library.get(b"JSObjectMakeTypedArrayWithArrayBuffer\0")?,
-                memory: library
-                    .get(b"JSGetMemoryUsageStatistics\0")
-                    .ok()
-                    .map(|s| *s),
-                proxy_target: library.get(b"JSObjectGetProxyTarget\0").ok().map(|s| *s),
+                memory: *library.get(b"JSGetMemoryUsageStatistics\0")?,
+                proxy_target: *library.get(b"JSObjectGetProxyTarget\0")?,
                 json_string: *library.get(b"JSValueCreateJSONString\0")?,
                 get_chars: *library.get(b"JSValueGetStringCharacters\0")?,
                 get_bytes: *library.get(b"JSValueGetBytes\0")?,
@@ -413,8 +395,37 @@ impl JavaScriptCore {
         }
     }
 
+    // WARNING: JSC keeps pointing at `source` and `bytecode`, so both must outlive the VM.
+    unsafe fn evaluate_latin1(
+        &self,
+        ctx: Ptr,
+        source: &[u8],
+        this: Ptr,
+        url: Ptr,
+        bytecode: &[u8],
+        exception: *mut Ptr,
+    ) -> Ptr {
+        let bytecode_ptr = if bytecode.is_empty() {
+            ptr::null()
+        } else {
+            bytecode.as_ptr()
+        };
+        unsafe {
+            (self.evaluate_latin1)(
+                ctx,
+                source.as_ptr().cast(),
+                source.len(),
+                this,
+                url,
+                bytecode_ptr,
+                bytecode.len(),
+                exception,
+            )
+        }
+    }
+
     pub(crate) fn shrink_pending(&self) -> bool {
-        self.shrink.is_some() && self.busy.get() >= std::time::Duration::from_millis(20)
+        self.busy.get() >= std::time::Duration::from_millis(20)
     }
 
     // JSC's GC timers never fire here. Ignore idle polls and timers when scheduling costly collections that
@@ -441,13 +452,11 @@ impl JavaScriptCore {
     }
 
     pub(crate) fn shrink(&self) {
-        if let Some(shrink) = self.shrink {
-            self.busy.set(Default::default());
-            self.burst.set(false);
-            self.quiet.set(0);
-            self.shrunk.set(std::time::Instant::now());
-            unsafe { shrink(self.group) };
-        }
+        self.busy.set(Default::default());
+        self.burst.set(false);
+        self.quiet.set(0);
+        self.shrunk.set(std::time::Instant::now());
+        unsafe { (self.shrink)(self.group) };
     }
 }
 
@@ -458,42 +467,40 @@ impl Drop for JavaScriptCore {
 }
 
 // The bytecode is never freed, because decoded code points into it.
-fn create_bytecode(
-    api: &JavaScriptCore,
-    ctx: Ptr,
-    url: &str,
-    source: &str,
-) -> Result<&'static [u8]> {
-    let create = api
-        .create_bytecode
-        .context("This JavaScriptCore can't build bytecode")?;
+fn create_bytecode(api: &JavaScriptCore, ctx: Ptr, url: &str, source: &str) -> &'static [u8] {
     let name = api.string(url);
     let mut size = 0;
-    let data = unsafe { create(ctx, source.as_ptr().cast(), source.len(), name, &mut size) };
+    let data = unsafe {
+        (api.create_bytecode)(ctx, source.as_ptr().cast(), source.len(), name, &mut size)
+    };
     unsafe { (api.string_release)(name) };
-    Ok(if data.is_null() {
+    if data.is_null() {
         &[]
     } else {
         unsafe { std::slice::from_raw_parts(data, size) }
-    })
+    }
 }
 
 pub(crate) fn prebuild(api: &JavaScriptCore, webgpu: bool, node: bool) {
-    if api.aot.is_some() || api.evaluate_latin1.is_none() || api.create_bytecode.is_none() {
+    if api.aot.is_some() {
         return;
     }
     let mut scripts = SCRIPTS.lock().unwrap();
-    let count = scripts.0.len();
+    let count = scripts.list.len();
     let node = NODE_SCRIPTS.into_iter().filter(|_| node);
     for (url, source) in WEB_SCRIPTS.into_iter().chain(PAGE_SCRIPTS).chain(node) {
-        if (webgpu || url != "apps:gpu") && !scripts.0.iter().any(|script| script.0 == url) {
-            scripts.0.push((url, source(), None));
+        if (webgpu || url != "apps:gpu") && !scripts.list.iter().any(|script| script.url == url) {
+            scripts.list.push(Script {
+                url,
+                source: source(),
+                bytecode: None,
+            });
         }
     }
-    if scripts.1 || scripts.0.len() == count {
+    if scripts.building || scripts.list.len() == count {
         return;
     }
-    scripts.1 = true;
+    scripts.building = true;
     drop(scripts);
     let _ = std::thread::Builder::new()
         .name("apps-bytecode".into())
@@ -506,16 +513,16 @@ fn build_bytecode() -> Result<()> {
     loop {
         let next = {
             let mut scripts = SCRIPTS.lock().unwrap();
-            let next = scripts.0.iter().find(|script| script.2.is_none());
-            let next = next.map(|script| (script.0, script.1));
-            scripts.1 = next.is_some();
+            let next = scripts.list.iter().find(|script| script.bytecode.is_none());
+            let next = next.map(|script| (script.url, script.source));
+            scripts.building = next.is_some();
             next
         };
         let Some((url, source)) = next else { break };
-        let bytecode = create_bytecode(&api, ctx, url, source)?;
+        let bytecode = create_bytecode(&api, ctx, url, source);
         let mut scripts = SCRIPTS.lock().unwrap();
-        if let Some(script) = scripts.0.iter_mut().find(|script| script.0 == url) {
-            script.2 = Some(bytecode);
+        if let Some(script) = scripts.list.iter_mut().find(|script| script.url == url) {
+            script.bytecode = Some(bytecode);
         }
     }
     unsafe { (api.release)(ctx) };
@@ -526,51 +533,45 @@ pub fn bytecode<'a>(
     disabled: u32,
     app: &[(&'a str, &'a str)],
 ) -> Result<Vec<(&'a str, &'static [u8])>> {
-    SCRIPTS.lock().unwrap().1 = true;
+    SCRIPTS.lock().unwrap().building = true;
     let api = JavaScriptCore::load()?;
-    for role in [Role::Main, Role::Renderer(1)] {
-        let host = Rc::new(RefCell::new(Host {
-            disabled,
-            ..Host::default()
-        }));
-        let doc = crate::dom::Document::parse("<html><body></body></html>");
-        host.borrow_mut()
-            .pages
-            .insert(1, crate::host::Page { doc, dirty: false });
-        JsContext::new(api.clone(), host, role)?;
-    }
+    prebuild(
+        &api,
+        disabled & crate::bundle::feature_bit("webgpu") == 0,
+        true,
+    );
     build_bytecode()?;
     let mut bytecode: Vec<(&str, &[u8])> = SCRIPTS
         .lock()
         .unwrap()
-        .0
+        .list
         .iter()
-        .filter_map(|script| Some((script.0, script.2?)))
+        .filter_map(|script| Some((script.url, script.bytecode?)))
         .collect();
     let ctx = unsafe { (api.create)(api.group, ptr::null_mut()) };
     for &(name, source) in app.iter().filter(|(_, source)| source.is_ascii()) {
-        bytecode.push((name, create_bytecode(&api, ctx, name, source)?));
+        bytecode.push((name, create_bytecode(&api, ctx, name, source)));
     }
     unsafe { (api.release)(ctx) };
     bytecode.retain(|(_, data)| !data.is_empty());
     Ok(bytecode)
 }
 
-pub(crate) fn add_bytecode(name: &'static str, source: &'static str, bytecode: &'static [u8]) {
-    SCRIPTS
-        .lock()
-        .unwrap()
-        .0
-        .push((name, source, Some(bytecode)));
+pub(crate) fn add_bytecode(url: &'static str, source: &'static str, bytecode: &'static [u8]) {
+    SCRIPTS.lock().unwrap().list.push(Script {
+        url,
+        source,
+        bytecode: Some(bytecode),
+    });
 }
 
 fn bundled(source: &[u8]) -> Option<&'static [u8]> {
     let scripts = SCRIPTS.lock().unwrap();
     let script = scripts
-        .0
+        .list
         .iter()
-        .find(|script| !source.is_empty() && ptr::eq(script.1.as_bytes(), source))?;
-    script.2.filter(|bytecode| !bytecode.is_empty())
+        .find(|script| !source.is_empty() && ptr::eq(script.source.as_bytes(), source))?;
+    script.bytecode.filter(|bytecode| !bytecode.is_empty())
 }
 
 static MAPPED: std::sync::Mutex<Vec<std::sync::Weak<memmap2::Mmap>>> =
@@ -603,21 +604,19 @@ fn in_place(source: &[u8]) -> bool {
     }
 }
 
-type Binding = (
-    Rc<JavaScriptCore>,
-    Rc<RefCell<Host>>,
-    Role,
-    Rc<RefCell<crate::node::sqlite::State>>,
-    Rc<RefCell<crate::web::State>>,
-    Rc<RefCell<crate::node::child_process::State>>,
-    Rc<crate::node::ffi::State>,
-    Rc<RefCell<crate::node::State>>,
-    Rc<RefCell<crate::node::pty::State>>,
-);
+struct Binding {
+    api: Rc<JavaScriptCore>,
+    host: Rc<RefCell<Host>>,
+    role: Role,
+    sqlite: RefCell<crate::node::sqlite::State>,
+    web: RefCell<crate::web::State>,
+    ffi: crate::node::ffi::State,
+    node: RefCell<crate::node::State>,
+    inspector: std::cell::Cell<Ptr>,
+}
 thread_local! {
-    static HOSTS: RefCell<rustc_hash::FxHashMap<usize, Binding>> = RefCell::default();
+    static HOSTS: RefCell<rustc_hash::FxHashMap<usize, Rc<Binding>>> = RefCell::default();
     static ARMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static INSPECTED: RefCell<rustc_hash::FxHashMap<usize, Ptr>> = RefCell::default();
     static INSPECTOR_MESSAGES: RefCell<Vec<(usize, String)>> = const { RefCell::new(Vec::new()) };
     // The render loop sets this, so engines without windows, like the CLI's, don't link the renderer.
     pub(crate) static REFLOW: std::cell::Cell<Option<fn(u64)>> = const { std::cell::Cell::new(None) };
@@ -711,32 +710,32 @@ pub(crate) fn contexts() -> Vec<(usize, Role)> {
     HOSTS.with_borrow(|hosts| {
         hosts
             .iter()
-            .map(|(&ctx, binding)| (ctx, binding.2))
+            .map(|(&ctx, binding)| (ctx, binding.role))
             .collect()
     })
 }
 
 pub(crate) fn connect_inspector(ctx: usize) -> Result<bool> {
-    if INSPECTED.with_borrow(|inspected| inspected.contains_key(&ctx)) {
+    let binding = HOSTS
+        .with_borrow(|hosts| hosts.get(&ctx).cloned())
+        .context("The JavaScript context is closed")?;
+    if !binding.inspector.get().is_null() {
         return Ok(false);
     }
-    let api = HOSTS
-        .with_borrow(|hosts| hosts.get(&ctx).map(|binding| binding.0.clone()))
-        .context("The JavaScript context is closed")?;
-    let inspector = api
-        .inspector
-        .as_ref()
-        .context("This JavaScriptCore has no inspector. Rebuild it with scripts/build-jsc.sh")?;
+    let inspector =
+        binding.api.inspector.as_ref().context(
+            "This JavaScriptCore has no inspector. Rebuild it with scripts/build-jsc.sh",
+        )?;
     let connection =
         unsafe { (inspector.connect)(ctx as Ptr, inspector_message, inspector_pause, ctx as Ptr) };
-    INSPECTED.with_borrow_mut(|inspected| inspected.insert(ctx, connection));
+    binding.inspector.set(connection);
     Ok(true)
 }
 
 pub(crate) fn inspect(ctx: usize, message: &str) -> Result<()> {
     connect_inspector(ctx)?;
     let api = HOSTS
-        .with_borrow(|hosts| hosts.get(&ctx).map(|binding| binding.0.clone()))
+        .with_borrow(|hosts| hosts.get(&ctx).map(|binding| binding.api.clone()))
         .context("The JavaScript context is closed")?;
     let inspector = api.inspector.as_ref().context("Missing inspector")?;
     unsafe { (inspector.dispatch)(ctx as Ptr, message.as_ptr().cast(), message.len()) };
@@ -769,7 +768,7 @@ unsafe extern "C" fn compile(
         hosts
             .borrow()
             .get(&(ctx as usize))
-            .map(|binding| (binding.0.clone(), binding.1.clone(), binding.2))
+            .map(|binding| (binding.api.clone(), binding.host.clone(), binding.role))
     });
     let Some((api, host, role)) = binding else {
         return ptr::null_mut();
@@ -781,13 +780,12 @@ unsafe extern "C" fn compile(
             .try_borrow()
             .is_ok_and(|host| host.enabled("jsExecute"))
     {
-        if !exception.is_null() {
-            let message = api.string("EvalError: Code generation is disabled in pages");
-            unsafe {
-                *exception = (api.make_string)(ctx, message);
-                (api.string_release)(message);
-            }
-        }
+        throw(
+            &api,
+            ctx,
+            exception,
+            "EvalError: Code generation is disabled in pages",
+        );
         return ptr::null_mut();
     }
     if count != 2 {
@@ -812,6 +810,16 @@ unsafe extern "C" fn compile(
     result
 }
 
+fn throw(api: &JavaScriptCore, ctx: Ptr, exception: *mut Ptr, message: &str) {
+    if !exception.is_null() {
+        let message = api.string(message);
+        unsafe {
+            *exception = (api.make_string)(ctx, message);
+            (api.string_release)(message);
+        }
+    }
+}
+
 // This runs only scripts of the app bundle, by name, and never arms code generation.
 unsafe extern "C" fn chunk(
     ctx: Ptr,
@@ -825,7 +833,7 @@ unsafe extern "C" fn chunk(
         hosts
             .borrow()
             .get(&(ctx as usize))
-            .map(|binding| (binding.0.clone(), binding.1.clone()))
+            .map(|binding| (binding.api.clone(), binding.host.clone()))
     });
     let Some((api, host)) = binding else {
         return ptr::null_mut();
@@ -842,13 +850,12 @@ unsafe extern "C" fn chunk(
     let Some(source) =
         source.filter(|source| source.is_ascii() || std::str::from_utf8(source).is_ok())
     else {
-        if !exception.is_null() {
-            let message = api.string(&format!("Error: Missing bundled script: {name}"));
-            unsafe {
-                *exception = (api.make_string)(ctx, message);
-                (api.string_release)(message);
-            }
-        }
+        throw(
+            &api,
+            ctx,
+            exception,
+            &format!("Error: Missing bundled script: {name}"),
+        );
         return ptr::null_mut();
     };
     if let Some(aot) = api.aot {
@@ -856,13 +863,7 @@ unsafe extern "C" fn chunk(
             Ok(Some(module)) => return aot.call(&api, ctx, module, ptr::null_mut(), exception),
             Ok(None) => {}
             Err(error) => {
-                if !exception.is_null() {
-                    let message = api.string(&format!("Error: {error:#}"));
-                    unsafe {
-                        *exception = (api.make_string)(ctx, message);
-                        (api.string_release)(message);
-                    }
-                }
+                throw(&api, ctx, exception, &format!("Error: {error:#}"));
                 return ptr::null_mut();
             }
         }
@@ -870,27 +871,10 @@ unsafe extern "C" fn chunk(
     let url = api.string(&format!("apps:///{name}"));
     // Keep these bytes alive for JSC. JSEvaluateScript copies source and uses UTF-16 for NUL or non-ASCII
     // input.
-    let result = if let Some(evaluate) = api.evaluate_latin1
-        && source.is_ascii()
-    {
+    let result = if source.is_ascii() {
         let bytecode = bundled(&source).unwrap_or_default();
         let source = std::mem::ManuallyDrop::new(source);
-        unsafe {
-            evaluate(
-                ctx,
-                source.as_ptr().cast(),
-                source.len(),
-                ptr::null_mut(),
-                url,
-                if bytecode.is_empty() {
-                    ptr::null()
-                } else {
-                    bytecode.as_ptr()
-                },
-                bytecode.len(),
-                exception,
-            )
-        }
+        unsafe { api.evaluate_latin1(ctx, &source[..], ptr::null_mut(), url, bytecode, exception) }
     } else {
         let script = api.string(&String::from_utf8_lossy(&source));
         let result = unsafe { (api.evaluate)(ctx, script, ptr::null_mut(), url, 1, exception) };
@@ -991,7 +975,7 @@ unsafe extern "C" fn call(
     let Some(binding) = binding else {
         return ptr::null_mut();
     };
-    let api = binding.0.clone();
+    let api = binding.api.clone();
     let values = if count == 0 || args.is_null() {
         &[][..]
     } else {
@@ -1018,10 +1002,10 @@ unsafe extern "C" fn call(
                 .filter(|op| !op.is_empty())
                 .context("Invalid host operation")?
         };
-        access(binding.2, op)?;
+        access(binding.role, op)?;
         let run = |buffers, action: &mut dyn FnMut() -> Result<Value>| -> Result<Ptr> {
             let mut failure = None;
-            let payload = crate::jsc::payload::Payload::capture(buffers, || {
+            let payload = payload::Payload::capture(buffers, || {
                 action().unwrap_or_else(|error| {
                     failure = Some(error);
                     Value::Null
@@ -1035,25 +1019,25 @@ unsafe extern "C" fn call(
         if generic {
             let (buffers, _roots) = values
                 .get(3)
-                .map(|&buffers| crate::jsc::payload::input(&api, ctx, buffers))
+                .map(|&buffers| payload::input(&api, ctx, buffers))
                 .transpose()?
                 .unzip();
             let buffers = buffers.unwrap_or_default();
             let mut json = api.text(ctx, *values.get(2).context("Expected JSON arguments")?);
             well_formed(&mut json);
-            if let (Role::Renderer(id), Some(op)) = (binding.2, op.strip_prefix("gpu.")) {
+            if let (Role::Renderer(id), Some(op)) = (binding.role, op.strip_prefix("gpu.")) {
                 return run(buffers, &mut || gpu(&binding, ctx, id, op, json.as_bytes()));
             }
             let mut args = Some(serde_json::from_str(&json)?);
             let result = run(buffers, &mut || {
                 dispatch(&binding, ctx, op, args.take().unwrap_or_default())
             });
-            if let Role::Renderer(id) = binding.2 {
+            if let Role::Renderer(id) = binding.role {
                 report_nodes(&binding, ctx, id);
             }
             return result;
         }
-        let role = binding.2;
+        let role = binding.role;
         // A forced layout builds the page, which borrows the host, so it runs before any borrow.
         if let Role::Renderer(id) = role
             && op == "dom.reflow"
@@ -1069,13 +1053,13 @@ unsafe extern "C" fn call(
             ensure!(values.len() == 4, "Expected DOM operations");
             let text = api.text(ctx, values[1]);
             let size = unsafe { (api.to_number)(ctx, values[3], ptr::null_mut()) } * 4.;
-            let codes = crate::jsc::payload::view(&api, ctx, values[2])?;
+            let codes = payload::view(&api, ctx, values[2])?;
             let codes = (size >= 0. && size.fract() == 0.)
                 .then(|| codes.get(..size as usize))
                 .flatten()
                 .context("Expected DOM operations")?;
             let errors = binding
-                .1
+                .host
                 .try_borrow_mut()
                 .context("Host is busy")?
                 .batch(id, codes, &text)?;
@@ -1085,7 +1069,7 @@ unsafe extern "C" fn call(
         if let Role::Renderer(id) = role
             && op == "dom.layout"
         {
-            let mut host = binding.1.try_borrow_mut().context("Host is busy")?;
+            let mut host = binding.host.try_borrow_mut().context("Host is busy")?;
             let host = &mut *host;
             let page = host.pages.get_mut(&id).context("Window is closed")?;
             let state = host.dom.entry(id).or_default();
@@ -1140,9 +1124,7 @@ unsafe extern "C" fn call(
                 5 => {
                     // These bytes are not static: they borrow the arguments, which live only until the call
                     // returns.
-                    buffers.push(bytes::Bytes::from_static(crate::jsc::payload::view(
-                        &api, ctx, value,
-                    )?));
+                    buffers.push(bytes::Bytes::from_static(payload::view(&api, ctx, value)?));
                     serde_json::json!({"$appsBytes": buffers.len() - 1})
                 }
                 7 => bail!("Do not know how to serialize a BigInt"),
@@ -1200,7 +1182,14 @@ fn dispatch(
     op: &str,
     mut args: serde_json::Value,
 ) -> Result<serde_json::Value> {
-    let (_, host, role, sqlite, web, children, _, node, pty) = binding;
+    let Binding {
+        host,
+        role,
+        sqlite,
+        web,
+        node,
+        ..
+    } = binding;
     let role = *role;
     let values = &args;
     if let Some(op) = op.strip_prefix("browser.") {
@@ -1216,30 +1205,30 @@ fn dispatch(
             if op == "create" {
                 let mut values = values.clone();
                 values[0]["inspectable"] = false.into();
-                return host.browsers.call(op, &values);
+                let host = &mut *host;
+                return host.browsers.call(
+                    op,
+                    &values,
+                    host.app_name.as_deref().unwrap_or_default(),
+                );
             }
         }
-        return host.browsers.call(op, values);
+        let host = &mut *host;
+        return host
+            .browsers
+            .call(op, values, host.app_name.as_deref().unwrap_or_default());
     }
-    if let Some(op) = op.strip_prefix("node.") {
+    if let Some((service @ ("node" | "pty" | "child"), op)) = op.split_once('.') {
         anyhow::ensure!(
             !matches!(role, Role::Renderer(_)),
             "Node APIs are unavailable in page scripts"
         );
-        return node
-            .try_borrow_mut()
-            .context("Node is busy")?
-            .call(op, &mut args);
-    }
-    if let Some(op) = op.strip_prefix("pty.") {
-        anyhow::ensure!(
-            !matches!(role, Role::Renderer(_)),
-            "PTYs are unavailable in page scripts"
-        );
-        return pty
-            .try_borrow_mut()
-            .context("PTY is busy")?
-            .call(op, values);
+        let mut node = node.try_borrow_mut().context("Node is busy")?;
+        return match service {
+            "pty" => node.pty.call(op, values),
+            "child" => node.children.call(op, values),
+            _ => node.call(op, &mut args),
+        };
     }
     if let Some(op) = op.strip_prefix("native.") {
         anyhow::ensure!(
@@ -1284,10 +1273,7 @@ fn dispatch(
             .bridge
             .entry(id)
             .or_default()
-            .insert(
-                name.to_owned(),
-                crate::jsc::payload::Payload::snapshot(value.clone()),
-            );
+            .insert(name.to_owned(), payload::Payload::snapshot(value.clone()));
         return Ok(serde_json::Value::Null);
     }
     if op == "bridge.file" {
@@ -1331,7 +1317,7 @@ fn dispatch(
         };
         if let Some(link) = link {
             use crate::desktop::link::{ToMain, ToPage};
-            use crate::jsc::payload::Payload;
+            use payload::Payload;
             match (role, target) {
                 (Role::Main, Some(Role::Preload(id))) => {
                     let mut message = args[1].take();
@@ -1364,8 +1350,8 @@ fn dispatch(
         }
         let destination = HOSTS.with(|hosts| {
             hosts.borrow().iter().find_map(|(&ctx, binding)| {
-                if Rc::ptr_eq(host, &binding.1) && target == Some(binding.2) {
-                    Some((ctx, binding.0.clone()))
+                if Rc::ptr_eq(host, &binding.host) && target == Some(binding.role) {
+                    Some((ctx, binding.api.clone()))
                 } else {
                     None
                 }
@@ -1380,16 +1366,11 @@ fn dispatch(
         return Ok(receive(
             &target_api,
             destination as Ptr,
-            crate::jsc::payload::Payload::snapshot(message),
+            payload::Payload::snapshot(message),
         )?
         .into_value());
     }
-    if let Some(op) = op.strip_prefix("child.") {
-        children
-            .try_borrow_mut()
-            .context("Child processes are busy")?
-            .call(role, op, &args)
-    } else if let Some(op) = op.strip_prefix("web.") {
+    if let Some(op) = op.strip_prefix("web.") {
         anyhow::ensure!(
             !op.starts_with("serve.") || matches!(role, Role::Main),
             "HTTP servers are only available in the main context"
@@ -1537,29 +1518,26 @@ fn dispatch(
 // Account for native DOM memory so removed wrappers trigger GC before row churn exhausts memory.
 fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
     let created = binding
-        .1
+        .host
         .try_borrow_mut()
         .ok()
         .and_then(|mut host| Some(std::mem::take(&mut host.dom.get_mut(&id)?.created)));
-    if let Some(report) = binding.0.extra_memory
-        && let Some(created) = created.filter(|&created| created > 0)
-    {
+    if let Some(created) = created.filter(|&created| created > 0) {
         // Count only wrapped nodes: JSC resets this cost only after a full GC.
-        unsafe { report(ctx, created * 65536) };
+        unsafe { (binding.api.extra_memory)(ctx, created * 65536) };
     }
 }
 
 fn gpu(binding: &Binding, ctx: Ptr, id: u64, op: &str, args: &[u8]) -> Result<serde_json::Value> {
-    let mut host = binding.1.try_borrow_mut().context("Host is busy")?;
+    let mut host = binding.host.try_borrow_mut().context("Host is busy")?;
     let result = host.gpu(id, op, args);
     // JSC cannot see GPU memory, so wrappers that own it would wait for an unrelated GC.
-    if let Some(report) = binding.0.extra_memory
-        && let Some(gpu) = host.graphics.get_mut(&id)
+    if let Some(gpu) = host.graphics.get_mut(&id)
         && let bytes = gpu.take_allocated()
         && bytes > 0
     {
         drop(host);
-        unsafe { report(ctx, bytes as usize) };
+        unsafe { (binding.api.extra_memory)(ctx, bytes as usize) };
     }
     result
 }
@@ -1579,7 +1557,7 @@ fn buffer(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes, typed: bool) -> P
             ctx,
             bytes.as_ptr().cast_mut().cast(),
             bytes.len(),
-            Some(crate::jsc::payload::release),
+            Some(payload::release),
             Box::into_raw(bytes).cast(),
             ptr::null_mut(),
         );
@@ -1591,9 +1569,9 @@ fn buffer(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes, typed: bool) -> P
     }
 }
 
-fn output(api: &JavaScriptCore, ctx: Ptr, payload: crate::jsc::payload::Payload) -> Ptr {
+fn output(api: &JavaScriptCore, ctx: Ptr, payload: payload::Payload) -> Ptr {
     use serde_json::Value;
-    let crate::jsc::payload::Payload { value, mut buffers } = payload;
+    let payload::Payload { value, mut buffers } = payload;
     unsafe {
         match value {
             Value::Null => (api.null)(ctx),
@@ -1699,7 +1677,7 @@ unsafe extern "C" fn now(
         hosts
             .borrow()
             .get(&(ctx as usize))
-            .map(|binding| binding.0.clone())
+            .map(|binding| binding.api.clone())
     });
     let Some(api) = api else {
         return ptr::null_mut();
@@ -1724,16 +1702,13 @@ unsafe extern "C" fn is_proxy(
     args: *const Ptr,
     _exception: *mut Ptr,
 ) -> Ptr {
-    let Some(api) = HOSTS.with(|hosts| hosts.borrow().get(&(ctx as usize)).map(|b| b.0.clone()))
+    let Some(api) = HOSTS.with(|hosts| hosts.borrow().get(&(ctx as usize)).map(|b| b.api.clone()))
     else {
         return ptr::null_mut();
     };
     unsafe {
-        let proxy = count > 0
-            && (api.value_type)(ctx, *args) == 5
-            && api
-                .proxy_target
-                .is_some_and(|target| !target(*args).is_null());
+        let proxy =
+            count > 0 && (api.value_type)(ctx, *args) == 5 && !(api.proxy_target)(*args).is_null();
         (api.boolean)(ctx, proxy)
     }
 }
@@ -1747,15 +1722,16 @@ unsafe extern "C" fn ffi_call(
     exception: *mut Ptr,
 ) -> Ptr {
     let binding = HOSTS.with(|hosts| hosts.borrow().get(&(ctx as usize)).cloned());
-    let Some((api, _, role, _, _, _, ffi, _, _)) = binding else {
+    let Some(binding) = binding else {
         return ptr::null_mut();
     };
+    let (api, role, ffi) = (&binding.api, binding.role, &binding.ffi);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<crate::node::ffi::Output> {
             anyhow::ensure!(count > 0, "Missing FFI request");
             let values = unsafe { std::slice::from_raw_parts(args, count) };
             let request = serde_json::from_str(&api.text(ctx, values[0]))?;
-            ffi.call(&api, ctx, role, &request, &values[1..])
+            ffi.call(api, ctx, role, &request, &values[1..])
         },
     ));
     let value = match result {
@@ -1837,7 +1813,7 @@ unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
         hosts.try_borrow().ok().and_then(|hosts| {
             hosts
                 .get(&(ctx as usize))
-                .map(|binding| (binding.0.clone(), binding.2))
+                .map(|binding| (binding.api.clone(), binding.role))
         })
     });
     let Some((api, role)) = binding else {
@@ -1848,9 +1824,7 @@ unsafe extern "C" fn page_limit(ctx: Ptr, _: Ptr) -> bool {
     };
     // The limit ends with this call, so a script that goes on needs a new one.
     let again = || {
-        if let Some(limit) = api.execution_limit {
-            unsafe { limit(api.group, PAGE_TICK, Some(page_limit), ptr::null_mut()) };
-        }
+        unsafe { (api.execution_limit)(api.group, PAGE_TICK, Some(page_limit), ptr::null_mut()) };
         false
     };
     if stopping(id) {
@@ -1909,7 +1883,7 @@ pub(crate) fn stop_pages() {
 struct Interrupt {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     group: Ptr,
-    limit: unsafe extern "C" fn(Ptr, f64, Option<unsafe extern "C" fn(Ptr, Ptr) -> bool>, Ptr),
+    limit: Limit,
 }
 
 // Bundles run one entry script per call of this source, so callers loop until it returns `false`.
@@ -1918,7 +1892,7 @@ pub(crate) const NEXT: &str = "this.__appsNext?.()";
 pub struct JsContext {
     api: Rc<JavaScriptCore>,
     ctx: Ptr,
-    napi: Option<Rc<crate::node::napi::State>>,
+    napi: Option<Rc<crate::node::napi::Root>>,
     interrupt: Option<Box<Interrupt>>,
     scope: Ptr,
 }
@@ -1938,44 +1912,53 @@ impl JsContext {
         let ctx = unsafe { (api.create)(api.group, ptr::null_mut()) };
         anyhow::ensure!(!ctx.is_null(), "Cannot create a JavaScriptCore context");
         unsafe {
-            if let Some(inspectable) = api.inspectable {
-                inspectable(ctx, devtools);
-            }
-            if let Some(set_name) = api.set_name {
-                let name = api.string(&format!("apps {role:?}"));
-                set_name(ctx, name);
-                (api.string_release)(name);
-            }
+            (api.inspectable)(ctx, devtools);
+            let name = api.string(&format!("apps {role:?}"));
+            (api.set_name)(ctx, name);
+            (api.string_release)(name);
         }
-        HOSTS.with(|hosts| {
-            hosts.borrow_mut().insert(
-                ctx as usize,
-                (
-                    api.clone(),
-                    host.clone(),
-                    role,
-                    Rc::default(),
-                    Rc::default(),
-                    Rc::default(),
-                    Rc::default(),
-                    Rc::default(),
-                    Rc::default(),
-                ),
-            )
-        });
-        HOSTS.with(|hosts| {
-            hosts.borrow()[&(ctx as usize)].4.borrow_mut().renderer =
-                matches!(role, Role::Renderer(_))
-        });
+        let binding = Binding {
+            api: api.clone(),
+            host: host.clone(),
+            role,
+            sqlite: RefCell::default(),
+            web: RefCell::default(),
+            ffi: Default::default(),
+            node: RefCell::default(),
+            inspector: std::cell::Cell::new(ptr::null_mut()),
+        };
+        binding.web.borrow_mut().renderer = matches!(role, Role::Renderer(_));
+        let callback_api = api.clone();
+        binding
+            .sqlite
+            .borrow_mut()
+            .set_authorizer_callback(Rc::new(move |id, action, args| {
+                call_json(
+                    &callback_api,
+                    ctx,
+                    "__appsSqliteAuthorize",
+                    &[
+                        &id.to_string(),
+                        &action.to_string(),
+                        &serde_json::to_string(&args)?,
+                    ],
+                    |value| callback_api.text(ctx, value),
+                )?
+                .parse::<i32>()
+                .context("Authorizer must return a SQLite authorization code")
+            }));
+        binding.web.borrow_mut().configure_storage(
+            &host.borrow(),
+            match role {
+                Role::Renderer(id) | Role::Preload(id) => Some(id),
+                Role::Main => None,
+            },
+        );
+        HOSTS.with(|hosts| hosts.borrow_mut().insert(ctx as usize, Rc::new(binding)));
         let napi = if matches!(role, Role::Renderer(_)) {
             None
         } else {
-            Some(crate::node::napi::State::new(
-                api.clone(),
-                ctx,
-                &host,
-                false,
-            )?)
+            Some(crate::node::napi::Root::new(api.clone(), ctx, &host))
         };
         let mut engine = Self {
             api,
@@ -1984,14 +1967,33 @@ impl JsContext {
             interrupt: None,
             scope: ptr::null_mut(),
         };
-        if let Some(interrupt) = interrupt {
-            engine.set_interrupt(interrupt)?;
-        } else if matches!(role, Role::Renderer(_))
-            && let Some(limit) = engine.api.execution_limit
-        {
+        if let Some(stop) = interrupt {
+            unsafe extern "C" fn interrupted(_: Ptr, context: Ptr) -> bool {
+                let state = unsafe { &*context.cast::<Interrupt>() };
+                if state.stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return true;
+                }
+                unsafe { (state.limit)(state.group, 0.01, Some(interrupted), context) };
+                false
+            }
+            let mut state = Box::new(Interrupt {
+                stop,
+                group: engine.api.group,
+                limit: engine.api.execution_limit,
+            });
+            unsafe {
+                (state.limit)(
+                    state.group,
+                    0.01,
+                    Some(interrupted),
+                    (&mut *state as *mut Interrupt).cast(),
+                )
+            };
+            engine.interrupt = Some(state);
+        } else if matches!(role, Role::Renderer(_)) {
             // The limit is per context group, which every engine of this thread shares.
             unsafe {
-                limit(
+                (engine.api.execution_limit)(
                     engine.api.group,
                     PAGE_TICK,
                     Some(page_limit),
@@ -1999,39 +2001,6 @@ impl JsContext {
                 )
             };
         }
-        let callback_api = engine.api.clone();
-        HOSTS.with(|hosts| {
-            hosts.borrow()[&(ctx as usize)]
-                .3
-                .borrow_mut()
-                .set_authorizer_callback(Rc::new(move |id, action, args| {
-                    call_json(
-                        &callback_api,
-                        ctx,
-                        "__appsSqliteAuthorize",
-                        &[
-                            &id.to_string(),
-                            &action.to_string(),
-                            &serde_json::to_string(&args)?,
-                        ],
-                        |value| callback_api.text(ctx, value),
-                    )?
-                    .parse::<i32>()
-                    .context("Authorizer must return a SQLite authorization code")
-                }))
-        });
-        HOSTS.with(|hosts| {
-            hosts.borrow()[&(ctx as usize)]
-                .4
-                .borrow_mut()
-                .configure_storage(
-                    &host.borrow(),
-                    match role {
-                        Role::Renderer(id) | Role::Preload(id) => Some(id),
-                        Role::Main => None,
-                    },
-                )
-        });
         encoding::install(&engine.api, ctx);
         let natives = [
             ("__appsNative", call as Callback),
@@ -2128,15 +2097,13 @@ impl JsContext {
             (engine.api.rejection_callback)(ctx, callback, ptr::null_mut());
             (engine.api.string_release)(name);
         }
-        if let Some(set) = engine.api.module_loader {
-            let name = engine.api.string("__appsModuleLoader");
-            unsafe {
-                set(
-                    ctx,
-                    (engine.api.get)(ctx, (engine.api.global)(ctx), name, ptr::null_mut()),
-                );
-                (engine.api.string_release)(name);
-            }
+        let name = engine.api.string("__appsModuleLoader");
+        unsafe {
+            (engine.api.module_loader)(
+                ctx,
+                (engine.api.get)(ctx, (engine.api.global)(ctx), name, ptr::null_mut()),
+            );
+            (engine.api.string_release)(name);
         }
         engine.eval(
             "delete globalThis.__appsRejection;delete globalThis.__appsModuleLoader",
@@ -2173,21 +2140,22 @@ impl JsContext {
             self.api.busy.set(self.api.busy.get() + start.elapsed());
             return self.checked(url, result, exception).map(drop);
         }
-        let Some(evaluate) = self.api.evaluate_latin1 else {
-            return self.eval(source, url).map(drop);
-        };
         let (bytecode, build) = {
             let mut scripts = SCRIPTS.lock().unwrap();
             let found = scripts
-                .0
+                .list
                 .iter()
-                .find(|script| script.0 == url)
-                .map(|script| script.2);
+                .find(|script| script.url == url)
+                .map(|script| script.bytecode);
             if found.is_none() {
-                scripts.0.push((url, source, None));
+                scripts.list.push(Script {
+                    url,
+                    source,
+                    bytecode: None,
+                });
             }
-            let build = found == Some(None) && !scripts.1;
-            scripts.1 |= build;
+            let build = found == Some(None) && !scripts.building;
+            scripts.building |= build;
             (found.flatten().unwrap_or_default(), build)
         };
         if build {
@@ -2199,18 +2167,12 @@ impl JsContext {
         let mut exception = ptr::null_mut();
         let start = std::time::Instant::now();
         let result = unsafe {
-            evaluate(
+            self.api.evaluate_latin1(
                 self.ctx,
-                source.as_ptr().cast(),
-                source.len(),
+                source.as_bytes(),
                 ptr::null_mut(),
                 source_url,
-                if bytecode.is_empty() {
-                    ptr::null()
-                } else {
-                    bytecode.as_ptr()
-                },
-                bytecode.len(),
+                bytecode,
                 &mut exception,
             )
         };
@@ -2259,22 +2221,15 @@ impl JsContext {
         let mut exception = ptr::null_mut();
         let start = std::time::Instant::now();
         let bytecode = bundled(source.as_bytes());
-        let result = match (compiled, self.api.evaluate_latin1) {
-            (Some((aot, module)), _) => aot.call(&self.api, self.ctx, module, this, &mut exception),
-            (None, Some(evaluate)) if bytecode.is_some() || in_place(source.as_bytes()) => unsafe {
-                let bytecode = bytecode.unwrap_or_default();
-                evaluate(
+        let result = match compiled {
+            Some((aot, module)) => aot.call(&self.api, self.ctx, module, this, &mut exception),
+            None if bytecode.is_some() || in_place(source.as_bytes()) => unsafe {
+                self.api.evaluate_latin1(
                     self.ctx,
-                    source.as_ptr().cast(),
-                    source.len(),
+                    source.as_bytes(),
                     this,
                     source_url,
-                    if bytecode.is_empty() {
-                        ptr::null()
-                    } else {
-                        bytecode.as_ptr()
-                    },
-                    bytecode.len(),
+                    bytecode.unwrap_or_default(),
                     &mut exception,
                 )
             },
@@ -2297,15 +2252,10 @@ impl JsContext {
     fn log(&self, url: &str, message: &str) {
         HOSTS.with(|hosts| {
             if let Some(binding) = hosts.borrow().get(&(self.ctx as usize))
-                && let Ok(mut host) = binding.1.try_borrow_mut()
+                && let Ok(mut host) = binding.host.try_borrow_mut()
                 && !host.packaged
             {
-                if host.logs.len() == 500 {
-                    host.logs.pop_front();
-                }
-                host.logs.push_back(
-                    serde_json::json!({"type":"error","message":format!("{url}: {message}")}),
-                );
+                host.log(serde_json::json!({"type":"error","message":format!("{url}: {message}")}));
             }
         });
     }
@@ -2318,48 +2268,10 @@ impl JsContext {
         bridge(&self.api, self.ctx, "__appsBridgeDeliver", payload).map(|_| ())
     }
 
-    pub fn set_interrupt(
-        &mut self,
-        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> Result<()> {
-        unsafe extern "C" fn interrupted(_: Ptr, context: Ptr) -> bool {
-            let state = unsafe { &*context.cast::<Interrupt>() };
-            if state.stop.load(std::sync::atomic::Ordering::Acquire) {
-                return true;
-            }
-            unsafe {
-                (state.limit)(state.group, 0.01, Some(interrupted), context);
-            }
-            false
-        }
-        let limit = self
-            .api
-            .execution_limit
-            .context("JavaScriptCore does not support interruptible workers")?;
-        let mut state = Box::new(Interrupt {
-            stop,
-            group: unsafe { (self.api.context_group)(self.ctx) },
-            limit,
-        });
-        unsafe {
-            limit(
-                state.group,
-                0.01,
-                Some(interrupted),
-                (&mut *state as *mut Interrupt).cast(),
-            );
-        }
-        self.interrupt = Some(state);
-        Ok(())
-    }
-
     pub(crate) fn heap(&self) -> Result<serde_json::Value> {
-        let memory = self
-            .api
-            .memory
-            .context("Missing JSGetMemoryUsageStatistics")?;
         unsafe {
-            let json = (self.api.json_string)(self.ctx, memory(self.ctx), 0, ptr::null_mut());
+            let json =
+                (self.api.json_string)(self.ctx, (self.api.memory)(self.ctx), 0, ptr::null_mut());
             ensure!(!json.is_null(), "Cannot read heap statistics");
             let text = self
                 .api
@@ -2425,14 +2337,14 @@ impl JsContext {
     fn install(&self, files: &BBTreeMap<String, String>) -> Result<()> {
         HOSTS.with(|hosts| {
             let binding = &hosts.borrow()[&(self.ctx as usize)];
-            let mut host = binding.1.borrow_mut();
+            let mut host = binding.host.borrow_mut();
             host.install(files)?;
             if !host.scripts.is_empty() {
-                let window = match binding.2 {
+                let window = match binding.role {
                     Role::Renderer(id) | Role::Preload(id) => Some(id),
                     Role::Main => None,
                 };
-                binding.4.borrow_mut().configure_storage(&host, window);
+                binding.web.borrow_mut().configure_storage(&host, window);
             }
             Ok(())
         })
@@ -2441,19 +2353,16 @@ impl JsContext {
 
 impl Drop for JsContext {
     fn drop(&mut self) {
-        // Addon work that still runs has the address of this state, so the state stays if it could not close.
-        if let Some(napi) = &self.napi
-            && !napi.close()
-        {
-            std::mem::forget(napi.clone());
+        if let Some(napi) = &self.napi {
+            napi.close();
         }
         if !self.scope.is_null() {
             unsafe { (self.api.unprotect)(self.ctx, self.scope) };
         }
         let binding = HOSTS.with(|hosts| hosts.borrow_mut().remove(&(self.ctx as usize)));
-        if let Some(binding) = binding {
-            if let Role::Preload(id) = binding.2
-                && let Ok(mut host) = binding.1.try_borrow_mut()
+        if let Some(binding) = &binding {
+            if let Role::Preload(id) = binding.role
+                && let Ok(mut host) = binding.host.try_borrow_mut()
             {
                 host.bridge.remove(&id);
             }
@@ -2461,14 +2370,14 @@ impl Drop for JsContext {
                 hosts
                     .borrow()
                     .iter()
-                    .filter(|(_, peer)| Rc::ptr_eq(&binding.1, &peer.1))
-                    .map(|(&ctx, peer)| (ctx, peer.0.clone()))
+                    .filter(|(_, peer)| Rc::ptr_eq(&binding.host, &peer.host))
+                    .map(|(&ctx, peer)| (ctx, peer.api.clone()))
                     .collect::<Vec<_>>()
             });
             for (ctx, api) in peers {
                 let script = api.string(&format!(
                     "globalThis.__appsBridgeClosed?.({})",
-                    serde_json::to_string(&binding.2).unwrap()
+                    serde_json::to_string(&binding.role).unwrap()
                 ));
                 unsafe {
                     (api.evaluate)(
@@ -2483,8 +2392,9 @@ impl Drop for JsContext {
                 }
             }
         }
-        if let Some(connection) =
-            INSPECTED.with_borrow_mut(|inspected| inspected.remove(&(self.ctx as usize)))
+        if let Some(connection) = binding
+            .map(|binding| binding.inspector.get())
+            .filter(|connection| !connection.is_null())
             && let Some(inspector) = &self.api.inspector
         {
             // A connected inspector keeps the global object alive.
@@ -2499,6 +2409,18 @@ impl Drop for JsContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn page_host(id: u64, html: &str) -> Rc<RefCell<Host>> {
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            id,
+            crate::host::Page {
+                doc: crate::dom::Document::parse(html),
+                dirty: false,
+            },
+        );
+        host
+    }
 
     #[test]
     fn bundled_chunks_keep_nul_bytes_and_non_ascii_text() {
@@ -2548,14 +2470,7 @@ mod tests {
     #[test]
     fn dispatched_clicks_run_activation_behavior() {
         let api = JavaScriptCore::load().unwrap();
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            crate::host::Page {
-                doc: crate::dom::Document::parse("<body></body>"),
-                dirty: false,
-            },
-        );
+        let host = page_host(1, "<body></body>");
         let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
         let script = "const box = document.createElement('input'); box.type = 'checkbox'; \
             document.body.append(box); const seen = []; box.addEventListener('change', () => seen.push('change')); \
@@ -2568,14 +2483,7 @@ mod tests {
     #[test]
     fn channel_messages_are_tasks_and_file_readers_finish() {
         let api = JavaScriptCore::load().unwrap();
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            crate::host::Page {
-                doc: crate::dom::Document::parse("<body></body>"),
-                dirty: false,
-            },
-        );
+        let host = page_host(1, "<body></body>");
         let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
         let script = "globalThis.seen = []; const { port1, port2 } = new MessageChannel(); \
             port1.onmessage = () => seen.push('message'); port2.postMessage(0); \
@@ -2611,14 +2519,7 @@ mod tests {
                 )
                 .is_err()
         );
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            crate::host::Page {
-                doc: crate::dom::Document::parse("<body><p id='value'>before</p></body>"),
-                dirty: false,
-            },
-        );
+        let host = page_host(1, "<body><p id='value'>before</p></body>");
         let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
         let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
         let page = JsContext::new(api, host.clone(), Role::Renderer(1)).unwrap();
@@ -2663,15 +2564,8 @@ mod tests {
     }
     #[test]
     fn pages_cannot_turn_strings_into_code() {
-        let host = Rc::new(RefCell::new(Host::default()));
+        let host = page_host(1, "<body></body>");
         host.borrow_mut().disabled = crate::bundle::disabled_features(None).unwrap();
-        host.borrow_mut().pages.insert(
-            1,
-            crate::host::Page {
-                doc: crate::dom::Document::parse("<body></body>"),
-                dirty: false,
-            },
-        );
         let page =
             JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
         for code in [
@@ -2711,20 +2605,11 @@ mod tests {
     #[test]
     fn runaway_page_scripts_stop_but_main_keeps_running() {
         let api = JavaScriptCore::load().unwrap();
-        let host = Rc::new(RefCell::new(Host::default()));
         // The stop list is global, so this page has an id no other test uses.
-        host.borrow_mut().pages.insert(
-            900,
-            crate::host::Page {
-                doc: crate::dom::Document::parse("<body></body>"),
-                dirty: false,
-            },
-        );
+        let host = page_host(900, "<body></body>");
         let main = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
         let page = JsContext::new(api.clone(), host, Role::Renderer(900)).unwrap();
-        unsafe {
-            (api.execution_limit.unwrap())(api.group, 0.2, Some(page_limit), ptr::null_mut())
-        };
+        unsafe { (api.execution_limit)(api.group, 0.2, Some(page_limit), ptr::null_mut()) };
         stop_page(900);
         assert!(page.eval("while(true){}", "test").is_err());
         page_stopped(900);
@@ -2801,14 +2686,7 @@ mod tests {
 
     #[test]
     fn page_timers_clamp_deep_nesting() {
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            crate::host::Page {
-                doc: crate::dom::Document::parse("<body></body>"),
-                dirty: false,
-            },
-        );
+        let host = page_host(1, "<body></body>");
         let page =
             JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
         page.eval(
@@ -2838,14 +2716,7 @@ mod tests {
             ["a\u{fffd}", "\\ud83d", "\n\u{fffd}", "\u{1f}"]
         );
         let api = JavaScriptCore::load().unwrap();
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            crate::host::Page {
-                doc: crate::dom::Document::parse("<body></body>"),
-                dirty: false,
-            },
-        );
+        let host = page_host(1, "<body></body>");
         let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
         let page = JsContext::new(api.clone(), host, Role::Renderer(1)).unwrap();
         preload
@@ -2886,14 +2757,7 @@ mod tests {
     #[test]
     fn preload_document_handles_are_released() {
         let api = JavaScriptCore::load().unwrap();
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            crate::host::Page {
-                doc: crate::dom::Document::parse("<body></body>"),
-                dirty: false,
-            },
-        );
+        let host = page_host(1, "<body></body>");
         let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
         let page = JsContext::new(api, host, Role::Renderer(1)).unwrap();
         page.eval("globalThis.made=[];const create=document.createElement.bind(document);document.createElement=name=>{const node=create(name);made.push(new WeakRef(node));return node}", "test").unwrap();
@@ -2927,14 +2791,7 @@ mod tests {
     #[test]
     fn replaced_rows_free_without_gc() {
         let api = JavaScriptCore::load().unwrap();
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            crate::host::Page {
-                doc: crate::dom::Document::parse("<body><div id=list></div></body>"),
-                dirty: false,
-            },
-        );
+        let host = page_host(1, "<body><div id=list></div></body>");
         let page = JsContext::new(api, host.clone(), Role::Renderer(1)).unwrap();
         assert_eq!(
             page.eval("customElements.define('x-row', class extends HTMLElement {});const list = document.getElementById('list');for (let i = 0; i < 50; i++) { list.innerHTML = '<div><span>a</span><span>b</span></div>'.repeat(20); list.insertAdjacentHTML('beforeend', '<p><b>c</b></p>'.repeat(20)); __appsDomSweep(); }const kept = list.firstChild, observer = new MutationObserver(() => {});observer.observe(list, { childList: true });list.innerHTML = '<i>x</i>';const records = observer.takeRecords();__appsDomSweep();[kept.textContent, kept.isConnected, records.length, records[0].removedNodes.length, records[0].removedNodes[0] === kept, list.textContent].join()", "test").unwrap(),
@@ -2948,15 +2805,9 @@ mod tests {
     #[test]
     fn resize_observers_see_style_changes_after_the_next_layout() {
         let api = JavaScriptCore::load().unwrap();
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
+        let host = page_host(
             1,
-            crate::host::Page {
-                doc: crate::dom::Document::parse(
-                    "<body><div id=box style='width:100px;padding:5px'></div></body>",
-                ),
-                dirty: false,
-            },
+            "<body><div id=box style='width:100px;padding:5px'></div></body>",
         );
         let page = JsContext::new(api, host.clone(), Role::Renderer(1)).unwrap();
         let id: usize = page
@@ -3007,6 +2858,8 @@ mod tests {
             (Role::Preload(1), "info", true),
             (Role::Renderer(1), "native.clipboard.readText", false),
             (Role::Renderer(1), "node.fs.read", false),
+            (Role::Renderer(1), "child.spawn", false),
+            (Role::Renderer(1), "pty.spawn", false),
             (Role::Renderer(1), "web.tcp.connect", false),
             (Role::Renderer(1), "web.fetch", true),
             (Role::Renderer(1), "infox", false),
@@ -3014,14 +2867,7 @@ mod tests {
             assert_eq!(access(role, op).is_ok(), allowed, "{role:?} {op}");
         }
         let api = JavaScriptCore::load().unwrap();
-        let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
-            1,
-            crate::host::Page {
-                doc: crate::dom::Document::parse("<body></body>"),
-                dirty: false,
-            },
-        );
+        let host = page_host(1, "<body></body>");
         let preload = JsContext::new(api.clone(), host.clone(), Role::Preload(1)).unwrap();
         assert_eq!(
             preload
@@ -3086,5 +2932,12 @@ mod tests {
         };
         assert!(!popup(serde_json::json!([["a", "0);evil("]])));
         assert!(popup(serde_json::json!([["a", 1], null])));
+        for op in ["node.poll", "child.spawn", "pty.spawn"] {
+            let error = dispatch(&binding, page.ctx, op, serde_json::json!([])).unwrap_err();
+            assert!(
+                error.to_string().contains("unavailable in page scripts"),
+                "{op}"
+            );
+        }
     }
 }

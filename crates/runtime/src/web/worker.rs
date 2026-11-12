@@ -44,7 +44,6 @@ struct Subscriber {
     names: Vec<String>,
     queue: Vec<(String, Payload)>,
     wake: crate::host::Waker,
-    thread: std::thread::ThreadId,
 }
 static CHANNELS: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Subscriber>>> =
     std::sync::LazyLock::new(Default::default);
@@ -145,7 +144,6 @@ impl State {
                         names: Vec::new(),
                         queue: Vec::new(),
                         wake: crate::host::Waker::current(),
-                        thread: std::thread::current().id(),
                     },
                 );
                 self.channels.push(id);
@@ -236,11 +234,7 @@ impl State {
                     crate::host::Waker::install(move || { let _ = own.send(Value::Null.into()); });
                     PARENT.with(|parent| *parent.borrow_mut() = Some(Parent { events: output.clone(), wake: wake.clone(), data, id, stop: cancelled.clone(), received: Vec::new(), code: None }));
                     let result = (|| -> Result<()> {
-                        let host = Rc::new(RefCell::new(Host::default()));
-                        host.borrow_mut().app_name=Some(namespace);
-                        host.borrow_mut().packaged=packaged;
-                        host.borrow_mut().disabled=disabled;
-                        host.borrow_mut().scripts=scripts;
+                        let host = Rc::new(RefCell::new(Host { app_name: Some(namespace), packaged, disabled, scripts, ..Host::default() }));
                         let role = if native { Role::Main } else {
                             host.borrow_mut().pages.insert(crate::host::WORKER_PAGE, Page { doc: Document::parse("<html><body></body></html>"), dirty: false });
                             Role::Renderer(crate::host::WORKER_PAGE)
@@ -281,8 +275,6 @@ impl State {
                     let terminated=cancelled.load(Ordering::Acquire);
                     let code = PARENT.with(|parent| parent.borrow().as_ref().and_then(|parent| parent.code)).unwrap_or(if result.is_ok() && !terminated {0} else {1});
                     if !terminated && let Err(error) = &result { let _ = output.send(json!({"kind":"error","message":format!("{error:#}")}).into()); }
-                    let thread = std::thread::current().id();
-                    CHANNELS.lock().unwrap().retain(|_, subscriber| subscriber.thread != thread);
                     let _ = output.send(json!({"kind":"exit","code":code}).into());
                     wake.wake();
                     PARENT.with(|parent| *parent.borrow_mut() = None);

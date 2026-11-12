@@ -339,13 +339,6 @@ pub fn write(
     Ok(bytes.len())
 }
 
-// Parse one slice to avoid a separate deserializer for each reader type.
-pub fn from_json(mut input: impl std::io::Read) -> Result<Bundle> {
-    let mut bytes = Vec::new();
-    input.read_to_end(&mut bytes)?;
-    Ok(serde_json::from_slice(&bytes)?)
-}
-
 // Replace stdin with /dev/null so child processes cannot read bundles or keep the bundle pipe open.
 pub fn from_stdin() -> Result<(Bundle, impl std::io::BufRead + Send + 'static)> {
     #[cfg(unix)]
@@ -461,6 +454,7 @@ pub fn read(directory: &Path) -> Result<Bundle> {
     }
     // JSC reads bytecode and script chunks in place, so the mapping stays for the rest of the process.
     let mapped = |data: &[u8]| unsafe { std::slice::from_raw_parts(data.as_ptr(), data.len()) };
+    let pinned = !bytecode.is_empty();
     for (name, range) in bytecode {
         let source = if name == "app.js" {
             bundle.main.as_ref()
@@ -473,6 +467,8 @@ pub fn read(directory: &Path) -> Result<Bundle> {
             source.unwrap_or(""),
             mapped(&bytes[range]),
         );
+    }
+    if pinned {
         std::mem::forget(bytes.clone());
     }
     if let Some(source) = bundle.files.get_mut("native.json") {

@@ -32,6 +32,13 @@ pub(crate) fn breaks(
     let glyphs = &line.glyphs;
     let mut rows = Vec::new();
     let mut chances = Vec::new();
+    if even {
+        chances.push(Chance {
+            glyph: 0,
+            x: 0.,
+            words_end: 0.,
+        });
+    }
     let mut chance: Option<(u32, Pixels)> = None;
     let (mut row_glyph, mut row_x) = (0, px(0.));
     let (mut started, mut words_end, mut previous_index) = (false, 0., 0);
@@ -96,14 +103,6 @@ pub(crate) fn breaks(
     if !even || rows.is_empty() {
         return rows;
     }
-    chances.insert(
-        0,
-        Chance {
-            glyph: 0,
-            x: 0.,
-            words_end: 0.,
-        },
-    );
     chances.push(Chance {
         glyph: row_glyph,
         x: line.width.0,

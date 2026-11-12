@@ -419,7 +419,7 @@ impl State {
                     }
                 } else if let Some(server) = self.servers.remove(&id) {
                     for id in &server.sockets {
-                        sockets.call("abort", &json!([id]), false)?;
+                        sockets.sockets.remove(id);
                     }
                 }
                 Ok(Value::Null)

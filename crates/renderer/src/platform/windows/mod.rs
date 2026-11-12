@@ -9,12 +9,13 @@ mod keys;
 mod text;
 mod window;
 
-use crate::{ControlKind, Cursor, Rect, WindowOptions, app::Callbacks, point, px, size};
+use super::single::Task;
+use crate::{Cursor, Rect, WindowOptions, app::Callbacks, point, px, size};
 use anyhow::Result;
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering::*};
-use std::sync::{Condvar, LockResult, Mutex, Once, PoisonError, mpsc};
-use std::{cell::RefCell, collections::VecDeque, mem, thread, time::Duration, time::Instant};
+use std::sync::{Condvar, LockResult, Mutex, Once, PoisonError};
+use std::{cell::RefCell, collections::VecDeque, thread, time::Duration, time::Instant};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::{Dwm::*, Gdi::*};
 use windows::Win32::System::{DataExchange::*, Memory::*, Ole::*, Threading::GetCurrentThreadId};
@@ -25,11 +26,7 @@ pub(crate) use text::TextSystem;
 pub(crate) use window::Window;
 pub use window::WindowControl;
 
-type Task = Box<dyn FnOnce() + Send>;
-
 const WM_WAKE: u32 = WM_APP + 1;
-// How long another thread waits for the main thread in `ask`.
-const ASK_LIMIT: Duration = Duration::from_millis(100);
 
 static HOST: AtomicIsize = AtomicIsize::new(0);
 static MAIN: AtomicU32 = AtomicU32::new(0);
@@ -56,7 +53,7 @@ fn host() -> HWND {
     HWND(HOST.load(Acquire) as _)
 }
 
-fn on_main() -> bool {
+pub(crate) fn on_main() -> bool {
     // SAFETY: a plain thread query.
     unsafe { GetCurrentThreadId() == MAIN.load(Acquire) }
 }
@@ -70,18 +67,6 @@ fn current_cursor() -> Option<HCURSOR> {
 struct Pinned(Box<dyn FnOnce()>);
 // SAFETY: pinned tasks are queued and run on the main thread only, and the inbox is never dropped.
 unsafe impl Send for Pinned {}
-
-#[derive(Copy, Clone)]
-pub(crate) struct AppThread(u32);
-
-pub(crate) fn app_thread() -> AppThread {
-    // SAFETY: a plain thread query.
-    AppThread(unsafe { GetCurrentThreadId() })
-}
-
-pub(crate) fn post(_: AppThread, task: Task) {
-    native_post(task);
-}
 
 pub(crate) fn native_post(task: Task) {
     held(INBOX.lock()).push_back(task);
@@ -107,35 +92,6 @@ fn drain() {
         };
         task();
     }
-}
-
-// Runs `f` on the main thread and hands its result to the returned channel.
-//
-// # Safety
-//
-// What `f` borrows must live until it ran or the channel closed.
-unsafe fn on_main_later<'a, R: Send + 'a>(f: impl FnOnce() -> R + Send + 'a) -> mpsc::Receiver<R> {
-    let (answer, answered) = mpsc::sync_channel(1);
-    let job: Box<dyn FnOnce() + Send + 'a> = Box::new(move || {
-        let _ = answer.send(f());
-    });
-    // SAFETY: the caller keeps the borrows alive, as above.
-    native_post(unsafe { mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Task>(job) });
-    answered
-}
-
-// The main thread runs the app itself, so from there this is a plain call.
-pub(crate) fn ask<R, F>(thread: AppThread, f: F) -> Option<R>
-where
-    R: Send + 'static,
-    F: FnOnce() -> R + Send + 'static,
-{
-    if app_thread().0 == thread.0 {
-        return Some(f());
-    }
-    // SAFETY: `f` borrows nothing.
-    let answer = unsafe { on_main_later(f) };
-    answer.recv_timeout(ASK_LIMIT).ok()
 }
 
 pub(crate) use native_after as run_after;
@@ -175,30 +131,6 @@ fn fire(id: usize) {
     if let Some(f) = TIMERS.with_borrow_mut(|timers| timers.waiting.remove(&id)) {
         f();
     }
-}
-
-pub(crate) fn native_sync<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    if on_main() {
-        return f();
-    }
-    // SAFETY: this thread waits until the job ran or was dropped, so what `f` borrows outlives it.
-    let answer = unsafe { on_main_later(f) };
-    answer.recv().expect("the main thread dropped its work")
-}
-
-pub(crate) fn spawn_render(
-    init: impl FnOnce() + Send + 'static,
-    _: impl FnOnce() + Send + 'static,
-) {
-    init();
-}
-
-pub(crate) fn end_thread() {}
-
-pub(crate) fn park_render() {}
-
-pub(crate) fn control_size(_: ControlKind) -> [f32; 2] {
-    [0., 0.]
 }
 
 fn setting<T>(action: SYSTEM_PARAMETERS_INFO_ACTION, value: &mut T) -> bool {
@@ -419,6 +351,15 @@ fn points(rect: RECT, scale: f32) -> Rect {
     Rect::new(corner, extent) / scale
 }
 
+fn extent(rect: RECT) -> [i32; 4] {
+    [
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+    ]
+}
+
 // Windows that want frames. A pacing thread waits for each composition of the desktop and then invalidates
 // them, so frames come as WM_PAINT, which yields to input, and an idle window gets none.
 struct Pacing {
@@ -435,11 +376,10 @@ static PACER: Once = Once::new();
 fn want_frames(hwnd: HWND, on: bool) {
     let key = hwnd.0 as isize;
     let mut windows = held(PACING.wanting.lock());
-    let known = windows.contains(&key);
-    match (on, known) {
-        (false, _) => windows.retain(|&other| other != key),
-        (true, false) => windows.push(key),
-        (true, true) => {}
+    if !on {
+        windows.retain(|&other| other != key);
+    } else if !windows.contains(&key) {
+        windows.push(key);
     }
     drop(windows);
     if on {

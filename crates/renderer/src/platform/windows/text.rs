@@ -1,3 +1,4 @@
+use super::extent;
 use crate::text::{FaceMetrics, Features, GlyphRaster, SUBPIXEL_STEPS, Span};
 use crate::{Color, Font, FontId, Glyph, GlyphId, Line, Pixels, Rect, Size, point, px, size};
 use anyhow::{Context as _, Result, bail, ensure};
@@ -140,15 +141,6 @@ fn typo_metrics(face: &IDWriteFontFace3) -> Option<[f32; 2]> {
         });
         face.ReleaseFontTable(context);
         read.filter(|[ascent, descent]| *ascent > 0. && *descent < 0.)
-    }
-}
-
-fn texture_rect(bounds: Rect<i32>) -> RECT {
-    RECT {
-        left: bounds.origin.x,
-        top: bounds.origin.y,
-        right: bounds.origin.x + bounds.size.width,
-        bottom: bounds.origin.y + bounds.size.height,
     }
 }
 
@@ -347,34 +339,6 @@ impl Library {
             let fallback =
                 self.describe(face, HSTRING::from(family), self.system.clone(), None, None);
             Some(self.register(fallback))
-        }
-    }
-
-    fn metrics(&self, id: FontId) -> FaceMetrics {
-        let face = self.face(id);
-        let mut metrics = DWRITE_FONT_METRICS1::default();
-        // SAFETY: a plain query into a local.
-        unsafe { face.face.GetMetrics(&mut metrics) };
-        let base = &metrics.Base;
-        let em = face.per_em;
-        let (ascent, descent) = (f32::from(base.ascent), -f32::from(base.descent));
-        let [typo_ascent, typo_descent] = typo_metrics(&face.face).unwrap_or([ascent, descent]);
-        let [left, top, right, bottom] = [
-            metrics.glyphBoxLeft,
-            metrics.glyphBoxTop,
-            metrics.glyphBoxRight,
-            metrics.glyphBoxBottom,
-        ]
-        .map(f32::from);
-        FaceMetrics {
-            ascent: ascent / em,
-            descent: descent / em,
-            line_gap: f32::from(base.lineGap) / em,
-            cap_height: f32::from(base.capHeight) / em,
-            x_height: f32::from(base.xHeight) / em,
-            bounds: Rect::new(point(left, bottom), size(right - left, top - bottom)) / em,
-            em_ascent: typo_ascent / (typo_ascent - typo_descent),
-            tall: false,
         }
     }
 
@@ -602,15 +566,6 @@ impl Library {
 
 // Grayscale analyses give their coverage in the aliased texture type, one byte per pixel.
 const COVERAGE: DWRITE_TEXTURE_TYPE = DWRITE_TEXTURE_ALIASED_1x1;
-
-fn extent(rect: RECT) -> [i32; 4] {
-    [
-        rect.left,
-        rect.top,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-    ]
-}
 
 // Empty bounds give no bytes.
 fn alpha(analysis: &IDWriteGlyphRunAnalysis, area: Option<RECT>) -> Result<(RECT, Vec<u8>)> {
@@ -868,7 +823,32 @@ impl TextSystem {
     }
 
     pub fn metrics(&self, font: FontId) -> FaceMetrics {
-        self.0.borrow().metrics(font)
+        let library = self.0.borrow();
+        let face = library.face(font);
+        let mut metrics = DWRITE_FONT_METRICS1::default();
+        // SAFETY: a plain query into a local.
+        unsafe { face.face.GetMetrics(&mut metrics) };
+        let base = &metrics.Base;
+        let em = face.per_em;
+        let (ascent, descent) = (f32::from(base.ascent), -f32::from(base.descent));
+        let [typo_ascent, typo_descent] = typo_metrics(&face.face).unwrap_or([ascent, descent]);
+        let [left, top, right, bottom] = [
+            metrics.glyphBoxLeft,
+            metrics.glyphBoxTop,
+            metrics.glyphBoxRight,
+            metrics.glyphBoxBottom,
+        ]
+        .map(f32::from);
+        FaceMetrics {
+            ascent: ascent / em,
+            descent: descent / em,
+            line_gap: f32::from(base.lineGap) / em,
+            cap_height: f32::from(base.capHeight) / em,
+            x_height: f32::from(base.xHeight) / em,
+            bounds: Rect::new(point(left, bottom), size(right - left, top - bottom)) / em,
+            em_ascent: typo_ascent / (typo_ascent - typo_descent),
+            tall: false,
+        }
     }
 
     pub fn glyph(&self, font: FontId, ch: char) -> Option<GlyphId> {
@@ -913,11 +893,6 @@ impl TextSystem {
             len: text.len(),
             ..Default::default()
         };
-        for span in spans {
-            let metrics = library.metrics(span.font);
-            line.ascent = line.ascent.max(span.size * metrics.ascent);
-            line.descent = line.descent.max(span.size * -metrics.descent);
-        }
         if text.is_empty() || spans.is_empty() {
             return line;
         }
@@ -958,7 +933,12 @@ impl TextSystem {
         if glyph.subpixel > 0 {
             canvas.width += 1;
         }
-        let area = texture_rect(Rect::new(bounds.origin, canvas));
+        let area = RECT {
+            left: bounds.origin.x,
+            top: bounds.origin.y,
+            right: bounds.origin.x + canvas.width,
+            bottom: bounds.origin.y + canvas.height,
+        };
         let library = self.0.borrow();
         if glyph.emoji
             && let Ok(pixels) = library.color_glyph(glyph, area)

@@ -49,9 +49,9 @@
   const finalizers = new Set();
   let collected = new WeakRef({});
   globalThis.__appsFinalizers = class {
-    constructor(release) { this.release = release; this.live = new Map(); this.tokens = new WeakMap(); finalizers.add(this); }
-    register(object, value, token) { const key = {}; this.live.set(key, { ref: new WeakRef(object), value }); if (token) { let keys = this.tokens.get(token); if (!keys) this.tokens.set(token, keys = new Set()); keys.add(key); } }
-    unregister(token) { const keys = this.tokens.get(token); if (!keys) return false; for (const key of keys) this.live.delete(key); this.tokens.delete(token); return true; }
+    constructor(release) { this.release = release; this.live = new Set(); this.tokens = new WeakMap(); finalizers.add(this); }
+    register(object, value, token) { const entry = { ref: new WeakRef(object), value }; this.live.add(entry); if (token) this.tokens.set(token, entry); }
+    unregister(token) { const entry = this.tokens.get(token); if (!entry) return false; this.live.delete(entry); this.tokens.delete(token); return true; }
   };
   const inspector = globalThis.__appsInspect, { inspect, formatWithOptions } = inspector;
   delete globalThis.__appsInspect;
@@ -207,7 +207,7 @@
       phase = 2;
       try {
         // WeakRef targets only die in a GC, so sweep only after the canary is collected.
-        if (!collected.deref()) { collected = new WeakRef({}); for (const registry of finalizers) for (const [key, entry] of registry.live) if (!entry.ref.deref()) { registry.live.delete(key); registry.release(entry.value); } }
+        if (!collected.deref()) { collected = new WeakRef({}); for (const registry of finalizers) for (const entry of registry.live) if (!entry.ref.deref()) { registry.live.delete(entry); registry.release(entry.value); } }
         globalThis.__appsDomSweep?.();
         globalThis.__appsDecoded?.();
         globalThis.__appsGPUPoll?.();
@@ -249,7 +249,7 @@
   globalThis.__appsAlive = () => {
     return refs > 0 || ticks.length > 0 || immediates.size > 0 || pollWeb.pending() || !!servers?.pending() || __appsPending();
   };
-  if (typeof role === 'object' && 'renderer' in role) {
+  if (!nodeRole) {
     globalThis.__appsDOM = call;
     globalThis.__appsEventState = pollWeb.eventState;
     globalThis.__appsFiles = hooks.files;
@@ -485,13 +485,13 @@
   const { path, os } = node;
   let ready = false, nextWindow = 0, resolveReady;
   const readyPromise = new Promise(resolve => { resolveReady = resolve; });
-  const windows = new Map(), captures = new Map(), states = new WeakMap(), pages = new WeakMap(), opened = new Map();
+  const windows = new Map(), captures = new Map(), states = new WeakMap(), pages = new WeakMap();
   let nextCapture = 0, nextLoad = 0, nextCSS = 0;
   const destroyed = () => Error('Object has been destroyed');
   const state = win => { if (win.isDestroyed()) throw destroyed(); return states.get(win); };
   const loadError = (code, description, url) => Object.assign(new Error(`${description} (${code}) loading '${url}'`), { code: description, errno: code, url });
   const pending = (win, op, ...args) => new Promise((resolve, reject) => { const id = ++nextCapture; captures.set(id, { resolve, reject, win, op }); call('window', op, win, id, ...args); });
-  class WebContents extends events.EventEmitter {
+  class WebContents extends browsers.Contents {
     constructor(win) { super(); Object.defineProperty(this, 'id', { value: browsers.reserve(), enumerable: true }); pages.set(this, { win, url: '', title: '', loading: false, load: null, html: null, zoom: [1, 0] }); }
     #page() { const page = pages.get(this); if (!windows.has(page.win)) throw destroyed(); return page; }
     _load(op, target, url) {
@@ -547,38 +547,28 @@
     static { for (const method of ['on', 'addListener', 'prependListener', 'once', 'prependOnceListener', 'removeListener', 'removeAllListeners']) this.prototype[method] = function(...args) { events.EventEmitter.prototype[method].apply(this, args); return this.#listen(); }; }
     getType() { return 'window'; }
     get session() { return browsers.session.defaultSession; }
-    get mainFrame() { return frameOf(this); }
-    get focusedFrame() { return frameOf(this); }
-    get navigationHistory() { return navigationHistory(this); }
+    #frame; #history; #debugger;
+    get mainFrame() {
+      const contents = this;
+      return this.#frame ??= { get url() { return contents.getURL(); }, get name() { return ''; }, get top() { return this; }, get parent() { return null; }, frames: [], framesInSubtree: [], get origin() { try { return new URL(contents.getURL()).origin; } catch { return ''; } }, processId: info.pid, routingId: 1, frameTreeNodeId: 1, visibilityState: 'visible', detached: false, ipc: contents.ipc,
+        executeJavaScript: code => contents.executeJavaScript(code), send: (channel, ...args) => contents.send(channel, ...args), postMessage: (channel, message) => contents.send(channel, message), isDestroyed: () => contents.isDestroyed(), reload: () => { contents.reload(); return true; }, collectJavaScriptCallStack: async () => '' };
+    }
+    get focusedFrame() { return this.mainFrame; }
+    get navigationHistory() {
+      const contents = this;
+      return this.#history ??= { canGoBack: () => false, canGoForward: () => false, canGoToOffset: () => false, goBack() { contents.executeJavaScript('history.back()'); }, goForward() { contents.executeJavaScript('history.forward()'); }, goToOffset() {}, goToIndex() {}, clear() {}, getActiveIndex: () => 0, length: () => 1, getEntryAtIndex: () => ({ url: contents.getURL(), title: contents.getTitle() }), getAllEntries: () => [{ url: contents.getURL(), title: contents.getTitle() }] };
+    }
     get hostWebContents() { return null; }
     get devToolsWebContents() { return null; }
-    get debugger() { return debuggerOf(this); }
-    ipc = Object.assign(new events.EventEmitter(), { handle() {}, handleOnce() {}, removeHandler() {} });
+    get debugger() { return this.#debugger ??= Object.assign(new events.EventEmitter(), { attach() { throw new Error('Chrome DevTools Protocol is not supported'); }, detach() {}, isAttached: () => false, sendCommand: () => Promise.reject(new Error('Chrome DevTools Protocol is not supported')) }); }
     isFocused() { return !this.isDestroyed() && states.get(windows.get(pages.get(this).win)).focused; }
-    isLoadingMainFrame() { return this.isLoading(); }
     getUserAgent() { return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) ${info.appName}/${info.appVersion}`; }
-    setUserAgent() {}
-    setBackgroundThrottling() {}
-    getBackgroundThrottling() { return false; }
-    setIgnoreMenuShortcuts() {}
-    setVisualZoomLevelLimits() { return Promise.resolve(); }
-    setAudioMuted() {}
-    isAudioMuted() { return false; }
-    isCurrentlyAudible() { return false; }
-    isDevToolsOpened() { return false; }
-    closeDevTools() {}
-    isCrashed() { return false; }
     stop() {}
-    startDrag() {}
-    sendInputEvent() {}
     replaceMisspelling(text) { this.replace(text); }
-    copyImageAt() {}
-    executeJavaScriptInIsolatedWorld(_world, scripts) { return Promise.all(scripts.map(({ code }) => this.executeJavaScript(code))).then(results => results.at(-1)); }
     getFrameRate() { return 120; }
     setFrameRate() {}
     getProcessMemoryInfo() { return Promise.resolve({ residentSet: process.memoryUsage.rss() >> 10, private: 0, shared: 0 }); }
     reload() { const page = this.#page(), html = page.url === 'apps://app/'; if (page.url) this._load(html ? 'load' : 'loadFile', html ? page.html : page.url, page.url).catch(() => {}); }
-    reloadIgnoringCache() { this.reload(); }
     send(channel, ...args) { bridge.send(this.#page().win, channel, ...args); }
     executeJavaScript(code) { return pending(this.#page().win, 'execute', String(code)); }
     insertCSS(css, { cssOrigin = 'author' } = {}) { const key = `apps-css-${++nextCSS}`; call('window', 'insertCSS', this.#page().win, key, String(css), cssOrigin === 'user'); return Promise.resolve(key); }
@@ -608,25 +598,6 @@
     getOSProcessId() { return info.pid; }
     getProcessId() { return info.pid; }
   }
-  const frames = new WeakMap();
-  const frameOf = contents => {
-    let frame = frames.get(contents);
-    if (!frame) frames.set(contents, frame = { get url() { return contents.getURL(); }, get name() { return ''; }, get top() { return frame; }, get parent() { return null; }, frames: [], framesInSubtree: [], get origin() { try { return new URL(contents.getURL()).origin; } catch { return ''; } }, processId: info.pid, routingId: 1, frameTreeNodeId: 1, visibilityState: 'visible', detached: false, ipc: contents.ipc,
-      executeJavaScript: code => contents.executeJavaScript(code), send: (channel, ...args) => contents.send(channel, ...args), postMessage: (channel, message) => contents.send(channel, message), isDestroyed: () => contents.isDestroyed(), reload: () => { contents.reload(); return true; }, collectJavaScriptCallStack: async () => '' });
-    return frame;
-  };
-  const histories = new WeakMap();
-  const navigationHistory = contents => {
-    let history = histories.get(contents);
-    if (!history) histories.set(contents, history = { canGoBack: () => false, canGoForward: () => false, canGoToOffset: () => false, goBack() { contents.executeJavaScript('history.back()'); }, goForward() { contents.executeJavaScript('history.forward()'); }, goToOffset() {}, goToIndex() {}, clear() {}, getActiveIndex: () => 0, length: () => 1, getEntryAtIndex: () => ({ url: contents.getURL(), title: contents.getTitle() }), getAllEntries: () => [{ url: contents.getURL(), title: contents.getTitle() }] });
-    return history;
-  };
-  const debuggers = new WeakMap();
-  const debuggerOf = contents => {
-    let item = debuggers.get(contents);
-    if (!item) debuggers.set(contents, item = Object.assign(new events.EventEmitter(), { attach() { throw new Error('Chrome DevTools Protocol is not supported'); }, detach() {}, isAttached: () => false, sendCommand: () => Promise.reject(new Error('Chrome DevTools Protocol is not supported')) }));
-    return item;
-  };
   const webContents = Object.freeze({
     getAllWebContents: () => [...[...windows.values()].map(win => win.webContents), ...browsers.all()],
     fromId: id => webContents.getAllWebContents().find(contents => contents.id === id),
@@ -635,7 +606,6 @@
   const closed = win => {
     const closing = quitting;
     windows.delete(win.id);
-    opened.delete(win.id);
     for (const child of win.contentView.children) win.contentView.removeChildView(child);
     const page = pages.get(win.webContents);
     page.load?.reject(loadError(-3, 'ERR_ABORTED', page.load.url));
@@ -699,11 +669,11 @@
     'did-fail-load': (_event, errorCode, errorDescription, validatedURL) => ({ errorCode, errorDescription, validatedURL, isMainFrame: true }),
     'console-message': (_event, level, message, line, sourceId) => ({ level, message, line, sourceId }), 'render-process-gone': (_event, details) => ({ details }), 'destroyed': () => ({}),
   };
-  globalThis.__appsWindowOpen = (id, [kind, url, frameName, features, disposition]) => {
-    const opener = windows.get(id);
+  globalThis.__appsWindowOpen = (id, args) => {
+    const opener = windows.get(id), [kind, url, frameName, features, disposition] = args;
     if (!opener) return 'null';
-    if (kind === 'webview') { try { return JSON.stringify(webview(opener, url, frameName, features) ?? null); } catch (error) { hooks.report(error); return 'null'; } }
-    if (kind !== 'open') { const child = opened.get(url) === id ? windows.get(url) : null; if (kind === 'close') child?.close(); return JSON.stringify(!child); }
+    if (kind === 'webview') { const [, op, guestId, data] = args; try { return JSON.stringify(webview(opener, op, guestId, data) ?? null); } catch (error) { hooks.report(error); return 'null'; } }
+    if (kind !== 'open') { const child = windows.get(url), own = states.get(child)?.opener === id; if (own && kind === 'close') child.close(); return JSON.stringify(!own); }
     const page = pages.get(opener.webContents), details = { url, frameName, features, disposition, referrer: { url: page.url, policy: 'strict-origin-when-cross-origin' }, postBody: undefined };
     try {
       const result = page.open ? page.open(details) : { action: 'allow' };
@@ -712,7 +682,7 @@
       for (const [, key, value] of features.matchAll(/(\w+)\s*=\s*([\d.]+)/g)) { const name = { width: 'width', height: 'height', left: 'x', top: 'y' }[key.toLowerCase()]; if (name) options[name] = Number(value); }
       Object.assign(options, result.overrideBrowserWindowOptions);
       const win = new BrowserWindow(options);
-      opened.set(win.id, id);
+      states.get(win).opener = id;
       win.loadFile(url).catch(() => {});
       opener.webContents.emit('did-create-window', win, { ...details, options });
       return String(win.id);
@@ -1052,7 +1022,7 @@
       if (!updated.defaultPrevented) { states.get(win).title = data; call('window', 'title', id, data); }
     }
     else if (name === 'loaded' || name === 'failed') { win?.webContents._event(name, data); if (name === 'loaded') win?.emit('ready-to-show'); }
-    else if (name === 'context-menu') win?.webContents.emit('context-menu', event(), { ...data, frame: frameOf(win.webContents) });
+    else if (name === 'context-menu') win?.webContents.emit('context-menu', event(), { ...data, frame: win.webContents.mainFrame });
     else if (name === 'input-event') win?.webContents.emit('input-event', event(), data);
     else if (name === 'file-picker') { if (win) pickFiles(win, data); }
     else if (name === 'select-popup') {
@@ -1157,12 +1127,12 @@
     });
   };
   const perf_hooks = { performance, PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList, createHistogram: () => new RecordableHistogram(), monitorEventLoopDelay };
-  const compat = once(() => installCompat(events.EventEmitter, stream(), netModule().tls));
+  const compat = once(() => installCompat(events.EventEmitter, stream));
   const crypto = once(() => ({ ...globalThis.__appsNodeCrypto, ...io().crypto }));
   const lazy = (target, key, get) => Object.defineProperty(target, key, { get, enumerable: true, configurable: true });
   // The keys keep their order, which `builtinModules` lists.
   const modules = {};
-  for (const key of ['async_hooks', 'diagnostics_channel', 'sea', 'tls', 'undici', 'v8']) lazy(modules, key, () => compat()[key]);
+  for (const key of ['async_hooks', 'diagnostics_channel', 'sea', 'tls', 'undici', 'v8']) lazy(modules, key, () => key === 'tls' ? netModule().tls : compat()[key]);
   lazy(events, 'EventEmitterAsyncResource', () => compat().EventEmitterAsyncResource);
   Object.assign(modules, { fs, path, os, process, events });
   lazy(modules, 'stream', stream);

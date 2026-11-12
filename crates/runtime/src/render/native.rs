@@ -100,9 +100,6 @@ pub(super) fn paint(
     window: &mut renderer::Window,
 ) {
     let controls = view.controls.borrow();
-    if controls.shown.is_empty() {
-        return;
-    }
     let (Some(&(key, seen)), Some(sink)) = (controls.shown.get(&id), &controls.sink) else {
         return;
     };

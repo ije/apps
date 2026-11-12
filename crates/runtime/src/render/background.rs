@@ -1,14 +1,14 @@
 use super::paint::Effected;
 use crate::style;
 use crate::style::Prop;
-use renderer::{Child, Color, px};
+use renderer::{Child, px};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     rc::Rc,
     sync::{Arc, Mutex, PoisonError},
 };
 
-type Backgrounds = HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>;
+type Bitmaps = HashMap<String, Arc<renderer::RenderImage>>;
 
 pub(super) type Decoding = Arc<Mutex<Option<renderer::RenderImage>>>;
 
@@ -67,11 +67,7 @@ pub(super) fn css_background(
             pick(&repeats, index),
         );
         if let Some(source) = image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
-            let source = source.trim().trim_matches(['"', '\'']);
-            if let Some(path) = super::image::data_file(source).or_else(|| {
-                let base = base?;
-                crate::host::local_path(assets, base, &base.join(source).ok()?)
-            }) {
+            if let Some(path) = super::image::url_file(source, base, assets) {
                 let fit = match size.as_str() {
                     "cover" => renderer::ObjectFit::Cover,
                     "contain" => renderer::ObjectFit::Contain,
@@ -80,12 +76,6 @@ pub(super) fn css_background(
                 };
                 let file = path.to_string_lossy().into_owned();
                 let source = format!("{size} {file}");
-                let shared = (usize::MAX, {
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::hash::DefaultHasher::new();
-                    file.hash(&mut hasher);
-                    hasher.finish() as usize
-                });
                 let view = view.clone();
                 layers.push(
                     renderer::canvas_within(
@@ -98,7 +88,8 @@ pub(super) fn css_background(
                             }
                             let view = &*view;
                             let mut host = view.host.borrow_mut();
-                            let backgrounds = &mut host.dom.entry(view.id).or_default().backgrounds;
+                            let dom = host.dom.entry(view.id).or_default();
+                            let (backgrounds, bitmaps) = (&mut dom.backgrounds, &mut dom.bitmaps);
                             let scale = window.scale_factor();
                             let [[tile_width, tile_height], [tile_x, tile_y]] =
                                 super::effects::tile(&size, &position, &units, width, height);
@@ -143,27 +134,21 @@ pub(super) fn css_background(
                                 source.clone()
                             };
                             let key = (id, slot * 64 + index);
-                            let decoded = |backgrounds: &Backgrounds| {
-                                backgrounds
-                                    .get(&shared)
-                                    .filter(|(old, _)| *old == file)
-                                    .map(|(_, image)| image.clone())
+                            let fixed = |bitmaps: &Bitmaps, image: &Arc<renderer::RenderImage>| {
+                                bitmaps
+                                    .get(&file)
+                                    .is_some_and(|bitmap| Arc::ptr_eq(bitmap, image))
                             };
-                            let fixed =
-                                |backgrounds: &Backgrounds, image: &Arc<renderer::RenderImage>| {
-                                    decoded(backgrounds)
-                                        .is_some_and(|bitmap| Arc::ptr_eq(&bitmap, image))
-                                };
                             if backgrounds.get(&key).is_none_or(|(old, image)| {
                                 *old != source
-                                    || !fixed(backgrounds, image)
+                                    || !fixed(bitmaps, image)
                                         && [image.size().width, image.size().height]
                                             .map(|side| side as u32)
                                             != cell
                             }) {
                                 // Take a decoded bitmap only where a layer holds it at once, since `retire`
                                 // drops unheld bitmaps.
-                                let bitmap = match decoded(backgrounds) {
+                                let bitmap = match bitmaps.get(&file).cloned() {
                                     Some(bitmap) => bitmap,
                                     None => {
                                         let mut decoding = view.decoding.borrow_mut();
@@ -177,13 +162,7 @@ pub(super) fn css_background(
                                                 let slot = Decoding::default();
                                                 decoding.insert(file.clone(), (id, slot.clone()));
                                                 let (path, done) = (path.clone(), slot.clone());
-                                                type Job = Box<dyn FnOnce() + Send>;
-                                                static JOBS: Mutex<(VecDeque<Job>, usize)> =
-                                                    Mutex::new((VecDeque::new(), 0));
-                                                let mut jobs = JOBS
-                                                    .lock()
-                                                    .unwrap_or_else(PoisonError::into_inner);
-                                                jobs.0.push_back(Box::new(move || {
+                                                super::image::decode_later(Box::new(move || {
                                                     let image = (|| -> anyhow::Result<_> {
                                                         anyhow::ensure!(
                                                             std::fs::metadata(&path)?.len()
@@ -201,34 +180,13 @@ pub(super) fn css_background(
                                                         .unwrap_or_else(PoisonError::into_inner) =
                                                         Some(image);
                                                 }));
-                                                if jobs.1 < 2
-                                                    && std::thread::Builder::new()
-                                                        .name("apps-image".into())
-                                                        .spawn(|| {
-                                                            while let Some(job) = {
-                                                                let mut jobs =
-                                                                    JOBS.lock().unwrap_or_else(
-                                                                        PoisonError::into_inner,
-                                                                    );
-                                                                let job = jobs.0.pop_front();
-                                                                jobs.1 -=
-                                                                    usize::from(job.is_none());
-                                                                job
-                                                            } {
-                                                                job();
-                                                            }
-                                                        })
-                                                        .is_ok()
-                                                {
-                                                    jobs.1 += 1;
-                                                }
                                                 window.next_frame(redraw_when_decoded(slot));
                                             }
                                             return;
                                         };
                                         decoding.remove(&file);
                                         let image = Arc::new(image);
-                                        backgrounds.insert(shared, (file.clone(), image.clone()));
+                                        bitmaps.insert(file.clone(), image.clone());
                                         image
                                     }
                                 };
@@ -370,7 +328,7 @@ pub(super) fn css_background(
                                 }
                                 return;
                             }
-                            let target = if fixed(backgrounds, image) {
+                            let target = if fixed(bitmaps, image) {
                                 fit.place(bounds, natural)
                             } else {
                                 bounds
@@ -497,7 +455,7 @@ pub(super) fn css_background(
                             let image = super::effects::gradient_svg(
                                 &kind, &body, &size, position, &repeat, units, width, height,
                             )
-                            .and_then(|source| super::canvas::svg(&source, rw, rh, None).ok())?;
+                            .and_then(|source| super::canvas::svg(&source, rw, rh).ok())?;
                             const LIMIT: u32 = 8 << 20;
                             if new && rw * rh * 4 <= LIMIT / 4 {
                                 dom.gradients.push((inputs.clone(), image.clone()));
@@ -591,7 +549,7 @@ pub(super) fn css_background(
         let mut color = renderer::node()
             .absolute()
             .size_full()
-            .bg(Color::hex(ink << 8 | alpha as u32));
+            .bg(crate::style::rgba((ink, alpha)));
         color.style().corner_radii = radius;
         group = group.child(color);
     }

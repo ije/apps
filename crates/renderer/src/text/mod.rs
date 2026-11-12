@@ -216,6 +216,56 @@ impl Fonts {
     }
 }
 
+#[cfg(not(windows))]
+fn nearest_value(
+    values: impl Iterator<Item = f32> + Clone,
+    wanted: f32,
+    down: bool,
+) -> Option<f32> {
+    let below = values
+        .clone()
+        .filter(|&value| value <= wanted)
+        .reduce(f32::max);
+    let above = values.filter(|&value| value > wanted).reduce(f32::min);
+    if down {
+        below.or(above)
+    } else {
+        above.or(below)
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn best(
+    faces: &[(f32, FontStyle, f32)],
+    weight: f32,
+    style: FontStyle,
+) -> Option<usize> {
+    let mut set: Vec<usize> = (0..faces.len()).collect();
+    let stretch = nearest_value(set.iter().map(|&at| faces[at].2), 1., true)?;
+    set.retain(|&at| faces[at].2 == stretch);
+    let order = match style {
+        FontStyle::Italic => [FontStyle::Italic, FontStyle::Oblique, FontStyle::Normal],
+        FontStyle::Oblique => [FontStyle::Oblique, FontStyle::Italic, FontStyle::Normal],
+        FontStyle::Normal => [FontStyle::Normal, FontStyle::Oblique, FontStyle::Italic],
+    };
+    let style = order
+        .into_iter()
+        .find(|style| set.iter().any(|&at| faces[at].1 == *style))?;
+    set.retain(|&at| faces[at].1 == style);
+    let weights = set.iter().map(|&at| faces[at].0);
+    let has = |value: f32| weights.clone().any(|weight| weight == value);
+    let chosen = if has(weight) {
+        weight
+    } else if (400. ..450.).contains(&weight) && has(500.) {
+        500.
+    } else if (450. ..=500.).contains(&weight) && has(400.) {
+        400.
+    } else {
+        nearest_value(weights.clone(), weight, weight <= 500.)?
+    };
+    set.into_iter().find(|&at| faces[at].0 == chosen)
+}
+
 pub fn warm(lists: Vec<Vec<String>>) {
     if !lists.is_empty() {
         platform::TextSystem::warm(lists);
@@ -243,13 +293,9 @@ impl TextSystem {
     }
 
     pub(crate) fn for_window(&self) -> Self {
-        Self::sharing(self.fonts.clone())
-    }
-
-    fn sharing(fonts: Rc<Fonts>) -> Self {
         Self {
-            generation: Cell::new(fonts.generation.get()),
-            fonts,
+            generation: Cell::new(self.fonts.generation.get()),
+            fonts: self.fonts.clone(),
             cache: Cache::default(),
             spans: Cell::default(),
         }
@@ -284,7 +330,6 @@ impl TextSystem {
         &self,
         runs: impl Iterator<Item = (usize, &'a TextRun)>,
         font_size: Pixels,
-        glyphs_only: bool,
     ) -> Vec<Span> {
         let mut spans = self.spans.take();
         spans.clear();
@@ -294,7 +339,7 @@ impl TextSystem {
                 last.color != run.color
                     || last.underline != run.underline
                     || last.strikethrough != run.strikethrough
-                    || !glyphs_only && last.background_color != run.background_color
+                    || last.background_color != run.background_color
             });
             let font = match last {
                 Some((last, id)) if last.font == run.font => id,
@@ -334,10 +379,8 @@ impl TextSystem {
             !text.contains('\n'),
             "shape_line takes text without newlines"
         );
-        let spans = self.spans(std::iter::once((run.len, run)), font_size, true);
-        let (text, line, _) = self
-            .cache()
-            .get(&self.platform, text, font_size, &spans, None);
+        let spans = self.spans(std::iter::once((run.len, run)), font_size);
+        let (text, line, _) = self.cache().get(&self.fonts, text, font_size, &spans, None);
         self.spans.set(spans);
         TextLine {
             line,
@@ -371,7 +414,7 @@ impl TextSystem {
             }
             pieces.clear();
             cursor.take(source.len(), |len, run| pieces.push((len, run)));
-            let spans = self.spans(pieces.iter().copied(), font_size, false);
+            let spans = self.spans(pieces.iter().copied(), font_size);
             let wrap = wrapping.width.map(|width| Wrapping {
                 width: Some(width),
                 max_lines: wrapping.max_lines.map(|max| max.saturating_sub(rows)),
@@ -380,7 +423,7 @@ impl TextSystem {
             });
             let (text, line, breaks) =
                 self.cache()
-                    .get(&self.platform, source, font_size, &spans, wrap.as_ref());
+                    .get(&self.fonts, source, font_size, &spans, wrap.as_ref());
             self.spans.set(spans);
             rows += breaks.len() + 1;
             // The newline takes one byte of the runs.

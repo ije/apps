@@ -6,12 +6,12 @@ const chunk = this.__appsChunk ?? globalThis.__appsChunk;
 const definitions = new Map(), modules = new Map(), starredBy = new Map(), chunks = new Map(), loaded = new Set(), bind = Object.defineProperties, slots = [];
 const namespaceOf = module => {
   if (module.namespace) return module.namespace;
-  const namespace = Object.defineProperty(Object.create(null), Symbol.toStringTag, { value: 'Module' }), table = module.definition.slots;
+  const namespace = Object.defineProperty(Object.create(null), Symbol.toStringTag, { value: 'Module' }), table = module.definition.slots, descriptors = Object.create(null);
   for (const name in table) {
     const slot = table[name];
-    bind(namespace, { [name]: { enumerable: true, get: typeof slot !== 'number' ? () => namespaceOf(modules.get(slot[0]))[slot[1]] : slot < 0 ? () => slots[~slot]() : () => slots[slot] } });
+    descriptors[name] = { enumerable: true, get: typeof slot !== 'number' ? () => namespaceOf(modules.get(slot[0]))[slot[1]] : slot < 0 ? () => slots[~slot]() : () => slots[slot] };
   }
-  return module.namespace = Object.preventExtensions(namespace);
+  return module.namespace = Object.preventExtensions(bind(namespace, descriptors));
 };
 const define = definition => {
   if (definitions.has(definition.id)) throw Error('Duplicate module: ' + definition.id);
@@ -189,7 +189,7 @@ const load = (id, ancestors = new Set()) => {
     refreshStars(id);
     return;
   }
-  const visiting = new Set(ancestors).add(id);
+  ancestors.add(id);
   const pending = [];
   const execute = () => {
     for (const item of module.definition.imports ?? []) {
@@ -212,12 +212,12 @@ const load = (id, ancestors = new Set()) => {
   try {
     for (const dependency of module.definition.deps) {
       if (dependency === null) continue;
-      const loading = load(dependency, visiting);
+      const loading = load(dependency, ancestors);
       if (loading instanceof Promise && modules.get(dependency).state !== 2) pending.push(loading);
     }
-    if (module.definition.defers) for (const loading of loadAsync(module.definition.defers, visiting)) if (loading instanceof Promise) pending.push(loading);
+    if (module.definition.defers) for (const loading of loadAsync(module.definition.defers, ancestors)) if (loading instanceof Promise) pending.push(loading);
     result = pending.length ? Promise.all(pending).then(execute) : execute();
-  } catch (error) { failed(error); }
+  } catch (error) { failed(error); } finally { ancestors.delete(id); }
   if (result instanceof Promise) module.promise = result.catch(failed);
   return module.promise;
 };

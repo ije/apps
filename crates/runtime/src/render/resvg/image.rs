@@ -27,19 +27,10 @@ fn render_vector(
     tree: &usvg::Tree,
     transform: tiny_skia::Transform,
     pixmap: &mut tiny_skia::PixmapMut,
-) -> Option<()> {
+) {
     let mut sub_pixmap = tiny_skia::Pixmap::new(pixmap.width(), pixmap.height()).unwrap();
     super::render(tree, transform, &mut sub_pixmap.as_mut());
-    pixmap.draw_pixmap(
-        0,
-        0,
-        sub_pixmap.as_ref(),
-        &tiny_skia::PixmapPaint::default(),
-        tiny_skia::Transform::default(),
-        None,
-    );
-
-    Some(())
+    super::render::draw_over(pixmap, sub_pixmap.as_ref(), 0, 0, 1.0);
 }
 
 fn render_raster(
@@ -65,12 +56,13 @@ fn render_raster(
         .to_rect(0.0, 0.0)?;
 
     let quality = match rendering_mode {
-        usvg::ImageRendering::OptimizeQuality => tiny_skia::FilterQuality::Bicubic,
-        usvg::ImageRendering::OptimizeSpeed => tiny_skia::FilterQuality::Nearest,
+        usvg::ImageRendering::OptimizeQuality | usvg::ImageRendering::HighQuality => {
+            tiny_skia::FilterQuality::Bicubic
+        }
+        usvg::ImageRendering::OptimizeSpeed
+        | usvg::ImageRendering::CrispEdges
+        | usvg::ImageRendering::Pixelated => tiny_skia::FilterQuality::Nearest,
         usvg::ImageRendering::Smooth => tiny_skia::FilterQuality::Bilinear,
-        usvg::ImageRendering::HighQuality => tiny_skia::FilterQuality::Bicubic,
-        usvg::ImageRendering::CrispEdges => tiny_skia::FilterQuality::Nearest,
-        usvg::ImageRendering::Pixelated => tiny_skia::FilterQuality::Nearest,
     };
 
     let pattern = tiny_skia::Pattern::new(

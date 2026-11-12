@@ -111,6 +111,8 @@ static int open_track(AppsMedia *m, Track *track, enum AVMediaType type) {
   return 1;
 }
 
+void apps_ffmpeg_close(AppsMedia *m);
+
 AppsMedia *apps_ffmpeg_open(const char *path, const uint8_t *data, int64_t size, int video, int rate,
                            int channels, AppsMediaInfo *info, char *error, int error_size) {
   av_log_set_level(AV_LOG_QUIET);
@@ -167,19 +169,7 @@ AppsMedia *apps_ffmpeg_open(const char *path, const uint8_t *data, int64_t size,
   return m;
 fail:
   av_strerror(status, error, error_size);
-  if (m) {
-    avformat_close_input(&m->format);
-    if (m->io) av_freep(&m->io->buffer);
-    avio_context_free(&m->io);
-    av_frame_free(&m->frame);
-    av_frame_free(&m->software);
-    av_frame_free(&m->picture);
-    av_packet_free(&m->packet);
-    avcodec_free_context(&m->video.codec);
-    avcodec_free_context(&m->audio.codec);
-    av_buffer_unref(&m->device);
-    av_free(m);
-  }
+  if (m) apps_ffmpeg_close(m);
   return NULL;
 }
 

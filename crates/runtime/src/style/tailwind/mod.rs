@@ -3,19 +3,30 @@ use crate::dom::Document;
 use rustc_hash::FxHashMap;
 use std::{
     cmp::{Ordering, Reverse},
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     fmt::Write,
     rc::Rc,
+    sync::LazyLock,
 };
 
 const THEME: &str = include_str!("theme.css");
 const PREFLIGHT: &str = include_str!("preflight.css");
 
-thread_local! {
-    static DEFAULTS: HashMap<&'static str, &'static str> = THEME
+static DEFAULTS: LazyLock<FxHashMap<&str, &str>> = LazyLock::new(|| {
+    THEME
         .lines()
         .filter_map(|line| line.strip_suffix(';')?.split_once(':'))
-        .collect();
+        .collect()
+});
+
+static ORDER_INDEX: LazyLock<FxHashMap<&str, u16>> = LazyLock::new(|| {
+    (0..)
+        .zip(ORDER)
+        .map(|(index, name)| (*name, index))
+        .collect()
+});
+
+thread_local! {
     static BASE: Rc<Stylesheet> = Rc::new(Stylesheet::parse(&format!("@layer base{{{PREFLIGHT}}}")));
 }
 
@@ -216,7 +227,6 @@ const ORDER: &[&str] = &[
     "grid-row-end",
     "float",
     "clear",
-    "--tw-container-component",
     "margin",
     "margin-inline",
     "margin-block",
@@ -328,8 +338,6 @@ const ORDER: &[&str] = &[
     "divide-x-width",
     "divide-y-width",
     "--tw-divide-y-reverse",
-    "divide-style",
-    "divide-color",
     "place-self",
     "align-self",
     "justify-self",
@@ -341,12 +349,6 @@ const ORDER: &[&str] = &[
     "overscroll-behavior-y",
     "scroll-behavior",
     "border-radius",
-    "border-start-radius",
-    "border-end-radius",
-    "border-top-radius",
-    "border-right-radius",
-    "border-bottom-radius",
-    "border-left-radius",
     "border-start-start-radius",
     "border-start-end-radius",
     "border-end-end-radius",
@@ -499,7 +501,6 @@ const ORDER: &[&str] = &[
     "text-decoration-thickness",
     "text-underline-offset",
     "-webkit-font-smoothing",
-    "placeholder-color",
     "caret-color",
     "accent-color",
     "color-scheme",
@@ -1666,8 +1667,7 @@ impl Compiler {
                 at
             }
         };
-        let config = self.0.remove(at);
-        self.0.push(config);
+        self.0[at..].rotate_left(1);
         let config = self.0.last_mut()?;
         Some(config.update(sheets, index, doc, order))
     }
@@ -1729,13 +1729,13 @@ impl Config {
         let mut used = String::new();
         let first = self.header.is_none();
         if first {
-            let theme: Vec<_> = self
+            for name in self
                 .theme
                 .keys()
                 .filter(|name| !self.inline.contains(*name))
-                .map(|name| format!("var({name})"))
-                .collect();
-            used = theme.concat();
+            {
+                let _ = write!(used, "var({name})");
+            }
             if self.import == Some(true) {
                 used.push_str(PREFLIGHT);
             }
@@ -1775,6 +1775,9 @@ impl Config {
                     }
                 }
             }
+        }
+        if self.classes.len() > 1 << 16 {
+            self.classes.retain(|_, compiled| *compiled);
         }
         for sheet in sheets.iter_mut() {
             if let Some((_, applied)) = self
@@ -1842,45 +1845,31 @@ impl Config {
             // Keys must stay below 2^56, so a selector index fits below them in 64 bits.
             const KEYS: u64 = 1 << 56;
             let mut renumber = false;
-            if fresh.len() <= 16 {
-                for (sort, rules) in fresh {
-                    let position = self.sorted.partition_point(|(other, ..)| *other < sort);
-                    let low = position
-                        .checked_sub(1)
-                        .map_or(0, |previous| self.sorted[previous].1);
-                    let high = self.sorted.get(position).map_or(KEYS, |(_, key, _)| *key);
-                    let key = low + (high - low) / 2;
-                    renumber |= key == low;
+            let mut merged = Vec::with_capacity(self.sorted.len() + fresh.len());
+            let mut fresh = fresh.into_iter().peekable();
+            let mut sorted = std::mem::take(&mut self.sorted).into_iter().peekable();
+            while let Some(next) = fresh.peek() {
+                while let Some(old) = sorted.next_if(|old| old.0 < next.0) {
+                    merged.push(old);
+                }
+                let low = merged.last().map_or(0, |(_, key, _)| *key);
+                let high = sorted.peek().map_or(KEYS, |(_, key, _)| *key);
+                let mut run = Vec::new();
+                while let Some(item) =
+                    fresh.next_if(|item| sorted.peek().is_none_or(|old| item.0 < old.0))
+                {
+                    run.push(item);
+                }
+                let step = (high - low) / (run.len() as u64 + 1);
+                renumber |= step == 0;
+                for (index, (sort, rules)) in run.into_iter().enumerate() {
+                    let key = low + step * (index as u64 + 1);
                     new.insert(key);
-                    self.sorted.insert(position, (sort, key, rules));
+                    merged.push((sort, key, rules));
                 }
-            } else {
-                let mut merged = Vec::with_capacity(self.sorted.len() + fresh.len());
-                let mut fresh = fresh.into_iter().peekable();
-                let mut sorted = std::mem::take(&mut self.sorted).into_iter().peekable();
-                while let Some(next) = fresh.peek() {
-                    while let Some(old) = sorted.next_if(|old| old.0 < next.0) {
-                        merged.push(old);
-                    }
-                    let low = merged.last().map_or(0, |(_, key, _)| *key);
-                    let high = sorted.peek().map_or(KEYS, |(_, key, _)| *key);
-                    let mut run = Vec::new();
-                    while let Some(item) =
-                        fresh.next_if(|item| sorted.peek().is_none_or(|old| item.0 < old.0))
-                    {
-                        run.push(item);
-                    }
-                    let step = (high - low) / (run.len() as u64 + 1);
-                    renumber |= step == 0;
-                    for (index, (sort, rules)) in run.into_iter().enumerate() {
-                        let key = low + step * (index as u64 + 1);
-                        new.insert(key);
-                        merged.push((sort, key, rules));
-                    }
-                }
-                merged.extend(sorted);
-                self.sorted = merged;
             }
+            merged.extend(sorted);
+            self.sorted = merged;
             if renumber {
                 let step = KEYS / (self.sorted.len() as u64 + 1);
                 for (index, (_, key, _)) in self.sorted.iter_mut().enumerate() {
@@ -1982,9 +1971,7 @@ impl Config {
                 Some(value) => value.clone(),
                 None if self.removed(&name) || INLINE.contains(&name.as_str()) => continue,
                 None => {
-                    let Some(value) =
-                        DEFAULTS.with(|defaults| defaults.get(name.as_str()).copied())
-                    else {
+                    let Some(&value) = DEFAULTS.get(name.as_str()) else {
                         continue;
                     };
                     match value
@@ -2215,11 +2202,8 @@ impl Config {
             .chain(body.nested.iter().flat_map(|(.., values)| values))
         {
             count += 1;
-            if let Some(index) = ORDER
-                .iter()
-                .position(|name| *name == body.sort.unwrap_or(key))
-            {
-                properties.insert(index as u16);
+            if let Some(&index) = ORDER_INDEX.get(body.sort.unwrap_or(key)) {
+                properties.insert(index);
             }
         }
         let mut properties: Vec<_> = properties.into_iter().collect();
@@ -2323,24 +2307,11 @@ impl Config {
         } else if let Some(value) = name.strip_prefix('@') {
             ("@min", value)
         } else {
-            [
-                "group",
-                "peer",
-                "not",
-                "has",
-                "in",
-                "aria",
-                "data",
-                "nth-last-of-type",
-                "nth-of-type",
-                "nth-last",
-                "nth",
-                "supports",
-                "min",
-                "max",
-            ]
-            .iter()
-            .find_map(|root| Some((*root, name.strip_prefix(root)?.strip_prefix('-')?)))?
+            VARIANTS
+                .iter()
+                .filter(|(_, template)| template.is_empty())
+                .filter_map(|(root, _)| Some((*root, name.strip_prefix(root)?.strip_prefix('-')?)))
+                .max_by_key(|(root, _)| root.len())?
         };
         if value.is_empty() {
             return None;
@@ -2572,23 +2543,23 @@ impl Config {
         if self.removed(name) {
             return None;
         }
-        DEFAULTS.with(|defaults| defaults.get(name).map(|value| (*value).to_owned()))
+        DEFAULTS.get(name).map(|value| (*value).to_owned())
     }
 
     fn theme(&self, namespace: &str, key: &str) -> Option<String> {
-        let name = format!("{namespace}-{key}");
-        let name = if self.raw(&name).is_none() && key.contains('.') {
-            format!("{namespace}-{}", key.replace('.', "_"))
-        } else {
-            name
-        };
+        let mut name = format!("{namespace}-{key}");
+        let mut value = self.raw(&name);
+        if value.is_none() && key.contains('.') {
+            name = format!("{namespace}-{}", key.replace('.', "_"));
+            value = self.raw(&name);
+        }
         if kept(&name, namespace) {
             return None;
         }
         if self.inline.contains(&name) || INLINE.contains(&name.as_str()) {
-            return self.raw(&name);
+            return value;
         }
-        self.raw(&name).map(|_| format!("var({name})"))
+        value.map(|_| format!("var({name})"))
     }
 
     fn custom(&self, class: &str) -> Option<Body> {
@@ -4524,13 +4495,11 @@ impl Config {
                 ),
             ),
             "container" if value.is_none() => {
-                let mut breakpoints: Vec<_> = DEFAULTS.with(|defaults| {
-                    defaults
-                        .keys()
-                        .filter_map(|name| name.strip_prefix("--breakpoint-"))
-                        .map(str::to_owned)
-                        .collect()
-                });
+                let mut breakpoints: Vec<_> = DEFAULTS
+                    .keys()
+                    .filter_map(|name| name.strip_prefix("--breakpoint-"))
+                    .map(str::to_owned)
+                    .collect();
                 breakpoints.extend(
                     self.theme
                         .keys()
@@ -4541,12 +4510,8 @@ impl Config {
                     .into_iter()
                     .filter_map(|name| self.raw(&format!("--breakpoint-{name}")))
                     .collect();
-                widths.sort_by(|a, b| {
-                    let pixels = |width: &String| {
-                        let ((_, key), _) = self.media(">=", width, "min").unwrap_or_default();
-                        key
-                    };
-                    pixels(a).cmp(&pixels(b))
+                widths.sort_by_cached_key(|width| {
+                    self.media(">=", width, "min").map(|((_, key), _)| key)
                 });
                 widths.dedup();
                 let mut body = Body::new(&[("width", "100%".into())])?;
@@ -4627,18 +4592,7 @@ fn statements(source: &str) -> Vec<(&str, Option<&str>)> {
             '\\' => {
                 chars.next();
             }
-            '"' | '\'' => {
-                let mut escaped = false;
-                for (_, other) in chars.by_ref() {
-                    if escaped {
-                        escaped = false;
-                    } else if other == '\\' {
-                        escaped = true;
-                    } else if other == character {
-                        break;
-                    }
-                }
-            }
+            '"' | '\'' => skip_string(&mut chars, character),
             '(' | '[' => parens += 1,
             ')' | ']' => parens = parens.saturating_sub(1),
             '{' => {
@@ -4669,6 +4623,19 @@ fn statements(source: &str) -> Vec<(&str, Option<&str>)> {
         items.push((rest, None));
     }
     items
+}
+
+fn skip_string(chars: &mut std::str::CharIndices, quote: char) {
+    let mut escaped = false;
+    for (_, other) in chars.by_ref() {
+        if escaped {
+            escaped = false;
+        } else if other == '\\' {
+            escaped = true;
+        } else if other == quote {
+            break;
+        }
+    }
 }
 
 fn call(text: &str, name: &str) -> Option<(usize, usize, usize)> {
@@ -4729,18 +4696,7 @@ fn split(value: &str, separator: char) -> Vec<&str> {
             '\\' => {
                 chars.next();
             }
-            '"' | '\'' => {
-                let mut escaped = false;
-                for (_, other) in chars.by_ref() {
-                    if escaped {
-                        escaped = false;
-                    } else if other == '\\' {
-                        escaped = true;
-                    } else if other == character {
-                        break;
-                    }
-                }
-            }
+            '"' | '\'' => skip_string(&mut chars, character),
             '(' => stack.push(')'),
             '[' => stack.push(']'),
             '{' => stack.push('}'),

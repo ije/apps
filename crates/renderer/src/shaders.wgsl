@@ -21,11 +21,9 @@ const BOX: u32 = 0u;
 const SHADOW: u32 = 1u;
 const LINE: u32 = 2u;
 const GLYPH: u32 = 3u;
-const IMAGE: u32 = 4u;
 // A box without radii, borders or a rounded clip, set by the vertex stage.
 const FILL: u32 = 5u;
 
-const SOLID: u32 = 0u;
 const DASHED: u32 = 1u;
 const DOTTED: u32 = 2u;
 const DOUBLE: u32 = 3u;

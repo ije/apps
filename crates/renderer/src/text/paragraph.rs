@@ -1,6 +1,6 @@
 use super::{
-    SharedString, TextAlign, TextLine, TextRun, TextStyle, TextWrap, WhiteSpace, WordBreak,
-    Wrapping, breaks::breaks,
+    RunCursor, SharedString, TextAlign, TextLine, TextRun, TextStyle, TextWrap, WhiteSpace,
+    WordBreak, Wrapping, breaks::breaks,
 };
 use crate::{AvailableSpace, Pixels, Point, Rect, Size, Window, px};
 use std::{
@@ -196,24 +196,24 @@ impl TextState {
                 }
                 None => lines.clone(),
                 Some((width, clamp, wrap)) => {
-                    let nowrap = runs.iter().any(|run| run.nowrap);
-                    let (mut start, mut wrapped) = (0, 0);
+                    let mut cursor = RunCursor {
+                        runs,
+                        at: 0,
+                        used: 0,
+                    };
+                    let mut wrapped = 0;
                     lines
                         .iter()
                         .enumerate()
                         .map(|(index, line)| {
-                            let end = start + line.len();
-                            let mut ranges = Vec::new();
-                            if nowrap {
-                                let mut at = 0;
-                                for run in runs {
-                                    let range = at.max(start)..(at + run.len).min(end);
-                                    if run.nowrap && range.start < range.end {
-                                        ranges.push(range.start - start..range.end - start);
-                                    }
-                                    at += run.len;
+                            let (mut ranges, mut at) = (Vec::new(), 0);
+                            cursor.take(line.len(), |len, run| {
+                                if run.nowrap {
+                                    ranges.push(at..at + len);
                                 }
-                            }
+                                at += len;
+                            });
+                            cursor.take(1, |_, _| {});
                             let wrapping = Wrapping {
                                 width: Some(width),
                                 max_lines: clamp.map(|max: usize| max.saturating_sub(wrapped)),
@@ -226,7 +226,7 @@ impl TextState {
                                 word_break,
                             };
                             let boundaries = breaks(&line.line, &line.text, &wrapping, &ranges);
-                            (start, wrapped) = (end + 1, wrapped + boundaries.len() + 1);
+                            wrapped += boundaries.len() + 1;
                             TextLine {
                                 breaks: boundaries.into(),
                                 wrap: Some(width),
@@ -381,8 +381,8 @@ impl Paragraph {
             return;
         };
         let mut origin = bounds.origin + Point::new(px(0.), inner.top);
+        let width = Some(bounds.size.width);
         for line in inner.lines.iter() {
-            let width = Some(bounds.size.width);
             line.paint_background(origin, inner.line_height, align, width, window);
             line.paint(origin, inner.line_height, align, width, window);
             origin.y += line.extent(inner.line_height).height;

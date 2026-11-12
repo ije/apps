@@ -1,6 +1,7 @@
+use super::super::native_sync;
 use super::d3d::{Atlas, Renderer};
-use super::{MAIN, keys, monitor_info, monitor_scale, native_post, native_sync, on_main, points};
-use super::{current_cursor, run_after, setting, want_frames};
+use super::{MAIN, keys, monitor_info, monitor_scale, native_post, on_main, points};
+use super::{current_cursor, extent, run_after, setting, want_frames};
 use crate::app::Callbacks;
 use crate::{Button, Cursor, Event, Pixels, Point, Rect, Scene, Size, Timer, WheelPhase};
 use crate::{WindowChange, WindowOptions, WindowState, point, px};
@@ -263,7 +264,6 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        want_frames(self.shared.hwnd, false);
         // SAFETY: the window procedure drops the window's count of the state at `WM_NCDESTROY`.
         let _ = unsafe { DestroyWindow(self.shared.hwnd) };
     }
@@ -456,15 +456,6 @@ fn polite(hwnd: HWND, on: bool) {
             false => RemovePropW(hwnd, name).map(drop),
         };
     }
-}
-
-fn extent(rect: RECT) -> [i32; 4] {
-    [
-        rect.left,
-        rect.top,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-    ]
 }
 
 fn follow_theme(hwnd: HWND) {
@@ -996,10 +987,7 @@ impl Shared {
                         // Alt-tab can leave Alt held for us, since its release went to another window.
                         let now = (keys::held(), keys::caps_lock());
                         self.seen.set(Some(now));
-                        callbacks.input(Event::ModifiersChanged {
-                            modifiers: now.0,
-                            caps_lock: now.1,
-                        });
+                        callbacks.input(Event::ModifiersChanged { modifiers: now.0 });
                     }
                     callbacks.changed();
                     None

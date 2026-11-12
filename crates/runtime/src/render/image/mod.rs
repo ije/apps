@@ -172,6 +172,44 @@ pub(crate) fn encode_png(image: &tiny_skia::Pixmap) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+pub(crate) fn decode_later(job: Box<dyn FnOnce() + Send>) {
+    use std::sync::{Mutex, PoisonError};
+    type Job = Box<dyn FnOnce() + Send>;
+    static JOBS: Mutex<(std::collections::VecDeque<Job>, usize)> =
+        Mutex::new((std::collections::VecDeque::new(), 0));
+    let mut jobs = JOBS.lock().unwrap_or_else(PoisonError::into_inner);
+    jobs.0.push_back(job);
+    if jobs.1 < 2
+        && std::thread::Builder::new()
+            .name("apps-image".into())
+            .spawn(|| {
+                while let Some(job) = {
+                    let mut jobs = JOBS.lock().unwrap_or_else(PoisonError::into_inner);
+                    let job = jobs.0.pop_front();
+                    jobs.1 -= usize::from(job.is_none());
+                    job
+                } {
+                    job();
+                }
+            })
+            .is_ok()
+    {
+        jobs.1 += 1;
+    }
+}
+
+pub(crate) fn url_file(
+    source: &str,
+    base: Option<&url::Url>,
+    assets: &std::collections::HashMap<String, std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let source = source.trim().trim_matches(['"', '\'']);
+    data_file(source).or_else(|| {
+        let base = base?;
+        crate::host::local_path(assets, base, &base.join(source).ok()?)
+    })
+}
+
 pub(crate) fn data_file(url: &str) -> Option<std::path::PathBuf> {
     use std::hash::{Hash, Hasher};
     let (header, payload) = url.strip_prefix("data:")?.split_once(',')?;

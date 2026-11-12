@@ -296,65 +296,42 @@ fn list(value: &Value) -> &[Value] {
     value.as_array().map_or(&[], Vec::as_slice)
 }
 
+fn at<'a>(value: &'a Value, index: usize, name: &str) -> &'a Value {
+    if value.is_array() {
+        &value[index]
+    } else {
+        &value[name]
+    }
+}
+
 fn extent(value: &Value) -> Result<Extent3d> {
     Ok(Extent3d {
-        width: u32::try_from(number(if value.is_array() {
-            &value[0]
-        } else {
-            &value["width"]
-        })?)?,
-        height: u32::try_from(
-            if value.is_array() {
-                &value[1]
-            } else {
-                &value["height"]
-            }
-            .as_u64()
-            .unwrap_or(1),
-        )?,
+        width: u32::try_from(number(at(value, 0, "width"))?)?,
+        height: u32::try_from(at(value, 1, "height").as_u64().unwrap_or(1))?,
         depth_or_array_layers: u32::try_from(
-            if value.is_array() {
-                &value[2]
-            } else {
-                &value["depthOrArrayLayers"]
-            }
-            .as_u64()
-            .unwrap_or(1),
+            at(value, 2, "depthOrArrayLayers").as_u64().unwrap_or(1),
         )?,
     })
 }
 
 fn color(value: &Value) -> Color {
+    let channel = |index, name| at(value, index, name).as_f64().unwrap_or(0.);
     Color {
-        r: if value.is_array() {
-            &value[0]
-        } else {
-            &value["r"]
-        }
-        .as_f64()
-        .unwrap_or(0.),
-        g: if value.is_array() {
-            &value[1]
-        } else {
-            &value["g"]
-        }
-        .as_f64()
-        .unwrap_or(0.),
-        b: if value.is_array() {
-            &value[2]
-        } else {
-            &value["b"]
-        }
-        .as_f64()
-        .unwrap_or(0.),
-        a: if value.is_array() {
-            &value[3]
-        } else {
-            &value["a"]
-        }
-        .as_f64()
-        .unwrap_or(0.),
+        r: channel(0, "r"),
+        g: channel(1, "g"),
+        b: channel(2, "b"),
+        a: channel(3, "a"),
     }
+}
+
+fn feature_names(features: Features) -> Vec<&'static str> {
+    let mut names: Vec<_> = FEATURES
+        .iter()
+        .filter(|(_, f)| features.contains(*f))
+        .map(|(n, _)| *n)
+        .collect();
+    names.push("core-features-and-limits");
+    names
 }
 
 fn layout(value: &Value) -> Result<TexelCopyBufferLayout> {
@@ -378,30 +355,9 @@ impl Gpu {
             texture: resource!(self, device, &value["texture"], Texture),
             mip_level: decode(&value["mipLevel"], json!(0))?,
             origin: Origin3d {
-                x: decode(
-                    if origin.is_array() {
-                        &origin[0]
-                    } else {
-                        &origin["x"]
-                    },
-                    json!(0),
-                )?,
-                y: decode(
-                    if origin.is_array() {
-                        &origin[1]
-                    } else {
-                        &origin["y"]
-                    },
-                    json!(0),
-                )?,
-                z: decode(
-                    if origin.is_array() {
-                        &origin[2]
-                    } else {
-                        &origin["z"]
-                    },
-                    json!(0),
-                )?,
+                x: decode(at(origin, 0, "x"), json!(0))?,
+                y: decode(at(origin, 1, "y"), json!(0))?,
+                z: decode(at(origin, 2, "z"), json!(0))?,
             },
             aspect: decode(&value["aspect"], json!("all"))?,
         })
@@ -428,13 +384,7 @@ impl Gpu {
             };
             self.next += 1;
             let info = adapter.get_info();
-            let mut features: Vec<_> = FEATURES
-                .iter()
-                .filter(|(_, f)| adapter.features().contains(*f))
-                .map(|(n, _)| *n)
-                .collect();
-            features.push("core-features-and-limits");
-            let result = json!({"id":self.next,"features":features,"limits":adapter.limits(),"info":{"vendor":format!("{:x}",info.vendor),"architecture":"","device":format!("{:x}",info.device),"description":info.name,"isFallbackAdapter":info.device_type==DeviceType::Cpu}});
+            let result = json!({"id":self.next,"features":feature_names(adapter.features()),"limits":adapter.limits(),"info":{"vendor":format!("{:x}",info.vendor),"architecture":"","device":format!("{:x}",info.device),"description":info.name,"isFallbackAdapter":info.device_type==DeviceType::Cpu}});
             self.adapters.insert(self.next, adapter);
             return Ok(result);
         }
@@ -468,13 +418,8 @@ impl Gpu {
                 eprintln!("apps: WebGPU error: {error}")
             }));
             self.next += 1;
-            let mut names: Vec<_> = FEATURES
-                .iter()
-                .filter(|(_, f)| features.contains(*f))
-                .map(|(n, _)| *n)
-                .collect();
-            names.push("core-features-and-limits");
-            let result = json!({"id":self.next,"features":names,"limits":device.limits()});
+            let result =
+                json!({"id":self.next,"features":feature_names(features),"limits":device.limits()});
             let (signal, wait) = std::sync::mpsc::channel::<()>();
             let (poller, done) = (device.clone(), self.done.clone());
             std::thread::Builder::new()
@@ -1067,6 +1012,7 @@ impl Gpu {
             "destroyBuffer" => {
                 resource!(self, id, p, Buffer).destroy();
                 self.resources.remove(&number(p)?);
+                self.mapped.remove(&number(p)?);
                 return Ok(Value::Null);
             }
             "destroyTexture" => {
@@ -1085,6 +1031,7 @@ impl Gpu {
                     {
                         self.resources.remove(&key);
                         self.textures.remove(&key);
+                        self.mapped.remove(&key);
                     }
                 }
                 return Ok(Value::Null);
@@ -1454,6 +1401,16 @@ impl Gpu {
     }
 
     fn render_command(&self, id: u64, pass: &mut RenderPass<'_>, c: &Value) -> Result<()> {
+        fn slice<'a>(buffer: &'a Buffer, c: &Value) -> Result<BufferSlice<'a>> {
+            let offset = c[3].as_u64().unwrap_or(0);
+            let end = c[4]
+                .as_u64()
+                .map(|s| s.checked_add(offset).context("Buffer range overflow"))
+                .transpose()?
+                .unwrap_or(buffer.size());
+            ensure!(offset < end && end <= buffer.size(), "Invalid buffer slice");
+            Ok(buffer.slice(offset..end))
+        }
         match c[0].as_str().context("Missing render command")? {
             "setPipeline" => pass.set_pipeline(resource!(self, id, &c[1], RenderPipeline)),
             "setBindGroup" => {
@@ -1465,27 +1422,13 @@ impl Gpu {
                 );
             }
             "setVertexBuffer" => {
-                let buffer = resource!(self, id, &c[2], Buffer);
-                let offset = c[3].as_u64().unwrap_or(0);
-                let end = c[4]
-                    .as_u64()
-                    .map(|s| s.checked_add(offset).context("Buffer range overflow"))
-                    .transpose()?
-                    .unwrap_or(buffer.size());
-                ensure!(offset < end && end <= buffer.size(), "Invalid buffer slice");
-                pass.set_vertex_buffer(decode(&c[1], Value::Null)?, buffer.slice(offset..end));
+                let slice = slice(resource!(self, id, &c[2], Buffer), c)?;
+                pass.set_vertex_buffer(decode(&c[1], Value::Null)?, slice);
             }
-            "setIndexBuffer" => {
-                let buffer = resource!(self, id, &c[1], Buffer);
-                let offset = c[3].as_u64().unwrap_or(0);
-                let end = c[4]
-                    .as_u64()
-                    .map(|s| s.checked_add(offset).context("Buffer range overflow"))
-                    .transpose()?
-                    .unwrap_or(buffer.size());
-                ensure!(offset < end && end <= buffer.size(), "Invalid buffer slice");
-                pass.set_index_buffer(buffer.slice(offset..end), decode(&c[2], Value::Null)?);
-            }
+            "setIndexBuffer" => pass.set_index_buffer(
+                slice(resource!(self, id, &c[1], Buffer), c)?,
+                decode(&c[2], Value::Null)?,
+            ),
             "draw" | "drawIndexed" => {
                 let count: u32 = decode(&c[1], Value::Null)?;
                 let instances: u32 = decode(&c[2], json!(1))?;

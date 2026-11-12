@@ -459,7 +459,7 @@ impl State {
                 _ => bail!("Unknown session storage operation"),
             };
         }
-        if self.database.is_none() {
+        let open = |file: &str, setup: &CStr| -> Result<Database> {
             let _setup = SETUP
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -467,60 +467,39 @@ impl State {
                 !self.path.as_os_str().is_empty(),
                 "Browser storage namespace is not configured"
             );
-            std::fs::create_dir_all(self.path.parent().unwrap())?;
+            let folder = self.path.parent().unwrap();
+            std::fs::create_dir_all(folder)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    self.path.parent().unwrap(),
-                    std::fs::Permissions::from_mode(0o700),
-                )?;
+                std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700))?;
             }
-            let database = Database::open(&self.path)?;
+            let database = Database::open(&self.path.with_file_name(file))?;
             unsafe { sql::sqlite3_busy_timeout(database.0, 1000) };
-            database.query("PRAGMA journal_mode=WAL", &[])?;
-            database.query("PRAGMA synchronous=NORMAL", &[])?;
-            database.query("CREATE TABLE IF NOT EXISTS databases (name TEXT PRIMARY KEY, version INTEGER NOT NULL)",&[])?;
-            database.query("CREATE TABLE IF NOT EXISTS stores (db TEXT, name TEXT, options TEXT NOT NULL, PRIMARY KEY(db,name))",&[])?;
-            database.query("CREATE TABLE IF NOT EXISTS entries (db TEXT, store TEXT, key TEXT, value TEXT NOT NULL, PRIMARY KEY(db,store,key))",&[])?;
-            self.database = Some(database);
-        }
-        let db = self.database.as_ref().unwrap();
+            ensure!(
+                unsafe {
+                    sql::sqlite3_exec(
+                        database.0,
+                        setup.as_ptr(),
+                        None,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                    )
+                } == sql::SQLITE_OK,
+                "{}",
+                unsafe { CStr::from_ptr(sql::sqlite3_errmsg(database.0)) }.to_string_lossy()
+            );
+            Ok(database)
+        };
         if let Some(op) = op.strip_prefix("local.") {
             if self.local_database.is_none() {
-                let _setup = SETUP
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let database = Database::open(&self.path.with_file_name("local.sqlite"))?;
-                unsafe { sql::sqlite3_busy_timeout(database.0, 1000) };
-                database.query("PRAGMA journal_mode=WAL", &[])?;
-                database.query("PRAGMA synchronous=NORMAL", &[])?;
-                database.query(
-                    "CREATE TABLE IF NOT EXISTS local (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-                    &[],
-                )?;
-                database.query("CREATE TABLE IF NOT EXISTS local_size (id INTEGER PRIMARY KEY CHECK(id=1), bytes INTEGER NOT NULL)", &[])?;
-                database.query("INSERT OR IGNORE INTO local_size SELECT 1,coalesce(sum(length(CAST(key AS BLOB))+length(CAST(value AS BLOB))),0) FROM local", &[])?;
-                for (name, operation, delta) in [
-                    (
-                        "insert",
-                        "INSERT",
-                        "length(CAST(new.key AS BLOB))+length(CAST(new.value AS BLOB))",
-                    ),
-                    (
-                        "delete",
-                        "DELETE",
-                        "-length(CAST(old.key AS BLOB))-length(CAST(old.value AS BLOB))",
-                    ),
-                    (
-                        "update",
-                        "UPDATE",
-                        "length(CAST(new.key AS BLOB))+length(CAST(new.value AS BLOB))-length(CAST(old.key AS BLOB))-length(CAST(old.value AS BLOB))",
-                    ),
-                ] {
-                    database.query(&format!("CREATE TRIGGER IF NOT EXISTS local_size_{name} AFTER {operation} ON local BEGIN UPDATE local_size SET bytes=bytes+({delta}) WHERE id=1; SELECT CASE WHEN (SELECT bytes FROM local_size WHERE id=1)>5242880 THEN RAISE(ABORT,'QuotaExceededError: localStorage is full') END; END"), &[])?;
-                }
-                self.local_database = Some(database);
+                self.local_database = Some(open("local.sqlite", c"PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;\
+                    CREATE TABLE IF NOT EXISTS local (key TEXT PRIMARY KEY, value TEXT NOT NULL);\
+                    CREATE TABLE IF NOT EXISTS local_size (id INTEGER PRIMARY KEY CHECK(id=1), bytes INTEGER NOT NULL);\
+                    INSERT OR IGNORE INTO local_size SELECT 1,coalesce(sum(length(CAST(key AS BLOB))+length(CAST(value AS BLOB))),0) FROM local;\
+                    CREATE TRIGGER IF NOT EXISTS local_size_insert AFTER INSERT ON local BEGIN UPDATE local_size SET bytes=bytes+(length(CAST(new.key AS BLOB))+length(CAST(new.value AS BLOB))) WHERE id=1; SELECT CASE WHEN (SELECT bytes FROM local_size WHERE id=1)>5242880 THEN RAISE(ABORT,'QuotaExceededError: localStorage is full') END; END;\
+                    CREATE TRIGGER IF NOT EXISTS local_size_delete AFTER DELETE ON local BEGIN UPDATE local_size SET bytes=bytes+(-length(CAST(old.key AS BLOB))-length(CAST(old.value AS BLOB))) WHERE id=1; SELECT CASE WHEN (SELECT bytes FROM local_size WHERE id=1)>5242880 THEN RAISE(ABORT,'QuotaExceededError: localStorage is full') END; END;\
+                    CREATE TRIGGER IF NOT EXISTS local_size_update AFTER UPDATE ON local BEGIN UPDATE local_size SET bytes=bytes+(length(CAST(new.key AS BLOB))+length(CAST(new.value AS BLOB))-length(CAST(old.key AS BLOB))-length(CAST(old.value AS BLOB))) WHERE id=1; SELECT CASE WHEN (SELECT bytes FROM local_size WHERE id=1)>5242880 THEN RAISE(ABORT,'QuotaExceededError: localStorage is full') END; END;")?);
             }
             let db = self.local_database.as_ref().unwrap();
             let key = args[0].as_str().unwrap_or("");
@@ -576,6 +555,13 @@ impl State {
                 _ => bail!("Unknown local storage operation"),
             };
         }
+        if self.database.is_none() {
+            self.database = Some(open("browser.sqlite", c"PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;\
+                CREATE TABLE IF NOT EXISTS databases (name TEXT PRIMARY KEY, version INTEGER NOT NULL);\
+                CREATE TABLE IF NOT EXISTS stores (db TEXT, name TEXT, options TEXT NOT NULL, PRIMARY KEY(db,name));\
+                CREATE TABLE IF NOT EXISTS entries (db TEXT, store TEXT, key TEXT, value TEXT NOT NULL, PRIMARY KEY(db,store,key));")?);
+        }
+        let db = self.database.as_ref().unwrap();
         match op {
             "open"=>{
                 let name=args[0].as_str().context("Expected database name")?;

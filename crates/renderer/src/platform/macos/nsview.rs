@@ -1,20 +1,23 @@
 use super::{
     controls,
-    events::{TISGetInputSourceProperty, translate},
+    events::{
+        BUTTONS, TISCopyCurrentKeyboardInputSource, TISGetInputSourceProperty,
+        kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType,
+        kTISTypeKeyboardInputMode, translate,
+    },
     glass, lock, native_after,
     nswindow::AppsWindow,
     threads::ask_within,
     vsync::step,
 };
 use crate::{
-    Button, Cursor, Event, Key, Modifiers, Pixels, WheelPhase,
+    Button, Cursor, Event, Key, Modifiers, WheelPhase,
     app::{Callbacks, dispatch, send_ime_key},
     point, px,
 };
 use core_foundation_sys::{
     base::{CFEqual, CFRelease},
     number::{CFBooleanGetValue, CFBooleanRef},
-    string::CFStringRef,
 };
 use objc2::{
     AllocAnyThread, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message,
@@ -38,14 +41,6 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-
-#[link(name = "Carbon", kind = "framework")]
-unsafe extern "C" {
-    fn TISCopyCurrentKeyboardInputSource() -> *mut AnyObject;
-    static kTISPropertyInputSourceType: CFStringRef;
-    static kTISTypeKeyboardInputMode: CFStringRef;
-    static kTISPropertyInputSourceIsASCIICapable: CFStringRef;
-}
 
 // How long a live resize waits for the app thread to draw the new size.
 const RESIZE_WAIT: Duration = Duration::from_millis(8);
@@ -230,11 +225,11 @@ define_class!(
                 return;
             }
             let present = ask_within(callbacks.thread, RESIZE_WAIT, move || {
-                callbacks.with(move |window, _| window.platform.set_presents_with_transaction(visible));
+                callbacks.with(move |window, _| window.platform.renderer.set_presents_with_transaction(visible));
                 step(callbacks);
                 callbacks.with(|window, _| {
-                    window.platform.set_presents_with_transaction(false);
-                    window.platform.take_present()
+                    window.platform.renderer.set_presents_with_transaction(false);
+                    window.platform.renderer.take_present()
                 })
             });
             // Presents here, on main, inside the transaction.
@@ -383,27 +378,24 @@ fn plain(text: &AnyObject) -> String {
 // A merge keeps the order of events: only moves with the same buttons and modifiers, and wheel deltas of
 // one gesture, combine.
 fn merge(waiting: &mut Event, next: &Event) -> bool {
-    match (waiting, next) {
-        (
-            waiting @ Event::PointerMove { .. },
-            Event::PointerMove {
-                held, modifiers, ..
-            },
-        ) => {
-            let Event::PointerMove {
-                held: was_held,
-                modifiers: was_modifiers,
-                ..
-            } = waiting
-            else {
-                unreachable!()
-            };
-            if was_held != held || was_modifiers != modifiers {
-                return false;
-            }
-            *waiting = next.clone();
-            true
+    if let (
+        Event::PointerMove {
+            held, modifiers, ..
+        },
+        Event::PointerMove {
+            held: next_held,
+            modifiers: next_modifiers,
+            ..
+        },
+    ) = (&*waiting, next)
+    {
+        if held != next_held || modifiers != next_modifiers {
+            return false;
         }
+        *waiting = next.clone();
+        return true;
+    }
+    match (waiting, next) {
         (
             Event::Wheel {
                 at,
@@ -433,7 +425,7 @@ fn merge(waiting: &mut Event, next: &Event) -> bool {
     }
 }
 
-fn repeat_drag(view: Weak<AppsView>, serial: usize, event: Event) {
+fn repeat_drag(view: Weak<AppsView>, serial: usize, held: Button, event: Event) {
     native_after(DRAG_REPEAT, move || {
         let Some(view) = view.load() else {
             return;
@@ -442,23 +434,17 @@ fn repeat_drag(view: Weak<AppsView>, serial: usize, event: Event) {
         if ivars.drag_serial.get() != serial {
             return;
         }
-        let Event::PointerMove { held, .. } = &event else {
-            return;
-        };
-        // AppKit numbers the buttons left, right, middle, back, forward. A menu can take the button up.
-        let bit = match held {
-            Some(Button::Right) => 1,
-            Some(Button::Middle) => 2,
-            Some(Button::Back) => 3,
-            Some(Button::Forward) => 4,
-            _ => 0,
-        };
+        // A menu can take the button up.
+        let bit = BUTTONS
+            .iter()
+            .position(|button| *button == held)
+            .unwrap_or(0);
         if NSEvent::pressedMouseButtons() & (1 << bit) == 0 {
             ivars.drag_serial.set(serial + 1);
             return;
         }
         view.send_pointer(event.clone(), Instant::now());
-        repeat_drag(Weak::from_retained(&view), serial, event);
+        repeat_drag(Weak::new(&*view), serial, held, event);
     });
 }
 
@@ -509,11 +495,6 @@ impl AppsView {
         self.window()?.downcast::<AppsWindow>().ok()
     }
 
-    fn height(&self) -> Pixels {
-        self.host()
-            .map_or(px(0.), |window| window.content_size().height)
-    }
-
     // In screen coordinates.
     fn content_corner(&self) -> CGPoint {
         let Some(window) = self.host() else {
@@ -545,7 +526,7 @@ impl AppsView {
     fn key(&self, event: &NSEvent, equivalent: bool) -> bool {
         let ivars = self.ivars();
         let callbacks = ivars.callbacks;
-        let Some(input) = translate(event, px(self.frame().origin.x as f32), self.height()) else {
+        let Some(input) = translate(event, self.frame()) else {
             return false;
         };
         let down = match &input {
@@ -657,8 +638,7 @@ impl AppsView {
 
     fn pointer(&self, event: &NSEvent) {
         let ivars = self.ivars();
-        let Some(mut input) = translate(event, px(self.frame().origin.x as f32), self.height())
-        else {
+        let Some(mut input) = translate(event, self.frame()) else {
             return;
         };
         match &mut input {
@@ -706,10 +686,12 @@ impl AppsView {
                 }
                 self.handle_in_context(event);
             }
-            Event::PointerMove { held: Some(_), .. } if !ivars.files_over.get() => {
+            Event::PointerMove {
+                held: Some(held), ..
+            } if !ivars.files_over.get() => {
                 let serial = ivars.drag_serial.get() + 1;
                 ivars.drag_serial.set(serial);
-                repeat_drag(Weak::from_retained(&self.retain()), serial, input.clone());
+                repeat_drag(Weak::new(self), serial, *held, input.clone());
             }
             Event::PointerUp { .. } => ivars.drag_serial.set(ivars.drag_serial.get() + 1),
             Event::ModifiersChanged { .. } => {

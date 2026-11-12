@@ -24,7 +24,7 @@ mod windows;
 use windows::Window;
 
 #[derive(Default)]
-struct Events(Mutex<VecDeque<Value>>);
+pub(crate) struct Events(Mutex<VecDeque<Value>>);
 
 impl Events {
     fn push(&self, mut event: Value) {
@@ -96,7 +96,7 @@ thread_local! {
 
 pub(super) struct Browser {
     view: WebView,
-    window: Window,
+    pub(crate) window: Window,
     _session: Rc<Session>,
     events: Arc<Events>,
     token: String,
@@ -107,13 +107,7 @@ impl Browser {
     pub fn new(parent: Option<RawWindowHandle>, options: &Value) -> Result<Self> {
         let events = Arc::new(Events::default());
         let window = Window::new(parent, options, events.clone())?;
-        let partition = options["partition"]
-            .as_str()
-            .unwrap_or(if options["persistent"] == true {
-                "persist:default"
-            } else {
-                ""
-            });
+        let partition = options["partition"].as_str().unwrap_or("");
         let application = options["application"]
             .as_str()
             .filter(|name| !name.is_empty())
@@ -175,7 +169,14 @@ impl Browser {
         let mut context = session.context.borrow_mut();
         let mut builder = WebViewBuilder::new_with_web_context(&mut context)
             .with_devtools(options["inspectable"] == true)
-            .with_initialization_script_for_main_only(include_str!("../js/bridge.js"), false)
+            .with_initialization_script_for_main_only(
+                concat!(
+                    "(",
+                    include_str!("../js/bridge.js"),
+                    ")(data=>window.ipc.postMessage(JSON.stringify({message:data,mainFrame:window===window.top})))"
+                ),
+                false,
+            )
             .with_ipc_handler(move |request| {
                 if request.body().len() > 4 * 1024 * 1024 { return; }
                 let Ok(data) = serde_json::from_str::<Value>(request.body()) else { return; };
@@ -205,16 +206,6 @@ impl Browser {
             token,
             waiting,
         })
-    }
-
-    pub fn attach(&self, parent: RawWindowHandle) -> Result<()> {
-        self.window.attach(parent)
-    }
-    pub fn set_bounds(&self, bounds: [f64; 4]) -> Result<()> {
-        self.window.set_bounds(bounds)
-    }
-    pub fn detach(&self) -> Result<()> {
-        self.window.detach()
     }
 
     pub fn command(&self, operation: &str, arguments: &Value) -> Result<()> {
@@ -400,8 +391,9 @@ mod tests {
         let parent = Window::new(None, &json!({"show":true}), Arc::default()).unwrap();
         let browser =
             Browser::new(None, &json!({"show":false,"partition":"browser-smoke"})).unwrap();
-        browser.set_bounds([10., 20., 320., 240.]).unwrap();
+        browser.window.set_bounds([10., 20., 320., 240.]).unwrap();
         browser
+            .window
             .attach(parent.window_handle().unwrap().as_raw())
             .unwrap();
         browser.command("loadHTML", &json!({"html":"<!doctype html><title>System browser</title><h1 id='value'>你好</h1>","baseURL":"https://example.test/base/"})).unwrap();
@@ -493,9 +485,10 @@ mod tests {
         );
         browser.command("clearStorage", &json!({"id":11})).unwrap();
         assert!(wait(&browser, |event| event["id"] == 11)["error"].is_null());
-        browser.set_bounds([0., 0., 0., 0.]).unwrap();
-        browser.set_bounds([10., 20., 320., 240.]).unwrap();
+        browser.window.set_bounds([0., 0., 0., 0.]).unwrap();
+        browser.window.set_bounds([10., 20., 320., 240.]).unwrap();
         browser
+            .window
             .attach(parent.window_handle().unwrap().as_raw())
             .unwrap();
         browser

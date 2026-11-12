@@ -46,17 +46,7 @@ pub(crate) mod ffi {
         SQLITE_OPEN_NOMUTEX = 0x8000, SQLITE_OPEN_FULLMUTEX = 0x10000,
         SQLITE_DBCONFIG_ENABLE_FKEY = 1002, SQLITE_DBCONFIG_DEFENSIVE = 1010,
         SQLITE_DBCONFIG_DQS_DML = 1013, SQLITE_DBCONFIG_DQS_DDL = 1014,
-        SQLITE_DENY = 1, SQLITE_IGNORE = 2,
-        SQLITE_CREATE_INDEX = 1, SQLITE_CREATE_TABLE = 2, SQLITE_CREATE_TEMP_INDEX = 3,
-        SQLITE_CREATE_TEMP_TABLE = 4, SQLITE_CREATE_TEMP_TRIGGER = 5, SQLITE_CREATE_TEMP_VIEW = 6,
-        SQLITE_CREATE_TRIGGER = 7, SQLITE_CREATE_VIEW = 8, SQLITE_DELETE = 9, SQLITE_DROP_INDEX = 10,
-        SQLITE_DROP_TABLE = 11, SQLITE_DROP_TEMP_INDEX = 12, SQLITE_DROP_TEMP_TABLE = 13,
-        SQLITE_DROP_TEMP_TRIGGER = 14, SQLITE_DROP_TEMP_VIEW = 15, SQLITE_DROP_TRIGGER = 16,
-        SQLITE_DROP_VIEW = 17, SQLITE_INSERT = 18, SQLITE_PRAGMA = 19, SQLITE_READ = 20,
-        SQLITE_SELECT = 21, SQLITE_TRANSACTION = 22, SQLITE_UPDATE = 23, SQLITE_ATTACH = 24,
-        SQLITE_DETACH = 25, SQLITE_ALTER_TABLE = 26, SQLITE_REINDEX = 27, SQLITE_ANALYZE = 28,
-        SQLITE_CREATE_VTABLE = 29, SQLITE_DROP_VTABLE = 30, SQLITE_FUNCTION = 31,
-        SQLITE_SAVEPOINT = 32, SQLITE_RECURSIVE = 33
+        SQLITE_DENY = 1, SQLITE_IGNORE = 2
     }
     pub const SQLITE_PREPARE_PERSISTENT: c_uint = 1;
     #[link(name = "sqlite3")]
@@ -258,6 +248,7 @@ impl Drop for Statement {
     }
 }
 
+// Fields drop in order: backups and statements before their databases.
 #[derive(Default)]
 pub(crate) struct State {
     backups: HashMap<u64, Backup>,
@@ -277,18 +268,6 @@ impl State {
             !matches!(role, Role::Renderer(_)),
             "SQLite is unavailable in page scripts"
         );
-        if op == "sqlite.constants" {
-            return Ok(json!({
-                "SQLITE_OK":ffi::SQLITE_OK,"SQLITE_DENY":ffi::SQLITE_DENY,"SQLITE_IGNORE":ffi::SQLITE_IGNORE,
-                "SQLITE_CREATE_INDEX":ffi::SQLITE_CREATE_INDEX,"SQLITE_CREATE_TABLE":ffi::SQLITE_CREATE_TABLE,"SQLITE_CREATE_TEMP_INDEX":ffi::SQLITE_CREATE_TEMP_INDEX,"SQLITE_CREATE_TEMP_TABLE":ffi::SQLITE_CREATE_TEMP_TABLE,
-                "SQLITE_CREATE_TEMP_TRIGGER":ffi::SQLITE_CREATE_TEMP_TRIGGER,"SQLITE_CREATE_TEMP_VIEW":ffi::SQLITE_CREATE_TEMP_VIEW,"SQLITE_CREATE_TRIGGER":ffi::SQLITE_CREATE_TRIGGER,"SQLITE_CREATE_VIEW":ffi::SQLITE_CREATE_VIEW,
-                "SQLITE_DELETE":ffi::SQLITE_DELETE,"SQLITE_DROP_INDEX":ffi::SQLITE_DROP_INDEX,"SQLITE_DROP_TABLE":ffi::SQLITE_DROP_TABLE,"SQLITE_DROP_TEMP_INDEX":ffi::SQLITE_DROP_TEMP_INDEX,"SQLITE_DROP_TEMP_TABLE":ffi::SQLITE_DROP_TEMP_TABLE,
-                "SQLITE_DROP_TEMP_TRIGGER":ffi::SQLITE_DROP_TEMP_TRIGGER,"SQLITE_DROP_TEMP_VIEW":ffi::SQLITE_DROP_TEMP_VIEW,"SQLITE_DROP_TRIGGER":ffi::SQLITE_DROP_TRIGGER,"SQLITE_DROP_VIEW":ffi::SQLITE_DROP_VIEW,
-                "SQLITE_INSERT":ffi::SQLITE_INSERT,"SQLITE_PRAGMA":ffi::SQLITE_PRAGMA,"SQLITE_READ":ffi::SQLITE_READ,"SQLITE_SELECT":ffi::SQLITE_SELECT,"SQLITE_TRANSACTION":ffi::SQLITE_TRANSACTION,"SQLITE_UPDATE":ffi::SQLITE_UPDATE,
-                "SQLITE_ATTACH":ffi::SQLITE_ATTACH,"SQLITE_DETACH":ffi::SQLITE_DETACH,"SQLITE_ALTER_TABLE":ffi::SQLITE_ALTER_TABLE,"SQLITE_REINDEX":ffi::SQLITE_REINDEX,"SQLITE_ANALYZE":ffi::SQLITE_ANALYZE,
-                "SQLITE_CREATE_VTABLE":ffi::SQLITE_CREATE_VTABLE,"SQLITE_DROP_VTABLE":ffi::SQLITE_DROP_VTABLE,"SQLITE_FUNCTION":ffi::SQLITE_FUNCTION,"SQLITE_SAVEPOINT":ffi::SQLITE_SAVEPOINT,"SQLITE_RECURSIVE":ffi::SQLITE_RECURSIVE
-            }));
-        }
         // Handles belong to this JSC context. Statements must be finalized before their database closes.
         unsafe {
             if op == "sqlite.open" {
@@ -637,9 +616,8 @@ impl State {
                                             json!({"real": value.to_string()})
                                         }
                                     }
-                                    ffi::SQLITE_TEXT | ffi::SQLITE_BLOB => {
-                                        let text = ffi::sqlite3_column_type(raw, index)
-                                            == ffi::SQLITE_TEXT;
+                                    kind @ (ffi::SQLITE_TEXT | ffi::SQLITE_BLOB) => {
+                                        let text = kind == ffi::SQLITE_TEXT;
                                         let data = if text {
                                             ffi::sqlite3_column_text(raw, index)
                                         } else {
@@ -658,7 +636,7 @@ impl State {
                                         if text {
                                             json!(String::from_utf8_lossy(bytes))
                                         } else {
-                                            json!({"blob": crate::web::base64(bytes)})
+                                            json!({"blob": crate::jsc::payload::write(bytes.to_vec())})
                                         }
                                     }
                                     _ => bail!("Unsupported SQLite value"),
@@ -688,13 +666,6 @@ impl State {
                 _ => bail!("Unsupported SQLite operation: {op}"),
             }
         }
-    }
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        self.backups.clear();
-        self.statements.clear();
     }
 }
 

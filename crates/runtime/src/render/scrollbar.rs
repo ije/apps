@@ -39,7 +39,7 @@ impl Part {
                 .get(prop)
                 .and_then(style::color)
                 .map_or(Color::TRANSPARENT, |(ink, alpha)| {
-                    Color::hex(ink << 8 | alpha as u32)
+                    crate::style::rgba((ink, alpha))
                 })
         };
         let border = if style
@@ -125,7 +125,7 @@ impl Look {
                 let parts = style::components(value, ' ');
                 let [thumb, track] =
                     [parts.first()?, parts.get(1)?].map(|value| style::color(value));
-                Some([thumb?, track?].map(|(ink, alpha)| Color::hex(ink << 8 | alpha as u32)))
+                Some([thumb?, track?].map(crate::style::rgba))
             }),
             custom: None,
             forced: [
@@ -294,7 +294,8 @@ impl Scrollbar {
             state.offset = Some(drawn);
         }
         let shown = look.shown(self.axes, max);
-        if look.space(shown) != self.reserved {
+        let space = look.space(shown);
+        if space != self.reserved {
             window.redraw();
         }
         if !shown.contains(&true) {
@@ -311,7 +312,6 @@ impl Scrollbar {
             Some((size, _)) => size[axis],
             None => OVERLAY[usize::from(look.thin)][0],
         });
-        let space = look.space(shown);
         let (max, offset, stretch) = (
             [max.x, max.y].map(f32::from),
             [offset.x, offset.y].map(f32::from),
@@ -485,93 +485,61 @@ impl Scrollbar {
         drop(current);
         let handle = self.handle.clone();
         window.on_capture({
-            let (state, bars) = (state.clone(), bars.clone());
+            let (state, bars, handle) = (state.clone(), bars.clone(), handle.clone());
             move |event, window, _| {
-                let Event::PointerMove { at: position, .. } = *event else {
-                    return;
-                };
                 let mut state = state.borrow_mut();
-                if let Pointer::Drag(axis, grab) = state.pointer {
-                    if let Some(bar) = &bars[axis] {
-                        let travel = bar.track[1] - bar.thumb[1];
-                        let ratio = if travel > 0. {
-                            ((along(position, axis) - grab - bar.track[0]) / travel).clamp(0., 1.)
-                        } else {
-                            0.
-                        };
-                        let mut offset = handle.offset();
-                        if axis == 0 {
-                            offset.x = px(-ratio * bar.max);
-                        } else {
-                            offset.y = px(-ratio * bar.max);
+                match *event {
+                    Event::PointerMove { at: position, .. } => {
+                        if let Pointer::Drag(axis, grab) = state.pointer {
+                            if let Some(bar) = &bars[axis] {
+                                let travel = bar.track[1] - bar.thumb[1];
+                                let ratio = if travel > 0. {
+                                    ((along(position, axis) - grab - bar.track[0]) / travel)
+                                        .clamp(0., 1.)
+                                } else {
+                                    0.
+                                };
+                                let mut offset = handle.offset();
+                                if axis == 0 {
+                                    offset.x = px(-ratio * bar.max);
+                                } else {
+                                    offset.y = px(-ratio * bar.max);
+                                }
+                                handle.set_offset(offset);
+                                window.refresh();
+                            }
+                            return;
                         }
-                        handle.set_offset(offset);
+                        let pointer = Pointer::over(&bars, position, window);
+                        if pointer != state.pointer {
+                            if pointer == Pointer::Away {
+                                state.active = Some(Instant::now());
+                            }
+                            state.pointer = pointer;
+                            window.refresh();
+                        }
+                    }
+                    Event::PointerLeave { .. } if matches!(state.pointer, Pointer::Over(..)) => {
+                        state.pointer = Pointer::Away;
+                        state.active = Some(Instant::now());
                         window.refresh();
                     }
-                    return;
-                }
-                let pointer = Pointer::over(&bars, position, window);
-                if pointer != state.pointer {
-                    if pointer == Pointer::Away {
+                    Event::PointerUp {
+                        at: position,
+                        button: Button::Left,
+                        ..
+                    } if matches!(state.pointer, Pointer::Drag(..)) => {
+                        // The pointer left no hover behind: it can be anywhere now, also outside the window.
+                        state.pointer = Pointer::over(&bars, position, window);
                         state.active = Some(Instant::now());
+                        window.refresh();
                     }
-                    state.pointer = pointer;
-                    window.refresh();
+                    _ => {}
                 }
             }
         });
-        window.on_capture({
-            let state = state.clone();
-            move |event, window, _| {
-                let mut state = state.borrow_mut();
-                if matches!(event, Event::PointerLeave { .. })
-                    && matches!(state.pointer, Pointer::Over(..))
-                {
-                    state.pointer = Pointer::Away;
-                    state.active = Some(Instant::now());
-                    window.refresh();
-                }
-            }
-        });
-        window.on_bubble({
-            let (state, handle, bars) = (state.clone(), self.handle.clone(), bars.clone());
-            move |event, window, cx| {
-                let Event::PointerDown {
-                    at: position,
-                    button: Button::Left,
-                    ..
-                } = *event
-                else {
-                    return;
-                };
-                let Some((axis, bar)) = bars.iter().enumerate().find_map(|(axis, bar)| {
-                    Some((axis, bar.as_ref().filter(|bar| bar.hitbox.hovered(window))?))
-                }) else {
-                    return;
-                };
-                cx.stop_event();
-                let position = along(position, axis);
-                let mut state = state.borrow_mut();
-                state.active = Some(Instant::now());
-                if position >= bar.thumb[0] && position < bar.thumb[0] + bar.thumb[1] {
-                    state.pointer = Pointer::Drag(axis, position - bar.thumb[0]);
-                } else if bar.max > 0. {
-                    let step = (bar.view * 0.875).max(bar.view - 40.).max(1.);
-                    let step = if position < bar.thumb[0] { step } else { -step };
-                    let mut offset = handle.target();
-                    let value = if axis == 0 {
-                        &mut offset.x
-                    } else {
-                        &mut offset.y
-                    };
-                    *value = (*value + px(step)).clamp(px(-bar.max), px(0.));
-                    handle.animate_to(offset, false);
-                }
-                window.refresh();
-            }
-        });
-        window.on_capture(move |event, window, _| {
-            let Event::PointerUp {
+        window.on_bubble(move |event, window, cx| {
+            let Event::PointerDown {
                 at: position,
                 button: Button::Left,
                 ..
@@ -579,13 +547,31 @@ impl Scrollbar {
             else {
                 return;
             };
+            let Pointer::Over(axis, on_thumb) = Pointer::over(&bars, position, window) else {
+                return;
+            };
+            let Some(bar) = &bars[axis] else {
+                return;
+            };
+            cx.stop_event();
+            let position = along(position, axis);
             let mut state = state.borrow_mut();
-            if matches!(state.pointer, Pointer::Drag(..)) {
-                // The pointer left no hover behind: it can be anywhere now, also outside the window.
-                state.pointer = Pointer::over(&bars, position, window);
-                state.active = Some(Instant::now());
-                window.refresh();
+            state.active = Some(Instant::now());
+            if on_thumb {
+                state.pointer = Pointer::Drag(axis, position - bar.thumb[0]);
+            } else if bar.max > 0. {
+                let step = (bar.view * 0.875).max(bar.view - 40.).max(1.);
+                let step = if position < bar.thumb[0] { step } else { -step };
+                let mut offset = handle.target();
+                let value = if axis == 0 {
+                    &mut offset.x
+                } else {
+                    &mut offset.y
+                };
+                *value = (*value + px(step)).clamp(px(-bar.max), px(0.));
+                handle.animate_to(offset, false);
             }
+            window.refresh();
         });
     }
 }

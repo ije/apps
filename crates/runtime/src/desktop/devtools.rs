@@ -90,7 +90,7 @@ fn page() -> Result<&'static str> {
 
 // The panel of one window, at its left side. Where it cannot dock, and for the main process, it has its own
 // window.
-pub struct DevTools {
+pub(crate) struct DevTools {
     browser: Browser,
     mode: &'static str,
     // The context that the tools look at. Only its console messages have values to expand.
@@ -105,7 +105,7 @@ pub struct DevTools {
 }
 
 impl DevTools {
-    pub fn new(title: &str, role: Role, window: Option<&renderer::Window>) -> Result<Self> {
+    pub(crate) fn new(title: &str, role: Role, window: Option<&renderer::Window>) -> Result<Self> {
         let page = page()?;
         let docked = window.filter(|_| cfg!(target_os = "macos")).map(|window| {
             let browser = Browser::new(window, &json!({"inspectable":true}))?;
@@ -145,7 +145,7 @@ impl DevTools {
         self.browser.evaluate(id, source)
     }
 
-    pub fn commands(&self) -> Vec<Value> {
+    pub(crate) fn commands(&self) -> Vec<Value> {
         self.browser
             .poll()
             .into_iter()
@@ -176,11 +176,11 @@ impl DevTools {
             .collect()
     }
 
-    pub fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.closed.get()
     }
 
-    pub fn events(&self, values: &[Value]) -> Result<()> {
+    pub(crate) fn events(&self, values: &[Value]) -> Result<()> {
         let batch: Vec<_> = values.iter().map(|event| if event["method"] == "Runtime.consoleAPICalled" {
             let params = &event["params"];
             let values = (params["context"] == self.context).then(|| &params["ref"]);

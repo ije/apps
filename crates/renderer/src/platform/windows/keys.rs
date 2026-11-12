@@ -40,10 +40,7 @@ pub(super) fn key(seen: &Seen, wparam: WPARAM, lparam: LPARAM, pressed: bool) ->
         if seen.replace(Some(now)) == Some(now) {
             return None;
         }
-        return Some(Event::ModifiersChanged {
-            modifiers: now.0,
-            caps_lock: now.1,
-        });
+        return Some(Event::ModifiersChanged { modifiers: now.0 });
     }
     if code == VK_PACKET {
         return None;
@@ -56,26 +53,25 @@ pub(super) fn key(seen: &Seen, wparam: WPARAM, lparam: LPARAM, pressed: bool) ->
             typed(code, scan, &state)
         })
         .flatten();
-    let name = match code {
-        _ if named(code).is_some() => named(code).map(str::to_owned),
-        _ if (VK_F1.0..=VK_F24.0).contains(&code.0) => Some(format!("f{}", code.0 - VK_F1.0 + 1)),
+    let name = if let Some(&(_, name)) = NAMES.iter().find(|(key, _)| *key == code) {
+        Some(name.to_owned())
+    } else if (VK_F1.0..=VK_F24.0).contains(&code.0) {
+        Some(format!("f{}", code.0 - VK_F1.0 + 1))
+    } else if modifiers.shift() && !ime && symbol(code) {
         // Shifted symbols go by what they type, without the shift: shift-1 on a US layout is `!`.
-        _ if modifiers.shift() && !ime && symbol(code) => {
-            let mut state = [0u8; 256];
-            state[usize::from(VK_SHIFT.0)] = 0x80;
-            let shifted = typed(code, scan, &state);
-            if shifted.is_some() {
-                modifiers = modifiers.with(Modifiers::SHIFT, false);
-            }
-            shifted
+        let mut state = [0u8; 256];
+        state[usize::from(VK_SHIFT.0)] = 0x80;
+        let shifted = typed(code, scan, &state);
+        if shifted.is_some() {
+            modifiers = modifiers.with(Modifiers::SHIFT, false);
         }
-        _ => {
-            // SAFETY: a plain keyboard layout query.
-            let unit = unsafe { MapVirtualKeyW(u32::from(code.0), MAPVK_VK_TO_CHAR) } & 0xFFFF;
-            char::from_u32(unit)
-                .filter(|&c| c != '\0')
-                .map(|c| c.to_ascii_lowercase().to_string())
-        }
+        shifted
+    } else {
+        // SAFETY: a plain keyboard layout query.
+        let unit = unsafe { MapVirtualKeyW(u32::from(code.0), MAPVK_VK_TO_CHAR) } & 0xFFFF;
+        char::from_u32(unit)
+            .filter(|&c| c != '\0')
+            .map(|c| c.to_ascii_lowercase().to_string())
     };
     let key = Key {
         name: match name {
@@ -136,12 +132,6 @@ const NAMES: [(VIRTUAL_KEY, &str); 18] = [
     (VK_BROWSER_BACK, "back"),
     (VK_BROWSER_FORWARD, "forward"),
 ];
-
-fn named(code: VIRTUAL_KEY) -> Option<&'static str> {
-    NAMES
-        .iter()
-        .find_map(|&(key, name)| (key == code).then_some(name))
-}
 
 fn symbol(code: VIRTUAL_KEY) -> bool {
     (VK_0.0..=VK_9.0).contains(&code.0)

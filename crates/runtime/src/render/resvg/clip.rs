@@ -1,8 +1,6 @@
 // Copyright 2019 the Resvg Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use super::render::Context;
-
 pub fn apply(
     clip: &usvg::ClipPath,
     transform: tiny_skia::Transform,
@@ -78,11 +76,8 @@ fn draw_children(
                     continue;
                 }
 
-                let ctx = Context {
-                    max_bbox: tiny_skia::IntRect::from_xywh(0, 0, 1, 1).unwrap(),
-                };
-
-                super::path::fill_path(path, mode, &ctx, transform, pixmap);
+                let max_bbox = tiny_skia::IntRect::from_xywh(0, 0, 1, 1).unwrap();
+                super::path::fill_path(path, mode, max_bbox, transform, pixmap);
             }
             usvg::Node::Text(text) => {
                 draw_children(text.flattened(), mode, transform, pixmap);
@@ -106,7 +101,7 @@ fn clip_group(
     clip: &usvg::ClipPath,
     transform: tiny_skia::Transform,
     pixmap: &mut tiny_skia::PixmapMut,
-) -> Option<()> {
+) {
     let mut clip_pixmap = tiny_skia::Pixmap::new(pixmap.width(), pixmap.height()).unwrap();
 
     draw_children(
@@ -129,6 +124,4 @@ fn clip_group(
         tiny_skia::Transform::identity(),
         None,
     );
-
-    Some(())
 }

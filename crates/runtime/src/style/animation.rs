@@ -34,19 +34,39 @@ const PAINT: &[Prop] = &[
 #[derive(Clone, Debug)]
 pub(crate) struct Animation {
     pub name: String,
-    pub paused: bool,
+    paused: bool,
     duration: f64,
     delay: f64,
     iterations: f64,
-    direction: String,
-    fill: String,
+    direction: u8,
+    // Index in FILLS: bit 1 fills backwards, bit 2 forwards.
+    fill: u8,
     timing: Easing,
     easing: Easing,
     end_delay: f64,
     iteration_start: f64,
-    composite: String,
+    composite: u8,
     pub pseudo: u8,
-    tracks: Vec<(Prop, Keyframes)>,
+    tracks: Vec<(Prop, Vec<Keyframe>)>,
+}
+
+const DIRECTIONS: [&str; 4] = ["normal", "reverse", "alternate", "alternate-reverse"];
+const FILLS: [&str; 4] = ["none", "backwards", "forwards", "both"];
+const COMPOSITES: [&str; 3] = ["replace", "add", "accumulate"];
+
+fn keyword(table: &[&str], value: &str) -> Option<u8> {
+    table
+        .iter()
+        .position(|&name| name == value)
+        .map(|index| index as u8)
+}
+
+#[derive(Clone, Debug)]
+struct Keyframe {
+    at: f64,
+    value: String,
+    timing: Option<Easing>,
+    lerp: Option<Rc<Lerp>>,
 }
 
 // A duration or delay alone transitions `all`, the initial `transition-property`.
@@ -56,8 +76,6 @@ const TRANSITIONS: [Prop; 4] = [
     Prop::TRANSITION_DURATION,
     Prop::TRANSITION_DELAY,
 ];
-
-type Keyframes = Vec<(f64, String, Option<Easing>, Option<Rc<Lerp>>)>;
 
 type Animated = Vec<(usize, Rc<Style>, bool)>;
 
@@ -76,57 +94,50 @@ impl Animation {
             .map(|value| components(value, ','));
         (0..names.as_ref().map_or(shorthand.len(), Vec::len))
             .filter_map(|index| {
-                let mut values = HashMap::from([
-                    ("name", "none"),
-                    ("duration", "0s"),
-                    ("delay", "0s"),
-                    ("iteration-count", "1"),
-                    ("direction", "normal"),
-                    ("fill-mode", "none"),
-                    ("timing-function", "ease"),
-                    ("play-state", "running"),
-                ]);
+                // Name, duration, delay, iteration count, direction, fill mode, timing function, play state.
+                let mut values = ["none", "0s", "0s", "1", "normal", "none", "ease", "running"];
                 let mut times = 0;
                 for part in components(shorthand[index % shorthand.len()], ' ') {
-                    let key = if part.ends_with('s') && time(part).is_some() {
+                    let slot = if part.ends_with('s') && time(part).is_some() {
                         times += 1;
-                        if times == 1 { "duration" } else { "delay" }
+                        if times == 1 { 1 } else { 2 }
                     } else if part == "infinite" || part.parse::<f64>().is_ok() {
-                        "iteration-count"
-                    } else if matches!(
-                        part,
-                        "normal" | "reverse" | "alternate" | "alternate-reverse"
-                    ) {
-                        "direction"
-                    } else if matches!(part, "forwards" | "backwards" | "both" | "none") {
-                        "fill-mode"
+                        3
+                    } else if DIRECTIONS.contains(&part) {
+                        4
+                    } else if FILLS.contains(&part) {
+                        5
                     } else if matches!(part, "paused" | "running") {
-                        "play-state"
+                        7
                     } else if timing_function(part) {
-                        "timing-function"
+                        6
                     } else {
-                        "name"
+                        0
                     };
-                    values.insert(key, part);
+                    values[slot] = part;
                 }
-                for (key, prop) in [
-                    ("name", Prop::ANIMATION_NAME),
-                    ("duration", Prop::ANIMATION_DURATION),
-                    ("delay", Prop::ANIMATION_DELAY),
-                    ("iteration-count", Prop::ANIMATION_ITERATION_COUNT),
-                    ("direction", Prop::ANIMATION_DIRECTION),
-                    ("fill-mode", Prop::ANIMATION_FILL_MODE),
-                    ("timing-function", Prop::ANIMATION_TIMING_FUNCTION),
-                    ("play-state", Prop::ANIMATION_PLAY_STATE),
-                ] {
+                for (slot, prop) in [
+                    Prop::ANIMATION_NAME,
+                    Prop::ANIMATION_DURATION,
+                    Prop::ANIMATION_DELAY,
+                    Prop::ANIMATION_ITERATION_COUNT,
+                    Prop::ANIMATION_DIRECTION,
+                    Prop::ANIMATION_FILL_MODE,
+                    Prop::ANIMATION_TIMING_FUNCTION,
+                    Prop::ANIMATION_PLAY_STATE,
+                ]
+                .into_iter()
+                .enumerate()
+                {
                     if let Some(value) = style.get(prop) {
                         let parts = components(value, ',');
                         if !parts.is_empty() {
-                            values.insert(key, parts[index % parts.len()]);
+                            values[slot] = parts[index % parts.len()];
                         }
                     }
                 }
-                let name = values["name"].trim_matches(['\'', '"']);
+                let [name, duration, delay, count, direction, fill, timing, state] = values;
+                let name = name.trim_matches(['\'', '"']);
                 let rules: Vec<_> = keyframes
                     .get(name)?
                     .iter()
@@ -140,33 +151,33 @@ impl Animation {
                     .collect();
                 Some(Self {
                     name: name.into(),
-                    paused: values["play-state"] == "paused",
-                    duration: time(values["duration"])?.max(0.),
-                    delay: time(values["delay"])?,
-                    iterations: if values["iteration-count"] == "infinite" {
+                    paused: state == "paused",
+                    duration: time(duration)?.max(0.),
+                    delay: time(delay)?,
+                    iterations: if count == "infinite" {
                         f64::INFINITY
                     } else {
-                        values["iteration-count"]
+                        count
                             .parse::<f64>()
                             .ok()
                             .filter(|value| value.is_finite())?
                             .max(0.)
                     },
-                    direction: values["direction"].into(),
-                    fill: values["fill-mode"].into(),
-                    timing: Easing::parse(values["timing-function"])?,
+                    direction: keyword(&DIRECTIONS, direction).unwrap_or(0),
+                    fill: keyword(&FILLS, fill).unwrap_or(0),
+                    timing: Easing::parse(timing)?,
                     easing: Easing::Linear,
                     end_delay: 0.,
                     iteration_start: 0.,
                     composite: style
                         .get(Prop::ANIMATION_COMPOSITION)
-                        .map(|value| components(value, ','))
-                        .and_then(|parts| {
+                        .and_then(|value| {
+                            let parts = components(value, ',');
                             parts
                                 .get(index % parts.len().max(1))
-                                .map(|part| part.to_string())
+                                .map(|part| keyword(&COMPOSITES, part).unwrap_or(1))
                         })
-                        .unwrap_or_else(|| "replace".into()),
+                        .unwrap_or(0),
                     pseudo: 0,
                     tracks: tracks(style, &rules, registry, true),
                 })
@@ -180,8 +191,8 @@ fn tracks(
     rules: &[(f64, Style, Option<Easing>)],
     registry: &Registry,
     merge: bool,
-) -> Vec<(Prop, Keyframes)> {
-    let mut tracks: Vec<(Prop, Keyframes)> = Vec::new();
+) -> Vec<(Prop, Vec<Keyframe>)> {
+    let mut tracks: Vec<(Prop, Vec<Keyframe>)> = Vec::new();
     for (offset, declarations, timing) in rules {
         let mut frame = style.clone();
         let mut custom = Vec::new();
@@ -209,11 +220,16 @@ fn tracks(
             let Some(value) = computed(&frame, key, registry) else {
                 continue;
             };
-            let frame = (*offset, value.to_owned(), timing.clone(), None);
+            let frame = Keyframe {
+                at: *offset,
+                value: value.to_owned(),
+                timing: timing.clone(),
+                lerp: None,
+            };
             match tracks.iter_mut().find(|(name, _)| *name == key) {
                 Some((_, frames)) => {
                     if merge {
-                        frames.retain(|(at, ..)| *at != frame.0);
+                        frames.retain(|other| other.at != frame.at);
                     }
                     frames.push(frame);
                 }
@@ -222,10 +238,11 @@ fn tracks(
         }
     }
     for (key, frames) in &mut tracks {
-        frames.sort_by(|a, b| a.0.total_cmp(&b.0));
+        frames.sort_by(|a, b| a.at.total_cmp(&b.at));
         if !key.is_custom() || animatable(*key, registry) {
             for index in 1..frames.len() {
-                frames[index - 1].3 = lerp(key.name(), &frames[index - 1].1, &frames[index].1);
+                frames[index - 1].lerp =
+                    lerp(key.name(), &frames[index - 1].value, &frames[index].value);
             }
         }
     }
@@ -240,6 +257,16 @@ impl Animation {
         } else {
             self.duration * self.iterations
         }
+    }
+
+    // Whether the effect only paints, and whether it keeps the box in place.
+    fn paints(&self) -> (bool, bool) {
+        (
+            self.tracks.iter().all(|(key, _)| PAINT.contains(key)),
+            self.tracks.iter().all(|(key, frames)| {
+                keeps_box_in_place(*key, frames.iter().map(|frame| frame.value.as_str()))
+            }),
+        )
     }
 
     pub fn sample(
@@ -258,9 +285,7 @@ impl Animation {
         let ended = elapsed >= stop;
         let active = !paused && !ended && !before;
         let mut wake = (!paused && !ended).then_some(if before { start } else { stop } - elapsed);
-        if before && !matches!(self.fill.as_str(), "backwards" | "both")
-            || ended && !matches!(self.fill.as_str(), "forwards" | "both")
-        {
+        if before && self.fill & 1 == 0 || ended && self.fill & 2 == 0 {
             return (wake, ended);
         }
         let time = (elapsed - self.delay).min(length).max(0.);
@@ -287,9 +312,12 @@ impl Animation {
                 wake.min((iteration + 1. - self.iteration_start) * self.duration - time)
             });
         }
-        let reverse = self.direction == "reverse"
-            || self.direction == "alternate" && iteration % 2. == 1.
-            || self.direction == "alternate-reverse" && iteration % 2. == 0.;
+        let reverse = match self.direction {
+            1 => true,
+            2 => iteration % 2. == 1.,
+            3 => iteration % 2. == 0.,
+            _ => false,
+        };
         if reverse {
             progress = 1. - progress;
         }
@@ -301,15 +329,19 @@ impl Animation {
                 wake = Some(0.);
             }
         }
-        let replace = self.composite == "replace";
+        let replace = self.composite == 0;
         let mut keys: Vec<(f64, Cow<str>, Option<&Easing>)> = Vec::new();
         for (property, frames) in &self.tracks {
             // Keyframes at 0 and 1 replace the value under them, so their stored segments apply.
-            let fixed = replace && frames[0].0 <= 0. && frames[frames.len() - 1].0 >= 1.;
+            let fixed = replace && frames[0].at <= 0. && frames[frames.len() - 1].at >= 1.;
             if !fixed {
                 keys.clear();
-                keys.extend(frames.iter().map(|(at, value, timing, _)| {
-                    (*at, Cow::Borrowed(value.as_str()), timing.as_ref())
+                keys.extend(frames.iter().map(|frame| {
+                    (
+                        frame.at,
+                        Cow::Borrowed(frame.value.as_str()),
+                        frame.timing.as_ref(),
+                    )
                 }));
                 let under = out
                     .get(*property)
@@ -318,12 +350,9 @@ impl Animation {
                 if let Some(under) = under {
                     if !replace {
                         for key in &mut keys {
-                            if let Some(sum) = add(
-                                property.name(),
-                                &under,
-                                &key.1,
-                                self.composite == "accumulate",
-                            ) {
+                            if let Some(sum) =
+                                add(property.name(), &under, &key.1, self.composite == 2)
+                            {
                                 key.1 = Cow::Owned(sum);
                             }
                         }
@@ -339,8 +368,8 @@ impl Animation {
             let count = if fixed { frames.len() } else { keys.len() };
             let key = |index: usize| {
                 if fixed {
-                    let (at, value, timing, _) = &frames[index];
-                    (*at, value.as_str(), timing.as_ref())
+                    let frame = &frames[index];
+                    (frame.at, frame.value.as_str(), frame.timing.as_ref())
                 } else {
                     let (at, value, timing) = &keys[index];
                     (*at, &**value, *timing)
@@ -366,7 +395,7 @@ impl Animation {
             let value = if property.is_custom() && !animatable(*property, registry) {
                 None
             } else if fixed {
-                interpolate(frames[index].3.as_deref(), from.1, to.1, eased)
+                interpolate(frames[index].lerp.as_deref(), from.1, to.1, eased)
             } else {
                 interpolate(
                     lerp(property.name(), from.1, to.1).as_deref(),
@@ -444,16 +473,22 @@ impl Playback {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Phase {
+    Pending,
+    Running,
+    Ended,
+    Canceled,
+}
+
 struct Clock {
     serial: u32,
     name: String,
     playback: Playback,
-    ended: bool,
-    started: bool,
+    phase: Phase,
     iteration: f64,
     delay: f64,
     held: Option<bool>,
-    canceled: bool,
 }
 
 #[derive(Clone)]
@@ -714,6 +749,14 @@ fn after(now: Instant, seconds: f64) -> Option<Instant> {
         .and_then(|delay| now.checked_add(delay))
 }
 
+fn drop_important(styles: &ComputedStyles, id: usize, out: &mut Style) {
+    if let Some(props) = styles.important.get(&id) {
+        for &prop in props.iter() {
+            out.remove(prop);
+        }
+    }
+}
+
 pub(crate) struct Scripted {
     id: u32,
     rules: Vec<(f64, Style, Option<Easing>)>,
@@ -744,13 +787,13 @@ impl Scripted {
                 duration,
                 delay,
                 iterations,
-                direction: direction.into(),
-                fill: fill.into(),
+                direction: keyword(&DIRECTIONS, direction).unwrap_or(0),
+                fill: keyword(&FILLS, fill).unwrap_or(0),
                 timing: Easing::Linear,
                 easing: Easing::parse(easing).unwrap_or(Easing::Linear),
                 end_delay,
                 iteration_start,
-                composite: composite.into(),
+                composite: keyword(&COMPOSITES, composite).unwrap_or(1),
                 pseudo,
                 tracks: Vec::new(),
             },
@@ -763,11 +806,14 @@ impl Scripted {
         }
     }
 
-    fn base<'a>(
-        &self,
+    // Returns the wake of the sample, or None when the pseudo-element has no style.
+    fn sample<'a>(
+        &mut self,
         id: usize,
-        styles: &'a ComputedStyles,
-    ) -> Option<(Rc<dyn std::any::Any>, Cow<'a, Style>)> {
+        styles: &ComputedStyles,
+        now: Instant,
+        out: impl FnOnce() -> &'a mut Style,
+    ) -> Option<Option<f64>> {
         let (owner, style): (Rc<dyn std::any::Any>, &Style) = match self.effect.pseudo {
             0 => (styles.values[id].clone(), &*styles.values[id]),
             slot => {
@@ -776,27 +822,27 @@ impl Scripted {
             }
         };
         let vars = &styles.vars[id];
-        Some((
-            owner,
-            if style.vars().is_empty() && !vars.is_empty() {
-                let mut style = style.clone();
-                style.set_vars(vars.clone());
-                Cow::Owned(style)
-            } else {
-                Cow::Borrowed(style)
-            },
-        ))
-    }
-
-    fn resolve(&mut self, owner: Rc<dyn std::any::Any>, base: &Style, registry: &Registry) {
+        let base = if style.vars().is_empty() && !vars.is_empty() {
+            let mut style = style.clone();
+            style.set_vars(vars.clone());
+            Cow::Owned(style)
+        } else {
+            Cow::Borrowed(style)
+        };
         if self
             .base
             .as_ref()
             .is_none_or(|(old, vars)| !Rc::ptr_eq(old, &owner) || !Rc::ptr_eq(vars, base.vars()))
         {
-            self.effect.tracks = tracks(base, &self.rules, registry, false);
+            self.effect.tracks = tracks(&base, &self.rules, &styles.registry, false);
             self.base = Some((owner, base.vars().clone()));
         }
+        let (local, paused) = (self.playback.at(now), self.playback.rate == 0.);
+        Some(
+            self.effect
+                .sample(local, paused, &base, &styles.registry, out())
+                .0,
+        )
     }
 }
 
@@ -812,13 +858,13 @@ pub(crate) struct Motion {
     pub custom: HashMap<usize, Style>,
     pub wake: Option<(Instant, renderer::Timer)>,
     pub parked: Vec<usize>,
-    scripted: HashMap<usize, Vec<Scripted>>,
+    scripted: FxHashMap<usize, Vec<Scripted>>,
     script_nodes: FxHashMap<u32, usize>,
     serial: u32,
     queued: Events,
     pub pseudos: Vec<(usize, Rc<[Style; 2]>)>,
     pub painted: Option<Vec<bool>>,
-    backdrop: HashMap<usize, (Rc<Style>, Vec<Transition>)>,
+    backdrop: FxHashMap<usize, (Rc<Style>, Vec<Transition>)>,
     pub backdrops: Vec<(usize, Rc<Style>)>,
     pub iterations: bool,
 }
@@ -854,7 +900,7 @@ impl Motion {
             .map(|&at| {
                 let mut out = Style::default();
                 for (effect, clock) in self.pairs(id, styles) {
-                    if !clock.canceled && effect.pseudo == 0 {
+                    if clock.phase != Phase::Canceled && effect.pseudo == 0 {
                         let paused = clock.playback.rate == 0.;
                         effect.sample(clock.playback.at(at), paused, base, registry, &mut out);
                     }
@@ -868,14 +914,7 @@ impl Motion {
                             .sample(local, paused, base, registry, &mut out);
                     }
                 }
-                for &prop in styles
-                    .important
-                    .get(&id)
-                    .into_iter()
-                    .flat_map(|props| props.iter())
-                {
-                    out.remove(prop);
-                }
+                drop_important(styles, id, &mut out);
                 for transition in self.transitions.get(&id).into_iter().flatten() {
                     if let Some(progress) = transition.progress(at) {
                         out.insert(transition.property, transition.value(progress));
@@ -911,7 +950,7 @@ impl Motion {
         let (mut running, mut effects) = (None, 0);
         for (effect, playback) in self
             .pairs(id, styles)
-            .filter(|(_, clock)| !clock.canceled)
+            .filter(|(_, clock)| clock.phase != Phase::Canceled)
             .map(|(effect, clock)| (effect, &clock.playback))
             .chain(scripted.map(|animation| (&animation.effect, &animation.playback)))
         {
@@ -928,12 +967,7 @@ impl Motion {
             {
                 return None;
             }
-            let period = effect.duration
-                * if effect.direction.contains("alternate") {
-                    2.
-                } else {
-                    1.
-                };
+            let period = effect.duration * if effect.direction >= 2 { 2. } else { 1. };
             let phase = (local - effect.delay + effect.iteration_start * effect.duration)
                 .rem_euclid(period);
             running = Some((period, phase, (stop - local) / period, effect));
@@ -955,7 +989,7 @@ impl Motion {
 
     pub fn next_event(&self, id: usize, styles: &ComputedStyles, now: Instant) -> Option<Instant> {
         let animations = self.pairs(id, styles).filter_map(|(effect, clock)| {
-            if clock.playback.rate == 0. || clock.canceled || clock.ended {
+            if clock.playback.rate == 0. || matches!(clock.phase, Phase::Ended | Phase::Canceled) {
                 return None;
             }
             let elapsed = clock.playback.at(now);
@@ -1106,9 +1140,9 @@ impl Motion {
         }
         for &node in nodes {
             for (effect, clock) in self.pairs(node, styles) {
-                if clock.canceled
+                if clock.phase == Phase::Canceled
                     || effect.pseudo != 0 && !pseudos
-                    || clock.ended && !matches!(effect.fill.as_str(), "forwards" | "both")
+                    || clock.phase == Phase::Ended && effect.fill & 2 == 0
                 {
                     continue;
                 }
@@ -1119,12 +1153,12 @@ impl Motion {
                     .tracks
                     .iter()
                     .flat_map(|(prop, keys)| {
-                        keys.iter().map(move |(offset, value, timing, _)| {
+                        keys.iter().map(move |frame| {
                             serde_json::json!([
-                                offset,
+                                frame.at,
                                 prop.name(),
-                                value,
-                                timing.as_ref().unwrap_or(&effect.timing).to_string()
+                                frame.value,
+                                frame.timing.as_ref().unwrap_or(&effect.timing).to_string()
                             ])
                         })
                     })
@@ -1136,7 +1170,7 @@ impl Motion {
                     "animation",
                     name,
                     time * 1000.,
-                    if clock.ended {
+                    if clock.phase == Phase::Ended {
                         "finished"
                     } else if paused {
                         "paused"
@@ -1154,8 +1188,8 @@ impl Motion {
                         },
                         0.
                     ],
-                    effect.direction,
-                    effect.fill,
+                    DIRECTIONS[usize::from(effect.direction)],
+                    FILLS[usize::from(effect.fill)],
                     "linear",
                     frames,
                     pseudo,
@@ -1195,22 +1229,21 @@ impl Motion {
             match action {
                 "pause" => clock.held = Some(true),
                 "play" => {
-                    if clock.ended || clock.canceled {
+                    if matches!(clock.phase, Phase::Ended | Phase::Canceled) {
                         clock.playback.time = 0.;
-                        (clock.ended, clock.started, clock.canceled, clock.iteration) =
-                            (false, false, false, 0.);
+                        (clock.phase, clock.iteration) = (Phase::Pending, 0.);
                     }
                     clock.held = Some(false);
                 }
                 "seek" => clock.playback.time = time / 1000.,
                 "finish" if end.is_finite() => clock.playback.time = end,
                 "cancel" => {
-                    if clock.started && !clock.ended && !clock.canceled {
+                    if clock.phase == Phase::Running {
                         let active = (clock.playback.time - clock.delay).max(0.);
                         self.queued
                             .push((node, "animationcancel", clock.name.clone(), active));
                     }
-                    clock.canceled = true;
+                    clock.phase = Phase::Canceled;
                 }
                 _ => return false,
             }
@@ -1285,23 +1318,10 @@ impl Motion {
             .take_while(|animation| animation.id <= upto)
             .filter(|animation| animation.effect.pseudo == pseudo)
         {
-            let Some((owner, base)) = animation.base(node, styles) else {
-                continue;
-            };
-            animation.resolve(owner, &base, &styles.registry);
-            let (local, paused) = (animation.playback.at(now), animation.playback.rate == 0.);
-            animation
-                .effect
-                .sample(local, paused, &base, &styles.registry, &mut out);
+            animation.sample(node, styles, now, || &mut out);
         }
-        for &prop in styles
-            .important
-            .get(&node)
-            .filter(|_| pseudo == 0)
-            .into_iter()
-            .flat_map(|props| props.iter())
-        {
-            out.remove(prop);
+        if pseudo == 0 {
+            drop_important(styles, node, &mut out);
         }
         (!out.is_empty()).then_some(out)
     }
@@ -1332,14 +1352,7 @@ impl Motion {
                         .iter()
                         .any(|(_, rule, _)| rule.contains(Prop::DISPLAY))
             }) {
-                let Some((owner, base)) = animation.base(id, styles) else {
-                    continue;
-                };
-                animation.resolve(owner, &base, registry);
-                let (local, paused) = (animation.playback.at(now), animation.playback.rate == 0.);
-                animation
-                    .effect
-                    .sample(local, paused, &base, registry, &mut out);
+                animation.sample(id, styles, now, || &mut out);
             }
             if out.get(Prop::DISPLAY).is_some_and(|value| value != "none") {
                 revealed.push(id);
@@ -1493,7 +1506,7 @@ impl Motion {
             cancel(&running, &[], (id, "::backdrop\0"), now, events);
         }
         let cancel_clock = |id: usize, clock: &Clock, events: &mut Events| {
-            if clock.started && !clock.ended && !clock.canceled {
+            if clock.phase == Phase::Running {
                 events.push((
                     id,
                     "animationcancel",
@@ -1555,12 +1568,10 @@ impl Motion {
                                         since: now,
                                         rate: f64::from(u8::from(!effect.paused)),
                                     },
-                                    ended: false,
-                                    started: false,
+                                    phase: Phase::Pending,
                                     iteration: 0.,
                                     delay: effect.delay,
                                     held: None,
-                                    canceled: false,
                                 }
                             }
                         },
@@ -1577,7 +1588,7 @@ impl Motion {
                     clock.playback.set(now, f64::from(u8::from(!paused)));
                 }
                 clock.delay = effect.delay;
-                if clock.canceled {
+                if clock.phase == Phase::Canceled {
                     continue;
                 }
                 let elapsed = clock.playback.at(now);
@@ -1600,8 +1611,8 @@ impl Motion {
                 } else {
                     0.
                 };
-                if !clock.started && active >= 0. {
-                    clock.started = true;
+                if clock.phase == Phase::Pending && active >= 0. {
+                    clock.phase = Phase::Running;
                     clock.iteration = iteration;
                     events.push((
                         id,
@@ -1610,7 +1621,7 @@ impl Motion {
                         (-effect.delay).min(effect.active()).max(0.),
                     ));
                 }
-                if clock.started && effect.duration > 0. && !ended {
+                if clock.phase != Phase::Pending && effect.duration > 0. && !ended {
                     if iteration > clock.iteration && self.iterations {
                         events.push((
                             id,
@@ -1621,21 +1632,24 @@ impl Motion {
                     }
                     clock.iteration = iteration;
                 }
-                if ended && !clock.ended {
-                    events.push((id, "animationend", effect.name.clone(), effect.active()));
+                if ended {
+                    if clock.phase != Phase::Ended {
+                        events.push((id, "animationend", effect.name.clone(), effect.active()));
+                    }
+                    clock.phase = Phase::Ended;
+                } else if clock.phase == Phase::Ended {
+                    clock.phase = Phase::Running;
                 }
-                clock.ended = ended;
                 let end = if paused || ended {
                     f64::INFINITY
                 } else {
                     effect.delay + effect.active() - elapsed
                 };
+                let (paint, still) = effect.paints();
                 wakes.push((
                     id,
-                    effect.tracks.iter().all(|(key, _)| PAINT.contains(key)),
-                    effect.tracks.iter().all(|(key, frames)| {
-                        keeps_box_in_place(*key, frames.iter().map(|(_, value, ..)| value.as_str()))
-                    }),
+                    paint,
+                    still,
                     if effect.tracks.is_empty() {
                         end
                     } else {
@@ -1650,47 +1664,31 @@ impl Motion {
                 continue;
             }
             for animation in list.iter_mut() {
-                let Some((owner, base)) = animation.base(id, styles) else {
-                    continue;
-                };
-                animation.resolve(owner, &base, registry);
-                let out = match animation.effect.pseudo {
+                let slot = animation.effect.pseudo;
+                let Some(wake) = animation.sample(id, styles, now, || match slot {
                     0 => animated.entry(id).or_default(),
                     slot => pseudo.entry((id, slot)).or_default(),
+                }) else {
+                    continue;
                 };
-                let (local, rate) = (animation.playback.at(now), animation.playback.rate);
-                let (wake, _) = animation
-                    .effect
-                    .sample(local, rate == 0., &base, registry, out);
+                let rate = animation.playback.rate;
                 if rate == 0. {
                     continue;
                 }
                 let change = if rate > 0. {
                     wake.map_or(f64::INFINITY, |wake| wake / rate)
-                } else if local > 0. {
+                } else if animation.playback.at(now) > 0. {
                     0.
                 } else {
                     f64::INFINITY
                 };
-                let tracks = &animation.effect.tracks;
-                wakes.push((
-                    id,
-                    tracks.iter().all(|(key, _)| PAINT.contains(key)),
-                    tracks.iter().all(|(key, frames)| {
-                        keeps_box_in_place(*key, frames.iter().map(|(_, value, ..)| value.as_str()))
-                    }),
-                    change,
-                    f64::INFINITY,
-                ));
+                let (paint, still) = animation.effect.paints();
+                wakes.push((id, paint, still, change, f64::INFINITY));
             }
         }
         // Important declarations override animations, but not transitions.
-        for (id, props) in &styles.important {
-            if let Some(out) = animated.get_mut(id) {
-                for &prop in props.iter() {
-                    out.remove(prop);
-                }
-            }
+        for (&id, out) in &mut animated {
+            drop_important(styles, id, out);
         }
         for (&id, list) in &mut self.transitions {
             let out = animated.entry(id).or_default();
@@ -1776,7 +1774,7 @@ impl Motion {
         for (id, key, value) in inherited {
             animated.entry(id).or_default().insert(key, value);
         }
-        let layout: FxHashSet<usize> = animated
+        let mut layout: FxHashSet<usize> = animated
             .iter()
             .filter(|(id, values)| {
                 values.iter().any(|(key, _)| {
@@ -1840,6 +1838,23 @@ impl Motion {
             Cow::Owned(painted) => Some(painted),
             Cow::Borrowed(_) => None,
         };
+        let mut pairs: FxHashMap<usize, [Style; 2]> = FxHashMap::default();
+        let mut only = Vec::new();
+        for ((id, slot), values) in pseudo {
+            let Some(pair) = styles.pseudos.get(&id).filter(|_| !values.is_empty()) else {
+                continue;
+            };
+            if values.iter().any(|(key, _)| !PAINT.contains(&key)) {
+                layout.insert(id);
+            }
+            pairs.entry(id).or_insert_with(|| {
+                if !animated.contains_key(&id) {
+                    only.push(id);
+                }
+                (**pair).clone()
+            })[usize::from(slot) - 1]
+                .extend(values.iter().map(|(key, value)| (key, value.clone())));
+        }
         self.styled.retain(|id, _| animated.contains_key(id));
         let mut animated: Animated = animated
             .into_iter()
@@ -1874,19 +1889,10 @@ impl Motion {
                 (id, style, layout.contains(&id))
             })
             .collect();
-        let mut pairs: HashMap<usize, [Style; 2]> = HashMap::new();
-        for ((id, slot), values) in pseudo {
-            let Some(pair) = styles.pseudos.get(&id).filter(|_| !values.is_empty()) else {
-                continue;
-            };
-            let layout = values.iter().any(|(key, _)| !PAINT.contains(&key));
-            pairs.entry(id).or_insert_with(|| (**pair).clone())[usize::from(slot) - 1]
-                .extend(values.iter().map(|(key, value)| (key, value.clone())));
-            match animated.iter_mut().find(|(node, ..)| *node == id) {
-                Some(entry) => entry.2 |= layout,
-                None => animated.push((id, styles.values[id].clone(), layout)),
-            }
-        }
+        animated.extend(
+            only.into_iter()
+                .map(|id| (id, styles.values[id].clone(), layout.contains(&id))),
+        );
         self.pseudos = pairs
             .into_iter()
             .map(|(id, pair)| (id, Rc::new(pair)))
@@ -3153,8 +3159,8 @@ mod tests {
         finite.duration = 1.;
         finite.delay = -0.5;
         finite.iterations = 2.;
-        finite.direction = "alternate".into();
-        finite.fill = "both".into();
+        finite.direction = 2;
+        finite.fill = 3;
         assert_eq!(sample(&finite, 0.).0, Some(0.));
         assert_eq!(sample(&finite, 2.), (Some(1.), false));
         finite.paused = true;
@@ -3859,7 +3865,7 @@ mod tests {
         let new = |frames: &[(f64, &str, &str)], timing, direction, fill, easing| {
             let mut animation =
                 Scripted::new(1, frames, timing, [direction, fill, easing, "replace"], 0);
-            animation.resolve(base.clone(), &base, &Default::default());
+            animation.effect.tracks = tracks(&base, &animation.rules, &Default::default(), false);
             animation
         };
         let frames = [(0., "opacity:0", "linear"), (1., "opacity:1", "linear")];
@@ -4757,7 +4763,7 @@ mod tests {
             styles.animations[&div][0]
                 .tracks
                 .iter()
-                .all(|(_, frames)| frames[0].3.is_some())
+                .all(|(_, frames)| frames[0].lerp.is_some())
         );
         let (animated, ..) = step(&mut Motion::default(), &doc, &styles, Instant::now());
         let style = &animated[&div].0;
@@ -4790,7 +4796,7 @@ mod tests {
             ["normal", "both", "steps(2, jump-start)", "replace"],
             0,
         );
-        animation.resolve(base.clone(), &base, &Default::default());
+        animation.effect.tracks = tracks(&base, &animation.rules, &Default::default(), false);
         let opacity = |local: f64| {
             let mut out = Style::new();
             animation

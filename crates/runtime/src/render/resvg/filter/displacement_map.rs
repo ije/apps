@@ -37,7 +37,7 @@ pub fn apply(
         let ox = (x as f32 + dx * sx * fe.scale()).round() as i32;
         let oy = (y as f32 + dy * sy * fe.scale()).round() as i32;
 
-        if x < w as u32 && y < h as u32 && ox >= 0 && ox < w && oy >= 0 && oy < h {
+        if ox >= 0 && ox < w && oy >= 0 && oy < h {
             let idx = (oy * w + ox) as usize;
             let idx1 = (y * w as u32 + x) as usize;
             dest.data[idx1] = src.data[idx];

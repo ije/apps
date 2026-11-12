@@ -247,6 +247,13 @@ pub(super) fn content(node: &crate::dom::Node) -> (u64, u64) {
     (own, attrs.finish())
 }
 
+pub(super) fn replaced(tag: &str) -> bool {
+    matches!(
+        tag,
+        "iframe" | "webview" | "canvas" | "video" | "embed" | "object"
+    )
+}
+
 pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, margin: f32) -> u16 {
     let display = style.get(Prop::DISPLAY).unwrap_or("inline");
     let position = style.get(Prop::POSITION).unwrap_or("static");
@@ -256,10 +263,7 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
             .get(Prop::WRITING_MODE)
             .is_some_and(|value| value.starts_with("vertical") || value.starts_with("sideways"));
     let blocked = moved
-        || matches!(
-            tag,
-            "iframe" | "webview" | "canvas" | "video" | "embed" | "object"
-        )
+        || replaced(tag)
         || matches!(position, "absolute" | "fixed" | "sticky")
         || style
             .get(Prop::CONTAINER_TYPE)
@@ -576,16 +580,8 @@ pub(super) fn spacer(
             let near = f32::from(window.viewport_size().height) / 2.;
             let shown = resized || reflowed || y < high && y + height > low;
             if shown || moved && y < high + near && y + height > low - near {
-                let mut kept = view.kept.borrow_mut();
-                for id in path.iter() {
-                    kept.remove(id);
-                }
                 dom.cull.off |= resized || reflowed;
-                if shown {
-                    window.redraw();
-                } else {
-                    window.request_animation_frame();
-                }
+                wake(view, &path, shown, window);
             }
             let delta = [at[0] - last.get()[0], at[1] - last.get()[1]];
             last.set(at);
@@ -652,15 +648,7 @@ pub(super) fn anchor(
                 }
             }
             if shown || moved && close {
-                let mut kept = view.kept.borrow_mut();
-                for id in path.iter() {
-                    kept.remove(id);
-                }
-                if shown {
-                    window.redraw();
-                } else {
-                    window.request_animation_frame();
-                }
+                wake(view, &path, shown, window);
             }
         },
         |_, _, _| {},
@@ -672,6 +660,18 @@ pub(super) fn anchor(
     .into()
 }
 
+fn wake(view: &super::PageState, path: &[usize], shown: bool, window: &mut renderer::Window) {
+    let mut kept = view.kept.borrow_mut();
+    for id in path {
+        kept.remove(id);
+    }
+    if shown {
+        window.redraw();
+    } else {
+        window.request_animation_frame();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,7 +679,7 @@ mod tests {
 
     fn page(html: &str) -> (Document, Rc<style::ComputedStyles>, impl Fn(&str) -> usize) {
         let mut doc = Document::parse(html);
-        let styles = crate::dom::styles(&mut doc, &mut Default::default(), [800., 600.], None);
+        let styles = crate::dom::styles(&mut doc, &mut Default::default(), [800., 600.]);
         let ids: HashMap<String, usize> = (0..doc.nodes.len())
             .filter_map(|id| Some((doc.nodes[id].attrs.get("id")?.clone(), id)))
             .collect();
@@ -1147,9 +1147,9 @@ mod tests {
             );
         }
         for node in [id("a"), id("b"), text, id("h"), id("i")] {
-            assert_eq!(bounds[&node], [21., -198., 3., 4.]);
+            assert_eq!(bounds.get(&node), Some(&[21., -198., 3., 4.]));
         }
-        assert_eq!(bounds[&id("c")], [1., 2., 3., 4.]);
+        assert_eq!(bounds.get(&id("c")), Some(&[1., 2., 3., 4.]));
         assert_eq!(subtrees.1[&id("a")].len(), 3);
     }
 }

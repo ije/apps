@@ -45,10 +45,6 @@ impl Attrs {
         Some(self.0.remove(index).1)
     }
 
-    pub fn clear(&mut self) {
-        self.0.clear();
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
         self.0.iter().map(|(key, value)| (key, value))
     }
@@ -158,7 +154,7 @@ impl Nodes {
     }
 
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Node> {
-        self.revisions.fill_with(stamp);
+        self.revisions.fill(stamp());
         self.latest = stamp();
         self.tree = self.latest;
         self.log.clear();
@@ -236,17 +232,13 @@ impl std::ops::Index<usize> for Nodes {
 
 impl std::ops::IndexMut<usize> for Nodes {
     fn index_mut(&mut self, id: usize) -> &mut Node {
-        self.note(id);
-        self.latest = stamp();
-        self.tree = self.latest;
-        self.revisions[id] = self.latest;
-        &mut self.list[id]
+        self.get_mut(id).unwrap()
     }
 }
 
 impl From<Vec<Node>> for Nodes {
     fn from(list: Vec<Node>) -> Self {
-        let revisions = list.iter().map(|_| stamp()).collect();
+        let revisions = vec![stamp(); list.len()];
         let latest = stamp();
         Self {
             list,
@@ -322,6 +314,21 @@ const TABLE: usize = 3;
 const SELECT: usize = 4;
 const SPECIAL: usize = 5;
 const HTML: usize = 6;
+const MARKER: usize = 7;
+
+const RAW: [&str; 8] = [
+    "style",
+    "script",
+    "xmp",
+    "iframe",
+    "noembed",
+    "noframes",
+    "noscript",
+    "plaintext",
+];
+const IMPLIED: [&str; 10] = [
+    "dd", "dt", "li", "optgroup", "option", "p", "rb", "rp", "rt", "rtc",
+];
 
 const SVG_TAGS: &str = "altGlyph altGlyphDef altGlyphItem animateColor animateMotion animateTransform clipPath feBlend feColorMatrix feComponentTransfer feComposite feConvolveMatrix feDiffuseLighting feDisplacementMap feDistantLight feDropShadow feFlood feFuncA feFuncB feFuncG feFuncR feGaussianBlur feImage feMerge feMergeNode feMorphology feOffset fePointLight feSpecularLighting feSpotLight feTile feTurbulence foreignObject glyphRef linearGradient radialGradient textPath";
 const SVG_ATTRS: &str = "attributeName attributeType baseFrequency baseProfile calcMode clipPathUnits diffuseConstant edgeMode filterUnits glyphRef gradientTransform gradientUnits kernelMatrix kernelUnitLength keyPoints keySplines keyTimes lengthAdjust limitingConeAngle markerHeight markerUnits markerWidth maskContentUnits maskUnits numOctaves pathLength patternContentUnits patternTransform patternUnits pointsAtX pointsAtY pointsAtZ preserveAlpha preserveAspectRatio primitiveUnits refX refY repeatCount repeatDur requiredExtensions requiredFeatures specularConstant specularExponent spreadMethod startOffset stdDeviation stitchTiles surfaceScale systemLanguage tableValues targetX targetY textLength viewBox viewTarget xChannelSelector yChannelSelector zoomAndPan";
@@ -542,44 +549,57 @@ impl Builder {
                         | "wbr"
                         | "xmp"
                 );
+        let marker = html
+            && matches!(
+                tag,
+                "applet" | "caption" | "marquee" | "object" | "td" | "th" | "template"
+            );
         let bits = u8::from(default)
             | u8::from(default || html && matches!(tag, "ol" | "ul")) << LIST
             | u8::from(default || html && tag == "button") << BUTTON
             | u8::from(html && matches!(tag, "html" | "table" | "template")) << TABLE
             | u8::from(!(html && matches!(tag, "optgroup" | "option"))) << SELECT
             | u8::from(special) << SPECIAL
-            | u8::from(html) << HTML;
+            | u8::from(html) << HTML
+            | u8::from(marker) << MARKER;
         let key = key(tag);
-        let position = self.stack.len() + 1;
-        let prev = self.last.insert(key, position).unwrap_or(0);
-        let below = self.bound;
-        for (kind, bound) in self.bound.iter_mut().enumerate() {
-            if bits & 1 << kind != 0 {
-                *bound = position;
-            }
-        }
         let saved = mode.map(|mode| std::mem::replace(&mut self.mode, mode));
-        if html
-            && matches!(
-                tag,
-                "applet" | "caption" | "marquee" | "object" | "td" | "th" | "template"
-            )
-        {
+        if marker {
             self.active.push(None);
         }
         if self.opened.len() <= id {
             self.opened.resize(id + 1, false);
         }
-        self.opened[id] = true;
-        self.stack.push(Open {
+        self.enter(Open {
             id,
             key,
             svg,
             bits,
-            prev,
-            below,
+            prev: 0,
+            below: [0; 7],
             saved,
         });
+    }
+
+    fn enter(&mut self, mut open: Open) {
+        let at = self.stack.len() + 1;
+        open.prev = self.last.insert(open.key, at).unwrap_or(0);
+        open.below = self.bound;
+        for (kind, bound) in self.bound.iter_mut().enumerate() {
+            if open.bits & 1 << kind != 0 {
+                *bound = at;
+            }
+        }
+        self.opened[open.id] = true;
+        self.stack.push(open);
+    }
+
+    fn leave(&mut self, open: &Open) {
+        match open.prev {
+            0 => self.last.remove(&open.key),
+            prev => self.last.insert(open.key, prev),
+        };
+        self.bound = open.below;
     }
 
     fn pop(&mut self) {
@@ -588,20 +608,10 @@ impl Builder {
         }
         let Some(open) = self.stack.pop() else { return };
         self.opened[open.id] = false;
-        if !open.svg
-            && matches!(
-                self.nodes[open.id].tag.as_str(),
-                "applet" | "caption" | "marquee" | "object" | "td" | "th" | "template"
-            )
-        {
+        if open.bits & 1 << MARKER != 0 {
             while let Some(Some(_)) = self.active.pop() {}
         }
-        if open.prev == 0 {
-            self.last.remove(&open.key);
-        } else {
-            self.last.insert(open.key, open.prev);
-        }
-        self.bound = open.below;
+        self.leave(&open);
         if let Some(mode) = open.saved {
             self.mode = mode;
         }
@@ -616,31 +626,14 @@ impl Builder {
     fn split(&mut self, at: usize) -> Vec<Open> {
         let tail = self.stack.split_off(at);
         for open in tail.iter().rev() {
-            match open.prev {
-                0 => self.last.remove(&open.key),
-                prev => self.last.insert(open.key, prev),
-            };
-            self.bound = open.below;
+            self.leave(open);
         }
         tail
     }
 
     fn restore(&mut self, tail: Vec<Open>) {
         for open in tail {
-            let at = self.stack.len() + 1;
-            let prev = self.last.insert(open.key, at).unwrap_or(0);
-            let below = self.bound;
-            for (kind, bound) in self.bound.iter_mut().enumerate() {
-                if open.bits & 1 << kind != 0 {
-                    *bound = at;
-                }
-            }
-            self.opened[open.id] = true;
-            self.stack.push(Open {
-                prev,
-                below,
-                ..open
-            });
+            self.enter(open);
         }
     }
 
@@ -1119,25 +1112,13 @@ impl Builder {
                 self.start(tag, attrs, closing)
             }
             Mode::AfterHead => {
-                if let Some(head) = self.head
-                    && matches!(
-                        tag,
-                        "base"
-                            | "basefont"
-                            | "bgsound"
-                            | "link"
-                            | "meta"
-                            | "noframes"
-                            | "script"
-                            | "style"
-                            | "template"
-                            | "title"
-                    )
-                {
+                if let Some(head) = self.head {
                     self.push(head, false, None);
-                    let content = self.head(tag, &mut attrs);
-                    self.remove(self.stack.len() - if tag == "template" { 2 } else { 1 });
-                    return content.unwrap_or(Content::Markup);
+                    if let Some(content) = self.head(tag, &mut attrs) {
+                        self.remove(self.stack.len() - if tag == "template" { 2 } else { 1 });
+                        return content;
+                    }
+                    self.pop();
                 }
                 if tag == "head" {
                     return Content::Markup;
@@ -1504,20 +1485,7 @@ impl Builder {
                     && self.stack.len() > 1
                     && self.stack.last().is_some_and(|open| {
                         let name = self.nodes[open.id].tag.as_str();
-                        !open.svg
-                            && name != except
-                            && matches!(
-                                name,
-                                "dd" | "dt"
-                                    | "li"
-                                    | "optgroup"
-                                    | "option"
-                                    | "p"
-                                    | "rb"
-                                    | "rp"
-                                    | "rt"
-                                    | "rtc"
-                            )
+                        !open.svg && name != except && IMPLIED.contains(&name)
                     })
                 {
                     self.pop();
@@ -1787,19 +1755,7 @@ impl Builder {
                     return;
                 }
                 while self.stack.last().is_some_and(|open| {
-                    !open.svg
-                        && matches!(
-                            self.nodes[open.id].tag.as_str(),
-                            "dd" | "dt"
-                                | "li"
-                                | "optgroup"
-                                | "option"
-                                | "p"
-                                | "rb"
-                                | "rp"
-                                | "rt"
-                                | "rtc"
-                        )
+                    !open.svg && IMPLIED.contains(&self.nodes[open.id].tag.as_str())
                 }) {
                     self.pop();
                 }
@@ -1940,17 +1896,7 @@ impl Document {
             newline: false,
         };
         if let Some(context) = context {
-            let raw = matches!(
-                context,
-                "style"
-                    | "script"
-                    | "xmp"
-                    | "iframe"
-                    | "noembed"
-                    | "noframes"
-                    | "noscript"
-                    | "plaintext"
-            );
+            let raw = RAW.contains(&context);
             if raw || matches!(context, "title" | "textarea") {
                 if !source.is_empty() {
                     builder.nodes.push(Node {
@@ -2275,19 +2221,9 @@ impl Document {
                     let source = node.stylesheet.as_ref().map(|sheet| sheet.source());
                     let text = source.as_deref().unwrap_or(&node.text);
                     if !foreign
-                        && node.parent.is_some_and(|parent| {
-                            matches!(
-                                self.nodes[parent].tag.as_str(),
-                                "script"
-                                    | "style"
-                                    | "xmp"
-                                    | "iframe"
-                                    | "noembed"
-                                    | "noframes"
-                                    | "noscript"
-                                    | "plaintext"
-                            )
-                        })
+                        && node
+                            .parent
+                            .is_some_and(|parent| RAW.contains(&self.nodes[parent].tag.as_str()))
                     {
                         result.push_str(text);
                     } else {
@@ -2305,9 +2241,14 @@ impl Document {
                 }
                 "#doctype" => {
                     let mut ids = node.text.split('\0');
-                    result.push_str(&format!("<!DOCTYPE {}", ids.next().unwrap_or("")));
+                    result.push_str("<!DOCTYPE ");
+                    result.push_str(ids.next().unwrap_or(""));
                     if let (Some(public), Some(system)) = (ids.next(), ids.next()) {
-                        result.push_str(&format!(" PUBLIC \"{public}\" \"{system}\""));
+                        result.push_str(" PUBLIC \"");
+                        result.push_str(public);
+                        result.push_str("\" \"");
+                        result.push_str(system);
+                        result.push('"');
                     }
                     result.push('>');
                     continue;
@@ -2332,7 +2273,9 @@ impl Document {
                     result.push('"');
                 }
                 if mark && !node.attrs.contains_key("id") {
-                    result.push_str(&format!(" id=\"apps-{id}\""));
+                    result.push_str(" id=\"apps-");
+                    result.push_str(&id.to_string());
+                    result.push('"');
                 }
                 for (name, value) in replaced.unwrap_or_default() {
                     if !value.is_empty() {
@@ -2398,7 +2341,10 @@ impl Document {
     }
 }
 
-pub fn escape(value: &str) -> String {
+pub fn escape(value: &str) -> std::borrow::Cow<'_, str> {
+    if !value.contains(['&', '<', '>', '"']) {
+        return value.into();
+    }
     let mut escaped = String::with_capacity(value.len());
     let mut last = 0;
     for (at, found) in value.match_indices(['&', '<', '>', '"']) {
@@ -2412,10 +2358,10 @@ pub fn escape(value: &str) -> String {
         last = at + 1;
     }
     escaped.push_str(&value[last..]);
-    escaped
+    escaped.into()
 }
 
-pub fn decode(value: &str, attribute: bool) -> String {
+fn decode(value: &str, attribute: bool) -> String {
     const C1: [u16; 32] = [
         0x20ac, 0, 0x201a, 0x192, 0x201e, 0x2026, 0x2020, 0x2021, 0x2c6, 0x2030, 0x160, 0x2039,
         0x152, 0, 0x17d, 0, 0, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014, 0x2dc,

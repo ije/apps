@@ -3930,3 +3930,57 @@ fn select_popup_picks_options() {
         if (s.value !== 'Five') throw Error('A list box opened a menu');
     "#, "test").unwrap();
 }
+
+#[test]
+fn throwing_resize_observer_does_not_stop_layout_callbacks() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: Document::parse("<html><body><main><div id='box'></div></main></body></html>"),
+            dirty: false,
+        },
+    );
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
+    engine
+        .eval(
+            r#"
+        const box = document.getElementById('box'), seen = [];
+        addEventListener('error', event => { seen.push('error'); event.preventDefault(); });
+        new ResizeObserver(() => { throw Error('boom'); }).observe(box);
+        new ResizeObserver(() => seen.push('resize')).observe(box);
+        box.addEventListener('scroll', () => seen.push('scroll'));
+        box.scrollTo(0, 5);
+        __appsLayout();
+        if (seen.join() !== 'error,resize,scroll') throw Error(seen.join());
+    "#,
+            "test",
+        )
+        .unwrap();
+}
+
+#[test]
+fn tab_order_includes_custom_elements_with_their_own_tab_index() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><body><button id='a'></button><x-pad id='pad' contenteditable='true'></x-pad><button id='b'></button></body></html>"),
+        dirty: false,
+    });
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
+    engine.eval(r#"
+        customElements.define('x-pad', class extends HTMLElement { get tabIndex() { return 0; } });
+        const order = [];
+        for (let n = 0; n < 3; n++) { __appsDispatch('keydown', [], { key: 'Tab' }); order.push(document.activeElement.id); }
+        if (order.join() !== 'a,pad,b') throw Error(order.join());
+    "#, "test").unwrap();
+}

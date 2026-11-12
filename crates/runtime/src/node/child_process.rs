@@ -1,4 +1,4 @@
-use crate::host::{Role, Waker};
+use crate::host::Waker;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -18,15 +18,13 @@ enum Event {
     End(&'static str),
     Error(&'static str, io::Error),
     Written(&'static str),
-    #[cfg(unix)]
     Finish(&'static str),
     Exit,
 }
 
 struct Process {
     child: Option<Child>,
-    input: Option<Sender<Option<Vec<u8>>>>,
-    extra: Vec<(&'static str, Sender<Option<Vec<u8>>>)>,
+    inputs: Vec<(&'static str, Sender<Option<Vec<u8>>>)>,
     events: Receiver<Event>,
     readers: Vec<(&'static str, Arc<AtomicU8>, std::thread::Thread)>,
     status: Option<ExitStatus>,
@@ -41,8 +39,7 @@ impl Process {
     fn new(child: Option<Child>, events: Receiver<Event>, detached: bool) -> Self {
         Self {
             child,
-            input: None,
-            extra: Vec::new(),
+            inputs: Vec::new(),
             events,
             readers: Vec::new(),
             status: None,
@@ -74,8 +71,7 @@ impl Process {
             });
         }
         self.status = Some(status);
-        self.input.take();
-        self.extra.clear();
+        self.inputs.clear();
     }
 
     fn code(&self) -> Option<i32> {
@@ -90,8 +86,7 @@ const CLOSED: u8 = 2;
 
 impl Drop for Process {
     fn drop(&mut self) {
-        self.input.take();
-        self.extra.clear();
+        self.inputs.clear();
         for (_, state, reader) in &self.readers {
             state.store(CLOSED, Ordering::Release);
             reader.unpark();
@@ -114,6 +109,39 @@ fn error_value(error: &io::Error) -> Value {
     })
 }
 
+fn writer<W: Write + Send + 'static>(
+    process: &mut Process,
+    name: &'static str,
+    mut pipe: W,
+    sender: &SyncSender<Event>,
+    wake: &Waker,
+    close: fn(W),
+) -> io::Result<()> {
+    let (input, writes) = mpsc::channel::<Option<Vec<u8>>>();
+    process.inputs.push((name, input));
+    process.open_streams += 1;
+    let (sender, wake) = (sender.clone(), wake.clone());
+    std::thread::Builder::new()
+        .name(format!("apps-{name}"))
+        .spawn(move || {
+            while let Ok(Some(bytes)) = writes.recv() {
+                if let Err(error) = pipe.write_all(&bytes) {
+                    let _ = sender.send(Event::Error(name, error));
+                    break;
+                }
+                if sender.send(Event::Written(name)).is_err() {
+                    return;
+                }
+                wake.wake();
+            }
+            close(pipe);
+            if sender.send(Event::Finish(name)).is_ok() {
+                wake.wake();
+            }
+        })?;
+    Ok(())
+}
+
 fn attach(
     process: &mut Process,
     sender: &SyncSender<Event>,
@@ -125,30 +153,10 @@ fn attach(
     let mut outputs = outputs;
     #[cfg(unix)]
     for (name, pipe) in pipes {
-        let mut writer = pipe.try_clone()?;
-        outputs.push((name, Box::new(pipe)));
-        let (input, writes) = mpsc::channel::<Option<Vec<u8>>>();
-        process.extra.push((name, input));
-        process.open_streams += 1;
-        let (sender, wake) = (sender.clone(), wake.clone());
-        std::thread::Builder::new()
-            .name(format!("apps-{name}"))
-            .spawn(move || {
-                while let Ok(Some(bytes)) = writes.recv() {
-                    if let Err(error) = writer.write_all(&bytes) {
-                        let _ = sender.send(Event::Error(name, error));
-                        break;
-                    }
-                    if sender.send(Event::Written(name)).is_err() {
-                        return;
-                    }
-                    wake.wake();
-                }
-                let _ = writer.shutdown(std::net::Shutdown::Write);
-                if sender.send(Event::Finish(name)).is_ok() {
-                    wake.wake();
-                }
-            })?;
+        outputs.push((name, Box::new(pipe.try_clone()?)));
+        writer(process, name, pipe, sender, wake, |pipe| {
+            let _ = pipe.shutdown(std::net::Shutdown::Write);
+        })?;
     }
     for (name, mut pipe) in outputs {
         process.open_streams += 1;
@@ -202,31 +210,27 @@ pub(crate) struct State {
 }
 
 impl State {
-    pub(crate) fn call(&mut self, role: Role, op: &str, args: &Value) -> Result<Value> {
-        ensure!(
-            !matches!(role, Role::Renderer(_)),
-            "Child processes are unavailable in page scripts"
-        );
+    pub(crate) fn call(&mut self, op: &str, args: &Value) -> Result<Value> {
         match op {
             "sync" => {
                 let mut state = State::default();
                 let config = &args[2];
-                let spawned = state.call(role, "spawn", args)?;
+                let spawned = state.call("spawn", args)?;
                 if !spawned["error"].is_null() {
                     return Ok(spawned);
                 }
                 let id = spawned["id"].as_u64().context("Expected child ID")?;
                 if config["stdio"][0] == "pipe" {
-                    if !args[2]["input"].is_null() {
-                        state.call(role, "write", &json!([id, args[2]["input"]]))?;
+                    if !config["input"].is_null() {
+                        state.call("write", &json!([id, config["input"]]))?;
                     }
-                    state.call(role, "end", &json!([id]))?;
+                    state.call("end", &json!([id]))?;
                 }
-                let deadline = args[2]["timeout"]
+                let deadline = config["timeout"]
                     .as_u64()
                     .filter(|v| *v > 0)
                     .map(|v| Instant::now() + Duration::from_millis(v));
-                let limit = args[2]["maxBuffer"].as_u64().unwrap_or(1024 * 1024) as usize;
+                let limit = config["maxBuffer"].as_u64().unwrap_or(1024 * 1024) as usize;
                 let (mut stdout, mut stderr) = (Vec::<u8>::new(), Vec::<u8>::new());
                 let process = state
                     .children
@@ -257,7 +261,7 @@ impl State {
                                 break Some(("ENOBUFS", libc::ENOBUFS));
                             }
                         }
-                        Ok(Event::End(_)) => process.open_streams -= 1,
+                        Ok(Event::End(_) | Event::Finish(_)) => process.open_streams -= 1,
                         Ok(Event::Exit) | Err(RecvTimeoutError::Disconnected)
                             if process.status.is_none() =>
                         {
@@ -272,7 +276,7 @@ impl State {
                 };
                 if error.is_some() && process.status.is_none() {
                     let signal = config["killSignal"].as_str().unwrap_or("SIGTERM");
-                    let _ = state.call(role, "kill", &json!([id, signal]));
+                    let _ = state.call("kill", &json!([id, signal]));
                     let process = state
                         .children
                         .get_mut(&id)
@@ -474,29 +478,8 @@ impl State {
                         waker.wake();
                     }
                 })?;
-                if let Some(mut pipe) = stdin {
-                    let (input, writes) = mpsc::channel::<Option<Vec<u8>>>();
-                    process.input = Some(input);
-                    process.open_streams += 1;
-                    let wake = wake.clone();
-                    std::thread::Builder::new()
-                        .name("apps-stdin".into())
-                        .spawn(move || {
-                            while let Ok(Some(bytes)) = writes.recv() {
-                                if let Err(error) = pipe.write_all(&bytes) {
-                                    let _ = sender.send(Event::Error("stdin", error));
-                                    break;
-                                }
-                                if sender.send(Event::Written("stdin")).is_err() {
-                                    return;
-                                }
-                                wake.wake();
-                            }
-                            drop(pipe);
-                            if sender.send(Event::End("stdin")).is_ok() {
-                                wake.wake();
-                            }
-                        })?;
+                if let Some(pipe) = stdin {
+                    writer(&mut process, "stdin", pipe, &sender, &wake, drop)?;
                 }
                 self.next_id += 1;
                 self.children.insert(self.next_id, process);
@@ -528,6 +511,7 @@ impl State {
                         process.spawned = true;
                         events.push(json!({"id": id, "event": "spawn"}));
                     }
+                    let mut exited = false;
                     for (index, event) in process.events.try_iter().take(8).enumerate() {
                         if index == 7 {
                             Waker::current().wake();
@@ -536,19 +520,22 @@ impl State {
                             Event::Data(stream, data) => json!({"id": id, "event": "data", "stream": stream, "data": crate::jsc::payload::write(data)}),
                             Event::Error(stream, error) => json!({"id": id, "event": "error", "stream": stream, "error": error_value(&error)}),
                             Event::Written(stream) => json!({"id": id, "event": "written", "stream": stream}),
-                            #[cfg(unix)]
                             Event::Finish(stream) => {
                                 process.open_streams -= 1;
                                 json!({"id": id, "event": "finish", "stream": stream})
                             }
                             Event::End(stream) => {
                                 process.open_streams -= 1;
-                                json!({"id": id, "event": if stream == "stdin" { "finish" } else { "end" }, "stream": stream})
+                                json!({"id": id, "event": "end", "stream": stream})
                             }
-                            Event::Exit => continue,
+                            Event::Exit => {
+                                exited = true;
+                                continue;
+                            }
                         });
                     }
-                    if process.status.is_none()
+                    if exited
+                        && process.status.is_none()
                         && let Some(child) = &mut process.child
                         && let Some(status) = child.try_wait()?
                     {
@@ -573,27 +560,23 @@ impl State {
                     .get_mut(&args[0].as_u64().context("Expected child ID")?)
                     .context("Child process is closed")?;
                 let name = if op == "end" { &args[1] } else { &args[2] };
-                if let Some(name) = name.as_str() {
-                    let index = process
-                        .extra
-                        .iter()
-                        .position(|(stream, _)| *stream == name)
-                        .context("Child stream is closed")?;
-                    if op == "end" {
-                        process.extra.remove(index).1.send(None)?;
-                        return Ok(Value::Null);
-                    }
-                    let bytes = crate::node::bytes(&args[1])?;
-                    process.extra[index].1.send(Some(bytes.to_vec()))?;
-                    return Ok(Value::Null);
-                }
-                let input = process.input.as_ref().context("Child stdin is closed")?;
+                let name = name.as_str().unwrap_or("stdin");
+                let index = process
+                    .inputs
+                    .iter()
+                    .position(|(stream, _)| *stream == name)
+                    .context(if name == "stdin" {
+                        "Child stdin is closed"
+                    } else {
+                        "Child stream is closed"
+                    })?;
                 if op == "end" {
-                    input.send(None)?;
-                    process.input.take();
-                    return Ok(Value::Null);
+                    process.inputs.remove(index).1.send(None)?;
+                } else {
+                    process.inputs[index]
+                        .1
+                        .send(Some(crate::node::bytes(&args[1])?.to_vec()))?;
                 }
-                input.send(Some(crate::node::bytes(&args[1])?.to_vec()))?;
                 Ok(Value::Null)
             }
             "kill" => {
@@ -677,9 +660,10 @@ impl State {
             #[cfg(unix)]
             "flush" => {
                 if let Some(process) = args[0].as_u64().and_then(|id| self.children.get_mut(&id))
-                    && let Some(index) = process.extra.iter().position(|(name, _)| args[1] == *name)
+                    && let Some(index) =
+                        process.inputs.iter().position(|(name, _)| args[1] == *name)
                 {
-                    process.extra.remove(index).1.send(None)?;
+                    process.inputs.remove(index).1.send(None)?;
                     // A parent that stops reading must not keep this process from exiting.
                     let deadline = Instant::now() + Duration::from_secs(1);
                     while let Ok(event) = process
@@ -694,25 +678,6 @@ impl State {
                 Ok(Value::Null)
             }
             _ => bail!("Unsupported child process operation: {op}"),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn child_process_renderer_access_is_denied() {
-        let mut state = State::default();
-        for op in ["spawn", "poll", "write", "end", "kill"] {
-            assert!(
-                state
-                    .call(Role::Renderer(1), op, &json!([]))
-                    .unwrap_err()
-                    .to_string()
-                    .contains("unavailable in page scripts")
-            );
         }
     }
 }

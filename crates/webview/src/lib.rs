@@ -17,6 +17,7 @@ unsafe extern "C" {
     fn apps_browser_create(
         parent: *mut c_void,
         options: *const c_char,
+        script: *const c_char,
         callback: unsafe extern "C" fn(*mut c_void, *const c_char),
         context: *mut c_void,
     ) -> *mut c_void;
@@ -88,9 +89,6 @@ unsafe extern "C" fn receive(context: *mut c_void, message: *const c_char) {
     }
     let events = unsafe { &*context.cast::<Mutex<VecDeque<Value>>>() };
     let bytes = unsafe { CStr::from_ptr(message) }.to_bytes();
-    if bytes.len() > 4 * 1024 * 1024 {
-        return;
-    }
     if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
         let mut events = events.lock().unwrap_or_else(PoisonError::into_inner);
         // Never drop results or navigation events: callers wait for them.
@@ -152,9 +150,20 @@ impl Browser {
             Native(parent),
             Native((&mut *events as *mut Mutex<VecDeque<Value>>).cast()),
         );
+        let script = concat!(
+            "(",
+            include_str!("../js/bridge.js"),
+            ")(data=>window.webkit.messageHandlers.apps.postMessage(data))\0"
+        );
         let handle = sync_main(move || {
             Native(unsafe {
-                apps_browser_create(parent.get(), options.as_ptr(), receive, context.get())
+                apps_browser_create(
+                    parent.get(),
+                    options.as_ptr(),
+                    script.as_ptr().cast(),
+                    receive,
+                    context.get(),
+                )
             })
         })
         .get();
@@ -181,7 +190,7 @@ impl Browser {
         }
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
-            self.backend.attach(window.window_handle()?.as_raw())
+            self.backend.window.attach(window.window_handle()?.as_raw())
         }
     }
 
@@ -206,7 +215,7 @@ impl Browser {
             }
         }
         #[cfg(any(target_os = "windows", target_os = "linux"))]
-        self.backend.set_bounds(bounds)?;
+        self.backend.window.set_bounds(bounds)?;
         Ok(())
     }
 
@@ -232,7 +241,7 @@ impl Browser {
             sync_main(move || unsafe { apps_browser_attach(browser.get(), std::ptr::null_mut()) });
         }
         #[cfg(any(target_os = "windows", target_os = "linux"))]
-        self.backend.detach()?;
+        self.backend.window.detach()?;
         Ok(())
     }
 

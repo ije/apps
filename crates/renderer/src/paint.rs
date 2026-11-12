@@ -302,11 +302,7 @@ impl Window {
             DecorationStyle::Dashed => thickness * 2.,
             _ => 0.,
         };
-        for row in [0., 2.].iter().take(if style == DecorationStyle::Double {
-            2
-        } else {
-            1
-        }) {
+        for row in &[0., 2.][..1 + usize::from(style == DecorationStyle::Double)] {
             let mut line = instance;
             line.rect[1] += thickness * row;
             let shown = crate::gpu::rect(line.rect).intersect(clip.bounds);

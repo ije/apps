@@ -130,7 +130,6 @@ pub enum Event {
     },
     ModifiersChanged {
         modifiers: Modifiers,
-        caps_lock: bool,
     },
     PointerDown {
         at: Point<Pixels>,

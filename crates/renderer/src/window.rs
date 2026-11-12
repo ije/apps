@@ -284,7 +284,12 @@ impl Placed {
     }
 }
 
-pub(crate) type Placement = (Point<Pixels>, Clip<Pixels>, usize);
+#[derive(Clone, Copy)]
+pub(crate) struct Placement {
+    pub(crate) offset: Point<Pixels>,
+    pub(crate) mask: Clip<Pixels>,
+    pub(crate) transform: usize,
+}
 
 type Listener = Box<dyn FnMut(&Event, &mut Window, &mut App)>;
 pub(crate) type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
@@ -608,7 +613,7 @@ impl Window {
 
     pub fn demote(&mut self) {
         #[cfg(target_os = "macos")]
-        self.platform.demote();
+        self.platform.renderer.demote();
         self.tracks.clear();
     }
 
@@ -625,7 +630,7 @@ impl Window {
         if self.will_draw() || self.drawn_at.elapsed() < Duration::from_millis(250) {
             return false;
         }
-        let Some(&(_, index)) = self.scene.keyed.iter().find(|(keyed, _)| *keyed == key) else {
+        let Some(index) = self.scene.keyed(key) else {
             return false;
         };
         let layer = &self.scene.layers[index];
@@ -690,7 +695,7 @@ impl Window {
                 })
                 .collect();
             let begin = start.elapsed().as_secs_f64();
-            self.platform.promote(
+            self.platform.renderer.promote(
                 key,
                 index,
                 region,
@@ -919,7 +924,7 @@ impl Window {
                 self.refresh();
             }
             self.caret_covered = covered;
-            self.platform.set_caret(
+            self.platform.renderer.set_caret(
                 caret
                     .filter(|caret| caret.overlay && !covered)
                     .map(|caret| (caret.bounds, caret.color, caret.since)),
@@ -1227,7 +1232,11 @@ impl Window {
             .hit_transform
             .as_ref()
             .map_or(0, |transform| Rc::as_ptr(transform) as usize);
-        (self.offset(), self.content_mask(), transform)
+        Placement {
+            offset: self.offset(),
+            mask: self.content_mask(),
+            transform,
+        }
     }
 
     #[cfg(debug_assertions)]

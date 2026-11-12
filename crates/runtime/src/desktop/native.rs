@@ -82,7 +82,6 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
         | "power.thermal"
         | "power.battery"
         | "app.releaseInstance"
-        | "app.hasInstance"
         | "app.locale"
         | "app.emojiPanel"
         | "app.state"

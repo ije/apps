@@ -206,37 +206,21 @@ pub fn package_app(
         stage.path().to_owned()
     };
     fs::create_dir_all(&libraries)?;
-    let destination = libraries.join(library_name);
-    ensure!(
-        !destination.exists(),
-        "JavaScriptCore conflicts with a build file"
-    );
-    bytes += fs::copy(&jsc, destination)? as usize;
+    let folder = runtime.canonicalize()?;
     let license = jsc.with_file_name("JavaScriptCore.LICENSE");
+    let mut shipped = vec![(jsc, library_name, None)];
     if license.is_file() {
-        let destination = libraries.join("JavaScriptCore.LICENSE");
-        ensure!(
-            !destination.exists(),
-            "JavaScriptCore license conflicts with a build file"
-        );
-        bytes += fs::copy(license, destination)? as usize;
+        shipped.push((license, "JavaScriptCore.LICENSE", None));
     }
     if let Some(name) = webgpu {
-        let source = runtime.canonicalize()?.with_file_name(name);
-        target.validate_binary(&source).context(
-            "The webgpu feature needs the WebGPU library next to the runtime. Build the workspace first with cargo build --workspace --release.",
-        )?;
-        let destination = libraries.join(name);
-        ensure!(!destination.exists(), "WebGPU conflicts with a build file");
-        bytes += fs::copy(source, destination)? as usize;
+        shipped.push((folder.with_file_name(name), name, Some("The webgpu feature needs the WebGPU library next to the runtime. Build the workspace first with cargo build --workspace --release.")));
     }
-    let folder = runtime.canonicalize()?;
-    for name in &media {
-        let source = folder.with_file_name(name);
-        if *name != "FFmpeg.LICENSE" {
-            target.validate_binary(&source).context(
-                "The media and simpleAudio features need their library next to the runtime. Build the workspace first with cargo build --workspace --release.",
-            )?;
+    for name in media {
+        shipped.push((folder.with_file_name(name), name, (name != "FFmpeg.LICENSE").then_some("The media and simpleAudio features need their library next to the runtime. Build the workspace first with cargo build --workspace --release.")));
+    }
+    for (source, name, context) in &shipped {
+        if let Some(context) = context {
+            target.validate_binary(source).context(*context)?;
         }
         let destination = libraries.join(name);
         ensure!(!destination.exists(), "{name} conflicts with a build file");
@@ -264,10 +248,10 @@ pub fn package_app(
                 !files.contains_key(relative.to_string_lossy().as_ref())
                     && !(target.platform == "windows"
                         && relative.to_str().is_some_and(|name| {
-                            name.eq_ignore_ascii_case(library_name)
-                                || name.eq_ignore_ascii_case("JavaScriptCore.LICENSE")
-                                || webgpu.is_some_and(|webgpu| name.eq_ignore_ascii_case(webgpu))
-                                || media.iter().any(|media| name.eq_ignore_ascii_case(media))
+                            name.eq_ignore_ascii_case("JavaScriptCore.LICENSE")
+                                || shipped
+                                    .iter()
+                                    .any(|(_, library, _)| name.eq_ignore_ascii_case(library))
                         }))
                     && relative != Path::new(&executable_name)
                     && !matches!(
@@ -683,7 +667,7 @@ mod tests {
         for (features, shipped) in [
             ("[]", false),
             (r#"["webgpu"]"#, true),
-            (r#"["*","-webgpu","-video","-audio"]"#, false),
+            (r#"["*","-webgpu","-media","-simpleAudio"]"#, false),
         ] {
             build(features).unwrap();
             assert_eq!(libraries.join(name).is_file(), shipped, "{features}");

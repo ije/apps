@@ -312,6 +312,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
             let mut extract = Hasher::new(name, Some(bytes(&args[2])?))?;
             extract.update(bytes(&args[1])?);
             let key = extract.digest();
+            let info = bytes(&args[3])?;
             let (mut output, mut block) = (Vec::with_capacity(length + 64), Vec::new());
             for counter in 1..=255u8 {
                 if output.len() >= length {
@@ -319,7 +320,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                 }
                 let mut mac = Hasher::new(name, Some(&key))?;
                 mac.update(&block);
-                mac.update(bytes(&args[3])?);
+                mac.update(info);
                 mac.update(&[counter]);
                 block = mac.digest();
                 output.extend_from_slice(&block);
@@ -450,12 +451,13 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                 );
             } else if length > 0 {
                 let mac = Hasher::new(args[4].as_str().unwrap_or(""), Some(bytes(&args[0])?))?;
+                let salt = bytes(&args[1])?;
                 for (index, block) in key
                     .chunks_mut(if args[4] == "md5" { 16 } else { 28 })
                     .enumerate()
                 {
                     let mut next = mac.clone();
-                    next.update(bytes(&args[1])?);
+                    next.update(salt);
                     next.update(&(index as u32 + 1).to_be_bytes());
                     let mut round = next.digest();
                     let mut sum = round.clone();
@@ -478,11 +480,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                 format => format,
             };
             let inflate = args[1] == true;
-            let dictionary = if args[6].is_null() {
-                None
-            } else {
-                Some(bytes(&args[6])?)
-            };
+            let dictionary = (!args[6].is_null()).then(|| bytes(&args[6])).transpose()?;
             let mut ended = false;
             let output = Codec::new(
                 format,
@@ -602,7 +600,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                     };
                 }
                 let mut query = vec![0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
-                getrandom::fill(&mut query[..2]).map_err(|error| anyhow::anyhow!("{error}"))?;
+                getrandom::fill(&mut query[..2])?;
                 for label in name.split('.') {
                     ensure!(
                         !label.is_empty() && label.len() < 64 && name.len() < 254,
@@ -781,7 +779,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                             data[0],
                             data[1],
                             data[2],
-                            crate::web::base64(&data[3..])
+                            crate::jsc::payload::write(data[3..].to_vec())
                         ]),
                         257 if data.len() >= 2 => {
                             let tag = data.get(2..2 + data[1] as usize).context("EBADRESP")?;
@@ -1075,7 +1073,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                 Ok(json!(counters.working_set))
             }
         }
-        "process.resourceUsage" => {
+        "process.resourceUsage" | "process.cpu" => {
             #[cfg(unix)]
             {
                 let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -1084,36 +1082,31 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                 #[allow(clippy::useless_conversion)]
                 let micros =
                     |time: libc::timeval| time.tv_sec * 1_000_000 + i64::from(time.tv_usec);
+                let (user, system) = (micros(usage.ru_utime), micros(usage.ru_stime));
+                if op == "process.cpu" {
+                    return Ok(json!({"user":user,"system":system}));
+                }
                 Ok(
-                    json!({"userCPUTime":micros(usage.ru_utime),"systemCPUTime":micros(usage.ru_stime),"maxRSS":usage.ru_maxrss / 1024,"sharedMemorySize":usage.ru_ixrss,"unsharedDataSize":usage.ru_idrss,"unsharedStackSize":usage.ru_isrss,"minorPageFault":usage.ru_minflt,"majorPageFault":usage.ru_majflt,"swappedOut":usage.ru_nswap,"fsRead":usage.ru_inblock,"fsWrite":usage.ru_oublock,"ipcSent":usage.ru_msgsnd,"ipcReceived":usage.ru_msgrcv,"signalsCount":usage.ru_nsignals,"voluntaryContextSwitches":usage.ru_nvcsw,"involuntaryContextSwitches":usage.ru_nivcsw}),
+                    json!({"userCPUTime":user,"systemCPUTime":system,"maxRSS":usage.ru_maxrss / 1024,"sharedMemorySize":usage.ru_ixrss,"unsharedDataSize":usage.ru_idrss,"unsharedStackSize":usage.ru_isrss,"minorPageFault":usage.ru_minflt,"majorPageFault":usage.ru_majflt,"swappedOut":usage.ru_nswap,"fsRead":usage.ru_inblock,"fsWrite":usage.ru_oublock,"ipcSent":usage.ru_msgsnd,"ipcReceived":usage.ru_msgrcv,"signalsCount":usage.ru_nsignals,"voluntaryContextSwitches":usage.ru_nvcsw,"involuntaryContextSwitches":usage.ru_nivcsw}),
                 )
             }
-            #[cfg(not(unix))]
-            Ok(
-                json!({"userCPUTime":0,"systemCPUTime":0,"maxRSS":0,"sharedMemorySize":0,"unsharedDataSize":0,"unsharedStackSize":0,"minorPageFault":0,"majorPageFault":0,"swappedOut":0,"fsRead":0,"fsWrite":0,"ipcSent":0,"ipcReceived":0,"signalsCount":0,"voluntaryContextSwitches":0,"involuntaryContextSwitches":0}),
-            )
-        }
-        "process.cpu" => {
-            #[cfg(unix)]
-            unsafe {
-                let mut usage: libc::rusage = std::mem::zeroed();
-                libc::getrusage(libc::RUSAGE_SELF, &mut usage);
-                // `tv_usec` is `i32` on macOS and `i64` on Linux.
-                #[allow(clippy::useless_conversion)]
-                let micros =
-                    |time: libc::timeval| time.tv_sec * 1_000_000 + i64::from(time.tv_usec);
-                Ok(json!({"user":micros(usage.ru_utime),"system":micros(usage.ru_stime)}))
-            }
             #[cfg(windows)]
-            unsafe {
+            {
+                if op == "process.resourceUsage" {
+                    return Ok(
+                        json!({"userCPUTime":0,"systemCPUTime":0,"maxRSS":0,"sharedMemorySize":0,"unsharedDataSize":0,"unsharedStackSize":0,"minorPageFault":0,"majorPageFault":0,"swappedOut":0,"fsRead":0,"fsWrite":0,"ipcSent":0,"ipcReceived":0,"signalsCount":0,"voluntaryContextSwitches":0,"involuntaryContextSwitches":0}),
+                    );
+                }
                 let (mut creation, mut exit, mut kernel, mut user) = (0, 0, 0, 0);
-                win::GetProcessTimes(
-                    win::GetCurrentProcess(),
-                    &mut creation,
-                    &mut exit,
-                    &mut kernel,
-                    &mut user,
-                );
+                unsafe {
+                    win::GetProcessTimes(
+                        win::GetCurrentProcess(),
+                        &mut creation,
+                        &mut exit,
+                        &mut kernel,
+                        &mut user,
+                    )
+                };
                 Ok(json!({"user":user / 10,"system":kernel / 10}))
             }
         }

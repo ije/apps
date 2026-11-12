@@ -103,10 +103,10 @@ impl NodeStyle {
         if let Self::Shared(style) = self {
             *self = Self::Own(Box::new(Style::clone(style)));
         }
-        match self {
-            Self::Own(style) => style,
-            Self::Shared(_) => unreachable!("the style was copied above"),
-        }
+        let Self::Own(style) = self else {
+            unreachable!("the style was copied above")
+        };
+        style
     }
 }
 
@@ -323,10 +323,10 @@ impl Node {
         if let NodeStyle::Own(style) = &mut self.style {
             self.style = NodeStyle::Shared(Rc::new(std::mem::take(&mut **style)));
         }
-        match &self.style {
-            NodeStyle::Shared(style) => style.clone(),
-            NodeStyle::Own(_) => unreachable!("the style was shared above"),
-        }
+        let NodeStyle::Shared(style) = &self.style else {
+            unreachable!("the style was shared above")
+        };
+        style.clone()
     }
 
     pub fn element_id(&self) -> Option<NodeKey> {
@@ -346,10 +346,6 @@ impl Node {
 
     pub fn shares(&self, style: &Rc<Style>) -> bool {
         matches!(&self.style, NodeStyle::Shared(own) if Rc::ptr_eq(own, style))
-    }
-
-    pub fn has_children(&self) -> bool {
-        !self.children.is_empty()
     }
 
     pub fn child(mut self, child: impl Into<Child>) -> Self {
@@ -373,17 +369,17 @@ impl Node {
     pub fn adopt(mut self, text: Node) -> Self {
         debug_assert!(self.children.is_empty() && matches!(self.content, Content::None));
         self.content = text.content;
-        if let Some(hooks) = text.hooks {
-            self.hooks = Some(match self.hooks.take() {
-                Some(inner) => Rc::new(Chain(hooks, inner)),
-                None => hooks,
-            });
+        match text.hooks {
+            Some(hooks) => self.chain(hooks),
+            None => self,
         }
-        self
     }
 
-    pub fn hooks(mut self, hooks: impl Hooks) -> Self {
-        let outer: Rc<dyn Hooks> = Rc::new(hooks);
+    pub fn hooks(self, hooks: impl Hooks) -> Self {
+        self.chain(Rc::new(hooks))
+    }
+
+    fn chain(mut self, outer: Rc<dyn Hooks>) -> Self {
         self.hooks = Some(match self.hooks.take() {
             Some(inner) => Rc::new(Chain(outer, inner)),
             None => outer,

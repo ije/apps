@@ -48,7 +48,12 @@ pub(crate) struct Tile {
 }
 
 pub(crate) trait PageStore {
-    fn insert(&mut self, kind: PageKind, size: Size<i32>, bytes: &[u8]) -> Result<Tile>;
+    fn insert(
+        &mut self,
+        kind: PageKind,
+        size: Size<i32>,
+        bytes: &[u8],
+    ) -> Result<(usize, Rect<i32>, u32)>;
     fn remove(&mut self, tile: Tile);
     fn max_side(&self) -> i32;
 }
@@ -64,6 +69,7 @@ pub(crate) struct Atlas<B> {
     retired: RefCell<Vec<(u32, Tile)>>,
     frame: Cell<u32>,
     glyph_pixels: Cell<usize>,
+    swept: Cell<u32>,
     pub(crate) pages: RefCell<B>,
 }
 
@@ -82,6 +88,7 @@ impl<B: PageStore> Atlas<B> {
             retired: RefCell::default(),
             frame: Cell::new(0),
             glyph_pixels: Cell::new(0),
+            swept: Cell::new(0),
             pages: RefCell::new(pages),
         }
     }
@@ -98,15 +105,22 @@ impl<B: PageStore> Atlas<B> {
         // Cache failed or oversized tiles as empty to prevent allocation retries every frame.
         let (tile, bounds) = match build() {
             Ok(Some((bounds, size, bytes))) => {
-                let max = self.pages.borrow().max_side();
-                let tile = if size.width <= max && size.height <= max {
-                    self.pages
-                        .borrow_mut()
-                        .insert(key.kind(), size, &bytes)
-                        .ok()
-                } else {
-                    None
+                let (max, kind) = (self.pages.borrow().max_side(), key.kind());
+                let pixel = match kind {
+                    PageKind::Mask => 1,
+                    PageKind::Color => 4,
                 };
+                let tile =
+                    (size.width > 0 && size.height > 0 && size.width <= max && size.height <= max)
+                        .then(|| bytes.get(..size.width as usize * pixel * size.height as usize))
+                        .flatten()
+                        .and_then(|bytes| self.pages.borrow_mut().insert(kind, size, bytes).ok())
+                        .map(|(page, rect, id)| Tile {
+                            page: page as u32,
+                            kind,
+                            id,
+                            rect,
+                        });
                 if let (Some(tile), TileKey::Glyph(_)) = (tile, key) {
                     self.glyph_pixels
                         .set(self.glyph_pixels.get() + pixels(&tile));
@@ -150,9 +164,11 @@ impl<B: PageStore> Atlas<B> {
         }
         drop(retired);
         let mut glyph_pixels = self.glyph_pixels.get();
-        if glyph_pixels <= MAX_GLYPH_PIXELS {
+        // Glyphs used in the last frames stay, so a sweep that frees too little isn't repeated at once.
+        if glyph_pixels <= MAX_GLYPH_PIXELS || frame.wrapping_sub(self.swept.get()) < MAX_AGE / 4 {
             return;
         }
+        self.swept.set(frame);
         let mut pages = self.pages.borrow_mut();
         self.tiles.borrow_mut().retain(|key, entry| {
             if !matches!(key, TileKey::Glyph(_)) || frame.wrapping_sub(entry.used.get()) < MAX_AGE {
@@ -195,17 +211,17 @@ impl<B: PageStore> Atlas<B> {
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub fn clear(&self, reset: impl FnOnce(&mut B)) {
+    pub fn clear(&self, pages: B) {
         self.tiles.borrow_mut().clear();
         self.retired.borrow_mut().clear();
         self.glyph_pixels.set(0);
-        reset(&mut self.pages.borrow_mut());
+        *self.pages.borrow_mut() = pages;
     }
 }
 
 pub(crate) struct PageList<T> {
-    pub pages: Vec<Option<T>>,
-    pub free: Vec<usize>,
+    pages: Vec<Option<(Packer, T)>>,
+    free: Vec<usize>,
     spare: Option<usize>,
 }
 
@@ -221,23 +237,41 @@ impl<T> Default for PageList<T> {
 
 impl<T> PageList<T> {
     pub fn get(&self, index: usize) -> Option<&T> {
-        self.pages.get(index)?.as_ref()
+        self.pages.get(index)?.as_ref().map(|(_, page)| page)
     }
 
-    pub fn emptied(&mut self, index: usize, empty: impl Fn(&T) -> bool) {
+    fn is_empty(&self, index: usize) -> bool {
+        self.pages
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|(packer, _)| packer.live == 0)
+    }
+
+    pub fn free(&mut self, index: usize, id: u32) -> bool {
+        let Some((packer, _)) = self.pages.get_mut(index).and_then(Option::as_mut) else {
+            return false;
+        };
+        packer
+            .allocator
+            .deallocate(etagere::AllocId::deserialize(id));
+        packer.live = packer.live.saturating_sub(1);
+        if packer.live != 0 {
+            return false;
+        }
         if let Some(old) = self.spare.replace(index)
             && old != index
-            && self.get(old).is_some_and(empty)
+            && self.is_empty(old)
         {
             self.pages[old] = None;
             self.free.push(old);
         }
+        true
     }
 
     #[cfg(target_os = "macos")]
-    pub fn trim(&mut self, empty: impl Fn(&T) -> bool) {
+    pub fn trim(&mut self) {
         if let Some(index) = self.spare.take()
-            && self.get(index).is_some_and(empty)
+            && self.is_empty(index)
         {
             self.pages[index] = None;
             self.free.push(index);
@@ -247,39 +281,44 @@ impl<T> PageList<T> {
     pub fn allocate(
         &mut self,
         size: Size<i32>,
-        packer: impl Fn(&mut T) -> &mut Packer,
         page: impl FnOnce(Size<i32>) -> Result<T>,
-    ) -> Result<(usize, Rect<i32>, u32)> {
-        let place =
-            |slot: &mut Option<T>| slot.as_mut().and_then(|page| packer(page).allocate(size));
-        for index in (0..self.pages.len()).rev() {
-            if let Some((rect, id)) = place(&mut self.pages[index]) {
-                return Ok((index, rect, id));
-            }
-        }
-        let page = Some(page(page_size(size))?);
-        let index = match self.free.pop() {
-            Some(index) => {
-                self.pages[index] = page;
-                index
-            }
+    ) -> Result<(usize, &T, Rect<i32>, u32)> {
+        let found = (0..self.pages.len()).rev().find_map(|index| {
+            let (packer, _) = self.pages[index].as_mut()?;
+            packer.allocate(size).map(|(rect, id)| (index, rect, id))
+        });
+        let (index, rect, id) = match found {
+            Some(found) => found,
             None => {
-                self.pages.push(page);
-                self.pages.len() - 1
+                let side = page_size(size);
+                let mut packer = Packer::new(side);
+                let (rect, id) = packer.allocate(size).context("a new page has no room")?;
+                let page = Some((packer, page(side)?));
+                let index = match self.free.pop() {
+                    Some(index) => {
+                        self.pages[index] = page;
+                        index
+                    }
+                    None => {
+                        self.pages.push(page);
+                        self.pages.len() - 1
+                    }
+                };
+                (index, rect, id)
             }
         };
-        let (rect, id) = place(&mut self.pages[index]).context("a new page has no room")?;
-        Ok((index, rect, id))
+        let (_, page) = self.pages[index].as_ref().context("atlas page")?;
+        Ok((index, page, rect, id))
     }
 }
 
-pub(crate) struct Packer {
+struct Packer {
     allocator: etagere::BucketedAtlasAllocator,
     size: Size<i32>,
     live: usize,
 }
 
-pub(crate) fn page_size(tile: Size<i32>) -> Size<i32> {
+fn page_size(tile: Size<i32>) -> Size<i32> {
     if tile.width <= MIN_TEXTURE_SIDE && tile.height <= MIN_TEXTURE_SIDE {
         Size::new(MIN_TEXTURE_SIDE, MIN_TEXTURE_SIDE)
     } else {
@@ -288,7 +327,7 @@ pub(crate) fn page_size(tile: Size<i32>) -> Size<i32> {
 }
 
 impl Packer {
-    pub fn new(size: Size<i32>) -> Self {
+    fn new(size: Size<i32>) -> Self {
         Self {
             allocator: etagere::BucketedAtlasAllocator::new(etagere::size2(
                 size.width,
@@ -299,11 +338,7 @@ impl Packer {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.live == 0
-    }
-
-    pub fn allocate(&mut self, size: Size<i32>) -> Option<(crate::Rect<i32>, u32)> {
+    fn allocate(&mut self, size: Size<i32>) -> Option<(crate::Rect<i32>, u32)> {
         // Keep small tiles off large pages so an icon cannot retain a large texture.
         if page_size(size) != self.size {
             return None;
@@ -318,12 +353,6 @@ impl Packer {
             allocation.id.serialize(),
         ))
     }
-
-    pub fn free(&mut self, id: u32) -> bool {
-        self.allocator.deallocate(etagere::AllocId::deserialize(id));
-        self.live = self.live.saturating_sub(1);
-        self.live == 0
-    }
 }
 
 #[cfg(test)]
@@ -332,33 +361,30 @@ mod tests {
 
     #[derive(Default)]
     struct Fake {
-        list: PageList<Packer>,
+        list: PageList<Size<i32>>,
         made: usize,
         freed: Vec<Tile>,
     }
 
     fn raster(width: i32, height: i32) -> Option<Raster<Cow<'static, [u8]>>> {
         let size = Size::new(width, height);
-        Some((Rect::new(Default::default(), size), size, [][..].into()))
+        let bytes = vec![0; width.max(0) as usize * height.max(0) as usize * 4];
+        Some((Rect::new(Default::default(), size), size, bytes.into()))
     }
 
     impl PageStore for Fake {
-        fn insert(&mut self, kind: PageKind, size: Size<i32>, _: &[u8]) -> Result<Tile> {
+        fn insert(
+            &mut self,
+            _: PageKind,
+            size: Size<i32>,
+            _: &[u8],
+        ) -> Result<(usize, Rect<i32>, u32)> {
             let made = &mut self.made;
-            let (index, rect, id) = self.list.allocate(
-                size,
-                |packer| packer,
-                |size| {
-                    *made += 1;
-                    Ok(Packer::new(size))
-                },
-            )?;
-            Ok(Tile {
-                page: index as u32,
-                kind,
-                id,
-                rect,
-            })
+            let (index, _, rect, id) = self.list.allocate(size, |size| {
+                *made += 1;
+                Ok(size)
+            })?;
+            Ok((index, rect, id))
         }
 
         fn max_side(&self) -> i32 {
@@ -367,13 +393,7 @@ mod tests {
 
         fn remove(&mut self, tile: Tile) {
             self.freed.push(tile);
-            let index = tile.page as usize;
-            if self.list.pages[index]
-                .as_mut()
-                .is_some_and(|packer| packer.free(tile.id))
-            {
-                self.list.emptied(index, Packer::is_empty);
-            }
+            self.list.free(tile.page as usize, tile.id);
         }
     }
 
@@ -395,14 +415,14 @@ mod tests {
             assert_eq!(tile.rect.size, Size::new(width, height));
             let backend = atlas.pages.borrow();
             let page = backend.list.get(tile.page as usize).unwrap();
-            assert_eq!(page.size, Size::new(width, height));
+            assert_eq!(*page, Size::new(width, height));
         }
         atlas.remove(&TileKey::Image(1));
         atlas.finish_frame();
         atlas.finish_frame();
         atlas.finish_frame();
         let backend = atlas.pages.borrow();
-        assert!(backend.list.get(big.page as usize).unwrap().is_empty());
+        assert!(backend.list.is_empty(big.page as usize));
     }
 
     #[cfg(target_os = "macos")]
@@ -460,7 +480,22 @@ mod tests {
             .0;
         let backend = atlas.pages.borrow();
         let texture = backend.list.get(tile.page as usize).unwrap();
-        assert_eq!(texture.size, Size::new(1024, 1024));
+        assert_eq!(*texture, Size::new(1024, 1024));
+    }
+
+    #[test]
+    fn glyph_sweeps_that_free_nothing_wait() {
+        let atlas = Atlas::new(Fake::default());
+        atlas.glyph_pixels.set(MAX_GLYPH_PIXELS + 1);
+        let mut sweeps = Vec::new();
+        for _ in 0..46 {
+            let before = atlas.swept.get();
+            atlas.finish_frame();
+            if atlas.swept.get() != before {
+                sweeps.push(atlas.swept.get());
+            }
+        }
+        assert_eq!(sweeps, [MAX_AGE / 4, MAX_AGE / 2, MAX_AGE / 4 * 3]);
     }
 
     #[test]

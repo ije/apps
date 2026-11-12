@@ -26,14 +26,13 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
     });
     let package = bundle.files.get("package.json").map(String::as_str);
     let (_, name, version, _) = crate::bundle::package_metadata(package)?;
-    let assets = bundle
+    let assets: std::collections::HashMap<String, std::path::PathBuf> = bundle
         .files
         .get("assets.json")
         .map(|source| serde_json::from_str(source))
         .transpose()
         .context("Invalid assets.json")?
         .unwrap_or_default();
-    let assets: std::collections::HashMap<String, std::path::PathBuf> = assets;
     let _ = crate::web::ASSETS.set(assets.clone());
     let host = Rc::new(RefCell::new(Host {
         app_version: Some(version),

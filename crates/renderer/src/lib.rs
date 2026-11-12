@@ -23,7 +23,8 @@ pub use node::{
     AvailableSpace, Child, Hooks, Node, NodeCx, NodeKey, ScrollRef, canvas, canvas_within, layers,
     node, shared, text,
 };
-pub use scene::{Backdrop, BlendMode, BorderStyle, Glass, PaintEffect, RenderImage, Scene};
+pub(crate) use scene::Scene;
+pub use scene::{Backdrop, BlendMode, BorderStyle, Glass, PaintEffect, RenderImage};
 pub use style::*;
 pub use text::{
     Decoration, DecorationStyle, Font, FontId, FontStyle, FontWeight, Glyph, GlyphId, Line,

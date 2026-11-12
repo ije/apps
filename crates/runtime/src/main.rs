@@ -29,8 +29,8 @@ fn main() {
             argv.extend(args);
             // A built app runs only its own scripts. Otherwise anyone could run code as the app with a variable.
             let bundle = match std::env::var_os("APPS_DEV_BUNDLE").filter(|_| !packaged) {
-                Some(path) => apps_runtime::bundle::from_json(
-                    std::fs::File::open(path).context("Cannot read the app bundle")?,
+                Some(path) => serde_json::from_slice(
+                    &std::fs::read(path).context("Cannot read the app bundle")?,
                 )
                 .context("Cannot read the app bundle")?,
                 None => apps_runtime::bundle::read(&home)?,

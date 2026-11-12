@@ -21,11 +21,11 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TryRecvError};
+use url::{Url, quirks};
 
 static NETWORK: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static TLS: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 static ROOTS: OnceLock<Arc<NativeRoots>> = OnceLock::new();
-use url::{Url, quirks};
 
 pub(crate) fn network() -> Result<&'static tokio::runtime::Runtime> {
     if NETWORK.get().is_none() {
@@ -154,6 +154,31 @@ pub fn download(url: &str) -> Result<Vec<u8>> {
     })
 }
 
+// Moves up to 64 events of one source. `None` while it stays open, `Some(false)` when it ended without a last event.
+pub(crate) fn drain(
+    events: &mut Vec<Value>,
+    id: u64,
+    receiver: &mut Receiver<crate::jsc::payload::Payload>,
+    last: &[&str],
+) -> Option<bool> {
+    for _ in 0..64 {
+        match receiver.try_recv() {
+            Ok(event) => {
+                let mut event = event.into_value();
+                let done = last.iter().any(|kind| event["kind"] == *kind);
+                event["id"] = json!(id);
+                events.push(event);
+                if done {
+                    return Some(true);
+                }
+            }
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => return Some(false),
+        }
+    }
+    None
+}
+
 pub(crate) fn bytes(value: &Value) -> Result<Vec<u8>> {
     if let Some(bytes) = crate::jsc::payload::read(value) {
         return bytes.map(Vec::from);
@@ -162,10 +187,6 @@ pub(crate) fn bytes(value: &Value) -> Result<Vec<u8>> {
         Some(text) => STANDARD.decode(text)?,
         None => Vec::deserialize(value)?,
     })
-}
-
-pub(crate) fn base64(bytes: &[u8]) -> Value {
-    crate::jsc::payload::write(bytes::Bytes::copy_from_slice(bytes))
 }
 
 static LISTENING: std::sync::Mutex<Vec<std::net::SocketAddr>> = std::sync::Mutex::new(Vec::new());
@@ -193,8 +214,7 @@ impl Drop for Listening {
     }
 }
 
-pub(crate) static ASSETS: std::sync::OnceLock<HashMap<String, std::path::PathBuf>> =
-    std::sync::OnceLock::new();
+pub(crate) static ASSETS: OnceLock<HashMap<String, std::path::PathBuf>> = OnceLock::new();
 
 pub(crate) static LOCAL_NETWORK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -619,29 +639,32 @@ impl State {
             }
             "fetch.poll" => {
                 let mut events = Vec::new();
-                self.fetches.retain(|id, fetch| {
-                    for _ in 0..64 {
-                        match fetch.events.try_recv() {
-                            Ok(event) => { let mut event = event.into_value(); let done = event["kind"] == "done" || event["kind"] == "error"; event["id"] = json!(id); events.push(event); if done { return false; } }
-                            Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Disconnected) => { events.push(json!({"id": id, "kind": "error", "message": "Fetch worker closed"})); return false; }
+                self.fetches.retain(|&id, fetch| {
+                    match drain(&mut events, id, &mut fetch.events, &["done", "error"]) {
+                        None => true,
+                        Some(clean) => {
+                            if !clean {
+                                events.push(json!({"id": id, "kind": "error", "message": "Fetch worker closed"}));
+                            }
+                            false
                         }
                     }
-                    true
                 });
                 Ok(json!(events))
             }
-            _ if op.starts_with("platform.") => self.platform.call(&op[9..], args),
-            _ if op.starts_with("serve.") => self.servers.call(&op[6..], args, &mut self.sockets),
-            _ if op.starts_with("socket.") => self.sockets.call(&op[7..], args, self.renderer),
-            _ if op.starts_with("crypto.") => crate::web::crypto::call(&op[7..], args),
-            _ if op.starts_with("worker.") => self.workers.call(&op[7..], args),
-            _ if op.starts_with("tcp.") => self.tcp.call(&op[4..], args),
-            _ if op.starts_with("storage.") => self.storage.call(&op[8..], args),
             "cpus" => Ok(std::thread::available_parallelism()
                 .map_or(1, |count| count.get())
                 .into()),
-            _ => bail!("Unknown web operation: {op}"),
+            _ => match op.split_once('.') {
+                Some(("platform", op)) => self.platform.call(op, args),
+                Some(("serve", op)) => self.servers.call(op, args, &mut self.sockets),
+                Some(("socket", op)) => self.sockets.call(op, args, self.renderer),
+                Some(("crypto", op)) => crate::web::crypto::call(op, args),
+                Some(("worker", op)) => self.workers.call(op, args),
+                Some(("tcp", op)) => self.tcp.call(op, args),
+                Some(("storage", op)) => self.storage.call(op, args),
+                _ => bail!("Unknown web operation: {op}"),
+            },
         }
     }
 }

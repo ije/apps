@@ -88,7 +88,7 @@
     },
     listeners(name) { return list(this, name, true); },
     rawListeners(name) { return list(this, name, false); },
-    listenerCount(name, listener) { const all = list(this, name, false); return listener == null ? all.length : all.filter(item => item === listener || item.listener === listener).length; },
+    listenerCount(name, listener) { if (listener == null) { const all = this._events?.[name]; return all === undefined ? 0 : typeof all === 'function' ? 1 : all.length; } return list(this, name, false).filter(item => item === listener || item.listener === listener).length; },
     eventNames() { return this._eventsCount > 0 ? Reflect.ownKeys(this._events) : []; },
     emit(name, ...args) {
       const events = this._events;

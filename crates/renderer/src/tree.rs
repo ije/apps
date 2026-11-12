@@ -33,6 +33,7 @@ enum Kind {
 struct Slot {
     key: (u64, u32),
     live: bool,
+    seen: u32,
     parent: u32,
     children: Vec<NodeId>,
     style: Rc<Styled>,
@@ -48,7 +49,9 @@ struct Slot {
     layout: Layout,
     baselines: Baselines,
     origin: Point<f32>,
-    bounds: [Rect<Pixels>; 3],
+    bounds: Rect<Pixels>,
+    painted: Rect<Pixels>,
+    exact: Rect<Pixels>,
     hitbox: u32,
     listed: bool,
     free: [bool; 2],
@@ -72,6 +75,7 @@ impl Slot {
         Self {
             key,
             live: true,
+            seen: 0,
             parent: NONE,
             children: Vec::new(),
             style,
@@ -87,7 +91,9 @@ impl Slot {
             layout: Layout::new(),
             baselines: Baselines::NONE,
             origin: Point::default(),
-            bounds: Default::default(),
+            bounds: Rect::default(),
+            painted: Rect::default(),
+            exact: Rect::default(),
             hitbox: NONE,
             listed: false,
             free: [true; 2],
@@ -127,7 +133,7 @@ impl Slot {
         self.layout = Layout::new();
         self.baselines = Baselines::NONE;
         self.origin = Point::default();
-        self.bounds = Default::default();
+        (self.bounds, self.painted, self.exact) = Default::default();
         self.hitbox = NONE;
         self.listed = false;
         self.free = [true; 2];
@@ -167,7 +173,6 @@ pub struct Tree {
     occurrences: FxHashMap<u64, u32>,
     scopes: Vec<u64>,
     pass: u32,
-    seen: Vec<u32>,
     orphans: Vec<u32>,
     root: Option<u32>,
     measured_with: (f32, usize),
@@ -202,7 +207,6 @@ impl Tree {
     pub(crate) fn begin(&mut self, scale: f32, fonts: usize) {
         if mem::replace(&mut self.measured_with, (scale, fonts)) != (scale, fonts) {
             self.slots.clear();
-            self.seen.clear();
             self.free.clear();
             self.keys.clear();
             self.orphans.clear();
@@ -215,18 +219,16 @@ impl Tree {
         self.scopes.clear();
     }
 
+    fn index(&self, id: NodeKey) -> Option<u32> {
+        self.keys.get(&(identity(Some(id), 0), 0)).copied()
+    }
+
     pub fn contains(&self, id: impl Into<NodeKey>) -> bool {
-        self.keys.contains_key(&(identity(Some(id.into()), 0), 0))
+        self.index(id.into()).is_some()
     }
 
     pub fn style_of(&self, id: impl Into<NodeKey>) -> Option<&Style> {
-        let &index = self.keys.get(&(identity(Some(id.into()), 0), 0))?;
-        Some(&self.slots[index as usize].style)
-    }
-
-    pub fn align_self(&self, id: NodeKey) -> Option<AlignItems> {
-        let &index = self.keys.get(&(identity(Some(id), 0), 0))?;
-        self.slots[index as usize].style.align_self
+        Some(&self.slots[self.index(id.into())? as usize].style)
     }
 
     pub(crate) fn commit_root(
@@ -275,10 +277,10 @@ impl Tree {
             Child::Kept(id) => (id, None),
             Child::Placed(id, place) => (id, Some(place)),
         };
-        let index = self.keys.get(&(identity(Some(id), 0), 0)).copied();
+        let index = self.index(id);
         debug_assert!(index.is_some(), "kept box {id:?} is not in the tree");
         let index = index?;
-        self.seen[index as usize] = self.pass;
+        self.slots[index as usize].seen = self.pass;
         self.inherit(index, inherited, scale);
         let style = &self.slots[index as usize].style.style;
         let length = crate::Length::Px;
@@ -450,7 +452,6 @@ impl Tree {
                     None => {
                         self.slots
                             .push(Slot::new(key, inherited.clone(), self.blank.clone()));
-                        self.seen.push(0);
                         (self.slots.len() - 1) as u32
                     }
                 };
@@ -458,8 +459,8 @@ impl Tree {
                 index
             }
         };
-        self.seen[index as usize] = self.pass;
         let slot = &mut self.slots[index as usize];
+        slot.seen = self.pass;
         let same_measure = match &measurement {
             Some(measurement) => {
                 measurement.same(slot.state.as_ref())
@@ -595,7 +596,7 @@ impl Tree {
         let mut pending = mem::take(&mut self.orphans);
         while let Some(index) = pending.pop() {
             let slot = &mut self.slots[index as usize];
-            if !slot.live || self.seen[index as usize] == pass {
+            if !slot.live || slot.seen == pass {
                 continue;
             }
             self.keys.remove(&slot.key);
@@ -619,11 +620,9 @@ impl Tree {
     fn compact(&mut self) {
         let mut moved = vec![NONE; self.slots.len()];
         let mut slots = Vec::with_capacity((self.slots.len() - self.free.len()) * 3 / 2);
-        let mut seen = Vec::with_capacity(slots.capacity());
         for (index, slot) in mem::take(&mut self.slots).into_iter().enumerate() {
             if slot.live {
                 moved[index] = slots.len() as u32;
-                seen.push(self.seen[index]);
                 slots.push(slot);
             }
         }
@@ -640,7 +639,6 @@ impl Tree {
         }
         self.root = self.root.map(|root| moved[root as usize]);
         self.slots = slots;
-        self.seen = seen;
         self.free.clear();
         self.hitboxes.clear();
         self.layers.clear();
@@ -721,7 +719,12 @@ impl Tree {
                 let (mut pending, mut boxes) = (vec![index_of(root)], Vec::new());
                 while let Some(index) = pending.pop() {
                     let slot = &tree.slots[index as usize];
-                    boxes.push((index, slot.origin, slot.bounds, slot.listed));
+                    boxes.push((
+                        index,
+                        slot.origin,
+                        [slot.bounds, slot.painted, slot.exact],
+                        slot.listed,
+                    ));
                     pending.extend(slot.children.iter().map(|&child| index_of(child)));
                 }
                 boxes
@@ -784,8 +787,9 @@ impl Tree {
         if !self.full
             && !slot.below
             && !slot.volatile
-            && slot.placed.is_some_and(|(pass, _, (_, mask, transform))| {
-                pass == prepaints.wrapping_sub(1) && (mask, transform) == (placement.1, placement.2)
+            && slot.placed.is_some_and(|(pass, _, placed)| {
+                pass == prepaints.wrapping_sub(1)
+                    && (placed.mask, placed.transform) == (placement.mask, placement.transform)
             })
         {
             self.keep(index, parent, window);
@@ -815,31 +819,13 @@ impl Tree {
         slot.listed = false;
         let [bounds, exact] = self.bounds(index, origin, window);
         let slot = &mut self.slots[index as usize];
-        [slot.bounds[0], slot.bounds[2]] = [bounds, exact];
-        match slot.hooks.clone() {
-            Some(hooks) => {
-                let (text, state) = (slot.text.clone(), slot.state.clone());
-                let baselines = self.baselines(index, window.scale_factor());
-                let style = self.slots[index as usize].style.clone();
-                let inset = inset(&self.slots[index as usize].layout, window.scale_factor());
-                let mut cx = NodeCx {
-                    window,
-                    bounds,
-                    exact,
-                    inset,
-                    baselines,
-                    text: &text,
-                    style: &style,
-                    state: state.as_ref(),
-                };
-                let mut inner = |window: &mut Window| self.prepaint_box(index, &style, window);
-                hooks.prepaint(&mut cx, &mut inner);
-            }
-            None => {
-                let style = slot.style.clone();
-                self.prepaint_box(index, &style, window);
-            }
-        }
+        (slot.bounds, slot.exact) = (bounds, exact);
+        self.visit(
+            index,
+            window,
+            |hooks, cx, inner| hooks.prepaint(cx, inner),
+            |tree, style, window| tree.prepaint_box(index, style, window),
+        );
         self.reach(index);
         if let Some(order) = self.slots[index as usize].style.z_index
             && let Some(list) = self.stacks.last_mut()
@@ -929,7 +915,7 @@ impl Tree {
         let [bounds, exact] = self.bounds(index, origin, window);
         let scale = window.scale_factor();
         let slot = &mut self.slots[index as usize];
-        slot.bounds[1] = bounds;
+        slot.painted = bounds;
         if let Some(state) = slot
             .state
             .as_ref()
@@ -959,40 +945,20 @@ impl Tree {
         let placement = window.placement();
         let moved = slot
             .placed
-            .is_none_or(|(_, at, (offset, ..))| (at, offset) != (origin, placement.0));
+            .is_none_or(|(_, at, placed)| (at, placed.offset) != (origin, placement.offset));
         slot.placed = Some((self.prepaints, origin, placement));
         if moved {
             slot.origin = origin;
             let [bounds, exact] = self.bounds(index, origin, window);
             let slot = &mut self.slots[index as usize];
-            [slot.bounds[0], slot.bounds[2]] = [bounds, exact];
+            (slot.bounds, slot.exact) = (bounds, exact);
         }
-        let slot = &self.slots[index as usize];
-        match slot.hooks.clone() {
-            Some(hooks) => {
-                let (text, state) = (slot.text.clone(), slot.state.clone());
-                let [bounds, _, exact] = slot.bounds;
-                let baselines = self.baselines(index, window.scale_factor());
-                let style = self.slots[index as usize].style.clone();
-                let inset = inset(&self.slots[index as usize].layout, window.scale_factor());
-                let mut cx = NodeCx {
-                    window,
-                    bounds,
-                    exact,
-                    inset,
-                    baselines,
-                    text: &text,
-                    style: &style,
-                    state: state.as_ref(),
-                };
-                let mut inner = |window: &mut Window| self.keep_box(index, &style, moved, window);
-                hooks.kept(&mut cx, &mut inner);
-            }
-            None => {
-                let style = slot.style.clone();
-                self.keep_box(index, &style, moved, window);
-            }
-        }
+        self.visit(
+            index,
+            window,
+            |hooks, cx, inner| hooks.kept(cx, inner),
+            |tree, style, window| tree.keep_box(index, style, moved, window),
+        );
         if moved {
             self.reach(index);
         }
@@ -1007,7 +973,7 @@ impl Tree {
         let origin = self.slots[index as usize].origin;
         let [bounds, _] = match moved {
             true => self.place(index, origin, window),
-            false => [self.slots[index as usize].bounds[1]; 2],
+            false => [self.slots[index as usize].painted; 2],
         };
         window.scope(Scope::Clip(style.overflow_mask(bounds)), |window| {
             let slot = &mut self.slots[index as usize];
@@ -1051,7 +1017,7 @@ impl Tree {
                             + shadow.spread_radius,
                     )
                 });
-                let mut reach = slot.bounds[1].outset(grow);
+                let mut reach = slot.painted.outset(grow);
                 if matches!(slot.kind, Kind::Text(..) | Kind::Measured) {
                     let line = slot.text.line_height.round() * 2.;
                     reach = Rect::new(
@@ -1067,6 +1033,33 @@ impl Tree {
             })
         });
         self.slots[index as usize].reach = reach;
+    }
+
+    fn visit(
+        &mut self,
+        index: u32,
+        window: &mut Window,
+        step: impl FnOnce(&dyn Hooks, &mut NodeCx<'_>, &mut dyn FnMut(&mut Window)),
+        mut inner: impl FnMut(&mut Self, &Style, &mut Window),
+    ) {
+        let slot = &self.slots[index as usize];
+        let style = slot.style.clone();
+        let Some(hooks) = slot.hooks.clone() else {
+            return inner(self, &style, window);
+        };
+        let (text, state) = (slot.text.clone(), slot.state.clone());
+        let scale = window.scale_factor();
+        let mut cx = NodeCx {
+            window,
+            bounds: slot.bounds,
+            exact: slot.exact,
+            inset: inset(&slot.layout, scale),
+            baselines: self.baselines(index, scale),
+            text: &text,
+            style: &style,
+            state: state.as_ref(),
+        };
+        step(&*hooks, &mut cx, &mut |window| inner(self, &style, window));
     }
 
     fn baselines(&self, index: u32, scale: f32) -> [Option<Pixels>; 2] {
@@ -1100,31 +1093,12 @@ impl Tree {
         let unbounded = slot.hooks.as_ref().is_some_and(|hooks| !hooks.bounded());
         self.unbounded += u32::from(unbounded);
         let smoothing = mem::replace(&mut window.font_smoothing, slot.text.font_smoothing);
-        match slot.hooks.clone() {
-            Some(hooks) => {
-                let (text, state) = (slot.text.clone(), slot.state.clone());
-                let [bounds, _, exact] = slot.bounds;
-                let baselines = self.baselines(index, window.scale_factor());
-                let style = self.slots[index as usize].style.clone();
-                let inset = inset(&self.slots[index as usize].layout, window.scale_factor());
-                let mut cx = NodeCx {
-                    window,
-                    bounds,
-                    exact,
-                    inset,
-                    baselines,
-                    text: &text,
-                    style: &style,
-                    state: state.as_ref(),
-                };
-                let mut inner = |window: &mut Window| self.paint_box(index, &style, window);
-                hooks.paint(&mut cx, &mut inner);
-            }
-            None => {
-                let style = self.slots[index as usize].style.clone();
-                self.paint_box(index, &style, window);
-            }
-        }
+        self.visit(
+            index,
+            window,
+            |hooks, cx, inner| hooks.paint(cx, inner),
+            |tree, style, window| tree.paint_box(index, style, window),
+        );
         self.unbounded -= u32::from(unbounded);
         window.font_smoothing = smoothing;
         if escaped.is_some() {
@@ -1137,7 +1111,7 @@ impl Tree {
             return;
         }
         let slot = &self.slots[index as usize];
-        let bounds = slot.bounds[1];
+        let bounds = slot.painted;
         if let Kind::Layers(negative) = slot.kind {
             self.paint_layers(negative, window);
             return;
@@ -1165,12 +1139,11 @@ impl Tree {
                 }
                 let painted = matches!(slot.kind, Kind::Text(..) | Kind::Measured)
                     && slot.hooks.as_ref().is_some_and(|hooks| {
-                        let [bounds, _, exact] = slot.bounds;
                         let scale = window.scale_factor();
                         let mut cx = NodeCx {
                             window,
-                            bounds,
-                            exact,
+                            bounds: slot.bounds,
+                            exact: slot.exact,
                             inset: inset(&slot.layout, scale),
                             baselines: self.baselines(index, scale),
                             text: &slot.text,
@@ -1302,18 +1275,14 @@ impl Fingerprint for Style {
         {
             length(hasher, value);
         }
-        for color in [
-            self.background,
-            self.border_color,
-            self.text.color().copied(),
-        ] {
+        for color in [self.background, self.border_color, self.text.color] {
             color
                 .map(|color| [color.r, color.g, color.b, color.a].map(f32::to_bits))
                 .hash(hasher);
         }
         self.border_widths.top.0.to_bits().hash(hasher);
         self.text
-            .font_size()
+            .font_size
             .map(|size| size.0.to_bits())
             .hash(hasher);
     }
@@ -1614,33 +1583,9 @@ impl LayoutTree<'_> {
             child.display == taffy::Display::None
                 || child.position != taffy::Position::Absolute
                     && aligns(child.align_self.unwrap_or(style.align_items))
-                    && child.box_sizing == taffy::BoxSizing::BorderBox
-                    && child.aspect_ratio.is_none()
                     && !child.flex_basis.is_sizing_keyword()
                     && !child.flex_basis.is_content()
-                    && !child.size.width.is_sizing_keyword()
-                    && matches!(
-                        child.size.height.into_raw().tag(),
-                        CompactLength::AUTO_TAG | CompactLength::LENGTH_TAG
-                    )
-                    && child.min_size.height.is_auto()
-                    && child.max_size.height.is_auto()
-                    && [
-                        child.margin.top,
-                        child.margin.right,
-                        child.margin.bottom,
-                        child.margin.left,
-                    ]
-                    .iter()
-                    .all(|margin| !margin.is_auto())
-                    && [
-                        child.inset.top,
-                        child.inset.right,
-                        child.inset.bottom,
-                        child.inset.left,
-                    ]
-                    .iter()
-                    .all(|inset| inset.is_auto())
+                    && plain(child)
         });
         if !simple {
             return None;
@@ -1965,54 +1910,15 @@ impl LayoutTree<'_> {
         for order in 0..self.slots[index].children.len() {
             let child = self.slots[index].children[order];
             if self.slots[usize::from(child)].taffy().display == taffy::Display::None {
-                self.set_unrounded_layout(child, &Layout::with_order(order as u32));
-                self.compute(
-                    child,
-                    LayoutInput {
-                        run_mode: RunMode::PerformLayout,
-                        sizing_mode: taffy::SizingMode::ContentSize,
-                        axis: taffy::RequestedAxis::Both,
-                        known_dimensions: taffy::Size::NONE,
-                        known_dimensions_are_definite: taffy::Size {
-                            width: true,
-                            height: true,
-                        },
-                        parent_size: taffy::Size::NONE,
-                        available_space: taffy::Size {
-                            width: taffy::AvailableSpace::MaxContent,
-                            height: taffy::AvailableSpace::MaxContent,
-                        },
-                        vertical_margins_are_collapsible: taffy::Line::FALSE,
-                    },
-                    None,
-                );
+                self.hide(child, order);
             }
         }
-        let mut output = LayoutOutput::from_sizes_and_baselines(
-            size,
-            taffy::Rect::ZERO,
-            if contain.suppresses_baseline() {
-                Baselines::NONE
-            } else {
-                Baselines::from_first(first)
-            },
-        );
-        output.oof_positioning_area = Some(taffy::OofPositioningArea {
-            size: size - border.sum_axes(),
-            offset: taffy::Point {
-                x: border.left,
-                y: border.top,
-            },
-        });
-        Some(output)
+        Some(finish(size, border, contain, first))
     }
 
     // Preserve Taffy's sum order. Columns that can flex, shrink or move items must use Taffy.
     fn stack(&mut self, node: NodeId, inputs: LayoutInput) -> Option<LayoutOutput> {
-        use taffy::{
-            AlignContentKeyword, CompactLength, MaybeMath, MaybeResolve, ResolveOrZero,
-            prelude::TaffyMaxContent,
-        };
+        use taffy::{AlignContentKeyword, CompactLength, MaybeMath, MaybeResolve, ResolveOrZero};
         let LayoutInput {
             known_dimensions: known,
             parent_size,
@@ -2072,35 +1978,7 @@ impl LayoutTree<'_> {
                                 | AlignContentKeyword::SpaceBetween
                         )
                 }
-                _ => {
-                    starts(child.align_self)
-                        && child.box_sizing == taffy::BoxSizing::BorderBox
-                        && child.aspect_ratio.is_none()
-                        && child.flex_basis.is_auto()
-                        && !child.size.width.is_sizing_keyword()
-                        && matches!(
-                            child.size.height.into_raw().tag(),
-                            CompactLength::AUTO_TAG | CompactLength::LENGTH_TAG
-                        )
-                        && child.min_size.height.is_auto()
-                        && child.max_size.height.is_auto()
-                        && [
-                            child.margin.top,
-                            child.margin.right,
-                            child.margin.bottom,
-                            child.margin.left,
-                        ]
-                        .iter()
-                        .all(|margin| !margin.is_auto())
-                        && [
-                            child.inset.top,
-                            child.inset.right,
-                            child.inset.bottom,
-                            child.inset.left,
-                        ]
-                        .iter()
-                        .all(|inset| inset.is_auto())
-                }
+                _ => starts(child.align_self) && child.flex_basis.is_auto() && plain(child),
             }
         });
         if !simple {
@@ -2301,24 +2179,7 @@ impl LayoutTree<'_> {
             let child = self.slots[index].children[order];
             let style = self.slots[usize::from(child)].taffy();
             if style.display == taffy::Display::None {
-                self.set_unrounded_layout(child, &Layout::with_order(order as u32));
-                self.compute(
-                    child,
-                    LayoutInput {
-                        run_mode: RunMode::PerformLayout,
-                        sizing_mode: taffy::SizingMode::ContentSize,
-                        axis: taffy::RequestedAxis::Both,
-                        known_dimensions: taffy::Size::NONE,
-                        known_dimensions_are_definite: taffy::Size {
-                            width: true,
-                            height: true,
-                        },
-                        parent_size: taffy::Size::NONE,
-                        available_space: taffy::Size::MAX_CONTENT,
-                        vertical_margins_are_collapsible: taffy::Line::FALSE,
-                    },
-                    None,
-                );
+                self.hide(child, order);
             } else if style.position == taffy::Position::Absolute {
                 let area = |start, end| taffy::AxisStaticPosition {
                     area: taffy::Line { start, end },
@@ -2335,24 +2196,33 @@ impl LayoutTree<'_> {
                 });
             }
         }
-        let mut output = LayoutOutput::from_sizes_and_baselines(
-            size,
-            taffy::Rect::ZERO,
-            if contain.suppresses_baseline() {
-                Baselines::NONE
-            } else {
-                Baselines::from_first(first)
-            },
-        );
+        let mut output = finish(size, border, contain, first);
         output.oof_candidates = candidates;
-        output.oof_positioning_area = Some(taffy::OofPositioningArea {
-            size: size - border.sum_axes(),
-            offset: taffy::Point {
-                x: border.left,
-                y: border.top,
-            },
-        });
         Some(output)
+    }
+
+    fn hide(&mut self, child: NodeId, order: usize) {
+        self.set_unrounded_layout(child, &Layout::with_order(order as u32));
+        self.compute(
+            child,
+            LayoutInput {
+                run_mode: RunMode::PerformLayout,
+                sizing_mode: taffy::SizingMode::ContentSize,
+                axis: taffy::RequestedAxis::Both,
+                known_dimensions: taffy::Size::NONE,
+                known_dimensions_are_definite: taffy::Size {
+                    width: true,
+                    height: true,
+                },
+                parent_size: taffy::Size::NONE,
+                available_space: taffy::Size {
+                    width: taffy::AvailableSpace::MaxContent,
+                    height: taffy::AvailableSpace::MaxContent,
+                },
+                vertical_margins_are_collapsible: taffy::Line::FALSE,
+            },
+            None,
+        );
     }
 
     fn flexbox(&mut self, node: NodeId, inputs: LayoutInput) -> LayoutOutput {
@@ -2710,6 +2580,60 @@ impl LayoutContainingBlock for LayoutTree<'_> {
     fn add_hoisted_children(&mut self, _: NodeId, _: &[NodeId]) {}
 }
 
+fn plain(child: &taffy::Style) -> bool {
+    use taffy::CompactLength;
+    child.box_sizing == taffy::BoxSizing::BorderBox
+        && child.aspect_ratio.is_none()
+        && !child.size.width.is_sizing_keyword()
+        && matches!(
+            child.size.height.into_raw().tag(),
+            CompactLength::AUTO_TAG | CompactLength::LENGTH_TAG
+        )
+        && child.min_size.height.is_auto()
+        && child.max_size.height.is_auto()
+        && [
+            child.margin.top,
+            child.margin.right,
+            child.margin.bottom,
+            child.margin.left,
+        ]
+        .iter()
+        .all(|margin| !margin.is_auto())
+        && [
+            child.inset.top,
+            child.inset.right,
+            child.inset.bottom,
+            child.inset.left,
+        ]
+        .iter()
+        .all(|inset| inset.is_auto())
+}
+
+fn finish(
+    size: taffy::Size<f32>,
+    border: taffy::Rect<f32>,
+    contain: taffy::style::Contain,
+    first: Option<f32>,
+) -> LayoutOutput {
+    let mut output = LayoutOutput::from_sizes_and_baselines(
+        size,
+        taffy::Rect::ZERO,
+        if contain.suppresses_baseline() {
+            Baselines::NONE
+        } else {
+            Baselines::from_first(first)
+        },
+    );
+    output.oof_positioning_area = Some(taffy::OofPositioningArea {
+        size: size - border.sum_axes(),
+        offset: taffy::Point {
+            x: border.left,
+            y: border.top,
+        },
+    });
+    output
+}
+
 fn cache_input(free: [bool; 2], relative: bool, input: &LayoutInput) -> LayoutInput {
     let mut input = *input;
     if !relative {
@@ -2821,16 +2745,15 @@ impl LayoutGridContainer for LayoutTree<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tree, identity, index_of};
-    use crate::{Child, NodeKey, node, px, size};
+    use super::{Tree, index_of};
+    use crate::{Child, node, px, size};
 
     fn live(tree: &Tree) -> usize {
         tree.slots.iter().filter(|slot| slot.live).count()
     }
 
     fn slot(tree: &Tree, id: usize) -> &super::Slot {
-        let index = tree.keys[&(identity(Some(NodeKey::from(id)), 0), 0)];
-        &tree.slots[index as usize]
+        &tree.slots[tree.index(id.into()).unwrap() as usize]
     }
 
     #[test]
@@ -2853,7 +2776,7 @@ mod tests {
         tree.commit_root(page(vec![moved]), viewport, 1.);
         assert!(tree.contains(2usize) && !tree.contains(1usize));
         assert_eq!(live(&tree), 1 + 1 + 3);
-        let parent = tree.keys[&(identity(Some(NodeKey::from(4usize)), 0), 0)];
+        let parent = tree.index(4usize.into()).unwrap();
         assert_eq!(slot(&tree, 2).parent, parent);
         assert!(
             slot(&tree, 2)
@@ -2889,7 +2812,7 @@ mod tests {
         let child = index_of(slot(&tree, 3).children[0]);
         assert_eq!(
             tree.slots[child as usize].parent,
-            tree.keys[&(identity(Some(NodeKey::from(3usize)), 0), 0)]
+            tree.index(3usize.into()).unwrap()
         );
         assert_eq!(slot(&tree, 3).parent, root);
     }
@@ -2965,8 +2888,8 @@ mod tests {
         tree.begin(1., 0);
         tree.commit_root(page(field(10.).into()), viewport, 1.);
         let (parent, own, inner) = (
-            tree.keys[&(identity(Some(NodeKey::from(1usize)), 0), 0)],
-            tree.keys[&(identity(Some(NodeKey::from(2usize)), 0), 0)],
+            tree.index(1usize.into()).unwrap(),
+            tree.index(2usize.into()).unwrap(),
             slot(&tree, 2).children.clone(),
         );
         let slots = live(&tree);

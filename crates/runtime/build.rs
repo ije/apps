@@ -34,15 +34,8 @@ fn main() {
         for entry in fs::read_dir(root.join(dir)).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|extension| extension == "js") {
-                // Strip only whitespace and comments: compression loses script completion values. Preserve
-                // napi.js line numbers for napi.rs.
+                // Strip only whitespace and comments: compression loses script completion values.
                 let source = fs::read_to_string(&path).unwrap();
-                if path.ends_with("node/napi.js") {
-                    hash(path.strip_prefix(&root).unwrap(), &source);
-                    let data = miniz_oxide::deflate::compress_to_vec(source.as_bytes(), 10);
-                    fs::write(out.join(dir).join("napi.js"), data).unwrap();
-                    continue;
-                }
                 let allocator = oxc_allocator::Allocator::default();
                 let parsed =
                     oxc_parser::Parser::new(&allocator, &source, oxc_span::SourceType::script())

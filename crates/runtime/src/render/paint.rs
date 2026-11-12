@@ -593,21 +593,27 @@ impl Hooks for DomBox {
                 }
                 flags
             };
-            if let Some((browser, _)) = view.browsers.borrow().get(&self.id)
-                && let Some((set, ..)) = view.frames.borrow_mut().get_mut(&self.id)
-            {
-                let zoom = window.zoom();
-                let bounds = [
-                    window_bounds.origin.x,
-                    window_bounds.origin.y,
-                    window_bounds.size.width,
-                    window_bounds.size.height,
-                ]
-                .map(|value| (f32::from(value) * zoom) as f64);
-                if *set != bounds {
-                    *set = bounds;
-                    let _ = browser.set_bounds(bounds);
-                }
+            let moved = view
+                .frames
+                .borrow_mut()
+                .get_mut(&self.id)
+                .is_some_and(|frame| {
+                    let zoom = window.zoom();
+                    let bounds = [
+                        window_bounds.origin.x,
+                        window_bounds.origin.y,
+                        window_bounds.size.width,
+                        window_bounds.size.height,
+                    ]
+                    .map(|value| (f32::from(value) * zoom) as f64);
+                    frame.bounds != bounds && {
+                        frame.bounds = bounds;
+                        true
+                    }
+                });
+            // The web view can run its event loop while it moves, so only a shared borrow is held.
+            if moved && let Some(frame) = view.frames.borrow().get(&self.id) {
+                let _ = frame.browser.set_bounds(frame.bounds);
             }
             window.scope(renderer::Scope::Offset(offset), |window| inner(window));
             self.reached(window_bounds, flags);
@@ -786,12 +792,12 @@ impl DomBox {
                             || (image.size().height as u32) != raster[1]
                     })
             }) {
-                if shapes.is_none()
+                let image = if shapes.is_none()
                     && let Some([across, down]) =
                         super::effects::axis_mask(style, &units, size, raster)
                 {
                     let opaque = |alpha: &f32| *alpha >= 0.999;
-                    let image = (!across.iter().all(opaque) || !down.iter().all(opaque)).then(|| {
+                    (!across.iter().all(opaque) || !down.iter().all(opaque)).then(|| {
                         let mut bytes = vec![0; across.len() * down.len() * 4];
                         for (row, y) in bytes.chunks_exact_mut(across.len() * 4).zip(&down) {
                             for (pixel, x) in row.as_chunks_mut::<4>().0.iter_mut().zip(&across) {
@@ -799,43 +805,34 @@ impl DomBox {
                             }
                         }
                         std::sync::Arc::new(renderer::RenderImage::new(raster[0], raster[1], bytes))
-                    });
-                    if let Some((_, Some(old))) = masks.insert(self.id, (inputs, image)) {
-                        window.release_image(old);
+                    })
+                } else {
+                    let source = match (shapes, mask_svg(style, units, size, base.as_ref(), &host.assets)) {
+                        (Some(shape), Some(layers)) => format!(
+                            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"><defs><clipPath id=\"apps-clip\">{shape}</clipPath></defs><g clip-path=\"url(#apps-clip)\">{layers}</g></svg>"
+                        ),
+                        (Some(shape), None) => format!(
+                            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{shape}</svg>"
+                        ),
+                        (None, Some(layers)) => format!(
+                            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{layers}</svg>"
+                        ),
+                        (None, None) => return None,
+                    };
+                    // The mask names the image files itself, so they may be read.
+                    match super::canvas::svg_tree(&source, true).and_then(|tree| {
+                        super::canvas::render_svg(&tree, raster[0], raster[1], None)
+                    }) {
+                        Ok(image) => Some(image),
+                        // Keep the failure too, or every paint builds and reports the same mask again.
+                        Err(error) => {
+                            eprintln!("apps: mask: {error}");
+                            None
+                        }
                     }
-                    return masks
-                        .get(&self.id)
-                        .and_then(|(_, image)| image.clone().map(|image| (image, bounds)));
-                }
-                let source = match (shapes, mask_svg(style, units, size, base.as_ref(), &host.assets)) {
-                    (Some(shape), Some(layers)) => format!(
-                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"><defs><clipPath id=\"apps-clip\">{shape}</clipPath></defs><g clip-path=\"url(#apps-clip)\">{layers}</g></svg>"
-                    ),
-                    (Some(shape), None) => format!(
-                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{shape}</svg>"
-                    ),
-                    (None, Some(layers)) => format!(
-                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{layers}</svg>"
-                    ),
-                    (None, None) => return None,
                 };
-                // The mask names the image files itself, so they may be read.
-                let mask = super::canvas::svg_tree(&source, true).and_then(|tree| {
-                    super::canvas::render_svg(&tree, raster[0], raster[1], None)
-                });
-                match mask {
-                    Ok(image) => {
-                        if let Some((_, Some(old))) = masks.insert(self.id, (inputs, Some(image))) {
-                            window.release_image(old);
-                        }
-                    }
-                    // Keep the failure too, or every paint builds and reports the same mask again.
-                    Err(error) => {
-                        eprintln!("apps: mask: {error}");
-                        if let Some((_, Some(old))) = masks.insert(self.id, (inputs, None)) {
-                            window.release_image(old);
-                        }
-                    }
+                if let Some((_, Some(old))) = masks.insert(self.id, (inputs, image)) {
+                    window.release_image(old);
                 }
             }
             masks
@@ -878,7 +875,7 @@ impl DomBox {
                         .get(Prop::MACOS_GLASS_TINT_COLOR)
                         .and_then(style::color)
                         .filter(|(_, alpha)| *alpha > 0)
-                        .map(|(color, alpha)| renderer::Color::hex(color << 8 | u32::from(alpha))),
+                        .map(crate::style::rgba),
                     clear: kind == "clear",
                     interactive: style.get(Prop::MACOS_GLASS_INTERACTIVE) == Some("true")
                         && style.get(Prop::POINTER_EVENTS) != Some("none")
@@ -947,8 +944,8 @@ fn nest_effects(
     }
 }
 
-fn mask_svg(
-    style: &style::Style,
+fn mask_svg<'a>(
+    style: &'a style::Style,
     units: style::Lengths,
     [width, height]: [f32; 2],
     base: Option<&url::Url>,
@@ -960,35 +957,26 @@ fn mask_svg(
     if images.is_empty() || images == "none" {
         return None;
     }
-    let list = |props| {
-        style::components(get(props), ',')
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    };
+    let list = |props| style::components(get(props), ',');
     let (sizes, positions, repeats) = (
         list([Prop::MASK_SIZE, Prop::WEBKIT_MASK_SIZE]),
         list([Prop::MASK_POSITION, Prop::WEBKIT_MASK_POSITION]),
         list([Prop::MASK_REPEAT, Prop::WEBKIT_MASK_REPEAT]),
     );
-    let pick = |values: &[String], index: usize| {
+    let pick = |values: &[&'a str], index: usize| {
         values
             .get(index % values.len().max(1))
-            .cloned()
-            .unwrap_or_default()
+            .copied()
+            .unwrap_or("")
     };
     let mut content = String::new();
     for (index, image) in style::components(images, ',').into_iter().enumerate().rev() {
         let image = image.trim();
         if let Some(source) = image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
-            let source = source.trim().trim_matches(['"', '\'']);
-            let Some(path) = super::image::data_file(source).or_else(|| {
-                let base = base?;
-                crate::host::local_path(assets, base, &base.join(source).ok()?)
-            }) else {
+            let Some(path) = super::image::url_file(source, base, assets) else {
                 continue;
             };
-            let aspect = match pick(&sizes, index).as_str() {
+            let aspect = match pick(&sizes, index) {
                 "cover" => "xMidYMid slice",
                 "contain" => "xMidYMid meet",
                 _ => "none",
@@ -1012,13 +1000,13 @@ fn mask_svg(
         if let Some(svg) = super::effects::gradient_svg(
             kind,
             body,
-            if size.is_empty() { "auto" } else { &size },
+            if size.is_empty() { "auto" } else { size },
             if position.is_empty() {
                 "0% 0%"
             } else {
-                &position
+                position
             },
-            if repeat.is_empty() { "repeat" } else { &repeat },
+            if repeat.is_empty() { "repeat" } else { repeat },
             units,
             width,
             height,

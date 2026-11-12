@@ -7,17 +7,16 @@ mod text;
 mod wayland;
 mod x11;
 
-use crate::{ControlKind, Cursor, Pixels, Point, Rect, Scene, Size, WindowChange, WindowOptions};
+use super::single::Task;
+use crate::{Cursor, Pixels, Point, Rect, Scene, Size, WindowChange, WindowOptions};
 use crate::{WindowState, app::Callbacks};
 use anyhow::Result;
 use gpu::{Atlas, Capture};
 use raw_window_handle::RawWindowHandle;
 use rustc_hash::FxHashMap;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
-use std::{
-    cell::Cell, cell::RefCell, cmp::Reverse, collections::BinaryHeap, collections::VecDeque,
-};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::{cell::Cell, cell::RefCell, collections::BTreeMap, collections::VecDeque};
 use std::{rc::Rc, rc::Weak, time::Duration, time::Instant};
 
 pub(crate) use text::TextSystem;
@@ -25,11 +24,8 @@ pub(crate) use text::TextSystem;
 // A window that stops drawing releases its spare GPU resources after this.
 const QUIET: Duration = Duration::from_secs(1);
 
-type Task = Box<dyn FnOnce() + Send>;
+type Job = Box<dyn FnOnce()>;
 type Watcher = Box<dyn FnMut() -> bool>;
-
-#[derive(Clone, Copy)]
-pub(crate) struct AppThread;
 
 static INBOX: Mutex<Vec<Task>> = Mutex::new(vec![]);
 static BELL: OnceLock<OwnedFd> = OnceLock::new();
@@ -42,9 +38,8 @@ fn inbox() -> MutexGuard<'static, Vec<Task>> {
 struct Turn {
     main: Cell<bool>,
     done: Cell<bool>,
-    soon: RefCell<VecDeque<Box<dyn FnOnce()>>>,
-    due: RefCell<BinaryHeap<Reverse<(Instant, u64)>>>,
-    timed: RefCell<FxHashMap<u64, Box<dyn FnOnce()>>>,
+    soon: RefCell<VecDeque<Job>>,
+    due: RefCell<BTreeMap<(Instant, u64), Job>>,
     count: Cell<u64>,
     // The call is `None` while it runs.
     watches: RefCell<Vec<(RawFd, i16, Option<Watcher>)>>,
@@ -55,7 +50,7 @@ thread_local! {
     static TURN: Turn = Turn::default();
 }
 
-fn on_main() -> bool {
+pub(crate) fn on_main() -> bool {
     TURN.with(|turn| turn.main.get())
 }
 
@@ -76,10 +71,8 @@ pub(super) fn watch(fd: RawFd, write: bool, f: impl FnMut() -> bool + 'static) {
 pub(crate) fn run_after(delay: Duration, f: impl FnOnce() + 'static) {
     TURN.with(|turn| {
         let number = turn.count.replace(turn.count.get() + 1);
-        turn.due
-            .borrow_mut()
-            .push(Reverse((Instant::now() + delay, number)));
-        turn.timed.borrow_mut().insert(number, Box::new(f));
+        let at = Instant::now() + delay;
+        turn.due.borrow_mut().insert((at, number), Box::new(f));
     });
 }
 
@@ -92,58 +85,7 @@ pub(crate) fn native_post(task: Task) {
     }
 }
 
-pub(crate) fn post(_: AppThread, task: Task) {
-    native_post(task);
-}
-
 pub(crate) use run_after as native_after;
-
-pub(crate) fn ask<R: Send + 'static>(
-    _: AppThread,
-    f: impl FnOnce() -> R + Send + 'static,
-) -> Option<R> {
-    if on_main() {
-        return Some(f());
-    }
-    let (answer, wait) = mpsc::sync_channel(1);
-    native_post(Box::new(move || {
-        let _ = answer.send(f());
-    }));
-    wait.recv_timeout(Duration::from_millis(100)).ok()
-}
-
-pub(crate) fn native_sync<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    if on_main() {
-        return f();
-    }
-    let (answer, wait) = mpsc::sync_channel(1);
-    let job: Box<dyn FnOnce() + Send + '_> = Box::new(move || {
-        let _ = answer.send(f());
-    });
-    // SAFETY: this thread waits for the job, so what the job borrows outlives it.
-    native_post(unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, Task>(job) });
-    wait.recv().expect("the main thread dropped its work")
-}
-
-pub(crate) fn app_thread() -> AppThread {
-    AppThread
-}
-
-// The app runs on this thread, and `app::run` drops it after the loop.
-pub(crate) fn spawn_render(
-    init: impl FnOnce() + Send + 'static,
-    _: impl FnOnce() + Send + 'static,
-) {
-    init();
-}
-
-pub(crate) fn end_thread() {}
-
-pub(crate) fn park_render() {}
-
-pub(crate) fn control_size(_: ControlKind) -> [f32; 2] {
-    [0.; 2]
-}
 
 trait Display {
     fn fd(&self) -> RawFd;
@@ -154,8 +96,10 @@ trait Display {
     fn write_clipboard(&self, text: &str);
     fn set_cursor(&self, cursor: Cursor);
     fn display_bounds(&self) -> Option<Rect>;
-    fn open(self: Rc<Self>, options: &WindowOptions, calls: Callbacks) -> Result<Rc<dyn Native>>;
+    fn open(self: Rc<Self>, options: &WindowOptions, calls: Callbacks) -> Result<Opened>;
 }
+
+type Opened = (Rc<dyn Native>, Rc<Atlas>);
 
 enum Action {
     Title(String),
@@ -175,7 +119,6 @@ trait Native {
     fn extent(&self) -> Size<Pixels>;
     fn state(&self) -> WindowState;
     fn active(&self) -> bool;
-    fn atlas(&self) -> Rc<Atlas>;
     fn want_frames(&self);
     fn draw(&self, scene: &Scene, capture: bool) -> Capture;
     fn release(&self);
@@ -238,23 +181,21 @@ impl Platform {
                 }
                 let now = Instant::now();
                 loop {
-                    let mut due = turn.due.borrow_mut();
-                    let Some(&Reverse((_, number))) = due.peek().filter(|first| first.0.0 <= now)
-                    else {
-                        break;
+                    let task = match turn.due.borrow_mut().first_entry() {
+                        Some(first) if first.key().0 <= now => first.remove(),
+                        _ => break,
                     };
-                    due.pop();
-                    drop(due);
-                    let task = turn.timed.borrow_mut().remove(&number);
-                    if let Some(task) = task {
-                        task();
-                    }
+                    task();
                 }
-                if turn.done.get() || !display.prepare() || turn.done.get() {
+                if turn.done.get() || !display.prepare() {
                     break;
                 }
                 let busy = !turn.soon.borrow().is_empty() || !inbox().is_empty();
-                let next = turn.due.borrow().peek().map(|first| first.0.0);
+                let next = turn
+                    .due
+                    .borrow()
+                    .first_key_value()
+                    .map(|(first, _)| first.0);
                 let timeout = match next {
                     _ if busy => 0,
                     Some(when) => {
@@ -354,7 +295,7 @@ impl Platform {
     }
 
     pub fn open_window(&self, options: &WindowOptions, calls: Callbacks) -> Result<Window> {
-        let native = self.display.clone().open(options, calls)?;
+        let (native, atlas) = self.display.clone().open(options, calls)?;
         let key = TURN.with(|turn| {
             let key = turn.count.replace(turn.count.get() + 1);
             turn.windows
@@ -362,7 +303,6 @@ impl Platform {
                 .insert(key, Rc::downgrade(&native));
             key
         });
-        let atlas = native.atlas();
         Ok(Window {
             native,
             atlas,

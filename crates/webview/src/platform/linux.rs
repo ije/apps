@@ -7,7 +7,7 @@ use webkit2gtk::{
     WebsiteDataManagerExtManual, WebsiteDataTypes,
 };
 
-pub(super) struct Window {
+pub(crate) struct Window {
     window: gtk::Window,
     attached: Cell<bool>,
     visible: bool,
@@ -123,7 +123,7 @@ impl Window {
         native.reparent(parent.upcast_ref(), 0, 0);
         native.raise();
         self.attached.set(true);
-        let bounds = self.bounds.replace(None).unwrap_or([0., 0., 800., 600.]);
+        let bounds = self.bounds.take().unwrap_or([0., 0., 800., 600.]);
         self.set_bounds(bounds)
     }
 
@@ -147,7 +147,7 @@ impl Window {
 
     pub fn set_visible(&self, visible: bool) -> Result<()> {
         self.shown.set(visible);
-        let bounds = self.bounds.replace(None).unwrap_or([0., 0., 800., 600.]);
+        let bounds = self.bounds.take().unwrap_or([0., 0., 800., 600.]);
         self.set_bounds(bounds)
     }
 

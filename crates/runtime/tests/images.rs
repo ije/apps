@@ -4,9 +4,7 @@ use serde_json::{Value, json};
 fn decoded(doc: &mut Document, state: &mut dom::State) -> Value {
     let started = std::time::Instant::now();
     loop {
-        let results = dom::call("dom.decoded", &json!([]), doc, state, [640., 480.])
-            .unwrap()
-            .unwrap();
+        let results = dom::call("dom.decoded", &json!([]), doc, state, [640., 480.]).unwrap();
         if let Some(result) = results.get(0) {
             return result[1].clone();
         }
@@ -38,7 +36,6 @@ fn web_images_decode_in_the_dom() {
             &mut state,
             [640., 480.],
         )
-        .unwrap()
         .unwrap();
         assert_eq!(decoded(&mut doc, &mut state), json!(size));
         assert!(state.images.contains_key(&1));
@@ -160,7 +157,6 @@ fn svg_and_bundled_images_load_through_the_host() {
             &mut state,
             [640., 480.],
         )
-        .unwrap()
         .unwrap();
         assert_eq!(decoded(&mut doc, &mut state), json!([30., 12.]));
         assert!(!state.images.contains_key(&1));
@@ -172,7 +168,6 @@ fn svg_and_bundled_images_load_through_the_host() {
         &mut state,
         [640., 480.],
     )
-    .unwrap()
     .unwrap();
     assert!(decoded(&mut doc, &mut state).is_string());
 

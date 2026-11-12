@@ -266,6 +266,8 @@ pub(crate) struct State {
     watchers: HashMap<u64, notify::RecommendedWatcher>,
     hashers: HashMap<u64, Hasher>,
     codecs: HashMap<u64, (Codec, bool)>,
+    pub(crate) children: child_process::State,
+    pub(crate) pty: pty::State,
 }
 impl Default for State {
     fn default() -> Self {
@@ -278,6 +280,8 @@ impl Default for State {
             watchers: HashMap::new(),
             hashers: HashMap::new(),
             codecs: HashMap::new(),
+            children: child_process::State::default(),
+            pty: pty::State::default(),
         }
     }
 }
@@ -361,11 +365,7 @@ impl State {
             }
             "hash.new" | "hash.copy" => {
                 let hasher = if op == "hash.new" {
-                    let key = if args[1].is_null() {
-                        None
-                    } else {
-                        Some(bytes(&args[1])?)
-                    };
+                    let key = (!args[1].is_null()).then(|| bytes(&args[1])).transpose()?;
                     Hasher::new(args[0].as_str().context("Expected digest")?, key)?
                 } else {
                     self.hashers
@@ -396,11 +396,7 @@ impl State {
                 Ok(Value::Null)
             }
             "zlib.new" => {
-                let dictionary = if args[4].is_null() {
-                    None
-                } else {
-                    Some(bytes(&args[4])?)
-                };
+                let dictionary = (!args[4].is_null()).then(|| bytes(&args[4])).transpose()?;
                 let codec = Codec::new(
                     args[0].as_str().unwrap_or(""),
                     args[1] == true,

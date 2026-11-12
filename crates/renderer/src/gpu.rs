@@ -77,14 +77,6 @@ impl Instance {
         };
         rect(area).intersect(rect(self.clip))
     }
-
-    pub fn is_opaque_rect(&self) -> bool {
-        self.kind() == BOX
-            && self.color[3] >= 1.
-            && self.aux == [0.; 4]
-            && self.radii == [0.; 8]
-            && self.round_radii == [0.; 8]
-    }
 }
 
 pub(crate) fn rect([x, y, width, height]: [f32; 4]) -> Rect<f32> {

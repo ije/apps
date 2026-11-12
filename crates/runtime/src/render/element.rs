@@ -25,7 +25,8 @@ pub(super) struct Build<'a> {
     pub(super) measured: &'a RefCell<super::grid::Measurements>,
     pub(super) perspective: Option<(f32, String)>,
     pub(super) siblings: &'a RefCell<HashMap<usize, Rc<Siblings>>>,
-    pub(super) margins: &'a RefCell<Margins>,
+    pub(super) walks: &'a RefCell<rustc_hash::FxHashMap<usize, Used>>,
+    pub(super) adjoins: &'a RefCell<rustc_hash::FxHashMap<usize, Sets>>,
     pub(super) blocks: &'a RefCell<rustc_hash::FxHashMap<usize, [f32; 2]>>,
     pub(super) ids: &'a Rc<super::effects::Ids>,
     pub(super) info: &'a [cull::Info],
@@ -49,6 +50,7 @@ pub(super) struct Build<'a> {
 
 // Log external reads through Build::log, or disable reuse of this box.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(debug_assertions, derive(Debug))]
 pub(super) enum Query {
     Margins,
     Parent(Prop),
@@ -264,27 +266,12 @@ fn starts_line(doc: &Document, id: usize) -> bool {
 
 fn insets(styles: &ComputedStyles, node: usize, padding: bool, width: f32) -> [f32; 4] {
     let (style, units) = (&styles.values[node], &styles.lengths[node]);
-    let padding = if padding {
-        units.edges(style, style::PADDING, width)
-    } else {
-        [0.; 4]
-    };
-    std::array::from_fn(|side| {
-        let [size, kind, _] = style::BORDERS[side];
-        padding[side]
-            + if style
-                .get(kind)
-                .is_none_or(|kind| matches!(kind, "none" | "hidden"))
-            {
-                0.
-            } else {
-                style
-                    .get(size)
-                    .map_or(Some(3.), |v| units.resolve(v, width))
-                    .unwrap_or(0.)
-                    .max(0.)
-            }
-    })
+    let borders = units.borders(style, width);
+    if !padding {
+        return borders;
+    }
+    let padding = units.edges(style, style::PADDING, width);
+    std::array::from_fn(|side| padding[side] + borders[side])
 }
 
 fn backdrop(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<(usize, u32)> {
@@ -386,11 +373,7 @@ fn uses(
         let current = &doc.nodes[node];
         pending.extend(current.children.iter().map(|&child| (child, outside)));
         if current.tag == "use"
-            && let Some(name) = current
-                .attrs
-                .get("href")
-                .or_else(|| current.attrs.get("xlink:href"))
-                .and_then(|value| value.strip_prefix('#'))
+            && let Some(name) = href(current)
         {
             found = true;
             name.hash(&mut hasher);
@@ -404,6 +387,13 @@ fn uses(
         }
     }
     found.then(|| hasher.finish())
+}
+
+fn href(node: &crate::dom::Node) -> Option<&str> {
+    node.attrs
+        .get("href")
+        .or_else(|| node.attrs.get("xlink:href"))
+        .and_then(|value| value.strip_prefix('#'))
 }
 
 fn scrolled(handle: Option<&renderer::ScrollRef>) -> Option<[bool; 2]> {
@@ -597,7 +587,7 @@ impl<'a> Build<'a> {
     }
 }
 
-pub(super) fn positioner(
+fn positioner(
     position: &str,
     mut ancestors: impl Iterator<Item = usize>,
     mut made: impl FnMut(usize) -> super::effects::Establishes,
@@ -616,7 +606,7 @@ pub(super) fn positioner(
 }
 
 // Find the scroll container by style, not by handle, since scripts make handles for any box.
-pub(super) fn scroller(
+fn scroller(
     doc: &Document,
     styles: &ComputedStyles,
     mut ancestors: impl Iterator<Item = usize>,
@@ -697,7 +687,7 @@ impl SvgSource<'_> {
         // resvg doesn't take CSS transforms, `transform-box` or `transform-origin`, so they become a matrix.
         if transform
             && element != root
-            && [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE]
+            && super::TRANSFORM_PROPS
                 .iter()
                 .any(|&prop| own.get(prop).is_some())
         {
@@ -844,17 +834,12 @@ impl SvgSource<'_> {
         while let Some(node) = pending.pop() {
             let node = &self.doc.nodes[node];
             if node.tag == "use"
-                && let Some(target) = node
-                    .attrs
-                    .get("href")
-                    .or_else(|| node.attrs.get("xlink:href"))
-                    .and_then(|value| value.strip_prefix('#'))
-                    .and_then(|name| {
-                        super::effects::index(self.ids, self.doc)
-                            .get(name)?
-                            .first()
-                            .copied()
-                    })
+                && let Some(target) = href(node).and_then(|name| {
+                    super::effects::index(self.ids, self.doc)
+                        .get(name)?
+                        .first()
+                        .copied()
+                })
                 && !targets.contains(&target)
             {
                 targets.push(target);
@@ -872,23 +857,12 @@ impl SvgSource<'_> {
         super::canvas::svg_shape(&source)
     }
 }
-pub(super) type Svg = (
-    Vec<Rc<style::Style>>,
-    ([f32; 2], u64),
-    String,
-    crate::dom::SvgBoxes,
-);
-pub(super) type Margins = (
-    rustc_hash::FxHashMap<usize, Rc<rustc_hash::FxHashMap<usize, [f32; 2]>>>,
-    rustc_hash::FxHashMap<usize, ([f32; 2], [f32; 2], bool)>,
-);
+pub(super) type Svg = (Vec<Rc<style::Style>>, ([f32; 2], u64));
 
-pub(super) type Adjoined = ((u64, u32), ([f32; 2], [f32; 2], bool));
-
-pub(super) type Walked = (
-    (u64, u32, [bool; 2]),
-    Rc<rustc_hash::FxHashMap<usize, [f32; 2]>>,
-);
+type Used = Rc<rustc_hash::FxHashMap<usize, [f32; 2]>>;
+type Sets = ([f32; 2], [f32; 2], bool);
+pub(super) type Adjoined = ((u64, u32), Sets);
+pub(super) type Walked = ((u64, u32, [bool; 2]), Used);
 
 thread_local! {
     // Reserve a quarter of the stack for layout and paint, which recurse as deeply as build.
@@ -1321,43 +1295,6 @@ fn print(build: &Build<'_>, from: usize, child: &Child) -> u64 {
     print
 }
 
-#[cfg(debug_assertions)]
-impl std::fmt::Debug for Query {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            Query::Margins => write!(f, "Margins"),
-            Query::Parent(prop) => write!(f, "Parent({})", prop.name()),
-            Query::ParentFont => write!(f, "ParentFont"),
-            Query::FlatParent => write!(f, "FlatParent"),
-            Query::FlatParentPadding => write!(f, "FlatParentPadding"),
-            Query::StickyParent => write!(f, "StickyParent"),
-            Query::Break => write!(f, "Break"),
-            Query::UserSelect => write!(f, "UserSelect"),
-            Query::Positioner(fixed) => write!(f, "Positioner({fixed})"),
-            Query::Backdrop(node) => write!(f, "Backdrop({node})"),
-            Query::Scroller => write!(f, "Scroller"),
-            Query::Editable => write!(f, "Editable"),
-            Query::Cell => write!(f, "Cell"),
-            Query::Shrunk => write!(f, "Shrunk"),
-            Query::Uses(node) => write!(f, "Uses({node})"),
-            Query::Block(node) => write!(f, "Block({node})"),
-            Query::Scroll(node) => write!(f, "Scroll({node})"),
-            Query::Width(node) => write!(f, "Width({node})"),
-            Query::Track(node, axis) => write!(f, "Track({node}, {axis})"),
-            Query::Baselines(node) => write!(f, "Baselines({node})"),
-            Query::Atom(node) => write!(f, "Atom({node})"),
-            Query::Image(node) => write!(f, "Image({node})"),
-            Query::Look(node) => write!(f, "Look({node})"),
-            Query::Boxless(node) => write!(f, "Boxless({node})"),
-            Query::RowFill => write!(f, "RowFill"),
-            Query::Collapse => write!(f, "Collapse"),
-            Query::Value(node) => write!(f, "Value({node})"),
-            Query::Viewport => write!(f, "Viewport"),
-            Query::Theme => write!(f, "Theme"),
-        }
-    }
-}
-
 fn create(
     build: &Build<'_>,
     id: usize,
@@ -1563,7 +1500,9 @@ fn create(
     };
     let align_of = |element: &mut renderer::Child| match element {
         renderer::Child::Node(node) => node.style_ref().align_self,
-        renderer::Child::Kept(id) | renderer::Child::Placed(id, _) => build.tree.align_self(*id),
+        renderer::Child::Kept(id) | renderer::Child::Placed(id, _) => {
+            build.tree.style_of(*id).and_then(|style| style.align_self)
+        }
     };
     // Combine the zero-width strut with the first item, or Taffy can wrap the first item after the strut.
     let with_strut = |mut element: renderer::Child| {
@@ -1588,7 +1527,7 @@ fn create(
         let ink = [Prop::CARET_COLOR, Prop::COLOR]
             .into_iter()
             .find_map(|prop| style::color(style.get(prop)?))
-            .map_or(0x000000ff, |(color, alpha)| color << 8 | alpha as u32);
+            .map_or(Color::hex(0x000000ff), style::rgba);
         let view = view.clone();
         let above = above();
         let mut br = renderer::canvas(
@@ -1621,7 +1560,7 @@ fn create(
                         &painter,
                         [id, 0, 0],
                         Rect::new(bounds.origin, size(px(1.), px(line_height))),
-                        Color::hex(ink),
+                        ink,
                         window,
                     );
                 }
@@ -1678,14 +1617,17 @@ fn create(
                 .get(Prop::POSITION)
                 .is_some_and(|value| matches!(value, "absolute" | "fixed"))
     };
-    let breaks = display != "inline"
-        && flat.iter().any(|&child| doc.nodes[child].tag == "br")
-        && measured
+    let inline_text = || {
+        measured
             .borrow_mut()
             .texts
             .entry(id)
             .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
-            .is_none();
+            .clone()
+    };
+    let breaks = display != "inline"
+        && flat.iter().any(|&child| doc.nodes[child].tag == "br")
+        && inline_text().is_none();
     let all_inline = flow
         && !flat.is_empty()
         && !breaks
@@ -1756,13 +1698,7 @@ fn create(
         ))
     .then(|| {
         use std::hash::{Hash, Hasher};
-        let texted = measured
-            .borrow_mut()
-            .texts
-            .entry(id)
-            .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
-            .as_ref()
-            .map(|data| data.text.is_empty());
+        let texted = inline_text().map(|data| data.text.is_empty());
         let mut hasher = rustc_hash::FxHasher::default();
         (
             Rc::as_ptr(&parsed),
@@ -1860,12 +1796,7 @@ fn create(
         let merged = !text_field(node)
             && symbol.is_none()
             && !matches!(node.tag.as_str(), "svg" | "canvas" | "iframe")
-            && measured
-                .borrow_mut()
-                .texts
-                .entry(id)
-                .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
-                .is_some();
+            && inline_text().is_some();
         if display != "inline"
             && !merged
             && flat.iter().any(|&child| {
@@ -2037,13 +1968,17 @@ fn create(
         else {
             unreachable!()
         };
-        let ratio = node.attrs.get("viewBox").and_then(|value| {
-            let parts: Vec<f32> = value
-                .split(|c: char| c == ',' || c.is_ascii_whitespace())
-                .filter_map(|part| part.parse().ok())
-                .collect();
-            (parts.len() == 4 && parts[2] > 0. && parts[3] > 0.).then(|| parts[2] / parts[3])
-        });
+        let view_box = node
+            .attrs
+            .get("viewBox")
+            .map(|value| {
+                value
+                    .split(|c: char| c == ',' || c.is_ascii_whitespace())
+                    .filter_map(|part| part.parse::<f32>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|parts| parts.len() == 4 && parts[2] > 0. && parts[3] > 0.);
+        let ratio = view_box.as_ref().map(|parts| parts[2] / parts[3]);
         let [width, height] = match (width, height, ratio) {
             (None, Some(height), Some(ratio)) => [height * ratio, height],
             (Some(width), None, Some(ratio)) => [width, width / ratio],
@@ -2055,7 +1990,8 @@ fn create(
             scope = parent;
         }
         let mut pending = vec![id];
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = rustc_hash::FxHashSet::default();
+        let mut linked = false;
         let mut targets = Vec::new();
         let mut painted = Vec::new();
         let mut hasher = rustc_hash::FxHasher::default();
@@ -2067,12 +2003,9 @@ fn create(
             painted.push(styles.values[child].clone());
             let child = &doc.nodes[child];
             pending.extend(&child.children);
+            linked |= child.tag == "use";
             if child.tag == "use"
-                && let Some(reference) = child
-                    .attrs
-                    .get("href")
-                    .or_else(|| child.attrs.get("xlink:href"))
-                    .and_then(|value| value.strip_prefix('#'))
+                && let Some(reference) = href(child)
                 && let Some(target) =
                     super::effects::index(ids, doc)
                         .get(reference)
@@ -2094,44 +2027,37 @@ fn create(
                 pending.push(target);
             }
         }
-        let used = uses(doc, styles, ids, id);
+        // `uses` finds a link only through a `use` element of the subtree just walked.
+        let used = if linked {
+            uses(doc, styles, ids, id)
+        } else {
+            None
+        };
         if used.is_some() {
             reader.log(Query::Uses(id as u32), 1, hashed(used));
         }
         let key = ([width, height], std::hash::Hasher::finish(&hasher));
         let props = || style::SVG.iter().chain(&SVG_SOURCE);
-        let kept = view
-            .svgs
+        let kept = view.svgs.borrow().get(&id).is_some_and(|(old, at)| {
+            *at == key
+                && old.len() == painted.len()
+                && old
+                    .iter()
+                    .zip(&painted)
+                    .enumerate()
+                    .all(|(index, (old, new))| {
+                        Rc::ptr_eq(old, new)
+                            || props().all(|&prop| {
+                                index == 0 && !prop.inherited() || old.get(prop) == new.get(prop)
+                            })
+                    })
+        }) && view
+            .host
             .borrow()
-            .get(&id)
-            .and_then(|(old, at, source, boxes)| {
-                (*at == key
-                    && old.len() == painted.len()
-                    && old
-                        .iter()
-                        .zip(&painted)
-                        .enumerate()
-                        .all(|(index, (old, new))| {
-                            Rc::ptr_eq(old, new)
-                                || props().all(|&prop| {
-                                    index == 0 && !prop.inherited()
-                                        || old.get(prop) == new.get(prop)
-                                })
-                        }))
-                .then(|| (source.clone(), boxes.clone()))
-            });
-        let built = kept.is_none();
-        let (source, boxes) = kept.unwrap_or_else(|| {
-            let view_box = node
-                .attrs
-                .get("viewBox")
-                .map(|value| {
-                    value
-                        .split(|c: char| c == ',' || c.is_ascii_whitespace())
-                        .filter_map(|part| part.parse::<f32>().ok())
-                        .collect::<Vec<_>>()
-                })
-                .filter(|parts| parts.len() == 4 && parts[2] > 0. && parts[3] > 0.);
+            .dom
+            .get(&view.id)
+            .is_some_and(|state| state.svg_sources.contains_key(&id));
+        if !kept {
             let mut header = format!(
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\""
             );
@@ -2208,15 +2134,10 @@ fn create(
                 end = start + "currentcolor".len();
             }
             replaced.push_str(&source[end..]);
-            let boxes = (String::new(), names, [0.; 2], Vec::new(), [0.; 4]);
-            view.svgs
-                .borrow_mut()
-                .insert(id, (painted, key, replaced.clone(), boxes.clone()));
-            (replaced, boxes)
-        });
-        let mut host = view.host.borrow_mut();
-        let state = host.dom.entry(view.id).or_default();
-        if built || !state.svg_sources.contains_key(&id) {
+            let source: Rc<str> = replaced.into();
+            view.svgs.borrow_mut().insert(id, (painted, key));
+            let mut host = view.host.borrow_mut();
+            let state = host.dom.entry(view.id).or_default();
             // Discard the raster on source changes: paint checks only inline SVG dimensions.
             if state.svgs.get(&id).is_some_and(|(old, _)| *old != source)
                 && let Some((_, image)) = state.svgs.remove(&id)
@@ -2224,10 +2145,11 @@ fn create(
             {
                 state.retired.push(image);
             }
-            state.svg_boxes.insert(id, boxes);
+            state
+                .svg_boxes
+                .insert(id, ("".into(), names, [0.; 2], Vec::new(), [0.; 4]));
             state.svg_sources.insert(id, source);
         }
-        drop(host);
         el = el
             .w(px(width))
             .h(px(height))
@@ -2389,18 +2311,18 @@ fn create(
         let text_color = style
             .get(Prop::COLOR)
             .and_then(style::color)
-            .map(|(c, a)| Color::hex((c << 8) | a as u32))
+            .map(style::rgba)
             .unwrap_or(renderer::Color::BLACK);
         let caret_color = style
             .get(Prop::CARET_COLOR)
             .and_then(style::color)
-            .map(|(color, alpha)| Color::hex((color << 8) | alpha as u32))
+            .map(style::rgba)
             .unwrap_or(text_color);
         let placeholder_color = styles
             .text_pseudos
             .get(&id)
             .and_then(|pseudos| style::color(pseudos[3].as_ref()?.get(Prop::COLOR)?))
-            .map(|(color, alpha)| Color::hex((color << 8) | alpha as u32))
+            .map(style::rgba)
             .unwrap_or(Color::hex(0x757575ff));
         let single_line = node.tag != "textarea";
         let padding = units.edges(style, style::PADDING, containing[0]);
@@ -2491,9 +2413,9 @@ fn create(
         });
     }
     if hit.is_none()
-        && let Some((ink, alpha)) = parsed.ink
+        && let Some(ink) = parsed.ink
     {
-        el = el.text_color(Color::hex((ink << 8) | alpha as u32));
+        el = el.text_color(style::rgba(ink));
     }
     let inline_box = display == "inline"
         && symbol.is_none()
@@ -2504,9 +2426,7 @@ fn create(
             node.tag.as_str(),
             "img" | "svg" | "canvas" | "input" | "button" | "select" | "textarea" | "iframe"
         )
-        && !style
-            .get(Prop::POSITION)
-            .is_some_and(|value| matches!(value, "absolute" | "fixed"));
+        && !matches!(position, "absolute" | "fixed");
     let mut inline_fill = renderer::Color::TRANSPARENT;
     let mut cell_background = parsed.background;
     if cell_background.is_none() && matches!(node.tag.as_str(), "td" | "th") {
@@ -2526,7 +2446,7 @@ fn create(
         );
     }
     if let Some(color) = cell_background {
-        let color = Color::hex((color.0 << 8) | color.1 as u32);
+        let color = style::rgba(color);
         let blended = style
             .get(Prop::BACKGROUND_BLEND_MODE)
             .is_some_and(|value| value.split(',').any(|mode| mode.trim() != "normal"))
@@ -2683,24 +2603,10 @@ fn create(
     {
         el = el.ml_auto();
     }
-    let ink = parsed.ink.map_or(Color::hex(0x000000ff), |(ink, alpha)| {
-        Color::hex(ink << 8 | alpha as u32)
-    });
-    let mut borders = parsed.borders.unwrap_or_else(|| {
-        style::BORDERS.map(|[width, kind, _]| {
-            if style
-                .get(kind)
-                .is_none_or(|kind| matches!(kind, "none" | "hidden"))
-            {
-                return 0.;
-            }
-            style
-                .get(width)
-                .map_or(Some(3.), |width| units.resolve(width, containing[0]))
-                .unwrap_or(0.)
-                .max(0.)
-        })
-    });
+    let ink = parsed.ink.map_or(Color::hex(0x000000ff), style::rgba);
+    let mut borders = parsed
+        .borders
+        .unwrap_or_else(|| units.borders(style, containing[0]));
     let sides = style::BORDERS.map(|[width, kind, color]| (width, kind, color));
     let mut border_colors = parsed.border_colors;
     let mut border_kinds = sides.map(|(_, kind, _)| style.get(kind).unwrap_or("none"));
@@ -2928,7 +2834,7 @@ fn create(
         if look.control == super::control::Control::Menu {
             padding[1] += 16.;
             padding[3] += 4.;
-            if list.is_none() && style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
+            if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
                 let (font, size) = (parsed.face.clone(), px(units.font.em));
                 let mut widest = 0f32;
                 let mut stack = node.children.clone();
@@ -3158,6 +3064,12 @@ fn create(
     {
         inner_shadows = units.shadows(value, true);
     }
+    let percentage = |value: &str| {
+        value
+            .strip_suffix('%')
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+    };
     for (prop, value) in style.iter().filter(|_| hit.is_none()) {
         let value: &str = value;
         let vertical = matches!(
@@ -3175,11 +3087,7 @@ fn create(
             | Prop::MIN_HEIGHT
             | Prop::MAX_HEIGHT => {
                 let axis = usize::from(vertical);
-                let length: renderer::Length = if let Some(percent) = value
-                    .strip_suffix('%')
-                    .and_then(|s| s.parse::<f32>().ok())
-                    .filter(|v| v.is_finite())
-                {
+                let length: renderer::Length = if let Some(percent) = percentage(value) {
                     match block_size {
                         Some(_) => px(percent.max(0.) / 100. * base + extra[axis]).into(),
                         None => renderer::Length::Calc(percent.max(0.) / 100., px(extra[axis])),
@@ -3302,11 +3210,7 @@ fn create(
                         .is_some_and(|v| v.starts_with("column")),
                 );
                 let base = containing[axis];
-                el.style().flex_basis = if let Some(percent) = value
-                    .strip_suffix('%')
-                    .and_then(|v| v.parse::<f32>().ok())
-                    .filter(|v| v.is_finite())
-                {
+                el.style().flex_basis = if let Some(percent) = percentage(value) {
                     renderer::Length::Calc(percent.max(0.) / 100., px(extra[axis]))
                 } else if let Some(length) = units.resolve(value, base) {
                     px(length.max(0.) + extra[axis]).into()
@@ -3377,11 +3281,7 @@ fn create(
             Prop::LEFT | Prop::RIGHT | Prop::TOP | Prop::BOTTOM
                 if matches!(position, "relative" | "absolute") =>
             {
-                let length: renderer::Length = if let Some(percent) = value
-                    .strip_suffix('%')
-                    .and_then(|v| v.parse::<f32>().ok())
-                    .filter(|v| v.is_finite())
-                {
+                let length: renderer::Length = if let Some(percent) = percentage(value) {
                     match block_size {
                         Some(_) => px(percent / 100. * base).into(),
                         None => relative(percent / 100.),
@@ -3880,7 +3780,7 @@ fn create(
         let color = style
             .get(Prop::OUTLINE_COLOR)
             .and_then(style::color)
-            .map_or(ink, |(ink, alpha)| Color::hex(ink << 8 | alpha as u32));
+            .map_or(ink, style::rgba);
         let mut outline = renderer::node()
             .absolute()
             .top(px(-grow - borders[0]))
@@ -3945,59 +3845,13 @@ fn create(
                 }
             });
         }
-        let kinds = border_kinds.map(border_style);
-        el = el.child(
-            renderer::canvas(
-                |_, _| (),
-                move |bounds, _, window| {
-                    let outer = Rect::new(
-                        point(
-                            bounds.left() - px(borders[3]),
-                            bounds.top() - px(borders[0]),
-                        ),
-                        size(
-                            bounds.size.width + px(borders[1] + borders[3]),
-                            bounds.size.height + px(borders[0] + borders[2]),
-                        ),
-                    );
-                    for (inset, widths, colors) in &bands {
-                        let bounds = Rect::between(
-                            outer.origin + point(px(inset[3]), px(inset[0])),
-                            outer.bottom_right() - point(px(inset[1]), px(inset[2])),
-                        );
-                        let corners = radius
-                            .resolve(outer.size)
-                            .inset(px(inset[0]), px(inset[1]), px(inset[2]), px(inset[3]))
-                            .fit(bounds.size);
-                        for side in 0..4 {
-                            if widths[side] <= 0. {
-                                continue;
-                            }
-                            window.draw_box(
-                                bounds,
-                                corners,
-                                renderer::Color::TRANSPARENT,
-                                renderer::Border {
-                                    widths: renderer::Edges {
-                                        top: px(widths[0]),
-                                        right: px(widths[1]),
-                                        bottom: px(widths[2]),
-                                        left: px(widths[3]),
-                                    },
-                                    color: colors[side],
-                                    style: kinds[side],
-                                    sides: 1 << side,
-                                },
-                            );
-                        }
-                    }
-                },
-            )
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full(),
-        );
+        el = el.child(border_canvas(
+            bands,
+            borders,
+            radius,
+            border_kinds.map(border_style),
+            false,
+        ));
     }
     let resizer = (node.tag == "textarea"
         && style.get(Prop::RESIZE).is_none_or(|value| value != "none"))
@@ -4207,9 +4061,7 @@ fn create(
                 .unwrap_or(style)
                 .get(Prop::COLOR)
                 .and_then(style::color)
-                .map_or(Color::hex(0x000000ff), |(ink, alpha)| {
-                    Color::hex(ink << 8 | alpha as u32)
-                });
+                .map_or(Color::hex(0x000000ff), style::rgba);
             let [ascent, descent, _] = metrics;
             let offset = (ascent * 2. / 3.).floor();
             let leading = ((line * pixel_ratio - ascent - descent) / 2.).floor();
@@ -4245,8 +4097,8 @@ fn create(
                 .text_size(px(size))
                 .line_height(px(line));
             marker_box.text_style().set_font_style(face.style);
-            if let Some((ink, alpha)) = marker.get(Prop::COLOR).and_then(style::color) {
-                marker_box = marker_box.text_color(Color::hex(ink << 8 | alpha as u32));
+            if let Some(ink) = marker.get(Prop::COLOR).and_then(style::color) {
+                marker_box = marker_box.text_color(style::rgba(ink));
             }
         }
         el = el.child(marker_box);
@@ -4370,8 +4222,8 @@ fn create(
                 }
                 style::LineHeight::Normal => {}
             }
-            if let Some((ink, alpha)) = pseudo.get(Prop::COLOR).and_then(style::color) {
-                decoration = decoration.text_color(Color::hex(ink << 8 | alpha as u32));
+            if let Some(ink) = pseudo.get(Prop::COLOR).and_then(style::color) {
+                decoration = decoration.text_color(style::rgba(ink));
             }
             let absolute = pseudo
                 .get(Prop::POSITION)
@@ -4389,19 +4241,7 @@ fn create(
                 .edges(pseudo, style::PADDING, containing[0])
                 .map(|v| v.max(0.));
             let pseudo_margin = pseudo_units.edges(pseudo, style::MARGIN, containing[0]);
-            let pseudo_borders = sides.map(|(width, kind, _)| {
-                if pseudo
-                    .get(kind)
-                    .is_none_or(|kind| matches!(kind, "none" | "hidden"))
-                {
-                    return 0.;
-                }
-                pseudo
-                    .get(width)
-                    .map_or(Some(3.), |width| pseudo_units.resolve(width, containing[0]))
-                    .unwrap_or(0.)
-                    .max(0.)
-            });
+            let pseudo_borders = pseudo_units.borders(pseudo, containing[0]);
             decoration = decoration
                 .pt(px(pseudo_padding[0]))
                 .pr(px(pseudo_padding[1]))
@@ -4421,7 +4261,7 @@ fn create(
                 pseudo
                     .get(color)
                     .and_then(style::color)
-                    .map_or(ink, |(ink, alpha)| Color::hex(ink << 8 | alpha as u32))
+                    .map_or(ink, style::rgba)
             });
             let mut shown = (0..4).filter(|&side| pseudo_borders[side] > 0.);
             if let Some(first) = shown.next() {
@@ -4431,50 +4271,13 @@ fn create(
                     decoration = decoration.border_color(renderer::Color::TRANSPARENT);
                     let kinds =
                         sides.map(|(_, kind, _)| border_style(pseudo.get(kind).unwrap_or("solid")));
-                    let (borders, radius) = (pseudo_borders, pseudo_radius);
-                    decoration = decoration.child(
-                        renderer::canvas(
-                            |_, _| (),
-                            move |bounds, _, window| {
-                                let outer = Rect::new(
-                                    point(
-                                        bounds.left() - px(borders[3]),
-                                        bounds.top() - px(borders[0]),
-                                    ),
-                                    size(
-                                        bounds.size.width + px(borders[1] + borders[3]),
-                                        bounds.size.height + px(borders[0] + borders[2]),
-                                    ),
-                                );
-                                let corners = radius.resolve(outer.size).fit(outer.size);
-                                for side in 0..4 {
-                                    if borders[side] <= 0. {
-                                        continue;
-                                    }
-                                    window.draw_box(
-                                        outer,
-                                        corners,
-                                        renderer::Color::TRANSPARENT,
-                                        renderer::Border {
-                                            widths: renderer::Edges {
-                                                top: px(borders[0]),
-                                                right: px(borders[1]),
-                                                bottom: px(borders[2]),
-                                                left: px(borders[3]),
-                                            },
-                                            color: colors[side],
-                                            style: kinds[side],
-                                            sides: 1 << side,
-                                        },
-                                    );
-                                }
-                            },
-                        )
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full(),
-                    );
+                    decoration = decoration.child(border_canvas(
+                        vec![([0.; 4], pseudo_borders, colors)],
+                        pseudo_borders,
+                        pseudo_radius,
+                        kinds,
+                        true,
+                    ));
                 }
             }
             let mut pseudo_shadows = Vec::new();
@@ -4486,11 +4289,7 @@ fn create(
                 );
                 let base = containing[usize::from(vertical)];
                 let length = || -> Option<renderer::Length> {
-                    match value
-                        .strip_suffix('%')
-                        .and_then(|v| v.parse::<f32>().ok())
-                        .filter(|v| v.is_finite())
-                    {
+                    match percentage(value) {
                         Some(percent) => Some(relative(percent / 100.)),
                         None => match percent_calc(&pseudo_units, value) {
                             Some((fraction, offset)) => {
@@ -4529,13 +4328,12 @@ fn create(
                         };
                     }
                     Prop::BACKGROUND_COLOR => {
-                        if let Some((color, alpha)) = style::color(value) {
-                            decoration = decoration.bg(Color::hex(color << 8 | alpha as u32));
+                        if let Some(color) = style::color(value) {
+                            decoration = decoration.bg(style::rgba(color));
                         }
                     }
                     Prop::OPACITY => {
-                        decoration =
-                            decoration.opacity(super::effects::opacity(pseudo).clamp(0., 1.));
+                        decoration = decoration.opacity(super::effects::opacity(pseudo));
                     }
                     Prop::BOX_SHADOW => {
                         decoration.style().box_shadow = pseudo_units.shadows(value, false);
@@ -4603,7 +4401,7 @@ fn create(
                 }),
                 None => decoration,
             };
-            let decoration = if [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE]
+            let decoration = if super::TRANSFORM_PROPS
                 .iter()
                 .any(|&prop| pseudo.get(prop).is_some_and(|value| value != "none"))
             {
@@ -4659,23 +4457,17 @@ fn create(
         {
             None
         } else {
-            measured
-                .borrow_mut()
-                .texts
-                .entry(id)
-                .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
-                .clone()
-                .filter(|data| {
-                    !data.text.is_empty() || {
-                        let found = content_editable(doc, id);
-                        reader.log(
-                            Query::Editable,
-                            found.map_or(1, |node| reader.scope_of(id, node)),
-                            hashed(found.is_some()),
-                        );
-                        found.is_some()
-                    }
-                })
+            inline_text().filter(|data| {
+                !data.text.is_empty() || {
+                    let found = content_editable(doc, id);
+                    reader.log(
+                        Query::Editable,
+                        found.map_or(1, |node| reader.scope_of(id, node)),
+                        hashed(found.is_some()),
+                    );
+                    found.is_some()
+                }
+            })
         };
     let hit_test = inline.is_some();
     let drag = style
@@ -4809,7 +4601,7 @@ fn create(
                         .is_some_and(|value| value == "justify")
                 }),
         });
-        let alone = !el.has_children()
+        let alone = el.kids().is_empty()
             && data.atoms.is_empty()
             && trim_top == 0.
             && trim_bottom == 0.
@@ -4822,7 +4614,7 @@ fn create(
             && matches!(position, "static" | "relative")
             && el.style_ref().overflow.x == renderer::Overflow::Visible
             && el.style_ref().overflow.y == renderer::Overflow::Visible
-            && [Prop::TRANSFORM, Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE]
+            && super::TRANSFORM_PROPS
                 .iter()
                 .all(|&prop| style.get(prop).is_none_or(|value| value == "none"))
             && style
@@ -5467,6 +5259,7 @@ fn create(
                 .is_none_or(|value| !value.contains("nowrap"));
         el.reserve(children.len());
         let mut item_margins = rustc_hash::FxHashMap::<*const style::Style, [f32; 4]>::default();
+        let (mut scanned, mut last_flow, mut flowing) = (0, None, None);
         for (index, &child) in children.iter().enumerate() {
             if index != joined && shown(index) {
                 if let Some((slots, runs, then, zone)) = plan.as_mut()
@@ -5646,26 +5439,33 @@ fn create(
                     let block = child_style
                         .get(Prop::DISPLAY)
                         .is_some_and(|value| !value.starts_with("inline"));
-                    let pending = flat
-                        [..flat.iter().position(|&other| other == child).unwrap_or(0)]
-                        .iter()
-                        .rev()
-                        .find(|&&other| in_flow(doc, info, other) && !floated(other))
-                        .filter(|&&other| {
-                            block && line.is_none() && !all_inline && self::block(build, other)
-                        })
-                        .map_or(0., |&other| {
-                            let (_, [positive, negative], _) = adjoining(build, other, content[0]);
-                            let used = margins(
-                                build,
-                                other,
-                                &styles.lengths[other],
-                                content[0],
-                                false,
-                                false,
-                            )[2];
-                            (positive + negative - used).max(0.)
-                        });
+                    let pending = if block && line.is_none() && !all_inline {
+                        for &other in &children[scanned..index] {
+                            if in_flow(doc, info, other) && !floated(other) {
+                                last_flow = Some(other);
+                            }
+                        }
+                        scanned = index;
+                        last_flow
+                    } else {
+                        None
+                    };
+                    let pending =
+                        pending
+                            .filter(|&other| self::block(build, other))
+                            .map_or(0., |other| {
+                                let (_, [positive, negative], _) =
+                                    adjoining(build, other, content[0]);
+                                let used = margins(
+                                    build,
+                                    other,
+                                    &styles.lengths[other],
+                                    content[0],
+                                    false,
+                                    false,
+                                )[2];
+                                (positive + negative - used).max(0.)
+                            });
                     let entity = view.clone();
                     let mut placeholder = renderer::canvas(
                         move |mut bounds, _| {
@@ -5687,9 +5487,11 @@ fn create(
                         if block
                             && (line.is_some()
                                 || all_inline
-                                    && flat
-                                        .iter()
-                                        .any(|&other| other != child && in_flow(doc, info, other)))
+                                    && *flowing.get_or_insert_with(|| {
+                                        flat.iter()
+                                            .filter(|&&other| in_flow(doc, info, other))
+                                            .count()
+                                    }) > usize::from(in_flow(doc, info, child)))
                         {
                             units.font.lh
                         } else {
@@ -5945,7 +5747,7 @@ fn create(
         el = el.child(renderer::layers(false));
     }
     el = el.children(bars);
-    let sticky = (style.get(Prop::POSITION).is_some_and(|v| v == "sticky"))
+    let sticky = (position == "sticky")
         .then(|| {
             let host = view.host.borrow();
             let scrolls = &host.dom.get(&view.id)?.scroll;
@@ -6384,7 +6186,7 @@ fn only_auto_ratio(mut el: renderer::Node, style: &style::Style) -> renderer::No
     el
 }
 
-pub(crate) fn aspect_ratio(value: &str) -> Option<f32> {
+pub(super) fn aspect_ratio(value: &str) -> Option<f32> {
     let value = value.replace('/', " / ");
     let parts = style::components(&value, ' ');
     let numbers: Vec<f32> = parts.iter().filter_map(|part| part.parse().ok()).collect();
@@ -6527,7 +6329,7 @@ fn paint_broken_icon(origin: renderer::Point<renderer::Pixels>, window: &mut ren
     let raster = (16. * window.scale_factor()).ceil() as u32;
     let Some(image) = ICON.with_borrow_mut(|icon| {
         if icon.as_ref().is_none_or(|(size, _)| *size != raster) {
-            *icon = super::canvas::svg(SVG, raster, raster, None)
+            *icon = super::canvas::svg(SVG, raster, raster)
                 .ok()
                 .map(|image| (raster, image));
         }
@@ -6691,7 +6493,7 @@ fn in_flow(doc: &Document, info: &[cull::Info], id: usize) -> bool {
 }
 
 // Keep these margins equal to layout margins: culled spacers use them.
-pub(super) fn margins(
+fn margins(
     build: &Build<'_>,
     id: usize,
     units: &style::Lengths,
@@ -6703,7 +6505,7 @@ pub(super) fn margins(
     let Some(parent) = build.doc.nodes[id].parent.filter(|_| !flex_parent && !slot) else {
         return margin;
     };
-    let walked = build.margins.borrow().0.get(&parent).cloned();
+    let walked = build.walks.borrow().get(&parent).cloned();
     let walked = walked.unwrap_or_else(|| {
         let collapses = container(build, parent);
         let open =
@@ -6716,7 +6518,7 @@ pub(super) fn margins(
             && *old == key
             && !animated
         {
-            build.margins.borrow_mut().0.insert(parent, used.clone());
+            build.walks.borrow_mut().insert(parent, used.clone());
             return used.clone();
         }
         let mut used = rustc_hash::FxHashMap::default();
@@ -6771,7 +6573,7 @@ pub(super) fn margins(
             }
         }
         let used = Rc::new(used);
-        build.margins.borrow_mut().0.insert(parent, used.clone());
+        build.walks.borrow_mut().insert(parent, used.clone());
         if !animated {
             build
                 .view
@@ -6898,8 +6700,8 @@ fn percent_calc(units: &style::Lengths, value: &str) -> Option<(f32, f32)> {
     })
 }
 
-fn adjoining(build: &Build<'_>, id: usize, width: f32) -> ([f32; 2], [f32; 2], bool) {
-    if let Some(&sets) = build.margins.borrow().1.get(&id) {
+fn adjoining(build: &Build<'_>, id: usize, width: f32) -> Sets {
+    if let Some(&sets) = build.adjoins.borrow().get(&id) {
         return sets;
     }
     let key = (build.info[id].revision, width.to_bits());
@@ -6908,7 +6710,7 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> ([f32; 2], [f32; 2], b
         && let Some(&(old, sets)) = build.view.adjoined.borrow().get(&id)
         && old == key
     {
-        build.margins.borrow_mut().1.insert(id, sets);
+        build.adjoins.borrow_mut().insert(id, sets);
         return sets;
     }
     let (style, units) = (&build.styles.values[id], build.styles.lengths[id]);
@@ -6972,11 +6774,7 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> ([f32; 2], [f32; 2], b
         top = [top[0].max(bottom[0]), top[1].min(bottom[1])];
         bottom = top;
     }
-    build
-        .margins
-        .borrow_mut()
-        .1
-        .insert(id, (top, bottom, empty));
+    build.adjoins.borrow_mut().insert(id, (top, bottom, empty));
     if !animated && !deep {
         build
             .view
@@ -7054,9 +6852,7 @@ fn columns(
             let color = rule_color
                 .or_else(|| style.get(Prop::COLOR))
                 .and_then(style::color)
-                .map_or(renderer::Color::BLACK, |(ink, alpha)| {
-                    Color::hex(ink << 8 | alpha as u32)
-                });
+                .map_or(renderer::Color::BLACK, style::rgba);
             (width, color, border_style(kind))
         })
         .filter(|(width, ..)| *width > 0.);
@@ -7275,19 +7071,18 @@ fn border_style(kind: &str) -> renderer::BorderStyle {
 }
 
 fn shade_border(color: renderer::Color, dark: bool) -> renderer::Color {
-    let rgba = color;
-    let value = rgba.r.max(rgba.g).max(rgba.b);
+    let value = color.r.max(color.g).max(color.b);
     if value <= 0. {
         let gray = if dark { 0.33 } else { 0.66 };
         return renderer::Color {
             r: gray,
             g: gray,
             b: gray,
-            a: rgba.a,
+            a: color.a,
         };
     }
     let end = if dark { 0. } else { 1. };
-    let distance = (rgba.r - end).powi(2) + (rgba.g - end).powi(2) + (rgba.b - end).powi(2);
+    let distance = (color.r - end).powi(2) + (color.g - end).powi(2) + (color.b - end).powi(2);
     if distance <= 3. * (if dark { 32. } else { 20. } / 255.0f32).powi(2) {
         return color;
     }
@@ -7297,11 +7092,76 @@ fn shade_border(color: renderer::Color, dark: bool) -> renderer::Color {
         (value + 0.33).min(1.) / value
     };
     renderer::Color {
-        r: (rgba.r * factor).min(1.),
-        g: (rgba.g * factor).min(1.),
-        b: (rgba.b * factor).min(1.),
-        a: rgba.a,
+        r: (color.r * factor).min(1.),
+        g: (color.g * factor).min(1.),
+        b: (color.b * factor).min(1.),
+        a: color.a,
     }
+}
+
+fn border_canvas(
+    bands: Vec<([f32; 4], [f32; 4], [renderer::Color; 4])>,
+    borders: [f32; 4],
+    radius: renderer::Radii<renderer::Length>,
+    kinds: [renderer::BorderStyle; 4],
+    pseudo: bool,
+) -> renderer::Node {
+    renderer::canvas(
+        |_, _| (),
+        move |bounds, _, window| {
+            let outer = Rect::new(
+                point(
+                    bounds.left() - px(borders[3]),
+                    bounds.top() - px(borders[0]),
+                ),
+                size(
+                    bounds.size.width + px(borders[1] + borders[3]),
+                    bounds.size.height + px(borders[0] + borders[2]),
+                ),
+            );
+            for (inset, widths, colors) in &bands {
+                // Pseudo-element borders paint on `outer`, box borders on the rect between the insets: the two
+                // differ by an ulp at fractional positions.
+                let bounds = if pseudo {
+                    outer
+                } else {
+                    Rect::between(
+                        outer.origin + point(px(inset[3]), px(inset[0])),
+                        outer.bottom_right() - point(px(inset[1]), px(inset[2])),
+                    )
+                };
+                let corners = radius
+                    .resolve(outer.size)
+                    .inset(px(inset[0]), px(inset[1]), px(inset[2]), px(inset[3]))
+                    .fit(bounds.size);
+                for side in 0..4 {
+                    if widths[side] <= 0. {
+                        continue;
+                    }
+                    window.draw_box(
+                        bounds,
+                        corners,
+                        renderer::Color::TRANSPARENT,
+                        renderer::Border {
+                            widths: renderer::Edges {
+                                top: px(widths[0]),
+                                right: px(widths[1]),
+                                bottom: px(widths[2]),
+                                left: px(widths[3]),
+                            },
+                            color: colors[side],
+                            style: kinds[side],
+                            sides: 1 << side,
+                        },
+                    );
+                }
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
 }
 
 fn inset_shadows(
@@ -7390,14 +7250,6 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                         })
                         .collect();
                     entry.0 = source.clone();
-                    if let Some(kept) = geometry
-                        .svgs
-                        .borrow_mut()
-                        .get_mut(&id)
-                        .filter(|kept| kept.2 == *source)
-                    {
-                        kept.3 = entry.clone();
-                    }
                 }
                 let [scale_x, scale_y] =
                     [0, 1].map(|axis| [width, height][axis] / entry.2[axis].max(f32::EPSILON));
@@ -7433,19 +7285,19 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
             let mut host = view.host.borrow_mut();
             let state = host.dom.entry(view.id).or_default();
             let source = if inline {
-                state.svg_sources.get(&id).map(String::as_str)
+                state.svg_sources.get(&id).cloned()
             } else {
-                state.svg_images.get(&id).map(|(source, _)| &**source)
+                state.svg_images.get(&id).map(|(source, _)| source.clone())
             };
             let Some(source) = source else { return };
             if state.svgs.get(&id).is_none_or(|(old, image)| {
-                !inline && old != source
+                !inline && *old != source
                     || (image.size().width as u32) != raster[0]
                     || (image.size().height as u32) != raster[1]
             }) {
                 let shared = state
                     .svg_cache
-                    .get(source)
+                    .get(&source)
                     .filter(|_| inline)
                     .and_then(|(_, images)| {
                         images.iter().find(|image| {
@@ -7456,7 +7308,7 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                 let image = match (&shared, state.svg_trees.remove(&id).filter(|_| inline)) {
                     (Some(image), _) => Ok(image.clone()),
                     (_, Some(tree)) => super::canvas::render_svg(&tree, raster[0], raster[1], None),
-                    _ => super::canvas::svg(source, raster[0], raster[1], None),
+                    _ => super::canvas::svg(&source, raster[0], raster[1]),
                 };
                 match image {
                     Ok(image) => {
@@ -7464,11 +7316,11 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>) -> Child {
                             && shared.is_none()
                             && raster[0] <= 96
                             && raster[1] <= 96
-                            && let Some((_, images)) = state.svg_cache.get_mut(source)
+                            && let Some((_, images)) = state.svg_cache.get_mut(&source)
                         {
                             images.push(image.clone());
                         }
-                        if let Some((_, old)) = state.svgs.insert(id, (source.to_owned(), image))
+                        if let Some((_, old)) = state.svgs.insert(id, (source, image))
                             && Arc::strong_count(&old) == 1
                         {
                             window.release_image(old);

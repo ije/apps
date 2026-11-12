@@ -2,6 +2,7 @@ use crate::{
     Color, Pixels, Rect, Size, point, px, size,
     text::{
         FaceMetrics, Features, Font, FontId, FontStyle, Glyph, GlyphId, GlyphRaster, Line, Span,
+        best,
     },
 };
 use anyhow::{Context as _, Result, bail};
@@ -81,60 +82,6 @@ impl Default for TextSystem {
             lines: Vec::new(),
             last: None,
         }))
-    }
-}
-
-fn closest(faces: &[(f32, FontStyle, f32)], weight: f32, style: FontStyle) -> Option<usize> {
-    let pick = |values: &mut dyn Iterator<Item = f32>, wanted: f32, low_first: bool| {
-        let (mut below, mut above) = (None::<f32>, None::<f32>);
-        for value in values {
-            if value <= wanted {
-                below = Some(below.map_or(value, |kept| kept.max(value)));
-            } else {
-                above = Some(above.map_or(value, |kept| kept.min(value)));
-            }
-        }
-        match low_first {
-            true => below.or(above),
-            false => above.or(below),
-        }
-    };
-    let stretch = pick(&mut faces.iter().map(|face| face.2), 1., true)?;
-    let fallbacks = match style {
-        FontStyle::Normal => [FontStyle::Normal, FontStyle::Oblique, FontStyle::Italic],
-        FontStyle::Italic => [FontStyle::Italic, FontStyle::Oblique, FontStyle::Normal],
-        FontStyle::Oblique => [FontStyle::Oblique, FontStyle::Italic, FontStyle::Normal],
-    };
-    let slant = fallbacks.into_iter().find(|slant| {
-        faces
-            .iter()
-            .any(|face| face.2 == stretch && face.1 == *slant)
-    })?;
-    let fits = |face: &&(f32, FontStyle, f32)| face.2 == stretch && face.1 == slant;
-    let has = |value: f32| faces.iter().filter(fits).any(|face| face.0 == value);
-    let chosen = if has(weight) {
-        weight
-    } else if (400. ..450.).contains(&weight) && has(500.) {
-        500.
-    } else if (450. ..=500.).contains(&weight) && has(400.) {
-        400.
-    } else {
-        pick(
-            &mut faces.iter().filter(fits).map(|face| face.0),
-            weight,
-            weight <= 500.,
-        )?
-    };
-    faces
-        .iter()
-        .position(|face| fits(&face) && face.0 == chosen)
-}
-
-fn slant(style: fontdb::Style) -> FontStyle {
-    match style {
-        fontdb::Style::Normal => FontStyle::Normal,
-        fontdb::Style::Italic => FontStyle::Italic,
-        fontdb::Style::Oblique => FontStyle::Oblique,
     }
 }
 
@@ -364,12 +311,16 @@ impl TextSystem {
                 };
                 Some((
                     weight,
-                    slant(face.style),
+                    match face.style {
+                        fontdb::Style::Normal => FontStyle::Normal,
+                        fontdb::Style::Italic => FontStyle::Italic,
+                        fontdb::Style::Oblique => FontStyle::Oblique,
+                    },
                     f32::from(face.stretch.to_number()) / 5.,
                 ))
             })
             .collect();
-        let at = closest(&traits, font.weight, font.style)?;
+        let at = best(&traits, font.weight, font.style)?;
         shelf.face(faces[at], traits[at].0, &font.features)
     }
 
@@ -434,13 +385,6 @@ impl TextSystem {
             font_size,
             ..Default::default()
         };
-        for span in spans {
-            let face = &shelf.faces[span.font as usize];
-            let metrics = face.font.as_swash().metrics(&face.coords);
-            let em = f32::from(metrics.units_per_em.max(1));
-            line.ascent = line.ascent.max(span.size * (metrics.ascent / em));
-            line.descent = line.descent.max(span.size * (metrics.descent / em));
-        }
         // cosmic-text panics on paragraphs of different directions in one line, so each is shaped alone.
         let mut start = 0;
         for (at, ch) in text.char_indices() {

@@ -1,6 +1,6 @@
 globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   const pending=new Map(),functions=new Map(),functionIds=new WeakMap(),handlers=new Map(),queue=[],refs=new Map(),refIds=new WeakMap(),facades=new Map(),emitter=EventEmitter?new EventEmitter():null;
-  const random=crypto.randomUUID.bind(crypto),errors={Error,EvalError,RangeError,ReferenceError,SyntaxError,TypeError,URIError};
+  const random=crypto.randomUUID.bind(crypto),errors={Error,EvalError,RangeError,ReferenceError,SyntaxError,TypeError,URIError},constructors={Int8Array,Uint8Array,Uint8ClampedArray,Int16Array,Uint16Array,Int32Array,Uint32Array,Float32Array,Float64Array,BigInt64Array,BigUint64Array,DataView};
   // Expose dropped-file indices, never paths. Forged indices can access only files dropped on that page.
   const files=hooks.files=new WeakMap();
   const peer=role=>role==='main'?'main':typeof role==='object'&&role!==null?'preload'in role?'preload:'+role.preload:'renderer'in role?'renderer:'+role.renderer:null:null;
@@ -62,7 +62,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     else if(value.type==='date')result=new Date(Number(value.value));
     else if(value.type==='error'){result=new(Object.hasOwn(errors,value.name)?errors[value.name]:Error)(value.value);if(result.name!==value.name)result.name=value.name;result.stack=value.stack;}
     else if(value.type==='blob'){result=value.name===undefined?new Blob([value.value],{type:value.mime}):new File([value.value],value.name,{type:value.mime,lastModified:value.lastModified});if(value.file!==undefined)files.set(result,value.file);}
-    else if(value.type==='bytes'){const bytes=new Uint8Array(value.value);const constructors={Int8Array,Uint8Array,Uint8ClampedArray,Int16Array,Uint16Array,Int32Array,Uint32Array,Float32Array,Float64Array,BigInt64Array,BigUint64Array,DataView};result=value.name==='ArrayBuffer'?bytes.buffer:new (constructors[value.name]??Uint8Array)(bytes.buffer);}
+    else if(value.type==='bytes'){const bytes=new Uint8Array(value.value);result=value.name==='ArrayBuffer'?bytes.buffer:new (constructors[value.name]??Uint8Array)(bytes.buffer);}
     else result=value.type==='array'?new Array(value.items.length):value.type==='map'?new Map():value.type==='set'?new Set():{};
     seen.set(value.id,result);
     if(value.type==='array')value.items.forEach((v,i)=>{if(v)result[i]=decode(v,target,seen);});

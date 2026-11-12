@@ -1509,7 +1509,7 @@ fn sf_symbol_tags_keep_siblings_and_tailwind_sizes() {
         "<link rel='stylesheet' href='./style.css'><main><sf-symbol-folder-fill class='size-16'/><span>After</span><sf-symbol-xmark /></main>",
     )
     .unwrap();
-    let source = html(&path, Rc::default(), Rc::default(), false).unwrap();
+    let source = html(&path, &Rc::default()).unwrap();
     let doc = apps_runtime::bundle::page(&source);
     let [symbol, after, close] = ["sf-symbol-folder-fill", "span", "sf-symbol-xmark"]
         .map(|tag| doc.nodes.iter().position(|node| node.tag == tag).unwrap());
@@ -1558,7 +1558,7 @@ fn glass_classes_work_with_nested_css_and_no_glass_import() {
             ),
         )
         .unwrap();
-        let source = html(&path, Rc::default(), Rc::default(), false).unwrap();
+        let source = html(&path, &Rc::default()).unwrap();
         assert_eq!(
             linked_css(&source).contains("@import \"tailwindcss\";"),
             tailwind
@@ -1610,8 +1610,12 @@ fn tailwind_import_survives_nested_css_without_a_package() {
         "<link rel='stylesheet' href='./style.css'><div class='h-4 w-4 flex bg-mint-500'></div>",
     )
     .unwrap();
-    let files = Rc::default();
-    let source = html(&path, Rc::clone(&files), Rc::default(), false).unwrap();
+    let files: Rc<RefCell<BTreeSet<PathBuf>>> = Rc::default();
+    let shared = Rc::new(Shared {
+        files: Rc::clone(&files),
+        ..Shared::default()
+    });
+    let source = html(&path, &shared).unwrap();
     assert!(linked_css(&source).contains("@import \"tailwindcss\";"));
     assert!(!source.contains(".h-4"));
     assert_eq!(files.borrow().len(), 2);
@@ -1641,7 +1645,7 @@ fn tailwind_parts_keep_their_imports() {
         "<link rel='stylesheet' href='./style.css'><ul class='flex'></ul>",
     )
     .unwrap();
-    let source = html(&path, Rc::default(), Rc::default(), false).unwrap();
+    let source = html(&path, &Rc::default()).unwrap();
     let css = linked_css(&source);
     assert!(css.contains("@import \"tailwindcss/theme.css\";"));
     assert!(css.contains("@import \"tailwindcss/utilities\";"));
@@ -2677,7 +2681,6 @@ fn resolves_dotted_files_package_imports_browser_fields_and_type_only_imports() 
             &dir.path().join("style.css"),
             None,
             &mut Vec::new(),
-            &Rc::default(),
             &Shared::default()
         )
         .is_err()
@@ -3631,6 +3634,79 @@ fn production_drops_unused_modules_of_side_effect_free_packages() {
 }
 
 #[test]
+fn main_workers_share_pages_and_skip_package_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("index.html"), "<p>main-page</p>").unwrap();
+    fs::write(dir.path().join("other.html"), "<p>other-page</p>").unwrap();
+    fs::write(
+        dir.path().join("worker.js"),
+        "postMessage(import.meta.resolve('./other.html'));",
+    )
+    .unwrap();
+    let package = dir.path().join("node_modules/some-pkg");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(
+        package.join("package.json"),
+        r#"{"name":"some-pkg","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(package.join("worker.js"), "postMessage(1);").unwrap();
+    fs::write(
+        dir.path().join("a.html"),
+        "<p>preload-page</p><script type='preload'>new Worker(new URL('./page-worker.js', import.meta.url));</script>",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("page-worker.js"),
+        "postMessage(import.meta.resolve('./a.html'));",
+    )
+    .unwrap();
+    let entry = dir.path().join("app.js");
+    fs::write(
+        &entry,
+        "globalThis.page = import.meta.resolve('./index.html'); new Worker(new URL('./worker.js', import.meta.url)); new Worker(import.meta.resolve('some-pkg/worker.js')); if (globalThis.window) window.loadFile('a.html');",
+    )
+    .unwrap();
+    for production in [false, true] {
+        let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+        let pages: Vec<_> = files
+            .iter()
+            .filter(|(name, _)| name.starts_with("page-"))
+            .collect();
+        assert_eq!(pages.len(), 3, "production={production}");
+        let (other, _) = pages
+            .iter()
+            .find(|(_, source)| source.contains("other-page"))
+            .unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|(name, source)| name.starts_with("script-")
+                    && source.contains(&format!("apps:///{other}"))),
+            "production={production}"
+        );
+        let (preload, _) = pages
+            .iter()
+            .find(|(_, source)| source.contains("preload-page"))
+            .unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|(name, source)| name.starts_with("script-")
+                    && source.contains(&format!("apps:///{preload}"))),
+            "production={production}"
+        );
+        for (_, source) in &files {
+            for (at, _) in source.match_indices("apps:///page-") {
+                let name = &source[at + 8..];
+                let name = &name[..name.find(".html").unwrap() + 5];
+                assert!(files.contains_key(name), "{name} production={production}");
+            }
+        }
+    }
+}
+
+#[test]
 fn main_workers_from_paths_known_at_build_time_get_node_apis() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("lib")).unwrap();
@@ -4084,8 +4160,10 @@ fn css_urls_skip_comments_and_strings_and_asset_names_are_stable() {
     let css = urls(
         "/* url( */ .a{background:URL( '../img/a.png' )} .b::after{content:'url('} .c{background:url(../img/b.png)}",
         &root.join("web"),
-        &Rc::default(),
-        &root,
+        &Shared {
+            root: root.clone(),
+            ..Shared::default()
+        },
     );
     assert_eq!(
         css,

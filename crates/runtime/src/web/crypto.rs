@@ -1,4 +1,4 @@
-use crate::web::{base64, bytes};
+use crate::{jsc::payload::write, web::bytes};
 use anyhow::{Context, Result, bail, ensure};
 use ring::{
     aead, hmac,
@@ -44,7 +44,9 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
             }
             let key = signature::Ed25519KeyPair::from_seed_unchecked(&seed)
                 .map_err(|_| anyhow::anyhow!("Invalid Ed25519 key"))?;
-            Ok(json!({"private":base64(&seed),"public":base64(key.public_key().as_ref())}))
+            Ok(
+                json!({"private":write(seed.to_vec()),"public":write(key.public_key().as_ref().to_vec())}),
+            )
         }
         "generate" => {
             let signing = if args[0] == "P-384" {
@@ -63,7 +65,9 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
             let mut inner = der(&mut octets, 0x30)?;
             der(&mut inner, 2)?;
             let private = der(&mut inner, 4)?;
-            Ok(json!({"private":base64(private),"public":base64(key.public_key().as_ref())}))
+            Ok(
+                json!({"private":write(private.to_vec()),"public":write(key.public_key().as_ref().to_vec())}),
+            )
         }
         "sign" | "verify" => {
             let algorithm = args[0].as_str().context("Expected algorithm")?;
@@ -120,12 +124,14 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                         signing, &secret, &public, &rng,
                     )
                     .map_err(|_| anyhow::anyhow!("Invalid ECDSA key"))?;
-                    return Ok(base64(key.sign(&rng, &data).map_err(failed)?.as_ref()));
+                    return Ok(write(
+                        key.sign(&rng, &data).map_err(failed)?.as_ref().to_vec(),
+                    ));
                 }
                 "ed25519" => {
                     let key = signature::Ed25519KeyPair::from_seed_and_public_key(&secret, &public)
                         .map_err(|_| anyhow::anyhow!("Invalid Ed25519 key"))?;
-                    return Ok(base64(key.sign(&data).as_ref()));
+                    return Ok(write(key.sign(&data).as_ref().to_vec()));
                 }
                 "rsa" | "rsa-pss" => {
                     let padding: &'static dyn signature::RsaEncoding = match (algorithm, hash) {
@@ -142,7 +148,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                     let mut output = vec![0; key.public().modulus_len()];
                     key.sign(padding, &rng, &data, &mut output)
                         .map_err(failed)?;
-                    return Ok(base64(&output));
+                    return Ok(write(output));
                 }
                 _ => {}
             }
@@ -158,7 +164,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
             if op == "verify" {
                 Ok(json!(hmac::verify(&key, &data, &signature).is_ok()))
             } else {
-                Ok(base64(hmac::sign(&key, &data).as_ref()))
+                Ok(write(hmac::sign(&key, &data).as_ref().to_vec()))
             }
         }
         "encrypt" | "decrypt" => {
@@ -200,7 +206,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                     .len();
                 data.truncate(size);
             }
-            Ok(crate::jsc::payload::write(data))
+            Ok(write(data))
         }
         "pbkdf2" | "hkdf" => crate::node::system::call(op, args),
         _ => bail!("Unsupported crypto operation: {op}"),

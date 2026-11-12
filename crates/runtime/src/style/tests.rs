@@ -1729,14 +1729,14 @@ fn shadows_split_inset_and_outer_lists() {
 }
 
 #[test]
-fn filters_fold_into_one_color_matrix() {
+fn filters_parse_into_color_matrices() {
     let units = Lengths::new(16., 800., 600.);
     let parse = |value: &str| Filter::parse(value, &units);
-    let (gray, opacity, shadows) = parse("grayscale(100%) opacity(50%) blur(2px)");
+    let (gray, opacity) = parse("grayscale(100%)");
     let gray = gray.unwrap();
     assert!(gray.0.iter().all(|row| row[..3] == gray.0[0][..3]));
-    assert_eq!(opacity, 0.5);
-    assert!(shadows.is_empty());
+    assert_eq!(opacity, 1.);
+    assert_eq!(parse("opacity(50%)"), (None, 0.5));
     let (ink, alpha) = gray.color((0xff0000, 128));
     assert_eq!(
         (ink >> 16, ink >> 8 & 255, ink & 255, alpha),
@@ -1747,30 +1747,18 @@ fn filters_fold_into_one_color_matrix() {
         (0xff007f, 255)
     );
     assert_eq!(
-        parse("brightness(2) contrast(0)")
-            .0
-            .unwrap()
-            .color((0x123456, 255)),
+        parse("contrast(0)").0.unwrap().color((0x123456, 255)),
         (0x808080, 255)
     );
-    assert_eq!(parse("hue-rotate(0deg) saturate(1)").0, None);
-    assert_eq!(parse("grayscale(-1)").0, None);
-    assert_eq!(parse("sepia(1) unknown(2)").0, None);
-    let (matrix, _, shadows) = parse("drop-shadow(2px 3px 4px #ff0000) invert(1)");
-    assert_eq!(shadows.len(), 1);
     assert_eq!(
-        shadows[0].offset,
-        renderer::point(renderer::px(2.), renderer::px(3.))
+        parse("brightness(2)").0.unwrap().color((0x123456, 255)),
+        (0x2468ac, 255)
     );
-    assert_eq!(shadows[0].color, renderer::Color::hex(0x00ffffff));
-    let twice = matrix.unwrap().then(matrix.unwrap());
-    assert!(
-        twice
-            .0
-            .iter()
-            .zip([[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]])
-            .all(|(a, b)| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-4))
-    );
+    assert_eq!(parse("hue-rotate(0deg)").0, None);
+    assert_eq!(parse("saturate(1)").0, None);
+    assert_eq!(parse("grayscale(-1)").0, None);
+    assert_eq!(parse("unknown(2)"), (None, 1.));
+    assert_eq!(parse("blur(2px)"), (None, 1.));
 }
 
 #[test]
@@ -3375,7 +3363,7 @@ fn attach(doc: &mut Document) -> Rc<Shadows> {
         let node = &mut doc.nodes[root];
         node.parent = None;
         node.tag = "#fragment".into();
-        node.attrs.clear();
+        node.attrs = Default::default();
     }
     let host = pairs[0].0;
     let mut composed: FxHashMap<usize, Vec<usize>> = pairs

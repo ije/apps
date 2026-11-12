@@ -1,7 +1,6 @@
 globalThis.__appsWorkers = (call, nativeAccess, task) => {
   const cryptoCodec = globalThis.__appsCryptoCodec, { decode: decodeBytes } = globalThis.__appsBytes;
   const stringify = JSON.stringify.bind(JSON), parse = JSON.parse.bind(JSON);
-  const encodeBytes = value => value.toBase64();
   delete globalThis.__appsCryptoCodec;
   if (!nativeAccess) delete globalThis.__appsBytes;
   const fresh = new WeakSet();
@@ -19,7 +18,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task) => {
       if (globalThis.CryptoKey && value instanceof CryptoKey) node = ['crypto', cryptoCodec.encode(value)];
       else if (globalThis.ImageBitmap && value instanceof ImageBitmap) { const [width, height, bytes] = value._wire(); fresh.add(bytes.buffer); node = ['bitmap', width, height, visit(bytes.buffer)]; }
       else if (globalThis.OffscreenCanvas && value instanceof OffscreenCanvas) { if (!transfer?.includes(value)) throw new DOMException('An OffscreenCanvas must be transferred', 'DataCloneError'); node = ['offscreen', ...value._wire()]; }
-      else if (value instanceof ArrayBuffer) node = ['buffer', buffers ? buffers.push(value) - 1 : encodeBytes(new Uint8Array(value))];
+      else if (value instanceof ArrayBuffer) node = ['buffer', buffers ? buffers.push(value) - 1 : new Uint8Array(value).toBase64()];
       else if (ArrayBuffer.isView(value)) node = ['view', value.constructor.name, visit(value.buffer), value.byteOffset, value.byteLength];
       else if (value instanceof Date) node = ['date', value.getTime()];
       else if (value instanceof RegExp) node = ['regexp', value.source, value.flags];

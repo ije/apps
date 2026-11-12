@@ -37,16 +37,6 @@ pub(crate) const BORDERS: [[Prop; 3]; 4] = [
     ],
 ];
 
-impl Lengths {
-    pub fn edges(&self, style: &Style, sides: [Prop; 4], base: f32) -> [f32; 4] {
-        sides.map(|side| {
-            style
-                .get(side)
-                .map_or(0., |value| self.resolve(value, base).unwrap_or(0.))
-        })
-    }
-}
-
 pub fn length(value: &str, base: f32, font: f32, vw: f32, vh: f32) -> f32 {
     Lengths::new(font, vw, vh)
         .parse(value, base)
@@ -185,28 +175,49 @@ fn tokenized(value: &str, separator: char) -> Vec<&str> {
     parts
 }
 
-type ShadowMemo = rustc_hash::FxHashMap<u64, (Box<str>, bool, [u32; 16], Vec<renderer::BoxShadow>)>;
+type ShadowMemo = rustc_hash::FxHashMap<u64, (Box<str>, bool, [u32; 18], Vec<renderer::BoxShadow>)>;
 
 thread_local! {
     static SHADOWS: std::cell::RefCell<ShadowMemo> = Default::default();
 }
 
 impl Lengths {
+    pub fn edges(&self, style: &Style, sides: [Prop; 4], base: f32) -> [f32; 4] {
+        sides.map(|side| {
+            style
+                .get(side)
+                .map_or(0., |value| self.resolve(value, base).unwrap_or(0.))
+        })
+    }
+
+    pub fn borders(&self, style: &Style, base: f32) -> [f32; 4] {
+        BORDERS.map(|[width, kind, _]| {
+            if style
+                .get(kind)
+                .is_none_or(|kind| matches!(kind, "none" | "hidden"))
+            {
+                return 0.;
+            }
+            style
+                .get(width)
+                .map_or(Some(3.), |width| self.resolve(width, base))
+                .unwrap_or(0.)
+                .max(0.)
+        })
+    }
+
     pub fn shadows(&self, value: &str, inset: bool) -> Vec<renderer::BoxShadow> {
         if value == "none" {
             return Vec::new();
         }
-        let [font, root] = [self.font, self.root].map(|units| {
-            [units.em, units.ch, units.ex, units.cap, units.ic, units.lh].map(f32::to_bits)
-        });
         let [vw, vh] = self.viewport.map(f32::to_bits);
         let [cw, ch] = self
             .container
             .map_or([u32::MAX; 2], |size| size.map(f32::to_bits));
-        let mut units = [0; 16];
-        units[..6].copy_from_slice(&font);
-        units[6..12].copy_from_slice(&root);
-        units[12..].copy_from_slice(&[vw, vh, cw, ch]);
+        let mut units = [0; 18];
+        units[..7].copy_from_slice(&self.font.bits());
+        units[7..14].copy_from_slice(&self.root.bits());
+        units[14..].copy_from_slice(&[vw, vh, cw, ch]);
         let hash = {
             use std::hash::{Hash, Hasher};
             let mut hasher = rustc_hash::FxHasher::default();
@@ -265,146 +276,106 @@ impl Lengths {
 pub(crate) struct Filter(pub [[f32; 4]; 3]);
 
 impl Filter {
-    pub fn parse(value: &str, units: &Lengths) -> (Option<Self>, f32, Vec<renderer::BoxShadow>) {
+    // One filter function: `effects::filters` splits the list and composes the matrices.
+    pub fn parse(value: &str, units: &Lengths) -> (Option<Self>, f32) {
         let identity = Self([[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]]);
-        let (mut matrix, mut opacity, mut shadows) =
-            (identity, 1f32, Vec::<renderer::BoxShadow>::new());
-        for part in components(value, ' ') {
-            let Some((name, args)) = part.strip_suffix(')').and_then(|part| part.split_once('('))
-            else {
-                return (None, 1., Vec::new());
-            };
-            let args = args.trim();
-            let amount = if args.is_empty() {
-                Some(1.)
-            } else if let Some(percent) = args.strip_suffix('%') {
-                percent.trim().parse::<f32>().ok().map(|value| value / 100.)
-            } else {
-                units
-                    .math(args, 0., &[])
-                    .filter(|(_, kind)| *kind == parser::Kind::Number)
-                    .map(|(value, _)| value as f32)
-            }
-            .filter(|value| value.is_finite() && *value >= 0.);
-            let blend = |rows: [[f32; 3]; 3], amount: f32| {
-                Self(std::array::from_fn(|i| {
-                    let mut row = [0.; 4];
-                    for (j, value) in row.iter_mut().take(3).enumerate() {
-                        *value = rows[i][j] + amount * (f32::from(i == j) - rows[i][j]);
-                    }
-                    row
-                }))
-            };
-            let diagonal = |scale: f32, offset: f32| {
-                Self(std::array::from_fn(|i| {
-                    let mut row = [0., 0., 0., offset];
-                    row[i] = scale;
-                    row
-                }))
-            };
-            let step = match (name.to_ascii_lowercase().as_str(), amount) {
-                ("grayscale", Some(amount)) => {
-                    blend([[0.2126, 0.7152, 0.0722]; 3], 1. - amount.min(1.))
-                }
-                ("sepia", Some(amount)) => blend(
-                    [
-                        [0.393, 0.769, 0.189],
-                        [0.349, 0.686, 0.168],
-                        [0.272, 0.534, 0.131],
-                    ],
-                    1. - amount.min(1.),
-                ),
-                ("saturate", Some(amount)) => blend([[0.213, 0.715, 0.072]; 3], amount),
-                ("invert", Some(amount)) => diagonal(1. - 2. * amount.min(1.), amount.min(1.)),
-                ("brightness", Some(amount)) => diagonal(amount, 0.),
-                ("contrast", Some(amount)) => diagonal(amount, 0.5 - 0.5 * amount),
-                ("opacity", Some(amount)) => {
-                    opacity *= amount.min(1.);
-                    continue;
-                }
-                ("hue-rotate", _) => {
-                    let Some((angle, _)) = (if args.is_empty() {
-                        Some((0., parser::Kind::Angle))
-                    } else {
-                        units.math(args, 0., &[]).filter(|(value, kind)| {
-                            *kind == parser::Kind::Angle
-                                || *kind == parser::Kind::Number && *value == 0.
-                        })
-                    }) else {
-                        return (None, 1., Vec::new());
-                    };
-                    let (sin, cos) = (angle as f32).to_radians().sin_cos();
-                    Self([
-                        [
-                            0.213 + cos * 0.787 - sin * 0.213,
-                            0.715 - cos * 0.715 - sin * 0.715,
-                            0.072 - cos * 0.072 + sin * 0.928,
-                            0.,
-                        ],
-                        [
-                            0.213 - cos * 0.213 + sin * 0.143,
-                            0.715 + cos * 0.285 + sin * 0.140,
-                            0.072 - cos * 0.072 - sin * 0.283,
-                            0.,
-                        ],
-                        [
-                            0.213 - cos * 0.213 - sin * 0.787,
-                            0.715 - cos * 0.715 + sin * 0.715,
-                            0.072 + cos * 0.928 + sin * 0.072,
-                            0.,
-                        ],
-                    ])
-                }
-                ("drop-shadow", _) => {
-                    let found = units.shadows(args, false);
-                    if found.is_empty() {
-                        return (None, 1., Vec::new());
-                    }
-                    shadows.extend(found);
-                    continue;
-                }
-                ("blur" | "url", _) => continue,
-                _ => return (None, 1., Vec::new()),
-            };
-            for shadow in &mut shadows {
-                shadow.color = step.hsla(shadow.color);
-            }
-            matrix = matrix.then(step);
+        let Some((name, args)) = value
+            .strip_suffix(')')
+            .and_then(|part| part.split_once('('))
+        else {
+            return (None, 1.);
+        };
+        let args = args.trim();
+        let amount = if args.is_empty() {
+            Some(1.)
+        } else if let Some(percent) = args.strip_suffix('%') {
+            percent.trim().parse::<f32>().ok().map(|value| value / 100.)
+        } else {
+            units
+                .math(args, 0., &[])
+                .filter(|(_, kind)| *kind == parser::Kind::Number)
+                .map(|(value, _)| value as f32)
         }
-        ((matrix != identity).then_some(matrix), opacity, shadows)
-    }
-
-    pub fn then(self, outer: Self) -> Self {
-        Self(std::array::from_fn(|i| {
-            let mut row = [0., 0., 0., outer.0[i][3]];
-            for (j, value) in row.iter_mut().enumerate() {
-                *value += (0..3).map(|k| outer.0[i][k] * self.0[k][j]).sum::<f32>();
+        .filter(|value| value.is_finite() && *value >= 0.);
+        let blend = |rows: [[f32; 3]; 3], amount: f32| {
+            Self(std::array::from_fn(|i| {
+                let mut row = [0.; 4];
+                for (j, value) in row.iter_mut().take(3).enumerate() {
+                    *value = rows[i][j] + amount * (f32::from(i == j) - rows[i][j]);
+                }
+                row
+            }))
+        };
+        let diagonal = |scale: f32, offset: f32| {
+            Self(std::array::from_fn(|i| {
+                let mut row = [0., 0., 0., offset];
+                row[i] = scale;
+                row
+            }))
+        };
+        let matrix = match (name.to_ascii_lowercase().as_str(), amount) {
+            ("grayscale", Some(amount)) => {
+                blend([[0.2126, 0.7152, 0.0722]; 3], 1. - amount.min(1.))
             }
-            row
-        }))
-    }
-
-    fn rgb(&self, rgb: [f32; 3]) -> [f32; 3] {
-        self.0
-            .map(|row| (row[0] * rgb[0] + row[1] * rgb[1] + row[2] * rgb[2] + row[3]).clamp(0., 1.))
+            ("sepia", Some(amount)) => blend(
+                [
+                    [0.393, 0.769, 0.189],
+                    [0.349, 0.686, 0.168],
+                    [0.272, 0.534, 0.131],
+                ],
+                1. - amount.min(1.),
+            ),
+            ("saturate", Some(amount)) => blend([[0.213, 0.715, 0.072]; 3], amount),
+            ("invert", Some(amount)) => diagonal(1. - 2. * amount.min(1.), amount.min(1.)),
+            ("brightness", Some(amount)) => diagonal(amount, 0.),
+            ("contrast", Some(amount)) => diagonal(amount, 0.5 - 0.5 * amount),
+            ("opacity", Some(amount)) => return (None, amount.min(1.)),
+            ("hue-rotate", _) => {
+                let Some((angle, _)) = (if args.is_empty() {
+                    Some((0., parser::Kind::Angle))
+                } else {
+                    units.math(args, 0., &[]).filter(|(value, kind)| {
+                        *kind == parser::Kind::Angle
+                            || *kind == parser::Kind::Number && *value == 0.
+                    })
+                }) else {
+                    return (None, 1.);
+                };
+                let (sin, cos) = (angle as f32).to_radians().sin_cos();
+                Self([
+                    [
+                        0.213 + cos * 0.787 - sin * 0.213,
+                        0.715 - cos * 0.715 - sin * 0.715,
+                        0.072 - cos * 0.072 + sin * 0.928,
+                        0.,
+                    ],
+                    [
+                        0.213 - cos * 0.213 + sin * 0.143,
+                        0.715 + cos * 0.285 + sin * 0.140,
+                        0.072 - cos * 0.072 - sin * 0.283,
+                        0.,
+                    ],
+                    [
+                        0.213 - cos * 0.213 - sin * 0.787,
+                        0.715 - cos * 0.715 + sin * 0.715,
+                        0.072 + cos * 0.928 + sin * 0.072,
+                        0.,
+                    ],
+                ])
+            }
+            _ => return (None, 1.),
+        };
+        ((matrix != identity).then_some(matrix), 1.)
     }
 
     #[cfg(test)]
     pub fn color(&self, (ink, alpha): (u32, u8)) -> (u32, u8) {
-        let [r, g, b] = self
-            .rgb([16, 8, 0].map(|shift| ((ink >> shift) & 255) as f32 / 255.))
-            .map(|value| (value * 255.).round() as u32);
+        let rgb = [16, 8, 0].map(|shift| ((ink >> shift) & 255) as f32 / 255.);
+        let [r, g, b] = self.0.map(|row| {
+            ((row[0] * rgb[0] + row[1] * rgb[1] + row[2] * rgb[2] + row[3]).clamp(0., 1.) * 255.)
+                .round() as u32
+        });
         (r << 16 | g << 8 | b, alpha)
-    }
-
-    pub fn hsla(&self, color: renderer::Color) -> renderer::Color {
-        let [r, g, b] = self.rgb([color.r, color.g, color.b]);
-        renderer::Color {
-            r,
-            g,
-            b,
-            a: color.a,
-        }
     }
 }
 

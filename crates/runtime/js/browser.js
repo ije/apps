@@ -4,7 +4,27 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
   const eventOf = (fields = {}) => ({ ...fields, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
   const failure = text => { const match = /^(\w*Error): ([\s\S]*)$/.exec(text ?? ''); return match ? Object.assign(new Error(match[2]), { name: match[1] }) : new Error(text); };
   let nextRequest = 0;
-  class WebContents extends EventEmitter {
+  class Contents extends EventEmitter {
+    ipc = Object.assign(new EventEmitter(), { handle() {}, handleOnce() {}, removeHandler() {} });
+    isLoadingMainFrame() { return this.isLoading(); }
+    reloadIgnoringCache() { this.reload(); }
+    setUserAgent() {}
+    setBackgroundThrottling() {}
+    getBackgroundThrottling() { return false; }
+    setIgnoreMenuShortcuts() {}
+    setVisualZoomLevelLimits() { return Promise.resolve(); }
+    setAudioMuted() {}
+    isAudioMuted() { return false; }
+    isCurrentlyAudible() { return false; }
+    isDevToolsOpened() { return false; }
+    closeDevTools() {}
+    isCrashed() { return false; }
+    startDrag() {}
+    sendInputEvent() {}
+    copyImageAt() {}
+    executeJavaScriptInIsolatedWorld(_world, scripts) { return Promise.all(scripts.map(({ code }) => this.executeJavaScript(code))).then(results => results.at(-1)); }
+  }
+  class WebContents extends Contents {
     #destroyed = false;
     #url = '';
     #title = '';
@@ -19,14 +39,6 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
       Object.defineProperty(this, 'id', { value: call('browser.create', { partition: options.partition || 'persist:default', javascript: options.javascript ?? true, inspectable: options.devTools ?? true, navigation: true, ...(options.show ? { show: true } : {}) }) });
       this.#devTools = options.devTools !== false;
       this.#partition = options.partition;
-      this._storage = Object.freeze({
-        cookies: Object.freeze({
-          get: (filter = {}) => this.#request('cookies.get', { filter }),
-          set: details => this.#request('cookies.set', { details }),
-          remove: (url, name) => this.#request('cookies.remove', { filter: { url: String(url), name: String(name) } }),
-        }),
-        clearStorageData: () => this.#request('clearStorage', {}),
-      });
       contents.set(this.id, this);
     }
     loadURL(url) {
@@ -51,7 +63,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
     }
     #partition;
     setWindowOpenHandler(handler) { if (handler !== null && typeof handler !== 'function') throw new TypeError('Expected a window open handler'); this.#open = handler; }
-    #request(operation, arguments_) {
+    _request(operation, arguments_) {
       if (this.#destroyed) return Promise.reject(new Error('Browser is destroyed'));
       return new Promise((resolve, reject) => {
         const id = ++nextRequest;
@@ -60,9 +72,9 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
         catch (error) { pending.delete(id); reject(error); }
       });
     }
-    executeJavaScript(script) { return this.#request('evaluate', { script: String(script) }); }
+    executeJavaScript(script) { return this._request('evaluate', { script: String(script) }); }
     capturePage(rect) {
-      return this.#request('capture', rect ? { rect } : {}).then(image => nativeImage.createFromBuffer(Uint8Array.fromBase64(image.png)));
+      return this._request('capture', rect ? { rect } : {}).then(image => nativeImage.createFromBuffer(Uint8Array.fromBase64(image.png)));
     }
     get session() { return session.fromPartition(this.#partition ?? 'persist:default'); }
     get mainFrame() { const contents = this; return { get url() { return contents.getURL(); }, get top() { return this; }, parent: null, frames: [], framesInSubtree: [], processId: 0, routingId: 1, frameTreeNodeId: this.id, visibilityState: 'visible', detached: false, executeJavaScript: code => contents.executeJavaScript(code), send() {}, isDestroyed: () => contents.isDestroyed() }; }
@@ -70,37 +82,19 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
     get navigationHistory() { const contents = this; return { canGoBack: () => contents.canGoBack(), canGoForward: () => contents.canGoForward(), goBack: () => contents.goBack(), goForward: () => contents.goForward(), canGoToOffset: () => false, goToOffset() {}, goToIndex() {}, clear() {}, getActiveIndex: () => 0, length: () => 1, getEntryAtIndex: () => ({ url: contents.getURL(), title: contents.getTitle() }), getAllEntries: () => [{ url: contents.getURL(), title: contents.getTitle() }] }; }
     get debugger() { return this.#debugger ??= new Debugger(this); }
     #debugger;
-    ipc = Object.assign(new EventEmitter(), { handle() {}, handleOnce() {}, removeHandler() {} });
     hostWebContents = null;
     devToolsWebContents = null;
     getType() { return this.hostWebContents ? 'webview' : 'browserView'; }
-    reloadIgnoringCache() { this.reload(); }
     isFocused() { return false; }
-    isLoadingMainFrame() { return this.isLoading(); }
-    isCrashed() { return false; }
-    isDevToolsOpened() { return false; }
-    closeDevTools() {}
     getOSProcessId() { return process.pid; }
     getProcessId() { return process.pid; }
     getUserAgent() { return this.session.getUserAgent(); }
-    setUserAgent() {}
-    setBackgroundThrottling() {}
-    getBackgroundThrottling() { return false; }
-    setIgnoreMenuShortcuts() {}
-    setAudioMuted() {}
-    isAudioMuted() { return false; }
-    isCurrentlyAudible() { return false; }
     getZoomLevel() { return Math.log(this.#zoom) / Math.log(1.2); }
     setZoomLevel(level) { this.setZoomFactor(1.2 ** level); }
-    setVisualZoomLevelLimits() { return Promise.resolve(); }
-    executeJavaScriptInIsolatedWorld(_world, scripts) { return Promise.all(scripts.map(({ code }) => this.executeJavaScript(code))).then(results => results.at(-1)); }
     insertCSS(css) { return this.executeJavaScript(`document.head.append(Object.assign(document.createElement('style'),{textContent:${JSON.stringify(String(css))}}))`).then(() => ''); }
     insertText(text) { return this.executeJavaScript(`document.execCommand('insertText',false,${JSON.stringify(String(text))})`).then(() => {}); }
-    sendInputEvent() {}
     send() {}
-    startDrag() {}
     replaceMisspelling() {}
-    copyImageAt() {}
     getURL() { return this.#url; }
     getTitle() { return this.#title; }
     isLoading() { return this.#loading; }
@@ -298,9 +292,9 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
       super();
       this.#partition = partition;
       this.cookies = Object.assign(new EventEmitter(), {
-        get: filter => this.#contents()._storage.cookies.get(filter),
-        set: details => this.#contents()._storage.cookies.set(details),
-        remove: (url, name) => this.#contents()._storage.cookies.remove(url, name),
+        get: (filter = {}) => this.#contents()._request('cookies.get', { filter }),
+        set: details => this.#contents()._request('cookies.set', { details }),
+        remove: (url, name) => this.#contents()._request('cookies.remove', { filter: { url: String(url), name: String(name) } }),
         flushStore: async () => {},
       });
       const noop = () => {};
@@ -311,7 +305,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
     #contents() { if (!partitions.has(this.#partition)) partitions.set(this.#partition, new WebContents({ partition: this.#partition })); return partitions.get(this.#partition); }
     get storagePath() { return null; }
     get availableSpellCheckerLanguages() { return []; }
-    clearStorageData() { return partitions.has(this.#partition) ? this.#contents()._storage.clearStorageData() : Promise.resolve(); }
+    clearStorageData() { return partitions.has(this.#partition) ? this.#contents()._request('clearStorage', {}) : Promise.resolve(); }
     clearCache() { return this.clearStorageData(); }
     clearAuthCache() { return Promise.resolve(); }
     clearHostResolverCache() { return Promise.resolve(); }
@@ -345,7 +339,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
     get defaultSession() { return this.fromPartition('persist:default'); },
   });
   // Linux webviews need GTK pumping from poll; other platforms wake the loop on events.
-  return { View, WebContentsView, session, poll, pending: () => contents.size > 0 && process.platform === 'linux', reserve: () => call('browser.reserve'), all: () => [...contents.values()].filter(item => ![...partitions.values()].includes(item)),
+  return { Contents, View, WebContentsView, session, poll, pending: () => contents.size > 0 && process.platform === 'linux', reserve: () => call('browser.reserve'), all: () => { const hidden = new Set(partitions.values()); return [...contents.values()].filter(item => !hidden.has(item)); },
     contentView(window, options) {
       const view = new View(), state = layouts.get(view);
       state.root = state.window = window;
@@ -694,8 +688,8 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false, nativeImage
       return native('power.idle') >= threshold ? 'idle' : 'active';
     },
     getCurrentThermalState: () => native('power.thermal'),
-    on(name, listener) { native('power.init'); observePower = true; return EventEmitter.prototype.on.call(this, name, listener); },
   });
+  for (const method of ['on', 'addListener', 'prependListener']) powerMonitor[method] = function (...args) { native('power.init'); observePower = true; return EventEmitter.prototype[method].apply(this, args); };
   let displays = null;
   const screen = new EventEmitter();
   const distance = (display, x, y) => { const { x: left, y: top, width, height } = display.bounds; return Math.hypot(Math.max(left - x, 0, x - left - width), Math.max(top - y, 0, y - top - height)); };
@@ -714,8 +708,8 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false, nativeImage
       const best = native('screen.displays').reduce((best, display) => area(display) > area(best) ? display : best);
       return area(best) > 0 ? best : nearest(rect.x + rect.width / 2, rect.y + rect.height / 2);
     },
-    on(name, listener) { displays ??= native('screen.displays'); return EventEmitter.prototype.on.call(this, name, listener); },
   });
+  for (const method of ['on', 'addListener', 'prependListener']) screen[method] = function (...args) { displays ??= native('screen.displays'); return EventEmitter.prototype[method].apply(this, args); };
   const poll = () => {
     if (!menuActive && !popups.size && !trays.size && !shortcuts.size && !notifications.size && !replies.size && !observeTheme && !observePower && !observeApp && !displays) return;
     for (const event of native('poll')) {

@@ -12,8 +12,7 @@ pub(super) struct TextHighlight {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint_text(
-    line: &renderer::Line,
-    wraps: &[u32],
+    text_line: &renderer::TextLine,
     origin: Point<Pixels>,
     line_height: Pixels,
     runs: &[renderer::TextRun],
@@ -25,6 +24,7 @@ pub(super) fn paint_text(
     strut: renderer::FontId,
     window: &mut Window,
 ) {
+    let (line, wraps) = (&text_line.line, &text_line.breaks[..]);
     let shift = |row: usize| rows.get(row).map_or(px(0.), |row| row.shift);
     let justify = |row: usize, index: usize| {
         rows.get(row)
@@ -341,14 +341,6 @@ fn row_extents<'a>(
         .collect()
 }
 
-fn computed_clone(view: &super::PageState, id: usize) -> bool {
-    view.host.borrow().dom.get(&view.id).is_some_and(|dom| {
-        dom.computed.as_ref().is_some_and(|styles| {
-            styles.values[id].get(Prop::BOX_DECORATION_BREAK) == Some("clone")
-        })
-    })
-}
-
 pub(crate) fn text_position(
     layout: &renderer::Paragraph,
     text: &str,
@@ -373,11 +365,10 @@ fn text_start(
     end: usize,
 ) -> Option<Point<Pixels>> {
     let at = text_position(layout, text, rows, index)?;
-    let whole = text;
     let next = text
         .get(index..end)
-        .and_then(|text| text.chars().next())
-        .and_then(|first| text_position(layout, whole, rows, index + first.len_utf8()))
+        .and_then(|part| part.chars().next())
+        .and_then(|first| text_position(layout, text, rows, index + first.len_utf8()))
         .filter(|next| next.y > at.y);
     Some(next.map_or(at, |next| {
         let row = ((next.y - layout.bounds().top()) / layout.line_height()).round();
@@ -439,23 +430,16 @@ fn inline_box(
     rows: &[crate::dom::Row],
     range: &std::ops::Range<usize>,
     style: Option<(&style::Style, style::Lengths)>,
-    root: &renderer::TextStyle,
+    base: Pixels,
     window: &Window,
 ) -> Option<(Point<Pixels>, Point<Pixels>, Pixels, Pixels)> {
     let a = text_start(layout, text, rows, range.start, range.end)?;
     let b = text_position(layout, text, rows, range.end)?;
-    let line_height = layout.line_height();
     let Some((style, units)) = style else {
-        return Some((a, b, px(0.), line_height));
+        return Some((a, b, px(0.), layout.line_height()));
     };
     let system = window.text_system();
     let scale = window.scale_factor();
-    let base = system.baseline(
-        system.face(&root.font()),
-        root.font_size,
-        line_height,
-        scale,
-    );
     let [ascent, descent, _] = system
         .line_metrics(system.face(&style::font(style)), px(units.font.em * scale))
         .map(|value| value / scale);
@@ -548,18 +532,10 @@ pub(super) struct InlineText {
 pub(super) struct Prepainted {
     hitboxes: Vec<(renderer::Region, renderer::Cursor)>,
     rows: crate::dom::Rows,
-    layouts: Vec<(usize, TextLayoutEntry)>,
+    layouts: Vec<(usize, crate::dom::TextLayout)>,
     rects: Vec<(usize, [f32; 4])>,
     origin: Point<Pixels>,
 }
-
-type TextLayoutEntry = (
-    renderer::Paragraph,
-    Rc<str>,
-    std::ops::Range<usize>,
-    crate::dom::Rows,
-    [Pixels; 2],
-);
 
 pub(super) struct AtomSlot {
     pub(super) size: [f32; 3],
@@ -610,8 +586,11 @@ fn with_atoms(
     sizes: impl Fn(usize) -> f32,
     runs: &mut [renderer::TextRun],
 ) {
+    if data.first_line.is_some() {
+        return;
+    }
     for (index, atom) in data.atoms.iter().enumerate() {
-        if let Some(run) = runs.get_mut(atom.run).filter(|_| data.first_line.is_none()) {
+        if let Some(run) = runs.get_mut(atom.run) {
             run.inset[1] = px(sizes(index));
         }
     }
@@ -623,7 +602,7 @@ struct Measured {
     data: Rc<style::InlineText>,
     atoms: Box<[([f32; 3], Option<AlignItems>)]>,
     styled: std::cell::RefCell<Option<renderer::TextStyle>>,
-    measured: Rc<std::cell::Cell<[Pixels; 2]>>,
+    measured: std::cell::Cell<[Pixels; 2]>,
     cached: std::cell::Cell<Option<MeasuredSize>>,
     baselines: std::cell::Cell<[Pixels; 2]>,
 }
@@ -637,12 +616,7 @@ impl PartialEq for Measured {
 impl From<InlineText> for renderer::Node {
     fn from(text: InlineText) -> Self {
         let data = &text.data;
-        let sized = data.runs.iter().any(|run| run.font_size.is_some())
-            || data
-                .first_line
-                .as_deref()
-                .is_some_and(|(_, pseudo, _)| pseudo.font_size.is_some());
-        if data.first_line.is_none() && !sized {
+        if data.first_line.is_none() && !data.runs.iter().any(|run| run.font_size.is_some()) {
             return renderer::text(data.text.clone(), Some(data.runs.to_vec())).hooks(text);
         }
         renderer::node()
@@ -655,7 +629,7 @@ impl From<InlineText> for renderer::Node {
                         .map(|slot| (slot.size, slot.align))
                         .collect(),
                     styled: Default::default(),
-                    measured: Rc::default(),
+                    measured: Default::default(),
                     cached: std::cell::Cell::new(None),
                     baselines: std::cell::Cell::new([px(0.); 2]),
                 },
@@ -809,13 +783,12 @@ impl renderer::Hooks for InlineText {
             )
         };
         let (bounds, exact, style) = (inside(cx.bounds), inside(cx.exact), cx.text.clone());
-        let measured = cx.state::<Measured>().map(|kept| kept.measured.clone());
+        let measured = cx.state::<Measured>().map(|kept| kept.measured.get());
         let node_layout = cx.text_layout().cloned();
         let window = &mut *cx.window;
-        if let Some(measured) = &measured {
+        if let Some(measured) = measured {
             // Snapped bounds can be narrower than measured text. Do not wrap or truncate again.
             let wrap = measured
-                .get()
                 .into_iter()
                 .filter(|width| *width >= bounds.size.width && *width - bounds.size.width < px(1.))
                 .fold(bounds.size.width, Pixels::max);
@@ -854,6 +827,8 @@ impl renderer::Hooks for InlineText {
             window.text_system(),
             window.scale_factor(),
         );
+        let view = &*self.view;
+        let mut lead_styles = None;
         let mut drop = px(0.);
         if style.text_align != renderer::TextAlign::Left
             || !self.data.boxes.is_empty()
@@ -920,7 +895,18 @@ impl renderer::Hooks for InlineText {
             if inline.lead == 0. || range.start == range.end {
                 continue;
             }
-            let clone = computed_clone(&self.view, *id);
+            let clone = lead_styles
+                .get_or_insert_with(|| {
+                    view.host
+                        .borrow()
+                        .dom
+                        .get(&view.id)
+                        .and_then(|dom| dom.computed.clone())
+                })
+                .as_ref()
+                .is_some_and(|styles| {
+                    styles.values[*id].get(Prop::BOX_DECORATION_BREAK) == Some("clone")
+                });
             for row in rows.iter_mut() {
                 let wrapped =
                     row.start > 0 && self.data.text.as_bytes().get(row.start - 1) != Some(&b'\n');
@@ -932,20 +918,20 @@ impl renderer::Hooks for InlineText {
             }
         }
         let rows: crate::dom::Rows = rows.into();
+        let base = window.text_system().baseline(
+            strut,
+            style.font_size,
+            layout.line_height(),
+            window.scale_factor(),
+        );
         for (atom, slot) in self.data.atoms.iter().zip(self.atoms.iter()) {
-            let base = window.text_system().baseline(
-                strut,
-                style.font_size,
-                layout.line_height(),
-                window.scale_factor(),
-            );
             if let Some((a, ..)) = inline_box(
                 layout,
                 &self.data.text,
                 &rows,
                 &(atom.at..atom.at + '\u{fffc}'.len_utf8()),
                 None,
-                &style,
+                base,
                 window,
             ) {
                 let row = rows
@@ -970,7 +956,6 @@ impl renderer::Hooks for InlineText {
             .map(|(rect, cursor)| (window.add_region(rect, renderer::Hit::Pass), cursor))
             .collect();
         let shift = exact.origin - bounds.origin;
-        let view = &*self.view;
         let mut host = view.host.borrow_mut();
         let dom = host.dom.entry(view.id).or_default();
         let computed = dom.computed.clone();
@@ -984,8 +969,9 @@ impl renderer::Hooks for InlineText {
         };
         layouts.clear();
         rects.clear();
+        let mut boxes = self.data.boxes.iter().peekable();
         for (at, (id, range)) in self.data.ranges.iter().enumerate() {
-            let boxed = self.data.boxes.iter().find(|inline| inline.index == at);
+            let boxed = boxes.next_if(|inline| inline.index == at);
             if let Some((mut a, mut b, mut top, mut height)) = inline_box(
                 layout,
                 &self.data.text,
@@ -994,7 +980,7 @@ impl renderer::Hooks for InlineText {
                 computed
                     .as_deref()
                     .map(|styles| (&*styles.values[*id], styles.lengths[*id])),
-                &style,
+                base,
                 window,
             ) {
                 let font = [top, height];
@@ -1173,12 +1159,19 @@ impl renderer::Hooks for InlineText {
         for (hitbox, cursor) in hitboxes.iter() {
             window.set_cursor(hitbox, *cursor);
         }
+        let strut = window.text_system().face(&text_style.font());
         let mut highlights = Vec::new();
         {
             let view = &*self.view;
             let host = view.host.borrow();
             let dom = &host.dom[&view.id];
             if let Some(styles) = &dom.computed {
+                let base = window.text_system().baseline(
+                    strut,
+                    text_style.font_size,
+                    layout.line_height(),
+                    window.scale_factor(),
+                );
                 for inline in &self.data.boxes {
                     if inline.fill == 0 && (inline.border == 0 || inline.borders == [0.; 4]) {
                         continue;
@@ -1192,7 +1185,7 @@ impl renderer::Hooks for InlineText {
                         rows,
                         range,
                         Some((style, units)),
-                        &text_style,
+                        base,
                         window,
                     ) {
                         let radii = [
@@ -1279,51 +1272,48 @@ impl renderer::Hooks for InlineText {
                         }
                     }
                 }
-            }
-            for (id, range) in &self.data.ranges {
-                let Some([start, end]) = dom.selection.get(id) else {
-                    continue;
-                };
-                let Some(styles) = &dom.computed else {
-                    continue;
-                };
-                if styles.user_select[*id].0 == style::UserSelect::None || dom.inert(*id) {
-                    continue;
-                }
-                let caret = dom.selection_caret == Some(*id);
-                let text = &self.data.text[range.clone()];
-                let source = host
-                    .pages
-                    .get(&view.id)
-                    .map_or("", |page| page.doc.nodes[*id].text.as_str());
-                let start = range.start + crate::dom::shown_index(source, text, *start);
-                let end = range.start + crate::dom::shown_index(source, text, *end);
-                if caret {
-                    let ink = [Prop::CARET_COLOR, Prop::COLOR]
-                        .into_iter()
-                        .find_map(|prop| style::color(styles.values[*id].get(prop)?))
-                        .map_or(0x000000ff, |(color, alpha)| color << 8 | alpha as u32);
-                    if let Some(position) = text_position(layout, &self.data.text, rows, start) {
-                        super::input::paint_caret(
-                            view,
-                            [*id, start, range.len()],
-                            Rect::new(position, size(px(1.), layout.line_height())),
-                            Color::hex(ink),
-                            window,
-                        );
+                for (id, range) in &self.data.ranges {
+                    let Some([start, end]) = dom.selection.get(id) else {
+                        continue;
+                    };
+                    if styles.user_select[*id].0 == style::UserSelect::None || dom.inert(*id) {
+                        continue;
                     }
-                } else if start != end {
-                    let (color, background) =
-                        style::selection_colors(&styles.values[*id], styles.selections.get(id));
-                    highlights.push(TextHighlight {
-                        range: start.min(end)..start.max(end),
-                        color: color.map(Color::hex),
-                        background: Color::hex(background),
-                    });
+                    let caret = dom.selection_caret == Some(*id);
+                    let text = &self.data.text[range.clone()];
+                    let source = host
+                        .pages
+                        .get(&view.id)
+                        .map_or("", |page| page.doc.nodes[*id].text.as_str());
+                    let start = range.start + crate::dom::shown_index(source, text, *start);
+                    let end = range.start + crate::dom::shown_index(source, text, *end);
+                    if caret {
+                        let ink = [Prop::CARET_COLOR, Prop::COLOR]
+                            .into_iter()
+                            .find_map(|prop| style::color(styles.values[*id].get(prop)?))
+                            .map_or(0x000000ff, |(color, alpha)| color << 8 | alpha as u32);
+                        if let Some(position) = text_position(layout, &self.data.text, rows, start)
+                        {
+                            super::input::paint_caret(
+                                view,
+                                [*id, start, range.len()],
+                                Rect::new(position, size(px(1.), layout.line_height())),
+                                Color::hex(ink),
+                                window,
+                            );
+                        }
+                    } else if start != end {
+                        let (color, background) =
+                            style::selection_colors(&styles.values[*id], styles.selections.get(id));
+                        highlights.push(TextHighlight {
+                            range: start.min(end)..start.max(end),
+                            color: color.map(Color::hex),
+                            background: Color::hex(background),
+                        });
+                    }
                 }
             }
         }
-        let strut = window.text_system().face(&text_style.font());
         let passes = self
             .data
             .shadows
@@ -1342,10 +1332,15 @@ impl renderer::Hooks for InlineText {
                     if origin.y > mask.bottom() {
                         break;
                     }
-                    if origin.y + height + layout.line_height() > mask.top() {
+                    // Taller rows above push this line down: the next row's drop says how far.
+                    let dropped = match rows.get(row + count) {
+                        Some(next) => next.drop - next.above,
+                        None if rows.is_empty() => px(0.),
+                        None => px(f32::INFINITY),
+                    };
+                    if origin.y + height + dropped + layout.line_height() > mask.top() {
                         paint_text(
-                            &line.line,
-                            &line.breaks,
+                            line,
                             origin,
                             layout.line_height(),
                             runs,

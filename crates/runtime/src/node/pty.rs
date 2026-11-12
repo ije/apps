@@ -70,21 +70,25 @@ pub(crate) struct State {
 }
 impl State {
     pub(crate) fn call(&mut self, op: &str, args: &Value) -> Result<Value> {
+        let size = |cols: u64, rows: u64| -> Result<PtySize> {
+            ensure!(
+                (1..=65535).contains(&cols) && (1..=65535).contains(&rows),
+                "Invalid PTY dimensions"
+            );
+            Ok(PtySize {
+                cols: cols as u16,
+                rows: rows as u16,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+        };
         match op {
             "spawn" => {
                 let options = &args[2];
-                let cols = options["cols"].as_u64().unwrap_or(80);
-                let rows = options["rows"].as_u64().unwrap_or(24);
-                ensure!(
-                    (1..=65535).contains(&cols) && (1..=65535).contains(&rows),
-                    "Invalid PTY dimensions"
-                );
-                let pair = portable_pty::native_pty_system().openpty(PtySize {
-                    cols: cols as u16,
-                    rows: rows as u16,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })?;
+                let pair = portable_pty::native_pty_system().openpty(size(
+                    options["cols"].as_u64().unwrap_or(80),
+                    options["rows"].as_u64().unwrap_or(24),
+                )?)?;
                 let mut command = CommandBuilder::new(args[0].as_str().context("Expected shell")?);
                 for arg in args[1].as_array().context("Expected arguments")? {
                     command.arg(arg.as_str().context("Expected argument string")?);
@@ -214,20 +218,10 @@ impl State {
                     .context("PTY is closed")?;
                 match op {
                     "write" => session.input.send(crate::node::bytes(&args[1])?.to_vec())?,
-                    "resize" => {
-                        let cols = args[1].as_u64().context("Expected columns")?;
-                        let rows = args[2].as_u64().context("Expected rows")?;
-                        ensure!(
-                            (1..=65535).contains(&cols) && (1..=65535).contains(&rows),
-                            "Invalid PTY dimensions"
-                        );
-                        session.master.resize(PtySize {
-                            cols: cols as u16,
-                            rows: rows as u16,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        })?;
-                    }
+                    "resize" => session.master.resize(size(
+                        args[1].as_u64().context("Expected columns")?,
+                        args[2].as_u64().context("Expected rows")?,
+                    )?)?,
                     _ => {
                         // Never signal a reaped child; its PID may belong to another process.
                         let Some(child) = session.child.as_mut().filter(|_| !session.exited) else {

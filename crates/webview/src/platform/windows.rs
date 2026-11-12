@@ -12,19 +12,15 @@ use ::windows::{
 };
 use ::wry::WebViewExtWindows;
 use raw_window_handle::{HandleError, HasWindowHandle, Win32WindowHandle, WindowHandle};
-use std::{
-    cell::Cell,
-    num::NonZeroIsize,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{cell::Cell, num::NonZeroIsize};
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 
 struct WindowState {
     events: Arc<Events>,
-    closed: AtomicBool,
+    closed: Cell<bool>,
 }
 
-pub(super) struct Window {
+pub(crate) struct Window {
     handle: HWND,
     state: Box<WindowState>,
     bounds: Cell<Option<[f64; 4]>>,
@@ -47,7 +43,7 @@ unsafe extern "system" fn window_proc(
         if message == WM_CLOSE {
             let state = GetWindowLongPtrW(window, GWLP_USERDATA) as *const WindowState;
             if let Some(state) = state.as_ref() {
-                state.closed.store(true, Ordering::Relaxed);
+                state.closed.set(true);
                 state.events.push(json!({"type":"closed"}));
             }
             let _ = ShowWindow(window, SW_HIDE);
@@ -100,7 +96,7 @@ impl Window {
         };
         let mut state = Box::new(WindowState {
             events,
-            closed: AtomicBool::new(false),
+            closed: Cell::new(false),
         });
         let handle = unsafe {
             let instance = GetModuleHandleW(None)?;
@@ -248,7 +244,7 @@ impl Window {
             )?;
         }
         self.attached.set(true);
-        let bounds = self.bounds.replace(None).unwrap_or([0., 0., 800., 600.]);
+        let bounds = self.bounds.take().unwrap_or([0., 0., 800., 600.]);
         self.set_bounds(bounds)
     }
 
@@ -263,7 +259,7 @@ impl Window {
 
     pub fn set_visible(&self, visible: bool) -> anyhow::Result<()> {
         self.shown.set(visible);
-        let bounds = self.bounds.replace(None).unwrap_or([0., 0., 800., 600.]);
+        let bounds = self.bounds.take().unwrap_or([0., 0., 800., 600.]);
         self.set_bounds(bounds)
     }
 
@@ -287,7 +283,7 @@ impl Window {
                 self.handle,
                 if (self.attached.get() || self.visible)
                     && self.shown.get()
-                    && !self.state.closed.load(Ordering::Relaxed)
+                    && !self.state.closed.get()
                     && width > 0.
                     && height > 0.
                 {

@@ -1,4 +1,4 @@
-globalThis.__appsCrypto = (call, encodeBytes, decodeBytes, base) => {
+globalThis.__appsCrypto = (call, decodeBytes, base) => {
   const keys = new WeakMap();
   const bytes = value => value instanceof ArrayBuffer ? new Uint8Array(value) : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : (() => { throw new TypeError('Expected bytes'); })();
   const encode = value => value.toBase64({ alphabet: 'base64url', omitPadding: true });
@@ -41,8 +41,8 @@ globalThis.__appsCrypto = (call, encodeBytes, decodeBytes, base) => {
     const hash = name(algorithm.hash), pbkdf2 = data.algorithm.name === 'PBKDF2';
     if (!sizes[hash]) fail('Unsupported digest algorithm');
     if (length == null || length % 8 || (pbkdf2 && !algorithm.iterations)) fail('Invalid derivation parameters', 'OperationError');
-    const salt = encodeBytes(bytes(algorithm.salt)), digest = hash.replace('-', '').toLowerCase();
-    try { return decodeBytes(call('web.crypto.' + (pbkdf2 ? 'pbkdf2' : 'hkdf'), ...(pbkdf2 ? [data.private, salt, algorithm.iterations, length / 8, digest] : [digest, data.private, salt, encodeBytes(bytes(algorithm.info)), length / 8]))).buffer; }
+    const salt = bytes(algorithm.salt), digest = hash.replace('-', '').toLowerCase();
+    try { return decodeBytes(call('web.crypto.' + (pbkdf2 ? 'pbkdf2' : 'hkdf'), ...(pbkdf2 ? [data.private, salt, algorithm.iterations, length / 8, digest] : [digest, data.private, salt, bytes(algorithm.info), length / 8]))).buffer; }
     catch (error) { fail(error.message, 'OperationError'); }
   };
   const subtle = {
@@ -134,14 +134,14 @@ globalThis.__appsCrypto = (call, encodeBytes, decodeBytes, base) => {
     let digest = hash?.name;
     if (kind === 'ECDSA' && (digest = name(algorithm.hash)) !== (namedCurve === 'P-256' ? 'SHA-256' : 'SHA-384')) fail(`${namedCurve} keys sign with ${namedCurve === 'P-256' ? 'SHA-256' : 'SHA-384'} only`);
     if (kind === 'RSA-PSS' && algorithm.saltLength !== sizes[digest]) fail('RSA-PSS salts must be as long as the digest');
-    const args = [{ Ed25519: 'ed25519', 'RSASSA-PKCS1-v1_5': 'rsa', 'RSA-PSS': 'rsa-pss' }[kind] ?? kind, data.private ?? [], data.public ?? [], encodeBytes(bytes(input)), encodeBytes(bytes(signature)), digest];
+    const args = [{ Ed25519: 'ed25519', 'RSASSA-PKCS1-v1_5': 'rsa', 'RSA-PSS': 'rsa-pss' }[kind] ?? kind, data.private ?? [], data.public ?? [], bytes(input), bytes(signature), digest];
     try { const result = call('web.crypto.' + operation, ...args); return operation === 'sign' ? decodeBytes(result).buffer : result; }
     catch (error) { fail(error.message, 'OperationError'); }
   };
   for (const operation of ['encrypt', 'decrypt']) subtle[operation] = async (algorithm, key, input) => {
     const data = access(key, operation, algorithm);
     if (data.algorithm.name !== 'AES-GCM' || (algorithm.tagLength !== undefined && algorithm.tagLength !== 128)) fail('Only AES-GCM with a 128 bit tag is supported');
-    try { return decodeBytes(call('web.crypto.' + operation, data.private, encodeBytes(bytes(algorithm.iv)), algorithm.additionalData ? encodeBytes(bytes(algorithm.additionalData)) : [], encodeBytes(bytes(input)))).buffer; }
+    try { return decodeBytes(call('web.crypto.' + operation, data.private, bytes(algorithm.iv), algorithm.additionalData ? bytes(algorithm.additionalData) : [], bytes(input))).buffer; }
     catch (error) { fail(error.message, 'OperationError'); }
   };
   globalThis.__appsNodeCrypto = {

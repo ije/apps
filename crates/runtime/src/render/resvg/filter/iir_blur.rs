@@ -11,8 +11,9 @@ struct BlurData {
     height: usize,
     sigma_x: f64,
     sigma_y: f64,
-    steps: usize,
 }
+
+const STEPS: usize = 4;
 
 pub fn apply(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
     let buf_size = (src.width * src.height) as usize;
@@ -24,14 +25,12 @@ pub fn apply(sigma_x: f64, sigma_y: f64, src: ImageRefMut) {
         height: src.height as usize,
         sigma_x,
         sigma_y,
-        steps: 4,
     };
 
     let data: &mut [u8] = rgb::bytemuck::cast_slice_mut(src.data);
-    gaussian_channel(data, &d, 0, buf);
-    gaussian_channel(data, &d, 1, buf);
-    gaussian_channel(data, &d, 2, buf);
-    gaussian_channel(data, &d, 3, buf);
+    for channel in 0..4 {
+        gaussian_channel(data, &d, channel, buf);
+    }
 }
 
 fn gaussian_channel(data: &mut [u8], d: &BlurData, channel: usize, buf: &mut [f64]) {
@@ -51,11 +50,11 @@ fn gaussian_channel(data: &mut [u8], d: &BlurData, channel: usize, buf: &mut [f6
 fn gaussianiir2d(d: &BlurData, buf: &mut [f64]) {
     let width = d.width;
     let (lambda_x, dnu_x) = if d.sigma_x > 0.0 {
-        let (lambda, dnu) = gen_coefficients(d.sigma_x, d.steps);
+        let (lambda, dnu) = gen_coefficients(d.sigma_x, STEPS);
 
         for rows in buf.chunks_mut(width * 4) {
             let n = rows.len() / width;
-            for _ in 0..d.steps {
+            for _ in 0..STEPS {
                 for x in 1..width {
                     for row in 0..n {
                         rows[row * width + x] += dnu * rows[row * width + x - 1];
@@ -75,8 +74,8 @@ fn gaussianiir2d(d: &BlurData, buf: &mut [f64]) {
     };
 
     let (lambda_y, dnu_y) = if d.sigma_y > 0.0 {
-        let (lambda, dnu) = gen_coefficients(d.sigma_y, d.steps);
-        for _ in 0..d.steps {
+        let (lambda, dnu) = gen_coefficients(d.sigma_y, STEPS);
+        for _ in 0..STEPS {
             for y in 1..d.height {
                 let (done, rest) = buf.split_at_mut(y * width);
                 for (out, prev) in rest[..width].iter_mut().zip(&done[(y - 1) * width..]) {
@@ -96,8 +95,7 @@ fn gaussianiir2d(d: &BlurData, buf: &mut [f64]) {
         (1.0, 1.0)
     };
 
-    let post_scale =
-        ((dnu_x * dnu_y).sqrt() / (lambda_x * lambda_y).sqrt()).powi(2 * d.steps as i32);
+    let post_scale = ((dnu_x * dnu_y).sqrt() / (lambda_x * lambda_y).sqrt()).powi(2 * STEPS as i32);
     buf.iter_mut().for_each(|v| *v *= post_scale);
 }
 

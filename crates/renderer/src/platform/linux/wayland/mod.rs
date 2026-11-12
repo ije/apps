@@ -1,7 +1,7 @@
 mod window;
 
 use super::input::{self, Clicks, Composer, Ime, NOTCH_LINES};
-use super::{Display, Native, run_after, soon, watch};
+use super::{Display, Native as _, Opened, run_after, soon, watch};
 use crate::{Button, Cursor, Event, Key, Modifiers, Pixels, Point, Rect, WindowOptions};
 use crate::{app::Callbacks, point, px, size};
 use anyhow::{Context as _, Result};
@@ -121,11 +121,11 @@ type WlDataOffer = wl_data_offer::WlDataOffer;
 type WlSurface = wl_surface::WlSurface;
 type Token = activation::xdg_activation_token_v1::XdgActivationTokenV1;
 
-fn maybe<I: Proxy + 'static>(list: &GlobalList, qh: &QueueHandle<Hub>, newest: u32) -> Option<I>
+fn maybe<I: Proxy + 'static>(list: &GlobalList, qh: &QueueHandle<Hub>) -> Option<I>
 where
     Hub: wayland_client::Dispatch<I, ()>,
 {
-    list.bind(qh, 1..=newest, ()).ok()
+    list.bind(qh, 1..=1, ()).ok()
 }
 
 struct Globals {
@@ -301,7 +301,7 @@ impl Client {
             }
         });
         let seat: wl_seat::WlSeat = seat.context("the Wayland compositor has no seat")?;
-        let viewporter = maybe(&list, &qh, 1);
+        let viewporter = maybe(&list, &qh);
         let globals = Globals {
             compositor: list
                 .bind(&qh, 4..=6, ())
@@ -310,13 +310,13 @@ impl Client {
                 .bind(&qh, 1..=6, ())
                 .context("the compositor has no xdg_wm_base")?,
             devices: list.bind(&qh, 3..=3, ()).ok(),
-            shapes: maybe(&list, &qh, 1),
+            shapes: maybe(&list, &qh),
             // A fractional scale sizes the buffer through a viewport.
-            fractions: viewporter.as_ref().and_then(|_| maybe(&list, &qh, 1)),
+            fractions: viewporter.as_ref().and_then(|_| maybe(&list, &qh)),
             viewporter,
-            decorations: maybe(&list, &qh, 1),
-            activation: maybe(&list, &qh, 1),
-            typing: maybe(&list, &qh, 1),
+            decorations: maybe(&list, &qh),
+            activation: maybe(&list, &qh),
+            typing: maybe(&list, &qh),
         };
         anyhow::ensure!(
             !needs_decorations || globals.decorations.is_some(),
@@ -416,10 +416,6 @@ impl Client {
         if live.mouse.focus.as_ref() == Some(id) {
             live.mouse.focus = None;
         }
-    }
-
-    fn press_serial(&self) -> Option<u32> {
-        self.live.borrow().press.as_ref().map(|(serial, _)| *serial)
     }
 
     fn activate(&self, surface: &WlSurface) {
@@ -794,15 +790,9 @@ impl Client {
                     return;
                 };
                 xkb.update_mask(down, latched, locked, 0, 0, group);
-                let (modifiers, caps_lock) = input::held(xkb);
+                let (modifiers, _) = input::held(xkb);
                 live.keys.modifiers = modifiers;
-                later(
-                    live.focused(),
-                    Event::ModifiersChanged {
-                        modifiers,
-                        caps_lock,
-                    },
-                );
+                later(live.focused(), Event::ModifiersChanged { modifiers });
             }
             Kb::Key {
                 serial,
@@ -1321,12 +1311,12 @@ impl Display for Client {
         })
     }
 
-    fn open(self: Rc<Self>, options: &WindowOptions, calls: Callbacks) -> Result<Rc<dyn Native>> {
-        let window = Surface::open(&self, options, calls)?;
+    fn open(self: Rc<Self>, options: &WindowOptions, calls: Callbacks) -> Result<Opened> {
+        let (window, atlas) = Surface::open(&self, options, calls)?;
         let startup = self.live.borrow_mut().startup.take();
         if let (Some(activation), Some(token)) = (&self.globals.activation, startup) {
             activation.activate(token, window.surface());
         }
-        Ok(window)
+        Ok((window, atlas))
     }
 }

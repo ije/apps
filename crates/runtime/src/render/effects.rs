@@ -15,10 +15,6 @@ pub(crate) struct Ids {
 }
 
 impl Ids {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     pub(crate) fn of(walk: std::rc::Rc<Vec<(u32, u32)>>) -> Self {
         Self {
             map: Default::default(),
@@ -214,9 +210,8 @@ pub(crate) fn transform(
         };
         let args = components(args, ',');
         let next = match (name.to_ascii_lowercase().as_str(), args.as_slice()) {
-            ("translate", [x]) => translate(length(x, size[0])?, 0., 0.),
+            ("translate" | "translatex", [x]) => translate(length(x, size[0])?, 0., 0.),
             ("translate", [x, y]) => translate(length(x, size[0])?, length(y, size[1])?, 0.),
-            ("translatex", [x]) => translate(length(x, size[0])?, 0., 0.),
             ("translatey", [y]) => translate(0., length(y, size[1])?, 0.),
             ("translatez", [z]) => translate(0., 0., length(z, 0.)?),
             ("translate3d", [x, y, z]) => {
@@ -312,7 +307,7 @@ pub(crate) fn translation(matrix: &Matrix) -> Option<[f32; 2]> {
     (*matrix == plain).then_some([matrix[12], matrix[13]])
 }
 
-pub(crate) fn map(matrix: &Matrix, [x, y]: [f32; 2]) -> Option<[f32; 2]> {
+fn map(matrix: &Matrix, [x, y]: [f32; 2]) -> Option<[f32; 2]> {
     let w = matrix[3] * x + matrix[7] * y + matrix[15];
     (w > 1e-4).then(|| {
         [
@@ -367,22 +362,6 @@ fn then_matrix(inner: &[f32; 20], outer: &[f32; 20]) -> [f32; 20] {
 
 pub(crate) fn filters(value: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Vec<PaintEffect> {
     let mut effects: Vec<PaintEffect> = Vec::new();
-    let push_matrix = |effects: &mut Vec<PaintEffect>, matrix: [f32; 20]| {
-        if let Some(last) = effects.last_mut()
-            && last.blur == px(0.)
-            && last.shadow.is_none()
-        {
-            last.color_matrix = Some(match last.color_matrix {
-                Some(inner) => then_matrix(&inner, &matrix),
-                None => matrix,
-            });
-        } else {
-            effects.push(PaintEffect {
-                color_matrix: Some(matrix),
-                ..Default::default()
-            });
-        }
-    };
     for part in components(value, ' ') {
         let Some((name, args)) = part.strip_suffix(')').and_then(|part| part.split_once('('))
         else {
@@ -412,9 +391,23 @@ pub(crate) fn filters(value: &str, units: &Lengths, doc: &Document, ids: &Ids) -
             }
             "url" => effects.extend(svg_filter(args, units, doc, ids)),
             _ => {
-                let (filter, opacity, _) = style::Filter::parse(part, units);
-                if let Some(matrix) = color_matrix(filter, opacity) {
-                    push_matrix(&mut effects, matrix);
+                let (filter, opacity) = style::Filter::parse(part, units);
+                let Some(matrix) = color_matrix(filter, opacity) else {
+                    continue;
+                };
+                if let Some(last) = effects.last_mut()
+                    && last.blur == px(0.)
+                    && last.shadow.is_none()
+                {
+                    last.color_matrix = Some(match last.color_matrix {
+                        Some(inner) => then_matrix(&inner, &matrix),
+                        None => matrix,
+                    });
+                } else {
+                    effects.push(PaintEffect {
+                        color_matrix: Some(matrix),
+                        ..Default::default()
+                    });
                 }
             }
         }
@@ -504,7 +497,7 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Ve
                     matrix[15..18].copy_from_slice(&[0.2125, 0.7154, 0.0721]);
                     Some(matrix)
                 } else {
-                    let (filter, opacity, _) = style::Filter::parse(&css, units);
+                    let (filter, opacity) = style::Filter::parse(&css, units);
                     color_matrix(filter, opacity)
                 };
                 if let Some(matrix) = matrix {
@@ -532,7 +525,7 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Ve
 pub(crate) fn backdrop(value: &str, units: &Lengths) -> Option<(Pixels, Option<[f32; 20]>)> {
     let mut blur = px(0.);
     let mut matrix: Option<[f32; 20]> = None;
-    for effect in filters(value, units, &Document::default(), &Ids::new()) {
+    for effect in filters(value, units, &Document::default(), &Ids::default()) {
         blur = blur.max(effect.blur);
         if let Some(next) = effect.color_matrix {
             matrix = Some(match matrix {
@@ -1526,7 +1519,7 @@ mod tests {
             "grayscale(1) contrast(2) blur(4px) drop-shadow(1px 2px 6px red) opacity(.5)",
             &units,
             &doc,
-            &Ids::new(),
+            &Ids::default(),
         );
         assert_eq!(effects.len(), 4);
         assert!(effects[0].color_matrix.is_some());
@@ -1588,7 +1581,7 @@ mod tests {
         let doc = Document::parse(
             "<svg><clipPath id=c><rect width=5 height=5></rect></clipPath></svg><p id=c></p>",
         );
-        let ids = &Ids::new();
+        let ids = &Ids::default();
         assert!(matches!(
             clip("inset(10px round 4px)", &units, [100., 60.], &doc, ids),
             Some(Clip::Rounded([10., 10., 80., 40.], [4., 4., 4., 4.]))

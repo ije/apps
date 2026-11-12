@@ -1,7 +1,7 @@
 use crate::{
-    Color, Size,
-    atlas::{self, Packer, PageKind, PageList, PageStore, Tile},
-    frame::{Command, RenderFrame, Target},
+    Color, Rect, Size,
+    atlas::{self, PageKind, PageList, PageStore, Tile},
+    frame::{Command, Pool, RenderFrame, Target},
     gpu::{ATTRIBUTES, Blur, Composite, Globals, Instance, Plain, bytes},
     scene::Scene,
 };
@@ -23,7 +23,6 @@ use windows::{
 const FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 const SWAP_BUFFERS: u32 = 2;
 const MAX_INSTANCE_BYTES: usize = 256 << 20;
-const SPARE_FRAMES: u8 = 3;
 // DirectWrite gives linear coverage, and the targets blend in sRGB, which makes dark text heavy and light
 // text thin. This moves coverage back toward the ink.
 const TEXT_CONTRAST: f32 = 0.3;
@@ -247,12 +246,11 @@ impl Gpu {
                 device: device.clone(),
                 context: context.clone(),
                 max: max_texture as i32,
-                mask: PageList::default(),
-                color: PageList::default(),
+                pages: Default::default(),
             };
             let atlas = match atlas {
                 Some(atlas) => {
-                    atlas.clear(|old| *old = pages);
+                    atlas.clear(pages);
                     atlas
                 }
                 None => Rc::new(Atlas::new(pages)),
@@ -415,12 +413,6 @@ impl Image {
     }
 }
 
-struct Layer {
-    image: Image,
-    size: [u32; 2],
-    idle: u8,
-}
-
 // A window has one composition target.
 struct Surface {
     chain: IDXGISwapChain1,
@@ -478,8 +470,7 @@ pub(crate) struct Renderer {
     background: [f32; 4],
     size: [u32; 2],
     surface: Option<Surface>,
-    pool: Vec<Layer>,
-    slots: Vec<usize>,
+    pool: Pool<Image>,
     frame: RenderFrame,
 }
 
@@ -495,8 +486,7 @@ impl Renderer {
             background: [0., 0., 0., f32::from(u8::from(!transparent))],
             size,
             surface: Some(surface),
-            pool: Vec::new(),
-            slots: Vec::new(),
+            pool: Pool::default(),
             frame: RenderFrame::default(),
         })
     }
@@ -546,7 +536,6 @@ impl Renderer {
     // Layers go; the swap chain keeps the last frame on screen.
     pub fn release(&mut self) {
         self.pool.clear();
-        self.slots.clear();
     }
 
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
@@ -596,40 +585,12 @@ impl Renderer {
         Ok(pixels)
     }
 
-    fn layers(&mut self, sizes: &[[u32; 2]]) -> Result<()> {
-        for layer in &mut self.pool {
-            layer.idle = layer.idle.saturating_add(1);
-        }
-        self.pool.retain(|layer| layer.idle <= SPARE_FRAMES);
-        self.slots.clear();
-        for &size in sizes {
-            let reuse = self
-                .pool
-                .iter()
-                .position(|layer| layer.idle > 0 && layer.size == size);
-            let index = match reuse {
-                Some(index) => index,
-                None => {
-                    let bind = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-                    let device = &self.gpu.device;
-                    let image = Image::new(device, texture(device, size, FORMAT, bind)?, bind)?;
-                    self.pool.push(Layer {
-                        image,
-                        size,
-                        idle: 0,
-                    });
-                    self.pool.len() - 1
-                }
-            };
-            self.pool[index].idle = 0;
-            self.slots.push(index);
-        }
-        Ok(())
-    }
-
     fn encode(&mut self, frame: &RenderFrame) -> Result<()> {
-        self.layers(&frame.textures)?;
         let gpu = &*self.gpu;
+        self.pool.fill(frame, |size| {
+            let bind = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            Image::new(&gpu.device, texture(&gpu.device, size, FORMAT, bind)?, bind)
+        })?;
         let context = &gpu.context;
         let instances = gpu.instances(bytes(&frame.instances))?;
         let back = self
@@ -637,10 +598,7 @@ impl Renderer {
             .as_ref()
             .and_then(|surface| surface.back.as_ref())
             .context("no back buffer")?;
-        let image = |target: Target| match target {
-            Target::Frame => back,
-            Target::Layer(index) => &self.pool[self.slots[frame.layers[index].texture]].image,
-        };
+        let image = |target: Target| self.pool.get(frame, target).unwrap_or(back);
         let source = |target: Target| image(target).read.clone();
         let pages = gpu.atlas.pages.borrow();
         let page = |kind, index: Option<u32>| index.and_then(|index| pages.view(kind, index));
@@ -808,72 +766,44 @@ fn read_back(gpu: &Gpu, source: &ID3D11Texture2D, size: [u32; 2]) -> Result<Vec<
     Ok(pixels)
 }
 
-struct Page {
-    packer: Packer,
-    image: Image,
-}
-
 // Atlas pages: mask pages keep coverage in red, color pages are BGRA like the frame.
 pub(crate) struct Pages {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     max: i32,
-    mask: PageList<Page>,
-    color: PageList<Page>,
+    // Indexed by `PageKind`.
+    pages: [PageList<Image>; 2],
 }
 
 impl Pages {
-    fn list(&mut self, kind: PageKind) -> &mut PageList<Page> {
-        match kind {
-            PageKind::Mask => &mut self.mask,
-            PageKind::Color => &mut self.color,
-        }
-    }
-
     fn view(&self, kind: PageKind, index: u32) -> Option<ID3D11ShaderResourceView> {
-        let list = match kind {
-            PageKind::Mask => &self.mask,
-            PageKind::Color => &self.color,
-        };
-        list.get(index as usize)?.image.read.clone()
+        self.pages[kind as usize].get(index as usize)?.read.clone()
     }
 }
 
 impl PageStore for Pages {
-    fn insert(&mut self, kind: PageKind, size: Size<i32>, bytes: &[u8]) -> Result<Tile> {
-        ensure!(
-            size.width > 0 && size.height > 0,
-            "atlas tiles must have a size"
-        );
-        let (format, pixel) = match kind {
-            PageKind::Mask => (DXGI_FORMAT_R8_UNORM, 1),
-            PageKind::Color => (FORMAT, 4),
+    fn insert(
+        &mut self,
+        kind: PageKind,
+        size: Size<i32>,
+        bytes: &[u8],
+    ) -> Result<(usize, Rect<i32>, u32)> {
+        let format = match kind {
+            PageKind::Mask => DXGI_FORMAT_R8_UNORM,
+            PageKind::Color => FORMAT,
         };
-        let row = size.width as usize * pixel;
-        ensure!(
-            bytes.len() >= row * size.height as usize,
-            "atlas upload is too short"
-        );
-        let device = self.device.clone();
-        let (index, rect, id) = self.list(kind).allocate(
-            size,
-            |page| &mut page.packer,
-            |size| {
-                let side = [size.width as u32, size.height as u32];
-                let bind = D3D11_BIND_SHADER_RESOURCE;
-                Ok(Page {
-                    packer: Packer::new(size),
-                    image: Image::new(&device, texture(&device, side, format, bind)?, bind)?,
-                })
-            },
-        )?;
-        let context = self.context.clone();
-        let page = self.list(kind).get(index).context("no atlas page")?;
+        let row = bytes.len() / size.height as usize;
+        let (device, context) = (&self.device, &self.context);
+        let (index, page, rect, id) = self.pages[kind as usize].allocate(size, |size| {
+            let side = [size.width as u32, size.height as u32];
+            let bind = D3D11_BIND_SHADER_RESOURCE;
+            Image::new(device, texture(device, side, format, bind)?, bind)
+        })?;
         let (x, y) = (rect.origin.x as u32, rect.origin.y as u32);
         // SAFETY: the bytes cover the tile, which lies within the page.
         unsafe {
             context.UpdateSubresource(
-                &page.image.pixels,
+                &page.pixels,
                 0,
                 Some(&D3D11_BOX {
                     left: x,
@@ -888,25 +818,11 @@ impl PageStore for Pages {
                 0,
             );
         }
-        Ok(Tile {
-            page: index as u32,
-            kind,
-            id,
-            rect,
-        })
+        Ok((index, rect, id))
     }
 
     fn remove(&mut self, tile: Tile) {
-        let list = self.list(tile.kind);
-        let index = tile.page as usize;
-        if list
-            .pages
-            .get_mut(index)
-            .and_then(Option::as_mut)
-            .is_some_and(|page| page.packer.free(tile.id))
-        {
-            list.emptied(index, |page| page.packer.is_empty());
-        }
+        self.pages[tile.kind as usize].free(tile.page as usize, tile.id);
     }
 
     fn max_side(&self) -> i32 {

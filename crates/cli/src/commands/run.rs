@@ -121,7 +121,6 @@ pub fn run(
         .then(|| std::env::temp_dir().join(format!("apps-bundle-{}.json", std::process::id())));
     let result = (|| -> Result<i32> {
         let mut fresh = true;
-        let mut launch = bundle.is_some();
         let mut failed = bundle.is_none();
         let mut changed = None;
         loop {
@@ -162,9 +161,7 @@ pub fn run(
                     }
                 }
             }
-            if launch {
-                launch = false;
-                let files = bundle.take().unwrap();
+            if let Some(files) = bundle.take() {
                 let mut cmd = Command::new(binary.as_ref().unwrap());
                 if rust.is_some() {
                     cmd.env("APPS_RUST_DEV", "1")
@@ -382,7 +379,6 @@ pub fn run(
                                     let _ = writer.join();
                                 }
                                 bundle = Some(next.files);
-                                launch = true;
                                 println!("apps: restarted in {} ms", rebuild.elapsed().as_millis());
                             }
                             Err(error) => {

@@ -41,7 +41,7 @@ pub(crate) struct Hud {
     raw: NonNull<c_void>,
     library: &'static Library,
     pub(crate) started: Cell<Instant>,
-    timer: RefCell<Option<Timer>>,
+    timer: RefCell<Timer>,
 }
 
 impl Hud {
@@ -54,7 +54,7 @@ impl Hud {
                         raw,
                         library,
                         started: Cell::new(Instant::now()),
-                        timer: RefCell::new(Some(tick(Rc::downgrade(view), window))),
+                        timer: RefCell::new(tick(Rc::downgrade(view), window)),
                     });
                     view.hud.replace(hud);
                 }
@@ -64,7 +64,7 @@ impl Hud {
         window.refresh();
     }
 
-    pub(crate) fn paint(&self, window: &mut Window) {
+    pub(super) fn paint(&self, window: &mut Window) {
         let size = window.viewport_size();
         unsafe {
             (self.library.paint)(
@@ -108,7 +108,7 @@ fn tick(view: Weak<PageState>, window: &Window) -> Timer {
             if unsafe { (hud.library.tick)(hud.raw.as_ptr()) } {
                 window.refresh();
             }
-            hud.timer.replace(Some(tick(view, window)));
+            hud.timer.replace(tick(view, window));
         }
     })
 }
@@ -128,14 +128,7 @@ extern "C" fn paint(window: *mut c_void, item: &Item) {
         len: text.len(),
         font: renderer::Font::new(FONT),
         color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-        letter_spacing: px(0.),
-        word_spacing: px(0.),
-        font_size: None,
-        inset: Default::default(),
-        nowrap: false,
+        ..Default::default()
     };
     let line = window.text_system().shape_line(&text, px(item.size), &run);
     let align = match item.align {

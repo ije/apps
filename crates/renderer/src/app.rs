@@ -225,12 +225,8 @@ impl App {
         self.platform.write_clipboard(&text);
     }
 
-    pub fn primary_display_bounds(&self) -> Option<Rect> {
-        self.platform.primary_display_bounds()
-    }
-
     pub fn centered(&self, size: Size<Pixels>) -> Rect {
-        let display = self.primary_display_bounds().unwrap_or_default();
+        let display = self.platform.primary_display_bounds().unwrap_or_default();
         let room = display.size - size;
         Rect::new(
             display.origin + Point::new(room.width / 2., room.height / 2.),

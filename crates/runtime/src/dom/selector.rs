@@ -353,15 +353,8 @@ impl SelectorCache {
                 if list.len() >= 16.max(*compacted as usize * 2) {
                     // Drop forgotten nodes during compaction, or parents retain dependencies on every past
                     // child.
-                    self.stamp = self.stamp.wrapping_add(1);
-                    if self.stamp == 0 {
-                        self.stamps.fill(0);
-                        self.stamp = 1;
-                    }
-                    if self.stamps.len() < self.seen.len() {
-                        self.stamps.resize(self.seen.len(), 0);
-                    }
-                    let (seen, stamps, stamp) = (&self.seen, &mut self.stamps, self.stamp);
+                    let stamp = next_stamp(&mut self.stamp, &mut self.stamps, self.seen.len());
+                    let (seen, stamps) = (&self.seen, &mut self.stamps);
                     list.retain(|&node| {
                         seen.get(node as usize).is_some_and(|&seen| seen != 0)
                             && std::mem::replace(&mut stamps[node as usize], stamp) != stamp
@@ -389,6 +382,10 @@ impl SelectorCache {
         self.children.shrink_to_fit();
         self.watched.truncate(len);
         self.watched.shrink_to_fit();
+        self.blooms.truncate(len);
+        self.blooms.shrink_to_fit();
+        self.stamps.truncate(len);
+        self.stamps.shrink_to_fit();
         self.within.retain(|&anchor, _| anchor < len);
     }
 
@@ -602,14 +599,7 @@ impl SelectorCache {
             }
             // A change can flip the `:has()` results of the nodes above it, and of their children that read
             // siblings.
-            self.stamp = self.stamp.wrapping_add(1);
-            if self.stamp == 0 {
-                self.stamps.fill(0);
-                self.stamp = 1;
-            }
-            if self.stamps.len() < self.seen.len() {
-                self.stamps.resize(self.seen.len(), 0);
-            }
+            next_stamp(&mut self.stamp, &mut self.stamps, self.seen.len());
             let mut above = Vec::new();
             // A local result reads no style attribute or own class list, and a new place follows a change
             // of the parent's children.
@@ -971,16 +961,22 @@ impl SelectorCache {
     }
 }
 
+fn next_stamp(stamp: &mut u32, stamps: &mut Vec<u32>, len: usize) -> u32 {
+    *stamp = stamp.wrapping_add(1);
+    if *stamp == 0 {
+        stamps.fill(0);
+        *stamp = 1;
+    }
+    if stamps.len() < len {
+        stamps.resize(len, 0);
+    }
+    *stamp
+}
+
 // Match `disabled` in dom.js: a disabled fieldset disables the controls in it, except in its first legend,
 // and a disabled optgroup its options.
 fn disabled(doc: &Document, id: usize, memo: &mut SelectorCache) -> bool {
     let tag = doc.nodes[id].tag.as_str();
-    if !matches!(
-        tag,
-        "button" | "input" | "select" | "textarea" | "optgroup" | "option" | "fieldset"
-    ) {
-        return false;
-    }
     let (mut at, mut child) = (id, None);
     while !doc.nodes[at].tag.starts_with('#') {
         let node = &doc.nodes[at];
@@ -1759,20 +1755,7 @@ impl Selector {
     }
 
     pub(crate) fn matches(&self, doc: &Document, id: usize) -> bool {
-        self.matches_scope(doc, id, None)
-    }
-
-    fn matches_scope(&self, doc: &Document, id: usize, scope: Option<usize>) -> bool {
-        self.matches_cached(doc, id, scope, &mut SelectorCache::default())
-    }
-
-    pub(crate) fn matches_reusing(
-        &self,
-        doc: &Document,
-        id: usize,
-        memo: &mut SelectorCache,
-    ) -> bool {
-        self.matches_cached(doc, id, None, memo)
+        self.matches_cached(doc, id, None, &mut SelectorCache::default())
     }
 
     pub(crate) fn matches_fresh(
@@ -2578,7 +2561,6 @@ impl Selector {
                 _ => {
                     let mut ancestor = Some(parent);
                     let mut visited = Vec::new();
-                    let start = memo.dependencies.len();
                     let mut matched = false;
                     while let Some(id) = ancestor {
                         // Memoize only reads from the ancestor upward, or sibling lookups inherit each
@@ -2608,11 +2590,6 @@ impl Selector {
                         memo.reserve(dependencies.len());
                         memo.values.insert(key, (matched, dependencies));
                     }
-                    let mut dependencies = memo.dependencies[start..].to_vec();
-                    dependencies.sort_unstable();
-                    dependencies.dedup();
-                    memo.dependencies.truncate(start);
-                    memo.dependencies.extend(&dependencies);
                     matched
                 }
             }
@@ -2623,8 +2600,6 @@ impl Selector {
         let mut dependencies = memo.dependencies[start..].to_vec();
         dependencies.sort_unstable();
         dependencies.dedup();
-        memo.dependencies.truncate(start);
-        memo.dependencies.extend(&dependencies);
         memo.reserve(dependencies.len());
         memo.values.insert(key, (result, dependencies.into()));
         result
@@ -2766,8 +2741,9 @@ mod tests {
         let body = doc.nodes.iter().position(|n| n.tag == "body").unwrap();
         let html = doc.nodes.iter().position(|n| n.tag == "html").unwrap();
         let selector = &Selector::parse(":scope > body", None)[0];
-        assert!(selector.matches_scope(&doc, body, Some(0)));
-        assert!(Selector::parse(":scope", None)[0].matches_scope(&doc, html, Some(0)));
+        let mut memo = SelectorCache::default();
+        assert!(selector.matches_cached(&doc, body, Some(0), &mut memo));
+        assert!(Selector::parse(":scope", None)[0].matches_cached(&doc, html, Some(0), &mut memo));
     }
 
     #[test]
@@ -3354,7 +3330,12 @@ mod tests {
             .unwrap();
         let scoped = Selector::try_parse("& > i").unwrap();
         let inside = find(&nested, "in");
-        assert!(scoped[0].matches_scope(&nested, inside, Some(div)));
+        assert!(scoped[0].matches_cached(
+            &nested,
+            inside,
+            Some(div),
+            &mut SelectorCache::default()
+        ));
         assert_eq!(scoped[0].specificity, [0, 0, 1]);
     }
 
