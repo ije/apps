@@ -84,6 +84,7 @@ name = "apps"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "apps-audio",
  "apps-media",
  "apps-runtime",
  "apps-webgpu",
@@ -109,6 +110,13 @@ dependencies = [
  "tempfile",
  "url",
  "zip",
+]
+
+[[package]]
+name = "apps-audio"
+version = "0.0.0"
+dependencies = [
+ "cpal",
 ]
 
 [[package]]
@@ -182,6 +190,7 @@ name = "apps-runtime"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "apps-audio",
  "apps-mcp",
  "apps-media",
  "apps-renderer",

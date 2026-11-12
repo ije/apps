@@ -613,10 +613,11 @@ impl Host {
         match op {
             "open" => {
                 let video = args[2].as_bool().unwrap_or(false);
-                let feature = if video { "video" } else { "audio" };
+                let enabled = |feature| disabled & crate::bundle::feature_bit(feature) == 0;
+                let ffmpeg = enabled("media");
                 ensure!(
-                    disabled & crate::bundle::feature_bit(feature) == 0,
-                    "The {feature} feature is disabled. Add \"{feature}\" to \"features\" in package.json"
+                    ffmpeg || !video && enabled("simpleAudio"),
+                    "The media feature is disabled. Add \"media\" to \"features\" in package.json"
                 );
                 if args[1].is_string() {
                     let path = local_file(
@@ -625,9 +626,9 @@ impl Host {
                         args[1].as_str().context("Expected a URL")?,
                     )?
                     .context("Media is not a bundled asset or local file")?;
-                    media.open(node, Ok(&path), video)?;
+                    media.open(node, Ok(&path), video, ffmpeg)?;
                 } else {
-                    media.open(node, Err(crate::node::bytes(&args[1])?), video)?;
+                    media.open(node, Err(crate::node::bytes(&args[1])?), video, ffmpeg)?;
                 }
             }
             "control" => media.control(

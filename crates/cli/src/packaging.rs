@@ -22,17 +22,19 @@ pub fn package_app(
     let enabled = |feature| disabled & apps_runtime::bundle::feature_bit(feature) == 0;
     let webgpu = apps_runtime::gpu::library_name(target.platform).filter(|_| enabled("webgpu"));
     // FFmpeg is LGPL, so it ships as its own library with its license, which users can replace.
-    let media = if enabled("video") || enabled("audio") {
+    let media = if enabled("media") {
         let ffmpeg = apps_runtime::media::ffmpeg_name(target.platform);
         ensure!(
             runtime.canonicalize()?.with_file_name(ffmpeg).is_file(),
-            "The video and audio features need the media library and its FFmpeg next to the runtime. Run bash scripts/build-ffmpeg.sh, then cargo build --workspace --release."
+            "The media feature needs the media library and its FFmpeg next to the runtime. Run bash scripts/build-ffmpeg.sh, then cargo build --workspace --release."
         );
         vec![
-            apps_runtime::media::library_name(target.platform),
+            apps_runtime::media::library_name(target.platform, true),
             ffmpeg,
             "FFmpeg.LICENSE",
         ]
+    } else if enabled("simpleAudio") {
+        vec![apps_runtime::media::library_name(target.platform, false)]
     } else {
         Vec::new()
     };
@@ -233,7 +235,7 @@ pub fn package_app(
         let source = folder.with_file_name(name);
         if *name != "FFmpeg.LICENSE" {
             target.validate_binary(&source).context(
-                "The video and audio features need the media library next to the runtime. Build the workspace first with cargo build --workspace --release.",
+                "The media and simpleAudio features need their library next to the runtime. Build the workspace first with cargo build --workspace --release.",
             )?;
         }
         let destination = libraries.join(name);
@@ -607,12 +609,13 @@ mod tests {
                 None,
             )
         };
-        let error = build(r#"["video"]"#).unwrap_err();
+        let error = build(r#"["media"]"#).unwrap_err();
         assert!(error.to_string().contains("FFmpeg"), "{error}");
         let names = [
-            apps_runtime::media::library_name(target.platform),
+            apps_runtime::media::library_name(target.platform, true),
             apps_runtime::media::ffmpeg_name(target.platform),
             "FFmpeg.LICENSE",
+            apps_runtime::media::library_name(target.platform, false),
         ];
         for name in &names {
             fs::copy(
@@ -621,14 +624,16 @@ mod tests {
             )
             .unwrap();
         }
+        // The last flag is for the audio library, which ships only without FFmpeg.
         for (features, shipped) in [
-            ("[]", false),
-            (r#"["audio"]"#, true),
-            (r#"["video","-audio"]"#, true),
-            (r#"["video","-video"]"#, false),
+            ("[]", [false; 4]),
+            (r#"["media"]"#, [true, true, true, false]),
+            (r#"["simpleAudio"]"#, [false, false, false, true]),
+            (r#"["media","simpleAudio"]"#, [true, true, true, false]),
+            (r#"["media","-media"]"#, [false; 4]),
         ] {
             build(features).unwrap();
-            for name in &names {
+            for (name, shipped) in names.iter().zip(shipped) {
                 assert_eq!(libraries.join(name).is_file(), shipped, "{features} {name}");
             }
         }

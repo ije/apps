@@ -68,6 +68,7 @@ path = "src/main.rs"
 
 [dev-dependencies]
 apps-mcp = { path = "../mcp" }
+apps-audio = { path = "../audio" }
 apps-media = { path = "../media" }
 apps-webgpu = { path = "../webgpu" }
 image.workspace = true

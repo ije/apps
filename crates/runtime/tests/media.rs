@@ -226,8 +226,59 @@ fn media_features_are_disabled_by_default() {
         engine
             .eval("media.error.message", "media-test")
             .unwrap()
-            .contains(r#"Add "video" to "features""#)
+            .contains(r#"Add "media" to "features""#)
     );
+}
+
+#[test]
+fn simple_audio_plays_only_wave_files() {
+    let package = r#"{"features":["simpleAudio"]}"#;
+    let (_host, engine, base) =
+        page(apps_runtime::bundle::disabled_features(Some(package)).unwrap());
+    engine
+        .eval(
+            &format!("globalThis.media = new Audio('{base}tone.wav'); {EVENTS} media.currentTime = 0.2; media.play()"),
+            "media-test",
+        )
+        .unwrap();
+    assert_eq!(
+        wait(
+            &engine,
+            "media.ended ? [media.duration, media.currentTime, events.includes('seeked'), media.canPlayType('audio/wav; codecs=1'), media.canPlayType('audio/mpeg'), document.createElement('video').canPlayType('video/mp4')].join() : media.error?.message ?? 'pending'"
+        ),
+        "0.5,0.5,true,probably,,"
+    );
+    // 0.1 seconds of 8-bit silence, from memory.
+    engine
+        .eval(
+            "globalThis.media = new Audio('data:audio/wav;base64,' + btoa(atob('UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YSADAAA=') + '\\x80'.repeat(800)))",
+            "media-test",
+        )
+        .unwrap();
+    assert_eq!(
+        wait(
+            &engine,
+            "media.readyState === 4 ? media.duration : media.error?.message ?? 'pending'"
+        ),
+        "0.1"
+    );
+    for (element, file, message) in [
+        (
+            "audio",
+            "tone.mp3",
+            "simpleAudio feature plays only PCM WAV",
+        ),
+        ("video", "clip.mp4", r#"Add "media" to "features""#),
+    ] {
+        engine
+            .eval(
+                &format!("globalThis.media = document.createElement('{element}'); media.src = '{base}{file}'"),
+                "media-test",
+            )
+            .unwrap();
+        let error = wait(&engine, "media.error?.message ?? 'pending'");
+        assert!(error.contains(message), "{error}");
+    }
 }
 
 #[test]

@@ -1205,7 +1205,7 @@ fn video_frames_keep_the_boxes_around_them() {
             console.log('VIDEO ' + await pixel(30, 20));
             "#
         ),
-        &[("package.json", r#"{"features":["video"]}"#)],
+        &[("package.json", r#"{"features":["media"]}"#)],
     );
     let line = |name: &str| {
         text.lines()

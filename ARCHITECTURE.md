@@ -13,7 +13,7 @@
 | [crates/renderer](crates/renderer) | Native windows, input, retained box trees, Taffy layout, text, atlases, and GPU backends |
 | [crates/webview](crates/webview) | System web views and their native bridge |
 | [crates/webgpu](crates/webgpu) | The optional WebGPU API through wgpu |
-| [crates/media](crates/media) | The optional audio and video player through FFmpeg and cpal |
+| [crates/media](crates/media), [crates/audio](crates/audio) | The optional audio and video player through FFmpeg and cpal, and its build without FFmpeg |
 | [crates/perfhud](crates/perfhud), [crates/mcp](crates/mcp) | Development tools: the FPS HUD and devtools server |
 | [packages](packages) | npm launcher, TypeScript declarations, and packages for each platform and architecture |
 | [scripts](scripts) | JavaScriptCore, FFmpeg, and npm package builds |
@@ -125,7 +125,8 @@ The `features` array in `package.json` controls optional behavior. All entries i
 | `httpImport` | Permits remote JavaScript and CSS imports |
 | `localNetwork` | Permits page access to private network addresses |
 | `webgpu` | Enables the WebGPU API |
-| `video`, `audio` | Enable the media player |
+| `media` | Enables the media player for `<video>` and `<audio>` |
+| `simpleAudio` | Enables `<audio>` for WAV files only, without FFmpeg |
 | `reactCompiler` | Enables the Oxc React compiler for app page modules |
 
 Without `localNetwork`, page fetch and WebSocket connections reject private addresses except loopback ports that the app itself serves. System web views use their own engine and security model.
@@ -181,7 +182,9 @@ On macOS, `ns-*` inputs use AppKit controls and Liquid Glass uses `NSGlassEffect
 
 [WebGPU](crates/runtime/src/web/gpu.rs) uses `apps-webgpu`. macOS and Windows load it as an optional shared library. Linux links it into the runtime because the page renderer already uses wgpu. WebGPU canvas frames reach the page renderer through CPU readback.
 
-[Media](crates/runtime/src/web/media.rs) uses the optional `apps-media` shared library. The library uses FFmpeg for media decode and cpal for audio output. [build-ffmpeg.sh](scripts/build-ffmpeg.sh) produces a shared FFmpeg library without GPL or nonfree components. App packages include that library and `FFmpeg.LICENSE` when audio or video is enabled.
+[Media](crates/runtime/src/web/media.rs) uses the optional `apps-media` shared library. The library uses FFmpeg for media decode and cpal for audio output. [build-ffmpeg.sh](scripts/build-ffmpeg.sh) produces a shared FFmpeg library without GPL or nonfree components. App packages include that library and `FFmpeg.LICENSE` when the `media` feature is enabled.
+
+`apps-audio` compiles the source of `apps-media` without FFmpeg. A WAV decoder takes the place of the FFmpeg functions, so the player and the mixer are the same. The runtime loads it for the `simpleAudio` feature when `media` is disabled, and the app package then has no FFmpeg.
 
 ## Memory and idle work
 

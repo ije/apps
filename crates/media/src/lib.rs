@@ -120,48 +120,256 @@ unsafe extern "C" {
     fn apps_ffmpeg_close(media: *mut c_void);
 }
 
+// Decodes PCM WAV files in place of `native/ffmpeg.c`, with the same functions, in builds without FFmpeg.
 #[cfg(not(ffmpeg))]
-mod missing {
+mod wave {
     use super::*;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
+
+    trait Input: Read + Seek {}
+    impl<T: Read + Seek> Input for T {}
+
+    pub struct Wave {
+        input: Box<dyn Input>,
+        start: u64,
+        frames: u64,
+        float: bool,
+        width: usize,
+        channels: usize,
+        rate: f64,
+        output: (f64, usize),
+        speed: f64,
+        position: f64,
+        bytes: Vec<u8>,
+        samples: Vec<f32>,
+    }
+
+    pub fn open(mut input: impl Read + Seek + 'static, rate: f64, channels: usize) -> Option<Wave> {
+        let mut head = [0; 12];
+        input.read_exact(&mut head).ok()?;
+        if &head[..4] != b"RIFF" || &head[8..] != b"WAVE" {
+            return None;
+        }
+        let mut format = None;
+        let (start, size) = loop {
+            let mut chunk = [0; 8];
+            input.read_exact(&mut chunk).ok()?;
+            let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u64;
+            match &chunk[..4] {
+                b"fmt " if size >= 16 => {
+                    let mut fields = [0; 26];
+                    let length = size.min(26) as usize;
+                    input.read_exact(&mut fields[..length]).ok()?;
+                    let skip = size - length as u64 + (size & 1);
+                    input.seek(SeekFrom::Current(skip as i64)).ok()?;
+                    format = Some(fields);
+                }
+                b"data" => {
+                    let start = input.stream_position().ok()?;
+                    let rest = input.seek(SeekFrom::End(0)).ok()?.saturating_sub(start);
+                    // Recorders that cannot seek back leave the size 0.
+                    break (start, if size == 0 { rest } else { size.min(rest) });
+                }
+                _ => {
+                    let skip = size + (size & 1);
+                    input.seek(SeekFrom::Current(skip as i64)).ok()?;
+                }
+            }
+        };
+        let format = format?;
+        let field = |at: usize| u16::from_le_bytes([format[at], format[at + 1]]);
+        // An extensible format has its real tag at the start of the subformat.
+        let tag = if field(0) == 0xfffe {
+            field(24)
+        } else {
+            field(0)
+        };
+        let (input_channels, block) = (field(2) as usize, field(12) as usize);
+        let input_rate = u32::from_le_bytes([format[4], format[5], format[6], format[7]]);
+        if input_channels == 0 || input_rate == 0 || block % input_channels != 0 {
+            return None;
+        }
+        let width = block / input_channels;
+        if !matches!((tag, width), (1, 1..=4) | (3, 4 | 8)) {
+            return None;
+        }
+        Some(Wave {
+            input: Box::new(input),
+            start,
+            frames: size / block as u64,
+            float: tag == 3,
+            width,
+            channels: input_channels,
+            rate: input_rate as f64,
+            output: (rate.max(1.), channels.max(1)),
+            speed: 1.,
+            position: 0.,
+            bytes: Vec::new(),
+            samples: Vec::new(),
+        })
+    }
+
+    impl Wave {
+        pub fn seek(&mut self, time: f64) {
+            self.position = (time.max(0.) * self.rate).min(self.frames as f64);
+        }
+
+        // Up to 4096 frames at the output rate and channels, and the media time of the first one.
+        pub fn next(&mut self) -> std::io::Result<Option<(f64, &[f32])>> {
+            let first = self.position as u64;
+            if first >= self.frames {
+                return Ok(None);
+            }
+            let step = self.rate * self.speed / self.output.0;
+            let left = ((self.frames as f64 - self.position) / step).ceil().max(1.) as usize;
+            let count = ((4096. / step) as usize).clamp(64, 4096).min(left);
+            // The curve through four frames needs one frame before the position and two after it.
+            let from = first.saturating_sub(1);
+            let to = ((self.position + (count - 1) as f64 * step) as u64 + 3).min(self.frames);
+            let (width, channels, block) = (self.width, self.channels, self.width * self.channels);
+            self.bytes.resize((to - from) as usize * block, 0);
+            self.input
+                .seek(SeekFrom::Start(self.start + from * block as u64))?;
+            self.input.read_exact(&mut self.bytes)?;
+            let (bytes, float) = (&self.bytes, self.float);
+            let sample = |frame: i64, channel: usize| {
+                let frame = (frame.max(from as i64) as u64).min(to - 1) - from;
+                let bytes = &bytes[frame as usize * block + channel * width..][..width];
+                match (float, width) {
+                    (true, 4) => f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                    (true, _) => f64::from_le_bytes(bytes.try_into().unwrap()) as f32,
+                    (false, 1) => (bytes[0] as f32 - 128.) / 128.,
+                    (false, _) => {
+                        let mut value = [0; 4];
+                        value[4 - width..].copy_from_slice(bytes);
+                        i32::from_le_bytes(value) as f32 / 2147483648.
+                    }
+                }
+            };
+            let outputs = self.output.1;
+            self.samples.clear();
+            for index in 0..count {
+                let position = self.position + index as f64 * step;
+                let (frame, t) = (position as i64, position.fract() as f32);
+                let value = |channel| {
+                    let [a, b, c, d] = [-1, 0, 1, 2].map(|offset| sample(frame + offset, channel));
+                    b + 0.5
+                        * t
+                        * (c - a + t * (2. * a - 5. * b + 4. * c - d + t * (3. * (b - c) + d - a)))
+                };
+                for output in 0..outputs {
+                    self.samples.push(match (channels, outputs) {
+                        (_, 1) => (0..channels).map(value).sum::<f32>() / channels as f32,
+                        (1, _) if output < 2 => value(0),
+                        _ if output < channels && channels > 1 => value(output),
+                        _ => 0.,
+                    });
+                }
+            }
+            let time = self.position / self.rate;
+            self.position += count as f64 * step;
+            Ok(Some((time, &self.samples)))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn apps_ffmpeg_open(
-        _: *const c_char,
-        _: *const u8,
-        _: i64,
+        path: *const c_char,
+        data: *const u8,
+        size: i64,
         _: c_int,
-        _: c_int,
-        _: c_int,
-        _: *mut Info,
+        rate: c_int,
+        channels: c_int,
+        info: *mut Info,
         error: *mut c_char,
-        size: c_int,
+        error_size: c_int,
     ) -> *mut c_void {
-        let message = b"FFmpeg is missing from this build. Run bash scripts/build-ffmpeg.sh\0";
-        let length = message.len().min(size as usize);
-        unsafe { std::ptr::copy_nonoverlapping(message.as_ptr().cast(), error, length) };
+        let (rate, channels) = (rate as f64, channels as usize);
+        let wave = if data.is_null() {
+            unsafe { std::ffi::CStr::from_ptr(path) }
+                .to_str()
+                .map_err(|error| error.to_string())
+                .and_then(|path| std::fs::File::open(path).map_err(|error| error.to_string()))
+                .map(|file| open(file, rate, channels))
+        } else {
+            // The caller keeps the bytes until `apps_ffmpeg_close`.
+            let bytes = unsafe { std::slice::from_raw_parts(data, size as usize) };
+            Ok(open(Cursor::new(bytes), rate, channels))
+        };
+        let message = match wave {
+            Ok(Some(wave)) => {
+                unsafe {
+                    *info = Info {
+                        duration: wave.frames as f64 / wave.rate,
+                        audio: 1,
+                        ..Info::default()
+                    }
+                };
+                return Box::into_raw(Box::new(wave)).cast();
+            }
+            Ok(None) if env!("CARGO_PKG_NAME") == "apps-media" => {
+                "FFmpeg is missing from this build, so only PCM WAV files play. Run bash scripts/build-ffmpeg.sh".into()
+            }
+            Ok(None) => {
+                "The simpleAudio feature plays only PCM WAV files. Add \"media\" to \"features\" in package.json".into()
+            }
+            Err(message) => message,
+        };
+        let length = message.len().min((error_size as usize).saturating_sub(1));
+        unsafe {
+            std::ptr::copy_nonoverlapping(message.as_ptr().cast(), error, length);
+            *error.add(length) = 0;
+        }
         std::ptr::null_mut()
     }
+
     pub unsafe fn apps_ffmpeg_next(
-        _: *mut c_void,
-        _: c_int,
-        _: *mut f64,
+        media: *mut c_void,
+        want: c_int,
+        time: *mut f64,
         _: *mut c_int,
         _: *mut c_int,
-        _: *mut *const f32,
-        _: *mut c_int,
+        samples: *mut *const f32,
+        count: *mut c_int,
     ) -> c_int {
-        0
+        let wave = unsafe { &mut *media.cast::<Wave>() };
+        if want & 2 == 0 {
+            return 0;
+        }
+        let channels = wave.output.1;
+        match wave.next() {
+            Ok(Some((start, frames))) => {
+                unsafe {
+                    *time = start;
+                    *samples = frames.as_ptr();
+                    *count = (frames.len() / channels) as c_int;
+                }
+                2
+            }
+            Ok(None) => 0,
+            Err(_) => -1,
+        }
     }
+
     pub unsafe fn apps_ffmpeg_pixels(_: *mut c_void, _: *mut u8) -> c_int {
         -1
     }
-    pub unsafe fn apps_ffmpeg_seek(_: *mut c_void, _: f64) -> c_int {
-        -1
+
+    pub unsafe fn apps_ffmpeg_seek(media: *mut c_void, time: f64) -> c_int {
+        unsafe { &mut *media.cast::<Wave>() }.seek(time);
+        0
     }
-    pub unsafe fn apps_ffmpeg_speed(_: *mut c_void, _: f64) {}
-    pub unsafe fn apps_ffmpeg_close(_: *mut c_void) {}
+
+    pub unsafe fn apps_ffmpeg_speed(media: *mut c_void, speed: f64) {
+        unsafe { &mut *media.cast::<Wave>() }.speed = speed;
+    }
+
+    pub unsafe fn apps_ffmpeg_close(media: *mut c_void) {
+        drop(unsafe { Box::from_raw(media.cast::<Wave>()) });
+    }
 }
 #[cfg(not(ffmpeg))]
-use missing::*;
+use wave::*;
 
 static PLAYING: [AtomicPtr<Sound>; 64] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 64];
 // Odd while the audio callback reads `PLAYING`. Do not free removed sounds until that read ends.
@@ -1140,6 +1348,82 @@ mod tests {
         sound.mix(&mut out, ticks(Instant::now()));
         assert_eq!(out, [4., 4., 0., 0.]);
         assert!((7. ..7.25).contains(&sound.time().0));
+    }
+
+    #[cfg(not(ffmpeg))]
+    #[test]
+    fn wave_files_decode_resample_and_seek() {
+        let file = |tag: u16, channels: u16, rate: u32, width: u16, data: &[u8]| {
+            let mut bytes = b"RIFF\0\0\0\0WAVELIST\x03\0\0\0abc\0fmt \x10\0\0\0".to_vec();
+            bytes.extend(tag.to_le_bytes());
+            bytes.extend(channels.to_le_bytes());
+            bytes.extend(rate.to_le_bytes());
+            bytes.extend((rate * (channels * width) as u32).to_le_bytes());
+            bytes.extend((channels * width).to_le_bytes());
+            bytes.extend((width * 8).to_le_bytes());
+            bytes.extend(b"data");
+            bytes.extend((data.len() as u32).to_le_bytes());
+            bytes.extend(data);
+            std::io::Cursor::new(bytes)
+        };
+        let all = |mut wave: wave::Wave| {
+            let mut samples = Vec::new();
+            while let Some((_, block)) = wave.next().unwrap() {
+                samples.extend_from_slice(block);
+            }
+            samples
+        };
+        let pcm = |values: &[i16]| {
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let stereo = pcm(&[16384, -32768, 0, 8192]);
+        assert_eq!(
+            all(wave::open(file(1, 2, 8000, 2, &stereo), 8000., 2).unwrap()),
+            [0.5, -1., 0., 0.25]
+        );
+        assert_eq!(
+            all(wave::open(file(1, 2, 8000, 2, &stereo), 8000., 1).unwrap()),
+            [-0.25, 0.125]
+        );
+        assert_eq!(
+            all(wave::open(file(1, 1, 8000, 1, &[255, 64]), 8000., 3).unwrap()),
+            [127. / 128., 127. / 128., 0., -0.5, -0.5, 0.]
+        );
+        assert_eq!(
+            all(wave::open(file(1, 1, 8000, 3, &[0, 0, 64, 0, 0, 192]), 8000., 1).unwrap()),
+            [0.5, -0.5]
+        );
+        let floats: Vec<u8> = [0.25f32, -0.75]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(
+            all(wave::open(file(3, 1, 8000, 4, &floats), 8000., 1).unwrap()),
+            [0.25, -0.75]
+        );
+        let ramp = pcm(&[0, 8192, 16384, 24576]);
+        let doubled = all(wave::open(file(1, 1, 4000, 2, &ramp), 8000., 1).unwrap());
+        assert_eq!(doubled.len(), 8);
+        assert_eq!(doubled[2..5], [0.25, 0.375, 0.5]);
+        let mut wave = wave::open(file(1, 1, 4000, 2, &ramp), 4000., 1).unwrap();
+        wave.seek(0.0005);
+        assert_eq!(wave.next().unwrap(), Some((0.0005, &[0.5, 0.75][..])));
+        assert_eq!(wave.next().unwrap(), None);
+        wave.seek(9.);
+        assert_eq!(wave.next().unwrap(), None);
+        assert!(wave::open(file(6, 1, 8000, 1, &[0]), 8000., 1).is_none());
+        assert!(wave::open(file(1, 0, 8000, 2, &[0, 0]), 8000., 1).is_none());
+        assert!(
+            wave::open(
+                std::io::Cursor::new(b"ID3\x04 not a wave file".to_vec()),
+                8000.,
+                1
+            )
+            .is_none()
+        );
     }
 
     #[test]

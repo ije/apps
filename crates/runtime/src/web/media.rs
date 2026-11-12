@@ -59,11 +59,15 @@ struct Library {
     recycle: unsafe extern "C" fn(*mut c_void, u64, *mut u8, u32, u32),
 }
 
-pub fn library_name(platform: &str) -> &'static str {
-    match platform {
-        "macos" => "libapps_media.dylib",
-        "windows" => "apps_media.dll",
-        _ => "libapps_media.so",
+// The audio library is the media library without FFmpeg. It plays only WAV files.
+pub fn library_name(platform: &str, ffmpeg: bool) -> &'static str {
+    match (platform, ffmpeg) {
+        ("macos", true) => "libapps_media.dylib",
+        ("macos", false) => "libapps_audio.dylib",
+        ("windows", true) => "apps_media.dll",
+        ("windows", false) => "apps_audio.dll",
+        (_, true) => "libapps_media.so",
+        (_, false) => "libapps_audio.so",
     }
 }
 
@@ -75,12 +79,12 @@ pub fn ffmpeg_name(platform: &str) -> &'static str {
     }
 }
 
-fn load() -> Result<Library> {
+fn load(ffmpeg: bool) -> Result<Library> {
     let executable = crate::desktop::app::library_exe()?;
     let directory = executable
         .parent()
         .context("Missing executable directory")?;
-    let name = library_name(std::env::consts::OS);
+    let name = library_name(std::env::consts::OS, ffmpeg);
     // Like JavaScriptCore, the library only loads from the app, never from the environment.
     let path = ["../Frameworks", "."]
         .iter()
@@ -119,13 +123,13 @@ pub struct Media {
 }
 
 impl Media {
-    fn raw(&mut self) -> Result<(NonNull<c_void>, &'static Library)> {
+    fn raw(&mut self, ffmpeg: bool) -> Result<(NonNull<c_void>, &'static Library)> {
         if let Some(raw) = self.raw {
             return Ok(raw);
         }
-        static LIBRARY: OnceLock<Result<Library, String>> = OnceLock::new();
-        let library = LIBRARY
-            .get_or_init(|| load().map_err(|error| format!("{error:#}")))
+        static LIBRARY: [OnceLock<Result<Library, String>>; 2] = [OnceLock::new(), OnceLock::new()];
+        let library = LIBRARY[ffmpeg as usize]
+            .get_or_init(|| load(ffmpeg).map_err(|error| format!("{error:#}")))
             .as_ref()
             .map_err(|error| anyhow!("{error}"))?;
         let raw = NonNull::new(unsafe { (library.new)((&raw const HOST).cast()) })
@@ -133,8 +137,14 @@ impl Media {
         Ok(*self.raw.insert((raw, library)))
     }
 
-    pub fn open(&mut self, id: u64, source: Result<&Path, &[u8]>, video: bool) -> Result<()> {
-        let (raw, library) = self.raw()?;
+    pub fn open(
+        &mut self,
+        id: u64,
+        source: Result<&Path, &[u8]>,
+        video: bool,
+        ffmpeg: bool,
+    ) -> Result<()> {
+        let (raw, library) = self.raw(ffmpeg)?;
         let (data, file) = match source {
             Ok(path) => (
                 path.to_str()
