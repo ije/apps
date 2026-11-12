@@ -37,6 +37,6 @@ url.workspace = true
 zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
-apps-audio = { path = "../audio" }
+apps-audio = { path = "../media/audio" }
 apps-media = { path = "../media" }
 apps-webgpu = { path = "../webgpu" }

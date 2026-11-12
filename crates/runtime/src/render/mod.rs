@@ -21,6 +21,7 @@ use crate::style::Prop;
 use crate::{desktop::Desktop, host::Host, style};
 pub(crate) use element::dimension;
 use element::{Build, element};
+pub(crate) use hud::Hud;
 pub(crate) use inspect::Inspect;
 use renderer::{App, Color, Event, Window, WindowId};
 use std::{
@@ -57,7 +58,7 @@ pub(crate) struct PageState {
     reach: RefCell<Vec<[f32; 2]>>,
     reaching: RefCell<Vec<([f32; 2], u8)>>,
     caret: RefCell<Option<input::Blink>>,
-    hud: RefCell<Option<hud::Hud>>,
+    pub(crate) hud: RefCell<Option<hud::Hud>>,
     pub(crate) inspect: Cell<inspect::Inspect>,
     kept: RefCell<rustc_hash::FxHashMap<usize, element::Kept>>,
     plans: RefCell<plan::Plans>,

@@ -24,11 +24,50 @@ pub(crate) fn pages_open() -> bool {
     PAGE_TOOLS.load(Ordering::Relaxed) > 0
 }
 
-// The page of the panel, or the script that inspects a context for it. Both are in the developer tools
-// library, so built apps don't carry them.
+const ABI: u32 = 3;
+
+// The developer tools library, with the panel page, the MCP server and the FPS HUD. Built apps ship without
+// it. It is never unloaded: its threads run and the panel uses its texts until the app quits.
+pub(crate) fn load() -> Result<&'static libloading::Library> {
+    static LOADED: OnceLock<libloading::Library> = OnceLock::new();
+    if let Some(library) = LOADED.get() {
+        return Ok(library);
+    }
+    let directory = super::app::library_exe()?
+        .parent()
+        .context("Missing executable directory")?
+        .to_owned();
+    let name = libloading::library_filename("apps_devtools");
+    let path = [".", "deps"]
+        .iter()
+        .map(|folder| directory.join(folder).join(&name))
+        .find(|path| path.is_file())
+        .with_context(|| {
+            format!(
+                "The developer tools library {} is missing next to the runtime. Build the workspace with cargo build --workspace.",
+                name.display()
+            )
+        })?;
+    let library = unsafe { libloading::Library::new(&path) }.with_context(|| {
+        format!(
+            "Cannot load the developer tools library from {}",
+            path.display()
+        )
+    })?;
+    let abi: libloading::Symbol<extern "C" fn() -> u32> =
+        unsafe { library.get(b"apps_devtools_abi\0")? };
+    ensure!(
+        abi() == ABI,
+        "{} does not match this runtime",
+        path.display()
+    );
+    Ok(LOADED.get_or_init(|| library))
+}
+
+// The page of the panel, or the script that inspects a context for it.
 fn text(agent: bool) -> Result<&'static str> {
     let panel: libloading::Symbol<extern "C" fn(bool, &mut usize) -> *const u8> =
-        unsafe { super::mcp::load()?.get(b"apps_dev_panel\0")? };
+        unsafe { load()?.get(b"apps_devtools_panel\0")? };
     let mut len = 0;
     let text = panel(agent, &mut len);
     Ok(std::str::from_utf8(unsafe {
@@ -180,6 +219,15 @@ impl DevTools {
                 .context("Expected a width")
                 .and_then(|width| self.browser.dock(width.clamp(200., 800.)))
                 .map(Value::from),
+            Some("Hud.toggle") => {
+                if let Some(page) = page {
+                    host.borrow_mut().command(
+                        crate::desktop::link::Target::Window(page.id),
+                        json!({"op":"window","args":["hud",page.id]}),
+                    );
+                }
+                Ok(Value::Null)
+            }
             Some("Inspect.set") => {
                 if let Some(page) = page {
                     let mut inspect = page.inspect.get();
@@ -212,10 +260,12 @@ impl DevTools {
         ))
     }
 
-    // Tells the panel which node is selected and if the picker is on.
+    // Tells the panel which node is selected and if the picker and the HUD are on.
     pub(crate) fn inspected(&self, page: &crate::render::PageState) -> Result<()> {
-        let inspect = page.inspect.get();
-        self.events(&[json!({"type":"inspect","pick":inspect.pick,"selected":inspect.selected})])
+        let (inspect, hud) = (page.inspect.get(), page.hud.borrow().is_some());
+        self.events(&[
+            json!({"type":"inspect","pick":inspect.pick,"selected":inspect.selected,"hud":hud}),
+        ])
     }
 
     // Tells the panel when the document changed or a new page loaded, at most four times a second. Returns the

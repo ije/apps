@@ -67,8 +67,8 @@ name = "apps-runtime"
 path = "src/main.rs"
 
 [dev-dependencies]
-apps-dev = { path = "../dev" }
-apps-audio = { path = "../audio" }
+apps-devtools = { path = "../devtools" }
+apps-audio = { path = "../media/audio" }
 apps-media = { path = "../media" }
 apps-webgpu = { path = "../webgpu" }
 image.workspace = true

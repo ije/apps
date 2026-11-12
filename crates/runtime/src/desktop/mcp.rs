@@ -13,8 +13,6 @@ use std::{
     time::Instant,
 };
 
-const ABI: u32 = 2;
-
 type Done = extern "C" fn(*mut c_void, bool, *const u8, usize);
 
 #[repr(C)]
@@ -48,57 +46,19 @@ static HOST: Host = Host {
     call,
 };
 
-// The developer tools library. Built apps ship without it. It is never unloaded: the server threads run and
-// the panel uses its texts until the app quits.
-pub(crate) fn load() -> Result<&'static libloading::Library> {
-    static LOADED: OnceLock<libloading::Library> = OnceLock::new();
-    if let Some(library) = LOADED.get() {
-        return Ok(library);
-    }
-    let directory = super::app::library_exe()?
-        .parent()
-        .context("Missing executable directory")?
-        .to_owned();
-    let name = libloading::library_filename("apps_dev");
-    let path = [".", "deps"]
-        .iter()
-        .map(|folder| directory.join(folder).join(&name))
-        .find(|path| path.is_file())
-        .with_context(|| {
-            format!(
-                "The developer tools library {} is missing next to the runtime. Build the workspace with cargo build --workspace.",
-                name.display()
-            )
-        })?;
-    let library = unsafe { libloading::Library::new(&path) }.with_context(|| {
-        format!(
-            "Cannot load the developer tools library from {}",
-            path.display()
-        )
-    })?;
-    let abi: libloading::Symbol<extern "C" fn() -> u32> =
-        unsafe { library.get(b"apps_dev_abi\0")? };
-    ensure!(
-        abi() == ABI,
-        "{} does not match this runtime",
-        path.display()
-    );
-    Ok(LOADED.get_or_init(|| library))
-}
-
 pub(crate) fn start(port: u16, link: Link) -> Result<()> {
-    let library = load()?;
+    let library = super::devtools::load()?;
     let (start, library) = unsafe {
         let start: extern "C" fn(u16, &'static Host) -> *const c_char =
-            *library.get(b"apps_dev_start\0")?;
+            *library.get(b"apps_devtools_mcp_start\0")?;
         let functions = Library {
-            install: *library.get(b"apps_dev_install\0")?,
-            uninstall: *library.get(b"apps_dev_uninstall\0")?,
-            poll: *library.get(b"apps_dev_poll\0")?,
-            paused: *library.get(b"apps_dev_paused\0")?,
-            logs: *library.get(b"apps_dev_logs\0")?,
-            profiling: *library.get(b"apps_dev_profiling\0")?,
-            frame: *library.get(b"apps_dev_frame\0")?,
+            install: *library.get(b"apps_devtools_mcp_install\0")?,
+            uninstall: *library.get(b"apps_devtools_mcp_uninstall\0")?,
+            poll: *library.get(b"apps_devtools_mcp_poll\0")?,
+            paused: *library.get(b"apps_devtools_mcp_paused\0")?,
+            logs: *library.get(b"apps_devtools_mcp_logs\0")?,
+            profiling: *library.get(b"apps_devtools_mcp_profiling\0")?,
+            frame: *library.get(b"apps_devtools_mcp_frame\0")?,
         };
         (start, functions)
     };

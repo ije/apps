@@ -344,6 +344,7 @@ pub(crate) fn native_action(action: &str) -> bool {
 pub(crate) enum Tool {
     Hud,
     DevTools,
+    Console,
     Pick,
 }
 
@@ -353,15 +354,16 @@ pub(crate) fn tool(key: &str, modifiers: renderer::Modifiers) -> Option<Tool> {
     } else {
         modifiers.ctrl()
     };
+    // The modifiers of the developer tools shortcuts in Chrome.
+    let chrome =
+        (modifiers.command() && modifiers.alt()) || (modifiers.ctrl() && modifiers.shift());
     if key == "f" && modifiers.alt() && primary {
         Some(Tool::Hud)
-    } else if key == "f12"
-        || (key == "i"
-            && ((modifiers.command() && modifiers.alt())
-                || (modifiers.ctrl() && modifiers.shift())))
-    {
+    } else if key == "f12" || (key == "i" && chrome) {
         Some(Tool::DevTools)
-    } else if key == "c" && modifiers.shift() && primary {
+    } else if key == "j" && chrome {
+        Some(Tool::Console)
+    } else if key == "c" && (chrome || (modifiers.shift() && primary)) {
         Some(Tool::Pick)
     } else {
         None
@@ -630,7 +632,7 @@ impl Main {
         };
         if !self.inputs.borrow().contains(&id)
             || self.driving.get()
-            || !packaged && matches!(tool(&key.name, modifiers), Some(Tool::Hud | Tool::DevTools))
+            || !packaged && tool(&key.name, modifiers).is_some()
         {
             return false;
         }

@@ -13,8 +13,8 @@
 | [crates/renderer](crates/renderer) | Native windows, input, retained box trees, Taffy layout, text, atlases, and GPU backends |
 | [crates/webview](crates/webview) | System web views and their native bridge |
 | [crates/webgpu](crates/webgpu) | The optional WebGPU API through wgpu |
-| [crates/media](crates/media), [crates/audio](crates/audio) | The optional audio and video player through FFmpeg and cpal, and its build without FFmpeg |
-| [crates/perfhud](crates/perfhud), [crates/dev](crates/dev) | Development tools: the FPS HUD, and the devtools library with the panel page and the server |
+| [crates/media](crates/media) | The optional audio and video player through FFmpeg and cpal, and its build without FFmpeg in [audio](crates/media/audio) |
+| [crates/devtools](crates/devtools) | The development tools library: the devtools panel page, the devtools server, and the FPS HUD |
 | [packages](packages) | npm launcher, TypeScript declarations, and packages for each platform and architecture |
 | [scripts](scripts) | JavaScriptCore, FFmpeg, and npm package builds |
 
@@ -206,8 +206,8 @@ The allocator belongs to `apps-runtime`, so a Rust app cannot define another glo
 
 The runtime implements Node compatibility through [JavaScript modules](crates/runtime/js/node) and [Rust services](crates/runtime/src/node). Node-API addons and `node:ffi` call native code in the same process. There is no Node.js or libuv runtime.
 
-`--devtools` opens the [developer tools](crates/runtime/src/desktop/devtools.rs): a panel at the left side of the window with a tree of layers and a console. The panel is a system web view beside the page view, so the page gets the rest of the window. Its styles are Tailwind classes that the runtime's own Tailwind compiler turns into CSS when the panel opens. A script in the page reads the DOM and the logged values for the panel, and the renderer draws the box of the selected node. The panel page and this script are in the devtools library, which the runtime loads when the tools first open. On Windows and Linux the panel has a separate window.
+`--devtools` opens the [developer tools](crates/runtime/src/desktop/devtools.rs): a panel at the left side of the window with a tree of layers and a console. The panel is a system web view beside the page view, so the page gets the rest of the window. Its styles are Tailwind classes that the runtime's own Tailwind compiler turns into CSS when the panel opens. A script in the page reads the DOM and the logged values for the panel, and the renderer draws the box of the selected node. The panel page and this script are in the devtools library, which the runtime loads when the tools first open. On Windows and Linux the panel has a separate window. The shortcuts are those of Chrome, and a button in the panel shows the FPS HUD.
 
-`--enable-devtools-mcp` starts the HTTP/MCP server of the same library for inspection, screenshots, input, and CPU profiles. The FPS HUD loads separately. Production packages omit the devtools and HUD libraries and reject developer tools.
+`--enable-devtools-mcp` starts the HTTP/MCP server of the same library for inspection, screenshots, input, and CPU profiles. The FPS HUD is in this library too. Production packages omit the library and reject developer tools.
 
 The `@pierre/apps` npm package contains the launcher and types. An optional package for the host platform supplies the native CLI, runtime, and libraries. On macOS and Linux, the install script links the launcher directly to the CLI. [build-npm.sh](scripts/build-npm.sh) prepares these packages, and the [release workflow](.github/workflows/release.yml) publishes them.

@@ -872,8 +872,11 @@ impl Desktop {
                             .as_deref_mut()
                             .context("Developer Tools require a native window")?;
                         let view = self.views.get(&id);
-                        let open = self.devtools.remove(&id).is_none();
-                        if open {
+                        // The console or the picker opens the tools, and keeps open tools.
+                        let show = args[2].as_str();
+                        let fresh = !self.devtools.contains_key(&id);
+                        let open = fresh || show.is_some();
+                        if fresh {
                             let title = format!("Window {id}");
                             let tools = view
                                 .and_then(|view| view.handle)
@@ -890,18 +893,53 @@ impl Desktop {
                                     devtools::DevTools::new(&title, Role::Renderer(id), None)
                                 })?;
                             self.devtools.insert(id, tools);
-                        } else if let Some(engine) = view.and_then(|view| view.renderer.as_deref())
-                        {
-                            devtools::release(engine)?;
+                        } else if !open {
+                            self.devtools.remove(&id);
+                            if let Some(engine) = view.and_then(|view| view.renderer.as_deref()) {
+                                devtools::release(engine)?;
+                            }
                         }
                         if let Some(data) = view.and_then(|view| view.data.upgrade()) {
-                            data.inspect.set(crate::render::Inspect {
-                                open,
-                                ..Default::default()
-                            });
+                            let mut inspect = data.inspect.get();
+                            if fresh || !open {
+                                inspect = crate::render::Inspect {
+                                    open,
+                                    ..Default::default()
+                                };
+                            }
+                            if show == Some("pick") {
+                                inspect.pick = true;
+                            }
+                            data.inspect.set(inspect);
+                            if let Some(tools) = self.devtools.get(&id) {
+                                tools.inspected(&data)?;
+                                if show == Some("console") {
+                                    tools
+                                        .events(&[serde_json::json!({"type":"show","tab":show})])?;
+                                }
+                            }
                         }
                         if let Some(handle) = view.and_then(|view| view.handle) {
                             cx.refresh_window(handle);
+                        }
+                    }
+                    // The FPS HUD of the window. Open developer tools show if it is on.
+                    "hud" => {
+                        if self.host.borrow().packaged {
+                            continue;
+                        }
+                        let (Some(view), Some(cx)) = (self.views.get(&id), cx.as_deref_mut())
+                        else {
+                            continue;
+                        };
+                        let (Some(data), Some(handle)) = (view.data.upgrade(), view.handle) else {
+                            continue;
+                        };
+                        cx.update_window(handle, |window, _| {
+                            crate::render::Hud::toggle(&data, window)
+                        });
+                        if let Some(tools) = self.devtools.get(&id) {
+                            tools.inspected(&data)?;
                         }
                     }
                     // The picker of the developer tools: the pointer moved to a place on the page, or

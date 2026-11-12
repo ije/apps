@@ -1,5 +1,5 @@
 use super::PageState;
-use anyhow::{Context, Result, ensure};
+use anyhow::Result;
 use renderer::{Rect, TextAlign, TextRun, Timer, Window, point, px, size};
 use std::{
     cell::{Cell, RefCell},
@@ -10,7 +10,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const ABI: u32 = 1;
 const FONT: &str = if cfg!(target_os = "macos") {
     "Menlo"
 } else if cfg!(windows) {
@@ -89,30 +88,14 @@ impl Drop for Hud {
 }
 
 fn load() -> Result<Library> {
-    let path = crate::desktop::app::library_exe()?
-        .with_file_name(libloading::library_filename("apps_perfhud"));
+    let library = crate::desktop::devtools::load()?;
     unsafe {
-        let library = libloading::Library::new(&path).with_context(|| {
-            format!(
-                "Cannot load the FPS HUD from {}. Build the workspace with cargo build --workspace --release.",
-                path.display()
-            )
-        })?;
-        let abi: libloading::Symbol<extern "C" fn() -> u32> = library.get(b"apps_perfhud_abi\0")?;
-        ensure!(
-            abi() == ABI,
-            "{} does not match this runtime",
-            path.display()
-        );
-        let functions = Library {
-            new: *library.get(b"apps_perfhud_new\0")?,
-            free: *library.get(b"apps_perfhud_free\0")?,
-            tick: *library.get(b"apps_perfhud_tick\0")?,
-            paint: *library.get(b"apps_perfhud_paint\0")?,
-        };
-        // The usage thread of a hidden HUD can still run, so the library is never unloaded.
-        std::mem::forget(library);
-        Ok(functions)
+        Ok(Library {
+            new: *library.get(b"apps_devtools_hud_new\0")?,
+            free: *library.get(b"apps_devtools_hud_free\0")?,
+            tick: *library.get(b"apps_devtools_hud_tick\0")?,
+            paint: *library.get(b"apps_devtools_hud_paint\0")?,
+        })
     }
 }
 

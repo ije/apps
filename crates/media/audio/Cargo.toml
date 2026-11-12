@@ -6,7 +6,7 @@ license.workspace = true
 
 # The media library without FFmpeg: it plays only WAV files, for the simpleAudio feature.
 [lib]
-path = "../media/src/lib.rs"
+path = "../src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

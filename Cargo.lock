@@ -120,12 +120,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "apps-dev"
+name = "apps-devtools"
 version = "0.0.0"
 dependencies = [
  "anyhow",
  "base64",
+ "core-foundation",
+ "libc",
  "serde_json",
+ "windows",
 ]
 
 [[package]]
@@ -134,15 +137,6 @@ version = "0.0.0"
 dependencies = [
  "cc",
  "cpal",
-]
-
-[[package]]
-name = "apps-perfhud"
-version = "0.0.0"
-dependencies = [
- "core-foundation",
- "libc",
- "windows",
 ]
 
 [[package]]
@@ -191,7 +185,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "apps-audio",
- "apps-dev",
+ "apps-devtools",
  "apps-media",
  "apps-renderer",
  "apps-webgpu",

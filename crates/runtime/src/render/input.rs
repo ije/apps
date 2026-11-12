@@ -390,34 +390,27 @@ impl renderer::View for PageView {
             } => {
                 let key = named.name.as_str();
                 let pick = (key == "escape" && self.inspect.get().pick).then_some(Tool::Pick);
-                match pick
-                    .or_else(|| tool(key, *modifiers).filter(|_| !self.host.borrow().packaged))
-                {
-                    Some(Tool::Hud) => {
-                        super::hud::Hud::toggle(&self.0, window);
-                        cx.stop_event();
-                        return;
+                let tool =
+                    pick.or_else(|| tool(key, *modifiers).filter(|_| !self.host.borrow().packaged));
+                let open = self.inspect.get().open;
+                let args = match tool {
+                    Some(Tool::Hud) => serde_json::json!(["hud", id]),
+                    Some(Tool::DevTools) => serde_json::json!(["devtools", id]),
+                    Some(Tool::Console) => serde_json::json!(["devtools", id, "console"]),
+                    Some(Tool::Pick) if open => {
+                        serde_json::json!(["inspect", id, (key == "escape").then_some(false)])
                     }
-                    Some(Tool::Pick) if !self.inspect.get().open => {}
-                    Some(Tool::Pick) => {
-                        self.host.borrow_mut().command(
-                            crate::desktop::link::Target::Window(id),
-                            serde_json::json!({"op":"window","args":["inspect",id,(key == "escape").then_some(false)]}),
-                        );
-                        self.drive(cx);
-                        cx.stop_event();
-                        return;
-                    }
-                    Some(Tool::DevTools) => {
-                        self.host.borrow_mut().command(
-                            crate::desktop::link::Target::Window(id),
-                            serde_json::json!({"op":"window","args":["devtools",id]}),
-                        );
-                        self.drive(cx);
-                        cx.stop_event();
-                        return;
-                    }
-                    None => {}
+                    Some(Tool::Pick) => serde_json::json!(["devtools", id, "pick"]),
+                    None => serde_json::Value::Null,
+                };
+                if !args.is_null() {
+                    self.host.borrow_mut().command(
+                        crate::desktop::link::Target::Window(id),
+                        serde_json::json!({"op":"window","args":args}),
+                    );
+                    self.drive(cx);
+                    cx.stop_event();
+                    return;
                 }
                 let allowed = Desktop::dispatch(
                     self.runtime.clone(),

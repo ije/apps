@@ -31,6 +31,7 @@ body { -webkit-user-select: none; }
     <button data-tab="console">Console<i id="alert" hidden class="ml-1.5 inline-block size-1.5 rounded-full bg-bad align-middle"></i></button>
   </div>
   <button id="pick" title="Select an element on the page (⇧⌘C)"><svg viewBox="0 0 16 16" class="size-4 fill-none stroke-current stroke-[1.5]"><path d="M3 2.5l3.6 10 1.6-4 4-1.6z" stroke-linejoin="round"/></svg></button>
+  <button id="hud" title="Show the FPS HUD (⌥⌘F)"><svg viewBox="0 0 16 16" class="size-4 fill-none stroke-current stroke-[1.5]"><path d="M2 11.5l3.2-4 2.6 2.4 2.7-5.4 3.5 4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
   <button id="close" title="Close (F12)" class="grid size-7 flex-none place-items-center rounded-md text-dim hover:bg-raise hover:text-ink"><svg viewBox="0 0 16 16" class="size-4 fill-none stroke-current stroke-[1.5]"><path d="M4 4l8 8M12 4l-8 8" stroke-linecap="round"/></svg></button>
 </header>
 <div class="flex min-h-0 flex-1">
@@ -66,7 +67,7 @@ body { -webkit-user-select: none; }
     return el;
   };
   const pending = new Map();
-  let next = 0, selected = null, picking = false;
+  let next = 0, selected = null, picking = false, hud = false, docked = false;
   const request = (method, params = {}) => new Promise((resolve, reject) => { const id = ++next; pending.set(id, { resolve, reject }); window.apps.postMessage({ id, method, params }); });
   const caret = (shown, open, more = '') => h('i', { class: 'caret grid size-3 flex-none place-items-center text-dim transition-transform' + more + (shown ? '' : ' invisible') + (open ? ' rotate-90' : ''), innerHTML: '<svg viewBox="0 0 12 12" class="size-3"><path d="M4.5 2.5l4 3.5-4 3.5z" fill="currentColor"/></svg>' });
 
@@ -239,9 +240,12 @@ body { -webkit-user-select: none; }
     if (name === 'console') { $('#alert').hidden = true; drawConsole(); expression.focus(); }
   };
   for (const tab of tabs) tab.onclick = () => show(tab.dataset.tab);
-  const pick = $('#pick');
-  const drawPick = () => { pick.className = 'grid size-7 flex-none place-items-center rounded-md' + (picking ? ' bg-accent text-white' : ' text-dim hover:bg-raise hover:text-ink'); };
+  const pick = $('#pick'), meter = $('#hud');
+  const drawTools = () => { for (const [button, on] of [[pick, picking], [meter, hud]]) button.className = 'grid size-7 flex-none place-items-center rounded-md' + (on ? ' bg-accent text-white' : ' text-dim hover:bg-raise hover:text-ink'); };
   pick.onclick = () => request('Inspect.set', { pick: !picking });
+  meter.onclick = () => request('Hud.toggle');
+  // Without tabs the console is always there.
+  const showConsole = () => docked ? show('console') : expression.focus();
   $('#close').onclick = () => request('Panel.close');
   $('#grip').onpointerdown = event => {
     const grip = event.currentTarget, from = event.screenX, start = innerWidth;
@@ -250,17 +254,23 @@ body { -webkit-user-select: none; }
     grip.onpointerup = grip.onpointercancel = () => { grip.onpointermove = null; };
   };
   addEventListener('keydown', event => {
+    // The shortcuts of Chrome, which the page takes too.
+    const chrome = event.metaKey && event.altKey || event.ctrlKey && event.shiftKey;
     if (event.key === 'Escape' && picking) request('Inspect.set', { pick: false });
-    else if (event.key === 'F12' || event.code === 'KeyI' && event.metaKey && event.altKey) { event.preventDefault(); request('Panel.close'); }
-    else if (event.code === 'KeyC' && event.shiftKey && (event.metaKey || event.ctrlKey)) { event.preventDefault(); request('Inspect.set', { pick: !picking }); }
+    else if (event.key === 'F12' || event.code === 'KeyI' && chrome) { event.preventDefault(); request('Panel.close'); }
+    else if (event.code === 'KeyJ' && chrome) { event.preventDefault(); showConsole(); }
+    else if (event.code === 'KeyC' && (chrome || event.shiftKey && event.metaKey)) { event.preventDefault(); request('Inspect.set', { pick: !picking }); }
+    else if (event.code === 'KeyF' && event.altKey && (event.metaKey || event.ctrlKey)) { event.preventDefault(); request('Hud.toggle'); }
+    else if (event.code === 'KeyK' && event.metaKey || event.code === 'KeyL' && event.ctrlKey) { event.preventDefault(); $('#clear').click(); }
   });
   const events = {
     // `docked` is a panel at the side of the page with tabs, `window` shows the layers beside the console, and `main` is the console of the main process.
     init({ mode, titlebar }) {
       document.body.style.paddingTop = titlebar + 'px';
-      drawPick();
+      docked = mode === 'docked';
+      drawTools();
       show('layers');
-      if (mode === 'docked') { $('#grip').hidden = false; document.body.classList.add('border-r', 'border-line'); }
+      if (docked) { $('#grip').hidden = false; document.body.classList.add('border-r', 'border-line'); }
       else { $('#console').hidden = false; $('#tabs').classList.add('invisible'); layers.className = 'w-80 flex-none overflow-auto border-r border-line pb-3 outline-none'; }
       if (mode === 'main') { $('#bar').hidden = layers.hidden = true; $('#tools').classList.add('pt-2.5'); expression.focus(); } else events.reset();
     },
@@ -268,11 +278,13 @@ body { -webkit-user-select: none; }
     error: message => log('error', message.message ?? JSON.stringify(message)),
     inspect(message) {
       picking = message.pick;
-      drawPick();
+      hud = message.hud;
+      drawTools();
       if (message.selected === selected) return;
       selected = message.selected;
       if (selected == null) { tree.stamp = ''; refreshTree(); } else reveal(selected);
     },
+    show: showConsole,
     dom: refreshTree,
     // Reads the page: when the panel opens, and after each reload.
     reset() {

@@ -7,8 +7,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-// Update this ABI version with `Item` or function signatures, and match the runtime.
-const ABI: u32 = 1;
 const CAPACITY: usize = 120;
 const READOUT: Duration = Duration::from_millis(500);
 const FPS_WINDOW: Duration = Duration::from_secs(1);
@@ -73,12 +71,7 @@ pub struct Hud {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn apps_perfhud_abi() -> u32 {
-    ABI
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn apps_perfhud_new() -> *mut Hud {
+pub extern "C" fn apps_devtools_hud_new() -> *mut Hud {
     let usage = Arc::default();
     let (stop, stopped) = mpsc::channel();
     let shared = Arc::clone(&usage);
@@ -102,9 +95,9 @@ pub extern "C" fn apps_perfhud_new() -> *mut Hud {
 }
 
 /// # Safety
-/// `hud` comes from `apps_perfhud_new` and is not used again.
+/// `hud` comes from `apps_devtools_hud_new` and is not used again.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn apps_perfhud_free(hud: *mut Hud) {
+pub unsafe extern "C" fn apps_devtools_hud_free(hud: *mut Hud) {
     drop(unsafe { Box::from_raw(hud) });
 }
 
@@ -112,9 +105,9 @@ pub unsafe extern "C" fn apps_perfhud_free(hud: *mut Hud) {
 /// draws one frame to update the readings. That frame is not a sample.
 ///
 /// # Safety
-/// `hud` comes from `apps_perfhud_new`.
+/// `hud` comes from `apps_devtools_hud_new`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn apps_perfhud_tick(hud: *mut Hud) -> bool {
+pub unsafe extern "C" fn apps_devtools_hud_tick(hud: *mut Hud) -> bool {
     let hud = unsafe { &mut *hud };
     let idle = !std::mem::take(&mut hud.drawn);
     hud.own |= idle;
@@ -125,10 +118,10 @@ pub unsafe extern "C" fn apps_perfhud_tick(hud: *mut Hud) -> bool {
 /// of a window of `width` by `height` pixels. `redrawing` is a second pass of the same frame.
 ///
 /// # Safety
-/// `hud` comes from `apps_perfhud_new`. `paint` gets `cx` and an item that lives during the call.
+/// `hud` comes from `apps_devtools_hud_new`. `paint` gets `cx` and an item that lives during the call.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn apps_perfhud_paint(
+pub unsafe extern "C" fn apps_devtools_hud_paint(
     hud: *mut Hud,
     draw: u64,
     redrawing: bool,
