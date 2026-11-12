@@ -15,7 +15,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const AGENT: &str = include_str!("../../assets/devtools-agent.js");
 const POLL: Duration = Duration::from_millis(250);
 
 // The open tools of pages. Main sends its logs to the pages only while some are open.
@@ -25,18 +24,29 @@ pub(crate) fn pages_open() -> bool {
     PAGE_TOOLS.load(Ordering::Relaxed) > 0
 }
 
+// The page of the panel, or the script that inspects a context for it. Both are in the developer tools
+// library, so built apps don't carry them.
+fn text(agent: bool) -> Result<&'static str> {
+    let panel: libloading::Symbol<extern "C" fn(bool, &mut usize) -> *const u8> =
+        unsafe { super::mcp::load()?.get(b"apps_dev_panel\0")? };
+    let mut len = 0;
+    let text = panel(agent, &mut len);
+    Ok(std::str::from_utf8(unsafe {
+        std::slice::from_raw_parts(text, len)
+    })?)
+}
+
 // The page of the panel. Its style is Tailwind, compiled for the classes that the page has.
-fn page() -> &'static str {
+fn page() -> Result<&'static str> {
     static PAGE: OnceLock<String> = OnceLock::new();
-    PAGE.get_or_init(|| {
-        let html = include_str!("../../assets/devtools.html");
-        let (head, rest) = html.split_once("<style>").unwrap_or((html, ""));
-        let (css, body) = rest.split_once("</style>").unwrap_or_default();
-        format!(
-            "{head}<style>{}</style>{body}",
-            crate::style::tailwind(css, body)
-        )
-    })
+    if let Some(page) = PAGE.get() {
+        return Ok(page);
+    }
+    let html = text(false)?;
+    let (head, rest) = html.split_once("<style>").unwrap_or((html, ""));
+    let (css, body) = rest.split_once("</style>").unwrap_or_default();
+    let css = crate::style::tailwind(css, body);
+    Ok(PAGE.get_or_init(|| format!("{head}<style>{css}</style>{body}")))
 }
 
 // The panel of one window, at its left side. Where it cannot dock, and for the main process, it has its own
@@ -57,6 +67,7 @@ pub struct DevTools {
 
 impl DevTools {
     pub fn new(title: &str, role: Role, window: Option<&renderer::Window>) -> Result<Self> {
+        let page = page()?;
         let docked = window.filter(|_| cfg!(target_os = "macos")).map(|window| {
             let browser = Browser::new(window, &json!({"inspectable":true}))?;
             let titlebar = browser.dock(300.)?;
@@ -71,7 +82,7 @@ impl DevTools {
                 (Browser::detached(&options)?, mode, 0.)
             }
         };
-        browser.load_html(page(), "about:blank")?;
+        browser.load_html(page, "about:blank")?;
         if role != Role::Main {
             PAGE_TOOLS.fetch_add(1, Ordering::Relaxed);
         }
@@ -239,7 +250,8 @@ impl Drop for DevTools {
 // Calls the script that inspects a context from inside it. A new context gets the script on its first call.
 pub(crate) fn agent(engine: &JsContext, method: &str, params: &Value) -> Result<Value> {
     if engine.eval_page("typeof this.__appsAgent", "apps:devtools")? != "function" {
-        engine.eval_page(&format!("this.__appsAgent={AGENT}"), "apps:devtools")?;
+        let source = format!("this.__appsAgent={}", text(true)?);
+        engine.eval_page(&source, "apps:devtools")?;
     }
     let call = format!(
         "JSON.stringify(this.__appsAgent({},{})??null)",
@@ -427,7 +439,7 @@ mod tests {
         assert_eq!(left.unwrap(), "undefinedundefined");
         release(&engine).unwrap();
 
-        let page = page();
+        let page = page().unwrap();
         assert!(page.contains(".bg-panel{") && page.contains("box-sizing:border-box"));
         assert!(!page.contains("@import"));
     }

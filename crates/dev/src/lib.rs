@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const ABI: u32 = 1;
+const ABI: u32 = 2;
 
 type Done = extern "C" fn(*mut c_void, bool, *const u8, usize);
 
@@ -104,12 +104,24 @@ const PAUSED: &str = "The app is paused in the debugger. Resume it with the debu
 const SHOW: &str = r#"function(){const seen=new WeakSet(),plain=(v,d)=>{if(typeof v==='bigint')return v+'n';if(typeof v==='symbol'||v===undefined)return String(v);if(typeof v==='function')return`[Function ${v.name||'(anonymous)'}]`;if(v===null||typeof v!=='object')return v;if(typeof Node==='function'&&v instanceof Node)return String(v.outerHTML??v.textContent??'').slice(0,4000);if(v instanceof Error)return`${v.name}: ${v.message}`+(v.stack?'\n'+v.stack:'');if(v instanceof Date)return v.toISOString();if(seen.has(v))return'[Circular]';if(d>4)return Array.isArray(v)?`[Array(${v.length})]`:`[${v.constructor?.name??'Object'}]`;seen.add(v);if(v instanceof Map||v instanceof Set||Array.isArray(v)||ArrayBuffer.isView(v))return Array.from(v).slice(0,100).map(e=>plain(e,d+1));const o={};for(const k of Object.keys(v).slice(0,100)){try{o[k]=plain(v[k],d+1)}catch{o[k]='[Thrown]'}}return o},show=v=>{const p=plain(v,0),s=typeof p==='string'?p:JSON.stringify(p)??String(p);return s.length>120&&typeof p==='object'?JSON.stringify(p,null,1):s};return this instanceof Promise?this.then(show,e=>{throw show(e)}):show(this)}"#;
 
 #[unsafe(no_mangle)]
-pub extern "C" fn apps_mcp_abi() -> u32 {
+pub extern "C" fn apps_dev_abi() -> u32 {
     ABI
 }
 
+// The page of the developer tools panel, or the script that inspects a context for it.
 #[unsafe(no_mangle)]
-pub extern "C" fn apps_mcp_start(port: u16, host: &'static Host) -> *mut c_char {
+pub extern "C" fn apps_dev_panel(agent: bool, len: &mut usize) -> *const u8 {
+    let text = if agent {
+        include_str!("../assets/devtools-agent.js")
+    } else {
+        include_str!("../assets/devtools.html")
+    };
+    *len = text.len();
+    text.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn apps_dev_start(port: u16, host: &'static Host) -> *mut c_char {
     let _ = HOST.set(host);
     let start = || -> Result<()> {
         let listener = TcpListener::bind(("127.0.0.1", port))
@@ -138,7 +150,7 @@ pub extern "C" fn apps_mcp_start(port: u16, host: &'static Host) -> *mut c_char 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn apps_mcp_install(key: u64) {
+pub extern "C" fn apps_dev_install(key: u64) {
     let (sender, calls) = mpsc::channel();
     PAGES
         .lock()
@@ -148,7 +160,7 @@ pub extern "C" fn apps_mcp_install(key: u64) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn apps_mcp_uninstall() {
+pub extern "C" fn apps_dev_uninstall() {
     if let Some(key) = CHANNEL.with(|channel| channel.get().map(|(_, key)| *key)) {
         PAGES
             .lock()
@@ -505,7 +517,7 @@ fn settle_step() {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn apps_mcp_poll(app: *mut c_void) -> bool {
+pub extern "C" fn apps_dev_poll(app: *mut c_void) -> bool {
     if app.is_null() && !MAIN_CHANNEL.with(|channel| channel.get().is_some()) {
         return false;
     }
@@ -526,7 +538,7 @@ pub extern "C" fn apps_mcp_poll(app: *mut c_void) -> bool {
 /// # Safety
 /// `logs` is a JSON array of `len` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn apps_mcp_logs(logs: *const u8, len: usize) {
+pub unsafe extern "C" fn apps_dev_logs(logs: *const u8, len: usize) {
     let Ok(logs) =
         serde_json::from_slice::<Vec<Value>>(unsafe { std::slice::from_raw_parts(logs, len) })
     else {
@@ -559,12 +571,12 @@ pub unsafe extern "C" fn apps_mcp_logs(logs: *const u8, len: usize) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn apps_mcp_profiling() -> bool {
+pub extern "C" fn apps_dev_profiling() -> bool {
     FRAMES.with_borrow(Option::is_some)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn apps_mcp_frame(window: u64, nanos: u64) {
+pub extern "C" fn apps_dev_frame(window: u64, nanos: u64) {
     FRAMES.with_borrow_mut(|frames| {
         if let Some(frames) = frames {
             frames.push((window, Duration::from_nanos(nanos)));
@@ -575,7 +587,7 @@ pub extern "C" fn apps_mcp_frame(window: u64, nanos: u64) {
 /// # Safety
 /// Runs while JSC is paused in `ctx`, and dispatches protocol messages until JSC sets `done`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn apps_mcp_paused(ctx: usize, done: *mut bool) {
+pub unsafe extern "C" fn apps_dev_paused(ctx: usize, done: *mut bool) {
     pump();
     let page = CHANNEL.with(|channel| channel.get().map(|(_, key)| *key));
     if page.is_none() && !MAIN_CHANNEL.with(|channel| channel.get().is_some()) {

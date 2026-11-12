@@ -67,7 +67,7 @@ name = "apps-runtime"
 path = "src/main.rs"
 
 [dev-dependencies]
-apps-mcp = { path = "../mcp" }
+apps-dev = { path = "../dev" }
 apps-audio = { path = "../audio" }
 apps-media = { path = "../media" }
 apps-webgpu = { path = "../webgpu" }

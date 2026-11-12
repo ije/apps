@@ -120,7 +120,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "apps-mcp"
+name = "apps-dev"
 version = "0.0.0"
 dependencies = [
  "anyhow",
@@ -191,7 +191,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "apps-audio",
- "apps-mcp",
+ "apps-dev",
  "apps-media",
  "apps-renderer",
  "apps-webgpu",
