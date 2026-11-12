@@ -1,34 +1,298 @@
 <!doctype html>
-<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Developer Tools</title>
+<html lang="en"><meta charset="utf-8"><title>Developer Tools</title>
 <style>
-:root{color-scheme:light dark;font:12px -apple-system,BlinkMacSystemFont,sans-serif;background:#202124;color:#e8eaed}*{box-sizing:border-box}body{margin:0;height:100vh;display:flex;flex-direction:column}header{display:flex;gap:3px;padding:0 10px;border-bottom:1px solid #494a4d;background:#292a2d}button{font:inherit;color:inherit;background:transparent;border:0;cursor:pointer;padding:10px}button[aria-selected=true]{color:#8ab4f8;border-bottom:2px solid #8ab4f8}button:hover{background:#35363a}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #8ab4f8;outline-offset:-2px}.toolbar{display:flex;align-items:center;gap:8px;border-bottom:1px solid #3c4043;padding:0 6px;min-height:36px}.toolbar input{flex:1;color:inherit;background:#292a2d;border:1px solid #5f6368;border-radius:3px;padding:5px}.toolbar small{color:#bdc1c6}main{flex:1;min-height:0;display:flex;flex-direction:column}.panel{display:none;flex:1;min-height:0}.panel.active{display:flex;flex-direction:column}pre,code,textarea{font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;tab-size:2}pre{margin:0;padding:10px;white-space:pre-wrap;overflow:auto}#console-output{flex:1;overflow:auto;user-select:text}.entry{padding:5px 12px;border-bottom:1px solid #303134;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}.entry.error{background:#372323;color:#ffb4ab}.entry.warn{background:#383126;color:#fdd663}.entry.command{color:#8ab4f8}.entry.result{color:#a8c7fa}.console-input{display:flex;border-top:1px solid #494a4d;padding:8px;gap:8px}.console-input span{color:#8ab4f8}#expression{resize:none;flex:1;color:inherit;background:transparent;border:0;outline:0;min-height:26px}.source-layout{display:flex;flex:1;min-height:0}#source-list{width:220px;overflow:auto;border-right:1px solid #494a4d}#source-list button{display:block;width:100%;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#source-text{flex:1;white-space:pre}#status{border-top:1px solid #494a4d;padding:5px 12px;color:#bdc1c6}.notice{margin:10px;padding:10px;border:1px solid #5f6368;border-radius:4px;color:#bdc1c6}#dom{white-space:pre}.empty{padding:16px;color:#9aa0a6}
+@import "tailwindcss";
+@theme {
+  --color-panel: #111113;
+  --color-box: #1d1d20;
+  --color-raise: #2e2e33;
+  --color-line: #26262a;
+  --color-ink: #ededf0;
+  --color-dim: #8f8f98;
+  --color-accent: #0d99ff;
+  --color-bad: #ffb4ab;
+  --color-bad-bg: #3a1d1d;
+  --color-warn: #fdd663;
+  --color-warn-bg: #352c18;
+  --color-str: #f28b54;
+  --color-num: #a78bfa;
+  --color-key: #8ab4f8;
+}
+:root { color-scheme: dark; }
+body { -webkit-user-select: none; }
+#output { -webkit-user-select: text; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #35353a; border-radius: 4px; border: 2px solid var(--color-panel); }
 </style>
-<header role="tablist" aria-label="Developer tools"><button role="tab" data-panel="elements">Elements</button><button role="tab" aria-selected="true" data-panel="console">Console</button><button role="tab" data-panel="sources">Sources</button></header>
-<main>
-<section id="elements" class="panel" role="tabpanel"><div class="toolbar"><button id="refresh-dom">↻ Refresh</button><input id="selector" placeholder="CSS selector" aria-label="CSS selector"><button id="inspect-element">Inspect</button></div><pre id="dom" aria-live="polite">Loading document…</pre></section>
-<section id="console" class="panel active" role="tabpanel"><div class="toolbar"><button id="clear">Clear console</button><input id="filter" placeholder="Filter" aria-label="Filter console"><small id="count">0 messages</small></div><div id="console-output" role="log"></div><form class="console-input"><span>❯</span><textarea id="expression" rows="1" aria-label="JavaScript expression" placeholder="Evaluate JavaScript (Enter)"></textarea><button type="submit">Run</button></form></section>
-<section id="sources" class="panel" role="tabpanel"><div class="toolbar"><button id="refresh-sources">↻ Refresh</button><button id="pause">Pause on debugger statement</button><button id="inspect-native">Open Web Inspector</button></div><div class="notice">WebKit views use Web Inspector for breakpoints and stepping. App JavaScript contexts have no step debugger.</div><div class="source-layout"><nav id="source-list" aria-label="Sources"></nav><pre id="source-text">Select a source file.</pre></div></section>
-</main><footer id="status" role="status">Connected to apps</footer>
+<body class="flex h-screen cursor-default flex-col overflow-hidden bg-panel text-xs text-ink select-none">
+<header id="bar" class="flex flex-none items-center gap-2 px-3 py-2.5">
+  <div id="tabs" class="flex flex-1 rounded-lg bg-box p-0.5">
+    <button data-tab="layers">Layers</button>
+    <button data-tab="console">Console<i id="alert" hidden class="ml-1.5 inline-block size-1.5 rounded-full bg-bad align-middle"></i></button>
+  </div>
+  <button id="pick" title="Select an element on the page (⇧⌘C)"><svg viewBox="0 0 16 16" class="size-4 fill-none stroke-current stroke-[1.5]"><path d="M3 2.5l3.6 10 1.6-4 4-1.6z" stroke-linejoin="round"/></svg></button>
+  <button id="close" title="Close (F12)" class="grid size-7 flex-none place-items-center rounded-md text-dim hover:bg-raise hover:text-ink"><svg viewBox="0 0 16 16" class="size-4 fill-none stroke-current stroke-[1.5]"><path d="M4 4l8 8M12 4l-8 8" stroke-linecap="round"/></svg></button>
+</header>
+<div class="flex min-h-0 flex-1">
+  <div id="layers" tabindex="0" class="min-w-0 flex-1 overflow-auto pb-3 outline-none"></div>
+  <div id="console" hidden class="flex min-w-0 flex-1 flex-col font-mono text-[11px] leading-normal">
+    <div id="tools" class="flex flex-none gap-1.5 px-3 pb-2 font-sans text-xs">
+      <input id="filter" placeholder="Filter" class="min-w-0 flex-1 rounded-md border border-transparent bg-box px-2 py-1 outline-none placeholder:text-dim focus:border-accent">
+      <button id="clear" class="rounded-md px-1.5 text-dim hover:bg-raise hover:text-ink">Clear</button>
+    </div>
+    <div id="output" role="log" class="flex-1 overflow-auto select-text"></div>
+    <form id="prompt" class="flex flex-none gap-1.5 border-t border-line px-3 py-2">
+      <span class="text-accent">›</span>
+      <textarea id="expression" rows="1" placeholder="Evaluate JavaScript" aria-label="JavaScript expression" class="min-h-[18px] flex-1 resize-none outline-none placeholder:text-dim"></textarea>
+    </form>
+  </div>
+</div>
+<div id="grip" hidden class="absolute inset-y-0 right-0 z-10 w-1.5 cursor-col-resize"></div>
 <script>
-(()=>{
-  const pending=new Map(),history=[],messages=[];let next=0,historyIndex=0,scheduled=false;
-  const status=text=>document.getElementById('status').textContent=text;
-  const request=(method,params={})=>new Promise((resolve,reject)=>{const id=++next;pending.set(id,{resolve,reject});window.apps.postMessage({id,method,params});});
-  const format=value=>typeof value==='string'?value:JSON.stringify(value,null,2)??String(value);
-  const render=()=>{const output=document.getElementById('console-output'),filter=document.getElementById('filter').value.toLowerCase();output.replaceChildren();for(const message of messages){if(filter&&!message.text.toLowerCase().includes(filter))continue;const row=document.createElement('div');row.className='entry '+message.level;row.textContent=message.text;output.append(row)}output.scrollTop=output.scrollHeight;document.getElementById('count').textContent=messages.length+' messages';};
-  const log=(level,text)=>{messages.push({level,text});if(messages.length>2000)messages.shift();if(!scheduled){scheduled=true;requestAnimationFrame(()=>{scheduled=false;render()})}};
-  window.appsDevTools={receive(message){if(message.id){const item=pending.get(message.id);if(!item)return;pending.delete(message.id);if(message.error)item.reject(Error(message.error));else item.resolve(message.value);}else if(message.type==='console')log(message.level??'log',(message.args??[]).map(format).join(' '));else if(message.type==='error')log('error',message.message??format(message));}};
-  const refreshDom=async()=>{try{document.getElementById('dom').textContent=format(await request('DOM.getDocument'));status('Document updated');}catch(error){status(error.message)}};
-  const refreshSources=async()=>{try{const sources=await request('Sources.list'),list=document.getElementById('source-list');list.replaceChildren();for(const source of sources??[]){const button=document.createElement('button');button.textContent=source.name;button.addEventListener('click',()=>document.getElementById('source-text').textContent=source.source);list.append(button)}}catch(error){status(error.message)}};
-  for(const button of document.querySelectorAll('[data-panel]'))button.addEventListener('click',()=>{for(const tab of document.querySelectorAll('[data-panel]'))tab.setAttribute('aria-selected',String(tab===button));for(const panel of document.querySelectorAll('.panel'))panel.classList.toggle('active',panel.id===button.dataset.panel);if(button.dataset.panel==='elements')refreshDom();if(button.dataset.panel==='sources')refreshSources();});
-  document.getElementById('refresh-dom').onclick=refreshDom;document.getElementById('refresh-sources').onclick=refreshSources;
-  document.getElementById('clear').onclick=()=>{messages.length=0;render()};document.getElementById('filter').oninput=render;
-  document.getElementById('inspect-element').onclick=async()=>{try{document.getElementById('dom').textContent=format(await request('DOM.querySelector',{selector:document.getElementById('selector').value}));}catch(error){status(error.message)}};
-  document.getElementById('pause').onclick=()=>request('Debugger.pause').then(value=>status(format(value))).catch(error=>status(error.message));
-  document.getElementById('inspect-native').onclick=()=>request('Debugger.open').catch(error=>status(error.message));
-  const expression=document.getElementById('expression');
-  document.querySelector('form').onsubmit=async event=>{event.preventDefault();const source=expression.value.trim();if(!source)return;expression.value='';history.push(source);historyIndex=history.length;log('command','❯ '+source);try{const result=await request('Runtime.evaluate',{expression:source});log('result',format(result));}catch(error){log('error',error.message)}};
-  expression.addEventListener('keydown',event=>{if(event.isComposing)return;if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();document.querySelector('form').requestSubmit();}else if(event.key==='ArrowUp'&&!expression.value.includes('\n')){event.preventDefault();expression.value=history[Math.max(0,--historyIndex)]??'';}else if(event.key==='ArrowDown'&&!expression.value.includes('\n')){event.preventDefault();historyIndex=Math.min(history.length,historyIndex+1);expression.value=history[historyIndex]??'';}});
-  window.apps.postMessage({id:0,method:'ready',params:{}});
+(() => {
+  'use strict';
+  const $ = (selector, root = document) => root.querySelector(selector);
+  const h = (tag, props, ...kids) => {
+    const el = document.createElement(tag);
+    for (const [key, value] of Object.entries(props ?? {})) {
+      if (value == null || value === false) continue;
+      if (key.startsWith('on')) el.addEventListener(key.slice(2), value);
+      else if (key === 'class') el.className = value;
+      else if (key === 'style') el.style.cssText = value;
+      else if (key in el) el[key] = value;
+      else el.setAttribute(key, value);
+    }
+    el.append(...kids.flat(2).filter(kid => kid != null && kid !== false));
+    return el;
+  };
+  const pending = new Map();
+  let next = 0, mode = '', selected = null, picking = false;
+  const request = (method, params = {}) => new Promise((resolve, reject) => { const id = ++next; pending.set(id, { resolve, reject }); window.apps.postMessage({ id, method, params }); });
+  const quiet = promise => promise.catch(() => null);
+  // A small arrow that turns when its row opens.
+  const caret = (shown, open, more = '') => h('i', { class: 'caret grid size-3 flex-none place-items-center text-dim transition-transform' + more + (shown ? '' : ' invisible') + (open ? ' rotate-90' : ''), innerHTML: '<svg viewBox="0 0 12 12" class="size-3"><path d="M4.5 2.5l4 3.5-4 3.5z" fill="currentColor"/></svg>' });
+
+  // Console
+  const messages = [], history = [];
+  let historyAt = 0, drawing = false;
+  const marks = {
+    error: '<svg viewBox="0 0 12 12" class="size-3"><circle cx="6" cy="6" r="5.5" fill="#e5665e"/><path d="M4 4l4 4M8 4l-4 4" stroke="#3a1d1d" stroke-width="1.4" stroke-linecap="round"/></svg>',
+    warn: '<svg viewBox="0 0 12 12" class="size-3"><path d="M6 .8l5.6 10.4H.4z" fill="#f0a23b" stroke="#f0a23b" stroke-linejoin="round"/><path d="M6 4.6v3M6 9.3v.4" stroke="#352c18" stroke-width="1.4" stroke-linecap="round"/></svg>',
+    info: '<svg viewBox="0 0 12 12" class="size-3"><circle cx="6" cy="6" r="5.5" fill="#4a9eff"/><path d="M6 5.4v3.2M6 3.2v.4" stroke="#111113" stroke-width="1.4" stroke-linecap="round"/></svg>',
+    debug: '<svg viewBox="0 0 12 12" class="size-3"><circle cx="6" cy="6" r="2.5" fill="#8f8f98"/></svg>',
+    command: '›', result: '‹',
+  };
+  const tones = { error: ' bg-bad-bg text-bad', warn: ' bg-warn-bg text-warn', command: ' text-accent' };
+  const types = { string: ' text-str', number: ' text-num', boolean: ' text-num', bigint: ' text-num', undefined: ' text-dim', null: ' text-dim', symbol: ' text-dim', function: ' italic', error: ' text-bad' };
+  const row = (level, ...kids) => h('div', { class: 'flex flex-none gap-1.5 border-b border-white/5 px-2.5 py-[3px] whitespace-pre-wrap [overflow-wrap:anywhere]' + (tones[level] ?? '') }, h('i', { class: 'grid h-4 w-3 flex-none place-items-center text-dim not-italic', innerHTML: marks[level] ?? '' }), kids);
+  // One value. An object opens to its properties, and an error also to its stack.
+  const leaf = (item, name) => {
+    const arrow = !!item.id && caret(true, false, ' mt-0.5'), text = name != null && item.type === 'string' ? JSON.stringify(item.text) : item.text;
+    const head = h('div', { class: 'flex items-start gap-0.5' }, arrow, name != null && h('b', { class: 'flex-none font-semibold text-key' }, name, ': '), h('span', { class: 'min-w-0 flex-1' + (name == null && item.type === 'string' ? '' : types[item.type] ?? '') }, text));
+    const node = h('div', { class: 'min-w-0 flex-1' }, head);
+    if (arrow) head.onclick = async () => {
+      if (getSelection().toString()) return;
+      if (!arrow.classList.toggle('rotate-90')) return node.lastChild.remove();
+      const kids = h('div', { class: 'pl-3.5' }, item.stack && h('pre', { class: 'whitespace-pre-wrap opacity-80' }, item.stack));
+      node.append(kids);
+      kids.append(...(await request('Console.props', { id: item.id })).map(part => leaf(part, part.name)));
+    };
+    return node;
+  };
+  // Errors and warnings show their first line. The rest, like a stack, and the logged objects open below.
+  const entry = message => {
+    if (message.value) return row(message.level, leaf(message.value));
+    const lines = message.text.split('\n'), folded = /error|warn/.test(message.level) && lines.length > 1;
+    const arrow = (folded || message.ref != null) && caret(true, false, ' mt-0.5'), kids = h('div', { class: 'pl-3.5' });
+    const head = h('div', { class: 'flex items-start gap-0.5' }, arrow, h('span', { class: 'min-w-0 flex-1' }, folded ? lines[0] : message.text));
+    if (arrow) head.onclick = async () => {
+      if (getSelection().toString()) return;
+      if (!arrow.classList.toggle('rotate-90')) return kids.replaceChildren();
+      if (folded) kids.append(h('pre', { class: 'whitespace-pre-wrap opacity-80' }, lines.slice(1).join('\n')));
+      if (message.ref != null) kids.append(...(await request('Console.args', { ref: message.ref })).filter(item => item.id).map(item => leaf(item)));
+    };
+    return row(message.level, h('div', { class: 'min-w-0 flex-1' }, head, kids));
+  };
+  const drawConsole = () => {
+    drawing = false;
+    const filter = $('#filter').value.toLowerCase(), output = $('#output'), end = output.scrollTop + output.clientHeight >= output.scrollHeight - 24;
+    output.replaceChildren(...messages.filter(message => !filter || message.text.toLowerCase().includes(filter)).map(message => message.row ??= entry(message)));
+    if (end) output.scrollTop = output.scrollHeight;
+  };
+  const log = (level, text, more) => {
+    messages.push({ level, text, ...more });
+    if (messages.length > 2000) messages.shift();
+    if (level === 'error' && $('#console').hidden) $('#alert').hidden = false;
+    if (!drawing) { drawing = true; requestAnimationFrame(drawConsole); }
+  };
+  const expression = $('#expression');
+  $('#clear').onclick = () => { messages.length = 0; drawConsole(); quiet(request('Console.clear')); };
+  $('#filter').oninput = drawConsole;
+  $('#prompt').onsubmit = async event => {
+    event.preventDefault();
+    const source = expression.value.trim();
+    if (!source) return;
+    expression.value = '';
+    history.push(source);
+    historyAt = history.length;
+    log('command', source);
+    try {
+      const result = await request('Runtime.evaluate', { expression: source }), value = result.value ?? result.thrown;
+      log(result.thrown ? 'error' : 'result', value.text, { value });
+    } catch (error) { log('error', error.message); }
+    $('#output').scrollTop = $('#output').scrollHeight;
+  };
+  expression.onkeydown = event => {
+    if (event.isComposing) return;
+    const single = !expression.value.includes('\n');
+    if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('#prompt').requestSubmit(); }
+    else if (event.key === 'ArrowUp' && single) { event.preventDefault(); expression.value = history[historyAt = Math.max(0, historyAt - 1)] ?? ''; }
+    else if (event.key === 'ArrowDown' && single) { event.preventDefault(); expression.value = history[historyAt = Math.min(history.length, historyAt + 1)] ?? ''; }
+  };
+
+  // Layers
+  const tree = { root: [], kids: new Map(), open: new Set(), stamp: '' };
+  const glyphs = { img: '▣', svg: '◇', button: '▭', input: '▭', a: '↗', p: 'T', span: 'T', h1: 'T', h2: 'T', h3: 'T', h4: 'T', h5: 'T', h6: 'T', label: 'T' };
+  const layers = $('#layers');
+  const loadTree = async ids => {
+    const result = await request('DOM.tree', { ids });
+    for (const id of ids) {
+      const list = result[id ?? 'root'] ?? [];
+      if (id == null) tree.root = list;
+      else if (list.length) tree.kids.set(id, list);
+      else { tree.kids.delete(id); tree.open.delete(id); }
+    }
+    return JSON.stringify(result);
+  };
+  const drawTree = () => {
+    const rows = [];
+    const walk = (list, depth) => {
+      for (const node of list) {
+        const open = tree.open.has(node.id) && tree.kids.has(node.id);
+        rows.push(h('div', { class: 'layer flex h-[26px] flex-none items-center gap-1.5 pr-2.5 whitespace-nowrap hover:outline hover:-outline-offset-1 hover:outline-accent' + (node.id === selected ? ' bg-accent/20' : '') + (node.tag ? '' : ' text-dim'), style: `padding-left:${8 + depth * 14}px`, title: node.cls, 'data-id': node.id, 'data-depth': depth, 'data-text': node.tag ? null : '' },
+          caret(node.kids, open),
+          h('span', { class: 'w-3.5 flex-none text-center text-[11px] text-dim' }, node.tag ? glyphs[node.tag] ?? '#' : 'T'),
+          node.tag && h('span', null, node.tag), node.key && h('span', { class: 'text-accent' }, '#' + node.key),
+          h('span', { class: 'truncate text-dim' }, node.text ?? (node.key ? '' : node.cls?.split(/\s+/)[0] ?? ''))));
+        if (open) walk(tree.kids.get(node.id), depth + 1);
+      }
+    };
+    walk(tree.root, 0);
+    layers.replaceChildren(...rows);
+  };
+  const refreshTree = async () => {
+    const stamp = await loadTree([null, ...tree.open]) + selected;
+    if (stamp !== tree.stamp) { tree.stamp = stamp; drawTree(); }
+  };
+  const startTree = async () => {
+    tree.kids.clear();
+    tree.open.clear();
+    await loadTree([null]);
+    // Opens the way down to the first node with more than one child.
+    for (let list = tree.root, depth = 0; depth < 8 && list?.length; depth++) {
+      const parts = list.filter(node => node.tag), node = parts.find(node => node.tag === 'body') ?? (parts.length === 1 ? parts[0] : null);
+      if (!node?.kids) break;
+      tree.open.add(node.id);
+      await loadTree([node.id]);
+      list = tree.kids.get(node.id);
+    }
+    tree.stamp = '';
+    drawTree();
+  };
+  const reveal = async id => {
+    const path = await request('DOM.path', { id });
+    for (const parent of path.slice(0, -1)) tree.open.add(parent);
+    tree.stamp = '';
+    await refreshTree();
+    $(`.layer[data-id="${id}"]`)?.scrollIntoView({ block: 'nearest' });
+  };
+  const toggle = async id => {
+    if (!tree.open.delete(id)) { tree.open.add(id); await loadTree([id]); }
+    drawTree();
+  };
+  const choose = id => request('Inspect.set', { selected: id });
+  layers.onclick = event => {
+    const row = event.target.closest('.layer');
+    if (!row) return;
+    const id = +row.dataset.id;
+    if (event.target.closest('.caret')) toggle(id);
+    else if (row.dataset.text == null) choose(id);
+  };
+  layers.ondblclick = event => { const row = event.target.closest('.layer'); if (row && !event.target.closest('.caret')) toggle(+row.dataset.id); };
+  layers.onmouseover = event => { const row = event.target.closest('.layer:not([data-text])'); request('Inspect.set', { hover: row ? +row.dataset.id : null }); };
+  layers.onmouseleave = () => request('Inspect.set', { hover: null });
+  layers.onkeydown = event => {
+    const rows = [...layers.querySelectorAll('.layer:not([data-text])')], at = rows.findIndex(row => +row.dataset.id === selected), row = rows[at];
+    const step = { ArrowDown: 1, ArrowUp: -1 }[event.key];
+    if (step) { event.preventDefault(); const to = rows[at < 0 ? 0 : at + step]; if (to) choose(+to.dataset.id); }
+    else if (row && event.key === 'ArrowRight' && !tree.open.has(selected)) toggle(selected);
+    else if (row && event.key === 'ArrowLeft') {
+      if (tree.open.has(selected)) return toggle(selected);
+      const parent = rows.slice(0, at).reverse().find(other => +other.dataset.depth < +row.dataset.depth);
+      if (parent) choose(+parent.dataset.id);
+    }
+  };
+
+  // Panel
+  const tabs = [...document.querySelectorAll('[data-tab]')];
+  const show = name => {
+    for (const tab of tabs) {
+      const on = tab.dataset.tab === name;
+      tab.className = 'flex-1 rounded-md py-1.5 font-medium' + (on ? ' bg-raise text-ink' : ' text-dim');
+      $('#' + tab.dataset.tab).hidden = !on;
+    }
+    if (name === 'console') { $('#alert').hidden = true; drawConsole(); expression.focus(); }
+  };
+  for (const tab of tabs) tab.onclick = () => show(tab.dataset.tab);
+  const pick = $('#pick');
+  const drawPick = () => { pick.className = 'grid size-7 flex-none place-items-center rounded-md' + (picking ? ' bg-accent text-white' : ' text-dim hover:bg-raise hover:text-ink'); };
+  pick.onclick = () => request('Inspect.set', { pick: !picking });
+  $('#close').onclick = () => request('Panel.close');
+  $('#grip').onpointerdown = event => {
+    const grip = event.currentTarget, from = event.screenX, start = innerWidth;
+    grip.setPointerCapture(event.pointerId);
+    grip.onpointermove = move => request('Panel.resize', { width: start + move.screenX - from });
+    grip.onpointerup = grip.onpointercancel = () => { grip.onpointermove = null; };
+  };
+  addEventListener('keydown', event => {
+    if (event.key === 'Escape' && picking) request('Inspect.set', { pick: false });
+    else if (event.key === 'F12' || event.code === 'KeyI' && event.metaKey && event.altKey) { event.preventDefault(); request('Panel.close'); }
+    else if (event.code === 'KeyC' && event.shiftKey && (event.metaKey || event.ctrlKey)) { event.preventDefault(); request('Inspect.set', { pick: !picking }); }
+  });
+  const events = {
+    // `docked` is a panel at the side of the page with tabs, `window` shows the layers beside the console, and `main` is the console of the main process.
+    init(message) {
+      mode = message.mode;
+      document.body.style.paddingTop = message.titlebar + 'px';
+      drawPick();
+      show('layers');
+      if (mode === 'docked') { $('#grip').hidden = false; document.body.classList.add('border-r', 'border-line'); }
+      else { $('#console').hidden = false; $('#tabs').classList.add('invisible'); layers.className = 'w-80 flex-none overflow-auto border-r border-line pb-3 outline-none'; }
+      if (mode === 'main') { $('#bar').hidden = layers.hidden = true; $('#tools').classList.add('pt-2.5'); expression.focus(); } else events.reset();
+    },
+    console: message => log(message.level ?? 'log', message.text ?? '', { ref: message.ref }),
+    error: message => log('error', message.message ?? JSON.stringify(message)),
+    inspect(message) {
+      picking = message.pick;
+      drawPick();
+      if (message.selected === selected) return;
+      selected = message.selected;
+      if (selected == null) { tree.stamp = ''; refreshTree(); } else reveal(selected);
+    },
+    dom: refreshTree,
+    // Reads the page: when the panel opens, and after each reload.
+    reset() {
+      selected = null;
+      request('Inspect.set', { selected: null, hover: null });
+      return startTree();
+    },
+  };
+  window.appsDevTools = { request, receive(message) {
+    if (!message.id) return void Promise.resolve(events[message.type]?.(message)).catch(error => log('error', error.message));
+    const item = pending.get(message.id);
+    pending.delete(message.id);
+    if (message.error) item?.reject(Error(message.error)); else item?.resolve(message.value);
+  } };
+  window.apps.postMessage({ id: 0, method: 'ready', params: {} });
 })();
 </script></html>

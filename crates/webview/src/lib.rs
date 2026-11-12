@@ -23,6 +23,7 @@ unsafe extern "C" {
     fn apps_browser_destroy(handle: *mut c_void);
     fn apps_browser_attach(handle: *mut c_void, parent: *mut c_void);
     fn apps_browser_bounds(handle: *mut c_void, x: f64, y: f64, width: f64, height: f64);
+    fn apps_browser_dock(handle: *mut c_void, width: f64) -> f64;
     fn apps_browser_command(
         handle: *mut c_void,
         operation: *const c_char,
@@ -223,6 +224,21 @@ impl Browser {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         self.backend.set_bounds(bounds)?;
         Ok(())
+    }
+
+    /// Moves a browser of a window to the left side of that window, beside the page. Returns the height of
+    /// the title bar that covers the top of the browser.
+    pub fn dock(&self, width: f64) -> Result<f64> {
+        ensure!(width.is_finite() && width > 0., "Invalid dock width");
+        #[cfg(target_os = "macos")]
+        {
+            let browser = Native(self.handle.as_ptr());
+            Ok(sync_main(move || unsafe {
+                apps_browser_dock(browser.get(), width)
+            }))
+        }
+        #[cfg(not(target_os = "macos"))]
+        bail!("Docked browsers require macOS");
     }
 
     pub fn detach(&self) -> Result<()> {

@@ -147,7 +147,9 @@ pub(crate) fn native_sync<R: Send>(job: impl FnOnce() -> R + Send) -> R {
     struct Done<'a>(&'a (Mutex<bool>, Condvar));
     impl Drop for Done<'_> {
         fn drop(&mut self) {
-            *lock(&self.0.0) = true;
+            // Notify under the lock: the caller frees the pair as soon as it sees the flag.
+            let mut finished = lock(&self.0.0);
+            *finished = true;
             self.0.1.notify_all();
         }
     }

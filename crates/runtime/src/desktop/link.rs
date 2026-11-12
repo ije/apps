@@ -344,6 +344,7 @@ pub(crate) fn native_action(action: &str) -> bool {
 pub(crate) enum Tool {
     Hud,
     DevTools,
+    Pick,
 }
 
 pub(crate) fn tool(key: &str, modifiers: renderer::Modifiers) -> Option<Tool> {
@@ -360,6 +361,8 @@ pub(crate) fn tool(key: &str, modifiers: renderer::Modifiers) -> Option<Tool> {
                 || (modifiers.ctrl() && modifiers.shift())))
     {
         Some(Tool::DevTools)
+    } else if key == "c" && modifiers.shift() && primary {
+        Some(Tool::Pick)
     } else {
         None
     }
@@ -523,13 +526,15 @@ impl Main {
                     }
                 }
                 (ToMain::Native(command), _) => self.native(command),
-                (ToMain::OpenTools, Some(_)) => match super::devtools::DevTools::new("Main") {
-                    Ok(tools) => *self.tools.borrow_mut() = Some(tools),
-                    Err(error) => {
-                        eprintln!("apps: {error:#}");
-                        self.link.fail();
+                (ToMain::OpenTools, Some(_)) => {
+                    match super::devtools::DevTools::new("Main", crate::host::Role::Main, None) {
+                        Ok(tools) => *self.tools.borrow_mut() = Some(tools),
+                        Err(error) => {
+                            eprintln!("apps: {error:#}");
+                            self.link.fail();
+                        }
                     }
-                },
+                }
                 (ToMain::OpenTools, None) => {}
                 (ToMain::Event(..) | ToMain::Sync(..) | ToMain::Open(..), None) => {}
             }
@@ -625,7 +630,7 @@ impl Main {
         };
         if !self.inputs.borrow().contains(&id)
             || self.driving.get()
-            || !packaged && tool(&key.name, modifiers).is_some()
+            || !packaged && matches!(tool(&key.name, modifiers), Some(Tool::Hud | Tool::DevTools))
         {
             return false;
         }
@@ -979,13 +984,7 @@ impl Main {
             let logs: Vec<_> = self.host.borrow_mut().logs.drain(..).collect();
             if let Some(tools) = &*self.tools.borrow() {
                 for command in tools.commands() {
-                    let request = command["id"].as_u64().unwrap_or(0);
-                    match super::devtools::dispatch(&command, engine, &self.host, 0) {
-                        Ok(value) => tools.respond(request, value, None)?,
-                        Err(error) => {
-                            tools.respond(request, Value::Null, Some(&error.to_string()))?
-                        }
-                    }
+                    tools.answer(&command, engine, &self.host, None)?;
                 }
                 tools.events(&logs)?;
                 delay = delay.min(16);

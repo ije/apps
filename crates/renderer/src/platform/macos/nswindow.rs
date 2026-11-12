@@ -438,11 +438,19 @@ impl AppsWindow {
         self.ivars().view.get().expect("The window has a view")
     }
 
+    // The frame of the page view in the content view. Panels docked at its sides make it narrower.
+    fn page_frame(&self) -> NSRect {
+        match self.ivars().view.get() {
+            Some(view) => view.frame(),
+            None => self
+                .contentView()
+                .map(|view| view.bounds())
+                .unwrap_or_default(),
+        }
+    }
+
     pub fn content_size(&self) -> Size<Pixels> {
-        let inner = self
-            .contentView()
-            .map(|view| view.frame().size)
-            .unwrap_or_default();
+        let inner = self.page_frame().size;
         size(px(inner.width as f32), px(inner.height as f32))
     }
 
@@ -489,9 +497,12 @@ impl AppsWindow {
                 .map(|screen| flip(rect(screen), top))
                 .unwrap_or_default()
         };
+        let (mut content, page) = (self.contentRectForFrameRect(frame), self.page_frame());
+        content.origin.x += page.origin.x;
+        content.size.width = page.size.width;
         let state = WindowState {
             frame: flip(frame, top),
-            content: flip(self.contentRectForFrameRect(frame), top),
+            content: flip(content, top),
             minimized,
             maximized: zoomed && !minimized && !fullscreen,
             fullscreen,
@@ -649,7 +660,7 @@ impl AppsWindow {
     fn drop_point(&self, info: &ProtocolObject<dyn NSDraggingInfo>) -> Point<Pixels> {
         let at = info.draggingLocation();
         Point::new(
-            px(at.x as f32),
+            px((at.x - self.page_frame().origin.x) as f32),
             self.content_size().height - px(at.y as f32),
         )
     }

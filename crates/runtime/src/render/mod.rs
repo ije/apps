@@ -9,6 +9,7 @@ pub(crate) mod grid;
 mod hud;
 pub mod image;
 mod input;
+mod inspect;
 pub(crate) mod native;
 mod paint;
 mod plan;
@@ -20,6 +21,7 @@ use crate::style::Prop;
 use crate::{desktop::Desktop, host::Host, style};
 pub(crate) use element::dimension;
 use element::{Build, element};
+pub(crate) use inspect::Inspect;
 use renderer::{App, Color, Event, Window, WindowId};
 use std::{
     cell::{Cell, RefCell},
@@ -57,6 +59,7 @@ pub(crate) struct PageState {
     reaching: RefCell<Vec<([f32; 2], u8)>>,
     caret: RefCell<Option<input::Blink>>,
     hud: RefCell<Option<hud::Hud>>,
+    pub(crate) inspect: Cell<inspect::Inspect>,
     kept: RefCell<rustc_hash::FxHashMap<usize, element::Kept>>,
     plans: RefCell<plan::Plans>,
     repaint: RefCell<rustc_hash::FxHashSet<usize>>,
@@ -347,6 +350,7 @@ impl PageView {
             promote: Cell::new(None),
             caret: RefCell::default(),
             hud: RefCell::default(),
+            inspect: Cell::default(),
             kept: RefCell::default(),
             plans: RefCell::default(),
             repaint: RefCell::default(),
@@ -405,6 +409,25 @@ impl PageView {
                 })
             {
                 window.request_animation_frame();
+            }
+            if data.inspect.get().pick {
+                let view = data.clone();
+                // The picker of the developer tools takes the pointer from the page.
+                window.on_capture(move |event, _, cx| {
+                    let (at, click) = match *event {
+                        Event::PointerMove { at, .. } => (at, false),
+                        Event::PointerDown { at, .. } => (at, true),
+                        Event::PointerUp { .. } => return cx.stop_event(),
+                        _ => return,
+                    };
+                    view.host.borrow_mut().command(
+                        crate::desktop::link::Target::Window(view.id),
+                        serde_json::json!({"op":"window","args":["inspect",view.id,f32::from(at.x),f32::from(at.y),click]}),
+                    );
+                    let runtime = view.runtime.clone();
+                    cx.defer(move |cx| Desktop::drive(runtime, cx));
+                    cx.stop_event();
+                });
             }
             let view = data.clone();
             window.on_capture(move |event, window, cx| {
@@ -2058,6 +2081,14 @@ impl PageView {
                 )
                 .absolute()
             }))
+            .children({
+                let inspect = self.inspect.get();
+                (inspect.hover.is_some() || inspect.selected.is_some()).then(|| {
+                    let data = self.0.clone();
+                    renderer::canvas(|_, _| (), move |_, _, window| inspect::paint(&data, window))
+                        .absolute()
+                })
+            })
             .children(self.hud.borrow().is_some().then(|| {
                 let data = self.0.clone();
                 renderer::canvas(

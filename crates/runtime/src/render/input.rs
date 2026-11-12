@@ -389,9 +389,22 @@ impl renderer::View for PageView {
                 ime,
             } => {
                 let key = named.name.as_str();
-                match tool(key, *modifiers).filter(|_| !self.host.borrow().packaged) {
+                let pick = (key == "escape" && self.inspect.get().pick).then_some(Tool::Pick);
+                match pick
+                    .or_else(|| tool(key, *modifiers).filter(|_| !self.host.borrow().packaged))
+                {
                     Some(Tool::Hud) => {
                         super::hud::Hud::toggle(&self.0, window);
+                        cx.stop_event();
+                        return;
+                    }
+                    Some(Tool::Pick) if !self.inspect.get().open => {}
+                    Some(Tool::Pick) => {
+                        self.host.borrow_mut().command(
+                            crate::desktop::link::Target::Window(id),
+                            serde_json::json!({"op":"window","args":["inspect",id,(key == "escape").then_some(false)]}),
+                        );
+                        self.drive(cx);
                         cx.stop_event();
                         return;
                     }

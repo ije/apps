@@ -869,10 +869,76 @@ impl Desktop {
                         if self.host.borrow().packaged {
                             continue;
                         }
-                        ensure!(cx.is_some(), "Developer Tools require a native window");
-                        if self.devtools.remove(&id).is_none() {
-                            self.devtools
-                                .insert(id, devtools::DevTools::new(&format!("Window {id}"))?);
+                        let cx = cx
+                            .as_deref_mut()
+                            .context("Developer Tools require a native window")?;
+                        let view = self.views.get(&id);
+                        let open = self.devtools.remove(&id).is_none();
+                        if open {
+                            let title = format!("Window {id}");
+                            let tools = view
+                                .and_then(|view| view.handle)
+                                .and_then(|handle| {
+                                    cx.update_window(handle, |window, _| {
+                                        devtools::DevTools::new(
+                                            &title,
+                                            Role::Renderer(id),
+                                            Some(window),
+                                        )
+                                    })
+                                })
+                                .unwrap_or_else(|| {
+                                    devtools::DevTools::new(&title, Role::Renderer(id), None)
+                                })?;
+                            self.devtools.insert(id, tools);
+                        }
+                        if let Some(data) = view.and_then(|view| view.data.upgrade()) {
+                            data.inspect.set(crate::render::Inspect {
+                                open,
+                                ..Default::default()
+                            });
+                        }
+                        if let Some(handle) = view.and_then(|view| view.handle) {
+                            cx.refresh_window(handle);
+                        }
+                    }
+                    // The picker of the developer tools: the pointer moved to a place on the page, or
+                    // pressed there. Without a place it turns the picker on or off.
+                    "inspect" => {
+                        let (Some(tools), Some(view)) =
+                            (self.devtools.get(&id), self.views.get(&id))
+                        else {
+                            continue;
+                        };
+                        let (Some(data), Some(engine), Some(cx)) =
+                            (view.data.upgrade(), &view.renderer, cx.as_deref_mut())
+                        else {
+                            continue;
+                        };
+                        let mut inspect = data.inspect.get();
+                        if args[2].is_number() {
+                            let at = serde_json::json!({"x":args[2],"y":args[3]});
+                            let node = crate::render::scripted(cx, None, || {
+                                devtools::agent(engine, "pick", &at)
+                            })?
+                            .as_u64()
+                            .map(|node| node as usize);
+                            if args[4] == true {
+                                inspect.selected = node;
+                            } else if inspect.hover == node {
+                                continue;
+                            }
+                            inspect.hover = node;
+                        } else {
+                            inspect.pick = args[2].as_bool().unwrap_or(!inspect.pick);
+                            inspect.hover = None;
+                        }
+                        data.inspect.set(inspect);
+                        if !args[2].is_number() || args[4] == true {
+                            tools.inspected(&data)?;
+                        }
+                        if let Some(handle) = view.handle {
+                            cx.refresh_window(handle);
                         }
                     }
                     "close" => {
@@ -1210,20 +1276,24 @@ impl Desktop {
                 }
             }
             for (&id, tools) in &app.devtools {
-                let Some(engine) = app.views.get(&id).and_then(|view| view.renderer.as_deref())
-                else {
+                let Some(view) = app.views.get(&id) else {
                     continue;
                 };
-                for command in tools.commands() {
-                    let request = command["id"].as_u64().unwrap_or(0);
-                    match devtools::dispatch(&command, engine, &app.host, id) {
-                        Ok(value) => tools.respond(request, value, None)?,
-                        Err(error) => tools.respond(
-                            request,
-                            serde_json::Value::Null,
-                            Some(&error.to_string()),
-                        )?,
+                let Some(engine) = view.renderer.as_deref() else {
+                    continue;
+                };
+                let (commands, data) = (tools.commands(), view.data.upgrade());
+                crate::render::scripted(cx, None, || -> Result<()> {
+                    for command in &commands {
+                        tools.answer(command, engine, &app.host, data.as_deref())?;
                     }
+                    tools.poll(engine)
+                })?;
+                if let Some(handle) = view.handle.filter(|_| !commands.is_empty()) {
+                    cx.refresh_window(handle);
+                }
+                if let Some(data) = data.filter(|_| tools.is_closed()) {
+                    data.inspect.take();
                 }
             }
             app.devtools.retain(|_, tools| !tools.is_closed());

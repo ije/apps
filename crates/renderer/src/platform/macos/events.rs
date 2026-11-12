@@ -41,15 +41,15 @@ fn button(number: isize) -> Option<Button> {
     .copied()
 }
 
-/// Positions are from the top of a content view `height` points tall.
-pub(crate) fn translate(native: &NSEvent, height: Pixels) -> Option<Event> {
+/// Positions are from the top of a page view `height` points tall, `left` points from the window's left edge.
+pub(crate) fn translate(native: &NSEvent, left: Pixels, height: Pixels) -> Option<Event> {
     let kind = native.r#type();
     // Read flags and locations only for the kinds below.
     let flags = || native.modifierFlags();
     let modifiers = || held(flags());
     let at = || {
         let location = native.locationInWindow();
-        point(px(location.x as f32), height - px(location.y as f32))
+        point(px(location.x as f32) - left, height - px(location.y as f32))
     };
     Some(match kind {
         Kind::FlagsChanged => Event::ModifiersChanged {

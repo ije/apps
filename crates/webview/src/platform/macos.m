@@ -19,6 +19,7 @@ typedef void (*AppsCallback)(void *, const char *);
 @property(nonatomic, copy) NSString *committedURL;
 @property(nonatomic) NSInteger nextDecision;
 @property(nonatomic, strong) NSMutableDictionary *decisions;
+@property(nonatomic, weak) NSView *page;
 @end
 
 static NSString *AppsString(const char *text) { return text ? [NSString stringWithUTF8String:text] : @""; }
@@ -158,8 +159,27 @@ void *apps_browser_create(void *parent, const char *optionsJSON, AppsCallback ca
     return (__bridge_retained void *)owner;
 }
 
+// Puts the view at the left side of the window and the page view in the space that is left. No width takes
+// it out.
+double apps_browser_dock(void *handle, double width) {
+    AppsBrowser *owner = (__bridge AppsBrowser *)handle;
+    NSView *view = owner.view;
+    if (!owner.page) owner.page = view.superview;
+    NSView *page = owner.page, *content = page.superview;
+    if (!content) return 0;
+    NSSize size = content.bounds.size;
+    if (width > 0) {
+        if (view.superview != content) [content addSubview:view];
+        view.autoresizingMask = NSViewHeightSizable | NSViewMaxXMargin;
+        view.frame = NSMakeRect(0, 0, width, size.height);
+    } else [view removeFromSuperview];
+    page.frame = NSMakeRect(width, 0, MAX(1, size.width - width), size.height);
+    return content.window ? size.height - content.window.contentLayoutRect.size.height : 0;
+}
+
 void apps_browser_destroy(void *handle) {
     if (!handle) return;
+    if (((__bridge AppsBrowser *)handle).page) apps_browser_dock(handle, 0);
     AppsBrowser *owner = (__bridge_transfer AppsBrowser *)handle;
     owner.callback = NULL;
     owner.context = NULL;

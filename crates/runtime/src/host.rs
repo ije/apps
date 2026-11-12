@@ -660,7 +660,7 @@ impl Host {
                     self.logs.pop_front();
                 }
                 let text: String = text.chars().take(16384).collect();
-                self.logs.push_back(json!({"method":"Runtime.consoleAPICalled","params":{"type":args[1].as_str().unwrap_or("log"),"text":text,"context":role}}));
+                self.logs.push_back(json!({"method":"Runtime.consoleAPICalled","params":{"type":args[1].as_str().unwrap_or("log"),"text":text,"context":role,"ref":args[2]}}));
             }
             return Ok(Value::Null);
         }

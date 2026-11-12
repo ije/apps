@@ -527,7 +527,10 @@ impl AppsView {
             true => frame.size.height,
             false => window.contentLayoutRect().size.height,
         };
-        CGPoint::new(frame.origin.x, frame.origin.y + height)
+        CGPoint::new(
+            frame.origin.x + self.frame().origin.x,
+            frame.origin.y + height,
+        )
     }
 
     fn handle_in_context(&self, event: &NSEvent) -> bool {
@@ -542,7 +545,7 @@ impl AppsView {
     fn key(&self, event: &NSEvent, equivalent: bool) -> bool {
         let ivars = self.ivars();
         let callbacks = ivars.callbacks;
-        let Some(input) = translate(event, self.height()) else {
+        let Some(input) = translate(event, px(self.frame().origin.x as f32), self.height()) else {
             return false;
         };
         let down = match &input {
@@ -654,7 +657,8 @@ impl AppsView {
 
     fn pointer(&self, event: &NSEvent) {
         let ivars = self.ivars();
-        let Some(mut input) = translate(event, self.height()) else {
+        let Some(mut input) = translate(event, px(self.frame().origin.x as f32), self.height())
+        else {
             return;
         };
         match &mut input {

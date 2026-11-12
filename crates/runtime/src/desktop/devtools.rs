@@ -1,31 +1,74 @@
-use crate::{desktop::browser::Browser, host::Host, jsc::JsContext};
-use anyhow::{Context, Result, bail};
+use crate::{
+    desktop::browser::Browser,
+    host::{Host, Role},
+    jsc::JsContext,
+};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    sync::OnceLock,
+    time::{Duration, Instant},
 };
 
+const AGENT: &str = include_str!("../../assets/devtools-agent.js");
+
+// The page of the panel. Its style is Tailwind, compiled for the classes that the page has.
+fn page() -> &'static str {
+    static PAGE: OnceLock<String> = OnceLock::new();
+    PAGE.get_or_init(|| {
+        let html = include_str!("../../assets/devtools.html");
+        let (head, rest) = html.split_once("<style>").unwrap_or((html, ""));
+        let (css, body) = rest.split_once("</style>").unwrap_or_default();
+        format!("{head}<style>{}</style>{body}", crate::style::tailwind(css, body))
+    })
+}
+
+// The panel of one window, at its left side. Where it cannot dock, and for the main process, it has its own
+// window.
 pub struct DevTools {
     browser: Browser,
+    mode: &'static str,
+    // The context that the tools look at. Only its console messages have values to expand.
+    context: Value,
+    titlebar: f64,
     ready: Cell<bool>,
     closed: Cell<bool>,
     next: Cell<u64>,
     events: RefCell<Vec<Value>>,
+    polled: Cell<Instant>,
+    fresh: Cell<bool>,
 }
 
 impl DevTools {
-    pub fn new(title: &str) -> Result<Self> {
-        let browser = Browser::detached(
-            &json!({"title":format!("Developer Tools — {title}"),"inspectable":true}),
-        )?;
-        browser.load_html(include_str!("../../assets/devtools.html"), "about:blank")?;
+    pub fn new(title: &str, role: Role, window: Option<&renderer::Window>) -> Result<Self> {
+        let docked = window.filter(|_| cfg!(target_os = "macos")).map(|window| {
+            let browser = Browser::new(window, &json!({"inspectable":true}))?;
+            let titlebar = browser.dock(300.)?;
+            anyhow::Ok((browser, titlebar))
+        });
+        let (browser, mode, titlebar) = match docked {
+            Some(Ok((browser, titlebar))) => (browser, "docked", titlebar),
+            _ => {
+                let options =
+                    json!({"title":format!("Developer Tools — {title}"),"inspectable":true});
+                let mode = if window.is_some() { "window" } else { "main" };
+                (Browser::detached(&options)?, mode, 0.)
+            }
+        };
+        browser.load_html(page(), "about:blank")?;
         Ok(Self {
             browser,
+            mode,
+            context: json!(role),
+            titlebar,
             ready: Cell::new(false),
             closed: Cell::new(false),
             next: Cell::new(0),
             events: RefCell::default(),
+            polled: Cell::new(Instant::now()),
+            fresh: Cell::new(true),
         })
     }
 
@@ -42,24 +85,26 @@ impl DevTools {
             .filter_map(|event| {
                 if event["type"] == "closed" {
                     self.closed.set(true);
-                    return None;
+                }
+                if event["type"] == "message" && event["data"]["kind"] == "error" {
+                    eprintln!("apps: developer tools: {}", event["data"]);
                 }
                 if event["type"] != "message" || event["data"]["kind"] != "message" {
                     return None;
                 }
                 let command = event["data"]["data"].clone();
-                if command["method"] == "ready" {
-                    self.ready.set(true);
-                    let events = std::mem::take(&mut *self.events.borrow_mut());
-                    if !events.is_empty() {
-                        let _ = self.evaluate(&format!(
-                            "for(const event of {})window.appsDevTools.receive(event)",
-                            json!(events)
-                        ));
-                    }
-                    return None;
+                if command["method"] != "ready" {
+                    return Some(command);
                 }
-                Some(command)
+                self.ready.set(true);
+                let mut events =
+                    vec![json!({"type":"init","mode":self.mode,"titlebar":self.titlebar})];
+                events.append(&mut self.events.borrow_mut());
+                let _ = self.evaluate(&format!(
+                    "for(const event of {})window.appsDevTools.receive(event)",
+                    json!(events)
+                ));
+                None
             })
             .collect()
     }
@@ -68,16 +113,11 @@ impl DevTools {
         self.closed.get()
     }
 
-    pub fn respond(&self, id: u64, value: Value, error: Option<&str>) -> Result<()> {
-        self.evaluate(&format!(
-            "window.appsDevTools?.receive({})",
-            json!({"id":id,"value":value,"error":error})
-        ))
-    }
-
     pub fn events(&self, values: &[Value]) -> Result<()> {
         let batch: Vec<_> = values.iter().map(|event| if event["method"] == "Runtime.consoleAPICalled" {
-            json!({"type":"console","level":event["params"]["type"],"args":[event["params"]["text"]]})
+            let params = &event["params"];
+            let values = (params["context"] == self.context).then(|| &params["ref"]);
+            json!({"type":"console","level":params["type"],"text":params["text"],"ref":values})
         } else { event.clone() }).collect();
         if !self.ready.get() {
             let mut events = self.events.borrow_mut();
@@ -93,15 +133,98 @@ impl DevTools {
         }
         Ok(())
     }
+
+    // Runs a command of the panel and sends the answer back to it.
+    pub(crate) fn answer(
+        &self,
+        command: &Value,
+        engine: &JsContext,
+        host: &Rc<RefCell<Host>>,
+        page: Option<&crate::render::PageState>,
+    ) -> Result<()> {
+        let params = &command["params"];
+        let result = match command["method"].as_str() {
+            Some("Panel.close") => {
+                self.closed.set(true);
+                Ok(Value::Null)
+            }
+            Some("Panel.resize") if self.mode == "docked" => params["width"]
+                .as_f64()
+                .context("Expected a width")
+                .and_then(|width| self.browser.dock(width.clamp(200., 800.)))
+                .map(Value::from),
+            Some("Inspect.set") => {
+                if let Some(page) = page {
+                    let mut inspect = page.inspect.get();
+                    let node = |value: &Value| value.as_u64().map(|id| id as usize);
+                    if let Some(pick) = params["pick"].as_bool() {
+                        inspect.pick = pick;
+                    }
+                    if let Some(hover) = params.get("hover") {
+                        inspect.hover = node(hover);
+                    }
+                    if let Some(selected) = params.get("selected") {
+                        inspect.selected = node(selected);
+                    }
+                    page.inspect.set(inspect);
+                    if params.get("hover").is_none() {
+                        self.inspected(page)?;
+                    }
+                }
+                Ok(Value::Null)
+            }
+            _ => dispatch(command, engine, host),
+        };
+        let (value, error) = match result {
+            Ok(value) => (value, None),
+            Err(error) => (Value::Null, Some(format!("{error:#}"))),
+        };
+        self.evaluate(&format!(
+            "window.appsDevTools?.receive({})",
+            json!({"id":command["id"],"value":value,"error":error})
+        ))
+    }
+
+    // Tells the panel which node is selected and if the picker is on.
+    pub(crate) fn inspected(&self, page: &crate::render::PageState) -> Result<()> {
+        let inspect = page.inspect.get();
+        self.events(&[json!({"type":"inspect","pick":inspect.pick,"selected":inspect.selected})])
+    }
+
+    // Tells the panel when the document changed or a new page loaded. At most four times a second.
+    pub(crate) fn poll(&self, engine: &JsContext) -> Result<()> {
+        if self.polled.get().elapsed() < Duration::from_millis(250) {
+            return Ok(());
+        }
+        self.polled.set(Instant::now());
+        let state = agent(engine, "poll", &Value::Null)?.as_u64();
+        // A new panel reads the page by itself.
+        if self.fresh.replace(false) {
+            return Ok(());
+        }
+        match state {
+            Some(2) => self.events(&[json!({"type":"reset"})]),
+            Some(1) => self.events(&[json!({"type":"dom"})]),
+            _ => Ok(()),
+        }
+    }
 }
 
-pub fn dispatch(
-    command: &Value,
-    engine: &JsContext,
-    host: &Rc<RefCell<Host>>,
-    window: u64,
-) -> Result<Value> {
-    anyhow::ensure!(
+// Calls the script that inspects a context from inside it. A new context gets the script on its first call.
+pub(crate) fn agent(engine: &JsContext, method: &str, params: &Value) -> Result<Value> {
+    if engine.eval_page("typeof this.__appsAgent", "apps:devtools")? != "function" {
+        engine.eval_page(&format!("this.__appsAgent={AGENT}"), "apps:devtools")?;
+    }
+    let call = format!(
+        "JSON.stringify(this.__appsAgent({},{})??null)",
+        json!(method),
+        params
+    );
+    Ok(serde_json::from_str(&engine.eval_page(&call, "apps:devtools")?)?)
+}
+
+pub fn dispatch(command: &Value, engine: &JsContext, host: &Rc<RefCell<Host>>) -> Result<Value> {
+    ensure!(
         !host.borrow().packaged,
         "Developer tools are unavailable in packaged apps"
     );
@@ -110,62 +233,29 @@ pub fn dispatch(
         .as_str()
         .context("Expected developer tools method")?
     {
+        // Answers the value of an expression, or the error that it threw, as the console shows them.
         "Runtime.evaluate" => {
             let expression = params["expression"]
                 .as_str()
                 .context("Expected JavaScript expression")?;
-            let output = engine.eval_page(&format!("(()=>{{const result=this.__appsCompile({},'apps:console');try{{return JSON.stringify(result,(_,v)=>typeof v==='bigint'?String(v)+'n':v)}}catch{{return JSON.stringify(String(result))}}}})()", json!(expression)), "apps:devtools")?;
-            Ok(serde_json::from_str(&output).unwrap_or(Value::String(output)))
+            agent(engine, "inspect", &Value::Null)?;
+            let output = engine.eval_page(&format!("(()=>{{const agent=this.__appsAgent;try{{return JSON.stringify({{value:agent('inspect',{{value:this.__appsCompile({},'apps:console')}})}})}}catch(error){{return JSON.stringify({{thrown:agent('inspect',{{value:error}})}})}}}})()", json!(expression)), "apps:devtools")?;
+            Ok(serde_json::from_str(&output)?)
         }
-        "DOM.getDocument" => {
-            let host = host.borrow();
-            let page = host.pages.get(&window).context("Window has no document")?;
-            Ok(page.doc.serialize(0).into())
-        }
-        "DOM.querySelector" => {
-            let selector = params["selector"]
-                .as_str()
-                .context("Expected CSS selector")?;
-            let host = host.borrow();
-            let page = host.pages.get(&window).context("Window has no document")?;
-            let mut pending = vec![0];
-            while let Some(node) = pending.pop() {
-                if page.doc.matches(node, selector) {
-                    return Ok(page.doc.serialize(node).into());
-                }
-                pending.extend(page.doc.nodes[node].children.iter().rev().copied());
-            }
-            Ok(Value::Null)
-        }
-        "Sources.list" => {
-            let mut sources: Vec<_> = engine.sources().into_iter().collect();
-            sources.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            Ok(Value::Array(
-                sources
-                    .into_iter()
-                    .map(|(name, source)| json!({"name":name,"source":source}))
-                    .collect(),
-            ))
-        }
-        "Debugger.pause" => {
-            engine.eval("debugger;", "apps:devtools")?;
-            Ok("Debugger statement ran. App contexts have no attached debugger, so execution did not pause.".into())
-        }
-        "Debugger.open" => bail!(
-            "App JavaScript contexts have no step debugger. WebKit browser views can open their inspector directly."
-        ),
-        method => bail!("Unsupported developer tools method: {method}"),
+        method => match method
+            .strip_prefix("DOM.")
+            .or_else(|| method.strip_prefix("Console."))
+        {
+            Some(name) => agent(engine, name, params),
+            None => bail!("Unsupported developer tools method: {method}"),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        dom::Document,
-        host::{Page, Role},
-        jsc::JavaScriptCore,
-    };
+    use crate::{dom::Document, host::Page, jsc::JavaScriptCore};
 
     #[test]
     fn packaged_apps_disable_developer_tools() {
@@ -177,13 +267,12 @@ mod tests {
             JsContext::new(JavaScriptCore::load().unwrap(), host.clone(), Role::Main).unwrap();
         engine.eval("globalThis.answer = 42", "app.js").unwrap();
         assert!(engine.sources().is_empty());
-        assert!(dispatch(&json!({"method":"Sources.list"}), &engine, &host, 0).is_err());
+        assert!(dispatch(&json!({"method":"Theme.get"}), &engine, &host).is_err());
         assert!(
             dispatch(
                 &json!({"method":"Runtime.evaluate","params":{"expression":"answer = 0"}}),
                 &engine,
-                &host,
-                0
+                &host
             )
             .is_err()
         );
@@ -224,17 +313,77 @@ mod tests {
         )
         .unwrap();
         let command = json!({"method":"Runtime.evaluate","params":{"expression":"document.querySelector('#value').textContent = 'changed'"}});
-        assert_eq!(dispatch(&command, &engine, &host, 1).unwrap(), "changed");
-        let document = dispatch(
-            &json!({"method":"DOM.querySelector","params":{"selector":"#value"}}),
-            &engine,
-            &host,
+        assert_eq!(
+            dispatch(&command, &engine, &host).unwrap(),
+            json!({"value":{"type":"string","text":"changed"}})
+        );
+        assert!(host.borrow().pages[&1].dirty);
+        let call = |method: &str, params: Value| {
+            dispatch(&json!({"method":method,"params":params}), &engine, &host).unwrap()
+        };
+        let thrown = call(
+            "Runtime.evaluate",
+            json!({"expression":"throw new TypeError('expected')"}),
+        );
+        assert_eq!(thrown["thrown"]["text"], "TypeError: expected");
+        assert!(thrown["thrown"]["stack"].is_string());
+        let object = call(
+            "Runtime.evaluate",
+            json!({"expression":"({a: 1, list: [1, 'x'], get b() { return 2 }})"}),
+        );
+        assert_eq!(object["value"]["text"], "{a: 1, list: Array(2), b: (…)}");
+        let props = call("Console.props", json!({"id":object["value"]["id"]}));
+        assert_eq!(props[0], json!({"name":"a","type":"number","text":"1"}));
+        assert_eq!(props[1]["text"], "(2) [1, \"x\"]");
+        assert_eq!(props[3]["name"], "[[Prototype]]");
+        // A logged object stays for the console to expand.
+        engine
+            .eval_page(
+                "console.log('plain'); console.log('with', {deep: {er: 1}})",
+                "page",
+            )
+            .unwrap();
+        let logs: Vec<_> = host.borrow_mut().logs.drain(..).collect();
+        assert_eq!(logs[0]["params"]["ref"], Value::Null);
+        let args = call("Console.args", json!({"ref":logs[1]["params"]["ref"]}));
+        assert_eq!(args[1]["text"], "{deep: {…}}");
+        assert!(dispatch(&json!({"method":"Debugger.open"}), &engine, &host).is_err());
+    }
+
+    #[test]
+    fn page_tools_read_the_tree_and_the_panel_has_its_styles() {
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
             1,
+            Page {
+                doc: Document::parse("<head><title>t</title></head><body><p id='value' class='a b'>before</p> <script></script></body>"),
+                dirty: false,
+            },
+        );
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
         )
         .unwrap();
-        assert!(document.as_str().unwrap().contains("changed"));
-        assert!(host.borrow().pages[&1].dirty);
-        assert!(dispatch(&json!({"method":"Runtime.evaluate","params":{"expression":"throw new Error('expected')"}}), &engine, &host, 1).is_err());
-        assert!(dispatch(&json!({"method":"Debugger.open"}), &engine, &host, 1).is_err());
+        let call = |method: &str, params: Value| {
+            dispatch(&json!({"method":method,"params":params}), &engine, &host).unwrap()
+        };
+        assert_eq!(agent(&engine, "poll", &Value::Null).unwrap(), 2);
+        let tree = call("DOM.tree", json!({"ids":[null]}));
+        assert_eq!((&tree["root"][0]["tag"], &tree["root"][0]["kids"]), (&json!("html"), &json!(1)));
+        let html = tree["root"][0]["id"].clone();
+        let body = call("DOM.tree", json!({"ids":[html]}))[html.to_string()][0]["id"].clone();
+        let kids = call("DOM.tree", json!({"ids":[body]}))[body.to_string()].clone();
+        assert_eq!(kids[0]["text"], "before");
+        assert_eq!(kids.as_array().unwrap().len(), 1);
+        assert_eq!(call("DOM.path", json!({"id":kids[0]["id"]})), json!([html, body, kids[0]["id"]]));
+        engine.eval_page("document.querySelector('p').className = 'c'", "page").unwrap();
+        assert_eq!(agent(&engine, "poll", &Value::Null).unwrap(), 1);
+        assert_eq!(agent(&engine, "poll", &Value::Null).unwrap(), 0);
+
+        let page = page();
+        assert!(page.contains(".bg-panel{") && page.contains("box-sizing:border-box"));
+        assert!(!page.contains("@import"));
     }
 }

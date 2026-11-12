@@ -1049,6 +1049,26 @@ struct CollapsedTable {
     styles: FxHashMap<CellKey, Rc<Style>>,
 }
 
+// Compiles Tailwind for a page that a system web view shows, like the developer tools: `css`, and the
+// classes among the words of `text`.
+pub(crate) fn tailwind(css: &str, text: &str) -> String {
+    let stop = |c: char| c.is_whitespace() || "\"'`<>=;,&".contains(c);
+    let words: Vec<_> = text.split(stop).filter(|word| !word.is_empty()).collect();
+    let doc = Document::parse(&format!("<p class=\"{}\">", words.join(" ")));
+    let order: Vec<_> = (0..doc.nodes.len() as u32).map(|id| (id, 0)).collect();
+    let mut sheets = vec![Rc::new(Stylesheet::parse(css))];
+    tailwind::Compiler::default().update(&mut sheets, &doc, &order);
+    // A web view does not know the rules that only configure Tailwind.
+    let plain = |rule: &&Rc<Rule>| {
+        !matches!(
+            ***rule,
+            Rule::Tailwind(_) | Rule::Theme(..) | Rule::Variant(..) | Rule::Utility(..)
+        )
+    };
+    let rules = sheets.iter().flat_map(|sheet| &sheet.0).filter(plain);
+    rules.map(|rule| rule.source()).collect()
+}
+
 impl StyleCache {
     fn walk(&mut self, doc: &Document, shadows: &Rc<Shadows>) -> Rc<TreeWalk> {
         let walk = self.walk.take().and_then(|walk| Rc::try_unwrap(walk).ok());
