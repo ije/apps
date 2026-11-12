@@ -331,7 +331,7 @@ impl Host {
                         ensure!(child > 0, "Invalid child");
                         let tag = &doc.nodes[parent].tag;
                         ensure!(
-                            !tag.starts_with('#') || parent == 0 || tag == "#fragment",
+                            !tag.starts_with('#') || tag == "#document" || tag == "#fragment",
                             "Invalid parent"
                         );
                         let before = usize::try_from(c).ok();
@@ -500,16 +500,33 @@ impl Host {
                     }
                     8 => {
                         use crate::dom::{
-                            BROKEN, CHECKED, DIRTY, FULLSCREEN, LEAVING, MODAL, POPOVER, TOP_LAYER,
+                            BROKEN, CHECKED, DIRTY, FULLSCREEN, INDETERMINATE, INVALID, LEAVING,
+                            MODAL, POPOVER, TOP_LAYER,
                         };
                         let id = node(doc, a)?;
-                        let bits = [CHECKED, DIRTY, MODAL, POPOVER, FULLSCREEN, BROKEN]
-                            .into_iter()
-                            .enumerate()
-                            .fold(0, |bits, (index, bit)| {
-                                bits | if b & 1 << index != 0 { bit } else { 0 }
-                            });
-                        let mask = CHECKED | DIRTY | MODAL | POPOVER | FULLSCREEN | BROKEN;
+                        let bits = [
+                            CHECKED,
+                            DIRTY,
+                            MODAL,
+                            POPOVER,
+                            FULLSCREEN,
+                            BROKEN,
+                            INDETERMINATE,
+                            INVALID,
+                        ]
+                        .into_iter()
+                        .enumerate()
+                        .fold(0, |bits, (index, bit)| {
+                            bits | if b & 1 << index != 0 { bit } else { 0 }
+                        });
+                        let mask = CHECKED
+                            | DIRTY
+                            | MODAL
+                            | POPOVER
+                            | FULLSCREEN
+                            | BROKEN
+                            | INDETERMINATE
+                            | INVALID;
                         let old = doc.nodes[id].state;
                         if old & mask == bits {
                             return Ok(false);

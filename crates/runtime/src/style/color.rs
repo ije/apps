@@ -539,7 +539,17 @@ fn parse(value: &str, depth: u8) -> Option<(Space, [f64; 3], f64)> {
         }
     }
     let vars = if origin.is_some() { &vars[..] } else { &[] };
+    // Percentages are lengths to the math parser, so a length like `5px` is told apart by scaling the base.
+    let percentage = |text: &str, reference: f64, value: f64| {
+        text.contains('%')
+            && units
+                .math(text, (reference * 2.) as f32, vars)
+                .is_some_and(|(double, _)| {
+                    (double - value * 2.).abs() <= 1e-6 * value.abs().max(1.)
+                })
+    };
     let mut values = [0.; 3];
+    let mut percentages = [false; 3];
     for index in 0..3 {
         values[index] = if channels[index].eq_ignore_ascii_case("none") && !legacy {
             f64::NAN
@@ -547,10 +557,24 @@ fn parse(value: &str, depth: u8) -> Option<(Space, [f64; 3], f64)> {
             let reference = references[index] * scale;
             match units.math(channels[index], reference as f32, vars)? {
                 (value, Kind::Number | Kind::Angle) if reference == 0. => value,
-                (value, Kind::Number | Kind::Length) if reference != 0. => value / scale,
+                (value, Kind::Number) if reference != 0. => value / scale,
+                (value, Kind::Length)
+                    if reference != 0. && percentage(channels[index], reference, value) =>
+                {
+                    percentages[index] = true;
+                    value / scale
+                }
                 _ => return None,
             }
         };
+    }
+    if legacy
+        && match space {
+            Space::Hsl => !percentages[1] || !percentages[2],
+            _ => percentages[0] != percentages[1] || percentages[1] != percentages[2],
+        }
+    {
+        return None;
     }
     if matches!(space, Space::Lab | Space::Lch | Space::Oklab | Space::Oklch) {
         values[0] = values[0].clamp(0., references[0]);
@@ -561,7 +585,8 @@ fn parse(value: &str, depth: u8) -> Option<(Space, [f64; 3], f64)> {
     let alpha = match alpha {
         Some(alpha) if alpha.eq_ignore_ascii_case("none") && !legacy => f64::NAN,
         Some(alpha) => match units.math(alpha, 1., vars)? {
-            (alpha, Kind::Number | Kind::Length) => alpha.clamp(0., 1.),
+            (value, Kind::Number) => value.clamp(0., 1.),
+            (value, Kind::Length) if percentage(alpha, 1., value) => value.clamp(0., 1.),
             _ => return None,
         },
         None => vars.get(3).map_or(1., |var| var.1),

@@ -6,7 +6,10 @@ use cssparser::{
 };
 use std::rc::Rc;
 
+type Checked = (Vec<u8>, rustc_hash::FxHashMap<Box<[u8]>, bool>);
+
 thread_local! {
+    static VALID: std::cell::RefCell<Checked> = Default::default();
     pub(crate) static DROPPED: std::cell::RefCell<std::collections::BTreeSet<String>> = Default::default();
 }
 
@@ -15,6 +18,7 @@ struct Rules {
     parent: Option<SelectorList>,
     top_level: bool,
     declarations_only: bool,
+    descriptors: bool,
     theme: bool,
     scope: bool,
     suffix: String,
@@ -60,12 +64,17 @@ impl Rule {
 
 impl Declarations {
     pub(crate) fn parse(source: &str) -> Self {
-        Self::parse_input(&mut Parser::new(source))
+        Self::parse_input(&mut Parser::new(source), false)
     }
 
-    fn parse_input(input: &mut Parser<'_>) -> Self {
+    pub(crate) fn descriptors(source: &str) -> Self {
+        Self::parse_input(&mut Parser::new(source), true)
+    }
+
+    fn parse_input(input: &mut Parser<'_>, descriptors: bool) -> Self {
         let mut parser = Rules {
             declarations_only: true,
+            descriptors,
             ..Rules::default()
         };
         Self(
@@ -127,12 +136,13 @@ impl<'i> DeclarationParser<'i> for Rules {
         let custom = name.starts_with("--");
         input.skip_whitespace();
         let mut value = String::new();
+        let separator = if custom { "/**/" } else { " " };
         let delimiters = if custom {
             Delimiter::Bang
         } else {
             Delimiter::Bang | Delimiter::CurlyBracketBlock
         };
-        input.parse_until_before(delimiters, |input| source(input, &mut value))?;
+        input.parse_until_before(delimiters, |input| source(input, &mut value, separator))?;
         value.truncate(value.trim_end().len());
         if value.contains("env(") {
             value = environment(&value);
@@ -144,19 +154,75 @@ impl<'i> DeclarationParser<'i> for Rules {
             value.push_str(" !important");
         }
         input.expect_exhausted()?;
-        Ok(Item::Declaration(Declaration::Property(
-            if custom {
-                name.to_string()
-            } else if name.eq_ignore_ascii_case("-webkit-user-select") {
-                "user-select".into()
-            } else if name.eq_ignore_ascii_case("-webkit-app-region") {
-                "app-region".into()
-            } else {
-                name.to_ascii_lowercase()
-            },
-            value,
-        )))
+        let name = if custom {
+            name.to_string()
+        } else if name.eq_ignore_ascii_case("-webkit-user-select") {
+            "user-select".into()
+        } else if name.eq_ignore_ascii_case("-webkit-app-region") {
+            "app-region".into()
+        } else {
+            name.to_ascii_lowercase()
+        };
+        if !custom
+            && !self.descriptors
+            && !self.theme
+            && invalid(&name, value.strip_suffix(" !important").unwrap_or(&value))
+        {
+            DROPPED.with_borrow_mut(|dropped| {
+                if dropped.len() < 256 {
+                    dropped.insert(format!("{name}: {value}"));
+                }
+            });
+            return Err(ParseError::unexpected_token());
+        }
+        Ok(Item::Declaration(Declaration::Property(name, value)))
     }
+}
+
+// Sheets and `var()` results repeat declarations, so each `property:value` is checked once.
+pub(super) fn invalid(name: &str, plain: &str) -> bool {
+    VALID.with_borrow_mut(|(key, valid)| {
+        key.clear();
+        key.extend_from_slice(name.as_bytes());
+        key.push(b':');
+        // Validity never depends on which nonzero digits a number with a unit has, so `1px` and `27px` share an
+        // entry. Plain numbers can have a range, like `cubic-bezier(2, 0, 0, 1)`.
+        let (bytes, mut index, mut word) = (plain.as_bytes(), 0, false);
+        while let Some(&byte) = bytes.get(index) {
+            index += 1;
+            if byte.is_ascii_digit() && !word {
+                let (start, mut zero) = (index - 1, byte == b'0');
+                while let Some(&digit) = bytes.get(index).filter(|b| b.is_ascii_digit()) {
+                    zero &= digit == b'0';
+                    index += 1;
+                }
+                match bytes.get(index) {
+                    Some(unit) if unit.is_ascii_alphabetic() || *unit == b'%' => {
+                        key.push(if zero { b'0' } else { b'1' })
+                    }
+                    _ => key.extend_from_slice(&bytes[start..index]),
+                }
+                continue;
+            }
+            word = byte.is_ascii_alphanumeric()
+                || byte >= 0x80
+                || matches!(byte, b'#' | b'_' | b'\\')
+                || byte == b'-' && word;
+            key.push(byte);
+        }
+        if let Some(&result) = valid.get(key.as_slice()) {
+            return result;
+        }
+        let result = !["env(", "attr(", "theme(", "--spacing(", "--alpha("]
+            .iter()
+            .any(|function| plain.contains(function))
+            && super::supports(name, plain) == Some(false);
+        if valid.len() > 4096 {
+            valid.clear();
+        }
+        valid.insert(key.as_slice().into(), result);
+        result
+    })
 }
 
 impl<'i> QualifiedRuleParser<'i> for Rules {
@@ -166,7 +232,7 @@ impl<'i> QualifiedRuleParser<'i> for Rules {
 
     fn parse_prelude(&mut self, input: &mut Parser<'i>) -> Result<SelectorList, ParseError<()>> {
         let mut value = String::new();
-        source(input, &mut value)?;
+        source(input, &mut value, "/**/")?;
         if self.scope {
             value = value.replace(":scope", "&");
         }
@@ -234,7 +300,10 @@ impl<'i> AtRuleParser<'i> for Rules {
             while input.next().is_ok() {}
             return Ok(Item::Rule(Rule::Tailwind(None)));
         }
-        if name.eq_ignore_ascii_case("keyframes") && !self.declarations_only {
+        if (name.eq_ignore_ascii_case("keyframes")
+            || name.eq_ignore_ascii_case("-webkit-keyframes"))
+            && !self.declarations_only
+        {
             let name = input.expect_ident_or_string()?.to_string();
             input.expect_exhausted()?;
             return Ok(Item::Rule(Rule::Keyframes(name, Vec::new())));
@@ -244,14 +313,14 @@ impl<'i> AtRuleParser<'i> for Rules {
             let mut template = String::new();
             if !input.is_exhausted() {
                 input.expect_parenthesis_block()?;
-                input.parse_nested_block(|input| source(input, &mut template))?;
+                input.parse_nested_block(|input| source(input, &mut template, "/**/"))?;
                 input.expect_exhausted()?;
             }
             return Ok(Item::Rule(Rule::Variant(name, template.trim().to_owned())));
         }
         if name.eq_ignore_ascii_case("variant") && self.parent.is_some() {
             let mut name = String::new();
-            source(input, &mut name)?;
+            source(input, &mut name, "/**/")?;
             return Ok(Item::Rule(Rule::Variant(
                 name.trim().to_owned(),
                 String::new(),
@@ -280,7 +349,7 @@ impl<'i> AtRuleParser<'i> for Rules {
             let group = |input: &mut Parser<'i>| -> Result<String, ParseError<()>> {
                 input.expect_parenthesis_block()?;
                 let mut text = String::new();
-                input.parse_nested_block(|input| source(input, &mut text))?;
+                input.parse_nested_block(|input| source(input, &mut text, "/**/"))?;
                 Ok(text.trim().to_owned())
             };
             let start = input.try_parse(group).ok();
@@ -297,19 +366,23 @@ impl<'i> AtRuleParser<'i> for Rules {
             input.expect_exhausted()?;
             return Ok(Item::Starting);
         }
-        if name.eq_ignore_ascii_case("font-face") && self.top_level {
+        if name.eq_ignore_ascii_case("font-face")
+            && self.parent.is_none()
+            && !self.declarations_only
+            && !self.theme
+        {
             input.expect_exhausted()?;
             return Ok(Item::Rule(Rule::FontFace(Declarations::default())));
         }
         if name.eq_ignore_ascii_case("utility") && self.top_level {
             let mut name = String::new();
-            source(input, &mut name)?;
+            source(input, &mut name, "/**/")?;
             name.retain(|c| !c.is_whitespace());
             return Ok(Item::Rule(Rule::Utility(name, String::new())));
         }
         if name.eq_ignore_ascii_case("apply") && self.parse_declarations() {
             let mut value = String::new();
-            source(input, &mut value)?;
+            source(input, &mut value, "/**/")?;
             return Ok(Item::Declaration(Declaration::Apply(
                 super::components(&value, ' ')
                     .into_iter()
@@ -319,7 +392,7 @@ impl<'i> AtRuleParser<'i> for Rules {
         }
         if name.eq_ignore_ascii_case("layer") && !self.declarations_only {
             let mut value = String::new();
-            source(input, &mut value)?;
+            source(input, &mut value, "/**/")?;
             return Ok(Item::Rule(Rule::Layer(
                 value
                     .split(',')
@@ -334,12 +407,12 @@ impl<'i> AtRuleParser<'i> for Rules {
             input.skip_whitespace();
             let start = input.state();
             let supported =
-                condition(input, true, true)?.matches(0., 0., false, 0, FontUnits::new(16.))
+                condition(input, true, true)?.matches(0., 0., false, 0, Lengths::new(16., 0., 0.))
                     == Some(true);
             input.expect_exhausted()?;
             input.reset(&start);
             let mut value = String::new();
-            source(input, &mut value)?;
+            source(input, &mut value, "/**/")?;
             return Ok(Item::Rule(Rule::Supports(value, supported, Vec::new())));
         }
         if name.eq_ignore_ascii_case("container") && !self.declarations_only {
@@ -419,10 +492,10 @@ impl<'i> AtRuleParser<'i> for Rules {
                             let not = input
                                 .try_parse(|input| input.expect_ident_matching("not"))
                                 .is_ok();
-                            if !not {
-                                let _ =
-                                    input.try_parse(|input| input.expect_ident_matching("only"));
-                            }
+                            let only = !not
+                                && input
+                                    .try_parse(|input| input.expect_ident_matching("only"))
+                                    .is_ok();
                             let medium = input.expect_ident_cloned()?;
                             if ["not", "only", "and", "or", "layer"]
                                 .iter()
@@ -436,14 +509,15 @@ impl<'i> AtRuleParser<'i> for Rules {
                                 input.expect_ident_matching("and")?;
                                 condition(input, false, false)?
                             };
-                            let matched = medium.eq_ignore_ascii_case("all")
-                                || medium.eq_ignore_ascii_case("screen");
-                            Ok(match (matched, not) {
-                                (true, false) => query,
-                                (true, true) => MediaQuery::Not(Box::new(query)),
-                                (false, false) => MediaQuery::Not(Box::new(MediaQuery::All)),
-                                (false, true) => MediaQuery::All,
-                            })
+                            let prefix = match (not, only) {
+                                (true, _) => "not ",
+                                (_, true) => "only ",
+                                _ => "",
+                            };
+                            Ok(MediaQuery::Typed(
+                                format!("{prefix}{}", medium.to_ascii_lowercase()),
+                                Box::new(query),
+                            ))
                         })
                     });
                     Ok::<_, ParseError<()>>(query.unwrap_or_else(|_| {
@@ -540,10 +614,10 @@ impl<'i> AtRuleParser<'i> for Rules {
                 }
                 .body(input),
             ),
-            Item::Rule(Rule::FontFace(_)) => Rule::FontFace(Declarations::parse_input(input)),
+            Item::Rule(Rule::FontFace(_)) => Rule::FontFace(Declarations::parse_input(input, true)),
             Item::Rule(Rule::Property(name, ..)) => {
                 let (mut syntax, mut inherits, mut initial) = (None, None, None);
-                for declaration in Declarations::parse_input(input).0 {
+                for declaration in Declarations::parse_input(input, true).0 {
                     if let Declaration::Property(key, value) = declaration {
                         match key.as_str() {
                             "syntax" => syntax = Some(value.trim_matches(['"', '\'']).to_owned()),
@@ -560,23 +634,28 @@ impl<'i> AtRuleParser<'i> for Rules {
                 let (Some(syntax), Some(inherits)) = (syntax, inherits) else {
                     return Err(ParseError::unexpected_token());
                 };
-                if syntax.trim() != "*"
-                    && initial.as_deref().is_none_or(|value| {
-                        value.contains("var(") || !super::syntax_matches(&syntax, value)
-                    })
-                {
-                    return Err(ParseError::unexpected_token());
+                if syntax.trim() != "*" {
+                    // The initial value must not depend on an element, so `2em` drops the rule.
+                    let Some((value, true)) = initial
+                        .filter(|value| {
+                            !value.contains("var(") && super::syntax_matches(&syntax, value)
+                        })
+                        .map(|value| super::computed(&syntax, &value))
+                    else {
+                        return Err(ParseError::unexpected_token());
+                    };
+                    initial = Some(value);
                 }
                 Rule::Property(name, syntax, inherits == 1, initial)
             }
             Item::Rule(Rule::Utility(name, _)) => {
                 let mut body = String::new();
-                source(input, &mut body)?;
+                source(input, &mut body, "/**/")?;
                 Rule::Utility(name, body)
             }
             Item::Rule(Rule::Variant(name, template)) if template.is_empty() => {
                 let mut body = String::new();
-                source(input, &mut body)?;
+                source(input, &mut body, "/**/")?;
                 if !self.top_level {
                     body = format!("{{{body}}}");
                 }
@@ -652,7 +731,7 @@ fn condition(
                 return Ok(Some(query));
             }
             let mut text = String::new();
-            source(input, &mut text)?;
+            source(input, &mut text, "/**/")?;
             let text = text.trim();
             if supports {
                 let supported = match selector.as_deref() {
@@ -785,7 +864,22 @@ fn condition(
 fn environment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
+    let (mut quote, mut escaped) = (None, false);
     while let Some(start) = rest.find("env(") {
+        for c in rest[..start].chars() {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' | '\'' if quote.is_none_or(|quote| quote == c) => quote = quote.xor(Some(c)),
+                _ => {}
+            }
+        }
+        if quote.is_some() || escaped {
+            escaped = false;
+            out.push_str(&rest[..start + 4]);
+            rest = &rest[start + 4..];
+            continue;
+        }
         let body = &rest[start + 4..];
         let (mut depth, mut comma, mut end) = (1, None, None);
         for (index, c) in body.char_indices() {
@@ -836,33 +930,56 @@ fn environment(value: &str) -> String {
     out
 }
 
-fn source(input: &mut Parser<'_>, output: &mut String) -> Result<(), ParseError<()>> {
-    let mut previous = TokenSerializationType::Nothing;
+fn source(
+    input: &mut Parser<'_>,
+    output: &mut String,
+    separator: &str,
+) -> Result<(), ParseError<()>> {
+    let (mut previous, mut comment) = (TokenSerializationType::Nothing, false);
     loop {
         let start = input.position();
         let Ok(token) = input.next_including_whitespace_and_comments() else {
             return Ok(());
         };
         if matches!(token, Token::Comment(_)) {
+            comment = true;
             continue;
         }
         if token.is_parse_error() {
             return Err(ParseError::unexpected_token());
         }
         let current = token.serialization_type();
+        let ident = match token {
+            Token::Ident(name) if separator == " " => Some(name.clone()),
+            _ => None,
+        };
         let close = match token {
             Token::Function(_) | Token::ParenthesisBlock => Some(')'),
             Token::SquareBracketBlock => Some(']'),
             Token::CurlyBracketBlock => Some('}'),
             _ => None,
         };
-        if previous.needs_separator_when_before(current) {
-            output.push_str("/**/");
+        // Values keep adjacent tokens as written, like `spacing.2`, and only a dropped comment separates them.
+        if previous.needs_separator_when_before(current) && (separator != " " || comment) {
+            output.push_str(separator);
         }
-        output.push_str(input.slice_from(start));
+        comment = false;
+        let text = input.slice_from(start);
+        match ident.filter(|name| {
+            text.contains('\\')
+                && !name
+                    .trim_start_matches('-')
+                    .starts_with(|c: char| c.is_ascii_digit())
+                && name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+        }) {
+            Some(name) => output.push_str(&name),
+            None => output.push_str(text),
+        }
         previous = current;
         if let Some(close) = close {
-            input.parse_nested_block(|input| source(input, output))?;
+            input.parse_nested_block(|input| source(input, output, separator))?;
             output.push(close);
             previous = TokenSerializationType::Other;
         }
@@ -971,7 +1088,8 @@ impl Lengths {
     pub fn parse(&self, source: &str, base: f32) -> Option<(f32, bool)> {
         let (value, kind) = self.math(source, base, &[])?;
         let value = value as f32;
-        (kind != Kind::Angle && value.is_finite()).then_some((value, kind == Kind::Length))
+        (matches!(kind, Kind::Number | Kind::Length) && value.is_finite())
+            .then_some((value, kind == Kind::Length))
     }
 
     pub fn math(&self, source: &str, base: f32, vars: &[(&str, f64)]) -> Option<(f64, Kind)> {
@@ -998,6 +1116,7 @@ pub(crate) enum Kind {
     Number,
     Length,
     Angle,
+    Time,
 }
 
 struct Math<'a> {
@@ -1159,7 +1278,7 @@ impl Math<'_> {
                 ("rem", 2) if same => (a % b, kind),
                 ("abs", 1) => (a.abs(), kind),
                 ("sign", 1) => (f64::from(i8::from(a > 0.) - i8::from(a < 0.)), Kind::Number),
-                ("sin" | "cos" | "tan", 1) if kind != Kind::Length => {
+                ("sin" | "cos" | "tan", 1) if matches!(kind, Kind::Number | Kind::Angle) => {
                     let radians = if number { a } else { a.to_radians() };
                     let value = match name {
                         "sin" => radians.sin(),
@@ -1244,6 +1363,8 @@ impl Math<'_> {
             "grad" => (0.9, Kind::Angle),
             "rad" => (180. / std::f64::consts::PI, Kind::Angle),
             "turn" => (360., Kind::Angle),
+            "s" => (1., Kind::Time),
+            "ms" => (0.001, Kind::Time),
             "%" => (f64::from(self.base) / 100., Kind::Length),
             _ => {
                 let scale = match unit {
@@ -1308,7 +1429,7 @@ impl<'i> QualifiedRuleParser<'i> for Keyframes {
         _: &ParserState,
         input: &mut Parser<'i>,
     ) -> Result<Vec<(f32, Declarations)>, ParseError<()>> {
-        let values = Declarations::parse_input(input);
+        let values = Declarations::parse_input(input, false);
         Ok(offsets
             .into_iter()
             .map(|offset| (offset, values.clone()))
@@ -1554,7 +1675,7 @@ mod tests {
             };
             let matched = queries.is_empty()
                 || queries.iter().any(|query| {
-                    query.matches(800., 600., false, 0, FontUnits::new(16.)) == Some(true)
+                    query.matches(800., 600., false, 0, Lengths::new(16., 800., 600.)) == Some(true)
                 });
             Some((matched, sheet.source()))
         };
@@ -1683,7 +1804,13 @@ mod tests {
             let Rule::Media(queries, _) = &**rule else {
                 return None;
             };
-            queries[0].matches(800., 600., false, 200 << 16 | 64, FontUnits::new(16.))
+            queries[0].matches(
+                800.,
+                600.,
+                false,
+                200 << 16 | 64,
+                Lengths::new(16., 800., 600.),
+            )
         };
         assert_eq!(retina("(min-resolution: 2dppx)"), Some(true));
         assert_eq!(retina("(-webkit-min-device-pixel-ratio: 2)"), Some(true));

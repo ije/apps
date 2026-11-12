@@ -167,6 +167,16 @@ fn positioned_boxes_follow_their_containing_block_and_scroller() {
         await expect('scrolled', "s.scrollTop", 40);
         await expect('unscrolled', "s.style.overflow = 'visible'; s.scrollTop", 0);
         await expect('page', "scrollTo(0, 250);" + rect('t'), '0,0,10');
+        await load('escape.html');
+        const hit = (x, y) => `(e => e.id || e.localName)(document.elementFromPoint(${x}, ${y}))`;
+        await expect('absolute menu', hit(170, 20), 'menu');
+        await expect('fixed overlay', hit(250, 220), 'overlay');
+        await expect('clipped by its block', hit(160, 130), 'html');
+        await expect('fixed in a transform', "s.style.transform = 'translateX(0px)';" + hit(250, 220), 'html');
+        await run("s.style.transform = ''; document.getElementById('host').attachShadow({mode: 'open'}).innerHTML = `<i style='position:absolute;left:250px;top:0;width:20px;height:20px'></i>`");
+        await win.webContents.capturePage();
+        await expect('shadow host', hit(260, 10), 'host');
+        await expect('shadow hits', "const root = document.getElementById('host').shadowRoot; [root.elementFromPoint(260, 10).localName, document.elementsFromPoint(260, 10).filter(e => e.id === 'host').length, root.elementsFromPoint(260, 10)[0].localName].join()", 'i,1,i');
         "#,
         &[
             (
@@ -184,6 +194,16 @@ fn positioned_boxes_follow_their_containing_block_and_scroller() {
                  <div id=s style='height:100px;overflow:auto'><div style='height:300px'>\
                  <b id=t style='position:sticky;top:0;display:block;height:10px'></b></div></div>\
                  <div style='height:2000px'></div>\
+                 <script>globalThis.s = document.getElementById('s')</script></body>",
+            ),
+            (
+                "escape.html",
+                "<body style='margin:0'><div id=s style='width:100px;height:100px;overflow:hidden'>\
+                 <div id=menu style='position:absolute;left:150px;top:0;width:50px;height:50px'></div>\
+                 <div id=overlay style='position:fixed;left:0;top:200px;width:300px;height:50px'></div>\
+                 <div style='position:relative;height:100px'>\
+                 <i id=clipped style='position:absolute;left:150px;top:120px;width:20px;height:20px'></i></div>\
+                 <div><div id=host></div></div></div>\
                  <script>globalThis.s = document.getElementById('s')</script></body>",
             ),
         ],

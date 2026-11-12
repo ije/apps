@@ -406,6 +406,30 @@ fn canvas_pixels_survive_partial_updates_and_clipping() {
 }
 
 #[test]
+fn inner_html_of_a_form_drops_nested_forms() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: Document::parse("<form id=f><div id=d></div></form>"),
+            dirty: false,
+        },
+    );
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    engine
+        .eval(
+            r#"
+      const d=document.getElementById('d');d.innerHTML='<form id=n><input name=a></form>b';
+      if(d.innerHTML!=='<input name="a">b')throw Error(d.innerHTML);
+      const out=document.createElement('div');out.innerHTML='<form id=n><input></form>';
+      if(out.querySelectorAll('form').length!==1)throw Error(out.innerHTML);
+    "#,
+            "test",
+        )
+        .unwrap();
+}
+
+#[test]
 fn custom_elements_shadow_styles_and_lifecycle() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page { doc: Document::parse("<html><body><div id='outside'>outside</div><test-existing></test-existing></body></html>"), dirty: false });
@@ -491,7 +515,7 @@ fn shadow_slots_render_light_dom_and_receive_pointer_events() {
         if (document.elementFromPoint(10,10) !== edit) throw Error('Slotted button is not hit-testable');
         edit.slot = 'missing';
         if (slot.assignedNodes().length || slot.assignedNodes({flatten:true})[0].id !== 'fallback') throw Error('Fallback assignment');
-        if (document.elementFromPoint(10,10)?.id !== 'fallback') throw Error('Fallback is not hit-testable');
+        if (root.elementFromPoint(10,10)?.id !== 'fallback' || document.elementFromPoint(10,10) !== host) throw Error('Fallback is not hit-testable');
         edit.slot = 'actions';
         if (document.elementFromPoint(10,10) !== edit) throw Error('Slot reassignment did not redraw');
         const closed = document.createElement('test-closed');
@@ -588,7 +612,7 @@ fn hit_testing_follows_paint_order_clipping_and_shadow_trees() {
         document.body.append(front);
         if(document.elementFromPoint(40,40)!==front)throw Error('Reordered element');
         front.remove();
-        if(document.elementFromPoint(75,75)!==shadowHost.shadowRoot.firstChild)throw Error('Shadow hit');
+        if(shadowHost.shadowRoot.elementFromPoint(75,75)!==shadowHost.shadowRoot.firstChild||document.elementFromPoint(75,75)!==shadowHost)throw Error('Shadow hit');
         shadowHost.remove();
         if(document.elementFromPoint(75,75)!==back)throw Error('Detached shadow');
         if(document.elementFromPoint(-1,10)!==null||document.elementsFromPoint(900,10).length)throw Error('Viewport clipping');
@@ -718,7 +742,7 @@ fn scrolling_snaps_to_device_pixels_and_respects_scroll_margins() {
 fn computed_styles_follow_random_tree_changes() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><head><style>body{color:rgb(1, 1, 1)} p + p{color:rgb(6, 6, 6)} .a{color:rgb(2, 2, 2)} li:first-child{color:rgb(4, 4, 4)} li:nth-child(3n){color:rgb(5, 5, 5)} div:empty{color:rgb(7, 7, 7)} [inert] span{color:rgb(8, 8, 8)} td:last-child{color:rgb(9, 9, 9)} .a > .b{color:rgb(3, 3, 3)} .flat{display:contents}</style></head><body><ul id='list'></ul><table><tbody id='rows'></tbody></table><div id='box' class='a'></div></body></html>"),
+        doc: Document::parse("<html><head><style>body{color:rgb(1, 1, 1)} p + p{color:rgb(6, 6, 6)} .a{color:rgb(2, 2, 2)} li:first-child{color:rgb(4, 4, 4)} li:nth-child(3n){color:rgb(5, 5, 5)} div:empty{color:rgb(7, 7, 7)} [inert] span{color:rgb(8, 8, 8)} td:last-child{color:rgb(9, 9, 9)} .a > .b{color:rgb(3, 3, 3)} .flat{display:contents} span ~ p{background-color:rgb(1, 0, 0)} div:has(+ div){background-color:rgb(2, 0, 0)} li:last-child{background-color:rgb(3, 0, 0)} li:only-child{background-color:rgb(4, 0, 0)} li:nth-last-child(2){background-color:rgb(5, 0, 0)} li:has(> .a){background-color:rgb(6, 0, 0)} td:has(~ .a){background-color:rgb(7, 0, 0)} ul:has(.b) p{background-color:rgb(8, 0, 0)} body:has(.flat) td{background-color:rgb(9, 0, 0)}</style></head><body><ul id='list'></ul><table><tbody id='rows'></tbody></table><div id='box' class='a'></div></body></html>"),
         dirty: false,
     });
     let engine = JsContext::new(
@@ -730,6 +754,7 @@ fn computed_styles_follow_random_tree_changes() {
     engine.eval(r#"
         const rules = [['body', 'rgb(1, 1, 1)'], ['p + p', 'rgb(6, 6, 6)'], ['.a', 'rgb(2, 2, 2)'], ['li:first-child', 'rgb(4, 4, 4)'], ['li:nth-child(3n)', 'rgb(5, 5, 5)'], ['div:empty', 'rgb(7, 7, 7)'], ['[inert] span', 'rgb(8, 8, 8)'], ['td:last-child', 'rgb(9, 9, 9)'], ['.a > .b', 'rgb(3, 3, 3)']];
         const expected = el => { for (let i = rules.length; i--;) if (el.matches(rules[i][0])) return rules[i][1]; return el.parentElement ? expected(el.parentElement) : 'rgb(0, 0, 0)'; };
+        const places = [['span ~ p', 'rgb(1, 0, 0)'], ['div:has(+ div)', 'rgb(2, 0, 0)'], ['li:last-child', 'rgb(3, 0, 0)'], ['li:only-child', 'rgb(4, 0, 0)'], ['li:nth-last-child(2)', 'rgb(5, 0, 0)'], ['li:has(> .a)', 'rgb(6, 0, 0)'], ['td:has(~ .a)', 'rgb(7, 0, 0)'], ['ul:has(.b) p', 'rgb(8, 0, 0)'], ['body:has(.flat) td', 'rgb(9, 0, 0)']];
         let seed = 12345, step = 0;
         const random = below => (seed = Math.imul(seed, 1103515245) + 12345 >>> 0, (seed >>> 8) % below);
         const list = document.getElementById('list'), rows = document.getElementById('rows'), box = document.getElementById('box');
@@ -763,8 +788,52 @@ fn computed_styles_follow_random_tree_changes() {
             for (const el of document.body.querySelectorAll('*')) {
                 const color = getComputedStyle(el).color;
                 if (color !== expected(el)) throw Error(`step ${step}: <${el.tagName} class="${el.className}"> is ${color}, not ${expected(el)}`);
+                const back = getComputedStyle(el).backgroundColor, place = places.findLast(rule => el.matches(rule[0]))?.[1] ?? 'rgba(0, 0, 0, 0)';
+                if (back !== place) throw Error(`step ${step}: <${el.tagName} class="${el.className}"> has ${back}, not ${place}`);
             }
         }
+    "#, "test").unwrap();
+}
+
+// Release builds hash only the changed nodes, so this is a check of them.
+#[test]
+fn rules_added_later_follow_names_that_nodes_already_had() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html class='dark'><head><style>p{color:rgb(1, 1, 1)}</style></head><body><div data-on='1'><p class='x'>a</p></div></body></html>"),
+        dirty: false,
+    });
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    let styles = engine.eval(r#"
+        const p = document.querySelector('p'), sheet = document.styleSheets[0], seen = [getComputedStyle(p).color];
+        sheet.insertRule('.dark .x{color:rgb(2, 2, 2)}', 1);
+        sheet.insertRule('[data-on] > .x{background-color:rgb(3, 3, 3)}', 2);
+        seen.push(getComputedStyle(p).color, getComputedStyle(p).backgroundColor);
+        document.documentElement.classList.remove('dark');
+        p.parentNode.removeAttribute('data-on');
+        seen.push(getComputedStyle(p).color, getComputedStyle(p).backgroundColor);
+        seen.join('|')
+    "#, "test").unwrap();
+    assert_eq!(
+        styles,
+        "rgb(1, 1, 1)|rgb(2, 2, 2)|rgb(3, 3, 3)|rgb(1, 1, 1)|rgba(0, 0, 0, 0)"
+    );
+}
+
+#[test]
+fn script_animations_leave_important_declarations() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><style>#d{opacity:0.5 !important}</style><body><div id=d></div><div id=e style='color:red !important'></div></body></html>"),
+        dirty: false,
+    });
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    engine.eval(r#"
+        const d=document.getElementById('d'),e=document.getElementById('e');
+        const a=d.animate([{opacity:0},{opacity:1}],{duration:1000,fill:'both'});a.pause();a.currentTime=250;
+        e.animate([{color:'blue'},{color:'blue'}],{duration:1000,fill:'both'}).pause();
+        if(getComputedStyle(d).opacity!=='0.5')throw Error('sheet '+getComputedStyle(d).opacity);
+        if(getComputedStyle(e).color!=='rgb(255, 0, 0)')throw Error('inline '+getComputedStyle(e).color);
     "#, "test").unwrap();
 }
 
@@ -802,6 +871,41 @@ fn computed_styles_follow_mutations_and_resize() {
 }
 
 #[test]
+fn form_pseudo_classes_follow_script_state() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><body><form><input id=em type=email value=nope><input id=req required><input id=num type=number min=5 value=2><input id=plain><fieldset id=fs disabled><input id=in1 required></fieldset><select id=sel required><option value=''>-</option><option>a</option></select><input type=radio name=r id=r1 required><input type=radio name=r id=r2><input type=checkbox id=cb><textarea id=ta required></textarea></form><x-el id=x></x-el></body></html>"),
+        dirty: false,
+    });
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    engine.eval(r#"
+        const q=s=>[...document.querySelectorAll(s)].map(e=>e.id).join(),$=id=>document.getElementById(id);
+        const expect=(s,v,step)=>{if(q(s)!==v)throw Error(step+': '+s+' = '+q(s));};
+        expect(':invalid','em,req,num,sel,r1,r2,ta','load');
+        $('em').value='a@b.co';$('req').value='x';$('num').setAttribute('min','1');$('ta').value='t';
+        expect(':invalid','sel,r1,r2','values');
+        $('req').value='';$('plain').setCustomValidity('bad');
+        expect(':invalid','req,plain,sel,r1,r2','custom');
+        $('plain').setCustomValidity('');$('sel').value='a';$('r2').checked=true;$('fs').disabled=false;
+        expect(':invalid','req,in1','groups');
+        const made=document.createElement('input');made.id='made';made.required=true;$('fs').append(made);
+        expect('fieldset :invalid','in1,made','created');
+        $('fs').disabled=true;
+        expect(':invalid','req','disabled');
+        $('cb').indeterminate=true;
+        expect(':indeterminate','cb','indeterminate');
+        $('cb').click();
+        if($('cb').indeterminate||!$('cb').checked)throw Error('click clears indeterminate');
+        expect(':indeterminate','','click');
+        expect(':not(:defined)','x','undefined');
+        customElements.define('x-el',class extends HTMLElement{});
+        const y=document.createElement('y-el');y.id='y';document.body.append(y);
+        expect(':not(:defined)','y','defined');
+        expect('[type=EMAIL], [TYPE=radio i]','em,r1,r2','case');
+    "#, "test").unwrap();
+}
+
+#[test]
 fn hostile_selectors_canvas_data_and_traversal() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
@@ -819,7 +923,7 @@ fn hostile_selectors_canvas_data_and_traversal() {
         const seen=[];for(let n;(n=walker.nextNode());)seen.push(n.id);
         if(seen.join()!=="a,it's,c")throw Error('TreeWalker filters');
         const [a,c]=['a','c'].map(id=>document.getElementById(id));
-        if(a.compareDocumentPosition(c)!==4||c.compareDocumentPosition(a)!==2||document.body.compareDocumentPosition(a)!==20||a.compareDocumentPosition(document.createElement('p'))!==33)throw Error('Document position');
+        if(a.compareDocumentPosition(c)!==4||c.compareDocumentPosition(a)!==2||document.body.compareDocumentPosition(a)!==20||(a.compareDocumentPosition(document.createElement('p'))|6)!==39)throw Error('Document position');
         if(!(document.querySelector('circle') instanceof SVGElement)||document.getElementById('html') instanceof SVGElement)throw Error('SVG wrapper');
         const calls=[];a.addEventListener('ping',()=>{throw Error('listener failure')});a.addEventListener('ping',()=>calls.push('second'));document.body.addEventListener('ping',()=>calls.push('bubble'));
         a.dispatchEvent(new Event('ping',{bubbles:true}));if(calls.join()!=='second,bubble')throw Error('Listener exception stopped dispatch');
@@ -972,7 +1076,7 @@ fn core_dom_interfaces_follow_the_standard() {
       check('lit-like template', () => { const t = document.createElement('template'); t.innerHTML = '<div a$lit$="x" class="c"><?lit$1$></div>'; const f = document.importNode(t.content, true), w = document.createTreeWalker(f, 133); w.currentNode = f; const seen = []; let n; while ((n = w.nextNode())) seen.push(n.nodeType === 1 ? n.getAttributeNames().join('+') : n.nodeType + ':' + n.data); return seen.join() === 'a$lit$+class,8:?lit$1$'; });
       check('custom element via innerHTML', () => { class XProbe extends HTMLElement { connectedCallback() { this.dataset.on = '1'; } } customElements.define('x-probe', XProbe); const d = document.createElement('div'); document.body.append(d); d.innerHTML = '<x-probe></x-probe>'; const ok = d.firstChild instanceof XProbe && d.firstChild.dataset.on === '1'; d.remove(); return ok; });
       check('template inert', () => document.querySelectorAll('p').length === 0 && document.getElementById('t').content.querySelectorAll('p').length === 1);
-      check('svg serialize', () => { const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); svg.setAttribute('viewBox', '0 0 1 1'); return new XMLSerializer().serializeToString(svg) === '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"></svg>'; });
+      check('svg serialize', () => { const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); svg.setAttribute('viewBox', '0 0 1 1'); return new XMLSerializer().serializeToString(svg) === '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"/>'; });
       check('style quotes', () => { const d = document.createElement('div'); d.style.cssText = 'content: "a;b"; color: red'; return d.style.length === 2 && d.style.content === '"a;b"' && d.style.color === 'red'; });
       check('isConnected', () => a.isConnected && !document.createElement('div').isConnected);
       check('ownerDocument', () => document.createElement('div').ownerDocument === document);
@@ -1183,6 +1287,71 @@ fn canvas_paths_matrices_patterns_and_shadows() {
     "#,
     );
     assert_eq!(result, "ok");
+}
+
+#[test]
+fn uncaught_page_errors_fire_error_events() {
+    let (_, engine) = checked_page(
+        "<html><body></body></html>",
+        r#"
+        globalThis.seen = [];
+        addEventListener('error', e => { seen.push(e.constructor.name + ':' + e.message + ':' + (e.lineno > 0) + ':' + (e.error?.message === e.message.slice(16)));});
+        addEventListener('unhandledrejection', e => { seen.push('rejection:' + e.reason.message); e.preventDefault(); });
+        window.onerror = (message, source, line, column, error) => { seen.push('onerror:' + [typeof message, typeof source, typeof line, typeof column, error.message]); return error.message !== 'timer'; };
+        setTimeout(() => { throw Error('timer'); });
+        queueMicrotask(() => { throw Error('micro'); });
+        requestAnimationFrame(() => { throw Error('frame'); }); __appsAnimationFrame();
+        Promise.reject(Error('promise'));
+        const event = new ErrorEvent('error', { message: 'm', lineno: 3, error: 1 });
+        check('ErrorEvent fields', () => event.message === 'm' && event.filename === '' && event.lineno === 3 && event.colno === 0 && event.error === 1);
+        let canceled; document.body.onerror = e => { canceled = e; return true; }; document.body.dispatchEvent(new ErrorEvent('error'));
+        check('element onerror gets the event', () => canceled instanceof ErrorEvent);
+        "#,
+    );
+    for _ in 0..5 {
+        engine.tick().unwrap();
+    }
+    assert_eq!(
+        engine.eval("seen.join('\\n')", "test").unwrap(),
+        "ErrorEvent:Uncaught Error: frame:true:true\nonerror:string,string,number,number,frame\nErrorEvent:Uncaught Error: micro:true:true\nonerror:string,string,number,number,micro\nErrorEvent:Uncaught Error: timer:true:true\nonerror:string,string,number,number,timer\nrejection:promise"
+    );
+}
+
+#[test]
+fn labels_walkers_names_documents_selectors_and_validity_follow_browsers() {
+    checked_page(
+        "<html><body><label><input type=checkbox id=c><input id=t><textarea id=ta></textarea><span id=s>s</span></label>\
+         <select id=sel required><option value=''>pick</option></select><input type=radio name=a id=r1 required><input type=radio name=a id=r2>\
+         <select id=list><option>One</option><option selected>Two</option><option hidden>Hidden</option></select></body></html>",
+        r#"
+        const $ = id => document.getElementById(id), c = $('c');
+        $('t').click(); $('ta').click(); check('a click on other controls in a label does not activate its control', () => !c.checked);
+        $('s').click(); check('a click on plain label content activates its control', () => c.checked);
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, () => true), iterator = document.createNodeIterator(document.body, NodeFilter.SHOW_ELEMENT, { acceptNode: () => '1' });
+        check('filter results convert to numbers', () => walker.nextNode() === document.querySelector('label') && iterator.nextNode() === document.body);
+        const error = fn => { try { fn(); } catch (e) { return e.name; } };
+        check('invalid attribute names throw', () => ['', 'a b', 'a/b', 'a=b', 'a>b'].every(name => error(() => document.body.setAttribute(name, '')) === 'InvalidCharacterError') && error(() => document.body.toggleAttribute(' ', false)) === 'InvalidCharacterError' && error(() => document.createAttribute('a b')) === 'InvalidCharacterError');
+        document.body.setAttribute('data-x:y', 1); document.body.toggleAttribute('data-z');
+        check('valid attribute names work', () => document.body.getAttribute('data-x:y') === '1' && document.body.hasAttribute('data-z') && document.createAttribute('A').name === 'a' && document.createAttribute('a').value === '');
+        check('invalid element names throw', () => ['1bad', '', 'a b', '#text'].every(name => error(() => document.createElement(name)) === 'InvalidCharacterError') && error(() => document.createElementNS(null, '#text')) === 'InvalidCharacterError');
+        check('documents and doctypes have no text content', () => { document.textContent = 'x'; return document.textContent === null && document.body.childElementCount === 5 && document.implementation.createDocumentType('html', '', '').textContent === null; });
+        const parsed = new DOMParser().parseFromString('<p>a</p>', 'text/html'), made = document.implementation.createHTMLDocument('t');
+        parsed.documentElement.remove(); parsed.append(parsed.createElement('html')); made.insertBefore(made.createComment('c'), made.documentElement);
+        check('other documents take children', () => parsed.documentElement.localName === 'html' && made.firstChild.nodeType === 8 && error(() => made.append('text')) === 'HierarchyRequestError');
+        const style = document.createElement('style'); style.textContent = 'div>.c{} a + b{} a~b{} a  b{} .p{& > .q{}}'; document.head.append(style);
+        check('selectors serialize with spaced combinators', () => [...style.sheet.cssRules].map(rule => rule.selectorText).join() === 'div > .c,a + b,a ~ b,a b,.p' && style.sheet.cssRules[4].cssRules[0].selectorText === '& > .q');
+        check('innerText of a select lists its options', () => $('list').innerText === 'One\nTwo');
+        const sel = $('sel'), option = new Option('x', 'x', true, true);
+        sel.append(option); check('adding an option revalidates its select', () => !sel.matches(':invalid'));
+        option.remove(); check('removing an option revalidates its select', () => sel.matches(':invalid'));
+        $('r2').checked = true; $('r2').name = 'b';
+        check('renaming a radio revalidates its old group', () => $('r1').matches(':invalid') && $('r1').validity.valueMissing);
+        const box = document.createElement('div'); box.style.marginLeft = '3px'; document.body.append(box);
+        const animation = box.animate([{ marginLeft: '5px' }, { marginLeft: '5px' }], { duration: 1000, fill: 'both' }); animation.pause();
+        const before = getComputedStyle(box).marginLeft; animation.effect.composite = 'add';
+        check('a new composite reaches the engine', () => before === '5px' && getComputedStyle(box).marginLeft === '8px');
+        "#,
+    );
 }
 
 #[test]
@@ -1635,10 +1804,82 @@ fn mirror_follows_random_mutations_and_releases() {
 }
 
 #[test]
+fn inner_text_selections_and_table_displays_follow_rendering() {
+    checked_page(
+        "<html><body><div id='n'>\n  <div>\n    <p>one   two</p>\n    <p>three</p>\n  </div>\n  <div> four <b>five</b></div>\n</div>\
+         <div id='br'><div>a<br></div><div>b<br><br></div>c<br></div>\
+         <div id='pre'><pre>  a  b\n  c </pre><span style='white-space:pre-wrap'> x  y </span><span style='white-space:pre-line'> p  q\n r </span>z</div>\
+         <table id='t'><thead><tr><th>h1</th><th>h2</th></tr></thead><tbody><tr><td>a</td><td>b</td></tr><tr><td>c</td><td></td></tr></tbody></table>\
+         <div id='tt'>x<table><tr><td>a <div>b</div></td><td>c</td></tr></table>y</div>\
+         <div id='l'><ul><li>one</li><li>two <ol><li>three</li></ol></li></ul>after</div>\
+         <div id='pt'><p>para</p>text<h1>head</h1>tail</div>\
+         <div id='h'>a<span style='display:none'>b</span><span style='visibility:hidden'>c<span style='visibility:visible'>d</span></span>f</div>\
+         <div id='f' style='display:flex'><span>a</span> <span>b</span></div>\
+         <div id='s'><p>one   two</p>\n<div>three <b>four</b> five</div>\n<table><tr><td>a</td><td>b</td></tr></table></div>\
+         <table id='g' style='display:grid'><tbody style='display:contents'><tr style='display:contents'><td style='display:block'>g</td></tr></tbody></table></body></html>",
+        r#"
+        const text = id => document.getElementById(id).innerText;
+        check('blocks and white space', () => text('n') === 'one two\n\nthree\n\nfour five');
+        check('br at block ends', () => text('br') === 'a\n\nb\n\n\nc\n');
+        check('white-space', () => text('pre') === '  a  b\n  c \n x  y  p q\nr z');
+        check('table', () => text('t') === 'h1\th2\na\tb\nc\t');
+        check('blocks in cells', () => text('tt') === 'x\na\nb\n\tc\ny');
+        check('lists', () => text('l') === 'one\ntwo\nthree\nafter');
+        check('paragraph then text', () => text('pt') === 'para\n\ntext\nhead\ntail');
+        check('hidden', () => text('h') === 'adf');
+        check('flex items', () => text('f') === 'a\nb');
+        const detached = document.createElement('div'); detached.innerHTML = '<p>a  b</p><p>c</p>';
+        check('detached', () => detached.innerText === 'a  bc');
+        const s = document.getElementById('s'), range = document.createRange(), selection = getSelection();
+        range.setStart(s.querySelector('p').firstChild, 4); range.setEnd(s.querySelector('b').nextSibling, 3);
+        selection.removeAllRanges(); selection.addRange(range);
+        check('selection inside text nodes', () => selection.toString() === 'two\n\nthree four fi');
+        check('range stays raw', () => range.toString() === '  two\nthree four fi');
+        range.selectNodeContents(s);
+        check('whole selection', () => selection.toString() === 'one two\n\nthree four five\na\tb');
+        const display = selector => getComputedStyle(document.querySelector(selector)).display;
+        check('built-in table displays', () => [display('#t'), display('#t tbody'), display('#t tr'), display('#t td')].join() === 'table,table-row-group,table-row,table-cell');
+        check('author table displays', () => [display('#g'), display('#g tbody'), display('#g tr'), display('#g td')].join() === 'grid,contents,contents,block');
+        check('author displays in text', () => text('g') === 'g');
+        const host = document.createElement('div'); host.innerHTML = '<span>light</span>'; document.body.append(host);
+        const root = host.attachShadow({ mode: 'open' }); root.innerHTML = '<template><slot></slot></template><slot id=slot></slot>';
+        check('slots skip templates', () => root.querySelector('#slot').assignedNodes().length === 1 && host.firstChild.assignedSlot === root.querySelector('#slot') && host.innerText === 'light');
+        "#,
+    );
+}
+
+#[test]
+fn freed_shadow_roots_drop_their_adopted_sheets() {
+    let (_, engine) = checked_page(
+        "<html><body></body></html>",
+        r#"
+        const sheet = new CSSStyleSheet(); sheet.replaceSync('span { color: rgb(255, 0, 0) }');
+        (() => { const host = document.createElement('div'); document.body.append(host); const root = host.attachShadow({ mode: 'open' }); root.adoptedStyleSheets = [sheet]; root.innerHTML = '<span>x</span>'; globalThis.old = root._id; getComputedStyle(root.firstChild).color; host.remove(); })();
+    "#,
+    );
+    let mut reused = String::new();
+    for _ in 0..20 {
+        engine.collect_garbage();
+        engine.tick().unwrap();
+        reused = engine.eval(r#"__appsDomSweep(true); (() => {
+            const hosts = []; let root;
+            for (let i = 0; i < 8 && root?._id !== old; i++) { const host = document.createElement('div'); document.body.append(host); hosts.push(host); root = host.attachShadow({ mode: 'open' }); }
+            if (root._id !== old) { hosts.forEach(host => host.remove()); return ''; }
+            root.innerHTML = '<span>y</span>';
+            return root.adoptedStyleSheets.length + ' ' + getComputedStyle(root.firstChild).color;
+        })()"#, "test").unwrap();
+        if !reused.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(reused, "0 rgb(0, 0, 0)");
+}
+
+#[test]
 fn layout_mirror_feeds_observers_offsets_and_scrolling() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><div id='clip' style='overflow:hidden'><p id='a'>a</p><p id='b'>b</p></div><div id='rel' style='position:relative'><span id='c'>c</span></div></body></html>"),
+        doc: Document::parse("<html><body><div id='clip' style='overflow:hidden'><p id='a'>a</p><p id='b'>b</p></div><div id='rel' style='position:relative'><span id='c'>c</span></div><div id='gone' style='display:none'></div></body></html>"),
         dirty: false,
     });
     let engine = JsContext::new(
@@ -1670,10 +1911,14 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
     ]);
     engine.eval(r#"
         globalThis.seen = [];
+        let margin; try { new IntersectionObserver(() => {}, { rootMargin: 'foo' }); } catch (e) { margin = e.name; }
+        if (margin !== 'SyntaxError' || new IntersectionObserver(() => {}, { rootMargin: '10px 5%' }).rootMargin !== '10px 5% 10px 5%') throw Error('rootMargin ' + margin);
+        let reported; addEventListener('error', event => { reported = event.error.message; event.preventDefault(); }, { once: true });
+        new IntersectionObserver(() => { throw Error('failing observer'); }).observe(document.getElementById('a'));
         const io = new IntersectionObserver(entries => seen.push(...entries.map(e => [e.target.id, e.isIntersecting, e.intersectionRatio, e.intersectionRect.y, e.intersectionRect.height].join())), { threshold: [0, 0.5, 1] });
-        for (const id of ['a', 'b', 'c']) io.observe(document.getElementById(id));
+        for (const id of ['a', 'b', 'c', 'gone']) io.observe(document.getElementById(id));
         __appsLayout();
-        if (seen.join(';') !== 'a,true,0.5,50,50;b,false,0,200,0;c,true,1,320,10') throw Error(seen.join(';'));
+        if (seen.join(';') !== 'a,true,0.5,50,50;b,false,0,200,0;c,true,1,320,10;gone,false,0,0,0' || reported !== 'failing observer') throw Error(seen.join(';'));
         seen.length = 0; __appsLayout();
         if (seen.length) throw Error('Unchanged targets reported');
         let entry;
@@ -1959,6 +2204,108 @@ fn sf_symbols_parse_and_serialize_as_void_elements() {
         .position(|node| node.attrs.get("id").is_some_and(|id| id == "symbols"))
         .unwrap();
     assert_eq!(doc.serialize(id), source);
+}
+
+#[test]
+fn cssom_edits_keep_the_engine_and_detached_rules_apart() {
+    let (_, engine) = css_page(
+        "<html><head><style id=s>#a{color:red} @media all{#b{color:green}} @keyframes k{from{opacity:0}to{opacity:1}} @font-face{font-family:A;src:local(Arial)} @media not all{#c{color:blue}}</style></head><body><p id=a>a</p><p id=b>b</p><p id=c>c</p></body></html>",
+    );
+    engine.eval(r#"
+        const style = document.getElementById('s'), sheet = style.sheet, color = id => getComputedStyle(document.getElementById(id)).color;
+        // Reads the engine's rules back, which also detaches every rule object.
+        const same = step => { const js = [...sheet.cssRules].map(rule => rule.cssText).join(' | '); sheet._text = null; const engine = [...sheet.cssRules].map(rule => rule.cssText).join(' | '); if (js !== engine) throw Error(step + ': ' + js + ' != ' + engine); };
+        const media = sheet.cssRules[1]; sheet.deleteRule(1);
+        media.deleteRule(0); media.insertRule('#a{color:pink}', 0); media.cssRules[0].style.color = 'lime'; media.cssRules[0].selectorText = '#b'; media.media.mediaText = 'not all';
+        if (color('a') !== 'rgb(255, 0, 0)' || color('b') !== 'rgb(0, 0, 0)' || media.cssRules[0].cssText !== '#b { color: lime; }') throw Error('stale rule ' + color('a') + ' ' + media.cssRules[0].cssText);
+        same('stale');
+        if (sheet.insertRule('#b{color:navy}', 1) !== 1 || color('b') !== 'rgb(0, 0, 128)') throw Error('insert after stale');
+        same('insert');
+        const [, , keys, face] = sheet.cssRules;
+        keys.cssRules[0].style.opacity = '0.5'; keys.cssRules[1].keyText = '50.0%'; keys.name = 'k2'; keys.appendRule('to{opacity:.75}');
+        let bad; try { keys.cssRules[0].keyText = 'middle'; } catch (e) { bad = e.name; } if (bad !== 'SyntaxError') throw Error('keyText ' + bad);
+        face.style.setProperty('font-family', 'B');
+        if (!/^@keyframes k2 \{ 0% \{ opacity: 0\.5; \} 50% \{ opacity: 1; \} 100% \{ opacity: \.?0?\.75; \} \}$/.test(keys.cssText) || !face.cssText.includes('font-family: B')) throw Error('keyframes ' + keys.cssText + ' ' + face.cssText);
+        same('keyframes');
+        const hidden = sheet.cssRules[4];
+        if (color('c') !== 'rgb(0, 0, 0)') throw Error('not all');
+        hidden.media.appendMedium('all'); if (color('c') !== 'rgb(0, 0, 255)' || hidden.media.length !== 2) throw Error('appendMedium');
+        hidden.media.deleteMedium('all'); if (color('c') !== 'rgb(0, 0, 0)') throw Error('deleteMedium');
+        hidden.media.mediaText = 'all'; if (color('c') !== 'rgb(0, 0, 255)' || hidden.conditionText !== 'all') throw Error('mediaText');
+        same('media');
+        const first = sheet.cssRules[0]; first.selectorText = '###';
+        if (first.selectorText !== '#a' || color('a') !== 'rgb(255, 0, 0)') throw Error('invalid selectorText');
+        first.selectorText = 'p#a'; if (first.selectorText !== 'p#a') throw Error('selectorText');
+        same('selector');
+        const old = sheet.cssRules[0]; style.textContent = '#b{color:olive}'; old.selectorText = '#b'; old.style.color = 'red';
+        if (color('b') !== 'rgb(128, 128, 0)' || sheet.cssRules.length !== 1) throw Error('text change');
+        same('text');
+        const page = new CSSStyleSheet({ media: 'not all' }); page.replaceSync('#a{color:teal}'); document.adoptedStyleSheets.push(page);
+        if (color('a') === 'rgb(0, 128, 128)' || document.adoptedStyleSheets.length !== 1) throw Error('constructed media');
+        page.media.mediaText = 'all'; if (color('a') !== 'rgb(0, 128, 128)') throw Error('constructed media change');
+        let typed; try { document.adoptedStyleSheets.push({}); } catch (e) { typed = e.name; }
+        if (typed !== 'TypeError' || document.adoptedStyleSheets.length !== 1) throw Error('adopted push ' + typed);
+    "#, "test").unwrap();
+}
+
+#[test]
+fn ranges_and_iterators_follow_moved_merged_and_removed_nodes() {
+    checked_page(
+        "<html><body><p id=p></p><div id=d><b>x</b><u>m</u><i>yz</i>w</div><div id=s><b>x</b><i>y</i></div><div id=r><a></a><b></b><i></i></div></body></html>",
+        r#"
+        const $ = id => document.getElementById(id), p = $('p'), d = $('d'), s = $('s'), r = $('r');
+        const a = document.createTextNode('abc'), b = document.createTextNode('def'); p.append(a, b);
+        const inner = document.createRange(), between = document.createRange(), wide = document.createRange();
+        inner.setStart(b, 1); inner.setEnd(b, 2); between.setStart(p, 1); wide.setStart(a, 1); wide.setEnd(p, 2);
+        getSelection().collapse(b, 2);
+        p.normalize();
+        check('normalize', () => p.childNodes.length === 1 && inner.startContainer === a && inner.startOffset === 4 && inner.endOffset === 5 && between.startContainer === a && between.startOffset === 3 && wide.endContainer === p && wide.endOffset === 1 && getSelection().anchorNode === a && getSelection().anchorOffset === 5);
+        const [bold, under, italic] = d.children, watcher = document.createRange(), range = document.createRange();
+        watcher.setStart(under.firstChild, 1); range.setStart(bold.firstChild, 0); range.setEnd(italic.firstChild, 1);
+        const fragment = range.extractContents();
+        check('extract moves', () => fragment.children[1] === under && fragment.textContent === 'xmy' && d.innerHTML === '<b></b><i>z</i>w' && range.collapsed && range.startContainer === d && range.startOffset === 1 && watcher.startContainer === d && watcher.startOffset === 1);
+        const kept = s.firstChild, around = document.createRange(), span = document.createElement('span');
+        span.textContent = 'old'; around.selectNodeContents(s); around.surroundContents(span);
+        check('surround moves', () => s.firstChild === span && span.firstChild === kept && span.textContent === 'xy' && around.startContainer === s && around.startOffset === 0 && around.endOffset === 1);
+        check('surround partial', () => { const part = document.createRange(); part.setStart(kept.firstChild, 0); part.setEnd(span.lastChild.firstChild, 1); try { part.surroundContents(document.createElement('q')); } catch (e) { return e.name === 'InvalidStateError'; } });
+        check('insertNode extends', () => { const host = document.createElement('div'); host.textContent = 'ab'; const at = document.createRange(); at.setStart(host.firstChild, 1); at.collapse(true); at.insertNode(document.createElement('em')); return host.innerHTML === 'a<em></em>b' && at.startContainer === host.firstChild && at.startOffset === 1 && at.endContainer === host && at.endOffset === 2; });
+        const it = document.createNodeIterator(r, NodeFilter.SHOW_ELEMENT);
+        it.nextNode(); it.nextNode();
+        r.firstChild.remove();
+        check('iterator after', () => it.referenceNode === r && !it.pointerBeforeReferenceNode && it.nextNode()?.localName === 'b');
+        it.nextNode(); it.previousNode();
+        r.children[0].remove();
+        check('iterator before', () => it.referenceNode.localName === 'i' && it.pointerBeforeReferenceNode && it.nextNode()?.localName === 'i');
+        r.textContent = '';
+        check('iterator clear', () => it.referenceNode === r && !it.pointerBeforeReferenceNode && it.nextNode() === null);
+        "#,
+    );
+}
+
+#[test]
+fn focus_editing_fonts_and_xml_follow_the_standard() {
+    checked_page(
+        "<html><body><button id=b1>1</button><x-host id=h><button id=light>light</button></x-host><button id=b3>3</button><textarea id=t></textarea><svg viewBox='0 0 10 10'><text>a&nbsp;b</text><foreignObject><div>x<br>y</div></foreignObject></svg></body></html>",
+        r#"
+        const $ = id => document.getElementById(id), root = $('h').attachShadow({ mode: 'open' }), order = [];
+        root.innerHTML = '<button id=inner>inner</button><slot></slot>';
+        $('b1').focus();
+        for (let i = 0; i < 4; i++) { __appsDispatch('keydown', [], { key: 'Tab', code: 'Tab' }); order.push(root.activeElement?.id ?? document.activeElement.id); }
+        check('tab enters slots', () => order.join() === 'inner,light,b3,t');
+        const t = $('t'), key = (name, options = {}) => __appsDispatch('keydown', [], { key: name, code: name, ...options }), edits = [];
+        t.focus();
+        for (const value of ['ab👨‍👩‍👧', 'xé', 'a🇫🇷🇩🇪', '🇫🇷'.repeat(40), 'q🏳️‍🌈']) { t.value = value; t.setSelectionRange(value.length, value.length); key('Backspace'); edits.push(t.value); }
+        t.value = '🇫🇷🇩🇪x'; t.setSelectionRange(0, 0); key('Delete'); edits.push(t.value);
+        t.value = 'foo  bar  '; t.setSelectionRange(10, 10); key('Backspace', { altKey: true, ctrlKey: !navigator.platform.includes('Mac') }); edits.push(t.value);
+        t.value = '  foo bar'; t.setSelectionRange(0, 0); key('Delete', { altKey: true, ctrlKey: !navigator.platform.includes('Mac') }); edits.push(t.value);
+        check('graphemes and words', () => JSON.stringify(edits) === JSON.stringify(['ab', 'x', 'a🇫🇷', '🇫🇷'.repeat(39), 'q', '🇩🇪x', 'foo  ', ' bar']));
+        const data = new FontFace('X', new Uint8Array([0, 1, 2, 3]).buffer), url = new FontFace('Y', 'url(y.woff2)');
+        check('font data loads', () => data.status === 'error' && url.status === 'unloaded');
+        const xml = new XMLSerializer();
+        check('xml', () => xml.serializeToString(document.querySelector('svg')) === '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><text>a b</text><foreignObject><div xmlns="http://www.w3.org/1999/xhtml">x<br />y</div></foreignObject></svg>' && xml.serializeToString(document.createTextNode('a <&>')) === 'a &lt;&amp;&gt;');
+        check('xml attributes', () => { const div = document.createElement('div'); div.setAttribute('title', '"\n'); return xml.serializeToString(div) === '<div xmlns="http://www.w3.org/1999/xhtml" title="&quot;&#10;"></div>'; });
+        "#,
+    );
 }
 
 #[test]
@@ -2449,6 +2796,120 @@ fn custom_element_reactions_and_slot_changes() {
 }
 
 #[test]
+fn child_lists_inline_shorthands_and_serialization_stay_current() {
+    checked_page(
+        "<html><body><div id='box'></div></body></html>",
+        r#"
+        const p = document.getElementById('box');
+        for (let i = 0; i < 4; i++) p.append(document.createElement('span'), 't');
+        const kids = p.children, nodes = p.childNodes;
+        kids[0].className = 'x'; p.setAttribute('data-x', '1');
+        check('lists survive attribute writes', () => kids === p.children && nodes === p.childNodes);
+        for (const kid of p.children) kid.remove();
+        check('lists are static and renew after a change', () => kids.length === 4 && nodes.length === 8 && p.children.length === 0 && p.childNodes.length === 4);
+        const q = document.createElement('div'); q.innerHTML = '<i></i>'; q.childNodes; p.append(q.firstChild);
+        check('moves renew both lists', () => q.childNodes.length === 0 && p.lastChild.localName === 'i');
+        p.innerHTML = '<a></a><b></b>'; check('innerHTML renews lists', () => p.children.length === 2 && p.firstChild.localName === 'a');
+        p.textContent = 'x'; check('textContent renews lists', () => p.childNodes.length === 1 && p.children.length === 0);
+        const d = document.createElement('div'), css = () => d.getAttribute('style');
+        d.style.background = 'red';
+        check('background reads back', () => d.style.background === 'red' && css() === 'background: red;' && d.style.backgroundColor === 'red');
+        d.style.background = ''; check('an empty shorthand removes its longhands', () => !d.hasAttribute('style') || css() === '');
+        d.style.font = 'bold 12px / 1.5 serif'; check('font reads back', () => d.style.font === 'bold 12px / 1.5 serif' && d.style.removeProperty('font') === 'bold 12px / 1.5 serif' && d.style.length === 0);
+        d.style.border = 'solid'; check('border omits default parts', () => d.style.border === 'solid');
+        d.removeAttribute('style'); d.style.marginBlock = '1px';
+        check('logical shorthands read back without folding physical sides', () => d.style.marginBlock === '1px' && css() === 'margin-top: 1px; margin-bottom: 1px;');
+        d.removeAttribute('style'); d.style.borderInline = '1px solid red'; d.style.inlineSize = '5px';
+        check('logical border and alias', () => d.style.borderInline === '1px solid red' && d.style.inlineSize === '5px' && css() === 'border-inline: 1px solid red; width: 5px;');
+        d.removeAttribute('style'); d.style.background = 'url(a.png) no-repeat 1px 2px / 3px, blue';
+        check('background layers', () => d.style.background === 'url(a.png) 1px 2px / 3px no-repeat, blue');
+        const svg = document.createElement('div'); svg.innerHTML = '<svg><style>a&lt;b</style></svg><style>a<b</style>';
+        check('only HTML raw text stays raw', () => svg.innerHTML === '<svg><style>a&lt;b</style></svg><style>a<b</style>');
+        const deep = document.createElement('div'); deep.innerHTML = '<div>'.repeat(20000);
+        check('deep trees serialize and clone', () => deep.innerHTML.length === 220000 && deep.cloneNode(true).innerHTML.length === 220000);
+        const x = document.createElement('a'), y = document.createElement('a'); x.setAttribute('p', '1'); x.setAttribute('q', '2'); y.setAttribute('q', '2'); y.setAttribute('p', '1');
+        check('isEqualNode ignores attribute order', () => x.isEqualNode(y) && !x.isEqualNode(document.createElement('a')));
+        const [m, n] = [document.createElement('i'), document.createElement('i')], mn = m.compareDocumentPosition(n), nm = n.compareDocumentPosition(m);
+        check('disconnected nodes have opposite positions', () => (mn & 33) === 33 && (nm & 33) === 33 && (mn & 6) + (nm & 6) === 6);
+        const t = document.createElement('p'); t.append('a', '', 'b', document.createElement('i'), ''); const r = new Range(); r.setStart(t.childNodes[2], 1); r.setEnd(t, 3); t.normalize();
+        check('normalize keeps ranges in the merged text', () => t.childNodes.length === 2 && r.startContainer === t.firstChild && r.startOffset === 2 && r.endContainer === t && r.endOffset === 1);
+        check('a document takes one element', () => { try { document.appendChild(document.createElement('div')); return false; } catch (e) { return e.name === 'HierarchyRequestError' && document.children.length === 1; } });
+        const html = document.documentElement, other = document.createElement('html'); document.replaceChild(other, html); other.replaceWith(html);
+        check('the document element can be replaced', () => document.documentElement === html && document.children.length === 1);
+        check('insertAdjacentElement takes elements', () => { try { x.insertAdjacentElement('beforeend', 'text'); return false; } catch (e) { return e instanceof TypeError && !x.hasChildNodes(); } });
+        x.insertAdjacentText('beforeend', 'text'); check('insertAdjacentText', () => x.textContent === 'text');
+        const node = x.getAttributeNode('p'); x.setAttribute('p', '3');
+        check('attribute nodes are kept and live', () => node === x.getAttributeNode('p') && node === x.attributes.p && node.value === '3');
+        "#,
+    );
+}
+
+#[test]
+fn events_trust_errors_listener_signals_and_shadow_paths() {
+    checked_page(
+        "<html><body><form id='f'><input id='cb' type='checkbox'></form></body></html>",
+        r#"
+        const log = [], cb = document.getElementById('cb'), f = document.getElementById('f');
+        for (const type of ['click', 'input', 'change', 'submit', 'reset', 'invalid']) f.addEventListener(type, e => log.push(type + ':' + e.isTrusted), true);
+        cb.click(); f.requestSubmit(); f.reset(); cb.required = true; cb.checkValidity();
+        check('engine events are trusted and script clicks are not', () => log.join() === 'click:false,input:true,change:true,submit:true,reset:true,invalid:true');
+        let trusted; cb.addEventListener('change', e => { if (e.isTrusted) { trusted = e; } });
+        cb.click(); log.length = 0; cb.dispatchEvent(trusted);
+        check('dispatchEvent makes events untrusted', () => log.join() === 'change:false' && !trusted.isTrusted);
+        cb.indeterminate = true; cb.addEventListener('click', e => e.preventDefault(), { once: true }); cb.click();
+        check('a canceled click restores indeterminate', () => cb.indeterminate);
+        const errors = [];
+        addEventListener('error', e => { errors.push(e.error.message); e.preventDefault(); if (e.error.message === 'first') throw Error('nested'); });
+        cb.addEventListener('boom', () => { throw Error('first'); }); cb.dispatchEvent(new Event('boom'));
+        reportError(Error('second'));
+        check('listener errors reach window error listeners once', () => errors.join() === 'first,second');
+        const ctrl = new AbortController(); let hits = 0; const fn = () => hits++;
+        cb.addEventListener('w', fn, { signal: ctrl.signal }); cb.removeEventListener('w', fn); cb.addEventListener('w', fn); ctrl.abort(); cb.dispatchEvent(new Event('w'));
+        check('abort removes only its own listener', () => hits === 1);
+        const host = document.createElement('div'), open = document.createElement('div'); document.body.append(host, open);
+        const inner = document.createElement('span'); host.attachShadow({ mode: 'closed' }).append(inner);
+        let path; document.addEventListener('y', e => { path = e.composedPath(); });
+        inner.dispatchEvent(new Event('y', { bubbles: true, composed: true }));
+        check('composedPath hides closed trees', () => path[0] === host && path.length === 5);
+        const root = open.attachShadow({ mode: 'open' }), a = document.createElement('i'), b = document.createElement('b'); root.append(a, b);
+        let seen = 'none', inside; root.addEventListener('mouseover', e => { inside = e.relatedTarget; }); document.addEventListener('mouseover', e => { seen = e.relatedTarget; });
+        const over = new MouseEvent('mouseover', { bubbles: true, composed: true, relatedTarget: b }); a.dispatchEvent(over);
+        check('relatedTarget in the same tree stops at the shadow root', () => inside === b && seen === 'none' && over.relatedTarget === null);
+        b.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, composed: true, relatedTarget: cb }));
+        check('relatedTarget outside the tree passes', () => seen === cb);
+        const d = document.createElement('div'); d.setAttribute('hidden', 'until-found');
+        const mo = new MutationObserver(() => {}); mo.observe(d, { attributes: true });
+        check('toggleAttribute keeps a present attribute', () => d.toggleAttribute('hidden', true) && d.getAttribute('hidden') === 'until-found' && mo.takeRecords().length === 0);
+        "#,
+    );
+}
+
+#[test]
+fn form_controls_keep_radio_groups_values_and_clones() {
+    checked_page(
+        "<html><body><form id='f'><input type=radio name=r value=1 checked><input type=radio name=r value=2 checked><select id=s name=s><option>a</option><option>b</option></select></form></body></html>",
+        r#"
+        const f = document.getElementById('f'), [r1, r2] = f.querySelectorAll('[type=radio]');
+        check('the last parsed checked radio wins', () => !r1.checked && r2.checked && !r1.matches(':checked') && [...new FormData(f)].map(e => e.join('=')).join('&') === 'r=2&s=a');
+        r1.checked = true; r2.removeAttribute('checked'); r2.setAttribute('checked', '');
+        check('the checked attribute checks a clean radio', () => r2.checked && !r1.checked);
+        r1.checked = true; f.reset(); check('reset restores the group', () => r2.checked && !r1.checked);
+        const c = document.createElement('input'); c.type = 'checkbox'; c.checked = false; c.defaultChecked = true;
+        check('the checked attribute leaves a dirty checkbox', () => !c.checked);
+        const i = document.createElement('input'); i.value = 'a\nb'; check('text values drop newlines', () => i.value === 'ab' && i.selectionStart === 2 && i.selectionEnd === 2);
+        i.type = 'number'; i.value = 'abc'; check('number values sanitize', () => i.value === '');
+        i.type = 'email'; i.value = ' a@b.c '; check('email values trim', () => i.value === 'a@b.c');
+        i.type = 'text'; i.value = 'typed'; const t = document.createElement('textarea'); t.value = 'note';
+        c.checked = true; const o = document.createElement('option'); o.selected = true;
+        check('clones keep form state', () => i.cloneNode().value === 'typed' && t.cloneNode().value === 'note' && c.cloneNode().checked && o.cloneNode().selected);
+        const s = document.getElementById('s'); s.value = 'zzz';
+        check('an unknown value selects nothing', () => s.selectedIndex === -1);
+        s.append(new Option('c')); check('new options select the first again', () => s.selectedIndex === 0);
+        "#,
+    );
+}
+
+#[test]
 fn child_node_methods_reactions_and_observers_follow_the_standard() {
     let (_, engine) = checked_page(
         "<html><body><div id='box'></div></body></html>",
@@ -2793,6 +3254,63 @@ fn inline_style_declarations_validate_expand_and_serialize() {
 }
 
 #[test]
+fn web_animations_release_finished_effects_and_commit_their_own_stack() {
+    let (_, engine) = css_page("<html><body><div id=a></div><div id=b></div></body></html>");
+    engine.eval(r#"
+        const [a, b] = ['a', 'b'].map(id => document.getElementById(id)), counts = { finish: 0, settled: 0 };
+        const check = (got, want) => { if (JSON.stringify(got) !== JSON.stringify(want)) throw Error(JSON.stringify(got) + ' != ' + JSON.stringify(want)); };
+        const opacity = () => getComputedStyle(a).opacity;
+        const done = a.animate({ opacity: [0, 1] }, 100);
+        done.onfinish = () => counts.finish++; done.finished.then(() => counts.settled++);
+        done.finish();
+        check([done.playState, a.getAnimations().length, opacity()], ['finished', 0, '1']);
+        done.pause(); done.currentTime = 50;
+        check([a.getAnimations().length, opacity()], [1, '0.5']);
+        done.effect.updateTiming({ duration: 200 });
+        check(opacity(), '0.25');
+        done.effect.setKeyframes({ opacity: [1, 0] });
+        check(opacity(), '0.75');
+        done.finish(); check(a.getAnimations().length, 0);
+        done.reverse(); check(a.getAnimations().length, 1);
+        done.cancel(); done.play(); check(a.getAnimations().length, 1);
+        done.cancel();
+        const split = a.animate([{ offset: 0, opacity: 0 }, { offset: 0.5, opacity: 0.2 }, { offset: 0.5, opacity: 0.8 }, { offset: 1, opacity: 1 }], { duration: 1000, fill: 'both' });
+        split.pause(); split.currentTime = 250; const low = opacity(); split.currentTime = 500;
+        check([low, opacity()], ['0.1', '0.8']); split.cancel();
+        const one = a.animate({ opacity: [0.25, 0.25] }, { duration: 1000, fill: 'forwards' }), two = a.animate({ opacity: [0.9, 0.9], width: ['30px', '30px'] }, { duration: 1000, fill: 'forwards' });
+        const three = a.animate({ width: ['10px', '10px'] }, { duration: 1000, fill: 'forwards' });
+        for (const animation of [one, two, three]) animation.pause();
+        one.commitStyles(); three.commitStyles();
+        check([a.style.opacity, a.style.width], ['0.25', '10px']);
+        for (const animation of [one, two, three]) animation.cancel();
+        const older = b.animate({ opacity: [0, 0.3] }, { duration: 2000, fill: 'forwards' }), newer = b.animate({ opacity: [0, 0.6] }, { duration: 1000, fill: 'forwards' });
+        const kept = b.animate({ opacity: [0, 0.1] }, { duration: 3000, fill: 'forwards' }); kept.persist();
+        newer.finish(); kept.finish(); older.finish();
+        check([older.replaceState, newer.replaceState, kept.replaceState, b.getAnimations().length], ['removed', 'active', 'persisted', 2]);
+        newer.cancel(); older.commitStyles();
+        check(b.style.opacity, '0.3');
+        const steps = new KeyframeEffect(null, { opacity: [0, 1] }, { duration: 100, delay: 100, fill: 'both', easing: 'steps(2, jump-start)' });
+        new Animation(steps).currentTime = 50;
+        check(steps.getComputedTiming().progress, 0);
+        check(['steps(0)', 'cubic-bezier(2, 0, 0, 1)', 'linear(0)', 'steps(2)'].map(value => CSS.supports('transition-timing-function', value)), [false, false, false, true]);
+        try { a.animate({ opacity: [0, 1] }, { easing: 'cubic-bezier(2,0,0,1)' }); throw Error('accepted'); } catch (error) { if (!(error instanceof TypeError)) throw error; }
+    "#, "test").unwrap();
+    let started = std::time::Instant::now();
+    while engine.eval("counts.finish", "test").unwrap() == "0" {
+        let delay = engine.tick().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(delay.clamp(1, 10) as u64));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+    for _ in 0..3 {
+        engine.tick().unwrap();
+    }
+    assert_eq!(
+        engine.eval("JSON.stringify(counts)", "test").unwrap(),
+        r#"{"finish":2,"settled":1}"#
+    );
+}
+
+#[test]
 fn focus_visible_follows_the_input_modality() {
     let (_, engine) = css_page(
         "<html><head><style>:focus-visible{color:red}</style></head><body><button id=b>b</button><input id=i><button id=c>c</button></body></html>",
@@ -3131,7 +3649,7 @@ fn document_types_follow_the_parser_and_the_document() {
         const doctype = document.doctype;
         check('parsed', () => doctype instanceof DocumentType && doctype.nodeType === 10 && doctype.name === 'html' && doctype.publicId === '' && doctype.systemId === '' && doctype.nodeName === 'html' && doctype.textContent === null && document.firstChild === doctype && document.childNodes.length === 2);
         check('standards mode', () => document.compatMode === 'CSS1Compat');
-        check('serialized', () => new XMLSerializer().serializeToString(document).startsWith('<!DOCTYPE html><html>'));
+        check('serialized', () => new XMLSerializer().serializeToString(document).startsWith('<!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml">'));
         check('string tag', () => Object.prototype.toString.call(doctype) === '[object DocumentType]');
         check('created', () => { const made = document.implementation.createDocumentType('svg:svg', '-//W3C//DTD SVG 1.1//EN', 'x.dtd'); return made.name === 'svg:svg' && made.publicId === '-//W3C//DTD SVG 1.1//EN' && made.systemId === 'x.dtd' && made.parentNode === null; });
         check('invalid name', () => { try { document.implementation.createDocumentType('1x', '', ''); return false; } catch (e) { return e.name === 'InvalidCharacterError'; } });
@@ -3207,7 +3725,7 @@ fn custom_element_reactions_wait_for_the_call_and_report_errors() {
         "<html><body><div id='box'></div><x-bad id='bad'></x-bad></body></html>",
         r#"
         globalThis.log = []; globalThis.errors = [];
-        addEventListener('error', event => { errors.push(event.message); event.preventDefault(); });
+        addEventListener('error', event => { errors.push(event.error.message); event.preventDefault(); });
         customElements.define('x-throw', class extends HTMLElement { connectedCallback() { log.push('in:' + this.id); throw new Error('boom ' + this.id); } });
         const box = document.getElementById('box'), a = document.createElement('x-throw'), b = document.createElement('x-throw');
         a.id = 'a'; b.id = 'b';

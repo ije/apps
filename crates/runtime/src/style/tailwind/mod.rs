@@ -2,7 +2,7 @@ use super::{Declaration, Declarations, Prop, Rule, Style, Stylesheet};
 use crate::dom::Document;
 use rustc_hash::FxHashMap;
 use std::{
-    cmp::Reverse,
+    cmp::{Ordering, Reverse},
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write,
     rc::Rc,
@@ -1514,12 +1514,52 @@ type Rank = (u16, String);
 
 type Expansion = (usize, Option<String>, Option<String>);
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq)]
 struct Sort {
     variants: Vec<Rank>,
     properties: Vec<u16>,
     count: Reverse<usize>,
     name: String,
+}
+
+impl PartialOrd for Sort {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Sort {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (&self.variants, &self.properties, self.count)
+            .cmp(&(&other.variants, &other.properties, other.count))
+            .then_with(|| {
+                // Tailwind compares digit runs as numbers, so `p-2` sorts before `p-10`.
+                let (a, z) = (self.name.as_bytes(), other.name.as_bytes());
+                let mut i = 0;
+                while i < a.len().min(z.len()) {
+                    if a[i].is_ascii_digit() && z[i].is_ascii_digit() {
+                        let end =
+                            |s: &[u8]| i + s[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+                        let (x, y) = (&a[i..end(a)], &z[i..end(z)]);
+                        let trim =
+                            |s: &[u8]| s.len() - s.iter().take_while(|&&b| b == b'0').count();
+                        let order = trim(x)
+                            .cmp(&trim(y))
+                            .then_with(|| x[x.len() - trim(x)..].cmp(&y[y.len() - trim(y)..]))
+                            .then_with(|| x.cmp(y));
+                        if order.is_ne() {
+                            return order;
+                        }
+                        i += x.len();
+                    } else if a[i] != z[i] {
+                        return a[i].cmp(&z[i]);
+                    } else {
+                        i += 1;
+                    }
+                }
+                a.len().cmp(&z.len())
+            })
+    }
 }
 
 struct Compiled {
@@ -1768,15 +1808,17 @@ impl Config {
         let mut rules = Vec::new();
         if header {
             replaced.extend(self.header.take());
-            let mut css = String::from(
-                "@layer properties;@layer theme,base,components,utilities;@layer properties{*,::before,::after{",
-            );
+            let mut css = String::from("@layer properties;@layer theme,base,components,utilities;");
             for (name, value) in PROPERTIES {
                 if self.properties.contains(name) {
-                    let _ = write!(css, "{name}:{value};");
+                    let _ = write!(css, "@property {name}{{syntax:\"*\";inherits:false;");
+                    if *value != "initial" {
+                        let _ = write!(css, "initial-value:{value}");
+                    }
+                    css.push('}');
                 }
             }
-            css.push_str("}}@layer theme{:root,:host{");
+            css.push_str("@layer theme{:root,:host{");
             for (name, value) in &self.vars {
                 let _ = write!(css, "{name}:{value};");
             }
@@ -2227,7 +2269,7 @@ impl Config {
             if modifier.is_some() || raw.starts_with('@') && raw.contains('&') {
                 return None;
             }
-            let value = self.arbitrary(name)?;
+            let mut value = self.arbitrary(name)?;
             if value.contains(['{', '}']) {
                 return None;
             }
@@ -2242,7 +2284,8 @@ impl Config {
             } else if value.contains('&') {
                 value.clone()
             } else {
-                format!("&:is({value})")
+                value = format!("&:is({value})");
+                value.clone()
             };
             let mut variant = template(&source);
             variant.relative = relative;
@@ -2367,7 +2410,15 @@ impl Config {
                     return None;
                 }
                 Some((
-                    (rank, format!("{:05}{}", inner_rank.0, inner_rank.1)),
+                    (
+                        rank,
+                        format!(
+                            "{:05}{}{}",
+                            inner_rank.0,
+                            inner_rank.1,
+                            modifier.map_or(String::new(), |name| format!("\0{name}"))
+                        ),
+                    ),
                     Variant {
                         branches,
                         ..Variant::default()
@@ -2376,26 +2427,25 @@ impl Config {
             }
             _ if modifier.is_some() && !root.starts_with('@') => None,
             "aria" | "data" => {
-                let selector = if value.starts_with('[') {
-                    format!("&[{root}-{}]", quote(&self.arbitrary(value)?))
+                let (key, selector) = if value.starts_with('[') {
+                    let value = self.arbitrary(value)?;
+                    let selector = format!("&[{root}-{}]", quote(&value));
+                    (format!("1{value}"), selector)
                 } else if !named_value(value) {
                     return None;
                 } else if root == "aria" {
-                    format!("&[aria-{value}=\"true\"]")
+                    (format!("0{value}"), format!("&[aria-{value}=\"true\"]"))
                 } else {
-                    format!("&[data-{value}]")
+                    (format!("0{value}"), format!("&[data-{value}]"))
                 };
-                Some(((rank, value.to_owned()), template(&selector)))
+                Some(((rank, key), template(&selector)))
             }
             "nth" | "nth-last" | "nth-of-type" | "nth-last-of-type" => {
-                let argument = if value.starts_with('[') {
-                    self.arbitrary(value)?
+                let (kind, argument) = if value.starts_with('[') {
+                    ('1', self.arbitrary(value)?)
                 } else {
-                    value
-                        .parse::<u32>()
-                        .ok()
-                        .filter(|_| integer(value))?
-                        .to_string()
+                    let number = value.parse::<u32>().ok().filter(|_| integer(value))?;
+                    ('0', number.to_string())
                 };
                 let pseudo = match root {
                     "nth" => "nth-child",
@@ -2403,18 +2453,21 @@ impl Config {
                     _ => root,
                 };
                 Some((
-                    (rank, argument.clone()),
+                    (rank, format!("{kind}{argument}")),
                     template(&format!("&:{pseudo}({argument})")),
                 ))
             }
             "supports" => {
                 if value == "bg-glass" {
-                    return Some(((rank, value.into()), template("@media (-macos-glass)")));
+                    return Some((
+                        (rank, "0bg-glass".into()),
+                        template("@media (-macos-glass)"),
+                    ));
                 }
-                let raw = if value.starts_with(['[', '(']) {
-                    self.arbitrary(value)?
+                let (kind, raw) = if value.starts_with(['[', '(']) {
+                    ('1', self.arbitrary(value)?)
                 } else if named_value(value) {
-                    value.to_owned()
+                    ('0', value.to_owned())
                 } else {
                     return None;
                 };
@@ -2436,7 +2489,7 @@ impl Config {
                     }
                 };
                 Some((
-                    (rank, raw),
+                    (rank, format!("{kind}{raw}")),
                     Variant {
                         branches: vec![(vec![format!("@supports {condition}")], None)],
                         ..Variant::default()
@@ -2461,9 +2514,9 @@ impl Config {
                     None => String::new(),
                 };
                 let operator = if root == "@max" { "<" } else { ">=" };
-                let ((_, key), _) = self.media(operator, &width, root)?;
+                let (rank, _) = self.media(operator, &width, root)?;
                 Some((
-                    (rank, format!("{key}{name}")),
+                    rank,
                     Variant {
                         branches: vec![(
                             vec![format!("@container {name}(width {operator} {width})")],
@@ -2477,22 +2530,29 @@ impl Config {
     }
 
     fn media(&self, operator: &str, width: &str, root: &str) -> Option<(Rank, Variant)> {
-        let pixels = width
-            .strip_suffix("rem")
-            .or_else(|| width.strip_suffix("em"))
-            .and_then(|value| value.parse::<f32>().ok())
-            .map(|value| value * 16.)
-            .or_else(|| width.strip_suffix("px")?.parse().ok())
-            .unwrap_or(0.);
-        let key = if operator == "<" {
-            1e6 - pixels
-        } else {
-            pixels
+        // Tailwind groups breakpoints by unit (or function name) and only then by number, so `px` values sort
+        // before `rem` values.
+        let bucket = match width.find('(') {
+            Some(end) => width[..end].to_owned(),
+            None => width.replace(|c: char| c.is_ascii_digit() || c == '.', ""),
+        };
+        let sign = usize::from(width.starts_with(['+', '-']));
+        let end = width[sign..]
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .map_or(width.len(), |end| sign + end);
+        let key = match width[..end].parse::<f64>() {
+            Ok(value) => {
+                let value = if operator == "<" { -value } else { value } + 0.;
+                let bits = value.to_bits();
+                let bits = if value < 0. { !bits } else { bits | 1 << 63 };
+                format!("{bucket}\0{bits:016x}")
+            }
+            Err(_) => format!("{bucket}\0\u{1}{width}"),
         };
         Some((
             (
                 VARIANTS.iter().position(|(name, _)| *name == root)? as u16,
-                format!("{key:012.3}"),
+                key,
             ),
             Variant {
                 branches: vec![(vec![format!("@media (width {operator} {width})")], None)],
@@ -4004,12 +4064,20 @@ impl Config {
                         "line-height",
                         self.arbitrary(modifier)
                             .or_else(|| self.theme("--leading", modifier))
-                            .or_else(|| self.spacing(modifier))?,
+                            .or_else(|| self.spacing(modifier))
+                            .or_else(|| (modifier == "none").then(|| "1".into()))?,
                     )),
                     None if raw.is_none() => {
-                        if let Some(height) = self.theme("--text", &format!("{value}--line-height"))
-                        {
-                            body.push(("line-height", format!("var(--tw-leading, {height})")));
+                        for (property, var) in [
+                            ("line-height", "leading"),
+                            ("letter-spacing", "tracking"),
+                            ("font-weight", "font-weight"),
+                        ] {
+                            if let Some(option) =
+                                self.theme("--text", &format!("{value}--{property}"))
+                            {
+                                body.push((property, format!("var(--tw-{var}, {option})")));
+                            }
                         }
                     }
                     None => {}

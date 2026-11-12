@@ -253,6 +253,7 @@
     globalThis.__appsDOM = call;
     globalThis.__appsEventState = pollWeb.eventState;
     globalThis.__appsFiles = hooks.files;
+    globalThis.__appsReport = report => { uncaught = error => (report(error), true); };
     const executed = (id, data) => call('dom.executed', id, stringify(data));
     Object.defineProperty(globalThis, '__appsExecuted', { value: (id, value, failed) => (failed ? Promise.reject(value) : Promise.resolve(value)).then(value => executed(id, { value })).catch(error => executed(id, { error: String(error?.message ?? error) })) });
     if (!disabled.has('webgpu')) globalThis.__appsGPU = call;

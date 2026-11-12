@@ -328,7 +328,7 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
         ]
         .into_iter()
         .any(|prop| style.get(prop).is_some_and(|value| value != "none"))
-        || [Prop::COLUMN_COUNT, Prop::COLUMN_WIDTH, Prop::COLUMNS]
+        || [Prop::COLUMN_COUNT, Prop::COLUMN_WIDTH]
             .into_iter()
             .any(|prop| style.get(prop).is_some_and(|value| value != "auto"));
     [

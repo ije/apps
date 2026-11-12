@@ -626,3 +626,30 @@ fn root_custom_properties() {
         .unwrap_or_default();
     println!("root_300_vars_10k_nodes_first_restyle_ms={restyle} rss_kb={rss}");
 }
+
+#[test]
+#[ignore = "release performance measurement"]
+fn list_changes() {
+    let html = format!(
+        "<style>li:last-child{{color:red}} li:nth-child(odd){{width:1px}} li+li{{height:1px}} ul:has(.x) b{{color:blue}}</style><ul>{}</ul>",
+        "<li><b>x</b></li>".repeat(2000)
+    );
+    println!(
+        "list_2000_append_prepend_class_rule_var_ms={}",
+        page(
+            &html,
+            r#"
+        const ul = document.querySelector('ul'), sheet = document.styleSheets[0];
+        const time = step => { const t = performance.now(); for (let i = 0; i < 20; i++) { step(i); getComputedStyle(ul.lastChild).color; } return ((performance.now() - t) / 20).toFixed(2); };
+        getComputedStyle(ul).color;
+        [
+            time(() => ul.append(document.createElement('li'))),
+            time(() => ul.prepend(document.createElement('li'))),
+            time(() => ul.children[5].classList.toggle('x')),
+            time(i => sheet.insertRule(`.r${i}{color:red}`, sheet.cssRules.length)),
+            time(i => document.documentElement.style.setProperty('--x', i + 'px')),
+        ].join()
+    "#
+        )
+    );
+}

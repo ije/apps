@@ -7017,19 +7017,12 @@ fn columns(
     units: &style::Lengths,
     width: f32,
 ) -> Option<(usize, f32, Option<ColumnRule>)> {
-    let mut count = style
+    let count = style
         .get(Prop::COLUMN_COUNT)
         .and_then(|value| value.parse::<usize>().ok());
-    let mut column_width = style
+    let column_width = style
         .get(Prop::COLUMN_WIDTH)
         .and_then(|value| units.resolve(value, width));
-    for part in style::components(style.get(Prop::COLUMNS).unwrap_or(""), ' ') {
-        if let Ok(value) = part.parse::<usize>() {
-            count = count.or(Some(value));
-        } else if let Some(value) = units.resolve(part, width) {
-            column_width = column_width.or(Some(value));
-        }
-    }
     let gap = style
         .get(Prop::COLUMN_GAP)
         .filter(|value| *value != "normal")
@@ -7047,32 +7040,11 @@ fn columns(
     if count < 2 {
         return None;
     }
-    let (mut rule_width, mut rule_style, mut rule_color) = (
+    let (rule_width, rule_style, rule_color) = (
         style.get(Prop::COLUMN_RULE_WIDTH),
         style.get(Prop::COLUMN_RULE_STYLE),
         style.get(Prop::COLUMN_RULE_COLOR),
     );
-    for part in style::components(style.get(Prop::COLUMN_RULE).unwrap_or(""), ' ') {
-        if matches!(
-            part,
-            "none"
-                | "hidden"
-                | "dotted"
-                | "dashed"
-                | "solid"
-                | "double"
-                | "groove"
-                | "ridge"
-                | "inset"
-                | "outset"
-        ) {
-            rule_style = rule_style.or(Some(part));
-        } else if style::color(part).is_some() {
-            rule_color = rule_color.or(Some(part));
-        } else {
-            rule_width = rule_width.or(Some(part));
-        }
-    }
     let rule = rule_style
         .filter(|kind| !matches!(*kind, "none" | "hidden"))
         .map(|kind| {

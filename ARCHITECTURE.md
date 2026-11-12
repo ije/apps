@@ -144,7 +144,11 @@ The runtime owns HTML and CSS behavior. The renderer owns windows and the lower-
 
 ### Incremental work
 
-DOM revisions and selector dependencies limit style updates to affected nodes. Computed styles use chunks with copy-on-write storage. A viewport or stylesheet change can require a full style pass.
+DOM revisions and selector dependencies limit style updates to affected nodes. Computed styles use chunks with copy-on-write storage. A viewport change can require a full style pass.
+
+A selector match records the node data that it read: tag and attributes, classes, state, children, or the place among siblings. A change marks only the nodes with a match that read this data. For example, a new last child gives a new style to the old last child, not to all its siblings. The result of each `:has()` is kept for its node and checked again when something changes below that node. The nodes that depend on the result get a new style only when it changes.
+
+A new rule or Tailwind class marks the nodes that can match it, and the other nodes keep their styles. A deleted rule, and a rule that any node can match, use a full style pass.
 
 The document keeps a short log of the nodes that changed. A tree change patches the list of nodes in document order, and reports the nodes that moved, joined or left. The style, visibility and culling passes then visit only these nodes and the nodes with a new style. A change to most of the tree uses the full passes, and so do the style lists of a page with shadow trees. Debug builds compare each patched result with a full pass.
 

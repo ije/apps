@@ -72,7 +72,7 @@
     // The children of each node. A null id gives the root element.
     tree: ({ ids }) => Object.fromEntries(ids.map(id => [id ?? 'root', id == null ? [entry(document.documentElement)] : get(id)?.isConnected ? kids(get(id)).map(entry) : []])),
     path({ id: from }) { const path = []; for (let node = get(from); node && node !== document; node = up(node)) path.unshift(id(node)); return path; },
-    pick({ x, y }) { const node = document.elementFromPoint(x, y); return node && id(node); },
+    pick({ x, y }) { let node = document.elementFromPoint(x, y); for (let inner; (inner = node?.shadowRoot?.elementFromPoint(x, y)) && inner !== node;) node = inner; return node && id(node); },
   };
   return (method, params) => api[method](params ?? {});
 })()

@@ -1485,7 +1485,13 @@ impl PageView {
                 dom.checked.clear();
             }
             for name in style::DROPPED.take() {
-                if dom.warned.insert(format!("@{name}")) {
+                if name.contains(':') {
+                    if dom.warned.insert(name.clone()) {
+                        warnings.push(format!(
+                            "Unsupported CSS `{name}`: the value is not supported."
+                        ));
+                    }
+                } else if dom.warned.insert(format!("@{name}")) {
                     warnings.push(format!(
                         "Unsupported CSS at-rule `@{name}`: its rules are ignored."
                     ));

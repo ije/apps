@@ -435,6 +435,38 @@ fn new_classes_join_the_scope_in_tailwind_order() {
 }
 
 #[test]
+fn utilities_and_variants_sort_like_tailwind() {
+    let mut compiler = super::Compiler::default();
+    let mut sheets = vec![Rc::new(super::Stylesheet::parse(
+        "@import 'tailwindcss/utilities';",
+    ))];
+    compiler.update(&mut sheets, &Document::parse(""), &[]);
+    let config = compiler.0.last().unwrap();
+    for chain in [
+        "z-9 z-10",
+        "p-2 p-10",
+        "text-red-50 text-red-100",
+        "opacity-50 opacity-100",
+        "m-[9.5px] m-[9px] m-[010px] m-[10px]",
+        "data-a:p-1 data-c:p-1 data-[a]:p-1 data-[b]:p-1",
+        "aria-checked:p-1 aria-[sort=ascending]:p-1",
+        "supports-grid:p-1 supports-[display:flex]:p-1",
+        "nth-10:p-1 nth-3:p-1 nth-[2n]:p-1",
+        "max-[1100px]:p-1 max-[900px]:p-1 max-lg:p-1 max-md:p-1",
+        "min-[300px]:p-1 min-[2000px]:p-1 sm:p-1 md:p-1",
+        "@max-[300px]:p-1 @max-md:p-1 @[300px]:p-1 @md:p-1",
+        "has-[.a]:p-1 has-[img]:p-1 has-[+p]:p-1 has-[>p]:p-1",
+        "group-hover:p-1 group-hover/a:p-1 group-hover/b:p-1",
+    ] {
+        let sorts: Vec<_> = chain
+            .split(' ')
+            .map(|class| config.compile(class, &super::escape(class)).unwrap().sort)
+            .collect();
+        assert!(sorts.is_sorted_by(|a, b| a < b), "{chain}");
+    }
+}
+
+#[test]
 fn configs_are_kept_per_theme() {
     let document = Rc::new(super::Stylesheet::parse(
         "@import 'tailwindcss'; @theme { --color-brand: #123456; }",
@@ -608,7 +640,18 @@ fn default_utilities_match_tailwind() {
                 "@max-md/main:hidden",
                 "@container main (width < 28rem){.\\@max-md\\/main\\:hidden{display:none;}}",
             ),
+            (
+                "text-xs/none",
+                ".text-xs\\/none{font-size:var(--text-xs);line-height:1;}",
+            ),
         ],
+    );
+    assert_generated(
+        "@theme{--text-tiny:10px;--text-tiny--line-height:1.1;--text-tiny--letter-spacing:0.1em;--text-tiny--font-weight:650}",
+        &[(
+            "text-tiny",
+            ".text-tiny{font-size:var(--text-tiny);line-height:var(--tw-leading, var(--text-tiny--line-height));letter-spacing:var(--tw-tracking, var(--text-tiny--letter-spacing));font-weight:var(--tw-font-weight, var(--text-tiny--font-weight));}",
+        )],
     );
 }
 
@@ -1431,6 +1474,25 @@ fn gradients_and_divides_reach_computed_styles() {
 }
 
 #[test]
+fn tw_properties_get_initial_values_without_leaking() {
+    let (doc, styles) = computed(
+        "<html><style>@import 'tailwindcss';</style><body><i class='ring-2 shadow-(--nope)'></i>
+        <b class=\"shadow-sm translate-x-4 before:content-['x'] before:ring-2\"></b><p>x</p></body></html>",
+        None,
+    );
+    let ring = "0 0 #0000, 0 0 #0000, 0 0 #0000,  0 0 0 calc(2px + 0px) #000000, 0 0 #0000";
+    assert_eq!(&styles.values[id(&doc, "i")]["box-shadow"], ring);
+    let b = id(&doc, "b");
+    assert_eq!(&styles.pseudos[&b][0]["box-shadow"], ring);
+    assert_eq!(&styles.values[b]["translate"], "calc(0.25rem * 4) 0");
+    let vars = &styles.vars[id(&doc, "p")];
+    assert!(
+        vars.iter()
+            .all(|(prop, _)| !prop.name().starts_with("--tw-"))
+    );
+}
+
+#[test]
 fn relative_has_selectors_match_and_invalid_candidates_emit_nothing() {
     let (doc, styles) = computed(
         "<html><style>@import 'tailwindcss';</style><body>
@@ -1543,6 +1605,90 @@ fn inserts_at_one_spot_keep_the_generated_sheets() {
             .unwrap();
         assert!(update.replaced.is_empty(), "step {step}");
         assert_eq!(update.rules.len(), 1, "step {step}");
+    }
+}
+
+#[test]
+fn incremental_inserts_match_a_fresh_compile() {
+    let classes: Vec<_> = (0..300)
+        .map(|i| match i / 100 {
+            0 => format!("w-{i}"),
+            1 => format!("m-[{}px]", i % 100),
+            _ => format!("min-[{}px]:p-1", i % 100),
+        })
+        .collect();
+    let html = "<p></p>".repeat(classes.len());
+    let base = Rc::new(super::Stylesheet::parse("@import 'tailwindcss/utilities';"));
+    let compile = |order: &[usize], fresh: bool| {
+        let mut doc = Document::parse(&html);
+        let nodes: Vec<_> = (0..doc.nodes.len())
+            .filter(|&id| doc.nodes[id].tag == "p")
+            .collect();
+        let all: Vec<(u32, u32)> = (0..doc.nodes.len() as u32)
+            .map(|id| (id, u32::MAX))
+            .collect();
+        let mut compiler = super::Compiler::default();
+        compiler.update(&mut vec![base.clone()], &doc, &all);
+        let mut rest = order;
+        for step in 0.. {
+            if rest.is_empty() {
+                break;
+            }
+            // Single inserts take the midpoint path, and batches of more than 16 the merge path.
+            let size = match (fresh, step % 8) {
+                (true, _) => rest.len(),
+                (_, 7) => rest.len().min(20),
+                _ => 1,
+            };
+            let (batch, tail) = rest.split_at(size);
+            rest = tail;
+            for &index in batch {
+                doc.nodes[nodes[index]].attrs.set("class", &classes[index]);
+            }
+            compiler.update(&mut vec![base.clone()], &doc, &all);
+        }
+        let config = compiler.0.pop().unwrap();
+        assert!(config.sorted.is_sorted_by(|a, b| a.0 < b.0 && a.1 < b.1));
+        for (_, key, rules) in &config.sorted {
+            for rule in rules {
+                super::selectors(rule, &mut |list| {
+                    assert_eq!(config.keys[&(Rc::as_ptr(list) as usize)] >> 8, *key);
+                });
+            }
+        }
+        let css: Vec<_> = config
+            .chunks
+            .iter()
+            .flat_map(|(_, sheet)| match &*sheet.0[0] {
+                super::Rule::Layer(_, rules) => rules.iter().map(|rule| rule.source()),
+                _ => unreachable!(),
+            })
+            .collect();
+        (
+            config
+                .sorted
+                .iter()
+                .map(|(sort, ..)| sort.name.clone())
+                .collect::<Vec<_>>(),
+            css,
+        )
+    };
+    let ascending: Vec<_> = (0..classes.len()).collect();
+    let fresh = compile(&ascending, true);
+    let mut seed = 7u64;
+    let mut shuffled = ascending.clone();
+    for index in (1..shuffled.len()).rev() {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        shuffled.swap(index, (seed >> 33) as usize % (index + 1));
+    }
+    for order in [
+        ascending.clone(),
+        ascending.iter().rev().copied().collect(),
+        shuffled,
+    ] {
+        assert_eq!(compile(&order, false), fresh);
     }
 }
 

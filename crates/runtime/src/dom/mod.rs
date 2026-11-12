@@ -449,6 +449,10 @@ pub(crate) const MODAL: u16 = 64;
 pub(crate) const POPOVER: u16 = 256;
 pub(crate) const FULLSCREEN: u16 = 512;
 pub(crate) const BROKEN: u16 = 1024;
+// Warning: one bit for both, as only custom elements can be undefined and they are never inputs.
+pub(crate) const INDETERMINATE: u16 = 4096;
+pub(crate) const DEFINED: u16 = INDETERMINATE;
+pub(crate) const INVALID: u16 = 32768;
 pub(crate) const TOP_LAYER: u16 = MODAL | POPOVER | FULLSCREEN;
 pub(crate) const LEAVING: u16 = TOP_LAYER << 5;
 
@@ -525,10 +529,19 @@ impl LayoutMirror {
     }
 
     fn reserve(&mut self, id: usize) {
-        if id < self.capacity {
-            return;
+        if id >= self.capacity {
+            self.resize((id + 1).next_power_of_two().max(1024));
         }
-        let capacity = (id + 1).next_power_of_two().max(1024);
+    }
+
+    fn shrink(&mut self, len: usize) {
+        let capacity = len.next_power_of_two().max(1024);
+        if capacity * 4 <= self.capacity {
+            self.resize(capacity);
+        }
+    }
+
+    fn resize(&mut self, capacity: usize) {
         let words = 4 + capacity * 8 + capacity / 4;
         let memory = std::ptr::NonNull::new(Box::into_raw(vec![0f32; words].into_boxed_slice()))
             .expect("Layout memory")
@@ -536,15 +549,12 @@ impl LayoutMirror {
         unsafe {
             *memory.as_ptr().add(1) = capacity as f32;
             if let Some(old) = &self.memory {
-                std::ptr::copy_nonoverlapping(
-                    self.slot(0),
-                    memory.as_ptr().add(4),
-                    self.capacity * 8,
-                );
+                let kept = self.capacity.min(capacity);
+                std::ptr::copy_nonoverlapping(self.slot(0), memory.as_ptr().add(4), kept * 8);
                 std::ptr::copy_nonoverlapping(
                     self.flags(0),
                     memory.as_ptr().add(4 + capacity * 8).cast::<u8>(),
-                    self.capacity,
+                    kept,
                 );
                 *memory.as_ptr().add(2) = *old.0.as_ptr().add(2);
                 // Pages keep reading the old buffer until they see this flag and fetch the new one.
@@ -866,6 +876,7 @@ impl State {
         self.painted.shrink_to_fit();
         self.motion.trim(len);
         self.cull.trim(len);
+        self.bounds.shrink(len);
         if len < before {
             doc.nodes.truncate(len);
             self.invalidate();
@@ -954,7 +965,9 @@ fn slots(
                     .entry(node.attrs.get("name").map_or("", String::as_str))
                     .or_insert(id);
             }
-            pending.extend(node.children.iter().rev());
+            if node.tag != "template" {
+                pending.extend(node.children.iter().rev());
+            }
         }
         for &child in &doc.nodes[host].children {
             let node = &doc.nodes[child];
@@ -1362,15 +1375,19 @@ pub fn call(
             )));
         }
         if op == "dom.easing" {
-            let easing = args[0].as_str().unwrap_or("linear");
-            return Ok(json!(style::easing(easing, args[1].as_f64().unwrap_or(0.))));
+            let progress = args[1].as_f64().unwrap_or(0.);
+            return Ok(json!(
+                style::Easing::parse(args[0].as_str().unwrap_or("linear"))
+                    .map_or(progress, |easing| easing.at(progress, args[2] == true))
+            ));
         }
         if op == "dom.animation" {
             let id = args[0].as_u64().context("Expected an animation")? as u32;
             state.dirty = true;
-            if let Some(node) = state.motion.unscript(id) {
-                state.animating.remove(&node);
-                state.animating_pseudos.remove(&node);
+            let old = state.motion.unscript(id);
+            if let Some((node, _)) = &old {
+                state.animating.remove(node);
+                state.animating_pseudos.remove(node);
             }
             let spec = &args[2];
             let Some(node) = args[1]
@@ -1382,7 +1399,7 @@ pub fn call(
             };
             state.animating.remove(&node);
             state.animating_pseudos.remove(&node);
-            let frames: Vec<(f64, &str, String)> = spec["frames"]
+            let frames: Vec<(f64, &str, &str)> = spec["frames"]
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -1390,7 +1407,7 @@ pub fn call(
                     Some((
                         frame[0].as_f64()?,
                         frame[1].as_str()?,
-                        frame[2].as_str().unwrap_or("linear").to_owned(),
+                        frame[2].as_str().unwrap_or("linear"),
                     ))
                 })
                 .collect();
@@ -1427,6 +1444,8 @@ pub fn call(
                 animation,
                 spec["time"].as_f64().unwrap_or(0.) / 1000.,
                 spec["rate"].as_f64(),
+                old.map(|(_, old)| old)
+                    .filter(|_| !spec["frames"].is_array()),
             );
             return Ok(Value::Null);
         }
@@ -1646,6 +1665,7 @@ pub fn call(
                         state.hosts.remove(&root);
                     }
                     state.hosts.remove(&id);
+                    state.style_cache.adopted.remove(&id);
                     state.motion.forget(id);
                     state.anchors.remove(&id);
                     state.blocks.remove(&id);
@@ -1945,13 +1965,17 @@ pub fn call(
             "dom.html" => {
                 let source = args[1].as_str().context("Expected HTML")?;
                 let tag = doc.nodes[id].tag.as_str();
+                let form = || {
+                    std::iter::successors(Some(id), |&at| doc.nodes[at].parent)
+                        .any(|at| doc.nodes[at].tag == "form")
+                };
                 let parsed = match args[2].as_str() {
                     _ if tag == "#document" => Document::parse(source),
-                    Some(context) => Document::fragment(source, context),
+                    Some(context) => Document::build(source, Some(context), form()),
                     // Shadow roots and template contents parse in `template` context, so the `<tr>` rows that
                     // Lit renders are kept.
                     None if tag.starts_with('#') => Document::fragment(source, "template"),
-                    None => Document::fragment(source, tag),
+                    None => Document::build(source, Some(tag), form()),
                 };
                 for child in std::mem::take(&mut doc.nodes[id].children) {
                     doc.nodes[child].parent = None;
@@ -2014,7 +2038,7 @@ pub fn call(
                 );
                 Ok(state
                     .motion
-                    .scripted(id, 0, &styles)
+                    .scripted(id, 0, &styles, args[1].as_u64().unwrap_or(0) as u32)
                     .map_or(Value::Null, |values| {
                         values
                             .iter()
@@ -2041,7 +2065,8 @@ pub fn call(
                     "after" => Some(2),
                     _ => None,
                 };
-                let scripted = slot.and_then(|slot| state.motion.scripted(id, slot, &styles));
+                let scripted =
+                    slot.and_then(|slot| state.motion.scripted(id, slot, &styles, u32::MAX));
                 // The compositor can play animations between frames, so they are sampled now.
                 let current = state
                     .animating
@@ -2127,23 +2152,11 @@ pub fn call(
                             style::resolved(style, &units, name, size, &container, &registry);
                         let tag = doc.nodes[id].tag.as_str();
                         json!(match (name, value.as_str()) {
-                            ("display", "grid") if tag == "table" => "table".to_owned(),
+                            ("display", display_value) if pseudo.is_empty() => {
+                                display(&styles, tag, id, display_value).to_owned()
+                            }
                             ("gap" | "row-gap" | "column-gap", _) if tag == "table" =>
                                 "normal".to_owned(),
-                            ("display", "contents")
-                                if matches!(tag, "thead" | "tbody" | "tfoot" | "tr") =>
-                            {
-                                match tag {
-                                    "thead" => "table-header-group",
-                                    "tbody" => "table-row-group",
-                                    "tfoot" => "table-footer-group",
-                                    _ => "table-row",
-                                }
-                                .to_owned()
-                            }
-                            ("display", "block") if matches!(tag, "td" | "th") =>
-                                "table-cell".to_owned(),
-                            ("display", "block") if tag == "caption" => "table-caption".to_owned(),
                             ("min-width" | "min-height", "auto")
                                 if parent.is_none_or(|parent| {
                                     parent.get(Prop::DISPLAY).is_none_or(|display| {
@@ -2246,25 +2259,33 @@ pub fn call(
                         json!(computed.user_select[id])
                     });
                 }
-                let mut text = String::new();
-                if let Some(ranges) = args[1].as_array() {
-                    for range in ranges {
-                        let node = range[0].as_u64().context("Expected selection node")? as usize;
-                        ensure!(node < doc.nodes.len(), "Invalid selection node");
-                        if computed.user_select[node].0 == style::UserSelect::None
-                            || state.inert(node)
-                        {
-                            continue;
-                        }
-                        let value = &doc.nodes[node].text;
-                        let start = utf16_index(value, range[1].as_u64().unwrap_or(0) as usize);
-                        let end = utf16_index(value, range[2].as_u64().unwrap_or(0) as usize);
-                        if start < end {
-                            text.push_str(&value[start..end]);
-                        }
-                    }
+                let mut range = rustc_hash::FxHashMap::default();
+                let (mut first, mut last) = (None, 0);
+                for item in args[1].as_array().into_iter().flatten() {
+                    let node = item[0].as_u64().context("Expected selection node")? as usize;
+                    ensure!(node < doc.nodes.len(), "Invalid selection node");
+                    let [start, end] =
+                        [1, 2].map(|index| item[index].as_u64().unwrap_or(0) as usize);
+                    range.insert(node, [start, end]);
+                    first.get_or_insert(node);
+                    last = node;
                 }
-                Ok(json!(text))
+                let Some(mut root) = first else {
+                    return Ok(json!(""));
+                };
+                while !std::iter::successors(Some(last), |&id| doc.nodes[id].parent)
+                    .any(|id| id == root)
+                    && let Some(parent) = doc.nodes[root].parent
+                {
+                    root = parent;
+                }
+                Ok(json!(rendered_text(
+                    doc,
+                    state,
+                    &computed,
+                    root,
+                    Some(&range)
+                )))
             }
             "dom.scroll" => {
                 let handle = state
@@ -2942,100 +2963,7 @@ pub fn call(
                     viewport,
                     system.as_deref().map(|system| (system, state.pixel_ratio)),
                 );
-                let mut text = String::new();
-                let (mut breaks, mut collapsed) = (0, false);
-                let mut pending = vec![(id, false)];
-                while let Some((node, close)) = pending.pop() {
-                    let current = &doc.nodes[node];
-                    let style = &computed.values[node];
-                    let display = style.get(Prop::DISPLAY).unwrap_or("inline");
-                    let required = if current.tag == "p" {
-                        2
-                    } else if display.starts_with("inline")
-                        || matches!(display, "contents" | "table-cell" | "ruby" | "none")
-                    {
-                        0
-                    } else {
-                        1
-                    };
-                    if close {
-                        if display == "table-cell" {
-                            text.push('\t');
-                        } else if display == "table-row" && text.ends_with('\t') {
-                            text.pop();
-                        }
-                        breaks = breaks.max(required);
-                        continue;
-                    }
-                    if node != id && display == "none" || current.tag == "#comment" {
-                        continue;
-                    }
-                    if current.tag == "br" {
-                        text.push('\n');
-                        (breaks, collapsed) = (0, false);
-                        continue;
-                    }
-                    if current.tag == "#text" {
-                        let parent = current
-                            .parent
-                            .map_or(style, |parent| &computed.values[parent]);
-                        if parent
-                            .get(Prop::VISIBILITY)
-                            .is_some_and(|value| matches!(value, "hidden" | "collapse"))
-                        {
-                            continue;
-                        }
-                        let space = parent.get(Prop::WHITE_SPACE).unwrap_or("normal");
-                        let keep = matches!(space, "pre" | "pre-wrap" | "break-spaces");
-                        let mut chunk = String::with_capacity(current.text.len());
-                        for character in current.text.chars() {
-                            if keep || character == '\n' && space == "pre-line" {
-                                chunk.push(character);
-                            } else if matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c') {
-                                if !chunk.ends_with(' ') {
-                                    chunk.push(' ');
-                                }
-                            } else {
-                                chunk.push(character);
-                            }
-                        }
-                        if chunk.is_empty() {
-                            continue;
-                        }
-                        if breaks > 0 && !text.is_empty() {
-                            if collapsed {
-                                text.truncate(text.trim_end_matches(' ').len());
-                            }
-                            text.extend(std::iter::repeat_n('\n', breaks));
-                        }
-                        breaks = 0;
-                        let chunk = if !keep && (text.is_empty() || text.ends_with([' ', '\n'])) {
-                            chunk.trim_start_matches(' ')
-                        } else {
-                            &chunk
-                        };
-                        text.push_str(chunk);
-                        collapsed = !keep;
-                        continue;
-                    }
-                    if node != id {
-                        breaks = breaks.max(required);
-                    }
-                    pending.push((node, true));
-                    pending.extend(
-                        computed
-                            .children
-                            .get(&node)
-                            .unwrap_or(&current.children)
-                            .iter()
-                            .rev()
-                            .map(|&child| (child, false)),
-                    );
-                }
-                if collapsed {
-                    text.truncate(text.trim_end_matches(' ').len());
-                }
-                Ok(json!(text))
+                Ok(json!(rendered_text(doc, state, &computed, id, None)))
             }
             _ => unreachable!(),
         }
@@ -3246,6 +3174,177 @@ pub(crate) fn flat_parent(
     }
 }
 
+fn display<'a>(computed: &style::ComputedStyles, tag: &str, id: usize, value: &'a str) -> &'a str {
+    if computed.flags[id] & style::AGENT_DISPLAY == 0 {
+        return value;
+    }
+    match (tag, value) {
+        ("table", "grid") => "table",
+        ("thead", "contents") => "table-header-group",
+        ("tbody", "contents") => "table-row-group",
+        ("tfoot", "contents") => "table-footer-group",
+        ("tr", "contents") => "table-row",
+        ("td" | "th", "block") => "table-cell",
+        ("caption", "block") => "table-caption",
+        _ => value,
+    }
+}
+
+// The innerText algorithm of HTML in one pass over the flat tree. With `range`, only the selected parts of
+// the text nodes in it count.
+fn rendered_text(
+    doc: &Document,
+    state: &State,
+    computed: &style::ComputedStyles,
+    root: usize,
+    range: Option<&rustc_hash::FxHashMap<usize, [usize; 2]>>,
+) -> String {
+    let push = |text: &mut String, breaks: &mut usize, space: &mut bool, character: char| {
+        if *breaks > 0 {
+            if !text.is_empty() {
+                text.extend(std::iter::repeat_n('\n', *breaks));
+            }
+            *breaks = 0;
+        } else if *space
+            && !matches!(character, '\n' | '\t')
+            && !text.is_empty()
+            && !text.ends_with(['\n', '\t'])
+        {
+            text.push(' ');
+        }
+        *space = false;
+        text.push(character);
+    };
+    let mut text = String::new();
+    let (mut breaks, mut space, mut rows, mut cells) = (0, false, false, false);
+    let mut left = range.map_or(0, |range| range.len());
+    // Open entries carry whether the parent blockifies its children, close entries the required line breaks
+    // and the table state to restore.
+    let mut pending = vec![(root, None, false, false)];
+    while let Some((node, close, a, b)) = pending.pop() {
+        let current = &doc.nodes[node];
+        let style = &computed.values[node];
+        let display = display(
+            computed,
+            &current.tag,
+            node,
+            style.get(Prop::DISPLAY).unwrap_or("inline"),
+        );
+        // The UA sheet hides the options of a drop-down select that are not chosen, but innerText lists them.
+        let display = if display == "none"
+            && matches!(current.tag.as_str(), "option" | "optgroup")
+            && computed.flags[node] & style::AGENT_DISPLAY != 0
+            && !current.attrs.contains_key("hidden")
+        {
+            "block"
+        } else {
+            display
+        };
+        if let Some(required) = close {
+            if matches!(display, "table" | "inline-table") {
+                (rows, cells) = (a, b);
+            }
+            breaks = breaks.max(required);
+            continue;
+        }
+        if node != root && display == "none" || current.tag == "#comment" {
+            continue;
+        }
+        let inside = range.is_none() || left > 0 && !text.is_empty();
+        if current.tag == "br" {
+            if inside {
+                push(&mut text, &mut breaks, &mut space, '\n');
+            }
+            continue;
+        }
+        if current.tag == "#text" {
+            let mut value = current.text.as_str();
+            if let Some(range) = range {
+                let Some(&[start, end]) = range.get(&node) else {
+                    continue;
+                };
+                left -= 1;
+                if computed.user_select[node].0 == style::UserSelect::None || state.inert(node) {
+                    continue;
+                }
+                let (start, end) = (utf16_index(value, start), utf16_index(value, end));
+                value = &value[start..end.max(start)];
+            }
+            let parent = current
+                .parent
+                .map_or(style, |parent| &computed.values[parent]);
+            if parent
+                .get(Prop::VISIBILITY)
+                .is_some_and(|value| matches!(value, "hidden" | "collapse"))
+            {
+                continue;
+            }
+            let white_space = parent.get(Prop::WHITE_SPACE).unwrap_or("normal");
+            let keep = matches!(white_space, "pre" | "pre-wrap" | "break-spaces");
+            let lines = white_space == "pre-line";
+            for character in value.chars() {
+                if !keep
+                    && !(lines && character == '\n')
+                    && matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c')
+                {
+                    space = true;
+                } else {
+                    push(&mut text, &mut breaks, &mut space, character);
+                }
+            }
+            continue;
+        }
+        let required = if display == "contents" {
+            0
+        } else if current.tag == "p" {
+            2
+        } else if a
+            || matches!(
+                display,
+                "block" | "list-item" | "flex" | "grid" | "table" | "flow-root" | "table-caption"
+            )
+        {
+            1
+        } else {
+            0
+        };
+        if node != root {
+            breaks = breaks.max(required);
+        }
+        pending.push((node, Some(required), rows, cells));
+        match display {
+            "table" | "inline-table" => (rows, cells) = (false, false),
+            "table-row" => {
+                if rows && inside {
+                    push(&mut text, &mut breaks, &mut space, '\n');
+                }
+                (rows, cells) = (true, false);
+            }
+            "table-cell" => {
+                if cells && inside {
+                    push(&mut text, &mut breaks, &mut space, '\t');
+                }
+                cells = true;
+            }
+            _ => {}
+        }
+        let blockify =
+            display.ends_with("flex") || display.ends_with("grid") || display == "contents" && a;
+        pending.extend(
+            state
+                .shadow_walk
+                .shadows
+                .composed
+                .get(&node)
+                .unwrap_or(&current.children)
+                .iter()
+                .rev()
+                .map(|&child| (child, None, blockify, false)),
+        );
+    }
+    text
+}
+
 pub(crate) fn hit_test(
     doc: &Document,
     state: &State,
@@ -3278,12 +3377,26 @@ pub(crate) fn hit_test(
                 && std::iter::successors(Some(id), |&id| up(id)).last() == Some(0)
         })
         .collect();
-    let mut pending = vec![(0, screen, false)];
-    pending.extend(top.iter().map(|&id| (id, screen, false)));
+    let mut pending = vec![(0, screen, false, 0)];
+    pending.extend(top.iter().map(|&id| (id, screen, false, 0)));
     let mut hits = Vec::new();
-    while let Some((id, mut clip, hit)) = pending.pop() {
+    // The ancestors of the current node with the clips inside them and, once read, the containing blocks they
+    // make: 1 when read, 2 for absolute and 4 for fixed boxes.
+    let mut path: Vec<(usize, [f32; 4], u8)> = Vec::new();
+    let inside = |clip: [f32; 4]| x >= clip[0] && x < clip[2] && y >= clip[1] && y < clip[3];
+    while let Some((id, mut clip, hit, depth)) = pending.pop() {
         if hit {
             hits.push(id);
+            continue;
+        }
+        // The last frame marked each subtree with an out-of-flow box uncullable.
+        if !inside(clip)
+            && state
+                .cull
+                .info
+                .get(id)
+                .is_some_and(|info| info.flags & crate::render::cull::UNCULLABLE == 0)
+        {
             continue;
         }
         let node = &doc.nodes[id];
@@ -3297,22 +3410,37 @@ pub(crate) fn hit_test(
         {
             continue;
         }
-        if let Some(&[left, top, width, height]) = state.bounds.get(&id) {
+        path.truncate(depth);
+        // An out-of-flow box gets only the clip of its containing block, as the renderer draws it. That clip
+        // holds the clip of each box between, so a box without a clip keeps it.
+        if clip != screen
+            && let Some(escape) = style
+                .get(Prop::POSITION)
+                .filter(|&value| matches!(value, "absolute" | "fixed"))
+        {
+            let bit = if escape == "fixed" { 4 } else { 2 };
+            clip = path
+                .iter_mut()
+                .rev()
+                .find_map(|(id, clip, made)| {
+                    if *made == 0 {
+                        let block = crate::render::effects::establishes(&computed.values[*id]);
+                        *made = 1 | (u8::from(block.absolute) * 2) | (u8::from(block.fixed) * 4);
+                    }
+                    (*made & bit != 0).then_some(*clip)
+                })
+                .unwrap_or(screen);
+        }
+        if inside(clip)
+            && let Some(&[left, top, width, height]) = state.bounds.get(&id)
+        {
             let selectable = !style
                 .get(Prop::POINTER_EVENTS)
                 .is_some_and(|value| value == "none")
                 && !style
                     .get(Prop::VISIBILITY)
                     .is_some_and(|value| matches!(value, "hidden" | "collapse"));
-            if caret
-                && node.tag == "#text"
-                && selectable
-                && height > 0.
-                && x >= clip[0]
-                && x < clip[2]
-                && y >= clip[1]
-                && y < clip[3]
-            {
+            if caret && node.tag == "#text" && selectable && height > 0. {
                 let distance = (left - x).max(0.).max(x - left - width).powi(2)
                     + (top - y).max(0.).max(y - top - height).powi(2);
                 nearest.push((id, distance));
@@ -3324,13 +3452,9 @@ pub(crate) fn hit_test(
                 && x < left + width
                 && y >= top
                 && y < top + height
-                && x >= clip[0]
-                && x < clip[2]
-                && y >= clip[1]
-                && y < clip[3]
                 && selectable
             {
-                pending.push((id, clip, true));
+                pending.push((id, clip, true, depth));
             }
             for (axis, prop) in [(0, Prop::OVERFLOW_X), (1, Prop::OVERFLOW_Y)] {
                 if style
@@ -3342,18 +3466,16 @@ pub(crate) fn hit_test(
                 }
             }
         }
-        if x >= clip[0] && x < clip[2] && y >= clip[1] && y < clip[3] {
-            let children = computed
+        path.push((id, clip, 0));
+        pending.extend(
+            computed
                 .children
                 .get(&id)
-                .unwrap_or(&doc.nodes[id].children);
-            pending.extend(
-                children
-                    .iter()
-                    .filter(|child| !top.contains(child))
-                    .map(|&child| (child, clip, false)),
-            );
-        }
+                .unwrap_or(&doc.nodes[id].children)
+                .iter()
+                .filter(|child| !top.contains(child))
+                .map(|&child| (child, clip, false, depth + 1)),
+        );
     }
     hits.sort_by_cached_key(|&id| {
         std::cmp::Reverse(
@@ -3806,13 +3928,14 @@ pub(crate) fn styles(
     result
 }
 
+// A path with a bad item is empty, so the edit fails with IndexSizeError instead of reaching another rule.
 fn path(value: &Value) -> Vec<usize> {
     value
         .as_array()
-        .map(|items| {
+        .and_then(|items| {
             items
                 .iter()
-                .filter_map(|item| Some(item.as_u64()? as usize))
+                .map(|item| Some(item.as_u64()? as usize))
                 .collect()
         })
         .unwrap_or_default()
@@ -3824,6 +3947,7 @@ fn edit<'a>(kind: &str, text: &'a str) -> style::Edit<'a> {
         "style" => style::Edit::Declarations(text),
         "selector" => style::Edit::Selector(text),
         "keyframe" => style::Edit::Keyframe(text),
+        "replace" => style::Edit::Replace(text),
         _ => style::Edit::Delete,
     }
 }
@@ -4121,6 +4245,7 @@ mod tests {
             face.load().then(() => log.push('bytes ' + face.status));
             new FontFace('Bad', 'url(a.eot) format("embedded-opentype")').load().catch(error => log.push('bad ' + error.name));
             new FontFace('Local', 'local("No Such Font 123")').load().catch(error => log.push('local ' + error.name));
+            const junk = new FontFace('Junk', new Uint8Array([1, 2, 3, 4])); junk.loaded.catch(error => log.push('junk ' + (error instanceof DOMException) + ' ' + error.name + ' ' + junk.status));
             document.fonts.ready.then(fonts => {{
                 log.push([...fonts].map(face => face.family + ' ' + face.status).join());
                 const context = document.createElement('canvas').getContext('2d');
@@ -4138,7 +4263,7 @@ mod tests {
         }
         assert_eq!(
             engine.eval("JSON.stringify(log)", "test").unwrap(),
-            r#"["bytes loaded","bad SyntaxError","local NetworkError","Css loaded,Later unloaded,Bytes loaded",15,15,true,true,false,true]"#
+            r#"["bytes loaded","bad SyntaxError","local NetworkError","junk true SyntaxError error","Css loaded,Later unloaded,Bytes loaded",15,15,true,true,false,true]"#
         );
     }
 
@@ -4491,6 +4616,151 @@ mod tests {
         }
         #[cfg(debug_assertions)]
         assert!(host.borrow().dom[&1].style_cache.incremental >= 15);
+    }
+
+    #[test]
+    fn incremental_styles_follow_added_rules_and_places() {
+        use crate::{
+            host::{Host, Page, Role},
+            jsc::{JavaScriptCore, JsContext},
+        };
+        use std::cell::RefCell;
+
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            Page {
+                doc: Document::parse(
+                    "<html><head><style>li:last-child{padding-left:1px} li:nth-child(odd){padding-right:2px}
+                    li+li{padding-top:3px} ul:has(.hit) b{color:red}</style><style>@import 'tailwindcss';</style></head>
+                    <body><ul id=list><li id=one class=late><b>1</b></li><li><b>2</b></li><li><b>3</b></li></ul>
+                    <p id=leaf class='flex late'>x</p></body></html>",
+                ),
+                dirty: false,
+            },
+        );
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
+        let read = "for(const e of document.querySelectorAll('*'))getComputedStyle(e).color;";
+        engine
+            .eval(&format!("for(const id of ['list','one','leaf'])globalThis[id]=document.getElementById(id);globalThis.sheet=document.styleSheets[0];globalThis.css=(e,p)=>getComputedStyle(e)[p];{read}"), "test")
+            .unwrap();
+        let mut passes = Vec::new();
+        for (step, check) in [
+            (
+                "sheet.insertRule('.late{color:rgb(1, 1, 1)}', sheet.cssRules.length)",
+                "css(leaf,'color')==='rgb(1, 1, 1)'&&css(one.firstChild,'color')==='rgb(1, 1, 1)'",
+            ),
+            (
+                "sheet.insertRule('#one b{color:rgb(2, 2, 2)}', 0)",
+                "css(one.firstChild,'color')==='rgb(2, 2, 2)'",
+            ),
+            (
+                "const s=document.createElement('style');s.textContent='li:first-child{margin-top:4px} .late::before{content:\"x\";color:rgb(3, 3, 3)}';document.head.append(s)",
+                "css(one,'marginTop')==='4px'&&getComputedStyle(leaf,'::before').color==='rgb(3, 3, 3)'",
+            ),
+            (
+                "leaf.classList.add('pt-[3px]')",
+                "css(leaf,'paddingTop')==='3px'",
+            ),
+            (
+                "list.append(document.createElement('li'))",
+                "css(list.lastChild,'paddingLeft')==='1px'&&css(list.children[2],'paddingLeft')==='0px'&&css(list.lastChild,'paddingRight')==='0px'",
+            ),
+            (
+                "list.prepend(document.createElement('li'))",
+                "css(one,'marginTop')==='0px'&&css(one,'paddingRight')==='0px'&&css(one,'paddingTop')==='3px'&&css(list.firstChild,'paddingTop')==='0px'",
+            ),
+            (
+                "list.lastChild.className='hit'",
+                "css(one.firstChild,'color')==='rgb(2, 2, 2)'&&css(list.children[2].firstChild,'color')==='rgb(255, 0, 0)'",
+            ),
+            (
+                "list.lastChild.remove()",
+                "css(list.children[2].firstChild,'color')==='rgb(1, 1, 1)'||css(list.children[2].firstChild,'color')==='rgb(0, 0, 0)'",
+            ),
+            (
+                "sheet.insertRule('*{margin-left:5px}', 0)",
+                "css(leaf,'marginLeft')==='5px'",
+            ),
+            ("sheet.deleteRule(0)", "css(leaf,'marginLeft')==='0px'"),
+        ] {
+            let before = host.borrow().dom[&1].style_cache.incremental;
+            let result = engine
+                .eval(&format!("{step};{read}{check}"), "test")
+                .unwrap();
+            assert_eq!(result, "true", "{step}");
+            passes.push(host.borrow().dom[&1].style_cache.incremental > before);
+        }
+        // A rule that any node can match, and a deleted rule, need a full pass.
+        assert_eq!(
+            passes,
+            [true, true, true, true, true, true, true, true, false, false]
+        );
+    }
+
+    #[test]
+    fn incremental_styles_renumber_counters() {
+        use crate::{
+            host::{Host, Page, Role},
+            jsc::{JavaScriptCore, JsContext},
+        };
+        use std::cell::RefCell;
+
+        let host = Rc::new(RefCell::new(Host::default()));
+        host.borrow_mut().pages.insert(
+            1,
+            Page {
+                doc: Document::parse(
+                    "<html><head><style>main{counter-reset:sec} h2{counter-increment:sec}
+                    h2::before{content:counter(sec) \". \"} h2::after{content:\"counter \" counters(sec, \"-\")}
+                    .big{font-size:20px}</style></head><body><main id=main><h2 id=a>a</h2><p id=p>p</p><h2 id=b>b</h2>
+                    <section id=s><h2 id=c>c</h2></section></main></body></html>",
+                ),
+                dirty: false,
+            },
+        );
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
+        let read = "[...document.querySelectorAll('h2')].map(h=>getComputedStyle(h,'::before').content+getComputedStyle(h,'::after').content).join('|')";
+        let numbers = |list: &[&str]| -> String {
+            let text = |n: &&str| {
+                format!(
+                    "\"{}\" \". \"\"counter \" \"{n}\"",
+                    n.rsplit('-').next().unwrap()
+                )
+            };
+            list.iter().map(text).collect::<Vec<_>>().join("|")
+        };
+        engine
+            .eval(&format!("for(const id of ['main','a','p','b','s','c'])globalThis[id]=document.getElementById(id);{read}"), "test")
+            .unwrap();
+        let mut passes = Vec::new();
+        for (step, expected) in [
+            ("p.className='big'", &["1", "2", "3"][..]),
+            (
+                "main.prepend(document.createElement('h2'))",
+                &["1", "2", "3", "4"],
+            ),
+            ("b.remove()", &["1", "2", "3"]),
+            ("s.style.counterReset='sec 7'", &["1", "2", "2-8"]),
+            ("s.style.counterReset=''", &["1", "2", "3"]),
+            ("a.className='big'", &["1", "2", "3"]),
+        ] {
+            let before = host.borrow().dom[&1].style_cache.incremental;
+            let result = engine.eval(&format!("{step};{read}"), "test").unwrap();
+            assert_eq!(result, numbers(expected), "{step}");
+            passes.push(host.borrow().dom[&1].style_cache.incremental > before);
+        }
+        assert_eq!(passes, [true; 6]);
     }
 
     #[test]
@@ -4855,5 +5125,101 @@ mod tests {
         doc.nodes[ids[0]] = Node::default();
         state.free.push(std::cmp::Reverse(ids[0]));
         assert_eq!(state.allocate(&mut doc, node()), ids[0]);
+    }
+
+    #[test]
+    fn reused_ids_drop_the_old_style_while_the_styles_are_shared() {
+        let mut doc =
+            Document::parse("<body><div><p style='color: rgb(255, 0, 0)'></p></div></body>");
+        let mut state = State::default();
+        let viewport = [800., 600.];
+        let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
+        let div = doc.nodes[p].parent.unwrap();
+        styles(&mut doc, &mut state, viewport, None);
+        let body = doc.nodes[div].parent.unwrap();
+        doc.nodes[body].children.clear();
+        doc.nodes[div].parent = None;
+        state.invalidate();
+        let shared = styles(&mut doc, &mut state, viewport, None);
+        assert_eq!(shared.values[p].get(Prop::COLOR), None);
+        for id in [p, div] {
+            doc.nodes[id] = Node::default();
+            state.free.push(std::cmp::Reverse(id));
+        }
+        let node = Node {
+            tag: "p".into(),
+            ..Default::default()
+        };
+        assert_eq!(state.allocate(&mut doc, node.clone()), div);
+        assert_eq!(state.allocate(&mut doc, node), p);
+        assert_eq!(
+            styles(&mut doc, &mut state, viewport, None).values[p].get(Prop::COLOR),
+            None
+        );
+    }
+
+    #[test]
+    fn trim_shrinks_the_layout_mirror_under_a_page_that_holds_it() {
+        use crate::{
+            host::{Host, Page, Role},
+            jsc::{JavaScriptCore, JsContext},
+        };
+        use std::cell::RefCell;
+
+        let host = Rc::new(RefCell::new(Host::default()));
+        let doc = Document::parse("<html><body><p id='a'></p></body></html>");
+        let a = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
+        host.borrow_mut()
+            .pages
+            .insert(1, Page { doc, dirty: false });
+        let engine = JsContext::new(
+            JavaScriptCore::load().unwrap(),
+            host.clone(),
+            Role::Renderer(1),
+        )
+        .unwrap();
+        let grow = |rect| {
+            let mut host = host.borrow_mut();
+            let host = &mut *host;
+            let (doc, state) = (
+                &mut host.pages.get_mut(&1).unwrap().doc,
+                host.dom.entry(1).or_default(),
+            );
+            let ids: Vec<usize> = (0..20_000)
+                .map(|_| state.allocate(doc, Node::default()))
+                .collect();
+            state.bounds.insert(a, rect);
+            state.bounds.insert(ids[ids.len() - 1], rect);
+            ids
+        };
+        let ids = grow([0., 0., 10., 10.]);
+        assert_eq!(
+            engine
+                .eval(
+                    "globalThis.a = document.getElementById('a'); a.offsetWidth",
+                    "test"
+                )
+                .unwrap(),
+            "10"
+        );
+        {
+            let mut host = host.borrow_mut();
+            let host = &mut *host;
+            let (doc, state) = (
+                &mut host.pages.get_mut(&1).unwrap().doc,
+                host.dom.get_mut(&1).unwrap(),
+            );
+            for &id in &ids {
+                state.free.push(std::cmp::Reverse(id));
+            }
+            assert!(state.trim(doc));
+            assert_eq!(state.bounds.capacity, 1024);
+            assert_eq!(state.bounds.get(&a), Some(&[0., 0., 10., 10.]));
+            state.bounds.insert(a, [0., 0., 30., 10.]);
+            state.bounds.touch();
+        }
+        assert_eq!(engine.eval("a.offsetWidth", "test").unwrap(), "30");
+        grow([0., 0., 40., 10.]);
+        assert_eq!(engine.eval("a.offsetWidth", "test").unwrap(), "40");
     }
 }

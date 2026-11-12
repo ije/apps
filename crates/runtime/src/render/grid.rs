@@ -1119,89 +1119,15 @@ pub(crate) fn layout(
     if outermost {
         measured.edges = Some(Default::default());
     }
-    let mut template = [
+    let template = [
         get(Prop::GRID_TEMPLATE_COLUMNS),
         get(Prop::GRID_TEMPLATE_ROWS),
     ]
     .map(|v| v.map(str::to_owned));
-    let mut areas = get(Prop::GRID_TEMPLATE_AREAS).map(str::to_owned);
-    let mut flow = get(Prop::GRID_AUTO_FLOW).unwrap_or("row").to_owned();
-    let mut implicit = [get(Prop::GRID_AUTO_COLUMNS), get(Prop::GRID_AUTO_ROWS)]
+    let areas = get(Prop::GRID_TEMPLATE_AREAS).map(str::to_owned);
+    let flow = get(Prop::GRID_AUTO_FLOW).unwrap_or("row").to_owned();
+    let implicit = [get(Prop::GRID_AUTO_COLUMNS), get(Prop::GRID_AUTO_ROWS)]
         .map(|v| v.unwrap_or("auto").to_owned());
-    if template.iter().all(Option::is_none)
-        && areas.is_none()
-        && let Some(value) = get(Prop::GRID_TEMPLATE)
-            .or_else(|| get(Prop::GRID))
-            .filter(|v| *v != "none")
-    {
-        let (mut depth, mut quote, mut split) = (0, None, value.len());
-        for (index, character) in value.char_indices() {
-            match character {
-                '"' | '\'' if quote.is_none_or(|quote| quote == character) => {
-                    quote = quote.xor(Some(character))
-                }
-                '(' | '[' if quote.is_none() => depth += 1,
-                ')' | ']' if quote.is_none() => depth -= 1,
-                '/' if depth == 0 && quote.is_none() => {
-                    split = index;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let (rows, columns) = (&value[..split], value.get(split + 1..).unwrap_or("").trim());
-        let sizes = |value: &str| {
-            let sizes: Vec<_> = value
-                .split_whitespace()
-                .filter(|word| !matches!(*word, "auto-flow" | "dense"))
-                .collect();
-            if sizes.is_empty() {
-                "auto".into()
-            } else {
-                sizes.join(" ")
-            }
-        };
-        if rows.contains("auto-flow") {
-            flow = if rows.contains("dense") {
-                "row dense"
-            } else {
-                "row"
-            }
-            .into();
-            implicit[1] = sizes(rows);
-            template[0] = Some(columns.into());
-        } else if columns.contains("auto-flow") {
-            flow = if columns.contains("dense") {
-                "column dense"
-            } else {
-                "column"
-            }
-            .into();
-            implicit[0] = sizes(columns);
-            template[1] = Some(rows.trim().into());
-        } else {
-            let (mut list, mut strings) = (Vec::new(), Vec::new());
-            for part in style::components(rows, ' ') {
-                if part.starts_with(['"', '\'']) {
-                    strings.push(part);
-                    list.push("auto");
-                } else if part.starts_with('[') {
-                    list.push(part);
-                } else if let Some(last) = list.iter_mut().rev().find(|v| !v.starts_with('[')) {
-                    *last = part;
-                }
-            }
-            template[0] = Some(columns.into());
-            template[1] = Some(if strings.is_empty() {
-                rows.trim().into()
-            } else {
-                list.join(" ")
-            });
-            if !strings.is_empty() {
-                areas = Some(strings.join(" "));
-            }
-        }
-    }
     let shared = [0, 1].map(|axis| {
         inherited
             .map(|grid| if axis == 0 { &grid.columns } else { &grid.rows })
@@ -1287,9 +1213,6 @@ pub(crate) fn layout(
         fit[axis] = collapse;
     }
     let automatic = [0, 1].map(|axis| tracks(&implicit[axis], units, available[axis], 0.).0);
-    let ident = |value: &&str| {
-        *value != "auto" && !value.contains(char::is_whitespace) && value.parse::<isize>().is_err()
-    };
     let alignment = |child: usize, axis: usize, replaced: bool| {
         let own = &styles.values[child];
         let margins = [
@@ -1355,39 +1278,15 @@ pub(crate) fn layout(
                     .and_then(|v| v.parse::<i32>().ok())
                     .unwrap_or(0);
                 let placed = {
-                    let split = |prop| {
-                        style.get(prop).map_or(Vec::new(), |v| {
-                            v.split('/').map(str::trim).collect::<Vec<_>>()
-                        })
-                    };
-                    let area = split(Prop::GRID_AREA);
                     let (mut position, mut span) = ([None; 2], [1; 2]);
                     for axis in 0..2 {
-                        let [name, start, end] = [
-                            [
-                                Prop::GRID_COLUMN,
-                                Prop::GRID_COLUMN_START,
-                                Prop::GRID_COLUMN_END,
-                            ],
-                            [Prop::GRID_ROW, Prop::GRID_ROW_START, Prop::GRID_ROW_END],
+                        let [start, end] = [
+                            [Prop::GRID_COLUMN_START, Prop::GRID_COLUMN_END],
+                            [Prop::GRID_ROW_START, Prop::GRID_ROW_END],
                         ][axis];
-                        let pair = split(name);
-                        let shorthand = if let Some(&first) = pair.first() {
-                            (
-                                Some(first),
-                                pair.get(1).copied().or(Some(first).filter(ident)),
-                            )
-                        } else {
-                            let start = area
-                                .get(1 - axis)
-                                .copied()
-                                .or(area.first().copied().filter(ident));
-                            (start, area.get(3 - axis).copied().or(start.filter(ident)))
-                        };
-                        let longhand = |prop| style.get(prop);
                         (position[axis], span[axis]) = placement(
-                            longhand(start).or(shorthand.0).unwrap_or("auto"),
-                            longhand(end).or(shorthand.1).unwrap_or("auto"),
+                            style.get(start).unwrap_or("auto"),
+                            style.get(end).unwrap_or("auto"),
                             &names[axis],
                             explicit[axis],
                         );
@@ -1746,10 +1645,20 @@ pub(crate) fn layout(
                     continue;
                 }
                 let start = cell[axis] + offset % cell[axis + 2];
-                let span = style
-                    .get([Prop::GRID_COLUMN, Prop::GRID_ROW][axis])
-                    .and_then(|v| v.trim().strip_prefix("span"))
-                    .and_then(|v| v.trim().parse::<usize>().ok())
+                let span = [
+                    [Prop::GRID_COLUMN_START, Prop::GRID_COLUMN_END],
+                    [Prop::GRID_ROW_START, Prop::GRID_ROW_END],
+                ][axis]
+                    .iter()
+                    .find_map(|&prop| {
+                        style
+                            .get(prop)?
+                            .trim()
+                            .strip_prefix("span")?
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                    })
                     .unwrap_or(1)
                     .clamp(1, cell[axis] + cell[axis + 2] - start);
                 let value = intrinsic(

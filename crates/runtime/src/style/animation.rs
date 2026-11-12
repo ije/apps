@@ -40,8 +40,8 @@ pub(crate) struct Animation {
     iterations: f64,
     direction: String,
     fill: String,
-    timing: String,
-    easing: String,
+    timing: Easing,
+    easing: Easing,
     end_delay: f64,
     iteration_start: f64,
     composite: String,
@@ -49,7 +49,15 @@ pub(crate) struct Animation {
     tracks: Vec<(Prop, Keyframes)>,
 }
 
-type Keyframes = Vec<(f64, String, String)>;
+// A duration or delay alone transitions `all`, the initial `transition-property`.
+const TRANSITIONS: [Prop; 4] = [
+    Prop::TRANSITION,
+    Prop::TRANSITION_PROPERTY,
+    Prop::TRANSITION_DURATION,
+    Prop::TRANSITION_DELAY,
+];
+
+type Keyframes = Vec<(f64, String, Option<Easing>, Option<Rc<Lerp>>)>;
 
 type Animated = Vec<(usize, Rc<Style>, bool)>;
 
@@ -126,8 +134,7 @@ impl Animation {
                         let declarations = declarations.resolve();
                         let timing = declarations
                             .get(Prop::ANIMATION_TIMING_FUNCTION)
-                            .map(str::to_owned)
-                            .unwrap_or_default();
+                            .and_then(Easing::parse);
                         (f64::from(*offset), declarations, timing)
                     })
                     .collect();
@@ -147,8 +154,8 @@ impl Animation {
                     },
                     direction: values["direction"].into(),
                     fill: values["fill-mode"].into(),
-                    timing: values["timing-function"].into(),
-                    easing: String::new(),
+                    timing: Easing::parse(values["timing-function"])?,
+                    easing: Easing::Linear,
                     end_delay: 0.,
                     iteration_start: 0.,
                     composite: style
@@ -161,7 +168,7 @@ impl Animation {
                         })
                         .unwrap_or_else(|| "replace".into()),
                     pseudo: 0,
-                    tracks: tracks(style, &rules, registry),
+                    tracks: tracks(style, &rules, registry, true),
                 })
             })
             .collect()
@@ -170,8 +177,9 @@ impl Animation {
 
 fn tracks(
     style: &Style,
-    rules: &[(f64, Style, String)],
+    rules: &[(f64, Style, Option<Easing>)],
     registry: &Registry,
+    merge: bool,
 ) -> Vec<(Prop, Keyframes)> {
     let mut tracks: Vec<(Prop, Keyframes)> = Vec::new();
     for (offset, declarations, timing) in rules {
@@ -190,7 +198,7 @@ fn tracks(
                 }),
         );
         resolve_style(&mut frame, Some(style), None, &custom, registry);
-        resolve_keywords(&mut frame, Some(style));
+        resolve_keywords(&mut frame, Some(style), None);
         for (key, value) in declarations.iter() {
             if value.ends_with("!important")
                 || key == Prop::OVERLAY
@@ -201,18 +209,25 @@ fn tracks(
             let Some(value) = computed(&frame, key, registry) else {
                 continue;
             };
-            let frame = (*offset, value.to_owned(), timing.clone());
+            let frame = (*offset, value.to_owned(), timing.clone(), None);
             match tracks.iter_mut().find(|(name, _)| *name == key) {
                 Some((_, frames)) => {
-                    frames.retain(|(at, ..)| *at != frame.0);
+                    if merge {
+                        frames.retain(|(at, ..)| *at != frame.0);
+                    }
                     frames.push(frame);
                 }
                 None => tracks.push((key, vec![frame])),
             }
         }
     }
-    for (_, frames) in &mut tracks {
+    for (key, frames) in &mut tracks {
         frames.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if !key.is_custom() || animatable(*key, registry) {
+            for index in 1..frames.len() {
+                frames[index - 1].3 = lerp(key.name(), &frames[index - 1].1, &frames[index].1);
+            }
+        }
     }
     tracks
 }
@@ -278,22 +293,24 @@ impl Animation {
         if reverse {
             progress = 1. - progress;
         }
-        if !self.easing.is_empty() && self.easing != "linear" {
-            progress = easing(&self.easing, progress);
+        if self.easing != Easing::Linear {
+            progress = self
+                .easing
+                .at(progress, before && !reverse || ended && reverse);
             if active {
                 wake = Some(0.);
             }
         }
-        let mut keys: Vec<(f64, Cow<str>, &str)> = Vec::new();
+        let replace = self.composite == "replace";
+        let mut keys: Vec<(f64, Cow<str>, Option<&Easing>)> = Vec::new();
         for (property, frames) in &self.tracks {
-            keys.clear();
-            keys.extend(
-                frames.iter().map(|(at, value, timing)| {
-                    (*at, Cow::Borrowed(value.as_str()), timing.as_str())
-                }),
-            );
-            let replace = self.composite == "replace";
-            if !replace || keys[0].0 > 0. || keys[keys.len() - 1].0 < 1. {
+            // Keyframes at 0 and 1 replace the value under them, so their stored segments apply.
+            let fixed = replace && frames[0].0 <= 0. && frames[frames.len() - 1].0 >= 1.;
+            if !fixed {
+                keys.clear();
+                keys.extend(frames.iter().map(|(at, value, timing, _)| {
+                    (*at, Cow::Borrowed(value.as_str()), timing.as_ref())
+                }));
                 let under = out
                     .get(*property)
                     .or_else(|| computed(base, *property, registry))
@@ -312,19 +329,28 @@ impl Animation {
                         }
                     }
                     if keys[0].0 > 0. {
-                        keys.insert(0, (0., Cow::Owned(under.clone()), ""));
+                        keys.insert(0, (0., Cow::Owned(under.clone()), None));
                     }
                     if keys[keys.len() - 1].0 < 1. {
-                        keys.push((1., Cow::Owned(under), ""));
+                        keys.push((1., Cow::Owned(under), None));
                     }
                 }
             }
-            let index = keys
-                .iter()
-                .rposition(|key| key.0 <= progress)
+            let count = if fixed { frames.len() } else { keys.len() };
+            let key = |index: usize| {
+                if fixed {
+                    let (at, value, timing, _) = &frames[index];
+                    (*at, value.as_str(), timing.as_ref())
+                } else {
+                    let (at, value, timing) = &keys[index];
+                    (*at, &**value, *timing)
+                }
+            };
+            let index = (0..count)
+                .rposition(|index| key(index).0 <= progress)
                 .unwrap_or(0)
-                .min(keys.len().saturating_sub(2));
-            let (from, to) = (&keys[index], &keys[(index + 1).min(keys.len() - 1)]);
+                .min(count.saturating_sub(2));
+            let (from, to) = (key(index), key((index + 1).min(count - 1)));
             let local = if to.0 > from.0 {
                 let local = (progress - from.0) / (to.0 - from.0);
                 if (0. ..=1.).contains(&progress) {
@@ -335,15 +361,20 @@ impl Animation {
             } else {
                 1.
             };
-            let timing = if from.2.is_empty() {
-                &self.timing
+            let timing = from.2.unwrap_or(&self.timing);
+            let eased = timing.at(local, false);
+            let value = if property.is_custom() && !animatable(*property, registry) {
+                None
+            } else if fixed {
+                interpolate(frames[index].3.as_deref(), from.1, to.1, eased)
             } else {
-                from.2
+                interpolate(
+                    lerp(property.name(), from.1, to.1).as_deref(),
+                    from.1,
+                    to.1,
+                    eased,
+                )
             };
-            let eased = easing(timing, local);
-            let value = (!property.is_custom() || animatable(*property, registry))
-                .then(|| interpolate(property.name(), &from.1, &to.1, eased))
-                .flatten();
             if active && to.0 > from.0 {
                 let steps = |count: f64| {
                     if reverse {
@@ -353,24 +384,17 @@ impl Animation {
                     }
                 };
                 let edge = if from.1 == to.1
-                    || matches!(timing, "step-start" | "step-end")
                     || *property == Prop::DISPLAY && (from.1 == "none" || to.1 == "none")
                     || *property == Prop::VISIBILITY && (from.1 == "visible" || to.1 == "visible")
                 {
                     Some(steps(1.))
-                } else if let Some(args) = timing.strip_prefix("steps(") {
-                    Some(steps(
-                        components(args.trim_end_matches(')'), ',')
-                            .first()
-                            .and_then(|value| value.parse::<f64>().ok())
-                            .unwrap_or(1.)
-                            .max(1.),
-                    ))
+                } else if let Easing::Steps(count, _) = timing {
+                    Some(steps(f64::from(*count)))
                 } else if value.is_none() {
                     let (mut low, mut flip) = (0., 1.);
                     for _ in 0..24 {
                         let middle = (low + flip) / 2.;
-                        if easing(timing, middle) < 0.5 {
+                        if timing.at(middle, false) < 0.5 {
                             low = middle;
                         } else {
                             flip = middle;
@@ -390,7 +414,7 @@ impl Animation {
                     None => 0.,
                 });
             }
-            let value = value.unwrap_or_else(|| if eased < 0.5 { &*from.1 } else { &*to.1 }.into());
+            let value = value.unwrap_or_else(|| if eased < 0.5 { from.1 } else { to.1 }.into());
             out.insert(*property, value);
         }
         (wake, ended)
@@ -441,7 +465,8 @@ struct Transition {
     playback: Playback,
     delay: f64,
     duration: f64,
-    timing: String,
+    timing: Easing,
+    lerp: Option<Rc<Lerp>>,
     reverse: String,
     shortening: f64,
     started: bool,
@@ -450,12 +475,12 @@ struct Transition {
 impl Transition {
     fn progress(&self, now: Instant) -> Option<f64> {
         let time = self.playback.at(now) - self.delay;
-        (time < self.duration).then(|| easing(&self.timing, (time / self.duration).max(0.)))
+        (time < self.duration).then(|| self.timing.at((time / self.duration).max(0.), false))
     }
 
     fn value(&self, progress: f64) -> Rc<str> {
         let near = if progress < 0.5 { &self.from } else { &self.to };
-        interpolate(self.property.name(), &self.from, &self.to, progress)
+        interpolate(self.lerp.as_deref(), &self.from, &self.to, progress)
             .unwrap_or_else(|| near.as_str().into())
     }
 
@@ -507,7 +532,7 @@ fn retarget(
     (id, pseudo): (usize, &str),
 ) -> (Vec<Transition>, Events) {
     let mut runs = Vec::new();
-    let mut properties: Vec<(Prop, f64, f64, String, bool)> = Vec::new();
+    let mut properties: Vec<(Prop, f64, f64, Easing, bool)> = Vec::new();
     for (name, duration, delay, timing, discrete) in transitions(new) {
         let names: Vec<Prop> = match name.as_str() {
             "none" => continue,
@@ -568,11 +593,11 @@ fn retarget(
                 None => continue,
             },
         };
-        if from == after
-            || !discrete
-                && (matches!(property, Prop::DISPLAY | Prop::OVERLAY)
-                    || interpolate(property.name(), &from, after, 0.5).is_none())
-        {
+        if from == after {
+            continue;
+        }
+        let lerp = lerp(property.name(), &from, after);
+        if !discrete && (matches!(property, Prop::DISPLAY | Prop::OVERLAY) || lerp.is_none()) {
             continue;
         }
         *serial += 1;
@@ -590,6 +615,7 @@ fn retarget(
             delay,
             duration: duration.max(0.) * factor,
             timing,
+            lerp,
             reverse,
             shortening: factor,
             started: false,
@@ -690,7 +716,7 @@ fn after(now: Instant, seconds: f64) -> Option<Instant> {
 
 pub(crate) struct Scripted {
     id: u32,
-    rules: Vec<(f64, Style, String)>,
+    rules: Vec<(f64, Style, Option<Easing>)>,
     effect: Animation,
     base: Option<(Rc<dyn std::any::Any>, super::Vars)>,
     playback: Playback,
@@ -699,7 +725,7 @@ pub(crate) struct Scripted {
 impl Scripted {
     pub fn new(
         id: u32,
-        keyframes: &[(f64, &str, String)],
+        keyframes: &[(f64, &str, &str)],
         [delay, end_delay, duration, iterations, iteration_start]: [f64; 5],
         [direction, fill, easing, composite]: [&str; 4],
         pseudo: u8,
@@ -709,7 +735,7 @@ impl Scripted {
             rules: keyframes
                 .iter()
                 .map(|(offset, source, easing)| {
-                    (*offset, super::declarations(source), easing.clone())
+                    (*offset, super::declarations(source), Easing::parse(easing))
                 })
                 .collect(),
             effect: Animation {
@@ -720,8 +746,8 @@ impl Scripted {
                 iterations,
                 direction: direction.into(),
                 fill: fill.into(),
-                timing: "linear".into(),
-                easing: easing.into(),
+                timing: Easing::Linear,
+                easing: Easing::parse(easing).unwrap_or(Easing::Linear),
                 end_delay,
                 iteration_start,
                 composite: composite.into(),
@@ -768,7 +794,7 @@ impl Scripted {
             .as_ref()
             .is_none_or(|(old, vars)| !Rc::ptr_eq(old, &owner) || !Rc::ptr_eq(vars, base.vars()))
         {
-            self.effect.tracks = tracks(base, &self.rules, registry);
+            self.effect.tracks = tracks(base, &self.rules, registry, false);
             self.base = Some((owner, base.vars().clone()));
         }
     }
@@ -787,6 +813,7 @@ pub(crate) struct Motion {
     pub wake: Option<(Instant, renderer::Timer)>,
     pub parked: Vec<usize>,
     scripted: HashMap<usize, Vec<Scripted>>,
+    script_nodes: FxHashMap<u32, usize>,
     serial: u32,
     queued: Events,
     pub pseudos: Vec<(usize, Rc<[Style; 2]>)>,
@@ -840,6 +867,14 @@ impl Motion {
                             .effect
                             .sample(local, paused, base, registry, &mut out);
                     }
+                }
+                for &prop in styles
+                    .important
+                    .get(&id)
+                    .into_iter()
+                    .flat_map(|props| props.iter())
+                {
+                    out.remove(prop);
                 }
                 for transition in self.transitions.get(&id).into_iter().flatten() {
                     if let Some(progress) = transition.progress(at) {
@@ -984,38 +1019,50 @@ impl Motion {
         if !self.transitions.is_empty() {
             self.transitions.remove(&id);
         }
-        if !self.scripted.is_empty() {
-            self.scripted.remove(&id);
+        if !self.scripted.is_empty()
+            && let Some(list) = self.scripted.remove(&id)
+        {
+            for animation in list {
+                self.script_nodes.remove(&animation.id);
+            }
         }
         if !self.backdrop.is_empty() {
             self.backdrop.remove(&id);
         }
     }
 
-    pub fn script(&mut self, node: usize, mut animation: Scripted, time: f64, rate: Option<f64>) {
+    pub fn script(
+        &mut self,
+        node: usize,
+        mut animation: Scripted,
+        time: f64,
+        rate: Option<f64>,
+        keep: Option<Scripted>,
+    ) {
         animation.playback = Playback {
             time,
             since: Instant::now(),
             rate: rate.filter(|rate| rate.is_finite()).unwrap_or(0.),
         };
+        if let Some(old) = keep {
+            (animation.rules, animation.base, animation.effect.tracks) =
+                (old.rules, old.base, old.effect.tracks);
+        }
         self.unscript(animation.id);
+        self.script_nodes.insert(animation.id, node);
         let list = self.scripted.entry(node).or_default();
         let index = list.partition_point(|other| other.id < animation.id);
         list.insert(index, animation);
     }
 
-    pub fn unscript(&mut self, id: u32) -> Option<usize> {
-        let node = self.scripted.iter().find_map(|(&node, list)| {
-            list.iter()
-                .any(|animation| animation.id == id)
-                .then_some(node)
-        })?;
+    pub fn unscript(&mut self, id: u32) -> Option<(usize, Scripted)> {
+        let node = self.script_nodes.remove(&id)?;
         let list = self.scripted.get_mut(&node)?;
-        list.retain(|animation| animation.id != id);
+        let animation = list.remove(list.iter().position(|animation| animation.id == id)?);
         if list.is_empty() {
             self.scripted.remove(&node);
         }
-        Some(node)
+        Some((node, animation))
     }
 
     pub fn css(
@@ -1049,7 +1096,7 @@ impl Motion {
                     ],
                     "normal",
                     "backwards",
-                    transition.timing,
+                    transition.timing.to_string(),
                     [
                         [0., name, transition.from, "linear"],
                         [1., name, transition.to, "linear"]
@@ -1072,16 +1119,12 @@ impl Motion {
                     .tracks
                     .iter()
                     .flat_map(|(prop, keys)| {
-                        keys.iter().map(move |(offset, value, timing)| {
+                        keys.iter().map(move |(offset, value, timing, _)| {
                             serde_json::json!([
                                 offset,
                                 prop.name(),
                                 value,
-                                if timing.is_empty() {
-                                    &effect.timing
-                                } else {
-                                    timing
-                                }
+                                timing.as_ref().unwrap_or(&effect.timing).to_string()
                             ])
                         })
                     })
@@ -1227,12 +1270,19 @@ impl Motion {
         style
     }
 
-    pub fn scripted(&mut self, node: usize, pseudo: u8, styles: &ComputedStyles) -> Option<Style> {
+    pub fn scripted(
+        &mut self,
+        node: usize,
+        pseudo: u8,
+        styles: &ComputedStyles,
+        upto: u32,
+    ) -> Option<Style> {
         let now = Instant::now();
         let list = self.scripted.get_mut(&node)?;
         let mut out = Style::new();
         for animation in list
             .iter_mut()
+            .take_while(|animation| animation.id <= upto)
             .filter(|animation| animation.effect.pseudo == pseudo)
         {
             let Some((owner, base)) = animation.base(node, styles) else {
@@ -1243,6 +1293,15 @@ impl Motion {
             animation
                 .effect
                 .sample(local, paused, &base, &styles.registry, &mut out);
+        }
+        for &prop in styles
+            .important
+            .get(&node)
+            .filter(|_| pseudo == 0)
+            .into_iter()
+            .flat_map(|props| props.iter())
+        {
+            out.remove(prop);
         }
         (!out.is_empty()).then_some(out)
     }
@@ -1326,7 +1385,7 @@ impl Motion {
             if Rc::ptr_eq(&self.previous[id], new) {
                 continue;
             }
-            if (new.contains(Prop::TRANSITION) || new.contains(Prop::TRANSITION_PROPERTY))
+            if TRANSITIONS.iter().any(|&prop| new.contains(prop))
                 && new.get(Prop::DISPLAY) == Some("none")
             {
                 exits.push(id);
@@ -1367,7 +1426,7 @@ impl Motion {
             if old.is_empty()
                 || !shown && !hiding(&painted, id, new)
                 || !exiting && old.get(Prop::DISPLAY).is_some_and(|value| value == "none")
-                || !new.contains(Prop::TRANSITION) && !new.contains(Prop::TRANSITION_PROPERTY)
+                || !TRANSITIONS.iter().any(|&prop| new.contains(prop))
             {
                 cancel(&[], events);
                 continue;
@@ -1575,7 +1634,7 @@ impl Motion {
                     id,
                     effect.tracks.iter().all(|(key, _)| PAINT.contains(key)),
                     effect.tracks.iter().all(|(key, frames)| {
-                        keeps_box_in_place(*key, frames.iter().map(|(_, value, _)| value.as_str()))
+                        keeps_box_in_place(*key, frames.iter().map(|(_, value, ..)| value.as_str()))
                     }),
                     if effect.tracks.is_empty() {
                         end
@@ -1618,11 +1677,19 @@ impl Motion {
                     id,
                     tracks.iter().all(|(key, _)| PAINT.contains(key)),
                     tracks.iter().all(|(key, frames)| {
-                        keeps_box_in_place(*key, frames.iter().map(|(_, value, _)| value.as_str()))
+                        keeps_box_in_place(*key, frames.iter().map(|(_, value, ..)| value.as_str()))
                     }),
                     change,
                     f64::INFINITY,
                 ));
+            }
+        }
+        // Important declarations override animations, but not transitions.
+        for (id, props) in &styles.important {
+            if let Some(out) = animated.get_mut(id) {
+                for &prop in props.iter() {
+                    out.remove(prop);
+                }
             }
         }
         for (&id, list) in &mut self.transitions {
@@ -2001,7 +2068,7 @@ fn computed<'a>(style: &'a Style, prop: Prop, registry: &'a Registry) -> Option<
     })
 }
 
-fn transitions(style: &Style) -> Vec<(String, f64, f64, String, bool)> {
+fn transitions(style: &Style) -> Vec<(String, f64, f64, Easing, bool)> {
     const DEFAULT: [&str; 5] = ["all", "0s", "0s", "ease", "normal"];
     let shorthand: Vec<[&str; 5]> = style
         .get(Prop::TRANSITION)
@@ -2034,7 +2101,9 @@ fn transitions(style: &Style) -> Vec<(String, f64, f64, String, bool)> {
         Prop::TRANSITION_BEHAVIOR,
     ]
     .map(|prop| style.get(prop).map(|value| components(value, ',')));
-    (0..longhands[0].as_ref().map_or(shorthand.len(), Vec::len))
+    (0..longhands[0]
+        .as_ref()
+        .map_or(shorthand.len().max(1), Vec::len))
         .filter_map(|index| {
             let mut parts = shorthand
                 .get(index % shorthand.len().max(1))
@@ -2049,20 +2118,14 @@ fn transitions(style: &Style) -> Vec<(String, f64, f64, String, bool)> {
                 parts[0].to_owned(),
                 time(parts[1])?,
                 time(parts[2])?,
-                parts[3].to_owned(),
+                Easing::parse(parts[3])?,
                 parts[4] == "allow-discrete",
             ))
         })
         .collect()
 }
 
-fn interpolate(property: &str, from: &str, to: &str, t: f64) -> Option<Rc<str>> {
-    if from == to || t == 0. {
-        return Some(from.into());
-    }
-    if t == 1. {
-        return Some(to.into());
-    }
+fn lerp(property: &str, from: &str, to: &str) -> Option<Rc<Lerp>> {
     if matches!(property, "opacity" | "scale") && (from.contains('%') || to.contains('%')) {
         let number = |value: &str| {
             value
@@ -2077,14 +2140,14 @@ fn interpolate(property: &str, from: &str, to: &str, t: f64) -> Option<Rc<str>> 
         };
         let (from, to) = (number(from), number(to));
         if !from.contains('%') && !to.contains('%') {
-            return interpolate(property, &from, &to, t);
+            return lerp(property, &from, &to);
         }
     }
     thread_local! {
-        static LERPS: std::cell::RefCell<(Lerps, String)> = Default::default();
+        static LERPS: std::cell::RefCell<Lerps> = Default::default();
     }
     let key = std::hash::BuildHasher::hash_one(&rustc_hash::FxBuildHasher, (property, from, to));
-    LERPS.with_borrow_mut(|(lerps, text)| {
+    LERPS.with_borrow_mut(|lerps| {
         if !lerps
             .get(&key)
             .is_some_and(|(p, a, b, _)| p == property && a == from && b == to)
@@ -2092,18 +2155,34 @@ fn interpolate(property: &str, from: &str, to: &str, t: f64) -> Option<Rc<str>> 
             if lerps.len() >= 1024 {
                 lerps.clear();
             }
-            let lerp = Lerp::new(property, from, to);
+            let lerp = Lerp::new(property, from, to).map(Rc::new);
             lerps.insert(key, (property.into(), from.into(), to.into(), lerp));
         }
-        let lerp = lerps[&key].3.as_ref()?;
+        lerps[&key].3.clone()
+    })
+}
+
+fn interpolate(lerp: Option<&Lerp>, from: &str, to: &str, t: f64) -> Option<Rc<str>> {
+    if from == to || t == 0. {
+        return Some(from.into());
+    }
+    if t == 1. {
+        return Some(to.into());
+    }
+    thread_local! {
+        static TEXT: std::cell::RefCell<String> = Default::default();
+    }
+    let lerp = lerp?;
+    TEXT.with_borrow_mut(|text| {
         text.clear();
         lerp.write(t, text);
         Some(Rc::from(&**text))
     })
 }
 
-type Lerps = rustc_hash::FxHashMap<u64, (String, String, String, Option<Lerp>)>;
+type Lerps = rustc_hash::FxHashMap<u64, (String, String, String, Option<Rc<Lerp>>)>;
 
+#[derive(Debug)]
 enum Lerp {
     Same(String),
     Between(String, String, String),
@@ -2276,6 +2355,24 @@ impl Lerp {
     fn new(property: &str, from: &str, to: &str) -> Option<Self> {
         if from == to {
             return Some(Self::Same(from.to_owned()));
+        }
+        let keyword = |value| match (property, value) {
+            ("font-weight", "normal") => "400",
+            ("font-weight", "bold") => "700",
+            ("letter-spacing" | "word-spacing", "normal") => "0px",
+            (_, "thin" | "medium" | "thick")
+                if property.ends_with("-width") && property != "border-image-width" =>
+            {
+                match value {
+                    "thin" => "1px",
+                    "medium" => "3px",
+                    _ => "5px",
+                }
+            }
+            _ => value,
+        };
+        if keyword(from) != from || keyword(to) != to {
+            return Self::new(property, keyword(from), keyword(to));
         }
         let shown = match property {
             "visibility" if from == "visible" || to == "visible" => Some("visible"),
@@ -2452,6 +2549,60 @@ impl Lerp {
                 .collect::<Option<Vec<_>>>()
                 .map(|list| Self::List(list, ", "));
         }
+        if matches!(property, "filter" | "backdrop-filter") {
+            let [a, b] = [from, to].map(|list| {
+                if list == "none" {
+                    Vec::new()
+                } else {
+                    components(list, ' ')
+                }
+            });
+            if a.len() != b.len() {
+                let (short, long) = if a.len() < b.len() {
+                    (&a, &b)
+                } else {
+                    (&b, &a)
+                };
+                if short
+                    .iter()
+                    .zip(long)
+                    .any(|(x, y)| x.split_once('(').map(|p| p.0) != y.split_once('(').map(|p| p.0))
+                {
+                    return None;
+                }
+                let mut padded = short.join(" ");
+                for part in &long[short.len()..] {
+                    let (name, args) = part.strip_suffix(')')?.split_once('(')?;
+                    let one = matches!(name, "brightness" | "contrast" | "opacity" | "saturate");
+                    if name == "url" || args.is_empty() {
+                        return None;
+                    }
+                    let args = components(args, ' ')
+                        .into_iter()
+                        .map(|arg| {
+                            let unit = arg.trim_start_matches(|c: char| {
+                                c.is_ascii_digit() || ".+-".contains(c)
+                            });
+                            match unit {
+                                _ if unit.len() == arg.len() => "transparent".to_owned(),
+                                "%" => format!("{}%", if one { 100 } else { 0 }),
+                                _ => format!("{}{unit}", u8::from(one && unit.is_empty())),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !padded.is_empty() {
+                        padded.push(' ');
+                    }
+                    padded.push_str(&format!("{name}({args})"));
+                }
+                return if a.len() < b.len() {
+                    Self::new(property, &padded, to)
+                } else {
+                    Self::new(property, from, &padded)
+                };
+            }
+        }
         if from == "none" || to == "none" {
             let other = if from == "none" { to } else { from };
             let identity = match property {
@@ -2523,7 +2674,27 @@ impl Lerp {
         if let (Some((name, a)), Some((other, b))) = (function(from), function(to))
             && name == other
         {
-            return Self::new(property, a, b)
+            let sides = |args: &str| {
+                let (box_, round) = args.split_once(" round ").unwrap_or((args, ""));
+                let sides = components(box_, ' ');
+                if !(1..=4).contains(&sides.len()) {
+                    return args.to_owned();
+                }
+                let order = [[0, 0, 0, 0], [0, 1, 0, 1], [0, 1, 2, 1], [0, 1, 2, 3]];
+                let mut out = order[sides.len() - 1].map(|index| sides[index]).join(" ");
+                if !round.is_empty() {
+                    out.push_str(" round ");
+                    out.push_str(round);
+                }
+                out
+            };
+            let [a, b] = if name == "inset" && components(a, ' ').len() != components(b, ' ').len()
+            {
+                [sides(a), sides(b)].map(Cow::Owned)
+            } else {
+                [a, b].map(Cow::Borrowed)
+            };
+            return Self::new(property, &a, &b)
                 .map(|args| Self::Function(name.into(), Box::new(args)));
         }
         fn number(value: &str) -> Option<(f64, &str)> {
@@ -2564,7 +2735,7 @@ impl Lerp {
         use std::fmt::Write;
         let round = |value: f64, integer: bool, out: &mut String| {
             if integer {
-                let _ = write!(out, "{}", value.round());
+                let _ = write!(out, "{}", (value + 0.5).floor());
             } else {
                 super::value::write_number(value, out);
             }
@@ -2718,174 +2889,218 @@ fn time(value: &str) -> Option<f64> {
         .map(|value| value * scale)
 }
 
-fn linear_points(value: &str) -> Option<Rc<[(f64, f64)]>> {
-    type Points = HashMap<String, Option<Rc<[(f64, f64)]>>>;
-    thread_local! {
-        static POINTS: std::cell::RefCell<Points> = Default::default();
-    }
-    if let Some(points) = POINTS.with_borrow(|cache| cache.get(value).cloned()) {
-        return points;
-    }
-    let mut stops: Vec<(Option<f64>, f64)> = Vec::new();
-    for part in components(
-        value.trim_start_matches("linear(").trim_end_matches(')'),
-        ',',
-    ) {
-        let mut items = components(part, ' ').into_iter();
-        let Some(output) = items.next().and_then(|value| value.parse::<f64>().ok()) else {
-            continue;
-        };
-        let inputs: Vec<f64> = items
-            .filter_map(|value| value.strip_suffix('%')?.parse::<f64>().ok())
-            .map(|value| value / 100.)
-            .collect();
-        if inputs.is_empty() {
-            stops.push((None, output));
-        }
-        stops.extend(
-            inputs
-                .into_iter()
-                .take(2)
-                .map(|input| (Some(input), output)),
-        );
-    }
-    let points = (stops.len() >= 2).then(|| {
-        stops[0].0.get_or_insert(0.);
-        let last = stops.len() - 1;
-        let mut largest = f64::MIN;
-        for (index, (input, _)) in stops.iter_mut().enumerate() {
-            if index == last && input.is_none() {
-                *input = Some(largest.max(1.));
-            }
-            if let Some(input) = input {
-                *input = input.max(largest);
-                largest = *input;
-            }
-        }
-        let mut index = 1;
-        while index < stops.len() {
-            if stops[index].0.is_some() {
-                index += 1;
-                continue;
-            }
-            let end = (index..stops.len())
-                .find(|&end| stops[end].0.is_some())
-                .unwrap_or(last);
-            let [from, to] = [stops[index - 1].0, stops[end].0].map(|input| input.unwrap_or(1.));
-            for (step, stop) in stops[index..end].iter_mut().enumerate() {
-                stop.0 = Some(from + (to - from) * (step + 1) as f64 / (end - index + 1) as f64);
-            }
-            index = end;
-        }
-        stops
-            .into_iter()
-            .map(|(input, output)| (input.unwrap_or(1.), output))
-            .collect::<Rc<[_]>>()
-    });
-    POINTS.with_borrow_mut(|cache| {
-        if cache.len() >= 64 {
-            cache.clear();
-        }
-        cache.insert(value.to_owned(), points.clone());
-    });
-    points
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Easing {
+    Linear,
+    Bezier(Box<[f64; 4]>),
+    // The position is 0 for end, 1 for start, 2 for both and 3 for none.
+    Steps(u32, u8),
+    Points(Rc<[(f64, f64)]>),
 }
 
-pub(crate) fn easing(value: &str, progress: f64) -> f64 {
-    let curve = match value {
-        "linear" => return progress,
-        _ if value.starts_with("linear(") => {
-            let Some(points) = linear_points(value) else {
-                return progress;
-            };
-            let index = points
-                .iter()
-                .rposition(|point| point.0 <= progress)
-                .unwrap_or(0)
-                .min(points.len() - 2);
-            let ((x0, y0), (x1, y1)) = (points[index], points[index + 1]);
-            return if x1 > x0 {
-                y0 + (y1 - y0) * (progress - x0) / (x1 - x0)
-            } else {
-                y1
-            };
+const EASES: [(&str, [f64; 4]); 4] = [
+    ("ease", [0.25, 0.1, 0.25, 1.]),
+    ("ease-in", [0.42, 0., 1., 1.]),
+    ("ease-out", [0., 0., 0.58, 1.]),
+    ("ease-in-out", [0.42, 0., 0.58, 1.]),
+];
+
+impl Easing {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let number = |value: &str| value.parse::<f64>().ok().filter(|value| value.is_finite());
+        match value {
+            "linear" => return Some(Self::Linear),
+            "step-start" => return Some(Self::Steps(1, 1)),
+            "step-end" => return Some(Self::Steps(1, 0)),
+            _ => {}
         }
-        "step-start" => return 1.,
-        "step-end" => return if progress == 1. { 1. } else { 0. },
-        "ease-in" => [0.42, 0., 1., 1.],
-        "ease-out" => [0., 0., 0.58, 1.],
-        "ease-in-out" => [0.42, 0., 0.58, 1.],
-        _ if value.starts_with("steps(") => {
-            let parts = components(
-                value.trim_start_matches("steps(").trim_end_matches(')'),
-                ',',
-            );
-            let count = parts
-                .first()
-                .and_then(|value| value.parse::<f64>().ok())
-                .unwrap_or(1.)
-                .max(1.);
-            let position = parts.get(1).copied().unwrap_or("end");
-            let start = matches!(position, "start" | "jump-start" | "jump-both");
-            let jumps = count
-                + if position == "jump-both" {
-                    1.
-                } else if position == "jump-none" {
-                    -1.
-                } else {
-                    0.
+        if let Some((_, curve)) = EASES.iter().find(|(name, _)| *name == value) {
+            return Some(Self::Bezier(Box::new(*curve)));
+        }
+        let (name, args) = value.strip_suffix(')')?.split_once('(')?;
+        let args = components(args, ',');
+        match name {
+            "cubic-bezier" => {
+                let curve: [f64; 4] = args
+                    .into_iter()
+                    .map(number)
+                    .collect::<Option<Vec<_>>>()?
+                    .try_into()
+                    .ok()?;
+                ((0. ..=1.).contains(&curve[0]) && (0. ..=1.).contains(&curve[2]))
+                    .then(|| Self::Bezier(Box::new(curve)))
+            }
+            "steps" => {
+                let position = match args.get(1).copied() {
+                    None | Some("end" | "jump-end") => 0,
+                    Some("start" | "jump-start") => 1,
+                    Some("jump-both") => 2,
+                    Some("jump-none") => 3,
+                    _ => return None,
                 };
-            return ((progress * count).floor() + f64::from(start)).min(jumps) / jumps.max(1.);
+                let count = args.first()?.parse::<u32>().ok()?;
+                (args.len() <= 2 && count > u32::from(position == 3))
+                    .then_some(Self::Steps(count, position))
+            }
+            "linear" => {
+                let mut stops: Vec<(Option<f64>, f64)> = Vec::new();
+                for part in args {
+                    let (mut output, mut inputs) = (None, Vec::new());
+                    for item in components(part, ' ') {
+                        match item.strip_suffix('%') {
+                            Some(input) if inputs.len() < 2 => inputs.push(number(input)? / 100.),
+                            None if output.is_none() => output = Some(number(item)?),
+                            _ => return None,
+                        }
+                    }
+                    let output = output?;
+                    if inputs.is_empty() {
+                        stops.push((None, output));
+                    }
+                    stops.extend(inputs.into_iter().map(|input| (Some(input), output)));
+                }
+                if stops.len() < 2 {
+                    return None;
+                }
+                stops[0].0.get_or_insert(0.);
+                let last = stops.len() - 1;
+                let mut largest = f64::MIN;
+                for (index, (input, _)) in stops.iter_mut().enumerate() {
+                    if index == last && input.is_none() {
+                        *input = Some(largest.max(1.));
+                    }
+                    if let Some(input) = input {
+                        *input = input.max(largest);
+                        largest = *input;
+                    }
+                }
+                let mut index = 1;
+                while index < stops.len() {
+                    if stops[index].0.is_some() {
+                        index += 1;
+                        continue;
+                    }
+                    let end = (index..stops.len())
+                        .find(|&end| stops[end].0.is_some())
+                        .unwrap_or(last);
+                    let [from, to] =
+                        [stops[index - 1].0, stops[end].0].map(|input| input.unwrap_or(1.));
+                    for (step, stop) in stops[index..end].iter_mut().enumerate() {
+                        stop.0 =
+                            Some(from + (to - from) * (step + 1) as f64 / (end - index + 1) as f64);
+                    }
+                    index = end;
+                }
+                Some(Self::Points(
+                    stops
+                        .into_iter()
+                        .map(|(input, output)| (input.unwrap_or(1.), output))
+                        .collect(),
+                ))
+            }
+            _ => None,
         }
-        _ if value.starts_with("cubic-bezier(") => {
-            let parts: Vec<f64> = components(
-                value
-                    .trim_start_matches("cubic-bezier(")
-                    .trim_end_matches(')'),
-                ',',
-            )
-            .into_iter()
-            .filter_map(|value| value.parse().ok())
-            .collect();
-            parts.try_into().unwrap_or([0.25, 0.1, 0.25, 1.])
-        }
-        _ => [0.25, 0.1, 0.25, 1.],
-    };
-    if progress == 0. || progress == 1. {
-        return progress;
     }
-    let bezier = |t: f64, a: f64, b: f64| {
-        3. * (1. - t) * (1. - t) * t * a + 3. * (1. - t) * t * t * b + t * t * t
-    };
-    let mut t = progress;
-    for _ in 0..8 {
-        let x = bezier(t, curve[0], curve[2]) - progress;
-        if x.abs() < 1e-7 {
-            return bezier(t, curve[1], curve[3]);
+
+    pub(crate) fn at(&self, progress: f64, before: bool) -> f64 {
+        let curve = match self {
+            Self::Linear => return progress,
+            Self::Points(points) => {
+                let index = points
+                    .iter()
+                    .rposition(|point| point.0 <= progress)
+                    .unwrap_or(0)
+                    .min(points.len() - 2);
+                let ((x0, y0), (x1, y1)) = (points[index], points[index + 1]);
+                return if x1 > x0 {
+                    y0 + (y1 - y0) * (progress - x0) / (x1 - x0)
+                } else {
+                    y1
+                };
+            }
+            Self::Steps(count, position) => {
+                let count = f64::from(*count);
+                let jumps = count + [0., 0., 1., -1.][usize::from(*position)];
+                let mut step =
+                    (progress * count).floor() + f64::from(u8::from(matches!(position, 1 | 2)));
+                if before && (progress * count).fract() == 0. {
+                    step -= 1.;
+                }
+                if progress >= 0. && step < 0. {
+                    step = 0.;
+                }
+                if progress <= 1. && step > jumps {
+                    step = jumps;
+                }
+                return step / jumps;
+            }
+            Self::Bezier(curve) => curve,
+        };
+        if progress == 0. || progress == 1. {
+            return progress;
         }
-        let slope = 3. * (1. - t) * (1. - t) * curve[0]
-            + 6. * (1. - t) * t * (curve[2] - curve[0])
-            + 3. * t * t * (1. - curve[2]);
-        if slope.abs() < 1e-6 {
-            break;
+        let bezier = |t: f64, a: f64, b: f64| {
+            3. * (1. - t) * (1. - t) * t * a + 3. * (1. - t) * t * t * b + t * t * t
+        };
+        let mut t = progress;
+        for _ in 0..8 {
+            let x = bezier(t, curve[0], curve[2]) - progress;
+            if x.abs() < 1e-7 {
+                return bezier(t, curve[1], curve[3]);
+            }
+            let slope = 3. * (1. - t) * (1. - t) * curve[0]
+                + 6. * (1. - t) * t * (curve[2] - curve[0])
+                + 3. * t * t * (1. - curve[2]);
+            if slope.abs() < 1e-6 {
+                break;
+            }
+            t -= x / slope;
         }
-        t -= x / slope;
+        let (mut low, mut high) = (0., 1.);
+        t = progress;
+        for _ in 0..40 {
+            let x = bezier(t, curve[0], curve[2]);
+            if (x - progress).abs() < 1e-7 {
+                break;
+            }
+            if x < progress {
+                low = t;
+            } else {
+                high = t;
+            }
+            t = (low + high) / 2.;
+        }
+        bezier(t, curve[1], curve[3])
     }
-    let (mut low, mut high) = (0., 1.);
-    t = progress;
-    for _ in 0..40 {
-        let x = bezier(t, curve[0], curve[2]);
-        if (x - progress).abs() < 1e-7 {
-            break;
+}
+
+impl std::fmt::Display for Easing {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::Linear => f.write_str("linear"),
+            Self::Bezier(curve) => match EASES.iter().find(|(_, other)| other == &**curve) {
+                Some((name, _)) => f.write_str(name),
+                None => write!(
+                    f,
+                    "cubic-bezier({}, {}, {}, {})",
+                    curve[0], curve[1], curve[2], curve[3]
+                ),
+            },
+            Self::Steps(count, position) => write!(
+                f,
+                "steps({count}{})",
+                ["", ", start", ", jump-both", ", jump-none"][usize::from(*position)]
+            ),
+            Self::Points(points) => {
+                f.write_str("linear(")?;
+                for (index, (input, output)) in points.iter().enumerate() {
+                    let comma = if index > 0 { ", " } else { "" };
+                    write!(f, "{comma}{output} {}%", input * 100.)?;
+                }
+                f.write_str(")")
+            }
         }
-        if x < progress {
-            low = t;
-        } else {
-            high = t;
-        }
-        t = (low + high) / 2.;
     }
-    bezier(t, curve[1], curve[3])
 }
 
 #[cfg(test)]
@@ -2893,6 +3108,10 @@ mod tests {
     use super::*;
     use crate::dom::Document;
     use std::time::Duration;
+
+    fn easing(value: &str, progress: f64) -> f64 {
+        Easing::parse(value).unwrap().at(progress, false)
+    }
 
     fn computed_styles(doc: &Document) -> ComputedStyles {
         super::super::compute_styles(
@@ -2979,7 +3198,7 @@ mod tests {
     #[test]
     fn values_interpolate_by_type() {
         let mix = |property: &str, from: &str, to: &str, t: f64| {
-            interpolate(property, from, to, t).map(|value| value.to_string())
+            interpolate(lerp(property, from, to).as_deref(), from, to, t).map(|v| v.to_string())
         };
         assert_eq!(mix("color", "red", "blue", 0.5).unwrap(), "#800080ff");
         assert_eq!(
@@ -3620,7 +3839,7 @@ mod tests {
         assert_eq!(easing("linear(0, 1 50%, 0.2 30%)", 0.5), 0.2);
         assert!((easing("linear(0, 1)", 1.5) - 1.5).abs() < 1e-9);
         assert!((easing("linear(0, 1.2 60%, 1)", 0.6) - 1.2).abs() < 1e-9);
-        assert_eq!(easing("linear(1)", 0.4), 0.4);
+        assert!(Easing::parse("linear(1)").is_none());
     }
 
     #[test]
@@ -3637,16 +3856,13 @@ mod tests {
             out.get(Prop::OPACITY)
                 .map(|value| (value.parse::<f64>().unwrap() * 1e4).round() / 1e4)
         };
-        let new = |frames: &[(f64, &str, String)], timing, direction, fill, easing| {
+        let new = |frames: &[(f64, &str, &str)], timing, direction, fill, easing| {
             let mut animation =
                 Scripted::new(1, frames, timing, [direction, fill, easing, "replace"], 0);
             animation.resolve(base.clone(), &base, &Default::default());
             animation
         };
-        let frames = [
-            (0., "opacity:0", "linear".into()),
-            (1., "opacity:1", "linear".into()),
-        ];
+        let frames = [(0., "opacity:0", "linear"), (1., "opacity:1", "linear")];
         let alternate = new(
             &frames,
             [0., 0., 1., 3., 0.5],
@@ -3669,7 +3885,7 @@ mod tests {
         );
         assert_eq!(opacity(&spring, 0.6), Some(1.2));
         let single = new(
-            &[(1., "opacity:1", "linear".into())],
+            &[(1., "opacity:1", "linear")],
             [0., 0., 1., 1., 0.],
             "normal",
             "none",
@@ -3682,6 +3898,7 @@ mod tests {
             new(&frames, [0., 0., 10., 1., 0.], "normal", "none", "linear"),
             2.,
             Some(1.),
+            None,
         );
         let visible = vec![true; doc.nodes.len()];
         let (animated, next) = motion.update(
@@ -3705,6 +3922,7 @@ mod tests {
             new(&frames, [0., 0., 10., 1., 0.], "normal", "none", "linear"),
             5.,
             None,
+            None,
         );
         let (animated, next) = motion.update(
             &doc,
@@ -3719,8 +3937,8 @@ mod tests {
             (animated[0].1.get(Prop::OPACITY), next),
             (Some("0.5"), None)
         );
-        assert_eq!(motion.unscript(1), Some(id));
-        assert!(motion.scripted(id, 0, &styles).is_none());
+        assert_eq!(motion.unscript(1).map(|(node, _)| node), Some(id));
+        assert!(motion.scripted(id, 0, &styles, u32::MAX).is_none());
     }
 
     #[test]
@@ -3841,7 +4059,28 @@ mod tests {
         assert_eq!(easing("steps(2, jump-end)", 0.49), 0.);
         assert_eq!(easing("steps(2, jump-end)", 0.5), 0.5);
         assert_eq!(easing("steps(2, jump-start)", 0.), 0.5);
-        assert!(easing("steps()", 0.5).is_finite());
+        for invalid in [
+            "steps()",
+            "steps(0)",
+            "steps(2.5)",
+            "steps(1, jump-none)",
+            "cubic-bezier(1.5, 0, 0, 1)",
+            "cubic-bezier(0, 0, 1)",
+            "linear(0)",
+        ] {
+            assert!(Easing::parse(invalid).is_none(), "{invalid}");
+        }
+        for name in [
+            "ease-in",
+            "steps(3, jump-both)",
+            "cubic-bezier(0.1, 2, 0.3, -1)",
+        ] {
+            assert_eq!(Easing::parse(name).unwrap().to_string(), name);
+        }
+        assert_eq!(
+            easing("linear(0, 0.5 25%, 1)", 0.5),
+            easing("linear(0 0%, 0.5 25%, 1 100%)", 0.5)
+        );
         let frames = HashMap::from([("pulse".into(), Vec::new())]);
         assert!(
             Animation::parse(
@@ -3874,8 +4113,8 @@ mod tests {
                 (Prop::new("transition-timing-function"), "linear".into())
             ])),
             vec![
-                ("opacity".into(), 0.2, 1., "linear".into(), false),
-                ("all".into(), 0.3, 0., "linear".into(), true)
+                ("opacity".into(), 0.2, 1., Easing::Linear, false),
+                ("all".into(), 0.3, 0., Easing::Linear, true)
             ]
         );
     }
@@ -4309,8 +4548,8 @@ mod tests {
             Scripted::new(
                 1,
                 &[
-                    (0., "display:block;opacity:0", "linear".into()),
-                    (1., "display:block;opacity:1", "linear".into()),
+                    (0., "display:block;opacity:0", "linear"),
+                    (1., "display:block;opacity:1", "linear"),
                 ],
                 [0., 0., 1., 1., 0.],
                 ["normal", "none", "linear", "replace"],
@@ -4318,6 +4557,7 @@ mod tests {
             ),
             0.,
             Some(1.),
+            None,
         );
         let start = Instant::now();
         let mut update = |seconds: f64| {
@@ -4483,5 +4723,84 @@ mod tests {
         let (changed, shown, animated, _, next) = step(&doc, 2.6);
         assert_eq!(animated[&b].get(Prop::DISPLAY), Some("none"));
         assert!(changed && !shown[b] && !shown[em] && next.is_none());
+    }
+
+    #[test]
+    fn transition_duration_alone_transitions_all_properties() {
+        let mut doc = Document::parse(
+            "<style>div{opacity:1;transition-duration:1s;transition-timing-function:linear}div.on{opacity:0}p{opacity:1;transition-delay:-0.5s;transition-duration:1s;transition-timing-function:linear}p.on{opacity:0}</style><div></div><p></p>",
+        );
+        let [div, p] = ["div", "p"].map(|tag| node(&doc, tag));
+        let start = Instant::now();
+        let at = |seconds: f64| start + Duration::from_secs_f64(seconds);
+        let mut motion = Motion::default();
+        step(&mut motion, &doc, &computed_styles(&doc), at(0.));
+        for id in [div, p] {
+            doc.nodes[id].attrs.insert("class".into(), "on".into());
+        }
+        let styles = computed_styles(&doc);
+        step(&mut motion, &doc, &styles, at(0.));
+        let (animated, ..) = step(&mut motion, &doc, &styles, at(0.25));
+        assert_eq!(animated[&div].0.get(Prop::OPACITY), Some("0.75"));
+        assert_eq!(animated[&p].0.get(Prop::OPACITY), Some("0.25"));
+        assert!(motion.transitions[&div][0].lerp.is_some());
+    }
+
+    #[test]
+    fn keyframes_interpolate_filters_keywords_shapes_and_steps() {
+        let doc = Document::parse(
+            "<style>@keyframes k{from{filter:none;backdrop-filter:blur(2px);font-weight:normal;border-top-width:0px;letter-spacing:normal;clip-path:inset(0px);z-index:-1}to{filter:blur(4px) brightness(50%);backdrop-filter:blur(4px) brightness(2);font-weight:bold;border-top-width:thick;letter-spacing:4px;clip-path:inset(10px 20px);z-index:-4}}div{border-top-style:solid;animation:k 1s linear -0.5s paused}</style><div></div>",
+        );
+        let styles = computed_styles(&doc);
+        let div = node(&doc, "div");
+        assert!(
+            styles.animations[&div][0]
+                .tracks
+                .iter()
+                .all(|(_, frames)| frames[0].3.is_some())
+        );
+        let (animated, ..) = step(&mut Motion::default(), &doc, &styles, Instant::now());
+        let style = &animated[&div].0;
+        assert_eq!(
+            [
+                "filter",
+                "backdrop-filter",
+                "font-weight",
+                "border-top-width",
+                "letter-spacing",
+                "clip-path",
+                "z-index"
+            ]
+            .map(|name| style.get(Prop::new(name))),
+            [
+                Some("blur(2px) brightness(75%)"),
+                Some("blur(3px) brightness(1.5)"),
+                Some("550"),
+                Some("2.5px"),
+                Some("2px"),
+                Some("inset(5px 10px 5px 10px)"),
+                Some("-2")
+            ]
+        );
+        let base = styles.values[div].clone();
+        let mut animation = Scripted::new(
+            1,
+            &[(0., "opacity:0", "linear"), (1., "opacity:1", "linear")],
+            [1., 0., 1., 1., 0.],
+            ["normal", "both", "steps(2, jump-start)", "replace"],
+            0,
+        );
+        animation.resolve(base.clone(), &base, &Default::default());
+        let opacity = |local: f64| {
+            let mut out = Style::new();
+            animation
+                .effect
+                .sample(local, true, &base, &Default::default(), &mut out);
+            out.get(Prop::OPACITY).map(str::to_owned)
+        };
+        assert_eq!(
+            [0.5, 1., 1.6].map(opacity),
+            ["0", "0.5", "1"].map(|v| Some(v.into()))
+        );
     }
 }

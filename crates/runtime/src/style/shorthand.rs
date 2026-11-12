@@ -120,7 +120,7 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             )
         }
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left"
-        | "border-inline" | "border-block" | "outline" => {
+        | "border-inline" | "border-block" | "outline" | "column-rule" => {
             let sides: &[&str] = match key {
                 "border-top" => &["top"],
                 "border-right" => &["right"],
@@ -128,14 +128,14 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 "border-left" => &["left"],
                 "border-inline" => &["inline-start", "inline-end"],
                 "border-block" => &["top", "bottom"],
-                "outline" => &[""],
+                "outline" | "column-rule" => &[""],
                 _ => &SIDES,
             };
             let mut names = Vec::new();
             for side in sides {
                 for part in ["width", "style", "color"] {
                     names.push(if side.is_empty() {
-                        format!("outline-{part}")
+                        format!("{key}-{part}")
                     } else {
                         format!("border-{side}-{part}")
                     });
@@ -144,9 +144,18 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
             (names, 3)
         }
         "background" => (
-            ["color", "image", "position", "size", "repeat", "clip"]
-                .map(|part| format!("background-{part}"))
-                .into(),
+            [
+                "color",
+                "image",
+                "position",
+                "size",
+                "repeat",
+                "clip",
+                "origin",
+                "attachment",
+            ]
+            .map(|part| format!("background-{part}"))
+            .into(),
             4,
         ),
         "font" => (
@@ -158,6 +167,13 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 "font-size",
                 "line-height",
                 "font-family",
+                "font-variant-ligatures",
+                "font-variant-numeric",
+                "font-kerning",
+                "font-size-adjust",
+                "font-optical-sizing",
+                "font-feature-settings",
+                "font-variation-settings",
             ]
             .map(String::from)
             .into(),
@@ -202,6 +218,44 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 .map(String::from)
                 .into(),
             10,
+        ),
+        "columns" => (
+            ["column-width", "column-count"].map(String::from).into(),
+            11,
+        ),
+        "grid-row" | "grid-column" => ([format!("{key}-start"), format!("{key}-end")].into(), 12),
+        "grid-area" => (
+            [
+                "grid-row-start",
+                "grid-column-start",
+                "grid-row-end",
+                "grid-column-end",
+            ]
+            .map(String::from)
+            .into(),
+            12,
+        ),
+        "grid-template" | "grid" => {
+            let mut names: Vec<String> = [
+                "grid-template-rows",
+                "grid-template-columns",
+                "grid-template-areas",
+            ]
+            .map(String::from)
+            .into();
+            if key == "grid" {
+                names.extend(
+                    ["grid-auto-flow", "grid-auto-rows", "grid-auto-columns"].map(String::from),
+                );
+            }
+            (names, 13)
+        }
+        // `mask` stays as well, because SVG reads it.
+        "mask" | "-webkit-mask" => (
+            ["", "-image", "-position", "-size", "-repeat"]
+                .map(|part| format!("{key}{part}"))
+                .into(),
+            4,
         ),
         _ => return false,
     };
@@ -298,15 +352,16 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         }
         4 => {
             let layers = components(value, ',');
-            let mut result = vec![Vec::new(); 6];
+            let mut result = vec![Vec::new(); 8];
             let mut color = "transparent".to_owned();
             for (index, layer) in layers.iter().enumerate() {
-                let (mut image, mut position, mut size, mut repeat, mut boxes) = (
+                let (mut image, mut position, mut size, mut repeat, mut boxes, mut attachment) = (
                     "none".to_owned(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    "scroll",
                 );
                 let mut after_slash = false;
                 for part in components(layer, ' ') {
@@ -333,7 +388,7 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                     {
                         boxes.push(part);
                     } else if matches!(part, "scroll" | "fixed" | "local") {
-                        continue;
+                        attachment = part;
                     } else if after_slash
                         && (length(part) || matches!(part, "auto" | "cover" | "contain"))
                     {
@@ -360,13 +415,28 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                     repeat.into_iter().map(String::from).collect(),
                     "repeat",
                 ));
-                result[5].push(boxes.last().unwrap_or(&"border-box").to_string());
+                let (origin, clip) = match boxes.as_slice() {
+                    [] => ("padding-box", "border-box"),
+                    ["text"] => ("padding-box", "text"),
+                    [one] => (*one, *one),
+                    [origin, clip, ..] => (*origin, *clip),
+                };
+                result[5].push(clip.into());
+                result[6].push(origin.into());
+                result[7].push(attachment.into());
             }
             result[0].push(color);
-            result.into_iter().map(|values| values.join(", ")).collect()
+            let result = result.into_iter().map(|values| values.join(", "));
+            if key == "background" {
+                result.collect()
+            } else {
+                std::iter::once(value.to_owned())
+                    .chain(result.skip(1))
+                    .collect()
+            }
         }
         5 => {
-            if matches!(
+            let mut values = if matches!(
                 first,
                 "caption" | "icon" | "menu" | "message-box" | "small-caption" | "status-bar"
             ) {
@@ -421,7 +491,14 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 values[5] = line.unwrap_or_else(|| "normal".into());
                 values.push(family);
                 values
-            }
+            };
+            values.extend(
+                [
+                    "normal", "normal", "auto", "none", "auto", "normal", "normal",
+                ]
+                .map(String::from),
+            );
+            values
         }
         6 => match parts.as_slice() {
             ["none"] => vec!["0".into(), "0".into(), "auto".into()],
@@ -484,6 +561,123 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                     "inside" | "outside" => values[1] = part.into(),
                     _ if part.starts_with("url(") => values[2] = part.into(),
                     _ => values[0] = part.into(),
+                }
+            }
+            values
+        }
+        11 => {
+            let mut values = vec!["auto".to_owned(), "auto".to_owned()];
+            for &part in &parts {
+                if part != "auto" {
+                    values[usize::from(part.parse::<u32>().is_ok())] = part.into();
+                }
+            }
+            values
+        }
+        12 => {
+            let lines = components(value, '/');
+            let ident = |value: &&str| {
+                *value != "auto"
+                    && !value.contains(char::is_whitespace)
+                    && value.parse::<isize>().is_err()
+            };
+            let line = |index: usize, fallback: Option<&str>| {
+                lines
+                    .get(index)
+                    .copied()
+                    .or(fallback.filter(ident))
+                    .unwrap_or("auto")
+                    .to_owned()
+            };
+            let start = lines.first().copied();
+            if names.len() == 2 {
+                vec![line(0, None), line(1, start)]
+            } else {
+                let column = line(1, start);
+                vec![
+                    line(0, None),
+                    column.clone(),
+                    line(2, start),
+                    line(3, Some(&column)),
+                ]
+            }
+        }
+        13 => {
+            let grid = names.len() == 6;
+            let mut values = vec!["none".to_owned(); 3];
+            values.extend(["row", "auto", "auto"].map(String::from));
+            if value != "none" {
+                let (mut depth, mut quote, mut split) = (0, None, value.len());
+                for (index, character) in value.char_indices() {
+                    match character {
+                        '"' | '\'' if quote.is_none_or(|quote| quote == character) => {
+                            quote = quote.xor(Some(character))
+                        }
+                        '(' | '[' if quote.is_none() => depth += 1,
+                        ')' | ']' if quote.is_none() => depth -= 1,
+                        '/' if depth == 0 && quote.is_none() => {
+                            split = index;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                let (rows, columns) = (
+                    value[..split].trim(),
+                    value.get(split + 1..).unwrap_or("").trim(),
+                );
+                let sizes = |value: &str| {
+                    let sizes: Vec<_> = components(value, ' ')
+                        .into_iter()
+                        .filter(|word| !matches!(*word, "auto-flow" | "dense"))
+                        .collect();
+                    if sizes.is_empty() {
+                        "auto".into()
+                    } else {
+                        sizes.join(" ")
+                    }
+                };
+                let flow = |axis: &str, side: &str| {
+                    if side.contains("dense") {
+                        format!("{axis} dense")
+                    } else {
+                        axis.into()
+                    }
+                };
+                if grid && rows.contains("auto-flow") {
+                    values[3] = flow("row", rows);
+                    values[4] = sizes(rows);
+                    values[1] = columns.into();
+                } else if grid && columns.contains("auto-flow") {
+                    values[3] = flow("column", columns);
+                    values[5] = sizes(columns);
+                    values[0] = rows.into();
+                } else {
+                    let (mut list, mut strings) = (Vec::new(), Vec::new());
+                    for part in components(rows, ' ') {
+                        if part.starts_with(['"', '\'']) {
+                            strings.push(part);
+                            list.push("auto");
+                        } else if part.starts_with('[') {
+                            list.push(part);
+                        } else if let Some(last) =
+                            list.iter_mut().rev().find(|v| !v.starts_with('['))
+                        {
+                            *last = part;
+                        }
+                    }
+                    values[1] = columns.into();
+                    if strings.is_empty() {
+                        values[0] = rows.into();
+                    } else {
+                        values[0] = list.join(" ");
+                        values[2] = strings.join(" ");
+                    }
+                }
+                for value in &mut values {
+                    if value.is_empty() {
+                        *value = "none".into();
+                    }
                 }
             }
             values

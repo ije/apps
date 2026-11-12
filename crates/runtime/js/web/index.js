@@ -24,7 +24,7 @@ globalThis.__appsWeb = (call, codec) => {
     preventDefault() { const state = eventStates.get(this); if (state.cancelable && !state.passive) state.defaultPrevented = true; }
     stopPropagation() { eventStates.get(this).stopped = true; }
     stopImmediatePropagation() { const state = eventStates.get(this); state.stopped = state.immediate = true; }
-    composedPath() { const state = eventStates.get(this); return state.dispatching ? [...(state.path ?? [state.target])] : []; }
+    composedPath() { const state = eventStates.get(this), path = state.path ?? [state.target]; return !state.dispatching ? [] : state.hidden ? path.filter(node => !state.hidden(node, state.currentTarget)) : [...path]; }
     get cancelBubble() { return eventStates.get(this).stopped; }
     set cancelBubble(value) { if (value) this.stopPropagation(); }
     get returnValue() { return !this.defaultPrevented; }
@@ -42,6 +42,9 @@ globalThis.__appsWeb = (call, codec) => {
   class CustomEvent extends Event {
     constructor(type, options = {}) { super(type, options); this.detail = options.detail ?? null; }
     initCustomEvent(type, bubbles, cancelable, detail = null) { this.initEvent(type, bubbles, cancelable); this.detail = detail; }
+  }
+  class ErrorEvent extends Event {
+    constructor(type, options = {}) { super(type, options); this.message = String(options.message ?? ''); this.filename = String(options.filename ?? ''); this.lineno = options.lineno >>> 0; this.colno = options.colno >>> 0; this.error = options.error ?? null; }
   }
   class EventTarget {
     constructor() { eventTargets.set(this, new Map()); }
@@ -69,7 +72,7 @@ globalThis.__appsWeb = (call, codec) => {
       if (!(event instanceof Event)) throw new TypeError('Expected an Event');
       const state = eventStates.get(event);
       if (state.dispatching) throw new DOMException('Event is already in dispatch', 'InvalidStateError');
-      Object.assign(state, { target: this, currentTarget: this, eventPhase: 2, dispatching: true });
+      Object.assign(state, { target: this, currentTarget: this, eventPhase: 2, dispatching: true, trusted: false, path: null, hidden: null });
       // Removal replaces the list and adding appends to it, so the first `length` items are the snapshot.
       const target = eventTargets.get(this), list = target.get(event.type) ?? [];
       try {
@@ -79,13 +82,13 @@ globalThis.__appsWeb = (call, codec) => {
           if (item.once) this.removeEventListener(event.type, item.callback, item.capture);
           state.passive = item.passive;
           try { if (typeof item.callback === 'function') item.callback.call(this, event); else item.callback.handleEvent(event); }
-          catch (error) { console.error(error); }
+          catch (error) { (globalThis.reportError ?? console.error)(error); }
           state.passive = false;
         }
         // Run only own on* properties. Accessor handlers already have listeners, so a second call duplicates
         // their events.
         try { const handler = Object.hasOwn(this, 'on' + event.type) ? this['on' + event.type] : null; if (!state.immediate && typeof handler === 'function') handler.call(this, event); }
-        catch (error) { console.error(error); }
+        catch (error) { (globalThis.reportError ?? console.error)(error); }
       } finally { Object.assign(state, { currentTarget: null, eventPhase: 0, dispatching: false, stopped: false, immediate: false, passive: false }); }
       return !event.defaultPrevented;
     }
@@ -790,7 +793,7 @@ globalThis.__appsWeb = (call, codec) => {
     readAsDataURL(blob) { this.#read(blob, buffer => `data:${blob.type || 'application/octet-stream'};base64,${new Uint8Array(buffer).toBase64()}`); }
     abort() { if (this.readyState !== 1) { return; } this.#run++; this.readyState = 2; this.result = null; const blob = new Blob(); this.#fire('abort', blob); this.#fire('loadend', blob); }
   }
-  Object.assign(globalThis, { FileReader, ProgressEvent, XMLHttpRequest, XMLHttpRequestEventTarget, XMLHttpRequestUpload, DOMException, Event, CustomEvent, EventTarget, AbortSignal, AbortController, TextEncoder, TextDecoder, TextEncoderStream,
+  Object.assign(globalThis, { FileReader, ProgressEvent, XMLHttpRequest, XMLHttpRequestEventTarget, XMLHttpRequestUpload, DOMException, Event, CustomEvent, ErrorEvent, EventTarget, AbortSignal, AbortController, TextEncoder, TextDecoder, TextEncoderStream,
     TextDecoderStream, URL, URLSearchParams, crypto, Headers, Request, Response, Blob, File, FormData, fetch, WebSocket, MessageEvent, CloseEvent });
   return poll;
 };

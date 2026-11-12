@@ -351,6 +351,7 @@ struct Builder {
     bound: [usize; 7],
     mode: Mode,
     head: Option<usize>,
+    form: Option<usize>,
     foster: bool,
     newline: bool,
 }
@@ -371,6 +372,7 @@ fn tag(source: &str) -> Option<(String, Attrs, bool, usize)> {
         .position(|&c| space(c) || c == b'/' || c == b'>')?;
     let name = source[..i].to_ascii_lowercase();
     let mut attrs = Attrs::default();
+    let mut names: Option<rustc_hash::FxHashSet<String>> = None;
     let mut closing = false;
     loop {
         match *bytes.get(i)? {
@@ -416,7 +418,17 @@ fn tag(source: &str) -> Option<(String, Attrs, bool, usize)> {
                 value = decode(&source[start..i], true);
             }
         }
-        if !attrs.contains_key(&key) {
+        let new = match &mut names {
+            Some(names) => names.insert(key.clone()),
+            None if attrs.0.len() < 32 => !attrs.contains_key(&key),
+            None => {
+                let mut set: rustc_hash::FxHashSet<String> = attrs.keys().cloned().collect();
+                let new = set.insert(key.clone());
+                names = Some(set);
+                new
+            }
+        };
+        if new {
             attrs.0.push((key, value));
         }
         closing = false;
@@ -601,6 +613,44 @@ impl Builder {
         }
     }
 
+    fn split(&mut self, at: usize) -> Vec<Open> {
+        let tail = self.stack.split_off(at);
+        for open in tail.iter().rev() {
+            match open.prev {
+                0 => self.last.remove(&open.key),
+                prev => self.last.insert(open.key, prev),
+            };
+            self.bound = open.below;
+        }
+        tail
+    }
+
+    fn restore(&mut self, tail: Vec<Open>) {
+        for open in tail {
+            let at = self.stack.len() + 1;
+            let prev = self.last.insert(open.key, at).unwrap_or(0);
+            let below = self.bound;
+            for (kind, bound) in self.bound.iter_mut().enumerate() {
+                if open.bits & 1 << kind != 0 {
+                    *bound = at;
+                }
+            }
+            self.opened[open.id] = true;
+            self.stack.push(Open {
+                prev,
+                below,
+                ..open
+            });
+        }
+    }
+
+    // Only for elements that are not formatting markers and saved no mode.
+    fn remove(&mut self, at: usize) {
+        let mut tail = self.split(at);
+        self.opened[tail.remove(0).id] = false;
+        self.restore(tail);
+    }
+
     fn scope(&self, tag: &str, kind: usize) -> usize {
         self.last
             .get(&key(tag))
@@ -636,10 +686,11 @@ impl Builder {
         }
     }
 
-    fn place(&self) -> (usize, Option<usize>) {
-        let target = self.stack.last().map_or(0, |open| open.id);
+    fn place(&self, target: Option<&Open>) -> (usize, Option<usize>) {
+        let svg = target.is_some_and(|open| open.svg);
+        let target = target.map_or(0, |open| open.id);
         if self.foster
-            && self.stack.last().is_some_and(|open| !open.svg)
+            && !svg
             && matches!(
                 self.nodes[target].tag.as_str(),
                 "table" | "tbody" | "tfoot" | "thead" | "tr"
@@ -655,7 +706,7 @@ impl Builder {
                         self.nodes[parent]
                             .children
                             .iter()
-                            .position(|&child| child == id),
+                            .rposition(|&child| child == id),
                     ),
                     None => (self.stack[table - 2].id, None),
                 };
@@ -667,20 +718,23 @@ impl Builder {
         (target, None)
     }
 
-    fn element(&mut self, tag: &str, attrs: Attrs) -> usize {
-        let (parent, before) = self.place();
-        let id = self.nodes.len();
-        self.nodes.push(Node {
-            tag: tag.into(),
-            attrs,
-            parent: Some(parent),
-            ..Node::default()
-        });
+    fn attach(&mut self, id: usize, (parent, before): (usize, Option<usize>)) {
+        self.nodes[id].parent = Some(parent);
         let children = &mut self.nodes[parent].children;
         match before {
             Some(index) => children.insert(index, id),
             None => children.push(id),
         }
+    }
+
+    fn element(&mut self, tag: &str, attrs: Attrs) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(Node {
+            tag: tag.into(),
+            attrs,
+            ..Node::default()
+        });
+        self.attach(id, self.place(self.stack.last()));
         id
     }
 
@@ -789,15 +843,7 @@ impl Builder {
                 self.active.remove(index);
                 return;
             };
-            let common = self.stack[position - 1].id;
-            let mut tail = self.stack.split_off(position);
-            for open in tail.iter().rev() {
-                match open.prev {
-                    0 => self.last.remove(&open.key),
-                    prev => self.last.insert(open.key, prev),
-                };
-                self.bound = open.below;
-            }
+            let mut tail = self.split(position);
             let mut bookmark = index;
             let mut last = furthest;
             let mut at = tail
@@ -850,7 +896,10 @@ impl Builder {
                 self.adopt(last, clone);
                 last = clone;
             }
-            self.adopt(last, common);
+            if let Some(old) = self.nodes[last].parent {
+                self.nodes[old].children.retain(|&id| id != last);
+            }
+            self.attach(last, self.place(self.stack.last()));
             let clone = self.nodes.len();
             self.nodes.push(Node {
                 tag: subject.into(),
@@ -883,39 +932,27 @@ impl Builder {
                 .position(|open| open.id == furthest)
                 .map_or(tail.len(), |at| at + 1);
             tail.insert(below, open);
-            for open in tail {
-                let at = self.stack.len() + 1;
-                let prev = self.last.insert(open.key, at).unwrap_or(0);
-                let below = self.bound;
-                for (kind, bound) in self.bound.iter_mut().enumerate() {
-                    if open.bits & 1 << kind != 0 {
-                        *bound = at;
-                    }
-                }
-                self.opened[open.id] = true;
-                self.stack.push(Open {
-                    prev,
-                    below,
-                    ..open
-                });
-            }
+            self.restore(tail);
         }
     }
 
     fn insert(&mut self, text: &str) {
-        let (parent, before) = self.place();
+        let (parent, before) = self.place(self.stack.last());
         let children = &self.nodes[parent].children;
         let previous = match before {
             Some(index) => index.checked_sub(1).map(|index| children[index]),
             None => children.last().copied(),
         };
-        match previous.filter(|&previous| self.nodes[previous].tag == "#text") {
-            Some(previous) => self.nodes[previous].text.push_str(text),
-            None => {
-                let id = self.element("#text", Attrs::default());
-                self.nodes[id].text = text.into();
-            }
+        if let Some(previous) = previous.filter(|&previous| self.nodes[previous].tag == "#text") {
+            return self.nodes[previous].text.push_str(text);
         }
+        let id = self.nodes.len();
+        self.nodes.push(Node {
+            tag: "#text".into(),
+            text: text.into(),
+            ..Node::default()
+        });
+        self.attach(id, (parent, before));
     }
 
     fn comment(&mut self, text: &str) {
@@ -1093,12 +1130,13 @@ impl Builder {
                             | "noframes"
                             | "script"
                             | "style"
+                            | "template"
                             | "title"
                     )
                 {
                     self.push(head, false, None);
                     let content = self.head(tag, &mut attrs);
-                    self.pop();
+                    self.remove(self.stack.len() - if tag == "template" { 2 } else { 1 });
                     return content.unwrap_or(Content::Markup);
                 }
                 if tag == "head" {
@@ -1278,8 +1316,12 @@ impl Builder {
         if let Some(content) = self.head(tag, &mut attrs) {
             return content;
         }
+        let template = tag == "form" && self.last.contains_key(&key("template"));
+        if tag == "form" && self.form.is_some() && !template {
+            return Content::Markup;
+        }
         let heading = |tag: &str| matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6");
-        if heading(tag)
+        let block = heading(tag)
             || matches!(
                 tag,
                 "address"
@@ -1317,8 +1359,8 @@ impl Builder {
                     | "li"
                     | "dd"
                     | "dt"
-            )
-        {
+            );
+        if block {
             let p = self.scope("p", BUTTON);
             self.pop_to(p);
         }
@@ -1393,7 +1435,7 @@ impl Builder {
                     self.active
                         .retain(|entry| entry.as_ref().is_none_or(|(other, _)| *other != id));
                     if let Some(at) = self.stack.iter().rposition(|open| open.id == id) {
-                        self.pop_to(at + 1);
+                        self.remove(at);
                     }
                 }
                 self.reconstruct();
@@ -1407,7 +1449,7 @@ impl Builder {
                     .rposition(Option::is_none)
                     .map_or(0, |at| at + 1);
                 let same: Vec<usize> = (marker..self.active.len())
-                    .filter(|&at| matches!(&self.active[at], Some((id, other)) if self.nodes[*id].tag == tag && *other == attrs))
+                    .filter(|&at| matches!(&self.active[at], Some((id, other)) if self.nodes[*id].tag == tag && other.0.len() == attrs.0.len() && attrs.iter().all(|(name, value)| other.get(name) == Some(value))))
                     .collect();
                 if same.len() >= 3 {
                     self.active.remove(same[0]);
@@ -1415,6 +1457,14 @@ impl Builder {
                 let id = self.element(tag, attrs.clone());
                 self.push(id, false, None);
                 self.active.push(Some((id, attrs)));
+                Content::Markup
+            }
+            "form" => {
+                let id = self.element(tag, attrs);
+                self.push(id, false, None);
+                if !template {
+                    self.form = Some(id);
+                }
                 Content::Markup
             }
             "table" => self.open(tag, attrs, Some(Mode::Table)),
@@ -1428,6 +1478,9 @@ impl Builder {
             }
             "textarea" => Content::Raw(self.element(tag, attrs), true),
             "xmp" | "iframe" | "noembed" | "noscript" => {
+                if tag == "xmp" {
+                    self.reconstruct();
+                }
                 Content::Raw(self.element(tag, attrs), false)
             }
             "select" => {
@@ -1476,7 +1529,9 @@ impl Builder {
                 self.svg(tag, attrs, closing)
             }
             _ => {
-                self.reconstruct();
+                if !block {
+                    self.reconstruct();
+                }
                 let id = self.element(tag, attrs);
                 if self.nodes[id].sf_symbol().is_none() {
                     self.push(id, false, None);
@@ -1526,7 +1581,12 @@ impl Builder {
                 self.element(tag, attrs);
                 Content::Markup
             }
-            "form" => Content::Markup,
+            "form" => {
+                if self.form.is_none() && !self.last.contains_key(&key("template")) {
+                    self.form = Some(self.element(tag, attrs));
+                }
+                Content::Markup
+            }
             _ => {
                 self.foster = true;
                 let content = self.body(tag, attrs, closing);
@@ -1716,8 +1776,34 @@ impl Builder {
             "template" => return self.template_end(),
             "body" | "html" => return,
             "br" => {
+                self.reconstruct();
                 self.element(tag, Attrs::default());
                 return;
+            }
+            "form" if !self.last.contains_key(&key("template")) => {
+                let Some(form) = self.form.take() else { return };
+                let at = self.scope(tag, DEFAULT);
+                if at == 0 || self.stack[at - 1].id != form {
+                    return;
+                }
+                while self.stack.last().is_some_and(|open| {
+                    !open.svg
+                        && matches!(
+                            self.nodes[open.id].tag.as_str(),
+                            "dd" | "dt"
+                                | "li"
+                                | "optgroup"
+                                | "option"
+                                | "p"
+                                | "rb"
+                                | "rp"
+                                | "rt"
+                                | "rtc"
+                        )
+                }) {
+                    self.pop();
+                }
+                return self.remove(at - 1);
             }
             "p" => {
                 if self.scope(tag, BUTTON) == 0 {
@@ -1813,14 +1899,15 @@ impl Builder {
 
 impl Document {
     pub fn parse(source: &str) -> Self {
-        Self::build(source, None)
+        Self::build(source, None, false)
     }
 
     pub fn fragment(source: &str, context: &str) -> Self {
-        Self::build(source, Some(context))
+        Self::build(source, Some(context), false)
     }
 
-    fn build(source: &str, context: Option<&str>) -> Self {
+    // `form` is true when the context element is in a form, so the fragment can't open another one.
+    pub(crate) fn build(source: &str, context: Option<&str>, form: bool) -> Self {
         let normalized;
         let source = if source.contains('\r') {
             normalized = source.replace("\r\n", "\n").replace('\r', "\n");
@@ -1847,6 +1934,8 @@ impl Document {
             bound: [0; 7],
             mode: Mode::Initial,
             head: None,
+            // Node 0 is never an open form, so `</form>` ignores this pointer.
+            form: form.then_some(0),
             foster: false,
             newline: false,
         };
@@ -1922,21 +2011,43 @@ impl Document {
                         break;
                     }
                     Content::Raw(id, references) => {
-                        let mut from = pos;
+                        let script = name == "script";
+                        let mut state = 0;
+                        let mut at = pos;
                         let close = loop {
-                            let Some(at) = source[from..].find("</").map(|n| from + n) else {
-                                break bytes.len();
+                            let found = if state == 0 {
+                                source[at..].find('<')
+                            } else {
+                                source[at..].find(['<', '-'])
                             };
-                            let after = &bytes[at + 2..];
-                            if after.len() >= name.len()
-                                && after[..name.len()].eq_ignore_ascii_case(name.as_bytes())
-                                && after
-                                    .get(name.len())
-                                    .is_none_or(|&c| space(c) || c == b'/' || c == b'>')
-                            {
-                                break at;
+                            let Some(n) = found else { break bytes.len() };
+                            at += n;
+                            let after = &bytes[at..];
+                            let word = |from: usize| {
+                                after
+                                    .get(from..from + name.len())
+                                    .is_some_and(|word| word.eq_ignore_ascii_case(name.as_bytes()))
+                                    && after
+                                        .get(from + name.len())
+                                        .is_none_or(|&c| space(c) || c == b'/' || c == b'>')
+                            };
+                            match after {
+                                [b'-', b'-', b'>', ..] => state = 0,
+                                [b'<', b'!', b'-', b'-', ..] if script && state == 0 => {
+                                    state = 1;
+                                    at += 2;
+                                    continue;
+                                }
+                                [b'<', b'/', ..] if word(2) => {
+                                    if state < 2 {
+                                        break at;
+                                    }
+                                    state = 1;
+                                }
+                                [b'<', ..] if state == 1 && word(1) => state = 2,
+                                _ => {}
                             }
-                            from = at + 2;
+                            at += 1;
                         };
                         let text = &source[pos..close];
                         let text = if name == "textarea" {
@@ -1993,8 +2104,17 @@ impl Document {
                 } else if body.starts_with("->") {
                     ("", 6)
                 } else {
-                    body.find("-->")
-                        .map_or((body, rest.len()), |n| (&body[..n], n + 7))
+                    let mut from = 0;
+                    loop {
+                        let Some(at) = body[from..].find("--").map(|n| from + n) else {
+                            break (body, rest.len());
+                        };
+                        match body.as_bytes()[at + 2..] {
+                            [b'>', ..] => break (&body[..at], at + 7),
+                            [b'!', b'>', ..] => break (&body[..at], at + 8),
+                            _ => from = at + 1,
+                        }
+                    }
                 };
                 builder.comment(data);
                 pos += length;
@@ -2058,6 +2178,20 @@ impl Document {
                 pos += (close + 1).min(rest.len());
             }
         }
+        if context.is_none()
+            && !builder.stack.first().is_some_and(|html| {
+                builder.nodes[html.id]
+                    .children
+                    .iter()
+                    .any(|&child| builder.nodes[child].tag == "body")
+            })
+        {
+            builder.pop_to(2);
+            if builder.head.is_some() {
+                builder.mode = Mode::AfterHead;
+            }
+            builder.start("body", Attrs::default(), false);
+        }
         Self {
             nodes: builder.nodes.into(),
         }
@@ -2117,8 +2251,18 @@ impl Document {
         svg: Option<&dyn Fn(usize) -> Vec<(&'static str, String)>>,
     ) -> String {
         let mut result = String::new();
-        let mut pending = vec![(id, false)];
-        while let Some((id, close)) = pending.pop() {
+        let mut foreign = false;
+        let mut up = Some(id);
+        while let Some(at) = up {
+            let tag = self.nodes[at].tag.as_str();
+            if tag == "svg" || at != id && matches!(tag, "foreignObject" | "desc" | "title") {
+                foreign = tag == "svg";
+                break;
+            }
+            up = self.nodes[at].parent;
+        }
+        let mut pending = vec![(id, false, foreign)];
+        while let Some((id, close, foreign)) = pending.pop() {
             let node = &self.nodes[id];
             if close {
                 result.push_str("</");
@@ -2128,9 +2272,10 @@ impl Document {
             }
             match node.tag.as_str() {
                 "#text" => {
-                    match &node.stylesheet {
-                        Some(sheet) => result.push_str(&sheet.source()),
-                        None if node.parent.is_some_and(|parent| {
+                    let source = node.stylesheet.as_ref().map(|sheet| sheet.source());
+                    let text = source.as_deref().unwrap_or(&node.text);
+                    if !foreign
+                        && node.parent.is_some_and(|parent| {
                             matches!(
                                 self.nodes[parent].tag.as_str(),
                                 "script"
@@ -2142,11 +2287,11 @@ impl Document {
                                     | "noscript"
                                     | "plaintext"
                             )
-                        }) =>
-                        {
-                            result.push_str(&node.text)
-                        }
-                        None => result.push_str(&escape(&node.text)),
+                        })
+                    {
+                        result.push_str(text);
+                    } else {
+                        result.push_str(&escape(text));
                     }
                     continue;
                 }
@@ -2204,7 +2349,7 @@ impl Document {
                 }
                 result.push('>');
             }
-            if matches!(node.tag.as_str(), "script" | "style") {
+            if !foreign && matches!(node.tag.as_str(), "script" | "style") {
                 if let Some(sheet) = &node.stylesheet {
                     result.push_str(&sheet.source());
                 } else {
@@ -2232,9 +2377,16 @@ impl Document {
                         | "wbr"
                 )
             {
-                pending.push((id, true));
+                pending.push((id, true, foreign));
             }
-            pending.extend(node.children.iter().rev().map(|&child| (child, false)));
+            let inner = node.tag == "svg"
+                || foreign && !matches!(node.tag.as_str(), "foreignObject" | "desc" | "title");
+            pending.extend(
+                node.children
+                    .iter()
+                    .rev()
+                    .map(|&child| (child, false, inner)),
+            );
         }
         result
     }
@@ -2487,6 +2639,11 @@ mod tests {
         ] {
             assert!(Document::parse(&source).nodes.len() > 50000);
         }
+        let names: String = (0..50000).map(|n| format!(" a{n}=x")).collect();
+        let doc = Document::parse(&format!("<p{names} a7=y a49999=y>"));
+        let p = find(&doc, "p");
+        assert_eq!(doc.nodes[p].attrs.keys().count(), 50000);
+        assert_eq!(doc.nodes[p].attrs["a49999"], "x");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         let doc = Document::parse(
             "<div><b>x</div>y<svg><linearGradient><stop/></LINEARGRADIENT><g></g></svg><table><tr><td><p>in</table><i>out</i>",
@@ -2627,6 +2784,43 @@ mod tests {
                 "<table><tr><td><b>x</td><td>y</td></tr></table>z",
                 "<html><head></head><body><table><tbody><tr><td><b>\"x\"</b></td><td>\"y\"</td></tr></tbody></table>\"z\"</body></html>",
             ),
+            ("", "<html><head></head><body></body></html>"),
+            (
+                "<!doctype html><title>t</title><script>1</script>",
+                "<!DOCTYPE html><html><head><title>\"t\"</title><script>\"1\"</script></head><body></body></html>",
+            ),
+            (
+                "<template>x",
+                "<html><head><template>\"x\"</template></head><body></body></html>",
+            ),
+            (
+                "<head></head><template id=t><p>x</p></template><body><p>y",
+                "<html><head><template id=\"t\"><p>\"x\"</p></template></head><body><p>\"y\"</p></body></html>",
+            ),
+            (
+                "<p>a<!--b--!>c<!--d--->e<!---->f</p>",
+                "<html><head></head><body><p>\"a\"<!--b-->\"c\"<!--d--->\"e\"<!---->\"f\"</p></body></html>",
+            ),
+            (
+                "<script><!--<script></script>x</script>y<script><!--<script>--></script>z",
+                "<html><head><script>\"<!--<script></script>x\"</script></head><body>\"y\"<script>\"<!--<script>-->\"</script>\"z\"</body></html>",
+            ),
+            (
+                "<p><b a=1 c=2><b c=2 a=1><b a=1 c=2><b c=2 a=1></p>x",
+                "<html><head></head><body><p><b a=\"1\" c=\"2\"><b c=\"2\" a=\"1\"><b a=\"1\" c=\"2\"><b c=\"2\" a=\"1\"></b></b></b></b></p><b c=\"2\" a=\"1\"><b a=\"1\" c=\"2\"><b c=\"2\" a=\"1\">\"x\"</b></b></b></body></html>",
+            ),
+            (
+                "<p><b>x</p><div>y</div><xmp>z</xmp></br>",
+                "<html><head></head><body><p><b>\"x\"</b></p><div><b>\"y\"</b></div><b><xmp>\"z\"</xmp><br></br></b></body></html>",
+            ),
+            (
+                "<a><table><a></table><p><a><div><a>",
+                "<html><head></head><body><a><a></a><table></table></a><p><a></a></p><div><a></a></div></body></html>",
+            ),
+            (
+                "<form id=g><div><form id=h><input name=b></form></div></form><form><p>x</form>y",
+                "<html><head></head><body><form id=\"g\"><div><input name=\"b\"></input></div></form><form><p>\"x\"</p></form>\"y\"</body></html>",
+            ),
         ] {
             assert_eq!(tree(&Document::parse(source), 0), expected, "{source}");
         }
@@ -2722,6 +2916,30 @@ mod tests {
                 "<table><input type=hidden><select><option>a</table>",
                 "<select><option>\"a\"</option></select><table><input type=\"hidden\"></input></table>",
             ),
+            (
+                "<a href=1><table><a href=2>x</a><tr><td>cell</td></tr></table></a>",
+                "<a href=\"1\"><a href=\"2\">\"x\"</a><table><tbody><tr><td>\"cell\"</td></tr></tbody></table></a>",
+            ),
+            (
+                "<a href=1><svg><foreignObject><a href=2>x</a><div>y</div></foreignObject><rect/></svg></a>",
+                "<a href=\"1\"><svg><foreignObject><a href=\"2\">\"x\"</a><div>\"y\"</div></foreignObject><rect></rect></svg></a>",
+            ),
+            (
+                "<a><table><a></table>x",
+                "<a><a></a><table></table></a><a>\"x\"</a>",
+            ),
+            (
+                "<table><a>1<p>2</a>3</p></table>",
+                "<a>\"1\"</a><p><a>\"2\"</a>\"3\"</p><table></table>",
+            ),
+            (
+                "<table><tr><b>1<div>2</b>3</div><td>c</table>",
+                "<b>\"1\"</b><div><b>\"2\"</b>\"3\"</div><table><tbody><tr><td>\"c\"</td></tr></tbody></table>",
+            ),
+            (
+                "<table><form id=f><tr><td>a</td></tr></table><form id=g>b</form>",
+                "<table><form id=\"f\"></form><tbody><tr><td>\"a\"</td></tr></tbody></table>\"b\"",
+            ),
         ] {
             let doc = Document::fragment(source, "body");
             assert_eq!(tree(&doc, 0), expected, "{source}");
@@ -2778,6 +2996,13 @@ mod tests {
         }
         assert!(Document::fragment("", "style").nodes[0].children.is_empty());
         assert_eq!(
+            tree(
+                &Document::build("<form id=a><input></form><form id=b>", Some("div"), true),
+                0
+            ),
+            "<input></input><form id=\"b\"></form>"
+        );
+        assert_eq!(
             Document::fragment("<template><tr><td>x</td></tr></template>", "body")
                 .nodes
                 .len(),
@@ -2817,6 +3042,16 @@ mod tests {
             doc.nodes[doc.nodes[doc.nodes[after].parent.unwrap()].parent.unwrap()].tag,
             "body"
         );
+        let doc = Document::parse(
+            "<svg><style>a&amp;lt;b</style><foreignObject><style>a<b</style></foreignObject></svg>",
+        );
+        let style = find(&doc, "style");
+        assert_eq!(doc.text(style), "a&lt;b");
+        assert_eq!(doc.serialize(style), "<style>a&amp;lt;b</style>");
+        assert!(doc.serialize(0).contains(
+            "<style>a&amp;lt;b</style><foreignObject><style>a<b</style></foreignObject>"
+        ));
+        assert_eq!(tree(&Document::parse(&doc.serialize(0)), 0), tree(&doc, 0));
         let doc = Document::fragment("<svg><g><div>x</div></g><circle/></svg>", "body");
         assert_eq!(
             tree(&doc, 0),

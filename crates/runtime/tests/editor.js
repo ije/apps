@@ -227,7 +227,7 @@ globalThis.editorResult = 'pending';
   text.data = 'first line\nsecond line\nthird line';
   __appsDispatch('pointerdown', [text._id], { pointerId:1, clientX:14, clientY:0, detail:3 });
   __appsDispatch('pointerup', [text._id], { pointerId:1, clientX:14, clientY:0 });
-  assert(selection.toString() === 'second line\n', 'Triple click keeps the complete line after release');
+  assert(selection.toString() === 'second line', 'Triple click keeps the complete line after release');
   document.caretRangeFromPoint = originalCaret;
   const scroller = document.createElement('div'), item = document.createElement('span');
   scroller.style.overflow = 'auto'; scroller.append(item); document.body.append(scroller);

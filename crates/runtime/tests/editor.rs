@@ -85,7 +85,7 @@ fn page_text_selection_respects_user_select() {
         pointer('pointerdown',first,7,{detail:3});pointer('pointerup',first,7);
         assert(selected.toString()==='alpha beta','Plain text triple click');
         pointer('pointerdown',first,0);pointer('pointerup',last,5);
-        assert(selected.toString()==='alpha betavisiblegamma','Drag skips none but includes text override');
+        assert(selected.toString()==='alpha beta\n\nvisible\n\ngamma','Drag skips none but includes text override');
         assert(selected.containsNode(blocked,true),'DOM range still spans excluded text');
         const previous=selected.toString();
         pointer('pointerdown',blocked,2);pointer('pointerup',last,8);
@@ -105,7 +105,7 @@ fn page_text_selection_respects_user_select() {
         pointer('pointerdown',all.firstChild,2);pointer('pointerup',all.firstChild,2);
         assert(selected.toString()==='whole group','All selects atomically');
         pointer('pointerdown',first,6);pointer('pointerup',all.lastChild.firstChild,2);
-        assert(selected.toString()==='betavisiblegamma deltawhole group','Drag expands all: '+selected.toString());
+        assert(selected.toString()==='beta\n\nvisible\n\ngamma delta\n\nwhole group','Drag expands all: '+selected.toString());
         pointer('pointerdown',first,0);pointer('pointerup',first,2);
         pointer('pointerdown',first,5,{shiftKey:true});pointer('pointerup',first,5);
         assert(selected.toString()==='alpha','Shift click extends selection');
@@ -113,7 +113,7 @@ fn page_text_selection_respects_user_select() {
         pointer('pointerdown',first,7);pointer('pointerup',last,5);
         assert(selected.toString()==='alpha','Canceled selectstart preserves selection');
         __appsDispatch('keydown',[],{key:'a',...(navigator.platform.includes('Mac')?{metaKey:true}:{ctrlKey:true})});
-        assert(selected.toString()==='alpha betavisiblegamma deltawhole group','Select all excludes none and controls');
+        assert(selected.toString()==='alpha beta\n\nvisible\n\ngamma delta\n\nwhole group','Select all excludes none and controls');
         const host=document.createElement('div');host.style.userSelect='none';document.body.append(host);
         const shadow=host.attachShadow({mode:'open'});shadow.innerHTML='<p>shadow hidden</p><p style="user-select:text">shadow visible</p>';
         selected.selectAllChildren(shadow);
