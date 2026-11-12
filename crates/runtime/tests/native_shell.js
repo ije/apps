@@ -8,8 +8,12 @@
     if (op === 'native.power.block') return 40 + calls.length;
     if (op === 'native.prefs.color') return { controlAccentColor: '#0A84FFFF', systemBlueColor: '#007AFFFF', controlBackgroundColor: '#FFFFFFFF' }[value] ?? null;
     if (op === 'native.prefs.askMedia' || op === 'native.prefs.promptTouchID') events.push({ type: 'reply', id: value.async, value: op.endsWith('Media') ? true : 'Canceled' });
+    if (op === 'native.clipboard.write') board = value;
+    if (op === 'native.clipboard.read') return board[value] ?? '';
+    if (op === 'native.clipboard.formats') return Object.keys(board);
     return null;
-  }, __apps.events.EventEmitter);
+  }, __apps.events.EventEmitter, false, { createFromBuffer: bytes => ({ bytes: Buffer.from(bytes).toString(), toPNG: () => Buffer.from('png') }) });
+  let board = {};
   const last = op => calls.filter(call => call[0] === op).at(-1)?.[1];
   const { powerSaveBlocker, systemPreferences } = shell;
   const first = powerSaveBlocker.start('prevent-app-suspension'), second = powerSaveBlocker.start('prevent-display-sleep');
@@ -31,4 +35,14 @@
   systemPreferences.askForMediaAccess('camera').then(value => nativeShellAsync.push(value));
   systemPreferences.promptTouchID('Unlock').catch(error => nativeShellAsync.push(error.message));
   shell.poll();
+
+  const { clipboard } = shell;
+  clipboard.write({ text: 'hi', html: '<b>hi</b>', rtf: '{\\rtf1 hi}', image: { toPNG: () => Buffer.from('png') }, bookmark: 'x' });
+  assert(Object.entries(board).map(([type, data]) => type + '=' + Buffer.from(data, 'base64')).join() === 'public.utf8-plain-text=hi,public.html=<b>hi</b>,public.rtf={\\rtf1 hi},public.png=png', 'write() sets each format at once');
+  assert(clipboard.availableFormats().join() === 'text/plain,text/html,text/rtf,image/png' && clipboard.has('public.html') && clipboard.has('image/png') && !clipboard.has('text/uri-list'), 'Formats');
+  assert(clipboard.readRTF() === '{\\rtf1 hi}' && clipboard.readImage().bytes === 'png' && clipboard.readBuffer('public.html').toString() === '<b>hi</b>', 'Read formats');
+  clipboard.writeBuffer('public.tiff', Buffer.from('tiff'));
+  assert(Object.keys(board).join() === 'public.tiff' && clipboard.readImage().bytes === 'tiff' && clipboard.availableFormats().join() === 'image/png', 'TIFF images');
+  clipboard.writeImage(clipboard.readImage());
+  assert(Object.keys(board).join() === 'public.png', 'writeImage');
 })();

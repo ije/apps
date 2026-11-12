@@ -84,6 +84,7 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
         | "app.releaseInstance"
         | "app.hasInstance"
         | "app.locale"
+        | "app.emojiPanel"
         | "app.state"
         | "screen.displays"
         | "screen.cursor"
@@ -154,6 +155,10 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
                     Some("regular" | "accessory" | "prohibited")
                 ),
             "Invalid activation policy"
+        ),
+        "app.recentDocument" => ensure!(
+            arguments.is_null() || arguments.is_string(),
+            "Expected a document path"
         ),
         "app.protocolClient" => ensure!(arguments["scheme"].is_string(), "Expected a scheme"),
         "image" => ensure!(
@@ -233,7 +238,7 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
                 arguments["request"].as_u64().is_some_and(|id| id > 0),
                 "Expected menu popup id"
             );
-            for name in ["x", "y"] {
+            for name in ["x", "y", "positioningItem", "minWidth"] {
                 ensure!(
                     arguments
                         .get(name)
@@ -257,12 +262,17 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
 
         "clipboard.readText"
         | "clipboard.readHTML"
+        | "clipboard.formats"
         | "clipboard.clear"
         | "theme.get"
         | "safeStorage.available" => {}
-        "clipboard.writeText"
-        | "clipboard.writeImage"
-        | "clipboard.writeHTML"
+        "clipboard.write" => ensure!(
+            arguments
+                .as_object()
+                .is_some_and(|items| items.values().all(Value::is_string)),
+            "Expected clipboard data"
+        ),
+        "clipboard.read"
         | "shell.openExternal"
         | "shell.openPath"
         | "shell.showItemInFolder"

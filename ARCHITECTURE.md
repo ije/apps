@@ -37,7 +37,7 @@ flowchart LR
 
 The [bundler](crates/cli/src/bundler/mod.rs) uses Oxc to parse, transform, and minify JavaScript, TypeScript, and JSX. It resolves dependencies separately for main, preload, and page code. It also processes HTML, CSS, assets, workers, native addons, and custom loaders.
 
-The bundler maps `electron` and `@pierre/apps` imports to runtime APIs. Literal `import.meta.resolve()` calls identify pages or script chunks. A `new Worker()` call with a path that the bundler can read from the code makes that file a script chunk. Literal `loadFile()` calls in main code also include the target HTML and its dependencies in the bundle.
+The bundler maps `electron` and `@pierre/apps` imports to runtime APIs. Literal `import.meta.resolve()` calls identify pages or script chunks. A `new Worker()` or `fork()` call with a path that the bundler can read from the code makes that file a script chunk. Literal `loadFile()` calls in main code also include the target HTML and its dependencies in the bundle.
 
 JavaScript apps use `apps-runtime` as their executable and `app.js` as their main entry. Apps with `"type": "rust"` use a Cargo binary linked to `apps-runtime`. Their entry calls `app::run()`, creates windows, and registers native handlers through the [Rust app API](crates/runtime/src/desktop/app.rs).
 
@@ -197,7 +197,7 @@ The allocator belongs to `apps-runtime`, so a Rust app cannot define another glo
 
 `apps run` compiles a development bundle and sends it to the app over stdin as a JSON line. With `--watch`, changes to pages and chunks used only by pages reload the open bundled pages. Main code, shared chunks, and other bundle changes restart the app. Rust source, Cargo manifest, or lockfile changes also rebuild the executable.
 
-`ELECTRON_RUN_AS_NODE=1` selects the [headless script runner](crates/runtime/src/node/script.rs). It runs JavaScript with the supported Node APIs and no desktop windows. This also lets an app launch a bundled server chunk as a child process.
+`ELECTRON_RUN_AS_NODE=1` selects the [headless script runner](crates/runtime/src/node/script.rs). It runs JavaScript with the supported Node APIs and no desktop windows. This also lets an app launch a bundled server chunk as a child process. `child_process.fork()` and `utilityProcess.fork()` start such a child with a JSON message channel on an extra descriptor.
 
 The runtime implements Node compatibility through [JavaScript modules](crates/runtime/js/node) and [Rust services](crates/runtime/src/node). Node-API addons and `node:ffi` call native code in the same process. There is no Node.js or libuv runtime.
 

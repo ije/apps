@@ -1,4 +1,4 @@
-globalThis.__appsNodeCompat = (EventEmitter, stream, net) => {
+globalThis.__appsNodeCompat = (EventEmitter, stream, tls) => {
   // JSC cannot hook await. Stores cover synchronous run() calls and functions from bind() or snapshot().
   let current = new Map();
   const within = (context, fn, self, args) => { const saved = current; current = context; try { return Reflect.apply(fn, self, args); } finally { current = saved; } };
@@ -21,6 +21,15 @@ globalThis.__appsNodeCompat = (EventEmitter, stream, net) => {
     emitDestroy() { return this; }
     asyncId() { return this.#id; }
     triggerAsyncId() { return 0; }
+  }
+  class EventEmitterAsyncResource extends EventEmitter {
+    #resource;
+    constructor(options = {}) { super(options); this.#resource = Object.assign(new AsyncResource(options.name ?? new.target.name), { eventEmitter: this }); }
+    emit(...args) { return this.#resource.runInAsyncScope(super.emit, this, ...args); }
+    emitDestroy() { this.#resource.emitDestroy(); }
+    get asyncResource() { return this.#resource; }
+    get asyncId() { return this.#resource.asyncId(); }
+    get triggerAsyncId() { return this.#resource.triggerAsyncId(); }
   }
   const async_hooks = { AsyncLocalStorage, AsyncResource, createHook: () => ({ enable() { return this; }, disable() { return this; } }), executionAsyncId: () => 0, triggerAsyncId: () => 0, executionAsyncResource: () => ({}) };
 
@@ -66,14 +75,6 @@ globalThis.__appsNodeCompat = (EventEmitter, stream, net) => {
 
   const absent = name => Object.assign(new Error(`Cannot get SEA asset ${name}: this is not a single executable application`), { code: 'ERR_NOT_IN_SINGLE_EXECUTABLE_APPLICATION' });
   const sea = { isSea: () => false, getAssetKeys: () => [], getAsset(name) { throw absent(name); }, getAssetAsBlob(name) { throw absent(name); }, getRawAsset(name) { throw absent(name); } };
-
-  const noTLS = () => Object.assign(new Error('TLS sockets are not supported, use fetch or https.request()'), { code: 'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM' });
-  class TLSSocket extends net.Socket { constructor() { super(); throw noTLS(); } }
-  class TLSServer extends net.Server { constructor() { super(); throw noTLS(); } }
-  const tls = {
-    TLSSocket, Server: TLSServer, connect() { throw noTLS(); }, createServer() { throw noTLS(); }, createSecureContext: () => ({}), rootCertificates: Object.freeze([]), getCACertificates: () => [], setDefaultCACertificates() {}, getCiphers: () => [], checkServerIdentity() {},
-    DEFAULT_MIN_VERSION: 'TLSv1.2', DEFAULT_MAX_VERSION: 'TLSv1.3', DEFAULT_ECDH_CURVE: 'auto', CLIENT_RENEG_LIMIT: 3, CLIENT_RENEG_WINDOW: 600,
-  };
 
   const body = response => {
     const output = response.body ? stream.Readable.fromWeb(response.body) : stream.Readable.from([]);
@@ -129,5 +130,5 @@ globalThis.__appsNodeCompat = (EventEmitter, stream, net) => {
     serialize: value => Buffer.from(JSON.stringify(value)),
     deserialize: bytes => JSON.parse(Buffer.from(bytes).toString()),
   };
-  return { async_hooks, diagnostics_channel, sea, tls, undici, v8 };
+  return { async_hooks, diagnostics_channel, sea, tls, undici, v8, EventEmitterAsyncResource };
 };

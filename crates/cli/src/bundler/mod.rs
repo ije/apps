@@ -278,6 +278,7 @@ const ELECTRON: &[&str] = &[
     "autoUpdater",
     "desktopCapturer",
     "ClipboardItem",
+    "utilityProcess",
 ];
 
 const BUILTINS: &str = include_str!("builtins.txt");
@@ -958,13 +959,25 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
         }
         let result = (|| -> Result<()> {
             let span = expression.span();
-            if let Expression::NewExpression(worker) = expression
-                && match worker.callee.get_inner_expression() {
-                    Expression::Identifier(name) => name.name == "Worker",
-                    Expression::StaticMemberExpression(member) => member.property.name == "Worker",
-                    _ => false,
+            let name = |callee: &Expression<'a>| match callee.get_inner_expression() {
+                Expression::Identifier(name) => Some(name.name.as_str()),
+                Expression::StaticMemberExpression(member) => Some(member.property.name.as_str()),
+                _ => None,
+            };
+            let script = match expression {
+                Expression::NewExpression(worker) if name(&worker.callee) == Some("Worker") => {
+                    Some(&mut worker.arguments)
                 }
-                && let Some(source) = worker.arguments.first().and_then(Argument::as_expression)
+                Expression::CallExpression(fork)
+                    if self.builder.realm != Realm::Renderer
+                        && name(&fork.callee) == Some("fork") =>
+                {
+                    Some(&mut fork.arguments)
+                }
+                _ => None,
+            };
+            if let Some(arguments) = script
+                && let Some(source) = arguments.first().and_then(Argument::as_expression)
                 && let Some(path) = self.local_path(source)
             {
                 let path = resolve_file(&path)
@@ -974,7 +987,7 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 let value = self
                     .allocator
                     .alloc_str(&format!("apps:///script-{index}.js"));
-                worker.arguments[0] =
+                arguments[0] =
                     Expression::new_string_literal(source.span(), value, None, &self.ast).into();
             }
             if let Expression::NewExpression(url) = expression

@@ -154,6 +154,7 @@ pub struct JavaScriptCore {
     make_array: unsafe extern "C" fn(Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
     typed_from_buffer: unsafe extern "C" fn(Ptr, u32, Ptr, *mut Ptr) -> Ptr,
     memory: Option<unsafe extern "C" fn(Ptr) -> Ptr>,
+    proxy_target: Option<unsafe extern "C" fn(Ptr) -> Ptr>,
     json_string: unsafe extern "C" fn(Ptr, Ptr, u32, *mut Ptr) -> Ptr,
     get_chars: unsafe extern "C" fn(Ptr, Ptr, *mut usize, *mut bool) -> *const c_void,
     get_bytes: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr, *mut usize) -> bool,
@@ -352,6 +353,7 @@ impl JavaScriptCore {
                     .get(b"JSGetMemoryUsageStatistics\0")
                     .ok()
                     .map(|s| *s),
+                proxy_target: library.get(b"JSObjectGetProxyTarget\0").ok().map(|s| *s),
                 json_string: *library.get(b"JSValueCreateJSONString\0")?,
                 get_chars: *library.get(b"JSValueGetStringCharacters\0")?,
                 get_bytes: *library.get(b"JSValueGetBytes\0")?,
@@ -1416,6 +1418,26 @@ fn dispatch(
             );
         }
         Ok(serde_json::Value::Null)
+    } else if let (Role::Renderer(id), "dom.selectPopup") = (role, op) {
+        let popup = &values[0];
+        anyhow::ensure!(
+            popup["id"].is_u64()
+                && popup["selected"].is_i64()
+                && ["x", "y", "width"]
+                    .iter()
+                    .all(|name| popup[name].is_number())
+                && popup["items"].as_array().is_some_and(|items| items
+                    .iter()
+                    .all(|item| item.is_null() || item[0].is_string() && item[1].is_u64())),
+            "Invalid select popup"
+        );
+        if let Some(link) = host.try_borrow().context("Host is busy")?.link.clone() {
+            link.event(
+                format!("__appsEvent('select-popup',{id},{popup})"),
+                "apps:select-popup",
+            );
+        }
+        Ok(serde_json::Value::Null)
     } else if let (Role::Renderer(id), "dom.open") = (role, op) {
         // Main runs these with page data, so only these shapes and `<webview>` methods pass.
         let data = &values[3];
@@ -1662,6 +1684,28 @@ unsafe extern "C" fn now(
                 .as_secs_f64()
                 * 1000.,
         )
+    }
+}
+
+unsafe extern "C" fn is_proxy(
+    ctx: Ptr,
+    _function: Ptr,
+    _this: Ptr,
+    count: usize,
+    args: *const Ptr,
+    _exception: *mut Ptr,
+) -> Ptr {
+    let Some(api) = HOSTS.with(|hosts| hosts.borrow().get(&(ctx as usize)).map(|b| b.0.clone()))
+    else {
+        return ptr::null_mut();
+    };
+    unsafe {
+        let proxy = count > 0
+            && (api.value_type)(ctx, *args) == 5
+            && api
+                .proxy_target
+                .is_some_and(|target| !target(*args).is_null());
+        (api.boolean)(ctx, proxy)
     }
 }
 
@@ -2034,31 +2078,24 @@ impl JsContext {
             aot.attach(ctx);
         }
         if !matches!(role, Role::Renderer(_)) {
-            let name = engine.api.string("__appsLoadAddon");
-            unsafe {
-                let callback = (engine.api.function)(ctx, name, crate::node::napi::load);
-                (engine.api.set)(
-                    ctx,
-                    (engine.api.global)(ctx),
-                    name,
-                    callback,
-                    0,
-                    ptr::null_mut(),
-                );
-                (engine.api.string_release)(name);
-            }
-            let name = engine.api.string("__appsFFINative");
-            unsafe {
-                let callback = (engine.api.function)(ctx, name, ffi_call);
-                (engine.api.set)(
-                    ctx,
-                    (engine.api.global)(ctx),
-                    name,
-                    callback,
-                    0,
-                    ptr::null_mut(),
-                );
-                (engine.api.string_release)(name);
+            for (name, callback) in [
+                ("__appsLoadAddon", crate::node::napi::load as Callback),
+                ("__appsFFINative", ffi_call),
+                ("__appsIsProxy", is_proxy),
+            ] {
+                let name = engine.api.string(name);
+                unsafe {
+                    let callback = (engine.api.function)(ctx, name, callback);
+                    (engine.api.set)(
+                        ctx,
+                        (engine.api.global)(ctx),
+                        name,
+                        callback,
+                        0,
+                        ptr::null_mut(),
+                    );
+                    (engine.api.string_release)(name);
+                }
             }
             for (url, source) in NODE_SCRIPTS {
                 engine.run(source(), url)?;
@@ -3024,5 +3061,16 @@ mod tests {
         assert!(picker(
             serde_json::json!({"id":1,"multiple":false,"directory":false,"accept":""})
         ));
+        let popup = |items| {
+            dispatch(
+                &binding,
+                page.ctx,
+                "dom.selectPopup",
+                serde_json::json!([{"id":1,"x":0,"y":0,"width":9,"selected":-1,"items":items}]),
+            )
+            .is_ok()
+        };
+        assert!(!popup(serde_json::json!([["a", "0);evil("]])));
+        assert!(popup(serde_json::json!([["a", 1], null])));
     }
 }

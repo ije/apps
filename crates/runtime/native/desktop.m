@@ -505,7 +505,8 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
     NSString *op = AppsString(operation);
     id args = AppsValue(argumentsJSON);
     id result = [NSNull null];
-    if (![NSThread isMainThread]) return strdup("{\"error\":\"Native desktop APIs require the main thread\"}");
+    // Canvas pages encode images on their render thread.
+    if (![NSThread isMainThread] && (![op isEqualToString:@"image"] || [args[@"op"] isEqual:@"fileIcon"])) return strdup("{\"error\":\"Native desktop APIs require the main thread\"}");
     if (([op hasPrefix:@"dialog."] || [op hasPrefix:@"menu."] || [op hasPrefix:@"shortcut."] || [op hasPrefix:@"tray."]) && !NSApp) return strdup("{\"error\":\"This operation requires a native app on the main thread\"}");
     if ([op isEqualToString:@"poll"]) {
         os_unfair_lock_lock(&AppsEventsLock);
@@ -623,8 +624,10 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         NSPoint point = args[@"x"] && args[@"y"] ? NSMakePoint([args[@"x"] doubleValue], [args[@"y"] doubleValue]) : [view convertPoint:NSApp.keyWindow.mouseLocationOutsideOfEventStream fromView:nil];
         if (view && !view.isFlipped && args[@"y"]) point.y = view.bounds.size.height - point.y;
         NSNumber *request = args[@"request"];
+        NSInteger index = args[@"positioningItem"] ? [args[@"positioningItem"] integerValue] : -1;
+        menu.minimumWidth = [args[@"minWidth"] doubleValue];
         AppsLater(^{
-            [menu popUpMenuPositioningItem:nil atLocation:point inView:view];
+            [menu popUpMenuPositioningItem:index >= 0 && index < menu.numberOfItems ? [menu itemAtIndex:index] : nil atLocation:point inView:view];
             AppsNativeEmit(@{ @"type": @"popup", @"id": request });
         });
     } else if ([op isEqualToString:@"shortcut.register"]) {
@@ -644,14 +647,12 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         if (hotkey) { UnregisterEventHotKey(hotkey.pointerValue); [AppsNativeOwner().hotkeys removeObjectForKey:args]; }
     } else if ([op isEqualToString:@"clipboard.readText"]) result = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeString] ?: @"";
     else if ([op isEqualToString:@"clipboard.readHTML"]) result = [[NSPasteboard generalPasteboard] stringForType:NSPasteboardTypeHTML] ?: @"";
-    else if ([op isEqualToString:@"clipboard.writeText"] || [op isEqualToString:@"clipboard.writeHTML"]) {
+    else if ([op isEqualToString:@"clipboard.read"]) result = [[[NSPasteboard generalPasteboard] dataForType:args] base64EncodedStringWithOptions:0] ?: @"";
+    else if ([op isEqualToString:@"clipboard.formats"]) result = [NSPasteboard generalPasteboard].types ?: @[];
+    else if ([op isEqualToString:@"clipboard.write"]) {
         NSPasteboard *board = [NSPasteboard generalPasteboard];
         [board clearContents];
-        [board setString:args forType:[op hasSuffix:@"Text"] ? NSPasteboardTypeString : NSPasteboardTypeHTML];
-    } else if ([op isEqualToString:@"clipboard.writeImage"]) {
-        NSPasteboard *board = [NSPasteboard generalPasteboard];
-        [board clearContents];
-        [board setData:[[NSData alloc] initWithBase64EncodedString:args options:0] forType:NSPasteboardTypePNG];
+        for (NSString *type in args) [board setData:[[NSData alloc] initWithBase64EncodedString:args[type] options:0] forType:type];
     } else if ([op isEqualToString:@"clipboard.clear"]) [[NSPasteboard generalPasteboard] clearContents];
     else if ([op isEqualToString:@"shell.openExternal"]) {
         NSURL *url = [NSURL URLWithString:args];
@@ -734,7 +735,7 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
         }];
         result = identifier;
     } else if ([op isEqualToString:@"notification.close"]) [[UNUserNotificationCenter currentNotificationCenter] removeDeliveredNotificationsWithIdentifiers:@[args]];
-    else if ([op isEqualToString:@"image"]) {
+    else if ([op isEqualToString:@"image"]) @autoreleasepool {
         NSString *kind = args[@"op"];
         NSData *data = [kind isEqual:@"fileIcon"] ? [NSWorkspace.sharedWorkspace iconForFile:args[@"path"]].TIFFRepresentation : [[NSData alloc] initWithBase64EncodedString:args[@"data"] options:0];
         size_t width = [args[@"width"] unsignedLongValue], height = [args[@"height"] unsignedLongValue];
@@ -876,6 +877,11 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
     else if ([op isEqualToString:@"app.hidden"]) { if ([args boolValue]) [NSApp hide:nil]; else [NSApp unhide:nil]; }
     else if ([op isEqualToString:@"app.state"]) result = @{ @"hidden": @(NSApp.isHidden), @"active": @(NSApp.isActive) };
     else if ([op isEqualToString:@"app.attention"]) result = @([NSApp requestUserAttention:[args isEqual:@"critical"] ? NSCriticalRequest : NSInformationalRequest]);
+    else if ([op isEqualToString:@"app.emojiPanel"]) [NSApp orderFrontCharacterPalette:nil];
+    else if ([op isEqualToString:@"app.recentDocument"]) {
+        if (args == NSNull.null) [NSDocumentController.sharedDocumentController clearRecentDocuments:nil];
+        else [NSDocumentController.sharedDocumentController noteNewRecentDocumentURL:[NSURL fileURLWithPath:args]];
+    }
     else if ([op isEqualToString:@"app.cancelAttention"]) [NSApp cancelUserAttentionRequest:[args integerValue]];
     else if ([op isEqualToString:@"app.downloadFinished"]) [[NSDistributedNotificationCenter defaultCenter] postNotificationName:@"com.apple.DownloadFileFinished" object:[args stringByResolvingSymlinksInPath]];
     else if ([op isEqualToString:@"app.activationPolicy"]) {

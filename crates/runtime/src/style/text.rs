@@ -596,6 +596,7 @@ pub(crate) fn inline_text(
     let own = doc.nodes[id].tag == "#text";
     if doc.nodes[id].sf_symbol().is_some()
         || !own && doc.nodes[id].children.is_empty()
+        || matches!(doc.nodes[id].tag.as_str(), "select" | "optgroup")
         || parent
             .get(Prop::DISPLAY)
             .is_some_and(|value| matches!(value, "grid" | "flex" | "inline-flex" | "inline-grid"))

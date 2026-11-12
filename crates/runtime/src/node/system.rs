@@ -510,6 +510,32 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
             ensure!(!addresses.is_empty(), "No address found");
             Ok(json!(addresses))
         }
+        #[cfg(unix)]
+        "lookupService" => {
+            let address = socket2::SockAddr::from(std::net::SocketAddr::new(
+                args[0].as_str().context("Expected address")?.parse()?,
+                u16::try_from(args[1].as_u64().context("Expected port")?)?,
+            ));
+            let (mut host, mut service) = ([0; 1025], [0; 32]);
+            let code = unsafe {
+                libc::getnameinfo(
+                    address.as_ptr().cast(),
+                    address.len(),
+                    host.as_mut_ptr(),
+                    host.len() as _,
+                    service.as_mut_ptr(),
+                    service.len() as _,
+                    libc::NI_NAMEREQD,
+                )
+            };
+            ensure!(code == 0, "ENOTFOUND");
+            let text = |name: &[libc::c_char]| {
+                unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            Ok(json!([text(&host), text(&service)]))
+        }
         "resolve" => {
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             {

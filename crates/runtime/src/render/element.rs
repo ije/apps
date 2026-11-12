@@ -1701,6 +1701,8 @@ fn create(
         } else if !matches!(doc.nodes[child].tag.as_str(), "#comment" | "#doctype")
             && !(doc.nodes[child].tag == "br"
                 && styles.values[child].get(Prop::DISPLAY) == Some("none"))
+            && !(doc.nodes[child].tag == "#text"
+                && matches!(node.tag.as_str(), "select" | "optgroup"))
         {
             flat.push(child);
         }

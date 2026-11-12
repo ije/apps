@@ -57,8 +57,9 @@
   delete globalThis.__appsInspect;
   const nodeRole = !(typeof role === 'object' && 'renderer' in role);
   let group = '';
-  const write = (level, text) => call('log', group ? text.replace(/^/gm, group) : text, level);
-  const print = level => (...args) => write(level, formatWithOptions({}, ...args));
+  // Open developer tools keep the logged values, to show their properties.
+  const write = (level, text, args) => call('log', group ? text.replace(/^/gm, group) : text, level, args && globalThis.__appsLogged?.(args));
+  const print = level => (...args) => write(level, formatWithOptions({}, ...args), args);
   const counts = new Map(), clocks = new Map();
   const elapsed = label => { const ms = performance.now() - clocks.get(label); return `${label}: ${ms >= 1000 ? (ms / 1000).toFixed(3) + 's' : ms.toFixed(3) + 'ms'}`; };
   const missing = (label, method) => { if (clocks.has(label)) return false; write('warn', `No such label '${label}' for console.${method}()`); return true; };
@@ -287,8 +288,8 @@
   globalThis.setImmediate = (fn, ...args) => { callable(fn, 'callback'); const immediate = new Immediate(); immediates.set(immediate, [fn, args]); return immediate; };
   globalThis.clearImmediate = immediate => { immediates.delete(immediate); };
   const once = make => { let made; return () => made ??= make(); };
-  const { __appsFFI: installFFI, __appsFFINative: ffiNative, __appsSQLite: installSQLite, __appsNodeStreams: installStreams, __appsChildProcess: installChildren, __appsNodeIO: installIO, __appsNet: installNet, __appsHTTP: installHTTP, __appsPty: installPty, __appsNodeCompat: installCompat } = globalThis;
-  for (const name of ['__appsFFI', '__appsFFINative', '__appsSQLite', '__appsNodeStreams', '__appsChildProcess', '__appsNodeIO', '__appsNet', '__appsHTTP', '__appsPty', '__appsNodeCompat']) delete globalThis[name];
+  const { __appsFFI: installFFI, __appsFFINative: ffiNative, __appsSQLite: installSQLite, __appsNodeStreams: installStreams, __appsChildProcess: installChildren, __appsNodeIO: installIO, __appsNet: installNet, __appsHTTP: installHTTP, __appsPty: installPty, __appsNodeCompat: installCompat, __appsIsProxy: isProxy } = globalThis;
+  for (const name of ['__appsFFI', '__appsFFINative', '__appsSQLite', '__appsNodeStreams', '__appsChildProcess', '__appsNodeIO', '__appsNet', '__appsHTTP', '__appsPty', '__appsNodeCompat', '__appsIsProxy']) delete globalThis[name];
   const ffi = once(() => installFFI(ffiNative, codec)), sqlite = once(() => installSQLite(call));
   const events = globalThis.__appsEvents;
   delete globalThis.__appsEvents;
@@ -304,6 +305,7 @@
   const io = once(() => ioMade = installIO({ call, sync: node.sync, asyncCall: node.asyncCall, Buffer: node.Buffer, stream: stream(), EventEmitter: events.EventEmitter, StringDecoder: node.string_decoder.StringDecoder, webcrypto: globalThis.__appsNodeCrypto.webcrypto, inspect, codec }));
   // Do not initialize crypto through io() just for this check. No KeyObject can exist before crypto loads.
   node.util.types.isKeyObject = value => ioMade !== undefined && value instanceof ioMade.crypto.KeyObject;
+  node.util.types.isProxy = value => value !== globalThis && isProxy(value);
   const bytes = globalThis.__appsBytes;
   delete globalThis.__appsBytes;
   const netModule = once(() => net = installNet(call, events.EventEmitter, stream(), node.Buffer, bytes));
@@ -321,19 +323,20 @@
   const isOnline = () => info.platform === 'win32' || Object.values(node.os.networkInterfaces()).flat().some(item => !item.internal && !/^(169\.254\.|fe80:)/i.test(item.address));
   const electron = globalThis.__appsElectron(call, events.EventEmitter, () => ready);
   delete globalThis.__appsElectron;
-  const electronNet = Object.freeze({ fetch: async (input, init) => { const handler = electron.handled(input); return handler ? handler(new Request(input, init)) : fetch(input, init); }, request: options => new (clientRequest())(options), isOnline, get online() { return isOnline(); } });
+  const electronNet = Object.freeze({ fetch: async (input, init) => { const handler = electron.handled(input); return handler ? handler(new Request(input, init)) : fetch(input, init); }, request: options => new (clientRequest())(options), isOnline,
+    resolveHost: (host, { queryType } = {}) => node.dns.promises.lookup(String(host), { all: true, family: queryType === 'A' ? 4 : queryType === 'AAAA' ? 6 : 0 }).then(items => ({ endpoints: items.map(({ address, family }) => ({ address, family: 'ipv' + family })) }), () => { throw new Error('net::ERR_NAME_NOT_RESOLVED'); }), get online() { return isOnline(); } });
   const ptyModule = once(() => pty = installPty(call));
   // Like Node.js, main has `fetch` but no `XMLHttpRequest`, and libraries look for it to detect a browser.
   for (const name of ['FileReader', 'ProgressEvent', 'XMLHttpRequest', 'XMLHttpRequestEventTarget', 'XMLHttpRequestUpload']) delete globalThis[name];
   browsers = globalThis.__appsBrowser(call, events.EventEmitter, () => ready, contents => app.emit('web-contents-created', event(), contents), electron.nativeImage);
   delete globalThis.__appsBrowser;
-  nativeShell = globalThis.__appsNativeShell(call, events.EventEmitter, role !== 'main');
+  nativeShell = globalThis.__appsNativeShell(call, events.EventEmitter, role !== 'main', electron.nativeImage);
   delete globalThis.__appsNativeShell;
   const nodeVersion = '24.0.0', electronVersion = '40.0.0';
   let exiting = false;
   const finish = code => {
     if (code !== undefined) process.exitCode = code;
-    if (!exiting) { exiting = true; process.emit('exit', Number(process.exitCode ?? 0) | 0); }
+    if (!exiting) { exiting = true; process.emit('exit', Number(process.exitCode ?? 0) | 0); children?.flush(); }
     return Number(process.exitCode ?? 0) | 0;
   };
   const quitApp = code => call('quit', finish(code));
@@ -388,6 +391,11 @@
   });
   process.hrtime.bigint = () => BigInt(Math.floor(performance.now() * 1e6));
   Object.defineProperty(process, 'ppid', { get: () => node.details().ppid ?? 0, enumerable: true });
+  if (role === 'main' && env.NODE_CHANNEL_FD && env.NODE_CHANNEL_SERIALIZATION_MODE !== 'advanced') {
+    const fd = +env.NODE_CHANNEL_FD, port = env.APPS_PARENT_PORT;
+    for (const name of ['NODE_CHANNEL_FD', 'NODE_CHANNEL_SERIALIZATION_MODE', 'APPS_PARENT_PORT']) delete env[name];
+    childProcess().connect(fd, port);
+  }
   if (info.platform !== 'win32') Object.assign(process, { getuid: () => node.details().ids[0], geteuid: () => node.details().ids[1], getgid: () => node.details().ids[2], getegid: () => node.details().ids[3] });
   uncaught = error => {
     process.emit('uncaughtExceptionMonitor', error, 'uncaughtException');
@@ -730,6 +738,7 @@
   const materials = { 'appearance-based': 0, titlebar: 3, selection: 4, menu: 5, popover: 6, sidebar: 7, header: 10, sheet: 11, window: 12, hud: 13, 'fullscreen-ui': 15, tooltip: 17, content: 18, 'under-window': 21, 'under-page': 22 };
   const material = type => { if (!type) return null; if (!Object.hasOwn(materials, type)) throw new TypeError(`Invalid vibrancy type: ${type}`); return materials[type]; };
   const effectStates = ['followWindow', 'active', 'inactive'];
+  const levels = { floating: 3, 'torn-off-menu': 3, 'modal-panel': 8, 'main-menu': 24, status: 25, 'pop-up-menu': 101, 'screen-saver': 1000 };
   // A parent destroys or keeps its children natively, so they leave it before it closes.
   const orphan = win => { for (const child of win.getChildWindows()) { states.get(child).parent = 0; call('window', 'parent', child.id, null); } };
   // Electron reads 4 and 8 digit hex colors as ARGB, CSS reads them as RGBA.
@@ -748,6 +757,7 @@
     windowState.content = { x: target.x + dx, y: target.y + dy, width: target.width - dw, height: target.height - dh };
   };
   class BrowserWindow extends events.EventEmitter {
+    #frames = false;
     constructor(options = {}) {
       super();
       if (!ready) throw Error('Call app.whenReady() before creating a window');
@@ -775,6 +785,8 @@
       app.emit('web-contents-created', event(), this.webContents);
       app.emit('browser-window-created', event(), this);
     }
+    #listen() { const on = this.listenerCount('will-resize') + this.listenerCount('will-move') > 0; if (on !== this.#frames && !this.isDestroyed()) { this.#frames = on; call('window', 'willChange', this.id, on); } return this; }
+    static { for (const method of ['on', 'addListener', 'prependListener', 'once', 'prependOnceListener', 'removeListener', 'removeAllListeners']) this.prototype[method] = function(...args) { events.EventEmitter.prototype[method].apply(this, args); return this.#listen(); }; }
     load(html) { return this.webContents._load('load', String(html), 'apps://app/'); }
     loadFile(file, options) { return this.webContents.loadFile(file, options); }
     loadURL(url) { return this.webContents.loadURL(url); }
@@ -788,7 +800,7 @@
     isMenuBarAutoHide() { state(this); return false; }
     setMenuBarVisibility() { state(this); }
     isMenuBarVisible() { state(this); return false; }
-    setDocumentEdited(edited) { state(this).edited = !!edited; }
+    setDocumentEdited(edited) { this.#flag('edited', edited); }
     isDocumentEdited() { return !!state(this).edited; }
     setRepresentedFilename(file) { state(this).represented = String(file); }
     getRepresentedFilename() { return state(this).represented ?? ''; }
@@ -840,7 +852,11 @@
     isClosable() { return state(this).closable; }
     setClosable(closable) { this.#flag('closable', closable); }
     isAlwaysOnTop() { return state(this).alwaysOnTop; }
-    setAlwaysOnTop(flag) { this.#flag('alwaysOnTop', flag); }
+    setAlwaysOnTop(flag, level = 'floating', relativeLevel = 0) {
+      const windowState = state(this), value = flag ? Math.min(Math.max((Object.hasOwn(levels, level) ? levels[level] : 0) + int(relativeLevel, 'relativeLevel'), -2147483643), 2147483630) : 0;
+      call('window', 'alwaysOnTop', this.id, value);
+      if (windowState.alwaysOnTop !== (windowState.alwaysOnTop = value !== 0)) this.emit('always-on-top-changed', event(), value !== 0);
+    }
     minimize() { state(this).minimized = true; call('window', 'minimize', this.id); }
     isMinimized() { return state(this).minimized; }
     maximize() { state(this).maximized = true; call('window', 'maximize', this.id); }
@@ -997,6 +1013,11 @@
     try { windows.get(id)?.webContents.emit('before-input-event', prevented, input); } catch (error) { hooks.report(error); }
     return prevented.defaultPrevented;
   };
+  globalThis.__appsWillChange = (id, [kind, x, y, width, height]) => {
+    const prevented = event(), move = kind === 'move';
+    try { windows.get(id)?.emit(move ? 'will-move' : 'will-resize', prevented, { x, y, width, height }, ...move ? [] : [{ edge: kind }]); } catch (error) { hooks.report(error); }
+    return prevented.defaultPrevented;
+  };
   globalThis.__appsEvent = (name, id, data) => {
     const win = windows.get(id);
     if (name === 'ready') { app.emit('will-finish-launching'); ready = true; app.emit('ready', event(), {}); resolveReady(); }
@@ -1033,6 +1054,13 @@
     else if (name === 'context-menu') win?.webContents.emit('context-menu', event(), { ...data, frame: frameOf(win.webContents) });
     else if (name === 'input-event') win?.webContents.emit('input-event', event(), data);
     else if (name === 'file-picker') { if (win) pickFiles(win, data); }
+    else if (name === 'select-popup') {
+      if (!win) return;
+      let picked = -1;
+      const zoom = win.webContents.getZoomFactor();
+      globalThis.__apps.Menu.buildFromTemplate(data.items.map((item, index) => item ? { label: item[0], type: 'checkbox', checked: index === data.selected, enabled: !item[1], click() { picked = index; } } : { type: 'separator' }))
+        .popup({ x: data.x * zoom, y: data.y * zoom, minWidth: data.width * zoom, positioningItem: data.selected, callback: () => deliver(win, 'selectPicked', data.id, picked) });
+    }
     else if (name === 'activate') app.emit('activate', event(), !!data);
     else if (name === 'open-url' || name === 'open-file') app.emit(name, event(), data);
     else if (name === 'before-quit') quit();
@@ -1128,12 +1156,13 @@
     });
   };
   const perf_hooks = { performance, PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList, createHistogram: () => new RecordableHistogram(), monitorEventLoopDelay };
-  const compat = once(() => installCompat(events.EventEmitter, stream(), netModule().api));
+  const compat = once(() => installCompat(events.EventEmitter, stream(), netModule().tls));
   const crypto = once(() => ({ ...globalThis.__appsNodeCrypto, ...io().crypto }));
   const lazy = (target, key, get) => Object.defineProperty(target, key, { get, enumerable: true, configurable: true });
   // The keys keep their order, which `builtinModules` lists.
   const modules = {};
   for (const key of ['async_hooks', 'diagnostics_channel', 'sea', 'tls', 'undici', 'v8']) lazy(modules, key, () => compat()[key]);
+  lazy(events, 'EventEmitterAsyncResource', () => compat().EventEmitterAsyncResource);
   Object.assign(modules, { fs, path, os, process, events });
   lazy(modules, 'stream', stream);
   Object.assign(modules, { util: node.util, url: node.url, buffer: node.buffer, string_decoder: node.string_decoder, assert: node.assert, querystring: node.querystring });
@@ -1168,5 +1197,6 @@
   apps.module = builtins.module;
   lazy(apps, 'pty', () => ptyModule().api);
   lazy(apps, 'ws', () => http().ws);
+  if (role === 'main') lazy(apps, 'utilityProcess', () => childProcess().utilityProcess);
   globalThis.__apps = Object.freeze(apps);
 })();

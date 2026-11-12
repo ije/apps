@@ -9,8 +9,8 @@ pub const RASTER_MAX: u32 = 4096;
 struct State {
     // F64, so a far translation and a far point cancel exactly.
     transform: [f64; 6],
-    fill: skia::Shader<'static>,
-    stroke: skia::Shader<'static>,
+    fill: Brush,
+    stroke: Brush,
     alpha: f32,
     width: f32,
     cap: skia::LineCap,
@@ -25,6 +25,140 @@ struct State {
     align: f32,
     baseline: u8,
     clip: Option<Rc<skia::Mask>>,
+    shadow: (skia::Color, f32, [f32; 2]),
+}
+
+impl State {
+    fn shadowed(&self) -> bool {
+        let (color, blur, offset) = self.shadow;
+        color.alpha() > 0. && (blur > 0. || offset != [0.; 2])
+    }
+}
+
+#[derive(Clone)]
+enum Brush {
+    Shader(skia::Shader<'static>),
+    Pattern(Rc<skia::Pixmap>, [bool; 2], skia::Transform),
+}
+
+fn paint(
+    source: &Brush,
+    smooth: bool,
+    alpha: f32,
+    blend_mode: skia::BlendMode,
+    transform: skia::Transform,
+) -> skia::Paint<'_> {
+    let mut shader = match source {
+        Brush::Shader(shader) => shader.clone(),
+        Brush::Pattern(pixels, _, m) => skia::Pattern::new(
+            pixels.as_ref().as_ref(),
+            skia::SpreadMode::Repeat,
+            if smooth {
+                skia::FilterQuality::Bilinear
+            } else {
+                skia::FilterQuality::Nearest
+            },
+            1.,
+            *m,
+        ),
+    };
+    shader.apply_opacity(alpha);
+    shader.transform(transform);
+    skia::Paint {
+        shader,
+        blend_mode,
+        ..Default::default()
+    }
+}
+
+fn strip<'a>(
+    source: &Brush,
+    clip: Option<&'a skia::Mask>,
+    t: [f64; 6],
+    [width, height]: [u32; 2],
+) -> Option<std::borrow::Cow<'a, skia::Mask>> {
+    let Brush::Pattern(pixels, [x @ false, y] | [x, y @ false], m) = source else {
+        return clip.map(std::borrow::Cow::Borrowed);
+    };
+    let mut mask = match clip {
+        Some(clip) => clip.clone(),
+        None => {
+            let mut mask = skia::Mask::new(width, height)?;
+            mask.data_mut().fill(255);
+            mask
+        }
+    };
+    let to_device = matrix(t).pre_concat(*m);
+    let seen = skia::Rect::from_xywh(0., 0., width as f32, height as f32)?
+        .transform(to_device.invert()?)?;
+    match skia::Rect::from_ltrb(
+        if *x { seen.left() } else { 0. },
+        if *y { seen.top() } else { 0. },
+        if *x {
+            seen.right()
+        } else {
+            pixels.width() as f32
+        },
+        if *y {
+            seen.bottom()
+        } else {
+            pixels.height() as f32
+        },
+    ) {
+        Some(rect) => mask.intersect_path(
+            &skia::PathBuilder::from_rect(rect),
+            skia::FillRule::Winding,
+            true,
+            to_device,
+        ),
+        None => mask.data_mut().fill(0),
+    }
+    Some(std::borrow::Cow::Owned(mask))
+}
+
+fn shadow(
+    layer: &skia::Pixmap,
+    (color, blur, [dx, dy]): (skia::Color, f32, [f32; 2]),
+) -> Option<(skia::Pixmap, i32, i32)> {
+    let width = layer.width() as usize;
+    let [mut left, mut top, mut right, mut bottom] = [usize::MAX, usize::MAX, 0, 0];
+    for (y, row) in layer.pixels().chunks_exact(width).enumerate() {
+        if let Some(first) = row.iter().position(|p| p.alpha() > 0) {
+            let last = row.iter().rposition(|p| p.alpha() > 0).unwrap_or(first);
+            [left, right, top, bottom] = [left.min(first), right.max(last + 1), top.min(y), y + 1];
+        }
+    }
+    if right <= left {
+        return None;
+    }
+    // Larger blurs cost memory past the canvas and are close to invisible.
+    let blur = blur.min(256.);
+    let pad = (blur * 1.5).ceil() as usize;
+    let mut shadow = skia::Pixmap::new(
+        (right - left + 2 * pad) as u32,
+        (bottom - top + 2 * pad) as u32,
+    )?;
+    let stride = shadow.width() as usize;
+    let tint: Vec<_> = (0..=255u8)
+        .map(|alpha| {
+            let mut color = color;
+            color.apply_opacity(f32::from(alpha) / 255.);
+            color.premultiply().to_color_u8()
+        })
+        .collect();
+    let out = shadow.pixels_mut();
+    for y in top..bottom {
+        for x in left..right {
+            out[(y - top + pad) * stride + x - left + pad] =
+                tint[layer.pixels()[y * width + x].alpha() as usize];
+        }
+    }
+    super::resvg::blur(&mut shadow, blur / 2.);
+    Some((
+        shadow,
+        (left as f32 - pad as f32 + dx).round() as i32,
+        (top as f32 - pad as f32 + dy).round() as i32,
+    ))
 }
 
 pub struct Canvas {
@@ -36,11 +170,20 @@ pub struct Canvas {
     path: skia::PathBuilder,
     glyphs: rustc_hash::FxHashMap<GlyphKey, Option<Glyph>>,
     glyph_bytes: usize,
+    paths: rustc_hash::FxHashMap<u64, Path2D>,
 }
+
+// The codes and argument counts must match `CanvasRenderingContext2D` and `Path2D` in `dom.js`.
+const ARGS: [usize; 44] = [
+    0, 0, 6, 6, 1, 1, 1, 1, 1, 1, 1, 0, 0, 2, 2, 4, 6, 4, 1, 0, 1, 4, 4, 4, 4, 11, 5, 4, 6, 8, 5,
+    12, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 4,
+];
 
 type GlyphKey = (u32, u16, u32, u32, u8, bool);
 
 type Glyph = (renderer::Point<i32>, renderer::Size<i32>, Vec<u8>);
+
+type Path2D = (Vec<f64>, [f64; 6], Option<skia::Path>);
 
 pub fn line(
     system: &renderer::TextSystem,
@@ -144,6 +287,14 @@ fn gradient(spec: &str) -> Option<skia::Shader<'static>> {
             stops,
             skia::SpreadMode::Pad,
             identity,
+        ),
+        [angle, x, y] => skia::SweepGradient::new(
+            (0., 0.).into(),
+            0.,
+            360.,
+            stops,
+            skia::SpreadMode::Pad,
+            skia::Transform::from_translate(x, y).pre_rotate(angle.to_degrees()),
         ),
         [x0, y0, r0, x1, y1, r1] => skia::RadialGradient::new(
             (x0, y0).into(),
@@ -288,6 +439,149 @@ fn arc(
     }
 }
 
+fn trace(path: &mut skia::PathBuilder, t: [f64; 6], code: u8, a: &[f64]) {
+    match code {
+        12 => path.close(),
+        13 | 14 => {
+            let Some([(x, y)]) = device(t, [[a[0], a[1]]]) else {
+                return;
+            };
+            if code == 13 || path.is_empty() {
+                path.move_to(x, y);
+            } else {
+                path.line_to(x, y);
+            }
+        }
+        15 => {
+            let Some([(x1, y1), (x, y)]) = device(t, [[a[0], a[1]], [a[2], a[3]]]) else {
+                return;
+            };
+            if path.is_empty() {
+                path.move_to(x1, y1);
+            }
+            path.quad_to(x1, y1, x, y);
+        }
+        16 => {
+            let Some([(x1, y1), (x2, y2), (x, y)]) =
+                device(t, [[a[0], a[1]], [a[2], a[3]], [a[4], a[5]]])
+            else {
+                return;
+            };
+            if path.is_empty() {
+                path.move_to(x1, y1);
+            }
+            path.cubic_to(x1, y1, x2, y2, x, y);
+        }
+        17 => {
+            let [x, y, w, h] = [a[0], a[1], a[2], a[3]];
+            let Some(points) = device(t, [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]) else {
+                return;
+            };
+            path.move_to(points[0].0, points[0].1);
+            for (x, y) in &points[1..] {
+                path.line_to(*x, *y);
+            }
+            path.close();
+        }
+        28 | 29 => {
+            let args = if code == 28 {
+                [a[0], a[1], a[2], a[2], 0., a[3], a[4], a[5]]
+            } else {
+                [a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]
+            };
+            if args.iter().all(|v| v.is_finite()) {
+                arc(path, t, args);
+            }
+        }
+        30 if a.iter().all(|v| v.is_finite()) => {
+            let [x1, y1, x2, y2, r] = [a[0], a[1], a[2], a[3], a[4]];
+            let Some([(cx, cy)]) = device(t, [[x1, y1]]) else {
+                return;
+            };
+            let Some(last) = path.last_point().filter(|_| !path.is_empty()) else {
+                path.move_to(cx, cy);
+                return;
+            };
+            let [ta, tb, tc, td, te, tf] = t;
+            let det = ta * td - tb * tc;
+            let [lx, ly] = [f64::from(last.x) - te, f64::from(last.y) - tf];
+            let from = [(td * lx - tc * ly) / det, (ta * ly - tb * lx) / det];
+            let from = if from.iter().all(|v| v.is_finite()) {
+                from
+            } else {
+                [f64::from(last.x), f64::from(last.y)]
+            };
+            let (dx0, dy0, dx1, dy1) = (x1 - from[0], y1 - from[1], x2 - x1, y2 - y1);
+            let (len0, len1) = (dx0.hypot(dy0), dx1.hypot(dy1));
+            let cross = dx0 * dy1 - dy0 * dx1;
+            if len0 == 0. || len1 == 0. || r == 0. || cross.abs() < 1e-6 {
+                path.line_to(cx, cy);
+                return;
+            }
+            let (ux0, uy0, ux1, uy1) = (dx0 / len0, dy0 / len0, dx1 / len1, dy1 / len1);
+            let turn = (ux0 * uy1 - uy0 * ux1).atan2(ux0 * ux1 + uy0 * uy1).abs();
+            let (reach, k) = (r * (turn / 2.).tan(), r * 4. / 3. * (turn / 4.).tan());
+            let (sx, sy) = (x1 - ux0 * reach, y1 - uy0 * reach);
+            let (ex, ey) = (x1 + ux1 * reach, y1 + uy1 * reach);
+            let Some([start, c1, c2, end]) = device(
+                t,
+                [
+                    [sx, sy],
+                    [sx + ux0 * k, sy + uy0 * k],
+                    [ex - ux1 * k, ey - uy1 * k],
+                    [ex, ey],
+                ],
+            ) else {
+                return;
+            };
+            path.line_to(start.0, start.1);
+            path.cubic_to(c1.0, c1.1, c2.0, c2.1, end.0, end.1);
+        }
+        31 if a.iter().all(|v| v.is_finite()) => {
+            let [x, y, w, h] = [a[0], a[1], a[2], a[3]];
+            let (right, bottom) = (x + w, y + h);
+            let (sx, sy) = (w.signum(), h.signum());
+            let r: [f64; 8] = std::array::from_fn(|i| a[4 + i] * if i % 2 == 0 { sx } else { sy });
+            const CORNER_CURVE: f64 = 0.447_715_25;
+            #[rustfmt::skip]
+            let Some(points) = device(t, [
+                [x + r[0], y],
+                [right - r[2], y], [right - r[2] * CORNER_CURVE, y], [right, y + r[3] * CORNER_CURVE], [right, y + r[3]],
+                [right, bottom - r[5]], [right, bottom - r[5] * CORNER_CURVE], [right - r[4] * CORNER_CURVE, bottom], [right - r[4], bottom],
+                [x + r[6], bottom], [x + r[6] * CORNER_CURVE, bottom], [x, bottom - r[7] * CORNER_CURVE], [x, bottom - r[7]],
+                [x, y + r[1]], [x, y + r[1] * CORNER_CURVE], [x + r[0] * CORNER_CURVE, y], [x + r[0], y],
+                [x, y],
+            ]) else {
+                return;
+            };
+            path.move_to(points[0].0, points[0].1);
+            for [line, c1, c2, end] in points[1..17].as_chunks::<4>().0 {
+                path.line_to(line.0, line.1);
+                path.cubic_to(c1.0, c1.1, c2.0, c2.1, end.0, end.1);
+            }
+            path.close();
+            path.move_to(points[17].0, points[17].1);
+        }
+        _ => {}
+    }
+}
+
+fn replay(ops: &[f64], t: [f64; 6]) -> Option<skia::Path> {
+    let (mut path, mut local, mut stack) = (skia::PathBuilder::new(), t, Vec::new());
+    let mut rest = ops;
+    while let [code, tail @ ..] = rest {
+        let (a, tail) = tail.split_at_checked(*ARGS.get(*code as usize)?)?;
+        rest = tail;
+        match *code as u8 {
+            0 => stack.push(local),
+            1 => local = stack.pop().unwrap_or(t),
+            2 => local = concat(local, [a[0], a[1], a[2], a[3], a[4], a[5]]),
+            code => trace(&mut path, local, code, a),
+        }
+    }
+    path.finish()
+}
+
 pub fn fonts(system: bool) -> MutexGuard<'static, (Arc<usvg::fontdb::Database>, bool)> {
     static FONTS: LazyLock<Mutex<(Arc<usvg::fontdb::Database>, bool)>> =
         LazyLock::new(Mutex::default);
@@ -373,8 +667,8 @@ impl Canvas {
             present: true,
             state: State {
                 transform: [1., 0., 0., 1., 0., 0.],
-                fill: skia::Shader::SolidColor(skia::Color::BLACK),
-                stroke: skia::Shader::SolidColor(skia::Color::BLACK),
+                fill: Brush::Shader(skia::Shader::SolidColor(skia::Color::BLACK)),
+                stroke: Brush::Shader(skia::Shader::SolidColor(skia::Color::BLACK)),
                 alpha: 1.,
                 width: 1.,
                 cap: skia::LineCap::Butt,
@@ -389,11 +683,13 @@ impl Canvas {
                 align: 0.,
                 baseline: 0,
                 clip: None,
+                shadow: (skia::Color::TRANSPARENT, 0., [0.; 2]),
             },
             stack: Vec::new(),
             path: skia::PathBuilder::new(),
             glyphs: Default::default(),
             glyph_bytes: 0,
+            paths: Default::default(),
         })
     }
 
@@ -408,24 +704,6 @@ impl Canvas {
             &std::collections::HashMap<String, String>,
         )>,
     ) -> Result<()> {
-        // The codes and argument counts must match `CanvasRenderingContext2D` in `dom.js`.
-        const ARGS: [usize; 41] = [
-            0, 0, 6, 6, 1, 1, 1, 1, 1, 1, 1, 0, 0, 2, 2, 4, 6, 4, 1, 0, 1, 4, 4, 4, 4, 11, 5, 4, 6,
-            8, 5, 12, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-        ];
-        let paint = |source: &skia::Shader<'static>,
-                     alpha: f32,
-                     blend_mode: skia::BlendMode,
-                     transform: skia::Transform| {
-            let mut shader = source.clone();
-            shader.apply_opacity(alpha);
-            shader.transform(transform);
-            skia::Paint {
-                shader,
-                blend_mode,
-                ..Default::default()
-            }
-        };
         let stroke = |state: &State| skia::Stroke {
             width: state.width,
             miter_limit: state.miter,
@@ -433,10 +711,25 @@ impl Canvas {
             line_join: state.join,
             dash: skia::StrokeDash::new(state.dash.clone(), state.dash_offset),
         };
-        // These modes also change pixels outside the shape, so the shape draws into a layer that covers the canvas.
+        // Shadows and modes that change pixels outside the shape draw the shape into a layer that covers the
+        // canvas.
         let mut covered: Option<skia::Pixmap> = None;
         let finish = |pixels: &mut skia::Pixmap, saved: skia::Pixmap, state: &State| {
             let layer = std::mem::replace(pixels, saved);
+            if let Some((shadow, x, y)) = shadow(&layer, state.shadow).filter(|_| state.shadowed())
+            {
+                pixels.draw_pixmap(
+                    x,
+                    y,
+                    shadow.as_ref(),
+                    &skia::PixmapPaint {
+                        blend_mode: state.blend,
+                        ..Default::default()
+                    },
+                    skia::Transform::identity(),
+                    state.clip.as_deref(),
+                );
+            }
             pixels.draw_pixmap(
                 0,
                 0,
@@ -468,15 +761,31 @@ impl Canvas {
             ensure!(tail.len() >= count, "Invalid canvas operation");
             let (a, tail) = tail.split_at(count);
             rest = tail;
-            let blend = if matches!(*code as u8, 18 | 19 | 21 | 22 | 24 | 25 | 27)
-                && matches!(
-                    self.state.blend,
-                    skia::BlendMode::SourceIn
-                        | skia::BlendMode::SourceOut
-                        | skia::BlendMode::DestinationIn
-                        | skia::BlendMode::DestinationAtop
-                        | skia::BlendMode::Source
-                ) {
+            let (code, a, shape) = if *code == 42. {
+                let t = self.state.transform;
+                let shape = self
+                    .paths
+                    .get_mut(&(a[0] as u64))
+                    .and_then(|(ops, at, built)| {
+                        if *at != t {
+                            (*at, *built) = (t, replay(ops, t));
+                        }
+                        built.clone()
+                    });
+                (a[1], &a[2..], Some(shape))
+            } else {
+                (*code, a, None)
+            };
+            let blend = if matches!(code as u8, 18 | 19 | 21 | 22 | 24 | 25 | 27)
+                && (self.state.shadowed()
+                    || matches!(
+                        self.state.blend,
+                        skia::BlendMode::SourceIn
+                            | skia::BlendMode::SourceOut
+                            | skia::BlendMode::DestinationIn
+                            | skia::BlendMode::DestinationAtop
+                            | skia::BlendMode::Source
+                    )) {
                 covered = Some(std::mem::replace(
                     &mut self.pixels,
                     skia::Pixmap::new(width, height).context("Cannot allocate canvas layer")?,
@@ -487,7 +796,7 @@ impl Canvas {
             };
             let state = &mut self.state;
             let t = state.transform;
-            match *code as u8 {
+            match code as u8 {
                 0 => self.stack.push(state.clone()),
                 1 => {
                     if let Some(saved) = self.stack.pop() {
@@ -496,24 +805,45 @@ impl Canvas {
                 }
                 2 | 3 if a.iter().all(|v| v.is_finite()) => {
                     let m = [a[0], a[1], a[2], a[3], a[4], a[5]];
-                    state.transform = if *code == 2. { concat(t, m) } else { m };
+                    state.transform = if code == 2. { concat(t, m) } else { m };
                 }
                 2 | 3 => {}
                 4 | 5 => {
                     let value = string(a[0]);
                     let source = if let Some(spec) = value.strip_prefix("gradient:") {
-                        Some(
-                            gradient(spec)
-                                .unwrap_or(skia::Shader::SolidColor(skia::Color::TRANSPARENT)),
-                        )
+                        Some(Brush::Shader(gradient(spec).unwrap_or(
+                            skia::Shader::SolidColor(skia::Color::TRANSPARENT),
+                        )))
+                    } else if let Some(spec) = value.strip_prefix("pattern:") {
+                        let [id, w, h, x, y, m @ ..]: [f64; 11] =
+                            serde_json::from_str(spec).context("Invalid canvas pattern")?;
+                        let pixels = if id < 0. {
+                            Some(Rc::new(self.pixels.clone()))
+                        } else {
+                            let key = (id as usize, [w as u32, h as u32]);
+                            match sources.entry(key).or_insert_with(|| image(key)) {
+                                Some(Source::Shared(pixels)) => Some(pixels.clone()),
+                                Some(Source::Pixels(pixels)) => Some(Rc::new((*pixels).clone())),
+                                None => None,
+                            }
+                        };
+                        pixels.map(|pixels| {
+                            let m = matrix(m).pre_scale(
+                                (w / f64::from(pixels.width())) as f32,
+                                (h / f64::from(pixels.height())) as f32,
+                            );
+                            Brush::Pattern(pixels, [x != 0., y != 0.], m)
+                        })
                     } else {
                         crate::style::color(value).map(|(rgb, alpha)| {
                             let [_, r, g, b] = rgb.to_be_bytes();
-                            skia::Shader::SolidColor(skia::Color::from_rgba8(r, g, b, alpha))
+                            Brush::Shader(skia::Shader::SolidColor(skia::Color::from_rgba8(
+                                r, g, b, alpha,
+                            )))
                         })
                     };
                     if let Some(source) = source {
-                        if *code == 4. {
+                        if code == 4. {
                             state.fill = source;
                         } else {
                             state.stroke = source;
@@ -541,49 +871,7 @@ impl Canvas {
                 9 => state.alpha = a[0] as f32,
                 10 => state.width = a[0] as f32,
                 11 => self.path.clear(),
-                12 => self.path.close(),
-                13 | 14 => {
-                    let Some([(x, y)]) = device(t, [[a[0], a[1]]]) else {
-                        continue;
-                    };
-                    if *code == 13. || self.path.is_empty() {
-                        self.path.move_to(x, y);
-                    } else {
-                        self.path.line_to(x, y);
-                    }
-                }
-                15 => {
-                    let Some([(x1, y1), (x, y)]) = device(t, [[a[0], a[1]], [a[2], a[3]]]) else {
-                        continue;
-                    };
-                    if self.path.is_empty() {
-                        self.path.move_to(x1, y1);
-                    }
-                    self.path.quad_to(x1, y1, x, y);
-                }
-                16 => {
-                    let Some([(x1, y1), (x2, y2), (x, y)]) =
-                        device(t, [[a[0], a[1]], [a[2], a[3]], [a[4], a[5]]])
-                    else {
-                        continue;
-                    };
-                    if self.path.is_empty() {
-                        self.path.move_to(x1, y1);
-                    }
-                    self.path.cubic_to(x1, y1, x2, y2, x, y);
-                }
-                17 => {
-                    let [x, y, w, h] = [a[0], a[1], a[2], a[3]];
-                    let Some(points) = device(t, [[x, y], [x + w, y], [x + w, y + h], [x, y + h]])
-                    else {
-                        continue;
-                    };
-                    self.path.move_to(points[0].0, points[0].1);
-                    for (x, y) in &points[1..] {
-                        self.path.line_to(*x, *y);
-                    }
-                    self.path.close();
-                }
+                12..=17 | 28..=31 => trace(&mut self.path, t, code as u8, a),
                 20 => {
                     let mut mask = match state.clip.take() {
                         Some(mask) => Rc::unwrap_or_clone(mask),
@@ -599,25 +887,31 @@ impl Canvas {
                     } else {
                         skia::FillRule::Winding
                     };
-                    match self.path.clone().finish() {
+                    match shape.unwrap_or_else(|| self.path.clone().finish()) {
                         Some(path) => mask.intersect_path(&path, rule, true, identity),
                         None => mask.data_mut().fill(0),
                     }
                     state.clip = Some(Rc::new(mask));
                 }
                 18 | 21 | 23 => {
-                    let mask = state.clip.as_deref();
-                    let paint = if *code == 23. {
+                    let mask = if code == 23. {
+                        state.clip.as_deref().map(std::borrow::Cow::Borrowed)
+                    } else {
+                        strip(&state.fill, state.clip.as_deref(), t, [width, height])
+                    };
+                    let mask = mask.as_deref();
+                    // tiny-skia's `Clear` ignores the clip mask.
+                    let paint = if code == 23. {
                         skia::Paint {
-                            blend_mode: skia::BlendMode::Clear,
+                            blend_mode: skia::BlendMode::DestinationOut,
                             ..Default::default()
                         }
                     } else {
-                        paint(&state.fill, state.alpha, blend, matrix(t))
+                        paint(&state.fill, state.smoothing, state.alpha, blend, matrix(t))
                     };
-                    if *code != 18. {
+                    if code != 18. {
                         fill_area(&mut self.pixels, t, [a[0], a[1], a[2], a[3]], &paint, mask);
-                    } else if let Some(path) = self.path.clone().finish() {
+                    } else if let Some(path) = shape.unwrap_or_else(|| self.path.clone().finish()) {
                         let rule = if a[0] == 1. {
                             skia::FillRule::EvenOdd
                         } else {
@@ -627,8 +921,8 @@ impl Canvas {
                     }
                 }
                 19 | 22 => {
-                    let path = if *code == 19. {
-                        self.path.clone().finish()
+                    let path = if code == 19. {
+                        shape.unwrap_or_else(|| self.path.clone().finish())
                     } else {
                         quad(t, [a[0], a[1], a[2], a[3]])
                     };
@@ -637,10 +931,11 @@ impl Canvas {
                     {
                         self.pixels.stroke_path(
                             &path,
-                            &paint(&state.stroke, state.alpha, blend, shift),
+                            &paint(&state.stroke, state.smoothing, state.alpha, blend, shift),
                             &stroke(state),
                             linear,
-                            state.clip.as_deref(),
+                            strip(&state.stroke, state.clip.as_deref(), t, [width, height])
+                                .as_deref(),
                         );
                     }
                 }
@@ -788,13 +1083,13 @@ impl Canvas {
                     };
                     let stride = layer.width() as usize;
                     let out = layer.pixels_mut();
-                    let source = if *code == 24. {
+                    let source = if code == 24. {
                         &state.fill
                     } else {
                         &state.stroke
                     };
                     let fill = match source {
-                        skia::Shader::SolidColor(color) => color.to_color_u8(),
+                        Brush::Shader(skia::Shader::SolidColor(color)) => color.to_color_u8(),
                         _ => skia::ColorU8::from_rgba(255, 255, 255, 255),
                     };
                     for (key, x, y) in placed {
@@ -853,7 +1148,9 @@ impl Canvas {
                     let to_canvas = to_canvas.pre_translate(left as f32, top as f32);
                     if let Some(to_layer) =
                         skia::Rect::from_xywh(0., 0., layer.width() as f32, layer.height() as f32)
-                            .filter(|_| !matches!(source, skia::Shader::SolidColor(_)))
+                            .filter(|_| {
+                                !matches!(source, Brush::Shader(skia::Shader::SolidColor(_)))
+                            })
                             .zip(to_canvas.invert())
                     {
                         let (rect, to_layer) = to_layer;
@@ -861,6 +1158,7 @@ impl Canvas {
                             rect,
                             &paint(
                                 source,
+                                state.smoothing,
                                 1.,
                                 skia::BlendMode::SourceIn,
                                 matrix(state.transform).post_concat(to_layer),
@@ -884,7 +1182,13 @@ impl Canvas {
                         layer.as_ref(),
                         &paint,
                         to_canvas,
-                        state.clip.as_deref(),
+                        strip(
+                            source,
+                            state.clip.as_deref(),
+                            state.transform,
+                            [width, height],
+                        )
+                        .as_deref(),
                     );
                 }
                 25 if a.iter().all(|v| v.is_finite()) && a[5] != 0. && a[6] != 0. => {
@@ -948,89 +1252,6 @@ impl Canvas {
                         self.pixels = saved;
                     }
                 }
-                28 | 29 => {
-                    let args = if *code == 28. {
-                        [a[0], a[1], a[2], a[2], 0., a[3], a[4], a[5]]
-                    } else {
-                        [a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]
-                    };
-                    if args.iter().all(|v| v.is_finite()) {
-                        arc(&mut self.path, t, args);
-                    }
-                }
-                30 if a.iter().all(|v| v.is_finite()) => {
-                    let [x1, y1, x2, y2, r] = [a[0], a[1], a[2], a[3], a[4]];
-                    let Some([(cx, cy)]) = device(t, [[x1, y1]]) else {
-                        continue;
-                    };
-                    let Some(last) = self.path.last_point().filter(|_| !self.path.is_empty())
-                    else {
-                        self.path.move_to(cx, cy);
-                        continue;
-                    };
-                    let [ta, tb, tc, td, te, tf] = t;
-                    let det = ta * td - tb * tc;
-                    let [lx, ly] = [f64::from(last.x) - te, f64::from(last.y) - tf];
-                    let from = [(td * lx - tc * ly) / det, (ta * ly - tb * lx) / det];
-                    let from = if from.iter().all(|v| v.is_finite()) {
-                        from
-                    } else {
-                        [f64::from(last.x), f64::from(last.y)]
-                    };
-                    let (dx0, dy0, dx1, dy1) = (x1 - from[0], y1 - from[1], x2 - x1, y2 - y1);
-                    let (len0, len1) = (dx0.hypot(dy0), dx1.hypot(dy1));
-                    let cross = dx0 * dy1 - dy0 * dx1;
-                    if len0 == 0. || len1 == 0. || r == 0. || cross.abs() < 1e-6 {
-                        self.path.line_to(cx, cy);
-                        continue;
-                    }
-                    let (ux0, uy0, ux1, uy1) = (dx0 / len0, dy0 / len0, dx1 / len1, dy1 / len1);
-                    let turn = (ux0 * uy1 - uy0 * ux1).atan2(ux0 * ux1 + uy0 * uy1).abs();
-                    let (reach, k) = (r * (turn / 2.).tan(), r * 4. / 3. * (turn / 4.).tan());
-                    let (sx, sy) = (x1 - ux0 * reach, y1 - uy0 * reach);
-                    let (ex, ey) = (x1 + ux1 * reach, y1 + uy1 * reach);
-                    let Some([start, c1, c2, end]) = device(
-                        t,
-                        [
-                            [sx, sy],
-                            [sx + ux0 * k, sy + uy0 * k],
-                            [ex - ux1 * k, ey - uy1 * k],
-                            [ex, ey],
-                        ],
-                    ) else {
-                        continue;
-                    };
-                    self.path.line_to(start.0, start.1);
-                    self.path.cubic_to(c1.0, c1.1, c2.0, c2.1, end.0, end.1);
-                }
-                30 => {}
-                31 if a.iter().all(|v| v.is_finite()) => {
-                    let [x, y, w, h] = [a[0], a[1], a[2], a[3]];
-                    let (right, bottom) = (x + w, y + h);
-                    let (sx, sy) = (w.signum(), h.signum());
-                    let r: [f64; 8] =
-                        std::array::from_fn(|i| a[4 + i] * if i % 2 == 0 { sx } else { sy });
-                    const CORNER_CURVE: f64 = 0.447_715_25;
-                    #[rustfmt::skip]
-                    let Some(points) = device(t, [
-                        [x + r[0], y],
-                        [right - r[2], y], [right - r[2] * CORNER_CURVE, y], [right, y + r[3] * CORNER_CURVE], [right, y + r[3]],
-                        [right, bottom - r[5]], [right, bottom - r[5] * CORNER_CURVE], [right - r[4] * CORNER_CURVE, bottom], [right - r[4], bottom],
-                        [x + r[6], bottom], [x + r[6] * CORNER_CURVE, bottom], [x, bottom - r[7] * CORNER_CURVE], [x, bottom - r[7]],
-                        [x, y + r[1]], [x, y + r[1] * CORNER_CURVE], [x + r[0] * CORNER_CURVE, y], [x + r[0], y],
-                        [x, y],
-                    ]) else {
-                        continue;
-                    };
-                    self.path.move_to(points[0].0, points[0].1);
-                    for [line, c1, c2, end] in points[1..17].as_chunks::<4>().0 {
-                        self.path.line_to(line.0, line.1);
-                        self.path.cubic_to(c1.0, c1.1, c2.0, c2.1, end.0, end.1);
-                    }
-                    self.path.close();
-                    self.path.move_to(points[17].0, points[17].1);
-                }
-                31 => {}
                 32 => {
                     state.cap = match string(a[0]) {
                         "round" => skia::LineCap::Round,
@@ -1087,6 +1308,27 @@ impl Canvas {
                 38 => state.spacing[0] = a[0] as f32,
                 39 => state.spacing[1] = a[0] as f32,
                 40 => state.smoothing = a[0] != 0.,
+                43 => {
+                    if let Some((rgb, alpha)) = crate::style::color(string(a[0])) {
+                        let [_, r, g, b] = rgb.to_be_bytes();
+                        state.shadow.0 = skia::Color::from_rgba8(r, g, b, alpha);
+                    }
+                    state.shadow.1 = a[1] as f32;
+                    state.shadow.2 = [a[2] as f32, a[3] as f32];
+                }
+                41 => {
+                    if a[2] != 0. {
+                        self.paths.clear();
+                    }
+                    let ops = data.get(a[1] as usize).context("Expected path data")?;
+                    let ops = ops
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|b| f64::from_ne_bytes(*b));
+                    self.paths
+                        .insert(a[0] as u64, (ops.collect(), [f64::NAN; 6], None));
+                }
                 _ => {
                     let bytes = data.get(a[0] as usize).context("Expected image data")?;
                     let (x, y) = (i64::from(a[1] as i32), i64::from(a[2] as i32));
@@ -1122,8 +1364,15 @@ impl Canvas {
         Ok(())
     }
 
-    pub fn hit(&self, x: f32, y: f32, even_odd: bool, stroke: bool) -> bool {
-        let Some(path) = self.path.clone().finish() else {
+    pub fn hit(&self, x: f32, y: f32, even_odd: bool, stroke: bool, path: Option<u64>) -> bool {
+        let path = match path {
+            Some(id) => self
+                .paths
+                .get(&id)
+                .and_then(|(ops, ..)| replay(ops, self.state.transform)),
+            None => self.path.clone().finish(),
+        };
+        let Some(path) = path else {
             return false;
         };
         let state = &self.state;
@@ -1190,6 +1439,38 @@ pub fn svg_options(text: bool, files: bool) -> usvg::Options<'static> {
         options.image_href_resolver.resolve_string = Box::new(|_, _| None);
     }
     options
+}
+
+pub fn svg_path(d: &str) -> Vec<f64> {
+    let d = d
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;");
+    let tree = svg_tree(
+        &format!(r#"<svg xmlns="http://www.w3.org/2000/svg"><path d="{d}"/></svg>"#),
+        false,
+    );
+    let Some(usvg::Node::Path(path)) = tree
+        .as_ref()
+        .ok()
+        .and_then(|tree| tree.root().children().first())
+    else {
+        return Vec::new();
+    };
+    let mut ops = Vec::new();
+    for segment in path.data().segments() {
+        use skia::PathSegment::*;
+        let (code, points): (f64, &[skia::Point]) = match &segment {
+            MoveTo(p) => (13., std::slice::from_ref(p)),
+            LineTo(p) => (14., std::slice::from_ref(p)),
+            QuadTo(c, p) => (15., &[*c, *p]),
+            CubicTo(c1, c2, p) => (16., &[*c1, *c2, *p]),
+            Close => (12., &[]),
+        };
+        ops.push(code);
+        ops.extend(points.iter().flat_map(|p| [f64::from(p.x), f64::from(p.y)]));
+    }
+    ops
 }
 
 pub fn svg_tree(source: &str, files: bool) -> Result<usvg::Tree> {
@@ -1421,7 +1702,22 @@ mod tests {
             let blue = pixel(&canvas, blue.0, blue.1);
             assert!(red[0] > 235 && red[2] < 20, "{shape:?}: {red:?}");
             assert!(blue[2] > 235 && blue[0] < 20, "{shape:?}: {blue:?}");
+            if shape[0] == 10 {
+                let [r, _, b, _] = pixel(&canvas, 30, 20);
+                assert!(r.abs_diff(121) <= 2 && b.abs_diff(134) <= 2, "{r} {b}");
+            }
         }
+    }
+
+    #[test]
+    fn svg_paths_keep_lines_and_stop_at_errors() {
+        assert_eq!(svg_path("M0 0L10 0"), [13., 0., 0., 14., 10., 0.]);
+        assert_eq!(svg_path("M1 1h2 x"), [13., 1., 1., 14., 3., 1.]);
+        assert_eq!(
+            svg_path("M0 0Q1 1 2 0Z\"&<"),
+            [13., 0., 0., 15., 1., 1., 2., 0., 12.]
+        );
+        assert!(svg_path("M5 5").is_empty());
     }
 
     #[test]
@@ -1499,11 +1795,11 @@ mod tests {
         );
         assert_eq!(pixel(&canvas, 5, 5)[3], 255);
         assert_eq!(pixel(&canvas, 15, 5)[3], 0);
-        assert!(canvas.hit(20., 5.5, false, true));
-        assert!(!canvas.hit(20., 0.5, false, true));
+        assert!(canvas.hit(20., 5.5, false, true, None));
+        assert!(!canvas.hit(20., 0.5, false, true, None));
         draw(&mut canvas, &[11., 17., 2., 2., 6., 6.], "");
-        assert!(canvas.hit(4., 4., false, false));
-        assert!(!canvas.hit(20., 4., false, false));
+        assert!(canvas.hit(4., 4., false, false, None));
+        assert!(!canvas.hit(20., 4., false, false, None));
         draw(&mut canvas, &[2., 2., 0., 0., 2., 3., 4.], "");
         assert_eq!(canvas.transform(), [2., 0., 0., 2., 3., 4.]);
     }

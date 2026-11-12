@@ -481,10 +481,7 @@ impl Desktop {
                                             size(px(max[0]), px(max[1])),
                                         ),
                                     ),
-                                    (
-                                        options["alwaysOnTop"] == true,
-                                        WindowChange::AlwaysOnTop(true),
-                                    ),
+                                    (options["alwaysOnTop"] == true, WindowChange::AlwaysOnTop(3)),
                                     (
                                         options["maximizable"] == false,
                                         WindowChange::Maximizable(false),
@@ -820,6 +817,7 @@ impl Desktop {
                             Some("webviewEvent") => "__appsWebviewEvent",
                             Some("webviewReply") => "__appsWebviewReply",
                             Some("filesPicked") => "__appsFilesPicked",
+                            Some("selectPicked") => "__appsSelectPicked",
                             _ => continue,
                         };
                         if let Some(renderer) = self.views[&id].renderer.clone() {
@@ -1515,6 +1513,12 @@ impl Desktop {
             renderer::native::on_window_event(move |window, event| {
                 events.window_event(window, event);
             });
+            let frames = main.clone();
+            renderer::native::on_will_change(move |window, kind, bounds| {
+                frames
+                    .page(window)
+                    .is_some_and(|id| frames.will_change(id, kind, bounds))
+            });
             let keys = main.clone();
             renderer::native::on_key(move |window, input, composing| {
                 keys.page(window)
@@ -1811,9 +1815,15 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
             "Window size limits must be between 0 and 16384"
         ),
         "fullscreen" | "resizable" | "minimizable" | "maximizable" | "closable" | "movable"
-        | "alwaysOnTop" | "shadow" | "contentProtection" | "focusable" => {
+        | "shadow" | "contentProtection" | "focusable" | "edited" => {
             ensure!(args[2].is_boolean(), "Expected a boolean")
         }
+        "alwaysOnTop" => ensure!(
+            args[2]
+                .as_i64()
+                .is_some_and(|level| i32::try_from(level).is_ok()),
+            "Expected a window level"
+        ),
         "ignoreMouse" | "workspaces" => ensure!(
             args[2].is_boolean() && args[3].is_boolean(),
             "Expected booleans"
@@ -1874,11 +1884,11 @@ pub(crate) fn validate(args: &serde_json::Value) -> Result<()> {
             ) && (args[3].is_null() || args[3].is_string()),
             "Invalid edit command"
         ),
-        "input" => ensure!(args[2].is_boolean(), "Expected a boolean"),
+        "input" | "willChange" => ensure!(args[2].is_boolean(), "Expected a boolean"),
         "deliver" => ensure!(
             matches!(
                 args[2].as_str(),
-                Some("webviewEvent" | "webviewReply" | "filesPicked")
+                Some("webviewEvent" | "webviewReply" | "filesPicked" | "selectPicked")
             ) && args[3].is_array(),
             "Invalid page delivery"
         ),
@@ -2581,6 +2591,26 @@ mod tests {
                 "JSON.stringify([parent.isDestroyed(), child.isDestroyed(), child.getParentWindow()])"
             ),
             "[true,false,null]"
+        );
+        assert_eq!(
+            eval(
+                &desktop,
+                "globalThis.seen = []; child.on('always-on-top-changed', (event, on) => seen.push(on)).on('will-resize', (event, bounds, details) => { seen.push(bounds.width, details.edge); event.preventDefault(); }); for (const args of [[true, 'screen-saver', 1], [true], [true, 'normal'], [false], [true, 'toString']]) child.setAlwaysOnTop(...args); child.setDocumentEdited(true); seen.push(__appsWillChange(2, ['right', 2, 2, 30, 40]), child.isDocumentEdited(), child.isAlwaysOnTop()); child.removeAllListeners('will-resize'); JSON.stringify(seen)"
+            ),
+            r#"[true,false,30,"right",true,true,false]"#
+        );
+        assert_eq!(
+            serde_json::Value::from(desktop.commands()),
+            serde_json::json!([
+                ["willChange", 2, true],
+                ["alwaysOnTop", 2, 1001],
+                ["alwaysOnTop", 2, 3],
+                ["alwaysOnTop", 2, 0],
+                ["alwaysOnTop", 2, 0],
+                ["alwaysOnTop", 2, 0],
+                ["edited", 2, true],
+                ["willChange", 2, false]
+            ])
         );
     }
 

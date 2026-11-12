@@ -288,6 +288,9 @@ fn node_events_match_node() {
         const shaped=new EventEmitter(),listener=()=>{};shaped.on('a',listener);const single=typeof shaped._events.a;shaped.on('a',listener);assert.deepStrictEqual([single,Array.isArray(shaped._events.a),shaped._eventsCount,Object.keys(new EventEmitter())],['function',true,1,['_events','_eventsCount','_maxListeners']]);
         const removed=[],emitter=new EventEmitter();emitter.on('removeListener',name=>removed.push(name));emitter.on('a',listener);emitter.on('a',listener);emitter.removeListener('a',listener);emitter.removeAllListeners('a');assert.deepStrictEqual([removed,emitter.eventNames()],[['a','a'],['removeListener']]);
         const sequence=[],prepended=new EventEmitter();prepended.on('a',()=>sequence.push(1));prepended.prependOnceListener('a',()=>sequence.push(0));prepended.emit('a');prepended.emit('a');assert.deepStrictEqual(sequence,[0,1,1]);
+        const storage=new __apps.async_hooks.AsyncLocalStorage(),scoped=storage.run(7,()=>new events.EventEmitterAsyncResource({name:'scoped'}));let store;scoped.on('a',()=>store=storage.getStore());scoped.emit('a');
+        assert.deepStrictEqual([store,scoped.asyncResource.type,scoped.asyncResource.eventEmitter===scoped,typeof scoped.asyncId,util.types.isProxy(new Proxy({},{})),util.types.isProxy({}),util.types.isProxy(globalThis)],[7,'scoped',true,'number',true,false,false]);
+        const readable=new __apps.stream.PassThrough();readable.end('x');assert.strictEqual(String(await new Promise(resolve=>readable.once('data',resolve))),'x');
     "##);
 }
 
@@ -809,6 +812,8 @@ fn electron_net_requests_fetch_and_online_state() {
         assert.throws(()=>net.request({url:base,redirect:'manual'}),/Unsupported redirect mode/);
         assert.strictEqual(await (await net.fetch(base+'/echo',{method:'PUT',body:'x',headers:{'X-Test':'f'}})).text(),'PUT /echo f x');
         assert.strictEqual(typeof net.isOnline(),'boolean');assert.strictEqual(net.online,net.isOnline());
+        assert.deepStrictEqual(await net.resolveHost('127.0.0.1'),{endpoints:[{address:'127.0.0.1',family:'ipv4'}]});
+        assert.ok((await net.resolveHost('localhost',{queryType:'A'})).endpoints.every(({address,family})=>family==='ipv4'&&address==='127.0.0.1'));
         await new Promise(resolve=>server.close(resolve));
     "#);
 }
@@ -833,6 +838,92 @@ fn node_net_reads_while_writing_and_reuses_socket_paths() {
         const text=await new Promise((resolve,reject)=>{let data='';const socket=net.connect(file);socket.setEncoding('utf8');socket.on('data',chunk=>data+=chunk);socket.on('end',()=>resolve(data));socket.on('error',reject);});
         assert.strictEqual(text,'hi');server.close();assert.ok(!fs.existsSync(file));
     "#);
+}
+
+const CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIBSzCB86ADAgECAgkAt3LHU8pBrg8wCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJ
+bG9jYWxob3N0MCAXDTI2MTExMjAxNTMwMVoYDzIxMjYxMDE5MDE1MzAxWjAUMRIw
+EAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARHjFq9
+L2MZn4xtgTaB+160UtIH4gKp8idS7RN5N+EP8LznfQF0GTNfAsOyhKBTLyXyYiDW
+f+zC8/P966mJZyhzoywwKjAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwDAYD
+VR0TAQH/BAIwADAKBggqhkjOPQQDAgNHADBEAiAI8BawuUPY/rEEK9zX3oSQSAiQ
+QlpIVn/oGHEvmwa3hQIgLXeAX9Pt1fOuGZoK57u8FdcVm3yAos05HmZjkGJl850=
+-----END CERTIFICATE-----
+";
+const KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgYk6xRZ2i3aoL4c52
+LHs+pMZ09Md+jxkRs1P9lOrFSJyhRANCAARHjFq9L2MZn4xtgTaB+160UtIH4gKp
+8idS7RN5N+EP8LznfQF0GTNfAsOyhKBTLyXyYiDWf+zC8/P966mJZyhz
+-----END PRIVATE KEY-----
+";
+
+#[test]
+fn node_tls_connects_upgrades_and_verifies() {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use std::io::{Read, Write};
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from_pem_slice(CERT.as_bytes()).unwrap()],
+            PrivateKeyDer::from_pem_slice(KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let config = std::sync::Arc::new(config);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // Plain connections send a STARTTLS line first. All of them echo over TLS until the client ends.
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let config = config.clone();
+            std::thread::spawn(move || {
+                let mut byte = [0];
+                if stream.peek(&mut byte).is_ok() && byte[0] != 0x16 {
+                    while stream.read(&mut byte).is_ok_and(|size| size == 1) && byte[0] != b'\n' {}
+                    stream.write_all(b"OK\r\n").unwrap();
+                }
+                let mut tls = rustls::StreamOwned::new(
+                    rustls::ServerConnection::new(config).unwrap(),
+                    stream,
+                );
+                let mut buffer = [0; 65536];
+                while let Ok(size @ 1..) = tls.read(&mut buffer) {
+                    if tls.write_all(&buffer[..size]).is_err() {
+                        return;
+                    }
+                }
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+                let _ = tls.sock.shutdown(std::net::Shutdown::Write);
+            });
+        }
+    });
+    run(&format!(
+        r#"
+        const require=__apps.module.createRequire(),tls=require('tls'),net=require('net'),{{assert}}=__apps,ca=`{CERT}`,port={port};
+        const open=options=>new Promise((resolve,reject)=>{{const socket=tls.connect({{port,host:'127.0.0.1',...options}},()=>resolve(socket));socket.once('error',reject);}});
+        let socket=await open({{ca}}),received=0;
+        assert.deepStrictEqual([socket.authorized,socket.authorizationError,socket.encrypted,socket.alpnProtocol,socket.getProtocol(),socket.getCipher().version,socket.remotePort],[true,null,true,false,'TLSv1.3','TLSv1.3',port]);
+        assert.match(socket.getCipher().name,/^TLS_(AES|CHACHA20)_/);
+        assert.deepStrictEqual(socket.getPeerCertificate().raw,Buffer.from(ca.replace(/-----[^-]+-----|\s/g,''),'base64'));
+        socket.on('data',chunk=>received+=chunk.length);socket.end(Buffer.alloc(8<<20,1));
+        await new Promise(resolve=>socket.on('end',resolve));assert.strictEqual(received,8<<20);
+        await assert.rejects(open({{ca,servername:'example.com'}}),{{code:'ERR_TLS_CERT_ALTNAME_INVALID',message:"Hostname/IP does not match certificate's altnames: Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1"}});
+        await assert.rejects(open({{}}),{{code:'DEPTH_ZERO_SELF_SIGNED_CERT',message:'self-signed certificate'}});
+        socket=await open({{rejectUnauthorized:false,ALPNProtocols:['x','h2']}});
+        assert.deepStrictEqual([socket.authorized,socket.authorizationError,socket.alpnProtocol],[false,'DEPTH_ZERO_SELF_SIGNED_CERT','h2']);socket.destroy();
+        assert.throws(()=>tls.connect({{port,cert:'x',key:'y'}}),{{code:'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM'}});
+        const plain=net.connect(port,'localhost'),lookup=new Promise(resolve=>plain.once('lookup',(...args)=>resolve(args)));plain.write('STARTTLS\r\n');
+        assert.deepStrictEqual(await lookup,[null,'127.0.0.1',4,'localhost']);
+        assert.strictEqual(String(await new Promise(resolve=>plain.once('data',resolve))),'OK\r\n');
+        socket=await new Promise((resolve,reject)=>{{const socket=tls.connect({{socket:plain,servername:'localhost',ca}},()=>resolve(socket));socket.once('error',reject);}});
+        assert.deepStrictEqual([socket.authorized,socket.remotePort],[true,port]);
+        let text='';socket.setEncoding('utf8');socket.on('data',chunk=>text+=chunk);socket.end('hello');
+        await new Promise(resolve=>plain.on('close',resolve));assert.strictEqual(text,'hello');
+        const seen=[];socket=tls.connect({{port,host:'127.0.0.1',ca}});for(const name of ['secureConnect','error'])socket.on(name,()=>seen.push(name));socket.on('connect',()=>socket.destroy());
+        await new Promise(resolve=>socket.on('close',resolve));assert.deepStrictEqual(seen,[]);
+    "#
+    ));
 }
 
 #[cfg(unix)]
@@ -982,6 +1073,8 @@ fn node_fs_descriptors_handles_and_streams() {
         assert.strictEqual(fs.readSync(fd,Buffer.alloc(4),0,3,1n),3);
         assert.strictEqual(fs.readSync(fd,Buffer.alloc(65<<20),0,65<<20,0),17);
         fs.closeSync(fd);
+        const lined=path.join(root,'lines.txt');fs.writeFileSync(lined,'a\r\nb\n\nc');const lines=[];for await(const line of (await fsp.open(lined)).readLines())lines.push(line);assert.deepStrictEqual(lines,['a','b','','c']);
+        const web=(await fsp.open(lined)).readableWebStream({{autoClose:true}});let streamed='';for await(const chunk of web)streamed+=Buffer.from(chunk);assert.strictEqual(streamed,'a\r\nb\n\nc');
         const moded=path.join(root,'moded.txt'),written=path.join(root,'written.txt');
         fs.closeSync(fs.openSync(moded,'w','600'));fs.writeFileSync(written,'x',{{mode:'640'}});
         assert.deepStrictEqual([moded,written].map(file=>(fs.statSync(file).mode&0o777).toString(8)),['600','640']);
@@ -1259,6 +1352,11 @@ fn node_dns_resolver_reads_answers_like_node() {
         assert.deepStrictEqual(await new Promise(resolve=>callbacks.reverse('192.0.2.1',(error,names)=>resolve(names))),['host.example.test']);
         const cancelled=resolver.resolve4(name);resolver.cancel();await assert.rejects(cancelled,{code:'ECANCELLED'});
         assert.deepStrictEqual([dns.NOTFOUND,dns.promises.TIMEOUT,dns.getDefaultResultOrder()],['ENOTFOUND','ETIMEOUT','verbatim']);
+        if(process.platform!=='win32'){
+            assert.deepStrictEqual(await dns.promises.lookupService('127.0.0.1',22),{hostname:'localhost',service:'ssh'});
+            assert.deepStrictEqual(await new Promise(resolve=>dns.lookupService('127.0.0.1',80,(error,...names)=>resolve(names))),['localhost','http']);
+            assert.throws(()=>dns.lookupService('x',22,()=>{}),{code:'ERR_INVALID_ARG_VALUE',message:"The argument 'address' is invalid. Received 'x'"});
+        }
     "#.replace("PORT", &port.to_string()));
 }
 
@@ -1369,6 +1467,48 @@ fn node_crypto_keys_signatures_and_kdfs_match_node() {
         assert.deepStrictEqual(['sha256','sha512','md5','sha224','sha1'].map(name=>Buffer.from(crypto.hkdfSync(name,'key','salt','info',42)).toString('hex').slice(0,20)),['9ca0d662557439e3b833','24156e2c35525baaf3d0','edd053d0030729baf813','0ff75af37d8684eb5b7a','a0bc90fe7a3fef57087f']);
         const derived=await util.promisify(crypto.hkdf)('sha256',Buffer.alloc(0),'','',16);assert.ok(derived instanceof ArrayBuffer);assert.strictEqual(Buffer.from(derived).toString('hex'),'eb70f01dede9afafa449eee1b1286504');
         assert.throws(()=>crypto.hkdfSync('sha256','k','s','i',255*32+1),{code:'ERR_CRYPTO_INVALID_KEYLEN'});
+        const {subtle}=crypto,der=Buffer.from(rsaDer,'base64'),rs256={name:'RSASSA-PKCS1-v1_5',hash:'SHA-256'},ps384={name:'RSA-PSS',hash:'SHA-384'};
+        const rsaKey=await subtle.importKey('pkcs8',der,rs256,true,['sign']),rsaJwk=await subtle.exportKey('jwk',rsaKey);
+        assert.deepStrictEqual(rsaKey.algorithm,{name:'RSASSA-PKCS1-v1_5',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:{name:'SHA-256'}});
+        assert.strictEqual(hash(JSON.stringify([rsaJwk.alg,rsaJwk.n,rsaJwk.e,rsaJwk.d,rsaJwk.p,rsaJwk.q,rsaJwk.dp,rsaJwk.dq,rsaJwk.qi])),'b10e36ce831fbd418bea2dfb3edbc7d8724661b8b495e8cbc236c05bed14ef93');
+        assert.ok(Buffer.from(await subtle.exportKey('pkcs8',rsaKey)).equals(der));
+        const rsaSigned=Buffer.from(await subtle.sign('RSASSA-PKCS1-v1_5',await subtle.importKey('jwk',rsaJwk,rs256,false,['sign']),msg));
+        assert.strictEqual(rsaSigned.toString('hex').slice(0,64),'6e6d4069d6ca270c300d20ff6e3e3a063ff09f762d53298eb08555b790443fe9');
+        const rsaVerifier=await subtle.importKey('jwk',{kty:'RSA',n:rsaJwk.n,e:rsaJwk.e},rs256,true,['verify']),rsaSpki=await subtle.exportKey('spki',rsaVerifier);
+        assert.strictEqual(hash(Buffer.from(rsaSpki)),'1dd714d2993e56cce33ceb3a100bac5b0e6238f3418d19c0a23d3ff5629ba6fe');
+        const rsaClone=structuredClone(rsaVerifier);assert.ok(rsaClone.algorithm.publicExponent instanceof Uint8Array&&await subtle.verify(rs256,rsaClone,rsaSigned,msg)&&!await subtle.verify(rs256,rsaClone,rsaSigned,der));
+        const psVerifier=await subtle.importKey('spki',rsaSpki,ps384,false,['verify']),psSigner=await subtle.importKey('pkcs8',der,ps384,false,['sign']);
+        assert.ok(await subtle.verify({name:'RSA-PSS',saltLength:48},psVerifier,Buffer.from(pss,'base64'),msg));
+        assert.ok(crypto.verify('sha384',msg,{key:rsaPublic,padding},Buffer.from(await subtle.sign({name:'RSA-PSS',saltLength:48},psSigner,msg))));
+        await assert.rejects(subtle.sign({name:'RSA-PSS',saltLength:32},psSigner,msg),{name:'NotSupportedError'});
+        await assert.rejects(subtle.exportKey('raw',rsaVerifier),{name:'NotSupportedError'});
+        await assert.rejects(subtle.importKey('jwk',{...rsaJwk,alg:'RS512'},rs256,true,['sign']),{name:'DataError'});
+        await assert.rejects(subtle.importKey('spki',rsaSpki,{name:'ECDSA',namedCurve:'P-256'},true,['verify']),{name:'DataError'});
+        await assert.rejects(subtle.importKey('pkcs8',der.subarray(0,100),rs256,true,['sign']),{name:'DataError'});
+        const p256={name:'ECDSA',namedCurve:'P-256'},p384={name:'ECDSA',namedCurve:'P-384'},es256={name:'ECDSA',hash:'SHA-256'},es384={name:'ECDSA',hash:'SHA-384'};
+        const ecPkcs8=ec.export({type:'pkcs8',format:'der'}),ecSpki=crypto.createPublicKey(ec).export({type:'spki',format:'der'});
+        const ecSigner=await subtle.importKey('pkcs8',ecPkcs8,p256,true,['sign']),ecVerifier=await subtle.importKey('spki',ecSpki,p256,true,['verify']);
+        assert.ok(Buffer.from(await subtle.exportKey('pkcs8',ecSigner)).equals(ecPkcs8)&&Buffer.from(await subtle.exportKey('spki',ecVerifier)).equals(ecSpki));
+        assert.strictEqual((await subtle.exportKey('jwk',ecSigner)).d,'gb6zknVzfr-AlLwHdPhZmCyb-ZU_D2HQiZuDKP_UanM');
+        assert.ok(await subtle.verify(es256,ecVerifier,Buffer.from('SHfQsOpqTWQGOP8Gnb4B1IO2JCUtO9LD4ihJBVU1Hw2yr0aVAdlypRqzwcIMAD8P4nUK93HOL8rnVTd88w+fhg==','base64'),msg));
+        assert.ok(await subtle.verify(es256,ecVerifier,await subtle.sign(es256,ecSigner,msg),msg));
+        const ec384Verifier=await subtle.importKey('spki',Buffer.from('MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEP4QpBhgXPCqQ7KwHF1FjxfyYA6jv1hLblGFaWUNAUJ86yK406km1SEF5u+S6WNl3RFUFqnRIHkRaxAQHbNcjeaEv5Sq8il8AlTBEg/V34Dx29uF4hRGayECMzbe4WAuC','base64'),p384,true,['verify']);
+        assert.ok(await subtle.verify(es384,ec384Verifier,Buffer.from('/ahA+cT91coLw4XP2+enl6Dg0j9vBDtjytq/LUBDW/c1n5V68sg0eFJn9rCDl6yWMYY5mezGG1fjJgxz6JPibnFte0Cj0u5aw02YgMjuZuV14dQo5cjvceHXzqeFaSrx','base64'),msg));
+        const pair384=await subtle.generateKey(p384,true,['sign','verify']),signed384=Buffer.from(await subtle.sign(es384,pair384.privateKey,msg));
+        assert.ok(crypto.verify('sha384',msg,{key:Buffer.from(await subtle.exportKey('spki',pair384.publicKey)),format:'der',type:'spki',dsaEncoding:'ieee-p1363'},signed384));
+        assert.strictEqual(crypto.createPrivateKey({key:Buffer.from(await subtle.exportKey('pkcs8',pair384.privateKey)),format:'der',type:'pkcs8'}).asymmetricKeyDetails.namedCurve,'secp384r1');
+        const jwk384=await subtle.exportKey('jwk',pair384.privateKey);assert.ok(jwk384.crv==='P-384'&&await subtle.verify(es384,pair384.publicKey,await subtle.sign(es384,await subtle.importKey('jwk',jwk384,p384,false,['sign']),msg),msg));
+        await assert.rejects(subtle.sign(es256,pair384.privateKey,msg),{name:'NotSupportedError'});
+        await assert.rejects(subtle.importKey('spki',ecSpki,p384,true,['verify']),{name:'DataError'});
+        await assert.rejects(subtle.exportKey('raw',pair384.privateKey),{name:'InvalidAccessError'});
+        const chachaKey=Buffer.from('808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f','hex'),nonce=Buffer.from('070000004041424344454647','hex'),aad=Buffer.from('50515253c0c1c2c3c4c5c6c7','hex');
+        const poem="Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.",chacha=crypto.createCipheriv('chacha20-poly1305',chachaKey,nonce,{authTagLength:16}).setAAD(aad);
+        const chachaSealed=Buffer.concat([chacha.update(poem.slice(0,10)),chacha.update(poem.slice(10)),chacha.final()]);
+        assert.deepStrictEqual([hash(chachaSealed),chacha.getAuthTag().toString('hex')],['eaf0adc045b86e7b8107ed2d6a8c2466cfb1c1f1a943dd5d37c578ee75a06829','1ae10b594f09e26a7e902ecbd0600691']);
+        const opened=crypto.createDecipheriv('chacha20-poly1305',chachaKey,nonce).setAAD(aad).setAuthTag(chacha.getAuthTag());assert.strictEqual(Buffer.concat([opened.update(chachaSealed),opened.final()]).toString(),poem);
+        const forged=crypto.createDecipheriv('chacha20-poly1305',chachaKey,nonce).setAuthTag(chacha.getAuthTag());forged.update(chachaSealed);assert.throws(()=>forged.final(),/unable to authenticate/);
+        assert.throws(()=>crypto.createCipheriv('chacha20-poly1305',chachaKey.subarray(16),nonce),{code:'ERR_CRYPTO_INVALID_KEYLEN'});
+        assert.ok(crypto.getCiphers().includes('chacha20-poly1305')&&crypto.getFips()===0);
     "#);
 }
 
@@ -1469,4 +1609,70 @@ fn node_perf_hooks_and_worker_thread_helpers() {
         const received=await counted;assert.ok(received>=4097&&received<=5001,'a reader that fell behind still gets later messages: '+received);flood.close();
         assert.strictEqual(typeof worker_threads.SHARE_ENV,'symbol');
     "#);
+}
+
+#[cfg(unix)]
+#[test]
+fn fork_and_utility_process_speak_node_ipc() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = r#"const port=process.parentPort,send=port?m=>port.postMessage(m):m=>process.send(m);
+send({ready:process.argv.slice(2),type:process.type??null,fd:process.env.NODE_CHANNEL_FD??null,connected:process.connected});
+(port??process).on('message',m=>{m=port?m.data:m;if(m==='big')send({big:'é\n'.repeat(1<<20)});else if(m==='bye'){send(1);send(2);process.exit(3);}else send({echo:m});});"#;
+    std::fs::write(dir.path().join("child.js"), child).unwrap();
+    let bundle = dir.path().join("bundle.json");
+    std::fs::write(
+        &bundle,
+        serde_json::json!({"files":[["child.js",child]],"pages":[]}).to_string(),
+    )
+    .unwrap();
+    let node = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+    run(&format!(
+        r#"const {{assert,child_process:{{fork,spawn}},utilityProcess,events:{{once}}}}=__apps;
+        const runtime={runtime},file={file},node={node},env={{...process.env,ELECTRON_RUN_AS_NODE:'1',APPS_DEV_BUNDLE:{bundle}}};
+        const code=fn=>{{try{{fn();}}catch(error){{return error.code;}}}};
+        const script=(child,log=[])=>{{for(const name of ['message','disconnect','exit','close'])child.on(name,(...args)=>log.push(name==='message'?args[0]:name==='exit'?'exit '+args[0]:name));return log;}};
+        const talk=async (child,send=m=>child.send(m))=>{{
+            const next=()=>once(child,'message').then(([m])=>m);
+            assert.deepStrictEqual(await next(),{{ready:['a','b'],type:child.postMessage?'utility':null,fd:null,connected:true}});
+            send({{x:[1,'π\n']}});assert.deepStrictEqual(await next(),{{echo:{{x:[1,'π\n']}}}});
+            send('big');assert.strictEqual((await next()).big,'é\n'.repeat(1<<20));
+            const echoes=[],echo=m=>echoes.push(m.echo);child.on('message',echo);for(let index=0;index<200;index++)send(index);
+            while(echoes.length<200)await once(child,'message');
+            child.off('message',echo);assert.deepStrictEqual(echoes,[...Array(200).keys()]);
+            const log=script(child);send('bye');await once(child,child.postMessage?'exit':'close');return log;
+        }};
+        const child=fork('apps:///child.js',['a','b'],{{execPath:runtime,env}});
+        assert.ok(child.connected&&child.channel&&child.stdio[3]===null&&child.stdout===null);
+        assert.strictEqual(code(()=>child.send('x',{{}})),'ERR_INVALID_HANDLE_TYPE');
+        assert.deepStrictEqual(await talk(child),[1,2,'disconnect','exit 3','close']);
+        assert.ok(!child.connected&&child.channel===null&&child.exitCode===3);
+        assert.strictEqual((await new Promise(resolve=>assert.strictEqual(child.send('late',resolve),false))).code,'ERR_IPC_CHANNEL_CLOSED');
+        const parted=fork('apps:///child.js',{{execPath:runtime,env,silent:true}});
+        await once(parted,'message');const echoed=once(parted,'message');
+        assert.strictEqual(await new Promise(resolve=>parted.send('first',resolve)),null);assert.deepStrictEqual((await echoed)[0],{{echo:'first'}});const log=script(parted);parted.disconnect();assert.ok(!parted.connected);
+        await once(parted,'close');assert.deepStrictEqual(log,['disconnect','exit 0','close']);
+        assert.strictEqual(code(()=>fork('x',{{serialization:'advanced'}})),'ERR_INVALID_ARG_VALUE');
+        assert.strictEqual(code(()=>fork('x',{{stdio:'pipe'.split()}})),'ERR_CHILD_PROCESS_IPC_REQUIRED');
+        assert.strictEqual(code(()=>spawn('x',{{stdio:['pipe','pipe','pipe','ipc','ipc']}})),'ERR_IPC_ONE_PIPE');
+        const utility=utilityProcess.fork('apps:///child.js',['a','b'],{{execPath:runtime,env,stdio:'pipe'}});
+        assert.ok(utility.pid>0&&utility.stdout&&utility.stderr);await once(utility,'spawn');
+        assert.strictEqual(code(()=>utility.postMessage('x',[{{}}])),'ERR_INVALID_ARG_VALUE');
+        assert.deepStrictEqual(await talk(utility,m=>utility.postMessage(m)),[1,2,'exit 3']);
+        assert.strictEqual(utility.pid,undefined);utility.postMessage('late');
+        if(node){{
+            assert.deepStrictEqual(await talk(fork(file,['a','b'],{{execPath:'node',env}})),[1,2,'disconnect','exit 3','close']);
+            const parent=spawn('node',['-e',`const c=require('child_process').fork('apps:///child.js',['a','b'],{{execPath:${{JSON.stringify(runtime)}}}}),log=[];
+                c.on('message',m=>{{log.push(m.big?m.big.length:m);if(m.ready)c.send('big');else if(m.big)c.send('bye');}});
+                for(const name of ['disconnect','exit','close'])c.on(name,code=>log.push(name+' '+code));c.on('close',()=>console.log(JSON.stringify(log)));`],{{env}});
+            const out=[];parent.stdout.on('data',data=>out.push(data));await once(parent,'close');
+            assert.deepStrictEqual(JSON.parse(Buffer.concat(out).toString()),[{{ready:['a','b'],type:null,fd:null,connected:true}},1<<21,1,2,'disconnect undefined','exit 3','close 3']);
+        }}
+    "#,
+        runtime = serde_json::to_string(env!("CARGO_BIN_EXE_apps-runtime")).unwrap(),
+        file = serde_json::to_string(&dir.path().join("child.js")).unwrap(),
+        bundle = serde_json::to_string(&bundle).unwrap(),
+    ));
 }

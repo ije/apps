@@ -247,7 +247,7 @@ impl State {
                         };
                         let api = JavaScriptCore::load()?;
                         let engine = JsContext::new_interruptible(api.clone(), host, role, Some(cancelled.clone()))?;
-                        engine.eval("delete globalThis.document; delete globalThis.window; delete globalThis.screen; delete globalThis.localStorage; delete globalThis.sessionStorage; globalThis.self=globalThis;", "apps:worker-scope")?;
+                        engine.eval("for (const name of ['document', 'window', 'screen', 'screenX', 'screenY', 'screenLeft', 'screenTop', 'outerWidth', 'outerHeight', 'localStorage', 'sessionStorage']) delete globalThis[name]; globalThis.self=globalThis;", "apps:worker-scope")?;
                         if native { engine.eval("globalThis.require = globalThis.__apps.module.createRequire(); globalThis.onmessage = null;", "apps:worker-modules")?; }
                         let _ = output.send(json!({"kind":"online"}).into());
                         wake.wake();

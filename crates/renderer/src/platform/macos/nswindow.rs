@@ -34,7 +34,6 @@ use std::{
 };
 
 const LEVEL_NORMAL: isize = 0;
-const LEVEL_FLOATING: isize = 3;
 
 // Title bar container, then the close, minimize and zoom buttons.
 type ButtonFrames = [NSRect; 4];
@@ -152,15 +151,32 @@ define_class!(
 
         #[unsafe(method(windowWillResize:toSize:))]
         fn will_resize(&self, _: &AnyObject, proposed: CGSize) -> CGSize {
-            let Some((ratio, extra)) = self.ivars().aspect.get() else {
-                return proposed;
-            };
             let frame = self.frame();
-            let inner = self.contentRectForFrameRect(frame).size;
-            let pad_x = frame.size.width - inner.width + extra.width;
-            let pad_y = frame.size.height - inner.height + extra.height;
-            let width = (pad_x + (proposed.height - pad_y) * ratio).round();
-            CGSize::new(width, (pad_y + (width - pad_x) / ratio).round())
+            let size = match self.ivars().aspect.get() {
+                Some((ratio, extra)) => {
+                    let inner = self.contentRectForFrameRect(frame).size;
+                    let pad_x = frame.size.width - inner.width + extra.width;
+                    let pad_y = frame.size.height - inner.height + extra.height;
+                    let width = (pad_x + (proposed.height - pad_y) * ratio).round();
+                    CGSize::new(width, (pad_y + (width - pad_x) / ratio).round())
+                }
+                None => proposed,
+            };
+            let edge = match (size.width - frame.size.width).abs() > (size.height - frame.size.height).abs() {
+                true => "right",
+                false => "bottom",
+            };
+            let bounds = flip(NSRect::new(frame.origin, size), primary_top(self.mtm()));
+            match self.ivars().callbacks.will_change(edge, bounds) {
+                true => frame.size,
+                false => size,
+            }
+        }
+
+        #[unsafe(method(windowWillMove:))]
+        fn will_move(&self, _: &AnyObject) {
+            let bounds = flip(self.frame(), primary_top(self.mtm()));
+            self.ivars().callbacks.will_change("move", bounds);
         }
 
         #[unsafe(method(windowDidChangeOcclusionState:))]
@@ -706,9 +722,7 @@ impl AppsWindow {
                 self.setMinSize(cg_size(min));
                 self.setMaxSize(CGSize::new(most(max.width), most(max.height)));
             }
-            WindowChange::AlwaysOnTop(on) => {
-                self.setLevel(if on { LEVEL_FLOATING } else { LEVEL_NORMAL })
-            }
+            WindowChange::AlwaysOnTop(level) => self.setLevel(level),
             WindowChange::Resizable(on) => style(NSWindowStyleMask::Resizable, on),
             WindowChange::Minimizable(on) => style(NSWindowStyleMask::Miniaturizable, on),
             WindowChange::Closable(on) => style(NSWindowStyleMask::Closable, on),
@@ -741,6 +755,7 @@ impl AppsWindow {
                 false => NSWindowSharingType::ReadOnly,
             }),
             WindowChange::Focusable(on) => ivars.focusable.set(on),
+            WindowChange::Edited(on) => self.setDocumentEdited(on),
             WindowChange::CancelComposition => {
                 if let Some(input) = self.view().inputContext() {
                     input.discardMarkedText();

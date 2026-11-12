@@ -763,7 +763,11 @@ impl Host {
                 return Ok(Value::Null);
             }
             if op == "dom.screen" {
-                let (display, work) = (state.window.display, state.window.work_area);
+                let (display, work, frame) = (
+                    state.window.display,
+                    state.window.work_area,
+                    state.window.frame,
+                );
                 let viewport = self.viewports.get(&id).unwrap_or(&[800., 600.]);
                 return Ok(if f32::from(display.size.width) > 0. {
                     json!(
@@ -773,12 +777,27 @@ impl Host {
                             work.origin.x,
                             work.origin.y,
                             work.size.width,
-                            work.size.height
+                            work.size.height,
+                            frame.origin.x,
+                            frame.origin.y,
+                            frame.size.width,
+                            frame.size.height
                         ]
                         .map(|value| f32::from(value).round())
                     )
                 } else {
-                    json!([viewport[0], viewport[1], 0, 0, viewport[0], viewport[1]])
+                    json!([
+                        viewport[0],
+                        viewport[1],
+                        0,
+                        0,
+                        viewport[0],
+                        viewport[1],
+                        0,
+                        0,
+                        viewport[0],
+                        viewport[1]
+                    ])
                 });
             }
             if op == "dom.fonts" {

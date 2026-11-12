@@ -366,12 +366,15 @@ impl renderer::View for PageView {
         self.render_page(tree, window, cx)
     }
 
-    fn window_changed(&mut self, _: &mut Window, cx: &mut App) {
+    fn window_changed(&mut self, window: &mut Window, cx: &mut App) {
         self.origin.set(None);
-        if let Ok(mut host) = self.host.try_borrow_mut()
-            && !host.window_changes.contains(&self.id)
-        {
-            host.window_changes.push(self.id);
+        if let Ok(mut host) = self.host.try_borrow_mut() {
+            if let Some(state) = host.dom.get_mut(&self.id) {
+                state.window = window.window_state();
+            }
+            if !host.window_changes.contains(&self.id) {
+                host.window_changes.push(self.id);
+            }
         }
         self.drive(cx);
     }

@@ -523,6 +523,8 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     async utimes(atime, mtime) { await asyncCall('futimes', this.#fd, seconds(atime), seconds(mtime)); }
     createReadStream(o) { return files.createReadStream(null, { ...o, fd: this }); }
     createWriteStream(o) { return files.createWriteStream(null, { ...o, fd: this }); }
+    readLines(o) { return process.getBuiltinModule('readline').createInterface({ input: this.createReadStream(o), crlfDelay: Infinity }); }
+    readableWebStream({ autoClose = false } = {}) { return new ReadableStream({ pull: async controller => { const chunk = bytes(await asyncCall('read', this.#fd, 65536, null)); if (chunk.length) controller.enqueue(chunk); else { controller.close(); if (autoClose) await this.close(); } }, cancel: () => autoClose ? this.close() : undefined }); }
     [Symbol.asyncDispose]() { return this.close(); }
   }
   const flags = new Set(['r', 'rs', 'sr', 'r+', 'rs+', 'sr+', 'w', 'wx', 'xw', 'w+', 'wx+', 'xw+', 'a', 'ax', 'xa', 'as', 'sa', 'a+', 'ax+', 'xa+', 'as+', 'sa+']);
@@ -1141,6 +1143,11 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     class Resolver extends PromiseResolver {}
     const methods = ['resolve', 'reverse', ...Object.keys(rrtypes).map(type => 'resolve' + (type === 'A' ? '4' : type === 'AAAA' ? '6' : type[0] + type.slice(1).toLowerCase()))];
     for (const method of methods) Resolver.prototype[method] = function(...args) { const callback = args.pop(); if (typeof callback !== 'function') throw typeError('callback', 'of type function', callback); PromiseResolver.prototype[method].apply(this, args).then(value => callback(null, value), callback); };
+    const lookupService = (address, port) => {
+      if (!call('web.tcp.ip', String(address))) throw error(TypeError, 'ERR_INVALID_ARG_VALUE', `The argument 'address' is invalid. Received '${address}'`);
+      if (!Number.isInteger(port) || port < 0 || port > 65535) throw error(RangeError, 'ERR_SOCKET_BAD_PORT', `Port should be >= 0 and < 65536. Received ${received(port)}.`);
+      return asyncCall('lookupService', address, port).then(([hostname, service]) => ({ hostname, service }), () => { throw Object.assign(new Error(`getnameinfo ENOTFOUND ${address}`), { code: 'ENOTFOUND', syscall: 'getnameinfo' }); });
+    };
     const resolver = new Resolver(), order = {
       getDefaultResultOrder: () => resultOrder,
       setDefaultResultOrder(value) { if (!['ipv4first', 'ipv6first', 'verbatim'].includes(value)) throw error(TypeError, 'ERR_INVALID_ARG_VALUE', `The argument 'order' must be one of: 'verbatim', 'ipv4first', 'ipv6first'. Received '${value}'`); resultOrder = value; },
@@ -1150,10 +1157,11 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     const dns = {
       ...order, Resolver, ADDRCONFIG: 1024, V4MAPPED: 2048, ALL: 256,
       ...Object.fromEntries(methods.map(method => [method, Resolver.prototype[method].bind(resolver)])),
+      lookupService(address, port, callback) { lookupService(address, port).then(result => callback(null, result.hostname, result.service), callback); },
       lookup(hostname, o, callback) { if (typeof o === 'function') { callback = o; o = {}; } o = typeof o === 'object' && o !== null ? o : { family: o }; resolve(hostname, o).then(list => o.all ? callback(null, list) : callback(null, list[0].address, list[0].family), callback); },
-      promises: { ...order, Resolver: PromiseResolver, ...Object.fromEntries(methods.map(method => [method, PromiseResolver.prototype[method].bind(resolver)])), lookup: async (hostname, o = {}) => { o = typeof o === 'object' && o !== null ? o : { family: o }; const list = await resolve(hostname, o); return o.all ? list : list[0]; } },
+      promises: { ...order, Resolver: PromiseResolver, ...Object.fromEntries(methods.map(method => [method, PromiseResolver.prototype[method].bind(resolver)])), lookupService, lookup: async (hostname, o = {}) => { o = typeof o === 'object' && o !== null ? o : { family: o }; const list = await resolve(hostname, o); return o.all ? list : list[0]; } },
     };
-    dns.lookup[promisify.custom] = dns.promises.lookup;
+    dns.lookup[promisify.custom] = dns.promises.lookup; dns.lookupService[promisify.custom] = lookupService;
     return dns;
   })();
 

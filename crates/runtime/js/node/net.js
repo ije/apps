@@ -14,6 +14,8 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer, { encode, decode })
   };
   const errno = code => { const value = globalThis.__apps?.os.constants.errno[code]; return value === undefined ? undefined : -value; };
   const failure = event => {
+    if (event.alert) return Object.assign(new Error(`SSL alert number ${event.alert}`), { code: 'ERR_SSL_' + ({ 40: 'SSLV3_ALERT_HANDSHAKE_FAILURE', 42: 'SSLV3_ALERT_BAD_CERTIFICATE', 46: 'SSLV3_ALERT_CERTIFICATE_UNKNOWN', 48: 'TLSV1_ALERT_UNKNOWN_CA', 70: 'TLSV1_ALERT_PROTOCOL_VERSION', 80: 'TLSV1_ALERT_INTERNAL_ERROR', 112: 'TLSV1_UNRECOGNIZED_NAME', 116: 'TLSV13_ALERT_CERTIFICATE_REQUIRED', 120: 'TLSV1_ALERT_NO_APPLICATION_PROTOCOL' }[event.alert] ?? 'TLS_ALERT_' + event.alert) });
+    if (event.message) return Object.assign(new Error(event.message), { code: event.code });
     const target = event.syscall === 'getaddrinfo' ? ` ${event.hostname}` : event.port !== undefined ? ` ${event.address}:${event.port}` : event.address !== undefined ? ` ${event.address}` : '';
     const message = event.syscall === 'listen' ? `listen ${event.code}: ${event.description}${target}` : `${event.syscall} ${event.code}${target}`;
     const error = Object.assign(new Error(message), { errno: event.errno ?? errno(event.code), code: event.code, syscall: event.syscall });
@@ -37,7 +39,7 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer, { encode, decode })
       const [options, listener] = normalize(args);
       if (options.path === undefined) options.port = port(options.port, 'Port');
       if (listener) this.once('connect', listener);
-      this.connecting = true; this.pending = true;
+      this.connecting = true; this.pending = true; this._lookup = options.path === undefined && !call('web.tcp.ip', options.host ??= 'localhost') ? options.host : undefined;
       this._socket = call('web.tcp.connect', options); sockets.set(this._socket, this);
       if (options.timeout) this.setTimeout(options.timeout);
       if (options.signal) {
@@ -151,12 +153,48 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer, { encode, decode })
     [Symbol.for('nodejs.util.inspect.custom')](depth, options, inspect) { return `BlockList ${inspect({ rules: this.rules }, options)}`; }
     static isBlockList(value) { return typeof value === 'object' && value !== null && #rules in value; }
   }
+  const unsupported = what => fail('ERR_FEATURE_UNAVAILABLE_ON_PLATFORM', `TLS ${what} are not supported`, Error);
+  class TLSSocket extends Socket {
+    constructor(socket, options = {}) {
+      const settings = options.secureContext?.context ?? options;
+      if (options.isServer) throw unsupported('servers');
+      if (settings.cert || settings.key || settings.pfx) throw unsupported('client certificates');
+      super(options); this.encrypted = true; this.authorized = false; this.authorizationError = null; this.alpnProtocol = false; this.servername = options.servername || options.host || 'localhost';
+      this._settings = { servername: this.servername, ca: settings.ca && [].concat(settings.ca).join('\n'), alpn: [...options.ALPNProtocols ?? []].map(item => Buffer.from(item).toString('latin1')), reject: !!(options.rejectUnauthorized ?? globalThis.process?.env.NODE_TLS_REJECT_UNAUTHORIZED !== '0') };
+      if (!socket) return;
+      if (socket._socket === undefined) throw fail('ERR_SOCKET_CLOSED', 'Socket is closed', Error);
+      this._socket = socket._socket; socket._upgrade = this; this.once('close', () => socket.destroy());
+      call('web.tcp.tls', this._socket, this._settings);
+    }
+    connect(...args) { super.connect(...args); call('web.tcp.tls', this._socket, this._settings); return this; }
+    getProtocol() { return this._secure?.protocol ?? null; }
+    getCipher() {
+      const { cipher, protocol } = this._secure ?? {};
+      if (!cipher) return;
+      const standardName = 'TLS_' + (cipher >> 8 === 0x13 ? '' : `ECDHE_${[0xc02f, 0xc030, 0xcca8].includes(cipher) ? 'RSA' : 'ECDSA'}_WITH_`) + ([0x1301, 0xc02b, 0xc02f].includes(cipher) ? 'AES_128_GCM_SHA256' : [0x1302, 0xc02c, 0xc030].includes(cipher) ? 'AES_256_GCM_SHA384' : 'CHACHA20_POLY1305_SHA256');
+      return { name: protocol === 'TLSv1.3' ? standardName : standardName.slice(4).replace('_WITH_', '_').replace(/AES_(\d+)/, 'AES$1').replace('POLY1305_SHA256', 'POLY1305').replaceAll('_', '-'), standardName, version: protocol };
+    }
+    getPeerCertificate() { return this._secure ? { raw: this._secure.raw } : {}; }
+  }
+  class TLSServer extends Server { constructor() { super(); throw unsupported('servers'); } }
+  const tls = {
+    TLSSocket, Server: TLSServer,
+    connect(...args) {
+      const callback = typeof args.at(-1) === 'function' ? args.pop() : undefined, options = { ...args.slice(1).find(value => value !== null && typeof value === 'object'), ...normalize(args)[0] };
+      const socket = new TLSSocket(options.socket, options);
+      if (callback) socket.once('secureConnect', callback);
+      if (!options.socket) socket.connect(options); else if (options.timeout) socket.setTimeout(options.timeout);
+      return socket;
+    },
+    createServer() { throw unsupported('servers'); }, createSecureContext: (options = {}) => ({ context: options }), rootCertificates: Object.freeze([]), getCACertificates: () => [], setDefaultCACertificates() {}, getCiphers: () => [], checkServerIdentity() {},
+    DEFAULT_MIN_VERSION: 'TLSv1.2', DEFAULT_MAX_VERSION: 'TLSv1.3', DEFAULT_ECDH_CURVE: 'auto', CLIENT_RENEG_LIMIT: 3, CLIENT_RENEG_WINDOW: 600,
+  };
   let autoSelect = false, autoSelectTimeout = 250;
   const api = { Socket, Server, BlockList, SocketAddress, createServer: (...args) => new Server(...args), connect, createConnection: connect,
     getDefaultAutoSelectFamily: () => autoSelect, setDefaultAutoSelectFamily: value => { autoSelect = !!value; },
     getDefaultAutoSelectFamilyAttemptTimeout: () => autoSelectTimeout, setDefaultAutoSelectFamilyAttemptTimeout: value => { autoSelectTimeout = Math.max(10, Number(value)); },
     isIP: value => call('web.tcp.ip', String(value)), isIPv4: value => call('web.tcp.ip', String(value)) === 4, isIPv6: value => call('web.tcp.ip', String(value)) === 6 };
-  return { api, normalize, port, failure,
+  return { api, tls, normalize, port, failure,
     poll() {
       if (!sockets.size && !servers.size) return;
       for (const event of call('web.tcp.poll')) {
@@ -166,13 +204,15 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer, { encode, decode })
           sockets.set(event.id, socket); server._connections.add(socket); server.emit('connection', socket); continue;
         }
         const socket = sockets.get(event.id); if (!socket) continue;
-        if (event.kind === 'connect') { if (socket._server) continue; Object.assign(socket, event.address); socket.connecting = socket.pending = false; socket.emit('connect'); socket.emit('ready'); }
+        if (event.kind === 'connect') { if (socket._server) continue; Object.assign(socket, event.address); socket.connecting = socket.pending = false; if (socket._lookup) socket.emit('lookup', null, socket.remoteAddress, socket.remoteFamily === 'IPv6' ? 6 : 4, socket._lookup); socket.emit('connect'); socket.emit('ready'); }
         else if (event.kind === 'data') { const data = Buffer.from(decode(event.bytes).buffer); socket.bytesRead += data.length; socket._touch(); if (!socket.push(data) && !socket._paused) { socket._paused = true; call('web.tcp.pause', event.id, true); } }
         else if (event.kind === 'written') { socket.bytesWritten += event.bytes; socket._touch(); const callback = socket._written; socket._written = null; callback?.(); }
+        else if (event.kind === 'tls') { const next = socket._upgrade; if (next) { sockets.set(event.id, next); Object.assign(next, event.address, { connecting: false, pending: false, _paused: socket._paused }); socket._socket = undefined; socket._paused = false; } }
+        else if (event.kind === 'secure') { socket.authorized = !event.error; socket.authorizationError = event.error ?? null; socket.alpnProtocol = event.alpn ?? false; socket._secure = { ...event, raw: Buffer.from(decode(event.bytes).buffer) }; socket.emit('secureConnect'); }
         else if (event.kind === 'finish') { const callback = socket._finished; socket._finished = null; callback?.(); }
         else if (event.kind === 'end') { socket.push(null); if (!socket.allowHalfOpen && socket.writable) socket.end(); }
         else if (event.kind === 'error') socket.destroy(failure(event));
-        else if (event.kind === 'close') socket.destroy();
+        else if (event.kind === 'close') { if (socket._readableState.ended && !socket.readableEnded && socket.readableFlowing) socket.once('end', () => socket.destroy()); else socket.destroy(); }
       }
     },
     pending: () => [...sockets.values(), ...servers.values()].some(value => value._referenced),

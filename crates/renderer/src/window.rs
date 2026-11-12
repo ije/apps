@@ -124,7 +124,8 @@ pub enum WindowChange {
     Blur,
     Restore,
     SizeLimits(Size<Pixels>, Size<Pixels>),
-    AlwaysOnTop(bool),
+    /// An `NSWindowLevel`, where 0 is normal.
+    AlwaysOnTop(isize),
     Resizable(bool),
     Minimizable(bool),
     Maximizable(bool),
@@ -140,6 +141,7 @@ pub enum WindowChange {
     AspectRatio(f32, Size<Pixels>),
     Parent(Option<raw_window_handle::RawWindowHandle>, bool),
     Vibrancy(Option<isize>, isize),
+    Edited(bool),
     CancelComposition,
 }
 

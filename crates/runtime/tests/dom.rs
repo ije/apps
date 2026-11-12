@@ -1132,12 +1132,54 @@ fn screen_describes_the_viewport_without_a_window() {
     let (.., result) = offscreen_page(
         r#"
         same([screen.width, screen.height, screen.availWidth, screen.availHeight, screen.availLeft, screen.availTop], [800, 600, 800, 600, 0, 0], 'size');
+        same([screenX, screenY, screenLeft, screenTop, outerWidth, outerHeight], [0, 0, 0, 0, 800, 600], 'window frame');
         same([screen.colorDepth, screen.pixelDepth, screen.orientation.type, screen.orientation.angle], [24, 24, 'landscape-primary', 0], 'depth');
         if (!(screen instanceof Screen) || !(screen.orientation instanceof ScreenOrientation) || window.screen !== screen) throw Error('types');
         if (String(screen) !== '[object Screen]' || screen.onchange !== null || !(screen instanceof EventTarget)) throw Error('events');
         await rejected(() => screen.orientation.lock('portrait'), 'NotSupportedError');
-        const inner = await reply(worker(`postMessage([typeof screen, typeof OffscreenCanvas, typeof createImageBitmap, typeof ImageBitmap])`));
-        same(inner, ['undefined', 'function', 'function', 'function'], 'worker globals');
+        const inner = await reply(worker(`postMessage([typeof screen, typeof screenX, typeof OffscreenCanvas, typeof createImageBitmap, typeof ImageBitmap])`));
+        same(inner, ['undefined', 'undefined', 'function', 'function', 'function'], 'worker globals');
+    "#,
+    );
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn canvas_paths_matrices_patterns_and_shadows() {
+    let (.., result) = offscreen_page(
+        r#"
+        const canvas = new OffscreenCanvas(20, 20), ctx = canvas.getContext('2d'), at = (x, y) => [...ctx.getImageData(x, y, 1, 1).data];
+        const square = new Path2D('M2 2h6v6H2z'), copy = new Path2D(square); copy.rect(12, 2, 6, 6);
+        ctx.beginPath(); ctx.rect(0, 12, 4, 4); ctx.fillStyle = '#ff0000'; ctx.fill(copy); ctx.translate(0, 10); ctx.fill(square, 'evenodd'); ctx.resetTransform();
+        same([at(5, 5), at(15, 5), at(5, 15), at(1, 13)], [[255, 0, 0, 255], [255, 0, 0, 255], [255, 0, 0, 255], [0, 0, 0, 0]], 'Path2D fill');
+        same([ctx.isPointInPath(square, 5, 5), ctx.isPointInPath(square, 9, 5), ctx.isPointInStroke(square, 2, 5), ctx.isPointInPath(1, 13), ctx.isPointInPath(NaN, 1)], [true, false, true, true, false], 'hits');
+        ctx.fill(); same(at(1, 13), [255, 0, 0, 255], 'current path');
+        const moved = new Path2D(); moved.addPath(square, new DOMMatrix().translate(10, 10)); ctx.fillStyle = '#0000ff'; ctx.fill(moved);
+        moved.arc(15, 15, 1, 0, 7); ctx.fill(moved); same(at(15, 15), [0, 0, 255, 255], 'addPath');
+        const half = new Path2D('M0 0H10V20H0Z'); ctx.save(); ctx.clip(half); ctx.clearRect(0, 0, 20, 20); ctx.restore(); same([at(5, 5)[3], at(15, 15)[3]], [0, 255], 'clip');
+        try { ctx.fill(square, 'odd'); throw Error('rule'); } catch (error) { if (!(error instanceof TypeError)) throw error; }
+        const m = new DOMMatrix([1, 2, 3, 4, 5, 6]);
+        same([String(m.inverse()), String(m.multiply(m.inverse())), m.is2D, m.isIdentity, new DOMMatrix().isIdentity], ['matrix(-2, 1, 1.5, -0.5, 1, -2)', 'matrix(1, 0, 0, 1, 0, 0)', true, false, true], 'matrix');
+        const p = new DOMMatrix().translate(10, 20).scale(2, 3).transformPoint(new DOMPoint(1, 1));
+        same([p.x, p.y, p.w, new DOMMatrix().translate(0, 0, 5).is2D, new DOMMatrix().rotate(0, 0, 30).toString() === new DOMMatrix().rotate(30).toString(), Math.round(new DOMMatrix().rotate(30).b * 1000)], [12, 23, 1, false, true, 500], 'transforms');
+        same([String(DOMMatrix.fromMatrix({ a: 2, f: 3 })), new DOMMatrix('matrix(1, 2, 3, 4, 5, 6)').f, new DOMMatrix(new DOMMatrix([1, 0, 0, 1, 7, 0])).e, [...new DOMMatrix().scale(2).toFloat64Array()].join()], ['matrix(2, 0, 0, 1, 0, 3)', 6, 7, '2,0,0,0,0,2,0,0,0,0,1,0,0,0,0,1'], 'conversions');
+        ctx.setTransform(new DOMMatrix([2, 0, 0, 2, 1, 1])); const t = ctx.getTransform(); same([t instanceof DOMMatrix, t.a, t.e], [true, 2, 1], 'getTransform'); ctx.resetTransform();
+        const near = (got, want, name) => { if (got.some((v, i) => Math.abs(v - want[i]) > 2)) throw Error(`${name}: ${got} is not ${want}`); };
+        const tile = new OffscreenCanvas(2, 1), tiles = tile.getContext('2d'); tiles.fillStyle = '#ff0000'; tiles.fillRect(0, 0, 1, 1); tiles.fillStyle = '#0000ff'; tiles.fillRect(1, 0, 1, 1);
+        ctx.clearRect(0, 0, 20, 20); ctx.fillStyle = ctx.createPattern(tile, 'repeat'); ctx.fillRect(0, 0, 20, 20);
+        same([at(4, 3), at(5, 3)], [[255, 0, 0, 255], [0, 0, 255, 255]], 'repeat');
+        const strip = ctx.createPattern(tile, 'repeat-x'); strip.setTransform(new DOMMatrix().translate(0, 10)); ctx.clearRect(0, 0, 20, 20); ctx.fillStyle = strip; ctx.fillRect(0, 0, 20, 20);
+        same([at(16, 10), at(17, 10), at(4, 9)[3], at(4, 11)[3]], [[255, 0, 0, 255], [0, 0, 255, 255], 0, 0], 'repeat-x');
+        ctx.clearRect(0, 0, 20, 20); ctx.fillStyle = ctx.createPattern(tile, 'no-repeat'); ctx.fillRect(0, 0, 20, 20); same([at(1, 0)[2], at(2, 0)[3], at(0, 1)[3]], [255, 0, 0], 'no-repeat');
+        same([ctx.createPattern(new Image(), null), (() => { try { ctx.createPattern(tile, 'x'); } catch (error) { return error.name; } })()], [null, 'SyntaxError'], 'pattern errors');
+        const cone = ctx.createConicGradient(0, 10.5, 10.5); cone.addColorStop(0, '#ff0000'); cone.addColorStop(1, '#0000ff'); ctx.fillStyle = cone; ctx.fillRect(0, 0, 20, 20);
+        near(at(10, 15), [191, 0, 64, 255], 'conic quarter'); near(at(5, 10), [128, 0, 128, 255], 'conic half');
+        ctx.clearRect(0, 0, 20, 20); ctx.fillStyle = '#ff0000'; ctx.shadowColor = '#0000ff'; ctx.shadowOffsetX = ctx.shadowOffsetY = 5; ctx.fillRect(2, 2, 4, 4);
+        same([at(3, 3), at(8, 8), at(12, 12)[3], at(3, 8)[3]], [[255, 0, 0, 255], [0, 0, 255, 255], 0, 0], 'shadow offset');
+        ctx.clearRect(0, 0, 20, 20); ctx.shadowOffsetX = ctx.shadowOffsetY = 0; ctx.shadowBlur = 4; ctx.fillRect(7, 7, 4, 4);
+        same([at(9, 9), Math.abs(at(9, 6)[3] - 66) < 10, at(9, 3)[3] > 0, at(9, 0)[3]], [[255, 0, 0, 255], true, true, 0], 'shadow blur');
+        ctx.shadowColor = 'transparent';
+        same(await reply(worker(`postMessage([typeof Path2D, typeof DOMMatrix, typeof DOMPoint])`)), ['function', 'function', 'function'], 'worker globals');
     "#,
     );
     assert_eq!(result, "ok");
@@ -1156,9 +1198,9 @@ fn offscreen_canvas_draws_reads_and_resizes() {
         same([...context.getImageData(1, 1, 1, 1).data], [255, 0, 0, 255], 'pixels');
         const element = document.createElement('canvas'); element.width = element.height = 4; const other = element.getContext('2d'); other.drawImage(canvas, 2, 2);
         same([...other.getImageData(3, 3, 1, 1).data], [255, 0, 0, 255], 'drawn on a canvas');
-        const blob = await canvas.convertToBlob({ type: 'image/jpeg' });
-        same(blob.type, 'image/png', 'blob type');
-        same([...new Uint8Array(await blob.arrayBuffer()).subarray(0, 4)], [137, 80, 78, 71], 'png');
+        const blob = await canvas.convertToBlob({ type: 'image/webp' }), jpeg = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.5 });
+        same([blob.type, jpeg.type, element.toDataURL('image/JPEG').slice(0, 26), element.toDataURL('text/plain').slice(0, 22)], ['image/png', 'image/jpeg', 'data:image/jpeg;base64,/9j', 'data:image/png;base64,'], 'blob type');
+        same([...new Uint8Array(await blob.arrayBuffer()).subarray(0, 4), ...new Uint8Array(await jpeg.arrayBuffer()).subarray(0, 2)], [137, 80, 78, 71, 255, 216], 'png');
         context.fillStyle = '#00ff00'; canvas.width = 6;
         same([canvas.width, [...context.getImageData(0, 0, 1, 1).data]], [6, [0, 0, 0, 0]], 'resize clears');
         same(context.fillStyle, '#000000', 'resize resets the state');
@@ -1965,6 +2007,9 @@ fn parser_raw_text_tables_and_document_structure() {
         check('insertAdjacentHTML context', () => tbody.children.length === 2 && tbody.lastChild.localName === 'tr');
         const parsed = new DOMParser().parseFromString('<title>t</title><p>x', 'text/html');
         check('DOMParser', () => parsed.head.firstChild.localName === 'title' && parsed.body.firstChild.localName === 'p' && parsed.title === 't');
+        const drawing = new DOMParser().parseFromString('<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2 2"><clipPath id="c"/><circle r="1"/></svg>', 'image/svg+xml');
+        check('DOMParser SVG', () => drawing.documentElement.localName === 'svg' && drawing.documentElement.namespaceURI === 'http://www.w3.org/2000/svg' && drawing.querySelector('clipPath').nextSibling.getAttribute('r') === '1' && drawing.documentElement.getAttribute('viewBox') === '0 0 2 2');
+        check('navigator', () => navigator.vendor === '' && navigator.appName === 'Netscape' && navigator.webdriver === false && navigator.appVersion === navigator.userAgent);
         const svg = document.createElement('div'); svg.innerHTML = '<svg viewbox="0 0 1 1"><lineargradient id="g"/><foreignObject><p>x</p></foreignObject></svg>';
         check('svg case', () => svg.querySelector('linearGradient')?.id === 'g' && svg.firstChild.getAttribute('viewBox') === '0 0 1 1' && svg.querySelector('foreignObject p') !== null);
         "#,
@@ -3334,4 +3379,36 @@ fn web_animation_times_must_be_finite_and_may_be_huge() {
         check('huge start', () => { animation.startTime = 1e300; animation.play(); return getComputedStyle(a).opacity === '0.5'; });
         "#,
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn select_popup_picks_options() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<select id='s'><option>One<optgroup label='G'><option disabled>Two<option>Three</optgroup><hr><option hidden>Four<option>Five</select>"),
+        dirty: false,
+    });
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
+    engine.eval(r#"
+        const s = document.getElementById('s'), seen = [];
+        for (const type of ['input', 'change']) s.addEventListener(type, () => seen.push(type + ':' + s.value));
+        const press = () => __appsDispatch('pointerdown', [s.selectedOptions[0]._id, s._id], {pointerId:1, pointerType:'mouse', clientX:1, clientY:1, button:0, buttons:1});
+        try { s.showPicker(); throw Error('showPicker() ran without a gesture'); } catch (error) { if (error.name !== 'NotAllowedError') throw error; }
+        press();
+        if (document.activeElement !== s || !s.matches(':active')) throw Error('The press did not reach the select');
+        __appsSelectPicked(1, 3);
+        if (s.value !== 'Three' || seen.join() !== 'input:Three,change:Three' || s.matches(':active')) throw Error('Picked ' + s.value + ' ' + seen + ' ' + s.matches(':active'));
+        press(); __appsSelectPicked(2, -1); press(); __appsSelectPicked(3, 4); press(); __appsSelectPicked(4, 3);
+        if (seen.length !== 2) throw Error('A closed menu changed the select: ' + seen);
+        press(); __appsSelectPicked(5, 5);
+        if (s.value !== 'Five' || s.selectedIndex !== 4) throw Error('Hidden options shift the menu: ' + s.value);
+        s.multiple = true; press(); __appsSelectPicked(6, 0);
+        if (s.value !== 'Five') throw Error('A list box opened a menu');
+    "#, "test").unwrap();
 }

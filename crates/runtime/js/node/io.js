@@ -172,15 +172,15 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
   const invalidTag = length => Object.assign(new TypeError(`Invalid authentication tag length: ${length}`), { code: 'ERR_CRYPTO_INVALID_AUTH_TAG' });
   const invalidState = name => Object.assign(new Error(`Invalid state for operation ${name}`), { code: 'ERR_CRYPTO_INVALID_STATE' });
   class Cipher extends stream.Transform {
-    #decrypt; #key; #iv; #chunks = []; #aad = new Uint8Array(0); #tag = null; #tagLength = 16; #done = false; #pad = new Uint8Array(0); #size = 0; #decoder = null;
+    #decrypt; #key; #iv; #mode; #chunks = []; #aad = new Uint8Array(0); #tag = null; #tagLength = 16; #done = false; #pad = new Uint8Array(0); #size = 0; #decoder = null;
     constructor(decrypt, algorithm, key, iv, options) {
       super();
-      const bits = /^aes-(128|256)-gcm$/i.exec(algorithm)?.[1];
-      if (!bits) throw Object.assign(new Error('Unknown cipher'), { code: 'ERR_CRYPTO_UNKNOWN_CIPHER' });
-      this.#decrypt = decrypt; this.#key = secret(key); this.#iv = input(iv);
+      const match = /^(?:aes-(128|256)-gcm|(chacha20-poly1305))$/i.exec(algorithm), bits = match?.[1] ?? 256;
+      if (!match) throw Object.assign(new Error('Unknown cipher'), { code: 'ERR_CRYPTO_UNKNOWN_CIPHER' });
+      this.#decrypt = decrypt; this.#key = secret(key); this.#iv = input(iv); this.#mode = match[2] ? 'chacha20-poly1305' : null;
       if (this.#key.length * 8 !== Number(bits)) throw Object.assign(new RangeError('Invalid key length'), { code: 'ERR_CRYPTO_INVALID_KEYLEN' });
       if (this.#iv.length !== 12) throw Object.assign(new TypeError('Invalid initialization vector'), { code: 'ERR_CRYPTO_INVALID_IV' });
-      // ring verifies only 16-byte GCM tags, so a decipher rejects the shorter tags that Node also takes.
+      // ring verifies only 16-byte tags, so a decipher rejects the shorter tags that Node also takes.
       const length = options?.authTagLength;
       if (length !== undefined && !(Number.isInteger(length) && (decrypt ? length === 16 : length === 4 || length === 8 || length >= 12 && length <= 16))) throw invalidTag(length);
       this.#tagLength = length ?? 16;
@@ -191,9 +191,9 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     update(data, inputEncoding, outputEncoding) {
       if (this.#done) throw Object.assign(new Error('Unsupported state'), { code: 'ERR_CRYPTO_INVALID_STATE' });
       const bytes = input(data, inputEncoding), end = this.#size + bytes.length;
-      // Encrypt zeros to obtain the data-independent AES-CTR keystream. Double the pad size to keep total
+      // Encrypt zeros to obtain the data-independent keystream. Double the pad size to keep total
       // work linear.
-      if (end > this.#pad.length) { const size = Math.max(end, this.#pad.length * 2, 4096); this.#pad = output(call('web.crypto.encrypt', this.#key, this.#iv, new Uint8Array(0), new Uint8Array(size))).subarray(0, size); }
+      if (end > this.#pad.length) { const size = Math.max(end, this.#pad.length * 2, 4096); this.#pad = output(call('web.crypto.encrypt', this.#key, this.#iv, new Uint8Array(0), new Uint8Array(size), null, this.#mode)).subarray(0, size); }
       const out = Buffer.allocUnsafe(bytes.length);
       for (let i = 0; i < bytes.length; i++) out[i] = bytes[i] ^ this.#pad[this.#size + i];
       this.#chunks.push(Buffer.from(bytes));
@@ -207,11 +207,11 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
       this.#chunks = []; this.#pad = new Uint8Array(0);
       if (this.#decrypt) {
         if (!this.#tag) throw new Error('Unsupported state or unable to authenticate data');
-        try { call('web.crypto.decrypt', this.#key, this.#iv, this.#aad, data, this.#tag); }
+        try { call('web.crypto.decrypt', this.#key, this.#iv, this.#aad, data, this.#tag, this.#mode); }
         catch { throw new Error('Unsupported state or unable to authenticate data'); }
         return tail;
       }
-      const sealed = output(call('web.crypto.encrypt', this.#key, this.#iv, this.#aad, data));
+      const sealed = output(call('web.crypto.encrypt', this.#key, this.#iv, this.#aad, data, null, this.#mode));
       this.#tag = sealed.subarray(sealed.length - 16);
       return tail;
     }
@@ -413,7 +413,8 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
     createHmac: (algorithm, secret) => new Hash(digest(algorithm), key(secret)),
     hash: (algorithm, data, encoding = 'hex') => new Hash(algorithm).update(data).digest(encoding),
     getHashes: () => [...hashes],
-    getCiphers: () => ['aes-128-gcm', 'aes-256-gcm'],
+    getCiphers: () => ['aes-128-gcm', 'aes-256-gcm', 'chacha20-poly1305'],
+    getFips: () => 0,
     getCurves: () => ['prime256v1', 'secp384r1'],
     KeyObject, Sign, Verify,
     createSecretKey: (value, encoding) => wrap({ type: 'secret', key: secret(value, encoding) }),

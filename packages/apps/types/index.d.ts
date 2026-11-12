@@ -2,6 +2,7 @@
 /// <reference path="./client.d.ts" />
 
 import { EventEmitter } from 'node:events'
+import type { Readable } from 'node:stream'
 
 export interface Point { x: number; y: number }
 export interface Size { width: number; height: number }
@@ -122,6 +123,11 @@ export interface App extends EventEmitter<AppEvents> {
   setBadgeCount(count?: number): boolean
   getBadgeCount(): number
   badgeCount: number
+  /** Needs the file type in the app's Info.plist, which `apps build` doesn't add. */
+  addRecentDocument(path: string): void
+  clearRecentDocuments(): void
+  isEmojiPanelSupported(): boolean
+  showEmojiPanel(): void
   /** macOS only. */
   readonly dock?: Dock
 }
@@ -248,6 +254,11 @@ export interface BrowserWindowEvents {
   resized: []
   move: []
   moved: []
+  /** Only for resizes by the user. `edge` is `right` or `bottom`. */
+  'will-resize': [event: Event, newBounds: Rectangle, details: { edge: 'right' | 'bottom' }]
+  /** Only for moves by the user. `preventDefault()` has no effect. */
+  'will-move': [event: Event, newBounds: Rectangle]
+  'always-on-top-changed': [event: Event, isAlwaysOnTop: boolean]
   'page-title-updated': [event: Event, title: string, explicitSet: boolean]
   'ready-to-show': []
 }
@@ -312,8 +323,7 @@ export declare class BrowserWindow extends EventEmitter<BrowserWindowEvents> {
   isClosable(): boolean
   setClosable(closable: boolean): void
   isAlwaysOnTop(): boolean
-  /** `level` and `relativeLevel` are ignored. */
-  setAlwaysOnTop(flag: boolean, level?: string, relativeLevel?: number): void
+  setAlwaysOnTop(flag: boolean, level?: 'normal' | 'floating' | 'torn-off-menu' | 'modal-panel' | 'main-menu' | 'status' | 'pop-up-menu' | 'screen-saver', relativeLevel?: number): void
   minimize(): void
   isMinimized(): boolean
   maximize(): void
@@ -694,6 +704,8 @@ export declare const net: {
   request(options: string | ClientRequestConstructorOptions): import('node:http').ClientRequest
   isOnline(): boolean
   readonly online: boolean
+  /** Uses the system resolver. The options other than `queryType` are ignored. */
+  resolveHost(host: string, options?: { queryType?: 'A' | 'AAAA' }): Promise<{ endpoints: { address: string; family: 'ipv4' | 'ipv6' }[] }>
 }
 
 export interface ClientRequestConstructorOptions {
@@ -1012,13 +1024,23 @@ export declare const dialog: {
 
 // System
 
-/** Reads and writes text and HTML only. */
 export declare const clipboard: {
   readText(type?: 'selection' | 'clipboard'): string
   writeText(text: string, type?: 'selection' | 'clipboard'): void
   readHTML(type?: 'selection' | 'clipboard'): string
   writeHTML(markup: string, type?: 'selection' | 'clipboard'): void
-  write(data: { text?: string; html?: string }, type?: 'selection' | 'clipboard'): void
+  readRTF(type?: 'selection' | 'clipboard'): string
+  writeRTF(text: string, type?: 'selection' | 'clipboard'): void
+  /** Reads PNG or TIFF data. */
+  readImage(type?: 'selection' | 'clipboard'): NativeImage
+  writeImage(image: NativeImage, type?: 'selection' | 'clipboard'): void
+  /** `format` is a pasteboard type, like `public.png`. */
+  readBuffer(format: string): Buffer
+  writeBuffer(format: string, buffer: Buffer, type?: 'selection' | 'clipboard'): void
+  availableFormats(type?: 'selection' | 'clipboard'): string[]
+  /** Takes a pasteboard type or a MIME type from `availableFormats()`. */
+  has(format: string, type?: 'selection' | 'clipboard'): boolean
+  write(data: { text?: string; html?: string; rtf?: string; image?: NativeImage }, type?: 'selection' | 'clipboard'): void
   clear(type?: 'selection' | 'clipboard'): void
 }
 
@@ -1072,6 +1094,29 @@ export declare const powerSaveBlocker: {
   start(type: 'prevent-app-suspension' | 'prevent-display-sleep'): number
   stop(id: number): boolean
   isStarted(id: number): boolean
+}
+
+export interface ForkOptions {
+  env?: Record<string, string | undefined>
+  execArgv?: string[]
+  cwd?: string
+  /** For stdout and stderr. stdin is always `ignore`. */
+  stdio?: 'pipe' | 'ignore' | 'inherit' | Array<'pipe' | 'ignore' | 'inherit'>
+  serviceName?: string
+}
+
+/** Messages are sent as JSON. */
+export declare class UtilityProcess extends EventEmitter<{ spawn: []; exit: [code: number]; message: [message: any] }> {
+  readonly pid: number | undefined
+  readonly stdout: Readable | null
+  readonly stderr: Readable | null
+  postMessage(message: any): void
+  kill(): boolean
+}
+
+/** `modulePath` must be a path the build can read, like `import.meta.resolve('./child.ts')` or `path.join(__dirname, 'child.ts')`. */
+export declare const utilityProcess: {
+  fork(modulePath: string, args?: string[], options?: ForkOptions): UtilityProcess
 }
 
 export interface Display {
@@ -1188,5 +1233,6 @@ declare const apps: {
   autoUpdater: typeof autoUpdater
   desktopCapturer: typeof desktopCapturer
   ClipboardItem: typeof ClipboardItem
+  utilityProcess: typeof utilityProcess
 }
 export default apps

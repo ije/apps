@@ -333,9 +333,11 @@ pub(crate) fn native_action(action: &str) -> bool {
             | "workspaces"
             | "contentProtection"
             | "focusable"
+            | "edited"
             | "aspectRatio"
             | "parent"
             | "input"
+            | "willChange"
     )
 }
 
@@ -386,6 +388,7 @@ pub(crate) struct Main {
     windows: RefCell<HashMap<u64, (WindowId, WindowControl)>>,
     opened: RefCell<std::collections::BTreeSet<u64>>,
     inputs: RefCell<std::collections::BTreeSet<u64>>,
+    frames: RefCell<std::collections::BTreeSet<u64>>,
     spawner: RefCell<Option<Spawner>>,
     waiting: RefCell<Vec<Value>>,
     changed: RefCell<Vec<u64>>,
@@ -413,6 +416,7 @@ impl Main {
             windows: RefCell::default(),
             opened: RefCell::default(),
             inputs: RefCell::default(),
+            frames: RefCell::default(),
             spawner: RefCell::default(),
             waiting: RefCell::default(),
             changed: RefCell::default(),
@@ -652,6 +656,39 @@ impl Main {
             .is_ok_and(|prevented| prevented == "true")
     }
 
+    // Like `before_input`, this never reenters a main script.
+    pub(crate) fn will_change(&self, id: u64, kind: &str, bounds: Rect) -> bool {
+        let Some(engine) = &self.engine else {
+            return false;
+        };
+        if !self.frames.borrow().contains(&id)
+            || self.driving.get()
+            || self.host.try_borrow().is_err()
+        {
+            return false;
+        }
+        let [x, y, width, height] = [
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.width,
+            bounds.size.height,
+        ]
+        .map(|value| f32::from(value).round());
+        self.driving.set(true);
+        let result = engine.call(
+            "__appsWillChange",
+            &[
+                &id.to_string(),
+                &json!([kind, x, y, width, height]).to_string(),
+            ],
+        );
+        self.driving.set(false);
+        self.link.wake_main();
+        result
+            .inspect_err(|error| eprintln!("apps: {error}"))
+            .is_ok_and(|prevented| prevented == "true")
+    }
+
     pub(crate) fn window_event(&self, window: WindowId, event: WindowEvent) {
         let Some(id) = self.page(window) else {
             return;
@@ -682,12 +719,15 @@ impl Main {
         let Some(id) = args[1].as_u64() else {
             return;
         };
-        if action == "input" {
-            let mut inputs = self.inputs.borrow_mut();
+        if action == "input" || action == "willChange" {
+            let mut ids = match action {
+                "input" => self.inputs.borrow_mut(),
+                _ => self.frames.borrow_mut(),
+            };
             if args[2] == true {
-                inputs.insert(id);
+                ids.insert(id);
             } else {
-                inputs.remove(&id);
+                ids.remove(&id);
             }
             return;
         }
@@ -715,6 +755,7 @@ impl Main {
             self.link
                 .event(format!("__appsEvent('closed',{id})"), "apps:closed");
             self.inputs.borrow_mut().remove(&id);
+            self.frames.borrow_mut().remove(&id);
             let mut opened = self.opened.borrow_mut();
             opened.remove(&id);
             if self.engine.is_none() && opened.is_empty() {
@@ -783,6 +824,7 @@ impl Main {
             "workspaces" => WindowChange::AllWorkspaces(on, args[3] == true),
             "contentProtection" => WindowChange::ContentProtection(on),
             "focusable" => WindowChange::Focusable(on),
+            "edited" => WindowChange::Edited(on),
             "aspectRatio" => WindowChange::AspectRatio(number(2).0, size(number(3), number(4))),
             "parent" => {
                 // Windows start on their own threads, so the parent can arrive after its child.
@@ -813,7 +855,7 @@ impl Main {
             "maximizable" => WindowChange::Maximizable(on),
             "closable" => WindowChange::Closable(on),
             "movable" => WindowChange::Movable(on),
-            "alwaysOnTop" => WindowChange::AlwaysOnTop(on),
+            "alwaysOnTop" => WindowChange::AlwaysOnTop(args[2].as_i64().unwrap_or(0) as isize),
             "composition" => WindowChange::CancelComposition,
             _ => return,
         };
@@ -1077,14 +1119,14 @@ mod tests {
     }
 
     #[test]
-    fn main_filters_the_keys_of_listening_windows_outside_its_scripts() {
+    fn main_filters_the_keys_and_frames_of_listening_windows_outside_its_scripts() {
         use renderer::{Event, Key, Modifiers};
         let api = JavaScriptCore::load().unwrap();
         let host = Rc::new(RefCell::new(Host::default()));
         let engine = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
         engine
             .eval(
-                "globalThis.keys=[];globalThis.__appsBeforeInput=(id,input)=>{keys.push(id+JSON.stringify(input));return input.code==='p'}",
+                "globalThis.keys=[];globalThis.__appsBeforeInput=(id,input)=>{keys.push(id+JSON.stringify(input));return input.code==='p'};globalThis.__appsWillChange=(id,change)=>{keys.push(id+JSON.stringify(change));return change[0]==='right'}",
                 "test",
             )
             .unwrap();
@@ -1164,5 +1206,13 @@ mod tests {
         main.native(json!({"op":"window","args":["input",5,false]}));
         assert!(!main.before_input(5, &p, &|| false));
         assert_eq!(keys(), "");
+        let bounds = Rect::new(point(px(1.4), px(2.)), size(px(30.), px(40.)));
+        assert!(!main.will_change(5, "right", bounds));
+        main.native(json!({"op":"window","args":["willChange",5,true]}));
+        assert!(main.will_change(5, "right", bounds) && !main.will_change(5, "move", bounds));
+        main.driving.set(true);
+        assert!(!main.will_change(5, "right", bounds));
+        main.driving.set(false);
+        assert_eq!(keys(), r#"5["right",1,2,30,40]|5["move",1,2,30,40]"#);
     }
 }

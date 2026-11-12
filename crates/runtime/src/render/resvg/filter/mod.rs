@@ -561,6 +561,16 @@ fn apply_drop_shadow(
     Ok(Image::from_image(pixmap, cs))
 }
 
+pub fn blur(pixmap: &mut tiny_skia::Pixmap, sigma: f32) {
+    if let Some((x, y, boxed)) = resolve_std_dev(sigma, sigma, usvg::Transform::identity()) {
+        if boxed {
+            box_blur::apply(x, y, pixmap.as_image_ref_mut());
+        } else {
+            iir_blur::apply(x, y, pixmap.as_image_ref_mut());
+        }
+    }
+}
+
 fn apply_blur(
     fe: &usvg::filter::GaussianBlur,
     cs: usvg::filter::ColorInterpolation,

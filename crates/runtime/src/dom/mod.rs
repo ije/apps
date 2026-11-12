@@ -1234,6 +1234,7 @@ pub fn call(
             | "dom.innerText"
             | "dom.wheel"
             | "dom.iterations"
+            | "dom.path"
     ) {
         return None;
     }
@@ -1434,6 +1435,11 @@ pub fn call(
         }
         if op == "dom.properties" {
             return Ok(json!(style::Prop::names()));
+        }
+        if op == "dom.path" {
+            return Ok(json!(crate::render::canvas::svg_path(
+                args[0].as_str().unwrap_or_default()
+            )));
         }
         if op == "dom.declare" {
             return Ok(json!(
@@ -2361,17 +2367,30 @@ pub fn call(
             }
             "dom.canvasURL" => {
                 use base64::Engine as _;
-                let bytes = match source_pixels(state, id, None) {
+                let base64 = base64::engine::general_purpose::STANDARD;
+                let png = match source_pixels(state, id, None) {
                     Some(pixels) => crate::render::image::encode_png(&pixels)?,
                     None => crate::render::image::encode_png(&new_canvas(&doc.nodes[id])?.pixels)?,
                 };
+                let (bytes, mime) = match args[2].as_str() {
+                    #[cfg(target_os = "macos")]
+                    Some("image/jpeg") => {
+                        let quality = args[3].as_f64().filter(|q| (0. ..=1.).contains(q));
+                        let jpeg = crate::desktop::native::native_call(
+                            "image",
+                            &json!({"op": "jpeg", "data": base64.encode(&png), "quality": quality.unwrap_or(0.92) * 100.}),
+                        )?;
+                        (
+                            base64.decode(jpeg["png"].as_str().unwrap_or_default())?,
+                            "image/jpeg",
+                        )
+                    }
+                    _ => (png, "image/png"),
+                };
                 Ok(if args[1] == true {
-                    crate::jsc::payload::write(bytes)
+                    json!([crate::jsc::payload::write(bytes), mime])
                 } else {
-                    json!(format!(
-                        "data:image/png;base64,{}",
-                        base64::engine::general_purpose::STANDARD.encode(bytes)
-                    ))
+                    json!(format!("data:{mime};base64,{}", base64.encode(bytes)))
                 })
             }
             "dom.canvasPixels" => {
@@ -2797,6 +2816,7 @@ pub fn call(
                         args[2].as_f64().unwrap_or(0.) as f32,
                         args[3].as_bool().unwrap_or(false),
                         args[4].as_bool().unwrap_or(false),
+                        args[5].as_u64(),
                     )),
                     None => json!(canvas.transform()),
                 })

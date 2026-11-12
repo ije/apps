@@ -440,7 +440,10 @@ fn child_process_options_stdio_and_sync_errors() {
             assert(child.stdio.map(item => item === null ? 'null' : item instanceof Writable ? 'W' : 'R').join() === kinds, 'stdio ' + JSON.stringify(stdio));
             await once(child, 'close');
         }
-        try { spawn('/bin/sh', [], { stdio: ['pipe', 'pipe', 'pipe', 'ipc'] }); assert(false, 'IPC accepted'); } catch (error) { assert(error.code === 'ERR_INVALID_ARG_VALUE', 'IPC error'); }
+        const ipc = spawn('/bin/sh', ['-c', 'printf \'{"a":[1]}\\n{"cmd":"NODE_X"}\\n\' >&$NODE_CHANNEL_FD; read line <&$NODE_CHANNEL_FD; printf "[%s,\\"%s\\"]\\n" "$line" "$NODE_CHANNEL_SERIALIZATION_MODE" >&$NODE_CHANNEL_FD'], { stdio: ['pipe', 'pipe', 'pipe', 'ipc'] }), got = [];
+        ipc.on('message', message => got.push(message)).send({ b: 'π' });
+        await once(ipc, 'close');
+        assert(JSON.stringify(got) === '[{"a":[1]},[{"b":"π"},"json"]]', 'IPC in spawn ' + JSON.stringify(got));
         const cat = spawn('/bin/cat'), order = [];
         let echoed = '';
         cat.stdout.on('data', data => { echoed += data; });

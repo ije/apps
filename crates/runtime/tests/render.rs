@@ -405,6 +405,23 @@ fn boxes_that_stop_scrolling_report_their_content_extent() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn closed_selects_draw_only_their_selected_option() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const boxes = await run("[...document.querySelectorAll('select')].map(s => { const r = s.getBoundingClientRect(); return [r.top, r.height].join(); }).join(' ')");
+        if (new Set(boxes.split(' ')).size !== 1 || !boxes.endsWith(',19')) fail('select boxes: ' + boxes);
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0'><select><option>A<option selected>B</select>\n<select>\n  <option>A</option>\n  <option selected>B</option>\n</select>\n\
+             <select>\n text <optgroup label=G>\n<option>A</option>\n</optgroup>\n<hr>\n<option selected>B</option>\n</select></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn kept_boxes_follow_what_their_build_read_outside_them() {
     run_hidden(
         r#"

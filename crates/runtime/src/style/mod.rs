@@ -162,7 +162,7 @@ iframe{border:2px inset}
 q::before{content:open-quote}
 q::after{content:close-quote}
 noembed,noframes{display:none}
-select:not([multiple]):not([size]) option:not(:checked){display:none}
+select:not([multiple]):not([size]) :is(option:not(:checked),hr){display:none}
 select[multiple] option,select[size]:not([size='0']):not([size='1']) option{padding:0 2px 1px}
 select[multiple] option:checked,select[size]:not([size='0']):not([size='1']) option:checked{background-color:light-dark(#cecece,#545454)}
 select[multiple],select[size]:not([size='0']):not([size='1']){overflow-y:auto;vertical-align:text-bottom}

@@ -23,7 +23,9 @@ declare namespace NodeJS {
   }
   interface Process {
     /** `browser` in main, `renderer` in preload scripts. */
-    readonly type: 'browser' | 'renderer'
+    readonly type: 'browser' | 'renderer' | 'utility'
+    /** In a process from `utilityProcess.fork()`. */
+    readonly parentPort?: import('node:events').EventEmitter<{ message: [event: { data: any; ports: [] }] }> & { postMessage(message: any): void }
   }
 }
 

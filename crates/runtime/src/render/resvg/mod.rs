@@ -18,6 +18,8 @@ mod mask;
 mod path;
 mod render;
 
+pub use filter::blur;
+
 pub fn render(
     tree: &usvg::Tree,
     transform: tiny_skia::Transform,

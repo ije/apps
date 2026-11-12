@@ -50,8 +50,8 @@
     on(name, listener) { return add(this, name, listener, false); },
     addListener(name, listener) { return add(this, name, listener, false); },
     prependListener(name, listener) { return add(this, name, listener, true); },
-    once(name, listener) { return add(this, name, wrap(this, name, listener), false); },
-    prependOnceListener(name, listener) { return add(this, name, wrap(this, name, listener), true); },
+    once(name, listener) { return this.on(name, wrap(this, name, listener)); },
+    prependOnceListener(name, listener) { return this.prependListener(name, wrap(this, name, listener)); },
     removeListener(name, listener) {
       checkListener(listener);
       const events = this._events, current = events?.[name];

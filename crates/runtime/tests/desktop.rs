@@ -332,6 +332,36 @@ fn native_glass_appearance_preserves_focus() {
 #[test]
 #[cfg(target_os = "macos")]
 #[ignore = "requires the macOS window server"]
+fn pages_see_the_window_frame_and_levels_apply() {
+    let main = r#"
+        const { app, BrowserWindow } = __apps;
+        app.whenReady().then(async () => {
+            setTimeout(() => process.exit(3), 8000);
+            const win = new BrowserWindow({ x: 80, y: 90, width: 400, height: 300, show: false });
+            await win.loadFile('apps:///index.html');
+            const frame = async () => JSON.stringify(await win.webContents.executeJavaScript('[screenX, screenY, screenLeft, screenTop, outerWidth, outerHeight]'));
+            const first = await frame();
+            const moved = new Promise(resolve => win.once('move', resolve));
+            win.setBounds({ x: 120, y: 130, width: 420 });
+            await moved;
+            const second = await frame();
+            if (first !== '[80,90,80,90,400,300]' || second !== '[120,130,120,130,420,300]') throw Error('Frame ' + first + ' ' + second);
+            win.setAlwaysOnTop(true, 'status');
+            win.setDocumentEdited(true);
+            console.log('WINDOW_FRAME_OK'); app.quit();
+        });
+    "#;
+    let output = run_window_test(main, "<body></body>");
+    let text = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && text.contains("WINDOW_FRAME_OK"),
+        "{text}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+#[ignore = "requires the macOS window server"]
 fn native_captures_repeat_and_fatal_errors_exit_with_failure() {
     let capture = r#"
         const { app, BrowserWindow } = __apps;

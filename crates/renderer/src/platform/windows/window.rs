@@ -629,9 +629,11 @@ impl Shared {
                     let _ = ShowWindow(hwnd, SW_RESTORE);
                 }
                 WindowChange::SizeLimits(min, max) => self.limits.set((min, max)),
-                WindowChange::AlwaysOnTop(on) => {
-                    place(if on { HWND_TOPMOST } else { HWND_NOTOPMOST })
-                }
+                WindowChange::AlwaysOnTop(level) => place(if level != 0 {
+                    HWND_TOPMOST
+                } else {
+                    HWND_NOTOPMOST
+                }),
                 WindowChange::Resizable(on) => self.set_style(WS_THICKFRAME, on),
                 WindowChange::Minimizable(on) => self.set_style(WS_MINIMIZEBOX, on),
                 WindowChange::Maximizable(on) => self.set_style(WS_MAXIMIZEBOX, on),
@@ -675,7 +677,8 @@ impl Shared {
                 | WindowChange::AllWorkspaces(..)
                 | WindowChange::Focusable(_)
                 | WindowChange::AspectRatio(..)
-                | WindowChange::Vibrancy(..) => {}
+                | WindowChange::Vibrancy(..)
+                | WindowChange::Edited(_) => {}
             }
         }
         self.callbacks.changed();

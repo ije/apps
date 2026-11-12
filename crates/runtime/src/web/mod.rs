@@ -24,6 +24,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender, error::TryRecvError};
 
 static NETWORK: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static TLS: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+static ROOTS: OnceLock<Arc<NativeRoots>> = OnceLock::new();
 use url::{Url, quirks};
 
 pub(crate) fn network() -> Result<&'static tokio::runtime::Runtime> {
@@ -47,7 +48,7 @@ pub(crate) fn network() -> Result<&'static tokio::runtime::Runtime> {
 }
 
 #[derive(Debug)]
-struct NativeRoots(
+pub(crate) struct NativeRoots(
     OnceLock<Option<Arc<rustls::client::WebPkiServerVerifier>>>,
     rustls::crypto::WebPkiSupportedAlgorithms,
 );
@@ -98,16 +99,23 @@ impl rustls::client::danger::ServerCertVerifier for NativeRoots {
     }
 }
 
+pub(crate) fn roots() -> Arc<NativeRoots> {
+    ROOTS
+        .get_or_init(|| {
+            Arc::new(NativeRoots(
+                OnceLock::new(),
+                rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            ))
+        })
+        .clone()
+}
+
 pub(crate) fn tls() -> Arc<rustls::ClientConfig> {
     TLS.get_or_init(|| {
-        let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
         Arc::new(
             rustls::ClientConfig::builder()
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NativeRoots(
-                    OnceLock::new(),
-                    algorithms,
-                )))
+                .with_custom_certificate_verifier(roots())
                 .with_no_client_auth(),
         )
     })

@@ -1728,8 +1728,8 @@ fn unsupported_electron_exports_fail_at_build_time() {
             "electron.crashReporter is not supported",
         ),
         (
-            "import {utilityProcess} from '@pierre/apps';",
-            "@pierre/apps.utilityProcess is not supported",
+            "import {MessageChannelMain} from '@pierre/apps';",
+            "@pierre/apps.MessageChannelMain is not supported",
         ),
         (
             "export {app, crashReporter} from 'electron';",
@@ -3708,6 +3708,10 @@ if (threads.isMainThread) {
             "{source}"
         );
     }
+    fs::write(&entry, "import {fork} from 'node:child_process'; import {utilityProcess} from 'electron'; import path from 'node:path'; fork(path.join(__dirname, 'lib', 'worker.ts')); utilityProcess.fork(import.meta.dirname + '/lib/worker.ts', []); saga.fork(() => 1);").unwrap();
+    let files = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap();
+    assert_eq!(files["app.js"].matches("apps:///script-0.js").count(), 2);
+    assert!(files.contains_key("script-0.js") && !files.contains_key("script-1.js"));
 }
 
 #[test]

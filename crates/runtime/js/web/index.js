@@ -608,7 +608,7 @@ globalThis.__appsWeb = (call, codec) => {
   });
   let beaconBytes = 0;
   globalThis.navigator ??= {};
-  for (const [name, get] of Object.entries({ language: () => new Intl.DateTimeFormat().resolvedOptions().locale, languages: () => [navigator.language], onLine: () => true, cookieEnabled: () => true, maxTouchPoints: () => 0, hardwareConcurrency: () => call('web.cpus') })) if (!(name in navigator)) Object.defineProperty(navigator, name, { get, configurable: true, enumerable: true });
+  for (const [name, get] of Object.entries({ language: () => new Intl.DateTimeFormat().resolvedOptions().locale, languages: () => [navigator.language], onLine: () => true, cookieEnabled: () => true, maxTouchPoints: () => 0, vendor: () => '', appName: () => 'Netscape', appCodeName: () => 'Mozilla', appVersion: () => navigator.userAgent, product: () => 'Gecko', webdriver: () => false, pdfViewerEnabled: () => false, hardwareConcurrency: () => call('web.cpus') })) if (!(name in navigator)) Object.defineProperty(navigator, name, { get, configurable: true, enumerable: true });
   navigator.sendBeacon = (url, data = null) => {
     const request = new Request(url, { method: 'POST', body: data, credentials: 'include' });
     if (!['http:', 'https:'].includes(new URL(request.url).protocol)) throw new TypeError('Beacon requires HTTP or HTTPS');

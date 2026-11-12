@@ -43,7 +43,7 @@
     changed = stale = true; version++; codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(alone(b)), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(alone(c)), c.length) : c; size += 4;
     if (!scheduled) { scheduled = true; microtask(drain); } else if (size > 1 << 18) flush();
   };
-  let webviewScan = true, pickFiles;
+  let webviewScan = true, pickFiles, openSelect;
   const call = (name, ...args) => { flush(); if (name === 'dom.html') { changed = true; webviewScan ||= /<webview/i.test(args[1]); } if (name === 'dom.html' || name === 'dom.scroll' || name === 'dom.focus' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font' || name === 'dom.animation') { stale = true; version++; } return host(name, ...args); };
   // Keep mirror arrays private. Retain constructors and avoid prototype getters. A nonzero first float means
   // Rust moved the buffer.
@@ -997,6 +997,7 @@
     get value() { return selectedness(this).find(option => option._current)?.value ?? ''; }
     set value(value) { value = String(value); const list = options(this); let found = false; for (const option of list) option._selected = !found && option.value === value && (found = true); this._none = !found; selectedness(this); }
     item(index) { return options(this)[index] ?? null; }
+    showPicker() { if (!native) throw new DOMException('showPicker() needs a user gesture', 'NotAllowedError'); openSelect(this); }
     namedItem(name) { return this.options.namedItem(name); }
     add(element, before = null) { const reference = typeof before === 'number' ? options(this)[before] ?? null : before; if (reference) reference.parentNode.insertBefore(element, reference); else this.append(element); }
     remove(index) { if (!arguments.length) super.remove(); else options(this)[index]?.remove(); }
@@ -1774,7 +1775,7 @@
   for (const Type of [Element, Document, DocumentFragment]) Object.defineProperties(Type.prototype, parentNode);
   class XMLSerializer { serializeToString(node) { if (!(node instanceof Node)) throw new TypeError('Expected a Node'); const source = serialize(node._m); return node.nodeType === 1 && node.namespaceURI && !node.hasAttribute('xmlns') ? source.replace(/^<[^\s>]+/, tag => tag + ' xmlns=' + quote(node.namespaceURI)) : source; } }
   class DOMParser {
-    parseFromString(source,type){if(type!=='text/html')throw new DOMException('Only HTML parsing is supported','NotSupportedError');const doc=wrap(create('#document'));load(json(call('dom.html',doc._id,String(source))));return doc;}
+    parseFromString(source,type){if(type!=='text/html'&&type!=='image/svg+xml')throw new DOMException('Only HTML and SVG parsing is supported','NotSupportedError');const doc=wrap(create('#document'));load(json(call('dom.html',doc._id,String(source))));if(type!=='text/html')Object.defineProperty(doc,'documentElement',{value:doc.querySelector('svg')});return doc;}
   }
   const comparePoints = (a, start, b, end) => {
     if (a === b) return Math.sign(start - end);
@@ -2000,10 +2001,85 @@
     for (const id of call('dom.release', dead, registered.splice(0))[1]) { const rec = records[id]; if (!rec) continue; records[id] = undefined; const name = rec.attrs?.get('id'); if (name) idDrop(name, rec); }
   };
 
+  const matrixFields = ['m11', 'm12', 'm13', 'm14', 'm21', 'm22', 'm23', 'm24', 'm31', 'm32', 'm33', 'm34', 'm41', 'm42', 'm43', 'm44'], plane = [0, 1, 4, 5, 12, 13];
+  const flat2D = m => m.every((v, i) => plane.includes(i) || v === +(i % 5 === 0)), flatMatrix = m => Object.assign(new DOMMatrix(m), { _2d: flat2D(m) });
+  class DOMMatrixReadOnly {
+    constructor(init) {
+      if (init !== undefined && typeof init?.[Symbol.iterator] !== 'function' || typeof init === 'string') { init = String(init); const match = /^\s*matrix(?:3d)?\(([^)]*)\)\s*$/.exec(init); if (!match && !/^\s*(none)?\s*$/.test(init)) throw new DOMException(`Failed to parse '${init}'`, 'SyntaxError'); init = match?.[1].split(','); }
+      const v = init === undefined ? [1, 0, 0, 1, 0, 0] : Array.from(init, Number);
+      if (v.length === 6) { this._m = [v[0], v[1], 0, 0, v[2], v[3], 0, 0, 0, 0, 1, 0, v[4], v[5], 0, 1]; this._2d = true; }
+      else if (v.length === 16) { this._m = v; this._2d = false; }
+      else throw new TypeError('A matrix needs 6 or 16 values');
+    }
+    static fromMatrix(init = {}) {
+      const read = init instanceof DOMMatrixReadOnly, m = read ? init._m : matrixFields.map((name, i) => +(init[name] ?? init['abcdef'[plane.indexOf(i)]] ?? +(i % 5 === 0)));
+      return Object.assign(new this(m), { _2d: read ? init._2d : init.is2D ?? flat2D(m) });
+    }
+    static fromFloat32Array(array) { return new this(array); } static fromFloat64Array(array) { return new this(array); }
+    get is2D() { return this._2d; } get isIdentity() { return this._m.every((v, i) => v === +(i % 5 === 0)); }
+    transformPoint(point = {}) { const m = this._m, { x = 0, y = 0, z = 0, w = 1 } = point; return new DOMPoint(m[0] * x + m[4] * y + m[8] * z + m[12] * w, m[1] * x + m[5] * y + m[9] * z + m[13] * w, m[2] * x + m[6] * y + m[10] * z + m[14] * w, m[3] * x + m[7] * y + m[11] * z + m[15] * w); }
+    flipX() { return this.multiply(new DOMMatrix([-1, 0, 0, 1, 0, 0])); } flipY() { return this.multiply(new DOMMatrix([1, 0, 0, -1, 0, 0])); }
+    toFloat32Array() { return new Float32Array(this._m); } toFloat64Array() { return new Float64Array(this._m); }
+    toString() { const m = this._m; return this._2d ? `matrix(${plane.map(i => m[i]).join(', ')})` : `matrix3d(${m.join(', ')})`; }
+    toJSON() { const json = {}; for (const name of [...'abcdef', ...matrixFields, 'is2D', 'isIdentity']) json[name] = this[name]; return json; }
+  }
+  class DOMMatrix extends DOMMatrixReadOnly {
+    multiplySelf(other) { const a = this._m, b = DOMMatrix.fromMatrix(other), m = b._m; this._m = a.map((_, i) => a[i & 3] * m[i & 12] + a[4 + (i & 3)] * m[(i & 12) + 1] + a[8 + (i & 3)] * m[(i & 12) + 2] + a[12 + (i & 3)] * m[(i & 12) + 3]); this._2d &&= b._2d; return this; }
+    preMultiplySelf(other) { const matrix = DOMMatrix.fromMatrix(other).multiplySelf(this); this._m = matrix._m; this._2d = matrix._2d; return this; }
+    translateSelf(x = 0, y = 0, z = 0) { return this.multiplySelf(flatMatrix([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1])); }
+    scaleSelf(x = 1, y = x, z = 1, ox = 0, oy = 0, oz = 0) { return this.translateSelf(ox, oy, oz).multiplySelf(flatMatrix([x, 0, 0, 0, 0, y, 0, 0, 0, 0, z, 0, 0, 0, 0, 1])).translateSelf(-ox, -oy, -oz); }
+    scale3dSelf(scale = 1, ox = 0, oy = 0, oz = 0) { return this.scaleSelf(scale, scale, scale, ox, oy, oz); }
+    rotateAxisAngleSelf(x = 0, y = 0, z = 0, angle = 0) {
+      const length = Math.hypot(x, y, z); if (!length) return this; [x, y, z] = [x / length, y / length, z / length];
+      const r = angle * Math.PI / 180, s = Math.sin(r), c = Math.cos(r), t = 1 - c;
+      return this.multiplySelf(flatMatrix([t * x * x + c, t * x * y + s * z, t * x * z - s * y, 0, t * x * y - s * z, t * y * y + c, t * y * z + s * x, 0, t * x * z + s * y, t * y * z - s * x, t * z * z + c, 0, 0, 0, 0, 1]));
+    }
+    rotateSelf(x = 0, y, z) { if (y === undefined && z === undefined) [x, y, z] = [0, 0, x]; return this.rotateAxisAngleSelf(0, 0, 1, z ?? 0).rotateAxisAngleSelf(0, 1, 0, y ?? 0).rotateAxisAngleSelf(1, 0, 0, x); }
+    skewXSelf(angle = 0) { return this.multiplySelf(new DOMMatrix([1, 0, Math.tan(angle * Math.PI / 180), 1, 0, 0])); } skewYSelf(angle = 0) { return this.multiplySelf(new DOMMatrix([1, Math.tan(angle * Math.PI / 180), 0, 1, 0, 0])); }
+    invertSelf() {
+      const m = this._m, out = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1], work = [...m];
+      for (let col = 0; col < 4; col++) {
+        let pivot = col; for (let row = col + 1; row < 4; row++) if (Math.abs(work[col * 4 + row]) > Math.abs(work[col * 4 + pivot])) pivot = row;
+        const value = work[col * 4 + pivot]; if (!value || !Number.isFinite(value)) { this._m = m.map(() => NaN); this._2d = false; return this; }
+        for (const array of [work, out]) for (let k = 0; k < 4; k++) [array[k * 4 + col], array[k * 4 + pivot]] = [array[k * 4 + pivot] / value, array[k * 4 + col]];
+        for (let row = 0; row < 4; row++) { const factor = work[col * 4 + row]; if (row !== col && factor) for (const array of [work, out]) for (let k = 0; k < 4; k++) array[k * 4 + row] -= factor * array[k * 4 + col]; }
+      }
+      this._m = out; return this;
+    }
+  }
+  for (const [name, self] of [['multiply', 'multiplySelf'], ['translate', 'translateSelf'], ['scale', 'scaleSelf'], ['scale3d', 'scale3dSelf'], ['rotate', 'rotateSelf'], ['rotateAxisAngle', 'rotateAxisAngleSelf'], ['skewX', 'skewXSelf'], ['skewY', 'skewYSelf'], ['inverse', 'invertSelf']]) DOMMatrixReadOnly.prototype[name] = function (...args) { return DOMMatrix.fromMatrix(this)[self](...args); };
+  for (const [i, name] of [...matrixFields.entries(), ...[...'abcdef'].map((name, i) => [plane[i], name])]) {
+    Object.defineProperty(DOMMatrixReadOnly.prototype, name, { configurable: true, enumerable: true, get() { return this._m[i]; } });
+    Object.defineProperty(DOMMatrix.prototype, name, { configurable: true, enumerable: true, get() { return this._m[i]; }, set(value) { this._m[i] = +value; if (!plane.includes(i) && +value !== +(i % 5 === 0)) this._2d = false; } });
+  }
+  class DOMPointReadOnly {
+    constructor(x = 0, y = 0, z = 0, w = 1) { this._p = [+x, +y, +z, +w]; }
+    static fromPoint(point = {}) { return new this(point.x, point.y, point.z, point.w); }
+    matrixTransform(matrix) { return DOMMatrixReadOnly.fromMatrix(matrix).transformPoint(this); }
+    toJSON() { const { x, y, z, w } = this; return { x, y, z, w }; }
+  }
+  class DOMPoint extends DOMPointReadOnly {}
+  for (const [i, name] of ['x', 'y', 'z', 'w'].entries()) { Object.defineProperty(DOMPointReadOnly.prototype, name, { configurable: true, enumerable: true, get() { return this._p[i]; } }); Object.defineProperty(DOMPoint.prototype, name, { configurable: true, enumerable: true, get() { return this._p[i]; }, set(value) { this._p[i] = +value; } }); }
   // Match Canvas::draw opcodes and argument counts in render/canvas.rs. Keep f64 precision for large
   // coordinates.
-  class CanvasRenderingContext2D {
-    constructor(canvas, options) { this.canvas = canvas; this._alpha = options?.alpha !== false; this._ops = new Float64Array(256); this._size = 0; this._texts = []; this._data = []; this._reset(); }
+  class CanvasPath {
+    arc(x, y, radius, start, end, counter = false) { if (radius < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); this._op(28, x, y, radius, start, end, counter ? 1 : 0); }
+    ellipse(x, y, rx, ry, rotation, start, end, counter = false) { if (rx < 0 || ry < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); this._op(29, x, y, rx, ry, rotation, start, end, counter ? 1 : 0); }
+    arcTo(x1, y1, x2, y2, radius) { if (radius < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); this._op(30, x1, y1, x2, y2, radius); }
+    roundRect(x, y, width, height, radii = 0) { const list = (Array.isArray(radii) ? radii : [radii]).map(v => typeof v === 'object' ? [+v.x || 0, +v.y || 0] : [+v, +v]); if (!list.length || list.length > 4 || list.some(r => r[0] < 0 || r[1] < 0)) throw new RangeError('Invalid corner radii'); const [a, b, c, d] = list.length === 1 ? [list[0], list[0], list[0], list[0]] : list.length === 2 ? [list[0], list[1], list[0], list[1]] : list.length === 3 ? [list[0], list[1], list[2], list[1]] : list; const w = Math.abs(width), h = Math.abs(height), fit = (size, sum) => sum > size ? size / sum : 1, k = Math.min(fit(w, a[0] + b[0]), fit(w, d[0] + c[0]), fit(h, a[1] + d[1]), fit(h, b[1] + c[1])); this._op(31, x, y, width, height, ...[a, b, c, d].flat().map(v => v * k)); }
+    closePath() { this._op(12); } moveTo(x, y) { this._op(13, x, y); } lineTo(x, y) { this._op(14, x, y); } rect(x, y, width, height) { this._op(17, x, y, width, height); }
+    quadraticCurveTo(x1, y1, x, y) { this._op(15, x1, y1, x, y); } bezierCurveTo(x1, y1, x2, y2, x, y) { this._op(16, x1, y1, x2, y2, x, y); }
+  }
+  const fillRule = (rule = 'nonzero') => { if (rule !== 'nonzero' && rule !== 'evenodd') throw new TypeError(`'${rule}' is not a valid fill rule`); return +(rule === 'evenodd'); };
+  let pathIds = 0;
+  class Path2D extends CanvasPath {
+    constructor(path) { super(); this._ops = new Float64Array(16); this._size = 0; this._id = ++pathIds; if (path instanceof Path2D) this._push(path._ops.subarray(0, path._size)); else if (path !== undefined) this._push(host('dom.path', String(path))); }
+    _op(...values) { this._push(values); }
+    _push(values) { const size = this._size + values.length; if (size > this._ops.length) { const grown = new Float64Array(Math.max(size, this._ops.length * 2)); grown.set(this._ops.subarray(0, this._size)); this._ops = grown; } this._ops.set(values, this._size); this._size = size; }
+    addPath(path, transform) { if (!(path instanceof Path2D)) throw new TypeError('Expected a Path2D'); const ops = path._ops.subarray(0, path._size), { a, b, c, d, e, f } = DOMMatrix.fromMatrix(transform); if ([a, b, c, d, e, f].every(Number.isFinite)) { this._push([0, 2, a, b, c, d, e, f]); this._push(ops); this._op(1); } }
+  }
+  class CanvasRenderingContext2D extends CanvasPath {
+    constructor(canvas, options) { super(); this.canvas = canvas; this._alpha = options?.alpha !== false; this._ops = new Float64Array(256); this._size = 0; this._texts = []; this._data = []; this._paths = new WeakMap(); this._pathSize = 0; this._reset(); }
     _reset() { this._state = { fillStyle: '#000000', strokeStyle: '#000000', font: '10px sans-serif', textAlign: 'start', textBaseline: 'alphabetic', globalAlpha: 1, lineWidth: 1, lineCap: 'butt', lineJoin: 'miter', miterLimit: 10, lineDash: [], lineDashOffset: 0, globalCompositeOperation: 'source-over', letterSpacing: '0px', wordSpacing: '0px', imageSmoothingEnabled: true, imageSmoothingQuality: 'low', shadowBlur: 0, shadowColor: 'rgba(0, 0, 0, 0)', shadowOffsetX: 0, shadowOffsetY: 0, filter: 'none', fontKerning: 'auto', fontStretch: 'normal', fontVariantCaps: 'normal', textRendering: 'auto', direction: 'inherit', lang: 'inherit' }; this._stack = []; }
     _op(code, ...args) {
       const size = this._size;
@@ -2013,9 +2089,16 @@
       if (!size) queueMicrotask(() => this._flush()); else if (this._size > 1 << 18) this._flush();
     }
     _flush() { if (!this._size) return; const ops = this._ops.subarray(0, this._size), text = this._texts.join(''), data = this._data; this._size = 0; this._texts.length = 0; this._data = []; bitmapDraws.delete(this); if (this.canvas.width && this.canvas.height) call('dom.canvas', this.canvas._id, ops, text, ...data); this.canvas._commit?.(); }
-    _resize() { this._size = 0; this._texts.length = 0; this._data = []; this._reset(); call('dom.canvas', this.canvas._id, null); }
+    // Canvas::draw keeps each Path2D it gets until the context resets or sends more than about 8 MB of paths.
+    _path(path) {
+      if (!(path instanceof Path2D)) throw new TypeError('Expected a Path2D');
+      if (this._paths.get(path) === path._size) return path._id;
+      const reset = (this._pathSize += path._size) > 1 << 20; if (reset) { this._paths = new WeakMap(); this._pathSize = path._size; }
+      this._paths.set(path, path._size); this._data.push(path._ops.subarray(0, path._size)); this._op(41, path._id, this._data.length - 1, +reset); return path._id;
+    }
+    _resize() { this._size = 0; this._texts.length = 0; this._data = []; this._reset(); this._paths = new WeakMap(); this._pathSize = 0; call('dom.canvas', this.canvas._id, null); }
     save() { this._stack.push({ ...this._state }); this._op(0); } restore() { if (this._stack.length) { this._state = this._stack.pop(); this._op(1); } }
-    setTransform(a = {}, b, c, d, e, f) { if (typeof a === 'object') ({ a = 1, b = 0, c = 0, d = 1, e = 0, f = 0 } = a); this._op(3, a, b, c, d, e, f); }
+    setTransform(a, b, c, d, e, f) { if (arguments.length < 2) ({ a, b, c, d, e, f } = DOMMatrix.fromMatrix(a)); this._op(3, a, b, c, d, e, f); }
     resetTransform() { this._op(3, 1, 0, 0, 1, 0, 0); } transform(a, b, c, d, e, f) { this._op(2, a, b, c, d, e, f); }
     scale(x, y) { this._op(2, x, 0, 0, y, 0, 0); } translate(x, y) { this._op(2, 1, 0, 0, 1, x, y); } rotate(a) { const cos = Math.cos(a), sin = Math.sin(a); this._op(2, cos, sin, -sin, cos, 0, 0); }
     fillRect(x, y, width, height) { this._op(21, x, y, width, height); } strokeRect(x, y, width, height) { this._op(22, x, y, width, height); } clearRect(x, y, width, height) { this._op(23, x, y, width, height); }
@@ -2023,9 +2106,16 @@
     _text(code, text, x, y, maxWidth = Infinity) { text = String(text); if (arguments.length > 4 && arguments[4] !== undefined && !(Number.isFinite(+maxWidth) && maxWidth > 0)) return; this._texts.push(alone(text)); this._op(code, text.length, x, y, maxWidth); }
     measureText(text) { const state = this._state, [width, left, right, top, bottom, ascent, descent, emAscent, emDescent] = call('dom.measureText', this.canvas._id, String(text), this.font, parseFloat(state.letterSpacing), parseFloat(state.wordSpacing)); const base = { top: emAscent, hanging: ascent * 0.8, middle: (emAscent - emDescent) / 2, bottom: -emDescent, ideographic: -descent }[state.textBaseline] ?? 0, anchor = width * ({ center: 0.5, right: 1, end: 1 }[state.textAlign] ?? 0); return Object.assign(Object.create(TextMetrics.prototype), { width, actualBoundingBoxLeft: left === right ? anchor : anchor - left, actualBoundingBoxRight: left === right ? -anchor : right - anchor, actualBoundingBoxAscent: top - base, actualBoundingBoxDescent: bottom + base, fontBoundingBoxAscent: ascent - base, fontBoundingBoxDescent: descent + base, emHeightAscent: emAscent - base, emHeightDescent: emDescent + base, hangingBaseline: ascent * 0.8 - base, alphabeticBaseline: -base, ideographicBaseline: -descent - base }); }
     getContextAttributes() { return { alpha: this._alpha, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }; } isContextLost() { return false; } drawFocusIfNeeded() {} reset() { this._resize(); }
-    getTransform() { this._flush(); const [a, b, c, d, e, f] = call('dom.canvasQuery', this.canvas._id); return { a, b, c, d, e, f, is2D: true }; }
-    isPointInPath(x, y, rule = 'nonzero') { this._flush(); return call('dom.canvasQuery', this.canvas._id, x, y, rule === 'evenodd', false); } isPointInStroke(x, y) { this._flush(); return call('dom.canvasQuery', this.canvas._id, x, y, false, true); }
-    createLinearGradient(x0, y0, x1, y1) { return new CanvasGradient([x0, y0, x1, y1]); } createRadialGradient(x0, y0, r0, x1, y1, r1) { if (r0 < 0 || r1 < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); return new CanvasGradient([x0, y0, r0, x1, y1, r1]); }
+    getTransform() { this._flush(); return new DOMMatrix(call('dom.canvasQuery', this.canvas._id)); }
+    isPointInPath(...args) { const id = args[0] instanceof Path2D ? this._path(args.shift()) : null, [x, y, rule] = args, evenOdd = !!fillRule(rule); if (!Number.isFinite(+x) || !Number.isFinite(+y)) return false; this._flush(); return call('dom.canvasQuery', this.canvas._id, +x, +y, evenOdd, false, id); }
+    isPointInStroke(...args) { const id = args[0] instanceof Path2D ? this._path(args.shift()) : null, [x, y] = args; if (!Number.isFinite(+x) || !Number.isFinite(+y)) return false; this._flush(); return call('dom.canvasQuery', this.canvas._id, +x, +y, false, true, id); }
+    createLinearGradient(x0, y0, x1, y1) { return new CanvasGradient([x0, y0, x1, y1]); } createRadialGradient(x0, y0, r0, x1, y1, r1) { if (r0 < 0 || r1 < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); return new CanvasGradient([x0, y0, r0, x1, y1, r1]); } createConicGradient(angle, x, y) { return new CanvasGradient([angle, x, y]); }
+    createPattern(image, repetition) {
+      if (!drawable(image)) throw new TypeError('Expected an image, canvas, video or bitmap');
+      repetition = repetition === null || repetition === '' ? 'repeat' : String(repetition); if (!['repeat', 'repeat-x', 'repeat-y', 'no-repeat'].includes(repetition)) throw new DOMException(`'${repetition}' is not a valid repetition`, 'SyntaxError');
+      const [width, height] = imageSize(image); if (!width || !height || image instanceof HTMLVideoElement && image.readyState < 2) { if (image instanceof HTMLCanvasElement || image instanceof OffscreenCanvas) throw new DOMException('The canvas has no pixels', 'InvalidStateError'); return null; }
+      return Object.assign(Object.create(CanvasPattern.prototype), { _image: image, _size: [width, height], _repeat: [repetition === 'repeat' || repetition === 'repeat-x', repetition === 'repeat' || repetition === 'repeat-y'], _matrix: new DOMMatrix() });
+    }
     setLineDash(list) { list = Array.from(list, Number); if (!list.every(v => Number.isFinite(v) && v >= 0)) return; if (list.length % 2) list = [...list, ...list]; this._state.lineDash = list; const text = list.join(); this._texts.push(text); this._op(35, text.length); } getLineDash() { return [...this._state.lineDash]; }
     createImageData(width,height) { if (width instanceof ImageData) return new ImageData(width.width,width.height); return new ImageData(width,height); }
     getImageData(x, y, width, height) { this._flush(); x |= 0; y |= 0; width |= 0; height |= 0; if (!width || !height) throw new DOMException('Image dimensions must be nonzero', 'IndexSizeError'); if (width < 0) { x += width; width = -width; } if (height < 0) { y += height; height = -height; } return new ImageData(new Uint8ClampedArray(call('dom.canvasPixels', this.canvas._id, x, y, width, height)), width, height); }
@@ -2044,17 +2134,13 @@
       if (image instanceof ImageBitmap) bitmapDraws.add(this); else if (image._context && image!==this.canvas) this._flush();
     }
 
-    arc(x, y, radius, start, end, counter = false) { if (radius < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); this._op(28, x, y, radius, start, end, counter ? 1 : 0); }
-    ellipse(x, y, rx, ry, rotation, start, end, counter = false) { if (rx < 0 || ry < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); this._op(29, x, y, rx, ry, rotation, start, end, counter ? 1 : 0); }
-    arcTo(x1, y1, x2, y2, radius) { if (radius < 0) throw new DOMException('The radius is negative', 'IndexSizeError'); this._op(30, x1, y1, x2, y2, radius); }
-    roundRect(x, y, width, height, radii = 0) { const list = (Array.isArray(radii) ? radii : [radii]).map(v => typeof v === 'object' ? [+v.x || 0, +v.y || 0] : [+v, +v]); if (!list.length || list.length > 4 || list.some(r => r[0] < 0 || r[1] < 0)) throw new RangeError('Invalid corner radii'); const [a, b, c, d] = list.length === 1 ? [list[0], list[0], list[0], list[0]] : list.length === 2 ? [list[0], list[1], list[0], list[1]] : list.length === 3 ? [list[0], list[1], list[2], list[1]] : list; const w = Math.abs(width), h = Math.abs(height), fit = (size, sum) => sum > size ? size / sum : 1, k = Math.min(fit(w, a[0] + b[0]), fit(w, d[0] + c[0]), fit(h, a[1] + d[1]), fit(h, b[1] + c[1])); this._op(31, x, y, width, height, ...[a, b, c, d].flat().map(v => v * k)); }
-    beginPath() { this._op(11); } closePath() { this._op(12); } moveTo(x, y) { this._op(13, x, y); } lineTo(x, y) { this._op(14, x, y); } rect(x, y, width, height) { this._op(17, x, y, width, height); }
-    quadraticCurveTo(x1, y1, x, y) { this._op(15, x1, y1, x, y); } bezierCurveTo(x1, y1, x2, y2, x, y) { this._op(16, x1, y1, x2, y2, x, y); }
-    fill(rule = 'nonzero') { this._op(18, rule === 'evenodd' ? 1 : 0); } stroke() { this._op(19); }
-    clip(rule = 'nonzero') { if (!['nonzero','evenodd'].includes(rule)) throw new TypeError('Invalid fill rule'); this._op(20, rule === 'evenodd' ? 1 : 0); }
+    beginPath() { this._op(11); }
+    fill(path, rule) { if (path instanceof Path2D) this._op(42, this._path(path), 18, fillRule(rule)); else this._op(18, fillRule(path)); }
+    stroke(path) { if (path === undefined) this._op(19); else this._op(42, this._path(path), 19, 0); }
+    clip(path, rule) { if (path instanceof Path2D) this._op(42, this._path(path), 20, fillRule(rule)); else this._op(20, fillRule(path)); }
   }
   for (const [name, code] of [['fillStyle', 4], ['strokeStyle', 5], ['font', 6], ['textAlign', 7], ['textBaseline', 8], ['globalAlpha', 9], ['lineWidth', 10]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { get() { return this._state[name]; }, set(value) {
-    if (code < 6 && value instanceof CanvasGradient) { this._state[name] = value; const text = value._spec(); this._texts.push(text); this._op(code, text.length); return; }
+    if (code < 6 && (value instanceof CanvasGradient || value instanceof CanvasPattern)) { this._state[name] = value; const image = value._image; image?._context?._flush?.(); const text = value._spec(image === this.canvas ? -1 : image?._id); this._texts.push(text); this._op(code, text.length); if (image instanceof ImageBitmap) bitmapDraws.add(this); else if (image?._context && image !== this.canvas) this._flush(); return; }
     if (code < 9) value = String(value); else if (value = Number(value), !(code === 9 ? value >= 0 && value <= 1 : value > 0 && value < Infinity)) return;
     if (this._state[name] === value) return;
     this._state[name] = value; if (code < 9) { this._texts.push(alone(value)); this._op(code, value.length); } else this._op(code, value);
@@ -2063,11 +2149,20 @@
   for (const [name, code, valid] of [['miterLimit', 34, v => v > 0 && v < Infinity], ['lineDashOffset', 36, Number.isFinite]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { value = Number(value); if (valid(value)) { this._state[name] = value; this._op(code, value); } } });
   for (const [name, code] of [['letterSpacing', 38], ['wordSpacing', 39]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { const px = /^(-?[\d.]+)px$/.exec(String(value).trim()); if (px) { this._state[name] = `${+px[1]}px`; this._op(code, +px[1]); } } });
   Object.defineProperty(CanvasRenderingContext2D.prototype, 'imageSmoothingEnabled', { configurable: true, enumerable: true, get() { return this._state.imageSmoothingEnabled; }, set(value) { this._state.imageSmoothingEnabled = !!value; this._op(40, value ? 1 : 0); } });
-  for (const name of ['imageSmoothingQuality', 'shadowBlur', 'shadowColor', 'shadowOffsetX', 'shadowOffsetY', 'filter', 'fontKerning', 'fontStretch', 'fontVariantCaps', 'textRendering', 'direction', 'lang']) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { this._state[name] = value; } });
+  for (const [name, valid] of [['shadowColor', () => true], ['shadowBlur', v => v >= 0 && v < Infinity], ['shadowOffsetX', Number.isFinite], ['shadowOffsetY', Number.isFinite]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) {
+    value = name === 'shadowColor' ? String(value) : Number(value); if (!valid(value)) return;
+    const state = this._state; state[name] = value; this._texts.push(state.shadowColor); this._op(43, state.shadowColor.length, state.shadowBlur, state.shadowOffsetX, state.shadowOffsetY);
+  } });
+  for (const name of ['imageSmoothingQuality', 'filter', 'fontKerning', 'fontStretch', 'fontVariantCaps', 'textRendering', 'direction', 'lang']) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { this._state[name] = value; } });
   class CanvasGradient {
     constructor(shape) { this._shape = shape.map(Number); this._stops = []; }
     addColorStop(offset, color) { offset = Number(offset); if (!(offset >= 0 && offset <= 1)) throw new DOMException('The offset is out of range', 'IndexSizeError'); this._stops.push([offset, String(color)]); }
     _spec() { return 'gradient:' + JSON.stringify([this._shape, [...this._stops].sort((a, b) => a[0] - b[0])]); }
+  }
+  class CanvasPattern {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    setTransform(matrix) { matrix = DOMMatrix.fromMatrix(matrix); if ([matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f].every(Number.isFinite)) this._matrix = matrix; }
+    _spec(id) { const { a, b, c, d, e, f } = this._matrix; return 'pattern:' + JSON.stringify([id, ...this._size, ...this._repeat.map(Number), a, b, c, d, e, f]); }
   }
   class TextMetrics {}
   class AudioNode { constructor(context) { this.context = context; this._target = null; } connect(target) { this._target = target; return target; } disconnect() { this._target = null; } }
@@ -2111,8 +2206,8 @@
     get width() { return canvasSize(this.getAttribute('width'), 300); } set width(v) { if (this._offscreen) throw transferred(); this.setAttribute('width', Number(v) >>> 0); }
     get height() { return canvasSize(this.getAttribute('height'), 150); } set height(v) { if (this._offscreen) throw transferred(); this.setAttribute('height', Number(v) >>> 0); }
     setAttribute(name, value) { super.setAttribute(name, value); if (name === 'width' || name === 'height') this._context?._resize(); }
-    toDataURL(type='image/png') { if (type!=='image/png') throw new DOMException('Only PNG encoding is supported','NotSupportedError');this._context?._flush?.();return call('dom.canvasURL',this._id); }
-    toBlob(callback,type='image/png') { const data=this.toDataURL(type).split(',')[1];queueMicrotask(()=>callback(new Blob([Uint8Array.fromBase64(data)],{type:'image/png'}))); }
+    toDataURL(type, quality) { this._context?._flush?.(); return call('dom.canvasURL', this._id, false, String(type).toLowerCase(), quality); }
+    toBlob(callback, type, quality) { if (typeof callback !== 'function') throw new TypeError('Expected a callback'); this._context?._flush?.(); const [bytes, mime] = call('dom.canvasURL', this._id, true, String(type).toLowerCase(), quality); setTimeout(() => callback(new Blob([bytes], { type: mime }))); }
     getContext(type, options) { if (this._offscreen) throw transferred(); if (['webgl','webgl2','experimental-webgl','experimental-webgl2'].includes(type))throw new DOMException('WebGL is not supported; use WebGPU or Canvas 2D','NotSupportedError'); return canvasContext(this, type, options, CanvasRenderingContext2D); }
     transferControlToOffscreen() { if (this._contextType || this._offscreen) throw new DOMException('The canvas has a context or was already transferred', 'InvalidStateError'); this._offscreen = true; const offscreen = new OffscreenCanvas(0, 0); offscreen._node = this; return offscreen; }
   }
@@ -2161,11 +2256,11 @@
       const node = canvasNode(width, height); call('dom.canvasTake', this._id, node._id);
       return bitmapOf(node);
     }
-    async convertToBlob() {
+    async convertToBlob(options) {
       if (!this._node) throw transferred();
       if (!this.width || !this.height) throw new DOMException('The canvas has no pixels', 'IndexSizeError');
       this._context?._flush?.();
-      return new Blob([call('dom.canvasURL', this._id, true)], { type: 'image/png' });
+      const [bytes, mime] = call('dom.canvasURL', this._id, true, String(options?.type).toLowerCase(), options?.quality); return new Blob([bytes], { type: mime });
     }
     _commit() { if (!this._linked || this._committing) return; this._committing = true; setTimeout(() => { this._committing = false; if (this._node) call('dom.canvasCommit', this._id); }, 0); }
     _pump() {
@@ -2222,6 +2317,7 @@
   }
   for (const [index, name] of ['width', 'height', 'availLeft', 'availTop', 'availWidth', 'availHeight'].entries()) Object.defineProperty(Screen.prototype, name, { configurable: true, enumerable: true, get: () => host('dom.screen')[index] });
   globalThis.screen = new Screen();
+  for (const [index, names] of [[6, 'screenX screenLeft'], [7, 'screenY screenTop'], [8, 'outerWidth'], [9, 'outerHeight']]) for (const name of names.split(' ')) Object.defineProperty(globalThis, name, { configurable: true, enumerable: true, get: () => host('dom.screen')[index] });
   const htmlTypes = new Map([['canvas', HTMLCanvasElement], ['img', HTMLImageElement], ['video', HTMLVideoElement], ['audio', HTMLAudioElement], ['slot', HTMLSlotElement], ['input', HTMLInputElement], ['textarea', HTMLTextAreaElement], ['template', HTMLTemplateElement], ['select', HTMLSelectElement], ['option', HTMLOptionElement], ['optgroup', HTMLOptGroupElement], ['button', HTMLButtonElement], ['fieldset', HTMLFieldSetElement], ['output', HTMLOutputElement], ['form', HTMLFormElement], ['dialog', HTMLDialogElement], ['details', HTMLDetailsElement], ['label', HTMLLabelElement]]);
   for (const [name, tags] of Object.entries({ Anchor: 'a', Area: 'area', Base: 'base', Body: 'body', BR: 'br', Data: 'data', DataList: 'datalist', Div: 'div', DList: 'dl', Embed: 'embed', Head: 'head', Heading: 'h1 h2 h3 h4 h5 h6', HR: 'hr', Html: 'html', IFrame: 'iframe', Legend: 'legend', LI: 'li', Link: 'link', Menu: 'menu', Meta: 'meta', Meter: 'meter', Mod: 'ins del', Object: 'object', OList: 'ol', Paragraph: 'p', Picture: 'picture', Pre: 'pre', Progress: 'progress', Quote: 'blockquote q', Script: 'script', Source: 'source', Span: 'span', Style: 'style', Table: 'table', TableCaption: 'caption', TableCell: 'td th', TableCol: 'col colgroup', TableRow: 'tr', TableSection: 'tbody tfoot thead', Time: 'time', Title: 'title', Track: 'track', UList: 'ul', Unknown: '' })) {
     const key = 'HTML' + name + 'Element', Type = globalThis[key] = { [key]: class extends HTMLElement {} }[key];
@@ -2271,7 +2367,7 @@
   globalThis.window = globalThis; globalThis.self = globalThis;
   selection = new Selection();
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) globalThis[name] = Node.prototype[name].bind(globalThis);
-  Object.assign(globalThis, { ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, TextMetrics, AudioContext, AudioNode, GainNode, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent });
+  Object.assign(globalThis, { ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, AudioNode, GainNode, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent });
   Object.assign(globalThis,{customElements,ShadowRoot,CSSStyleSheet,DOMParser});
   Object.assign(globalThis, { CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration });
   Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', adoptedProperty);
@@ -3111,6 +3207,17 @@
   const picks=new Map();let nextPick=0;
   pickFiles=input=>{if(!native)return;const id=++nextPick;picks.set(id,input);call('dom.filePicker',{id,multiple:input.multiple,directory:input.hasAttribute('webkitdirectory'),accept:input.getAttribute('accept')??''});};
   globalThis.__appsFilesPicked=(id,files)=>{const input=picks.get(id);picks.delete(id);if(!input)return;if(!files){dispatch(input,new Event('cancel',{bubbles:true}));return;}input._files=files.map(({name,lastModified,data})=>new File([Uint8Array.fromBase64(data)],name,{lastModified,type:fileType(name)}));setValue(input,files.length?'C:\\fakepath\\'+files[0].name:'');dispatch(input,new Event('input',{bubbles:true,composed:true}));dispatch(input,new Event('change',{bubbles:true}));};
+  const pickOption=(select,option)=>{if(option._current)return;for(const other of options(select))other._selected=other===option;select._none=false;selectedness(select);dispatch(select,trusted(new Event('input',{bubbles:true,composed:true})));dispatch(select,trusted(new Event('change',{bubbles:true})));};
+  openSelect=select=>{
+    if(!native||!navigator.platform.includes('Mac')||select.multiple||select.size>1||disabled(select))return;
+    const id=++nextPick,list=[],items=[],rect=select.getBoundingClientRect();let selected=-1;
+    const add=(option,group)=>{if(option.hidden)return;if(option._current)selected=items.length;list[items.length]=option;items.push([(group?'  ':'')+option.label,+disabled(option)]);};
+    selectedness(select);
+    for(const kid of select.children){if(kid.localName==='option')add(kid);else if(kid.localName==='hr')items.push(null);else if(kid.localName==='optgroup'&&!kid.hidden){items.push([kid.label,1]);for(const option of kid.children)if(option.localName==='option')add(option,true);}}
+    picks.set(id,[select,list]);call('dom.selectPopup',{id,x:rect.x,y:rect.y,width:rect.width,selected,items});
+  };
+  // The menu takes the pointerup of the press that opened it.
+  globalThis.__appsSelectPicked=(id,index)=>{const [select,list]=picks.get(id)??[];picks.delete(id);if(press&&select?.contains(press.target)){press=null;pointers.delete(1);call('dom.active',[]);}if(list?.[index]&&select.isConnected)pickOption(select,list[index]);};
   class ClipboardItem {
     constructor(items) { this._items = { ...items }; this.types = Object.keys(this._items); this.presentationStyle = 'unspecified'; }
     async getType(type) { if (!(type in this._items)) throw new DOMException('The type was not found', 'NotFoundError'); const value = await this._items[type]; return value instanceof Blob ? value : new Blob([value], { type }); }
@@ -3291,10 +3398,11 @@
       }
       if (event.key === 'Enter' && plain && (tag === 'button' || /^(button|submit|reset|image)$/.test(type) || (tag === 'a' || tag === 'area') && target.hasAttribute('href') || tag === 'summary') && !disabled(target)) { fireClick(target, { detail: 0 }, true); return false; }
       if (event.key === 'Escape' && closeRequest()) return false;
+      if (tag === 'select' && plain && event.key === ' ') { openSelect(target); return false; }
       if (tag === 'select' && plain && !disabled(target) && /^(ArrowUp|ArrowDown|Home|End|PageUp|PageDown)$/.test(event.key) || tag === 'select' && plain && event.key.length === 1 && event.key !== ' ') {
         const list = options(target).filter(option => !disabled(option)), index = list.indexOf(target.selectedOptions[0]);
         const next = event.key.length === 1 ? list.find((option, i) => i > index && option.text.toLowerCase().startsWith(event.key.toLowerCase())) ?? list.find(option => option.text.toLowerCase().startsWith(event.key.toLowerCase())) : list[event.key === 'Home' || event.key === 'PageUp' ? 0 : event.key === 'End' || event.key === 'PageDown' ? list.length - 1 : Math.max(0, Math.min(list.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1)))];
-        if (next && !next._current) { for (const option of options(target)) option._selected = option === next; target._none = false; selectedness(target); dispatch(target, trusted(new Event('input', { bubbles: true, composed: true }))); dispatch(target, trusted(new Event('change', { bubbles: true }))); }
+        if (next) pickOption(target, next);
         return false;
       }
       if (tag === 'input' && type === 'range' && plain && !disabled(target) && /^(Arrow(Up|Down|Left|Right)|Home|End|Page(Up|Down))$/.test(event.key)) {
@@ -3341,6 +3449,7 @@
       const focus = path(target).find(node => focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable));
       const offset = editable(focus) && button === 0 ? call('dom.textIndex', focus._id, data.clientX, data.clientY) : 0;
       if (focus) focus.focus(); else if (button === 0) active?.blur();
+      if (button === 0 && focus?.localName === 'select') openSelect(focus);
       if (button === 0 && focus?.localName === 'input' && focus.type === 'range') { sliding = [focus, focus.value]; slide(focus, data.clientX); }
       else if (button === 0 && editable(focus)) {
         const anchor = data.shiftKey ? (__appsEditing()?.start ?? offset) : offset;

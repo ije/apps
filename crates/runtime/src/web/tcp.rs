@@ -1,5 +1,10 @@
 use crate::jsc::payload::Payload;
 use anyhow::{Context, Result, bail};
+use rustls::{
+    CertificateError, ClientConfig,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, ServerName, UnixTime, pem::PemObject},
+};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -19,6 +24,122 @@ enum Command {
     End,
     NoDelay(bool),
     KeepAlive(bool, u64),
+    Tls(Box<(Arc<ClientConfig>, ServerName<'static>, Arc<Checked>)>),
+}
+#[derive(Debug)]
+struct Checked(
+    Arc<dyn ServerCertVerifier>,
+    bool,
+    Mutex<Option<(&'static str, String)>>,
+);
+impl ServerCertVerifier for Checked {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let error = match self.0.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Err(rustls::Error::InvalidCertificate(error)) => error,
+            result => return result,
+        };
+        let own = |cert| {
+            webpki::EndEntityCert::try_from(cert).is_ok_and(|cert| cert.issuer() == cert.subject())
+        };
+        let (code, message) = match &error {
+            CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
+                ("CERT_HAS_EXPIRED", "certificate has expired".into())
+            }
+            CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
+                ("CERT_NOT_YET_VALID", "certificate is not yet valid".into())
+            }
+            CertificateError::Revoked => ("CERT_REVOKED", "certificate revoked".into()),
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+                let presented = match &error {
+                    CertificateError::NotValidForNameContext { presented, .. } => presented
+                        .iter()
+                        .map(|name| {
+                            name.replace("DnsName(\"", "DNS:")
+                                .replace("IpAddress(", "IP Address:")
+                                .trim_end_matches(['"', ')'])
+                                .to_owned()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    _ => String::new(),
+                };
+                let target = match server_name {
+                    ServerName::IpAddress(_) => {
+                        format!("IP: {} is not in the cert's list: ", server_name.to_str())
+                    }
+                    _ => format!(
+                        "Host: {}. is not in the cert's altnames: ",
+                        server_name.to_str()
+                    ),
+                };
+                (
+                    "ERR_TLS_CERT_ALTNAME_INVALID",
+                    format!(
+                        "Hostname/IP does not match certificate's altnames: {target}{presented}"
+                    ),
+                )
+            }
+            CertificateError::UnknownIssuer if intermediates.is_empty() && own(end_entity) => (
+                "DEPTH_ZERO_SELF_SIGNED_CERT",
+                "self-signed certificate".into(),
+            ),
+            CertificateError::UnknownIssuer if intermediates.last().is_some_and(own) => (
+                "SELF_SIGNED_CERT_IN_CHAIN",
+                "self-signed certificate in certificate chain".into(),
+            ),
+            CertificateError::UnknownIssuer if intermediates.is_empty() => (
+                "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+                "unable to verify the first certificate".into(),
+            ),
+            CertificateError::UnknownIssuer => (
+                "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+                "unable to get local issuer certificate".into(),
+            ),
+            CertificateError::BadSignature => (
+                "CERT_SIGNATURE_FAILURE",
+                "certificate signature failure".into(),
+            ),
+            _ => ("CERT_UNTRUSTED", "certificate not trusted".into()),
+        };
+        *self.2.lock().unwrap() = Some((code, message));
+        if self.1 {
+            Err(rustls::Error::InvalidCertificate(error))
+        } else {
+            Ok(ServerCertVerified::assertion())
+        }
+    }
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.supported_verify_schemes()
+    }
 }
 trait Transport: AsyncRead + AsyncWrite + Send + Unpin + 'static {
     fn control(&self) -> std::io::Result<socket2::Socket>;
@@ -34,6 +155,14 @@ impl Transport for TcpStream {
         json!({"localAddress":local.map(|a|a.ip().to_string()),"localPort":local.map(|a|a.port()),"remoteAddress":peer.map(|a|a.ip().to_string()),"remotePort":peer.map(|a|a.port()),"remoteFamily":peer.map(|a|if a.is_ipv4(){"IPv4"}else{"IPv6"})})
     }
 }
+impl Transport for tokio_rustls::client::TlsStream<Accepted> {
+    fn control(&self) -> std::io::Result<socket2::Socket> {
+        self.get_ref().0.control()
+    }
+    fn address(&self) -> Value {
+        self.get_ref().0.address()
+    }
+}
 #[cfg(unix)]
 impl Transport for tokio::net::UnixStream {
     fn control(&self) -> std::io::Result<socket2::Socket> {
@@ -47,6 +176,10 @@ impl Transport for tokio::net::UnixStream {
 type Failure = (std::io::Error, &'static str, Value);
 
 fn failure((error, syscall, mut details): Failure) -> Value {
+    details["kind"] = "error".into();
+    if syscall == "tls" {
+        return details;
+    }
     let (code, errno) = if syscall == "getaddrinfo" {
         ("ENOTFOUND", Some(-3008))
     } else {
@@ -60,7 +193,6 @@ fn failure((error, syscall, mut details): Failure) -> Value {
     if let Some(first) = text.get_mut(..1) {
         first.make_ascii_lowercase();
     }
-    details["kind"] = "error".into();
     details["code"] = code.into();
     details["errno"] = errno.into();
     details["syscall"] = syscall.into();
@@ -69,7 +201,7 @@ fn failure((error, syscall, mut details): Failure) -> Value {
 }
 
 async fn run(
-    stream: Accepted,
+    mut stream: Accepted,
     mut commands: mpsc::UnboundedReceiver<Command>,
     mut paused: watch::Receiver<bool>,
     output: mpsc::Sender<Payload>,
@@ -85,58 +217,129 @@ async fn run(
         return Ok(());
     }
     let control = stream.control().map_err(io("connect"))?;
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    // Reads go on while a write waits for the peer, or two sockets piped into each other deadlock.
-    let read = async {
-        let mut bytes = [0; 16384];
-        loop {
-            let _ = paused.wait_for(|paused| !paused).await;
-            let size = reader.read(&mut bytes).await.map_err(io("read"))?;
-            if size == 0 {
-                events(json!({"kind":"end"}).into()).await;
-                return Ok(());
+    loop {
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let upgrading = tokio::sync::Notify::new();
+        // Reads go on while a write waits for the peer, or two sockets piped into each other deadlock.
+        // A read stops only while it waits, so no plain byte that arrives before a TLS upgrade is lost.
+        let read = async {
+            let mut bytes = [0; 16384];
+            let reading = async {
+                loop {
+                    let _ = paused.wait_for(|paused| !paused).await;
+                    let Ok(permit) = output.reserve().await else {
+                        return Ok(());
+                    };
+                    let size = match reader.read(&mut bytes).await {
+                        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+                        result => result.map_err(io("read"))?,
+                    };
+                    permit.send(if size == 0 {
+                        json!({"kind":"end"}).into()
+                    } else {
+                        Payload::with_bytes(json!({"kind":"data"}), "bytes", bytes[..size].to_vec())
+                    });
+                    wake.wake();
+                    if size == 0 {
+                        return Ok(());
+                    }
+                }
+            };
+            tokio::select! {
+                result = reading => result,
+                _ = upgrading.notified() => Ok(()),
             }
-            if !events(Payload::with_bytes(
-                json!({"kind":"data"}),
-                "bytes",
-                bytes[..size].to_vec(),
-            ))
-            .await
-            {
-                return Ok(());
-            }
-        }
-    };
-    let write = async {
-        while let Some(command) = commands.recv().await {
-            match command {
-                Command::Write(data) => {
-                    writer.write_all(&data).await.map_err(io("write"))?;
-                    if !events(json!({"kind":"written","bytes":data.len()}).into()).await {
+        };
+        let write = async {
+            while let Some(command) = commands.recv().await {
+                match command {
+                    Command::Write(data) => {
+                        writer.write_all(&data).await.map_err(io("write"))?;
+                        writer.flush().await.map_err(io("write"))?;
+                        if !events(json!({"kind":"written","bytes":data.len()}).into()).await {
+                            break;
+                        }
+                    }
+                    Command::End => {
+                        writer.shutdown().await.map_err(io("shutdown"))?;
+                        events(json!({"kind":"finish"}).into()).await;
                         break;
                     }
-                }
-                Command::End => {
-                    writer.shutdown().await.map_err(io("shutdown"))?;
-                    events(json!({"kind":"finish"}).into()).await;
-                    break;
-                }
-                Command::NoDelay(value) => {
-                    let _ = control.set_tcp_nodelay(value);
-                }
-                Command::KeepAlive(value, delay) => {
-                    let _ = control.set_keepalive(value);
-                    if value && delay > 0 {
-                        let _ = control.set_tcp_keepalive(
-                            &socket2::TcpKeepalive::new().with_time(Duration::from_millis(delay)),
-                        );
+                    Command::NoDelay(value) => {
+                        let _ = control.set_tcp_nodelay(value);
+                    }
+                    Command::KeepAlive(value, delay) => {
+                        let _ = control.set_keepalive(value);
+                        if value && delay > 0 {
+                            let _ = control.set_tcp_keepalive(
+                                &socket2::TcpKeepalive::new()
+                                    .with_time(Duration::from_millis(delay)),
+                            );
+                        }
+                    }
+                    Command::Tls(upgrade) => {
+                        upgrading.notify_one();
+                        return Ok(Some(upgrade));
                     }
                 }
             }
+            Ok(None)
+        };
+        let Some(upgrade) = tokio::try_join!(read, write)?.1 else {
+            return Ok(());
+        };
+        let (config, name, checked) = *upgrade;
+        let plain = reader.unsplit(writer);
+        if !events(json!({"kind":"tls","address":plain.address()}).into()).await {
+            return Ok(());
         }
-        Ok(())
-    };
-    tokio::try_join!(read, write).map(|_| ())
+        let secure = tokio_rustls::TlsConnector::from(config)
+            .connect(name, plain)
+            .await
+            .map_err(|error| {
+                let found = checked.2.lock().unwrap().take();
+                let inner = error.get_ref().and_then(|inner| inner.downcast_ref());
+                let details = match (found, inner) {
+                    (Some((code, message)), _) => json!({"code":code,"message":message}),
+                    // JavaScript names alerts and cipher suites: the rustls texts cost 33 KB.
+                    (None, Some(rustls::Error::AlertReceived(alert))) => {
+                        json!({"alert":u8::from(*alert)})
+                    }
+                    (None, Some(rustls::Error::InvalidMessage(_))) => {
+                        json!({"code":"ERR_SSL_WRONG_VERSION_NUMBER","message":"wrong version number"})
+                    }
+                    (None, Some(_)) => {
+                        json!({"code":"ERR_SSL_HANDSHAKE_FAILURE","message":"handshake failure"})
+                    }
+                    (None, None) if error.kind() == std::io::ErrorKind::UnexpectedEof => json!({
+                        "code": "ECONNRESET",
+                        "message": concat!(
+                            "Client network socket disconnected ",
+                            "before secure TLS connection was established"
+                        ),
+                    }),
+                    (None, None) => return (error, "read", json!({})),
+                };
+                (error, "tls", details)
+            })?;
+        let (_, session) = secure.get_ref();
+        let modern = session.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3);
+        let event = json!({
+            "kind": "secure",
+            "protocol": if modern { "TLSv1.3" } else { "TLSv1.2" },
+            "cipher": session.negotiated_cipher_suite().map(|suite| u16::from(suite.suite())),
+            "alpn": session.alpn_protocol().map(String::from_utf8_lossy),
+            "error": checked.2.lock().unwrap().take().map(|(code, _)| code),
+        });
+        let cert = session
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map_or(Vec::new(), |cert| cert.to_vec());
+        if !events(Payload::with_bytes(event, "bytes", cert)).await {
+            return Ok(());
+        }
+        stream = Box::new(secure);
+    }
 }
 
 type Accepted = Box<dyn Transport>;
@@ -387,7 +590,7 @@ impl State {
                 );
                 Ok(json!({"id":self.next_id,"address":address}))
             }
-            "write" | "end" | "pause" | "noDelay" | "keepAlive" => {
+            "write" | "end" | "pause" | "noDelay" | "keepAlive" | "tls" => {
                 let socket = self
                     .connections
                     .get(&args[0].as_u64().context("Expected socket ID")?)
@@ -400,6 +603,41 @@ impl State {
                         return Ok(Value::Null);
                     }
                     "noDelay" => Command::NoDelay(args[1] == true),
+                    "tls" => {
+                        let options = &args[1];
+                        let verifier: Arc<dyn ServerCertVerifier> = match options["ca"].as_str() {
+                            Some(ca) => {
+                                let mut roots = rustls::RootCertStore::empty();
+                                for cert in CertificateDer::pem_slice_iter(ca.as_bytes()) {
+                                    roots.add(cert?)?;
+                                }
+                                rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+                                    .build()?
+                            }
+                            None => crate::web::roots(),
+                        };
+                        let checked = Arc::new(Checked(
+                            verifier,
+                            options["reject"] != false,
+                            Mutex::default(),
+                        ));
+                        let mut config = ClientConfig::builder()
+                            .dangerous()
+                            .with_custom_certificate_verifier(checked.clone())
+                            .with_no_client_auth();
+                        config.alpn_protocols =
+                            serde_json::from_value::<Vec<String>>(options["alpn"].clone())?
+                                .into_iter()
+                                .map(String::into_bytes)
+                                .collect();
+                        let name = ServerName::try_from(
+                            options["servername"]
+                                .as_str()
+                                .context("Expected server name")?
+                                .to_owned(),
+                        )?;
+                        Command::Tls(Box::new((Arc::new(config), name, checked)))
+                    }
                     _ => Command::KeepAlive(args[1] == true, args[2].as_u64().unwrap_or(0)),
                 };
                 socket

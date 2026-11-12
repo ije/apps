@@ -63,9 +63,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
             let mut inner = der(&mut octets, 0x30)?;
             der(&mut inner, 2)?;
             let private = der(&mut inner, 4)?;
-            Ok(
-                json!({"private":base64(private),"public":base64(key.public_key().as_ref()),"pkcs8":base64(document.as_ref())}),
-            )
+            Ok(json!({"private":base64(private),"public":base64(key.public_key().as_ref())}))
         }
         "sign" | "verify" => {
             let algorithm = args[0].as_str().context("Expected algorithm")?;
@@ -179,17 +177,18 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                 );
                 data.extend_from_slice(&tag);
             }
-            let algorithm = match key.len() {
-                16 => &aead::AES_128_GCM,
-                32 => &aead::AES_256_GCM,
-                _ => bail!("AES-GCM requires a 128 or 256 bit key"),
+            let algorithm = match (args[5].as_str(), key.len()) {
+                (Some("chacha20-poly1305"), 32) => &aead::CHACHA20_POLY1305,
+                (None, 16) => &aead::AES_128_GCM,
+                (None, 32) => &aead::AES_256_GCM,
+                _ => bail!("Invalid key length"),
             };
             let key = aead::LessSafeKey::new(
                 aead::UnboundKey::new(algorithm, &key)
                     .map_err(|_| anyhow::anyhow!("Invalid AES key"))?,
             );
             let nonce = aead::Nonce::try_assume_unique_for_key(&iv)
-                .map_err(|_| anyhow::anyhow!("AES-GCM requires a 12 byte IV"))?;
+                .map_err(|_| anyhow::anyhow!("The IV must be 12 bytes"))?;
             let aad = aead::Aad::from(aad);
             if op == "encrypt" {
                 key.seal_in_place_append_tag(nonce, aad, &mut data)
@@ -202,6 +201,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                 Ok(base64(value))
             }
         }
+        "pbkdf2" | "hkdf" => crate::node::system::call(op, args),
         _ => bail!("Unsupported crypto operation: {op}"),
     }
 }

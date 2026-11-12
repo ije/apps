@@ -356,7 +356,7 @@ globalThis.__appsBrowser = (call, EventEmitter, isReady = () => true, created = 
   };
 };
 
-globalThis.__appsNativeShell = (call, EventEmitter, preload = false) => {
+globalThis.__appsNativeShell = (call, EventEmitter, preload = false, nativeImage) => {
   const native = (op, args = null) => call('native.' + op, args);
   const shortcuts = new Map(), notifications = new Map(), trays = new Map();
   const eventOf = () => ({ defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
@@ -395,6 +395,10 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false) => {
         return true;
       },
       getBadgeCount: () => badgeCount,
+      isEmojiPanelSupported: () => true,
+      showEmojiPanel: () => { native('app.emojiPanel'); },
+      addRecentDocument: path => { native('app.recentDocument', String(path)); },
+      clearRecentDocuments: () => { native('app.recentDocument'); },
       dock: Object.freeze({
         bounce: (type = 'informational') => native('app.attention', type),
         cancelBounce: id => native('app.cancelAttention', id),
@@ -408,19 +412,25 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false) => {
     });
     Object.defineProperty(app, 'badgeCount', { enumerable: true, get: app.getBadgeCount, set: app.setBadgeCount });
   };
+  const pasteboard = { text: 'public.utf8-plain-text', html: 'public.html', rtf: 'public.rtf', image: 'public.png' };
+  const formats = { 'public.utf8-plain-text': 'text/plain', 'public.html': 'text/html', 'public.rtf': 'text/rtf', 'public.png': 'image/png', 'public.tiff': 'image/png', 'public.file-url': 'text/uri-list' };
+  const read = type => Buffer.from(native('clipboard.read', type), 'base64');
+  const write = data => {
+    const items = {};
+    for (const key in pasteboard) if (data?.[key] != null) items[pasteboard[key]] = (key === 'image' ? data.image.toPNG() : Buffer.from(String(data[key]))).toString('base64');
+    native('clipboard.write', items);
+  };
   const clipboard = Object.freeze({
-    readText: () => native('clipboard.readText'), writeText: async text => { native('clipboard.writeText', String(text)); },
-    readHTML: () => native('clipboard.readHTML'), writeHTML: async text => { native('clipboard.writeHTML', String(text)); },
-    clear: () => native('clipboard.clear'),
-    async write(items) {
-      for (const item of items) for (const type of item.types) {
-        const blob = await item.getType(type);
-        if (type === 'text/plain') native('clipboard.writeText', await blob.text());
-        else if (type === 'text/html') native('clipboard.writeHTML', await blob.text());
-        else if (type === 'image/png') native('clipboard.writeImage', Buffer.from(await blob.arrayBuffer()).toString('base64'));
-        else throw new DOMException(`Type ${type} not supported on write.`, 'NotAllowedError');
-      }
-    },
+    readText: () => native('clipboard.readText'), writeText: text => write({ text }),
+    readHTML: () => native('clipboard.readHTML'), writeHTML: html => write({ html }),
+    readRTF: () => read('public.rtf').toString(), writeRTF: rtf => write({ rtf }),
+    readImage() { const png = read('public.png'); return nativeImage.createFromBuffer(png.length ? png : read('public.tiff')); },
+    writeImage: image => write({ image }),
+    readBuffer: format => read(String(format)),
+    writeBuffer: (format, buffer) => native('clipboard.write', { [format]: Buffer.from(buffer).toString('base64') }),
+    availableFormats: () => [...new Set(native('clipboard.formats').map(type => formats[type]).filter(Boolean))],
+    has: format => native('clipboard.formats').includes(format) || clipboard.availableFormats().includes(format),
+    clear: () => native('clipboard.clear'), write,
   });
   const shell = Object.freeze({
     async openExternal(url) { if (!native('shell.openExternal', String(url))) throw new Error('Could not open URL'); },
@@ -498,6 +508,7 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false) => {
       let submenu = options.submenu instanceof Menu ? options.submenu : Array.isArray(options.submenu) ? Menu.buildFromTemplate(options.submenu) : submenus[key] ? Menu.buildFromTemplate(submenus[key]()) : undefined;
       Object.assign(this, { id: options.id, label: options.label ?? (typeof label === 'function' ? label(nativeApp?.getName() ?? '') : label ?? ''), sublabel: options.sublabel ?? '', toolTip: options.toolTip ?? '', role, type: options.type ?? (submenu ? 'submenu' : 'normal'), accelerator: options.accelerator ?? defaults[1], icon: options.icon, enabled: options.enabled ?? true, visible: options.visible ?? true, checked: options.checked ?? false, submenu, registerAccelerator: options.registerAccelerator ?? true, menu: null });
       const action = options.click;
+      for (const key in options) if (!(key in this) && key !== 'click') this[key] = options[key];
       this.click = (event = {}, window = focused(), contents = window?.webContents) => {
         if (this.type === 'checkbox') this.checked = !this.checked;
         if (this.type === 'radio') {
@@ -524,8 +535,33 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false) => {
     constructor() { super(); this.items = []; }
     static buildFromTemplate(template) {
       if (!Array.isArray(template)) throw new TypeError('Expected menu template');
+      const order = (count, edges) => { const sorted = [], seen = new Set(), visit = i => { if (seen.has(i)) return; seen.add(i); edges[i]?.forEach(visit); sorted.push(i); }; for (let i = 0; i < count; i++) visit(i); return sorted; };
+      const isSeparator = item => item.type === 'separator' && !item.before && !item.after && !item.beforeGroupContaining && !item.afterGroupContaining;
+      const separators = template.filter(isSeparator), find = (id, skip) => groups.findIndex(group => group !== skip && group.some(item => item.id === id));
+      let groups = [[]];
+      for (const item of template) if (!isSeparator(item)) groups.at(-1).push(item); else if (groups.at(-1).length) groups.push([]);
+      if (!groups.at(-1).length) groups.pop();
+      merge: for (let i = 0; i < groups.length; i++) for (const item of groups[i]) for (const id of [...item.before ?? [], ...item.after ?? []]) {
+        const j = find(id, groups[i]);
+        if (j !== -1) { groups[j].push(...groups[i]); groups.splice(i, 1); i = -1; continue merge; }
+      }
+      groups = groups.map(group => {
+        const edges = [], index = new Map(group.map((item, i) => [item.id, i]));
+        group.forEach((item, i) => {
+          for (const id of item.before ?? []) if (index.has(id)) (edges[index.get(id)] ??= []).push(i);
+          for (const id of item.after ?? []) if (index.has(id)) (edges[i] ??= []).push(index.get(id));
+        });
+        return order(group.length, edges).map(i => group[i]);
+      });
+      const edges = [];
+      groups.forEach((group, i) => {
+        for (const item of group) {
+          for (const id of item.beforeGroupContaining ?? []) { const j = find(id, group); if (j !== -1) return (edges[j] ??= []).push(i); }
+          for (const id of item.afterGroupContaining ?? []) { const j = find(id, group); if (j !== -1) return (edges[i] ??= []).push(j); }
+        }
+      });
       const menu = new Menu();
-      for (const item of template) menu.append(item instanceof MenuItem ? item : new MenuItem(item));
+      order(groups.length, edges).forEach((g, n) => { for (const item of n ? [separators.shift() ?? separator, ...groups[g]] : groups[g]) menu.append(item instanceof MenuItem ? item : new MenuItem(item)); });
       return menu;
     }
     static setApplicationMenu(menu) {
@@ -542,7 +578,7 @@ globalThis.__appsNativeShell = (call, EventEmitter, preload = false) => {
     popup(options = {}) {
       const items = new Map(), template = serialize(this, items), request = ++nextNativeID;
       this.emit('menu-will-show', eventOf());
-      native('menu.popup', { template, request, ...(options.x === undefined ? {} : { x: options.x }), ...(options.y === undefined ? {} : { y: options.y }) });
+      native('menu.popup', { template, request, ...Object.fromEntries(['x', 'y', 'positioningItem', 'minWidth'].flatMap(key => options[key] === undefined ? [] : [[key, options[key]]])) });
       popups.set(request, { menu: this, items, callback: options.callback });
     }
     closePopup() {}

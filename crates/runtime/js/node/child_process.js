@@ -3,6 +3,49 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
   const key = {};
   let failureID = 0;
   const view = data => Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  const channel = (target, id, name) => {
+    let parts = [];
+    const disconnect = now => {
+      if (!target.connected) return;
+      target.connected = false; target.channel = null;
+      try { call('child.end', id, name); call('child.destroy', id, name); } catch {}
+      if (now) target.emit('disconnect'); else process.nextTick(() => target.emit('disconnect'));
+    };
+    const ipc = target.channel = {
+      sent: [], destroyed: false, unreferenced: false,
+      ref() { ipc.unreferenced = false; }, unref() { ipc.unreferenced = true; },
+      push(data) {
+        if (data === null) { ipc.destroyed = true; disconnect(true); return true; }
+        let start = 0;
+        for (let end; (end = data.indexOf(10, start)) !== -1; start = end + 1) {
+          parts.push(data.subarray(start, end));
+          const message = JSON.parse(Buffer.concat(parts).toString());
+          parts = [];
+          if (!target.connected || typeof message?.cmd === 'string' && message.cmd.startsWith('NODE_')) continue;
+          target.emit('message', message);
+          target.parentPort?.emit('message', { data: message, ports: [] });
+        }
+        if (start < data.length) parts.push(data.subarray(start));
+        return true;
+      },
+      _childWritten() { ipc.sent.shift()?.(null); },
+      _childEnded() {},
+      destroy(error) { ipc.destroyed = true; for (const callback of ipc.sent.splice(0)) callback ? callback(error) : target.emit('error', error); disconnect(true); },
+    };
+    target.connected = true;
+    target.send = (message, handle, options, callback) => {
+      if (typeof handle === 'function') [handle, callback] = [undefined, handle]; else if (typeof options === 'function') callback = options;
+      if (message === undefined) throw Object.assign(new TypeError('The "message" argument must be specified'), { code: 'ERR_MISSING_ARGS' });
+      if (handle != null) throw Object.assign(new TypeError('Sending handles is not supported'), { code: 'ERR_INVALID_HANDLE_TYPE' });
+      const data = Buffer.from(JSON.stringify(message) + '\n');
+      if (target.connected) try { call('child.write', id, data, name); ipc.sent.push(callback); return true; } catch {}
+      const error = Object.assign(new Error('Channel closed'), { code: 'ERR_IPC_CHANNEL_CLOSED' });
+      process.nextTick(() => callback ? callback(error) : target.emit('error', error));
+      return false;
+    };
+    target.disconnect = () => { if (target.connected) disconnect(false); else process.nextTick(() => target.emit('error', Object.assign(new Error('IPC channel is already disconnected'), { code: 'ERR_IPC_DISCONNECTED' }))); };
+    return ipc;
+  };
   const failed = (failure, syscall, file, args) => Object.assign(new Error(`${syscall} ${failure.code}`), { errno: failure.errno, code: failure.code, syscall, path: file, spawnargs: args });
   const input = id => {
     let done = null, finished = null;
@@ -30,13 +73,15 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
       this.stdout = output('stdout');
       this.stderr = output('stderr');
       this.stdio = [this.stdin, this.stdout, this.stderr];
+      this.connected = false;
       for (let index = 3; index < options.stdio.length; index++) {
-        if (options.stdio[index] !== 'pipe') { this.stdio[index] = null; continue; }
         const name = 'fd' + index, id = result.id;
-        if (id === undefined) { this.stdio[index] = null; continue; }
+        if (options.stdio[index] !== 'pipe' || id === undefined) { this.stdio[index] = null; continue; }
+        if (index === options.ipc) { this.stdio[index] = null; this[name] = channel(this, id, name); continue; }
         const pipe = this.stdio[index] = this[name] = new stream.Duplex({
           read() { if (this._paused) { this._paused = false; call('child.pause', id, name, false); } },
           write(data, _encoding, callback) { try { call('child.write', id, data, name); this._done = callback; } catch (error) { callback(error); } },
+          writev(chunks, callback) { this._write(Buffer.concat(chunks.map(({ chunk }) => chunk)), null, callback); },
           final(callback) { try { call('child.end', id, name); this._finished = callback; } catch (error) { callback(error); } },
           destroy(error, callback) { if (!this._finished) try { call('child.end', id, name); } catch {} try { call('child.destroy', id, name); } catch {} callback(error); },
         });
@@ -57,6 +102,7 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
   }
   const stdioOf = (stdio, index) => {
     if (stdio == null || stdio === 'overlapped') return index < 3 ? 'pipe' : 'ignore';
+    if (stdio === 'ipc') return index < 3 ? null : 'pipe';
     if (stdio === 'pipe' || stdio === 'ignore' || stdio === 'inherit') return index < 3 || stdio !== 'inherit' ? stdio : null;
     const fd = typeof stdio === 'number' ? stdio : typeof stdio?.fd === 'number' && typeof stdio.on === 'function' ? stdio.fd : -1;
     return index < 3 && fd >= 0 && fd <= 2 ? fd : null;
@@ -84,7 +130,15 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
     const stdio = options.stdio ?? 'pipe', list = typeof stdio === 'string' ? [stdio, stdio, stdio] : Array.isArray(stdio) ? stdio : null;
     if (!list) throw Object.assign(new TypeError(`The argument 'stdio' is invalid. Received ${stdio}`), { code: 'ERR_INVALID_ARG_VALUE' });
     result.stdio = Array.from({ length: Math.max(3, list.length) }, (_, index) => stdioOf(list[index], index));
-    for (let index = 0; index < Math.max(3, list.length); index++) if (stdioOf(list[index], index) === null) throw Object.assign(new TypeError(list[index] === 'ipc' ? 'IPC channels are not supported' : `Unsupported stdio option at index ${index}: ${String(list[index])}`), { code: 'ERR_INVALID_ARG_VALUE' });
+    for (let index = 0; index < Math.max(3, list.length); index++) if (stdioOf(list[index], index) === null) throw Object.assign(new TypeError(`Unsupported stdio option at index ${index}: ${String(list[index])}`), { code: 'ERR_INVALID_ARG_VALUE' });
+    const ipc = list.indexOf('ipc');
+    if (ipc !== -1) {
+      if (list.includes('ipc', ipc + 1)) throw Object.assign(new Error('Child process can have only one IPC pipe'), { code: 'ERR_IPC_ONE_PIPE' });
+      if ((options.serialization ?? 'json') !== 'json') throw Object.assign(new TypeError(`The property 'options.serialization' must be 'json'. Received ${String(options.serialization)}`), { code: 'ERR_INVALID_ARG_VALUE' });
+      if (process.platform === 'win32') throw Object.assign(new Error('IPC channels are not supported on Windows'), { code: 'ERR_FEATURE_UNAVAILABLE_ON_PLATFORM' });
+      Object.assign(result.env ??= Object.create(null), { NODE_CHANNEL_FD: String(ipc), NODE_CHANNEL_SERIALIZATION_MODE: 'json' });
+      result.ipc = ipc;
+    }
     if (sync) Object.assign(result, { input: options.input, timeout: options.timeout, killSignal: options.killSignal ?? 'SIGTERM', maxBuffer: options.maxBuffer === Infinity ? Number.MAX_SAFE_INTEGER : options.maxBuffer });
     return result;
   };
@@ -138,6 +192,7 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
         child.exitCode = event.code;
         child.signalCode = event.signal;
         if (event.event === 'close') { children.delete(event.id); closed(child, event.code, event.signal); }
+        else if (child.connected) child.once('disconnect', () => child.emit('exit', event.code, event.signal));
         else child.emit('exit', event.code, event.signal);
       } else child.emit(event.event);
     }
@@ -181,5 +236,47 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
   const execSync=(command,options={})=>{const{shell:custom,...rest}=options,program=typeof custom==='string'?custom:shell();return execFileSync(program,shellArgs(program,command),rest,command);};
   const custom=Symbol.for('nodejs.util.promisify.custom');
   for(const run of [exec,execFile])run[custom]=(...args)=>{let child;const promise=new Promise((resolve,reject)=>{child=run(...args,(error,stdout,stderr)=>error?reject(Object.assign(error,{stdout,stderr})):resolve({stdout,stderr}));});promise.child=child;return promise;};
-  return { api: { spawn, ChildProcess, spawnSync, execFileSync, execFile, exec, execSync }, poll, pending: () => [...children.values()].some(({child})=>!child._unreferenced) };
+  const fork = (modulePath, args, options) => {
+    if (modulePath instanceof URL || /^file:/.test(modulePath)) modulePath = globalThis.__apps.url.fileURLToPath(modulePath);
+    if (typeof modulePath !== 'string') throw Object.assign(new TypeError('The "modulePath" argument must be of type string or an instance of URL'), { code: 'ERR_INVALID_ARG_TYPE' });
+    if (!Array.isArray(args)) { options = args; args = []; }
+    options ??= {};
+    let stdio = options.stdio ?? (options.silent ? 'pipe' : [0, 1, 2]);
+    if (typeof stdio === 'string') stdio = [stdio, stdio, stdio, 'ipc'];
+    else if (!options.stdio) stdio = [...stdio, 'ipc'];
+    else if (!stdio.includes('ipc')) throw Object.assign(new Error("Forked processes must have an IPC channel, missing value 'ipc' in options.stdio"), { code: 'ERR_CHILD_PROCESS_IPC_REQUIRED' });
+    const env = { ...options.env ?? process.env, ELECTRON_RUN_AS_NODE: '1' };
+    for (const name of ['APPS_DEV_BUNDLE', 'APPS_JSC_LIBRARY']) env[name] ??= process.env[name];
+    return spawn(options.execPath ?? process.execPath, [...options.execArgv ?? process.execArgv, modulePath, ...args], { ...options, stdio, env, shell: false });
+  };
+  class UtilityProcess extends EventEmitter {
+    #child;
+    constructor(child) {
+      super();
+      this.#child = child;
+      Object.assign(this, { pid: child.pid, stdout: child.stdout, stderr: child.stderr });
+      child.on('spawn', () => this.emit('spawn')).on('message', message => this.emit('message', message));
+      child.on('exit', (code, signal) => { this.pid = undefined; this.emit('exit', code ?? globalThis.__apps.os.constants.signals[signal] ?? 1); });
+    }
+    postMessage(message, transfer) {
+      if (transfer?.length) throw Object.assign(new TypeError('Transferring MessagePortMain objects is not supported'), { code: 'ERR_INVALID_ARG_VALUE' });
+      this.#child.send(message, () => {});
+    }
+    kill() { return this.#child.kill(); }
+  }
+  const utilityProcess = Object.freeze({ fork(modulePath, args, options) {
+    if (!Array.isArray(args)) { options = args; args = []; }
+    const { stdio = 'inherit', env = process.env, ...rest } = options ?? {}, [, stdout = 'inherit', stderr = 'inherit'] = typeof stdio === 'string' ? [, stdio, stdio] : stdio;
+    return new UtilityProcess(fork(modulePath, args, { ...rest, env: { ...env, APPS_PARENT_PORT: '1' }, stdio: ['ignore', stdout, stderr, 'ipc'] }));
+  } });
+  let flush;
+  const connect = (fd, port) => {
+    const id = call('child.channel', fd);
+    if (id == null) return;
+    if (port) Object.assign(process, { type: 'utility', parentPort: Object.assign(new EventEmitter(), { postMessage: message => process.send(message) }) });
+    const ipc = channel(process, id, 'ipc'), live = name => process.listenerCount(name) || process.parentPort?.listenerCount(name);
+    children.set(id, { child: { ipc, stdio: [], emit() {}, get _unreferenced() { return !ipc.sent.length && !(process.connected && !ipc.unreferenced && (live('message') || live('disconnect'))); } } });
+    flush = () => { if (ipc.sent.length) call('child.flush', id, 'ipc'); };
+  };
+  return { api: { spawn, fork, ChildProcess, spawnSync, execFileSync, execFile, exec, execSync }, utilityProcess, connect, flush: () => flush?.(), poll, pending: () => [...children.values()].some(({child})=>!child._unreferenced) };
 };

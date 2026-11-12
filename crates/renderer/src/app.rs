@@ -397,6 +397,10 @@ impl Callbacks {
         });
     }
 
+    pub fn will_change(&self, kind: &str, bounds: Rect) -> bool {
+        native::will_change(self.id, kind, bounds)
+    }
+
     // Main decides, and closes the window itself.
     pub fn should_close(&self) -> bool {
         native::window_event(self.id, native::WindowEvent::CloseRequested);
@@ -513,11 +517,13 @@ pub mod native {
     // A handler, missing while it runs.
     type Slot<H> = Option<Box<H>>;
     type KeyFilter = dyn FnMut(WindowId, &Event, &dyn Fn() -> bool) -> bool;
+    type FrameFilter = dyn FnMut(WindowId, &str, Rect) -> bool;
 
     #[derive(Default)]
     struct Handlers {
         window: Slot<dyn FnMut(WindowId, WindowEvent)>,
         key: Slot<KeyFilter>,
+        will_change: Slot<FrameFilter>,
         reopen: Slot<dyn FnMut(bool)>,
         should_quit: Slot<dyn FnMut() -> bool>,
         open_urls: Slot<dyn FnMut(Vec<String>)>,
@@ -562,6 +568,19 @@ pub mod native {
         call(
             |handlers| &mut handlers.key,
             |filter| filter(id, event, composing),
+        )
+        .unwrap_or(false)
+    }
+
+    // `kind` is `move`, or the edge of a resize: `right` or `bottom`. Return true to cancel a resize.
+    pub fn on_will_change(f: impl FnMut(WindowId, &str, Rect) -> bool + 'static) {
+        HANDLERS.with_borrow_mut(|handlers| handlers.will_change = Some(Box::new(f)));
+    }
+
+    pub(crate) fn will_change(id: WindowId, kind: &str, bounds: Rect) -> bool {
+        call(
+            |handlers| &mut handlers.will_change,
+            |filter| filter(id, kind, bounds),
         )
         .unwrap_or(false)
     }
