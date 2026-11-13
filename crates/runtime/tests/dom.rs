@@ -1489,11 +1489,13 @@ fn page_workers_report_errors_and_get_files() {
             if (data === 'throw') throw new TypeError('bad');
             if (data === 'later') return setTimeout(() => { throw new Error('late'); });
             if (data === 'handled') { self.onerror = () => true; throw new Error('kept'); }
+            if (data.shared) return postMessage(Atomics.add(new Int32Array(data.shared), 0, 2));
+            if (data.move) return postMessage(data, [data.move]);
             if (data.file) return data.file.text().then(text => postMessage([data.file instanceof File, data.file.name, data.file.type, text, data.blob instanceof Blob && !(data.blob instanceof File), data.blob.size]));
             postMessage(data);
         }`);
         const failed = () => new Promise(resolve => inner.addEventListener('error', event => resolve([event instanceof ErrorEvent, event.message, event.lineno > 0]), { once: true }));
-        const answer = data => new Promise(resolve => { inner.onmessage = event => resolve(event.data); inner.postMessage(data); });
+        const answer = (data, transfer) => new Promise(resolve => { inner.onmessage = event => resolve(event.data); inner.postMessage(data, transfer); });
         let failure = failed(); inner.postMessage('throw');
         same(await failure, [true, 'Uncaught TypeError: bad', true], 'error in a handler');
         failure = failed(); inner.postMessage('later');
@@ -1503,6 +1505,12 @@ fn page_workers_report_errors_and_get_files() {
         same(await answer({ file: new File(['hello'], 'a.txt', { type: 'text/plain' }), blob: new Blob(['xy']) }), [true, 'a.txt', 'text/plain', 'hello', true, 2], 'files');
         const pixels = await answer(new ImageData(new Uint8ClampedArray([7, 0, 0, 255]), 1, 1));
         same([pixels instanceof ImageData, pixels.width, pixels.height, pixels.data[0]], [true, 1, 1, 7], 'image data');
+        const shared = new SharedArrayBuffer(8);
+        same([await answer({ shared }), new Int32Array(shared)[0]], [0, 2], 'shared memory');
+        await rejected(async () => Atomics.wait(new Int32Array(shared), 0, 0, 1), 'TypeError');
+        const moved = new ArrayBuffer(65536); new Uint8Array(moved)[1] = 5;
+        const back = (await answer({ move: moved }, [moved])).move;
+        same([moved.byteLength, back.byteLength, new Uint8Array(back)[1]], [0, 65536, 5], 'moved memory');
         const missing = new Worker('apps:///missing.js');
         same(await new Promise(resolve => { missing.onerror = event => resolve(event.message); }), 'Missing bundled worker: missing.js', 'a missing worker fails with an event');
     "#,

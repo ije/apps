@@ -80,7 +80,7 @@ static SCRIPTS: std::sync::Mutex<Scripts> = std::sync::Mutex::new(Scripts {
 pub struct JavaScriptCore {
     aot: Option<&'static aot::Image>,
     _library: Library,
-    group: Ptr,
+    pub(crate) group: Ptr,
     group_release: unsafe extern "C" fn(Ptr),
     garbage_collect: unsafe extern "C" fn(Ptr),
     shrink: unsafe extern "C" fn(Ptr),
@@ -104,6 +104,9 @@ pub struct JavaScriptCore {
     pub(crate) idle: std::cell::Cell<bool>,
     inspectable: unsafe extern "C" fn(Ptr, bool),
     pub(crate) extra_memory: unsafe extern "C" fn(Ptr, usize),
+    // An older library has no such functions. Buffers are then copied, and shared buffers can't be sent.
+    pub(crate) contents: Option<payload::Contents>,
+    pub(crate) terminate: Option<unsafe extern "C" fn(Ptr)>,
     set_name: unsafe extern "C" fn(Ptr, Ptr),
     execution_limit: Limit,
     create: unsafe extern "C" fn(Ptr, Ptr) -> Ptr,
@@ -255,7 +258,7 @@ impl JavaScriptCore {
             static OPTIONS: std::sync::Once = std::sync::Once::new();
             let mut group = None;
             OPTIONS.call_once(|| {
-                std::env::set_var("JSC_useSharedArrayBuffer", "1");
+                std::env::set_var("JSC_alwaysUseSharedArrayBuffer", "1");
                 // Limit heap growth to about 2x live size instead of 4x on machines with at least 16 GB.
                 std::env::set_var("JSC_heapGrowthMaxIncrease", "1");
                 // Sweep after each collection: JSC's timer never fires on the generic event loop, leaving
@@ -266,7 +269,7 @@ impl JavaScriptCore {
                 std::env::set_var("JSC_markedBlockCageSizeInMB", "0");
                 let _ = aot::load(&library, &image);
                 group = Some(group_create());
-                std::env::remove_var("JSC_useSharedArrayBuffer");
+                std::env::remove_var("JSC_alwaysUseSharedArrayBuffer");
                 std::env::remove_var("JSC_heapGrowthMaxIncrease");
                 std::env::remove_var("JSC_sweepSynchronously");
                 std::env::remove_var("JSC_markedBlockCageSizeInMB");
@@ -276,6 +279,18 @@ impl JavaScriptCore {
                 group: group.unwrap_or_else(|| group_create()),
                 inspectable: *library.get(b"JSGlobalContextSetInspectable\0")?,
                 extra_memory: *library.get(b"JSReportExtraMemoryCost\0")?,
+                terminate: library
+                    .get(b"JSContextGroupTerminate\0")
+                    .ok()
+                    .map(|function| *function),
+                contents: (|| {
+                    Some(payload::Contents {
+                        take: *library.get(b"JSObjectTakeContents\0").ok()?,
+                        bytes: *library.get(b"JSContentsGetBytes\0").ok()?,
+                        make: *library.get(b"JSObjectMakeWithContents\0").ok()?,
+                        release: *library.get(b"JSContentsRelease\0").ok()?,
+                    })
+                })(),
                 set_name: *library.get(b"JSGlobalContextSetName\0")?,
                 execution_limit: *library.get(b"JSContextGroupSetExecutionTimeLimit\0")?,
                 group_release: *library.get(b"JSContextGroupRelease\0")?,
@@ -1003,6 +1018,22 @@ unsafe extern "C" fn call(
                 .context("Invalid host operation")?
         };
         access(binding.role, op)?;
+        // This one needs the buffer itself, not its bytes. A number gives back memory that was never sent.
+        if op == "web.buffer.take" {
+            let value = *values.get(1).context("Expected a buffer")?;
+            let id = match unsafe { (api.value_type)(ctx, value) } {
+                3 => {
+                    payload::held(unsafe { (api.to_number)(ctx, value, ptr::null_mut()) } as u64);
+                    None
+                }
+                5 => payload::take(&api, ctx, value),
+                _ => None,
+            };
+            return Ok(match id {
+                Some(id) => unsafe { (api.number)(ctx, id as f64) },
+                None => unsafe { (api.undefined)(ctx) },
+            });
+        }
         let run = |buffers, action: &mut dyn FnMut() -> Result<Value>| -> Result<Ptr> {
             let mut failure = None;
             let payload = payload::Payload::capture(buffers, || {
@@ -1542,18 +1573,33 @@ fn gpu(binding: &Binding, ctx: Ptr, id: u64, op: &str, args: &[u8]) -> Result<se
     result
 }
 
-fn buffer(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes, typed: bool) -> Ptr {
-    // Copy small results into JSC memory. External buffers cost more and escape GC accounting.
-    if typed
-        && bytes.len() <= 16384
-        && let Ok((array, out)) = api.uint8_array(ctx, bytes.len())
-    {
-        out.copy_from_slice(&bytes);
-        return array;
-    }
-    let bytes = Box::new(Vec::from(bytes));
+// Makes the buffer of these bytes, or the object that they stand for. The flag tells if it is a buffer.
+fn buffer_object(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes) -> (Ptr, bool) {
+    let taken = payload::taken(&bytes);
     unsafe {
-        let array = (api.make_buffer)(
+        if let (Some((contents, kind)), Some(functions)) = (taken, api.contents)
+            && kind != payload::MOVED
+        {
+            let object = (functions.make)(ctx, contents);
+            if !object.is_null() {
+                return (object, kind == payload::SHARED_BUFFER);
+            }
+        }
+        // Memory that another thread gave up has one owner, so the buffer can use it as it is.
+        if taken.is_some() {
+            let bytes = Box::new(bytes);
+            let buffer = (api.make_buffer)(
+                ctx,
+                bytes.as_ptr().cast_mut().cast(),
+                bytes.len(),
+                Some(payload::release_bytes),
+                Box::into_raw(bytes).cast(),
+                ptr::null_mut(),
+            );
+            return (buffer, true);
+        }
+        let bytes = Box::new(Vec::from(bytes));
+        let buffer = (api.make_buffer)(
             ctx,
             bytes.as_ptr().cast_mut().cast(),
             bytes.len(),
@@ -1561,11 +1607,22 @@ fn buffer(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes, typed: bool) -> P
             Box::into_raw(bytes).cast(),
             ptr::null_mut(),
         );
-        if typed {
-            (api.typed_from_buffer)(ctx, 3, array, ptr::null_mut())
-        } else {
-            array
-        }
+        (buffer, true)
+    }
+}
+
+fn buffer(api: &JavaScriptCore, ctx: Ptr, bytes: bytes::Bytes) -> Ptr {
+    // Copy small results into JSC memory. External buffers cost more and escape GC accounting.
+    if bytes.len() <= 16384
+        && payload::taken(&bytes).is_none_or(|(_, kind)| kind == payload::MOVED)
+        && let Ok((array, out)) = api.uint8_array(ctx, bytes.len())
+    {
+        out.copy_from_slice(&bytes);
+        return array;
+    }
+    match buffer_object(api, ctx, bytes) {
+        (buffer, true) => unsafe { (api.typed_from_buffer)(ctx, 3, buffer, ptr::null_mut()) },
+        (object, false) => object,
     }
 }
 
@@ -1600,7 +1657,7 @@ fn output(api: &JavaScriptCore, ctx: Ptr, payload: payload::Payload) -> Ptr {
                     .and_then(Value::as_u64)
                     .and_then(|index| buffers.get_mut(index as usize))
                 {
-                    return buffer(api, ctx, std::mem::take(bytes), true);
+                    return buffer(api, ctx, std::mem::take(bytes));
                 }
                 // See `payload::raw`.
                 let (text, value) = match value {
@@ -1620,7 +1677,7 @@ fn output(api: &JavaScriptCore, ctx: Ptr, payload: payload::Payload) -> Ptr {
                     return root;
                 }
                 (api.protect)(ctx, root);
-                let mut arrays: Vec<Ptr> = vec![ptr::null_mut(); buffers.len()];
+                let mut arrays: Vec<(Ptr, bool)> = vec![(ptr::null_mut(), true); buffers.len()];
                 let mut pending = vec![(&value, root)];
                 while let Some((value, object)) = pending.pop() {
                     let children: Vec<(Ptr, Option<u32>, &Value)> = match value {
@@ -1640,11 +1697,15 @@ fn output(api: &JavaScriptCore, ctx: Ptr, payload: payload::Payload) -> Ptr {
                             && let Some(bytes) = buffers.get_mut(marker as usize)
                         {
                             let array = &mut arrays[marker as usize];
-                            if array.is_null() {
-                                *array = buffer(api, ctx, std::mem::take(bytes), false);
-                                (api.protect)(ctx, *array);
+                            if array.0.is_null() {
+                                *array = buffer_object(api, ctx, std::mem::take(bytes));
+                                (api.protect)(ctx, array.0);
                             }
-                            let view = (api.typed_from_buffer)(ctx, 3, *array, ptr::null_mut());
+                            let view = if array.1 {
+                                (api.typed_from_buffer)(ctx, 3, array.0, ptr::null_mut())
+                            } else {
+                                array.0
+                            };
                             match index {
                                 Some(index) => {
                                     (api.set_index)(ctx, object, index, view, ptr::null_mut())
@@ -1665,7 +1726,7 @@ fn output(api: &JavaScriptCore, ctx: Ptr, payload: payload::Payload) -> Ptr {
                         }
                     }
                 }
-                for array in arrays.into_iter().filter(|array| !array.is_null()) {
+                for (array, _) in arrays.into_iter().filter(|array| !array.0.is_null()) {
                     (api.unprotect)(ctx, array);
                 }
                 (api.unprotect)(ctx, root);

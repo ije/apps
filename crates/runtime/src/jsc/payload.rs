@@ -8,6 +8,110 @@ use std::cell::RefCell;
 // read of that argument.
 thread_local! { static FRAMES: RefCell<Vec<Vec<Bytes>>> = const { RefCell::new(Vec::new()) }; }
 
+// Memory that `take` moved out of a buffer or shared from it, until the next operation sends it away.
+thread_local! { static HELD: RefCell<std::collections::HashMap<u64, Bytes>> = RefCell::default(); }
+// What is on its way to another thread: the address of its bytes, its contents record and its kind. Other bytes
+// can't go to JavaScript without a copy, because they can have more readers.
+static TAKEN: std::sync::Mutex<Vec<(usize, usize, i32)>> = std::sync::Mutex::new(Vec::new());
+static TAKEN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+// The functions of scripts/jsc.patch that give an object of one VM to another VM.
+#[derive(Clone, Copy)]
+pub(crate) struct Contents {
+    pub(crate) take: unsafe extern "C" fn(crate::jsc::Ptr, crate::jsc::Ptr) -> crate::jsc::Ptr,
+    pub(crate) bytes:
+        unsafe extern "C" fn(crate::jsc::Ptr, *mut usize, *mut i32) -> crate::jsc::Ptr,
+    pub(crate) make: unsafe extern "C" fn(crate::jsc::Ptr, crate::jsc::Ptr) -> crate::jsc::Ptr,
+    pub(crate) release: unsafe extern "C" fn(crate::jsc::Ptr),
+}
+
+// The memory of an ArrayBuffer has one owner. The others are made again in each VM that gets them.
+pub(crate) const MOVED: i32 = 0;
+pub(crate) const SHARED_BUFFER: i32 = 1;
+
+struct Taken {
+    contents: usize,
+    data: usize,
+    size: usize,
+    release: unsafe extern "C" fn(crate::jsc::Ptr),
+}
+
+impl AsRef<[u8]> for Taken {
+    fn as_ref(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.data as *const u8, self.size) }
+    }
+}
+
+impl Drop for Taken {
+    fn drop(&mut self) {
+        let mut taken = TAKEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(index) = taken.iter().position(|&(data, ..)| data == self.data) {
+            taken.swap_remove(index);
+            TAKEN_COUNT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        drop(taken);
+        unsafe { (self.release)(self.contents as crate::jsc::Ptr) };
+    }
+}
+
+// Moves the memory of an ArrayBuffer out of its VM, or shares a SharedArrayBuffer, a shared WebAssembly.Memory
+// or a WebAssembly.Module. Returns the ID that the next operation passes to `held`.
+pub(crate) fn take(
+    api: &crate::jsc::JavaScriptCore,
+    ctx: crate::jsc::Ptr,
+    buffer: crate::jsc::Ptr,
+) -> Option<u64> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let functions = api.contents?;
+    let contents = unsafe { (functions.take)(ctx, buffer) };
+    if contents.is_null() {
+        return None;
+    }
+    let (mut size, mut kind) = (0, MOVED);
+    let data = unsafe { (functions.bytes)(contents, &mut size, &mut kind) };
+    // Only moved memory has bytes of its own on the way. The one byte of the others is the first byte of their
+    // contents record, which no other bytes can have as their address.
+    let (data, size) = if kind == MOVED {
+        (data as usize, size)
+    } else {
+        (contents as usize, 1)
+    };
+    TAKEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((data, contents as usize, kind));
+    TAKEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let taken = Taken {
+        contents: contents as usize,
+        data,
+        size,
+        release: functions.release,
+    };
+    HELD.with_borrow_mut(|held| held.insert(id, Bytes::from_owner(taken)));
+    Some(id)
+}
+
+pub(crate) fn held(id: u64) -> Option<Bytes> {
+    HELD.with_borrow_mut(|held| held.remove(&id))
+}
+
+// Tells if these bytes come from `take`, and gives their contents record and kind.
+pub(crate) fn taken(bytes: &Bytes) -> Option<(crate::jsc::Ptr, i32)> {
+    if TAKEN_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return None;
+    }
+    let address = bytes.as_ptr() as usize;
+    TAKEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|&&(data, ..)| data == address)
+        .map(|&(_, contents, kind)| (contents as crate::jsc::Ptr, kind))
+}
+
 #[derive(Clone, Default)]
 pub struct Payload {
     pub value: Value,
@@ -223,6 +327,10 @@ pub(crate) fn input<'a>(
 
 pub(crate) unsafe extern "C" fn release(_pointer: crate::jsc::Ptr, owner: crate::jsc::Ptr) {
     drop(unsafe { Box::from_raw(owner.cast::<Vec<u8>>()) });
+}
+
+pub(crate) unsafe extern "C" fn release_bytes(_pointer: crate::jsc::Ptr, owner: crate::jsc::Ptr) {
+    drop(unsafe { Box::from_raw(owner.cast::<Bytes>()) });
 }
 
 // A call result that is JSON text already. JavaScriptCore parses it as it is, so a large message is not parsed and

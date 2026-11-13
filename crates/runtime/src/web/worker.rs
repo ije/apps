@@ -46,6 +46,25 @@ pub(crate) fn exit(code: i32) -> bool {
     })
 }
 thread_local! { static PARENT: RefCell<Option<Parent>> = const { RefCell::new(None) }; }
+
+// The buffers of a message, in the order of its arguments. A number is memory that `web.buffer.take` moved or
+// shared, and other bytes still belong to the caller, so they are copied.
+fn buffers(items: Option<&[Value]>) -> Result<Vec<bytes::Bytes>> {
+    let items = items.unwrap_or_default();
+    // Take all the held memory first, so that an error does not leave some of it behind.
+    let held: Vec<_> = items
+        .iter()
+        .map(|item| item.as_u64().map(crate::jsc::payload::held))
+        .collect();
+    items
+        .iter()
+        .zip(held)
+        .map(|(item, held)| match held {
+            Some(bytes) => bytes.context("Expected held memory"),
+            None => crate::jsc::payload::read(item).context("Expected message bytes")?,
+        })
+        .collect()
+}
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 // An engine that is dropped never polls again, so a subscriber whose queue overflows is removed.
@@ -57,15 +76,32 @@ struct Subscriber {
 static CHANNELS: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Subscriber>>> =
     std::sync::LazyLock::new(Default::default);
 
+// The VM of a worker while its thread runs, and the function that stops its script from another thread.
+type Running = Arc<std::sync::Mutex<Option<(usize, unsafe extern "C" fn(crate::jsc::Ptr))>>>;
+
 struct Worker {
     input: mpsc::Sender<Payload>,
     events: mpsc::Receiver<Event>,
     stop: Arc<AtomicBool>,
+    running: Running,
+}
+impl Worker {
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.input.send(Value::Null.into());
+        // The flag stops a script only while it runs. This also ends a wait in `Atomics.wait`.
+        let running = self
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((group, terminate)) = *running {
+            unsafe { terminate(group as crate::jsc::Ptr) };
+        }
+    }
 }
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        let _ = self.input.send(Value::Null.into());
+        self.stop();
     }
 }
 
@@ -113,12 +149,12 @@ impl State {
                 )
             })),
             "post" => PARENT.with(|parent| {
+                let buffers = buffers(args.as_array().and_then(|args| args.get(1..)))?;
                 let parent = parent.borrow();
                 let parent = parent.as_ref().context("Worker has no parent")?;
                 let Value::String(text) = args[0].take() else {
                     bail!("Expected worker message");
                 };
-                let buffers = Payload::snapshot(Value::Null).buffers;
                 ensure!(
                     parent.events.send(Event::Message(text, buffers)).is_ok(),
                     "Worker parent is closed"
@@ -189,11 +225,18 @@ impl State {
                     .as_str()
                     .context("Expected channel name")?
                     .to_owned();
-                let message = Payload::snapshot(Value::Array(
-                    args.as_array_mut()
-                        .context("Expected channel message")?
-                        .split_off(2),
-                ));
+                let mut message = args
+                    .as_array_mut()
+                    .context("Expected channel message")?
+                    .split_off(2);
+                let buffers = buffers(message.get(1..))?;
+                for (index, item) in message.iter_mut().skip(1).enumerate() {
+                    *item = json!({"$appsBytes": index});
+                }
+                let message = Payload {
+                    value: Value::Array(message),
+                    buffers,
+                };
                 for (other, subscriber) in CHANNELS.lock().unwrap().iter_mut() {
                     if *other == id || !subscriber.names.contains(&name) {
                         continue;
@@ -222,9 +265,11 @@ impl State {
                 ))
             }
             "start" => {
+                // The worker data comes like a message: its text, then its buffers.
+                let received = buffers(args.as_array().and_then(|args| args.get(5..)))?;
                 ensure!(self.workers.len() < 64, "Too many workers");
                 let source = args[0].as_str().context("Expected worker source")?;
-                let source: bytes::Bytes = if args[3] == true {
+                let source: bytes::Bytes = if args[2] == true {
                     let name = source
                         .strip_prefix("apps:///")
                         .context("Expected a bundled worker URL")?;
@@ -237,8 +282,8 @@ impl State {
                 };
                 let native = args[1] == true;
                 // Web workers must not end when idle: they wait for messages.
-                let ends = native && args[4] == true;
-                let data = args[2].take();
+                let ends = native && args[3] == true;
+                let data = args[4].take();
                 let namespace = self.namespace.clone();
                 let packaged = self.packaged;
                 let disabled = self.disabled;
@@ -248,11 +293,13 @@ impl State {
                 let (output, events) = mpsc::sync_channel::<Event>(64);
                 let stop = Arc::new(AtomicBool::new(false));
                 let cancelled = stop.clone();
+                let running = Running::default();
+                let started = running.clone();
                 let wake = crate::host::Waker::current();
                 let own = input.clone();
                 std::thread::Builder::new().name(format!("apps-worker-{id}")).spawn(move || {
                     crate::host::Waker::install(move || { let _ = own.send(Value::Null.into()); });
-                    PARENT.with(|parent| *parent.borrow_mut() = Some(Parent { events: output.clone(), wake: wake.clone(), data, id, stop: cancelled.clone(), received: Vec::new(), code: None }));
+                    PARENT.with(|parent| *parent.borrow_mut() = Some(Parent { events: output.clone(), wake: wake.clone(), data, id, stop: cancelled.clone(), received, code: None }));
                     let result = (|| -> Result<()> {
                         let host = Rc::new(RefCell::new(Host { app_name: Some(namespace), packaged, disabled, scripts, ..Host::default() }));
                         let role = if native { Role::Main } else {
@@ -261,6 +308,11 @@ impl State {
                         };
                         let api = JavaScriptCore::load()?;
                         let engine = JsContext::new_interruptible(api.clone(), host, role, Some(cancelled.clone()))?;
+                        // Declared after the engine, so it is cleared before the VM goes away.
+                        struct Clear(Running);
+                        impl Drop for Clear { fn drop(&mut self) { self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take(); } }
+                        *started.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = api.terminate.map(|terminate| (api.group as usize, terminate));
+                        let _clear = Clear(started);
                         engine.eval("for (const name of ['document', 'window', 'screen', 'screenX', 'screenY', 'screenLeft', 'screenTop', 'outerWidth', 'outerHeight', 'localStorage', 'sessionStorage']) delete globalThis[name]; globalThis.self=globalThis;", "apps:worker-scope")?;
                         if native { engine.eval("globalThis.require = globalThis.__apps.module.createRequire(); globalThis.onmessage = null;", "apps:worker-modules")?; }
                         let _ = output.send(Event::Online);
@@ -305,19 +357,25 @@ impl State {
                         input,
                         events,
                         stop,
+                        running,
                     },
                 );
                 Ok(json!(id))
             }
             "send" => {
                 let id = args[0].as_u64().context("Expected worker ID")?;
-                let message = args
+                let mut message = args
                     .as_array_mut()
                     .context("Expected worker message")?
                     .split_off(1);
+                let buffers = buffers(message.get(1..))?;
+                message.truncate(1);
                 // A worker can end before its parent reads the exit event. As in browsers, the message is dropped.
                 if let Some(worker) = self.workers.get(&id) {
-                    let _ = worker.input.send(Payload::snapshot(Value::Array(message)));
+                    let _ = worker.input.send(Payload {
+                        value: Value::Array(message),
+                        buffers,
+                    });
                 }
                 Ok(Value::Null)
             }
@@ -326,8 +384,7 @@ impl State {
                     .workers
                     .get(&args[0].as_u64().context("Expected worker ID")?)
                 {
-                    worker.stop.store(true, Ordering::Release);
-                    let _ = worker.input.send(Value::Null.into());
+                    worker.stop();
                 }
                 Ok(Value::Null)
             }

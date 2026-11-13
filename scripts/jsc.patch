@@ -346,7 +346,7 @@ index f96eb07c..023862c1 100644
      auto typeCounts = vm.heap.objectTypeCounts();
      JSObject* objectTypeCounts = constructEmptyObject(globalObject);
 diff --git a/Source/JavaScriptCore/API/JSContextRef.cpp b/Source/JavaScriptCore/API/JSContextRef.cpp
-index b8e3b261..d1ba29ee 100644
+index b8e3b261..a6c7a603 100644
 --- a/Source/JavaScriptCore/API/JSContextRef.cpp
 +++ b/Source/JavaScriptCore/API/JSContextRef.cpp
 @@ -43,7 +43,9 @@
@@ -388,7 +388,20 @@ index b8e3b261..d1ba29ee 100644
  static bool internalScriptTimeoutCallback(JSGlobalObject* globalObject, void* callbackPtr, void* callbackData)
  {
      JSShouldTerminateCallback callback = reinterpret_cast<JSShouldTerminateCallback>(callbackPtr);
-@@ -166,7 +190,7 @@ JSGlobalContextRef JSGlobalContextRetain(JSGlobalContextRef ctx)
+@@ -105,6 +129,12 @@ void JSContextGroupSetExecutionTimeLimit(JSContextGroupRef group, double limit,
+         watchdog->setTimeLimit(Seconds { limit });
+ }
+ 
++// No lock: the thread of the group holds it while its script runs or waits.
++void JSContextGroupTerminate(JSContextGroupRef group)
++{
++    toJS(group)->notifyNeedTermination();
++}
++
+ void JSContextGroupClearExecutionTimeLimit(JSContextGroupRef group)
+ {
+     VM& vm = *toJS(group);
+@@ -166,7 +196,7 @@ JSGlobalContextRef JSGlobalContextRetain(JSGlobalContextRef ctx)
  {
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -397,7 +410,7 @@ index b8e3b261..d1ba29ee 100644
  
      gcProtect(globalObject);
      vm.refSuppressingSaferCPPChecking();
-@@ -177,7 +201,7 @@ void JSGlobalContextRelease(JSGlobalContextRef ctx)
+@@ -177,7 +207,7 @@ void JSGlobalContextRelease(JSGlobalContextRef ctx)
  {
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -406,7 +419,7 @@ index b8e3b261..d1ba29ee 100644
  
      bool protectCountIsZero = vm.heap.unprotect(globalObject);
      if (protectCountIsZero)
-@@ -192,7 +216,7 @@ JSObjectRef JSContextGetGlobalObject(JSContextRef ctx)
+@@ -192,7 +222,7 @@ JSObjectRef JSContextGetGlobalObject(JSContextRef ctx)
          return nullptr;
      }
      JSGlobalObject* globalObject = toJS(ctx);
@@ -415,7 +428,7 @@ index b8e3b261..d1ba29ee 100644
  
      return toRef(uncheckedDowncast<JSObject>(JSValue(globalObject).toThis(globalObject, ECMAMode::sloppy())));
  }
-@@ -214,7 +238,7 @@ JSGlobalContextRef JSContextGetGlobalContext(JSContextRef ctx)
+@@ -214,7 +244,7 @@ JSGlobalContextRef JSContextGetGlobalContext(JSContextRef ctx)
          return nullptr;
      }
      JSGlobalObject* globalObject = toJS(ctx);
@@ -424,7 +437,7 @@ index b8e3b261..d1ba29ee 100644
  
      return toGlobalRef(globalObject);
  }
-@@ -227,6 +251,7 @@ JSStringRef JSGlobalContextCopyName(JSGlobalContextRef ctx)
+@@ -227,6 +257,7 @@ JSStringRef JSGlobalContextCopyName(JSGlobalContextRef ctx)
      }
  
      JSGlobalObject* globalObject = toJS(ctx);
@@ -432,7 +445,7 @@ index b8e3b261..d1ba29ee 100644
  
      String name = globalObject->name();
      if (name.isNull())
-@@ -243,6 +268,7 @@ void JSGlobalContextSetName(JSGlobalContextRef ctx, JSStringRef name)
+@@ -243,6 +274,7 @@ void JSGlobalContextSetName(JSGlobalContextRef ctx, JSStringRef name)
      }
  
      JSGlobalObject* globalObject = toJS(ctx);
@@ -440,7 +453,7 @@ index b8e3b261..d1ba29ee 100644
      globalObject->setName(name ? name->string() : String());
  }
  
-@@ -274,6 +300,67 @@ void JSGlobalContextSetInspectable(JSGlobalContextRef ctx, bool inspectable)
+@@ -274,6 +306,67 @@ void JSGlobalContextSetInspectable(JSGlobalContextRef ctx, bool inspectable)
      globalObject->setInspectable(inspectable);
  }
  
@@ -508,7 +521,7 @@ index b8e3b261..d1ba29ee 100644
  void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObjectRef function, JSValueRef* exception)
  {
      if (!ctx) {
-@@ -283,7 +370,7 @@ void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObje
+@@ -283,7 +376,7 @@ void JSGlobalContextSetUnhandledRejectionCallback(JSGlobalContextRef ctx, JSObje
  
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
@@ -518,10 +531,10 @@ index b8e3b261..d1ba29ee 100644
      JSObject* object = toJS(function);
      if (!object->isCallable()) {
 diff --git a/Source/JavaScriptCore/API/JSContextRefPrivate.h b/Source/JavaScriptCore/API/JSContextRefPrivate.h
-index c009bb5a..ebec4bcb 100644
+index c009bb5a..b4550eda 100644
 --- a/Source/JavaScriptCore/API/JSContextRefPrivate.h
 +++ b/Source/JavaScriptCore/API/JSContextRefPrivate.h
-@@ -69,6 +69,106 @@ JS_EXPORT JSStringRef JSContextCreateBacktrace(JSContextRef ctx, unsigned maxSta
+@@ -69,6 +69,139 @@ JS_EXPORT JSStringRef JSContextCreateBacktrace(JSContextRef ctx, unsigned maxSta
  typedef bool
  (*JSShouldTerminateCallback) (JSContextRef ctx, void* context);
  
@@ -531,6 +544,12 @@ index c009bb5a..ebec4bcb 100644
 +@param group The JavaScript context group to shrink.
 +*/
 +JS_EXPORT void JSContextGroupShrinkFootprint(JSContextGroupRef group);
++
++/*!
++@function
++@abstract Stops the script of a context group from any thread, also while it waits in Atomics.wait.
++*/
++JS_EXPORT void JSContextGroupTerminate(JSContextGroupRef group);
 +
 +/*!
 +@function
@@ -625,14 +644,41 @@ index c009bb5a..ebec4bcb 100644
 +*/
 +JS_EXPORT JSObjectRef JSObjectMakeUint8ArrayUninitialized(JSContextRef ctx, size_t length, void** bytes, JSValueRef* exception);
 +
++/*!
++@function
++@abstract Takes what another VM needs to get the same object: the memory of an ArrayBuffer, which is detached, the shared memory of a SharedArrayBuffer or of a shared WebAssembly.Memory, or the code of a WebAssembly.Module.
++@result The contents, which any thread can use and must release. NULL for an empty, pinned or WebAssembly-owned ArrayBuffer, for a WebAssembly.Memory that is not shared, and for other values.
++*/
++JS_EXPORT void* JSObjectTakeContents(JSContextRef ctx, JSObjectRef object);
++
++/*!
++@function
++@abstract Gets the bytes of contents from JSObjectTakeContents. They stay valid until the contents are released.
++@param kind Receives 0 for the memory of an ArrayBuffer, 1 for the memory of a SharedArrayBuffer and 2 for contents without bytes.
++*/
++JS_EXPORT void* JSContentsGetBytes(void* contents, size_t* length, int* kind);
++
++/*!
++@function
++@abstract Makes the object of shared contents in this VM: a SharedArrayBuffer, a WebAssembly.Memory or a WebAssembly.Module. The contents stay valid, so every VM can make its own object.
++@result NULL for the memory of an ArrayBuffer, which has one owner.
++*/
++JS_EXPORT JSObjectRef JSObjectMakeWithContents(JSContextRef ctx, void* contents);
++
++/*!
++@function
++@abstract Releases contents from JSObjectTakeContents, on any thread.
++*/
++JS_EXPORT void JSContentsRelease(void* contents);
++
  /*!
  @function
  @abstract Sets the script execution time limit.
 diff --git a/Source/JavaScriptCore/API/JSTypedArray.cpp b/Source/JavaScriptCore/API/JSTypedArray.cpp
-index fb7313c3..90150713 100644
+index fb7313c3..a801e0a3 100644
 --- a/Source/JavaScriptCore/API/JSTypedArray.cpp
 +++ b/Source/JavaScriptCore/API/JSTypedArray.cpp
-@@ -26,11 +26,13 @@
+@@ -26,14 +26,23 @@
  
  #include "config.h"
  #include "JSTypedArray.h"
@@ -646,7 +692,17 @@ index fb7313c3..90150713 100644
  #include "JSGenericTypedArrayViewInlines.h"
  #include "JSTypedArrays.h"
  #include "TypedArrayController.h"
-@@ -137,6 +139,7 @@ static JSObject* createTypedArray(JSGlobalObject* globalObject, JSTypedArrayType
++
++#if ENABLE(WEBASSEMBLY)
++#include "JSWebAssemblyMemory.h"
++#include "JSWebAssemblyModule.h"
++#include "WasmMemory.h"
++#include "WasmModule.h"
++#endif
+ #include <wtf/RefPtr.h>
+ 
+ #if PLATFORM(IOS) || PLATFORM(VISION)
+@@ -137,6 +146,7 @@ static JSObject* createTypedArray(JSGlobalObject* globalObject, JSTypedArrayType
  
  JSTypedArrayType JSValueGetTypedArrayType(JSContextRef ctx, JSValueRef valueRef, JSValueRef*)
  {
@@ -654,7 +710,7 @@ index fb7313c3..90150713 100644
  
      JSGlobalObject* globalObject = toJS(ctx);
  
-@@ -154,6 +157,7 @@ JSTypedArrayType JSValueGetTypedArrayType(JSContextRef ctx, JSValueRef valueRef,
+@@ -154,6 +164,7 @@ JSTypedArrayType JSValueGetTypedArrayType(JSContextRef ctx, JSValueRef valueRef,
  
  JSObjectRef JSObjectMakeTypedArray(JSContextRef ctx, JSTypedArrayType arrayType, size_t length, JSValueRef* exception)
  {
@@ -662,7 +718,7 @@ index fb7313c3..90150713 100644
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
      auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-@@ -172,6 +176,7 @@ JSObjectRef JSObjectMakeTypedArray(JSContextRef ctx, JSTypedArrayType arrayType,
+@@ -172,6 +183,7 @@ JSObjectRef JSObjectMakeTypedArray(JSContextRef ctx, JSTypedArrayType arrayType,
  
  JSObjectRef JSObjectMakeTypedArrayWithBytesNoCopy(JSContextRef ctx, JSTypedArrayType arrayType, void* bytes, size_t length, JSTypedArrayBytesDeallocator destructor, void* destructorContext, JSValueRef* exception)
  {
@@ -670,7 +726,7 @@ index fb7313c3..90150713 100644
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
      auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-@@ -193,6 +198,7 @@ JSObjectRef JSObjectMakeTypedArrayWithBytesNoCopy(JSContextRef ctx, JSTypedArray
+@@ -193,6 +205,7 @@ JSObjectRef JSObjectMakeTypedArrayWithBytesNoCopy(JSContextRef ctx, JSTypedArray
  
  JSObjectRef JSObjectMakeTypedArrayWithArrayBuffer(JSContextRef ctx, JSTypedArrayType arrayType, JSObjectRef jsBufferRef, JSValueRef* exception)
  {
@@ -678,7 +734,7 @@ index fb7313c3..90150713 100644
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
      auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-@@ -220,6 +226,7 @@ JSObjectRef JSObjectMakeTypedArrayWithArrayBuffer(JSContextRef ctx, JSTypedArray
+@@ -220,6 +233,7 @@ JSObjectRef JSObjectMakeTypedArrayWithArrayBuffer(JSContextRef ctx, JSTypedArray
  
  JSObjectRef JSObjectMakeTypedArrayWithArrayBufferAndOffset(JSContextRef ctx, JSTypedArrayType arrayType, JSObjectRef jsBufferRef, size_t offset, size_t length, JSValueRef* exception)
  {
@@ -686,7 +742,7 @@ index fb7313c3..90150713 100644
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
      auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-@@ -241,6 +248,7 @@ JSObjectRef JSObjectMakeTypedArrayWithArrayBufferAndOffset(JSContextRef ctx, JST
+@@ -241,6 +255,7 @@ JSObjectRef JSObjectMakeTypedArrayWithArrayBufferAndOffset(JSContextRef ctx, JST
  
  void* JSObjectGetTypedArrayBytesPtr(JSContextRef ctx, JSObjectRef objectRef, JSValueRef* exception)
  {
@@ -694,7 +750,7 @@ index fb7313c3..90150713 100644
      JSGlobalObject* globalObject = toJS(ctx);
  
      JSObject* object = toJS(objectRef);
-@@ -256,8 +264,9 @@ void* JSObjectGetTypedArrayBytesPtr(JSContextRef ctx, JSObjectRef objectRef, JSV
+@@ -256,8 +271,9 @@ void* JSObjectGetTypedArrayBytesPtr(JSContextRef ctx, JSObjectRef objectRef, JSV
      return nullptr;
  }
  
@@ -705,7 +761,7 @@ index fb7313c3..90150713 100644
      JSObject* object = toJS(objectRef);
  
      if (JSArrayBufferView* typedArray = dynamicDowncast<JSArrayBufferView>(object))
-@@ -266,8 +275,9 @@ size_t JSObjectGetTypedArrayLength(JSContextRef, JSObjectRef objectRef, JSValueR
+@@ -266,8 +282,9 @@ size_t JSObjectGetTypedArrayLength(JSContextRef, JSObjectRef objectRef, JSValueR
      return 0;
  }
  
@@ -716,7 +772,7 @@ index fb7313c3..90150713 100644
      JSObject* object = toJS(objectRef);
  
      if (JSArrayBufferView* typedArray = dynamicDowncast<JSArrayBufferView>(object))
-@@ -276,8 +286,9 @@ size_t JSObjectGetTypedArrayByteLength(JSContextRef, JSObjectRef objectRef, JSVa
+@@ -276,8 +293,9 @@ size_t JSObjectGetTypedArrayByteLength(JSContextRef, JSObjectRef objectRef, JSVa
      return 0;
  }
  
@@ -727,7 +783,7 @@ index fb7313c3..90150713 100644
      JSObject* object = toJS(objectRef);
  
      if (JSArrayBufferView* typedArray = dynamicDowncast<JSArrayBufferView>(object))
-@@ -288,6 +299,7 @@ size_t JSObjectGetTypedArrayByteOffset(JSContextRef, JSObjectRef objectRef, JSVa
+@@ -288,6 +306,7 @@ size_t JSObjectGetTypedArrayByteOffset(JSContextRef, JSObjectRef objectRef, JSVa
  
  JSObjectRef JSObjectGetTypedArrayBuffer(JSContextRef ctx, JSObjectRef objectRef, JSValueRef* exception)
  {
@@ -735,7 +791,7 @@ index fb7313c3..90150713 100644
      JSGlobalObject* globalObject = toJS(ctx);
      auto &vm = globalObject->vm();
      
-@@ -306,6 +318,7 @@ JSObjectRef JSObjectGetTypedArrayBuffer(JSContextRef ctx, JSObjectRef objectRef,
+@@ -306,6 +325,7 @@ JSObjectRef JSObjectGetTypedArrayBuffer(JSContextRef ctx, JSObjectRef objectRef,
  
  JSObjectRef JSObjectMakeArrayBufferWithBytesNoCopy(JSContextRef ctx, void* bytes, size_t byteLength, JSTypedArrayBytesDeallocator bytesDeallocator, void* deallocatorContext, JSValueRef* exception)
  {
@@ -743,7 +799,7 @@ index fb7313c3..90150713 100644
      JSGlobalObject* globalObject = toJS(ctx);
      VM& vm = globalObject->vm();
      auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-@@ -324,6 +337,7 @@ JSObjectRef JSObjectMakeArrayBufferWithBytesNoCopy(JSContextRef ctx, void* bytes
+@@ -324,6 +344,7 @@ JSObjectRef JSObjectMakeArrayBufferWithBytesNoCopy(JSContextRef ctx, void* bytes
  
  void* JSObjectGetArrayBufferBytesPtr(JSContextRef ctx, JSObjectRef objectRef, JSValueRef* exception)
  {
@@ -751,7 +807,7 @@ index fb7313c3..90150713 100644
      JSGlobalObject* globalObject = toJS(ctx);
      JSObject* object = toJS(objectRef);
  
-@@ -349,8 +363,9 @@ inline static bool isLinkedBeforeTypedArrayLengthQuirk()
+@@ -349,8 +370,9 @@ inline static bool isLinkedBeforeTypedArrayLengthQuirk()
  inline static bool isLinkedBeforeTypedArrayLengthQuirk() { return false; }
  #endif
  
@@ -762,7 +818,7 @@ index fb7313c3..90150713 100644
      JSObject* object = toJS(objectRef);
  
      if (!object) {
-@@ -368,3 +383,36 @@ size_t JSObjectGetArrayBufferByteLength(JSContextRef, JSObjectRef objectRef, JSV
+@@ -368,3 +390,118 @@ size_t JSObjectGetArrayBufferByteLength(JSContextRef, JSObjectRef objectRef, JSV
  }
  
  WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
@@ -798,6 +854,88 @@ index fb7313c3..90150713 100644
 +        return nullptr;
 +    *bytes = array->typedVector();
 +    return toRef(array);
++}
++
++struct TakenContents {
++    ArrayBufferContents buffer;
++#if ENABLE(WEBASSEMBLY)
++    RefPtr<SharedArrayBufferContents> memory;
++    RefPtr<Wasm::Module> module;
++    bool memory64 { false };
++#endif
++};
++
++void* JSObjectTakeContents(JSContextRef ctx, JSObjectRef objectRef)
++{
++    JSGlobalObject* globalObject = toJS(ctx);
++    VM& vm = globalObject->vm();
++    JSLockHolder locker(vm);
++    JSObject* object = toJS(objectRef);
++    auto contents = std::unique_ptr<TakenContents>(new TakenContents);
++    if (auto* jsBuffer = dynamicDowncast<JSArrayBuffer>(object)) {
++        RefPtr buffer = jsBuffer->impl();
++        // transferTo copies a buffer that it can't detach, and the caller expects a move.
++        if (!buffer || (!buffer->isShared() && !buffer->isDetachable()) || !buffer->transferTo(vm, contents->buffer))
++            return nullptr;
++        return contents.release();
++    }
++#if ENABLE(WEBASSEMBLY)
++    if (auto* memory = dynamicDowncast<JSWebAssemblyMemory>(object)) {
++        if (memory->memory().sharingMode() != MemorySharingMode::Shared || !memory->memory().shared())
++            return nullptr;
++        contents->memory = memory->memory().shared();
++        contents->memory64 = memory->memory().addressType().is64Bit();
++        return contents.release();
++    }
++    if (auto* module = dynamicDowncast<JSWebAssemblyModule>(object)) {
++        contents->module = &module->module();
++        return contents.release();
++    }
++#endif
++    return nullptr;
++}
++
++void* JSContentsGetBytes(void* pointer, size_t* length, int* kind)
++{
++    auto* contents = static_cast<TakenContents*>(pointer);
++    if (!contents->buffer) {
++        *length = 0;
++        *kind = 2;
++        return nullptr;
++    }
++    *length = contents->buffer.sizeInBytes();
++    *kind = contents->buffer.isShared();
++    return contents->buffer.data();
++}
++
++JSObjectRef JSObjectMakeWithContents(JSContextRef ctx, void* pointer)
++{
++    JSGlobalObject* globalObject = toJS(ctx);
++    VM& vm = globalObject->vm();
++    JSLockHolder locker(vm);
++    auto* contents = static_cast<TakenContents*>(pointer);
++    if (contents->buffer.isShared()) {
++        ArrayBufferContents shared;
++        contents->buffer.shareWith(shared);
++        auto buffer = ArrayBuffer::create(WTF::move(shared));
++        return toRef(JSArrayBuffer::create(vm, globalObject->arrayBufferStructure(ArrayBufferSharingMode::Shared), WTF::move(buffer)));
++    }
++#if ENABLE(WEBASSEMBLY)
++    if (contents->module)
++        return toRef(JSWebAssemblyModule::create(vm, globalObject->webAssemblyModuleStructure(), Ref { *contents->module }));
++    if (contents->memory && contents->memory->memoryHandle()) {
++        JSWebAssemblyMemory* result = JSWebAssemblyMemory::create(vm, globalObject->webAssemblyMemoryStructure());
++        auto handler = [&vm, result](Wasm::Memory::GrowSuccess, PageCount oldPageCount, PageCount newPageCount) { result->growSuccessCallback(vm, oldPageCount, newPageCount); };
++        result->adopt(Wasm::Memory::create(Ref { *contents->memory }, Wasm::AddressType { contents->memory64 }, WTF::move(handler)));
++        return toRef(result);
++    }
++#endif
++    return nullptr;
++}
++
++void JSContentsRelease(void* contents)
++{
++    delete static_cast<TakenContents*>(contents);
 +}
 diff --git a/Source/JavaScriptCore/API/JSValueRef.cpp b/Source/JavaScriptCore/API/JSValueRef.cpp
 index cad19029..8cf9d0ef 100644

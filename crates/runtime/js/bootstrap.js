@@ -179,7 +179,7 @@
     promise.then(() => { modulesPending--; }, error => { modulesPending--; moduleErrors.push(error); });
   };
   let children, servers, node, pty, browsers, net, nativeShell, uncaught = () => false;
-  const workers = globalThis.__appsWorkers(call, nodeRole, task, fail, pollWeb.blob);
+  const workers = globalThis.__appsWorkers(call, nodeRole, task, fail, pollWeb.blob, value => native('web.buffer.take', value));
   delete globalThis.__appsWorkers;
   globalThis.__appsBrowserEnvironment(call, task);
   delete globalThis.__appsBrowserEnvironment;
@@ -250,6 +250,8 @@
     return refs > 0 || ticks.length > 0 || immediates.size > 0 || pollWeb.pending() || !!servers?.pending() || __appsPending();
   };
   if (!nodeRole) {
+    // As in browsers, a page can't block its thread. Its workers can.
+    if (workers.api.isMainThread) Atomics.wait = () => { throw new TypeError('Atomics.wait cannot be called from the current thread.'); };
     globalThis.__appsDOM = call;
     globalThis.__appsEventState = pollWeb.eventState;
     globalThis.__appsFiles = hooks.files;

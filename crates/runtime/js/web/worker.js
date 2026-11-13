@@ -1,9 +1,15 @@
-globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes) => {
+globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take) => {
   const cryptoCodec = globalThis.__appsCryptoCodec, { decode: decodeBytes } = globalThis.__appsBytes;
   const stringify = JSON.stringify.bind(JSON), parse = JSON.parse.bind(JSON);
   delete globalThis.__appsCryptoCodec;
   if (!nativeAccess) delete globalThis.__appsBytes;
   const fresh = new WeakSet();
+  // `take` moves the memory of an ArrayBuffer out of this thread, or shares the value. It gives a number for the
+  // native side, or undefined when it can't, like for the memory of a WebAssembly instance that is not shared.
+  const shared = value => globalThis.SharedArrayBuffer !== undefined && value instanceof SharedArrayBuffer;
+  // A compiled module and a shared memory are the same object in every thread that gets them.
+  const wasm = value => globalThis.WebAssembly !== undefined && (value instanceof WebAssembly.Memory || value instanceof WebAssembly.Module);
+  const uncloneable = () => { throw new DOMException('Value cannot be cloned', 'DataCloneError'); };
   // True when a JSON round trip gives the same value as a structured clone: no shared objects and no types
   // that JSON changes.
   const plain = value => {
@@ -44,6 +50,8 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes) => {
       else if (globalThis.ImageBitmap && value instanceof ImageBitmap) { const [width, height, bytes] = value._wire(); fresh.add(bytes.buffer); node = ['bitmap', width, height, visit(bytes.buffer)]; }
       else if (globalThis.OffscreenCanvas && value instanceof OffscreenCanvas) { if (!transfer?.includes(value)) throw new DOMException('An OffscreenCanvas must be transferred', 'DataCloneError'); node = ['offscreen', ...value._wire()]; }
       else if (value instanceof ArrayBuffer) node = ['buffer', buffers ? buffers.push(value) - 1 : new Uint8Array(value).toBase64()];
+      else if (shared(value)) node = ['buffer', buffers ? buffers.push(value) - 1 : uncloneable()];
+      else if (wasm(value)) node = ['wasm', buffers ? buffers.push(value) - 1 : uncloneable()];
       else if (ArrayBuffer.isView(value)) node = ['view', value.constructor.name, visit(value.buffer), value.byteOffset, value.byteLength];
       else if (value instanceof Date) node = ['date', value.getTime()];
       else if (value instanceof RegExp) node = ['regexp', value.source, value.flags];
@@ -87,6 +95,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes) => {
         case 'array': result = []; break;
         case 'object': result = {}; break;
         case 'error': result = failure(node[1], node[2]); result.stack = node[3]; break;
+        case 'wasm': result = (received ??= buffers())[node[1]]; break;
         case 'blob': result = node[3] === null ? new Blob([visit(node[2])], { type: node[1] }) : new File([visit(node[2])], node[3], { type: node[1], lastModified: node[4] }); break;
         case 'pixels': result = new ImageData(visit(node[1]), node[2], node[3]); break;
         default: throw new DOMException('Invalid clone data', 'DataCloneError');
@@ -106,18 +115,30 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes) => {
     if (new Set(values).size !== values.length || values.some(v => !(v instanceof ArrayBuffer && typeof v.transfer === 'function') && !(globalThis.ImageBitmap && v instanceof ImageBitmap) && !(globalThis.OffscreenCanvas && v instanceof OffscreenCanvas))) throw new DOMException('Only ArrayBuffer, ImageBitmap and OffscreenCanvas can be transferred', 'DataCloneError');
     return values;
   };
-  // The native side copies the bytes during the call. A message that waits in JavaScript needs its own copy
-  // (`keep`), because the caller can change its buffers before the message leaves.
-  const message = (value, options, keep) => {
+  // Memory that the sender gives up, and shared memory, go as a number from `take`. The native side copies other
+  // bytes during the call. A message that waits in JavaScript ('wait') needs its own copy, because the caller can
+  // change its buffers before the message leaves. A message with several readers ('many') moves no memory,
+  // because each reader needs its own.
+  const message = (value, options, mode) => {
     const transfer = transfers(options), buffers = [], text = stringify(encode(value, buffers, transfer));
-    const wire = [text, ...buffers.map(buffer => new Uint8Array(fresh.has(buffer) ? buffer : transfer.includes(buffer) ? buffer.transfer() : keep ? buffer.slice(0) : buffer))];
+    const wire = [text, ...buffers.map(buffer => {
+      if (shared(buffer) || wasm(buffer)) return take(buffer) ?? uncloneable();
+      if (!fresh.has(buffer) && !transfer.includes(buffer)) return new Uint8Array(mode === 'wait' ? buffer.slice(0) : buffer);
+      // A small buffer is cheaper to copy than to move.
+      return mode !== 'many' && buffer.byteLength > 16384 && take(buffer) || new Uint8Array(transfer.includes(buffer) ? buffer.transfer() : buffer);
+    })];
     for (const item of transfer) if (item._detach) item._detach(); else if (!item.detached) item.transfer(0);
     return wire;
   };
-  const clone = (value, transfer) => !plain(value) ? decode(graph(value, undefined, transfer)) : value !== null && typeof value === 'object' ? parse(stringify(value)) : value;
+  // A clone in the same thread keeps shared memory, moves what the transfer list gives and copies other buffers.
+  const clone = (value, transfer) => {
+    if (plain(value)) return value !== null && typeof value === 'object' ? parse(stringify(value)) : value;
+    const buffers = [], wire = graph(value, buffers, transfer);
+    return decode(wire, () => buffers.map(buffer => wasm(buffer) ? buffer : new Uint8Array(shared(buffer) || fresh.has(buffer) ? buffer : transfer?.includes(buffer) ? buffer.transfer() : buffer.slice(0))));
+  };
   if (!globalThis.structuredClone) globalThis.structuredClone = (value, options) => {
     const transfer = transfers(options), result = clone(value, transfer);
-    for (const item of transfer) if (item._detach) item._detach(); else item.transfer(0);
+    for (const item of transfer) if (item._detach) item._detach(); else if (!item.detached) item.transfer(0);
     return result;
   };
   globalThis.__appsStorageClone = { encode, decode, clone };
@@ -163,12 +184,11 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes) => {
       super();
       const start = (text, bundled = false) => {
         if (this._closed) return;
-        this.threadId = call('web.worker.start', text, nativeAccess, encode(options.workerData), bundled, node === true);
+        this.threadId = call('web.worker.start', text, nativeAccess, bundled, node === true, ...message(options.workerData));
         workers.set(this.threadId, this);
-        for (const message of this._queue) call('web.worker.send', this.threadId, ...message);
-        this._queue.length = 0;
+        for (const message of this._queue.splice(0)) call('web.worker.send', this.threadId, ...message);
       };
-      const url = String(source), failed = error => { this._closed = true; this._emit('error', error); };
+      const url = String(source), failed = error => { this._discard(); this._emit('error', error); };
       if (options.eval && nativeAccess) start(url);
       // A bundled worker starts at once, so that `threadId` is known. Its load error still comes as an event.
       else if (url.startsWith('apps:')) try { start(url, true); } catch (error) { Promise.resolve().then(() => failed(error)); }
@@ -181,11 +201,13 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes) => {
     }
     postMessage(value, options) {
       if (this._closed) return;
-      const wire = message(value, options, this.threadId === undefined);
+      const wire = message(value, options, this.threadId === undefined && 'wait');
       if (this.threadId === undefined) this._queue.push(wire); else call('web.worker.send', this.threadId, ...wire);
     }
+    // Messages that never leave give back the memory that they hold.
+    _discard() { this._closed = true; for (const message of this._queue.splice(0)) for (const item of message) if (typeof item === 'number') take(item); }
     terminate() {
-      this._closed = true;
+      this._discard();
       if (this._exitCode !== undefined) return Promise.resolve(this._exitCode);
       if (this.threadId === undefined) return Promise.resolve(0);
       call('web.worker.terminate', this.threadId);
@@ -231,7 +253,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes) => {
     postMessage(value) {
       if (this.#closed) throw new DOMException('BroadcastChannel is closed', 'InvalidStateError');
       dispatch(this.#name, value, this);
-      if (nativeAccess) call('web.worker.channel.post', subscriber, this.#name, ...message(value));
+      if (nativeAccess) call('web.worker.channel.post', subscriber, this.#name, ...message(value, undefined, 'many'));
     }
     close() {
       if (this.#closed) return;
@@ -262,7 +284,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes) => {
     },
     report,
     pending: () => !!parentPort && parentPort._referenced && ((parentPort._listeners.get('message')?.length ?? 0) > 0 || parentPort._messageListeners.size > 0 || typeof parentPort.onmessage === 'function') || [...workers.values()].some(worker => worker._referenced) || [...channels.values()].some(set => [...set].some(channel => channel._referenced)),
-    api: { Worker: NodeWorker, MessageChannel, MessagePort, BroadcastChannel, isMainThread: info.main, parentPort, workerData: decode(info.data) ?? null, threadId: info.id, SHARE_ENV: Symbol.for('nodejs.worker_threads.SHARE_ENV'),
+    api: { Worker: NodeWorker, MessageChannel, MessagePort, BroadcastChannel, isMainThread: info.main, parentPort, workerData: decode(info.data && parse(info.data), () => call('web.worker.buffers')) ?? null, threadId: info.id, SHARE_ENV: Symbol.for('nodejs.worker_threads.SHARE_ENV'),
       receiveMessageOnPort: port => port._pending?.length ? { message: port._pending.shift() } : undefined },
   };
 };

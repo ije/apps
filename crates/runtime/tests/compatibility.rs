@@ -674,12 +674,12 @@ fn renderer_cannot_forge_native_worker_requests() {
             try{crypto.getRandomValues(new Uint8Array(1));}finally{JSON.stringify=original;}
             Object.prototype.toJSON=function(){return this.op==='web.random'?{op:'web.worker.start',args:['postMessage("native")',true,null]}:this};
             try{crypto.getRandomValues(new Uint8Array(1));}finally{delete Object.prototype.toJSON}
-            const source='postMessage("native")';
+            const source='postMessage(typeof process+typeof require)';
             Array.prototype.toJSON=function(){if(this[0]===source&&this[1]===false){const args=this.slice();args[1]=true;return args;}return this};
             globalThis.result='pending';
             const worker=new Worker('data:text/javascript,'+encodeURIComponent(source));
             worker.onerror=event=>{delete Array.prototype.toJSON;result=event.error.message};
-            worker.onmessage=()=>{delete Array.prototype.toJSON;result='unsafe'};
+            worker.onmessage=event=>{delete Array.prototype.toJSON;result=event.data};
         })()
     "#,"test").unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -687,7 +687,12 @@ fn renderer_cannot_forge_native_worker_requests() {
         page.tick().unwrap();
         let result = page.eval("result", "test").unwrap();
         if result != "pending" {
-            assert_eq!(result, "Page workers cannot request native APIs");
+            // The request is refused, or the hook can't reach it and the worker has no native APIs.
+            assert!(
+                result == "Page workers cannot request native APIs"
+                    || result == "undefinedundefined",
+                "{result}"
+            );
             break;
         }
         assert!(
@@ -1648,6 +1653,60 @@ fn worker_messages_ports_and_listener_errors() {
         assert.ok(port1.hasRef()&&!port1.unref().hasRef()&&port1.ref().hasRef());
         assert.ok(echo.listenerCount('message')===0&&echo.emit('message',1)===false&&echo.addListener('x',()=>{}).listenerCount('x')===1);
         assert.strictEqual(await echo.terminate(),1);
+    "#);
+}
+
+#[test]
+fn workers_share_and_move_memory() {
+    run(r#"
+        const {assert,worker_threads:{Worker,MessageChannel,BroadcastChannel}}=__apps;
+        const shared=new SharedArrayBuffer(16),cells=new Int32Array(shared);cells[0]=1;
+        const worker=new Worker(`const{parentPort,workerData}=require('node:worker_threads');const cells=new Int32Array(workerData.shared);
+            parentPort.on('message',message=>{
+                if(message.add)return parentPort.postMessage(Atomics.add(new Int32Array(message.add),0,5));
+                if(message.wait)return parentPort.postMessage(Atomics.wait(cells,1,0,5000));
+                if(message.make){const made=new SharedArrayBuffer(8);new Int32Array(made)[0]=7;return parentPort.postMessage({made,view:new Uint8Array(workerData.shared,4,2)});}
+                parentPort.postMessage(message,message.move?[message.move]:[]);
+            });parentPort.postMessage(cells[0]);`,{eval:true,workerData:{shared}});
+        const next=()=>new Promise(resolve=>worker.once('message',resolve)),ask=(message,transfer)=>{worker.postMessage(message,transfer);return next();};
+        assert.strictEqual(await next(),1);
+        assert.strictEqual(await ask({add:shared}),1);assert.strictEqual(cells[0],6);
+        const waiting=ask({wait:true});await new Promise(resolve=>setTimeout(resolve,50));cells[1]=1;Atomics.notify(cells,1);assert.strictEqual(await waiting,'ok');
+        const {made,view}=await ask({make:true});
+        assert.ok(made instanceof SharedArrayBuffer&&new Int32Array(made)[0]===7&&view.buffer instanceof SharedArrayBuffer&&view.byteOffset===4&&view.length===2);
+        view[0]=9;assert.strictEqual(new Uint8Array(shared)[4],9);
+        const moved=new ArrayBuffer(1<<20);new Uint8Array(moved)[3]=4;const back=(await ask({move:moved},[moved])).move;
+        assert.deepStrictEqual([moved.byteLength,back.byteLength,new Uint8Array(back)[3]],[0,1<<20,4]);
+        const again=structuredClone(back,{transfer:[back]});assert.deepStrictEqual([back.byteLength,again.byteLength,new Uint8Array(again)[3]],[0,1<<20,4]);
+        const empty=new ArrayBuffer(0);assert.strictEqual((await ask({move:empty},[empty])).move.byteLength,0);
+        assert.throws(()=>worker.postMessage(shared,[shared]),{name:'DataCloneError'});
+        const copy=structuredClone({shared,bytes:new Uint8Array([1])});new Int32Array(copy.shared)[2]=3;assert.deepStrictEqual([cells[2],copy.bytes[0]],[3,1]);
+        const {port1,port2}=new MessageChannel();port2.onmessage=event=>{new Int32Array(event.data)[3]=4;};port1.postMessage(shared);
+        await new Promise(resolve=>setTimeout(resolve,20));assert.strictEqual(cells[3],4);
+        const listener=new Worker(`const{parentPort}=require('node:worker_threads');const channel=new BroadcastChannel('memory');channel.onmessage=event=>{Atomics.add(new Int32Array(event.data),0,10);channel.close();parentPort.postMessage('done');};parentPort.postMessage('ready');`,{eval:true});
+        await new Promise(resolve=>listener.once('message',resolve));const channel=new BroadcastChannel('memory');channel.postMessage(shared);
+        await new Promise(resolve=>listener.once('message',resolve));channel.close();assert.strictEqual(cells[0],16);
+        // (module (import "env" "memory" (memory 1 2 shared)) with add: i32.atomic.rmw.add, wait: memory.atomic.wait32,
+        // notify: memory.atomic.notify and load: i32.atomic.load)
+        const code=new WebAssembly.Module(Uint8Array.fromBase64('AGFzbQEAAAABDAJgAn9/AX9gAX8BfwIQAQNlbnYGbWVtb3J5AgMBAgMFBAAAAQEHHgQDYWRkAAAEd2FpdAABBm5vdGlmeQACBGxvYWQAAwoxBAoAIAAgAf4eAgALEAAgACABQoCo1rkH/gECAAsKACAAQQH+AAIACwgAIAD+EAIACw=='));
+        const memory=new WebAssembly.Memory({initial:1,maximum:2,shared:true}),local=new WebAssembly.Instance(code,{env:{memory}}).exports;
+        assert.ok(memory.buffer instanceof SharedArrayBuffer);
+        const threads=new Worker(`const{parentPort,workerData:{code,memory}}=require('node:worker_threads');const api=new WebAssembly.Instance(code,{env:{memory}}).exports;
+            parentPort.on('message',message=>parentPort.postMessage(message==='wait'?[api.wait(4,0),api.load(4)]:message==='grow'?memory.grow(1):api.add(0,message)));
+            parentPort.postMessage([code instanceof WebAssembly.Module,memory instanceof WebAssembly.Memory]);`,{eval:true,workerData:{code,memory}});
+        const reply=message=>{if(message!==undefined)threads.postMessage(message);return new Promise(resolve=>threads.once('message',resolve));};
+        assert.deepStrictEqual(await reply(),[true,true]);
+        local.add(0,1);assert.strictEqual(await reply(10),1);assert.strictEqual(local.load(0),11);
+        const woke=reply('wait');await new Promise(resolve=>setTimeout(resolve,50));new Int32Array(memory.buffer)[1]=5;
+        while(!local.notify(4))await new Promise(resolve=>setTimeout(resolve,5));
+        assert.deepStrictEqual(await woke,[0,5]);
+        assert.strictEqual(await reply('grow'),1);assert.strictEqual(memory.buffer.byteLength,131072);
+        assert.throws(()=>threads.postMessage(new WebAssembly.Memory({initial:1})),{name:'DataCloneError'});
+        const same=structuredClone({code,memory});assert.ok(same.code instanceof WebAssembly.Module&&same.memory.buffer.byteLength===131072);
+        assert.strictEqual(await threads.terminate(),1);
+        const blocked=new Worker(`const{parentPort,workerData}=require('node:worker_threads');parentPort.postMessage(1);Atomics.wait(new Int32Array(workerData),0,0);`,{eval:true,workerData:new SharedArrayBuffer(8)});
+        await new Promise(resolve=>blocked.once('message',resolve));await new Promise(resolve=>setTimeout(resolve,50));
+        assert.strictEqual(await blocked.terminate(),1);assert.strictEqual(await worker.terminate(),1);
     "#);
 }
 
