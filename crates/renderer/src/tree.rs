@@ -1,7 +1,7 @@
 use crate::{
-    AlignContent, AlignItems, AvailableSpace, Baseline, Clip, Display, Escape, Hit, Hooks, Inline,
-    Overflow, Pixels, Point, Position, Rect, Region, Scope, Size, Style, TextStyle, Visibility,
-    Window,
+    AlignContent, AlignItems, AvailableSpace, Baseline, Clip, Display, Escape, Flow, Hit, Hooks,
+    Inline, Overflow, Pixels, Point, Position, Rect, Region, Scope, Size, Style, TextStyle,
+    Visibility, Window,
     geometry::round_half_up,
     node::{Child, Content, Events, MeasureFn, Measurement, Node, NodeCx, NodeKey, NodeStyle},
     point, px, size,
@@ -65,7 +65,27 @@ struct Slot {
     measured: taffy::Size<f32>,
     // The far corners that `far` found, from the origin of the box. Cleared up the tree when a box changes.
     far: [Option<Point<f32>>; 2],
+    split: Option<Rc<Split>>,
+    // Floats are in the box, or below it in blocks of its formatting context.
+    floats: bool,
+    // The last layout broke the lines of the box beside floats.
+    banded: bool,
+    // The floats that the box placed in the context of its parent when no other float reached it, from its origin.
+    spill: Option<Box<Spill>>,
 }
+
+// Where a column set puts a box of its flow, in layout units.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Split {
+    // The move into its column, beyond the move of its parent.
+    pub(crate) shift: Point<f32>,
+    // A box that spans columns: its part in each column from its moved origin, and for text, the first row of
+    // each column after the first with its move.
+    pub(crate) rects: Box<[Rect<f32>]>,
+    pub(crate) rows: Box<[(u32, Point<f32>)]>,
+}
+
+type Spill = (Vec<[f32; 5]>, f32, f32);
 
 type Remains = (
     Option<Box<Events>>,
@@ -109,6 +129,10 @@ impl Slot {
             escaped: None,
             measured: taffy::Size::ZERO,
             far: [None; 2],
+            split: None,
+            floats: false,
+            banded: false,
+            spill: None,
         }
     }
 }
@@ -142,6 +166,9 @@ impl Slot {
         self.origin = Point::default();
         (self.bounds, self.painted, self.exact) = Default::default();
         self.far = [None; 2];
+        self.floats = false;
+        self.banded = false;
+        self.spill = None;
         self.hitbox = NONE;
         self.listed = false;
         self.free = [true; 2];
@@ -149,6 +176,7 @@ impl Slot {
         self.below = false;
         self.volatile = false;
         self.escaped = None;
+        self.split = None;
     }
 
     fn taffy(&self) -> &taffy::Style {
@@ -203,6 +231,10 @@ pub struct Tree {
     full: bool,
     graveyard: Vec<Remains>,
     refined: FxHashMap<usize, Refined>,
+    // A float was in the tree: layout skips the caches of boxes beside floats, so `dirty` goes up to the root.
+    floated: bool,
+    // Floats wait to paint after the blocks of their formatting context, like in CSS.
+    deferred: Vec<u32>,
 }
 
 fn identity(id: Option<NodeKey>, scope: u64) -> u64 {
@@ -487,7 +519,8 @@ impl Tree {
             || restyled
                 && (slot.style.baseline != styled.baseline
                     || slot.style.baseline_source != styled.baseline_source
-                    || slot.style.inline != styled.inline);
+                    || slot.style.inline != styled.inline
+                    || slot.style.flow != styled.flow);
         if !same_measure {
             match measurement {
                 Some(measurement) => {
@@ -521,6 +554,9 @@ impl Tree {
             self.orphans.extend(old.into_iter().map(index_of));
             for child in 0..self.slots[index as usize].children.len() {
                 let child = index_of(self.slots[index as usize].children[child]);
+                if self.slots[child as usize].parent != index {
+                    unsplit(&mut self.slots, child as usize);
+                }
                 self.slots[child as usize].parent = index;
             }
         }
@@ -550,8 +586,15 @@ impl Tree {
             let child = &self.slots[index_of(child) as usize];
             child.placed.is_none() || child.below || child.volatile
         });
+        let floats = self.slots[index as usize].children.iter().any(|&child| {
+            let child = &self.slots[index_of(child) as usize];
+            child.style.flow & Flow::FLOAT != 0
+                || child.floats && child.style.flow & Flow::BLOCK != 0
+        });
+        self.floated |= floats;
         let slot = &mut self.slots[index as usize];
         (slot.free, slot.below) = (free, below);
+        let relaid = mem::replace(&mut slot.floats, floats) != floats || relaid;
         if relaid {
             self.dirty(index);
         }
@@ -590,8 +633,9 @@ impl Tree {
         while index != NONE {
             let slot = &mut self.slots[index as usize];
             let parent = slot.parent;
-            // An empty cache means its parents were cleared too, unless it was just made.
+            // An empty cache means its parents were cleared too, unless it was just made or laid out beside floats.
             if matches!(slot.cache.clear(), ClearState::AlreadyEmpty)
+                && !self.floated
                 && parent != NONE
                 && self.slots[parent as usize].cache.is_empty()
             {
@@ -665,6 +709,12 @@ impl Tree {
             window,
             scale,
             exact: false,
+            floats: Vec::new(),
+            ceiling: f32::NEG_INFINITY,
+            reach: f32::NEG_INFINITY,
+            origin: [0.; 2],
+            active: false,
+            joined: false,
         };
         taffy::compute_root_layout(&mut tree, root, space);
         #[cfg(debug_assertions)]
@@ -792,7 +842,10 @@ impl Tree {
         let prepaints = self.prepaints;
         let slot = &mut self.slots[index as usize];
         let location = slot.layout.location;
-        let origin = point(parent.x + location.x, parent.y + location.y);
+        let mut origin = point(parent.x + location.x, parent.y + location.y);
+        if let Some(split) = &slot.split {
+            origin += split.shift;
+        }
         let placement = window.placement();
         if !self.full
             && !slot.below
@@ -849,7 +902,7 @@ impl Tree {
             |hooks, cx, inner| hooks.prepaint(cx, inner),
             |tree, style, window| tree.prepaint_box(index, style, window),
         );
-        self.reach(index);
+        self.reach(index, window.scale_factor());
         if self.slots[index as usize].escaped.is_some() {
             window.pop_content_mask();
         }
@@ -869,8 +922,12 @@ impl Tree {
             Some(_) if !slot.children.is_empty() => self.content(index, origin, scale),
             _ => bounds.size,
         };
+        // A box that spans columns takes pointer events in its first part.
+        let first = parts(&self.slots[index as usize], bounds.origin, scale)
+            .next()
+            .unwrap_or(bounds);
         window.scope(Scope::Clip(style.overflow_mask(bounds)), |window| {
-            let hitbox = needs_hitbox.then(|| window.add_region(bounds, Hit::Pass));
+            let hitbox = needs_hitbox.then(|| window.add_region(first, Hit::Pass));
             let offset = match &scroll {
                 Some(handle) => {
                     handle.drive(window);
@@ -930,7 +987,12 @@ impl Tree {
     // `nested`, only the content of its lines counts, not of boxes inside it.
     fn far(&mut self, index: u32, scale: f32, nested: bool) -> Point<f32> {
         let slot = &self.slots[index as usize];
-        let Layout { location, size, .. } = slot.layout;
+        let Layout {
+            mut location, size, ..
+        } = slot.layout;
+        if let Some(split) = &slot.split {
+            (location.x, location.y) = (location.x + split.shift.x, location.y + split.shift.y);
+        }
         if let Some(far) = slot.far[nested as usize].filter(|_| !self.full) {
             return point(location.x + far.x, location.y + far.y);
         }
@@ -938,7 +1000,19 @@ impl Tree {
             .style
             .overflow
             .map(|overflow| overflow == Overflow::Visible);
-        let mut far = point(size.width, size.height);
+        // The flow of a column set is one tall column, and only the boxes that it moved into columns count.
+        let flow = slot.parent != NONE && self.slots[slot.parent as usize].style.columns.is_some();
+        let parted = slot
+            .split
+            .as_ref()
+            .is_some_and(|split| !split.rects.is_empty());
+        let mut far = match flow || parted {
+            true => point(size.width, 0.),
+            false => point(size.width, size.height),
+        };
+        for part in slot.split.iter().flat_map(|split| &split.rects) {
+            far = far.max(point(part.right(), part.bottom()));
+        }
         if !visible.x && !visible.y {
             self.slots[index as usize].far[nested as usize] = Some(far);
             return point(location.x + far.x, location.y + far.y);
@@ -999,7 +1073,14 @@ impl Tree {
             {
                 continue;
             }
-            let at = point(origin.x + layout.location.x, origin.y + layout.location.y);
+            let shift = child
+                .split
+                .as_ref()
+                .map_or(Point::default(), |split| split.shift);
+            let at = point(
+                origin.x + layout.location.x + shift.x,
+                origin.y + layout.location.y + shift.y,
+            );
             let mut far = self.far(id, scale, false);
             if !absolute {
                 far.x += layout.margin.right.max(0.);
@@ -1044,7 +1125,10 @@ impl Tree {
     fn keep(&mut self, index: u32, parent: Point<f32>, window: &mut Window) {
         let slot = &mut self.slots[index as usize];
         let location = slot.layout.location;
-        let origin = point(parent.x + location.x, parent.y + location.y);
+        let mut origin = point(parent.x + location.x, parent.y + location.y);
+        if let Some(split) = &slot.split {
+            origin += split.shift;
+        }
         let placement = window.placement();
         let moved = slot
             .placed
@@ -1068,7 +1152,7 @@ impl Tree {
             |tree, style, window| tree.keep_box(index, style, moved, window),
         );
         if moved {
-            self.reach(index);
+            self.reach(index, window.scale_factor());
         }
     }
 
@@ -1078,10 +1162,14 @@ impl Tree {
             true => self.place(index, origin, window),
             false => [self.slots[index as usize].painted; 2],
         };
+        let scale = window.scale_factor();
+        let first = parts(&self.slots[index as usize], bounds.origin, scale)
+            .next()
+            .unwrap_or(bounds);
         window.scope(Scope::Clip(style.overflow_mask(bounds)), |window| {
             let slot = &mut self.slots[index as usize];
             if let Some(hitbox) = self.previous.get(slot.hitbox as usize) {
-                self.hitboxes.push(window.move_region(hitbox, bounds));
+                self.hitboxes.push(window.move_region(hitbox, first));
                 slot.hitbox = (self.hitboxes.len() - 1) as u32;
             }
             if style.display != Display::None {
@@ -1104,7 +1192,7 @@ impl Tree {
     }
 
     // Text can overflow horizontally and one glyph line vertically. Extend its reach across the window.
-    fn reach(&mut self, index: u32) {
+    fn reach(&mut self, index: u32, scale: f32) {
         let slot = &self.slots[index as usize];
         let reach = slot
             .hooks
@@ -1121,6 +1209,9 @@ impl Tree {
                     )
                 });
                 let mut reach = slot.painted.outset(grow);
+                for part in parts(slot, slot.painted.origin, scale) {
+                    reach = reach.union(part.outset(grow));
+                }
                 if matches!(slot.kind, Kind::Text(..) | Kind::Measured) {
                     let line = slot.text.line_height.round() * 2.;
                     reach = Rect::new(
@@ -1150,7 +1241,7 @@ impl Tree {
         let Some(hooks) = slot.hooks.clone() else {
             return inner(self, &style, window);
         };
-        let (text, state) = (slot.text.clone(), slot.state.clone());
+        let (text, state, split) = (slot.text.clone(), slot.state.clone(), slot.split.clone());
         let scale = window.scale_factor();
         let mut cx = NodeCx {
             window,
@@ -1161,6 +1252,7 @@ impl Tree {
             text: &text,
             style: &style,
             state: state.as_ref(),
+            split: split.as_deref(),
         };
         step(&*hooks, &mut cx, &mut |window| inner(self, &style, window));
     }
@@ -1172,6 +1264,7 @@ impl Tree {
 
     pub(crate) fn paint(&mut self, root: NodeId, window: &mut Window) {
         self.painting.clear();
+        self.deferred.clear();
         self.unbounded = 0;
         self.paint_node(index_of(root), false, window);
     }
@@ -1219,27 +1312,52 @@ impl Tree {
             self.paint_layers(negative, window);
             return;
         }
+        let pieces: Vec<_> = parts(slot, bounds.origin, window.scale_factor()).collect();
         window.scope(Scope::Opacity(style.opacity), |window| {
-            let radii = style.corner_radii.resolve(bounds.size);
-            window.draw_shadows(bounds, radii, &style.box_shadow, false);
-            if let Some(background) = style.background.filter(|color| !color.is_transparent()) {
-                window.draw_box(bounds, radii, background, Default::default());
-            }
-            window.draw_shadows(bounds, radii, &style.box_shadow, true);
-            if let Some(color) = style.border_color.filter(|color| !color.is_transparent())
-                && style.border_widths.any(|width| !width.is_zero())
+            let full = style.corner_radii.resolve(bounds.size);
+            let count = pieces.len().max(1);
+            let pieces = pieces.iter().copied();
+            // Like Chrome's `box-decoration-break: slice`, a part has no border and no corners at a cut.
+            for (at, part) in pieces
+                .chain((count == 1).then_some(bounds))
+                .take(count)
+                .enumerate()
             {
-                window.draw_box(
-                    bounds,
-                    radii,
-                    color.with_alpha(0.),
-                    crate::Border {
-                        widths: style.border_widths,
-                        color,
-                        style: style.border_style,
-                        sides: 0,
-                    },
-                );
+                let (first, last) = (at == 0, at + 1 >= count);
+                let mut radii = full;
+                for corners in [&mut radii.x, &mut radii.y] {
+                    if !first {
+                        (corners.top_left, corners.top_right) = (px(0.), px(0.));
+                    }
+                    if !last {
+                        (corners.bottom_left, corners.bottom_right) = (px(0.), px(0.));
+                    }
+                }
+                let sides = if first && last {
+                    0
+                } else {
+                    10 | u8::from(first) | u8::from(last) << 2
+                };
+                window.draw_shadows(part, radii, &style.box_shadow, false);
+                if let Some(background) = style.background.filter(|color| !color.is_transparent()) {
+                    window.draw_box(part, radii, background, Default::default());
+                }
+                window.draw_shadows(part, radii, &style.box_shadow, true);
+                if let Some(color) = style.border_color.filter(|color| !color.is_transparent())
+                    && style.border_widths.any(|width| !width.is_zero())
+                {
+                    window.draw_box(
+                        part,
+                        radii,
+                        color.with_alpha(0.),
+                        crate::Border {
+                            widths: style.border_widths,
+                            color,
+                            style: style.border_style,
+                            sides,
+                        },
+                    );
+                }
             }
             let mask = style.overflow_mask(bounds);
             window.scope(Scope::Clip(mask), |window| {
@@ -1267,6 +1385,7 @@ impl Tree {
                             text: &slot.text,
                             style,
                             state: slot.state.as_ref(),
+                            split: slot.split.as_deref(),
                         };
                         hooks.paint_content(&mut cx)
                     });
@@ -1288,9 +1407,30 @@ impl Tree {
                     if style.stacking {
                         self.painting.push(index);
                     }
+                    let mark = self.deferred.len();
                     for child in 0..self.slots[index as usize].children.len() {
                         let child = index_of(self.slots[index as usize].children[child]);
-                        self.paint_node(child, false, window);
+                        let slot = &self.slots[child as usize];
+                        if slot.style.flow & Flow::FLOAT != 0 && slot.style.z_index.is_none() {
+                            self.deferred.push(child);
+                        } else {
+                            self.paint_node(child, false, window);
+                        }
+                    }
+                    // A plain block passes its floats up. Other boxes paint them above their blocks, with their
+                    // clip, scroll offset and effects.
+                    if style.flow & Flow::BLOCK == 0
+                        || style.stacking
+                        || style.z_index.is_some()
+                        || style.opacity.is_some()
+                        || style.overflow.x != Overflow::Visible
+                        || style.overflow.y != Overflow::Visible
+                    {
+                        // A float catches the floats inside it, so painting one doesn't grow the list.
+                        for at in mark..self.deferred.len() {
+                            self.paint_node(self.deferred[at], false, window);
+                        }
+                        self.deferred.truncate(mark);
                     }
                     if style.stacking {
                         self.painting.pop();
@@ -1311,6 +1451,163 @@ impl Tree {
             });
         }
         self.layers.insert(context, list);
+    }
+}
+
+const FORCED: u8 = 1;
+const AVOID: u8 = 2;
+const END: u8 = 3;
+// The space below the content of a box, where a break can come anywhere: its chance holds where it starts and ends.
+const SLICE: u8 = 4;
+
+// Whether columns can break inside a box of their flow: in text between rows, in a flow of blocks or rows of
+// inline boxes between them. Other boxes stay whole, and so do boxes with out-of-flow children, like the layers of
+// backgrounds and outlines, which paint over the whole box.
+fn splits(slots: &[Slot], index: usize) -> bool {
+    let slot = &slots[index];
+    let (style, taffy) = (&slot.style, slot.taffy());
+    match slot.kind {
+        Kind::Text(_) => slot.children.is_empty(),
+        Kind::Box => {
+            taffy.display == taffy::Display::Flex
+                && (taffy.flex_direction == FlexDirection::Column
+                    && taffy.flex_wrap == taffy::FlexWrap::NoWrap
+                    || style.inline == Inline::Lines)
+                && style.columns.is_none()
+                && style.breaks & crate::Break::WHOLE == 0
+                && style.overflow.x == Overflow::Visible
+                && style.overflow.y == Overflow::Visible
+                && style.escape == 0
+                && slot.hooks.as_ref().is_none_or(|hooks| hooks.bounded())
+                && slot
+                    .children
+                    .iter()
+                    .all(|&child| slots[usize::from(child)].style.position != Position::Absolute)
+        }
+        _ => false,
+    }
+}
+
+// The break chances inside a box at `top` of a column flow, in order: where the next column starts, where the
+// content before it ends, and FORCED or AVOID.
+fn chances_in(
+    slots: &[Slot],
+    index: usize,
+    top: f32,
+    avoid: bool,
+    scale: f32,
+    out: &mut Vec<(f32, f32, u8)>,
+) -> f32 {
+    let slot = &slots[index];
+    let avoid = avoid || slot.style.breaks & crate::Break::AVOID_INSIDE != 0;
+    if let Kind::Text(_) = slot.kind {
+        let Layout {
+            size,
+            border,
+            padding,
+            ..
+        } = slot.layout;
+        let line = slot.text.line_height.0 * scale;
+        let start = top + border.top + padding.top;
+        let height = slot.measured.height;
+        let rows = (height / line).round();
+        // Rows of other heights make no even grid of lines.
+        if line > 0. && (rows * line - height).abs() <= 0.5 {
+            let rows = rows as u32;
+            let [orphans, widows] = slot.text.lines_kept.map(u32::from);
+            // Like Chrome, text with fewer rows than both keep needs only `orphans`.
+            let widows = if rows < orphans + widows { 0 } else { widows };
+            for row in 1..rows {
+                let y = start + row as f32 * line;
+                let kept = avoid || row < orphans || rows - row < widows;
+                out.push((y, y, if kept { AVOID } else { 0 }));
+            }
+        }
+        let (content, bottom) = (start + height, top + size.height);
+        if bottom > content + 0.01 && !avoid {
+            out.push((content, bottom, SLICE));
+        }
+        return content.min(bottom);
+    }
+    let (mut last, mut used): (Option<(f32, u8)>, f32) = (None, top);
+    for &child in &slot.children {
+        let child = usize::from(child);
+        let other = &slots[child];
+        if other.style.position == Position::Absolute || other.style.display == Display::None {
+            continue;
+        }
+        let at = top + other.layout.location.y - lift(other);
+        let breaks = other.style.breaks;
+        if let Some((bottom, before)) = last
+            && at >= bottom - 0.01
+        {
+            use crate::Break;
+            let kind = if (before & Break::AFTER) | (breaks & Break::BEFORE) != 0 {
+                FORCED
+            } else if avoid || (before & Break::AVOID_AFTER) | (breaks & Break::AVOID_BEFORE) != 0 {
+                AVOID
+            } else {
+                0
+            };
+            // Like Chrome, the margin at the top of a column is kept only after a forced break.
+            let cut = match kind {
+                FORCED => at - other.layout.margin.top.max(0.),
+                _ => at,
+            };
+            out.push((cut, bottom, kind));
+        }
+        if splits(slots, child) {
+            chances_in(slots, child, at, avoid, scale, out);
+        }
+        let bottom = at + other.layout.size.height;
+        last = Some((last.map_or(bottom, |(end, _)| end.max(bottom)), breaks));
+        used = used.max(bottom + other.layout.margin.bottom.max(0.));
+    }
+    // Like Chrome, a box taller than its content breaks anywhere below it.
+    let content = last.map_or(top, |(bottom, _)| bottom);
+    let bottom = top + slot.layout.size.height;
+    if bottom > used + 0.01 && !avoid {
+        out.push((used, bottom, SLICE));
+    }
+    content
+}
+
+// The offset of a relatively positioned box, which moves it but not its place in a column flow.
+fn lift(slot: &Slot) -> f32 {
+    let style = slot.taffy();
+    let length = |side: taffy::LengthPercentageAuto| {
+        let raw = side.into_raw();
+        (raw.tag() == taffy::CompactLength::LENGTH_TAG).then(|| raw.value())
+    };
+    match style.position {
+        taffy::Position::Relative => length(style.inset.top)
+            .or_else(|| length(style.inset.bottom).map(|bottom| -bottom))
+            .unwrap_or(0.),
+        _ => 0.,
+    }
+}
+
+// The parts of a box that spans columns, in window pixels from `origin`, its place.
+fn parts(
+    slot: &Slot,
+    origin: Point<Pixels>,
+    scale: f32,
+) -> impl Iterator<Item = Rect<Pixels>> + '_ {
+    let parts = slot.split.as_deref().map_or(&[][..], |split| &split.rects);
+    parts
+        .iter()
+        .map(move |part| (*part / scale).map(Pixels) + origin)
+}
+
+// Clears the column places of a box, and of the boxes inside it when it spanned columns.
+fn unsplit(slots: &mut [Slot], index: usize) {
+    if let Some(split) = slots[index].split.take() {
+        changed(slots, index);
+        if !split.rects.is_empty() {
+            for child in 0..slots[index].children.len() {
+                unsplit(slots, usize::from(slots[index].children[child]));
+            }
+        }
     }
 }
 
@@ -1399,6 +1696,15 @@ impl Fingerprint for Style {
             .font_size
             .map(|size| size.0.to_bits())
             .hash(hasher);
+        (
+            self.breaks,
+            self.text.lines_kept,
+            self.columns.as_deref().map(|columns| {
+                let height = columns.height.map(|height| height.0.to_bits());
+                (columns.count, columns.gap.0.to_bits(), height, columns.fill)
+            }),
+        )
+            .hash(hasher);
     }
 }
 
@@ -1417,6 +1723,7 @@ impl Fingerprint for TextStyle {
             self.font_family.len(),
             self.white_space as u8,
             self.text_align as u8,
+            self.lines_kept,
         )
             .hash(hasher);
     }
@@ -1530,6 +1837,18 @@ struct LayoutTree<'a> {
     window: &'a mut Window,
     scale: f32,
     exact: bool,
+    // The margin boxes `[left, top, right, bottom, right side]` of the floats in the formatting context, from the
+    // border box of its root.
+    floats: Vec<[f32; 5]>,
+    // The lowest top and bottom of all floats of the context, also the ones that ended above the current box.
+    ceiling: f32,
+    reach: f32,
+    // Where the border box of the box that `stack` lays out next is in the formatting context.
+    origin: [f32; 2],
+    // The next box that `compute` lays out is beside floats: it skips the cache, and `stack` places it in the
+    // formatting context of its parent.
+    active: bool,
+    joined: bool,
 }
 
 impl LayoutTree<'_> {
@@ -1539,6 +1858,7 @@ impl LayoutTree<'_> {
         mut inputs: LayoutInput,
         block: Option<&mut BlockContext<'_>>,
     ) -> LayoutOutput {
+        let joined = mem::take(&mut self.active);
         if inputs.run_mode == RunMode::PerformHiddenLayout {
             return taffy::compute_hidden_layout(self, node);
         }
@@ -1609,7 +1929,8 @@ impl LayoutTree<'_> {
         {
             inputs.known_dimensions_are_definite.height = false;
         }
-        let output = taffy::compute_cached_layout(self, node, inputs, |tree, node, inputs| {
+        let layout = |tree: &mut Self, node: NodeId, inputs: LayoutInput| {
+            tree.joined = joined;
             let slot = &tree.slots[usize::from(node)];
             let leaf = slot.children.is_empty();
             let mut output = match slot.taffy().display {
@@ -1622,12 +1943,61 @@ impl LayoutTree<'_> {
                 taffy::Display::Grid => taffy::compute_grid_layout(tree, node, inputs),
                 _ => taffy::compute_block_layout(tree, node, inputs, block),
             };
+            if tree.slots[usize::from(node)].style.columns.is_some() {
+                output = tree.columns(node, inputs, output);
+            }
             if inputs.run_mode == RunMode::PerformLayout {
                 taffy::compute_oof_layout(tree, node, &mut output);
                 output.baselines = tree.baselines(usize::from(node), &output);
             }
             output
-        });
+        };
+        let index = usize::from(node);
+        // A box with floats that no float of its context reaches lays out the same each time: it keeps its cache,
+        // and the floats it placed.
+        let quiet = joined
+            && self.slots[index].floats
+            && self.floats.iter().all(|float| float[3] <= self.origin[1]);
+        let output = if quiet {
+            let [x, y] = self.origin;
+            self.floats.clear();
+            match self.cache_get(node, &inputs) {
+                Some(output) if self.slots[index].spill.is_some() => {
+                    let (floats, ceiling, reach) = self.slots[index].spill.as_deref().unwrap();
+                    self.floats.extend(
+                        floats
+                            .iter()
+                            .map(|f| [f[0] + x, f[1] + y, f[2] + x, f[3] + y, f[4]]),
+                    );
+                    (self.ceiling, self.reach) =
+                        (self.ceiling.max(ceiling + y), self.reach.max(reach + y));
+                    output
+                }
+                _ => {
+                    let outer = (self.ceiling, self.reach);
+                    (self.ceiling, self.reach) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                    let output = layout(self, node, inputs);
+                    let floats = self
+                        .floats
+                        .iter()
+                        .map(|f| [f[0] - x, f[1] - y, f[2] - x, f[3] - y, f[4]])
+                        .collect();
+                    self.slots[index].spill =
+                        Some(Box::new((floats, self.ceiling - y, self.reach - y)));
+                    (self.ceiling, self.reach) =
+                        (outer.0.max(self.ceiling), outer.1.max(self.reach));
+                    self.cache_store(node, &inputs, output.clone());
+                    output
+                }
+            }
+        } else if joined {
+            // Beside floats, the result depends on them, so the cache is neither read nor stored, and a later
+            // layout without floats must not find a result from before them.
+            self.slots[index].cache.clear();
+            layout(self, node, inputs)
+        } else {
+            taffy::compute_cached_layout(self, node, inputs, layout)
+        };
         if inputs.run_mode == RunMode::PerformLayout
             && self.slots[usize::from(node)].baselines != output.baselines
         {
@@ -1637,6 +2007,243 @@ impl LayoutTree<'_> {
             }
         }
         output
+    }
+
+    // A column set lays out its flow as one column, then breaks it into columns of one height and moves its boxes
+    // there. The set is as tall as a column.
+    fn columns(&mut self, node: NodeId, inputs: LayoutInput, output: LayoutOutput) -> LayoutOutput {
+        let index = usize::from(node);
+        let (Some(columns), Some(&flow)) = (
+            self.slots[index].style.columns.as_deref().copied(),
+            self.slots[index].children.first(),
+        ) else {
+            return output;
+        };
+        // Without a width, the set is as wide as its columns of the content's width and the gaps between them.
+        if inputs.known_dimensions.width.is_none() {
+            let mut output = output;
+            let count = f32::from(columns.count);
+            output.size.width =
+                output.size.width * count + columns.gap.0 * self.scale * (count - 1.);
+            return output;
+        }
+        if inputs.run_mode != RunMode::PerformLayout {
+            let inputs = LayoutInput {
+                run_mode: RunMode::PerformLayout,
+                ..inputs
+            };
+            return LayoutOutput::from_outer_size(self.compute(node, inputs, None).size);
+        }
+        let flow = usize::from(flow);
+        let Layout { size: one, .. } = self.slots[flow].layout;
+        let pitch = one.width + columns.gap.0 * self.scale;
+        let mut chances = Vec::new();
+        // Like Chrome, the margin at the end of the content takes no room.
+        let end = chances_in(self.slots, flow, 0., false, self.scale, &mut chances);
+        chances.push((f32::INFINITY, end, END));
+        // Greedy fill: the column starts, the least extra height that would fit more, whether a break that should
+        // be avoided was taken or the last column overflows, and the tallest content of a column.
+        let fill = |height: f32| {
+            let (mut cuts, mut short, mut avoided, mut tallest) =
+                (vec![0f32], f32::INFINITY, false, 0f32);
+            let (mut fit, mut fit_avoided, mut at) = (None, None, 0);
+            while let Some(&(cut, end, bits)) = chances.get(at) {
+                let start = cuts[cuts.len() - 1];
+                if bits == SLICE {
+                    // The column ends inside the space: break there. Else the space fits up to its end, or a
+                    // whole piece before it overflows a column of its own.
+                    if end - start - height > 0.01 && cut <= start + height + 0.01 && height > 0.01
+                    {
+                        // Like Chrome, the part of the box that did not fit is a shortage too.
+                        short = short.min(end - start - height);
+                        cuts.push(start + height);
+                        (fit, fit_avoided, tallest) = (None, None, tallest.max(height));
+                        continue;
+                    }
+                    if end <= start + height + 0.01 {
+                        fit = Some(at);
+                    } else if cut > start + height {
+                        short = short.min(cut - start - height);
+                        if fit.is_none() && fit_avoided.is_none() {
+                            cuts.push(cut);
+                            tallest = tallest.max(cut - start);
+                            continue;
+                        }
+                    }
+                    at += 1;
+                    continue;
+                }
+                if cut <= start {
+                    at += 1;
+                    continue;
+                }
+                let over = end - start - height;
+                if over <= 0.01 {
+                    match bits {
+                        FORCED => {
+                            cuts.push(cut);
+                            (fit, fit_avoided) = (None, None);
+                            tallest = tallest.max(end - start);
+                        }
+                        AVOID => fit_avoided = Some(at),
+                        END => tallest = tallest.max(end - start),
+                        _ => fit = Some(at),
+                    }
+                    at += 1;
+                    continue;
+                }
+                short = short.min(over);
+                let pick = fit.or(fit_avoided).unwrap_or(at);
+                avoided |= fit.is_none() && chances[pick].2 == AVOID;
+                if chances[pick].2 == END {
+                    avoided = true;
+                    break;
+                }
+                let (cut, end, bits) = chances[pick];
+                cuts.push(if bits == SLICE { end } else { cut });
+                tallest = tallest.max(end - start);
+                (fit, fit_avoided, at) = (None, None, pick + 1);
+            }
+            (cuts, short, avoided, tallest)
+        };
+        let count = usize::from(columns.count);
+        let limit = columns.height.map(|height| height.0 * self.scale);
+        // Like Chrome, start from the runs between forced breaks with their end margins, and give the other
+        // breaks to the tallest runs.
+        let mut runs: Vec<(f32, f32)> = Vec::new();
+        let mut from = 0.;
+        for &(cut, _, bits) in &chances {
+            if bits == FORCED {
+                runs.push((cut - from, 1.));
+                from = cut;
+            }
+        }
+        runs.push((one.height - from, 1.));
+        for _ in runs.len()..count {
+            let tallest = runs
+                .iter_mut()
+                .max_by(|a, b| (a.0 / a.1).total_cmp(&(b.0 / b.1)));
+            if let Some(run) = tallest {
+                run.1 += 1.;
+            }
+        }
+        let mut height = runs.iter().map(|run| run.0 / run.1).fold(0., f32::max);
+        if let Some(limit) = limit.filter(|limit| columns.fill || *limit < height) {
+            height = limit;
+        }
+        // Balance like Chrome: grow the height by the least shortage until the content fits. A fixed number of
+        // steps keeps the cost linear in the content, and long content then searches between that height and one
+        // that fits.
+        let fits =
+            |(cuts, _, avoided, _): &(Vec<f32>, f32, bool, f32)| cuts.len() <= count && !avoided;
+        let mut done = fill(height);
+        if !(columns.fill && limit.is_some()) {
+            let upper = limit.unwrap_or(f32::INFINITY).min(one.height.max(height));
+            for _ in 0..16 {
+                if fits(&done) || !done.1.is_finite() || height >= upper {
+                    break;
+                }
+                height = (height + done.1.max(0.01)).min(upper);
+                done = fill(height);
+            }
+            if !fits(&done) && done.1.is_finite() && height < upper {
+                let mut low = height;
+                height = upper;
+                if fits(&fill(height)) {
+                    for _ in 0..24 {
+                        let middle = (low + height) / 2.;
+                        if fits(&fill(middle)) {
+                            height = middle;
+                        } else {
+                            low = middle;
+                        }
+                    }
+                    // The tallest column of the found breaks is the exact height that holds them.
+                    height = fill(height).3;
+                }
+                done = fill(height);
+            }
+        }
+        let cuts = done.0;
+        self.assign(flow, 0., Point::default(), &cuts, height, pitch);
+        let mut output = output;
+        output.size.height = height;
+        if let Some(area) = &mut output.oof_positioning_area {
+            area.size.height = height;
+        }
+        output
+    }
+
+    fn assign(
+        &mut self,
+        index: usize,
+        top: f32,
+        base: Point<f32>,
+        cuts: &[f32],
+        height: f32,
+        pitch: f32,
+    ) {
+        let column = |y: f32| {
+            cuts.partition_point(|&cut| cut <= y + 0.01)
+                .saturating_sub(1)
+        };
+        let place = |column: usize| point(column as f32 * pitch, -cuts[column]);
+        for child in 0..self.slots[index].children.len() {
+            let child = usize::from(self.slots[index].children[child]);
+            let slot = &self.slots[child];
+            let (at, extent) = (top + slot.layout.location.y - lift(slot), slot.layout.size);
+            let first = column(at);
+            let last = column(at + (extent.height - 0.02).max(0.));
+            let shift = place(first);
+            let spans = first != last && splits(self.slots, child);
+            let mut split = Split {
+                shift: shift - base,
+                rects: Box::default(),
+                rows: Box::default(),
+            };
+            if spans {
+                split.rects = (first..=last)
+                    .map(|column| {
+                        let from = if column == first { at } else { cuts[column] };
+                        let to = if column == last {
+                            at + extent.height
+                        } else {
+                            (cuts[column] + height).max(cuts[column + 1])
+                        };
+                        let y = from - cuts[column] - at + cuts[first];
+                        Rect::new(
+                            point((column - first) as f32 * pitch, y),
+                            size(extent.width, to - from),
+                        )
+                    })
+                    .collect();
+                if let Kind::Text(_) = slot.kind {
+                    let line = slot.text.line_height.0 * self.scale;
+                    let start = at + slot.layout.border.top + slot.layout.padding.top;
+                    split.rows = (first + 1..=last)
+                        .map(|column| {
+                            let row = ((cuts[column] - start) / line).round().max(0.) as u32;
+                            (row, place(column) - shift)
+                        })
+                        .collect();
+                }
+            }
+            let split = (split.shift != Point::default() || spans).then(|| Rc::new(split));
+            if self.slots[child].split != split {
+                let old = mem::replace(&mut self.slots[child].split, split);
+                if old.is_some_and(|old| !old.rects.is_empty()) && !spans {
+                    for inner in 0..self.slots[child].children.len() {
+                        unsplit(self.slots, usize::from(self.slots[child].children[inner]));
+                    }
+                }
+                if !self.exact {
+                    changed(self.slots, child);
+                }
+            }
+            if spans && matches!(self.slots[child].kind, Kind::Box) {
+                self.assign(child, at, shift, cuts, height, pitch);
+            }
+        }
     }
 
     // Preserve Taffy's sum order for exact layout values. Fall back to Taffy for unsupported rows.
@@ -2042,9 +2649,71 @@ impl LayoutTree<'_> {
             axis,
             ..
         } = inputs;
-        let width = known.width?;
+        let joined = mem::take(&mut self.joined);
         let index = usize::from(node);
+        if self.slots[index].floats
+            && run_mode == RunMode::ComputeSize
+            && axis == taffy::RequestedAxis::Horizontal
+            && known.width.is_none()
+            && self.slots[index].taffy().flex_direction == FlexDirection::Column
+            && self.slots[index].style.inline != Inline::Lines
+        {
+            // Like Chrome, floats side by side add up in the max-content width, with the box after them.
+            use taffy::ResolveOrZero;
+            let calc = |value, basis| crate::style::resolve_calc(value, basis);
+            let style = self.slots[index].taffy();
+            let sides = (style.padding.resolve_or_zero(parent_size.width, calc)
+                + style.border.resolve_or_zero(parent_size.width, calc))
+            .horizontal_axis_sum();
+            let most = available_space.width != taffy::AvailableSpace::MinContent;
+            let (mut widest, mut run) = (0f32, [0f32; 2]);
+            for order in 0..self.slots[index].children.len() {
+                let child = self.slots[index].children[order];
+                let slot = &self.slots[usize::from(child)];
+                let (bits, style) = (slot.style.flow, slot.taffy());
+                if style.display == taffy::Display::None
+                    || style.position == taffy::Position::Absolute
+                {
+                    continue;
+                }
+                let margin = style
+                    .margin
+                    .resolve_or_zero(None, calc)
+                    .horizontal_axis_sum();
+                let probe = LayoutInput {
+                    known_dimensions: taffy::Size::NONE,
+                    parent_size: taffy::Size::NONE,
+                    available_space: taffy::Size {
+                        width: available_space.width,
+                        height: taffy::AvailableSpace::MaxContent,
+                    },
+                    sizing_mode: taffy::SizingMode::InherentSize,
+                    ..inputs
+                };
+                let size = self.compute(child, probe, None).size.width + margin;
+                if bits & Flow::CLEAR_LEFT != 0 {
+                    run[0] = 0.;
+                }
+                if bits & Flow::CLEAR_RIGHT != 0 {
+                    run[1] = 0.;
+                }
+                if most && bits & Flow::FLOAT != 0 {
+                    run[usize::from(bits & Flow::RIGHT != 0)] += size.max(0.);
+                    widest = widest.max(run[0] + run[1]);
+                } else {
+                    widest = widest.max(size + if most { run[0] + run[1] } else { 0. });
+                    run = [0.; 2];
+                }
+            }
+            return Some(LayoutOutput::from_outer_size(taffy::Size {
+                width: widest + sides,
+                height: 0.,
+            }));
+        }
+        let width = known.width?;
         let style = self.slots[index].taffy();
+        // Floats lay out the same way in both passes, so the debug check compares only cached results.
+        let floating = joined || self.slots[index].floats;
         let calc = |value, basis| crate::style::resolve_calc(value, basis);
         let starts = |align: Option<taffy::AlignItems>| {
             align.is_none_or(|align| {
@@ -2054,15 +2723,17 @@ impl LayoutTree<'_> {
                 )
             })
         };
-        if self.exact
-            || style.flex_direction != FlexDirection::Column
+        // A box with floats must not fall back to flexbox, which stacks them as blocks.
+        if style.flex_direction != FlexDirection::Column
             || style.flex_wrap != taffy::FlexWrap::NoWrap
-            || style.direction != taffy::Direction::Ltr
-            || style.box_sizing != taffy::BoxSizing::BorderBox
-            || style.aspect_ratio.is_some()
-            || !starts(Some(style.align_items))
             || style.gap.height.into_raw().tag() != CompactLength::LENGTH_TAG
             || self.slots[index].style.inline == Inline::Lines
+            || !floating
+                && (self.exact
+                    || style.direction != taffy::Direction::Ltr
+                    || style.box_sizing != taffy::BoxSizing::BorderBox
+                    || style.aspect_ratio.is_some()
+                    || !starts(Some(style.align_items)))
         {
             return None;
         }
@@ -2070,8 +2741,12 @@ impl LayoutTree<'_> {
             child.position != taffy::Position::Absolute && child.display != taffy::Display::None
         };
         let simple = self.slots[index].children.iter().all(|&child| {
+            let floated = self.slots[usize::from(child)].style.flow & Flow::FLOAT != 0;
             let child = self.slots[usize::from(child)].taffy();
             match child.position {
+                _ if floating && child.position != taffy::Position::Absolute => {
+                    floated || child.box_sizing == taffy::BoxSizing::BorderBox
+                }
                 _ if child.display == taffy::Display::None => true,
                 taffy::Position::Absolute => {
                     let align = child.align_self.unwrap_or(style.align_items);
@@ -2116,31 +2791,73 @@ impl LayoutTree<'_> {
                 .maybe_clamp(min.height, max.height),
             taffy::SizingMode::ContentSize => None,
         };
-        let fixed = known.height.or(definite.or(styled).maybe_max(pb));
+        let ratio = style
+            .aspect_ratio
+            .filter(|_| floating && styled.is_none())
+            .map(|ratio| width / ratio);
+        let fixed = known.height.or(definite.or(styled).or(ratio).maybe_max(pb));
         let main = inset.top + inset.bottom;
         let cross = inset.left + inset.right;
         if run_mode == RunMode::ComputeSize
-            && (fixed.is_some() || axis == taffy::RequestedAxis::Horizontal)
-            || width.maybe_clamp(min.width, max.width) != width
+            && (fixed.is_some() && !floating || axis == taffy::RequestedAxis::Horizontal)
+            || width.maybe_clamp(min.width, max.width) != width && !floating
         {
             return None;
         }
+        let width = width.maybe_clamp(min.width, max.width);
+        // A box beside floats is in the formatting context of its parent, and other boxes with floats make one.
+        let context = (floating && !joined).then(|| {
+            let outer = (
+                mem::take(&mut self.floats),
+                self.origin,
+                self.ceiling,
+                self.reach,
+            );
+            (self.ceiling, self.reach) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+            outer
+        });
+        let origin = if joined { self.origin } else { [0.; 2] };
+        let edges = [origin[0] + inset.left, origin[0] + width - inset.right];
         let inner = width - cross;
         let line = (width - cross).max(0.);
         let gap = style.gap.height.into_raw().value();
-        let (justify, contain) = (style.justify_content.keyword(), style.contain);
+        let (justify, contain, aligned) = (
+            style.justify_content.keyword(),
+            style.contain,
+            style.align_items,
+        );
         let perform = run_mode == RunMode::PerformLayout;
         let mut total = inset.top;
         let (mut items, mut hypothetical, mut contents, mut grows, mut shrinks) =
             (0, 0., 0., false, false);
         let mut first = None;
+        // `plain` keeps percent heights out of the other columns.
+        let tall = fixed
+            .filter(|_| floating)
+            .map(|height| (height - main).max(0.));
+        // The offsets of a relatively positioned box.
+        let shift = |offsets: taffy::Rect<taffy::LengthPercentageAuto>| {
+            let side =
+                |start: taffy::LengthPercentageAuto, end: taffy::LengthPercentageAuto, basis| {
+                    let start: Option<f32> = start.maybe_resolve(basis, calc);
+                    let end: Option<f32> = end.maybe_resolve(basis, calc);
+                    start.or(end.map(|end| -end)).unwrap_or(0.)
+                };
+            [
+                side(offsets.left, offsets.right, Some(inner)),
+                side(offsets.top, offsets.bottom, tall),
+            ]
+        };
         for order in 0..self.slots[index].children.len() {
             let child = self.slots[index].children[order];
             let style = self.slots[usize::from(child)].taffy();
             if !flow(style) {
                 continue;
             }
-            let margin = style.margin.resolve_or_zero(Some(inner), calc);
+            let mut margin = style.margin.resolve_or_zero(Some(inner), calc);
+            let (offsets, sized_by, self_align) = (style.inset, style.size.width, style.align_self);
+            let [auto_left, auto_right] =
+                [style.margin.left.is_auto(), style.margin.right.is_auto()];
             let padding = style.padding.resolve_or_zero(Some(inner), calc);
             let border = style.border.resolve_or_zero(Some(inner), calc);
             let sides = (padding + border).sum_axes();
@@ -2157,55 +2874,373 @@ impl LayoutTree<'_> {
                 style.flex_shrink,
                 style.size.height.into_raw(),
             );
-            let output = self.compute(
-                child,
-                LayoutInput {
-                    run_mode: if perform {
-                        RunMode::PerformLayout
-                    } else {
-                        RunMode::ComputeSize
-                    },
-                    sizing_mode: taffy::SizingMode::InherentSize,
-                    axis: if perform {
-                        taffy::RequestedAxis::Both
-                    } else {
-                        taffy::RequestedAxis::Vertical
-                    },
-                    known_dimensions: taffy::Size {
-                        width: Some(width),
-                        height: None,
-                    },
-                    known_dimensions_are_definite: taffy::Size {
-                        width: true,
-                        height: true,
-                    },
-                    parent_size: taffy::Size {
-                        width: Some(inner),
-                        height: None,
-                    },
-                    available_space: taffy::Size {
-                        width: taffy::AvailableSpace::Definite(width),
-                        height: taffy::AvailableSpace::MaxContent,
-                    },
-                    vertical_margins_are_collapsible: taffy::Line::FALSE,
+            let input = |run_mode, axis, width: Option<f32>, space| LayoutInput {
+                run_mode,
+                sizing_mode: taffy::SizingMode::InherentSize,
+                axis,
+                known_dimensions: taffy::Size {
+                    width,
+                    height: None,
                 },
-                None,
-            );
-            let height = output.size.height;
-            // Taffy's content sizes take a fixed height even below the padding, which the box itself doesn't.
-            if styled.tag() == CompactLength::LENGTH_TAG && styled.value() != height {
-                return None;
+                known_dimensions_are_definite: taffy::Size {
+                    width: true,
+                    height: true,
+                },
+                parent_size: taffy::Size {
+                    width: Some(inner),
+                    height: tall,
+                },
+                available_space: taffy::Size {
+                    width: space,
+                    height: taffy::AvailableSpace::MaxContent,
+                },
+                vertical_margins_are_collapsible: taffy::Line::FALSE,
+            };
+            let (run, requested) = if perform {
+                (RunMode::PerformLayout, taffy::RequestedAxis::Both)
+            } else {
+                (RunMode::ComputeSize, taffy::RequestedAxis::Vertical)
+            };
+            let sized = |width: f32| {
+                input(
+                    run,
+                    requested,
+                    Some(width),
+                    taffy::AvailableSpace::Definite(width),
+                )
+            };
+            let bits = if floating {
+                self.slots[usize::from(child)].style.flow
+            } else {
+                0
+            };
+            if bits & Flow::FLOAT != 0 {
+                let width = match style.size.width.maybe_resolve(Some(inner), calc) {
+                    Some(width) => width.maybe_clamp(min, max).max(sides.width),
+                    None => {
+                        let mut probe = |space| {
+                            let probe = input(
+                                RunMode::ComputeSize,
+                                taffy::RequestedAxis::Horizontal,
+                                None,
+                                space,
+                            );
+                            self.compute(child, probe, None).size.width
+                        };
+                        let low = probe(taffy::AvailableSpace::MinContent);
+                        let high = probe(taffy::AvailableSpace::MaxContent);
+                        high.min(line - margin.left - margin.right)
+                            .max(low)
+                            .maybe_clamp(min, max)
+                            .max(sides.width)
+                    }
+                };
+                // A full layout also when the parent only measures, since some boxes measure to another height
+                // than they lay out, and the floats of both passes must be the same.
+                let output = self.compute(
+                    child,
+                    input(
+                        RunMode::PerformLayout,
+                        taffy::RequestedAxis::Both,
+                        Some(width),
+                        taffy::AvailableSpace::Definite(width),
+                    ),
+                    None,
+                );
+                let size = [
+                    width + margin.left + margin.right,
+                    output.size.height + margin.top + margin.bottom,
+                ];
+                let [x, y] = self.place(edges, size, origin[1] + total, bits);
+                if perform {
+                    let mut layout = Layout::with_order(order as u32);
+                    layout.size = taffy::Size {
+                        width,
+                        height: output.size.height,
+                    };
+                    let [right, down] = shift(offsets);
+                    layout.location = taffy::Point {
+                        x: x - origin[0] + margin.left + right,
+                        y: y - origin[1] + margin.top + down,
+                    };
+                    layout.padding = padding;
+                    layout.border = border;
+                    layout.margin = margin;
+                    self.set_unrounded_layout(child, &layout);
+                }
+                continue;
             }
             let margins = margin.top + margin.bottom;
             let offset = if items == 0 { 0. } else { gap };
-            let top = total + offset + margin.top;
+            let mut top = total + offset + margin.top;
+            let mut left = inset.left + margin.left;
+            let mut width = width;
+            let mut drop = 0.;
+            // `plain` keeps sizing keywords and other alignments out of the other columns.
+            let align = self_align.unwrap_or(aligned).keyword;
+            if floating
+                && (sized_by.is_sizing_keyword()
+                    || sized_by.is_auto()
+                        && !matches!(
+                            align,
+                            AlignItemsKeyword::Normal | AlignItemsKeyword::Stretch
+                        ))
+            {
+                let mut probe = |space| {
+                    let probe = input(
+                        RunMode::ComputeSize,
+                        taffy::RequestedAxis::Horizontal,
+                        None,
+                        space,
+                    );
+                    self.compute(child, probe, None).size.width
+                };
+                let low = probe(taffy::AvailableSpace::MinContent);
+                let high = probe(taffy::AvailableSpace::MaxContent);
+                let room = line - margin.left - margin.right;
+                width = high
+                    .min(room)
+                    .max(low)
+                    .maybe_clamp(min, max)
+                    .max(sides.width);
+                left += match align {
+                    AlignItemsKeyword::Center => (room - width) / 2.,
+                    AlignItemsKeyword::End | AlignItemsKeyword::FlexEnd => room - width,
+                    _ => 0.,
+                };
+            }
+            let output = if floating {
+                let slot = &self.slots[usize::from(child)];
+                let (measured, lines) =
+                    (slot.measure.is_some(), slot.style.inline == Inline::Lines);
+                // A line box of one paragraph, maybe with absolute boxes like the inline-blocks of its lines.
+                let mut lines_of = slot
+                    .children
+                    .iter()
+                    .filter(|&&kid| flow(self.slots[usize::from(kid)].taffy()));
+                let leaf = lines
+                    .then(|| lines_of.next().filter(|_| lines_of.next().is_none()))
+                    .flatten()
+                    .copied()
+                    .filter(|&only| {
+                        let only = &self.slots[usize::from(only)];
+                        only.measure.is_some() && only.style.flow & Flow::FLOAT == 0
+                    });
+                if bits & (Flow::CLEAR_LEFT | Flow::CLEAR_RIGHT) != 0 {
+                    let clear = self.cleared(bits) - origin[1];
+                    if clear > top {
+                        (drop, top) = (clear - top, clear);
+                    }
+                }
+                let y = origin[1] + top;
+                self.floats.retain(|float| float[3] > y);
+                let beside = !self.floats.is_empty();
+                // `plain` keeps auto margins out of the other columns.
+                if auto_left || auto_right {
+                    let free = (line - width - margin.left - margin.right).max(0.);
+                    let share = match (auto_left, auto_right) {
+                        (true, true) => free / 2.,
+                        (true, false) => free,
+                        _ => 0.,
+                    };
+                    (margin.left, left) = (margin.left + share, left + share);
+                }
+                if bits & Flow::BLOCK != 0
+                    && (slot.floats || beside)
+                    && (measured || leaf.is_some() || !lines)
+                {
+                    if measured || leaf.is_some() {
+                        let target = leaf.unwrap_or(child);
+                        let own = self.slots[usize::from(target)].taffy();
+                        let [own_padding, own_border] = [own.padding, own.border]
+                            .map(|edges| edges.resolve_or_zero(Some(inner), calc));
+                        // A measured block is the target itself: `left` and `y` hold its margins already.
+                        let (outer, own_margin) = match leaf {
+                            Some(_) => (
+                                padding + border,
+                                own.margin.resolve_or_zero(Some(inner), calc),
+                            ),
+                            None => (taffy::Rect::zero(), taffy::Rect::zero()),
+                        };
+                        let within =
+                            width - outer.left - outer.right - own_margin.left - own_margin.right;
+                        let content = [
+                            origin[0]
+                                + left
+                                + outer.left
+                                + own_margin.left
+                                + own_padding.left
+                                + own_border.left,
+                            y + outer.top + own_margin.top + own_padding.top + own_border.top,
+                        ];
+                        let span = within
+                            - own_padding.left
+                            - own_padding.right
+                            - own_border.left
+                            - own_border.right;
+                        let scale = self.scale;
+                        let floats: Vec<[f32; 4]> = self
+                            .floats
+                            .iter()
+                            .filter(|float| float[3] > content[1])
+                            .filter_map(|float| {
+                                let sides = if float[4] == 0. {
+                                    [(float[2] - content[0]).max(0.), 0.]
+                                } else {
+                                    [0., (content[0] + span - float[0]).max(0.)]
+                                };
+                                (sides != [0.; 2]).then(|| {
+                                    [
+                                        float[1] - content[1],
+                                        float[3] - content[1],
+                                        sides[0],
+                                        sides[1],
+                                    ]
+                                    .map(|value| value / scale)
+                                })
+                            })
+                            .collect();
+                        let floats = (!floats.is_empty()).then(|| Rc::from(floats));
+                        let system = self.window.text_system().clone();
+                        *system.floats.borrow_mut() = floats;
+                        self.active = true;
+                        // Like a float, a full layout also when the parent only measures: lines beside floats can
+                        // measure to another height than they lay out.
+                        let full = input(
+                            RunMode::PerformLayout,
+                            taffy::RequestedAxis::Both,
+                            Some(within),
+                            taffy::AvailableSpace::Definite(within),
+                        );
+                        let output = self.compute(target, full, None);
+                        *system.floats.borrow_mut() = None;
+                        if leaf.is_some() {
+                            if perform {
+                                let mut layout = Layout::with_order(0);
+                                layout.size = output.size;
+                                layout.location = taffy::Point {
+                                    x: outer.left + own_margin.left,
+                                    y: outer.top + own_margin.top,
+                                };
+                                layout.padding = own_padding;
+                                layout.border = own_border;
+                                layout.margin = own_margin;
+                                self.set_unrounded_layout(target, &layout);
+                            }
+                            // The line box gets the place and the baselines of its lines.
+                            let row = &mut self.slots[usize::from(child)];
+                            row.cache.clear();
+                            let shift = outer.top + own_margin.top;
+                            row.baselines = Baselines {
+                                first: output.baselines.first.map(|base| base + shift),
+                                last: output.baselines.last.map(|base| base + shift),
+                            };
+                            let (contain, first) = (row.taffy().contain, row.baselines.first);
+                            let size = taffy::Size {
+                                width,
+                                height: output.size.height
+                                    + own_margin.top
+                                    + own_margin.bottom
+                                    + outer.top
+                                    + outer.bottom,
+                            };
+                            let mut output = finish(size, border, contain, first);
+                            output.baselines = self.slots[usize::from(child)].baselines;
+                            if perform {
+                                // Like `compute`, the line box places its absolute boxes.
+                                let mut candidates = taffy::OofCandidates::new();
+                                for (order, &kid) in
+                                    self.slots[usize::from(child)].children.iter().enumerate()
+                                {
+                                    if self.slots[usize::from(kid)].taffy().position
+                                        == taffy::Position::Absolute
+                                    {
+                                        let area = |start, end| taffy::AxisStaticPosition {
+                                            area: taffy::Line { start, end },
+                                            align: taffy::AxisStaticAlign::from_keyword(
+                                                taffy::AxisStaticEdge::Start,
+                                            ),
+                                        };
+                                        candidates.push(taffy::OofCandidate {
+                                            node: kid,
+                                            order: order as u32,
+                                            position: taffy::Position::Absolute,
+                                            static_position: taffy::Point {
+                                                x: area(outer.left, size.width - outer.right),
+                                                y: area(outer.top, size.height - outer.bottom),
+                                            },
+                                        });
+                                    }
+                                }
+                                output.oof_candidates = candidates;
+                                taffy::compute_oof_layout(self, child, &mut output);
+                            }
+                            output
+                        } else {
+                            output
+                        }
+                    } else {
+                        self.origin = [origin[0] + left, y];
+                        self.active = true;
+                        let output = self.compute(child, sized(width), None);
+                        self.origin = origin;
+                        output
+                    }
+                } else if beside {
+                    // A box that makes its own formatting context goes beside the floats, or below them where it
+                    // doesn't fit.
+                    let auto = sized_by.is_auto();
+                    let mut y = y;
+                    loop {
+                        // The room must hold the box over its whole height, which depends on its width.
+                        let (mut tall, mut placed) = (0f32, None);
+                        for _ in 0..3 {
+                            let (room, low) = self.beside(edges, y, tall);
+                            let [from, to] = [
+                                (edges[0] + margin.left).max(room[0]),
+                                (edges[1] - margin.right).min(room[1]),
+                            ];
+                            if auto {
+                                width = (to - from).maybe_clamp(min, max).max(sides.width);
+                            }
+                            left = from - origin[0];
+                            let output = self.compute(child, sized(width), None);
+                            let height = output.size.height;
+                            placed = Some((output, width <= to - from + 0.01, low));
+                            if height <= tall {
+                                break;
+                            }
+                            tall = height;
+                        }
+                        let Some((output, fits, low)) = placed else {
+                            unreachable!()
+                        };
+                        if fits || low == f32::INFINITY {
+                            break output;
+                        }
+                        (drop, y) = (drop + low - y, low);
+                        top = y - origin[1];
+                    }
+                } else {
+                    self.compute(child, sized(width), None)
+                }
+            } else {
+                self.compute(child, sized(width), None)
+            };
+            let height = output.size.height;
+            // Taffy's content sizes take a fixed height even below the padding, which the box itself doesn't.
+            if !floating && styled.tag() == CompactLength::LENGTH_TAG && styled.value() != height {
+                return None;
+            }
             if perform {
                 let mut layout = Layout::with_order(order as u32);
                 layout.size = taffy::Size { width, height };
-                layout.location = taffy::Point {
-                    x: inset.left + margin.left,
-                    y: top,
-                };
+                layout.location = taffy::Point { x: left, y: top };
+                // `plain` keeps insets out of the other columns.
+                if floating {
+                    let [x, y] = shift(offsets);
+                    (layout.location.x, layout.location.y) = (left + x, top + y);
+                }
                 layout.padding = padding;
                 layout.border = border;
                 layout.margin = margin;
@@ -2214,8 +3249,9 @@ impl LayoutTree<'_> {
                     first = Some(top + output.baselines.first.unwrap_or(height));
                 }
             }
-            total += offset + margins + height;
-            hypothetical += height + margins;
+            total += offset + margins + height + drop;
+            hypothetical += height + margins + drop;
+            contents += drop;
             contents += match available_space.height {
                 taffy::AvailableSpace::Definite(_) => (height + margins).max(sides.height),
                 _ => {
@@ -2242,6 +3278,15 @@ impl LayoutTree<'_> {
             grows |= grow > 0.;
             shrinks |= shrink > 0.;
             items += 1;
+        }
+        if let Some((floats, outer, ceiling, low)) = context {
+            // Like a formatting context root, the box holds its floats.
+            let reach = self.reach - inset.top - contents;
+            if reach > 0. {
+                contents += reach;
+                hypothetical += reach;
+            }
+            (self.floats, self.origin, self.ceiling, self.reach) = (floats, outer, ceiling, low);
         }
         let gaps = if items <= 1 {
             0.
@@ -2270,7 +3315,7 @@ impl LayoutTree<'_> {
                 | AlignContentKeyword::FlexStart
                 | AlignContentKeyword::Stretch
         );
-        if free != 0. && (!packed || free > 0. && grows || free < 0. && shrinks) {
+        if free != 0. && (!packed || free > 0. && grows || free < 0. && shrinks) && !floating {
             return None;
         }
         if !perform {
@@ -2313,6 +3358,58 @@ impl LayoutTree<'_> {
         let mut output = finish(size, border, contain, first);
         output.oof_candidates = candidates;
         Some(output)
+    }
+
+    /// Places a float with its margin box `size` at or below `y`, between `edges`, like CSS 2 9.5.1.
+    fn place(&mut self, edges: [f32; 2], size: [f32; 2], mut y: f32, bits: u8) -> [f32; 2] {
+        let right = bits & Flow::RIGHT != 0;
+        // The flow only moves down, so floats that ended above it can't touch this one or the boxes after it.
+        self.floats.retain(|float| float[3] > y);
+        y = y.max(self.ceiling).max(self.cleared(bits));
+        loop {
+            let (room, low) = self.beside(edges, y, size[1]);
+            if room[1] - room[0] >= size[0] - 0.01 || low == f32::INFINITY {
+                let x = if right { room[1] - size[0] } else { room[0] };
+                self.floats
+                    .push([x, y, x + size[0], y + size[1], f32::from(u8::from(right))]);
+                (self.ceiling, self.reach) = (self.ceiling.max(y), self.reach.max(y + size[1]));
+                return [x, y];
+            }
+            y = low;
+        }
+    }
+
+    /// The room between the floats beside `y..y + height`, and the first bottom of those floats.
+    fn beside(&self, edges: [f32; 2], y: f32, height: f32) -> ([f32; 2], f32) {
+        self.floats
+            .iter()
+            .fold((edges, f32::INFINITY), |(room, low), float| {
+                if float[1] < y + height.max(0.01) && float[3] > y {
+                    let room = match float[4] == 0. {
+                        true => [room[0].max(float[2]), room[1]],
+                        false => [room[0], room[1].min(float[0])],
+                    };
+                    (room, low.min(float[3]))
+                } else {
+                    (room, low)
+                }
+            })
+    }
+
+    /// The bottom of the floats that `bits` clears.
+    fn cleared(&self, bits: u8) -> f32 {
+        self.floats.iter().fold(f32::NEG_INFINITY, |bottom, float| {
+            let side = if float[4] == 0. {
+                Flow::CLEAR_LEFT
+            } else {
+                Flow::CLEAR_RIGHT
+            };
+            if bits & side != 0 {
+                bottom.max(float[3])
+            } else {
+                bottom
+            }
+        })
     }
 
     fn hide(&mut self, child: NodeId, order: usize) {
@@ -2481,12 +3578,14 @@ impl LayoutTree<'_> {
     fn measure(&mut self, index: usize, inputs: LayoutInput) -> LayoutOutput {
         let scale = self.scale;
         let window = &mut *self.window;
+        let banded = window.text_system().floats.borrow().is_some();
         let Slot {
             stretched,
             measure,
             style,
             text,
             measured: kept,
+            banded: was,
             ..
         } = &mut self.slots[index];
         let taffy = stretched.as_deref().unwrap_or(&style.taffy);
@@ -2529,8 +3628,11 @@ impl LayoutTree<'_> {
                 size
             },
         );
-        let remeasured = inputs.run_mode == RunMode::PerformLayout
-            && content.is_some_and(|content| mem::replace(kept, content) != content);
+        let perform = inputs.run_mode == RunMode::PerformLayout;
+        let remeasured =
+            perform && content.is_some_and(|content| mem::replace(kept, content) != content);
+        // Lines beside floats can change without a new size, and the place of each line comes from prepaint.
+        let rebanded = perform && content.is_some() && (mem::replace(was, banded) || banded);
         if let Some([first, last]) = baselines.filter(|_| style.baseline != Baseline::None) {
             let top = padding.top + border.top;
             output.baselines = Baselines {
@@ -2538,7 +3640,9 @@ impl LayoutTree<'_> {
                 last: Some(last.0 * scale + top),
             };
         }
-        if remeasured {
+        if rebanded {
+            changed(self.slots, index);
+        } else if remeasured {
             unfar(self.slots, index);
         }
         output
@@ -2884,6 +3988,27 @@ mod tests {
 
     fn slot(tree: &Tree, id: usize) -> &super::Slot {
         &tree.slots[tree.index(id.into()).unwrap() as usize]
+    }
+
+    #[test]
+    fn column_and_break_styles_intern_apart() {
+        let mut styles = super::Interned::<super::Styled>::default();
+        let mut style = crate::Style::default();
+        let plain = styles.styled(style.clone(), 2.);
+        style.breaks = crate::Break::AVOID_INSIDE;
+        let avoid = styles.styled(style.clone(), 2.);
+        style.columns = Some(Box::new(crate::Columns {
+            count: 2,
+            gap: px(10.),
+            height: None,
+            fill: false,
+        }));
+        let set = styles.styled(style.clone(), 2.);
+        style.text.set_lines_kept([3, 2]);
+        let kept = styles.styled(style, 2.);
+        assert!(!std::rc::Rc::ptr_eq(&plain, &avoid));
+        assert!(!std::rc::Rc::ptr_eq(&avoid, &set));
+        assert!(!std::rc::Rc::ptr_eq(&set, &kept));
     }
 
     #[test]

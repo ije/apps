@@ -706,6 +706,8 @@ pub struct State {
     pub(crate) detached: Vec<usize>,
     live: rustc_hash::FxHashSet<usize>,
     pub bounds: LayoutMirror,
+    // The parts of boxes that columns split, which take pointer events.
+    pub(crate) fragments: rustc_hash::FxHashMap<usize, Box<[[f32; 4]]>>,
     pub(crate) text_layouts: rustc_hash::FxHashMap<usize, TextLayout>,
     pub scroll: rustc_hash::FxHashMap<usize, renderer::ScrollRef>,
     scroll_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
@@ -1541,6 +1543,7 @@ pub fn call(
                 }
                 doc.nodes[id] = Node::default();
                 state.bounds.remove(&id);
+                state.fragments.remove(&id);
                 state.cull.widths.remove(&id);
                 state.text_layouts.remove(&id);
                 state.scroll.remove(&id);
@@ -3517,13 +3520,24 @@ pub(crate) fn hit_test(
                     + (top - y).max(0.).max(y - top - height).powi(2);
                 nearest.push((id, distance));
             }
+            let within = |[left, top, width, height]: [f32; 4]| {
+                width > 0.
+                    && height > 0.
+                    && x >= left
+                    && x < left + width
+                    && y >= top
+                    && y < top + height
+            };
             if (caret || !node.tag.starts_with('#'))
-                && width > 0.
-                && height > 0.
-                && x >= left
-                && x < left + width
-                && y >= top
-                && y < top + height
+                && match state.fragments.is_empty() {
+                    true => within([left, top, width, height]),
+                    false => state
+                        .fragments
+                        .get(&id)
+                        .map_or(within([left, top, width, height]), |parts| {
+                            parts.iter().copied().any(within)
+                        }),
+                }
                 && selectable
             {
                 pending.push((id, clip, true, depth));

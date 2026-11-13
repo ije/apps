@@ -749,6 +749,9 @@
   };
   const layers = value => { const out = []; let depth = 0, start = 0; for (let i = 0; i < value.length; i++) { const c = value[i]; if (c === '(') depth++; else if (c === ')') depth--; else if (c === ',' && !depth) { out.push(value.slice(start, i).trim()); start = i + 1; } } out.push(value.slice(start).trim()); return out; };
   const shorthandValue = (name, values, parts) => {
+    if (name === 'border-image') return values.every(value => value === values[0]) && /^(inherit|initial|unset|revert|revert-layer)$/.test(values[0]) ? values[0] : values.join() === 'none,100%,1,0,stretch' ? 'none' : `${values[0]} ${values[1]} / ${values[2]} / ${values[3]} ${values[4]}`;
+    // `border` resets `border-image-source`, so it serializes only when that is `none`.
+    if (name === 'border' && parts.length === 13) { const source = values.splice(12)[0]; if (source !== 'none' && source !== values[0]) return ''; parts = parts.slice(0, 12); }
     if (name === 'border-radius') { const axes = [0, 1].map(axis => shorthandValue('margin', values.map(value => { const both = value.split(' '); return both[axis] ?? both[0]; }), ['margin-top'])); return axes[0] === axes[1] ? axes[0] : axes.join(' / '); }
     if (parts.length > 3 && parts.length % 3 === 0 && /-width$/.test(parts[0]) && /-style$/.test(parts[1])) { const first = values.slice(0, 3).join(); for (let i = 3; i < values.length; i += 3) if (values.slice(i, i + 3).join() !== first) return ''; return shorthandValue(name, values.slice(0, 3), parts.slice(0, 3)); }
     if (parts.length === 3 && /-width$/.test(parts[0]) && /-style$/.test(parts[1])) { const kept = values.filter((value, index) => value !== ['3px', 'none', 'currentcolor'][index]); return (name === 'outline' ? kept.reverse() : kept).join(' ') || 'none'; }

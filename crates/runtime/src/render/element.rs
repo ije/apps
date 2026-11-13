@@ -31,6 +31,8 @@ pub(super) struct Build<'a> {
     pub(super) ids: &'a Rc<super::effects::Ids>,
     pub(super) info: &'a [cull::Info],
     pub(super) zone: Option<Rc<cull::Zone>>,
+    // Inside a multi-column box, where boxes take break flags.
+    pub(super) columned: bool,
     pub(super) top_layer: &'a [usize],
     pub(super) tree: &'a renderer::Tree,
     pub(super) culls: &'a std::cell::Cell<usize>,
@@ -135,6 +137,7 @@ pub(super) struct Patch {
     pub(super) container: [f32; 2],
     pub(super) slot: Option<([f32; 4], super::grid::Grid)>,
     pub(super) flex_parent: bool,
+    pub(super) columned: bool,
     pub(super) perspective: Option<(f32, String)>,
     pub(super) value: u64,
 }
@@ -172,6 +175,7 @@ pub(super) struct Call {
     containing: [f32; 2],
     container: [f32; 2],
     flex_parent: bool,
+    columned: bool,
     cell: Option<(bool, bool, u64)>,
 }
 
@@ -966,6 +970,7 @@ pub(super) fn element(
         },
         container,
         flex_parent: build.flex_parent,
+        columned: build.columned,
         cell: slot.as_ref().map(|(_, grid)| {
             use std::hash::{Hash, Hasher};
             let mut tracks = rustc_hash::FxHasher::default();
@@ -998,7 +1003,9 @@ pub(super) fn element(
             break 'keep None;
         };
         let cell = slot.as_ref().map(|(bounds, _)| [bounds[2], bounds[3]]);
+        // A float is never culled, so it stays kept far from the view.
         if !record.culled
+            && float_side(&build.styles.values[id]).is_none()
             && let Some(zone) = &build.zone
         {
             let margin = build.styles.lengths[id].viewport[1];
@@ -1095,6 +1102,7 @@ pub(super) fn element(
         container,
         slot: slot.clone(),
         flex_parent: build.flex_parent,
+        columned: build.columned,
         perspective: build.perspective.clone(),
         value: hashed(&build.doc.nodes[id].value),
     });
@@ -1184,6 +1192,7 @@ pub(super) fn repaint(build: &Build<'_>, id: usize) -> Option<renderer::Node> {
     let place = Build {
         ancestors: ancestors.clone(),
         flex_parent,
+        columned: old.call.columned,
         perspective: None,
         zone: None,
         #[cfg(debug_assertions)]
@@ -1361,6 +1370,7 @@ fn create(
         ids,
         info,
         ref zone,
+        columned,
         top_layer,
         culls,
         reads,
@@ -1416,14 +1426,22 @@ fn create(
     // clip.
     let stacking = id == 0 || composited || made.stacking || layered;
     let chain: Rc<[usize]> = ancestors.iter().copied().chain([id]).collect();
+    // A column width can give columns for a wider content box than the containing one, so it always counts here.
+    let multicol = columns(style, &units, containing[0]).is_some()
+        || style
+            .get(Prop::COLUMN_WIDTH)
+            .is_some_and(|value| value != "auto");
     let child_build = Build {
+        columned: columned || multicol,
         #[cfg(debug_assertions)]
         extra: Default::default(),
         #[cfg(debug_assertions)]
         plan: Default::default(),
+        // Columns move boxes away from their flow, and a spacer for a box could not break between columns.
         zone: zone
             .as_ref()
             .filter(|_| info[id].flags & (cull::CHANGED | cull::MOVES_CONTENT) == 0)
+            .filter(|_| !multicol)
             .and_then(|zone| {
                 if style
                     .get(Prop::OVERFLOW_Y)
@@ -1836,6 +1854,7 @@ fn create(
             container.map(f32::to_bits),
             block_size.is_some(),
             flex_parent,
+            columned,
             info[id].flags & !(cull::CHANGED | cull::CHILDREN_CHANGED | cull::GEOMETRY_CHANGED),
             (all_inline, node.children.is_empty(), texted),
         )
@@ -1893,6 +1912,62 @@ fn create(
                 "fixed" => renderer::Escape::FIXED,
                 _ => 0,
             };
+            // Only boxes in columns break, so others skip these reads.
+            if columned {
+                use renderer::Break;
+                for (props, forced, avoid) in [
+                    (
+                        [Prop::BREAK_BEFORE, Prop::PAGE_BREAK_BEFORE],
+                        Break::BEFORE,
+                        Break::AVOID_BEFORE,
+                    ),
+                    (
+                        [Prop::BREAK_AFTER, Prop::PAGE_BREAK_AFTER],
+                        Break::AFTER,
+                        Break::AVOID_AFTER,
+                    ),
+                    (
+                        [Prop::BREAK_INSIDE, Prop::PAGE_BREAK_INSIDE],
+                        0,
+                        Break::AVOID_INSIDE,
+                    ),
+                ] {
+                    match props.iter().find_map(|&prop| style.get(prop)) {
+                        Some("column") => el.style().breaks |= forced,
+                        Some(value) if value.starts_with("avoid") => el.style().breaks |= avoid,
+                        _ => {}
+                    }
+                }
+                if matches!(
+                    node.tag.as_str(),
+                    "img"
+                        | "svg"
+                        | "canvas"
+                        | "video"
+                        | "audio"
+                        | "iframe"
+                        | "embed"
+                        | "object"
+                        | "input"
+                        | "textarea"
+                        | "select"
+                        | "button"
+                        | "meter"
+                        | "progress"
+                        | "webview"
+                ) {
+                    el.style().breaks |= Break::WHOLE;
+                }
+                let kept = [Prop::ORPHANS, Prop::WIDOWS].map(|prop| {
+                    style
+                        .get(prop)
+                        .and_then(|value| value.parse::<u8>().ok())
+                        .unwrap_or(2)
+                });
+                if kept != [2, 2] {
+                    el.text_style().set_lines_kept(kept);
+                }
+            }
             {
                 let text = el.text_style();
                 text.set_letter_spacing(parsed.spacing[0]);
@@ -2583,7 +2658,10 @@ fn create(
         });
     }
     if hit.is_none()
-        && let Some(ink) = parsed.ink
+        && let Some(ink) = style
+            .get(Prop::WEBKIT_TEXT_FILL_COLOR)
+            .and_then(style::color)
+            .or(parsed.ink)
     {
         el = el.text_color(style::rgba(ink));
     }
@@ -2599,6 +2677,12 @@ fn create(
         && !matches!(position, "absolute" | "fixed");
     let mut inline_fill = renderer::Color::TRANSPARENT;
     let mut clipped_fill = None;
+    // With `background-clip: text`, the background paints in one layer that shows through the text.
+    let text_clip = !matches!(node.tag.as_str(), "html" | "body")
+        && style
+            .get(Prop::BACKGROUND_CLIP)
+            .is_some_and(|value| value.contains("text"));
+    let mut text_fill = None;
     // The root element paints the background of the canvas, also when it comes from the body.
     let source = matches!(node.tag.as_str(), "html" | "body")
         .then(|| super::background::canvas_source(doc, styles))
@@ -2633,6 +2717,8 @@ fn create(
             .get((layers.max(1) - 1) % clips.len().max(1))
             .map_or("", |clip| clip.trim());
         if blended {
+        } else if text_clip {
+            text_fill = Some(color);
         } else if inline_box {
             inline_fill = color;
         } else if matches!(clip, "padding-box" | "content-box") {
@@ -2801,7 +2887,11 @@ fn create(
             el = el.mt(px(margin[0])).mb(px(margin[2]));
         }
         let same = border_colors.iter().all(|color| *color == border_colors[0]);
-        let border = if same && borders.iter().any(|width| *width > 0.) {
+        // A border image replaces the normal border.
+        let imaged = style
+            .get(Prop::BORDER_IMAGE_SOURCE)
+            .is_some_and(|value| value != "none");
+        let border = if same && !imaged && borders.iter().any(|width| *width > 0.) {
             border_colors[0]
         } else {
             renderer::Color::TRANSPARENT
@@ -3131,6 +3221,13 @@ fn create(
         borders[0] = height;
         border_colors = [renderer::Color::TRANSPARENT; 4];
         border_kinds = ["solid"; 4];
+    }
+    let border_image = hit
+        .is_none()
+        .then(|| super::background::border_image(style, units, id, 0, borders, view))
+        .flatten();
+    if border_image.is_some() {
+        border_colors = [renderer::Color::TRANSPARENT; 4];
     }
     if hit.is_none() {
         el = el
@@ -3977,6 +4074,31 @@ fn create(
         );
     }
     let layers = canvas.map_or(style, |source| &styles.values[source]);
+    let mut background = Vec::new();
+    if let Some(color) = text_fill {
+        background.push(
+            renderer::canvas(
+                |_, _| (),
+                move |bounds, _, window| {
+                    let outer = Rect::between(
+                        bounds.origin - point(px(borders[3]), px(borders[0])),
+                        bounds.bottom_right() + point(px(borders[1]), px(borders[2])),
+                    );
+                    window.draw_box(
+                        outer,
+                        radius.resolve(outer.size),
+                        color,
+                        renderer::Border::default(),
+                    );
+                },
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .into(),
+        );
+    }
     if !propagated
         && layers
             .get(Prop::BACKGROUND_IMAGE)
@@ -3988,7 +4110,7 @@ fn create(
             .dom
             .get(&view.id)
             .and_then(|state| state.base.clone());
-        el = el.children(css_background(
+        background.extend(css_background(
             layers,
             canvas.map_or(units, |source| styles.lengths[source]),
             id,
@@ -4005,9 +4127,29 @@ fn create(
             canvas.is_some(),
         ));
     }
+    if text_clip {
+        el = el.child(
+            renderer::node()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .children(background)
+                .hooks(super::paint::Effected {
+                    effect: renderer::PaintEffect {
+                        text_mask: true,
+                        ..Default::default()
+                    },
+                    backdrop: None,
+                }),
+        );
+    } else {
+        el = el.children(background);
+    }
     if !inner_shadows.is_empty() {
         el = el.child(inset_shadows(inner_shadows, radius, borders));
     }
+    el = el.children(border_image);
     el = el.children(field_layer);
     if cfg!(target_os = "macos")
         && let Some(symbol) = symbol
@@ -4812,6 +4954,17 @@ fn create(
                 && floated.is_none()
                 && !own.starts_with("inline")
                 && (all_inline || display == "inline");
+            // In a column, layout places the float. In a line, it goes to its side of the first line.
+            let column = !all_inline && display != "inline" && !flexbox;
+            if !absolute {
+                decoration.style().flow = clear_bits(pseudo)
+                    | match floated {
+                        Some(true) if column => renderer::Flow::RIGHT,
+                        Some(false) if column => renderer::Flow::LEFT,
+                        _ => 0,
+                    };
+            }
+            let floated = floated.filter(|_| !column);
             if floated.is_some() {
                 decoration.style().align_self = Some(renderer::AlignItems::FlexStart);
             }
@@ -4877,8 +5030,18 @@ fn create(
                     .and_then(style::color)
                     .map_or(ink, style::rgba)
             });
+            let border_image = super::background::border_image(
+                pseudo,
+                pseudo_units,
+                id,
+                index + 1,
+                pseudo_borders,
+                view,
+            );
             let mut shown = (0..4).filter(|&side| pseudo_borders[side] > 0.);
-            if let Some(first) = shown.next() {
+            if border_image.is_some() {
+                decoration = decoration.border_color(renderer::Color::TRANSPARENT);
+            } else if let Some(first) = shown.next() {
                 if shown.all(|side| colors[side] == colors[first]) {
                     decoration = decoration.border_color(colors[first]);
                 } else {
@@ -5090,6 +5253,7 @@ fn create(
                 decoration =
                     decoration.child(inset_shadows(pseudo_shadows, pseudo_radius, pseudo_borders));
             }
+            decoration = decoration.children(border_image);
             let blank = words.trim_ascii().is_empty();
             let collapsed = blank
                 && pseudo
@@ -5460,7 +5624,12 @@ fn create(
                     };
             }
         }
-        let paragraph = renderer::Node::from(InlineText {
+        // The floats of the paragraph come first, so layout places them before its lines.
+        for &child in flat.iter().filter(|&&child| floated(child)) {
+            let float = element(build, child, content_box(), container, None);
+            el = el.child(float);
+        }
+        let mut paragraph = renderer::Node::from(InlineText {
             data: data.clone(),
             atoms: atom_slots.clone(),
             view: view.clone(),
@@ -5494,7 +5663,28 @@ fn create(
             && style
                 .get(Prop::WRITING_MODE)
                 .is_none_or(|mode| mode.starts_with("horizontal"));
-        el = if alone {
+        paragraph.style().flow = renderer::Flow::BLOCK;
+        // Text straight in a multi-column box breaks between its rows.
+        let multicol = (flow && data.atoms.is_empty())
+            .then(|| {
+                let content = content_box();
+                columns(style, &units, content[0])
+                    .filter(|_| multicol)
+                    .map(|set| (set, content))
+            })
+            .flatten();
+        el = if let Some(((count, gap, rule), content)) = multicol {
+            let paragraph = paragraph.min_w(px(0.)).flex_shrink(1.);
+            el.child(column_set(
+                style,
+                content,
+                count,
+                gap,
+                rule,
+                true,
+                [paragraph],
+            ))
+        } else if alone {
             el.adopt(paragraph)
         } else {
             el.child(
@@ -5673,7 +5863,7 @@ fn create(
                 tracked[0] = Some((content[0], horizontal));
                 // A table is never narrower than its content, which also sets the minimum of flex items.
                 // A `<table>` box scrolls the table inside, so it can be narrower.
-                if matches!(style::role(styles, id), 1 | 2 | 10..)
+                if matches!(style::role(styles, id), 1 | 2 | 10..=12)
                     && style.get(Prop::MIN_WIDTH).is_none()
                 {
                     let [min, ..] = super::grid::intrinsic(
@@ -5883,20 +6073,22 @@ fn create(
                     || !node.tag.starts_with('#') && node.tag != "br" && inline_level(child)
             })
         };
-        let multicol = columns(style, &units, content[0]);
+        let multicol = columns(style, &units, content[0]).filter(|_| multicol);
         let mut line: Option<renderer::Node> = None;
         let mut lone = (0, None);
         let mut line_strut = false;
         let mut joined = usize::MAX;
         let mut floating = Vec::new();
-        let mut group: Option<(Vec<Child>, Vec<Child>, Vec<Child>)> = None;
         let columns = multicol.filter(|_| flow && grid.is_none() && !all_inline);
         let mut collected: Vec<(Option<usize>, Child)> = Vec::new();
         let shown = |index: usize| {
             // Columns only size and paint the cells of a table.
             if grid.is_some()
                 && style::table_box(style::role(styles, id))
-                && matches!(doc.nodes[children[index]].tag.as_str(), "col" | "colgroup")
+                && (matches!(doc.nodes[children[index]].tag.as_str(), "col" | "colgroup")
+                    || styles.values[children[index]]
+                        .get(Prop::DISPLAY)
+                        .is_some_and(|v| v.starts_with("table-column")))
             {
                 return false;
             }
@@ -5944,7 +6136,8 @@ fn create(
                         .get(Prop::JUSTIFY_CONTENT)
                         .is_none_or(|v| matches!(v, "normal" | "flex-start" | "start" | "stretch"))
             } else {
-                flow && !children.iter().any(|&child| floated(child))
+                // Floats are uncullable, so a run of blocks becomes a spacer only between them.
+                flow
             };
         plans = if info[id].flags & cull::MOVES_CONTENT != 0 {
             u8::MAX
@@ -6125,48 +6318,15 @@ fn create(
         macro_rules! place {
             ($element:expr, $child:expr) => {{
                 let element: renderer::Child = $element.into();
-                if std::mem::take(&mut strut_next) && group.is_none() && columns.is_none() {
+                if std::mem::take(&mut strut_next) && columns.is_none() {
                     el = el.child(strut());
                 }
                 if std::mem::take(&mut strut_due) {
                     el = el.child(strut());
                 }
-                match group.as_mut() {
-                    Some((_, _, content)) => content.push(element),
-                    None if columns.is_some() => collected.push(($child, element)),
+                match columns {
+                    Some(_) => collected.push(($child, element)),
                     None => el.push(element),
-                }
-            }};
-        }
-        macro_rules! close_group {
-            () => {{
-                if let Some(open) = line.take() {
-                    place!(open, None);
-                }
-                if let Some((lefts, rights, content)) = group.take() {
-                    // Floats that don't fit wrap to a new row below, like in Chrome. The content column has no
-                    // basis, so it stays on the last row of left floats.
-                    let row = renderer::node()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .items_start()
-                        .w_full()
-                        .children(lefts)
-                        .child(
-                            renderer::node()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .children(content),
-                        )
-                        .children(rights.into_iter().rev());
-                    if columns.is_some() {
-                        collected.push((None, row.into()));
-                    } else {
-                        el = el.child(row);
-                    }
                 }
             }};
         }
@@ -6313,46 +6473,13 @@ fn create(
                     }
                     _ => child_element,
                 };
-                if grid.is_none() && !out_of_flow {
-                    let clear = child_style.get(Prop::CLEAR).unwrap_or("none");
-                    if group.is_some() && clear != "none" {
-                        close_group!();
+                // A float is a box of the column, and layout places it beside the lines and blocks after it.
+                if floated(child) {
+                    if let Some(open) = line.take() {
+                        place!(open, None);
                     }
-                    if floated(child) {
-                        if let Some(open) = line.take() {
-                            place!(open, None);
-                        }
-                        let open = group.get_or_insert_with(Default::default);
-                        // A wrapper also keeps a float with negative side margins from pulling the line in:
-                        // lines avoid only the part of its margin box that is past the content edge.
-                        let float = if child_style
-                            .get(Prop::WIDTH)
-                            .is_none_or(|value| value == "auto")
-                            || [Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT].iter().any(|&prop| {
-                                child_style
-                                    .get(prop)
-                                    .is_some_and(|value| value.starts_with('-'))
-                            }) && !child_style
-                                .get(Prop::WIDTH)
-                                .is_some_and(|value| value.contains('%'))
-                        {
-                            renderer::node()
-                                .flex()
-                                .flex_col()
-                                .flex_shrink(1.)
-                                .min_w(px(0.))
-                                .child(child_element)
-                                .into()
-                        } else {
-                            child_element
-                        };
-                        if float_side(child_style) == Some(true) {
-                            open.1.push(float);
-                        } else {
-                            open.0.push(float);
-                        }
-                        continue;
-                    }
+                    place!(child_element, None);
+                    continue;
                 }
                 if flow
                     && grid.is_none()
@@ -6501,7 +6628,7 @@ fn create(
                     }
                 } else if out_of_flow {
                     // In place, out-of-flow boxes paint in tree order with the positioned boxes around them.
-                    if line.is_none() && group.is_none() && columns.is_none() {
+                    if line.is_none() && columns.is_none() {
                         el.push(child_element);
                     } else {
                         floating.push(child_element);
@@ -6523,7 +6650,7 @@ fn create(
                     } else {
                         (child_element, false)
                     };
-                    let direct = group.is_none() && columns.is_none();
+                    let direct = columns.is_none();
                     if display == "inline" && !doc.nodes[child].tag.starts_with('#') {
                         lone = (lone.0 + 1, percent_width(&child_element).flatten());
                     }
@@ -6535,7 +6662,9 @@ fn create(
                 }
             }
         }
-        close_group!();
+        if let Some(open) = line.take() {
+            place!(open, None);
+        }
         // An inline box around one box with a percent width must not stand between that box and the line.
         if let (1, Some(share)) = lone
             && hit.is_none()
@@ -6550,74 +6679,26 @@ fn create(
             reader.plan.replace(culled_ids.into());
         }
         if let Some((count, gap, rule)) = columns {
-            let width = ((content[0] - gap * (count - 1) as f32) / count as f32).max(0.);
-            let heights: Vec<f32> = collected
-                .iter()
-                .map(|(child, _)| {
-                    child.map_or(units.font.lh, |child| {
-                        super::grid::intrinsic(
-                            doc,
-                            child,
-                            styles,
-                            Some(width),
-                            None,
-                            text,
-                            &mut measured.borrow_mut(),
-                        )[3]
-                    })
-                })
-                .collect();
             // A `column-span: all` child splits the columns into sets above and below it.
-            let mut set: Vec<(Child, f32)> = Vec::new();
-            let mut items = collected.into_iter().zip(heights).peekable();
-            while let Some(((child, item), height)) = items.next() {
-                let spans = child.is_some_and(|child| {
-                    styles.values[child].get(Prop::COLUMN_SPAN) == Some("all")
-                });
-                let spanner = if spans {
-                    Some(item)
-                } else {
-                    set.push((item, height));
-                    None
-                };
-                if spanner.is_none() && items.peek().is_some() {
+            let spanner = |child: &Option<usize>| {
+                child
+                    .is_some_and(|child| styles.values[child].get(Prop::COLUMN_SPAN) == Some("all"))
+            };
+            let alone = !collected.iter().any(|(child, _)| spanner(child));
+            let mut set = Vec::new();
+            for (child, item) in collected {
+                if !spanner(&child) {
+                    set.push(item);
                     continue;
                 }
-                if set.is_empty() {
-                    el = el.children(spanner);
-                    continue;
+                if !set.is_empty() {
+                    let items = std::mem::take(&mut set);
+                    el = el.child(column_set(style, content, count, gap, rule, alone, items));
                 }
-                let target = set.iter().map(|(_, height)| height).sum::<f32>() / count as f32;
-                let mut columns: Vec<Vec<Child>> = (0..count).map(|_| Vec::new()).collect();
-                let (mut column, mut filled) = (0, 0.);
-                for (item, height) in set.drain(..) {
-                    if filled > 0. && filled + height / 2. > target && column + 1 < count {
-                        column += 1;
-                        filled = 0.;
-                    }
-                    filled += height;
-                    columns[column].push(item);
-                }
-                let mut row = renderer::node()
-                    .flex()
-                    .flex_row()
-                    .items_start()
-                    .w_full()
-                    .gap_x(px(gap));
-                for items in columns {
-                    row = row.child(
-                        renderer::node()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .children(items),
-                    );
-                }
-                if let Some((rule_width, color, kind)) = rule {
-                    row = row.child(column_rules(count, gap, rule_width, color, kind));
-                }
-                el = el.child(row).children(spanner);
+                el = el.child(item);
+            }
+            if !set.is_empty() {
+                el = el.child(column_set(style, content, count, gap, rule, alone, set));
             }
         }
         el = el.children(floating);
@@ -6789,7 +6870,7 @@ fn create(
         .get(Prop::WRITING_MODE)
         .filter(|mode| mode.starts_with("vertical") || mode.starts_with("sideways"))
         .filter(|_| id != 0 && !node.tag.starts_with('#') && slot.is_none());
-    let el = match vertical {
+    let mut el = match vertical {
         Some(mode) => {
             let [_, widest, ..] = super::grid::intrinsic(
                 doc,
@@ -6831,6 +6912,7 @@ fn create(
         None => el,
     };
     let hooks = DomBox {
+        text_clip,
         placed: Default::default(),
         offset: Default::default(),
         frame: node.tag == "iframe",
@@ -6909,10 +6991,9 @@ fn create(
             let mut rows: Vec<(usize, Vec<usize>)> = Vec::new();
             let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
             for &cell in &node.children {
-                let Some(row) = doc.nodes[cell]
-                    .parent
-                    .filter(|&row| row != id && style::role(styles, row) == style::ROW)
-                else {
+                let Some(row) = doc.nodes[cell].parent.filter(|&row| {
+                    row != id && (style::ROW..=style::FOOTER).contains(&style::role(styles, row))
+                }) else {
                     continue;
                 };
                 match rows.last_mut() {
@@ -6980,6 +7061,43 @@ fn create(
             ),
         )
     )));
+    if hit.is_none() {
+        let mut flow = clear_bits(style);
+        let placed =
+            !flex_parent && slot.is_none() && matches!(position, "static" | "relative" | "sticky");
+        let root = node
+            .parent
+            .is_none_or(|parent| doc.nodes[parent].tag.starts_with('#'));
+        match float_side(style) {
+            Some(right) if placed => {
+                flow |= if right {
+                    renderer::Flow::RIGHT
+                } else {
+                    renderer::Flow::LEFT
+                };
+            }
+            // A block that makes no formatting context of its own: floats around it reach into it.
+            None if placed
+                && !root
+                && matches!(display, "block" | "list-item")
+                && el.style_ref().overflow.x == renderer::Overflow::Visible
+                && el.style_ref().overflow.y == renderer::Overflow::Visible
+                && (el.style_ref().flex_direction == renderer::FlexDirection::Column
+                    || el.style_ref().inline == renderer::Inline::Lines)
+                && style.get(Prop::CONTAIN).is_none_or(|value| value == "none")
+                && style
+                    .get(Prop::COLUMN_COUNT)
+                    .is_none_or(|value| value == "auto")
+                && style
+                    .get(Prop::COLUMN_WIDTH)
+                    .is_none_or(|value| value == "auto") =>
+            {
+                flow |= renderer::Flow::BLOCK;
+            }
+            _ => {}
+        }
+        el.style().flow |= flow;
+    }
     let mut element = el.hooks(hooks);
     // Like Chrome, positioned boxes and stacking contexts with `z-index: auto` or 0 paint after the in-flow
     // boxes of their stacking context, in tree order.
@@ -7744,9 +7862,24 @@ fn margin_collapses_through(build: &Build<'_>, id: usize, side: usize, width: f3
             .get(Prop::DISPLAY)
             .is_some_and(|value| matches!(value, "block" | "list-item"))
         && float_side(style).is_none()
+        // A pseudo-element in the flow, like a clearfix, holds the margin of its side.
+        && styles.pseudos.get(&id).is_none_or(|pseudos| {
+            let pseudo = &pseudos[side / 2];
+            pseudo
+                .get(Prop::CONTENT)
+                .is_none_or(|value| matches!(value, "none" | "normal"))
+                || pseudo.get(Prop::DISPLAY) == Some("none")
+                || pseudo
+                    .get(Prop::POSITION)
+                    .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+        })
         && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
             .into_iter()
             .all(|key| style.get(key).is_none_or(|value| value == "visible"))
+        // A multi-column box holds the margins of its content.
+        && [Prop::COLUMN_COUNT, Prop::COLUMN_WIDTH]
+            .into_iter()
+            .all(|key| style.get(key).is_none_or(|value| value == "auto"))
         && style
             .get(Prop::POSITION)
             .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
@@ -7872,6 +8005,20 @@ pub(super) fn overscroll(style: &style::Style) -> renderer::Point<renderer::Over
     )
 }
 
+fn clear_bits(style: &style::Style) -> u8 {
+    let rtl = style.get(Prop::DIRECTION) == Some("rtl");
+    match style.get(Prop::CLEAR) {
+        Some("left") => renderer::Flow::CLEAR_LEFT,
+        Some("right") => renderer::Flow::CLEAR_RIGHT,
+        Some("both") => renderer::Flow::CLEAR_LEFT | renderer::Flow::CLEAR_RIGHT,
+        Some("inline-start") if rtl => renderer::Flow::CLEAR_RIGHT,
+        Some("inline-start") => renderer::Flow::CLEAR_LEFT,
+        Some("inline-end") if rtl => renderer::Flow::CLEAR_LEFT,
+        Some("inline-end") => renderer::Flow::CLEAR_RIGHT,
+        _ => 0,
+    }
+}
+
 fn float_side(style: &style::Style) -> Option<bool> {
     let rtl = style.get(Prop::DIRECTION) == Some("rtl");
     match style.get(Prop::FLOAT) {
@@ -7896,6 +8043,9 @@ fn columns(
     let column_width = style
         .get(Prop::COLUMN_WIDTH)
         .and_then(|value| units.resolve(value, width));
+    if count.is_none() && column_width.is_none() {
+        return None;
+    }
     let gap = style
         .get(Prop::COLUMN_GAP)
         .filter(|value| *value != "normal")
@@ -7932,6 +8082,40 @@ fn columns(
         })
         .filter(|(width, ..)| *width > 0.);
     Some((count, gap, rule))
+}
+
+// A set of columns: its first child holds the flow of content, as wide as one column, which the renderer breaks.
+fn column_set(
+    style: &style::Style,
+    content: [f32; 2],
+    count: usize,
+    gap: f32,
+    rule: Option<ColumnRule>,
+    alone: bool,
+    items: impl IntoIterator<Item = impl Into<Child>>,
+) -> renderer::Node {
+    // A height or max-height limits the columns, which then overflow to the right.
+    let fixed = style.get(Prop::HEIGHT).is_some_and(|value| value != "auto");
+    let limited = fixed
+        || style
+            .get(Prop::MAX_HEIGHT)
+            .is_some_and(|value| value != "none");
+    let mut set = renderer::node().flex().flex_col().w_full().flex_shrink_0();
+    set.style().columns = Some(Box::new(renderer::Columns {
+        count: count as u16,
+        gap: px(gap),
+        height: (limited && alone).then_some(px(content[1])),
+        fill: fixed && style.get(Prop::COLUMN_FILL) == Some("auto"),
+    }));
+    let share = renderer::Length::Calc(
+        1. / count as f32,
+        px(-gap * (count - 1) as f32 / count as f32),
+    );
+    set = set.child(renderer::node().flex().flex_col().w(share).children(items));
+    match rule {
+        Some((width, color, kind)) => set.child(column_rules(count, gap, width, color, kind)),
+        None => set,
+    }
 }
 
 fn column_rules(

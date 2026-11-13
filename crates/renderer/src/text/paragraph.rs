@@ -1,6 +1,7 @@
 use super::{
     RunCursor, SharedString, TextAlign, TextLine, TextRun, TextStyle, TextWrap, WhiteSpace,
-    WordBreak, Wrapping, breaks::breaks,
+    WordBreak, Wrapping,
+    breaks::{Banded, breaks_beside},
 };
 use crate::{AvailableSpace, Pixels, Point, Rect, Size, Window, px};
 use std::{
@@ -22,6 +23,7 @@ struct ParagraphState {
     line_height: Pixels,
     top: Pixels,
     wrap_width: Option<Pixels>,
+    floats: Option<Rc<[[f32; 4]]>>,
     truncated: bool,
     size: Size<Pixels>,
     baselines: [Pixels; 2],
@@ -39,6 +41,8 @@ pub(crate) struct TextState {
     probes: Cell<[Option<Probe>; 2]>,
     repaint: Cell<bool>,
     base: RefCell<Option<Base>>,
+    // The floats of the last layout, which `fit` keeps.
+    floats: RefCell<Option<Rc<[[f32; 4]]>>>,
 }
 
 type Probe = (Size<Pixels>, [Pixels; 2]);
@@ -61,6 +65,7 @@ impl TextState {
             probes: Cell::default(),
             repaint: Cell::new(false),
             base: RefCell::default(),
+            floats: RefCell::default(),
         }
     }
 
@@ -118,6 +123,17 @@ impl TextState {
         available: Size<AvailableSpace>,
         window: &mut Window,
     ) -> (Size<Pixels>, Option<[Pixels; 2]>) {
+        let floats = window.text_system().floats.borrow().clone();
+        self.measure_beside(known, available, window, floats)
+    }
+
+    fn measure_beside(
+        &self,
+        known: Size<Option<Pixels>>,
+        available: Size<AvailableSpace>,
+        window: &mut Window,
+        floats: Option<Rc<[[f32; 4]]>>,
+    ) -> (Size<Pixels>, Option<[Pixels; 2]>) {
         let Self {
             text,
             layout,
@@ -137,12 +153,17 @@ impl TextState {
         let truncate = style.text_overflow.clone().zip(width);
         let probe = ((wraps || style.float > px(0.)) && width.is_none())
             .then(|| (available.width != AvailableSpace::MinContent) as usize);
+        let floats = floats.filter(|_| width.is_some() && style.float == px(0.) && probe.is_none());
+        if width.is_some() {
+            *self.floats.borrow_mut() = floats.clone();
+        }
         if let Some(probe) = probe {
             if let Some((size, baselines)) = probes.get()[probe] {
                 return (size, Some(baselines));
             }
         } else if let Some(inner) = layout.0.borrow().as_ref()
             && wrap_width == inner.wrap_width
+            && inner.floats == floats
             && inner.shaped_width != Some(px(0.))
             && truncate.is_none()
             // A truncated layout answers an unconstrained probe with the truncated size,
@@ -172,6 +193,21 @@ impl TextState {
             (lines, reach)
         };
         // Skip truncate_text for a line that fits, or it shapes twice.
+        let banded = |floats| Banded {
+            floats,
+            line: line_height.0,
+            y: 0.,
+            rows: Vec::new(),
+        };
+        // Rows that don't wrap only take the insets of the floats beside them, and truncation takes the room
+        // of the first row.
+        let unwrapped = wrap_width.is_none() || truncate.is_some();
+        let mut later = floats.as_deref().filter(|_| unwrapped).map(banded);
+        let lean = later.as_ref().map_or(px(0.), |later| {
+            let [left, right] = later.edges(0.).0;
+            px(left + right)
+        });
+        let mut banded = floats.as_deref().filter(|_| !unwrapped).map(banded);
         let fits = truncate.as_ref().is_some_and(|(_, width)| {
             float == px(0.)
                 && wrap_width.is_none()
@@ -180,7 +216,7 @@ impl TextState {
                 && {
                     let mut kept = self.base.borrow_mut();
                     let (lines, _) = kept.get_or_insert_with(base);
-                    lines.len() == 1 && lines[0].line.width <= *width
+                    lines.len() == 1 && lines[0].line.width <= *width - lean
                 }
         });
         let (lines, top, truncated) = if (truncate.is_none() || fits) && float == px(0.) {
@@ -192,7 +228,9 @@ impl TextState {
             };
             let lines = match wrap {
                 Some((width, ..))
-                    if *first <= width.min(width - style.text_indent) && *rest <= width =>
+                    if banded.is_none()
+                        && *first <= width.min(width - style.text_indent)
+                        && *rest <= width =>
                 {
                     lines.clone()
                 }
@@ -227,11 +265,20 @@ impl TextState {
                                 wrap,
                                 word_break,
                             };
-                            let boundaries = breaks(&line.line, &line.text, &wrapping, &ranges);
+                            let boundaries = breaks_beside(
+                                &line.line,
+                                &line.text,
+                                &wrapping,
+                                &ranges,
+                                banded.as_mut(),
+                            );
                             wrapped += boundaries.len() + 1;
                             TextLine {
                                 breaks: boundaries.into(),
                                 wrap: Some(width),
+                                shifts: banded.as_mut().map_or_else(Rc::default, |banded| {
+                                    std::mem::take(&mut banded.rows).into()
+                                }),
                                 ..line.clone()
                             }
                         })
@@ -243,7 +290,7 @@ impl TextState {
             let (text, runs, truncated) = match truncate {
                 Some((affix, width)) => {
                     let (text, runs, truncated) =
-                        truncate_text(&system, style, text, runs, &affix, width, wrap_width);
+                        truncate_text(&system, style, text, runs, &affix, width - lean, wrap_width);
                     (text, Cow::Owned(runs), truncated)
                 }
                 None => (text.clone(), Cow::Borrowed(runs), false),
@@ -284,6 +331,16 @@ impl TextState {
                 truncated,
             )
         };
+        let lines: Rc<[TextLine]> = match later.as_mut() {
+            Some(later) => lines
+                .iter()
+                .map(|line| TextLine {
+                    shifts: later.rows(line.rows()),
+                    ..line.clone()
+                })
+                .collect(),
+            None => lines,
+        };
         let mut size = Size::<Pixels>::default();
         for (index, line) in lines.iter().enumerate() {
             let mut line_size = line.extent(line_height);
@@ -295,6 +352,9 @@ impl TextState {
         }
         if min_content {
             size.width = widest_piece(&lines, float - top - style.text_indent);
+        }
+        if let Some(banded) = &banded {
+            size.height = px(banded.y);
         }
         size.width = size.width.max(float);
         size.height += top;
@@ -319,6 +379,7 @@ impl TextState {
                 line_height,
                 top,
                 wrap_width,
+                floats,
                 truncated,
                 size,
                 baselines,
@@ -365,10 +426,12 @@ impl TextState {
                         }
                     });
         if stale {
-            self.measure(
+            let floats = self.floats.borrow().clone();
+            self.measure_beside(
                 Size::new(Some(width), None),
                 Size::new(AvailableSpace::Definite(width), AvailableSpace::MinContent),
                 window,
+                floats,
             );
         }
     }
@@ -619,6 +682,7 @@ mod tests {
             line_height: px(0.),
             top: px(0.),
             wrap_width: None,
+            floats: None,
             truncated: false,
             size: Size::default(),
             baselines: [px(0.); 2],

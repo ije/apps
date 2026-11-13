@@ -221,6 +221,7 @@ pub(super) struct DomBox {
     pub(super) placed: Cell<(Rect<Pixels>, Option<super::effects::Matrix>)>,
     pub(super) offset: Cell<Point<Pixels>>,
     pub(super) frame: bool,
+    pub(super) text_clip: bool,
 }
 
 // With its counts, a box's `Rc` must stay within the small blocks of the runtime's allocator.
@@ -249,10 +250,12 @@ impl DomBox {
 
     fn mirror(
         &self,
-        mirror: &mut crate::dom::LayoutMirror,
+        dom: &mut crate::dom::State,
         window_bounds: Rect<Pixels>,
         size: Size<Pixels>,
+        parts: &[Rect<Pixels>],
     ) {
+        let mirror = &mut dom.bounds;
         let [mut top, right, mut bottom, left] = self.shared.unwrap_or_default();
         if let Some([line, above, below]) = self.leading
             && (f32::from(window_bounds.size.height) - line).abs() < 0.5
@@ -278,6 +281,23 @@ impl DomBox {
             scaled(window_bounds.size.width, size.width)
                 || scaled(window_bounds.size.height, size.height),
         );
+        // Like Chrome, a box that columns split reports the union of its parts.
+        if let Some(union) = parts.iter().copied().reduce(|all, part| all.union(part)) {
+            let rect = |part: Rect<Pixels>| {
+                [
+                    part.origin.x,
+                    part.origin.y,
+                    part.size.width,
+                    part.size.height,
+                ]
+                .map(f32::from)
+            };
+            mirror.insert(self.id, rect(union));
+            dom.fragments
+                .insert(self.id, parts.iter().copied().map(rect).collect());
+        } else if !dom.fragments.is_empty() {
+            dom.fragments.remove(&self.id);
+        }
     }
 
     fn unions(&self) {
@@ -359,6 +379,7 @@ impl Hooks for DomBox {
     }
 
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let parts: Vec<_> = cx.fragments().collect();
         let (exact, baselines) = (cx.exact, cx.baselines);
         let window = &mut *cx.window;
         let mut bounds = exact;
@@ -563,6 +584,11 @@ impl Hooks for DomBox {
         }
         let mut prepaint = |window: &mut Window| {
             let window_bounds = window.transformed_bounds(bounds);
+            // The parts move with the box's offsets and transform.
+            let parts: Vec<_> = parts
+                .iter()
+                .map(|part| window.transformed_bounds(*part + (bounds.origin - exact.origin)))
+                .collect();
             let view = &*self.view;
             let flags = {
                 let mut host = view.host.borrow_mut();
@@ -581,7 +607,7 @@ impl Hooks for DomBox {
                 {
                     window.redraw();
                 }
-                self.mirror(&mut dom.bounds, window_bounds, bounds.size);
+                self.mirror(dom, window_bounds, bounds.size, &parts);
                 let width = f32::from(bounds.size.width);
                 let [top, right, bottom, left] = self.margin;
                 let cell = self
@@ -678,6 +704,7 @@ impl Hooks for DomBox {
     }
 
     fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let parts: Vec<_> = cx.fragments().collect();
         let (placed, matrix) = self.placed.get();
         let offset = self.offset.get();
         let bounds = Rect::new(cx.exact.origin + offset, cx.exact.size);
@@ -691,12 +718,16 @@ impl Hooks for DomBox {
         }
         let mut kept = |window: &mut Window| {
             let window_bounds = window.transformed_bounds(bounds);
+            let parts: Vec<_> = parts
+                .iter()
+                .map(|part| window.transformed_bounds(*part + offset))
+                .collect();
             let view = &*self.view;
             let flags = {
                 let mut host = view.host.borrow_mut();
                 let dom = host.dom.entry(view.id).or_default();
                 if moved {
-                    self.mirror(&mut dom.bounds, window_bounds, bounds.size);
+                    self.mirror(dom, window_bounds, bounds.size, &parts);
                 }
                 dom.cull.info.get(self.id).map_or(0, |info| info.flags)
             };
@@ -728,6 +759,10 @@ impl Hooks for DomBox {
             dom.paint_count += 1;
             dom.painted[self.id] = dom.paint_count;
         }
+        let inner = &mut |window: &mut Window| match self.text_clip {
+            true => window.with_text_clip(|window| inner(window)),
+            false => inner(window),
+        };
         if matrix.is_none() && self.effects.is_none() {
             return inner(window);
         }

@@ -113,13 +113,27 @@ impl Scene {
     }
 
     pub(crate) fn push(&mut self, instance: Instance) {
+        self.push_into(self.active.last().copied().unwrap_or(0), instance);
+    }
+
+    pub(crate) fn push_into(&mut self, index: usize, instance: Instance) {
         let reach = instance.reach();
         if reach.is_empty() {
             return;
         }
-        let layer = self.current();
+        let layer = &mut self.layers[index];
         layer.grow(reach);
         layer.instances.push(instance);
+    }
+
+    pub(crate) fn depth(&self) -> usize {
+        self.active.len()
+    }
+
+    // A layer outside the tree, which an effect reads as its mask.
+    pub(crate) fn mask_layer(&mut self) -> usize {
+        self.layers.push(self.spare.pop().unwrap_or_default());
+        self.layers.len() - 1
     }
 
     pub(crate) fn push_effect(&mut self, effect: EffectState, key: Option<u64>) {
@@ -300,6 +314,8 @@ pub struct PaintEffect {
     pub backdrop: Option<Backdrop>,
     pub glass: Option<Glass>,
     pub key: Option<u64>,
+    // Shows the content only through the text that `Window::with_text_clip` captures around it.
+    pub text_mask: bool,
 }
 
 impl Default for PaintEffect {
@@ -316,6 +332,7 @@ impl Default for PaintEffect {
             backdrop: None,
             glass: None,
             key: None,
+            text_mask: false,
         }
     }
 }
@@ -367,6 +384,8 @@ pub(crate) struct EffectState {
     pub backdrop: Option<BackdropState>,
     pub glass: Option<GlassState>,
     pub content_mask: Clip<f32>,
+    // The mask layer of `PaintEffect::text_mask`.
+    pub text_mask: Option<usize>,
 }
 
 // The shader reads the style as its position in this list.
@@ -451,6 +470,7 @@ pub(crate) fn effect(content_mask: Clip<f32>) -> EffectState {
         backdrop: None,
         glass: None,
         content_mask,
+        text_mask: None,
     }
 }
 

@@ -199,6 +199,46 @@ style! {
     contains: u8 = 0,
     /// An [`Escape`] bit when the box is out of flow: only the clips of its containing block apply.
     escape: u8 = 0,
+    /// A column set: its first child is the flow of content, as wide as one column.
+    columns: Option<Box<Columns>> = None,
+    /// [`Break`] bits of a box in a column flow.
+    breaks: u8 = 0,
+    /// [`Flow`] bits of a box in a block formatting context with floats.
+    flow: u8 = 0,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Columns {
+    pub count: u16,
+    pub gap: Pixels,
+    /// The height of the columns, which `fill` makes fixed. Without `fill`, they balance up to it.
+    pub height: Option<Pixels>,
+    pub fill: bool,
+}
+
+pub struct Break;
+
+impl Break {
+    pub const BEFORE: u8 = 1;
+    pub const AFTER: u8 = 2;
+    pub const AVOID_BEFORE: u8 = 4;
+    pub const AVOID_AFTER: u8 = 8;
+    pub const AVOID_INSIDE: u8 = 16;
+    /// Replaced content and controls, which columns never break.
+    pub const WHOLE: u8 = 32;
+}
+
+pub struct Flow;
+
+impl Flow {
+    pub const LEFT: u8 = 1;
+    pub const RIGHT: u8 = 2;
+    pub const CLEAR_LEFT: u8 = 4;
+    pub const CLEAR_RIGHT: u8 = 8;
+    /// A block column or line box in the formatting context of its parent: floats reach its lines and the boxes
+    /// in it, and floats in it reach the boxes after it.
+    pub const BLOCK: u8 = 16;
+    pub const FLOAT: u8 = Self::LEFT | Self::RIGHT;
 }
 
 pub struct Escape;

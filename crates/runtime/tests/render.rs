@@ -3239,3 +3239,321 @@ fn empty_items_clearfix_tables_and_row_boxes_like_chrome() {
         "an empty cell hides its background: {text}"
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn background_clip_text_shows_the_background_through_the_text_like_chrome() {
+    let row = |id: &str, background: &str| {
+        format!(
+            "<div id={id} style='width:200px;font:40px Helvetica;color:transparent;{background};-webkit-background-clip:text;text-decoration:line-through 20px'>MMMM</div>"
+        )
+    };
+    let page = format!(
+        "<body style='margin:0'>{}{}</body>",
+        row("a", "background:linear-gradient(90deg,red,blue)"),
+        row("b", "background-color:#c33")
+    );
+    let text = run_hidden(
+        r#"
+        await load('clip.html');
+        const shot = async step => {
+            await new Promise(done => setTimeout(done, 200));
+            await win.webContents.capturePage();
+            for (const [x, y] of [[5, 22], [120, 22], [160, 22], [190, 22], [5, 5], [5, 68], [190, 68]]) {
+                const [b, g, r] = (await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap();
+                console.log(`PIXEL ${step} ${x} ${y} ${r} ${g} ${b}`);
+            }
+        };
+        await shot(0);
+        await run("document.getElementById('a').textContent = 'MMMMM'");
+        await shot(1);
+        await run("document.getElementById('a').style.backgroundClip = 'border-box'");
+        await shot(2);
+        "#,
+        &[("clip.html", &page)],
+    );
+    let near = |step: u32, x: u32, y: u32, expected: [i32; 3]| {
+        let line = text
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("PIXEL {step} {x} {y} ")))
+            .unwrap_or_else(|| panic!("{text}"));
+        let actual: Vec<i32> = line.split(' ').map(|v| v.parse().unwrap()).collect();
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(a, e)| (a - e).abs() <= 12),
+            "step {step}: pixel at {x},{y} is {actual:?}, Chrome paints {expected:?}"
+        );
+    };
+    // The gradient shows only in the text and its line, with the colors of its place in the box.
+    near(0, 5, 22, [248, 0, 6]);
+    near(0, 120, 22, [101, 0, 153]);
+    near(0, 190, 22, [255, 255, 255]);
+    near(0, 5, 5, [255, 255, 255]);
+    // A background color fills only the text too.
+    near(0, 5, 68, [204, 51, 51]);
+    near(0, 190, 68, [255, 255, 255]);
+    // New text after the first frame shows the background.
+    near(1, 160, 22, [51, 0, 204]);
+    // Without the text clip, the gradient fills the box.
+    near(2, 5, 5, [248, 0, 6]);
+    near(2, 190, 22, [13, 0, 242]);
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn table_parts_without_a_table_get_an_anonymous_table_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        console.log('BOXES ' + await run("JSON.stringify(['p','a','b','q','r1','c1','c2','g','h','f','x','e'].map(id => (r => [r.x, r.y, r.width, r.height])(document.getElementById(id).getBoundingClientRect())))"));
+        console.log('DISPLAY ' + await run("['p','d','r1'].map(id => getComputedStyle(document.getElementById(id)).display).join()"));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0;font:12px Helvetica'><style>i{display:block;width:30px;height:10px}\
+             b{display:block;width:60px;height:20px}.c{display:table-cell;padding:2px}.r{display:table-row}</style>\
+             <div id=p><div class=c id=a><i></i></div><div class=c id=b style='vertical-align:middle'><b></b></div></div>\
+             <div id=q dir=rtl><div class=r id=r1><div class=c id=c1><i></i></div><div class=c><i></i></div></div>\
+             <div class=r><div class=c id=c2><b></b></div></div></div><div><div style='display:table-row-group'>\
+             <div class=c id=g><i></i></div></div><div style='display:table-header-group'><div class=c id=h><i></i></div></div></div>\
+             <div style='display:table;width:200px'><div class=c id=f style='width:100%'><i></i></div>\
+             <div class=c id=x style='width:1%'><i></i></div></div><div id=d style='display:inline-block;width:100px'>\
+             <div class=c id=e style='width:50%'><i></i></div><div class=c><b></b></div></div></body>",
+        )],
+    );
+    let line = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap_or_else(|| panic!("{text}"))
+            .trim()
+            .to_owned()
+    };
+    let boxes: Vec<[f32; 4]> = serde_json::from_str(&line("BOXES")).unwrap();
+    // Chrome's boxes in a 400px window: sibling cells sit side by side in an anonymous table as wide as its content,
+    // rows share their columns and in RTL the table is at the right, a header group goes first, a 100% column takes
+    // the space that the other columns don't need, and a 50% column makes room for its share.
+    let chrome: [[f32; 4]; 12] = [
+        [0., 0., 400., 24.],
+        [0., 0., 34., 24.],
+        [34., 0., 64., 24.],
+        [0., 24., 400., 38.],
+        [302., 24., 98., 14.],
+        [336., 24., 64., 14.],
+        [336., 38., 64., 24.],
+        [0., 76., 34., 14.],
+        [0., 62., 34., 14.],
+        [0., 90., 166., 14.],
+        [166., 90., 34., 14.],
+        [0., 104., 36., 24.],
+    ];
+    for (found, chrome) in boxes.iter().zip(chrome) {
+        assert!(
+            found.iter().zip(chrome).all(|(a, b)| (a - b).abs() < 0.6),
+            "{found:?} is not {chrome:?}: {boxes:?}"
+        );
+    }
+    assert_eq!(line("DISPLAY"), "block,inline-block,table-row");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn border_images_replace_the_border_and_follow_changes_like_chrome() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const color = async (x, y) => {
+            const bytes = (await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap();
+            return [bytes[2], bytes[1], bytes[0]].map(value => value > 200 ? 'f' : value < 60 ? '0' : '?').join('');
+        };
+        const look = async () => {
+            for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+            return [await color(4, 30), await color(30, 30), await color(84, 4), await color(110, 4), await color(84, 30)].join(' ');
+        };
+        let first = '';
+        for (let n = 0; n < 40 && first !== 'f00 fff 00f 0f0 f00'; n++) first = await look();
+        if (first !== 'f00 fff 00f 0f0 f00') fail('first frame: ' + first);
+        await run("document.getElementById('g').style.borderImageSource = 'linear-gradient(#00f, #00f)'; document.getElementById('i').style.borderWidth = '0'");
+        const changed = await look();
+        if (changed !== '00f fff fff fff fff') fail('after changes: ' + changed);
+        await run("document.getElementById('g').style.borderImage = 'none'");
+        const plain = await look();
+        if (!plain.startsWith('000 ')) fail('normal border: ' + plain);
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0;background:white'><div style='display:flex'>\
+             <div id=g style='width:40px;height:40px;border:10px solid black;border-image:linear-gradient(red, red) 1'></div>\
+             <div id=i style='margin-left:20px;width:40px;height:40px;border:10px solid black;border-image:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAMAAAADCAIAAADZSiLoAAAAFklEQVR4nGNgYPgPhiCa4T8QQFlgBACpdAr2Fc+7cAAAAABJRU5ErkJggg==) 1'></div></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn columns_break_text_rows_and_move_kept_boxes_like_chrome() {
+    let text = run_hidden(
+        &format!(
+            r#"{RECTS}
+            await load('columns.html');
+            console.log('RECTS ' + await rects());
+            await run(`document.getElementById('a').style.height = '40px'`);
+            await win.webContents.capturePage();
+            console.log('MOVED ' + await rects());
+            console.log('HITS ' + await run(`(() => {{
+                const p = document.getElementById('p').getBoundingClientRect();
+                return [50, 150, 250].map(x => document.elementFromPoint(x, p.y + 10)?.id).join();
+            }})()`));
+            "#
+        ),
+        &[(
+            "columns.html",
+            "<body style='margin:0;font:10px/20px sans-serif'><style>.w{columns:3;column-gap:0;width:300px}             .w div{height:20px;break-inside:avoid}p{margin:0}</style>             <div class=w><p id=p>One paragraph with enough words to run over all three columns of this box,              line after line, so each column holds two of its rows.</p></div>             <div class=w><div id=a></div><div id=b></div><div id=c></div><div id=d></div><div id=e></div><div id=f></div></div>             </body>",
+        )],
+    );
+    let before = rects(&text);
+    let line = |prefix: &str| {
+        let line = text.lines().find_map(|line| line.strip_prefix(prefix));
+        line.unwrap_or_else(|| panic!("{text}")).to_owned()
+    };
+    let moved: std::collections::HashMap<String, String> =
+        serde_json::from_str(&line("MOVED ")).unwrap();
+    let at = |rects: &std::collections::HashMap<String, String>, ids: &str| {
+        ids.chars()
+            .map(|id| rects[&id.to_string()].clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        before["p"].starts_with("0,0,300,"),
+        "the text spans three columns: {before:?}"
+    );
+    assert_eq!(
+        at(&before, "abcdef"),
+        [
+            "0,0,100,20",
+            "0,20,100,20",
+            "100,0,100,20",
+            "100,20,100,20",
+            "200,0,100,20",
+            "200,20,100,20"
+        ]
+    );
+    assert_eq!(
+        at(&moved, "abcdef"),
+        [
+            "0,0,100,40",
+            "0,40,100,20",
+            "100,0,100,20",
+            "100,20,100,20",
+            "100,40,100,20",
+            "200,0,100,20"
+        ],
+        "kept boxes move to the next columns like in Chrome"
+    );
+    assert_eq!(
+        line("HITS "),
+        "p,p,p",
+        "each column of the text takes pointer events"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn lines_beside_a_float_follow_its_new_height_like_chrome() {
+    // Words of six 10px letters make the rows: two fit beside the 50px float, three below it. The float grows
+    // after the first frame, so the paragraph two blocks down must lay out again, not keep a cached result.
+    let atoms = (1..=7)
+        .map(|index| {
+            format!(
+                "<span id=s{index}>{}</span>",
+                "abcdefg".repeat(6)[index - 1..]
+                    .chars()
+                    .take(6)
+                    .collect::<String>()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = run_hidden(
+        &format!(
+            r#"{RECTS}
+            await load('grow.html');
+            console.log('RECTS ' + await rects());
+            await run(`document.getElementById('f').style.height = '60px'`);
+            await win.webContents.capturePage();
+            await win.webContents.capturePage();
+            console.log('GROWN ' + await rects());"#
+        ),
+        &[(
+            "grow.html",
+            &format!(
+                "<body style='margin:0;font:16.6px/20px Menlo'><style>.w{{width:200px}}p{{margin:0}}</style>\
+                 <div class=w><div id=f style='float:left;width:50px;height:20px'></div>\
+                 <div><div><p>{atoms}</p></div></div></div></body>"
+            ),
+        )],
+    );
+    let grown = text
+        .lines()
+        .find_map(|line| line.strip_prefix("GROWN "))
+        .unwrap_or_else(|| panic!("{text}"));
+    let grown: std::collections::HashMap<String, String> = serde_json::from_str(grown).unwrap();
+    let at = |rects: &std::collections::HashMap<String, String>, id: &str| -> [f32; 2] {
+        let mut parts = rects[id].split(',').map(|v| v.parse::<f32>().unwrap());
+        [parts.next().unwrap(), parts.next().unwrap()]
+    };
+    let first = rects(&text);
+    for (rects, expected) in [
+        (&first, [("s1", 50.), ("s3", 0.), ("s6", 0.)]),
+        (&grown, [("s1", 50.), ("s3", 50.), ("s5", 50.)]),
+    ] {
+        for (id, x) in expected {
+            assert!(
+                (at(rects, id)[0] - x).abs() < 0.6,
+                "{id} starts its row at {x}, as in Chrome: {rects:?}"
+            );
+        }
+    }
+    assert!(
+        (at(&grown, "s7")[0]).abs() < 0.6 && at(&grown, "s7")[1] >= 60.,
+        "below the float the row takes the whole width: {grown:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn blocks_with_margins_beside_a_float_wrap_their_lines_like_chrome() {
+    // Chrome's rows: left and top of each text row from its box, and the height of the box.
+    let text = run_hidden(
+        r#"await load('margins.html');
+        console.log('ROWS ' + await run(`JSON.stringify([1, 2, 3, 4].map(i => {
+            const box = document.getElementById('c' + i), at = box.getBoundingClientRect(), range = document.createRange();
+            range.selectNodeContents(document.getElementById('t' + i));
+            return [...range.getClientRects()].map(rect => [rect.x - at.x, rect.y - at.y].map(Math.round).join(',')).join(' ') + ' ' + box.offsetHeight;
+        }))`));"#,
+        &[(
+            "margins.html",
+            "<body style='margin:0;font:12px/1.3 Helvetica'><style>.c{width:200px;display:flow-root}.l{float:left;width:50px;height:60px}</style>\
+             <div class=c id=c1><div class=l></div><div id=t1 style='margin-left:20px'>block with margin left beside the float text wraps along</div></div>\
+             <div class=c id=c2><div class=l></div><div id=t2 style='margin:0 30px'>block with side margins beside the float text wraps along</div></div>\
+             <div class=c id=c3><div class=l></div><p id=t3 style='margin:20px 0'>paragraph with margins beside the float text wraps along here</p></div>\
+             <div class=c id=c4 style='width:180px'><div class=l style='height:40px'></div><div id=t4 style='margin-top:30px'>margin top 30 text text text</div></div></body>",
+        )],
+    );
+    let rows = text
+        .lines()
+        .find_map(|line| line.strip_prefix("ROWS "))
+        .unwrap_or_else(|| panic!("{text}"));
+    let rows: Vec<String> = serde_json::from_str(rows).unwrap();
+    assert_eq!(
+        rows,
+        [
+            "50,1 50,16 50,32 60",
+            "50,1 50,16 50,32 60",
+            "50,21 50,36 50,52 87",
+            "50,31 0,46 61",
+        ],
+        "as in Chrome: {text}"
+    );
+}

@@ -213,7 +213,7 @@ pub(super) fn paint_text(
                 .and_then(|highlight| highlight.color)
                 .unwrap_or(runs[text_run].color)
         });
-        if color.a == 0. {
+        if color.a == 0. && !window.clips_text() {
             continue;
         }
         let gap = rows
@@ -382,16 +382,18 @@ fn text_start(
     end: usize,
 ) -> Option<Point<Pixels>> {
     let at = text_position(layout, text, rows, index)?;
+    // Compare the rows of the layout: rows that moved to other columns are not below in the window.
     let next = text
         .get(index..end)
         .and_then(|part| part.chars().next())
-        .and_then(|first| text_position(layout, text, rows, index + first.len_utf8()))
-        .filter(|next| next.y > at.y);
+        .and_then(|first| layout.point_at(index + first.len_utf8()))
+        .filter(|next| Some(next.y) > layout.point_at(index).map(|at| at.y));
     Some(next.map_or(at, |next| {
         let row = ((next.y - layout.bounds().top()) / layout.line_height()).round();
+        let row = rows.get(row as usize);
         point(
-            layout.bounds().left() + rows.get(row as usize).map_or(px(0.), |row| row.shift),
-            next.y,
+            layout.bounds().left() + row.map_or(px(0.), |row| row.shift),
+            next.y + row.map_or(px(0.), |row| row.drop),
         )
     }))
 }
@@ -471,13 +473,31 @@ pub(crate) fn text_index(
     nearest: bool,
 ) -> Result<usize, usize> {
     let (top, line_height) = (layout.bounds().top(), layout.line_height());
-    let row = rows
-        .iter()
-        .enumerate()
-        .rposition(|(index, row)| {
-            top + line_height * index as f32 + row.drop - row.above <= position.y
-        })
-        .unwrap_or(0);
+    let split = rows.windows(2).any(|pair| pair[1].drop < pair[0].drop);
+    let row = if split {
+        // Rows in columns: the nearest row box to the point.
+        let left = layout.bounds().left();
+        let distance = |(index, row): (usize, &crate::dom::Row)| {
+            let y = top + line_height * index as f32 + row.drop;
+            let dx = (left + row.shift - position.x)
+                .max(position.x - left - row.right)
+                .max(px(0.));
+            let dy = (y - position.y)
+                .max(position.y - y - line_height)
+                .max(px(0.));
+            f32::from(dx * dx.0 + dy * dy.0)
+        };
+        (0..rows.len())
+            .min_by(|&a, &b| distance((a, &rows[a])).total_cmp(&distance((b, &rows[b]))))
+            .unwrap_or(0)
+    } else {
+        rows.iter()
+            .enumerate()
+            .rposition(|(index, row)| {
+                top + line_height * index as f32 + row.drop - row.above <= position.y
+            })
+            .unwrap_or(0)
+    };
     let Some(placed) = rows.get(row) else {
         return layout.index_at(position, nearest);
     };
@@ -553,6 +573,8 @@ pub(super) struct Prepainted {
     layouts: Vec<(usize, crate::dom::TextLayout)>,
     rects: Vec<(usize, [f32; 4])>,
     origin: Point<Pixels>,
+    // Some rows moved to later columns, so rows don't go down in order.
+    split: bool,
 }
 
 pub(super) struct AtomSlot {
@@ -638,6 +660,8 @@ struct Measured {
     measured: std::cell::Cell<[Pixels; 2]>,
     cached: std::cell::Cell<Option<MeasuredSize>>,
     baselines: std::cell::Cell<[Pixels; 2]>,
+    // The floats beside the lines in the last layout.
+    floats: std::cell::RefCell<Option<Rc<[[f32; 4]]>>>,
 }
 
 impl PartialEq for Measured {
@@ -665,6 +689,7 @@ impl From<InlineText> for renderer::Node {
                     measured: Default::default(),
                     cached: std::cell::Cell::new(None),
                     baselines: std::cell::Cell::new([px(0.); 2]),
+                    floats: Default::default(),
                 },
                 |kept, style, known, available, window| {
                     let Measured {
@@ -674,6 +699,7 @@ impl From<InlineText> for renderer::Node {
                         measured,
                         cached,
                         baselines: kept_baselines,
+                        floats: kept_floats,
                     } = kept;
                     if styled.borrow().as_ref() != Some(style) {
                         cached.set(None);
@@ -684,17 +710,27 @@ impl From<InlineText> for renderer::Node {
                     let min_content = wraps
                         && known.width.is_none()
                         && available.width == renderer::AvailableSpace::MinContent;
-                    let width = known
-                        .width
-                        .or(match available.width {
-                            renderer::AvailableSpace::Definite(width) => Some(width),
-                            _ => None,
-                        })
-                        .filter(|_| wraps);
+                    let room = known.width.or(match available.width {
+                        renderer::AvailableSpace::Definite(width) => Some(width),
+                        _ => None,
+                    });
+                    let width = room.filter(|_| wraps);
                     let key = (min_content, width);
+                    let floats = window
+                        .text_system()
+                        .floats
+                        .borrow()
+                        .clone()
+                        .filter(|_| room.is_some() && !min_content);
+                    // Only a layout with a width keeps its floats for prepaint. The cache holds results with them.
+                    if room.is_some() && *kept_floats.borrow() != floats {
+                        cached.set(None);
+                        *kept_floats.borrow_mut() = floats.clone();
+                    }
+                    let kept = *kept_floats.borrow() == floats;
                     if let Some((_, size)) = cached
                         .get()
-                        .filter(|(cached, _): &(_, renderer::Size<Pixels>)| *cached == key)
+                        .filter(|(cached, _): &(_, renderer::Size<Pixels>)| kept && *cached == key)
                     {
                         measured.set([width.unwrap_or_default(), size.width]);
                         return (size, Some(kept_baselines.get()));
@@ -704,7 +740,7 @@ impl From<InlineText> for renderer::Node {
                     let (text, mut runs) = first_line(data, wrap, font_size, &system);
                     with_atoms(data, |index| atoms[index].0[0], &mut runs);
                     let mut size = renderer::Size::<Pixels>::default();
-                    let lines = system.shape_text(
+                    let lines = system.shape_beside(
                         &text,
                         font_size,
                         &runs,
@@ -724,6 +760,9 @@ impl From<InlineText> for renderer::Node {
                                 word_break => word_break,
                             },
                         },
+                        floats
+                            .as_deref()
+                            .map(|floats| (floats, f32::from(line_height))),
                     );
                     for (index, line) in lines.iter().enumerate() {
                         let mut line_size = line.extent(line_height);
@@ -735,6 +774,10 @@ impl From<InlineText> for renderer::Node {
                     }
                     if min_content {
                         size.width = renderer::widest_piece(&lines, -style.text_indent);
+                    }
+                    // Rows that moved below floats make the text taller.
+                    if let Some(&[.., top]) = lines.last().and_then(|line| line.shifts.last()) {
+                        size.height = px(top) + line_height;
                     }
                     let strut = (system.face(&style.font()), font_size, line_height);
                     let scale = window.scale_factor();
@@ -761,8 +804,10 @@ impl From<InlineText> for renderer::Node {
                         size.height - extents.last().map_or(px(0.), |row| row[1]) - line_height
                             + base,
                     ];
-                    cached.set(Some((key, size)));
-                    kept_baselines.set(baselines);
+                    if kept {
+                        cached.set(Some((key, size)));
+                        kept_baselines.set(baselines);
+                    }
                     measured.set([width.unwrap_or_default(), size.width]);
                     (size, Some(baselines))
                 },
@@ -805,6 +850,7 @@ impl renderer::Hooks for InlineText {
 
     fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window);
+        let moves: Vec<_> = cx.row_moves().collect();
         let [top, right, bottom, left] = cx.inset;
         let inside = |bounds: Rect<Pixels>| {
             Rect::new(
@@ -817,6 +863,9 @@ impl renderer::Hooks for InlineText {
         };
         let (bounds, exact, style) = (inside(cx.bounds), inside(cx.exact), cx.text.clone());
         let measured = cx.state::<Measured>().map(|kept| kept.measured.get());
+        let cx_floats = cx
+            .state::<Measured>()
+            .and_then(|kept| kept.floats.borrow().clone());
         let node_layout = cx.text_layout().cloned();
         let window = &mut *cx.window;
         if let Some(measured) = measured {
@@ -832,8 +881,12 @@ impl renderer::Hooks for InlineText {
             with_atoms(&self.data, |index| self.atoms[index].size[0], &mut runs);
             // Like Chromium, text starts at its exact place, and only each row's baseline snaps to a device pixel.
             let placed = renderer::Rect::new(exact.origin, bounds.size);
+            let floats = cx_floats;
+            let system = window.text_system().clone();
+            *system.floats.borrow_mut() = floats;
             let layout =
                 renderer::Paragraph::shape(text, runs.clone(), &style, wrap, placed, window);
+            *system.floats.borrow_mut() = None;
             *self.shaped.borrow_mut() = Some((layout, runs));
         }
         let shaped = self.shaped.borrow();
@@ -863,18 +916,22 @@ impl renderer::Hooks for InlineText {
         let view = &*self.view;
         let mut lead_styles = None;
         let mut drop = px(0.);
+        let banded = layout.lines().iter().any(|line| !line.shifts.is_empty());
         if style.text_align != renderer::TextAlign::Left
+            || banded
             || !self.data.boxes.is_empty()
             || indent != px(0.)
             || self.justify.is_some()
             || extents.iter().flatten().any(|extra| *extra > px(0.))
+            || !moves.is_empty()
         {
             let mut offset = 0;
             for line in layout.lines().iter() {
                 let glyphs = &line.line.glyphs;
                 let mut left = px(0.);
                 let mut start = offset;
-                for boundary in line.breaks.iter().map(Some).chain([None]) {
+                for (line_rows, boundary) in line.breaks.iter().map(Some).chain([None]).enumerate()
+                {
                     let (right, end) = boundary.map_or((line.line.width, line.line.width), |&at| {
                         let x = glyphs[at as usize].x;
                         let previous = (at as usize).checked_sub(1).map(|glyph| &glyphs[glyph]);
@@ -885,7 +942,20 @@ impl renderer::Hooks for InlineText {
                         (x, hanging.map_or(x, |glyph| glyph.x))
                     });
                     let indent = if rows.is_empty() { indent } else { px(0.) };
-                    let free = (bounds.size.width - indent - (end - left)).max(px(0.));
+                    // Beside floats, a row starts after the left ones, and moves down below the ones it doesn't fit.
+                    let [inset, outset, lowered] = line
+                        .shifts
+                        .get(line_rows)
+                        .map_or([0.; 3], |&[left, right, top]| {
+                            [
+                                left,
+                                right,
+                                top - f32::from(layout.line_height()) * rows.len() as f32,
+                            ]
+                        })
+                        .map(px);
+                    let free =
+                        (bounds.size.width - inset - outset - indent - (end - left)).max(px(0.));
                     let next = boundary.map_or(offset + line.len(), |&at| {
                         offset + glyphs[at as usize].index as usize
                     });
@@ -895,14 +965,14 @@ impl renderer::Hooks for InlineText {
                         None => false,
                     };
                     let (shift, gap) = if justified {
-                        (indent, free / gaps)
+                        (inset + indent, free / gaps)
                     } else {
                         let shift = match style.text_align {
                             renderer::TextAlign::Left => px(0.),
                             renderer::TextAlign::Center => free / 2.,
                             renderer::TextAlign::Right => free,
                         };
-                        (indent + shift, px(0.))
+                        (inset + indent + shift, px(0.))
                     };
                     let [above, below] = extents.get(rows.len()).copied().unwrap_or_default();
                     rows.push(crate::dom::Row {
@@ -910,7 +980,7 @@ impl renderer::Hooks for InlineText {
                         right: shift + end - left + gap * gaps,
                         gap,
                         start,
-                        drop: drop + above,
+                        drop: drop + above + lowered,
                         above,
                     });
                     drop += above + below;
@@ -948,6 +1018,15 @@ impl renderer::Hooks for InlineText {
                     row.shift += px(inline.lead);
                     row.right += px(inline.lead);
                 }
+            }
+        }
+        // Rows in later columns move there.
+        for (at, &(first, by)) in moves.iter().enumerate() {
+            let end = moves.get(at + 1).map_or(rows.len(), |next| next.0);
+            for row in rows.get_mut(first..end).into_iter().flatten() {
+                row.shift += by.x;
+                row.right += by.x;
+                row.drop += by.y;
             }
         }
         let rows: crate::dom::Rows = rows.into();
@@ -1092,12 +1171,48 @@ impl renderer::Hooks for InlineText {
                     }
                     (origin + low, high - low)
                 };
-                let rect = [
+                let mut rect = [
                     (left + shift.x).into(),
                     (a.y + top + shift.y).into(),
                     width.into(),
                     (b.y - a.y + height).into(),
                 ];
+                // Text in more than one column takes the union of its rows, and pointer events in each.
+                if !moves.is_empty() && a.y != b.y {
+                    let parts: Box<[[f32; 4]]> = text_rects(
+                        layout,
+                        &self.data.text,
+                        &rows,
+                        [range.start, range.end],
+                        font,
+                    )
+                    .into_iter()
+                    .map(|[x, y, width, height]| {
+                        [
+                            x + f32::from(shift.x),
+                            y + f32::from(shift.y),
+                            width,
+                            height,
+                        ]
+                    })
+                    .collect();
+                    if let Some(union) =
+                        parts.iter().copied().reduce(|[x, y, w, h], [a, b, c, d]| {
+                            let [left, top] = [x.min(a), y.min(b)];
+                            [
+                                left,
+                                top,
+                                (x + w).max(a + c) - left,
+                                (y + h).max(b + d) - top,
+                            ]
+                        })
+                    {
+                        rect = union;
+                    }
+                    dom.fragments.insert(*id, parts);
+                } else if !dom.fragments.is_empty() {
+                    dom.fragments.remove(id);
+                }
                 dom.bounds.insert(*id, rect);
                 rects.push((*id, rect));
                 let entry = (
@@ -1119,6 +1234,7 @@ impl renderer::Hooks for InlineText {
             layouts,
             rects,
             origin: exact.origin,
+            split: !moves.is_empty(),
         };
     }
 
@@ -1147,6 +1263,7 @@ impl renderer::Hooks for InlineText {
             layouts,
             rects,
             origin: at,
+            ..
         } = &mut *prepainted;
         let moved = origin != *at;
         let window = &mut *cx.window;
@@ -1170,6 +1287,10 @@ impl renderer::Hooks for InlineText {
                 rect[0] += x;
                 rect[1] += y;
                 dom.bounds.insert(*id, *rect);
+                for part in dom.fragments.get_mut(id).into_iter().flatten() {
+                    part[0] += x;
+                    part[1] += y;
+                }
             }
         }
         for (id, entry) in layouts.iter() {
@@ -1188,7 +1309,12 @@ impl renderer::Hooks for InlineText {
             (None, None) => return true,
         };
         let prepainted = self.prepainted.borrow();
-        let Prepainted { hitboxes, rows, .. } = &*prepainted;
+        let Prepainted {
+            hitboxes,
+            rows,
+            split,
+            ..
+        } = &*prepainted;
         for (hitbox, cursor) in hitboxes.iter() {
             window.set_cursor(hitbox, *cursor);
         }
@@ -1362,7 +1488,7 @@ impl renderer::Hooks for InlineText {
                 for line in layout.lines().iter() {
                     let count = line.rows();
                     let height = line.extent(layout.line_height()).height;
-                    if origin.y > mask.bottom() {
+                    if origin.y > mask.bottom() && !split {
                         break;
                     }
                     // Taller rows above push this line down: the next row's drop says how far.
@@ -1371,7 +1497,7 @@ impl renderer::Hooks for InlineText {
                         None if rows.is_empty() => px(0.),
                         None => px(f32::INFINITY),
                     };
-                    if origin.y + height + dropped + layout.line_height() > mask.top() {
+                    if *split || origin.y + height + dropped + layout.line_height() > mask.top() {
                         paint_text(
                             line,
                             origin,
@@ -1400,6 +1526,8 @@ impl renderer::Hooks for InlineText {
                     ..Default::default()
                 };
                 window.with_effect(effect, paint);
+            } else if ink.is_some() {
+                window.without_text_clip(paint);
             } else {
                 paint(window);
             }

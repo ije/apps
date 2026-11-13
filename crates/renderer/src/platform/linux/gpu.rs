@@ -1,5 +1,5 @@
 use crate::atlas::{self, PageKind, PageList, PageStore, Tile};
-use crate::frame::{Command, Pool, RenderFrame, Target};
+use crate::frame::{Command, Mask, Pool, RenderFrame, Target};
 use crate::gpu::{ATTRIBUTES, Blur, Composite, Globals, Instance, Plain, bytes};
 use crate::scene::Scene;
 use crate::{Rect, Size};
@@ -848,7 +848,11 @@ impl Renderer {
                     let wipe = std::mem::take(&mut current.1);
                     let into = pass.get_or_insert_with(|| open(&mut encoder, current.0, wipe));
                     let source = view(src);
-                    let mask = mask.map_or(source, |mask| page(true, Some(mask)));
+                    let mask = match mask {
+                        Some(Mask::Page(mask)) => page(true, Some(mask)),
+                        Some(Mask::Layer(mask)) => view(mask),
+                        None => source,
+                    };
                     into.set_pipeline(&pipelines.composite);
                     into.set_bind_group(
                         1,

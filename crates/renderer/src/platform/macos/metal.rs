@@ -1,7 +1,7 @@
 use crate::{
     Color, Rect, Size,
     atlas::{self, PageKind, PageList, PageStore, Tile},
-    frame::{Command, Pool, RenderFrame, Target},
+    frame::{Command, Mask, Pool, RenderFrame, Target},
     gpu::{ATTRIBUTES, Instance, bytes},
     scene::Scene,
 };
@@ -1129,7 +1129,11 @@ impl Renderer {
                     unsafe {
                         encoder.setFragmentTexture_atIndex(Some(source), 0);
                         encoder.setFragmentTexture_atIndex(
-                            Some(mask.map_or(source, |mask| page(PageKind::Color, Some(mask)))),
+                            Some(match mask {
+                                Some(Mask::Page(mask)) => page(PageKind::Color, Some(*mask)),
+                                Some(Mask::Layer(mask)) => texture(*mask),
+                                None => source,
+                            }),
                             1,
                         );
                         encoder

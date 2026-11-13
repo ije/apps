@@ -105,6 +105,8 @@ text_style! {
     text_wrap set_text_wrap: TextWrap = TextWrap::Wrap,
     word_break set_word_break: WordBreak = WordBreak::Normal,
     font_smoothing set_font_smoothing: bool = true,
+    // The `orphans` and `widows` lines that a column break keeps together.
+    lines_kept set_lines_kept: [u8; 2] = [2, 2],
 }
 
 impl TextStyle {

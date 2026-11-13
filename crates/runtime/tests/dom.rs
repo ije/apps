@@ -4363,3 +4363,57 @@ fn target_and_range_pseudo_classes_like_chrome() {
     "#,
     );
 }
+
+#[test]
+fn table_parts_without_a_table_keep_their_displays_like_chrome() {
+    checked_page(
+        "<html><body><div id='p'><div class='c'>a</div> <div class='c'>b</div></div>\
+         <div id='q' style='display:inline-block'><div class='r'><div class='c'>c</div><div class='c'>d</div></div></div>\
+         <style>.c{display:table-cell}.r{display:table-row}</style></body></html>",
+        r#"
+        const p = document.getElementById('p'), q = document.getElementById('q');
+        const display = node => getComputedStyle(node).display;
+        const style = node => [display(node), getComputedStyle(node).justifyContent, getComputedStyle(node).rowGap].join();
+        check('hosts keep their own styles', () => style(p) === 'block,normal,normal' && style(q) === 'inline-block,normal,normal');
+        check('parts keep their displays', () => [display(p.firstChild), display(q.firstChild), display(q.firstChild.firstChild)].join() === 'table-cell,table-row,table-cell');
+        check('cells of an anonymous table in text', () => p.innerText === 'a\tb' && q.innerText === 'c\td');
+        p.children[1].style.display = 'block';
+        check('a block among cells', () => display(p) === 'block' && display(p.firstChild) === 'table-cell' && display(p.children[1]) === 'block');
+        p.children[1].style.display = '';
+        p.append('text');
+        check('text among cells', () => display(p) === 'block' && display(p.firstChild) === 'table-cell');
+        p.lastChild.remove();
+        q.firstChild.className = '';
+        check('a row turns block', () => display(q) === 'inline-block' && display(q.firstChild) === 'block' && display(q.firstChild.firstChild) === 'table-cell');
+        q.firstChild.className = 'r';
+        check('the row comes back', () => display(q.firstChild) === 'table-row' && q.innerText === 'c\td');
+        "#,
+    );
+}
+
+#[test]
+fn border_images_parse_and_serialize_like_chrome() {
+    checked_page(
+        "<html><head><style>#r{border:10px solid red;border-image:linear-gradient(red, blue) 30% fill / 2 / 4px round space} @supports (border-image: linear-gradient(red, blue) 1) { #r { color: green } }</style></head><body><div id=r></div><div id=d></div></body></html>",
+        r#"
+        const d = document.getElementById('d'), r = document.getElementById('r');
+        for (const [text, expected] of [
+            ['border-image:linear-gradient(red, blue) 1', 'border-image: linear-gradient(red, blue) 1 / 1 / 0 stretch;'],
+            ['border-image:url(a.png) fill 10', 'border-image: url("a.png") 10 fill / 1 / 0 stretch;'],
+            ['border-image:url(a.png) 30 / / 2', 'border-image: url("a.png") 30 / 1 / 2 stretch;'],
+            ['border-image:url(a.png) 30 / auto 2 1px 10%', 'border-image: url("a.png") 30 / auto 2 1px 10% / 0 stretch;'],
+            ['border-image:#f00 1', ''], ['border-image:none', 'border-image: none;'], ['border-image:30', 'border-image: none 30 / 1 / 0 stretch;'],
+            ['border-image:linear-gradient(#f00, #00f) 1 1 1 1 / 1 / 0 stretch stretch', 'border-image: linear-gradient(rgb(255, 0, 0), rgb(0, 0, 255)) 1 / 1 / 0 stretch;'],
+            ['border-image-repeat:round round', 'border-image-repeat: round;'], ['border:1px solid red', 'border: 1px solid red;'],
+            // `border` resets only the source, where Chrome resets all of `border-image` and gives `border: 2px solid;`.
+            ['border-image:linear-gradient(red, blue) 1; border:2px solid', 'border: 2px solid; border-image-slice: 1; border-image-width: 1; border-image-outset: 0; border-image-repeat: stretch;'],
+            ['border:2px solid; border-image:linear-gradient(red, blue) 1', 'border-width: 2px; border-style: solid; border-color: currentcolor; border-image: linear-gradient(red, blue) 1 / 1 / 0 stretch;'],
+        ]) check(text, () => { d.style.cssText = text; return d.style.cssText === expected; });
+        const s = getComputedStyle(r);
+        check('computed', () => [s.borderImage, s.borderImageSlice, s.borderImageWidth, s.borderImageOutset, s.borderImageRepeat].join(' | ') === 'linear-gradient(red, blue) 30% fill / 2 / 4px round space | 30% fill | 2 | 4px | round space');
+        check('initial', () => { const s = getComputedStyle(d); d.style.cssText = ''; return [s.borderImage, s.borderImageSlice, s.borderImageWidth, s.borderImageOutset, s.borderImageRepeat].join() === 'none,100%,1,0,stretch'; });
+        check('@supports', () => s.color === 'rgb(0, 128, 0)');
+        check('CSS.supports', () => ['border-image', 'linear-gradient(red, blue) 1', 'border-image', 'url(a.png) 30 / 10px / 5px stretch repeat', 'border-image', 'red', 'border-image', '1 2 3 4 5', 'border-image-slice', '30 fill', 'border-image-slice', 'fill', 'border-image-slice', '-1', 'border-image-slice', '1px', 'border-image-repeat', 'round space', 'border-image-repeat', 'round space stretch', 'border-image-width', 'auto 1px 10% 2', 'border-image-width', '-1px', 'border-image-outset', '1 2px', 'border-image-outset', '10%', 'border-image-source', 'none', 'border-image-source', 'linear-gradient(red, blue)', 'border-image-source', 'red'].reduce((out, v, i, a) => i % 2 ? out : out + (CSS.supports(v, a[i + 1]) ? '1' : '0'), '') === '11001000101010110');
+        "#,
+    );
+}

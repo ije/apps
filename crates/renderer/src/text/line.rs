@@ -140,6 +140,8 @@ pub struct TextLine {
     pub wrap: Option<Pixels>,
     pub text: Rc<str>,
     pub looks: Rc<[Look]>,
+    /// Beside floats, `[left, right, top]` of each row: its insets and its top in the paragraph. Else empty.
+    pub shifts: Rc<[[f32; 3]]>,
 }
 
 impl TextLine {
@@ -276,6 +278,7 @@ mod tests {
             wrap: Some(px(30.)),
             text: "abcdef".into(),
             looks: Rc::default(),
+            shifts: Rc::default(),
         };
         let height = px(20.);
         assert_eq!(text.extent(height), Size::new(px(30.), px(40.)));

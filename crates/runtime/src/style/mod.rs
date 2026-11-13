@@ -19,7 +19,7 @@ pub(crate) use chunked::Chunked;
 pub(crate) use animation::{Animation, Easing, Motion, Scripted};
 pub use color::{color, rgba};
 pub(crate) use parser::{DROPPED, FontUnits, Lengths, NodeLengths};
-use shorthand::expand;
+use shorthand::{BORDER_IMAGE, BORDER_IMAGE_INITIAL, expand};
 pub(crate) use text::{
     InlineText, LineHeight, cursor, font, holds_block_box, inline_text, line_height, makes_no_line,
     restyle, selection_colors, spacing, text_run, text_transform, word_break,
@@ -42,8 +42,9 @@ const COUNTED: u16 = 64;
 pub(crate) const AGENT_DISPLAY: u16 = 128;
 // Table parts lay out as grids (tables), `contents` (row groups, rows) and blocks (cells, captions). Their role,
 // the index of their display here, is in the high byte of the style flags. Rows and row groups outside a table
-// make a table of their own, like the anonymous table around them in browsers.
-pub(crate) const TABLE_DISPLAYS: [&str; 13] = [
+// make a table of their own, like the anonymous table around them in browsers. The last two roles are blocks whose
+// children are all table parts, so they lay out as the anonymous table around those parts.
+pub(crate) const TABLE_DISPLAYS: [&str; 15] = [
     "",
     "table",
     "inline-table",
@@ -57,6 +58,8 @@ pub(crate) const TABLE_DISPLAYS: [&str; 13] = [
     "table-row",
     "table-row-group",
     "table-header-group",
+    "block",
+    "inline-block",
 ];
 pub(crate) const ROW: u16 = 4;
 pub(crate) const HEADER: u16 = 6;
@@ -984,6 +987,8 @@ pub(crate) struct StyleCache {
     changed: Vec<u64>,
     stamp: u64,
     tables: FxHashMap<usize, CollapsedTable>,
+    // Parents of table parts that are outside a table, so they can hold an anonymous table.
+    orphans: Vec<usize>,
     tailwind: tailwind::Compiler,
     // Retain source lists used as pointer keys to prevent address reuse.
     inheritable: FxHashMap<*const Vec<(Prop, Rc<str>)>, Inheritable>,
@@ -1608,8 +1613,42 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
     if name.starts_with("--") {
         return Some(true);
     }
-    let grammar = grammar(name)?;
     let lower = value.to_ascii_lowercase();
+    if let Some(index) = name
+        .strip_prefix("border-image")
+        .map(|longhand| {
+            (
+                longhand,
+                BORDER_IMAGE.iter().position(|name| name[12..] == *longhand),
+            )
+        })
+        .filter(|(longhand, index)| longhand.is_empty() || index.is_some())
+        .map(|(_, index)| index)
+    {
+        if lower.contains("var(")
+            || matches!(
+                lower.as_str(),
+                "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+            )
+        {
+            return Some(true);
+        }
+        // A longhand is valid when the shorthand takes it in its place and sets nothing else.
+        let text = match index {
+            Some(2) => format!("100% / {value}"),
+            Some(3) => format!("100% / / {value}"),
+            _ => value.to_owned(),
+        };
+        return Some(shorthand::border_image(&text).is_some_and(|parts| {
+            index.is_none()
+                || (0..5).all(|other| {
+                    Some(other) == index
+                        || (other == 1 && matches!(index, Some(2 | 3)))
+                        || parts[other] == BORDER_IMAGE_INITIAL[other]
+                })
+        }));
+    }
+    let grammar = grammar(name)?;
     Some(
         !value.is_empty()
             && (lower.contains("var(")
@@ -1681,6 +1720,11 @@ const INITIAL: &[(&str, &str)] = &[
     ("border-bottom-style", "none"),
     ("border-bottom-width", "3px"),
     ("border-collapse", "separate"),
+    ("border-image-outset", "0"),
+    ("border-image-repeat", "stretch"),
+    ("border-image-slice", "100%"),
+    ("border-image-source", "none"),
+    ("border-image-width", "1"),
     ("border-left-color", "currentcolor"),
     ("border-left-style", "none"),
     ("border-left-width", "3px"),
@@ -2142,6 +2186,14 @@ pub(crate) fn resolved(
                 parts.push(color);
             }
             return parts.join(" ");
+        }
+        "border-image" => {
+            let [source, slice, width, outset, repeat] = BORDER_IMAGE.map(get);
+            return if source == "none" {
+                source
+            } else {
+                format!("{source} {slice} / {width} / {outset} {repeat}")
+            };
         }
         "border-block" | "border-inline" => {
             let [start, end] = if name == "border-block" {
@@ -2619,6 +2671,22 @@ pub(crate) fn resolved(
                 .collect::<Vec<_>>()
                 .join(" ")
         }
+        "border-image-slice"
+        | "border-image-width"
+        | "border-image-outset"
+        | "border-image-repeat" => specified(name, &value)
+            .split(' ')
+            .map(|part| {
+                if part.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+                    && part.ends_with(|c: char| c.is_ascii_alphabetic())
+                {
+                    length(part)
+                } else {
+                    part.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
         "caret-color" if value == "auto" => paint(current),
         "font-stretch" => match value.as_str() {
             "ultra-condensed" => "50%",
@@ -2932,6 +3000,29 @@ pub(crate) fn specified(name: &str, value: &str) -> String {
             }
             text.join(" ")
         }
+        "border-image-slice"
+        | "border-image-width"
+        | "border-image-outset"
+        | "border-image-repeat" => {
+            let mut parts = components(&out, ' ');
+            let fill = parts
+                .iter()
+                .position(|part| *part == "fill")
+                .map(|at| parts.remove(at));
+            let sides = match parts.len() {
+                0 => return out,
+                1 => [0; 4],
+                2 => [0, 1, 0, 1],
+                3 => [0, 1, 2, 1],
+                _ => [0, 1, 2, 3],
+            };
+            let mut text = shortest(sides.map(|side| parts[side]));
+            if let Some(fill) = fill {
+                text.push(' ');
+                text.push_str(fill);
+            }
+            text
+        }
         "opacity" | "fill-opacity" | "stroke-opacity" | "flood-opacity" | "stop-opacity" => {
             match out
                 .strip_suffix('%')
@@ -3151,6 +3242,16 @@ pub(crate) fn declare(source: &str) -> Vec<[String; 3]> {
             || !expand(&name, value, &mut expanded)
         {
             expanded = vec![(name.clone(), value.to_owned())];
+        } else if name == "border"
+            && !matches!(
+                value,
+                "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+            )
+        {
+            // Like Chrome, scripts read the initial value that `border` resets `border-image-source` to.
+            if let Some((_, value)) = expanded.get_mut(12) {
+                *value = BORDER_IMAGE_INITIAL[0].into();
+            }
         }
         result.extend(
             expanded
@@ -4045,6 +4146,8 @@ pub(crate) struct ComputedStyles {
     counting: FxHashMap<usize, [Option<Rc<str>>; 2]>,
     pub registry: Rc<Registry>,
     pub authored: FxHashMap<usize, Rc<Style>>,
+    // The own flags of the nodes that an anonymous table changed. Their own styles are in `authored`.
+    anonymous: FxHashMap<usize, u16>,
     containers: Chunked<Option<Rc<Container>>>,
     counted: bool,
 }
@@ -4809,6 +4912,19 @@ pub(crate) fn compute_styles(
     out.vars.resize(count, vars);
     out.flags.resize(count, 0);
     out.containers.resize(count, None);
+    let mut orphans = std::mem::take(&mut style_cache.orphans);
+    match previous.filter(|_| fast) {
+        // The cascade must read the own styles of the nodes that the last anonymous tables changed.
+        Some(previous) => {
+            for (&id, &flags) in &previous.anonymous {
+                if let Some(own) = previous.authored.get(&id).filter(|_| id < count) {
+                    out.values[id] = own.clone();
+                    out.flags[id] = flags;
+                }
+            }
+        }
+        None => orphans.clear(),
+    }
     let mut inheritable = std::mem::take(&mut style_cache.inheritable);
     let mut local: Vec<Prop> = registry
         .iter()
@@ -4869,6 +4985,7 @@ pub(crate) fn compute_styles(
         list_items,
         counting,
         authored,
+        anonymous,
         containers,
         counted,
         ..
@@ -5052,6 +5169,11 @@ pub(crate) fn compute_styles(
                 all |= (id == 0 || html.contains(&id)) && font != Some(root);
             }
             counters |= style_flags[id] & COUNTED != 0;
+            if matches!(style_flags[id] >> 8, CELL | CAPTION | 10..=12)
+                && let Some(up) = up.filter(|&up| style_flags[up] >> 8 == 0)
+            {
+                orphans.push(up);
+            }
         };
         ($id:expr, $up:expr, $seen:expr) => {
             let id = $id;
@@ -6392,49 +6514,9 @@ pub(crate) fn compute_styles(
                 style.insert(Prop::WIDTH, "fit-content");
             }
         }
-        if style
-            .get(Prop::BACKGROUND_CLIP)
-            .is_some_and(|value| value.contains("text"))
-            && let Some(ink) = style.remove(Prop::BACKGROUND_IMAGE).and_then(|image| {
-                let body = image.split_once('(')?.1.to_owned();
-                components(&body, ',').into_iter().find_map(|part| {
-                    components(part, ' ')
-                        .into_iter()
-                        .find(|token| color(token).is_some())
-                        .map(str::to_owned)
-                })
-            })
-        {
-            style.insert(Prop::COLOR, ink.clone());
-            style.insert(Prop::WEBKIT_TEXT_FILL_COLOR, ink);
-        }
 
         if table_box(role) {
-            let spacing = if style
-                .get(Prop::BORDER_COLLAPSE)
-                .is_some_and(|value| value == "collapse")
-            {
-                "0".to_owned()
-            } else {
-                style.get(Prop::BORDER_SPACING).unwrap_or("0").to_owned()
-            };
-            let parts = components(&spacing, ' ');
-            if let Some(&column) = parts.first() {
-                let row = parts.get(1).copied().unwrap_or(column);
-                style.insert(Prop::COLUMN_GAP, column);
-                style.insert(Prop::ROW_GAP, row);
-                if spacing != "0" {
-                    for (prop, gap) in [
-                        (Prop::PADDING_TOP, row),
-                        (Prop::PADDING_RIGHT, column),
-                        (Prop::PADDING_BOTTOM, row),
-                        (Prop::PADDING_LEFT, column),
-                    ] {
-                        let value = format!("calc({} + {gap})", style.get(prop).unwrap_or("0px"));
-                        style.insert(prop, value);
-                    }
-                }
-            }
+            border_spacing(&mut style);
         }
         let parent_weight = parent_style
             .and_then(|parent| parent.get(Prop::FONT_WEIGHT))
@@ -7067,7 +7149,8 @@ pub(crate) fn compute_styles(
             }) {
             Some((previous, old))
                 if **old == style
-                    && previous.flags.get(id) == Some(&style_flags[id])
+                    && previous.anonymous.get(&id).or(previous.flags.get(id))
+                        == Some(&style_flags[id])
                     && previous.lengths.get(id).is_some_and(|old| {
                         old.container.is_none()
                             && units.container.is_none()
@@ -7736,6 +7819,86 @@ pub(crate) fn compute_styles(
             }
         }
     }
+    // A block whose children are all table parts outside a table lays out as their anonymous table, and its rows
+    // and row groups pass their cells on to it. Blocks with other content keep their parts as they are.
+    orphans.sort_unstable();
+    orphans.dedup();
+    orphans.retain(|&host| {
+        let part = |child: usize| matches!(style_flags[child] >> 8, CELL | CAPTION | 10..=12);
+        if host >= count
+            || walk.walk.place(host).is_none()
+            || !doc.nodes[host].children.iter().any(|&child| part(child))
+        {
+            return false;
+        }
+        let role = match styles[host].get(Prop::DISPLAY) {
+            Some("block") => 13,
+            Some("inline-block") => 14,
+            _ => return true,
+        };
+        if style_flags[host] >> 8 != 0
+            || shadows.roots.contains_key(&host)
+            || !doc.nodes[host].children.iter().all(|&child| {
+                let (node, style) = (&doc.nodes[child], &styles[child]);
+                match node.tag.as_str() {
+                    "#text" => node.text.trim_ascii().is_empty(),
+                    "#comment" => true,
+                    _ => {
+                        part(child)
+                            || style_flags[child] & DISPLAY_NONE != 0
+                            || style
+                                .get(Prop::DISPLAY)
+                                .is_some_and(|value| value.starts_with("table-column"))
+                            || style
+                                .get(Prop::POSITION)
+                                .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+                    }
+                }
+            })
+        {
+            return true;
+        }
+        let rows = doc.nodes[host]
+            .children
+            .iter()
+            .copied()
+            .filter(|&child| matches!(style_flags[child] >> 8, 10..=12))
+            .collect::<Vec<_>>();
+        for id in std::iter::once(host).chain(rows) {
+            let (own, flags) = (styles[id].clone(), style_flags[id]);
+            let (role, display) = match flags >> 8 {
+                10 => (ROW, "contents"),
+                11 => (5, "contents"),
+                12 => (HEADER, "contents"),
+                _ => (role, ["grid", "inline-grid"][usize::from(role == 14)]),
+            };
+            let kept = previous
+                .filter(|previous| fast && previous.anonymous.contains_key(&id))
+                .filter(|previous| {
+                    previous
+                        .authored
+                        .get(&id)
+                        .is_some_and(|old| Rc::ptr_eq(old, &own))
+                })
+                .and_then(|previous| previous.values.get(id).cloned());
+            styles[id] = kept.unwrap_or_else(|| {
+                let mut style = (*own).clone();
+                style.insert(Prop::DISPLAY, display);
+                if id == host {
+                    style.insert(Prop::JUSTIFY_CONTENT, "start");
+                    style.insert(Prop::ALIGN_CONTENT, "start");
+                    border_spacing(&mut style);
+                }
+                Rc::new(style)
+            });
+            style_flags[id] =
+                (flags & 0xff) | role << 8 | (u16::from(display == "contents") * DISPLAY_CONTENTS);
+            authored.insert(id, own);
+            anonymous.insert(id, flags);
+        }
+        true
+    });
+    style_cache.orphans = orphans;
     #[cfg(debug_assertions)]
     if fast {
         style_cache.incremental += 1;
@@ -8503,6 +8666,35 @@ pub(crate) fn dark(style: &Style) -> bool {
         v.contains("dark")
             && (!v.contains("light") || crate::desktop::native::theme_state() & 1 != 0)
     })
+}
+
+// A table's border spacing is the gap of its grid and padding at its edges.
+fn border_spacing(style: &mut Style) {
+    let spacing = if style
+        .get(Prop::BORDER_COLLAPSE)
+        .is_some_and(|value| value == "collapse")
+    {
+        "0".to_owned()
+    } else {
+        style.get(Prop::BORDER_SPACING).unwrap_or("0").to_owned()
+    };
+    let parts = components(&spacing, ' ');
+    if let Some(&column) = parts.first() {
+        let row = parts.get(1).copied().unwrap_or(column);
+        style.insert(Prop::COLUMN_GAP, column);
+        style.insert(Prop::ROW_GAP, row);
+        if spacing != "0" {
+            for (prop, gap) in [
+                (Prop::PADDING_TOP, row),
+                (Prop::PADDING_RIGHT, column),
+                (Prop::PADDING_BOTTOM, row),
+                (Prop::PADDING_LEFT, column),
+            ] {
+                let value = format!("calc({} + {gap})", style.get(prop).unwrap_or("0px"));
+                style.insert(prop, value);
+            }
+        }
+    }
 }
 
 fn blockify(style: &mut Style, item: bool, table_item: bool) {

@@ -223,6 +223,7 @@ impl Chain {
             text,
             style,
             state,
+            split,
             ..
         } = *cx;
         step(&*self.0, cx, &mut |window| {
@@ -235,6 +236,7 @@ impl Chain {
                 text,
                 style,
                 state,
+                split,
             };
             step(&*self.1, &mut cx, inner)
         })
@@ -276,6 +278,7 @@ pub struct NodeCx<'a> {
     pub text: &'a TextStyle,
     pub style: &'a Style,
     pub(crate) state: Option<&'a Rc<dyn Any>>,
+    pub(crate) split: Option<&'a crate::tree::Split>,
 }
 
 impl NodeCx<'_> {
@@ -285,6 +288,23 @@ impl NodeCx<'_> {
 
     pub fn text_layout(&self) -> Option<&crate::Paragraph> {
         Some(&self.state?.downcast_ref::<crate::text::TextState>()?.layout)
+    }
+
+    /// The parts of a box that spans columns, in window pixels. Empty for other boxes.
+    pub fn fragments(&self) -> impl Iterator<Item = Rect> + '_ {
+        let scale = self.window.scale_factor();
+        let parts = self.split.map_or(&[][..], |split| &split.rects);
+        parts
+            .iter()
+            .map(move |part| (*part / scale).map(Pixels) + self.exact.origin)
+    }
+
+    /// For text that spans columns, the first row of each column after the first, and how far it moves.
+    pub fn row_moves(&self) -> impl Iterator<Item = (usize, Point<Pixels>)> + '_ {
+        let scale = self.window.scale_factor();
+        let rows = self.split.map_or(&[][..], |split| &split.rows);
+        rows.iter()
+            .map(move |&(row, by)| (row as usize, (by / scale).map(Pixels)))
     }
 }
 

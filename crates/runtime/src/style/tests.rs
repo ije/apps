@@ -5481,3 +5481,23 @@ fn table_parts_take_roles_and_stay_cached() {
     assert_eq!(cached.flags[cell], fresh.flags[cell]);
     assert_eq!(TABLE_DISPLAYS[role(&cached, cell) as usize], "table-cell");
 }
+
+#[test]
+fn border_shorthands_set_and_reset_border_images_like_chrome() {
+    let doc = Document::parse(
+        "<style>#a{border-image:linear-gradient(red,blue) 1;border:1px solid}#b{border:1px solid;border-image:url(a.png) 30 / 2px round}\
+         #c{border-image:url(a.png) 30;border-image:red 1}#d{border-image:linear-gradient(red,blue) 1;border-image-slice:20 fill}</style>\
+         <div id=a></div><div id=b></div><div id=c></div><div id=d></div>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    assert_eq!(get("#a", "border-image-source"), None);
+    assert_eq!(
+        get("#b", "border-image-source").as_deref(),
+        Some("url(a.png)")
+    );
+    assert_eq!(get("#b", "border-image-width").as_deref(), Some("2px"));
+    assert_eq!(get("#b", "border-image-repeat").as_deref(), Some("round"));
+    assert_eq!(get("#c", "border-image-slice").as_deref(), Some("30"));
+    assert_eq!(get("#d", "border-image-slice").as_deref(), Some("20 fill"));
+}

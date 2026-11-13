@@ -1,5 +1,125 @@
 use super::components;
 
+pub(crate) const BORDER_IMAGE: [&str; 5] = [
+    "border-image-source",
+    "border-image-slice",
+    "border-image-width",
+    "border-image-outset",
+    "border-image-repeat",
+];
+pub(crate) const BORDER_IMAGE_INITIAL: [&str; 5] = ["none", "100%", "1", "0", "stretch"];
+
+// The longhands of a `border-image` value, or `None` when it is invalid, as in Chrome.
+pub(crate) fn border_image(value: &str) -> Option<[String; 5]> {
+    let mut tokens = Vec::new();
+    for part in components(value, ' ') {
+        if part.contains('(') {
+            tokens.push(part);
+            continue;
+        }
+        for (index, piece) in part.split('/').enumerate() {
+            if index > 0 {
+                tokens.push("/");
+            }
+            if !piece.is_empty() {
+                tokens.push(piece);
+            }
+        }
+    }
+    let units = super::Lengths::new(16., 100., 100.);
+    // 0: number, 1: percentage, 2: length, 3: `auto`.
+    let kind = |token: &str| -> Option<u8> {
+        let lower = token.to_ascii_lowercase();
+        let (number, kind) = match lower.strip_suffix('%') {
+            Some(number) => (number.parse::<f32>().ok(), 1),
+            None if lower == "auto" => return Some(3),
+            None => match lower.parse::<f32>() {
+                Ok(number) => (Some(number), 0),
+                Err(_) => (units.resolve(&lower, f32::NAN), 2),
+            },
+        };
+        number.filter(|number| *number >= 0. && !lower.starts_with('-'))?;
+        Some(kind)
+    };
+    let mut parts: [Option<String>; 5] = Default::default();
+    let mut index = 0;
+    // A run of up to four values whose kinds `allowed` takes.
+    let run = |index: &mut usize, allowed: &dyn Fn(u8) -> bool| {
+        let start = *index;
+        while *index < tokens.len()
+            && *index - start < 4
+            && kind(tokens[*index]).is_some_and(allowed)
+        {
+            *index += 1;
+        }
+        (*index > start).then(|| tokens[start..*index].join(" "))
+    };
+    while index < tokens.len() {
+        let token = tokens[index];
+        let lower = token.to_ascii_lowercase();
+        if parts[0].is_none()
+            && (lower == "none"
+                || lower.starts_with("url(")
+                || lower.contains("gradient(")
+                || lower.starts_with("image-set(")
+                || lower.starts_with("-webkit-image-set("))
+        {
+            parts[0] = Some(token.into());
+            index += 1;
+        } else if parts[4].is_none() && matches!(&*lower, "stretch" | "repeat" | "round" | "space")
+        {
+            let second = tokens
+                .get(index + 1)
+                .map(|token| token.to_ascii_lowercase());
+            let two = second
+                .as_deref()
+                .is_some_and(|second| matches!(second, "stretch" | "repeat" | "round" | "space"));
+            parts[4] = Some(if two {
+                format!("{lower} {}", second.unwrap_or_default())
+            } else {
+                lower
+            });
+            index += 1 + usize::from(two);
+        } else if parts[1].is_none()
+            && (lower == "fill" || kind(token).is_some_and(|kind| kind < 2))
+        {
+            let fill = lower == "fill";
+            index += usize::from(fill);
+            let mut slice = run(&mut index, &|kind| kind < 2)?;
+            if fill {
+                slice.push_str(" fill");
+            } else if tokens
+                .get(index)
+                .is_some_and(|token| token.eq_ignore_ascii_case("fill"))
+            {
+                slice.push_str(" fill");
+                index += 1;
+            }
+            parts[1] = Some(slice);
+            if tokens.get(index) == Some(&"/") {
+                index += 1;
+                parts[2] = run(&mut index, &|_| true);
+                if tokens.get(index) == Some(&"/") {
+                    index += 1;
+                    parts[3] = Some(run(&mut index, &|kind| kind == 0 || kind == 2)?);
+                } else {
+                    parts[2].as_ref()?;
+                }
+            }
+        } else {
+            return None;
+        }
+    }
+    if parts.iter().all(Option::is_none) {
+        return None;
+    }
+    Some(std::array::from_fn(|index| {
+        parts[index]
+            .take()
+            .unwrap_or_else(|| BORDER_IMAGE_INITIAL[index].into())
+    }))
+}
+
 pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) -> bool {
     let alias = match key {
         "inline-size" => "width",
@@ -20,6 +140,48 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
     };
     if !alias.is_empty() {
         out.push((alias.into(), value.into()));
+        return true;
+    }
+    if key == "border-image" {
+        let wide = matches!(
+            value,
+            "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+        );
+        let Some(parts) = (if wide {
+            Some([value; 5].map(String::from))
+        } else {
+            border_image(value)
+        }) else {
+            return true;
+        };
+        out.extend(BORDER_IMAGE.map(String::from).into_iter().zip(parts));
+        return true;
+    }
+    // `border` also resets `border-image`. Only its source changes what paints, so the other longhands keep their
+    // values, unlike in Chrome, and `border` costs one entry more, not five.
+    if key == "border" {
+        let reset = if matches!(
+            value,
+            "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+        ) {
+            value
+        } else {
+            "initial"
+        };
+        let start = out.len();
+        expand("border-top", value, out);
+        if out.len() == start {
+            return true;
+        }
+        let sides = out[start..].to_vec();
+        for side in ["right", "bottom", "left"] {
+            out.extend(
+                sides
+                    .iter()
+                    .map(|(name, value)| (name.replacen("top", side, 1), value.clone())),
+            );
+        }
+        out.push((BORDER_IMAGE[0].into(), reset.into()));
         return true;
     }
     if let Some((property, rest)) = key
@@ -119,17 +281,13 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 2,
             )
         }
-        "border" | "border-top" | "border-right" | "border-bottom" | "border-left"
-        | "border-inline" | "border-block" | "outline" | "column-rule" => {
+        "border-top" | "border-right" | "border-bottom" | "border-left" | "border-inline"
+        | "border-block" | "outline" | "column-rule" => {
             let sides: &[&str] = match key {
-                "border-top" => &["top"],
-                "border-right" => &["right"],
-                "border-bottom" => &["bottom"],
-                "border-left" => &["left"],
                 "border-inline" => &["inline-start", "inline-end"],
                 "border-block" => &["top", "bottom"],
                 "outline" | "column-rule" => &[""],
-                _ => &SIDES,
+                _ => &[&key[7..]],
             };
             let mut names = Vec::new();
             for side in sides {

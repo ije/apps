@@ -6,7 +6,7 @@ mod paragraph;
 mod raster;
 mod style;
 
-pub use breaks::Wrapping;
+pub use breaks::{Banded, Wrapping};
 pub use cache::Span;
 pub use draw::Decoration;
 pub use line::*;
@@ -21,6 +21,7 @@ use rustc_hash::FxHashMap;
 use std::{
     cell::{Cell, RefCell},
     hash::{Hash, Hasher},
+    mem,
     rc::Rc,
 };
 
@@ -278,6 +279,8 @@ pub struct TextSystem {
     cache: Cache,
     generation: Cell<usize>,
     spans: Cell<Vec<Span>>,
+    /// The floats beside the text box that layout measures now, `[top, bottom, left, right]` in its content box.
+    pub floats: RefCell<Option<Rc<[[f32; 4]]>>>,
 }
 
 impl std::ops::Deref for TextSystem {
@@ -298,6 +301,7 @@ impl TextSystem {
             fonts: self.fonts.clone(),
             cache: Cache::default(),
             spans: Cell::default(),
+            floats: Default::default(),
         }
     }
 
@@ -389,6 +393,7 @@ impl TextSystem {
             wrap: None,
             text,
             looks: looks(std::iter::once((run.len, run))),
+            shifts: Rc::default(),
         }
     }
 
@@ -452,6 +457,24 @@ impl TextSystem {
         runs: &[TextRun],
         wrapping: &Wrapping,
     ) -> Vec<TextLine> {
+        self.shape_beside(text, font_size, runs, wrapping, None)
+    }
+
+    /// Like `shape_text`, with rows beside the floats of `floats` (see [`Banded`]).
+    pub fn shape_beside(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[TextRun],
+        wrapping: &Wrapping,
+        floats: Option<(&[[f32; 4]], f32)>,
+    ) -> Vec<TextLine> {
+        let mut banded = floats.map(|(floats, line)| Banded {
+            floats,
+            line,
+            y: 0.,
+            rows: Vec::new(),
+        });
         let mut cursor = RunCursor {
             runs,
             at: 0,
@@ -475,9 +498,29 @@ impl TextSystem {
                 indent: if index == 0 { wrapping.indent } else { px(0.) },
                 ..*wrapping
             });
-            let (text, line, breaks) =
-                self.cache()
-                    .get(&self.fonts, source, font_size, &spans, wrap.as_ref());
+            let (text, line, mut breaks) = self.cache().get(
+                &self.fonts,
+                source,
+                font_size,
+                &spans,
+                wrap.as_ref().filter(|_| banded.is_none()),
+            );
+            let mut shifts = Rc::default();
+            if let (Some(banded), Some(wrap)) = (banded.as_mut(), &wrap) {
+                let mut end = 0;
+                let nowrap: Vec<_> = spans
+                    .iter()
+                    .filter_map(|span| {
+                        let start = end;
+                        end += span.len;
+                        span.nowrap.then_some(start..end)
+                    })
+                    .collect();
+                breaks = breaks::breaks_beside(&line, &text, wrap, &nowrap, Some(banded)).into();
+                shifts = mem::take(&mut banded.rows).into();
+            } else if let Some(banded) = banded.as_mut() {
+                shifts = banded.rows(breaks.len() + 1);
+            }
             self.spans.set(spans);
             let line = if source.contains('\t') {
                 self.tab_stops(line, &text, &pieces, font_size)
@@ -493,6 +536,7 @@ impl TextSystem {
                 wrap: wrapping.width,
                 text,
                 looks: looks(pieces.iter().copied()),
+                shifts,
             });
         }
         lines

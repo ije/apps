@@ -619,6 +619,15 @@ pub(crate) fn intrinsic(
         _ => available,
     };
     let vertical = sizes([Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT], height);
+    let floated = |child: usize| {
+        !matches!(display, "flex" | "inline-flex" | "grid" | "inline-grid")
+            && styles.values[child]
+                .get(Prop::FLOAT)
+                .is_some_and(|v| v != "none")
+            && styles.values[child]
+                .get(Prop::POSITION)
+                .is_none_or(|v| !matches!(v, "absolute" | "fixed"))
+    };
     let mut content = [0f32; 3];
     let mut collapsed = None;
     let natural = (node.tag != "svg")
@@ -964,6 +973,7 @@ pub(crate) fn intrinsic(
                 || doc.nodes[child].tag == "#text"
                     && node.tag == "details"
                     && !node.attrs.contains_key("open")
+                || floated(child)
         };
         // Flex base sizes decide where lines break, and the widths of a single line where text wraps.
         let mut resolved = Vec::new();
@@ -1288,6 +1298,16 @@ pub(crate) fn intrinsic(
         }
         collapsed = Some(sets);
     }
+    // Like Chrome, floats side by side add up in the max-content width, and the box holds the tallest.
+    if natural.is_none() {
+        let (mut low, mut sum, mut tall) = (0f32, 0f32, 0f32);
+        for &child in node.children.iter().filter(|&&child| floated(child)) {
+            let [min, max, _, height] =
+                intrinsic(doc, child, styles, available, None, text, measured);
+            (low, sum, tall) = (low.max(min), sum + max.max(0.), tall.max(height));
+        }
+        content = [content[0].max(low), content[1] + sum, content[2].max(tall)];
+    }
     if let Some(pseudos) = styles.pseudos.get(&id).filter(|_| {
         !matches!(
             node.tag.as_str(),
@@ -1514,6 +1534,19 @@ pub(crate) fn layout(
     use Sizing::*;
     let style = &styles.values[id];
     let units = &styles.lengths[id];
+    // An anonymous table is as wide as its content, inside its block.
+    let block = width;
+    let width = match width {
+        Some(space) if space > 0. && matches!(style::role(styles, id), 13 | 14) => {
+            let [min, max] = [Some(0.), None].map(|width| {
+                let grid = layout(doc, id, styles, width, None, None, None, text, measured);
+                grid.columns.iter().sum::<f32>()
+                    + grid.columns.len().saturating_sub(1) as f32 * grid.gap[0]
+            });
+            Some(space.min(max).max(min))
+        }
+        width => width,
+    };
     let available = [width, height];
     let get = |prop| style.get(prop);
     let outermost = measured.edges.is_none();
@@ -1734,7 +1767,11 @@ pub(crate) fn layout(
                 }
             });
         item.flowed &= legend != Some(child)
-            && !(table && matches!(doc.nodes[child].tag.as_str(), "col" | "colgroup"));
+            && !(table
+                && (matches!(doc.nodes[child].tag.as_str(), "col" | "colgroup")
+                    || style
+                        .get(Prop::DISPLAY)
+                        .is_some_and(|v| v.starts_with("table-column"))));
         item
     };
     let mut children: Vec<(usize, Item)> = doc.nodes[id]
@@ -1776,7 +1813,7 @@ pub(crate) fn layout(
             } else {
                 doc.nodes[*child]
                     .parent
-                    .filter(|&row| style::role(styles, row) == style::ROW)
+                    .filter(|&row| (style::ROW..=style::FOOTER).contains(&style::role(styles, row)))
             };
             let index = match lane {
                 Some((index, last)) if last == key => index,
@@ -1968,6 +2005,7 @@ pub(crate) fn layout(
     }
     // Widths of `<col>`, `<colgroup>` and cells size the columns, only of the first row with `table-layout: fixed`.
     let mut columns = Vec::new();
+    let mut percents: Vec<f32> = Vec::new();
     if table {
         let count = definitions[0].len();
         let base = available[0].map_or(0., |width| width - count.saturating_sub(1) as f32 * gap[0]);
@@ -2004,10 +2042,11 @@ pub(crate) fn layout(
             && style
                 .get(Prop::WIDTH)
                 .is_some_and(|v| !matches!(v, "auto" | "fit-content"));
+        percents.resize(count, 0.);
         for (&child, cell) in children.iter().zip(&cells) {
             let Some(value) = styles.values[child]
                 .get(Prop::WIDTH)
-                .filter(|v| *v != "auto" && (available[0].is_some() || !v.contains('%')))
+                .filter(|v| *v != "auto")
             else {
                 continue;
             };
@@ -2016,7 +2055,13 @@ pub(crate) fn layout(
                 continue;
             }
             let size = match value.strip_suffix('%').and_then(|v| v.parse::<f32>().ok()) {
-                Some(percent) => percent / 100. * base,
+                Some(percent) => {
+                    percents[cell[0]] = percents[cell[0]].max(percent / 100.);
+                    match available[0] {
+                        Some(_) => percent / 100. * base,
+                        None => continue,
+                    }
+                }
                 None => intrinsic(doc, child, styles, available[0], None, text, measured)[2],
             };
             if let Some(slot) = columns.get_mut(cell[0]) {
@@ -2034,7 +2079,9 @@ pub(crate) fn layout(
                     None => (Fixed(0.), Flex(1.)),
                 };
             }
-        } else if columns.iter().any(Option::is_none) {
+        } else if columns.iter().any(Option::is_none)
+            || percents.iter().any(|&percent| percent > 0.)
+        {
             for (track, size) in definitions[0].iter_mut().zip(&columns) {
                 if let Some(size) = *size {
                     *track = (Auto, Fixed(size));
@@ -2246,8 +2293,11 @@ pub(crate) fn layout(
             }
         }
         if axis == 0 {
+            // Percent columns grow to their share of the table, beyond the content of their cells only when there
+            // is room.
             contributions.extend(
                 (columns.iter().enumerate())
+                    .filter(|&(i, _)| percents.get(i).is_none_or(|&percent| percent == 0.))
                     .filter_map(|(i, size)| size.map(|size| (i, 1, [size; 3]))),
             );
         } else if table {
@@ -2292,14 +2342,40 @@ pub(crate) fn layout(
             offsets[axis] = offset;
             grid.gap[axis] += extra;
         }
-        if axis == 0 {
+        // Like Chrome, the widest content of a table makes room for the share of its percent columns, and
+        // columns of 100% with others beside them make it as wide as it can be.
+        if axis == 0 && available[0].is_none() && percents.iter().any(|&percent| percent > 0.) {
+            let mut sizes = sizes;
+            let rest: f32 = sizes
+                .iter()
+                .zip(&percents)
+                .filter(|(_, p)| **p == 0.)
+                .map(|(size, _)| size)
+                .sum();
+            let total: f32 = percents.iter().sum();
+            let width = sizes
+                .iter()
+                .zip(&percents)
+                .filter(|(_, p)| **p > 0.)
+                .map(|(size, p)| size / p)
+                .fold(rest, f32::max);
+            let width = match total < 1. {
+                true => width.max(rest / (1. - total)),
+                false if rest > 0. => 1e6,
+                false => width,
+            };
+            for (size, percent) in sizes.iter_mut().zip(&percents) {
+                *size = size.max(percent * width);
+            }
+            grid.columns = sizes;
+        } else if axis == 0 {
             grid.columns = sizes;
         } else {
             grid.rows = sizes;
         }
     }
     let row_starts = starts(&grid.rows);
-    let extent = available[0].unwrap_or_else(|| {
+    let extent = block.unwrap_or_else(|| {
         grid.columns.iter().sum::<f32>()
             + grid.gap[0] * grid.columns.len().saturating_sub(1) as f32
             + offsets[0] * 2.

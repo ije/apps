@@ -1,7 +1,7 @@
 use crate::{
     Color, Rect, Size,
     atlas::{self, PageKind, PageList, PageStore, Tile},
-    frame::{Command, Pool, RenderFrame, Target},
+    frame::{Command, Mask, Pool, RenderFrame, Target},
     gpu::{ATTRIBUTES, Blur, Composite, Globals, Instance, Plain, bytes},
     scene::Scene,
 };
@@ -730,9 +730,12 @@ impl Renderer {
                     }
                     gpu.write(&gpu.uniforms[1], &frame.composites[index as usize])?;
                     let layer = source(src);
-                    let mask = mask
-                        .and_then(|mask| page(PageKind::Color, Some(mask)))
-                        .or_else(|| layer.clone());
+                    let mask = match mask {
+                        Some(Mask::Page(mask)) => page(PageKind::Color, Some(mask)),
+                        Some(Mask::Layer(mask)) => source(mask),
+                        None => None,
+                    }
+                    .or_else(|| layer.clone());
                     let below = backdrop.map_or_else(|| layer.clone(), source);
                     quad(&gpu.composite, &gpu.over, &[layer, mask, below]);
                 }

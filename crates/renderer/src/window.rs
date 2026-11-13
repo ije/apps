@@ -430,6 +430,8 @@ pub struct Window {
     pub(crate) font_smoothing: bool,
     hit_transform: Option<Rc<HitTransform>>,
     opacity: f32,
+    // The mask layer and effect depth of `with_text_clip`.
+    pub(crate) text_clip: Option<(usize, usize)>,
     states: FxHashMap<(NodeKey, TypeId), Box<dyn Any>>,
     next_states: FxHashMap<(NodeKey, TypeId), Box<dyn Any>>,
     frame_callbacks: Vec<FrameCallback>,
@@ -494,6 +496,7 @@ impl Window {
             font_smoothing: true,
             hit_transform: None,
             opacity: 1.,
+            text_clip: None,
             states: FxHashMap::default(),
             next_states: FxHashMap::default(),
             frame_callbacks: Vec::new(),

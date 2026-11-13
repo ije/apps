@@ -34,7 +34,14 @@ struct Shelf {
     row: i32,
 }
 
-type Deferred = (Target, Option<u32>, Composite);
+type Deferred = (Target, Option<Mask>, Composite);
+
+#[derive(Clone, Copy)]
+pub enum Mask {
+    // A color atlas page.
+    Page(u32),
+    Layer(Target),
+}
 
 pub enum Command {
     Pass(Target, bool),
@@ -53,10 +60,9 @@ pub enum Command {
         dst: Target,
         region: [i32; 4],
     },
-    // `mask` is a color atlas page.
     Composite {
         src: Target,
-        mask: Option<u32>,
+        mask: Option<Mask>,
         backdrop: Option<Target>,
         index: u32,
     },
@@ -567,7 +573,7 @@ impl RenderFrame {
         &mut self,
         target: Target,
         src: Target,
-        mask: Option<u32>,
+        mask: Option<Mask>,
         backdrop: Option<Target>,
         composite: Composite,
     ) {
@@ -675,6 +681,13 @@ impl RenderFrame {
         let Some(content) = layer.bounds else {
             return;
         };
+        // Without text, a text mask hides all.
+        if effect
+            .text_mask
+            .is_some_and(|text| scene.layers[text].bounds.is_none())
+        {
+            return;
+        }
         let (w, h) = (self.window[0] as f32, self.window[1] as f32);
         let reach = if effect.transform.is_some() {
             [-w, -h, 3. * w, 3. * h]
@@ -692,12 +705,17 @@ impl RenderFrame {
         // Tiles must hold all their content, since drawing past a tile would reach the next one.
         let whole = Some(region)
             == self.region(content, [f32::MIN, f32::MIN, f32::INFINITY, f32::INFINITY]);
-        let tile = (!copies && !blurs && whole)
+        let tile = (!copies && !blurs && whole && effect.text_mask.is_none())
             .then(|| self.tile(region, target, depth))
             .flatten();
         if tile.is_none() {
             self.flush(target, depth);
         }
+        let text = effect.text_mask.map(|text| {
+            let texture = self.acquire(region, 1);
+            self.record_layer(scene, text, texture, true, depth + 1);
+            texture
+        });
         let texture = match tile {
             Some((tile, clear)) => {
                 self.record_layer(scene, nested.layer, tile, clear, depth + 1);
@@ -725,8 +743,17 @@ impl RenderFrame {
             base.flags |= COMPOSITE_MASK;
             base.mask_rect = bounds.to_array();
             base.mask_tile = tile.rect.map(|value| value as f32).to_array();
-            tile.page
+            Mask::Page(tile.page)
         });
+        let mask_texture = match text {
+            Some(text) => {
+                base.flags |= COMPOSITE_MASK;
+                base.mask_rect = region.map(|value| value as f32);
+                base.mask_tile = [0., 0., base.mask_rect[2], base.mask_rect[3]];
+                Some(Mask::Layer(text))
+            }
+            None => mask_texture,
+        };
         let region_rect = region.map(|value| value as f32);
 
         if let Some((offset, sigma, color)) = effect.shadow {
@@ -795,8 +822,8 @@ impl RenderFrame {
         }
         self.composite(target, src, mask_texture, backdrop, composite);
         self.release(src);
-        if let Some(backdrop) = backdrop {
-            self.release(backdrop);
+        for texture in [backdrop, text].into_iter().flatten() {
+            self.release(texture);
         }
     }
 }
@@ -835,6 +862,46 @@ mod tests {
                 .any(|composite| composite.opacity == 0.25)
         );
         frame
+    }
+
+    #[test]
+    fn text_masks_composite_through_their_own_layer() {
+        let mask = Clip::from(bounds([0., 0., 100., 100.]));
+        for has_text in [false, true] {
+            let mut scene = Scene::default();
+            let text = scene.mask_layer();
+            scene.push_effect(
+                EffectState {
+                    text_mask: Some(text),
+                    ..effect(mask)
+                },
+                None,
+            );
+            scene.push(Instance::new(BOX, bounds([10., 10., 50., 20.]), mask));
+            scene.pop_effect();
+            if has_text {
+                scene.push_into(text, Instance::new(BOX, bounds([12., 12., 10., 10.]), mask));
+            }
+            let mut frame = RenderFrame::default();
+            frame.record(&scene, [100, 100], 16384, true);
+            let masks: Vec<_> = frame
+                .commands
+                .iter()
+                .filter_map(|command| match command {
+                    Command::Composite { src, mask, .. } => Some((*src, *mask)),
+                    _ => None,
+                })
+                .collect();
+            if !has_text {
+                assert!(masks.is_empty());
+                continue;
+            }
+            let [(src, Some(super::Mask::Layer(text)))] = masks[..] else {
+                panic!("one composite through the text layer");
+            };
+            assert!(src != text && frame.texture(src) != frame.texture(text));
+            assert_eq!(frame.composites[0].mask_rect, [10., 10., 50., 20.]);
+        }
     }
 
     #[test]

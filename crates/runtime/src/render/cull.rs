@@ -262,9 +262,11 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
         || style
             .get(Prop::WRITING_MODE)
             .is_some_and(|value| value.starts_with("vertical") || value.starts_with("sideways"));
+    // A float can hang out of its block into the boxes after it, so no block around it becomes a spacer.
     let blocked = moved
         || replaced(tag)
         || matches!(position, "absolute" | "fixed" | "sticky")
+        || style.get(Prop::FLOAT).is_some_and(|value| value != "none")
         || style
             .get(Prop::CONTAINER_TYPE)
             .is_some_and(|value| value != "normal")
@@ -312,19 +314,18 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
             | "flow-root"
             | "contents"
             | "none"
-    ) || style.get(Prop::FLOAT).is_some_and(|value| value != "none")
-        || [
-            Prop::FILTER,
-            Prop::WEBKIT_FILTER,
-            Prop::CLIP_PATH,
-            Prop::WEBKIT_CLIP_PATH,
-            Prop::MASK_IMAGE,
-            Prop::WEBKIT_MASK_IMAGE,
-            Prop::BACKDROP_FILTER,
-            Prop::WEBKIT_BACKDROP_FILTER,
-        ]
-        .into_iter()
-        .any(|prop| style.get(prop).is_some_and(|value| value.contains("url(")))
+    ) || [
+        Prop::FILTER,
+        Prop::WEBKIT_FILTER,
+        Prop::CLIP_PATH,
+        Prop::WEBKIT_CLIP_PATH,
+        Prop::MASK_IMAGE,
+        Prop::WEBKIT_MASK_IMAGE,
+        Prop::BACKDROP_FILTER,
+        Prop::WEBKIT_BACKDROP_FILTER,
+    ]
+    .into_iter()
+    .any(|prop| style.get(prop).is_some_and(|value| value.contains("url(")))
         || [
             Prop::COUNTER_RESET,
             Prop::COUNTER_INCREMENT,
@@ -551,7 +552,7 @@ pub(super) fn spacer(
     } = run;
     let parent = path.last().copied().unwrap_or_default();
     let (first, last) = (Cell::new(None), Cell::new([left, top]));
-    renderer::canvas(
+    let mut spacer = renderer::canvas(
         move |bounds, window| {
             let view = &*view;
             let mut host = view.host.borrow_mut();
@@ -604,8 +605,10 @@ pub(super) fn spacer(
     .h(px(height))
     .mt(px(margins[0]))
     .mb(px(margins[1]))
-    .flex_shrink_0()
-    .into()
+    .flex_shrink_0();
+    // Like the blocks it stands for, floats don't move it.
+    spacer.style().flow = renderer::Flow::BLOCK;
+    spacer.into()
 }
 
 pub(super) fn anchor(
@@ -737,7 +740,7 @@ mod tests {
             ("i", PLAIN_BLOCK),
             ("j", PLAIN_BLOCK),
             ("k", 0),
-            ("l", 0),
+            ("l", UNCULLABLE),
             ("m", 0),
             ("n", PLAIN_BLOCK),
             ("o", 0),
@@ -757,7 +760,7 @@ mod tests {
             ("f", false),
             ("g", false),
             ("k", false),
-            ("l", true),
+            ("l", false),
             ("m", false),
             ("v", true),
         ] {

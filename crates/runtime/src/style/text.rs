@@ -271,7 +271,10 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
     renderer::TextRun {
         len,
         font: font(style),
-        color: ink,
+        color: style
+            .get(Prop::WEBKIT_TEXT_FILL_COLOR)
+            .and_then(color)
+            .map_or(ink, super::rgba),
         background_color: None,
         underline: lines.contains("underline").then(|| renderer::Decoration {
             thickness,
@@ -722,6 +725,18 @@ pub(crate) fn inline_text(
             || !node.tag.starts_with('#') && style.get(Prop::DISPLAY) == Some("none")
         {
             continue;
+        }
+        // A float of the block is a box beside the paragraph, not a part of it.
+        if atomic_allowed
+            && style.get(Prop::FLOAT).is_some_and(|value| value != "none")
+            && style
+                .get(Prop::POSITION)
+                .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
+        {
+            if node.parent == Some(id) {
+                continue;
+            }
+            return None;
         }
         if node.tag == "br" {
             if text.ends_with(' ')

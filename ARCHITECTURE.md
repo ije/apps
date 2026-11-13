@@ -160,6 +160,14 @@ Eligible blocks far outside the viewport become spacers with the same dimensions
 
 The renderer caches text layout, glyphs, images, and intermediate surfaces. It paints boxes in CSS order and uses separate layers for effects. Eligible opacity and transform animations use composited layers. On macOS, Core Animation can run these animations and blink an unobstructed text caret without new page frames.
 
+### Floats, columns and text masks
+
+Floats are boxes of their block column. The renderer places them as in CSS 2, in a list for the block formatting context. A block without a formatting context of its own lays out in the context of its parent, so floats reach the blocks after them and inside them. Lines of text beside floats are shorter, and a line where no word fits moves below a float. A box with its own formatting context goes beside the floats or below them. Boxes beside floats skip the layout cache, and floats paint after the blocks of their formatting context.
+
+A multi-column box gives the renderer one column set for each run of content between `column-span: all` boxes. The renderer lays out the flow of a set as one column, finds the break chances in that layout (between blocks, between lines of text, and in the empty space of a box), balances the column height, and moves each box into its column. A box that spans columns paints one part in each column. The page uses these parts for bounds and pointer events.
+
+With `background-clip: text`, a box paints its background in its own layer. The renderer also draws the glyphs of the box into a mask layer and composites the background through that mask.
+
 ### Platform backends
 
 | Platform | Windows | GPU | Text |

@@ -1733,6 +1733,7 @@ impl PageView {
             ids: &ids,
             info: &info,
             zone,
+            columned: false,
             top_layer: &top_layer,
             tree,
             culls: &Cell::new(0),
@@ -1876,6 +1877,7 @@ impl PageView {
                 let field = Build {
                     ancestors: patch.ancestors,
                     flex_parent: patch.flex_parent,
+                    columned: patch.columned,
                     perspective: patch.perspective,
                     zone: None,
                     #[cfg(debug_assertions)]
@@ -2547,7 +2549,14 @@ fn walk(
         return false;
     }
     let kind = |id: usize| match doc.nodes[id].tag.as_str() {
-        _ if style::role(styles, id) == style::CELL => 1,
+        // Rows show when anything in them shows, as an anonymous cell can hold text or a block.
+        _ if style::role(styles, id) == style::CELL
+            || doc.nodes[id].parent.is_some_and(|row| {
+                (style::ROW..=style::FOOTER).contains(&style::role(styles, row))
+            }) =>
+        {
+            1
+        }
         "canvas" => 2,
         "iframe" => 3,
         _ => 0,
@@ -2664,6 +2673,18 @@ fn drop_hidden_images(
     dom.backgrounds.retain(|&(id, layer), (_, image)| {
         let keep = if layer > usize::MAX - 64 {
             visible.get(id) == Some(&true)
+                && match layer.checked_sub(background::BORDER_IMAGE) {
+                    Some(slot) if slot < 8 => match slot {
+                        0 => styles.values.get(id).map(|style| &**style),
+                        _ => styles
+                            .pseudos
+                            .get(&id)
+                            .and_then(|pseudos| pseudos.get(slot - 1)),
+                    }
+                    .and_then(|style| style.get(Prop::BORDER_IMAGE_SOURCE))
+                    .is_some_and(|value| value != "none"),
+                    _ => true,
+                }
         } else {
             visible.get(id) == Some(&true)
                 && match layer / 64 {

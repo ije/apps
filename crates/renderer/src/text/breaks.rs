@@ -19,6 +19,30 @@ struct Chance {
     words_end: f32,
 }
 
+/// Floats beside a paragraph: `[top, bottom, left, right]` of each float in its content box, the line
+/// height, the top of the next row, and `[left, right, top]` of each row so far.
+pub struct Banded<'a> {
+    pub floats: &'a [[f32; 4]],
+    pub line: f32,
+    pub y: f32,
+    pub rows: Vec<[f32; 3]>,
+}
+
+impl Banded<'_> {
+    /// The insets of a row at `y`, and the first float bottom below it.
+    pub(crate) fn edges(&self, y: f32) -> ([f32; 2], f32) {
+        self.floats
+            .iter()
+            .filter(|float| float[0] < y + self.line && float[1] > y)
+            .fold(([0.; 2], f32::INFINITY), |(edges, low), float| {
+                (
+                    [edges[0].max(float[2]), edges[1].max(float[3])],
+                    low.min(float[1]),
+                )
+            })
+    }
+}
+
 /// Returns the glyph index that starts each row after the first.
 pub(crate) fn breaks(
     line: &Line,
@@ -26,9 +50,38 @@ pub(crate) fn breaks(
     wrapping: &Wrapping,
     nowrap: &[Range<usize>],
 ) -> Vec<u32> {
+    breaks_beside(line, text, wrapping, nowrap, None)
+}
+
+impl Banded<'_> {
+    /// The insets of the next `count` rows that don't wrap, like a `nowrap` line.
+    pub(crate) fn rows(&mut self, count: usize) -> std::rc::Rc<[[f32; 3]]> {
+        (0..count)
+            .map(|_| {
+                let [left, right] = self.edges(self.y).0;
+                self.y += self.line;
+                [left, right, self.y - self.line]
+            })
+            .collect()
+    }
+}
+
+/// Like `breaks`, with rows that get shorter beside floats and move below them when no word fits.
+pub(crate) fn breaks_beside(
+    line: &Line,
+    text: &str,
+    wrapping: &Wrapping,
+    nowrap: &[Range<usize>],
+    mut banded: Option<&mut Banded<'_>>,
+) -> Vec<u32> {
     let width = wrapping.width.unwrap_or_default();
     let held = |index: usize| nowrap.iter().any(|range| range.contains(&index));
-    let even = wrapping.wrap != TextWrap::Wrap && wrapping.max_lines.is_none();
+    let even = wrapping.wrap != TextWrap::Wrap && wrapping.max_lines.is_none() && banded.is_none();
+    let mut edges = [0.; 2];
+    if let Some(banded) = banded.as_deref_mut() {
+        edges = banded.edges(banded.y).0;
+        banded.rows.push([edges[0], edges[1], banded.y]);
+    }
     let glyphs = &line.glyphs;
     let mut rows = Vec::new();
     let mut chances = Vec::new();
@@ -81,11 +134,25 @@ pub(crate) fn breaks(
         if ch != ' ' {
             words_end = next_x.0;
         }
-        let room = if rows.is_empty() {
+        let mut room = if rows.is_empty() {
             width - wrapping.indent
         } else {
             width
-        };
+        } - px(edges[0] + edges[1]);
+        // Like Chrome, a row where the first word doesn't fit beside the floats moves below the first of them.
+        while ch != ' '
+            && chance.is_none()
+            && edges != [0.; 2]
+            && next_x - row_x > room + px(0.01)
+            && let Some(banded) = banded.as_deref_mut()
+        {
+            let y = banded.edges(banded.y).1;
+            banded.y = y;
+            room += px(edges[0] + edges[1]);
+            edges = banded.edges(y).0;
+            room -= px(edges[0] + edges[1]);
+            *banded.rows.last_mut().unwrap() = [edges[0], edges[1], y];
+        }
         if ch != ' '
             && next_x - row_x > room + px(0.01)
             && at > row_glyph
@@ -101,9 +168,17 @@ pub(crate) fn breaks(
             }
             (row_glyph, row_x) = chance.take().unwrap_or((at, glyph.x));
             rows.push(row_glyph);
+            if let Some(banded) = banded.as_deref_mut() {
+                banded.y += banded.line;
+                edges = banded.edges(banded.y).0;
+                banded.rows.push([edges[0], edges[1], banded.y]);
+            }
         }
         after_hyphen = ch == '-' && previous.is_alphanumeric();
         previous = ch;
+    }
+    if let Some(banded) = banded {
+        banded.y += banded.line;
     }
     if !even || rows.is_empty() {
         return rows;
@@ -247,6 +322,51 @@ mod tests {
             wrap,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn rows_beside_floats_shorten_and_move_below_them_like_chrome() {
+        // 10px glyphs and 10px rows. A left float of 30px is 15px tall, a right one of 20px 35px tall.
+        let floats = [[0., 15., 30., 0.], [0., 35., 0., 20.]];
+        let mut banded = Banded {
+            floats: &floats,
+            line: 10.,
+            y: 0.,
+            rows: Vec::new(),
+        };
+        let text = "ab cd ef gh ij";
+        let rows = breaks_beside(
+            &line(text),
+            text,
+            &wrapping(100., TextWrap::Wrap),
+            &[],
+            Some(&mut banded),
+        );
+        // Rows of 50px, 50px, 80px, then 100px.
+        assert_eq!(rows, [6, 12]);
+        assert_eq!(
+            banded.rows,
+            [[30., 20., 0.], [30., 20., 10.], [0., 20., 20.]]
+        );
+        assert_eq!(banded.y, 30.);
+        // A word wider than the room beside the floats moves below the first float that ends.
+        let mut banded = Banded {
+            floats: &floats,
+            line: 10.,
+            y: 0.,
+            rows: Vec::new(),
+        };
+        let text = "abcdefgh";
+        let rows = breaks_beside(
+            &line(text),
+            text,
+            &wrapping(100., TextWrap::Wrap),
+            &[],
+            Some(&mut banded),
+        );
+        assert!(rows.is_empty());
+        assert_eq!(banded.rows, [[0., 20., 15.]]);
+        assert_eq!(banded.y, 25.);
     }
 
     #[test]

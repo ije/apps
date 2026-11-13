@@ -270,6 +270,10 @@ impl Window {
                 interactive: glass.interactive,
             }),
             content_mask,
+            text_mask: effect
+                .text_mask
+                .then(|| self.text_clip.map(|(layer, _)| layer))
+                .flatten(),
         };
         self.scene.push_effect(state, effect.key);
         // Ancestor clips apply after the effect, in window space, so the layer starts unclipped.
@@ -278,6 +282,46 @@ impl Window {
         self.content_masks.pop();
         self.scene.pop_effect();
         result
+    }
+
+    /// Glyphs and text lines that `f` draws outside nested effects also draw into a mask, which an effect
+    /// with `text_mask` in `f` shows its content through, as `background-clip: text`.
+    pub fn with_text_clip<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let layer = self.scene.mask_layer();
+        let outer = self.text_clip.replace((layer, self.scene.depth()));
+        let result = f(self);
+        self.text_clip = outer;
+        result
+    }
+
+    /// Text that `f` draws, like a text shadow, takes no part in the mask of `with_text_clip`.
+    pub fn without_text_clip<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = self.text_clip.take();
+        let result = f(self);
+        self.text_clip = outer;
+        result
+    }
+
+    fn push_text(&mut self, instance: Instance) {
+        if let Some((layer, depth)) = self.text_clip
+            && depth == self.scene.depth()
+        {
+            let mut mask = instance;
+            match instance.kind() {
+                IMAGE => mask.info[2] = 1.,
+                GLYPH => (mask.color, mask.info[2]) = ([0., 0., 0., 1.], 1.),
+                _ => mask.color = [0., 0., 0., 1.],
+            }
+            self.scene.push_into(layer, mask);
+        }
+        if instance.kind() == IMAGE || instance.color[3] > 0. {
+            self.scene.push(instance);
+        }
+    }
+
+    /// Whether transparent text still draws, into the mask of `with_text_clip`.
+    pub fn clips_text(&self) -> bool {
+        self.text_clip.is_some()
     }
 
     // `origin` is the top left of the line.
@@ -322,7 +366,7 @@ impl Window {
                 continue;
             }
             if dash <= 0. {
-                self.scene.push(line);
+                self.push_text(line);
                 continue;
             }
             let period = dash * 2.;
@@ -333,7 +377,7 @@ impl Window {
                 let right = (start + dash).min(shown.right());
                 if left < right {
                     line.clip = [left, shown.top(), right - left, shown.size.height];
-                    self.scene.push(line);
+                    self.push_text(line);
                 }
                 start += period;
             }
@@ -403,7 +447,7 @@ impl Window {
             instance.color = color.fade(self.opacity).to_array();
             instance
         };
-        self.scene.push(instance);
+        self.push_text(instance);
     }
 
     fn sprite(
