@@ -5,6 +5,9 @@ enum Space {
     Srgb,
     SrgbLinear,
     DisplayP3,
+    A98,
+    ProPhoto,
+    Rec2020,
     XyzD50,
     XyzD65,
     Lab,
@@ -15,10 +18,13 @@ enum Space {
     Hwb,
 }
 
-const SPACES: [(&str, Space); 12] = [
+const SPACES: [(&str, Space); 15] = [
     ("srgb", Space::Srgb),
     ("srgb-linear", Space::SrgbLinear),
     ("display-p3", Space::DisplayP3),
+    ("a98-rgb", Space::A98),
+    ("prophoto-rgb", Space::ProPhoto),
+    ("rec2020", Space::Rec2020),
     ("xyz", Space::XyzD65),
     ("xyz-d65", Space::XyzD65),
     ("xyz-d50", Space::XyzD50),
@@ -83,6 +89,9 @@ pub(crate) fn serialize(value: &str) -> Option<String> {
             Space::Srgb => "color(srgb ",
             Space::SrgbLinear => "color(srgb-linear ",
             Space::DisplayP3 => "color(display-p3 ",
+            Space::A98 => "color(a98-rgb ",
+            Space::ProPhoto => "color(prophoto-rgb ",
+            Space::Rec2020 => "color(rec2020 ",
             Space::XyzD50 => "color(xyz-d50 ",
             Space::XyzD65 => "color(xyz-d65 ",
             Space::Lab => "lab(",
@@ -169,6 +178,63 @@ const XYZ_TO_P3: [[f64; 3]; 3] = [
         0.9568845240076872,
     ],
 ];
+const A98_TO_XYZ: [[f64; 3]; 3] = [
+    [0.5766690429101305, 0.1855582379065463, 0.1882286462349947],
+    [0.29734497525053605, 0.6273635662554661, 0.07529145849399788],
+    [0.02703136138641234, 0.07068885253582723, 0.9913375368376388],
+];
+const XYZ_TO_A98: [[f64; 3]; 3] = [
+    [
+        2.0415879038107465,
+        -0.5650069742788596,
+        -0.34473135077832956,
+    ],
+    [-0.9692436362808795, 1.8759675015077202, 0.04155505740717557],
+    [
+        0.013444280632031142,
+        -0.11836239223101838,
+        1.0151749943912054,
+    ],
+];
+// ProPhoto RGB is relative to D50.
+const PROPHOTO_TO_XYZ: [[f64; 3]; 3] = [
+    [0.7977604896723027, 0.13518583717574031, 0.0313493495815248],
+    [
+        0.2880711282292934,
+        0.7118432178101014,
+        0.00008565396060525902,
+    ],
+    [0., 0., 0.8251046025104601],
+];
+const XYZ_TO_PROPHOTO: [[f64; 3]; 3] = [
+    [
+        1.3457989731028281,
+        -0.25558010007997534,
+        -0.05110628506753401,
+    ],
+    [-0.5446224939028347, 1.5082327413132781, 0.02053603239147973],
+    [0., 0., 1.2119675456389454],
+];
+const REC2020_TO_XYZ: [[f64; 3]; 3] = [
+    [0.6369580483012914, 0.14461690358620832, 0.1688809751287843],
+    [0.2627002120112671, 0.6779980715188708, 0.05930171646986196],
+    [0., 0.028072693049087428, 1.060985057710791],
+];
+const XYZ_TO_REC2020: [[f64; 3]; 3] = [
+    [
+        1.7166511879712674,
+        -0.35567078377639233,
+        -0.25336628137365974,
+    ],
+    [-0.6666843518324892, 1.6164812366349395, 0.01576854581391113],
+    [
+        0.017639857445310783,
+        -0.042770613257808524,
+        0.9421031212354738,
+    ],
+];
+const REC2020_ALPHA: f64 = 1.09929682680944;
+const REC2020_BETA: f64 = 0.018053968510807;
 const D65_TO_D50: [[f64; 3]; 3] = [
     [
         1.0479297925449969,
@@ -471,8 +537,8 @@ fn parse(value: &str, depth: u8) -> Option<(Space, [f64; 3], f64)> {
     let space = match name {
         "rgb" | "rgba" => Space::Srgb,
         "hsla" => Space::Hsl,
-        "color" => find(&SPACES[..6], parts.next()?)?,
-        _ => find(&SPACES[6..], name)?,
+        "color" => find(&SPACES[..9], parts.next()?)?,
+        _ => find(&SPACES[9..], name)?,
     };
     let (references, keys) = match space {
         Space::Hsl => ([0., 100., 100.], ["h", "s", "l"]),
@@ -621,6 +687,35 @@ fn to_xyz(space: Space, values: [f64; 3]) -> [f64; 3] {
         Space::Srgb => matrix(SRGB_TO_XYZ, [a, b, c].map(linear)),
         Space::SrgbLinear => matrix(SRGB_TO_XYZ, [a, b, c]),
         Space::DisplayP3 => matrix(P3_TO_XYZ, [a, b, c].map(linear)),
+        Space::A98 => matrix(
+            A98_TO_XYZ,
+            [a, b, c].map(|v| v.abs().powf(563. / 256.).copysign(v)),
+        ),
+        Space::ProPhoto => matrix(
+            D50_TO_D65,
+            matrix(
+                PROPHOTO_TO_XYZ,
+                [a, b, c].map(|v| {
+                    if v.abs() <= 16. / 512. {
+                        v / 16.
+                    } else {
+                        v.abs().powf(1.8).copysign(v)
+                    }
+                }),
+            ),
+        ),
+        Space::Rec2020 => matrix(
+            REC2020_TO_XYZ,
+            [a, b, c].map(|v| {
+                if v.abs() < REC2020_BETA * 4.5 {
+                    v / 4.5
+                } else {
+                    ((v.abs() + REC2020_ALPHA - 1.) / REC2020_ALPHA)
+                        .powf(1. / 0.45)
+                        .copysign(v)
+                }
+            }),
+        ),
         Space::XyzD65 => [a, b, c],
         Space::XyzD50 => matrix(D50_TO_D65, [a, b, c]),
         Space::Lab | Space::Lch => {
@@ -674,6 +769,21 @@ fn from_xyz(space: Space, xyz: [f64; 3]) -> [f64; 3] {
         Space::Srgb => matrix(XYZ_TO_SRGB, xyz).map(gamma),
         Space::SrgbLinear => matrix(XYZ_TO_SRGB, xyz),
         Space::DisplayP3 => matrix(XYZ_TO_P3, xyz).map(gamma),
+        Space::A98 => matrix(XYZ_TO_A98, xyz).map(|v| v.abs().powf(256. / 563.).copysign(v)),
+        Space::ProPhoto => matrix(XYZ_TO_PROPHOTO, matrix(D65_TO_D50, xyz)).map(|v| {
+            if v.abs() < 1. / 512. {
+                v * 16.
+            } else {
+                v.abs().powf(1. / 1.8).copysign(v)
+            }
+        }),
+        Space::Rec2020 => matrix(XYZ_TO_REC2020, xyz).map(|v| {
+            if v.abs() > REC2020_BETA {
+                (REC2020_ALPHA * v.abs().powf(0.45) - (REC2020_ALPHA - 1.)).copysign(v)
+            } else {
+                4.5 * v
+            }
+        }),
         Space::XyzD65 => xyz,
         Space::XyzD50 => matrix(D65_TO_D50, xyz),
         Space::Lab | Space::Lch => {
@@ -801,7 +911,9 @@ mod tests {
             ("color(xyz-d65 0.4124 0.2126 0.0193)", Some((0xff0000, 255))),
             ("color(xyz-d50 0.4360 0.2225 0.0139)", Some((0xff0000, 255))),
             ("color(xyz 0.9505 1 1.089)", Some((0xffffff, 255))),
-            ("color(rec2020 1 0 0)", None),
+            ("color(rec2020 1 0 0)", Some((0xff0000, 255))),
+            ("color(a98-rgb 1 0 0)", Some((0xff0000, 255))),
+            ("color(prophoto-rgb .5 .5 .5)", Some((0x929292, 255))),
             ("rgb(from red r g b / 50%)", Some((0xff0000, 128))),
             ("rgb(from #d52c36 r g b / .15)", Some((0xd52c36, 38))),
             (

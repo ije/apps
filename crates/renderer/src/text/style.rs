@@ -19,7 +19,7 @@ keywords! {
     DecorationStyle { Solid, Double, Dotted, Dashed, Wavy }
     TextAlign { Left, Center, Right }
     WhiteSpace { Normal, Nowrap }
-    WordBreak { Normal, BreakWord, Anywhere, BreakAll }
+    WordBreak { Normal, BreakWord, Anywhere, BreakAll, KeepAll }
     TextWrap { Wrap, Balance, Pretty }
 }
 
@@ -31,11 +31,14 @@ pub struct TextRun {
     pub background_color: Option<Color>,
     pub underline: Option<Decoration>,
     pub strikethrough: Option<Decoration>,
+    pub overline: Option<Decoration>,
     pub letter_spacing: Pixels,
     pub word_spacing: Pixels,
     pub font_size: Option<Pixels>,
     pub inset: [Pixels; 2],
     pub nowrap: bool,
+    /// Spaces per tab stop, or pixels when negative.
+    pub tab_size: f32,
 }
 
 /// Declares `TextStyle` and its overrides from one list, so the two cannot drift.
@@ -133,11 +136,13 @@ impl TextStyle {
             background_color,
             underline,
             strikethrough,
+            overline: None,
             letter_spacing,
             word_spacing,
             font_size: None,
             inset: [Pixels::ZERO; 2],
             nowrap: false,
+            tab_size: 8.,
         }
     }
 }

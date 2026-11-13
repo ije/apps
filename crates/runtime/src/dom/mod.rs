@@ -509,6 +509,8 @@ const MIRROR_POSITIONED: u8 = 8;
 const MIRROR_HIDDEN: u8 = 16;
 const MIRROR_FIXED: u8 = 32;
 const MIRROR_INERT: u8 = 64;
+// The box or an ancestor has a transform that changes its size, so the bounds are not its layout box.
+const MIRROR_TRANSFORMED: u8 = 128;
 const HIDDEN: u8 = 1;
 const EDITABLE: u8 = 2;
 const INERT: u8 = 4;
@@ -580,6 +582,13 @@ impl LayoutMirror {
         unsafe {
             *self.slot(id).cast::<[f32; 4]>() = rect;
             *self.flags(id) |= MIRROR_BOUNDS;
+        }
+    }
+
+    pub(crate) fn transformed(&mut self, id: usize, on: bool) {
+        unsafe {
+            let flags = self.flags(id);
+            *flags = *flags & !MIRROR_TRANSFORMED | if on { MIRROR_TRANSFORMED } else { 0 };
         }
     }
 
@@ -1378,6 +1387,12 @@ pub fn call(
             args[0].as_str().unwrap_or_default()
         )));
     }
+    if op == "dom.specified" {
+        return Ok(json!(style::specified(
+            args[0].as_str().unwrap_or_default(),
+            args[1].as_str().unwrap_or_default()
+        )));
+    }
     if op == "dom.declare" {
         return Ok(json!(
             style::declare(args[0].as_str().unwrap_or_default()).concat()
@@ -1577,6 +1592,9 @@ pub fn call(
                 if state.focus == Some(id) {
                     state.focus = None;
                 }
+                if doc.target == Some(id) {
+                    doc.target = None;
+                }
                 state.selection.remove(&id);
                 state.atoms.remove(&id);
                 if state.selection_caret == Some(id) {
@@ -1754,6 +1772,19 @@ pub fn call(
             state.invalidate();
         }
         state.dirty |= used || focus != 0 || repaint;
+        return Ok(Value::Null);
+    }
+    if op == "dom.target" {
+        let target = args[0]
+            .as_u64()
+            .map(|id| id as usize)
+            .filter(|&id| id < doc.nodes.len());
+        for id in [doc.target, target].into_iter().flatten() {
+            doc.nodes.edit(id);
+        }
+        doc.target = target;
+        state.invalidate();
+        state.dirty = true;
         return Ok(Value::Null);
     }
     if op == "dom.reserve" {
@@ -1997,58 +2028,258 @@ pub fn call(
             };
             let Some(style) = style.filter(|style| !style.is_empty()) else {
                 return Ok(json!(if args[1].is_string() {
-                    json!("")
+                    json!(
+                        if args[1] == "content" && matches!(pseudo, "before" | "after") {
+                            "none"
+                        } else {
+                            ""
+                        }
+                    )
                 } else {
                     json!([])
                 }));
             };
             let units = styles.lengths[id];
-            let size = (pseudo.is_empty())
-                .then(|| state.bounds.get(&id).map(|rect| [rect[2], rect[3]]))
-                .flatten();
-            let container = || {
-                doc.nodes[id]
-                    .parent
-                    .and_then(|parent| {
-                        let rect = state.bounds.get(&parent)?;
-                        let (style, units) = (&styles.values[parent], styles.lengths[parent]);
-                        let padding = units.edges(style, style::PADDING, rect[2]);
-                        Some([
-                            rect[2] - padding[1] - padding[3],
-                            rect[3] - padding[0] - padding[2],
-                        ])
-                    })
-                    .unwrap_or(viewport)
+            let shown = |node: usize| {
+                state.bounds.get(&node).is_some()
+                    && unsafe { *state.bounds.flags(node) } & MIRROR_HIDDEN == 0
             };
+            // Padding, plus borders when `borders`, of each side, with percentages of `base`.
+            let edges = |style: &style::Style, units: &style::Lengths, base, borders| {
+                let mut edges = units.edges(style, style::PADDING, base);
+                for (edge, [width, kind, _]) in edges.iter_mut().zip(style::BORDERS) {
+                    if borders
+                        && style
+                            .get(kind)
+                            .is_some_and(|kind| !matches!(kind, "none" | "hidden"))
+                    {
+                        *edge += style
+                            .get(width)
+                            .map_or(Some(3.), |width| units.resolve(width, base))
+                            .unwrap_or(0.)
+                            .max(0.);
+                    }
+                }
+                edges
+            };
+            let position = style.get(Prop::POSITION).unwrap_or("static");
+            // The containing block: the parent's content box, or for positioned boxes the padding box of the
+            // nearest positioned or transformed ancestor. `None` is the viewport.
+            let block = match position {
+                "fixed" => None,
+                "absolute" => {
+                    std::iter::successors(doc.nodes[id].parent, |&node| doc.nodes[node].parent)
+                        .find(|&node| {
+                            styles.values[node]
+                                .get(Prop::POSITION)
+                                .is_some_and(|value| value != "static")
+                                || styles.values[node]
+                                    .get(Prop::TRANSFORM)
+                                    .is_some_and(|value| value != "none")
+                        })
+                }
+                _ => doc.nodes[id].parent,
+            }
+            .and_then(|node| {
+                let rect = *state.bounds.get(&node)?;
+                let (style, units) = (&styles.values[node], &styles.lengths[node]);
+                let outer = edges(style, units, rect[2], true);
+                let inner = state
+                    .cull
+                    .widths
+                    .get(&node)
+                    .copied()
+                    .unwrap_or([rect[2] - outer[1] - outer[3], rect[3] - outer[0] - outer[2]]);
+                let padding = if position == "absolute" {
+                    edges(style, units, inner[0], false)
+                } else {
+                    [0.; 4]
+                };
+                Some([
+                    rect[0] + outer[3] - padding[3],
+                    rect[1] + outer[0] - padding[0],
+                    inner[0] + padding[1] + padding[3],
+                    inner[1] + padding[0] + padding[2],
+                ])
+            })
+            .unwrap_or([0., 0., viewport[0], viewport[1]]);
+            let container = || [block[2], block[3]];
+            let inline = !doc.nodes[id].tag.starts_with('#')
+                && style
+                    .get(Prop::DISPLAY)
+                    .is_none_or(|display| display == "inline")
+                && !matches!(
+                    doc.nodes[id].tag.as_str(),
+                    "img"
+                        | "svg"
+                        | "canvas"
+                        | "video"
+                        | "audio"
+                        | "iframe"
+                        | "embed"
+                        | "object"
+                        | "input"
+                        | "select"
+                        | "textarea"
+                        | "button"
+                );
+            // The untransformed border box. Inline boxes and boxes that are not rendered have none, so their
+            // percentages stay as they are.
+            let size = (pseudo.is_empty() && !inline && shown(id))
+                .then(|| {
+                    let inner = state.cull.widths.get(&id)?;
+                    let sides = edges(style, &units, block[2], true);
+                    Some([
+                        inner[0] + sides[1] + sides[3],
+                        inner[1] + sides[0] + sides[2],
+                    ])
+                })
+                .flatten()
+                .or_else(|| {
+                    (pseudo.is_empty() && !inline && shown(id))
+                        .then(|| state.bounds.get(&id).map(|rect| [rect[2], rect[3]]))
+                        .flatten()
+                });
             let registry = state.style_cache.registry();
             let parent = doc.nodes[id].parent.map(|parent| &*styles.values[parent]);
-            Ok(match args[1].as_str() {
-                Some(name) => {
-                    let value = style::resolved(style, &units, name, size, &container, &registry);
-                    let tag = doc.nodes[id].tag.as_str();
-                    json!(match (name, value.as_str()) {
-                        ("display", display_value) if pseudo.is_empty() => {
-                            display(&styles, tag, id, display_value).to_owned()
-                        }
-                        ("gap" | "row-gap" | "column-gap", _) if tag == "table" =>
-                            "normal".to_owned(),
-                        ("min-width" | "min-height", "auto")
-                            if parent.is_none_or(|parent| {
-                                parent.get(Prop::DISPLAY).is_none_or(|display| {
-                                    !display.ends_with("flex") && !display.ends_with("grid")
-                                })
-                            }) =>
-                        {
-                            "0px".to_owned()
-                        }
-                        ("top" | "right" | "bottom" | "left", "auto")
-                            if style.get(Prop::POSITION) == Some("relative") =>
-                        {
-                            "0px".to_owned()
-                        }
-                        _ => value,
+            let flow = doc.nodes[id]
+                .parent
+                .is_some_and(|parent| style::table_box(style::role(&styles, parent)))
+                || parent.is_none_or(|parent| {
+                    parent.get(Prop::DISPLAY).is_none_or(|display| {
+                        !display.ends_with("flex") && !display.ends_with("grid")
                     })
+                });
+            let value = |name: &str| -> String {
+                let name = style::physical_name(style, name);
+                let get = |name| style::resolved(style, &units, name, size, &container, &registry);
+                let value = get(&name);
+                match (&*name, value.as_str()) {
+                    ("display", display_value) if pseudo.is_empty() => {
+                        display(&styles, id, display_value).to_owned()
+                    }
+                    ("gap" | "row-gap" | "column-gap", _)
+                        if style::table_box(style::role(&styles, id)) =>
+                    {
+                        "normal".to_owned()
+                    }
+                    ("min-width" | "min-height", "auto") if flow => "0px".to_owned(),
+                    ("top" | "right" | "bottom" | "left", "auto")
+                        if position != "static" && position != "sticky" =>
+                    {
+                        let (opposite, axis) = match &*name {
+                            "top" => ("bottom", 1),
+                            "bottom" => ("top", 1),
+                            "left" => ("right", 0),
+                            _ => ("left", 0),
+                        };
+                        if position == "relative" {
+                            let other = get(opposite);
+                            return match other
+                                .strip_suffix("px")
+                                .and_then(|px| px.parse::<f32>().ok())
+                            {
+                                Some(px) if px != 0. => {
+                                    format!("{}px", style::number(f64::from(-px)))
+                                }
+                                _ => "0px".to_owned(),
+                            };
+                        }
+                        let (Some(&[x, y, width, height]), Some(size)) =
+                            (state.bounds.get(&id), size)
+                        else {
+                            return value;
+                        };
+                        // The bounds hold the transformed box, whose center is the transformed center of the box.
+                        let bounds = renderer::Rect::new(
+                            renderer::point(renderer::px(0.), renderer::px(0.)),
+                            renderer::size(renderer::px(size[0]), renderer::px(size[1])),
+                        );
+                        let center =
+                            match crate::render::effects::transform(style, &units, bounds, None) {
+                                Some(m) if m[3] == 0. && m[7] == 0. && m[15] == 1. => {
+                                    let [cx, cy] = [size[0] / 2., size[1] / 2.];
+                                    [m[0] * cx + m[4] * cy + m[12], m[1] * cx + m[5] * cy + m[13]]
+                                }
+                                _ => [size[0] / 2., size[1] / 2.],
+                            };
+                        let corner = [x + width / 2. - center[0], y + height / 2. - center[1]];
+                        let margin = units.edges(style, style::MARGIN, block[2]);
+                        let start = corner[axis] - margin[3 - 3 * axis] - block[axis];
+                        let used = if name == "top" || name == "left" {
+                            start
+                        } else {
+                            block[2 + axis]
+                                - start
+                                - size[axis]
+                                - margin[3 - 3 * axis]
+                                - margin[1 + axis]
+                        };
+                        format!("{}px", style::number(f64::from((used * 64.).round() / 64.)))
+                    }
+                    ("margin-left" | "margin-right", "auto") if size.is_some() => {
+                        if !flow || position == "absolute" || position == "fixed" {
+                            return "0px".to_owned();
+                        }
+                        let other = get(if name == "margin-left" {
+                            "margin-right"
+                        } else {
+                            "margin-left"
+                        });
+                        let free = block[2] - size.unwrap_or_default()[0];
+                        let used = match other
+                            .strip_suffix("px")
+                            .and_then(|px| px.parse::<f32>().ok())
+                        {
+                            Some(px) => free - px,
+                            None => free / 2.,
+                        };
+                        format!("{}px", style::number(f64::from((used * 64.).round() / 64.)))
+                    }
+                    ("margin-top" | "margin-bottom", "auto") if size.is_some() => "0px".to_owned(),
+                    // Chrome gives the strings and `attr()` values of generated content as one string.
+                    ("content", _)
+                        if !pseudo.is_empty() && value != "none" && value != "normal" =>
+                    {
+                        let (mut parts, mut text) = (Vec::new(), None::<String>);
+                        let quote = |text: String| {
+                            format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+                        };
+                        for part in style::components(&value, ' ') {
+                            let mut input = cssparser::Parser::new(part);
+                            let mut strings = None::<String>;
+                            while let Ok(string) = input.expect_string() {
+                                strings.get_or_insert_default().push_str(string);
+                            }
+                            let string = strings.filter(|_| input.is_exhausted()).or_else(|| {
+                                let name = part.strip_prefix("attr(")?.strip_suffix(')')?.trim();
+                                Some(doc.nodes[id].attrs.get(name).cloned().unwrap_or_default())
+                            });
+                            match string {
+                                Some(string) => text.get_or_insert_default().push_str(&string),
+                                None => {
+                                    parts.extend(text.take().map(quote));
+                                    parts.push(part.to_owned());
+                                }
+                            }
+                        }
+                        parts.extend(text.map(quote));
+                        parts.join(" ")
+                    }
+                    _ => value,
                 }
+            };
+            Ok(match args[1].as_str() {
+                Some(name @ ("inset" | "margin")) => {
+                    let sides = if name == "inset" {
+                        ["top", "right", "bottom", "left"]
+                    } else {
+                        ["margin-top", "margin-right", "margin-bottom", "margin-left"]
+                    }
+                    .map(value);
+                    json!(style::shortest(sides.each_ref().map(String::as_str)))
+                }
+                Some(name) => json!(value(name)),
                 None => json!(
                     style::computed_names()
                         .chain(style.vars().iter().map(|(prop, _)| prop.name()))
@@ -2504,7 +2735,7 @@ pub fn call(
                         renderer::px(args[1].as_f64().unwrap_or(0.) as f32),
                         renderer::px(args[2].as_f64().unwrap_or(0.) as f32),
                     );
-                    let index = crate::render::text::text_index(layout, text, rows, position)
+                    let index = crate::render::text::text_index(layout, text, rows, position, true)
                         .unwrap_or_else(|index| index)
                         .clamp(range.start, range.end);
                     return Ok(json!(real(source_offset(
@@ -2557,11 +2788,13 @@ pub fn call(
                 background_color: None,
                 underline: None,
                 strikethrough: None,
+                overline: None,
                 letter_spacing: renderer::px(0.),
                 word_spacing: renderer::px(0.),
                 font_size: None,
                 inset: Default::default(),
                 nowrap: false,
+                tab_size: 8.,
             };
             let wrap = (!single
                 && !style
@@ -2689,21 +2922,23 @@ pub fn call(
             };
             let (style, units) = (&computed.values[id], &computed.lengths[id]);
             let tag = doc.nodes[id].tag.as_str();
-            if matches!(tag, "tr" | "thead" | "tbody" | "tfoot")
-                && style.get(Prop::DISPLAY) == Some("contents")
-            {
-                return Ok(json!([0., 0., rect[2], rect[3], 0., 0., 0., 0.]));
+            if (style::ROW..=style::FOOTER).contains(&style::role(&computed, id)) {
+                return Ok(json!([
+                    0., 0., rect[2], rect[3], 0., 0., 0., 0., rect[2], rect[3], 0., 0.
+                ]));
             }
             if tag.starts_with('#')
                 || style
                     .get(Prop::DISPLAY)
                     .is_none_or(|value| matches!(value, "inline" | "contents"))
             {
-                return Ok(json!([0.; 8].as_slice()));
+                return Ok(json!([
+                    0., 0., 0., 0., 0., 0., 0., 0., rect[2], rect[3], 0., 0.
+                ]));
             }
-            let shared = matches!(tag, "td" | "th")
+            let shared = style::role(&computed, id) == style::CELL
                 && std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent)
-                    .find(|&parent| doc.nodes[parent].tag == "table")
+                    .find(|&parent| style::table_box(style::role(&computed, parent)))
                     .is_some_and(|table| {
                         computed
                             .values
@@ -2747,15 +2982,48 @@ pub fn call(
             } else {
                 1.
             };
+            // Like offsetWidth, client sizes ignore transforms, so a transformed box takes its layout size,
+            // and the shift from its bounds to its own untransformed corner.
+            let transformed = unsafe { *state.bounds.flags(id) } & MIRROR_TRANSFORMED != 0;
+            let size = state.cull.widths.get(&id).filter(|_| transformed).map_or(
+                [rect[2], rect[3]],
+                |inner| {
+                    [
+                        inner[0] + padding[1] + padding[3] + borders[1] + borders[3],
+                        inner[1] + padding[0] + padding[2] + borders[0] + borders[2],
+                    ]
+                },
+            );
+            let local = renderer::Rect::new(
+                renderer::point(renderer::px(0.), renderer::px(0.)),
+                renderer::size(renderer::px(size[0]), renderer::px(size[1])),
+            );
+            let shift = match transformed
+                .then(|| crate::render::effects::transform(style, units, local, None))
+                .flatten()
+            {
+                Some(m) if m[3] == 0. && m[7] == 0. && m[15] == 1. => {
+                    let [x, y] = [size[0] / 2., size[1] / 2.];
+                    [
+                        rect[2] / 2. - m[0] * x - m[4] * y - m[12],
+                        rect[3] / 2. - m[1] * x - m[5] * y - m[13],
+                    ]
+                }
+                _ => [0., 0.],
+            };
             Ok(json!([
                 borders[3],
                 borders[0],
-                (rect[2] - borders[1] - borders[3] - bars[1] * gutters).max(0.),
-                (rect[3] - borders[0] - borders[2] - bars[0]).max(0.),
+                (size[0] - borders[1] - borders[3] - bars[1] * gutters).max(0.),
+                (size[1] - borders[0] - borders[2] - bars[0]).max(0.),
                 padding[0],
                 padding[1],
                 padding[2],
-                padding[3]
+                padding[3],
+                size[0],
+                size[1],
+                shift[0],
+                shift[1]
             ]))
         }
         "dom.innerText" => {
@@ -2942,8 +3210,13 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32
         state.bounds.reserve(id);
         unsafe {
             let flags = state.bounds.flags(id);
-            *flags =
-                (*flags & (MIRROR_BOUNDS | MIRROR_SCROLLER | MIRROR_HIDDEN | MIRROR_INERT)) | bits;
+            *flags = (*flags
+                & (MIRROR_BOUNDS
+                    | MIRROR_SCROLLER
+                    | MIRROR_HIDDEN
+                    | MIRROR_INERT
+                    | MIRROR_TRANSFORMED))
+                | bits;
         }
     }
 }
@@ -2964,19 +3237,10 @@ pub(crate) fn flat_parent(
     }
 }
 
-fn display<'a>(computed: &style::ComputedStyles, tag: &str, id: usize, value: &'a str) -> &'a str {
-    if computed.flags[id] & style::AGENT_DISPLAY == 0 {
-        return value;
-    }
-    match (tag, value) {
-        ("table", "grid") => "table",
-        ("thead", "contents") => "table-header-group",
-        ("tbody", "contents") => "table-row-group",
-        ("tfoot", "contents") => "table-footer-group",
-        ("tr", "contents") => "table-row",
-        ("td" | "th", "block") => "table-cell",
-        ("caption", "block") => "table-caption",
-        _ => value,
+fn display<'a>(computed: &style::ComputedStyles, id: usize, value: &'a str) -> &'a str {
+    match style::role(computed, id) {
+        0 => value,
+        role => style::TABLE_DISPLAYS[role as usize],
     }
 }
 
@@ -3014,12 +3278,7 @@ fn rendered_text(
     while let Some((node, close, a, b)) = pending.pop() {
         let current = &doc.nodes[node];
         let style = &computed.values[node];
-        let display = display(
-            computed,
-            &current.tag,
-            node,
-            style.get(Prop::DISPLAY).unwrap_or("inline"),
-        );
+        let display = display(computed, node, style.get(Prop::DISPLAY).unwrap_or("inline"));
         // The UA sheet hides the options of a drop-down select that are not chosen, but innerText lists them.
         let display = if display == "none"
             && matches!(current.tag.as_str(), "option" | "optgroup")
@@ -3030,14 +3289,23 @@ fn rendered_text(
         } else {
             display
         };
+        let table = style::table_box(style::role(computed, node));
         if let Some(required) = close {
-            if matches!(display, "table" | "inline-table") {
+            if table {
                 (rows, cells) = (a, b);
             }
             breaks = breaks.max(required);
             continue;
         }
-        if node != root && display == "none" || current.tag == "#comment" {
+        // Replaced elements draw no children, so their text is not rendered.
+        if node != root
+            && (display == "none"
+                || matches!(
+                    current.tag.as_str(),
+                    "textarea" | "canvas" | "video" | "audio" | "iframe"
+                ))
+            || current.tag == "#comment"
+        {
             continue;
         }
         let inside = range.is_none() || left > 0 && !text.is_empty();
@@ -3072,6 +3340,18 @@ fn rendered_text(
             let white_space = parent.get(Prop::WHITE_SPACE).unwrap_or("normal");
             let keep = matches!(white_space, "pre" | "pre-wrap" | "break-spaces");
             let lines = white_space == "pre-line";
+            let transformed;
+            match parent.get(Prop::TEXT_TRANSFORM) {
+                Some("uppercase") => {
+                    transformed = value.to_uppercase();
+                    value = &transformed;
+                }
+                Some("lowercase") => {
+                    transformed = value.to_lowercase();
+                    value = &transformed;
+                }
+                _ => {}
+            }
             for character in value.chars() {
                 if !keep
                     && !(lines && character == '\n')
@@ -3102,8 +3382,10 @@ fn rendered_text(
             breaks = breaks.max(required);
         }
         pending.push((node, Some(required), rows, cells));
+        if table {
+            (rows, cells) = (false, false);
+        }
         match display {
-            "table" | "inline-table" => (rows, cells) = (false, false),
             "table-row" => {
                 if rows && inside {
                     push(&mut text, &mut breaks, &mut space, '\n');
@@ -3565,10 +3847,13 @@ pub(crate) fn styles(
     let mut marks = std::mem::take(&mut state.select_marks);
     let mut select = std::mem::take(&mut result.user_select);
     state.bounds.reserve(doc.nodes.len().saturating_sub(1));
+    // `visibility: hidden` also takes focus away, as in browsers.
+    let unfocusable = |id: usize, marks: u8| {
+        marks & (HIDDEN | INERT) != 0 || result.flags[id] & style::INVISIBLE != 0
+    };
     let mirror = |bounds: &LayoutMirror, id: usize, marks: u8| unsafe {
         let mirror = bounds.flags(id);
-        *mirror =
-            (*mirror & !MIRROR_INERT) | (u8::from(marks & (HIDDEN | INERT) != 0) * MIRROR_INERT);
+        *mirror = (*mirror & !MIRROR_INERT) | (u8::from(unfocusable(id, marks)) * MIRROR_INERT);
     };
     let mut contents = None;
     match (base, touched) {
@@ -3635,7 +3920,7 @@ pub(crate) fn styles(
     }
     #[cfg(debug_assertions)]
     for &(id, _) in walk.nodes.iter() {
-        let shown = marks[id as usize] & (HIDDEN | INERT) == 0;
+        let shown = !unfocusable(id as usize, marks[id as usize]);
         let mirrored = unsafe { *state.bounds.flags(id as usize) } & MIRROR_INERT == 0;
         assert!(shown == mirrored, "kept inert mirror differs");
     }
@@ -4368,12 +4653,7 @@ mod tests {
                     <section id=s><h2 id=c>c</h2></section></main></body></html>");
         let read = "[...document.querySelectorAll('h2')].map(h=>getComputedStyle(h,'::before').content+getComputedStyle(h,'::after').content).join('|')";
         let numbers = |list: &[&str]| -> String {
-            let text = |n: &&str| {
-                format!(
-                    "\"{}\" \". \"\"counter \" \"{n}\"",
-                    n.rsplit('-').next().unwrap()
-                )
-            };
+            let text = |n: &&str| format!("\"{}. \"\"counter {n}\"", n.rsplit('-').next().unwrap());
             list.iter().map(text).collect::<Vec<_>>().join("|")
         };
         engine

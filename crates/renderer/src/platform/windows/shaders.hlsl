@@ -18,6 +18,8 @@ static const uint FILL = 5u;
 static const uint DASHED = 1u;
 static const uint DOTTED = 2u;
 static const uint DOUBLE = 3u;
+// A flag next to the border style: dashes of borders thinner than 3 CSS pixels.
+static const uint THIN = 16u;
 
 static const uint COMPOSITE_MATRIX = 1u;
 static const uint COMPOSITE_CLIP = 2u;
@@ -61,6 +63,7 @@ struct Composite {
 struct Blur {
     float4 region;
     float4 source_rect;
+    float4 edge;
     float2 direction;
     float sigma;
     float scale;
@@ -179,9 +182,9 @@ float either_speed(float a, float b) {
     return min(a, b);
 }
 
-float dash_coverage(float2 p, float4 rect, float4 rx, float4 ry, float4 widths, bool dotted, float depth, float inner) {
-    float period_widths = dotted ? 2.0 : 3.0;
-    float dash = (dotted ? 1.0 : 2.0) / period_widths;
+float dash_coverage(float2 p, float4 rect, float4 rx, float4 ry, float4 widths, bool dotted, bool thin, float depth, float inner) {
+    float period_widths = thin ? 5.0 : dotted ? 2.0 : 3.0;
+    float dash = (thin ? 3.0 : dotted ? 1.0 : 2.0) / period_widths;
     float2 local = p - rect.xy;
     float2 hs = rect.zw * 0.5;
     float2 from_center = local - hs;
@@ -192,6 +195,7 @@ float dash_coverage(float2 p, float4 rect, float4 rx, float4 ry, float4 widths, 
     float t = 0.0;
     float speed = 0.0;
     float total = 0.0;
+    bool centered = false;
     if (all(rx == 0.0)) {
         float width = across ? max(widths.x, widths.z) : max(widths.y, widths.w);
         speed = 1.0 / (period_widths * width);
@@ -204,7 +208,8 @@ float dash_coverage(float2 p, float4 rect, float4 rx, float4 ry, float4 widths, 
             either_speed(side_speed.z, side_speed.y),
             either_speed(side_speed.z, side_speed.w),
             either_speed(side_speed.x, side_speed.w));
-        float middle = dotted ? 0.5 : 0.0;
+        // Corners measure along the middle of the border.
+        float middle = 0.5;
         float4 sweep = max((float4)0.0, (rx.yzwx + ry.yzwx) * 0.5 - middle * max(widths.xzzx, widths.yyww)) * (PI * 0.5) * corner_speed;
         float top_end = (rect.z - rx.x - rx.y) * side_speed.x;
         float right_start = top_end + sweep.x;
@@ -246,10 +251,31 @@ float dash_coverage(float2 p, float4 rect, float4 rx, float4 ry, float4 widths, 
             speed = side_speed.y;
             t = right_start + (local.y - ry.y) * speed;
         }
+        float4 ends = float4(right_start - sweep.x * 0.5, right_end + sweep.y * 0.5, left_start - sweep.z * 0.5, left_end + sweep.w * 0.5);
+        if (t >= ends.w) {
+            t -= total;
+        }
+        float start = ends.z;
+        float end = ends.w;
+        if (t < ends.x) {
+            start = ends.w - total;
+            end = ends.x;
+        } else if (t < ends.y) {
+            start = ends.x;
+            end = ends.y;
+        } else if (t < ends.z) {
+            start = ends.y;
+            end = ends.z;
+        }
+        t -= start;
+        total = end - start;
+        centered = true;
     }
-    if (total >= 1.0) {
-        float period = total / floor(total);
-        float from_dash = fmod(t + (period - dash) * 0.5, period) - period * 0.5;
+    if (total >= 1.0 || (centered && total > 0.0)) {
+        float fewer = max(floor(total), 1.0);
+        float count = (fewer + 1.0 - total) * fewer < (total - fewer) * (fewer + 1.0) ? fewer + 1.0 : fewer;
+        float period = total / count;
+        float from_dash = fmod(t + (centered ? period * 0.5 : (period - dash) * 0.5), period) - period * 0.5;
         if (dotted) {
             float width = depth + inner;
             return saturate(0.5 - (length(float2(from_dash / speed, depth - width * 0.5)) - width * 0.5));
@@ -302,12 +328,14 @@ float4 box_color(float2 p, float4 rect, float4 rx, float4 ry, float4 fill, float
     if (sides != 0u) {
         alpha *= side_coverage(p - rect.xy, rect.zw, widths, sides);
     }
-    uint style = flags & 255u;
+    uint style = flags & 15u;
     if (style == DOUBLE) {
+        // Both lines take a whole number of pixels, like in Chromium.
         float width = inner - outer;
-        alpha *= saturate(0.5 - min(-outer - width / 3.0, width * 2.0 / 3.0 + outer));
+        float line = max(round(width / 3.0), 1.0);
+        alpha *= saturate(0.5 - min(-outer - line, width - line + outer));
     } else if (style == DASHED || style == DOTTED) {
-        alpha *= dash_coverage(p, rect, rx, ry, widths, style == DOTTED, -outer, inner);
+        alpha *= dash_coverage(p, rect, rx, ry, widths, style == DOTTED, (flags & THIN) != 0u, -outer, inner);
     }
     float4 fill_color = premultiply(fill);
     float4 over = float4(border.rgb * alpha, alpha) + fill_color * (1.0 - alpha);
@@ -415,7 +443,10 @@ float4 draw_fragment(Varyings v) : SV_Target {
         coverage = saturate(coverage + coverage * (1.0 - coverage) * ink * globals.text_contrast);
         color = premultiply(v.color) * coverage;
     } else {
-        float4 pixel = t1.SampleLevel(filtered, v.texel / texture_size(t1), 0.0);
+        // A pixelated image samples the center of its nearest texel. Edges sample only their own
+        // image, not the atlas around it, so a scaled image keeps solid edges.
+        float2 texel = clamp((flags & 4u) != 0u ? floor(v.texel) + 0.5 : v.texel, v.aux.xy + 0.5, max(v.aux.xy + 0.5, v.aux.xy + v.aux.zw - 0.5));
+        float4 pixel = t1.SampleLevel(filtered, texel / texture_size(t1), 0.0);
         if ((flags & 2u) != 0u && pixel.a > 0.0) {
             pixel = float4(pixel.rgb / pixel.a, pixel.a);
         }
@@ -454,7 +485,16 @@ float4 layer_pixel(Texture2D source, float2 at, float4 rect) {
     return source.SampleLevel(filtered, uv, 0.0);
 }
 
-float4 gaussian(Texture2D source, float2 at, float2 direction, float sigma, float texel, float4 rect) {
+// Reflects `at` into `edge`, the backdrop-filter edge mode. An empty `edge` keeps `at`.
+float2 edge_mirror(float2 at, float4 edge) {
+    if (edge.z <= 0.0) {
+        return at;
+    }
+    float2 span = max(edge.zw - 1.0, 0.0);
+    return edge.xy + 0.5 + clamp(span - abs(span - abs(at - edge.xy - 0.5)), 0.0, span);
+}
+
+float4 gaussian(Texture2D source, float2 at, float2 direction, float sigma, float texel, float4 rect, float4 edge) {
     if (sigma < 0.25) {
         return layer_pixel(source, at, rect);
     }
@@ -466,7 +506,7 @@ float4 gaussian(Texture2D source, float2 at, float2 direction, float sigma, floa
     [loop] for (float tap = 1.0; tap <= taps; tap += 1.0) {
         float offset = tap * stride;
         float weight = exp(-0.5 * offset * offset / (sigma * sigma));
-        sum += (layer_pixel(source, at + direction * offset, rect) + layer_pixel(source, at - direction * offset, rect)) * weight;
+        sum += (layer_pixel(source, edge_mirror(at + direction * offset, edge), rect) + layer_pixel(source, edge_mirror(at - direction * offset, edge), rect)) * weight;
         total += 2.0 * weight;
     }
     return sum / total;
@@ -544,11 +584,11 @@ float4 composite_fragment(Placed v) : SV_Target {
     }
     float4 color;
     if ((c.flags & COMPOSITE_BACKDROP) != 0u) {
-        color = gaussian(t0, p, float2(0.0, 1.0), c.blur, 1.0, c.source_rect);
+        color = gaussian(t0, p, float2(0.0, 1.0), c.blur, 1.0, c.source_rect, c.shadow);
     } else if ((c.flags & COMPOSITE_SHADOW) != 0u) {
-        color = c.shadow_color * gaussian(t0, v.local - c.shadow.xy, float2(0.0, 1.0), c.blur, 1.0, c.source_rect).a;
+        color = c.shadow_color * gaussian(t0, v.local - c.shadow.xy, float2(0.0, 1.0), c.blur, 1.0, c.source_rect, (float4)0.0).a;
     } else {
-        color = gaussian(t0, v.local, float2(0.0, 1.0), c.blur, 1.0, c.source_rect);
+        color = gaussian(t0, v.local, float2(0.0, 1.0), c.blur, 1.0, c.source_rect, (float4)0.0);
     }
     if ((c.flags & COMPOSITE_MATRIX) != 0u && color.a > 0.0) {
         float4 mapped = saturate(mul(c.color_matrix, float4(color.rgb / color.a, color.a)) + c.color_offset);
@@ -587,5 +627,5 @@ float4 blur_vertex(uint index : SV_VertexID) : SV_Position {
 
 float4 blur_fragment(float4 position : SV_Position) : SV_Target {
     float2 at = globals.viewport.xy + position.xy * blur.scale;
-    return gaussian(t0, at, blur.direction, blur.sigma, blur.scale, blur.source_rect);
+    return gaussian(t0, at, blur.direction, blur.sigma, blur.scale, blur.source_rect, blur.edge);
 }

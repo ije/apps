@@ -79,6 +79,7 @@ pub(crate) struct PageState {
     layout_queued: Cell<bool>,
     #[cfg(target_os = "macos")]
     canvas: Cell<(u32, u8)>,
+    canvas_layers: Cell<Option<u64>>,
 }
 
 pub(crate) struct Frame {
@@ -383,6 +384,7 @@ impl PageView {
             adjoined: RefCell::default(),
             #[cfg(target_os = "macos")]
             canvas: Cell::default(),
+            canvas_layers: Cell::default(),
             kept_frame: RefCell::default(),
             mismatched: RefCell::default(),
             layout_queued: Cell::default(),
@@ -749,9 +751,17 @@ impl PageView {
             .iter()
             .map(|&id| (id, clips(&doc, &styles, id).collect()))
             .collect();
+        // Units of nodes whose font size animates, like `em` lengths, swapped in for this frame.
+        let mut lengths = Vec::new();
         if !dom.motion.custom.is_empty() {
             dom.animated = std::mem::take(&mut dom.motion.custom);
             let restyled = crate::dom::styles(&mut doc, dom, [width, height]);
+            lengths = (0..restyled.values.len().min(styles.values.len()))
+                .filter_map(|id| {
+                    let new = *restyled.lengths.get(id)?;
+                    (styles.lengths.get(id) != Some(&new)).then_some((id, new))
+                })
+                .collect();
             animated = restyled
                 .values
                 .differing(&styles.values)
@@ -826,7 +836,15 @@ impl PageView {
         let painting = |paint: &[(usize, Rc<style::Style>)], id: usize| {
             paint.binary_search_by_key(&id, |(id, _)| *id).ok()
         };
-        let relaid = !restore.is_empty();
+        if !lengths.is_empty() {
+            dom.computed = None;
+            let units = &mut Rc::make_mut(&mut styles).lengths;
+            for (id, new) in &mut lengths {
+                let old = *units.get(*id).unwrap_or(new);
+                units.set(*id, std::mem::replace(new, old));
+            }
+        }
+        let relaid = !restore.is_empty() || !lengths.is_empty();
         // Clear node-ID caches for hidden or removed nodes here, and freed nodes in dom.release. New nodes
         // can reuse their IDs.
         let shown = |id: usize| visible.get(id) == Some(&true);
@@ -987,9 +1005,34 @@ impl PageView {
                 scheme.contains("dark")
                     && (!scheme.contains("light") || crate::desktop::native::theme_state() & 1 != 0)
             });
-        let background = html
+        let source = background::canvas_source(&doc, &styles);
+        // The html and body boxes read each other's background, which their kept builds don't track.
+        let layers = source.map(|id| {
+            let style = &styles.values[id];
+            element::hashed((
+                id,
+                [
+                    Prop::BACKGROUND_IMAGE,
+                    Prop::BACKGROUND_COLOR,
+                    Prop::BACKGROUND_SIZE,
+                    Prop::BACKGROUND_POSITION,
+                    Prop::BACKGROUND_REPEAT,
+                    Prop::BACKGROUND_ORIGIN,
+                    Prop::BACKGROUND_ATTACHMENT,
+                    Prop::BACKGROUND_BLEND_MODE,
+                ]
+                .map(|prop| style.get(prop)),
+                style.get(Prop::FONT_SIZE),
+            ))
+        });
+        if self.canvas_layers.replace(layers) != layers {
+            let mut kept = self.kept.borrow_mut();
+            for id in [0].into_iter().chain(html).chain(body) {
+                kept.remove(&id);
+            }
+        }
+        let background = source
             .and_then(canvas)
-            .or_else(|| body.and_then(canvas))
             .or_else(|| match state.backgrounds.get(&self.id).copied() {
                 Some(color) if color.1 == 0 => Some(color),
                 _ if dark => Some((0x121212, 255)),
@@ -1239,13 +1282,15 @@ impl PageView {
                                 | "col"
                                 | "q"
                                 | "slot"
-                        ) || pseudos.is_some_and(|pair| {
-                            pair.iter().any(|pseudo| {
-                                pseudo.get(Prop::CONTENT).is_some_and(|value| {
-                                    value.contains("counter") || value.contains("quote")
+                        ) || style::table_box(style::role(&styles, id))
+                            || style::role(&styles, id) == style::CAPTION
+                            || pseudos.is_some_and(|pair| {
+                                pair.iter().any(|pseudo| {
+                                    pseudo.get(Prop::CONTENT).is_some_and(|value| {
+                                        value.contains("counter") || value.contains("quote")
+                                    })
                                 })
-                            })
-                        });
+                            });
                         let heighted =
                             pseudos.is_some_and(|pair| pair.iter().any(cull::reads_height));
                         (
@@ -1718,7 +1763,7 @@ impl PageView {
                     records.reserve(doc.nodes.len().min(1 << 20) / 2);
                 }
             }
-            let swapped = !restore.is_empty() || !restore_pseudos.is_empty();
+            let swapped = !restore.is_empty() || !restore_pseudos.is_empty() || !lengths.is_empty();
             let (epoch, last) = self.epoch.get();
             build.epoch = epoch + u64::from(!same || swapped || last || kept.0 != frame);
             self.epoch.set((build.epoch, swapped));
@@ -1770,9 +1815,11 @@ impl PageView {
                             id,
                             3,
                             Default::default(),
+                            [[0.; 4]; 2],
                             self.0.clone(),
                             host.dom.get(&self.id).and_then(|state| state.base.as_ref()),
                             &host.assets,
+                            false,
                         ));
                     }
                 }
@@ -1957,9 +2004,13 @@ impl PageView {
             dom.measurements = measured.into_inner();
             dom.animating.clear();
             dom.animating_pseudos.clear();
-            let restored = !restore.is_empty() || !restore_pseudos.is_empty();
+            let restored =
+                !restore.is_empty() || !restore_pseudos.is_empty() || !lengths.is_empty();
             if restored {
                 let styles = Rc::make_mut(&mut styles);
+                for (id, old) in lengths {
+                    styles.lengths.set(id, old);
+                }
                 for (id, style) in restore {
                     dom.animating
                         .insert(id, std::mem::replace(&mut styles.values[id], style));
@@ -2496,7 +2547,7 @@ fn walk(
         return false;
     }
     let kind = |id: usize| match doc.nodes[id].tag.as_str() {
-        "td" | "th" => 1,
+        _ if style::role(styles, id) == style::CELL => 1,
         "canvas" => 2,
         "iframe" => 3,
         _ => 0,
@@ -2572,11 +2623,7 @@ fn visibility(
         if visible[node] {
             let mut parent = doc.nodes[node].parent;
             while let Some(id) = parent.filter(|&id| {
-                !visible[id]
-                    && matches!(
-                        doc.nodes[id].tag.as_str(),
-                        "tr" | "thead" | "tbody" | "tfoot"
-                    )
+                !visible[id] && (style::ROW..=style::FOOTER).contains(&style::role(styles, id))
             }) {
                 visible[id] = true;
                 parent = doc.nodes[id].parent;

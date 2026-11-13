@@ -206,6 +206,8 @@ pub struct Escape;
 impl Escape {
     pub const ABSOLUTE: u8 = 1;
     pub const FIXED: u8 = 2;
+    /// An outline: only the clips around its box apply, and it doesn't scroll with the content of the box.
+    pub const OUTLINE: u8 = 4;
 }
 
 impl Style {
@@ -337,10 +339,8 @@ impl Style {
         if !clips.x && !clips.y {
             return None;
         }
-        let border = match self.border_color {
-            Some(color) if !color.is_transparent() => self.border_widths,
-            _ => Edges::default(),
-        };
+        // Like Chrome, the clip is the padding box, also with transparent or multicolored borders.
+        let border = self.border_widths;
         let inner = Rect::between(
             bounds.origin + point(border.left, border.top),
             bounds.bottom_right() - point(border.right, border.bottom),
@@ -383,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_borders_and_radii_shrink_the_clip() {
+    fn borders_and_radii_shrink_the_clip_like_chrome() {
         let mut style = Style {
             border_widths: Edges::all(px(2.)),
             border_color: Some(Color::BLACK),
@@ -398,7 +398,10 @@ mod tests {
         assert_eq!(mask.rounded, mask.bounds);
         assert_eq!(mask.radii.x.top_left, px(4.));
         style.border_color = None;
-        assert_eq!(style.overflow_mask(bounds).unwrap().bounds, bounds);
+        assert_eq!(
+            style.overflow_mask(bounds).unwrap().bounds,
+            crate::rect(px(2.), px(2.), px(36.), px(16.))
+        );
     }
 
     #[test]

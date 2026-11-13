@@ -25,22 +25,55 @@ pub(crate) use text::{
     restyle, selection_colors, spacing, text_run, text_transform, word_break,
 };
 pub use value::length;
-pub(crate) use value::{BORDERS, Filter, MARGIN, PADDING, area_cells, clip_path, components};
+pub(crate) use value::{
+    BORDERS, Filter, MARGIN, PADDING, area_cells, clip_path, components, number, write_number,
+};
 
 pub use properties::Style;
 pub(crate) use properties::{Prop, Vars};
 
-pub(crate) const DISPLAY_NONE: u8 = 1;
-pub(crate) const DISPLAY_CONTENTS: u8 = 2;
-pub(crate) const INVISIBLE: u8 = 4;
-pub(crate) const SELECT_NONE: u8 = 8;
-pub(crate) const SELECT_ALL: u8 = 16;
-pub(crate) const SELECT_TEXT: u8 = 32;
-const COUNTED: u8 = 64;
-pub(crate) const AGENT_DISPLAY: u8 = 128;
+pub(crate) const DISPLAY_NONE: u16 = 1;
+pub(crate) const DISPLAY_CONTENTS: u16 = 2;
+pub(crate) const INVISIBLE: u16 = 4;
+pub(crate) const SELECT_NONE: u16 = 8;
+pub(crate) const SELECT_ALL: u16 = 16;
+pub(crate) const SELECT_TEXT: u16 = 32;
+const COUNTED: u16 = 64;
+pub(crate) const AGENT_DISPLAY: u16 = 128;
+// Table parts lay out as grids (tables), `contents` (row groups, rows) and blocks (cells, captions). Their role,
+// the index of their display here, is in the high byte of the style flags. Rows and row groups outside a table
+// make a table of their own, like the anonymous table around them in browsers.
+pub(crate) const TABLE_DISPLAYS: [&str; 13] = [
+    "",
+    "table",
+    "inline-table",
+    "block",
+    "table-row",
+    "table-row-group",
+    "table-header-group",
+    "table-footer-group",
+    "table-cell",
+    "table-caption",
+    "table-row",
+    "table-row-group",
+    "table-header-group",
+];
+pub(crate) const ROW: u16 = 4;
+pub(crate) const HEADER: u16 = 6;
+pub(crate) const FOOTER: u16 = 7;
+pub(crate) const CELL: u16 = 8;
+pub(crate) const CAPTION: u16 = 9;
+
+pub(crate) fn role(styles: &ComputedStyles, id: usize) -> u16 {
+    styles.flags.get(id).map_or(0, |flags| flags >> 8)
+}
+
+pub(crate) fn table_box(role: u16) -> bool {
+    matches!(role, 1..=3 | 10..)
+}
 
 const UA: &str = "
-html,body,address,blockquote,center,dialog,div,figure,figcaption,footer,form,header,hr,legend,main,p,pre,search,article,aside,h1,h2,h3,h4,h5,h6,hgroup,nav,section,dd,dl,dt,menu,ol,ul,details,summary,fieldset,optgroup,option,caption,td,th{display:block}
+html,body,address,blockquote,center,dialog,div,figure,figcaption,footer,form,header,hr,legend,main,p,pre,search,article,aside,h1,h2,h3,h4,h5,h6,hgroup,nav,section,dd,dl,dt,menu,ol,ul,details,summary,fieldset,optgroup,option{display:block}
 li{display:list-item}
 img,svg,canvas,video,audio,iframe,embed,object,input,button,select,textarea,progress,meter{display:inline-block}
 :-internal-sf-symbol{display:inline-block;width:1em;height:1em;vertical-align:middle;flex-shrink:0}
@@ -84,8 +117,13 @@ a[href]{color:LinkText;text-decoration:underline;cursor:pointer}
 center,caption{text-align:center}
 th{text-align:-internal-center}
 hr{margin:.5em auto;border:1px inset;color:gray;overflow:hidden}
-table{display:grid;width:fit-content;border-spacing:2px;text-indent:0}
-thead,tbody,tfoot,tr{display:contents}
+table{display:table;box-sizing:border-box;border-spacing:2px;text-indent:0}
+thead{display:table-header-group}
+tbody{display:table-row-group}
+tfoot{display:table-footer-group}
+tr{display:table-row}
+td,th{display:table-cell}
+caption{display:table-caption}
 td[colspan='2'],th[colspan='2']{grid-column:span 2}
 td[rowspan='2'],th[rowspan='2']{grid-row:span 2}
 td[colspan='3'],th[colspan='3']{grid-column:span 3}
@@ -96,9 +134,8 @@ td[colspan='5'],th[colspan='5']{grid-column:span 5}
 td[rowspan='5'],th[rowspan='5']{grid-row:span 5}
 td[colspan='6'],th[colspan='6']{grid-column:span 6}
 td[rowspan='6'],th[rowspan='6']{grid-row:span 6}
-caption{grid-column:1/-1}
 table[border]{border:1px outset}
-table[border] td,table[border] th{border:1px inset}
+table[border]:not([border='0']) td,table[border]:not([border='0']) th{border:1px inset}
 td,th{padding:1px}
 thead,tbody,tfoot,tr{vertical-align:middle}
 td,th{vertical-align:inherit}
@@ -120,6 +157,7 @@ input[type=radio i]{margin:3px 3px 0 5px}
 input[type=range i],input[type=ns-range i]{margin:2px;padding:0;border:0;background-color:transparent;color:light-dark(#101010,#fff)}
 input[type=color i],input[type=ns-color i]{width:50px;height:27px;border:1px solid light-dark(#000,#fff);background-color:light-dark(#efefef,#6b6b6b);box-sizing:border-box}
 input[type=file i]{padding:0;border:0;background-color:transparent}
+input[type=file i]::file-selector-button{margin:0 4px 0 0;padding:2px 7px;border:1px solid light-dark(#767676,#858585);border-radius:2px;background-color:light-dark(#efefef,#6b6b6b)}
 input[type=search i],input[type=ns-search i]{box-sizing:border-box}
 summary{list-style-position:inside}
 button:disabled,input[type=button i]:disabled,input[type=submit i]:disabled,input[type=reset i]:disabled,input[type=ns-button i]:disabled{color:light-dark(rgba(16,16,16,.3),rgba(255,255,255,.3));background-color:light-dark(rgba(239,239,239,.3),rgba(19,1,1,.3));border-color:light-dark(rgba(118,118,118,.3),rgba(195,195,195,.3))}
@@ -136,7 +174,7 @@ q::before{content:open-quote}
 q::after{content:close-quote}
 noembed,noframes{display:none}
 select:not([multiple]):not([size]) :is(option:not(:checked),hr){display:none}
-select[multiple] option,select[size]:not([size='0']):not([size='1']) option{padding:0 2px 1px}
+select[multiple] option,select[size]:not([size='0']):not([size='1']) option{padding:0 2px 1px;min-height:1.2em;line-height:normal!important}
 select[multiple] option:checked,select[size]:not([size='0']):not([size='1']) option:checked{background-color:light-dark(#cecece,#545454)}
 select[multiple],select[size]:not([size='0']):not([size='1']){overflow-y:auto;vertical-align:text-bottom}
 dialog{position:absolute;left:0;right:0;width:fit-content;height:fit-content;margin:auto;border:solid;padding:1em;background-color:#fff;color:#000}
@@ -510,7 +548,6 @@ struct StyleKey {
     inputs: Inputs,
     rules: StyleRef<[(usize, [usize; 3])]>,
     pseudos: Rc<[usize]>,
-    columns: usize,
     shadow: Option<Rc<[ShadowRule]>>,
     selection: Option<StyleRef>,
 }
@@ -581,7 +618,7 @@ struct CachedStyle {
     reads: Option<Box<[Read]>>,
     own: Box<[Read]>,
     missing: Box<[Box<str>]>,
-    flags: u8,
+    flags: u16,
     lengths: Lengths,
     pseudos: Option<Rc<[Style; 2]>>,
     text_pseudos: Option<Rc<[Option<Style>; 4]>>,
@@ -850,7 +887,6 @@ struct MatchedRules {
     dependencies: Box<[crate::dom::Dependency]>,
     rules: Rc<[(usize, [usize; 3])]>,
     pseudos: Rc<[usize]>,
-    columns: usize,
 }
 
 type Derived = HashMap<
@@ -1660,9 +1696,11 @@ const INITIAL: &[(&str, &str)] = &[
     ("bottom", "auto"),
     ("box-shadow", "none"),
     ("box-sizing", "content-box"),
+    ("caption-side", "top"),
     ("caret-color", "auto"),
     ("clear", "none"),
     ("clip-path", "none"),
+    ("color", "canvastext"),
     ("color-scheme", "normal"),
     ("column-count", "auto"),
     ("column-gap", "normal"),
@@ -1679,6 +1717,7 @@ const INITIAL: &[(&str, &str)] = &[
     ("cursor", "auto"),
     ("direction", "ltr"),
     ("display", "inline"),
+    ("empty-cells", "show"),
     ("field-sizing", "fixed"),
     ("fill", "black"),
     ("fill-opacity", "1"),
@@ -1706,6 +1745,7 @@ const INITIAL: &[(&str, &str)] = &[
     ("grid-template-rows", "none"),
     ("height", "auto"),
     ("hyphens", "manual"),
+    ("image-rendering", "auto"),
     ("isolation", "auto"),
     ("justify-content", "normal"),
     ("justify-items", "normal"),
@@ -1772,7 +1812,9 @@ const INITIAL: &[(&str, &str)] = &[
     ("text-decoration-thickness", "auto"),
     ("text-indent", "0px"),
     ("text-overflow", "clip"),
+    ("text-rendering", "auto"),
     ("text-shadow", "none"),
+    ("text-size-adjust", "auto"),
     ("text-transform", "none"),
     ("text-underline-offset", "auto"),
     ("text-wrap", "wrap"),
@@ -1790,6 +1832,7 @@ const INITIAL: &[(&str, &str)] = &[
     ("unicode-bidi", "normal"),
     ("user-select", "auto"),
     ("vertical-align", "baseline"),
+    ("view-transition-name", "none"),
     ("visibility", "visible"),
     ("white-space", "normal"),
     ("width", "auto"),
@@ -1798,6 +1841,7 @@ const INITIAL: &[(&str, &str)] = &[
     ("word-spacing", "0px"),
     ("writing-mode", "horizontal-tb"),
     ("z-index", "auto"),
+    ("zoom", "1"),
 ];
 
 const SHORTHANDS: &[(&str, &[&str])] = &[
@@ -1908,13 +1952,7 @@ pub(crate) fn resolved(
 ) -> String {
     let cell = std::cell::OnceCell::new();
     let container = &|| *cell.get_or_init(container);
-    let rtl = style.get(Prop::DIRECTION) == Some("rtl");
-    let name = LOGICAL
-        .iter()
-        .find(|(logical, ..)| logical.name() == name)
-        .map_or(name, |(_, ltr, rtl_side)| {
-            if rtl { rtl_side } else { ltr }.name()
-        });
+    let name = &*physical_name(style, name);
     if name.starts_with("--") {
         return Prop::find(name)
             .and_then(|prop| {
@@ -1999,14 +2037,14 @@ pub(crate) fn resolved(
             let keys: &[(&str, &str)] = if name == "transition" {
                 &[
                     ("property", "all"),
-                    ("duration", ""),
+                    ("duration", "0s"),
                     ("timing-function", "ease"),
                     ("delay", "0s"),
                     ("behavior", "normal"),
                 ]
             } else {
                 &[
-                    ("duration", ""),
+                    ("duration", "0s"),
                     ("timing-function", "ease"),
                     ("delay", "0s"),
                     ("iteration-count", "1"),
@@ -2021,16 +2059,32 @@ pub(crate) fn resolved(
                 .map(|(key, _)| list(name, key, defining))
                 .collect();
             let count = columns.iter().map(Vec::len).max().unwrap_or(1);
+            let delay = keys
+                .iter()
+                .position(|(key, _)| *key == "delay")
+                .unwrap_or(0);
             return (0..count)
                 .map(|index| {
-                    keys.iter()
+                    let at = |column: &Vec<String>| column.get(index).cloned().unwrap_or_default();
+                    // Like Chrome, a delay needs its duration, and an item of only initial values keeps its name.
+                    let kept = keys
+                        .iter()
                         .zip(&columns)
-                        .filter_map(|((_, initial), values)| {
-                            let value = values.get(index).cloned().unwrap_or_default();
-                            (initial.is_empty() || value != *initial).then_some(value)
+                        .filter_map(|((key, initial), values)| {
+                            let value = at(values);
+                            (value != *initial || *key == "duration" && at(&columns[delay]) != "0s")
+                                .then_some(value)
                         })
-                        .collect::<Vec<_>>()
-                        .join(" ")
+                        .collect::<Vec<_>>();
+                    if kept.is_empty() {
+                        at(&columns[if name == "transition" {
+                            0
+                        } else {
+                            keys.len() - 1
+                        }])
+                    } else {
+                        kept.join(" ")
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -2064,6 +2118,53 @@ pub(crate) fn resolved(
                 horizontal
             } else {
                 format!("{horizontal} / {vertical}")
+            };
+        }
+        "outline" => {
+            return ["outline-color", "outline-style", "outline-width"]
+                .map(get)
+                .join(" ");
+        }
+        "text-decoration" => {
+            let mut parts = vec![get("text-decoration-line")];
+            for (longhand, initial) in [
+                ("text-decoration-thickness", "auto"),
+                ("text-decoration-style", "solid"),
+            ] {
+                let value = get(longhand);
+                if value != initial {
+                    parts.push(value);
+                }
+            }
+            // The cascade can store `currentcolor` as the color it stands for, so equal colors count as it.
+            let color = get("text-decoration-color");
+            if color != get("color") {
+                parts.push(color);
+            }
+            return parts.join(" ");
+        }
+        "border-block" | "border-inline" => {
+            let [start, end] = if name == "border-block" {
+                ["border-top", "border-bottom"]
+            } else {
+                ["border-left", "border-right"]
+            }
+            .map(get);
+            return if start == end { start } else { String::new() };
+        }
+        "margin-block" | "margin-inline" | "padding-block" | "padding-inline" | "inset-block"
+        | "inset-inline" => {
+            let mut sides = Vec::new();
+            expand(name, "0 1", &mut sides);
+            let [start, end] = [0, sides.len().saturating_sub(1)].map(|index| {
+                sides
+                    .get(index)
+                    .map_or_else(String::new, |(side, _)| get(side))
+            });
+            return if start == end {
+                start
+            } else {
+                format!("{start} {end}")
             };
         }
         "border" => {
@@ -2265,6 +2366,8 @@ pub(crate) fn resolved(
     );
     let length = |value: &str| {
         let base = match value.contains('%') {
+            // A box that is not rendered has no used values, so its percentages stay.
+            true if size.is_none() => return value.to_owned(),
             true => container()[usize::from(vertical)],
             false => 0.,
         };
@@ -2294,7 +2397,6 @@ pub(crate) fn resolved(
         "border-right-width" if none(Prop::BORDER_RIGHT_STYLE) => "0px".into(),
         "border-bottom-width" if none(Prop::BORDER_BOTTOM_STYLE) => "0px".into(),
         "border-left-width" if none(Prop::BORDER_LEFT_STYLE) => "0px".into(),
-        "outline-width" if none(Prop::OUTLINE_STYLE) => "0px".into(),
         "column-rule-width" if none(Prop::COLUMN_RULE_STYLE) => "0px".into(),
         "width" | "height"
             if size.is_some()
@@ -2507,13 +2609,30 @@ pub(crate) fn resolved(
                         "right" | "bottom" => "100%",
                         part => part,
                     };
+                    if size.is_none() && part.contains('%') {
+                        return part.to_owned();
+                    }
                     units
                         .resolve(part, if index == 0 { width } else { height })
-                        .map_or_else(|| part.to_owned(), px)
+                        .map_or_else(|| part.to_owned(), |value| px((value * 64.).round() / 64.))
                 })
                 .collect::<Vec<_>>()
                 .join(" ")
         }
+        "caret-color" if value == "auto" => paint(current),
+        "font-stretch" => match value.as_str() {
+            "ultra-condensed" => "50%",
+            "extra-condensed" => "62.5%",
+            "condensed" => "75%",
+            "semi-condensed" => "87.5%",
+            "normal" => "100%",
+            "semi-expanded" => "112.5%",
+            "expanded" => "125%",
+            "extra-expanded" => "150%",
+            "ultra-expanded" => "200%",
+            _ => &value,
+        }
+        .to_owned(),
         _ if name.ends_with("color") || matches!(name, "fill" | "stroke") => {
             if value == "auto" {
                 value
@@ -2560,23 +2679,59 @@ pub(crate) fn resolved(
                     name,
                     "top" | "right" | "bottom" | "left" | "width" | "height"
                 );
-            components(&value, ' ')
+            let mut parts = components(&value, ' ')
                 .into_iter()
                 .map(|part| {
                     if !used && part.ends_with('%') {
                         part.to_owned()
+                    } else if used && size.is_some() {
+                        let text = length(part);
+                        // Layout boxes have sizes in 1/64 px, like Chrome's, so their used values round to it.
+                        match text
+                            .strip_suffix("px")
+                            .and_then(|number| number.parse::<f32>().ok())
+                        {
+                            Some(number) => px((number * 64.).round() / 64.),
+                            None => text,
+                        }
                     } else {
                         length(part)
                     }
                 })
-                .collect::<Vec<_>>()
-                .join(" ")
+                .collect::<Vec<_>>();
+            if name == "border-spacing" && parts.len() == 2 && parts[0] == parts[1] {
+                parts.pop();
+            }
+            parts.join(" ")
         }
         _ => value,
     }
 }
 
-fn shortest(sides: [&str; 4]) -> String {
+// The physical property that a logical property name maps to, as the cascade maps it.
+pub(crate) fn physical_name<'a>(style: &Style, name: &'a str) -> Cow<'a, str> {
+    if let Some((_, ltr, rtl)) = LOGICAL.iter().find(|(logical, ..)| logical.name() == name) {
+        return Cow::Borrowed(
+            if style.get(Prop::DIRECTION) == Some("rtl") {
+                rtl
+            } else {
+                ltr
+            }
+            .name(),
+        );
+    }
+    let mut out = Vec::new();
+    if (name.contains("block") || name.contains("inline"))
+        && expand(name, "0", &mut out)
+        && let [(physical, _)] = &out[..]
+        && physical != name
+    {
+        return Cow::Owned(physical_name(style, physical).into_owned());
+    }
+    Cow::Borrowed(name)
+}
+
+pub(crate) fn shortest(sides: [&str; 4]) -> String {
     let count = if sides[3] != sides[1] {
         4
     } else if sides[2] != sides[0] {
@@ -2587,6 +2742,381 @@ fn shortest(sides: [&str; 4]) -> String {
         1
     };
     sides[..count].join(" ")
+}
+
+// Chrome's text for a declared value: lowercase keywords, units and functions, short numbers, `0px` for
+// lengths, colors as `rgb()`, strings in double quotes and `, ` between items. Values with `var()` stay as
+// written, like in Chrome.
+pub(crate) fn specified(name: &str, value: &str) -> String {
+    let value = value.trim();
+    if name.starts_with("--")
+        || ["var(", "env(", "attr("]
+            .iter()
+            .any(|function| value.contains(function))
+    {
+        return value.to_owned();
+    }
+    let grammar = grammar(name).unwrap_or("*");
+    let length =
+        grammar.contains("length") && !grammar.contains("number>") && !grammar.contains("integer>")
+            || name.ends_with("-shadow")
+            || name.ends_with("-origin")
+            || name.ends_with("-position");
+    // Names that authors choose keep their case.
+    let named = matches!(
+        name,
+        "font" | "font-family" | "animation" | "animation-name" | "list-style" | "list-style-type"
+    ) || name.starts_with("grid")
+        || name.starts_with("counter-")
+        || name.starts_with("container")
+        || name.ends_with("-name");
+    let mut out = String::with_capacity(value.len());
+    canonical(value, length, named, &mut out);
+    let numeric =
+        |part: &str| part.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '-' | '+' | '.'));
+    let layers = |out: &str, layer: &dyn Fn(Vec<&str>) -> String| {
+        components(out, ',')
+            .into_iter()
+            .map(|item| layer(components(item.trim(), ' ')))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match name {
+        "font-family" => layers(&out, &|parts| match parts[..] {
+            // Chrome quotes names of several words and unquotes names that are one identifier.
+            [quoted]
+                if quoted.len() > 2
+                    && quoted.starts_with('"')
+                    && quoted[1..quoted.len() - 1].bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
+                    })
+                    && !quoted[1..].starts_with(|c: char| c.is_ascii_digit() || c == '-')
+                    && !matches!(
+                        &*quoted[1..quoted.len() - 1].to_ascii_lowercase(),
+                        "serif"
+                            | "sans-serif"
+                            | "monospace"
+                            | "cursive"
+                            | "fantasy"
+                            | "system-ui"
+                            | "math"
+                            | "emoji"
+                            | "fangsong"
+                            | "ui-serif"
+                            | "ui-sans-serif"
+                            | "ui-monospace"
+                            | "ui-rounded"
+                            | "inherit"
+                            | "initial"
+                            | "unset"
+                            | "default"
+                            | "revert"
+                    ) =>
+            {
+                quoted[1..quoted.len() - 1].to_owned()
+            }
+            [first, ..] if parts.len() > 1 && !first.starts_with('"') => {
+                format!("\"{}\"", parts.join(" "))
+            }
+            _ => parts.join(" "),
+        }),
+        "aspect-ratio" => match components(&out, ' ')[..] {
+            [ratio] if numeric(ratio) => format!("{ratio} / 1"),
+            _ => out,
+        },
+        "transition" => layers(&out, &|mut parts| {
+            let times: Vec<String> = parts
+                .iter()
+                .filter(|part| numeric(part))
+                .map(|part| part.to_string())
+                .collect();
+            if times.iter().all(|time| time == "0s") {
+                parts.retain(|part| !numeric(part));
+            } else if times.get(1).is_some_and(|delay| delay == "0s") {
+                let delay = parts.iter().rposition(|part| *part == "0s");
+                parts.remove(delay.unwrap_or_default());
+            }
+            parts.retain(|part| !matches!(*part, "ease" | "normal"));
+            if parts.len() > 1 {
+                parts.retain(|part| *part != "all");
+            }
+            if parts.is_empty() {
+                "all".into()
+            } else {
+                parts.join(" ")
+            }
+        }),
+        // Chrome lists every part of each animation, in this order.
+        "animation" if out != "none" => layers(&out, &|parts| {
+            let mut slots: [Option<&str>; 8] = [None; 8];
+            let mut times = 0;
+            for part in parts {
+                let slot = match part {
+                    _ if numeric(part) && part.ends_with('s') => {
+                        times += 1;
+                        if times == 1 { 0 } else { 2 }
+                    }
+                    "linear" | "ease" | "ease-in" | "ease-out" | "ease-in-out" | "step-start"
+                    | "step-end" => 1,
+                    _ if part.starts_with("cubic-bezier(")
+                        || part.starts_with("steps(")
+                        || part.starts_with("linear(") =>
+                    {
+                        1
+                    }
+                    "infinite" => 3,
+                    _ if numeric(part) => 3,
+                    "normal" | "reverse" | "alternate" | "alternate-reverse"
+                        if slots[4].is_none() =>
+                    {
+                        4
+                    }
+                    "forwards" | "backwards" | "both" | "none" if slots[5].is_none() => 5,
+                    "running" | "paused" if slots[6].is_none() => 6,
+                    _ => 7,
+                };
+                slots[slot] = Some(part);
+            }
+            slots
+                .iter()
+                .zip(["0s", "ease", "0s", "1", "normal", "none", "running", "none"])
+                .map(|(value, initial)| value.unwrap_or(initial))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }),
+        "columns" => match components(&out, ' ')[..] {
+            [count, width] if count.parse::<u32>().is_ok() => format!("{width} {count}"),
+            _ => out,
+        },
+        "translate" | "scale" => {
+            let mut parts = components(&out, ' ');
+            let zero = if name == "scale" { "1" } else { "0px" };
+            if parts.len() == 3 && parts[2] == zero {
+                parts.pop();
+            }
+            if parts.len() == 2
+                && (if name == "scale" {
+                    parts[1] == parts[0]
+                } else {
+                    parts[1] == zero
+                })
+            {
+                parts.pop();
+            }
+            parts.join(" ")
+        }
+        "background-position"
+        | "object-position"
+        | "mask-position"
+        | "transform-origin"
+        | "perspective-origin" => layers(&out, &|parts| match parts[..] {
+            [part @ ("top" | "bottom")] => format!("center {part}"),
+            [part] => format!("{part} center"),
+            _ => parts.join(" "),
+        }),
+        "counter-reset" | "counter-set" | "counter-increment" if out != "none" => {
+            let parts = components(&out, ' ');
+            let mut text = Vec::new();
+            for (index, part) in parts.iter().enumerate() {
+                text.push(part.to_string());
+                if !numeric(part) && parts.get(index + 1).is_none_or(|next| !numeric(next)) {
+                    text.push(
+                        if name == "counter-increment" {
+                            "1"
+                        } else {
+                            "0"
+                        }
+                        .into(),
+                    );
+                }
+            }
+            text.join(" ")
+        }
+        "opacity" | "fill-opacity" | "stroke-opacity" | "flood-opacity" | "stop-opacity" => {
+            match out
+                .strip_suffix('%')
+                .and_then(|percent| percent.parse::<f64>().ok())
+            {
+                Some(percent) => number(percent / 100.),
+                None => out,
+            }
+        }
+        "box-shadow" | "text-shadow" if out != "none" => layers(&out, &|mut parts| {
+            if let Some(color) = parts
+                .iter()
+                .position(|part| !numeric(part) && *part != "inset")
+            {
+                let color = parts.remove(color);
+                parts.insert(0, color);
+            }
+            parts.join(" ")
+        }),
+        _ => out,
+    }
+}
+
+fn canonical(value: &str, length: bool, named: bool, out: &mut String) {
+    for (index, item) in components(value, ',').into_iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        for (index, part) in components(item.trim(), ' ').into_iter().enumerate() {
+            if index > 0 {
+                out.push(' ');
+            }
+            let lower = part.to_ascii_lowercase();
+            let first = part.as_bytes()[0];
+            if first == b'"' || first == b'\'' {
+                let text = cssparser::Parser::new(part)
+                    .expect_string()
+                    .map_or_else(|_| part.to_owned(), |text| text.to_string());
+                out.push('"');
+                out.push_str(&text.replace('\\', "\\\\").replace('"', "\\\""));
+                out.push('"');
+            } else if let Some((function, args)) =
+                part.strip_suffix(')').and_then(|part| part.split_once('('))
+            {
+                let function = function.to_ascii_lowercase();
+                match function.as_str() {
+                    "url" => {
+                        let url = args.trim();
+                        let url = cssparser::Parser::new(url)
+                            .expect_string()
+                            .map_or_else(|_| url.to_owned(), |text| text.to_string());
+                        out.push_str("url(\"");
+                        out.push_str(&url.replace('\\', "\\\\").replace('"', "\\\""));
+                        out.push_str("\")");
+                    }
+                    "rgb" | "rgba" | "hsl" | "hsla" | "hwb" | "lab" | "lch" | "oklab" | "oklch" => {
+                        match color::serialize(part) {
+                            Some(color) => out.push_str(&color),
+                            None => out.push_str(&lower),
+                        }
+                    }
+                    "drop-shadow" => {
+                        let mut parts = String::new();
+                        canonical(args, true, named, &mut parts);
+                        let mut parts = components(&parts, ' ');
+                        if let Some(color) = parts.iter().position(|part| {
+                            !part.starts_with(|c: char| {
+                                c.is_ascii_digit() || matches!(c, '-' | '+' | '.')
+                            })
+                        }) {
+                            let color = parts.remove(color);
+                            parts.insert(0, color);
+                        }
+                        out.push_str("drop-shadow(");
+                        out.push_str(&parts.join(" "));
+                        out.push(')');
+                    }
+                    _ => {
+                        // Math of absolute lengths folds into one length, like `calc(1px + 2px)` to `calc(3px)`.
+                        let folded = (function == "calc"
+                            && !lower
+                                .replace("calc", "")
+                                .replace("px", "")
+                                .bytes()
+                                .any(|byte| byte.is_ascii_alphabetic() || byte == b'%'))
+                        .then(|| Lengths::new(16., 100., 100.).math(&lower, f32::NAN, &[]))
+                        .flatten()
+                        .filter(|(value, _)| value.is_finite());
+                        // Transform functions keep their camel case.
+                        let camel = [
+                            "translateX",
+                            "translateY",
+                            "translateZ",
+                            "translate3d",
+                            "scaleX",
+                            "scaleY",
+                            "scaleZ",
+                            "scale3d",
+                            "rotateX",
+                            "rotateY",
+                            "rotateZ",
+                            "rotate3d",
+                            "skewX",
+                            "skewY",
+                            "matrix3d",
+                        ];
+                        out.push_str(
+                            camel
+                                .iter()
+                                .find(|name| name.eq_ignore_ascii_case(&function))
+                                .unwrap_or(&&*function),
+                        );
+                        out.push('(');
+                        match folded {
+                            Some((value, kind)) => {
+                                write_number(value, out);
+                                if kind == parser::Kind::Length {
+                                    out.push_str("px");
+                                }
+                            }
+                            None => {
+                                let start = out.len();
+                                canonical(args, function.starts_with("translate"), named, out);
+                                // The default direction of a linear gradient is left out.
+                                if function.ends_with("linear-gradient") {
+                                    for default in ["to bottom, ", "180deg, "] {
+                                        if out[start..].starts_with(default) {
+                                            out.replace_range(start..start + default.len(), "");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        out.push(')');
+                    }
+                }
+            } else if first == b'#' && !named {
+                out.push_str(&color::serialize(part).unwrap_or(lower));
+            } else if part.len() > 1 && part.contains('/') && !part.contains(['(', '"', '\'']) {
+                for (index, side) in part.split('/').enumerate() {
+                    if index > 0 {
+                        out.push_str(" / ");
+                    }
+                    canonical(side.trim(), length, named, out);
+                }
+            } else if first.is_ascii_digit()
+                || matches!(first, b'+' | b'-' | b'.')
+                    && part
+                        .as_bytes()
+                        .get(1)
+                        .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'.')
+            {
+                let end = part
+                    .char_indices()
+                    .find(|&(index, c)| {
+                        !(c.is_ascii_digit()
+                            || c == '.'
+                            || (c == '+' || c == '-')
+                                && (index == 0
+                                    || matches!(part.as_bytes()[index - 1], b'e' | b'E'))
+                            || matches!(c, 'e' | 'E')
+                                && part[index + 1..].starts_with(|c: char| {
+                                    c.is_ascii_digit() || c == '+' || c == '-'
+                                }))
+                    })
+                    .map_or(part.len(), |(index, _)| index);
+                match part[..end].parse::<f64>() {
+                    Ok(number) => {
+                        write_number(number, out);
+                        let unit = &lower[end..];
+                        out.push_str(if unit.is_empty() && number == 0. && length {
+                            "px"
+                        } else {
+                            unit
+                        });
+                    }
+                    Err(_) => out.push_str(part),
+                }
+            } else if named {
+                out.push_str(part);
+            } else {
+                out.push_str(&lower);
+            }
+        }
+    }
 }
 
 pub(crate) fn declare(source: &str) -> Vec<[String; 3]> {
@@ -2700,6 +3230,179 @@ pub(crate) fn counter_text(kind: &str, number: i64) -> String {
                 roman
             }
         }
+        "lower-greek" | "hiragana" | "katakana" if number > 0 => {
+            let digits: Vec<char> = match kind {
+                "lower-greek" => "αβγδεζηθικλμνξοπρστυφχψω",
+                "hiragana" => "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわゐゑをん",
+                _ => "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヰヱヲン",
+            }
+            .chars()
+            .collect();
+            let mut letters = Vec::new();
+            let mut rest = number;
+            while rest > 0 {
+                rest -= 1;
+                letters.push(digits[(rest % digits.len() as i64) as usize]);
+                rest /= digits.len() as i64;
+            }
+            letters.into_iter().rev().collect()
+        }
+        "cjk-decimal" if number >= 0 => number
+            .to_string()
+            .chars()
+            .map(|digit| {
+                "〇一二三四五六七八九"
+                    .chars()
+                    .nth(digit as usize - '0' as usize)
+                    .unwrap_or(digit)
+            })
+            .collect(),
+        "cjk-ideographic" | "trad-chinese-informal" | "simp-chinese-informal"
+            if (1..10000).contains(&number) =>
+        {
+            let digits: Vec<char> = "零一二三四五六七八九".chars().collect();
+            let mut text = String::new();
+            let mut zero = false;
+            for (unit, name) in [(1000, "千"), (100, "百"), (10, "十"), (1, "")] {
+                let digit = (number / unit % 10) as usize;
+                if digit == 0 {
+                    zero = !text.is_empty();
+                    continue;
+                }
+                if std::mem::take(&mut zero) {
+                    text.push('零');
+                }
+                if !(unit == 10 && digit == 1 && number < 20) {
+                    text.push(digits[digit]);
+                }
+                text.push_str(name);
+            }
+            text
+        }
+        "armenian" | "upper-armenian" | "lower-armenian" | "georgian" | "hebrew"
+            if (1..10000).contains(&number) =>
+        {
+            let symbols: &[(i64, &str)] = match kind {
+                "georgian" => &[
+                    (9000, "ჰ"),
+                    (8000, "ჯ"),
+                    (7000, "ჴ"),
+                    (6000, "ხ"),
+                    (5000, "ჭ"),
+                    (4000, "წ"),
+                    (3000, "ძ"),
+                    (2000, "ც"),
+                    (1000, "ჩ"),
+                    (900, "შ"),
+                    (800, "ყ"),
+                    (700, "ღ"),
+                    (600, "ქ"),
+                    (500, "ფ"),
+                    (400, "ჳ"),
+                    (300, "ტ"),
+                    (200, "ს"),
+                    (100, "რ"),
+                    (90, "ჟ"),
+                    (80, "პ"),
+                    (70, "ო"),
+                    (60, "ჲ"),
+                    (50, "ნ"),
+                    (40, "მ"),
+                    (30, "ლ"),
+                    (20, "კ"),
+                    (10, "ი"),
+                    (9, "თ"),
+                    (8, "ჱ"),
+                    (7, "ზ"),
+                    (6, "ვ"),
+                    (5, "ე"),
+                    (4, "დ"),
+                    (3, "გ"),
+                    (2, "ბ"),
+                    (1, "ა"),
+                ],
+                "hebrew" => &[
+                    (400, "ת"),
+                    (300, "ש"),
+                    (200, "ר"),
+                    (100, "ק"),
+                    (90, "צ"),
+                    (80, "פ"),
+                    (70, "ע"),
+                    (60, "ס"),
+                    (50, "נ"),
+                    (40, "מ"),
+                    (30, "ל"),
+                    (20, "כ"),
+                    (19, "יט"),
+                    (18, "יח"),
+                    (17, "יז"),
+                    (16, "טז"),
+                    (15, "טו"),
+                    (10, "י"),
+                    (9, "ט"),
+                    (8, "ח"),
+                    (7, "ז"),
+                    (6, "ו"),
+                    (5, "ה"),
+                    (4, "ד"),
+                    (3, "ג"),
+                    (2, "ב"),
+                    (1, "א"),
+                ],
+                _ => &[
+                    (9000, "Ք"),
+                    (8000, "Փ"),
+                    (7000, "Ւ"),
+                    (6000, "Ց"),
+                    (5000, "Ր"),
+                    (4000, "Տ"),
+                    (3000, "Վ"),
+                    (2000, "Ս"),
+                    (1000, "Ռ"),
+                    (900, "Ջ"),
+                    (800, "Պ"),
+                    (700, "Չ"),
+                    (600, "Ո"),
+                    (500, "Շ"),
+                    (400, "Ն"),
+                    (300, "Յ"),
+                    (200, "Մ"),
+                    (100, "Ճ"),
+                    (90, "Ղ"),
+                    (80, "Ձ"),
+                    (70, "Հ"),
+                    (60, "Կ"),
+                    (50, "Ծ"),
+                    (40, "Խ"),
+                    (30, "Լ"),
+                    (20, "Ի"),
+                    (10, "Ժ"),
+                    (9, "Թ"),
+                    (8, "Ը"),
+                    (7, "Է"),
+                    (6, "Զ"),
+                    (5, "Ե"),
+                    (4, "Դ"),
+                    (3, "Գ"),
+                    (2, "Բ"),
+                    (1, "Ա"),
+                ],
+            };
+            let mut rest = number;
+            let mut text = String::new();
+            for &(value, symbol) in symbols {
+                while rest >= value {
+                    text.push_str(symbol);
+                    rest -= value;
+                }
+            }
+            if kind == "lower-armenian" {
+                text.to_lowercase()
+            } else {
+                text
+            }
+        }
         _ => number.to_string(),
     }
 }
@@ -2767,7 +3470,15 @@ impl MediaQuery {
                     .matches(width, height, reduced_motion, theme, lengths)
                     .map(|v| v != not);
             }
-            Self::Feature(name, op, value) => (name.as_str(), op.as_str(), value.as_str()),
+            Self::Feature(name, op, value) => (
+                name.as_str(),
+                match op.as_str() {
+                    "min" => ">=",
+                    "max" => "<=",
+                    op => op,
+                },
+                value.as_str(),
+            ),
         };
         let keyword = |values: &[&str], current: &str| match op {
             "" => Some(!matches!(current, "none" | "no-preference")),
@@ -2917,7 +3628,12 @@ impl MediaQuery {
         match self {
             Self::All => "all".into(),
             Self::Unknown(text) => text.clone(),
-            Self::Feature(name, op, value) => format!("({name}{op}{value})"),
+            Self::Feature(name, op, value) => match op.as_str() {
+                "" => format!("({name})"),
+                ":" => format!("({name}: {value})"),
+                "min" | "max" => format!("({op}-{name}: {value})"),
+                _ => format!("({name} {op} {value})"),
+            },
             Self::Typed(medium, query) => match **query {
                 Self::All => medium.clone(),
                 _ => format!("{medium} and {}", group(query)),
@@ -3306,7 +4022,7 @@ pub(crate) struct ComputedStyles {
     blended: std::cell::Cell<Option<bool>>,
     pub values: Chunked<Rc<Style>>,
     pub vars: Chunked<Vars>,
-    pub flags: Chunked<u8>,
+    pub flags: Chunked<u16>,
     pub lengths: NodeLengths,
     pub pseudos: FxHashMap<usize, Rc<[Style; 2]>>,
     pub text_pseudos: FxHashMap<usize, Rc<[Option<Style>; 4]>>,
@@ -4295,7 +5011,7 @@ pub(crate) fn compute_styles(
     let address =
         |list: Option<&Option<Rc<Container>>>| list.map(|list| list.as_ref().map(Rc::as_ptr));
     let mut hosted: Vec<Passed> = Vec::new();
-    let mut texts = FxHashMap::<_, (Rc<Style>, Vars, u8, Lengths)>::default();
+    let mut texts = FxHashMap::<_, (Rc<Style>, Vars, u16, Lengths, Option<Rc<Style>>)>::default();
     macro_rules! settle {
         (@changed $id:expr, $up:expr) => {
             let (id, up): (usize, Option<usize>) = ($id, $up);
@@ -4441,7 +5157,7 @@ pub(crate) fn compute_styles(
             let host = walk.trees[tree].1;
             styles.set(id, styles[host].clone(), Rc::ptr_eq);
             custom.set(id, custom[host].clone(), Rc::ptr_eq);
-            style_flags.set(id, style_flags[host], u8::eq);
+            style_flags.set(id, style_flags[host], u16::eq);
             lengths.set(id, lengths[host]);
             containers.set(id, containers[host].clone(), |a, b| {
                 address(Some(a)) == address(Some(b))
@@ -4455,7 +5171,8 @@ pub(crate) fn compute_styles(
         let seen = up.and_then(|up| containers[up].clone());
         let parent_style = up.map(|up| &styles[up]);
         // Children of a `display: contents` box are items of the nearest ancestor that has a box.
-        let item = {
+        let parent_role = up.map_or(0, |up| style_flags[up] >> 8);
+        let (item, table_item) = {
             let (mut at, mut display) = (
                 up,
                 parent_style.and_then(|parent| parent.get(Prop::DISPLAY)),
@@ -4467,9 +5184,12 @@ pub(crate) fn compute_styles(
                     .map(|at| at as usize);
                 display = at.and_then(|at| styles[at].get(Prop::DISPLAY));
             }
-            matches!(
-                display,
-                Some("flex" | "inline-flex" | "grid" | "inline-grid")
+            (
+                matches!(
+                    display,
+                    Some("flex" | "inline-flex" | "grid" | "inline-grid")
+                ),
+                at.is_some_and(|at| table_box(style_flags[at] >> 8)),
             )
         };
         let parent_vars = up
@@ -4544,7 +5264,6 @@ pub(crate) fn compute_styles(
                     dependencies: matches.dependencies.as_slice().into(),
                     rules: matched.into(),
                     pseudos,
-                    columns: 0,
                 });
             }
             let inner = &*inner;
@@ -4652,11 +5371,16 @@ pub(crate) fn compute_styles(
                     selection.map(Rc::as_ptr),
                 )
             });
-        if let Some((style, vars, flags, units)) = text.as_ref().and_then(|text| texts.get(text)) {
+        if let Some((style, vars, flags, units, selected)) =
+            text.as_ref().and_then(|text| texts.get(text))
+        {
             styles.set(id, style.clone(), Rc::ptr_eq);
             custom.set(id, vars.clone(), Rc::ptr_eq);
-            style_flags.set(id, *flags, u8::eq);
+            style_flags.set(id, *flags, u16::eq);
             lengths.set(id, *units);
+            if let Some(selected) = selected {
+                selections.insert(id, selected.clone());
+            }
             settle!(id, up, seen);
             continue;
         }
@@ -4765,11 +5489,10 @@ pub(crate) fn compute_styles(
                         .map(|id| id.map(|id| matches.signature(id)).unwrap_or_default());
                     (scope, [own[0], own[3], own[5], own[7], up[0], up[5], up[8]])
                 });
-                let (matched, matched_pseudos, columns) = if let Some(cached) =
-                    scoped.nodes[id].as_ref()
+                let (matched, matched_pseudos) = if let Some(cached) = scoped.nodes[id].as_ref()
                     && matches.valid_since(&cached.dependencies, &cached.checked)
                 {
-                    (cached.rules.clone(), cached.pseudos.clone(), cached.columns)
+                    (cached.rules.clone(), cached.pseudos.clone())
                 } else if node.tag.starts_with('#') {
                     let none = intern(&mut scoped.lists, &[]);
                     scoped.nodes[id] = Some(MatchedRules {
@@ -4778,9 +5501,8 @@ pub(crate) fn compute_styles(
                         dependencies: Box::default(),
                         rules: none.clone(),
                         pseudos: no_pseudos.clone(),
-                        columns: 0,
                     });
-                    (none, no_pseudos.clone(), 0)
+                    (none, no_pseudos.clone())
                 } else if let Some(share) = group.and_then(|group| shares.get(&group))
                     && share
                         .style
@@ -4794,9 +5516,8 @@ pub(crate) fn compute_styles(
                         dependencies: matches.dependencies.as_slice().into(),
                         rules: share.rules.clone(),
                         pseudos: share.pseudos.clone(),
-                        columns: 0,
                     });
-                    (share.rules.clone(), share.pseudos.clone(), 0)
+                    (share.rules.clone(), share.pseudos.clone())
                 } else {
                     matches.dependencies.clear();
                     // Candidates come from the node's classes, so its matches always read them.
@@ -4864,28 +5585,14 @@ pub(crate) fn compute_styles(
                     });
                     matched_pseudos.sort_unstable();
                     matched_pseudos.dedup();
-                    let mut columns = 0;
-                    if node.tag == "table" {
-                        matches.depend(id, 2);
-                        for &child in &node.children {
-                            let rows = match doc.nodes[child].tag.as_str() {
-                                "tr" => std::slice::from_ref(&child),
-                                "thead" | "tbody" | "tfoot" => {
-                                    matches.depend(child, 2);
-                                    &doc.nodes[child].children[..]
-                                }
-                                _ => &[],
-                            };
-                            for &row in rows.iter().filter(|&&row| doc.nodes[row].tag == "tr") {
-                                matches.depend(row, 2);
-                                columns = columns.max(
-                                    doc.nodes[row]
-                                        .children
-                                        .iter()
-                                        .filter(|&&cell| !doc.nodes[cell].tag.starts_with('#'))
-                                        .count(),
-                                );
-                            }
+                    // Cells take `cellpadding` from their table.
+                    if matches!(node.tag.as_str(), "td" | "th") {
+                        let mut at = node.parent;
+                        for _ in 0..3 {
+                            let Some(parent) = at else { break };
+                            matches.depend(parent, 0);
+                            matches.depend(parent, 1);
+                            at = doc.nodes[parent].parent;
                         }
                     }
                     let style = matches.reads(id, 6);
@@ -4900,7 +5607,6 @@ pub(crate) fn compute_styles(
                         Rc::from(matched_pseudos)
                     };
                     if let Some(group) = group
-                        && columns == 0
                         && matches.shareable(doc, id)
                     {
                         shares.insert(
@@ -4920,9 +5626,8 @@ pub(crate) fn compute_styles(
                         dependencies: matches.dependencies.as_slice().into(),
                         rules: shared.clone(),
                         pseudos: matched_pseudos.clone(),
-                        columns,
                     });
-                    (shared, matched_pseudos, columns)
+                    (shared, matched_pseudos)
                 };
                 let mut applies = |order: usize, passed: bool| {
                     if scoped.medias[order]
@@ -4995,6 +5700,48 @@ pub(crate) fn compute_styles(
                         && let Some(value) = svg_transform(value)
                     {
                         hints.push((Prop::TRANSFORM, value.into()));
+                    } else if node.tag == "svg" && matches!(name.as_ref(), "width" | "height") {
+                        // As in Chrome, these are CSS lengths like `1em` or `50%`, below author styles.
+                        let value = value.trim();
+                        let digits = value
+                            .find(|c: char| !c.is_ascii_digit() && c != '.')
+                            .unwrap_or(value.len());
+                        let unit = value[digits..].to_ascii_lowercase();
+                        if value[..digits].parse::<f32>().is_ok()
+                            && matches!(
+                                unit.as_str(),
+                                "" | "%"
+                                    | "px"
+                                    | "em"
+                                    | "rem"
+                                    | "ex"
+                                    | "ch"
+                                    | "vw"
+                                    | "vh"
+                                    | "vmin"
+                                    | "vmax"
+                                    | "cm"
+                                    | "mm"
+                                    | "q"
+                                    | "in"
+                                    | "pt"
+                                    | "pc"
+                            )
+                        {
+                            let prop = if name == "width" {
+                                Prop::WIDTH
+                            } else {
+                                Prop::HEIGHT
+                            };
+                            hints.push((
+                                prop,
+                                if unit.is_empty() {
+                                    format!("{value}px").into()
+                                } else {
+                                    value.into()
+                                },
+                            ));
+                        }
                     } else if let Some(prop) = presentation(name) {
                         let value = value.trim();
                         let pixels = matches!(
@@ -5028,6 +5775,102 @@ pub(crate) fn compute_styles(
                         hints.push((Prop::TRANSFORM_ORIGIN, "0 0".into()));
                     }
                 }
+                // HTML table attributes, as presentation hints.
+                let tag = node.tag.as_str();
+                if matches!(
+                    tag,
+                    "table" | "td" | "th" | "tr" | "thead" | "tbody" | "tfoot" | "col" | "colgroup"
+                ) {
+                    let length = |value: &str| -> Option<Rc<str>> {
+                        let value = value.trim();
+                        let (number, percent) = match value.strip_suffix('%') {
+                            Some(number) => (number, true),
+                            None => (value.strip_suffix("px").unwrap_or(value), false),
+                        };
+                        let number = number.trim().parse::<f32>().ok().filter(|v| *v >= 0.)?;
+                        Some(format!("{number}{}", if percent { "%" } else { "px" }).into())
+                    };
+                    let cell = matches!(tag, "td" | "th");
+                    let table = if cell {
+                        std::iter::successors(node.parent, |&at| doc.nodes[at].parent)
+                            .take(3)
+                            .find(|&at| doc.nodes[at].tag == "table")
+                    } else {
+                        None
+                    };
+                    let padding = table
+                        .and_then(|table| length(doc.nodes[table].attrs.get("cellpadding")?))
+                        .filter(|value| !value.ends_with('%'));
+                    let attrs = node
+                        .attrs
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.trim()));
+                    for (name, value) in
+                        attrs.chain(padding.as_deref().map(|value| ("cellpadding", value)))
+                    {
+                        let sides = |props: [Prop; 4], value: Rc<str>| {
+                            props.map(|prop| (prop, value.clone()))
+                        };
+                        let found: Vec<(Prop, Rc<str>)> = match (name, tag) {
+                            ("width", "table" | "td" | "th" | "col" | "colgroup") => length(value)
+                                .map(|value| (Prop::WIDTH, value))
+                                .into_iter()
+                                .collect(),
+                            ("height", "table" | "td" | "th" | "tr") => length(value)
+                                .map(|value| (Prop::HEIGHT, value))
+                                .into_iter()
+                                .collect(),
+                            ("bgcolor", _) => vec![(Prop::BACKGROUND_COLOR, value.into())],
+                            ("nowrap", "td" | "th") => vec![(Prop::WHITE_SPACE, "nowrap".into())],
+                            ("align", "table") if value.eq_ignore_ascii_case("center") => vec![
+                                (Prop::MARGIN_LEFT, "auto".into()),
+                                (Prop::MARGIN_RIGHT, "auto".into()),
+                            ],
+                            ("align", "table") => Vec::new(),
+                            ("align", _) => ["left", "right", "center", "justify"]
+                                .into_iter()
+                                .find(|side| value.eq_ignore_ascii_case(side))
+                                .map(|side| (Prop::TEXT_ALIGN, side.into()))
+                                .into_iter()
+                                .collect(),
+                            ("valign", _) => ["top", "middle", "bottom", "baseline"]
+                                .into_iter()
+                                .find(|side| value.eq_ignore_ascii_case(side))
+                                .map(|side| (Prop::VERTICAL_ALIGN, side.into()))
+                                .into_iter()
+                                .collect(),
+                            ("cellspacing", "table") => length(value)
+                                .filter(|value| !value.ends_with('%'))
+                                .map(|value| (Prop::BORDER_SPACING, value))
+                                .into_iter()
+                                .collect(),
+                            ("border", "table") => sides(
+                                [
+                                    Prop::BORDER_TOP_WIDTH,
+                                    Prop::BORDER_RIGHT_WIDTH,
+                                    Prop::BORDER_BOTTOM_WIDTH,
+                                    Prop::BORDER_LEFT_WIDTH,
+                                ],
+                                length(value)
+                                    .filter(|value| !value.ends_with('%'))
+                                    .unwrap_or("1px".into()),
+                            )
+                            .into(),
+                            ("cellpadding", _) if cell => sides(
+                                [
+                                    Prop::PADDING_TOP,
+                                    Prop::PADDING_RIGHT,
+                                    Prop::PADDING_BOTTOM,
+                                    Prop::PADDING_LEFT,
+                                ],
+                                value.into(),
+                            )
+                            .into(),
+                            _ => Vec::new(),
+                        };
+                        hints.extend(found);
+                    }
+                }
                 if node.state & (crate::dom::TOP_LAYER | crate::dom::LEAVING) != 0
                     && node.tag != "html"
                 {
@@ -5047,7 +5890,10 @@ pub(crate) fn compute_styles(
                                 .filter(|(prop, _)| prop.inherited())
                                 .map(|(prop, value)| (prop, value.clone()))
                                 .collect();
-                            if item {
+                            // Children of table parts take their roles from the parent's role.
+                            if parent_role != 0 {
+                                passed.insert(Prop::DISPLAY, TABLE_DISPLAYS[parent_role as usize]);
+                            } else if item {
                                 passed.insert(Prop::DISPLAY, "flex");
                             }
                             let passed = match style_cache.inherited.get(&passed) {
@@ -5091,7 +5937,6 @@ pub(crate) fn compute_styles(
                     },
                     rules: StyleRef(matched),
                     pseudos: matched_pseudos,
-                    columns,
                     shadow: shadow.clone(),
                     selection: selection.cloned().map(StyleRef),
                 };
@@ -5146,7 +5991,7 @@ pub(crate) fn compute_styles(
             }
             styles.set(id, cached.style.clone(), Rc::ptr_eq);
             custom.set(id, vars, Rc::ptr_eq);
-            style_flags.set(id, cached.flags, u8::eq);
+            style_flags.set(id, cached.flags, u16::eq);
             lengths.set(
                 id,
                 Lengths {
@@ -5195,6 +6040,7 @@ pub(crate) fn compute_styles(
                     custom[id].clone(),
                     style_flags[id],
                     lengths[id],
+                    selections.get(&id).cloned(),
                 );
                 texts.insert(text, outputs);
             }
@@ -5513,12 +6359,38 @@ pub(crate) fn compute_styles(
             };
             style.insert(Prop::DISPLAY, display);
         }
+        let mut role = 0;
         if !node.tag.starts_with('#') {
             let root = node.parent == Some(0);
             if root && style.get(Prop::DISPLAY) == Some("contents") {
                 style.insert(Prop::DISPLAY, "block");
             }
-            blockify(&mut style, item || root);
+            blockify(&mut style, item || root, table_item);
+            let grouped = table_box(parent_role) || matches!(parent_role, 5..=7);
+            let display;
+            (role, display) = match style.get(Prop::DISPLAY).unwrap_or("inline") {
+                "table" => (1, "grid"),
+                "inline-table" => (2, "inline-grid"),
+                // A `<table>` box holds the anonymous table of its rows.
+                "block" if node.tag == "table" => (3, "grid"),
+                "table-row" if grouped => (ROW, "contents"),
+                "table-row-group" if table_box(parent_role) => (5, "contents"),
+                "table-header-group" if table_box(parent_role) => (HEADER, "contents"),
+                "table-footer-group" if table_box(parent_role) => (FOOTER, "contents"),
+                "table-row" => (10, "grid"),
+                "table-row-group" | "table-footer-group" => (11, "grid"),
+                "table-header-group" => (12, "grid"),
+                "table-cell" => (CELL, "block"),
+                "table-caption" => (CAPTION, "block"),
+                _ => (0, ""),
+            };
+            if role != 0 {
+                style.insert(Prop::DISPLAY, display);
+            }
+            // Like a table, the grid is as wide as its content when its width is `auto`.
+            if table_box(role) && style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
+                style.insert(Prop::WIDTH, "fit-content");
+            }
         }
         if style
             .get(Prop::BACKGROUND_CLIP)
@@ -5537,21 +6409,14 @@ pub(crate) fn compute_styles(
             style.insert(Prop::WEBKIT_TEXT_FILL_COLOR, ink);
         }
 
-        if node.tag == "table"
-            && style
-                .get(Prop::DISPLAY)
-                .is_some_and(|value| value == "grid")
-        {
+        if table_box(role) {
             let spacing = if style
                 .get(Prop::BORDER_COLLAPSE)
                 .is_some_and(|value| value == "collapse")
             {
                 "0".to_owned()
             } else {
-                style
-                    .get(Prop::BORDER_SPACING)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| "2px".into())
+                style.get(Prop::BORDER_SPACING).unwrap_or("0").to_owned()
             };
             let parts = components(&spacing, ' ');
             if let Some(&column) = parts.first() {
@@ -5569,12 +6434,6 @@ pub(crate) fn compute_styles(
                         style.insert(prop, value);
                     }
                 }
-            }
-            if key.columns > 1 && !style.contains(Prop::GRID_TEMPLATE_COLUMNS) {
-                style.insert(
-                    Prop::GRID_TEMPLATE_COLUMNS,
-                    format!("repeat({},auto)", key.columns),
-                );
             }
         }
         let parent_weight = parent_style
@@ -5960,7 +6819,11 @@ pub(crate) fn compute_styles(
         if [&bar, &track, &thumb, &corner, &hovered]
             .iter()
             .any(|cascade| !cascade.is_empty())
-            && (matches!(node.tag.as_str(), "html" | "body")
+            && (matches!(node.tag.as_str(), "html" | "body" | "progress")
+                || node.tag == "input"
+                    && ["range", "file"]
+                        .iter()
+                        .any(|kind| node.input_type().eq_ignore_ascii_case(kind))
                 || [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
                     .into_iter()
                     .any(|prop| {
@@ -6076,7 +6939,11 @@ pub(crate) fn compute_styles(
                             display,
                             Some("flex" | "inline-flex" | "grid" | "inline-grid")
                         );
-                        blockify(&mut values, flex || item && display == Some("contents"));
+                        blockify(
+                            &mut values,
+                            flex || item && display == Some("contents"),
+                            false,
+                        );
                     }
                     values
                 })),
@@ -6187,8 +7054,9 @@ pub(crate) fn compute_styles(
                 _ => 0,
             }
             | flag(counted, COUNTED)
-            | flag(agent_display, AGENT_DISPLAY);
-        style_flags.set(id, bits, u8::eq);
+            | flag(agent_display, AGENT_DISPLAY)
+            | role << 8;
+        style_flags.set(id, bits, u16::eq);
         let style = match context
             .and_then(|context| context.previous.as_deref())
             .and_then(|previous| {
@@ -7637,7 +8505,7 @@ pub(crate) fn dark(style: &Style) -> bool {
     })
 }
 
-fn blockify(style: &mut Style, item: bool) {
+fn blockify(style: &mut Style, item: bool, table_item: bool) {
     let positioned = style
         .get(Prop::POSITION)
         .is_some_and(|value| matches!(value, "absolute" | "fixed"));
@@ -7652,6 +8520,12 @@ fn blockify(style: &mut Style, item: bool) {
         "inline-flex" => "flex",
         "inline-grid" => "grid",
         "inline-table" => "table",
+        "table-row" | "table-row-group" | "table-header-group" | "table-footer-group"
+        | "table-cell" | "table-caption"
+            if !table_item =>
+        {
+            "block"
+        }
         _ => return,
     };
     style.insert(Prop::DISPLAY, display);

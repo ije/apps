@@ -642,7 +642,7 @@ impl renderer::View for PageView {
         let host = self.host.borrow();
         let dom = host.dom.get(&self.id)?;
         if let Some((layout, text, span, rows, _)) = dom.text_layouts.get(&id) {
-            let index = super::text::text_index(layout, text, rows, point)
+            let index = super::text::text_index(layout, text, rows, point, false)
                 .unwrap_or_else(|index| index)
                 .clamp(span.start, span.end);
             let index = text[span.start..index].encode_utf16().count();

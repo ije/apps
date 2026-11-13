@@ -480,12 +480,16 @@ impl SelectorCache {
                 node.parent.map_or(0, |parent| parent as u32 + 1),
                 hash.hash_one(&node.children) as u32,
                 u32::from(!node.text.is_empty())
-                    | node
-                        .value
-                        .as_deref()
-                        .map_or(0, |value| 2 << u32::from(value.is_empty())),
+                    | node.value.as_deref().map_or(0, |value| {
+                        // Ranged inputs match by their value, other inputs only by whether they have one.
+                        if ranged(node) {
+                            hash.hash_one(value) as u32 | 2
+                        } else {
+                            2 << u32::from(value.is_empty())
+                        }
+                    }),
                 tag as u32,
-                u32::from(node.state),
+                u32::from(node.state) | u32::from(doc.target == Some(id)) << 16,
                 hash.hash_one((node.attrs.get("style"), &node.inline)) as u32,
                 node.attrs
                     .get("class")
@@ -973,6 +977,25 @@ fn next_stamp(stamp: &mut u32, stamps: &mut Vec<u32>, len: usize) -> u32 {
     *stamp
 }
 
+// Whether an input has a range limitation, so `:in-range` or `:out-of-range` matches it.
+fn ranged(node: &super::Node) -> bool {
+    node.tag == "input"
+        && [
+            "number",
+            "range",
+            "date",
+            "month",
+            "week",
+            "time",
+            "datetime-local",
+        ]
+        .iter()
+        .any(|kind| node.input_type().eq_ignore_ascii_case(kind))
+        && (node.input_type().eq_ignore_ascii_case("range")
+            || node.attrs.contains_key("min")
+            || node.attrs.contains_key("max"))
+}
+
 // Match `disabled` in dom.js: a disabled fieldset disables the controls in it, except in its first legend,
 // and a disabled optgroup its options.
 fn disabled(doc: &Document, id: usize, memo: &mut SelectorCache) -> bool {
@@ -1206,9 +1229,22 @@ impl Selector {
                     "part",
                     "starting-style",
                     "backdrop",
+                    "-webkit-slider-runnable-track",
+                    "-webkit-slider-thumb",
+                    "-webkit-progress-bar",
+                    "-webkit-progress-value",
+                    "file-selector-button",
+                    "-webkit-file-upload-button",
                 ]
                 .iter()
-                .position(|n| n == name)?,
+                .position(|n| n == name)
+                // The parts of ranges, progress bars and file inputs share the slots of the scrollbar track and
+                // thumb.
+                .map(|kind| match kind {
+                    16 | 18 | 20 | 21 => 8,
+                    17 | 19 => 9,
+                    kind => kind,
+                })?,
             ))
         })?;
         let mut selector = self.clone();
@@ -1849,6 +1885,8 @@ impl Selector {
                         | "enabled"
                         | "valid"
                         | "invalid"
+                        | "in-range"
+                        | "out-of-range"
                         | "default"
                 ) && !(name == "checked" && matches!(anchor.tag.as_str(), "optgroup" | "option"))
                     && parsed
@@ -2138,6 +2176,46 @@ impl Selector {
                                     _ => FOCUS,
                                 }
                                 != 0
+                        }
+                        "in-range" | "out-of-range" => {
+                            memo.depend(id, 0);
+                            memo.depend(id, 3);
+                            let value = node.current_value().unwrap_or("");
+                            let bound = |name| node.attrs.get(name).map(String::as_str);
+                            let numeric = node.input_type().eq_ignore_ascii_case("number");
+                            // Dates and times in their valid forms compare as strings.
+                            let beyond = |limit: Option<&str>, below: bool| {
+                                limit.is_some_and(|limit| {
+                                    let order = match (value.parse::<f64>(), limit.parse::<f64>()) {
+                                        (Ok(value), Ok(limit)) if numeric => {
+                                            value.partial_cmp(&limit)
+                                        }
+                                        _ if numeric
+                                            || value.is_empty()
+                                            || limit.len() != value.len() =>
+                                        {
+                                            None
+                                        }
+                                        _ => Some(value.cmp(limit)),
+                                    };
+                                    order
+                                        == Some(if below {
+                                            std::cmp::Ordering::Less
+                                        } else {
+                                            std::cmp::Ordering::Greater
+                                        })
+                                })
+                            };
+                            let out = !node.input_type().eq_ignore_ascii_case("range")
+                                && (beyond(bound("min"), true) || beyond(bound("max"), false));
+                            ranged(node)
+                                && !node.attrs.contains_key("readonly")
+                                && !disabled(doc, id, memo)
+                                && out == (name == "out-of-range")
+                        }
+                        "target" => {
+                            memo.depend(id, 5);
+                            doc.target == Some(id)
                         }
                         "link" | "any-link" | "-webkit-any-link" => {
                             matches!(node.tag.as_str(), "a" | "area")

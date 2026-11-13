@@ -59,6 +59,9 @@ pub(crate) fn breaks(
             && !joined
             && (matches!(previous, ' ' | '\u{fffc}')
                 || !is_word_char(ch)
+                    && !(wrapping.word_break == WordBreak::KeepAll
+                        && ch.is_alphanumeric()
+                        && previous.is_alphanumeric())
                 || wrapping.word_break == WordBreak::BreakAll
                 || after_hyphen && ch.is_alphabetic())
         {
@@ -86,7 +89,9 @@ pub(crate) fn breaks(
         if ch != ' '
             && next_x - row_x > room + px(0.01)
             && at > row_glyph
-            && (chance.is_some() || wrapping.word_break != WordBreak::Normal && !joined)
+            && (chance.is_some()
+                || !matches!(wrapping.word_break, WordBreak::Normal | WordBreak::KeepAll)
+                    && !joined)
         {
             if wrapping
                 .max_lines
@@ -261,6 +266,18 @@ mod tests {
             breaks(&line(text), text, &wrapping(0., TextWrap::Wrap), &[]),
             [3, 6, 11]
         );
+    }
+
+    #[test]
+    fn keep_all_holds_ideographs_together_like_chrome() {
+        let text = "ab 这是一个 中文";
+        let mut wrapping = wrapping(0., TextWrap::Wrap);
+        assert_eq!(
+            breaks(&line(text), text, &wrapping, &[]),
+            [3, 4, 5, 6, 8, 9]
+        );
+        wrapping.word_break = WordBreak::KeepAll;
+        assert_eq!(breaks(&line(text), text, &wrapping, &[]), [3, 8]);
     }
 
     #[test]

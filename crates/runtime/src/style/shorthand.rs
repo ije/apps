@@ -365,17 +365,27 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 );
                 let mut after_slash = false;
                 for part in components(layer, ' ') {
+                    // A size must follow a position, as in `center / cover`.
                     if part == "/" {
+                        if position.is_empty() {
+                            return true;
+                        }
                         after_slash = true;
                     } else if let Some((before, after)) =
                         part.split_once('/').filter(|_| !part.contains('('))
                     {
-                        position.push(before.to_owned());
+                        if before.is_empty() && position.is_empty() {
+                            return true;
+                        }
+                        if !before.is_empty() {
+                            position.push(before.to_owned());
+                        }
                         size.push(after.to_owned());
                         after_slash = true;
                     } else if part.starts_with("url(")
                         || part.contains("gradient(")
                         || part.starts_with("image-set(")
+                        || part.starts_with("-webkit-image-set(")
                         || part == "none"
                     {
                         image = part.into();
@@ -397,8 +407,36 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                         || matches!(part, "left" | "right" | "top" | "bottom" | "center")
                     {
                         position.push(part.into());
-                    } else if index + 1 == layers.len() {
+                    } else if index + 1 == layers.len()
+                        && match part.split_once('(') {
+                            Some((name, _)) => matches!(
+                                name.to_ascii_lowercase().as_str(),
+                                "rgb"
+                                    | "rgba"
+                                    | "hsl"
+                                    | "hsla"
+                                    | "hwb"
+                                    | "lab"
+                                    | "lch"
+                                    | "oklab"
+                                    | "oklch"
+                                    | "color"
+                                    | "color-mix"
+                                    | "light-dark"
+                                    | "var"
+                                    | "env"
+                                    | "attr"
+                            ),
+                            None => {
+                                part.eq_ignore_ascii_case("currentcolor")
+                                    || super::color(part).is_some()
+                            }
+                        }
+                    {
                         color = part.into();
+                    } else {
+                        // Browsers drop the whole declaration for a part they don't know.
+                        return true;
                     }
                 }
                 let join = |values: Vec<String>, fallback: &str| {

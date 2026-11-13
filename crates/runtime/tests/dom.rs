@@ -1337,7 +1337,7 @@ fn labels_walkers_names_documents_selectors_and_validity_follow_browsers() {
         check('documents and doctypes have no text content', () => { document.textContent = 'x'; return document.textContent === null && document.body.childElementCount === 5 && document.implementation.createDocumentType('html', '', '').textContent === null; });
         const parsed = new DOMParser().parseFromString('<p>a</p>', 'text/html'), made = document.implementation.createHTMLDocument('t');
         parsed.documentElement.remove(); parsed.append(parsed.createElement('html')); made.insertBefore(made.createComment('c'), made.documentElement);
-        check('other documents take children', () => parsed.documentElement.localName === 'html' && made.firstChild.nodeType === 8 && error(() => made.append('text')) === 'HierarchyRequestError');
+        check('other documents take children', () => parsed.documentElement.localName === 'html' && made.documentElement.previousSibling.nodeType === 8 && made.doctype.name === 'html' && error(() => made.append('text')) === 'HierarchyRequestError');
         const style = document.createElement('style'); style.textContent = 'div>.c{} a + b{} a~b{} a  b{} .p{& > .q{}}'; document.head.append(style);
         check('selectors serialize with spaced combinators', () => [...style.sheet.cssRules].map(rule => rule.selectorText).join() === 'div > .c,a + b,a ~ b,a b,.p' && style.sheet.cssRules[4].cssRules[0].selectorText === '& > .q');
         check('innerText of a select lists its options', () => $('list').innerText === 'One\nTwo');
@@ -1870,6 +1870,11 @@ fn inner_text_selections_and_table_displays_follow_rendering() {
         check('built-in table displays', () => [display('#t'), display('#t tbody'), display('#t tr'), display('#t td')].join() === 'table,table-row-group,table-row,table-cell');
         check('author table displays', () => [display('#g'), display('#g tbody'), display('#g tr'), display('#g td')].join() === 'grid,contents,contents,block');
         check('author displays in text', () => text('g') === 'g');
+        const css = document.createElement('div'); css.id = 'css';
+        css.innerHTML = "<div style='display:table'><div style='display:table-row'><div style='display:table-cell'>a</div><div style='display:table-cell'>b</div></div></div><table style='display:block'><tr><td>c</td></tr></table><div style='display:table-row'>d</div>";
+        document.body.append(css);
+        check('css table displays', () => [display('#css > div'), display('#css > div > div'), display('#css > div > div > div'), display('#css > table'), display('#css > table td'), display('#css > div:last-child')].join() === 'table,table-row,table-cell,block,table-cell,table-row');
+        check('css tables in text', () => text('css') === 'a\tb\nc\nd');
         const host = document.createElement('div'); host.innerHTML = '<span>light</span>'; document.body.append(host);
         const root = host.attachShadow({ mode: 'open' }); root.innerHTML = '<template><slot></slot></template><slot id=slot></slot>';
         check('slots skip templates', () => root.querySelector('#slot').assignedNodes().length === 1 && host.firstChild.assignedSlot === root.querySelector('#slot') && host.innerText === 'light');
@@ -2088,12 +2093,12 @@ fn native_presses_follow_the_browser_event_sequence() {
         for (const type of ['pointerdown','mousedown','pointerup','mouseup','click','auxclick','contextmenu','dblclick','wheel']) a.addEventListener(type, e => log.push(type + ':' + e.button + ':' + e.buttons + ':' + e.detail + ':' + e.isTrusted + (e instanceof MouseEvent ? '' : '!')));
         const press = (target, button, detail = 1) => { __appsDispatch('pointerdown', [target._id], { clientX: 5, clientY: 6, button, buttons: 1 << [0, 2, 1][button], detail }); __appsDispatch('pointerup', [target._id], { clientX: 7, clientY: 9, button, buttons: 0 }); };
         press(a, 0);
-        check('primary sequence', () => log.join() === 'pointerdown:0:1:1:true,mousedown:0:1:1:true,pointerup:0:0:0:true,mouseup:0:0:0:true,click:0:0:1:true');
+        check('primary sequence', () => log.join() === 'pointerdown:0:1:0:true,mousedown:0:1:1:true,pointerup:0:0:0:true,mouseup:0:0:1:true,click:0:0:1:true');
         check('primary press focuses', () => document.activeElement === a);
         log.length = 0; press(a, 2);
-        check('secondary sequence', () => log.join() === 'pointerdown:2:2:1:true,mousedown:2:2:1:true,contextmenu:2:2:1:true,pointerup:2:0:0:true,mouseup:2:0:0:true,auxclick:2:0:1:true');
+        check('secondary sequence', () => log.join() === 'pointerdown:2:2:0:true,mousedown:2:2:1:true,contextmenu:2:2:0:true,pointerup:2:0:0:true,mouseup:2:0:1:true,auxclick:2:0:1:true');
         log.length = 0; press(a, 1);
-        check('middle sequence', () => log.join().endsWith('mouseup:1:0:0:true,auxclick:1:0:1:true') && !log.join().includes('click:1:0:1:true,') && !log.join().includes('contextmenu'));
+        check('middle sequence', () => log.join().endsWith('mouseup:1:0:1:true,auxclick:1:0:1:true') && !log.join().includes('click:1:0:1:true,') && !log.join().includes('contextmenu'));
         log.length = 0; press(a, 0, 2);
         check('dblclick', () => log.at(-1) === 'dblclick:0:0:2:true');
         let fields;
@@ -2254,7 +2259,7 @@ fn cssom_edits_keep_the_engine_and_detached_rules_apart() {
         keys.cssRules[0].style.opacity = '0.5'; keys.cssRules[1].keyText = '50.0%'; keys.name = 'k2'; keys.appendRule('to{opacity:.75}');
         let bad; try { keys.cssRules[0].keyText = 'middle'; } catch (e) { bad = e.name; } if (bad !== 'SyntaxError') throw Error('keyText ' + bad);
         face.style.setProperty('font-family', 'B');
-        if (!/^@keyframes k2 \{ 0% \{ opacity: 0\.5; \} 50% \{ opacity: 1; \} 100% \{ opacity: \.?0?\.75; \} \}$/.test(keys.cssText) || !face.cssText.includes('font-family: B')) throw Error('keyframes ' + keys.cssText + ' ' + face.cssText);
+        if (keys.cssText !== '@keyframes k2 { \n  0% { opacity: 0.5; }\n  50% { opacity: 1; }\n  100% { opacity: 0.75; }\n}' || !face.cssText.includes('font-family: B')) throw Error('keyframes ' + keys.cssText + ' ' + face.cssText);
         same('keyframes');
         const hidden = sheet.cssRules[4];
         if (color('c') !== 'rgb(0, 0, 0)') throw Error('not all');
@@ -2422,7 +2427,7 @@ fn focus_follows_focusability_removal_and_shadow_roots() {
         const $ = id => document.getElementById(id);
         $('plain').focus();
         check('non-focusable ignored', () => document.activeElement === document.body);
-        check('link tabIndex', () => $('link').tabIndex === 0 && $('nolink').tabIndex === -1 && $('b').tabIndex === 0);
+        check('link tabIndex', () => $('link').tabIndex === 0 && $('nolink').tabIndex === 0 && $('plain').tabIndex === -1 && $('b').tabIndex === 0);
         $('link').focus();
         check('link focus', () => document.activeElement === $('link'));
         const detached = document.createElement('button'); detached.focus();
@@ -2613,7 +2618,7 @@ fn cssom_rule_lists_insert_delete_and_nest() {
         if (sheet !== style.sheet || document.styleSheets.length !== 1 || document.styleSheets[0] !== sheet || sheet.ownerNode !== style) throw Error('styleSheets');
         if (sheet.cssRules.length !== 2 || !(sheet.cssRules[0] instanceof CSSStyleRule) || sheet.cssRules[0].selectorText !== '.a' || sheet.cssRules[0].style.color !== 'red') throw Error('rules ' + sheet.cssRules.length);
         const media = sheet.cssRules[1];
-        if (!(media instanceof CSSMediaRule) || media.conditionText !== '(width>=1px)' || media.cssRules[0].selectorText !== '.b' || media.cssRules[0].parentRule !== media) throw Error('media ' + media.conditionText);
+        if (!(media instanceof CSSMediaRule) || media.conditionText !== '(min-width: 1px)' || media.cssRules[0].selectorText !== '.b' || media.cssRules[0].parentRule !== media) throw Error('media ' + media.conditionText);
         if (sheet.insertRule('.c{color:green}', 2) !== 2 || getComputedStyle(i).color !== 'rgb(0, 128, 0)') throw Error('insertRule');
         for (const [rule, name] of [['garbage', 'SyntaxError'], ['.e{} .f{}', 'SyntaxError']]) { let error; try { sheet.insertRule(rule); } catch (e) { error = e.name; } if (error !== name) throw Error(rule + ' ' + error); }
         let index; try { sheet.insertRule('.g{}', 9); } catch (e) { index = e.name; } if (index !== 'IndexSizeError') throw Error('index');
@@ -2753,8 +2758,8 @@ fn computed_styles_resolve_lengths_colors_initial_values_and_pseudo_elements() {
         expect(span, 'display', 'inline'); expect(span, 'boxSizing', 'content-box'); expect(span, 'borderTopWidth', '0px'); expect(span, 'backgroundColor', 'rgba(0, 0, 0, 0)'); expect(span, 'color', 'rgb(0, 0, 0)');
         if (parseFloat(s.marginTop) !== 10) throw Error('parseFloat');
         const before = getComputedStyle(a, '::before');
-        expect(before, 'content', "'x'"); expect(before, 'fontWeight', '700'); expect(before, 'color', 'rgba(255, 0, 0, 0.5)');
-        if (getComputedStyle(a, '::after').content !== '') throw Error('missing ::after');
+        expect(before, 'content', '"x"'); expect(before, 'fontWeight', '700'); expect(before, 'color', 'rgba(255, 0, 0, 0.5)');
+        if (getComputedStyle(a, '::after').content !== 'none') throw Error('missing ::after');
         a.style.transform = 'translate(10px, 5px)';
         expect(getComputedStyle(a), 'transform', 'matrix(1, 0, 0, 1, 10, 5)');
         expect(getComputedStyle(document.getElementById('h')), 'display', 'none');
@@ -2775,7 +2780,7 @@ fn hosts_take_pseudo_elements_from_their_shadow_tree() {
         check('inner important wins', () => before.fontWeight === '700');
         check(':host(.on)::after', () => getComputedStyle(card, '::after').content === '"B"');
         card.classList.remove('on');
-        check('class change', () => getComputedStyle(card, '::after').content === '');
+        check('class change', () => getComputedStyle(card, '::after').content === 'none');
         "#,
     );
 }
@@ -2851,7 +2856,7 @@ fn child_lists_inline_shorthands_and_serialization_stay_current() {
         d.removeAttribute('style'); d.style.borderInline = '1px solid red'; d.style.inlineSize = '5px';
         check('logical border and alias', () => d.style.borderInline === '1px solid red' && d.style.inlineSize === '5px' && css() === 'border-inline: 1px solid red; width: 5px;');
         d.removeAttribute('style'); d.style.background = 'url(a.png) no-repeat 1px 2px / 3px, blue';
-        check('background layers', () => d.style.background === 'url(a.png) 1px 2px / 3px no-repeat, blue');
+        check('background layers', () => d.style.background === 'url("a.png") 1px 2px / 3px no-repeat, blue');
         const svg = document.createElement('div'); svg.innerHTML = '<svg><style>a&lt;b</style></svg><style>a<b</style>';
         check('only HTML raw text stays raw', () => svg.innerHTML === '<svg><style>a&lt;b</style></svg><style>a<b</style>');
         const deep = document.createElement('div'); deep.innerHTML = '<div>'.repeat(20000);
@@ -2977,14 +2982,17 @@ fn child_node_methods_reactions_and_observers_follow_the_standard() {
         early.setPointerCapture(1);
         globalThis.lost = 0;
         document.addEventListener('lostpointercapture', () => lost++);
+        // As in Chrome, a capture takes effect at the next pointer event.
+        const move = () => __appsDispatch('pointermove', [], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 0, buttons: 1 });
+        move();
         early.remove();
         check('removal releases the pointer capture', () => !early.hasPointerCapture(1) && lost === 1);
         const target = document.createElement('i'), detached = document.createElement('div');
-        box.append(target); target.setPointerCapture(1);
+        box.append(target); target.setPointerCapture(1); move();
         let bubbled = false; box.addEventListener('lostpointercapture', () => bubbled = true);
-        target.releasePointerCapture(1);
+        target.releasePointerCapture(1); move();
         check('release fires a bubbling lostpointercapture', () => bubbled && lost === 2);
-        target.setPointerCapture(1); detached.append(target);
+        target.setPointerCapture(1); move(); detached.append(target);
         check('a move into a detached tree releases the pointer capture', () => !target.hasPointerCapture(1) && lost === 3);
         const field = document.createElement('input'); box.append(field); field.focus();
         let blurred = false; field.addEventListener('blur', () => blurred = true);
@@ -3840,7 +3848,7 @@ fn indexes_follow_ids_labels_forms_and_bases() {
         check('id changes update the index', () => document.getElementById('in') === null && document.getElementById('renamed') === input);
         input.id = 'in';
         check('labels', () => input.labels.length === 1 && input.labels[0].textContent === 'one' && document.getElementById('nested').labels[0].textContent.startsWith('two'));
-        check('form elements include controls outside the form', () => form.elements.length === 2 && form.elements[1] === out && form.elements.r === input);
+        check('form elements include controls outside the form', () => form.elements.length === 2 && form.elements[1] === out && form.elements.r instanceof RadioNodeList && form.elements.r[0] === input && form.elements.r[1] === out);
         out.checked = true; input.checked = true;
         check('radio groups follow the form owner', () => !out.checked);
         check('closest', () => input.closest('form') === form && input.closest(':scope') === input && input.closest('p') === null && out.closest('body') === document.body);
@@ -4012,4 +4020,338 @@ fn tab_order_includes_custom_elements_with_their_own_tab_index() {
         for (let n = 0; n < 3; n++) { __appsDispatch('keydown', [], { key: 'Tab' }); order.push(document.activeElement.id); }
         if (order.join() !== 'a,pad,b') throw Error(order.join());
     "#, "test").unwrap();
+}
+
+#[test]
+fn reflected_attributes_like_chrome() {
+    checked_page(
+        "<html><body><a id='a'>x</a><img id='img'><div id='d' spellcheck='false'><p id='p'>t</p></div><textarea id='t'></textarea><progress id='pr'></progress></body></html>",
+        r#"
+        const $ = id => document.getElementById(id), el = tag => document.createElement(tag), d = el('div');
+        check('draggable', () => !$('a').draggable && $('img').draggable && (d.draggable = true, d.getAttribute('draggable') === 'true') && (d.draggable = false, d.getAttribute('draggable') === 'false'));
+        check('spellcheck inherits', () => el('div').spellcheck && !$('p').spellcheck && ($('p').spellcheck = true, $('p').getAttribute('spellcheck') === 'true'));
+        check('translate', () => el('div').translate && (d.translate = false, d.getAttribute('translate') === 'no'));
+        d.accessKey = 'k'; d.enterKeyHint = 'go'; d.inputMode = 'numeric'; d.nonce = 'n';
+        check('strings', () => d.getAttribute('accesskey') === 'k' && d.getAttribute('enterkeyhint') === 'go' && d.inputMode === 'numeric' && d.nonce === 'n' && !d.hasAttribute('nonce') && el('div').accessKey === '');
+        check('keywords', () => (d.setAttribute('enterkeyhint', 'BOGUS'), d.enterKeyHint === '') && (d.setAttribute('inputmode', 'Numeric'), d.inputMode === 'numeric') && (d.dir = 'RTL', d.dir === 'rtl') && (d.dir = 'x', d.dir === '') && document.dir === '');
+        check('hidden', () => (d.hidden = 'until-found', d.hidden === 'until-found') && (d.hidden = true, d.getAttribute('hidden') === '') && (d.hidden = 0, !d.hasAttribute('hidden')));
+        check('tabIndex', () => [el('a'), el('area'), el('object'), el('video'), el('select')].every(node => node.tabIndex === 0) && el('summary').tabIndex === -1 && el('div').tabIndex === -1);
+        check('contentEditable', () => d.contentEditable === 'inherit' && (d.setAttribute('contenteditable', ''), d.contentEditable === 'true' && d.isContentEditable) && (d.setAttribute('contenteditable', 'BOGUS'), d.contentEditable === 'inherit' && !d.isContentEditable) && (d.contentEditable = 'inherit', !d.hasAttribute('contenteditable')));
+        check('contentEditable rejects values', () => { try { d.contentEditable = 'nope'; } catch (e) { return e.name === 'SyntaxError'; } });
+        check('numbers', () => el('input').maxLength === -1 && el('input').size === 20 && $('t').rows === 2 && $('t').cols === 20 && el('td').colSpan === 1 && el('ol').start === 1 && $('pr').max === 1 && $('pr').position === -1 && (() => { try { el('input').maxLength = -2; } catch (e) { return e.name === 'IndexSizeError'; } })());
+        check('anchor parts', () => el('a').protocol === ':' && el('a').origin === '' && $('a').text === 'x');
+        check('img', () => (i => (i.alt = 'a', i.loading = 'lazy', i.getAttribute('alt') === 'a' && i.loading === 'lazy' && el('img').loading === 'auto' && el('img').decoding === 'auto' && el('img').crossOrigin === null))(el('img')));
+        const host = el('div'); host.innerHTML = '<b>x</b>'; document.body.append(host);
+        check('newer methods', () => host.webkitMatchesSelector('div') && host.getHTML() === '<b>x</b>' && (host.setHTMLUnsafe('<i>y</i>'), host.innerHTML === '<i>y</i>') && typeof host.checkVisibility() === 'boolean' && (host.part.add('p'), host.getAttribute('part') === 'p'));
+        check('outerText', () => (host.firstChild.outerText = 'plain', host.innerHTML === 'plain'));
+    "#,
+    );
+}
+
+#[test]
+fn events_like_chrome() {
+    checked_page(
+        "<html><body><form id='f'><input name='q' value='1'></form><span id='s'></span></body></html>",
+        r#"
+        const s = document.getElementById('s'), f = document.getElementById('f');
+        let seen;
+        s.addEventListener('q', e => { seen = [e.srcElement, window.event === e]; });
+        s.dispatchEvent(new Event('q'));
+        check('srcElement and window.event', () => seen[0] === s && seen[1] && window.event === undefined);
+        check('constructors', () => [['TransitionEvent', 'propertyName'], ['AnimationEvent', 'animationName'], ['HashChangeEvent', 'newURL'], ['PopStateEvent', 'state'], ['PageTransitionEvent', 'persisted'], ['StorageEvent', 'key']].every(([name, key]) => new globalThis[name]('x')[key] !== undefined) && new TransitionEvent('t', { propertyName: 'opacity', elapsedTime: 1.5 }).elapsedTime === 1.5 && new StorageEvent('s').newValue === null);
+        check('keyboard fields', () => (e => e.location === 1 && e.which === 0 && e.charCode === 13 && KeyboardEvent.DOM_KEY_LOCATION_LEFT === 1)(new KeyboardEvent('keypress', { key: 'Enter', location: 1, charCode: 13 })) && new KeyboardEvent('keydown', { keyCode: 65 }).which === 65 && new UIEvent('x').which === 0);
+        check('createEvent', () => ['MessageEvent', 'StorageEvent', 'HashChangeEvent', 'CompositionEvent', 'DragEvent'].every(name => document.createEvent(name).constructor.name === name));
+        check('initMouseEvent', () => (e => (e.initMouseEvent('click', true, true, window, 1, 2, 3, 4, 5, true, false, false, false, 0, null), e.clientX === 4 && e.ctrlKey && e.bubbles))(document.createEvent('MouseEvents')));
+        check('toString', () => String(new Event('x')) === '[object Event]' && Object.prototype.toString.call(new File([], 'a')) === '[object File]');
+        const data = [];
+        f.addEventListener('formdata', e => data.push(e.constructor.name, e.bubbles, e.cancelable, e.formData.get('q')));
+        new FormData(f);
+        check('formdata event', () => data.join() === 'FormDataEvent,true,false,1');
+        check('abort reason', () => new AbortController().signal.reason === undefined && (c => (c.abort(), c.signal.reason.message === 'signal is aborted without reason'))(new AbortController()));
+        check('window.postMessage', () => typeof postMessage === 'function' && typeof requestIdleCallback === 'function');
+    "#,
+    );
+}
+
+#[test]
+fn documents_like_chrome() {
+    checked_page(
+        "<!doctype html><html><body><form name='f1' id='f1'></form><img name='im'><a href='#x'>x</a><a name='n'>y</a><div id='dsd'><template shadowrootmode='open'><slot></slot></template><b>b</b></div></body></html>",
+        r#"
+        check('collections', () => document.forms.length === 1 && document.forms.f1.id === 'f1' && document.images.length === 1 && document.links.length === 1 && document.anchors.length === 1 && document.scripts.length === 0);
+        check('fields', () => document.charset === 'UTF-8' && document.inputEncoding === 'UTF-8' && document.designMode === 'off' && document.referrer === '' && typeof document.lastModified === 'string' && document.contentType === 'text/html');
+        document.cookie = 'a=1'; document.cookie = 'b=2; path=/'; document.cookie = 'a=; max-age=0';
+        check('cookies', () => document.cookie === 'b=2');
+        const made = document.implementation.createHTMLDocument('X'), p = made.createElement('p');
+        check('created documents', () => made.doctype.name === 'html' && made.compatMode === 'CSS1Compat' && made.URL === 'about:blank' && made.defaultView === null && p.ownerDocument === made && made.createTextNode('t').ownerDocument === made);
+        document.adoptNode(p);
+        check('adopted nodes', () => p.ownerDocument === document && document.importNode(made.createElement('q')).ownerDocument === document);
+        check('declarative shadow roots', () => { const host = document.getElementById('dsd'); return host.shadowRoot?.mode === 'open' && host.querySelector('template') === null && host.shadowRoot.querySelector('slot').assignedNodes()[0].localName === 'b'; });
+        check('shadow hosts', () => { try { document.createElement('input').attachShadow({ mode: 'open' }); } catch (e) { return e.name === 'NotSupportedError' && document.createElement('x-y').attachShadow({ mode: 'open', delegatesFocus: true }).delegatesFocus; } });
+        check('custom element names', () => { try { customElements.define('nodash', class extends HTMLElement {}); } catch (e) { return e.name === 'SyntaxError'; } });
+        check('namespaces', () => document.body.lookupNamespaceURI(null) === 'http://www.w3.org/1999/xhtml' && document.body.isDefaultNamespace('http://www.w3.org/1999/xhtml') && document.getElementsByTagNameNS('*', 'a').length === 2);
+        check('dataset names', () => { try { document.body.dataset['a-b'] = 1; } catch (e) { return e.name === 'SyntaxError'; } });
+        const range = document.createRange(); range.selectNodeContents(document.body);
+        check('ranges in other trees', () => { try { range.comparePoint(document.createElement('x'), 0); } catch (e) { return e.name === 'WrongDocumentError' && !range.isPointInRange(document.createElement('x'), 0); } });
+        check('storage has', () => (localStorage.setItem('k', 'v'), 'k' in localStorage && !('nope' in localStorage)));
+    "#,
+    );
+}
+
+#[test]
+fn form_controls_like_chrome() {
+    checked_page(
+        "<html><body><form id='f'><input type='radio' name='r' value='x'><input type='radio' name='r' value='y' checked><input name='a'><input name='a'></form><input id='lv' type='hidden'></body></html>",
+        r#"
+        const f = document.getElementById('f'), input = type => Object.assign(document.createElement('input'), { type });
+        check('radio node lists', () => f.elements.r instanceof RadioNodeList && f.elements.r.value === 'y' && f.elements.a.length === 2 && (f.elements.r.value = 'x', f.elements.r[0].checked));
+        check('form fields', () => f.autocomplete === 'on' && f.encoding === 'application/x-www-form-urlencoded' && f.acceptCharset === '');
+        const n = input('number'); n.value = '5'; n.step = '3'; n.stepUp(); const up = n.value; n.stepDown(2);
+        check('number steps', () => up === '6' && n.value === '0' && (n.valueAsNumber = 2.5, n.value === '2.5') && (n.value = '', Number.isNaN(n.valueAsNumber)));
+        check('any step', () => { n.step = 'any'; try { n.stepUp(); } catch (e) { return e.name === 'InvalidStateError'; } });
+        const d = input('date'); d.value = '2024-02-29';
+        check('dates', () => d.valueAsNumber === 1709164800000 && d.valueAsDate.toISOString() === '2024-02-29T00:00:00.000Z' && (d.valueAsDate = new Date(Date.UTC(2020, 0, 5)), d.stepUp(3), d.value === '2020-01-08'));
+        const t = input('time'), m = input('month'), w = input('week'), l = input('datetime-local'); t.value = '13:45'; m.value = '2024-03'; w.value = '2024-W01'; l.value = '2024-01-02T03:04';
+        check('times', () => t.valueAsNumber === 49500000 && m.valueAsNumber === 650 && w.valueAsDate.toISOString() === '2024-01-01T00:00:00.000Z' && l.valueAsNumber === 1704164640000 && l.valueAsDate === null && (w.stepUp(), w.value === '2024-W02'));
+        const s = document.createElement('select'); s.add(new Option('a', 'A')); s.add(new Option('b', 'B'), 0);
+        check('select keeps its option', () => s.selectedIndex === 1 && s.value === 'A');
+        s.options.length = 0;
+        check('options length clears', () => s.length === 0 && (s.options[0] = new Option('z'), s.length === 1 && s.options[0].text === 'z'));
+        check('option selectedness', () => !new Option('t', 'v', true, false).selected);
+        check('hidden inputs have no labels', () => document.getElementById('lv').labels === null);
+    "#,
+    );
+}
+
+#[test]
+fn rendered_text_and_removed_focus_like_chrome() {
+    checked_page(
+        "<html><body><div id='t'><span style='text-transform:uppercase'>up</span> <span style='text-transform:lowercase'>LOW</span><textarea>ta</textarea><canvas>fallback</canvas></div><div id='box'><input id='i'></div></body></html>",
+        r#"
+        const $ = id => document.getElementById(id), seen = [];
+        check('innerText', () => $('t').innerText === 'UP low');
+        const p = document.createElement('p'); p.innerHTML = '<b>a</b><b>b</b>'; document.body.append(p);
+        p.firstChild.outerText = 'x\ny';
+        check('outerText lines', () => p.innerHTML === 'x<br>y<b>b</b>');
+        for (const target of [document, $('box')]) for (const type of ['blur', 'focusout']) target.addEventListener(type, event => seen.push(type + ':' + (target === document ? 'document' : 'box') + ':' + event.target.id), true);
+        $('i').focus(); $('box').removeChild($('i'));
+        check('removed focus blurs through the old ancestors', () => seen.join() === 'blur:document:i,blur:box:i,focusout:document:i,focusout:box:i' && document.activeElement === document.body);
+        const again = document.createElement('input'); again.id = 'j'; $('box').append(again); again.focus(); seen.length = 0; $('box').textContent = '';
+        check('cleared parents blur too', () => seen.join() === 'blur:document:j,blur:box:j,focusout:document:j,focusout:box:j');
+    "#,
+    );
+}
+
+#[test]
+fn link_activation_and_details_toggles_like_chrome() {
+    let (_, engine) = checked_page(
+        "<html><body><a id='same' href='#frag'>a</a><a id='blocked' href='#other'>b</a><a id='web' href='https://example.com/'>c</a><details id='d'><summary>s</summary>x</details></body></html>",
+        r#"
+        const $ = id => document.getElementById(id);
+        $('blocked').addEventListener('click', event => event.preventDefault());
+        $('same').click();
+        check('same-document links navigate', () => location.hash === '#frag');
+        $('blocked').click(); $('web').click();
+        check('canceled and web links stay', () => location.hash === '#frag');
+        globalThis.toggles = [];
+        $('d').addEventListener('toggle', event => toggles.push(event.oldState + '>' + event.newState));
+        $('d').open = true; $('d').open = false;
+    "#,
+    );
+    let started = std::time::Instant::now();
+    while engine.eval("toggles.length", "test").unwrap() == "0"
+        && started.elapsed() < std::time::Duration::from_secs(5)
+    {
+        engine.tick().unwrap();
+    }
+    assert_eq!(
+        engine.eval("toggles.join()", "test").unwrap(),
+        "closed>closed"
+    );
+}
+
+#[test]
+fn element_internals_like_chrome() {
+    checked_page(
+        "<html><body><form id='f'><input name='n' value='1'><object></object></form></body></html>",
+        r#"
+        class XField extends HTMLElement { static formAssociated = true; constructor() { super(); this.internals = this.attachInternals(); } }
+        customElements.define('x-field', XField);
+        const f = document.getElementById('f'), x = document.createElement('x-field'), i = x.internals, error = fn => { try { fn(); } catch (e) { return e.name; } };
+        x.setAttribute('name', 'xf'); f.prepend(x); i.setFormValue('val');
+        check('form participation', () => i.form === f && f.elements[0] === x && [...new FormData(f)].map(pair => pair.join('=')).join('&') === 'xf=val&n=1');
+        check('one per custom element', () => error(() => x.attachInternals()) === 'NotSupportedError' && error(() => document.createElement('div').attachInternals()) === 'NotSupportedError');
+        i.setValidity({ valueMissing: true }, 'need');
+        let submitted = false; f.addEventListener('submit', event => { submitted = true; event.preventDefault(); });
+        f.requestSubmit();
+        check('validity', () => !i.validity.valid && i.validity.valueMissing && i.validationMessage === 'need' && !f.checkValidity() && !submitted);
+        i.setValidity({});
+        f.requestSubmit();
+        check('valid again', () => i.validity.valid && i.validationMessage === '' && f.checkValidity() && submitted);
+    "#,
+    );
+}
+
+#[test]
+fn native_mouse_and_key_events_carry_chrome_fields() {
+    checked_page(
+        "<body><div id=a></div><input id=t><label id=l for=c>l</label><input type=checkbox id=c></body>",
+        r#"
+        const [a, t, l, c] = ['a', 't', 'l', 'c'].map(id => document.getElementById(id)), log = [];
+        for (const type of ['pointerover', 'mouseover', 'pointermove', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'])
+            a.addEventListener(type, e => log.push([type, e.button, e.which, e.detail, e.clientX, e.offsetX].join(' ')));
+        const at = { clientX: 10.5, clientY: 10.25 };
+        __appsDispatch('pointermove', [a._id], at);
+        __appsDispatch('pointerdown', [a._id], { ...at, button: 0, buttons: 1, detail: 1 });
+        __appsDispatch('pointerup', [a._id], { ...at, button: 0, buttons: 0 });
+        check('mouse fields: ' + log.join(), () => log.join() === 'pointerover -1 0 0 10.5 10.5,mouseover 0 0 0 10 11,pointermove -1 0 0 10.5 10.5,mousemove 0 0 0 10 11,pointerdown 0 1 0 10.5 10.5,mousedown 0 1 1 10 11,pointerup 0 1 0 10.5 10.5,mouseup 0 1 1 10 11,click 0 1 1 10 11');
+        log.length = 0;
+        c.addEventListener('click', e => log.push('click ' + e.detail));
+        __appsDispatch('pointerdown', [l._id], { ...at, button: 0, buttons: 1, detail: 1 });
+        __appsDispatch('pointerup', [l._id], { ...at, button: 0, buttons: 0 });
+        check('label click keeps its detail: ' + log.join(), () => log.join() === 'click 1' && c.checked);
+        log.length = 0;
+        for (const type of ['keydown', 'keypress', 'keyup']) t.addEventListener(type, e => log.push([type, e.key, e.keyCode, e.charCode, e.which, e.location].join(' ')));
+        t.addEventListener('keypress', e => { if (e.key === 'x') e.preventDefault(); });
+        t.focus();
+        const typed = __appsDispatch('keydown', [], { key: 'a', code: 'KeyA', keyCode: 65 });
+        const blocked = __appsDispatch('keydown', [], { key: 'x', code: 'KeyX', keyCode: 88 });
+        __appsDispatch('keydown', [], { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 });
+        __appsDispatch('modifiers', [], { shiftKey: true });
+        check('which in the init', () => new KeyboardEvent('keydown', { keyCode: 13, which: 13 }).which === 13);
+        check('key fields: ' + log.join(), () => typed && !blocked && log.join() === 'keydown a 65 0 65 0,keypress a 97 97 97 0,keydown x 88 0 88 0,keypress x 120 120 120 0,keydown ArrowLeft 37 0 37 0,keydown Shift 16 0 16 1');
+        "#,
+    );
+}
+
+#[test]
+fn focus_tab_order_and_radio_keys_follow_chrome() {
+    checked_page(
+        "<body><input id=i1><div id=e contenteditable>ed</div><button id=h style='visibility:hidden'>h</button><a id=a0>a</a><dialog id=d open>d</dialog><input id=i2>\
+         <input type=radio name=g id=r1><input type=radio name=g id=r2 disabled><input type=radio name=g id=r3></body>",
+        r#"
+        const $ = id => document.getElementById(id), log = [];
+        for (const type of ['focus', 'blur', 'focusout', 'change']) document.addEventListener(type, e => log.push(type + ':' + e.target.id + ':' + (document.activeElement.id || document.activeElement.localName)), true);
+        $('i1').focus();
+        $('i1')._edited = true;
+        const tab = shift => __appsDispatch('keydown', [], { key: 'Tab', keyCode: 9, shiftKey: shift });
+        tab();
+        check('blur sees no focused element: ' + log.join(), () => log.join() === 'focus:i1:i1,change:i1:body,blur:i1:body,focusout:i1:body,focus:e:e');
+        tab();
+        check('hidden boxes and dialogs are skipped: ' + document.activeElement.id, () => document.activeElement.id === 'i2');
+        check('anchors have tab index 0', () => $('a0').tabIndex === 0 && $('e').tabIndex === -1);
+        $('e').addEventListener('blur', () => $('r1').focus(), { once: true });
+        $('e').focus(); $('i1').focus();
+        check('a blur listener moves the focus: ' + document.activeElement.id, () => document.activeElement.id === 'r1');
+        const clicks = [];
+        for (const type of ['click', 'change']) document.addEventListener(type, e => clicks.push(type + ':' + e.target.id));
+        __appsDispatch('keydown', [], { key: 'ArrowDown', keyCode: 40 });
+        __appsDispatch('keydown', [], { key: 'ArrowDown', keyCode: 40 });
+        __appsDispatch('keyup', [], { key: ' ', keyCode: 32 });
+        check('arrows move in the group: ' + clicks.join(), () => clicks.join() === 'click:r3,change:r3,click:r1,change:r1' && $('r1').checked && document.activeElement.id === 'r1');
+        "#,
+    );
+}
+
+#[test]
+fn editing_keys_fire_input_events_like_chrome() {
+    checked_page(
+        "<body><input id=i value=ab><div id=e contenteditable>one <b id=b>two</b> three</div><label id=l for=i>l</label></body>",
+        r#"
+        const $ = id => document.getElementById(id), log = [];
+        for (const type of ['beforeinput', 'input']) document.addEventListener(type, e => log.push(type + ':' + e.inputType));
+        $('i').focus(); $('i').setSelectionRange(0, 0);
+        __appsDispatch('keydown', [], { key: 'Backspace', keyCode: 8 });
+        __appsDispatch('keydown', [], { key: 'Enter', keyCode: 13 });
+        check('nothing to delete, and Enter in a field: ' + log.join(), () => log.join() === 'beforeinput:deleteContentBackward,beforeinput:insertLineBreak' && $('i').value === 'ab');
+        $('e').focus();
+        check('an editing host gets a caret at its start', () => getSelection().anchorNode === $('e').firstChild && getSelection().anchorOffset === 0);
+        getSelection().collapse($('b').firstChild, 3);
+        __appsDispatch('keydown', [], { key: 'Enter', keyCode: 13 });
+        check('a split drops empty copies and ids: ' + $('e').innerHTML, () => $('e').innerHTML === 'one <b id="b">two</b><div> three</div>');
+        check('a label shares its hover', () => (__appsDispatch('pointermove', [$('l')._id], { clientX: 1, clientY: 1 }), $('i').matches(':hover')));
+        const event = new MouseEvent('x', { clientX: 10.7, screenY: 3.5 });
+        check('mouse events keep whole coordinates', () => event.clientX === 10 && event.screenY === 3 && new PointerEvent('x', { clientX: 10.7 }).clientX === 10.7);
+        "#,
+    );
+}
+
+#[test]
+fn declared_values_serialize_like_chrome() {
+    checked_page(
+        "<html><head><style id=s>@media (min-width: 100px) { .m { color: blue } } .n { color: red; &:hover { color: blue } } @font-face { font-family: \"X\"; src: url(x.woff2) }</style></head><body><div id=d></div></body></html>",
+        r#"
+        const d = document.getElementById('d'), rules = document.getElementById('s').sheet.cssRules;
+        for (const [text, expected] of [
+            ['color:RED', 'color: red;'], ['color:#FFF', 'color: rgb(255, 255, 255);'], ['color:rgba(1,2,3,.5)', 'color: rgba(1, 2, 3, 0.5);'],
+            ['width:calc(1px + 2px)', 'width: calc(3px);'], ['width:0', 'width: 0px;'], ['width:+.5E1px', 'width: 5px;'], ['line-height:1.50', 'line-height: 1.5;'],
+            ['transform:translateX( 1PX ) ROTATE(1turn)', 'transform: translateX(1px) rotate(1turn);'], ['transform:translate3d(1px, 2px, 0)', 'transform: translate3d(1px, 2px, 0px);'],
+            ['font-family:"Inter",  Some  Font, serif', 'font-family: Inter, "Some Font", serif;'], ['box-shadow:0 0 0 1px RED inset', 'box-shadow: red 0px 0px 0px 1px inset;'],
+            ['transition:all 0s ease 0s', 'transition: all;'], ['animation:x 1s infinite', 'animation: 1s ease 0s infinite normal none running x;'],
+            ['border-radius:1px 1px 1px 1px / 2px', 'border-radius: 1px / 2px;'], ['outline:2px solid transparent', 'outline: transparent solid 2px;'],
+            ['background-position:left', 'background-position: left center;'], ['opacity:50%', 'opacity: 0.5;'], ['aspect-ratio:16/9', 'aspect-ratio: 16 / 9;'],
+            ['mask-image:linear-gradient(to bottom, black, transparent)', 'mask-image: linear-gradient(black, transparent);'], ['width:var( --a , 1px )', 'width: var( --a , 1px );'],
+        ]) check(text, () => { d.style.cssText = text; return d.style.cssText === expected; });
+        d.style.cssText = ''; d.style.transform = 'translateX(10PX)';
+        check('a longhand reads back normalized', () => d.style.transform === 'translateX(10px)');
+        check('media rule text', () => rules[0].cssText === '@media (min-width: 100px) {\n  .m { color: blue; }\n}' && rules[0].conditionText === '(min-width: 100px)');
+        check('nested rule text', () => rules[1].cssText === '.n {\n  color: red;\n  &:hover { color: blue; }\n}');
+        check('font face text', () => rules[2].cssText === '@font-face { font-family: X; src: url("x.woff2"); }');
+        "#,
+    );
+}
+
+#[test]
+fn computed_styles_report_used_values_like_chrome() {
+    let (host, engine) = css_page(
+        "<html><head><style>#w{position:relative;width:200px;height:100px;padding:5px;border:2px solid} #a{position:absolute;width:50%;left:10%;top:4px;padding:2px 3%} #r{position:relative;top:10px;left:5px} #m{width:100px;margin:0 auto} #h{display:none;width:50%;transform-origin:center} #p::before{content:'x' attr(data-v) \"y\"}</style></head><body><div id=w><div id=a></div><div id=r></div><div id=m></div></div><div id=h></div><p id=p data-v=t></p></body></html>",
+    );
+    let id = |name: &str| -> usize {
+        engine
+            .eval(&format!("document.getElementById('{name}')._id"), "id")
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let ids = ["w", "a", "r", "m", "p"].map(id);
+    {
+        let mut host = host.borrow_mut();
+        let state = host.dom.entry(1).or_default();
+        state.bounds.extend(ids.into_iter().zip([
+            [8., 8., 214., 114.],
+            [31., 14., 117.6, 15.5],
+            [20., 25., 200., 0.],
+            [65., 15., 100., 0.],
+            [8., 130., 784., 16.],
+        ]));
+    }
+    engine.eval(r#"
+        const value = (id, name, pseudo) => getComputedStyle(document.getElementById(id), pseudo).getPropertyValue(name);
+        for (const [id, name, expected, pseudo] of [
+            ['a', 'width', '105px'], ['a', 'inline-size', '105px'], ['a', 'padding-left', '6.29688px'], ['a', 'left', '21px'], ['a', 'inset', '4px 71.4062px 90.5px 21px'],
+            ['r', 'right', '-5px'], ['r', 'bottom', '-10px'], ['m', 'margin', '0px 50px'], ['m', 'margin-left', '50px'],
+            ['h', 'width', '50%'], ['h', 'transform-origin', '50% 50%'],
+            ['p', 'content', '"xty"', '::before'], ['p', 'content', 'none', '::after'],
+        ]) if (value(id, name, pseudo) !== expected) throw Error(`${id} ${name}: ${value(id, name, pseudo)} != ${expected}`);
+    "#, "test").unwrap();
+}
+
+#[test]
+fn target_and_range_pseudo_classes_like_chrome() {
+    checked_page(
+        "<html><head><style>:target{color:red}</style></head><body><p id='a'>a</p><p id='b'>b</p><input id='n' type='number' min='1' max='5' value='3'><input id='d' type='date' min='2020-01-01' value='2019-12-31'><input id='r' type='range'><input id='x' type='number' value='9'></body></html>",
+        r#"
+        const target = () => document.querySelector(':target')?.id ?? null, color = id => getComputedStyle(document.getElementById(id)).color;
+        location.hash = 'a';
+        check('hash sets the target', () => target() === 'a' && color('a') === 'rgb(255, 0, 0)');
+        history.pushState(null, '', '#x');
+        check('pushState keeps it', () => target() === 'a');
+        location.hash = 'b';
+        check('a new hash moves it', () => target() === 'b' && color('a') === 'rgb(0, 0, 0)' && color('b') === 'rgb(255, 0, 0)');
+        const ids = s => [...document.querySelectorAll(s)].map(e => e.id).join(' ');
+        check('ranges', () => ids(':in-range') === 'n r' && ids(':out-of-range') === 'd');
+        const n = document.getElementById('n'); n.value = '7';
+        check('typed values', () => ids(':out-of-range') === 'n d' && n.matches(':out-of-range'));
+    "#,
+    );
 }

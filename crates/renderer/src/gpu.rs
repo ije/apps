@@ -128,6 +128,8 @@ pub struct Composite {
 pub struct Blur {
     pub region: [f32; 4],
     pub source_rect: [f32; 4],
+    /// Samples outside this rectangle reflect into it. Empty for no reflection.
+    pub edge: [f32; 4],
     pub direction: [f32; 2],
     pub sigma: f32,
     pub scale: f32,

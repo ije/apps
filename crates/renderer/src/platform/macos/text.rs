@@ -417,19 +417,12 @@ impl TextSystem {
         }
         let (width, height) = (canvas.width as usize, canvas.height as usize);
         // Glyphs draw black on opaque white and the mask inverts after: an alpha-only canvas makes them about 17%
-        // heavier. Dilated glyphs want exactly that, and emoji want color.
-        let opaque = !glyph.emoji && glyph.dilation == 0;
-        let (channels, info) = match (glyph.emoji, opaque) {
-            (true, _) => (4, 1),               // premultiplied RGBA
-            (false, true) => (4, 6 | 2 << 12), // BGRX
-            (false, false) => (1, 7),          // alpha only
-        };
-        let mut bytes = vec![0u8; width * height * channels];
-        let space = if channels == 4 {
-            CGColorSpace::new_device_rgb()
-        } else {
-            CGColorSpace::new_device_gray()
-        };
+        // heavier. Like Chromium, font smoothing dilates glyphs of every color the same.
+        let opaque = !glyph.emoji;
+        // Premultiplied RGBA for emoji, BGRX for masks.
+        let info = if opaque { 6 | 2 << 12 } else { 1 };
+        let mut bytes = vec![0u8; width * height * 4];
+        let space = CGColorSpace::new_device_rgb();
         // SAFETY: the buffer matches the size, row length and pixel format, and outlives the context.
         let context = unsafe {
             CGBitmapContextCreate(
@@ -437,7 +430,7 @@ impl TextSystem {
                 width,
                 height,
                 8,
-                width * channels,
+                width * 4,
                 space.as_deref(),
                 info,
             )
@@ -450,8 +443,8 @@ impl TextSystem {
                 cx,
                 CGRect::new(CGPoint::ZERO, CGSize::new(width as _, height as _)),
             );
-            CGContext::set_allows_font_smoothing(cx, false);
-            CGContext::set_should_smooth_fonts(cx, false);
+            CGContext::set_allows_font_smoothing(cx, glyph.dilation > 0);
+            CGContext::set_should_smooth_fonts(cx, glyph.dilation > 0);
         }
         CGContext::translate_ctm(
             cx,
@@ -469,12 +462,7 @@ impl TextSystem {
         CGContext::set_should_subpixel_position_fonts(cx, true);
         CGContext::set_allows_font_subpixel_quantization(cx, false);
         CGContext::set_should_subpixel_quantize_fonts(cx, false);
-        if glyph.dilation > 0 {
-            CGContext::set_should_smooth_fonts(cx, true);
-            CGContext::set_gray_fill_color(cx, f64::from(glyph.dilation) * 0.25, 1.);
-        } else {
-            CGContext::set_gray_fill_color(cx, 0., 1.);
-        }
+        CGContext::set_gray_fill_color(cx, 0., 1.);
         let shift = f32::from(glyph.subpixel) / f32::from(SUBPIXEL_STEPS);
         let font = self
             .0
@@ -531,7 +519,7 @@ impl TextSystem {
             .spawn(load);
     }
 
-    pub fn dilation(&self, color: Color) -> u8 {
+    pub fn dilation(&self, _: Color) -> u8 {
         static SMOOTHING: OnceLock<bool> = OnceLock::new();
         let smoothing = *SMOOTHING.get_or_init(|| {
             use objc2_core_foundation::{
@@ -545,11 +533,7 @@ impl TextSystem {
                 .and_then(|value| value.downcast::<CFNumber>().ok())
                 .is_none_or(|value| value.as_i64() != Some(0))
         });
-        if !smoothing {
-            return 0;
-        }
-        let luminance = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
-        ((4. * luminance + 0.5).floor() as i32).clamp(0, 4) as u8
+        smoothing.into()
     }
 }
 

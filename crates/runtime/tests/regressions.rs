@@ -276,3 +276,23 @@ fn published_binary_bridge_values_survive_reload_without_aliasing() {
         page.eval("first[0]=99;second[0]=99", "test").unwrap();
     }
 }
+
+#[test]
+fn page_script_errors_reach_the_error_event_like_chrome() {
+    let (engine, _) = page();
+    let mut files = bbtree::unsync::BBTreeMap::new();
+    files.insert("app.js".to_owned(), r#"
+$appsDefine({id:0,code:"globalThis.seen=[];addEventListener('error',event=>seen.push(event.message));null.boom",exports:[]});
+$appsDefine({id:1,code:"seen.push('second ran')",exports:[]});
+return [[0,1]];
+"#.to_owned());
+    engine
+        .eval_page(&apps_runtime::bundle::script_source(&files, true), "app.js")
+        .unwrap();
+    while engine.eval_page("this.__appsNext?.()", "app.js").unwrap() == "true" {}
+    let seen = engine.eval("seen.join('|')", "test").unwrap();
+    assert!(
+        seen.starts_with("Uncaught TypeError") && seen.ends_with("|second ran"),
+        "{seen}"
+    );
+}

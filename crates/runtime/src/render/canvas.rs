@@ -225,11 +225,13 @@ pub fn line(
         background_color: None,
         underline: None,
         strikethrough: None,
+        overline: None,
         letter_spacing: renderer::px(letter),
         word_spacing: renderer::px(word),
         font_size: None,
         inset: Default::default(),
         nowrap: false,
+        tab_size: 8.,
     };
     let font_size = size
         .split_whitespace()

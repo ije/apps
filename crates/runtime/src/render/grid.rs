@@ -8,6 +8,10 @@ use std::collections::HashMap;
 #[derive(Default)]
 pub(crate) struct Measurements {
     pub(crate) sizes: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), [f32; 4]>,
+    // The top and bottom margins of each measured box, as [positive, negative] after they collapse with the
+    // margins of children that they adjoin.
+    #[allow(clippy::type_complexity)]
+    pub(crate) margins: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), [[f32; 2]; 2]>,
     pub(crate) pixel_ratio: f32,
     pub(crate) naturals: rustc_hash::FxHashMap<usize, [f32; 2]>,
     pub(crate) texts: rustc_hash::FxHashMap<usize, Option<std::rc::Rc<style::InlineText>>>,
@@ -601,8 +605,22 @@ pub(crate) fn intrinsic(
         .or(width.map(|width| width - outer[0]))
         .or(fixed[0])
         .map(|width| clamp(width, used).max(0.));
+    // Content-sized widths measure the content without a width first.
+    let available = match (style.get(Prop::WIDTH), width) {
+        (Some(value @ ("min-content" | "max-content" | "fit-content")), Some(width)) => {
+            let [min, max, ..] = intrinsic(doc, id, styles, None, None, text, measured);
+            let size = match value {
+                "min-content" => min,
+                "max-content" => max,
+                _ => max.min(width.max(min)),
+            };
+            Some(clamp((size - outer[0]).max(0.), used))
+        }
+        _ => available,
+    };
     let vertical = sizes([Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT], height);
     let mut content = [0f32; 3];
+    let mut collapsed = None;
     let natural = (node.tag != "svg")
         .then(|| super::element::natural_size(doc, id, measured.naturals.get(&id).copied()))
         .flatten();
@@ -663,6 +681,16 @@ pub(crate) fn intrinsic(
         );
         content = [width, width, height];
     } else if node.tag == "input"
+        && node.input_type().eq_ignore_ascii_case("file")
+        && let Some(button) = styles
+            .scrollbars
+            .get(&id)
+            .and_then(|parts| parts[1].as_ref())
+    {
+        let [width, height] =
+            super::element::file_size(style, button, units, text, measured.pixel_ratio);
+        content = [width, width, height];
+    } else if node.tag == "input"
         && let Some(kind) = Some(node.input_type()).filter(|value| {
             ["button", "submit", "reset"]
                 .iter()
@@ -690,11 +718,13 @@ pub(crate) fn intrinsic(
             let [padding, height] = super::native::size(renderer::ControlKind::Button);
             content = [width + padding, width + padding, height];
         }
-    } else if let Some((source, mut runs, atoms)) = match alt {
+    } else if let Some((source, mut runs, atoms, heights, mixed)) = match alt {
         Some(alt) => Some((
             renderer::SharedString::from(alt.clone()),
             vec![style::text_run(style, units, alt.len())],
             Vec::new(),
+            Vec::new(),
+            false,
         )),
         None => measured
             .texts
@@ -706,12 +736,42 @@ pub(crate) fn intrinsic(
                     inline.text.clone(),
                     inline.runs.to_vec(),
                     inline.atoms.clone(),
+                    inline.line_heights.clone(),
+                    inline.mixed,
                 )
             }),
     } {
+        let mut boxes = Vec::with_capacity(atoms.len());
         for atom in &atoms {
-            let [_, max, ..] = intrinsic(doc, atom.node, styles, available, None, text, measured);
-            runs[atom.run].inset[1] = renderer::px(max);
+            let [_, max, used, height] =
+                intrinsic(doc, atom.node, styles, available, None, text, measured);
+            // A percent width takes its share of the line, so the box can wrap to a line of its own.
+            let percent = available.is_some()
+                && styles.values[atom.node]
+                    .get(Prop::WIDTH)
+                    .is_some_and(|v| v.contains('%'));
+            runs[atom.run].inset[1] = renderer::px(if percent { used } else { max });
+            // Like Chrome, a replaced box sits on the baseline, and other boxes on their last line.
+            let baseline = if super::element::natural_size(
+                doc,
+                atom.node,
+                measured.naturals.get(&atom.node).copied(),
+            )
+            .is_some()
+            {
+                height
+            } else {
+                let (own, lengths) = (&styles.values[atom.node], &styles.lengths[atom.node]);
+                let [ascent, descent, _] = text
+                    .line_metrics(
+                        text.face(&style::font(own)),
+                        renderer::px(lengths.font.em * measured.pixel_ratio),
+                    )
+                    .map(|v| f32::from(v) / measured.pixel_ratio);
+                let below = lengths.font.lh - ascent - ((lengths.font.lh - ascent - descent) / 2.);
+                height - frame(own, lengths, available.unwrap_or(0.))[2] - below
+            };
+            boxes.push((atom.at, [max, height, baseline], None));
         }
         let wrap = !style
             .get(Prop::WHITE_SPACE)
@@ -762,13 +822,32 @@ pub(crate) fn intrinsic(
             }
             at += run.len;
         }
+        // Runs of other sizes or line heights make some rows taller than the strut.
+        if mixed || !boxes.is_empty() {
+            let strut = (
+                text.face(&style::font(style)),
+                renderer::px(units.font.em),
+                renderer::px(units.font.lh),
+            );
+            for [above, below] in super::text::row_extents(
+                &lines,
+                &runs,
+                &heights,
+                &boxes,
+                strut,
+                text,
+                measured.pixel_ratio,
+            ) {
+                content[2] += f32::from(above + below);
+            }
+        }
         let mut line_start = 0;
         for line in &lines {
             let width = f32::from(line.line.width);
             content[1] = content[1].max(width);
             content[2] += line.rows() as f32 * units.font.lh;
             let mut glyphs = line.line.glyphs.iter().peekable();
-            let (mut start, mut previous) = (0., ' ');
+            let (mut start, mut previous, mut hyphen) = (0., ' ', false);
             while let Some(glyph) = glyphs.next() {
                 let character = line
                     .text
@@ -777,7 +856,15 @@ pub(crate) fn intrinsic(
                     .unwrap_or(' ');
                 if !character.is_whitespace() {
                     let x = f32::from(glyph.x);
-                    if anywhere || previous.is_whitespace() || character > '\u{2e7f}' {
+                    // The same break chances as wrapping, also after a hyphen that follows a letter or digit.
+                    if anywhere
+                        || previous.is_whitespace()
+                        || character > '\u{2e7f}'
+                            && !(word_break == renderer::WordBreak::KeepAll
+                                && character.is_alphanumeric()
+                                && previous.is_alphanumeric())
+                        || hyphen && character.is_alphabetic()
+                    {
                         start = x - opening
                             .iter()
                             .find(|(at, _)| *at == line_start + glyph.index as usize)
@@ -786,6 +873,7 @@ pub(crate) fn intrinsic(
                     let end = glyphs.peek().map_or(width, |next| f32::from(next.x));
                     content[0] = content[0].max(end - start);
                 }
+                hyphen = character == '-' && previous.is_alphanumeric();
                 previous = character;
             }
             line_start += line.text.len() + 1;
@@ -824,11 +912,12 @@ pub(crate) fn intrinsic(
         ));
         content = [min, max, natural];
         if available.is_some() || vertical[0].is_some() {
+            let fit = style.get(Prop::WIDTH) == Some("fit-content");
             let grid = layout(
                 doc,
                 id,
                 styles,
-                available,
+                available.map(|width| if fit { width.min(max).max(min) } else { width }),
                 vertical[0],
                 None,
                 None,
@@ -844,7 +933,7 @@ pub(crate) fn intrinsic(
                     || doc.nodes[child].tag == "br"
                     || styles.values[child]
                         .get(Prop::DISPLAY)
-                        .is_some_and(|value| value.starts_with("inline"))
+                        .is_none_or(|value| value.starts_with("inline"))
             });
         let flex = matches!(display, "flex" | "inline-flex");
         let row = inline
@@ -864,17 +953,118 @@ pub(crate) fn intrinsic(
         let preserve = style
             .get(Prop::WHITE_SPACE)
             .is_some_and(|v| matches!(v, "pre" | "pre-wrap" | "break-spaces"));
-        let (mut line, mut run) = ([0f32; 2], 0f32);
-        let mut first = true;
-        for &child in &node.children {
-            if styles.values[child]
+        let skipped = |child: usize| {
+            styles.values[child]
                 .get(Prop::POSITION)
                 .is_some_and(|v| matches!(v, "absolute" | "fixed"))
                 || styles.values[child].get(Prop::DISPLAY) == Some("none")
                 || !preserve
                     && doc.nodes[child].tag == "#text"
                     && doc.nodes[child].text.trim_ascii().is_empty()
-            {
+                || doc.nodes[child].tag == "#text"
+                    && node.tag == "details"
+                    && !node.attrs.contains_key("open")
+        };
+        // Flex base sizes decide where lines break, and the widths of a single line where text wraps.
+        let mut resolved = Vec::new();
+        if let Some(space) = available.filter(|_| flex && row) {
+            let mut items: Vec<[f32; 4]> = Vec::new();
+            for &child in &node.children {
+                if skipped(child) {
+                    continue;
+                }
+                let own = &styles.values[child];
+                let lengths = &styles.lengths[child];
+                let [min, _, auto, _] = intrinsic(doc, child, styles, None, None, text, measured);
+                let frame = frame(own, lengths, space);
+                let basis = own
+                    .get(Prop::FLEX_BASIS)
+                    .filter(|v| !matches!(*v, "auto" | "content"))
+                    .and_then(|v| lengths.resolve(v, space))
+                    .map_or(auto, |v| v + frame[1] + frame[3]);
+                let lower = if own
+                    .get(Prop::OVERFLOW_X)
+                    .is_some_and(|v| !matches!(v, "visible" | "clip"))
+                    || own.get(Prop::MIN_WIDTH).is_some_and(|v| v != "auto")
+                {
+                    own.get(Prop::MIN_WIDTH)
+                        .and_then(|v| lengths.resolve(v, space))
+                        .map_or(0., |v| v + frame[1] + frame[3])
+                } else {
+                    min
+                };
+                let factor = |prop, fallback| {
+                    own.get(prop)
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .unwrap_or(fallback)
+                        .max(0.)
+                };
+                items.push([
+                    basis.max(lower),
+                    lower,
+                    factor(Prop::FLEX_GROW, 0.),
+                    factor(Prop::FLEX_SHRINK, 1.) * basis,
+                ]);
+            }
+            resolved = items
+                .iter()
+                .map(|item| if wrap { item[0].min(space) } else { item[0] })
+                .collect::<Vec<_>>();
+            let space = space - gaps[0] * items.len().saturating_sub(1) as f32;
+            let mut frozen = vec![false; items.len()];
+            for _ in 0..if wrap { 0 } else { items.len() } {
+                let free = space - resolved.iter().sum::<f32>();
+                let index = 2 + usize::from(free < 0.);
+                let total: f32 = (0..items.len())
+                    .filter(|&i| !frozen[i])
+                    .map(|i| items[i][index])
+                    .sum();
+                if total <= 0. || free.abs() < 0.01 {
+                    break;
+                }
+                let free = if index == 2 {
+                    free * total.min(1.)
+                } else {
+                    free
+                };
+                let mut clamped = false;
+                for (i, item) in items.iter().enumerate() {
+                    if !frozen[i] {
+                        resolved[i] += free * item[index] / total;
+                        if resolved[i] < item[1] {
+                            resolved[i] = item[1];
+                            frozen[i] = true;
+                            clamped = true;
+                        }
+                    }
+                }
+                if !clamped {
+                    break;
+                }
+                // Restart the distribution from the bases of the items that are not frozen.
+                for (i, item) in items.iter().enumerate() {
+                    if !frozen[i] {
+                        resolved[i] = item[0];
+                    }
+                }
+            }
+        }
+        let mut resolved = resolved.into_iter();
+        // `line` is the width, the tallest piece, and how far raised pieces reach above and below the strut.
+        let (mut line, mut run) = ([0f32; 4], 0f32);
+        // Margins that adjoin the top edge, those after the last box placed, and whether a box was placed.
+        let (mut top, mut pending, mut placed) = ([0f32; 2], [0f32; 2], false);
+        let join = |a: [f32; 2], b: [f32; 2]| [a[0].max(b[0]), a[1].min(b[1])];
+        let total = |line: [f32; 4]| {
+            line[1].max(if line[2] + line[3] > 0. {
+                units.font.lh + line[2] + line[3]
+            } else {
+                0.
+            })
+        };
+        let mut first = true;
+        for &child in &node.children {
+            if skipped(child) {
                 continue;
             }
             let gap = if first { [0.; 2] } else { gaps };
@@ -884,23 +1074,62 @@ pub(crate) fn intrinsic(
                     || doc.nodes[child].tag == "br"
                     || styles.values[child]
                         .get(Prop::DISPLAY)
-                        .is_some_and(|value| value.starts_with("inline")));
+                        .is_none_or(|value| value.starts_with("inline")));
             if !row && !inline_level {
                 content[1] = content[1].max(run);
-                content[2] += line[1];
-                (line, run) = ([0.; 2], 0.);
+                let height = total(line);
+                if height > 0. {
+                    content[2] += pending[0] + pending[1] + height;
+                    (pending, placed) = ([0.; 2], true);
+                }
+                (line, run) = ([0.; 4], 0.);
                 let [min, max, _, height] =
                     intrinsic(doc, child, styles, available, None, text, measured);
-                content = [
-                    content[0].max(min),
-                    content[1].max(max),
-                    content[2] + height + gap[1],
-                ];
+                content = [content[0].max(min), content[1].max(max), content[2]];
+                let key = (child, available.map(f32::to_bits), None);
+                let [above, below] = measured.margins.get(&key).copied().unwrap_or_default();
+                // Flex children keep their margins apart. Like Chrome, block children collapse adjoining ones.
+                if flex {
+                    content[2] += height + gap[1];
+                    continue;
+                }
+                let inner = height - above[0] - above[1] - below[0] - below[1];
+                match (inner > 0., placed) {
+                    (false, false) => top = join(top, join(above, below)),
+                    (false, true) => pending = join(pending, join(above, below)),
+                    (true, false) => {
+                        top = join(top, above);
+                        content[2] += inner;
+                        (pending, placed) = (below, true);
+                    }
+                    (true, true) => {
+                        let between = join(pending, above);
+                        content[2] += between[0] + between[1] + inner;
+                        (pending, placed) = (below, true);
+                    }
+                }
                 continue;
             }
             let [min, max, _, height] = intrinsic(doc, child, styles, None, None, text, measured);
-            let width = available.map_or(max, |available| max.min(available));
-            let height = if width < max {
+            let width = resolved.next().unwrap_or_else(|| match available {
+                Some(available)
+                    if styles.values[child]
+                        .get(Prop::WIDTH)
+                        .is_some_and(|v| v.contains('%')) =>
+                {
+                    intrinsic(doc, child, styles, Some(available), None, text, measured)[2]
+                }
+                Some(available) => max.min(available),
+                None => max,
+            });
+            // A box with its own width takes percentages from the container.
+            let sized = flex
+                && styles.values[child]
+                    .get(Prop::WIDTH)
+                    .is_some_and(|v| v != "auto");
+            let height = if sized && available.is_some() {
+                intrinsic(doc, child, styles, available, None, text, measured)[3]
+            } else if width != max {
                 intrinsic(doc, child, styles, Some(width), None, text, measured)[3]
             } else {
                 height
@@ -916,21 +1145,148 @@ pub(crate) fn intrinsic(
                 && line[0] > 0.
                 && available.is_some_and(|available| line[0] + gaps[0] + width > available)
             {
-                content[2] += line[1] + gaps[1];
-                line = [0.; 2];
+                content[2] += total(line) + gaps[1];
+                line = [0.; 4];
             }
-            line = [
-                line[0] + if line[0] > 0. { gaps[0] } else { 0. } + width,
-                line[1].max(height),
-            ];
+            line[0] += if line[0] > 0. { gaps[0] } else { 0. } + width;
+            // Like a line box, a raised or lowered inline box grows the line by what it reaches past the strut.
+            let (child_style, child_units) = (&styles.values[child], &styles.lengths[child]);
+            let raise = match child_style.get(Prop::VERTICAL_ALIGN) {
+                _ if !inline_level
+                    || doc.nodes[child].tag.starts_with('#')
+                    || child_style
+                        .get(Prop::DISPLAY)
+                        .is_some_and(|value| value != "inline") =>
+                {
+                    None
+                }
+                Some("super") => Some(units.font.em / 3. + 1. / measured.pixel_ratio),
+                Some("sub") => Some(-units.font.em / 5. - 1. / measured.pixel_ratio),
+                Some(value) => child_units.resolve(value, child_units.font.lh),
+                None => None,
+            };
+            match raise {
+                Some(raise) => {
+                    let baseline = |style, units: &style::Lengths| {
+                        f32::from(text.baseline(
+                            text.face(&style::font(style)),
+                            renderer::px(units.font.em),
+                            renderer::px(units.font.lh),
+                            measured.pixel_ratio,
+                        ))
+                    };
+                    let (above, root) =
+                        (baseline(child_style, child_units), baseline(style, units));
+                    line[2] = line[2].max(above + raise - root);
+                    line[3] =
+                        line[3].max(child_units.font.lh - above - raise - (units.font.lh - root));
+                }
+                None => {
+                    line[1] = line[1].max(height);
+                    // A replaced box on the baseline of the strut keeps the strut below it in the line.
+                    if inline_level
+                        && !flex
+                        && child_style
+                            .get(Prop::VERTICAL_ALIGN)
+                            .is_none_or(|value| value == "baseline")
+                        && (doc.nodes[child].tag == "textarea"
+                            || doc.nodes[child].tag == "progress"
+                                && [Prop::APPEARANCE, Prop::WEBKIT_APPEARANCE]
+                                    .into_iter()
+                                    .any(|prop| child_style.get(prop) == Some("none"))
+                            || super::element::natural_size(
+                                doc,
+                                child,
+                                measured.naturals.get(&child).copied(),
+                            )
+                            .is_some())
+                    {
+                        let root = f32::from(text.baseline(
+                            text.face(&style::font(style)),
+                            renderer::px(units.font.em),
+                            renderer::px(units.font.lh),
+                            measured.pixel_ratio,
+                        ));
+                        // A range sits on the bottom of its border box.
+                        let hang = if doc.nodes[child].tag == "input" {
+                            frame(child_style, child_units, available.unwrap_or(0.))[2]
+                        } else {
+                            0.
+                        };
+                        line[2] = line[2].max(height - hang - root);
+                        line[3] = line[3].max(hang - (units.font.lh - root));
+                    }
+                }
+            }
             if !flex && doc.nodes[child].tag == "br" {
                 content[1] = content[1].max(run);
-                content[2] += line[1].max(styles.lengths[child].font.lh);
-                (line, run) = ([0.; 2], 0.);
+                content[2] += total(line).max(styles.lengths[child].font.lh);
+                (line, run) = ([0.; 4], 0.);
             }
         }
         content[1] = content[1].max(run);
-        content[2] += line[1];
+        // Like Chrome, an empty item keeps the line of its outside marker.
+        let height = if display == "list-item"
+            && style.get(Prop::LIST_STYLE_POSITION) != Some("inside")
+            && style.get(Prop::LIST_STYLE_TYPE) != Some("none")
+            && node.children.iter().all(|&child| {
+                doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty()
+            }) {
+            units.font.lh
+        } else {
+            total(line)
+        };
+        if height > 0. {
+            content[2] += pending[0] + pending[1] + height;
+            (pending, placed) = ([0.; 2], true);
+        }
+        // Like Chrome, margins of the first and last children pass through edges without padding or border,
+        // unless the box starts a block formatting context.
+        let parent = node
+            .parent
+            .and_then(|parent| styles.values[parent].get(Prop::DISPLAY))
+            .unwrap_or("block");
+        let contained = flex
+            || node.tag == "fieldset"
+            || !matches!(display, "block" | "list-item" | "")
+            || matches!(parent, "flex" | "inline-flex" | "grid" | "inline-grid")
+            || [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                .into_iter()
+                .any(|prop| {
+                    style
+                        .get(prop)
+                        .is_some_and(|v| !matches!(v, "visible" | "clip"))
+                })
+            || style.get(Prop::FLOAT).is_some_and(|v| v != "none")
+            || style
+                .get(Prop::POSITION)
+                .is_some_and(|v| matches!(v, "absolute" | "fixed"))
+            || style.get(Prop::CONTAIN).is_some_and(|v| v != "none");
+        let own = |value: f32| [value.max(0.), value.min(0.)];
+        let mut sets = [own(margin[0]), own(margin[2])];
+        if !placed {
+            pending = top;
+            top = [0.; 2];
+        }
+        if !contained && inner[1] == 0. && !placed && vertical.iter().all(Option::is_none) {
+            sets = [join(join(sets[0], sets[1]), pending), [0.; 2]];
+        } else {
+            if !contained && padding[0] + border[0] == 0. {
+                sets[0] = join(sets[0], top);
+            } else {
+                content[2] += top[0] + top[1];
+            }
+            if !contained
+                && padding[2] + border[2] == 0.
+                && vertical[0].is_none()
+                && vertical[1].is_none_or(|min| min == 0.)
+            {
+                sets[1] = join(sets[1], pending);
+            } else {
+                content[2] += pending[0] + pending[1];
+            }
+        }
+        collapsed = Some(sets);
     }
     if let Some(pseudos) = styles.pseudos.get(&id).filter(|_| {
         !matches!(
@@ -952,13 +1308,8 @@ pub(crate) fn intrinsic(
             {
                 continue;
             }
-            let mut units = *units;
-            if let Some(size) = pseudo
-                .get(Prop::FONT_SIZE)
-                .and_then(|value| units.resolve(value, units.font.em))
-            {
-                units.font = style::FontUnits::new(size);
-            }
+            let units =
+                super::element::pseudo_lengths(units, style, pseudo, text, measured.pixel_ratio);
             let [padding, margin] =
                 [style::PADDING, style::MARGIN].map(|edges| units.edges(pseudo, edges, base));
             let border = units.borders(pseudo, base);
@@ -998,17 +1349,53 @@ pub(crate) fn intrinsic(
                         + sides(0)[1]
                 }
             };
-            if pseudo
+            // Like the render, blank content of a block-level pseudo-element makes no line.
+            let line = if string.trim_ascii().is_empty()
+                && pseudo
+                    .get(Prop::DISPLAY)
+                    .is_some_and(|v| !v.starts_with("inline"))
+                && pseudo
+                    .get(Prop::WHITE_SPACE)
+                    .is_none_or(|v| !matches!(v, "pre" | "pre-wrap" | "pre-line" | "break-spaces"))
+            {
+                0.
+            } else {
+                units.font.lh
+            };
+            let height = height.map_or(line + sides(1)[1], |height| height + sides(1)[0]);
+            let [width, height] = [(width, 0), (height, 1)].map(|(size, axis)| {
+                let [min, max] = [
+                    [Prop::MIN_WIDTH, Prop::MAX_WIDTH],
+                    [Prop::MIN_HEIGHT, Prop::MAX_HEIGHT],
+                ][axis]
+                    .map(|prop| {
+                        pseudo
+                            .get(prop)
+                            .and_then(|value| units.resolve(value, base))
+                            .map(|limit| limit + sides(axis)[0])
+                    });
+                size.min(max.unwrap_or(f32::INFINITY))
+                    .max(min.unwrap_or(0.))
+            });
+            if matches!(display, "flex" | "inline-flex")
+                && style
+                    .get(Prop::FLEX_DIRECTION)
+                    .is_none_or(|v| !v.starts_with("column"))
+            {
+                content[0] += width;
+                content[1] += width;
+                content[2] = content[2].max(height);
+            } else if pseudo
                 .get(Prop::DISPLAY)
                 .is_none_or(|value| value.starts_with("inline"))
+                || pseudo.get(Prop::FLOAT).is_some_and(|value| value != "none")
             {
                 content[0] = content[0].max(width);
                 content[1] += width;
             } else {
                 content[0] = content[0].max(width);
                 content[1] = content[1].max(width);
-                content[2] +=
-                    height.map_or(units.font.lh + sides(1)[1], |height| height + sides(1)[0]);
+                content[2] += height;
             }
         }
     }
@@ -1018,6 +1405,9 @@ pub(crate) fn intrinsic(
             .attrs
             .get("size")
             .is_none_or(|size| size.trim().parse::<u32>().is_ok_and(|size| size <= 1))
+        && ![Prop::APPEARANCE, Prop::WEBKIT_APPEARANCE]
+            .into_iter()
+            .any(|prop| style.get(prop) == Some("none"))
     {
         let face = text.face(&style::font(style));
         let [ascent, descent, _] = text
@@ -1061,17 +1451,52 @@ pub(crate) fn intrinsic(
                 height.max(content[2])
             }
         });
+    let own = |value: f32| [value.max(0.), value.min(0.)];
+    let sets = collapsed.unwrap_or([own(margin[0]), own(margin[2])]);
     let result = [
         min + outer[0],
         max + outer[0],
-        available.unwrap_or(max) + outer[0],
-        clamp(vertical[0].or(ratio).unwrap_or(content[2]), vertical) + outer[1],
+        match style.get(Prop::WIDTH) {
+            Some("fit-content") => available.map_or(max, |width| max.min(min.max(width))),
+            Some("max-content") => max,
+            Some("min-content") => min,
+            _ => available.unwrap_or(max),
+        } + outer[0],
+        clamp(vertical[0].or(ratio).unwrap_or(content[2]), vertical)
+            + inner[1]
+            + sets
+                .iter()
+                .map(|[positive, negative]| positive + negative)
+                .sum::<f32>(),
     ];
     if measured.sizes.len() > 65536 {
         measured.sizes.clear();
+        measured.margins.clear();
     }
     measured.sizes.insert(key, result);
+    measured.margins.insert(key, sets);
     result
+}
+
+/// Margin, border and padding of each side: top, right, bottom, left.
+fn frame(style: &style::Style, units: &Lengths, base: f32) -> [f32; 4] {
+    let [margin, padding] =
+        [style::MARGIN, style::PADDING].map(|sides| units.edges(style, sides, base));
+    std::array::from_fn(|side| {
+        let [size, kind, _] = style::BORDERS[side];
+        let border = if style
+            .get(kind)
+            .is_none_or(|v| matches!(v, "none" | "hidden"))
+        {
+            0.
+        } else {
+            style
+                .get(size)
+                .map_or(Some(3.), |v| units.resolve(v, base))
+                .unwrap_or(0.)
+        };
+        margin[side] + padding[side] + border.max(0.)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1160,9 +1585,19 @@ pub(crate) fn layout(
     let mut fit = [None; 2];
     for axis in 0..2 {
         if let Some(sizes) = shared[axis] {
+            // The parent tracks hold the subgrid's margin, border and padding at both ends.
+            let frame = frame(style, units, width.unwrap_or(0.));
+            let [start, end] = if axis == 0 { [3, 1] } else { [0, 2] }.map(|side| frame[side]);
+            let last = sizes.len() - 1;
             defined[axis] = sizes
                 .iter()
-                .map(|&size| (Fixed(size), Fixed(size)))
+                .enumerate()
+                .map(|(i, &size)| {
+                    let size =
+                        (size - if i == 0 { start } else { 0. } - if i == last { end } else { 0. })
+                            .max(0.);
+                    (Fixed(size), Fixed(size))
+                })
                 .collect();
             explicit[axis] = sizes.len();
             continue;
@@ -1235,6 +1670,7 @@ pub(crate) fn layout(
         subgrid: [bool; 2],
     }
     let mut memo: rustc_hash::FxHashMap<(*const style::Style, bool), Item> = Default::default();
+    let table = style::table_box(style::role(styles, id));
     let legend = (doc.nodes[id].tag == "fieldset")
         .then(|| super::element::legend(doc, styles, id))
         .flatten()
@@ -1297,7 +1733,8 @@ pub(crate) fn layout(
                     subgrid,
                 }
             });
-        item.flowed &= legend != Some(child);
+        item.flowed &= legend != Some(child)
+            && !(table && matches!(doc.nodes[child].tag.as_str(), "col" | "colgroup"));
         item
     };
     let mut children: Vec<(usize, Item)> = doc.nodes[id]
@@ -1309,7 +1746,49 @@ pub(crate) fn layout(
         .map(|&child| (child, read(child)))
         .filter(|(_, item)| item.flowed)
         .collect();
-    children.sort_by_key(|(_, item)| item.order);
+    if table {
+        // Captions and header rows go first and footer rows last, whatever their place in the DOM.
+        children.sort_by_key(|&(child, item)| {
+            let section =
+                std::iter::successors(doc.nodes[child].parent, |&parent| doc.nodes[parent].parent)
+                    .take(2)
+                    .find_map(|parent| match style::role(styles, parent) {
+                        style::HEADER => Some(-1),
+                        style::FOOTER => Some(1),
+                        _ => None,
+                    });
+            let rank = match style::role(styles, child) {
+                style::CAPTION
+                    if styles.values[child].get(Prop::CAPTION_SIDE) == Some("bottom") =>
+                {
+                    2
+                }
+                style::CAPTION => -2,
+                _ => section.unwrap_or(0),
+            };
+            (rank, item.order)
+        });
+        // Each row, caption and run of cells outside rows is a lane of the grid.
+        let mut lane = None;
+        for (child, item) in &mut children {
+            let key = if style::role(styles, *child) == style::CAPTION {
+                Some(*child)
+            } else {
+                doc.nodes[*child]
+                    .parent
+                    .filter(|&row| style::role(styles, row) == style::ROW)
+            };
+            let index = match lane {
+                Some((index, last)) if last == key => index,
+                Some((index, _)) => index + 1,
+                None => 0,
+            };
+            lane = Some((index, key));
+            item.placed.0[1] = item.placed.0[1].or(Some(index));
+        }
+    } else {
+        children.sort_by_key(|(_, item)| item.order);
+    }
     let (children, derived): (Vec<usize>, Vec<Item>) = children.into_iter().unzip();
     let items: Vec<([Option<usize>; 2], [usize; 2])> =
         derived.iter().map(|item| item.placed).collect();
@@ -1425,8 +1904,12 @@ pub(crate) fn layout(
     let mut cells: Vec<[usize; 4]> = placed
         .iter()
         .zip(&items)
-        .map(|(at, (_, span))| {
+        .zip(&children)
+        .map(|((at, (_, span)), &child)| {
             let mut cell = [at[0], at[1], span[0], span[1]];
+            if table && style::role(styles, child) == style::CAPTION {
+                cell[2] = count[0];
+            }
             for axis in 0..2 {
                 if shared[axis].is_some() {
                     cell[axis] = cell[axis].min(explicit[axis] - 1);
@@ -1483,6 +1966,82 @@ pub(crate) fn layout(
             .map(|(track, _)| *track)
             .collect();
     }
+    // Widths of `<col>`, `<colgroup>` and cells size the columns, only of the first row with `table-layout: fixed`.
+    let mut columns = Vec::new();
+    if table {
+        let count = definitions[0].len();
+        let base = available[0].map_or(0., |width| width - count.saturating_sub(1) as f32 * gap[0]);
+        let width = |node: usize| {
+            styles.values[node]
+                .get(Prop::WIDTH)
+                .filter(|v| available[0].is_some() || !v.contains('%'))
+                .and_then(|v| styles.lengths[node].resolve(v, base))
+        };
+        columns.resize(count, None);
+        let mut at = 0;
+        for &group in doc.nodes[id].children.iter() {
+            if doc.nodes[group].tag != "colgroup" {
+                continue;
+            }
+            let cols = doc.nodes[group].children.iter().copied();
+            let cols: Vec<usize> = cols.filter(|&col| doc.nodes[col].tag == "col").collect();
+            for col in if cols.is_empty() { vec![group] } else { cols } {
+                let span = doc.nodes[col]
+                    .attrs
+                    .get("span")
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(1)
+                    .clamp(1, 1000);
+                let size = width(col).or_else(|| width(group).filter(|_| col == group));
+                for slot in columns.iter_mut().skip(at).take(span) {
+                    *slot = size;
+                }
+                at += span;
+            }
+        }
+        let fixed = style.get(Prop::TABLE_LAYOUT) == Some("fixed")
+            && available[0].is_some()
+            && style
+                .get(Prop::WIDTH)
+                .is_some_and(|v| !matches!(v, "auto" | "fit-content"));
+        for (&child, cell) in children.iter().zip(&cells) {
+            let Some(value) = styles.values[child]
+                .get(Prop::WIDTH)
+                .filter(|v| *v != "auto" && (available[0].is_some() || !v.contains('%')))
+            else {
+                continue;
+            };
+            if cell[2] != 1 || fixed && cell[1] != 0 || style::role(styles, child) == style::CAPTION
+            {
+                continue;
+            }
+            let size = match value.strip_suffix('%').and_then(|v| v.parse::<f32>().ok()) {
+                Some(percent) => percent / 100. * base,
+                None => intrinsic(doc, child, styles, available[0], None, text, measured)[2],
+            };
+            if let Some(slot) = columns.get_mut(cell[0]) {
+                *slot = match *slot {
+                    Some(old) if fixed => Some(old),
+                    Some(old) => Some(old.max(size)),
+                    None => Some(size),
+                };
+            }
+        }
+        if fixed {
+            for (track, size) in definitions[0].iter_mut().zip(&columns) {
+                *track = match *size {
+                    Some(size) => (Fixed(size), Fixed(size)),
+                    None => (Fixed(0.), Flex(1.)),
+                };
+            }
+        } else if columns.iter().any(Option::is_none) {
+            for (track, size) in definitions[0].iter_mut().zip(&columns) {
+                if let Some(size) = *size {
+                    *track = (Auto, Fixed(size));
+                }
+            }
+        }
+    }
     let starts = |sizes: &[f32]| {
         let mut sum = 0f32;
         std::iter::once(0.)
@@ -1521,16 +2080,56 @@ pub(crate) fn layout(
                 let [min, max, used, height] =
                     intrinsic(doc, child, styles, Some(area), None, text, measured);
                 let fraction = derived[index].alignment[0];
-                let size = if fraction.is_some() && derived[index].auto_width {
+                let caption = table && style::role(styles, child) == style::CAPTION;
+                // A caption sits outside the border spacing of the table.
+                let [x, area] = if caption {
+                    [x - gap[0], area + 2. * gap[0]]
+                } else {
+                    [x, area]
+                };
+                let size = if table {
+                    area
+                // Like Chrome, a table item of `auto` width stretches.
+                } else if fraction.is_none()
+                    && style::table_box(style::role(styles, child))
+                    && styles.values[child].get(Prop::WIDTH) == Some("fit-content")
+                {
+                    area.max(min)
+                } else if fraction.is_some() && derived[index].auto_width {
                     max.min(area).max(min)
                 } else {
                     used
                 };
-                let height = if size == used {
+                let mut height = if size == used && !caption {
                     height
                 } else {
                     intrinsic(doc, child, styles, Some(size), None, text, measured)[3]
                 };
+                // A subgrid of columns is as tall as its rows on the parent's columns.
+                if derived[index].subgrid == [true, false]
+                    && derived[index].height.is_none_or(|v| v == "auto")
+                {
+                    let frame = frame(&styles.values[child], &styles.lengths[child], area);
+                    let inner = layout(
+                        doc,
+                        child,
+                        styles,
+                        Some(size - frame[1] - frame[3]),
+                        None,
+                        Some(&Grid {
+                            columns: grid.columns[cell[0]..cell[0] + cell[2]].to_vec(),
+                            gap: grid.gap,
+                            ..Grid::default()
+                        }),
+                        None,
+                        text,
+                        measured,
+                    );
+                    height = inner.rows.iter().sum::<f32>()
+                        + inner.rows.len().saturating_sub(1) as f32 * inner.gap[1]
+                        + frame[0]
+                        + frame[2];
+                }
                 boxes[index] = [x + (area - size) * fraction.unwrap_or(0.), 0., size, height];
                 if let (Some(last), Some(&[first, end])) = (
                     derived[index].baseline,
@@ -1582,9 +2181,17 @@ pub(crate) fn layout(
             if !derived[index].subgrid[axis] {
                 let [min, max] = if axis == 0 {
                     let value = intrinsic(doc, child, styles, None, None, text, measured);
-                    [value[0], value[1]]
+                    // A caption widens the table to its min-content width only.
+                    let caption = table && style::role(styles, child) == style::CAPTION;
+                    [value[0], if caption { value[0] } else { value[1] }]
                 } else {
-                    [boxes[index][3] + shims.get(index).copied().unwrap_or(0.); 2]
+                    // A caption takes the border spacing beside it from its row.
+                    let spacing = if table && style::role(styles, child) == style::CAPTION {
+                        gap[1]
+                    } else {
+                        0.
+                    };
+                    [boxes[index][3] + shims.get(index).copied().unwrap_or(0.) - spacing; 2]
                 };
                 contributions.push((
                     cell[axis],
@@ -1638,6 +2245,26 @@ pub(crate) fn layout(
                 offset += span;
             }
         }
+        if axis == 0 {
+            contributions.extend(
+                (columns.iter().enumerate())
+                    .filter_map(|(i, size)| size.map(|size| (i, 1, [size; 3]))),
+            );
+        } else if table {
+            // The height of a row is the least height of its cells.
+            for (&child, cell) in children.iter().zip(&cells) {
+                if let Some(row) = doc.nodes[child]
+                    .parent
+                    .filter(|&row| style::role(styles, row) == style::ROW)
+                    && let Some(height) = styles.values[row]
+                        .get(Prop::HEIGHT)
+                        .filter(|v| !v.contains('%'))
+                        .and_then(|v| styles.lengths[row].resolve(v, 0.))
+                {
+                    contributions.push((cell[1], 1, [height; 3]));
+                }
+            }
+        }
         let content = get([Prop::JUSTIFY_CONTENT, Prop::ALIGN_CONTENT][axis]).unwrap_or("normal");
         let sizes = size(
             &definitions[axis],
@@ -1645,7 +2272,7 @@ pub(crate) fn layout(
             gap[axis],
             available[axis],
             matches!(content, "normal" | "stretch"),
-            axis == 0 && doc.nodes[id].tag == "table",
+            axis == 0 && table,
         );
         if let Some(space) = available[axis]
             && !sizes.is_empty()
@@ -1693,9 +2320,19 @@ pub(crate) fn layout(
         if value.is_some_and(|v| v.contains('%')) {
             height = intrinsic(doc, child, styles, Some(width), Some(area), text, measured)[3];
         }
-        if fraction.is_none() && value.is_none_or(|v| v == "auto") {
+        let caption = table && style::role(styles, child) == style::CAPTION;
+        if if table {
+            !caption
+        } else {
+            fraction.is_none() && value.is_none_or(|v| v == "auto")
+        } {
             height = area;
         }
+        let y = match styles.values[child].get(Prop::CAPTION_SIDE) {
+            _ if !caption => y,
+            Some("bottom") => y,
+            _ => y - gap[1],
+        };
         let shim = shims.get(index).copied().unwrap_or(0.);
         grid.cells.push((
             child,

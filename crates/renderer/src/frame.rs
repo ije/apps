@@ -510,14 +510,22 @@ impl RenderFrame {
         (x1 > x0 && y1 > y0).then_some([x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32])
     }
 
-    fn blur(&mut self, src: Target, region: [i32; 4], sigma: f32, release: bool) -> (Target, f32) {
+    /// With `mirror`, samples outside `region` reflect into it, as backdrop-filter reads its backdrop.
+    fn blur(
+        &mut self,
+        src: Target,
+        region: [i32; 4],
+        sigma: f32,
+        release: bool,
+        mirror: bool,
+    ) -> (Target, f32) {
         let covered = match src {
             Target::Layer(_) => self.rect(src).map(|value| value as i32),
             Target::Frame => region,
         };
         let scale = if sigma >= HALF_RESOLUTION_SIGMA { 2 } else { 1 };
         let horizontal = self.acquire(covered, scale);
-        self.blur_pass(src, horizontal, region, sigma, [1., 0.]);
+        self.blur_pass(src, horizontal, region, sigma, [1., 0.], mirror);
         if release {
             self.release(src);
         }
@@ -525,7 +533,7 @@ impl RenderFrame {
             return (horizontal, sigma);
         }
         let both = self.acquire(covered, scale);
-        self.blur_pass(horizontal, both, region, sigma, [0., 1.]);
+        self.blur_pass(horizontal, both, region, sigma, [0., 1.], mirror);
         self.release(horizontal);
         (both, 0.)
     }
@@ -537,11 +545,14 @@ impl RenderFrame {
         region: [i32; 4],
         sigma: f32,
         direction: [f32; 2],
+        mirror: bool,
     ) {
         let index = self.blurs.len() as u32;
+        let region = region.map(|value| value as f32);
         self.blurs.push(Blur {
-            region: region.map(|value| value as f32),
+            region,
             source_rect: self.rect(src),
+            edge: if mirror { region } else { [0.; 4] },
             direction,
             sigma,
             scale: match dst {
@@ -633,7 +644,7 @@ impl RenderFrame {
         }
         if let Some(backdrop) = &effect.backdrop
             && self.copy
-            && let Some(region) = self.region(backdrop.bounds.outset(backdrop.blur * 3.), visible)
+            && let Some(region) = self.region(backdrop.bounds, visible)
         {
             let copy = self.acquire(region, 1);
             self.commands.push(Command::Copy {
@@ -642,7 +653,7 @@ impl RenderFrame {
                 region,
             });
             let (src, sigma) = if backdrop.blur > 0.25 {
-                self.blur(copy, region, backdrop.blur, true)
+                self.blur(copy, region, backdrop.blur, true, true)
             } else {
                 (copy, 0.)
             };
@@ -653,6 +664,8 @@ impl RenderFrame {
             composite.clip = composite.bounds;
             composite.clip_radii = backdrop.corner_radii.to_array();
             composite.blur = sigma;
+            // A backdrop composite has no shadow, so `shadow` holds the edge for the blur.
+            composite.shadow = region.map(|value| value as f32);
             composite.source_rect = self.rect(src);
             matrix(&backdrop.color_matrix, &mut composite);
             self.composite(target, src, None, None, composite);
@@ -718,7 +731,7 @@ impl RenderFrame {
 
         if let Some((offset, sigma, color)) = effect.shadow {
             let (src, left) = if sigma > 0.25 {
-                self.blur(texture, region, sigma, false)
+                self.blur(texture, region, sigma, false, false)
             } else {
                 (texture, 0.)
             };
@@ -750,7 +763,7 @@ impl RenderFrame {
         }
 
         let (src, sigma) = if effect.blur > 0.25 {
-            self.blur(texture, region, effect.blur, true)
+            self.blur(texture, region, effect.blur, true, false)
         } else {
             (texture, 0.)
         };

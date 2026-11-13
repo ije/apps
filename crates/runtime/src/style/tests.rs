@@ -566,14 +566,14 @@ fn container_queries_parse_and_follow_container_sizes() {
     assert_eq!(
         sources,
         [
-            (Some("card".into()), false, "(width>=400px)".into()),
-            (None, true, "(aspect-ratio>1)".into()),
+            (Some("card".into()), false, "(min-width: 400px)".into()),
+            (None, true, "(aspect-ratio > 1)".into()),
             (None, false, "style(--x: 1)".into()),
-            (Some("card".into()), false, "not (width>100px)".into()),
+            (Some("card".into()), false, "not (width > 100px)".into()),
             (
                 None,
                 false,
-                "((width>300px) and (width<=600px)) or (width>2000px)".into()
+                "((width > 300px) and (width <= 600px)) or (width > 2000px)".into()
             ),
         ]
     );
@@ -2200,61 +2200,6 @@ fn cascade_variables_media_and_specificity() {
 }
 
 #[test]
-fn table_columns_follow_rows_and_stay_cached() {
-    let mut doc = Document::parse(
-        "<table id=t><thead><tr><th>a</th><th>b</th><th>c</th></tr></thead><tbody><tr><td>1</td><td><table id=inner><tr><td></td><td></td><td></td><td></td><td></td></tr></table></td></tr></tbody></table><table id=one><tr><td>x</td></tr></table><table id=own style='grid-template-columns:1fr 2fr'><tr><td></td><td></td></tr></table>",
-    );
-    let [table, inner, one, own] = ["#t", "#inner", "#one", "#own"].map(|s| element(&doc, s));
-    let mut sheets = HashMap::new();
-    let mut cache = StyleCache::default();
-    let first = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-    assert_eq!(
-        &first.values[table]["grid-template-columns"],
-        "repeat(3,auto)"
-    );
-    assert_eq!(
-        &first.values[inner]["grid-template-columns"],
-        "repeat(5,auto)"
-    );
-    assert!(!first.values[one].contains(Prop::GRID_TEMPLATE_COLUMNS));
-    assert_eq!(&first.values[own]["grid-template-columns"], "1fr 2fr");
-    let second = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-    assert!(Rc::ptr_eq(&first.values[table], &second.values[table]));
-    let row = doc.nodes[doc.nodes[table].children[1]].children[0];
-    for _ in 0..3 {
-        let cell = doc.nodes.len();
-        doc.nodes.push(crate::dom::Node {
-            tag: "td".into(),
-            parent: Some(row),
-            ..Default::default()
-        });
-        doc.nodes[row].children.push(cell);
-    }
-    let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-    assert_eq!(
-        &cached.values[table]["grid-template-columns"],
-        "repeat(5,auto)"
-    );
-    let last = *doc.nodes[row].children.last().unwrap();
-    doc.nodes[last].tag = "#text".into();
-    let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
-    let fresh = compute_styles(
-        &doc,
-        800.,
-        600.,
-        None,
-        &mut sheets,
-        &mut StyleCache::default(),
-        None,
-    );
-    assert_eq!(cached.values, fresh.values);
-    assert_eq!(
-        &cached.values[table]["grid-template-columns"],
-        "repeat(4,auto)"
-    );
-}
-
-#[test]
 fn structural_selectors_follow_sibling_changes() {
     let mut doc = Document::parse(
         "<style>li:nth-child(2n){color:red} li:nth-last-of-type(1){font-weight:700} li:only-child{padding-top:1px} li+li{margin-top:2px} li:nth-child(odd of .k){border-top-width:3px} p~li{margin-left:4px}</style><ul><li id=a class=k></li><li id=b></li><li id=c class=k></li></ul>",
@@ -2507,7 +2452,12 @@ fn inherited_lengths_blockification_and_counters_compute_like_browsers() {
     assert_eq!(get("#w", Prop::WIDTH).as_deref(), Some("30px"));
     assert_eq!(get("#w", Prop::BORDER_TOP_WIDTH).as_deref(), Some("0px"));
     assert_eq!(get("html", Prop::DISPLAY).as_deref(), Some("block"));
-    assert_eq!(get("#x", Prop::DISPLAY).as_deref(), Some("table"));
+    // A table lays out as a grid, and its role keeps the display that APIs report.
+    assert_eq!(get("#x", Prop::DISPLAY).as_deref(), Some("grid"));
+    assert_eq!(
+        TABLE_DISPLAYS[role(&out, element(&doc, "#x")) as usize],
+        "table"
+    );
     assert_eq!(get("#x", Prop::FLOAT), None);
     let pseudo = |selector: &str, slot: usize, prop: Prop| {
         out.pseudos[&element(&doc, selector)][slot]
@@ -3263,7 +3213,7 @@ fn computed_values_serialize_shorthands_and_color_spaces_like_webkit() {
             "rgb(255, 0, 0) url(x.png) no-repeat scroll 50% 50% / 10px 20px padding-box border-box",
         ),
         ("border", "2px solid rgb(0, 0, 255)"),
-        ("outline", "1px dashed rgb(0, 128, 0)"),
+        ("outline", "rgb(0, 128, 0) dashed 1px"),
         ("transition", "opacity 1s ease-in 2s, color 0.5s"),
         ("animation", "2s linear infinite spin"),
         ("list-style", "inside none square"),
@@ -5029,7 +4979,8 @@ fn invalid_declarations_are_dropped_at_parse_time() {
         ("#c", "unknown-thing", Some("1")),
         ("#c", "user-select", Some("none")),
         ("#d", "transition-duration", Some("calc(1s * 2)")),
-        ("#d", "display", Some("table-cell")),
+        // A cell lays out as a block, and `getComputedStyle()` reports `table-cell` from its role.
+        ("#d", "display", Some("block")),
         (
             "#d",
             "transition-timing-function",
@@ -5182,7 +5133,7 @@ fn parser_keeps_nested_font_faces_prefixed_keyframes_and_media_types() {
     );
     let source = sheet.source();
     for text in [
-        "@media screen and (width>=100px)",
+        "@media screen and (min-width: 100px)",
         "@media print{",
         "@media only screen{",
     ] {
@@ -5239,4 +5190,294 @@ fn nested_parent_selectors_record_their_attributes_once() {
         );
         cache.finish();
     }
+}
+
+#[test]
+fn list_counters_count_like_chrome() {
+    for (kind, number, text) in [
+        ("lower-greek", 7, "η"),
+        ("lower-greek", 25, "αα"),
+        ("hiragana", 9, "け"),
+        ("katakana", 2, "イ"),
+        ("cjk-decimal", 205, "二〇五"),
+        ("cjk-ideographic", 8, "八"),
+        ("cjk-ideographic", 15, "十五"),
+        ("cjk-ideographic", 105, "一百零五"),
+        ("armenian", 10, "Ժ"),
+        ("lower-armenian", 1, "ա"),
+        ("georgian", 11, "ია"),
+        ("hebrew", 12, "יב"),
+        ("hebrew", 15, "טו"),
+    ] {
+        assert_eq!(counter_text(kind, number), text, "{kind} {number}");
+    }
+}
+
+#[test]
+fn tables_have_border_box_sizing_like_chrome() {
+    let doc = Document::parse("<table id=t><tr><td>a</td></tr></table>");
+    let values = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    )
+    .values;
+    assert_eq!(
+        values[element(&doc, "#t")].get(Prop::BOX_SIZING),
+        Some("border-box")
+    );
+}
+
+#[test]
+fn invalid_background_shorthands_keep_the_earlier_value_like_chrome() {
+    let doc = Document::parse(
+        "<style>#a{background:red;background:lolwut(1 2 3)}#b{background:red;background:linear-gradient(red,blue) space / 30px 20px}\
+         #c{background:red;background:bogus}#d{background:url(a.png) center / cover, color-mix(in srgb, currentColor 30%, white)}\
+         #e{background:red;background:url(a.png) red, blue}</style>\
+         <div id=a></div><div id=b></div><div id=c></div><div id=d></div><div id=e></div>",
+    );
+    let styles = styles(&doc, 800., 600.);
+    let get = |selector, name| styles[element(&doc, selector)].get(name).cloned();
+    for selector in ["#a", "#b", "#c", "#e"] {
+        assert_eq!(
+            get(selector, "background-color").as_deref(),
+            Some("red"),
+            "{selector}"
+        );
+        assert_eq!(
+            get(selector, "background-image").as_deref(),
+            Some("none"),
+            "{selector}"
+        );
+    }
+    assert_eq!(get("#d", "background-size").as_deref(), Some("cover, auto"));
+    assert_eq!(
+        get("#d", "background-color").as_deref(),
+        Some("color(srgb 0.7 0.7 0.7)")
+    );
+}
+
+#[test]
+fn svg_width_and_height_attributes_are_css_lengths_like_chrome() {
+    let doc = Document::parse(
+        r#"<style>#c { width: 30px }</style><svg id="a" width="1em" height="50%"></svg><svg id="b" width="20" height="bad"></svg><svg id="c" width="10"></svg>"#,
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let size = |selector| {
+        [Prop::WIDTH, Prop::HEIGHT].map(|prop| {
+            computed.values[element(&doc, selector)]
+                .get(prop)
+                .map(str::to_owned)
+        })
+    };
+    assert_eq!(size("#a"), [Some("1em".into()), Some("50%".into())]);
+    assert_eq!(size("#b"), [Some("20px".into()), None]);
+    assert_eq!(size("#c")[0].as_deref(), Some("30px"));
+}
+
+#[test]
+fn small_caps_are_smaller_capitals_like_chrome() {
+    let doc = Document::parse("<p style='font:small-caps 20px Helvetica'>Ab cD 1</p>");
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
+    let inline = inline_text(&doc, &computed, p).unwrap();
+    assert_eq!(&*inline.text, "AB CD 1");
+    let runs: Vec<_> = inline
+        .runs
+        .iter()
+        .map(|run| (run.len, run.font_size.map(f32::from)))
+        .collect();
+    assert_eq!(
+        runs,
+        [
+            (1, None),
+            (1, Some(14.)),
+            (1, None),
+            (1, Some(14.)),
+            (3, None)
+        ]
+    );
+    assert!(inline.mixed);
+}
+
+#[test]
+fn text_nodes_that_share_a_cached_style_keep_their_selection_colors() {
+    let doc = Document::parse(
+        "<style>::selection{background:#fc0}</style><p>one</p><p>two</p><p style='user-select:none'>three</p>",
+    );
+    let (mut sheets, mut cache) = (HashMap::new(), StyleCache::default());
+    compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    let computed = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    for (id, node) in doc.nodes.iter().enumerate() {
+        if node.tag == "#text"
+            && node
+                .parent
+                .is_some_and(|parent| doc.nodes[parent].tag == "p")
+        {
+            assert_eq!(
+                computed
+                    .selections
+                    .get(&id)
+                    .map(|style| style.get(Prop::BACKGROUND_COLOR)),
+                Some(Some("#fc0")),
+                "{}",
+                node.text
+            );
+        }
+    }
+}
+
+#[test]
+fn computed_defaults_and_logical_names_read_like_chrome() {
+    let doc = Document::parse(
+        "<style>#p{color:rgb(1,2,3)} #c{color:initial;text-decoration:underline dotted;outline:2px dashed red;border-block-end:3px solid;font-stretch:condensed;caret-color:auto}</style><div id=p><p id=c></p></div>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let get = |selector, name| {
+        let id = element(&doc, selector);
+        resolved(
+            &computed.values[id],
+            &computed.lengths[id],
+            name,
+            None,
+            &|| [800., 600.],
+            &Registry::default(),
+        )
+    };
+    for (selector, name, expected) in [
+        ("#p", "transition", "all"),
+        ("#p", "animation", "none"),
+        ("#p", "text-decoration", "none"),
+        ("#p", "outline", "rgb(1, 2, 3) none 3px"),
+        ("#p", "caret-color", "rgb(1, 2, 3)"),
+        ("#p", "font-stretch", "100%"),
+        ("#p", "border-spacing", "0px"),
+        ("#p", "caption-side", "top"),
+        ("#p", "margin-block", "0px"),
+        ("#c", "color", "rgb(0, 0, 0)"),
+        ("#c", "text-decoration", "underline dotted"),
+        ("#c", "outline", "rgb(255, 0, 0) dashed 2px"),
+        ("#c", "border-block-end-width", "3px"),
+        ("#c", "font-stretch", "75%"),
+    ] {
+        assert_eq!(get(selector, name), expected, "{selector} {name}");
+    }
+}
+
+#[test]
+fn range_progress_and_file_parts_take_their_pseudo_elements_like_chrome() {
+    let doc = Document::parse(
+        "<style>input::-webkit-slider-runnable-track{height:8px}input:disabled::-webkit-slider-thumb{background:gray}progress::-webkit-progress-value{background:red}::file-selector-button{padding:6px}</style><input type=range disabled><progress></progress><input type=file><div></div>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let part = |tag: &str, file: bool, slot: usize| {
+        let id = (0..doc.nodes.len())
+            .filter(|&id| doc.nodes[id].tag == tag)
+            .nth(usize::from(file))
+            .unwrap();
+        computed.scrollbars[&id][slot].clone().unwrap()
+    };
+    assert_eq!(&part("input", false, 1)["height"], "8px");
+    assert_eq!(&part("input", false, 2)["background-color"], "gray");
+    assert_eq!(&part("progress", false, 2)["background-color"], "red");
+    assert_eq!(&part("input", true, 1)["padding-top"], "6px");
+    assert!(!computed.scrollbars.contains_key(&element(&doc, "div")));
+}
+
+#[test]
+fn table_parts_take_roles_and_stay_cached() {
+    let mut doc = Document::parse(
+        "<table id=t><thead><tr><th>a</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table><div id=d style='display:table'><div id=r style='display:table-row'><div id=c style='display:table-cell'></div></div></div><div id=o style='display:table-row'></div><div id=f style='display:flex'><div id=i style='display:table-cell'></div></div><table id=b style='display:block'></table>",
+    );
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    let first = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    let shown = |styles: &ComputedStyles, selector: &str| {
+        let id = element(&doc, selector);
+        let display = styles.values[id]
+            .get(Prop::DISPLAY)
+            .unwrap_or("inline")
+            .to_owned();
+        (TABLE_DISPLAYS[role(styles, id) as usize], display)
+    };
+    for (selector, reported, used) in [
+        ("#t", "table", "grid"),
+        ("thead", "table-header-group", "contents"),
+        ("tbody", "table-row-group", "contents"),
+        ("tr", "table-row", "contents"),
+        ("td", "table-cell", "block"),
+        ("#d", "table", "grid"),
+        ("#r", "table-row", "contents"),
+        ("#c", "table-cell", "block"),
+        // A row outside a table makes a table of its own, and a flex item is a block.
+        ("#o", "table-row", "grid"),
+        ("#i", "", "block"),
+        ("#b", "block", "grid"),
+    ] {
+        assert_eq!(
+            shown(&first, selector),
+            (reported, used.to_owned()),
+            "{selector}"
+        );
+    }
+    let table = element(&doc, "#t");
+    let second = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    assert!(Rc::ptr_eq(&first.values[table], &second.values[table]));
+    let row = doc.nodes[doc.nodes[table].children[1]].children[0];
+    let cell = doc.nodes.len();
+    doc.nodes.push(crate::dom::Node {
+        tag: "td".into(),
+        parent: Some(row),
+        ..Default::default()
+    });
+    doc.nodes[row].children.push(cell);
+    let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    let fresh = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut sheets,
+        &mut StyleCache::default(),
+        None,
+    );
+    assert_eq!(cached.values, fresh.values);
+    assert_eq!(cached.flags[cell], fresh.flags[cell]);
+    assert_eq!(TABLE_DISPLAYS[role(&cached, cell) as usize], "table-cell");
 }

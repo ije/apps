@@ -93,6 +93,9 @@ pub struct Node {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Document {
     pub nodes: Nodes,
+    // The element of the URL fragment, which `:target` matches.
+    #[serde(skip)]
+    pub(crate) target: Option<usize>,
 }
 
 static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1913,6 +1916,7 @@ impl Document {
                 }
                 return Self {
                     nodes: builder.nodes.into(),
+                    target: None,
                 };
             }
             builder.push(0, context == "svg", None);
@@ -2140,6 +2144,7 @@ impl Document {
         }
         Self {
             nodes: builder.nodes.into(),
+            target: None,
         }
     }
 

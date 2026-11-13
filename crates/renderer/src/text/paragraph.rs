@@ -26,6 +26,8 @@ struct ParagraphState {
     size: Size<Pixels>,
     baselines: [Pixels; 2],
     bounds: Option<Rect<Pixels>>,
+    // The widest line or unbreakable piece, which can overflow the box. Found when a scroll container asks.
+    overflow: Cell<Option<Pixels>>,
 }
 
 pub(crate) struct TextState {
@@ -88,8 +90,8 @@ impl TextState {
                 .filter(|(a, b)| a.len > 0 || b.len > 0)
                 .all(|(a, b)| {
                     let joined = last.is_none_or(|(x, y)| {
-                        same!(x, a; color, background_color, underline, strikethrough)
-                            == same!(y, b; color, background_color, underline, strikethrough)
+                        same!(x, a; color, background_color, underline, strikethrough, overline)
+                            == same!(y, b; color, background_color, underline, strikethrough, overline)
                     });
                     last = Some((a, b));
                     joined
@@ -321,6 +323,7 @@ impl TextState {
                 size,
                 baselines,
                 bounds: None,
+                overflow: Cell::new(None),
             });
         }
         (size, Some(baselines))
@@ -372,6 +375,17 @@ impl TextState {
 }
 
 impl Paragraph {
+    pub(crate) fn overflow(&self) -> Option<Pixels> {
+        let inner = self.0.borrow();
+        let state = inner.as_ref()?;
+        let width = state
+            .overflow
+            .get()
+            .unwrap_or_else(|| state.size.width.max(widest_piece(&state.lines, px(0.))));
+        state.overflow.set(Some(width));
+        Some(width)
+    }
+
     pub fn paint(&self, align: TextAlign, window: &mut Window) {
         let inner = self.0.borrow();
         let Some(inner) = inner.as_ref() else {
@@ -389,7 +403,8 @@ impl Paragraph {
         }
     }
 
-    pub fn index_at(&self, position: Point<Pixels>) -> Result<usize, usize> {
+    /// With `nearest`, the index of the nearest character edge, for a caret. Else the character under the point.
+    pub fn index_at(&self, position: Point<Pixels>, nearest: bool) -> Result<usize, usize> {
         let inner = self.0.borrow();
         let Some((inner, bounds)) = inner
             .as_ref()
@@ -409,7 +424,7 @@ impl Paragraph {
                 start += line.len() + 1;
             } else {
                 let at = position - origin;
-                return match line.hit((at.y / inner.line_height) as usize, at.x, false) {
+                return match line.hit((at.y / inner.line_height) as usize, at.x, nearest) {
                     Ok(index) => Ok(start + index),
                     Err(index) => Err(start + index),
                 };
@@ -608,6 +623,7 @@ mod tests {
             size: Size::default(),
             baselines: [px(0.); 2],
             bounds: None,
+            overflow: Cell::new(None),
         });
         assert!(old.keep(&state(vec![run(2, 0xff0000ff), run(3, 0x0000ffff)])));
         assert!(old.layout.0.borrow().is_some() && !old.repaint.get());

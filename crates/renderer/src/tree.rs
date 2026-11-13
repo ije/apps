@@ -1,6 +1,7 @@
 use crate::{
-    AlignContent, AlignItems, AvailableSpace, Baseline, Clip, Display, Hit, Hooks, Inline, Pixels,
-    Point, Rect, Region, Scope, Size, Style, TextStyle, Visibility, Window,
+    AlignContent, AlignItems, AvailableSpace, Baseline, Clip, Display, Escape, Hit, Hooks, Inline,
+    Overflow, Pixels, Point, Position, Rect, Region, Scope, Size, Style, TextStyle, Visibility,
+    Window,
     geometry::round_half_up,
     node::{Child, Content, Events, MeasureFn, Measurement, Node, NodeCx, NodeKey, NodeStyle},
     point, px, size,
@@ -60,6 +61,10 @@ struct Slot {
     volatile: bool,
     reach: Option<Rect<Pixels>>,
     escaped: Option<Clip<Pixels>>,
+    // The size that the measure function gave in the last layout, which can overflow the box.
+    measured: taffy::Size<f32>,
+    // The far corners that `far` found, from the origin of the box. Cleared up the tree when a box changes.
+    far: [Option<Point<f32>>; 2],
 }
 
 type Remains = (
@@ -102,6 +107,8 @@ impl Slot {
             volatile: false,
             reach: None,
             escaped: None,
+            measured: taffy::Size::ZERO,
+            far: [None; 2],
         }
     }
 }
@@ -134,6 +141,7 @@ impl Slot {
         self.baselines = Baselines::NONE;
         self.origin = Point::default();
         (self.bounds, self.painted, self.exact) = Default::default();
+        self.far = [None; 2];
         self.hitbox = NONE;
         self.listed = false;
         self.free = [true; 2];
@@ -497,11 +505,13 @@ impl Tree {
         slot.style = styled;
         slot.stretched = stretched;
         slot.volatile = hooks.as_ref().is_some_and(|hooks| hooks.volatile())
-            || slot.style.escape != 0
+            || slot.style.escape & !Escape::OUTLINE != 0
             || events
                 .as_ref()
                 .is_some_and(|events| events.scroll.is_some());
         slot.placed = None;
+        unfar(&mut self.slots, index as usize);
+        let slot = &mut self.slots[index as usize];
         slot.events = events;
         slot.hooks = hooks;
         slot.inherited = inherited.clone();
@@ -797,18 +807,25 @@ impl Tree {
         }
         // An out-of-flow box is volatile, so its ancestors are never kept and its containing block pushed its
         // clip to `blocks` in this pass.
-        let escape = slot.style.escape;
-        slot.escaped = (escape != 0).then(|| {
-            self.blocks
-                .iter()
-                .rev()
-                .find(|(contains, _)| contains & escape != 0)
-                .map_or_else(
-                    || Clip::from(Rect::new(Point::default(), window.viewport_size())),
-                    |(_, mask)| *mask,
-                )
-        });
+        let (escape, parent) = (slot.style.escape, slot.parent);
+        // An outline takes the clip of its box, not the overflow clip inside it.
+        let outline = (escape == Escape::OUTLINE)
+            .then(|| self.slots[parent as usize].placed)
+            .flatten()
+            .map(|(_, _, placed)| placed.mask);
         let slot = &mut self.slots[index as usize];
+        slot.escaped = outline.or_else(|| {
+            (escape != 0).then(|| {
+                self.blocks
+                    .iter()
+                    .rev()
+                    .find(|(contains, _)| contains & escape != 0)
+                    .map_or_else(
+                        || Clip::from(Rect::new(Point::default(), window.viewport_size())),
+                        |(_, mask)| *mask,
+                    )
+            })
+        });
         // The mask from the containing block's layer replaces intermediate clips.
         if let Some(mask) = slot.escaped {
             window.push_content_mask(mask);
@@ -816,7 +833,13 @@ impl Tree {
         let placement = window.placement();
         slot.placed = Some((prepaints, origin, placement));
         slot.origin = origin;
-        slot.listed = false;
+        // A listed box comes before the listed boxes inside it, which paint above it at the same z-index.
+        slot.listed = slot.style.z_index.is_some() && !self.stacks.is_empty();
+        if let Some(order) = slot.style.z_index
+            && let Some(list) = self.stacks.last_mut()
+        {
+            list.push((order, index, window.content_mask()));
+        }
         let [bounds, exact] = self.bounds(index, origin, window);
         let slot = &mut self.slots[index as usize];
         (slot.bounds, slot.exact) = (bounds, exact);
@@ -827,12 +850,6 @@ impl Tree {
             |tree, style, window| tree.prepaint_box(index, style, window),
         );
         self.reach(index);
-        if let Some(order) = self.slots[index as usize].style.z_index
-            && let Some(list) = self.stacks.last_mut()
-        {
-            list.push((order, index, window.content_mask()));
-            self.slots[index as usize].listed = true;
-        }
         if self.slots[index as usize].escaped.is_some() {
             window.pop_content_mask();
         }
@@ -849,18 +866,7 @@ impl Tree {
             .and_then(|events| events.scroll.clone());
         let needs_hitbox = Events::needs_region(slot.events.as_deref(), style);
         let content = match &scroll {
-            Some(_) if !slot.children.is_empty() => {
-                let mut min = point(f32::MAX, f32::MAX);
-                let mut max = point(f32::MIN, f32::MIN);
-                for &child in &slot.children {
-                    let layout = &self.slots[index_of(child) as usize].layout;
-                    let at = point(origin.x + layout.location.x, origin.y + layout.location.y);
-                    let far = point(at.x + layout.size.width, at.y + layout.size.height);
-                    min = min.min(at.map(round_half_up));
-                    max = max.max(far.map(round_half_up));
-                }
-                Size::from(max - min).map(|value| Pixels(value / scale))
-            }
+            Some(_) if !slot.children.is_empty() => self.content(index, origin, scale),
             _ => bounds.size,
         };
         window.scope(Scope::Clip(style.overflow_mask(bounds)), |window| {
@@ -891,9 +897,18 @@ impl Tree {
                 window.scope(Scope::Offset(offset), |window| {
                     for child in 0..self.slots[index as usize].children.len() {
                         let child = index_of(self.slots[index as usize].children[child]);
-                        self.prepaint_node(child, origin, window);
+                        if self.slots[child as usize].style.escape != Escape::OUTLINE {
+                            self.prepaint_node(child, origin, window);
+                        }
                     }
                 });
+                // Outlines don't scroll with the content.
+                for child in 0..self.slots[index as usize].children.len() {
+                    let child = index_of(self.slots[index as usize].children[child]);
+                    if self.slots[child as usize].style.escape == Escape::OUTLINE {
+                        self.prepaint_node(child, origin, window);
+                    }
+                }
                 if style.contains != 0 {
                     self.blocks.pop();
                 }
@@ -909,6 +924,94 @@ impl Tree {
             child.below || child.volatile
         });
         self.slots[index as usize].below = below;
+    }
+
+    // The far corner of a box and of the overflow that it doesn't clip, in the layout units of its parent. Without
+    // `nested`, only the content of its lines counts, not of boxes inside it.
+    fn far(&mut self, index: u32, scale: f32, nested: bool) -> Point<f32> {
+        let slot = &self.slots[index as usize];
+        let Layout { location, size, .. } = slot.layout;
+        if let Some(far) = slot.far[nested as usize].filter(|_| !self.full) {
+            return point(location.x + far.x, location.y + far.y);
+        }
+        let visible = slot
+            .style
+            .overflow
+            .map(|overflow| overflow == Overflow::Visible);
+        let mut far = point(size.width, size.height);
+        if !visible.x && !visible.y {
+            self.slots[index as usize].far[nested as usize] = Some(far);
+            return point(location.x + far.x, location.y + far.y);
+        }
+        // Without `nested`, only anonymous line boxes, which have no hooks, hold content of the scroll container.
+        let descend = nested || slot.hooks.is_none() && slot.style.inline != Inline::None;
+        if slot.measure.is_some() {
+            let sides = slot.layout.padding + slot.layout.border;
+            let text = slot
+                .state
+                .as_ref()
+                .and_then(|state| state.downcast_ref::<TextState>())
+                .and_then(|state| state.layout.overflow())
+                .map_or(0., |width| width.0 * scale);
+            far = far.max(point(
+                sides.left + slot.measured.width.max(text),
+                sides.top + slot.measured.height,
+            ));
+        }
+        if descend {
+            for child in 0..self.slots[index as usize].children.len() {
+                let child = index_of(self.slots[index as usize].children[child]);
+                if self.slots[child as usize].style.escape & (Escape::FIXED | Escape::OUTLINE) == 0
+                {
+                    far = far.max(self.far(child, scale, nested));
+                }
+            }
+        }
+        let far = point(
+            if visible.x { far.x } else { size.width },
+            if visible.y { far.y } else { size.height },
+        );
+        self.slots[index as usize].far[nested as usize] = Some(far);
+        point(location.x + far.x, location.y + far.y)
+    }
+
+    // The scrollable content of a scroll container from the start of its content box. Like Chrome, its end
+    // padding follows the margin boxes of its children and its lines, but not the overflow of boxes inside them.
+    fn content(&mut self, index: u32, origin: Point<f32>, scale: f32) -> Size<Pixels> {
+        let layout = self.slots[index as usize].layout;
+        let mut min = point(
+            origin.x + layout.border.left + layout.padding.left,
+            origin.y + layout.border.top + layout.padding.top,
+        )
+        .map(round_half_up);
+        let mut max = min;
+        let border = point(
+            layout.border.left + layout.border.right,
+            layout.border.top + layout.border.bottom,
+        );
+        let end = point(layout.padding.right, layout.padding.bottom);
+        for child in 0..self.slots[index as usize].children.len() {
+            let id = index_of(self.slots[index as usize].children[child]);
+            let child = &self.slots[id as usize];
+            let (layout, absolute) = (child.layout, child.style.position == Position::Absolute);
+            if child.style.escape & (Escape::FIXED | Escape::OUTLINE) != 0
+                || layout.size.width == 0. && layout.size.height == 0. && child.children.is_empty()
+            {
+                continue;
+            }
+            let at = point(origin.x + layout.location.x, origin.y + layout.location.y);
+            let mut far = self.far(id, scale, false);
+            if !absolute {
+                far.x += layout.margin.right.max(0.);
+                far.y += layout.margin.bottom.max(0.);
+            }
+            let nested = self.far(id, scale, true);
+            far = far.max(point(nested.x - end.x, nested.y - end.y));
+            min = min.min(at.map(round_half_up));
+            max = max.max(point(origin.x + far.x, origin.y + far.y).map(round_half_up));
+        }
+        // `clamp` takes the scroll range from the border box.
+        Size::from(max - min + border).map(|value| Pixels(value / scale))
     }
 
     fn place(&mut self, index: u32, origin: Point<f32>, window: &mut Window) -> [Rect<Pixels>; 2] {
@@ -953,6 +1056,11 @@ impl Tree {
             let slot = &mut self.slots[index as usize];
             (slot.bounds, slot.exact) = (bounds, exact);
         }
+        if let Some(order) = self.slots[index as usize].style.z_index
+            && let Some(list) = self.stacks.last_mut()
+        {
+            list.push((order, index, window.content_mask()));
+        }
         self.visit(
             index,
             window,
@@ -961,11 +1069,6 @@ impl Tree {
         );
         if moved {
             self.reach(index);
-        }
-        if let Some(order) = self.slots[index as usize].style.z_index
-            && let Some(list) = self.stacks.last_mut()
-        {
-            list.push((order, index, window.content_mask()));
         }
     }
 
@@ -1123,6 +1226,21 @@ impl Tree {
                 window.draw_box(bounds, radii, background, Default::default());
             }
             window.draw_shadows(bounds, radii, &style.box_shadow, true);
+            if let Some(color) = style.border_color.filter(|color| !color.is_transparent())
+                && style.border_widths.any(|width| !width.is_zero())
+            {
+                window.draw_box(
+                    bounds,
+                    radii,
+                    color.with_alpha(0.),
+                    crate::Border {
+                        widths: style.border_widths,
+                        color,
+                        style: style.border_style,
+                        sides: 0,
+                    },
+                );
+            }
             let mask = style.overflow_mask(bounds);
             window.scope(Scope::Clip(mask), |window| {
                 let slot = &self.slots[index as usize];
@@ -1179,21 +1297,6 @@ impl Tree {
                     }
                 }
             });
-            if let Some(color) = style.border_color.filter(|color| !color.is_transparent())
-                && style.border_widths.any(|width| !width.is_zero())
-            {
-                window.draw_box(
-                    bounds,
-                    radii,
-                    color.with_alpha(0.),
-                    crate::Border {
-                        widths: style.border_widths,
-                        color,
-                        style: style.border_style,
-                        sides: 0,
-                    },
-                );
-            }
         });
     }
 
@@ -1211,7 +1314,18 @@ impl Tree {
     }
 }
 
+fn unfar(slots: &mut [Slot], mut index: usize) {
+    while slots[index].far != [None; 2] {
+        slots[index].far = [None; 2];
+        match slots[index].parent {
+            NONE => break,
+            parent => index = parent as usize,
+        }
+    }
+}
+
 fn changed(slots: &mut [Slot], index: usize) {
+    unfar(slots, index);
     slots[index].placed = None;
     let mut parent = slots[index].parent;
     while parent != NONE && !slots[parent as usize].below {
@@ -2372,10 +2486,19 @@ impl LayoutTree<'_> {
             measure,
             style,
             text,
+            measured: kept,
             ..
         } = &mut self.slots[index];
         let taffy = stretched.as_deref().unwrap_or(&style.taffy);
+        use taffy::ResolveOrZero;
+        let calc = |value, basis| crate::style::resolve_calc(value, basis);
+        let width = inputs.parent_size.width;
+        let padding = taffy.padding.resolve_or_zero(width, calc);
+        let border = taffy.border.resolve_or_zero(width, calc);
+        // Taffy passes the known border box size, but measure functions take the content box, like `available`.
+        let inset = (padding + border).sum_axes();
         let mut baselines = None;
+        let mut content = None;
         let mut output = taffy::compute_leaf_layout(
             inputs,
             taffy,
@@ -2385,8 +2508,12 @@ impl LayoutTree<'_> {
                     return taffy::Size::ZERO;
                 };
                 let known = size(
-                    known.width.map(|value| Pixels(value / scale)),
-                    known.height.map(|value| Pixels(value / scale)),
+                    known
+                        .width
+                        .map(|value| Pixels((value - inset.width).max(0.) / scale)),
+                    known
+                        .height
+                        .map(|value| Pixels((value - inset.height).max(0.) / scale)),
                 );
                 let available = size(
                     AvailableSpace::unscaled(available.width, scale),
@@ -2394,22 +2521,25 @@ impl LayoutTree<'_> {
                 );
                 let (measured, lines) = measure(text, known, available, window);
                 baselines = lines;
-                taffy::Size {
+                let size = taffy::Size {
                     width: (measured.width.0.max(0.) * scale * 64.).ceil() / 64.,
                     height: (measured.height.0.max(0.) * scale * 64.).ceil() / 64.,
-                }
+                };
+                content = Some(size);
+                size
             },
         );
+        let remeasured = inputs.run_mode == RunMode::PerformLayout
+            && content.is_some_and(|content| mem::replace(kept, content) != content);
         if let Some([first, last]) = baselines.filter(|_| style.baseline != Baseline::None) {
-            use taffy::ResolveOrZero;
-            let width = inputs.parent_size.width;
-            let calc = |value, basis| crate::style::resolve_calc(value, basis);
-            let top = taffy.padding.top.resolve_or_zero(width, calc)
-                + taffy.border.top.resolve_or_zero(width, calc);
+            let top = padding.top + border.top;
             output.baselines = Baselines {
                 first: Some(first.0 * scale + top),
                 last: Some(last.0 * scale + top),
             };
+        }
+        if remeasured {
+            unfar(self.slots, index);
         }
         output
     }

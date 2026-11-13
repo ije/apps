@@ -2362,6 +2362,10 @@ impl Lerp {
         if from == to {
             return Some(Self::Same(from.to_owned()));
         }
+        // Chrome switches images, gradients too, halfway instead of blending them.
+        if property.ends_with("-image") || property == "border-image-source" {
+            return None;
+        }
         let keyword = |value| match (property, value) {
             ("font-weight", "normal") => "400",
             ("font-weight", "bold") => "700",
@@ -3294,6 +3298,14 @@ mod tests {
         assert_eq!(mix("display", "flex", "none", 0.9).unwrap(), "flex");
         assert_eq!(mix("display", "flex", "block", 0.4), None);
         assert_eq!(mix("font-size", "16px", "32px", 0.25).unwrap(), "20px");
+        let gradients = [
+            "linear-gradient(red, blue)",
+            "linear-gradient(green, yellow)",
+        ];
+        assert_eq!(
+            mix("background-image", gradients[0], gradients[1], 0.3),
+            None
+        );
         assert_eq!(
             mix("box-shadow", "none", "0 0 10px red", 0.5).unwrap(),
             "0px 0px 5px 0px #ff000080"

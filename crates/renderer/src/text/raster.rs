@@ -95,6 +95,35 @@ mod tests {
     use super::*;
     use crate::{Font, TextSystem, px};
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn smoothed_dark_glyphs_cover_the_rows_of_chrome() {
+        let text = TextSystem::new();
+        let font = text.face(&Font::new("Helvetica"));
+        let glyph = text.platform.glyph(font, 'H').unwrap();
+        // The top edge of an 'H' at 32 px and 2x, in the darkest pixel of each row.
+        let edge = |dilation| {
+            let raster = GlyphRaster {
+                font,
+                glyph,
+                size: px(32.),
+                scale: 2.,
+                subpixel: 0,
+                emoji: false,
+                dilation,
+            };
+            let (_, size, bytes) = text.raster(&raster, 512).unwrap().unwrap();
+            bytes
+                .chunks(size.width as usize)
+                .map(|row| *row.iter().max().unwrap())
+                .find(|&alpha| alpha > 0)
+                .unwrap()
+        };
+        // Chromium has a partial row of 120 above the cap height, and a glyph without smoothing starts lower.
+        assert!((i32::from(edge(1)) - 120).abs() < 16, "{}", edge(1));
+        assert!(edge(0) > 200, "{}", edge(0));
+    }
+
     #[test]
     fn huge_glyphs_raster_small_and_stretch_to_their_size() {
         let text = TextSystem::new();

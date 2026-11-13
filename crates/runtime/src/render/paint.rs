@@ -1,6 +1,6 @@
 use crate::style;
 use crate::style::Prop;
-use renderer::{Child, Hooks, NodeCx, Pixels, Point, Rect, Window, point, px};
+use renderer::{Child, Hooks, NodeCx, Pixels, Point, Rect, Size, Window, point, px};
 use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 pub(super) struct Turned {
@@ -121,6 +121,9 @@ pub(super) struct Picture {
     pub(super) source: Source,
     pub(super) fit: renderer::ObjectFit,
     pub(super) cropped: Option<renderer::Radii<Pixels>>,
+    /// `object-position` when it isn't centered.
+    pub(super) position: Option<(Rc<str>, style::Lengths)>,
+    pub(super) pixelated: bool,
 }
 
 impl Hooks for Picture {
@@ -155,12 +158,25 @@ impl Hooks for Picture {
             && image.size().height > 0
         {
             let bounds = cx.bounds;
-            let fitted = self.fit.place(bounds, image.size());
+            let mut fitted = self.fit.place(bounds, image.size());
+            if let Some((position, units)) = &self.position {
+                let free = bounds.size - fitted.size;
+                let [x, y] = super::effects::place(
+                    position,
+                    [f32::from(free.width), f32::from(free.height)],
+                    units,
+                );
+                fitted.origin = bounds.origin + point(px(x), px(y));
+            }
             match self.cropped {
-                Some(corners) => cx.window.draw_image(bounds, fitted, corners, image, false),
+                Some(corners) => {
+                    cx.window
+                        .draw_image(bounds, fitted, corners, image, false, self.pixelated)
+                }
                 None => {
                     let radii = cx.style.corner_radii.resolve(bounds.size);
-                    cx.window.draw_image(fitted, bounds, radii, image, false);
+                    cx.window
+                        .draw_image(fitted, fitted, radii, image, false, self.pixelated);
                 }
             }
         }
@@ -197,7 +213,7 @@ pub(super) struct DomBox {
     pub(super) margin: [f32; 4],
     pub(super) cell: Option<usize>,
     pub(super) grid: Option<(usize, bool)>,
-    pub(super) parts: Rc<[(usize, Vec<usize>)]>,
+    pub(super) parts: Rc<[(usize, bool, Vec<usize>)]>,
     pub(super) shared: Option<[f32; 4]>,
     pub(super) leading: Option<[f32; 3]>,
     pub(super) boxless: bool,
@@ -231,7 +247,12 @@ impl DomBox {
         }
     }
 
-    fn mirror(&self, mirror: &mut crate::dom::LayoutMirror, window_bounds: Rect<Pixels>) {
+    fn mirror(
+        &self,
+        mirror: &mut crate::dom::LayoutMirror,
+        window_bounds: Rect<Pixels>,
+        size: Size<Pixels>,
+    ) {
         let [mut top, right, mut bottom, left] = self.shared.unwrap_or_default();
         if let Some([line, above, below]) = self.leading
             && (f32::from(window_bounds.size.height) - line).abs() < 0.5
@@ -250,6 +271,12 @@ impl DomBox {
                     f32::from(window_bounds.size.height) - top - bottom,
                 ]
             },
+        );
+        let scaled = |a: Pixels, b: Pixels| (f32::from(a) - f32::from(b)).abs() > 0.01;
+        mirror.transformed(
+            self.id,
+            scaled(window_bounds.size.width, size.width)
+                || scaled(window_bounds.size.height, size.height),
         );
     }
 
@@ -271,21 +298,30 @@ impl DomBox {
         if !self.parts.is_empty() {
             let mut host = view.host.borrow_mut();
             let bounds = &mut host.dom.entry(view.id).or_default().bounds;
-            for (part, members) in self.parts.iter() {
+            // Rows and row groups span all columns of the table. A row ends where its first cell that
+            // spans no rows below ends.
+            let mut across = [f32::INFINITY, f32::NEG_INFINITY];
+            for (part, row, members) in self.parts.iter() {
                 let union = members
                     .iter()
                     .filter_map(|member| bounds.get(member).copied())
                     .reduce(|[x, y, w, h], [a, b, c, d]| {
                         let [left, top] = [x.min(a), y.min(b)];
-                        [
-                            left,
-                            top,
-                            (x + w).max(a + c) - left,
-                            (y + h).max(b + d) - top,
-                        ]
+                        let bottom = if *row {
+                            (y + h).min(b + d)
+                        } else {
+                            (y + h).max(b + d)
+                        };
+                        [left, top, (x + w).max(a + c) - left, bottom - top]
                     });
                 if let Some(union) = union {
+                    across = [across[0].min(union[0]), across[1].max(union[0] + union[2])];
                     bounds.insert(*part, union);
+                }
+            }
+            for (part, ..) in self.parts.iter() {
+                if let Some(rect) = bounds.get_mut(part) {
+                    [rect[0], rect[2]] = [across[0], across[1] - across[0]];
                 }
             }
         }
@@ -545,7 +581,7 @@ impl Hooks for DomBox {
                 {
                     window.redraw();
                 }
-                self.mirror(&mut dom.bounds, window_bounds);
+                self.mirror(&mut dom.bounds, window_bounds, bounds.size);
                 let width = f32::from(bounds.size.width);
                 let [top, right, bottom, left] = self.margin;
                 let cell = self
@@ -660,7 +696,7 @@ impl Hooks for DomBox {
                 let mut host = view.host.borrow_mut();
                 let dom = host.dom.entry(view.id).or_default();
                 if moved {
-                    self.mirror(&mut dom.bounds, window_bounds);
+                    self.mirror(&mut dom.bounds, window_bounds, bounds.size);
                 }
                 dom.cull.info.get(self.id).map_or(0, |info| info.flags)
             };
@@ -1010,6 +1046,7 @@ fn mask_svg<'a>(
             units,
             width,
             height,
+            [0., 0., width, height],
         ) && let Some(start) = svg.find('>')
             && let Some(end) = svg.rfind("</svg>")
         {

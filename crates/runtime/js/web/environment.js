@@ -21,6 +21,7 @@ globalThis.__appsBrowserEnvironment = (call, task) => {
     get(target, key) { if (typeof key === 'symbol' || key in target) { const value = Reflect.get(target, key, target); return typeof value === 'function' ? value.bind(target) : value; } return target.getItem(key) ?? undefined; },
     set(target, key, value) { target.setItem(key, value); return true; },
     deleteProperty(target, key) { target.removeItem(key); return true; },
+    has(target, key) { return key in target || typeof key === 'string' && target.getItem(key) !== null; },
     ownKeys(target) { return native(storageKinds.get(target) + '.keys'); },
     getOwnPropertyDescriptor(target, key) { const value = target.getItem(key); return value === null ? undefined : { value, enumerable: true, configurable: true, writable: true }; },
   });
@@ -207,11 +208,16 @@ globalThis.__appsBrowserEnvironment = (call, task) => {
   }
   Object.assign(globalThis, { Storage, IDBFactory, IDBDatabase, IDBTransaction, IDBRequest, IDBOpenDBRequest, IDBObjectStore, IDBCursor, IDBCursorWithValue: IDBCursor, IDBKeyRange, indexedDB: new IDBFactory() });
   let current = new URL('apps://app/'), entries = [{ url: current.href, state: null }], position = 0;
-  const changed = oldURL => { if (new URL(oldURL).hash !== current.hash) setTimeout(() => dispatchEvent(Object.assign(new Event('hashchange'), { oldURL, newURL: current.href })), 0); };
+  const changed = oldURL => { if (new URL(oldURL).hash !== current.hash) setTimeout(() => dispatchEvent(Object.assign(new (globalThis.HashChangeEvent ?? Event)('hashchange'), { oldURL, newURL: current.href })), 0); };
   const navigate = (url, replace = false, reload = false) => {
     const target = new URL(String(url), current), oldURL = current.href;
     if (!reload && target.href.split('#')[0] === current.href.split('#')[0]) {
-      current = target; if (replace) entries[position] = { url: current.href, state: null }; else { entries.splice(++position); entries.push({ url: current.href, state: null }); } dispatchEvent(Object.assign(new Event('popstate'), { state: null })); changed(oldURL); entryChanged();
+      current = target; if (replace) entries[position] = { url: current.href, state: null }; else { entries.splice(++position); entries.push({ url: current.href, state: null }); }
+      // As in browsers, the page scrolls to the element of the fragment, or to the top for an empty fragment or `#top`.
+      const id = decodeURIComponent(current.hash.slice(1)), element = id && globalThis.document?.getElementById(id);
+      globalThis.document?._target?.(element);
+      if (element) element.scrollIntoView(); else if (globalThis.document && (!id || id.toLowerCase() === 'top')) scrollTo(0, 0);
+      dispatchEvent(Object.assign(new (globalThis.PopStateEvent ?? Event)('popstate'), { state: null })); changed(oldURL); entryChanged();
     } else call('dom.navigate', target.href, replace, reload);
   };
   // URL origins of non-special schemes are opaque, but code uses `location.origin` as a base URL, as with a privileged Electron scheme.
@@ -231,7 +237,7 @@ globalThis.__appsBrowserEnvironment = (call, task) => {
     pushState(state, _, url) { this._set(state, url, false); }
     replaceState(state, _, url) { this._set(state, url, true); }
     _set(state, url, replace) { const target = url === undefined || url === null ? new URL(current) : new URL(String(url), current); if (target.origin !== current.origin || target.protocol !== current.protocol || target.host !== current.host) throw fail('SecurityError'); const entry = { url: target.href, state: clone(state) }; current = target; if (replace) entries[position] = entry; else { entries.splice(++position); entries.push(entry); } entryChanged(); }
-    go(delta = 0) { delta = Math.trunc(Number(delta) || 0); if (!delta) { navigate(current.href, true, true); return; } const next = position + delta; if (next < 0 || next >= entries.length) return; setTimeout(() => { const oldURL = current.href; position = next; current = new URL(entries[position].url); dispatchEvent(Object.assign(new Event('popstate'), { state: this.state })); changed(oldURL); entryChanged(); }, 0); }
+    go(delta = 0) { delta = Math.trunc(Number(delta) || 0); if (!delta) { navigate(current.href, true, true); return; } const next = position + delta; if (next < 0 || next >= entries.length) return; setTimeout(() => { const oldURL = current.href; position = next; current = new URL(entries[position].url); const id = decodeURIComponent(current.hash.slice(1)); globalThis.document?._target?.(id && document.getElementById(id)); dispatchEvent(Object.assign(new (globalThis.PopStateEvent ?? Event)('popstate'), { state: this.state })); changed(oldURL); entryChanged(); }, 0); }
     back() { this.go(-1); }
     forward() { this.go(1); }
   }

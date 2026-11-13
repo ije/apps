@@ -239,7 +239,8 @@ return (body, execute) => {
   // document.currentScript.
   if (this !== globalThis) {
     const pending = entries.slice();
-    this.__appsNext = () => { globalThis.__appsScript?.(null); if (!pending.length) return false; entry(pending.shift()); return true; };
+    // Like browsers, an error in one script goes to the window `error` event, and the next script still runs.
+    this.__appsNext = () => { globalThis.__appsScript?.(null); if (!pending.length) return false; try { entry(pending.shift()); } catch (error) { if (!globalThis.reportError) throw error; reportError(error); } return true; };
     return;
   }
   let failed = false, failure;

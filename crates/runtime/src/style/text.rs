@@ -39,6 +39,8 @@ pub(crate) struct InlineText {
     pub shadows: Vec<(f32, f32, f32, u32)>,
     pub first_line: Option<Box<(renderer::TextRun, renderer::TextRun, Option<String>)>>,
     pub line_heights: Vec<(usize, LineHeight)>,
+    /// A run has another font, size or line height than the block, so rows can grow around it.
+    pub mixed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -112,6 +114,9 @@ pub(crate) fn restyle(
                 }
                 if piece.strikethrough == base.strikethrough {
                     piece.strikethrough = pseudo.strikethrough;
+                }
+                if piece.overline == base.overline {
+                    piece.overline = pseudo.overline;
                 }
                 if piece.font_size == base.font_size {
                     piece.font_size = pseudo.font_size;
@@ -253,7 +258,9 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
             .and_then(|value| units.resolve(value, units.font.em))
             .map(renderer::px)
     };
-    let thickness = length(Prop::TEXT_DECORATION_THICKNESS).unwrap_or(renderer::px(1.));
+    // Like Chromium, `auto` and `from-font` are a tenth of the font size.
+    let thickness =
+        length(Prop::TEXT_DECORATION_THICKNESS).unwrap_or(renderer::px(units.font.em / 10.));
     let decoration_style = match style.get(Prop::TEXT_DECORATION_STYLE) {
         Some("double") => renderer::DecorationStyle::Double,
         Some("dotted") => renderer::DecorationStyle::Dotted,
@@ -280,11 +287,24 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
                 style: decoration_style,
                 offset: None,
             }),
+        overline: lines.contains("overline").then_some(renderer::Decoration {
+            thickness,
+            color: Some(decoration),
+            style: decoration_style,
+            offset: None,
+        }),
         letter_spacing: spacing(style, units, Prop::LETTER_SPACING),
         word_spacing: spacing(style, units, Prop::WORD_SPACING),
         font_size: None,
         inset: Default::default(),
         nowrap: false,
+        tab_size: style.get(Prop::TAB_SIZE).map_or(8., |value| {
+            value
+                .parse::<f32>()
+                .ok()
+                .filter(|count| *count >= 0.)
+                .unwrap_or_else(|| -units.resolve(value, units.font.em).unwrap_or(0.).max(0.))
+        }),
     }
 }
 
@@ -592,7 +612,10 @@ pub(crate) fn inline_text(
     let own = doc.nodes[id].tag == "#text";
     if doc.nodes[id].sf_symbol().is_some()
         || !own && doc.nodes[id].children.is_empty()
-        || matches!(doc.nodes[id].tag.as_str(), "select" | "optgroup")
+        || matches!(
+            doc.nodes[id].tag.as_str(),
+            "select" | "optgroup" | "progress" | "meter"
+        )
         || parent
             .get(Prop::DISPLAY)
             .is_some_and(|value| matches!(value, "grid" | "flex" | "inline-flex" | "inline-grid"))
@@ -747,6 +770,7 @@ pub(crate) fn inline_text(
             let mut run = text_run(parent, &styles.lengths[id], '\u{fffc}'.len_utf8());
             run.underline = None;
             run.strikethrough = None;
+            run.overline = None;
             run.color = renderer::Color::TRANSPARENT;
             run.nowrap = style.get(Prop::WHITE_SPACE) == Some("nowrap");
             run.font_size = Some(renderer::px(0.01));
@@ -852,6 +876,9 @@ pub(crate) fn inline_text(
             let mode = style.get(Prop::WHITE_SPACE).unwrap_or("normal");
             let preserve = matches!(mode, "pre" | "pre-wrap" | "break-spaces");
             let transform = style.get(Prop::TEXT_TRANSFORM).unwrap_or("");
+            // Like Chromium, small caps are capitals at 70% of the size, where the letter was lowercase.
+            let caps = style.get(Prop::FONT_VARIANT) == Some("small-caps");
+            let mut lowered: Vec<std::ops::Range<usize>> = Vec::new();
             let mut word = true;
             text.reserve(node.text.len());
             for c in node.text.chars() {
@@ -864,6 +891,16 @@ pub(crate) fn inline_text(
                     continue;
                 }
                 let c = case(c, transform, word);
+                let c = match c.to_uppercase().next() {
+                    Some(upper) if caps && c.is_lowercase() && upper.len_utf8() == c.len_utf8() => {
+                        match lowered.last_mut() {
+                            Some(last) if last.end == text.len() => last.end += c.len_utf8(),
+                            _ => lowered.push(text.len()..text.len() + c.len_utf8()),
+                        }
+                        upper
+                    }
+                    _ => c,
+                };
                 text.push(c);
                 space = c == '\n';
                 word = !c.is_alphanumeric();
@@ -881,12 +918,28 @@ pub(crate) fn inline_text(
                 }
                 led = boxes.len();
                 opening = 0.;
-                runs.push(run);
-                line_heights.push((text.len(), line_height(style)));
+                let mut from = start;
+                for range in lowered.iter().chain([&(text.len()..text.len())]) {
+                    for (end, small) in [(range.start, false), (range.end, true)] {
+                        if end > from {
+                            let mut piece = run.clone();
+                            piece.len = end - from;
+                            if small {
+                                piece.font_size = Some(renderer::px(size * 0.7));
+                            }
+                            if from > start {
+                                piece.inset[0] = renderer::px(0.);
+                            }
+                            runs.push(piece);
+                            line_heights.push((end, line_height(style)));
+                            from = end;
+                        }
+                    }
+                }
             }
         }
     }
-    if text.contains(['\t', '\r']) {
+    if text.contains('\r') {
         return None;
     }
     if text.ends_with(' ')
@@ -988,7 +1041,13 @@ pub(crate) fn inline_text(
                 + runs.get(run + 1).map_or(0., |run| f32::from(run.inset[0]));
         }
     }
+    let (root, height) = (font(parent), line_height(parent));
+    let mixed = runs
+        .iter()
+        .any(|run| run.font_size.is_some() || run.font != root)
+        || line_heights.iter().any(|(_, kind)| *kind != height);
     Some(InlineText {
+        mixed,
         text: text.into(),
         runs,
         ranges,
@@ -1012,6 +1071,7 @@ pub(crate) fn inline_text(
 pub(crate) fn word_break(style: &Style) -> renderer::WordBreak {
     match (style.get(Prop::WORD_BREAK), style.get(Prop::OVERFLOW_WRAP)) {
         (Some("break-all"), _) => renderer::WordBreak::BreakAll,
+        (Some("keep-all"), _) => renderer::WordBreak::KeepAll,
         (Some("break-word"), _) | (_, Some("anywhere")) => renderer::WordBreak::Anywhere,
         (_, Some("break-word")) => renderer::WordBreak::BreakWord,
         _ => renderer::WordBreak::Normal,

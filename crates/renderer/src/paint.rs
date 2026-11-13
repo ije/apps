@@ -71,7 +71,19 @@ impl Window {
         instance.color = fill.fade(self.opacity).to_array();
         instance.border_color = border.color.fade(self.opacity).to_array();
         instance.aux = [widths.top, widths.right, widths.bottom, widths.left];
-        instance.info[1] = (border.style as u32 | u32::from(border.sides) << 8) as f32;
+        // Like in Chromium, dashes of square borders thinner than 3 CSS pixels are longer.
+        let thin = border.style == BorderStyle::Dashed
+            && instance.radii == [0.; 8]
+            && [
+                border.widths.top,
+                border.widths.right,
+                border.widths.bottom,
+                border.widths.left,
+            ]
+            .iter()
+            .all(|width| width.0 < 3.);
+        instance.info[1] =
+            (border.style as u32 | u32::from(thin) << 4 | u32::from(border.sides) << 8) as f32;
         if instance.color[3] > 0. {
             self.scene.push(instance);
             return;
@@ -474,6 +486,7 @@ impl Window {
         radii: impl Into<Radii<Pixels>>,
         image: Arc<RenderImage>,
         grayscale: bool,
+        pixelated: bool,
     ) {
         if self.opacity <= 0. {
             return;
@@ -516,7 +529,11 @@ impl Window {
             .fit(visible.size)
             .scale(self.scale_factor)
             .to_array();
-        instance.info[1] = f32::from(u8::from(grayscale) | u8::from(image.is_premultiplied()) << 1);
+        instance.info[1] = f32::from(
+            u8::from(grayscale)
+                | u8::from(image.is_premultiplied()) << 1
+                | u8::from(pixelated) << 2,
+        );
         self.scene.push(instance);
     }
 

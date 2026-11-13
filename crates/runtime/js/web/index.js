@@ -26,6 +26,7 @@ globalThis.__appsWeb = (call, codec) => {
     composedPath() { const state = eventStates.get(this), path = state.path ?? [state.target]; return !state.dispatching ? [] : state.hidden ? path.filter(node => !state.hidden(node, state.currentTarget)) : [...path]; }
     get cancelBubble() { return eventStates.get(this).stopped; }
     set cancelBubble(value) { if (value) this.stopPropagation(); }
+    get srcElement() { return eventStates.get(this).target; }
     get returnValue() { return !this.defaultPrevented; }
     set returnValue(value) { if (!value) this.preventDefault(); }
     get isTrusted() { return !!eventStates.get(this).trusted; }
@@ -98,7 +99,7 @@ globalThis.__appsWeb = (call, codec) => {
   const abort = (signal, reason) => {
     const state = signals.get(signal);
     if (state.aborted) return;
-    state.aborted = true; state.reason = reason === undefined ? new DOMException('The operation was aborted', 'AbortError') : reason;
+    state.aborted = true; state.reason = reason === undefined ? new DOMException('signal is aborted without reason', 'AbortError') : reason;
     signal.dispatchEvent(new Event('abort'));
   };
   class AbortSignal extends EventTarget {
@@ -358,6 +359,7 @@ globalThis.__appsWeb = (call, codec) => {
   class File extends Blob {
     constructor(parts, name, options = {}) { super(parts, options); this.name = usv(name); this.lastModified = Number(options.lastModified ?? Date.now()); }
   }
+  for (const Type of [Blob, File]) Object.defineProperty(Type.prototype, Symbol.toStringTag, { configurable: true, value: Type.name });
   const forms = new WeakMap();
   const formValue = (value, filename) => {
     if (filename !== undefined && !(value instanceof Blob)) throw new TypeError('Filename requires a Blob');
@@ -365,7 +367,7 @@ globalThis.__appsWeb = (call, codec) => {
     return value instanceof File && filename === undefined ? value : new File([value], filename ?? 'blob', { type: value.type });
   };
   class FormData {
-    constructor(form, submitter = null) { forms.set(this, []); if (form !== undefined) { if (typeof HTMLFormElement !== 'function' || !(form instanceof HTMLFormElement)) throw new TypeError('Expected a form element'); for (const [name, value] of form._entries(submitter)) this.append(name, value); } }
+    constructor(form, submitter = null) { forms.set(this, []); if (form !== undefined) { if (typeof HTMLFormElement !== 'function' || !(form instanceof HTMLFormElement)) throw new TypeError('Expected a form element'); form._entries(submitter, this); } }
     append(name, value, filename) { forms.get(this).push([usv(name), formValue(value, filename)]); }
     set(name, value, filename) { name = usv(name); value = formValue(value, filename); const list = forms.get(this), first = list.findIndex(pair => pair[0] === name); if (first < 0) list.push([name, value]); else { list[first] = [name, value]; forms.set(this, list.filter((pair, i) => pair[0] !== name || i === first)); } }
     delete(name) { name = usv(name); forms.set(this, forms.get(this).filter(pair => pair[0] !== name)); }

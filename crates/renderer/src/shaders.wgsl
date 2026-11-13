@@ -27,6 +27,8 @@ const FILL: u32 = 5u;
 const DASHED: u32 = 1u;
 const DOTTED: u32 = 2u;
 const DOUBLE: u32 = 3u;
+// A flag next to the border style: dashes of borders thinner than 3 CSS pixels.
+const THIN: u32 = 16u;
 
 const COMPOSITE_MATRIX: u32 = 1u;
 const COMPOSITE_CLIP: u32 = 2u;
@@ -70,6 +72,7 @@ struct Composite {
 struct Blur {
     region: vec4<f32>,
     source_rect: vec4<f32>,
+    edge: vec4<f32>,
     direction: vec2<f32>,
     sigma: f32,
     scale: f32,
@@ -192,9 +195,12 @@ fn either_speed(a: f32, b: f32) -> f32 {
     return min(a, b);
 }
 
-fn dash_coverage(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, widths: vec4<f32>, dotted: bool, depth: f32, inner: f32) -> f32 {
-    let period_widths = select(3.0, 2.0, dotted);
-    let dash = select(2.0, 1.0, dotted) / period_widths;
+// Like Chromium: dashes are 2 widths long with 1 width gaps, or 3 and 2 below 3 CSS pixels (`thin`), and dots
+// have 1 width gaps. The gaps stretch or shrink to fit whole dashes. A rounded border has a dash centered in
+// each corner.
+fn dash_coverage(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, widths: vec4<f32>, dotted: bool, thin: bool, depth: f32, inner: f32) -> f32 {
+    let period_widths = select(select(3.0, 2.0, dotted), 5.0, thin);
+    let dash = select(select(2.0, 1.0, dotted), 3.0, thin) / period_widths;
     let local = p - rect.xy;
     let half = rect.zw * 0.5;
     let from_center = local - half;
@@ -205,6 +211,7 @@ fn dash_coverage(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, wi
     var t = 0.0;
     var speed = 0.0;
     var total = 0.0;
+    var centered = false;
     if all(rx == vec4<f32>(0.0)) {
         let width = select(max(widths.y, widths.w), max(widths.x, widths.z), across);
         speed = 1.0 / (period_widths * width);
@@ -219,7 +226,8 @@ fn dash_coverage(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, wi
             either_speed(side_speed.z, side_speed.w),
             either_speed(side_speed.x, side_speed.w),
         );
-        let middle = select(0.0, 0.5, dotted);
+        // Corners measure along the middle of the border.
+        let middle = 0.5;
         let sweep = max(vec4<f32>(0.0), (rx.yzwx + ry.yzwx) * 0.5 - middle * max(widths.xzzx, widths.yyww)) * (PI * 0.5) * corner_speed;
         let top_end = (rect.z - rx.x - rx.y) * side_speed.x;
         let right_start = top_end + sweep.x;
@@ -266,10 +274,32 @@ fn dash_coverage(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, wi
             speed = side_speed.y;
             t = right_start + (local.y - ry.y) * speed;
         }
+        // Each side runs from the middle of one corner to the middle of the next.
+        let ends = vec4<f32>(right_start - sweep.x * 0.5, right_end + sweep.y * 0.5, left_start - sweep.z * 0.5, left_end + sweep.w * 0.5);
+        if t >= ends.w {
+            t -= total;
+        }
+        var start = ends.z;
+        var end = ends.w;
+        if t < ends.x {
+            start = ends.w - total;
+            end = ends.x;
+        } else if t < ends.y {
+            start = ends.x;
+            end = ends.y;
+        } else if t < ends.z {
+            start = ends.y;
+            end = ends.z;
+        }
+        t -= start;
+        total = end - start;
+        centered = true;
     }
-    if total >= 1.0 {
-        let period = total / floor(total);
-        let from_dash = (t + (period - dash) * 0.5) % period - period * 0.5;
+    if total >= 1.0 || centered && total > 0.0 {
+        let fewer = max(floor(total), 1.0);
+        let count = select(fewer, fewer + 1.0, (fewer + 1.0 - total) * fewer < (total - fewer) * (fewer + 1.0));
+        let period = total / count;
+        let from_dash = (t + select((period - dash) * 0.5, period * 0.5, centered)) % period - period * 0.5;
         if dotted {
             let width = depth + inner;
             return saturate(0.5 - (length(vec2<f32>(from_dash / speed, depth - width * 0.5)) - width * 0.5));
@@ -323,12 +353,14 @@ fn box_color(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, fill: 
     if sides != 0u {
         alpha *= side_coverage(p - rect.xy, rect.zw, widths, sides);
     }
-    let style = flags & 255u;
+    let style = flags & 15u;
     if style == DOUBLE {
+        // Both lines take a whole number of pixels, like in Chromium.
         let width = inner - outer;
-        alpha *= saturate(0.5 - min(-outer - width / 3.0, width * 2.0 / 3.0 + outer));
+        let line = max(round(width / 3.0), 1.0);
+        alpha *= saturate(0.5 - min(-outer - line, width - line + outer));
     } else if style == DASHED || style == DOTTED {
-        alpha *= dash_coverage(p, rect, rx, ry, widths, style == DOTTED, -outer, inner);
+        alpha *= dash_coverage(p, rect, rx, ry, widths, style == DOTTED, (flags & THIN) != 0u, -outer, inner);
     }
     let fill_color = premultiply(fill);
     let over = vec4<f32>(border.rgb * alpha, alpha) + fill_color * (1.0 - alpha);
@@ -445,7 +477,10 @@ fn draw_fragment(v: Varyings) -> @location(0) vec4<f32> {
             color = premultiply(v.color) * coverage;
         }
         default: {
-            var pixel = textureSampleLevel(t1, filtered, v.texel / vec2<f32>(textureDimensions(t1)), 0.0);
+            // A pixelated image samples the center of its nearest texel. Edges sample only their own
+            // image, not the atlas around it, so a scaled image keeps solid edges.
+            let texel = clamp(select(v.texel, floor(v.texel) + 0.5, (flags & 4u) != 0u), v.aux.xy + 0.5, max(v.aux.xy + 0.5, v.aux.xy + v.aux.zw - 0.5));
+            var pixel = textureSampleLevel(t1, filtered, texel / vec2<f32>(textureDimensions(t1)), 0.0);
             if (flags & 2u) != 0u && pixel.a > 0.0 {
                 pixel = vec4<f32>(pixel.rgb / pixel.a, pixel.a);
             }
@@ -487,8 +522,17 @@ fn layer_pixel(source: texture_2d<f32>, at: vec2<f32>, rect: vec4<f32>) -> vec4<
     return textureSampleLevel(source, filtered, uv, 0.0);
 }
 
+// Reflects `at` into `edge`, the backdrop-filter edge mode. An empty `edge` keeps `at`.
+fn edge_mirror(at: vec2<f32>, edge: vec4<f32>) -> vec2<f32> {
+    if edge.z <= 0.0 {
+        return at;
+    }
+    let span = max(edge.zw - 1.0, vec2<f32>(0.0));
+    return edge.xy + 0.5 + clamp(span - abs(span - abs(at - edge.xy - 0.5)), vec2<f32>(0.0), span);
+}
+
 // A Gaussian along `direction` with at most 32 taps a side. `texel` is a source pixel in window pixels.
-fn gaussian(source: texture_2d<f32>, at: vec2<f32>, direction: vec2<f32>, sigma: f32, texel: f32, rect: vec4<f32>) -> vec4<f32> {
+fn gaussian(source: texture_2d<f32>, at: vec2<f32>, direction: vec2<f32>, sigma: f32, texel: f32, rect: vec4<f32>, edge: vec4<f32>) -> vec4<f32> {
     if sigma < 0.25 {
         return layer_pixel(source, at, rect);
     }
@@ -500,7 +544,7 @@ fn gaussian(source: texture_2d<f32>, at: vec2<f32>, direction: vec2<f32>, sigma:
     for (var tap = 1.0; tap <= taps; tap += 1.0) {
         let offset = tap * step;
         let weight = exp(-0.5 * offset * offset / (sigma * sigma));
-        sum += (layer_pixel(source, at + direction * offset, rect) + layer_pixel(source, at - direction * offset, rect)) * weight;
+        sum += (layer_pixel(source, edge_mirror(at + direction * offset, edge), rect) + layer_pixel(source, edge_mirror(at - direction * offset, edge), rect)) * weight;
         total += 2.0 * weight;
     }
     return sum / total;
@@ -579,11 +623,11 @@ fn composite_fragment(v: Placed) -> @location(0) vec4<f32> {
     }
     var color: vec4<f32>;
     if (c.flags & COMPOSITE_BACKDROP) != 0u {
-        color = gaussian(t0, p, vec2<f32>(0.0, 1.0), c.blur, 1.0, c.source_rect);
+        color = gaussian(t0, p, vec2<f32>(0.0, 1.0), c.blur, 1.0, c.source_rect, c.shadow);
     } else if (c.flags & COMPOSITE_SHADOW) != 0u {
-        color = c.shadow_color * gaussian(t0, v.local - c.shadow.xy, vec2<f32>(0.0, 1.0), c.blur, 1.0, c.source_rect).a;
+        color = c.shadow_color * gaussian(t0, v.local - c.shadow.xy, vec2<f32>(0.0, 1.0), c.blur, 1.0, c.source_rect, vec4<f32>(0.0)).a;
     } else {
-        color = gaussian(t0, v.local, vec2<f32>(0.0, 1.0), c.blur, 1.0, c.source_rect);
+        color = gaussian(t0, v.local, vec2<f32>(0.0, 1.0), c.blur, 1.0, c.source_rect, vec4<f32>(0.0));
     }
     if (c.flags & COMPOSITE_MATRIX) != 0u && color.a > 0.0 {
         let mapped = saturate(c.color_matrix * vec4<f32>(color.rgb / color.a, color.a) + c.color_offset);
@@ -624,7 +668,7 @@ fn blur_vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32
 @fragment
 fn blur_fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let at = globals.viewport.xy + position.xy * blur.scale;
-    return gaussian(t0, at, blur.direction, blur.sigma, blur.scale, blur.source_rect);
+    return gaussian(t0, at, blur.direction, blur.sigma, blur.scale, blur.source_rect, blur.edge);
 }
 
 @vertex

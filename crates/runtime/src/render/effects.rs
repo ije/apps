@@ -382,9 +382,10 @@ pub(crate) fn filters(value: &str, units: &Lengths, doc: &Document, ids: &Ids) -
                 }
             }
             "drop-shadow" => {
+                // Chrome uses the blur length as the standard deviation, not half of it as box-shadow does.
                 for shadow in units.shadows(args, false) {
                     effects.push(PaintEffect {
-                        shadow: Some((shadow.offset, shadow.blur_radius, shadow.color)),
+                        shadow: Some((shadow.offset, shadow.blur_radius * 2., shadow.color)),
                         ..Default::default()
                     });
                 }
@@ -579,7 +580,66 @@ pub(crate) fn clip(
     match name.to_ascii_lowercase().as_str() {
         "inset" | "rect" | "xywh" => {
             let (rect, radii) = style::clip_path(value, units, size)?;
-            Some(Clip::Rounded(rect, radii))
+            let round = args.split_once(" round ").map(|(_, round)| round.trim());
+            let Some(round) = round.filter(|round| round.contains(['%', '/'])) else {
+                return Some(Clip::Rounded(rect, radii));
+            };
+            // Percent and `/` radii can be elliptical. As for border-radius, percentages take the
+            // reference box, and radii that don't fit scale down together.
+            let (horizontal, vertical) = round.split_once('/').unwrap_or((round, round));
+            let corners = |list: &str, base: f32| -> Option<[f32; 4]> {
+                let values = components(list.trim(), ' ');
+                let values = match values[..] {
+                    [a] => [a; 4],
+                    [a, b] => [a, b, a, b],
+                    [a, b, c] => [a, b, c, b],
+                    [a, b, c, d] => [a, b, c, d],
+                    _ => return None,
+                };
+                let mut out = [0.; 4];
+                for (corner, value) in values.into_iter().enumerate() {
+                    out[corner] = units.resolve(value, base)?.max(0.);
+                }
+                Some(out)
+            };
+            let [w, h] = [rect[2], rect[3]];
+            let (mut rx, mut ry) = (corners(horizontal, width)?, corners(vertical, height)?);
+            let fit = [
+                w / (rx[0] + rx[1]),
+                h / (ry[1] + ry[2]),
+                w / (rx[2] + rx[3]),
+                h / (ry[3] + ry[0]),
+            ]
+            .into_iter()
+            .fold(1f32, f32::min);
+            rx = rx.map(|value| value * fit);
+            ry = ry.map(|value| value * fit);
+            if rx == ry {
+                return Some(Clip::Rounded(rect, rx));
+            }
+            let [x, y] = [rect[0], rect[1]];
+            Some(svg(format!(
+                "<path d=\"M{} {y}H{}A{} {} 0 0 1 {} {}V{}A{} {} 0 0 1 {} {}H{}A{} {} 0 0 1 {x} {}V{}A{} {} 0 0 1 {} {y}Z\"/>",
+                x + rx[0],
+                x + w - rx[1],
+                rx[1],
+                ry[1],
+                x + w,
+                y + ry[1],
+                y + h - ry[2],
+                rx[2],
+                ry[2],
+                x + w - rx[2],
+                y + h,
+                x + rx[3],
+                rx[3],
+                ry[3],
+                y + h - ry[3],
+                y + ry[0],
+                rx[0],
+                ry[0],
+                x + rx[0],
+            )))
         }
         "circle" | "ellipse" => {
             let (rect, radii) = style::clip_path(value, units, size)?;
@@ -791,41 +851,116 @@ pub(crate) fn gradient_axis(kind: &str, body: &str) -> Option<usize> {
     }
 }
 
+// The size and offset of a background tile in its positioning area. `natural` is the size of an image.
 pub(crate) fn tile(
     size: &str,
     position: &str,
     units: &Lengths,
     width: f32,
     height: f32,
+    natural: Option<[f32; 2]>,
 ) -> [[f32; 2]; 2] {
     let dims = style::components(size, ' ');
-    let dim = |axis: usize| {
-        let extent = [width, height][axis];
-        match dims.get(axis) {
-            None | Some(&"auto") => extent,
-            Some(value) => units.resolve(value, extent).unwrap_or(extent),
+    let [tw, th] = match (dims.as_slice(), natural) {
+        ([fit @ ("cover" | "contain")], Some([nw, nh])) => {
+            let [x, y] = [width / nw, height / nh];
+            let scale = if *fit == "cover" { x.max(y) } else { x.min(y) };
+            [nw * scale, nh * scale]
         }
-    };
-    let [tw, th] = if matches!(dims.as_slice(), ["cover"] | ["contain"]) {
-        [width, height]
-    } else {
-        [dim(0).max(0.1), dim(1).max(0.1)]
-    };
+        (["cover" | "contain"], None) => [width, height],
+        _ => {
+            let dim = |axis: usize| {
+                dims.get(axis)
+                    .filter(|value| **value != "auto")
+                    .and_then(|value| units.resolve(value, [width, height][axis]))
+            };
+            match ([dim(0), dim(1)], natural) {
+                ([Some(w), Some(h)], _) => [w, h],
+                ([Some(w), None], Some([nw, nh])) => [w, w * nh / nw],
+                ([None, Some(h)], Some([nw, nh])) => [h * nw / nh, h],
+                ([None, None], Some(natural)) => natural,
+                ([w, h], _) => [w.unwrap_or(width), h.unwrap_or(height)],
+            }
+        }
+    }
+    .map(|side| side.max(0.1));
     let tokens = style::components(position, ' ');
-    let (x, y) = match tokens.as_slice() {
-        [only] if matches!(*only, "top" | "bottom") => ("center", *only),
-        [only] => (*only, "center"),
-        [a, b, ..] if matches!(*a, "top" | "bottom") || matches!(*b, "left" | "right") => (*b, *a),
+    // Three and four values give each keyword an offset from its edge.
+    let mut pairs: Vec<(&str, Option<&str>)> = Vec::with_capacity(2);
+    for token in tokens.iter().copied() {
+        match pairs.last_mut() {
+            Some(last)
+                if tokens.len() > 2
+                    && !matches!(token, "left" | "right" | "top" | "bottom" | "center") =>
+            {
+                last.1 = Some(token)
+            }
+            _ => pairs.push((token, None)),
+        }
+    }
+    let center = ("center", None);
+    let (x, y) = match pairs.as_slice() {
+        [only] if matches!(only.0, "top" | "bottom") => (center, *only),
+        [only] => (*only, center),
+        [a, b, ..] if matches!(a.0, "top" | "bottom") || matches!(b.0, "left" | "right") => {
+            (*b, *a)
+        }
         [a, b, ..] => (*a, *b),
-        [] => ("0%", "0%"),
+        [] => (("0%", None), ("0%", None)),
     };
-    let at = [(x, width - tw), (y, height - th)].map(|(token, free)| match token {
-        "left" | "top" => 0.,
-        "center" => free / 2.,
-        "right" | "bottom" => free,
-        value => units.resolve(value, free).unwrap_or(0.),
+    let at = [(x, width - tw), (y, height - th)].map(|((token, offset), free)| {
+        let offset = offset
+            .and_then(|offset| units.resolve(offset, free))
+            .unwrap_or(0.);
+        match token {
+            "left" | "top" => offset,
+            "center" => free / 2.,
+            "right" | "bottom" => free - offset,
+            value => units.resolve(value, free).unwrap_or(0.),
+        }
     });
     [[tw, th], at]
+}
+
+/// The offset of a CSS `<position>` in `free`, the room left around the placed box.
+pub(crate) fn place(position: &str, free: [f32; 2], units: &Lengths) -> [f32; 2] {
+    let tokens = style::components(position, ' ');
+    let keyword = |token: &str| matches!(token, "left" | "right" | "top" | "bottom" | "center");
+    let offset = |token: &str, axis: usize| match token {
+        "left" | "top" => 0.,
+        "center" => free[axis] / 2.,
+        "right" | "bottom" => free[axis],
+        value => units.resolve(value, free[axis]).unwrap_or(0.),
+    };
+    if tokens.len() < 3 {
+        let (x, y) = match tokens.as_slice() {
+            [only] if matches!(*only, "top" | "bottom") => ("center", *only),
+            [only] => (*only, "center"),
+            [a, b] if matches!(*a, "top" | "bottom") || matches!(*b, "left" | "right") => (*b, *a),
+            [a, b, ..] => (*a, *b),
+            [] => ("0%", "0%"),
+        };
+        return [offset(x, 0), offset(y, 1)];
+    }
+    // Three or four values: keywords, each with an optional offset from its side.
+    let mut at = [None; 2];
+    let mut index = 0;
+    while let Some(&side) = tokens.get(index) {
+        let length = tokens.get(index + 1).filter(|token| !keyword(token));
+        index += 1 + usize::from(length.is_some());
+        let axis = match side {
+            "left" | "right" => 0,
+            "top" | "bottom" => 1,
+            _ => continue,
+        };
+        let length = length.map_or(0., |value| units.resolve(value, free[axis]).unwrap_or(0.));
+        at[axis] = Some(if matches!(side, "right" | "bottom") {
+            free[axis] - length
+        } else {
+            length
+        });
+    }
+    [0, 1].map(|axis| at[axis].unwrap_or(free[axis] / 2.))
 }
 
 fn gradient_stops<S: AsRef<str>>(
@@ -835,9 +970,18 @@ fn gradient_stops<S: AsRef<str>>(
     extent: f32,
 ) -> Option<Vec<(f32, (u32, u8))>> {
     let mut stops: Vec<(Option<f32>, (u32, u8))> = Vec::new();
+    let mut hints = Vec::new();
     for stop in parts.iter().map(AsRef::as_ref).skip(usize::from(prelude)) {
         let tokens = style::components(stop.trim(), ' ');
         let Some(ink) = tokens.iter().find_map(|token| style::color(token)) else {
+            // A lone position between two colors moves their midpoint.
+            if let [token] = tokens.as_slice()
+                && !stops.is_empty()
+                && let Some(offset) = units.resolve(token, extent).or_else(|| angle(token))
+            {
+                hints.push(stops.len());
+                stops.push((Some(offset), (0, 0)));
+            }
             continue;
         };
         let offsets: Vec<f32> = tokens
@@ -881,12 +1025,40 @@ fn gradient_stops<S: AsRef<str>>(
         }
         index += 1;
     }
-    Some(
-        stops
-            .into_iter()
-            .map(|(offset, ink)| (offset.unwrap_or(0.), ink))
-            .collect(),
-    )
+    let mut result = Vec::with_capacity(stops.len() + hints.len() * 8);
+    for (index, &(offset, ink)) in stops.iter().enumerate() {
+        let offset = offset.unwrap_or(0.);
+        if !hints.contains(&index) {
+            result.push((offset, ink));
+            continue;
+        }
+        let (Some(&(a, (ink_a, alpha_a))), Some(&(Some(b), (ink_b, alpha_b)))) = (
+            result.last(),
+            stops
+                .get(index + 1)
+                .filter(|_| !hints.contains(&(index + 1))),
+        ) else {
+            continue;
+        };
+        if b <= a {
+            continue;
+        }
+        let exponent = 0.5f32.ln() / ((offset - a) / (b - a)).clamp(0.001, 0.999).ln();
+        for step in 1..16 {
+            let t = step as f32 / 16.;
+            let p = t.powf(exponent);
+            let mix = |a: u32, b: u32| (a as f32 + (b as f32 - a as f32) * p).round() as u32;
+            let ink = [16, 8, 0]
+                .map(|shift| mix(ink_a >> shift & 255, ink_b >> shift & 255) << shift)
+                .into_iter()
+                .fold(0, |ink, channel| ink | channel);
+            result.push((
+                a + (b - a) * t,
+                (ink, mix(alpha_a.into(), alpha_b.into()) as u8),
+            ));
+        }
+    }
+    (result.len() >= 2).then_some(result)
 }
 
 pub(super) fn axis_mask(
@@ -977,8 +1149,10 @@ pub(crate) fn gradient_svg(
     units: Lengths,
     width: f32,
     height: f32,
+    area: [f32; 4],
 ) -> Option<String> {
-    let [[tw, th], [x, y]] = tile(size, position, &units, width, height);
+    let [[tw, th], [x, y]] = tile(size, position, &units, area[2], area[3], None);
+    let [x, y] = [x + area[0], y + area[1]];
     let parts = style::components(body, ',');
     let (first, space) = first_argument(body);
     let first = first.as_str();
@@ -1096,24 +1270,36 @@ pub(crate) fn gradient_svg(
         }
         _ => return None,
     };
-    let mut offsets = gradient_stops(&parts, prelude, &units, extent)?;
-    let space = space
-        .filter(|space| !space.starts_with("srgb"))
-        .or_else(|| {
-            let modern = ["oklch(", "oklab(", "lab(", "lch(", "color("];
-            modern
-                .iter()
-                .any(|name| body.contains(name))
-                .then(|| "oklab".to_owned())
-        });
-    if let Some(space) = space {
+    let stops = gradient_stops(&parts, prelude, &units, extent)?;
+    // Gradients mix premultiplied colors, and SVG mixes straight ones. So a transparent stop takes the color of
+    // each neighbor, and other alpha changes get mixed stops.
+    let mut offsets = Vec::with_capacity(stops.len() + 2);
+    for (index, &(offset, (ink, alpha))) in stops.iter().enumerate() {
+        if alpha > 0 {
+            offsets.push((offset, (ink, alpha)));
+            continue;
+        }
+        let [left, right] = [index.wrapping_sub(1), index + 1].map(|at| stops.get(at));
+        for side in [left.or(right), right.or(left)] {
+            offsets.push((offset, (side.map_or(ink, |stop| stop.1.0), 0)));
+        }
+    }
+    let space = space.filter(|space| space != "srgb").or_else(|| {
+        let modern = ["oklch(", "oklab(", "lab(", "lch(", "color("];
+        modern
+            .iter()
+            .any(|name| body.contains(name))
+            .then(|| "oklab".to_owned())
+    });
+    if space.is_some() || offsets.windows(2).any(|pair| pair[0].1.1 != pair[1].1.1) {
         let mut mixed = Vec::with_capacity(offsets.len() * 8);
         for pair in offsets.windows(2) {
             let [(a, (ink_a, alpha_a)), (b, (ink_b, alpha_b))] = [pair[0], pair[1]];
             mixed.push(pair[0]);
-            if (ink_a, alpha_a) == (ink_b, alpha_b) || a == b {
+            if ink_a == ink_b || space.is_none() && alpha_a == alpha_b || a == b {
                 continue;
             }
+            let space = space.as_deref().unwrap_or("srgb");
             for step in 1..8 {
                 let t = step as f32 / 8.;
                 let mix = format!(
@@ -1201,8 +1387,8 @@ pub(crate) fn gradient_svg(
                 };
                 let ink = mix(16) << 16 | mix(8) << 8 | mix(0);
                 let alpha = ((a.1).1 as f32 * (1. - t) + (b.1).1 as f32 * t) / 255.;
-                let [start, end] = [from + step as f32 * 2. - 0.3, from + step as f32 * 2. + 2.3]
-                    .map(f32::to_radians);
+                let [start, end] =
+                    [from + step as f32 * 2., from + step as f32 * 2. + 2.].map(f32::to_radians);
                 paths.push_str(&format!(
                     "<path d=\"M{cx} {cy}L{} {}L{} {}Z\" fill=\"#{ink:06x}\" fill-opacity=\"{alpha}\"/>",
                     cx + reach * start.sin(),
@@ -1212,7 +1398,7 @@ pub(crate) fn gradient_svg(
                 ));
             }
             format!(
-                "<defs><clipPath id=\"c\"><rect width=\"{tw}\" height=\"{th}\"/></clipPath></defs><g clip-path=\"url(#c)\">{paths}</g>"
+                "<defs><clipPath id=\"c\"><rect width=\"{tw}\" height=\"{th}\"/></clipPath></defs><g clip-path=\"url(#c)\" shape-rendering=\"crispEdges\">{paths}</g>"
             )
         }
     };
@@ -1512,6 +1698,21 @@ mod tests {
     }
 
     #[test]
+    fn positions_place_like_chrome() {
+        let units = Lengths::new(16., 800., 600.);
+        for (position, expected) in [
+            ("left bottom", [0., 60.]),
+            ("top", [50., 0.]),
+            ("20% 0", [20., 0.]),
+            ("right 5px top 10px", [95., 10.]),
+            ("bottom 10px right", [100., 50.]),
+            ("center bottom 1em", [50., 44.]),
+        ] {
+            assert_eq!(place(position, [100., 60.], &units), expected, "{position}");
+        }
+    }
+
+    #[test]
     fn filters_split_into_layers() {
         let units = Lengths::new(16., 800., 600.);
         let doc = Document::default();
@@ -1526,7 +1727,7 @@ mod tests {
         assert_eq!(effects[1].blur, px(4.));
         assert_eq!(
             effects[2].shadow.map(|(offset, blur, _)| (offset, blur)),
-            Some((point(px(1.), px(2.)), px(3.)))
+            Some((point(px(1.), px(2.)), px(6.)))
         );
         assert_eq!(effects[3].color_matrix.map(|matrix| matrix[18]), Some(0.5));
         let (blur, matrix) = backdrop("blur(10px) saturate(1.5)", &units).unwrap();
@@ -1558,6 +1759,23 @@ mod tests {
     }
 
     #[test]
+    fn gradient_hints_move_the_midpoint_like_chrome() {
+        let units = Lengths::new(16., 800., 600.);
+        let stops = gradient_stops(&["red", "80%", "blue"], false, &units, 100.).unwrap();
+        // Chrome mixes half and half at the hint, and less blue before it: t ^ (ln 0.5 / ln 0.8).
+        let at = |offset: f32| {
+            stops
+                .iter()
+                .find(|(at, _)| (at - offset).abs() < 0.01)
+                .unwrap()
+                .1
+        };
+        assert_eq!(at(0.), (0xff0000, 255));
+        assert_eq!(at(50.), (0xe1001e, 255));
+        assert_eq!(at(100.), (0x0000ff, 255));
+    }
+
+    #[test]
     fn gradient_interpolation_spaces_parse_in_any_order() {
         let units = Lengths::new(16., 800., 600.);
         for (body, valid) in [
@@ -1565,12 +1783,32 @@ mod tests {
             ("in hsl longer hue, red, blue", true),
             ("to right in oklch longer hue, red, blue", true),
         ] {
-            let svg = gradient_svg("linear-gradient", body, "auto", "", "", units, 10., 10.);
+            let svg = gradient_svg(
+                "linear-gradient",
+                body,
+                "auto",
+                "",
+                "",
+                units,
+                10.,
+                10.,
+                [0., 0., 10., 10.],
+            );
             assert_eq!(svg.is_some(), valid, "{body}");
         }
         for kind in ["radial-gradient", "conic-gradient"] {
             for body in ["hue in hsl, red, blue", "in, red, blue"] {
-                gradient_svg(kind, body, "auto", "", "", units, 10., 10.);
+                gradient_svg(
+                    kind,
+                    body,
+                    "auto",
+                    "",
+                    "",
+                    units,
+                    10.,
+                    10.,
+                    [0., 0., 10., 10.],
+                );
             }
         }
     }
@@ -1596,6 +1834,15 @@ mod tests {
             panic!("polygon");
         };
         assert!(polygon.contains("points=\"50,0 100,60 0,60 \""));
+        let Some(Clip::Shape(pill)) = clip("inset(0 round 50%)", &units, [100., 60.], &doc, ids)
+        else {
+            panic!("elliptical inset");
+        };
+        assert!(pill.contains("M50 0H50A50 30 0 0 1 100 30"), "{pill}");
+        assert!(matches!(
+            clip("inset(0 round 80px)", &units, [100., 60.], &doc, ids),
+            Some(Clip::Rounded(_, [80., 80., 80., 80.]))
+        ));
         let Some(Clip::Rounded(rect, radii)) = clip("circle(40%)", &units, [100., 60.], &doc, ids)
         else {
             panic!("circle");

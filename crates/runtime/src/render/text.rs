@@ -54,9 +54,9 @@ pub(super) fn paint_text(
         )
     });
     let shown = |row: usize| top(row) < mask.bottom() && top(row) + tall > mask.top();
-    let decorated = runs
-        .iter()
-        .any(|run| run.underline.is_some() || run.strikethrough.is_some());
+    let decorated = runs.iter().any(|run| {
+        run.underline.is_some() || run.strikethrough.is_some() || run.overline.is_some()
+    });
     // Backgrounds and highlights of all rows draw first, then decorations, then glyphs.
     for decorations in [false, true] {
         if decorations && !decorated {
@@ -97,7 +97,10 @@ pub(super) fn paint_text(
                     .filter(|_| ink.is_none() && !decorations);
                 if a >= b
                     || background.is_none()
-                        && (!decorations || run.underline.is_none() && run.strikethrough.is_none())
+                        && (!decorations
+                            || run.underline.is_none()
+                                && run.strikethrough.is_none()
+                                && run.overline.is_none())
                 {
                     continue;
                 }
@@ -117,25 +120,39 @@ pub(super) fn paint_text(
                     );
                     continue;
                 }
-                if let Some(underline) = &run.underline {
+                // Like Chromium: in device pixels, from the rounded ascent of the run's font, lines as thick as a
+                // whole number of pixels, an underline below the baseline by half its thickness, a line-through a
+                // third of the ascent above it, and an overline on top of the ascent.
+                let scale = window.scale_factor();
+                let system = window.text_system();
+                let size = run.font_size.unwrap_or(line.font_size) * scale;
+                let ascent = f32::from(system.line_metrics(system.face(&run.font), size)[0]);
+                let base = ((top + baseline).0 * scale).round();
+                for (decoration, kind) in [
+                    (&run.underline, 0),
+                    (&run.strikethrough, 1),
+                    (&run.overline, 2),
+                ] {
+                    let Some(decoration) = decoration else {
+                        continue;
+                    };
+                    let thick = (decoration.thickness.0 * scale).max(1.);
+                    let y = match kind {
+                        0 => {
+                            base + (thick / 2.).ceil()
+                                + decoration
+                                    .offset
+                                    .map_or(0., |offset| (offset.0 * scale).round())
+                        }
+                        1 => (base - ascent / 3. - thick / 2.).round(),
+                        _ => base - ascent - thick.floor(),
+                    };
                     window.draw_line(
-                        point(
-                            row_left + x,
-                            top + baseline + underline.offset.unwrap_or(line.descent * 0.618),
-                        ),
+                        point(row_left + x, px(y / scale)),
                         end_x - x,
-                        underline.thickness,
-                        ink.or(underline.color).unwrap_or_default(),
-                        underline.style,
-                    );
-                }
-                if let Some(strikethrough) = &run.strikethrough {
-                    window.draw_line(
-                        point(row_left + x, top + (line.ascent * 0.5 + baseline) * 0.5),
-                        end_x - x,
-                        strikethrough.thickness,
-                        ink.or(strikethrough.color).unwrap_or_default(),
-                        strikethrough.style,
+                        px(thick.floor() / scale),
+                        ink.or(decoration.color).unwrap_or_default(),
+                        decoration.style,
                     );
                 }
             }
@@ -241,7 +258,7 @@ pub(super) fn spaces(text: &str) -> f32 {
     text.bytes().filter(|byte| *byte == b' ').count() as f32
 }
 
-fn row_extents<'a>(
+pub(super) fn row_extents<'a>(
     lines: impl IntoIterator<Item = &'a renderer::TextLine>,
     runs: &[renderer::TextRun],
     heights: &[(usize, style::LineHeight)],
@@ -451,6 +468,7 @@ pub(crate) fn text_index(
     text: &str,
     rows: &[crate::dom::Row],
     mut position: Point<Pixels>,
+    nearest: bool,
 ) -> Result<usize, usize> {
     let (top, line_height) = (layout.bounds().top(), layout.line_height());
     let row = rows
@@ -461,7 +479,7 @@ pub(crate) fn text_index(
         })
         .unwrap_or(0);
     let Some(placed) = rows.get(row) else {
-        return layout.index_at(position);
+        return layout.index_at(position, nearest);
     };
     position.y = (position.y - placed.drop)
         .max(top + line_height * row as f32)
@@ -478,7 +496,7 @@ pub(crate) fn text_index(
             .ok_or(placed.start);
     }
     position.x -= placed.shift;
-    layout.index_at(position)
+    layout.index_at(position, nearest)
 }
 
 fn first_line(
@@ -548,14 +566,32 @@ pub(super) struct AtomBox {
     pub(super) index: usize,
     pub(super) node: usize,
     pub(super) view: Rc<super::PageState>,
+    // The width that the atom leaves free in a box as wide as the block, see `AtomRest`.
+    pub(super) rest: Option<Rc<std::cell::Cell<Pixels>>>,
+}
+
+// Fills the box of an atom with percent sizes. That box is as wide as the block, so the percentages
+// resolve against the block, and the atom is as wide as the box without this filler.
+pub(super) struct AtomRest(pub(super) Rc<std::cell::Cell<Pixels>>);
+
+impl renderer::Hooks for AtomRest {
+    fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        self.0.set(cx.exact.size.width);
+        inner(cx.window);
+    }
 }
 
 impl renderer::Hooks for AtomBox {
     fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let slot = &self.slots[self.index];
+        let offset = slot.at.get() - cx.bounds.origin;
+        // The filler reports its width in its own prepaint, so the children go first.
+        cx.window
+            .scope(renderer::Scope::Offset(offset), |window| inner(window));
         let height = f32::from(cx.exact.size.height);
+        let rest = self.rest.as_ref().map_or(px(0.), |rest| rest.get());
         let size = [
-            f32::from(cx.exact.size.width),
+            f32::from(cx.exact.size.width - rest),
             height,
             cx.baselines[0].map_or(height, f32::from),
         ];
@@ -575,9 +611,6 @@ impl renderer::Hooks for AtomBox {
                 .insert(self.node, size);
             cx.window.redraw();
         }
-        let offset = slot.at.get() - cx.bounds.origin;
-        cx.window
-            .scope(renderer::Scope::Offset(offset), |window| inner(window));
     }
 }
 
@@ -616,7 +649,7 @@ impl PartialEq for Measured {
 impl From<InlineText> for renderer::Node {
     fn from(text: InlineText) -> Self {
         let data = &text.data;
-        if data.first_line.is_none() && !data.runs.iter().any(|run| run.font_size.is_some()) {
+        if data.first_line.is_none() && !data.mixed {
             return renderer::text(data.text.clone(), Some(data.runs.to_vec())).hooks(text);
         }
         renderer::node()

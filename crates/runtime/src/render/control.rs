@@ -18,18 +18,17 @@ pub(super) enum Control {
     Resizer,
 }
 
+/// The control, whether it draws its native box, and whether it has `appearance: none` and draws its parts
+/// from pseudo-element styles, as ranges and progress bars do.
 pub(super) fn kind(
     tag: &str,
     input: Option<&str>,
     list: bool,
     style: &style::Style,
-) -> Option<(Control, bool)> {
-    if [Prop::APPEARANCE, Prop::WEBKIT_APPEARANCE]
+) -> Option<(Control, bool, bool)> {
+    let plain = [Prop::APPEARANCE, Prop::WEBKIT_APPEARANCE]
         .into_iter()
-        .any(|prop| style.get(prop).is_some_and(|value| value == "none"))
-    {
-        return None;
-    }
+        .any(|prop| style.get(prop).is_some_and(|value| value == "none"));
     let input = input.map(str::to_ascii_lowercase);
     let control = match (tag, input.as_deref()) {
         ("button", _) | (_, Some("button" | "submit" | "reset")) => Control::Button,
@@ -46,6 +45,10 @@ pub(super) fn kind(
         ("input", _) => Control::Field,
         _ => return None,
     };
+    if plain {
+        return matches!(control, Control::Range | Control::Progress)
+            .then_some((control, false, true));
+    }
     let (border, backgrounds): (&str, &[u32]) = match control {
         Control::Button | Control::Color => (
             if control == Control::Color {
@@ -57,7 +60,7 @@ pub(super) fn kind(
         ),
         Control::Field if tag == "input" => ("inset", &[0xffffff, 0x3b3b3b, 0xefefef]),
         Control::Field | Control::Menu => ("solid", &[0xffffff, 0x3b3b3b, 0xefefef]),
-        _ => return Some((control, false)),
+        _ => return Some((control, false, false)),
     };
     let edges: &[u32] = if matches!(control, Control::Button | Control::Color) {
         &[0x000000, 0xffffff, 0x767676, 0xc3c3c3]
@@ -88,13 +91,14 @@ pub(super) fn kind(
         && style
             .get(Prop::BACKGROUND_IMAGE)
             .is_none_or(|value| value == "none");
-    (boxed || control == Control::Menu).then_some((control, boxed))
+    (boxed || control == Control::Menu).then_some((control, boxed, false))
 }
 
 #[derive(Default)]
 pub(super) struct Look {
     pub control: Control,
     pub boxed: bool,
+    pub plain: bool,
     pub checked: bool,
     pub disabled: bool,
     pub hover: bool,
@@ -143,6 +147,7 @@ pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> Child 
                     bounds,
                     renderer::Radii::default(),
                     image.clone(),
+                    false,
                     false,
                 );
             }

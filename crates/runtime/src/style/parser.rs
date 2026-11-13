@@ -756,10 +756,11 @@ fn condition(
                     .replacen("-webkit-max-", "max--webkit-", 1);
                 let (name, value) = (name.as_str(), value.trim());
                 return Ok((ident(name) && !value.is_empty()).then(|| {
+                    // `min` and `max` keep the form that was written, for the text of the rule.
                     if let Some(name) = name.strip_prefix("min-") {
-                        feature(name, ">=", value)
+                        feature(name, "min", value)
                     } else if let Some(name) = name.strip_prefix("max-") {
-                        feature(name, "<=", value)
+                        feature(name, "max", value)
                     } else {
                         feature(name, ":", value)
                     }
@@ -1875,7 +1876,7 @@ mod tests {
             ("(z-index: 1.5)", Some(false)),
             ("(text-wrap: balance)", Some(true)),
             ("(word-break: break-all)", Some(true)),
-            ("(word-break: keep-all)", Some(false)),
+            ("(word-break: keep-all)", Some(true)),
             (
                 "((-webkit-hyphens: none) and (not (margin-trim: inline))) or ((-moz-orient: inline) and (not (color:rgb(from red r g b))))",
                 Some(false),

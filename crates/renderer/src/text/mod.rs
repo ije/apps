@@ -339,6 +339,7 @@ impl TextSystem {
                 last.color != run.color
                     || last.underline != run.underline
                     || last.strikethrough != run.strikethrough
+                    || last.overline != run.overline
                     || last.background_color != run.background_color
             });
             let font = match last {
@@ -391,6 +392,59 @@ impl TextSystem {
         }
     }
 
+    /// Like Chromium, a tab reaches the next multiple of `tab-size` spaces from the line start, or the one after
+    /// when that is closer than half a space.
+    fn tab_stops(
+        &self,
+        line: Rc<Line>,
+        text: &str,
+        pieces: &[(usize, &TextRun)],
+        font_size: Pixels,
+    ) -> Rc<Line> {
+        let mut tabbed = (*line).clone();
+        let mut shift = px(0.);
+        for at in 0..tabbed.glyphs.len() {
+            tabbed.glyphs[at].x += shift;
+            let glyph = tabbed.glyphs[at];
+            if text.as_bytes().get(glyph.index as usize) != Some(&b'\t') {
+                continue;
+            }
+            let Some(run) = pieces
+                .iter()
+                .scan(0, |end, &(len, run)| {
+                    *end += len;
+                    Some((*end, run))
+                })
+                .find(|(end, _)| *end > glyph.index as usize)
+                .map(|(_, run)| run)
+            else {
+                continue;
+            };
+            let size = run.font_size.unwrap_or(font_size);
+            let space = self
+                .advance(self.face(&run.font), size, ' ')
+                .unwrap_or(size * 0.25)
+                + run.letter_spacing
+                + run.word_spacing;
+            let stop = if run.tab_size < 0. {
+                px(-run.tab_size)
+            } else {
+                space * run.tab_size
+            };
+            let end = tabbed.glyphs.get(at + 1).map_or(line.width, |next| next.x) + shift;
+            if stop <= px(0.) {
+                continue;
+            }
+            let mut next = stop * ((glyph.x / stop).floor() + 1.);
+            if next - glyph.x < space * 0.5 {
+                next += stop;
+            }
+            shift += next - end;
+        }
+        tabbed.width += shift;
+        Rc::new(tabbed)
+    }
+
     pub fn shape_text(
         &self,
         text: &str,
@@ -425,6 +479,11 @@ impl TextSystem {
                 self.cache()
                     .get(&self.fonts, source, font_size, &spans, wrap.as_ref());
             self.spans.set(spans);
+            let line = if source.contains('\t') {
+                self.tab_stops(line, &text, &pieces, font_size)
+            } else {
+                line
+            };
             rows += breaks.len() + 1;
             // The newline takes one byte of the runs.
             cursor.take(1, |_, _| {});
