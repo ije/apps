@@ -2873,6 +2873,28 @@ mod tests {
     }
 
     #[test]
+    fn dialogs_of_main_and_pages_show_a_message_box() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<p>x</p>").unwrap();
+        let code =
+            "__apps.app.whenReady().then(() => new __apps.BrowserWindow().loadFile('index.html'));";
+        let desktop = app(code, &[], dir.path().to_path_buf());
+        crate::jsc::NATIVE.set(Some(|op, args| {
+            assert_eq!(op, "dialog.message");
+            let buttons = args["buttons"].as_array().map_or(0, Vec::len);
+            Ok(serde_json::json!({
+                "response": u8::from(args["message"] == "no"),
+                "input": format!("{}:{buttons}", args["input"].as_str().unwrap_or("-")),
+            }))
+        }));
+        let script = "[alert('hi'),confirm('yes'),confirm('no'),prompt('name','x'),prompt('no','x'),prompt()].join()";
+        let page = desktop.views[&1].renderer.clone().unwrap();
+        for engine in [&*page, desktop.js()] {
+            assert_eq!(engine.eval(script, "test").unwrap(), ",true,false,x:2,,:2");
+        }
+    }
+
+    #[test]
     fn main_runs_before_input_event_only_while_it_listens() {
         let code = "__apps.app.whenReady().then(()=>{globalThis.win=new __apps.BrowserWindow();globalThis.contents=win.webContents;globalThis.f=e=>e.preventDefault();globalThis.calls=0;const real=__appsBeforeInput;globalThis.__appsBeforeInput=(...args)=>(calls++,real(...args));win.load('<body></body>')})";
         let mut desktop = app(code, &[], std::path::PathBuf::new());

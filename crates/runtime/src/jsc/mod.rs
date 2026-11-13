@@ -931,6 +931,7 @@ const ACCESS: &[(&str, u8)] = &[
     ("bridge.preload", PRELOAD),
     ("bridge.file", PRELOAD),
     ("bridge.exposures", PAGE),
+    ("dom.open", PAGE | PRELOAD),
     ("dom.", PAGE),
     ("gpu.", PAGE),
     ("media.", PAGE),
@@ -1069,6 +1070,27 @@ unsafe extern "C" fn call(
             return result;
         }
         let role = binding.role;
+        // A `ShadowRealm` is a new global of this VM, with the module loader of its creator. Its `eval`
+        // keeps it alive.
+        if op == "web.realm" {
+            ensure!(values.len() == 2, "Expected a module loader");
+            ensure!(
+                binding
+                    .host
+                    .try_borrow()
+                    .is_ok_and(|host| host.enabled("jsExecute")),
+                "ShadowRealm needs the jsExecute feature"
+            );
+            let name = api.string("eval");
+            return Ok(unsafe {
+                let realm = (api.create)(api.group, ptr::null_mut());
+                (api.module_loader)(realm, values[1]);
+                let eval = (api.get)(realm, (api.global)(realm), name, ptr::null_mut());
+                (api.string_release)(name);
+                (api.release)(realm);
+                eval
+            });
+        }
         // A forced layout builds the page, which borrows the host, so it runs before any borrow.
         if let Role::Renderer(id) = role
             && op == "dom.reflow"
@@ -1479,10 +1501,14 @@ fn dispatch(
             );
         }
         Ok(serde_json::Value::Null)
-    } else if let (Role::Renderer(id), "dom.open") = (role, op) {
+    } else if let (Role::Renderer(id) | Role::Preload(id), "dom.open") = (role, op) {
         // Main runs these with page data, so only these shapes and `<webview>` methods pass.
         let data = &values[3];
         let valid = match (values[0].as_str(), values[1].as_str()) {
+            (Some("dialog"), Some("alert" | "confirm" | "prompt")) => {
+                values[2].is_string() && values[3].is_string()
+            }
+            _ if matches!(role, Role::Preload(_)) => false,
             (Some("open"), _) => (1..5).all(|index| values[index].is_string()),
             (Some("closed" | "close"), _) => values[1].is_u64(),
             (Some("webview"), Some("attach")) => {

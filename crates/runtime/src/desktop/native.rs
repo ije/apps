@@ -303,6 +303,7 @@ pub fn native_call(operation: &str, arguments: &Value) -> Result<Value> {
                 "buttonLabel",
                 "nameFieldLabel",
                 "type",
+                "input",
             ] {
                 ensure!(
                     options.get(name).is_none_or(Value::is_string),

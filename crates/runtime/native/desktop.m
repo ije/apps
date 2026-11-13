@@ -967,8 +967,15 @@ char *apps_native_call(const char *operation, const char *argumentsJSON) {
                 alert.suppressionButton.title = args[@"checkboxLabel"];
                 alert.suppressionButton.state = [args[@"checkboxChecked"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
             }
+            NSTextField *input = nil;
+            if (args[@"input"]) {
+                input = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 228, 22)];
+                input.stringValue = args[@"input"];
+                alert.accessoryView = input;
+                alert.window.initialFirstResponder = input;
+            }
             NSDictionary *(^finish)(NSModalResponse) = ^NSDictionary *(NSModalResponse response) {
-                return @{ @"response": @(response - NSAlertFirstButtonReturn), @"checkboxChecked": @(alert.suppressionButton.state == NSControlStateValueOn) };
+                return @{ @"response": @(response - NSAlertFirstButtonReturn), @"checkboxChecked": @(alert.suppressionButton.state == NSControlStateValueOn), @"input": input.stringValue ?: @"" };
             };
             NSWindow *window = NSApp.keyWindow ?: NSApp.mainWindow ?: NSApp.orderedWindows.firstObject, *host = nil;
             if (request && !window) {

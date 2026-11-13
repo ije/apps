@@ -138,12 +138,18 @@ globalThis.__appsCrypto = (call, decodeBytes, base) => {
     try { const result = call('web.crypto.' + operation, ...args); return operation === 'sign' ? decodeBytes(result).buffer : result; }
     catch (error) { fail(error.message, 'OperationError'); }
   };
-  for (const operation of ['encrypt', 'decrypt']) subtle[operation] = async (algorithm, key, input) => {
-    const data = access(key, operation, algorithm);
+  const cipher = (operation, usage = operation) => async (algorithm, key, input) => {
+    const data = access(key, usage, algorithm);
     if (data.algorithm.name !== 'AES-GCM' || (algorithm.tagLength !== undefined && algorithm.tagLength !== 128)) fail('Only AES-GCM with a 128 bit tag is supported');
     try { return decodeBytes(call('web.crypto.' + operation, data.private, bytes(algorithm.iv), algorithm.additionalData ? bytes(algorithm.additionalData) : [], bytes(input))).buffer; }
     catch (error) { fail(error.message, 'OperationError'); }
   };
+  const wrap = cipher('encrypt', 'wrapKey'), unwrap = cipher('decrypt', 'unwrapKey');
+  Object.assign(subtle, {
+    encrypt: cipher('encrypt'), decrypt: cipher('decrypt'),
+    async wrapKey(format, key, wrappingKey, algorithm) { const data = await subtle.exportKey(format, key); return wrap(algorithm, wrappingKey, format === 'jwk' ? new TextEncoder().encode(JSON.stringify(data)) : data); },
+    async unwrapKey(format, wrapped, unwrappingKey, algorithm, keyAlgorithm, extractable, usages) { const data = await unwrap(algorithm, unwrappingKey, wrapped); return subtle.importKey(format, format === 'jwk' ? JSON.parse(new TextDecoder().decode(data)) : data, keyAlgorithm, extractable, usages); },
+  });
   globalThis.__appsNodeCrypto = {
     webcrypto: null,
     randomUUID: base.randomUUID,
@@ -153,10 +159,12 @@ globalThis.__appsCrypto = (call, decodeBytes, base) => {
       if (callback) { queueMicrotask(() => callback(null, result)); return; } return result;
     },
   };
-  globalThis.CryptoKey = CryptoKey;
+  class SubtleCrypto { constructor() { throw new TypeError('Illegal constructor'); } }
+  class Crypto { constructor() { throw new TypeError('Illegal constructor'); } }
+  Object.assign(globalThis, { CryptoKey, SubtleCrypto, Crypto });
   // The codec output goes through JSON, so byte fields and an RSA publicExponent travel as strings.
   globalThis.__appsCryptoCodec = { encode: key => { const data = {...keys.get(key)}; for(const field of ['private','public'])if(data[field])data[field]=encode(data[field]);if(data.algorithm.publicExponent)data.algorithm={...data.algorithm,publicExponent:encode(data.algorithm.publicExponent)};return data; }, decode: value => { const data={...value};for(const field of ['private','public'])if(data[field])data[field]=typeof data[field]==='string'?decode(data[field]):new Uint8Array(data[field]);if(data.algorithm.publicExponent)data.algorithm={...data.algorithm,publicExponent:decode(data.algorithm.publicExponent)};return create(data); } };
-  const result = Object.freeze({ ...base, subtle: Object.freeze(subtle) });
+  const result = Object.freeze(Object.setPrototypeOf({ ...base, subtle: Object.freeze(Object.setPrototypeOf(subtle, SubtleCrypto.prototype)) }, Crypto.prototype));
   __appsNodeCrypto.webcrypto = result;
   return result;
 };

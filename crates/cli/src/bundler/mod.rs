@@ -244,6 +244,7 @@ struct Linker<'a, 'b> {
     required: Vec<usize>,
     resolved: serde_json::Map<String, Value>,
     requires: Vec<oxc_semantic::SymbolId>,
+    aliases: Vec<(oxc_semantic::SymbolId, &'static str)>,
     error: Option<anyhow::Error>,
 }
 
@@ -1000,14 +1001,32 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
         walk_mut::walk_variable_declarator(self, declarator);
     }
 
+    fn visit_import_specifier(&mut self, specifier: &mut ImportSpecifier<'a>) {
+        let imported = specifier.imported.name();
+        if specifier.local.name != imported
+            && let Some(name) = ["Worker", "fork"]
+                .into_iter()
+                .find(|name| imported == *name)
+        {
+            self.aliases.push((specifier.local.symbol_id(), name));
+        }
+    }
+
     fn visit_expression(&mut self, expression: &mut Expression<'a>) {
         if self.error.is_some() {
             return;
         }
         let result = (|| -> Result<()> {
             let span = expression.span();
+            let (scoping, aliases) = (self.scoping, &self.aliases);
             let name = |callee: &Expression<'a>| match callee.get_inner_expression() {
-                Expression::Identifier(name) => Some(name.name.as_str()),
+                Expression::Identifier(name) => Some(
+                    scoping
+                        .get_reference(name.reference_id())
+                        .symbol_id()
+                        .and_then(|symbol| aliases.iter().find(|alias| alias.0 == symbol))
+                        .map_or(name.name.as_str(), |alias| alias.1),
+                ),
                 Expression::StaticMemberExpression(member) => Some(member.property.name.as_str()),
                 _ => None,
             };
@@ -2148,6 +2167,7 @@ impl Builder {
             imported: Vec::new(),
             required: Vec::new(),
             requires: Vec::new(),
+            aliases: Vec::new(),
             resolved: serde_json::Map::new(),
             error: None,
         };

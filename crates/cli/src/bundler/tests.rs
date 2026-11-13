@@ -3719,8 +3719,10 @@ fn main_workers_from_paths_known_at_build_time_get_node_apis() {
     fs::write(&entry, r#"import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import * as threads from 'node:worker_threads';
+import {Worker as Thread} from 'node:worker_threads';
 if (threads.isMainThread) {
     const workers = [
+        new Thread(new URL(import.meta.url)),
         new Worker(new URL('./lib/worker.ts', import.meta.url).href),
         new Worker(String(new URL('./worker.ts', new URL('./lib/worker.ts', import.meta.url)))),
         new Worker(fileURLToPath(new URL('./lib/worker.ts', import.meta.url))),
@@ -3773,7 +3775,7 @@ if (threads.isMainThread) {
         }
         assert_eq!(
             engine.eval("result", "test").unwrap(),
-            (0..10)
+            (0..11)
                 .map(|index| format!("file-{index}function"))
                 .collect::<Vec<_>>()
                 .join(","),
@@ -3798,7 +3800,7 @@ if (threads.isMainThread) {
             "{source}"
         );
     }
-    fs::write(&entry, "import {fork} from 'node:child_process'; import {utilityProcess} from 'electron'; import path from 'node:path'; fork(path.join(__dirname, 'lib', 'worker.ts')); utilityProcess.fork(import.meta.dirname + '/lib/worker.ts', []); saga.fork(() => 1);").unwrap();
+    fs::write(&entry, "import {fork as start} from 'node:child_process'; import {utilityProcess} from 'electron'; import path from 'node:path'; start(path.join(__dirname, 'lib', 'worker.ts')); utilityProcess.fork(import.meta.dirname + '/lib/worker.ts', []); saga.fork(() => 1);").unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap();
     assert_eq!(files["app.js"].matches("apps:///script-0.js").count(), 2);
     assert!(files.contains_key("script-0.js") && !files.contains_key("script-1.js"));

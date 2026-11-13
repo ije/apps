@@ -123,7 +123,7 @@ The `features` array in `package.json` controls optional behavior. All entries i
 
 | Feature | Effect |
 |---|---|
-| `jsExecute` | Permits page code generation, such as `eval()` and `new Function()`, and imports from `data:` or `blob:` URLs |
+| `jsExecute` | Permits page code generation, such as `eval()` and `new Function()`, imports from `data:` or `blob:` URLs, and `ShadowRealm` |
 | `httpImport` | Permits remote JavaScript and CSS imports |
 | `localNetwork` | Permits page access to private network addresses |
 | `webgpu` | Enables the WebGPU API |

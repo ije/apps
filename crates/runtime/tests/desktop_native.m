@@ -225,7 +225,7 @@ int main(int argc, const char *argv[]) {
         [native("poll", "null") count];
         NSWindow *owner = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 200, 100) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
         [owner orderFront:nil];
-        for (NSString *request in @[@"{\"message\":\"Async\",\"type\":\"warning\",\"buttons\":[\"OK\",\"Cancel\"],\"defaultId\":1,\"cancelId\":0,\"async\":7}", @"{\"filters\":[{\"name\":\"Images\",\"extensions\":[\"png\",\"jpg\"]}],\"buttonLabel\":\"Pick\",\"async\":8}"]) {
+        for (NSString *request in @[@"{\"message\":\"Async\",\"type\":\"warning\",\"buttons\":[\"OK\",\"Cancel\"],\"defaultId\":1,\"cancelId\":0,\"async\":7}", @"{\"message\":\"Prompt\",\"buttons\":[\"OK\",\"Cancel\"],\"cancelId\":1,\"input\":\"typed\",\"async\":9}", @"{\"filters\":[{\"name\":\"Images\",\"extensions\":[\"png\",\"jpg\"]}],\"buttonLabel\":\"Pick\",\"async\":8}"]) {
             __block BOOL running = NO;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
                 running = !NSApp.modalWindow;
@@ -239,6 +239,7 @@ int main(int argc, const char *argv[]) {
                 events = native("poll", "null");
             }
             if (!running || events.count != 1 || ![events[0][@"type"] isEqual:@"reply"] || !events[0][@"value"]) return 30;
+            if ([request containsString:@"input"] && ![events[0][@"value"][@"input"] isEqual:@"typed"]) return 31;
         }
         return 0;
     }

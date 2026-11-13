@@ -42,7 +42,11 @@ fn main() {
     if os == "linux" {
         link("-Wl,-rpath,$ORIGIN".to_owned());
     }
-    let profile = out.ancestors().nth(3).unwrap();
+    // The depth of OUT_DIR below the profile folder depends on the cargo version.
+    let profile = out
+        .ancestors()
+        .find(|folder| folder.join("deps").is_dir())
+        .unwrap();
     let path = lib.join(name);
     for folder in [profile.to_owned(), profile.join("deps")] {
         let target = folder.join(name);

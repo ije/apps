@@ -81,7 +81,8 @@ globalThis.__appsPlatform = (call, node, codec) => {
     }
     return { idle, active, utilization: active / (idle + active) };
   };
-  globalThis.performance = Object.freeze({ timeOrigin: clock.origin, now: () => native() - base, toJSON() { return { timeOrigin: this.timeOrigin }; },
+  class Performance { constructor() { throw new TypeError('Illegal constructor'); } }
+  globalThis.performance = Object.freeze(Object.setPrototypeOf({ timeOrigin: clock.origin, now: () => native() - base, toJSON() { return { timeOrigin: this.timeOrigin }; },
     mark: (name, options) => record(new PerformanceMark(name, options)),
     measure(name, start, end) {
       let duration, detail = null;
@@ -95,8 +96,8 @@ globalThis.__appsPlatform = (call, node, codec) => {
     getEntriesByName: (name, type) => select(timeline, name, type).sort((a, b) => a.startTime - b.startTime),
     getEntriesByType: type => select(timeline, undefined, type).sort((a, b) => a.startTime - b.startTime),
     ...(node ? { timerify, eventLoopUtilization } : {}),
-  });
-  Object.assign(globalThis, { PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList });
+  }, Performance.prototype));
+  Object.assign(globalThis, { Performance, PerformanceEntry, PerformanceMark, PerformanceMeasure, PerformanceObserver, PerformanceObserverEntryList });
   globalThis.scheduler = Object.freeze({
     wait(delay, options = {}) {
       return new Promise((resolve, reject) => {

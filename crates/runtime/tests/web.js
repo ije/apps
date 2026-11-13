@@ -74,6 +74,34 @@ globalThis.testStep = 'start';
   await rejects(() => subtle.generateKey('Ed25519', true, ['encrypt']), 'SyntaxError');
   await rejects(() => subtle.generateKey({ name: 'RSA-PSS', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, true, ['sign']), 'NotSupportedError');
   await rejects(() => subtle.sign('ECDSA', edSecret, seed), 'InvalidAccessError');
+  const wrapper = await subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['wrapKey', 'unwrapKey']), wrapping = { name: 'AES-GCM', iv: new Uint8Array(12) };
+  for (const format of ['pkcs8', 'jwk']) {
+    const unwrapped = await subtle.unwrapKey(format, await subtle.wrapKey(format, edSecret, wrapper, wrapping), wrapper, wrapping, 'Ed25519', true, ['sign']);
+    assert(hex(await subtle.sign('Ed25519', unwrapped, new Uint8Array())) === hex(edSignature), 'wrapKey ' + format);
+  }
+  await rejects(() => subtle.encrypt(wrapping, wrapper, seed), 'InvalidAccessError');
+  await rejects(async () => subtle.wrapKey('pkcs8', edSecret, await subtle.generateKey({ name: 'AES-GCM', length: 128 }, false, ['encrypt']), wrapping), 'InvalidAccessError');
+  testStep = 'interfaces';
+  assert(subtle instanceof SubtleCrypto && crypto instanceof Crypto && performance instanceof Performance && typeof console.dirxml === 'function', 'interface objects');
+  let reported;
+  const onError = event => { reported = event.error; event.preventDefault(); };
+  addEventListener('error', onError); reportError(seed); removeEventListener('error', onError);
+  assert(reported === seed, 'reportError');
+  assert([alert, confirm, prompt].every(dialog => typeof dialog === 'function'), 'dialogs');
+  // Without a main process to show them, the dialogs of a page return like dismissed ones.
+  if (globalThis.process?.type !== 'browser') assert(alert('a') === undefined && confirm('a') === false && prompt('a', 'b') === null, 'dismissed dialogs');
+  testStep = 'ShadowRealm';
+  const realm = new ShadowRealm();
+  assert(realm.evaluate('globalThis.x = 40; x + 2') === 42 && typeof x === 'undefined' && realm.evaluate('typeof fetch') === 'undefined', 'realm globals');
+  const add = realm.evaluate('(a, f) => f(a, x)');
+  assert(add(2, (a, b) => a + b) === 42 && add instanceof Function && !('prototype' in add), 'realm functions');
+  const realmError = fn => { try { fn(); } catch (error) { return error.constructor.name + (Object.getPrototypeOf(error) === globalThis[error.constructor.name].prototype); } };
+  assert(realmError(() => realm.evaluate('({})')) === 'TypeErrortrue' && realmError(() => realm.evaluate('(')) === 'SyntaxErrortrue' && realmError(() => realm.evaluate('throw new RangeError("r")')) === 'TypeErrortrue', 'realm errors');
+  assert(realmError(() => add({}, () => 1)) === 'TypeErrortrue' && realmError(() => add(1, () => ({}))) === 'TypeErrortrue' && realmError(() => realm.evaluate(1)) === 'TypeErrortrue', 'realm objects');
+  assert(realm.evaluate('f => { try { f(); } catch (error) { return error instanceof TypeError && error.message; } }')(() => { throw new Error('outer'); }) === 'outer', 'realm catches');
+  assert(await realm.importValue('data:text/javascript,export const double = n => n * x', 'double').then(double => double(2)) === 80, 'realm imports');
+  await rejects(() => realm.importValue('data:text/javascript,export const a = 1', 'b'), 'TypeError');
+  await rejects(() => realm.importValue('./app.js', 'a'), 'TypeError');
   testStep = 'readable';
   let pulls = 0;
   const source = new ReadableStream({ pull(c) { if (++pulls <= 3) c.enqueue(pulls); else c.close(); } }, { highWaterMark: 0 });

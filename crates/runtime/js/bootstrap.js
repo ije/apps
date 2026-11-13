@@ -67,7 +67,7 @@
   globalThis.console = Object.freeze({
     log: print('log'), info: print('info'), warn: print('warn'), error: print('error'), debug: print('debug'),
     trace: (...args) => write('error', `Trace${args.length ? ': ' + formatWithOptions({}, ...args) : ''}\n${(new Error().stack ?? '').split('\n').slice(1).map(line => '    ' + line).join('\n')}`),
-    dir: (value, options) => write('log', inspect(value, options)),
+    dir: (value, options) => write('log', inspect(value, options)), dirxml: print('log'),
     assert: (condition, ...data) => { if (condition) return; if (typeof data[0] === 'string') data[0] = 'Assertion failed: ' + data[0]; else data.unshift('Assertion failed'); write('error', formatWithOptions({}, ...data)); },
     count: (label = 'default') => { const count = (counts.get(label) ?? 0) + 1; counts.set(label, count); write('info', `${label}: ${count}`); },
     countReset: (label = 'default') => { counts.delete(label); },
@@ -164,7 +164,7 @@
   const pollWeb = globalThis.__appsWeb(call, codec);
   delete globalThis.__appsWeb;
   const download = globalThis.fetch;
-  globalThis.__appsModuleLoader = (url, resolve, reject) => {
+  const moduleLoader = globalThis.__appsModuleLoader = (url, resolve, reject) => {
     const name = /^(?:data|blob):/.test(url) ? 'jsExecute' : /^https?:/.test(url) ? 'httpImport' : '';
     if (!name) return reject(new TypeError(`Cannot import ${url}. Only bundled modules, data:, blob: and http(s) URLs can be imported`));
     if (disabled.has(name)) return reject(new TypeError(`Importing ${url.slice(0, url.indexOf(':'))} URLs needs the ${name} feature. Add "${name}" to "features" in package.json`));
@@ -249,9 +249,50 @@
   globalThis.__appsAlive = () => {
     return refs > 0 || ticks.length > 0 || immediates.size > 0 || pollWeb.pending() || !!servers?.pending() || __appsPending();
   };
+  // JavaScriptCore's own ShadowRealm needs a hook that its API globals lack, so a realm is a bare global of this VM.
+  if (!disabled.has('jsExecute')) {
+    const text = error => { try { return String(error?.message ?? error); } catch { return 'Unknown error'; } };
+    const realms = new WeakMap();
+    globalThis.ShadowRealm = class ShadowRealm {
+      constructor() {
+        const run = call('web.realm', moduleLoader);
+        // The realm makes its own functions and errors, so no object of this global gets into it.
+        const make = run('(call => (...args) => { const [ok, value] = call(args); if (ok) return value; throw new TypeError(value); })');
+        const primitive = value => { if (typeof value === 'object' && value !== null) throw new TypeError('Only primitives and functions can cross a ShadowRealm'); return typeof value !== 'function'; };
+        const out = value => primitive(value) ? value : (...args) => { args = args.map(into); let result; try { result = value(...args); } catch (error) { throw new TypeError(text(error)); } return out(result); };
+        const into = value => primitive(value) ? value : make(args => { try { return [true, into(value(...Array.from(args, out)))]; } catch (error) { return [false, text(error)]; } });
+        realms.set(this, { run, out });
+      }
+      evaluate(source) {
+        const realm = realms.get(this);
+        if (!realm || typeof source !== 'string') throw new TypeError('ShadowRealm.prototype.evaluate needs a realm and a string');
+        let value;
+        try { value = realm.run(source); } catch (error) { throw new (error?.name === 'SyntaxError' ? SyntaxError : TypeError)(text(error)); }
+        return realm.out(value);
+      }
+      async importValue(specifier, name) {
+        const realm = realms.get(this);
+        if (!realm || typeof name !== 'string') throw new TypeError('ShadowRealm.prototype.importValue needs a realm and an export name');
+        let module;
+        try { module = await realm.run('specifier => import(specifier)')(String(specifier)); } catch (error) { throw new TypeError(text(error)); }
+        if (!(name in module)) throw new TypeError(`The module has no export '${name}'`);
+        return realm.out(module[name]);
+      }
+    };
+  }
+  // There is no stdin, so these show a message box of the app. Workers and headless scripts don't get them.
+  const dialogs = ask => {
+    if (workers.api.isMainThread) for (const kind of ['alert', 'confirm', 'prompt']) globalThis[kind] = (message = '', value = '') => {
+      let result = null;
+      try { result = ask(kind, String(message), String(value)); } catch {}
+      return kind === 'alert' ? undefined : kind === 'confirm' ? result === true : result;
+    };
+  };
+  const askMain = (...args) => call('dom.open', 'dialog', ...args);
   if (!nodeRole) {
     // As in browsers, a page can't block its thread. Its workers can.
     if (workers.api.isMainThread) Atomics.wait = () => { throw new TypeError('Atomics.wait cannot be called from the current thread.'); };
+    dialogs(askMain);
     globalThis.__appsDOM = call;
     globalThis.__appsEventState = pollWeb.eventState;
     globalThis.__appsFiles = hooks.files;
@@ -407,6 +448,12 @@
     return true;
   };
   hooks.report = error => { if (!uncaught(error)) console.error(error); };
+  globalThis.reportError = error => {
+    let message; try { message = 'Uncaught ' + error; } catch { message = 'Uncaught exception'; }
+    const event = new ErrorEvent('error', { cancelable: true, error, message, filename: error?.sourceURL, lineno: error?.line, colno: error?.column });
+    dispatchEvent(event);
+    if (!event.defaultPrevented) hooks.report(error);
+  };
   addEventListener('unhandledrejection', event => { if (!process.listenerCount('unhandledRejection')) return; event.preventDefault(); process.emit('unhandledRejection', event.reason, event.promise); });
   const output = fd => {
     const tty = node.tty.isatty(fd), writable = new (stream().Writable)({ write(data, _encoding, done) { call('process.write', fd, data); done(); } });
@@ -671,9 +718,15 @@
     'did-fail-load': (_event, errorCode, errorDescription, validatedURL) => ({ errorCode, errorDescription, validatedURL, isMainFrame: true }),
     'console-message': (_event, level, message, line, sourceId) => ({ level, message, line, sourceId }), 'render-process-gone': (_event, details) => ({ details }), 'destroyed': () => ({}),
   };
+  const modal = (kind, message, value) => {
+    const result = call('native.dialog.message', { message, ...(kind !== 'alert' && { buttons: ['OK', 'Cancel'], cancelId: 1 }), ...(kind === 'prompt' && { input: value }) });
+    return kind === 'alert' ? null : kind === 'confirm' ? result.response === 0 : result.response === 0 ? result.input : null;
+  };
+  if (!info.node) dialogs(role === 'main' ? modal : askMain);
   globalThis.__appsWindowOpen = (id, args) => {
     const opener = windows.get(id), [kind, url, frameName, features, disposition] = args;
     if (!opener) return 'null';
+    if (kind === 'dialog') try { return JSON.stringify(modal(url, frameName, features)); } catch { return 'null'; }
     if (kind === 'webview') { const [, op, guestId, data] = args; try { return JSON.stringify(webview(opener, op, guestId, data) ?? null); } catch (error) { hooks.report(error); return 'null'; } }
     if (kind !== 'open') { const child = windows.get(url), own = states.get(child)?.opener === id; if (own && kind === 'close') child.close(); return JSON.stringify(!own); }
     const page = pages.get(opener.webContents), details = { url, frameName, features, disposition, referrer: { url: page.url, policy: 'strict-origin-when-cross-origin' }, postBody: undefined };
