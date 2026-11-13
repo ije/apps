@@ -1,4 +1,7 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -42,13 +45,18 @@ fn main() {
     if os == "linux" {
         link("-Wl,-rpath,$ORIGIN".to_owned());
     }
-    // The depth of OUT_DIR below the profile folder depends on the cargo version.
+    // Cargo 1.100 moved the output folder one level down, so find the profile folder by name. Older versions
+    // run tests in its `deps` folder.
     let profile = out
         .ancestors()
-        .find(|folder| folder.join("deps").is_dir())
+        .find(|folder| folder.ends_with("build"))
+        .and_then(Path::parent)
         .unwrap();
     let path = lib.join(name);
     for folder in [profile.to_owned(), profile.join("deps")] {
+        if !folder.is_dir() {
+            continue;
+        }
         let target = folder.join(name);
         // MacOS kills processes that load a library rewritten in place, so copy to a new file.
         if fs::read(&target).ok() != Some(fs::read(&path).unwrap()) {

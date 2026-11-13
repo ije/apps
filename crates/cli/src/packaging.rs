@@ -603,7 +603,9 @@ mod tests {
         ];
         for name in &names {
             fs::copy(
-                std::env::current_exe().unwrap().with_file_name(name),
+                apps_runtime::app::library_exe(name)
+                    .unwrap()
+                    .with_file_name(name),
                 dir.path().join(name),
             )
             .unwrap();
@@ -660,7 +662,9 @@ mod tests {
         let error = build(r#"["webgpu"]"#).unwrap_err();
         assert!(error.to_string().contains("WebGPU library"), "{error}");
         fs::copy(
-            std::env::current_exe().unwrap().with_file_name(name),
+            apps_runtime::app::library_exe(name)
+                .unwrap()
+                .with_file_name(name),
             dir.path().join(name),
         )
         .unwrap();

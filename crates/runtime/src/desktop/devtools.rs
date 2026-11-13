@@ -33,11 +33,11 @@ pub(crate) fn load() -> Result<&'static libloading::Library> {
     if let Some(library) = LOADED.get() {
         return Ok(library);
     }
-    let directory = super::app::library_exe()?
+    let name = libloading::library_filename("apps_devtools");
+    let directory = super::app::library_exe(&name.to_string_lossy())?
         .parent()
         .context("Missing executable directory")?
         .to_owned();
-    let name = libloading::library_filename("apps_devtools");
     let path = [".", "deps"]
         .iter()
         .map(|folder| directory.join(folder).join(&name))

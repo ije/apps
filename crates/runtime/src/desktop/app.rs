@@ -14,11 +14,58 @@ use std::{
 
 static DEV_LIBRARIES: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-pub(crate) fn library_exe() -> std::io::Result<std::path::PathBuf> {
-    match DEV_LIBRARIES.get() {
-        Some(exe) => Ok(exe.clone()),
-        None => std::env::current_exe()?.canonicalize(),
+// The executable whose folder holds the library `name`.
+#[doc(hidden)]
+pub fn library_exe(name: &str) -> std::io::Result<std::path::PathBuf> {
+    if let Some(exe) = DEV_LIBRARIES.get() {
+        return Ok(exe.clone());
     }
+    let exe = std::env::current_exe()?.canonicalize()?;
+    // Since Cargo 1.100, a test runs in `build/<package>/<hash>/out` of the profile folder, and a library that
+    // only a test needs stays in such a folder. The newest one goes to the profile folder, where FFmpeg is.
+    #[cfg(debug_assertions)]
+    if let Some(profile) = exe
+        .ancestors()
+        .nth(4)
+        .filter(|build| {
+            build.ends_with("build") && exe.parent().is_some_and(|out| out.ends_with("out"))
+        })
+        .and_then(std::path::Path::parent)
+        .or(exe.parent())
+        && let Some(file) = exe.file_name()
+    {
+        let package = name
+            .trim_start_matches("lib")
+            .split('.')
+            .next()
+            .unwrap_or(name);
+        let modified =
+            |path: &std::path::Path| path.metadata().and_then(|file| file.modified()).ok();
+        let target = profile.join(name);
+        let built = std::fs::read_dir(profile.join("build").join(package.replace('_', "-")))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|hash| {
+                let path = hash.path().join("out").join(name);
+                Some((modified(&path)?, path))
+            })
+            .max();
+        // The threads of a test share the name of the temporary file, so one of them copies at a time.
+        static COPY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _copy = COPY.lock();
+        if let Some((time, path)) = built
+            && modified(&target).is_none_or(|old| old < time)
+        {
+            // MacOS kills processes that load a library rewritten in place, so copy to a new file.
+            let temporary = profile.join(format!(".{name}.{}", std::process::id()));
+            if std::fs::copy(&path, &temporary).is_ok() {
+                let _ = std::fs::rename(&temporary, &target);
+            }
+        }
+        return Ok(profile.join(file));
+    }
+    Ok(exe)
 }
 
 pub(crate) type Handler = Arc<dyn Fn(u64, Vec<Value>) -> Result<Value> + Send + Sync>;

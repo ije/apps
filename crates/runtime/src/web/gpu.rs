@@ -108,7 +108,7 @@ pub(crate) fn library(
     abi_symbol: &[u8],
     abi: u32,
 ) -> Result<&'static libloading::Library> {
-    let executable = crate::desktop::app::library_exe()?;
+    let executable = crate::desktop::app::library_exe(name)?;
     let directory = executable
         .parent()
         .context("Missing executable directory")?;

@@ -1209,15 +1209,6 @@ fn table_cells_keep_their_boxes_and_follow_their_rows() {
 #[test]
 #[ignore = "requires the macOS window server"]
 fn video_frames_keep_the_boxes_around_them() {
-    let runtime = std::path::Path::new(env!("CARGO_BIN_EXE_apps-runtime"))
-        .parent()
-        .unwrap();
-    // Copy the media library from deps to the executable's folder. Replace it atomically to preserve macOS
-    // code signatures.
-    let library = runtime.join("libapps_media.dylib");
-    let copy = runtime.join(format!("libapps_media.{}.tmp", std::process::id()));
-    std::fs::copy(runtime.join("deps/libapps_media.dylib"), &copy).unwrap();
-    std::fs::rename(&copy, &library).unwrap();
     let clip = url::Url::from_file_path(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/media/clip.mp4"),
     )
