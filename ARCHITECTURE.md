@@ -100,6 +100,8 @@ A page and its preload have separate globals but share a VM and host. On macOS, 
 
 [bridge.js](crates/runtime/js/bridge.js) implements IPC and `contextBridge`. IPC values follow structured clone semantics. The context bridge also supports function and promise proxies between page and preload contexts. Rust handlers accept JSON values. `AppHandle` lets Rust threads send events to pages or request app exit.
 
+A worker message crosses threads as JSON text, and each side parses it once. Data that JSON keeps exact, like objects, arrays, strings and finite numbers without shared objects, goes as plain JSON. Other values use a graph form that keeps types, shared objects and cycles. Binary buffers travel beside the text.
+
 Synchronous page calls, such as `ipcRenderer.sendSync()` and `window.open()`, can wait for main. On macOS, native input and IME queries wait at most 100 ms for a page. Live resize waits at most 8 ms for a frame. Main continues native work during these waits.
 
 Window commands execute on main. Close and quit requests interrupt page JavaScript so a hung page script cannot prevent shutdown. Native calls and addons still execute on the thread that calls them.

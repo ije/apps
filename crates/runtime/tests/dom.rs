@@ -1482,6 +1482,35 @@ fn huge_svg_images_draw_at_their_canvas_size() {
 }
 
 #[test]
+fn page_workers_report_errors_and_get_files() {
+    let (.., result) = offscreen_page(
+        r#"
+        const inner = worker(`onmessage = ({ data }) => {
+            if (data === 'throw') throw new TypeError('bad');
+            if (data === 'later') return setTimeout(() => { throw new Error('late'); });
+            if (data === 'handled') { self.onerror = () => true; throw new Error('kept'); }
+            if (data.file) return data.file.text().then(text => postMessage([data.file instanceof File, data.file.name, data.file.type, text, data.blob instanceof Blob && !(data.blob instanceof File), data.blob.size]));
+            postMessage(data);
+        }`);
+        const failed = () => new Promise(resolve => inner.addEventListener('error', event => resolve([event instanceof ErrorEvent, event.message, event.lineno > 0]), { once: true }));
+        const answer = data => new Promise(resolve => { inner.onmessage = event => resolve(event.data); inner.postMessage(data); });
+        let failure = failed(); inner.postMessage('throw');
+        same(await failure, [true, 'Uncaught TypeError: bad', true], 'error in a handler');
+        failure = failed(); inner.postMessage('later');
+        same(await failure, [true, 'Uncaught Error: late', true], 'error in a timer');
+        let seen = 0; inner.addEventListener('error', () => seen++); inner.postMessage('handled');
+        same([await answer('ping'), seen], ['ping', 0], 'the worker lives on and keeps the errors that it handles');
+        same(await answer({ file: new File(['hello'], 'a.txt', { type: 'text/plain' }), blob: new Blob(['xy']) }), [true, 'a.txt', 'text/plain', 'hello', true, 2], 'files');
+        const pixels = await answer(new ImageData(new Uint8ClampedArray([7, 0, 0, 255]), 1, 1));
+        same([pixels instanceof ImageData, pixels.width, pixels.height, pixels.data[0]], [true, 1, 1, 7], 'image data');
+        const missing = new Worker('apps:///missing.js');
+        same(await new Promise(resolve => { missing.onerror = event => resolve(event.message); }), 'Missing bundled worker: missing.js', 'a missing worker fails with an event');
+    "#,
+    );
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn bitmaps_and_canvases_move_between_threads() {
     let (host, engine, result) = offscreen_page(
         r#"

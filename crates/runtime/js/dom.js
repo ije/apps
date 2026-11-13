@@ -190,10 +190,11 @@
     if (reporting) return console.error(error);
     reporting = true;
     let message; try { message = 'Uncaught ' + error; } catch { message = 'Uncaught exception'; }
-    try { const event = new ErrorEvent('error', { cancelable: true, error, message, filename: error?.sourceURL, lineno: error?.line, colno: error?.column }); dispatch(globalThis, event); if (!event.defaultPrevented) console.error(error); } finally { reporting = false; }
+    try { const event = new ErrorEvent('error', { cancelable: true, error, message, filename: error?.sourceURL, lineno: error?.line, colno: error?.column }); dispatch(globalThis, event); if (!event.defaultPrevented) { console.error(error); escalate?.(event); } } finally { reporting = false; }
   };
   globalThis.reportError = report;
-  globalThis.__appsReport?.(report); delete globalThis.__appsReport;
+  // In a page worker, an error that the worker does not handle goes on to its `Worker` object.
+  const escalate = globalThis.__appsReport?.(report); delete globalThis.__appsReport;
   const hitAt = (x, y) => wrap(call('dom.hitTest', x, y, true));
   const rootOf = (root, node) => { for (let up = node.getRootNode?.(); up; up = up.host?.getRootNode()) if (up === root) return true; return false; };
   const hidden = (node, from) => { const root = node.getRootNode?.(); return root instanceof ShadowRoot && !rootOf(root, from) && (root.mode === 'closed' || hidden(root.host, from)); };
@@ -2549,7 +2550,7 @@
       if (!value) return;
       const created = own[name] = { value, listener(event) {
         const fn = created.value; if (typeof fn !== 'function') return;
-        if (name === 'error' && this === window && event instanceof ErrorEvent) { if (fn.call(this, event.message, event.filename, event.lineno, event.colno, event.error) === true) event.preventDefault(); }
+        if (name === 'error' && this === globalThis && event instanceof ErrorEvent) { if (fn.call(this, event.message, event.filename, event.lineno, event.colno, event.error) === true) event.preventDefault(); }
         else if (fn.call(this, event) === false) event.preventDefault();
       } };
       this.addEventListener(name, created.listener);

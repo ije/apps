@@ -17,7 +17,7 @@ enum Event {
     Data(&'static str, Vec<u8>),
     End(&'static str),
     Error(&'static str, io::Error),
-    Written(&'static str),
+    Written(&'static str, u32),
     Finish(&'static str),
     Exit,
 }
@@ -124,15 +124,30 @@ fn writer<W: Write + Send + 'static>(
     std::thread::Builder::new()
         .name(format!("apps-{name}"))
         .spawn(move || {
-            while let Ok(Some(bytes)) = writes.recv() {
+            while let Ok(Some(mut bytes)) = writes.recv() {
+                // A burst of small writes, like IPC messages, costs one write, one event and one wake.
+                let (mut count, mut open) = (1, true);
+                while open && bytes.len() < 1 << 20 {
+                    match writes.try_recv() {
+                        Ok(Some(more)) => {
+                            bytes.extend_from_slice(&more);
+                            count += 1;
+                        }
+                        Ok(None) => open = false,
+                        Err(_) => break,
+                    }
+                }
                 if let Err(error) = pipe.write_all(&bytes) {
                     let _ = sender.send(Event::Error(name, error));
                     break;
                 }
-                if sender.send(Event::Written(name)).is_err() {
+                if sender.send(Event::Written(name, count)).is_err() {
                     return;
                 }
                 wake.wake();
+                if !open {
+                    break;
+                }
             }
             close(pipe);
             if sender.send(Event::Finish(name)).is_ok() {
@@ -519,7 +534,7 @@ impl State {
                         events.push(match event {
                             Event::Data(stream, data) => json!({"id": id, "event": "data", "stream": stream, "data": crate::jsc::payload::write(data)}),
                             Event::Error(stream, error) => json!({"id": id, "event": "error", "stream": stream, "error": error_value(&error)}),
-                            Event::Written(stream) => json!({"id": id, "event": "written", "stream": stream}),
+                            Event::Written(stream, count) => json!({"id": id, "event": "written", "stream": stream, "count": count}),
                             Event::Finish(stream) => {
                                 process.open_streams -= 1;
                                 json!({"id": id, "event": "finish", "stream": stream})

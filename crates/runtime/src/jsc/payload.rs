@@ -225,6 +225,12 @@ pub(crate) unsafe extern "C" fn release(_pointer: crate::jsc::Ptr, owner: crate:
     drop(unsafe { Box::from_raw(owner.cast::<Vec<u8>>()) });
 }
 
+// A call result that is JSON text already. JavaScriptCore parses it as it is, so a large message is not parsed and
+// serialized again here. `buffers` has the shape of the result, but only down to its `$appsBytes` markers.
+pub(crate) fn raw(json: String, buffers: Value) -> Value {
+    json!({"$appsRaw": json, "$appsBuffers": buffers})
+}
+
 pub(crate) fn output(
     api: &crate::jsc::JavaScriptCore,
     ctx: crate::jsc::Ptr,

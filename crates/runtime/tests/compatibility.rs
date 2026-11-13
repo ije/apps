@@ -1611,6 +1611,46 @@ fn node_perf_hooks_and_worker_thread_helpers() {
     "#);
 }
 
+#[test]
+fn worker_messages_ports_and_listener_errors() {
+    run(r#"
+        const {assert,worker_threads:{Worker,MessageChannel}}=__apps;
+        const echo=new Worker(`const{parentPort}=require('node:worker_threads');parentPort.on('message',m=>parentPort.postMessage(m));`,{eval:true});
+        assert.strictEqual(typeof echo.threadId,'number');
+        const ask=(message,transfer)=>new Promise(resolve=>{echo.once('message',resolve);echo.postMessage(message,transfer);});
+        const shared={x:1},cycle={name:'c'};cycle.self=cycle;
+        for(const value of [{a:[1,'π\ud800',null,true,{b:{}}],__proto__x:1},[],'s',1.5,null,undefined,[-0],{u:undefined},{a:shared,b:shared},new Map([[1,new Set([2n])]]),{d:new Date(5),r:/x/g,bytes:new Uint8Array([1,2])}])assert.deepStrictEqual(await ask(value),value);
+        const twice=await ask({a:shared,b:shared});assert.strictEqual(twice.a,twice.b);assert.strictEqual((await ask(cycle)).self.self.name,'c');
+        const own=await ask(JSON.parse('{"__proto__":{"x":1}}'));assert.ok(Object.hasOwn(own,'__proto__')&&({}).x===undefined);
+        assert.throws(()=>echo.postMessage({f(){}}),{name:'DataCloneError'});
+        const bytes=new Uint8Array([1]),copied=ask({bytes});bytes[0]=2;assert.strictEqual((await copied).bytes[0],1);
+        const moved=new ArrayBuffer(8),unused=new ArrayBuffer(8);assert.strictEqual((await ask({moved},[moved,unused])).moved.byteLength,8);assert.deepStrictEqual([moved.byteLength,unused.byteLength],[0,0]);
+        const mixed=[];echo.on('message',message=>mixed.push(message.bytes?[message.i,message.bytes[0]]:message.i));
+        for(let i=0;i<6;i++)echo.postMessage(i%2?{i,bytes:new Uint8Array([i])}:{i});
+        while(mixed.length<6)await new Promise(resolve=>setTimeout(resolve,5));
+        assert.deepStrictEqual(mixed,[0,[1,1],2,[3,3],4,[5,5]]);echo.removeAllListeners('message');
+        const source={list:[{n:1}]},copy=structuredClone(source);assert.deepStrictEqual(copy,source);assert.notStrictEqual(copy.list[0],source.list[0]);
+        assert.ok(structuredClone(new RangeError('r')) instanceof RangeError);
+        const file=structuredClone(new File(['hi'],'a.txt',{type:'text/plain'}));assert.ok(file instanceof File&&file.name==='a.txt'&&file.type==='text/plain'&&await file.text()==='hi');
+        const caught=[],report=error=>caught.push(error.message);process.on('uncaughtException',report);
+        const burst=new Worker(`const{parentPort}=require('node:worker_threads');for(let i=0;i<5;i++)parentPort.postMessage(i);`,{eval:true});
+        const got=[];burst.on('message',message=>{got.push(message);throw Error('listener '+message);});
+        // The worker ends during this wait, so its messages and its exit come in one batch.
+        for(const end=Date.now()+200;Date.now()<end;);
+        assert.strictEqual(await new Promise(resolve=>burst.on('exit',resolve)),0);
+        assert.deepStrictEqual(got,[0,1,2,3,4]);assert.deepStrictEqual(caught,got.map(n=>'listener '+n));process.off('uncaughtException',report);
+        const ended=new Worker(`process.exit(0)`,{eval:true});for(const end=Date.now()+200;Date.now()<end;);
+        ended.postMessage('late');assert.strictEqual(await new Promise(resolve=>ended.on('exit',resolve)),0);
+        const failing=new Worker(`throw new TypeError('bad')`,{eval:true}),error=await new Promise(resolve=>failing.on('error',resolve));
+        assert.ok(error instanceof TypeError&&error.message==='bad');
+        const {port1,port2}=new MessageChannel(),seen=[];port1.postMessage('a');port2.onmessage=event=>seen.push(event.data);port1.postMessage('b');
+        await new Promise(resolve=>setTimeout(resolve,20));assert.deepStrictEqual(seen,['a','b']);
+        assert.ok(port1.hasRef()&&!port1.unref().hasRef()&&port1.ref().hasRef());
+        assert.ok(echo.listenerCount('message')===0&&echo.emit('message',1)===false&&echo.addListener('x',()=>{}).listenerCount('x')===1);
+        assert.strictEqual(await echo.terminate(),1);
+    "#);
+}
+
 #[cfg(unix)]
 #[test]
 fn fork_and_utility_process_speak_node_ipc() {
@@ -1654,6 +1694,13 @@ send({ready:process.argv.slice(2),type:process.type??null,fd:process.env.NODE_CH
         await once(parted,'message');const echoed=once(parted,'message');
         assert.strictEqual(await new Promise(resolve=>parted.send('first',resolve)),null);assert.deepStrictEqual((await echoed)[0],{{echo:'first'}});const log=script(parted);parted.disconnect();assert.ok(!parted.connected);
         await once(parted,'close');assert.deepStrictEqual(log,['disconnect','exit 0','close']);
+        const noisy=fork('apps:///child.js',{{execPath:runtime,env,silent:true}});await once(noisy,'message');
+        const failures=[],note=error=>failures.push(error.message),replies=[];process.on('uncaughtException',note);
+        noisy.on('message',message=>{{replies.push(message.echo);if(message.echo<3)throw Error('listener '+message.echo);}});
+        let sent=0;for(let index=0;index<500;index++)noisy.send(index,error=>{{assert.strictEqual(error,null);sent++;}});
+        while(replies.length<500||sent<500)await new Promise(resolve=>setTimeout(resolve,5));
+        process.off('uncaughtException',note);assert.deepStrictEqual(replies,[...Array(500).keys()]);assert.deepStrictEqual(failures,['listener 0','listener 1','listener 2']);
+        noisy.disconnect();await once(noisy,'close');
         assert.strictEqual(code(()=>fork('x',{{serialization:'advanced'}})),'ERR_INVALID_ARG_VALUE');
         assert.strictEqual(code(()=>fork('x',{{stdio:'pipe'.split()}})),'ERR_CHILD_PROCESS_IPC_REQUIRED');
         assert.strictEqual(code(()=>spawn('x',{{stdio:['pipe','pipe','pipe','ipc','ipc']}})),'ERR_IPC_ONE_PIPE');

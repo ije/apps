@@ -1,4 +1,4 @@
-globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
+globalThis.__appsChildProcess = (call, EventEmitter, stream, fail) => {
   const children = new Map();
   const key = {};
   let failureID = 0;
@@ -22,8 +22,8 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
           const message = JSON.parse(Buffer.concat(parts).toString());
           parts = [];
           if (!target.connected || typeof message?.cmd === 'string' && message.cmd.startsWith('NODE_')) continue;
-          target.emit('message', message);
-          target.parentPort?.emit('message', { data: message, ports: [] });
+          // A listener that throws must not lose the other messages of this chunk.
+          try { target.emit('message', message); target.parentPort?.emit('message', { data: message, ports: [] }); } catch (error) { fail(error); }
         }
         if (start < data.length) parts.push(data.subarray(start));
         return true;
@@ -180,11 +180,12 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
       for (const output of child.stdio) output?.destroy();
       closed(child, child.exitCode, null, true);
     }
-    for (const event of call('child.poll')) {
+    // A listener that throws must not lose the other events, like the exit of a child.
+    for (const event of call('child.poll')) try {
       const child = children.get(event.id)?.child;
       if (!child) continue;
       if (event.event === 'data') { const output=child[event.stream]; if(!output.destroyed&&!output.push(view(event.data))&&!output._paused){output._paused=true;call('child.pause',event.id,event.stream,true);} }
-      else if (event.event === 'written') (child[event.stream] ?? child.stdin)?._childWritten();
+      else if (event.event === 'written') for (let count = event.count; count > 0; count--) (child[event.stream] ?? child.stdin)?._childWritten();
       else if (event.event === 'finish') (child[event.stream] ?? child.stdin)?._childEnded();
       else if (event.event === 'end') { if (!child[event.stream].destroyed) child[event.stream].push(null); }
       else if (event.event === 'error') child[event.stream]?.destroy(Object.assign(new Error(`${event.stream === 'stdin' ? 'write' : 'read'} ${event.error.code}`), event.error, { message: `${event.stream === 'stdin' ? 'write' : 'read'} ${event.error.code}`, syscall: event.stream === 'stdin' ? 'write' : 'read' }));
@@ -195,7 +196,7 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream) => {
         else if (child.connected) child.once('disconnect', () => child.emit('exit', event.code, event.signal));
         else child.emit('exit', event.code, event.signal);
       } else child.emit(event.event);
-    }
+    } catch (error) { fail(error); }
     return children.size > 0;
   };
   const spawnSync=(...input)=>{

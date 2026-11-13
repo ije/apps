@@ -179,7 +179,7 @@
     promise.then(() => { modulesPending--; }, error => { modulesPending--; moduleErrors.push(error); });
   };
   let children, servers, node, pty, browsers, net, nativeShell, uncaught = () => false;
-  const workers = globalThis.__appsWorkers(call, nodeRole, task);
+  const workers = globalThis.__appsWorkers(call, nodeRole, task, fail, pollWeb.blob);
   delete globalThis.__appsWorkers;
   globalThis.__appsBrowserEnvironment(call, task);
   delete globalThis.__appsBrowserEnvironment;
@@ -253,7 +253,7 @@
     globalThis.__appsDOM = call;
     globalThis.__appsEventState = pollWeb.eventState;
     globalThis.__appsFiles = hooks.files;
-    globalThis.__appsReport = report => { uncaught = error => (report(error), true); };
+    globalThis.__appsReport = report => { uncaught = error => (report(error), true); return workers.report; };
     const executed = (id, data) => call('dom.executed', id, stringify(data));
     Object.defineProperty(globalThis, '__appsExecuted', { value: (id, value, failed) => (failed ? Promise.reject(value) : Promise.resolve(value)).then(value => executed(id, { value })).catch(error => executed(id, { error: String(error?.message ?? error) })) });
     if (!disabled.has('webgpu')) globalThis.__appsGPU = call;
@@ -301,7 +301,7 @@
   node = globalThis.__appsNode(call, events.EventEmitter, inspector, info, codec);
   delete globalThis.__appsNode;
   const stream = once(() => installStreams(events.EventEmitter, node.Buffer, node.string_decoder.StringDecoder));
-  const childProcess = once(() => children = installChildren(call, events.EventEmitter, stream()));
+  const childProcess = once(() => children = installChildren(call, events.EventEmitter, stream(), fail));
   let ioMade;
   const io = once(() => ioMade = installIO({ call, sync: node.sync, asyncCall: node.asyncCall, Buffer: node.Buffer, stream: stream(), EventEmitter: events.EventEmitter, StringDecoder: node.string_decoder.StringDecoder, webcrypto: globalThis.__appsNodeCrypto.webcrypto, inspect, codec }));
   // Do not initialize crypto through io() just for this check. No KeyObject can exist before crypto loads.

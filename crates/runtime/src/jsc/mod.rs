@@ -1602,8 +1602,18 @@ fn output(api: &JavaScriptCore, ctx: Ptr, payload: payload::Payload) -> Ptr {
                 {
                     return buffer(api, ctx, std::mem::take(bytes), true);
                 }
+                // See `payload::raw`.
+                let (text, value) = match value {
+                    Value::Object(mut raw) if raw.contains_key("$appsRaw") => {
+                        match (raw.remove("$appsRaw"), raw.remove("$appsBuffers")) {
+                            (Some(Value::String(text)), Some(tree)) => (text, tree),
+                            _ => return (api.null)(ctx),
+                        }
+                    }
+                    value => (value.to_string(), value),
+                };
                 let markers = !buffers.is_empty();
-                let json = api.string_owned(value.to_string());
+                let json = api.string_owned(text);
                 let root = (api.json_value)(ctx, json);
                 (api.string_release)(json);
                 if !markers || root.is_null() {

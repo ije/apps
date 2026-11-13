@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::{
     cell::RefCell,
     collections::HashMap,
+    fmt::Write,
     rc::Rc,
     sync::{
         Arc,
@@ -17,8 +18,16 @@ use std::{
     time::Duration,
 };
 
+enum Event {
+    Online,
+    // The JSON text of a message. The parent gets it as it is and parses it once.
+    Message(String, Vec<bytes::Bytes>),
+    Error(Value),
+    Exit(i32),
+}
+
 struct Parent {
-    events: mpsc::SyncSender<Payload>,
+    events: mpsc::SyncSender<Event>,
     wake: crate::host::Waker,
     data: Value,
     id: u64,
@@ -50,7 +59,7 @@ static CHANNELS: std::sync::LazyLock<std::sync::Mutex<HashMap<u64, Subscriber>>>
 
 struct Worker {
     input: mpsc::Sender<Payload>,
-    events: mpsc::Receiver<Payload>,
+    events: mpsc::Receiver<Event>,
     stop: Arc<AtomicBool>,
 }
 impl Drop for Worker {
@@ -106,13 +115,24 @@ impl State {
             "post" => PARENT.with(|parent| {
                 let parent = parent.borrow();
                 let parent = parent.as_ref().context("Worker has no parent")?;
-                parent
-                    .events
-                    .send(Payload::snapshot(
-                        json!({"kind":"message","data":args.take()}),
-                    ))
-                    .context("Worker parent is closed")?;
+                let Value::String(text) = args[0].take() else {
+                    bail!("Expected worker message");
+                };
+                let buffers = Payload::snapshot(Value::Null).buffers;
+                ensure!(
+                    parent.events.send(Event::Message(text, buffers)).is_ok(),
+                    "Worker parent is closed"
+                );
                 parent.wake.wake();
+                Ok(Value::Null)
+            }),
+            "error" => PARENT.with(|parent| {
+                if let Some(parent) = parent.borrow().as_ref() {
+                    let _ = parent.events.send(Event::Error(json!({
+                        "message": args[0], "filename": args[1], "lineno": args[2], "colno": args[3], "uncaught": true,
+                    })));
+                    parent.wake.wake();
+                }
                 Ok(Value::Null)
             }),
             "buffers" => Ok(json!(
@@ -225,7 +245,7 @@ impl State {
                 let scripts = self.scripts.clone();
                 let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                 let (input, inbox) = mpsc::channel::<Payload>();
-                let (output, events) = mpsc::sync_channel::<Payload>(64);
+                let (output, events) = mpsc::sync_channel::<Event>(64);
                 let stop = Arc::new(AtomicBool::new(false));
                 let cancelled = stop.clone();
                 let wake = crate::host::Waker::current();
@@ -243,7 +263,7 @@ impl State {
                         let engine = JsContext::new_interruptible(api.clone(), host, role, Some(cancelled.clone()))?;
                         engine.eval("for (const name of ['document', 'window', 'screen', 'screenX', 'screenY', 'screenLeft', 'screenTop', 'outerWidth', 'outerHeight', 'localStorage', 'sessionStorage']) delete globalThis[name]; globalThis.self=globalThis;", "apps:worker-scope")?;
                         if native { engine.eval("globalThis.require = globalThis.__apps.module.createRequire(); globalThis.onmessage = null;", "apps:worker-modules")?; }
-                        let _ = output.send(json!({"kind":"online"}).into());
+                        let _ = output.send(Event::Online);
                         wake.wake();
                         engine.eval_page(std::str::from_utf8(&source)?, "apps:worker")?;
                         while engine.eval_page(crate::jsc::NEXT, "apps:worker")? == "true" {}
@@ -274,8 +294,8 @@ impl State {
                     })();
                     let terminated=cancelled.load(Ordering::Acquire);
                     let code = PARENT.with(|parent| parent.borrow().as_ref().and_then(|parent| parent.code)).unwrap_or(if result.is_ok() && !terminated {0} else {1});
-                    if !terminated && let Err(error) = &result { let _ = output.send(json!({"kind":"error","message":format!("{error:#}")}).into()); }
-                    let _ = output.send(json!({"kind":"exit","code":code}).into());
+                    if !terminated && let Err(error) = &result { let _ = output.send(Event::Error(json!({"message":format!("{error:#}")}))); }
+                    let _ = output.send(Event::Exit(code));
                     wake.wake();
                     PARENT.with(|parent| *parent.borrow_mut() = None);
                 })?;
@@ -290,18 +310,15 @@ impl State {
                 Ok(json!(id))
             }
             "send" => {
-                let worker = self
-                    .workers
-                    .get(&args[0].as_u64().context("Expected worker ID")?)
-                    .context("Worker is closed")?;
+                let id = args[0].as_u64().context("Expected worker ID")?;
                 let message = args
                     .as_array_mut()
                     .context("Expected worker message")?
                     .split_off(1);
-                worker
-                    .input
-                    .send(Payload::snapshot(Value::Array(message)))
-                    .context("Worker is closed")?;
+                // A worker can end before its parent reads the exit event. As in browsers, the message is dropped.
+                if let Some(worker) = self.workers.get(&id) {
+                    let _ = worker.input.send(Payload::snapshot(Value::Array(message)));
+                }
                 Ok(Value::Null)
             }
             "terminate" => {
@@ -315,26 +332,47 @@ impl State {
                 Ok(Value::Null)
             }
             "poll" => {
-                let mut events = Vec::new();
+                let (mut events, mut tree) = (String::from("["), Vec::new());
                 self.workers.retain(|id, worker| {
                     for _ in 0..64 {
-                        match worker.events.try_recv() {
-                            Ok(event) => {
-                                let mut event = event.into_value();
-                                let done = event["kind"] == "exit";
-                                event["id"] = json!(id);
-                                events.push(event);
-                                if done {
-                                    return false;
-                                }
-                            }
+                        let event = match worker.events.try_recv() {
+                            Ok(event) => event,
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => return false,
+                        };
+                        if events.len() > 1 {
+                            events.push(',');
                         }
+                        tree.push(Value::Null);
+                        let _ = match event {
+                            Event::Online => write!(events, r#"{{"kind":"online","id":{id}}}"#),
+                            Event::Message(text, buffers) => {
+                                let _ = write!(events, r#"{{"kind":"message","id":{id},"data":[{text}"#);
+                                if !buffers.is_empty() {
+                                    let mut data = vec![Value::Null];
+                                    for bytes in buffers {
+                                        events.push_str(",null");
+                                        data.push(crate::jsc::payload::write(bytes));
+                                    }
+                                    *tree.last_mut().expect("event") = json!({"data": data});
+                                }
+                                write!(events, "]}}")
+                            }
+                            Event::Error(mut error) => {
+                                error["kind"] = json!("error");
+                                error["id"] = json!(id);
+                                write!(events, "{error}")
+                            }
+                            Event::Exit(code) => {
+                                let _ = write!(events, r#"{{"kind":"exit","id":{id},"code":{code}}}"#);
+                                return false;
+                            }
+                        };
                     }
                     true
                 });
-                Ok(json!(events))
+                events.push(']');
+                Ok(crate::jsc::payload::raw(events, Value::Array(tree)))
             }
             _ => bail!("Unsupported worker operation: {op}"),
         }

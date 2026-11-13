@@ -1,7 +1,7 @@
 globalThis.__appsBrowserEnvironment = (call, task) => {
   const codec = globalThis.__appsStorageClone, retries = globalThis.__appsRetries;
   delete globalThis.__appsStorageClone; delete globalThis.__appsRetries;
-  const clone = value => codec.decode(codec.encode(value));
+  const clone = codec.clone;
   const fail = (name, message = name) => new DOMException(message, name);
   const native = (op, ...args) => {
     try { return call('web.storage.' + op, ...args); }
