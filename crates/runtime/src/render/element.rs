@@ -1721,7 +1721,7 @@ fn create(
     let mut pending: Vec<usize> = if symbol.is_some()
         || matches!(
             node.tag.as_str(),
-            "svg" | "canvas" | "iframe" | "progress" | "meter"
+            "svg" | "canvas" | "iframe" | "progress" | "meter" | "terminal"
         ) {
         Vec::new()
     } else {
@@ -2001,7 +2001,7 @@ fn create(
         }
         let merged = !text_field(node)
             && symbol.is_none()
-            && !matches!(node.tag.as_str(), "svg" | "canvas" | "iframe")
+            && !matches!(node.tag.as_str(), "svg" | "canvas" | "iframe" | "terminal")
             && inline_text().is_some();
         if display != "inline"
             && !merged
@@ -2035,6 +2035,37 @@ fn create(
             .child(picture(super::paint::Source::Drawn).absolute());
         presented.style().aspect_ratio = natural_ratio;
         el = el.child(presented);
+    }
+    let mut grid_bar = None;
+    if node.tag == "terminal" {
+        let host = view.host.borrow();
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !host.enabled("terminal") && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "apps: The terminal feature is disabled. Add \"terminal\" to \"features\" in package.json"
+            );
+        }
+        if let Some(state) = host.dom.get(&view.id).filter(|_| host.enabled("terminal")) {
+            let look = super::terminal::look(style, styles.selections.get(&id), &units);
+            // The bar of the scrollback.
+            grid_bar = Some(scrollbar::Scrollbar {
+                id,
+                handle: (state.terminals.borrow_mut().bars.entry(id).or_default().0).clone(),
+                look: scrollbar::Look::new(style, None, &units, Some(look.background())),
+                axes: [false, true],
+                reserved: [0.; 2],
+                borders: insets(styles, id, false, containing[0]),
+                origin: [0.; 2],
+                quiet: true,
+            });
+            el = el.child(renderer::node().size_full().hooks(super::terminal::Grid {
+                id,
+                view: view.clone(),
+                terminals: state.terminals.clone(),
+                look: Rc::new(look),
+                edges: insets(styles, id, true, containing[0]),
+            }));
+        }
     }
     let mut picture = None;
     if node.tag == "img" || node.tag == "video" {
@@ -4531,8 +4562,10 @@ fn create(
                 padding[3] - borders[1] - borders[3],
                 padding[0] - borders[0] - borders[2],
             ],
+            quiet: false,
         });
     }
+    let bars = grid_bar.or(bars);
     let marker_style = styles
         .text_pseudos
         .get(&id)
@@ -5490,23 +5523,24 @@ fn create(
     if preserve && node.text == "\n" {
         el = el.min_h(px(units.font.lh));
     }
-    let inline =
-        if editable || symbol.is_some() || matches!(node.tag.as_str(), "svg" | "canvas" | "iframe")
-        {
-            None
-        } else {
-            inline_text().filter(|data| {
-                !data.text.is_empty() || {
-                    let found = content_editable(doc, id);
-                    reader.log(
-                        Query::Editable,
-                        found.map_or(1, |node| reader.scope_of(id, node)),
-                        hashed(found.is_some()),
-                    );
-                    found.is_some()
-                }
-            })
-        };
+    let inline = if editable
+        || symbol.is_some()
+        || matches!(node.tag.as_str(), "svg" | "canvas" | "iframe" | "terminal")
+    {
+        None
+    } else {
+        inline_text().filter(|data| {
+            !data.text.is_empty() || {
+                let found = content_editable(doc, id);
+                reader.log(
+                    Query::Editable,
+                    found.map_or(1, |node| reader.scope_of(id, node)),
+                    hashed(found.is_some()),
+                );
+                found.is_some()
+            }
+        })
+    };
     let hit_test = inline.is_some();
     let drag = style
         .get(Prop::APP_REGION)
@@ -5738,6 +5772,7 @@ fn create(
         }
     } else if !node.children.is_empty()
         && node.tag != "canvas"
+        && node.tag != "terminal"
         && node.tag != "iframe"
         && node.tag != "svg"
         && !editable

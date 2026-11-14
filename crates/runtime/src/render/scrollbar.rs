@@ -219,6 +219,17 @@ pub(super) struct State {
     wake: Option<(Instant, Timer)>,
 }
 
+impl State {
+    /// Shows the bars of a quiet `Scrollbar`.
+    pub(super) fn show(&mut self) {
+        self.active = Some(Instant::now());
+    }
+
+    pub(super) fn visible(&self) -> bool {
+        self.pointer != Pointer::Away || self.active.is_some_and(|at| at.elapsed() < HOLD + FADE)
+    }
+}
+
 pub(super) struct Bar {
     hitbox: Region,
     zone: Rect<Pixels>,
@@ -240,6 +251,8 @@ pub(super) struct Scrollbar {
     pub(super) reserved: [f32; 2],
     pub(super) borders: [f32; 4],
     pub(super) origin: [f32; 2],
+    /// A new offset does not show the bars. A terminal scrolls with its output, and shows them itself.
+    pub(super) quiet: bool,
 }
 
 type Prepainted = Option<(Rc<RefCell<State>>, Rc<[Option<Bar>; 2]>)>;
@@ -288,7 +301,7 @@ impl Scrollbar {
         {
             let mut state = state.borrow_mut();
             let drawn = offset + stretch;
-            if state.offset.is_some_and(|old| old != drawn) {
+            if !self.quiet && state.offset.is_some_and(|old| old != drawn) {
                 state.active = Some(Instant::now());
             }
             state.offset = Some(drawn);

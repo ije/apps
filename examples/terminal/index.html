@@ -1,0 +1,69 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Terminal</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        -terminal-black: #1d1f21; -terminal-red: #cc6666; -terminal-green: #8c9440; -terminal-yellow: #de935f;
+        -terminal-blue: #5f819d; -terminal-magenta: #85678f; -terminal-cyan: #5e8d87; -terminal-white: #707880;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root { -terminal-green: #b5bd68; -terminal-yellow: #f0c674; -terminal-blue: #81a2be; -terminal-magenta: #b294bb; -terminal-cyan: #8abeb7; -terminal-white: #c5c8c6; }
+      }
+      html, body { height: 100%; margin: 0; }
+      body { display: flex; flex-direction: column; font: 12px system-ui; background: Canvas; color: CanvasText; }
+      header { display: flex; gap: 12px; padding: 6px 10px; border-bottom: 1px solid color-mix(in srgb, CanvasText 15%, transparent); }
+      #status { margin-left: auto; opacity: 0.7; }
+      button { font: inherit; padding: 0 8px; }
+      terminal { flex: 1; width: auto; height: auto; min-height: 0; padding: 6px 8px; font: 13px/1.3 ui-monospace, Menlo, monospace; caret-color: #81a2be; }
+      terminal::selection { background: color-mix(in srgb, #81a2be 40%, transparent); }
+    </style>
+  </head>
+  <body>
+    <header><b id="process"></b><span id="cwd"></span><span id="size"></span><span id="status"></span><button id="image">Image</button></header>
+    <terminal id="terminal"></terminal>
+    <script type="module">
+      import { createTerminalSession } from './preload.ts'
+      const terminal = document.getElementById('terminal')
+      const show = (id, text) => (document.getElementById(id).textContent = text)
+      // The element shows nothing until it has a session. A session ends when its element leaves the document.
+      const start = () => {
+        const session = (terminal.session = createTerminalSession())
+        const update = () => {
+          show('process', session.process?.name ?? '')
+          show('cwd', session.cwd)
+          show('size', `${session.cols}×${session.rows}`)
+        }
+        for (const type of ['titlechange', 'cwdchange', 'resize']) session.addEventListener(type, update)
+        // Programs report what they do with OSC 7501, for example:
+        //   printf '\e]7501;state=working:progress=40:msg=%s\e\\' "$(printf Building | base64)"
+        session.addEventListener('statuschange', () => {
+          const record = session.programStatus.find(record => record.id === '')
+          show('status', record ? [record.app, record.state, record.progress === null ? '' : record.progress + '%', record.message].filter(Boolean).join(' · ') : '')
+        })
+        // A new shell takes the place of one that exits.
+        session.addEventListener('exit', () => {
+          session.close()
+          start()
+        })
+      }
+      start()
+      // Programs show images with the Kitty graphics protocol, for example:
+      //   printf '\e_Ga=T,f=100;%s\e\\' "$(base64 < image.png)"
+      document.getElementById('image').onclick = () => {
+        const image = document.createElement('canvas')
+        image.width = 320
+        image.height = 120
+        const context = image.getContext('2d')
+        const gradient = context.createLinearGradient(0, 0, image.width, image.height)
+        for (const [index, color] of ['#cc6666', '#f0c674', '#b5bd68', '#81a2be'].entries()) gradient.addColorStop(index / 3, color)
+        context.fillStyle = gradient
+        context.fillRect(0, 0, image.width, image.height)
+        terminal.session.output(`\x1b_Ga=T,f=100;${image.toDataURL().split(',')[1]}\x1b\\\r\n`)
+        terminal.focus()
+      }
+      terminal.focus()
+    </script>
+  </body>
+</html>

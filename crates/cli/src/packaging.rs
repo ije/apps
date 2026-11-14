@@ -38,6 +38,13 @@ pub fn package_app(
     } else {
         Vec::new()
     };
+    // libghostty-vt is in the terminal library, so its license ships with it.
+    let terminal = enabled("terminal").then(|| {
+        [
+            apps_runtime::terminal::library_name(target.platform),
+            apps_runtime::terminal::LICENSE,
+        ]
+    });
     if target.platform == "windows" {
         for value in [&name, &product_name] {
             let stem = value.split('.').next().unwrap().to_ascii_uppercase();
@@ -217,6 +224,9 @@ pub fn package_app(
     }
     for name in media {
         shipped.push((folder.with_file_name(name), name, (name != "FFmpeg.LICENSE").then_some("The media and simpleAudio features need their library next to the runtime. Build the workspace first with cargo build --workspace --release.")));
+    }
+    for name in terminal.into_iter().flatten() {
+        shipped.push((folder.with_file_name(name), name, (name != apps_runtime::terminal::LICENSE).then_some("The terminal feature needs the terminal library next to the runtime. Run bash scripts/build-ghostty.sh, then cargo build --workspace --release.")));
     }
     for (source, name, context) in &shipped {
         if let Some(context) = context {
@@ -671,10 +681,67 @@ mod tests {
         for (features, shipped) in [
             ("[]", false),
             (r#"["webgpu"]"#, true),
-            (r#"["*","-webgpu","-media","-simpleAudio"]"#, false),
+            (
+                r#"["*","-webgpu","-media","-simpleAudio","-terminal"]"#,
+                false,
+            ),
         ] {
             build(features).unwrap();
             assert_eq!(libraries.join(name).is_file(), shipped, "{features}");
+        }
+    }
+
+    #[test]
+    fn terminal_library_ships_only_with_the_feature() {
+        let target = BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        fs::write(&runtime, b"runtime").unwrap();
+        let out = dir.path().join("dist");
+        let libraries = if cfg!(target_os = "macos") {
+            out.join("App.app/Contents/Frameworks")
+        } else {
+            out.clone()
+        };
+        let build = |features: &str| {
+            let files = BBTreeMap::from([
+                ("app.js".into(), String::new()),
+                (
+                    "package.json".into(),
+                    format!(r#"{{"features":{features}}}"#),
+                ),
+            ]);
+            package_app(
+                &out,
+                &files,
+                &runtime,
+                dir.path(),
+                target,
+                None,
+                false,
+                None,
+            )
+        };
+        let error = build(r#"["terminal"]"#).unwrap_err();
+        assert!(error.to_string().contains("terminal library"), "{error}");
+        let names = [
+            apps_runtime::terminal::library_name(target.platform),
+            apps_runtime::terminal::LICENSE,
+        ];
+        for name in names {
+            fs::copy(
+                apps_runtime::app::library_exe(name)
+                    .unwrap()
+                    .with_file_name(name),
+                dir.path().join(name),
+            )
+            .unwrap();
+        }
+        for (features, shipped) in [("[]", false), (r#"["terminal"]"#, true)] {
+            build(features).unwrap();
+            for name in names {
+                assert_eq!(libraries.join(name).is_file(), shipped, "{features} {name}");
+            }
         }
     }
 

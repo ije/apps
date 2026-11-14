@@ -70,6 +70,7 @@ path = "src/main.rs"
 apps-devtools = { path = "../devtools" }
 apps-audio = { path = "../media/audio" }
 apps-media = { path = "../media" }
+apps-terminal = { path = "../terminal" }
 apps-webgpu = { path = "../webgpu" }
 image.workspace = true
 tempfile = "3.27.0"

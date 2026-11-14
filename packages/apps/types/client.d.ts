@@ -33,6 +33,114 @@ declare namespace NodeJS {
 interface Worker {}
 interface SharedWorker {}
 
+// Empty so the terminal types resolve without the DOM lib.
+interface HTMLElement {}
+
+/** A record of the program status protocol (OSC 7501). The record of the program itself has an empty `id`. */
+interface TerminalProgramStatus {
+  /** `build/test` is a child of `build`. */
+  readonly id: string
+  readonly state: 'idle' | 'working' | 'done' | 'blocked' | 'error'
+  /** What a blocked program needs. */
+  readonly kind: 'permission' | 'question' | 'auth' | null
+  /** 0 to 100, or `null` when the program gave no percentage. */
+  readonly progress: number | null
+  /** A stable name of the program, like `cargo`. A record without one takes it from its parent. */
+  readonly app: string
+  readonly title: string
+  readonly message: string
+}
+
+interface TerminalSessionEventMap {
+  /** The program ended. */
+  exit: Event & { readonly exitCode: number | null; readonly signal: string | null }
+  /** Input for the program of a session that has no program: keys, pastes and answers of the terminal. */
+  data: Event & { readonly data: string }
+  /** `cols` or `rows` changed. */
+  resize: Event
+  titlechange: Event
+  cwdchange: Event
+  bell: Event
+  /** `programStatus` changed. */
+  statuschange: Event
+  /** The session ended: `close()` was called, or its element left the document. */
+  close: Event
+}
+
+/**
+ * A terminal with its program. A preload script creates it with `new terminal.Session()` from `@pierre/apps`
+ * and gives it to the page, where a `<terminal>` element shows it. The page and the preload script have
+ * their own object for the same session.
+ */
+interface TerminalSession extends EventTarget {
+  /** Calls on a closed session throw. */
+  readonly closed: boolean
+  /** The size of the grid: 80 by 24, and then the size of the element as of its last frame. */
+  readonly cols: number
+  readonly rows: number
+  /** The cursor in the grid. */
+  readonly cursor: { readonly x: number; readonly y: number; readonly visible: boolean }
+  /** The process ID of the program, or `null` when no program runs. */
+  readonly pid: number | null
+  /** The process in the foreground, like `vim` in a shell. */
+  readonly process: { readonly pid: number; readonly name: string } | null
+  /** The directory that the shell reports, or else the directory of the foreground process. */
+  readonly cwd: string
+  /** The title that the program sets. */
+  readonly title: string
+  /** The records that programs report with OSC 7501. */
+  readonly programStatus: readonly TerminalProgramStatus[]
+  /** A full-screen program like `vim` uses the alternate screen. */
+  readonly alternateScreen: boolean
+  /** All text, with the scrollback. */
+  readonly text: string
+  readonly selectedText: string
+  /**
+   * Preload only. Starts a program and ends the one before it. A string is a command line for the login
+   * shell, an array is the program and its arguments, and without a command it is the login shell. Returns
+   * the process ID.
+   */
+  spawn(command?: string | string[] | null, options?: { cwd?: string; env?: Record<string, string> }): number
+  /** Sends a signal to the program. The default is `SIGHUP`. */
+  kill(signal?: 'SIGHUP' | 'SIGINT' | 'SIGQUIT' | 'SIGKILL' | 'SIGTERM'): void
+  /** Sends input to the program, as if the user typed it. */
+  input(data: string | ArrayBuffer | ArrayBufferView): void
+  /** Sends text to the program as a paste. */
+  paste(text: string): void
+  /** Shows output on the screen, as if the program wrote it. */
+  output(data: string | ArrayBuffer | ArrayBufferView): void
+  /** Clears the screen and the scrollback. */
+  reset(): void
+  selectAll(): void
+  clearSelection(): void
+  scrollToTop(): void
+  scrollToBottom(): void
+  /** Scrolls down by rows, or up when `count` is negative. */
+  scrollLines(count: number): void
+  /** Ends the program and the session. */
+  close(): void
+  addEventListener<K extends keyof TerminalSessionEventMap>(type: K, listener: (this: TerminalSession, event: TerminalSessionEventMap[K]) => any, options?: boolean | AddEventListenerOptions): void
+  addEventListener(type: string, listener: ((event: Event) => any) | { handleEvent(event: Event): any }, options?: boolean | AddEventListenerOptions): void
+  removeEventListener<K extends keyof TerminalSessionEventMap>(type: K, listener: (this: TerminalSession, event: TerminalSessionEventMap[K]) => any, options?: boolean | EventListenerOptions): void
+  removeEventListener(type: string, listener: ((event: Event) => any) | { handleEvent(event: Event): any }, options?: boolean | EventListenerOptions): void
+}
+
+/**
+ * A `<terminal>` element. It needs the `terminal` feature. A cell is `1ch` wide and `1lh` tall, and the
+ * `-terminal-*` properties set the 16 colors.
+ */
+interface HTMLTerminalElement extends HTMLElement {
+  /**
+   * The session that the element shows. Without one, the element is an empty box. A session shows in one
+   * element, and it ends when its element leaves the document.
+   */
+  session: TerminalSession | null
+}
+
+interface HTMLElementTagNameMap {
+  terminal: HTMLTerminalElement
+}
+
 declare module '*?raw' {
   const text: string
   export default text

@@ -4,7 +4,7 @@ on:
     tags: ['v*']
     # Tags can reuse only main's caches. Build JSC and FFmpeg on main when their scripts change.
     branches: [main]
-    paths: [scripts/build-jsc.sh, 'scripts/jsc*', 'scripts/aot-front-end/**', scripts/build-ffmpeg.sh, crates/media/native/ffmpeg.c, .github/workflows/release.yml]
+    paths: [scripts/build-jsc.sh, 'scripts/jsc*', 'scripts/aot-front-end/**', scripts/build-ffmpeg.sh, crates/media/native/ffmpeg.c, scripts/build-ghostty.sh, .github/workflows/release.yml]
   workflow_dispatch:
 permissions:
   contents: read
@@ -78,6 +78,22 @@ jobs:
       - if: runner.os == 'Windows' && steps.ffmpeg.outputs.cache-hit != 'true'
         shell: msys2 {0}
         run: bash scripts/build-ffmpeg.sh ${{ matrix.configure }}
+
+      # libghostty-vt builds with Zig. Windows has no terminal library yet.
+      - if: runner.os != 'Windows'
+        uses: actions/cache@v4
+        id: ghostty
+        with:
+          path: |
+            target/ghostty
+            !target/ghostty/source
+          key: ghostty-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ghostty.sh') }}
+      - if: runner.os != 'Windows' && steps.ghostty.outputs.cache-hit != 'true'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - if: runner.os != 'Windows' && steps.ghostty.outputs.cache-hit != 'true'
+        run: bash scripts/build-ghostty.sh
 
       - run: bash scripts/build-npm.sh "$([[ $GITHUB_REF_TYPE == tag ]] && echo "${GITHUB_REF_NAME#v}" || echo 0.0.0)"
       # A broken package must not reach npm: the packed CLI must start and build an app from the packed files.

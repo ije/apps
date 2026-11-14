@@ -14,9 +14,10 @@
 | [crates/webview](crates/webview) | System web views and their native bridge |
 | [crates/webgpu](crates/webgpu) | The optional WebGPU API through wgpu |
 | [crates/media](crates/media) | The optional audio and video player through FFmpeg and cpal, and its build without FFmpeg in [audio](crates/media/audio) |
+| [crates/terminal](crates/terminal) | The optional terminal for `<terminal>`: libghostty-vt, the PTY of the program, and the program status records |
 | [crates/devtools](crates/devtools) | The development tools library: the devtools panel page, the devtools server, and the FPS HUD |
 | [packages](packages) | npm launcher, TypeScript declarations, and packages for each platform and architecture |
-| [scripts](scripts) | JavaScriptCore, FFmpeg, and npm package builds |
+| [scripts](scripts) | JavaScriptCore, FFmpeg, libghostty-vt, and npm package builds |
 
 The runtime separates JavaScript API objects from native state. [js](crates/runtime/js) contains the API implementations and event loop. [src/jsc](crates/runtime/src/jsc) connects them to Rust and checks access by context role. [Host](crates/runtime/src/host.rs) owns app metadata, page documents, native resources, and commands.
 
@@ -89,6 +90,7 @@ On macOS, the main thread owns AppKit and each `BrowserWindow` has a render thre
 | Shared blocking pool | Async file, DNS lookup, crypto, zlib, and Node-API work, on up to four threads |
 | Network | A shared Tokio runtime for HTTP, WebSocket, TCP, and server I/O |
 | JavaScript workers | One thread and JavaScriptCore VM per worker |
+| Terminal programs | Three threads per program of a terminal session: one reads its output into the terminal, one writes its input, and one waits for its exit |
 
 On Windows and Linux, main code and window pages share the main thread. A busy script can delay all page frames there. The handler pool, blocking pool, network thread, and workers remain separate.
 
@@ -130,6 +132,7 @@ The `features` array in `package.json` controls optional behavior. All entries i
 | `media` | Enables the media player for `<video>` and `<audio>` |
 | `simpleAudio` | Enables `<audio>` for WAV files only, without FFmpeg |
 | `reactCompiler` | Enables the Oxc React compiler for app page modules |
+| `terminal` | Enables the `<terminal>` element and its sessions, which let preload scripts run programs |
 
 Without `localNetwork`, page fetch and WebSocket connections reject private addresses except loopback ports that the app itself serves. System web views use their own engine and security model.
 
@@ -199,6 +202,22 @@ On macOS, `ns-*` inputs use AppKit controls and Liquid Glass uses `NSGlassEffect
 [Media](crates/runtime/src/web/media.rs) uses the optional `apps-media` shared library. The library uses FFmpeg for media decode and cpal for audio output. [build-ffmpeg.sh](scripts/build-ffmpeg.sh) produces a shared FFmpeg library without GPL or nonfree components. App packages include that library and `FFmpeg.LICENSE` when the `media` feature is enabled.
 
 `apps-audio` compiles the source of `apps-media` without FFmpeg. A WAV decoder takes the place of the FFmpeg functions, so the player and the mixer are the same. The runtime loads it for the `simpleAudio` feature when `media` is disabled, and the app package then has no FFmpeg.
+
+## Terminal
+
+A `<terminal>` element shows a terminal session: a terminal and the program that runs in it. [terminal.rs](crates/runtime/src/web/terminal.rs) loads the optional `libGhostty` shared library of [crates/terminal](crates/terminal) for the `terminal` feature. The library links [libghostty-vt](https://github.com/ghostty-org/ghostty), which reads the escape sequences and keeps the screen, the scrollback and the selection. [build-ghostty.sh](scripts/build-ghostty.sh) builds it as a static library with Zig. App packages include `Ghostty.LICENSE` with the library. The library has no Windows build yet.
+
+A preload script creates a session with `terminal.Session` of `@pierre/apps`, and the page sets it on an element. The runtime keeps the sessions of a page by ID, and the session that each element shows. The page and its preload script each have their own object for a session, and the [bridge](crates/runtime/js/bridge.js) sends a session between them as its ID. The native side rejects a new session and a new program from page code. Each of the two contexts polls the events of its sessions after a task. When an element leaves the document, the next poll ends its session.
+
+The library starts the program in a PTY. A thread reads the output of the program and writes it to the terminal, so a program with much output does not stop the page. This thread lets the page take the lock of the terminal first, and it wakes the page one time until the page polls. The page then requests a frame.
+
+The element draws through a [paint hook](crates/runtime/src/render/terminal.rs), like `<canvas>`, so new output needs no style or layout work. The hook reads only the rows that changed since the last frame. For each of these rows, it shapes the text word by word and keeps the glyphs and the background spans. Each frame draws all rows from this data as rectangles and atlas glyphs. A cell is `1ch` wide and `1lh` tall, so the CSS box of the element sets the columns and rows. The hook gives a new size to the terminal and to the PTY in the frame that has it. An element without a session draws nothing. The scroll bar of the element is the one of other boxes. Each frame gives it the place of the screen in the scrollback, and a drag of its knob scrolls the terminal to a row.
+
+libghostty-vt also keeps the images of the Kitty graphics protocol. It decodes PNG data with the PNG decoder of the runtime, which the library gets as a callback. Each frame lists the images on the screen. The hook copies the pixels of an image out of the terminal one time, when the image is new or its pixels changed, and draws the images below or above the text as the program asks. An animated image on the screen sets a timer for its next picture.
+
+Keys, pasted text, the pointer and the wheel go from the event code of the page to libghostty-vt, which encodes them for the program by the modes that the program set. Without mouse tracking, the pointer selects text and the wheel moves through the scrollback. The text that an input method composes draws at the cursor.
+
+libghostty-vt reads the reports of the [program status protocol](https://www.superlogical.com/rex/docs/build/program-status) (OSC 7501) and answers its feature detection. The library keeps the records as the protocol says: a report replaces its record, a clear removes a record and its children, and a new shell prompt or the exit of the program removes the `working` and `blocked` records. The `done` and `error` records stay until the user presses a key in the terminal.
 
 ## Memory and idle work
 

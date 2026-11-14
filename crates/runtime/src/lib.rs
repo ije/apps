@@ -33,7 +33,7 @@ pub mod render;
 pub mod style;
 mod web;
 pub use web::download;
-pub use web::{gpu, media};
+pub use web::{gpu, media, terminal};
 
 pub use anyhow::Result;
 pub use desktop::app::{self, App, AppHandle, BrowserWindow, WindowOptions};

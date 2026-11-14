@@ -282,6 +282,7 @@ const ELECTRON: &[&str] = &[
     "desktopCapturer",
     "ClipboardItem",
     "utilityProcess",
+    "terminal",
 ];
 
 const BUILTINS: &str = include_str!("builtins.txt");

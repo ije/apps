@@ -334,7 +334,9 @@ pub(crate) fn makes_no_line(doc: &Document, styles: &ComputedStyles, id: usize) 
                 });
         }
         "br" | "img" | "svg" | "canvas" | "video" | "audio" | "iframe" | "embed" | "object"
-        | "input" | "button" | "select" | "textarea" | "progress" | "meter" => return false,
+        | "input" | "button" | "select" | "textarea" | "progress" | "meter" | "terminal" => {
+            return false;
+        }
         _ if node.sf_symbol().is_some() => return false,
         _ => {}
     }

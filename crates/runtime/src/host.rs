@@ -65,7 +65,7 @@ impl Drop for WakeOnDrop {
     }
 }
 
-fn reaches(
+pub(crate) fn reaches(
     doc: &Document,
     hosts: &rustc_hash::FxHashMap<usize, usize>,
     mut id: usize,
@@ -878,6 +878,9 @@ impl Host {
                     }
                     if let (Some(media), Some(node)) = (self.media.get_mut(&id), node.as_u64()) {
                         media.close(node);
+                    }
+                    if let (Some(state), Some(node)) = (self.dom.get(&id), node.as_u64()) {
+                        state.terminals.borrow_mut().release(node as usize);
                     }
                 }
             }

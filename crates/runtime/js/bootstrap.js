@@ -183,7 +183,58 @@
   delete globalThis.__appsWorkers;
   globalThis.__appsBrowserEnvironment(call, task);
   delete globalThis.__appsBrowserEnvironment;
-  const hooks = { blob: pollWeb.blob }, bridge = globalThis.__appsBridge(call, role, globalThis.__appsEvents?.EventEmitter, hooks);
+  // A terminal session is a terminal with its program. A preload script creates it, and a `<terminal>` element of
+  // the page shows it. The page and the preload script each have their own object for a session, and the
+  // bridge sends a session as its ID.
+  const sessions = new Map();
+  let adopted = 0, sessionId;
+  const terminalBytes = data => typeof data === 'string' ? data : new Uint8Array(ArrayBuffer.isView(data) ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : data);
+  const terminalProgram = (command, options) => [command === null || command === undefined ? null : Array.isArray(command) ? command.map(String) : String(command), { cwd: options?.cwd === undefined ? undefined : String(options.cwd), env: options?.env }];
+  class Session extends EventTarget {
+    #id;
+    // 0 for a closed session.
+    static { sessionId = value => typeof value === 'object' && value !== null && #id in value ? sessions.get(value.#id) === value ? value.#id : 0 : undefined; }
+    // The native side rejects a new session in a page. Only `adopt` makes the object of a session that exists.
+    constructor(options = {}) { super(); this.#id = adopted || call('terminal.create', !!options?.manual, ...terminalProgram(options?.command, options)); adopted = 0; sessions.set(this.#id, this); }
+    #info() { return call('terminal.info', this.#id); }
+    #control(op, value = 0) { call('terminal.control', this.#id, op, value); }
+    get closed() { return !sessionId(this); }
+    get cols() { return this.#info().cols; }
+    get rows() { return this.#info().rows; }
+    get cursor() { const [x, y, visible] = this.#info().cursor; return { x, y, visible }; }
+    get pid() { return this.#info().pid; }
+    get process() { return this.#info().process; }
+    get cwd() { return this.#info().cwd; }
+    get title() { return this.#info().title; }
+    get programStatus() { return this.#info().status; }
+    get alternateScreen() { return this.#info().alternate; }
+    get text() { return call('terminal.text', this.#id, false) ?? ''; }
+    get selectedText() { return call('terminal.text', this.#id, true) ?? ''; }
+    spawn(command = null, options = {}) { return call('terminal.spawn', this.#id, ...terminalProgram(command, options)); }
+    kill(signal = 'SIGHUP') { this.#control(7, String(signal)); }
+    input(data) { call('terminal.write', this.#id, 0, terminalBytes(data)); }
+    paste(text) { call('terminal.write', this.#id, 1, String(text)); }
+    output(data) { call('terminal.write', this.#id, 2, terminalBytes(data)); }
+    reset() { this.#control(6); }
+    selectAll() { this.#control(4); }
+    clearSelection() { this.#control(5); }
+    scrollToTop() { this.#control(1); }
+    scrollToBottom() { this.#control(2); }
+    scrollLines(count) { this.#control(3, Math.trunc(count) || 0); }
+    close() { if (!sessionId(this)) return; sessions.delete(this.#id); call('terminal.close', this.#id); this.dispatchEvent(new Event('close')); }
+  }
+  const adopt = id => sessions.get(id) ?? (call('terminal.open', id) ? (adopted = id, new Session()) : null);
+  const terminalEvents = { title: 'titlechange', cwd: 'cwdchange', status: 'statuschange' };
+  const terminalPoll = () => {
+    if (!sessions.size) return;
+    for (const [id, kind, ...values] of call('terminal.poll')) {
+      const session = sessions.get(id);
+      if (!session) continue;
+      if (kind === 'close') sessions.delete(id);
+      session.dispatchEvent(Object.assign(new Event(terminalEvents[kind] ?? kind), kind === 'exit' ? { exitCode: values[0], signal: values[1] } : kind === 'data' ? { data: values[0] } : null));
+    }
+  };
+  const hooks = { blob: pollWeb.blob, session: sessionId, adopt }, bridge = globalThis.__appsBridge(call, role, globalThis.__appsEvents?.EventEmitter, hooks);
   delete globalThis.__appsBridge;
   __appsSyncBridge();
   globalThis.__appsPending = () => modulesPending > 0 || moduleErrors.length > 0 || (children?.pending() ?? false) || (node?.poll.pending() ?? false) || (pty?.poll.pending() ?? false) || bridge.poll.pending() || workers.pending() || (net?.pending() ?? false);
@@ -212,6 +263,7 @@
         globalThis.__appsDecoded?.();
         globalThis.__appsGPUPoll?.();
         globalThis.__appsMediaPoll?.();
+        terminalPoll();
         bridge.poll();
         pollWeb();
         children?.poll();
@@ -302,6 +354,7 @@
     if (!disabled.has('webgpu')) globalThis.__appsGPU = call;
     else { globalThis.navigator.gpu = feature('webgpu'); globalThis.GPUCanvasContext = feature('webgpu'); }
     globalThis.__appsMedia = { media: !disabled.has('media'), simpleAudio: !disabled.has('simpleAudio') };
+    globalThis.__appsTerminal = sessionId;
     return;
   }
   const info = call('info');
@@ -1218,7 +1271,7 @@
   process.getBuiltinModule = name => isBuiltin(name) ? builtins[String(name).replace(/^node:/, '')] : undefined;
   if (info.node) globalThis.__appsFinish = () => { process.emit('beforeExit', Number(process.exitCode ?? 0) | 0); return __appsAlive() ? -1 : finish(); };
   const main = role === 'main' ? { app, BrowserWindow, View: browsers.View, WebContentsView: browsers.WebContentsView, session: browsers.session, webContents, protocol: electron.protocol, autoUpdater: electron.autoUpdater, desktopCapturer: electron.desktopCapturer } : {};
-  const apps = Object.defineProperties({ ...main, nativeImage: electron.nativeImage, ClipboardItem: electron.ClipboardItem, webFrame, ...nativeShell, ...bridge, ipcMain: role === 'main' ? bridge.ipcMain : undefined, ipcRenderer: role === 'main' ? undefined : bridge.ipcRenderer, serve: servers.serve }, Object.getOwnPropertyDescriptors(modules));
+  const apps = Object.defineProperties({ ...main, nativeImage: electron.nativeImage, ClipboardItem: electron.ClipboardItem, webFrame, ...nativeShell, ...bridge, ipcMain: role === 'main' ? bridge.ipcMain : undefined, ipcRenderer: role === 'main' ? undefined : bridge.ipcRenderer, terminal: typeof role === 'object' && 'preload' in role ? Object.freeze({ Session }) : undefined, serve: servers.serve }, Object.getOwnPropertyDescriptors(modules));
   Object.defineProperty(apps, 'net', { value: electronNet, enumerable: true, writable: true, configurable: true });
   apps.module = builtins.module;
   lazy(apps, 'pty', () => ptyModule().api);

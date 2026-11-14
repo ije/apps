@@ -43,6 +43,21 @@ jobs:
           key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'crates/media/native/ffmpeg.c') }}
       - if: runner.os != 'Windows' && steps.ffmpeg.outputs.cache-hit != 'true'
         run: bash scripts/build-ffmpeg.sh
+      # libghostty-vt builds with Zig. Windows has no terminal library yet.
+      - if: runner.os != 'Windows'
+        uses: actions/cache@v4
+        id: ghostty
+        with:
+          path: |
+            target/ghostty
+            !target/ghostty/source
+          key: ghostty-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ghostty.sh') }}
+      - if: runner.os != 'Windows' && steps.ghostty.outputs.cache-hit != 'true'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - if: runner.os != 'Windows' && steps.ghostty.outputs.cache-hit != 'true'
+        run: bash scripts/build-ghostty.sh
       - run: cargo fmt --all --check
       - run: cargo check --workspace --locked
       - if: runner.os != 'Windows'

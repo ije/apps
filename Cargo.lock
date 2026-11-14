@@ -87,6 +87,7 @@ dependencies = [
  "apps-audio",
  "apps-media",
  "apps-runtime",
+ "apps-terminal",
  "apps-webgpu",
  "base64",
  "bbtree",
@@ -188,6 +189,7 @@ dependencies = [
  "apps-devtools",
  "apps-media",
  "apps-renderer",
+ "apps-terminal",
  "apps-webgpu",
  "apps-webview",
  "avif-parse",
@@ -244,6 +246,14 @@ dependencies = [
  "usvg",
  "wuff",
  "zune-jpeg",
+]
+
+[[package]]
+name = "apps-terminal"
+version = "0.0.0"
+dependencies = [
+ "cc",
+ "libc",
 ]
 
 [[package]]

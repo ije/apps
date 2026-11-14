@@ -983,6 +983,12 @@ impl ScrollRef {
         self.0.borrow_mut().animate_to(offset, wheel);
     }
 
+    /// Sets the range of a handle that no box tracks, like the scrollback of a terminal.
+    pub fn set_range(&self, bounds: Rect, max_offset: Point<Pixels>) {
+        let scroll = &mut *self.0.borrow_mut();
+        (scroll.bounds, scroll.max_offset) = (bounds, max_offset);
+    }
+
     fn pan(&self, delta: Point<Pixels>, sent: Option<Instant>) -> (bool, Point<Pixels>) {
         self.0.borrow_mut().pan(delta, sent)
     }

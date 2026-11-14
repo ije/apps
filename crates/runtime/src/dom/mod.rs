@@ -751,6 +751,7 @@ pub struct State {
     pub frame_requested: bool,
     pub(crate) wheel: bool,
     pub canvases: rustc_hash::FxHashMap<usize, crate::render::canvas::Canvas>,
+    pub(crate) terminals: Rc<std::cell::RefCell<crate::web::terminal::Terminals>>,
     pub(crate) sources: std::cell::RefCell<rustc_hash::FxHashMap<usize, CanvasSource>>,
     pub images: rustc_hash::FxHashMap<usize, Arc<renderer::RenderImage>>,
     pub shadows: rustc_hash::FxHashMap<usize, usize>,
@@ -1537,7 +1538,7 @@ pub fn call(
             for id in subtree {
                 if matches!(
                     doc.nodes[id].tag.as_str(),
-                    "canvas" | "apps-canvas" | "video" | "audio"
+                    "canvas" | "apps-canvas" | "video" | "audio" | "terminal"
                 ) {
                     canvases.push(id);
                 }
@@ -3305,7 +3306,7 @@ fn rendered_text(
             && (display == "none"
                 || matches!(
                     current.tag.as_str(),
-                    "textarea" | "canvas" | "video" | "audio" | "iframe"
+                    "textarea" | "canvas" | "video" | "audio" | "iframe" | "terminal"
                 ))
             || current.tag == "#comment"
         {

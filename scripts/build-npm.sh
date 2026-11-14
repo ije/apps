@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the npm package of this platform and sets the version of all npm packages.
 #
-#   bash scripts/build-ffmpeg.sh && bash scripts/build-jsc.sh
+#   bash scripts/build-ffmpeg.sh && bash scripts/build-ghostty.sh && bash scripts/build-jsc.sh
 #   bash scripts/build-npm.sh 0.1.0
 #   npm publish packages/apps-darwin-arm64 --access public
 #
@@ -48,6 +48,8 @@ jsc=target/bun-jsc/$system-$arch
 jscs=("${lib}JavaScriptCore$ext" JavaScriptCore.LICENSE)
 # Linux links WebGPU into the runtime, and apps build --aot works only on macOS arm64.
 [[ $os != linux ]] && files+=("${lib}apps_webgpu$ext")
+# The terminal library has no Windows build yet.
+[[ $os != win32 ]] && files+=("${lib}Ghostty$ext" Ghostty.LICENSE)
 [[ $os-$cpu == darwin-arm64 ]] && jscs+=(libJavaScriptCoreAOT.dylib libJavaScriptCoreCompiler.dylib libapps_aot.dylib)
 rm -rf "$bin"
 mkdir -p "$bin"

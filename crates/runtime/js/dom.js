@@ -125,6 +125,11 @@
       try { host.attachShadow({ mode, delegatesFocus: rec.attrs.has('shadowrootdelegatesfocus'), clonable: rec.attrs.has('shadowrootclonable'), serializable: rec.attrs.has('shadowrootserializable') }).append(template.content); template.remove(); } catch {}
     }
   };
+  // The session that a `<terminal>` element shows, and the element that shows a session. `terminalOf` gives
+  // the ID of the session, or nothing without a session that is open.
+  const terminalSession = globalThis.__appsTerminal, terminalSessions = new WeakMap(), terminalViews = new WeakMap();
+  delete globalThis.__appsTerminal;
+  const terminalOf = node => terminalSession?.(terminalSessions.get(node));
   const load = list => {
     version++; declarative = null;
     let media = false, radios = null, controls = null;
@@ -275,7 +280,7 @@
     laidOut();
     if (marks[node._id] & 80) return false;
     const rec = node._m, tag = rec.tag;
-    return /^\s*[+-]?\d/.test(rec.attrs.get('tabindex') ?? '') || node.isContentEditable || /^(select|textarea|button|iframe|dialog)$/.test(tag) || tag === 'input' && node.type !== 'hidden' || (tag === 'a' || tag === 'area') && rec.attrs.has('href') || tag === 'summary' && activation(node);
+    return /^\s*[+-]?\d/.test(rec.attrs.get('tabindex') ?? '') || node.isContentEditable || /^(select|textarea|button|iframe|dialog|terminal)$/.test(tag) || tag === 'input' && node.type !== 'hidden' || (tag === 'a' || tag === 'area') && rec.attrs.has('href') || tag === 'summary' && activation(node);
   };
   const commit = node => { if (node._edited) { node._edited = false; dispatch(node, trusted(new Event('change', { bubbles: true }))); } };
   const selectors = (name, id, selector, first) => { try { return call(name, id, String(selector), first); } catch (error) { if (/^SyntaxError/.test(error?.message)) throw new DOMException(error.message.replace(/^SyntaxError: /, ''), 'SyntaxError'); throw error; } };
@@ -957,7 +962,7 @@
     get contentEditable() { const value = this.getAttribute('contenteditable')?.toLowerCase(); return value === '' ? 'true' : value === 'true' || value === 'false' || value === 'plaintext-only' ? value : 'inherit'; }
     set contentEditable(value) { value = String(value).toLowerCase(); if (value === 'inherit') this.removeAttribute('contenteditable'); else if (value === 'true' || value === 'false' || value === 'plaintext-only') this.setAttribute('contenteditable', value); else throw new DOMException(`'${value}' is not a valid contentEditable value`, 'SyntaxError'); }
     get isContentEditable() { const value = this.contentEditable; return value === 'true' || value === 'plaintext-only' || value === 'inherit' && !!this.parentElement?.isContentEditable; }
-    get tabIndex() { const value = parseInt(this.getAttribute('tabindex'), 10), tag = this.localName; return Number.isNaN(value) ? /^(input|textarea|button|select|iframe|object|video|audio)$/.test(tag) || (tag === 'a' || tag === 'area') && (this.namespaceURI === XHTML || this.hasAttribute('href')) || tag === 'summary' && activation(this) ? 0 : -1 : value; } set tabIndex(value) { this.setAttribute('tabindex', value); }
+    get tabIndex() { const value = parseInt(this.getAttribute('tabindex'), 10), tag = this.localName; return Number.isNaN(value) ? /^(input|textarea|button|select|iframe|object|video|audio|terminal)$/.test(tag) || (tag === 'a' || tag === 'area') && (this.namespaceURI === XHTML || this.hasAttribute('href')) || tag === 'summary' && activation(this) ? 0 : -1 : value; } set tabIndex(value) { this.setAttribute('tabindex', value); }
     attachShadow(options) { if (this._shadow) throw new DOMException('Shadow root already exists', 'NotSupportedError'); if(!['open','closed'].includes(options.mode))throw new TypeError('Invalid shadow mode');if(this.namespaceURI!==XHTML||!/^(article|aside|blockquote|body|div|footer|h[1-6]|header|main|nav|p|section|span|[a-z][a-z0-9._]*-[a-z0-9._-]*)$/.test(this.localName))throw new DOMException(`<${this.localName}> cannot have a shadow root`, 'NotSupportedError');const root = document.createDocumentFragment(); shadows++; Object.setPrototypeOf(root,ShadowRoot.prototype);root.host=this;root.mode=options.mode;root.delegatesFocus=!!options.delegatesFocus;root.slotAssignment=options.slotAssignment==='manual'?'manual':'named';root.clonable=!!options.clonable;root.serializable=!!options.serializable;this._shadow=root;root._m.host=this._m;this._m.shadow=root._m;op(6,this._id,root._id);return root; }
     get shadowRoot() { return this._shadow?.mode === 'open' ? this._shadow : null; }
     setPointerCapture(id) { if (!pointers.has(id)) throw new DOMException('Pointer is not active', 'NotFoundError'); captures.set(id, this); }
@@ -3345,6 +3350,27 @@
   }
   globalThis.HTMLWebViewElement = HTMLWebViewElement;
   htmlTypes.set('webview', HTMLWebViewElement);
+  // A `<terminal>` element shows the terminal of its session, which a preload script creates.
+  const terminalMods = event => (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.altKey ? 4 : 0) | (event.metaKey ? 8 : 0);
+  const terminalMouse = (session, kind, button, data) => call('terminal.mouse', session, kind, button, terminalMods(data), data.clientX, data.clientY, !!(data.buttons & 1));
+  let terminalDrag = null;
+  class HTMLTerminalElement extends HTMLElement {
+    _preedit = '';
+    get session() { return terminalOf(this) ? terminalSessions.get(this) : null; }
+    set session(value) {
+      value ??= null;
+      const id = value && terminalSession?.(value);
+      if (id === undefined) throw new TypeError('Expected a terminal session');
+      call('terminal.attach', this._id, id);
+      terminalViews.delete(terminalSessions.get(this)); terminalSessions.delete(this);
+      if (!value) return;
+      // A session shows in one element.
+      terminalSessions.delete(terminalViews.get(value));
+      terminalViews.set(value, this); terminalSessions.set(this, value);
+    }
+  }
+  globalThis.HTMLTerminalElement = HTMLTerminalElement;
+  htmlTypes.set('terminal', HTMLTerminalElement);
   globalThis.__appsWebviewEvent = (id, name, detail) => attachedWebviews.get(id)?.dispatchEvent(Object.assign(new Event(name), detail));
   globalThis.__appsWebviewReply = (id, value, error) => { const reply = webviewReplies.get(id); webviewReplies.delete(id); if (error === null) reply?.[0](value); else reply?.[1](new Error(error)); };
   globalThis.__appsMediaChanged=()=>{
@@ -3417,7 +3443,7 @@
     }
   };
 
-  globalThis.__appsEditing = () => editable(active) ? { id: active._id, text: active.value, start: active.selectionDirection === 'backward' ? active.selectionEnd : active.selectionStart, end: active.selectionDirection === 'backward' ? active.selectionStart : active.selectionEnd, marked: composing } : active?.isContentEditable ? { id: active._id, text: active.textContent, start: textOffset(active,selection.anchorNode,selection.anchorOffset), end: textOffset(active,selection.focusNode,selection.focusOffset), node: selection.focusNode?._id, offset: selection.focusOffset, marked: composing } : null;
+  globalThis.__appsEditing = () => terminalOf(active) ? { id: active._id, text: active._preedit, start: active._preedit.length, end: active._preedit.length, marked: composing } : editable(active) ? { id: active._id, text: active.value, start: active.selectionDirection === 'backward' ? active.selectionEnd : active.selectionStart, end: active.selectionDirection === 'backward' ? active.selectionStart : active.selectionEnd, marked: composing } : active?.isContentEditable ? { id: active._id, text: active.textContent, start: textOffset(active,selection.anchorNode,selection.anchorOffset), end: textOffset(active,selection.focusNode,selection.focusOffset), node: selection.focusNode?._id, offset: selection.focusOffset, marked: composing } : null;
   const paragraph = (host, range) => {
     let block = range.startContainer.nodeType === 3 ? range.startContainer.parentNode : range.startContainer;
     while (block !== host && !/^(div|p|li|h[1-6]|blockquote|pre)$/.test(block.localName)) block = block.parentNode;
@@ -3469,6 +3495,7 @@
     if (composing === null) return;
     const target = active, [at, removed, text] = composed;
     composing = null; call('dom.endComposition');
+    if (terminalOf(target)) { target._preedit = ''; call('terminal.preedit', terminalOf(target), ''); return; }
     if (!text || !target?.isConnected) return;
     remember(target, at, removed, text, !removed);
     dispatch(target, trusted(new CompositionEvent('compositionend', { bubbles: true, composed: true, data: text })));
@@ -3479,6 +3506,18 @@
     if (!target || disabled(target) || target.readOnly) return finishComposition();
     const state = __appsEditing(); if (!state) return finishComposition();
     text = String(text);
+    // A terminal shows the text that an input method composes at its cursor, and sends the result to its program.
+    const session = terminalOf(target);
+    if (session) {
+      const began = composing !== null;
+      if (mark && !began) dispatch(target, trusted(new CompositionEvent('compositionstart', { bubbles: true, composed: true, data: '' })));
+      if (mark) dispatch(target, trusted(new CompositionEvent('compositionupdate', { bubbles: true, composed: true, data: text })));
+      composing = mark ? [0, text.length] : null; composed = [0, '', mark ? text : ''];
+      call('terminal.preedit', session, target._preedit = mark ? text : '');
+      if (!mark && text) call('terminal.write', session, 0, text);
+      if (!mark && began) dispatch(target, trusted(new CompositionEvent('compositionend', { bubbles: true, composed: true, data: text })));
+      return true;
+    }
     start ??= composing?.[0] ?? Math.min(state.start,state.end); end ??= composing?.[1] ?? Math.max(state.start,state.end);
     start = Math.max(0, Math.min(start, state.text.length)); end = Math.max(start, Math.min(end, state.text.length));
     const isComposing = mark || composing !== null, control = editable(target);
@@ -3594,7 +3633,8 @@
     if (type === 'paste') data.setData('text/plain', text);
     if (dispatch(target, trusted(new ClipboardEvent(type, { bubbles: true, cancelable: true, composed: true, clipboardData: data })))) {
       const state = __appsEditing();
-      if (type === 'paste') { if (state) __appsInput(text, undefined, undefined, false, null, 'insertFromPaste', data); }
+      if (terminalOf(target)) { if (type === 'paste') call('terminal.write', terminalOf(target), 1, text); else data.setData('text/plain', call('terminal.text', terminalOf(target), true) ?? ''); }
+      else if (type === 'paste') { if (state) __appsInput(text, undefined, undefined, false, null, 'insertFromPaste', data); }
       else {
         data.setData('text/plain', state ? state.text.slice(Math.min(state.start,state.end), Math.max(state.start,state.end)) : selection.toString());
         if (type === 'cut' && state && state.start !== state.end) __appsInput('', undefined, undefined, false, null, 'deleteByCut');
@@ -3770,6 +3810,15 @@
         if (!dispatch(target, trusted(new KeyboardEvent('keypress', { bubbles: true, cancelable: true, composed: true, key, code, location, repeat, shiftKey, altKey, keyCode: char, charCode: char })))) return false;
       }
       const plain = !event.metaKey && !event.ctrlKey && !event.altKey, tag = target.localName, type = tag === 'input' ? target.type : '';
+      const session = data.nativeKey !== undefined && terminalOf(target);
+      if (session) {
+        const mac = navigator.platform.includes('Mac'), lower = event.key.toLowerCase(), down = name === 'keydown';
+        // Copy and paste are Cmd+C and Cmd+V on macOS, and Ctrl+Shift+C and Ctrl+Shift+V elsewhere, because Ctrl+C is for the program.
+        if (!mac && down && event.ctrlKey && event.shiftKey && (lower === 'c' || lower === 'v')) { if (lower === 'v') __appsClipboard('paste', call('dom.clipboard') ?? ''); else { const text = __appsClipboard('copy'); if (text) call('dom.clipboard', text); } return false; }
+        if (mac && down && event.metaKey && !event.ctrlKey && !event.altKey && lower === 'a') { call('terminal.control', session, 4, 0); return false; }
+        if (!(mac && event.metaKey) && call('terminal.key', session, down ? event.repeat ? 2 : 1 : 0, data.nativeKey, data.keyChar ?? '', terminalMods(event) | (target.hasAttribute('option-as-alt') ? 16 : 0))) return false;
+        if (!down) return true;
+      }
       if (name === 'keyup') {
         if (event.key === ' ' && plain && (tag === 'button' || /^(button|submit|reset|image|checkbox)$/.test(type) || type === 'radio' && !target.checked || tag === 'summary') && !disabled(target)) fireClick(target, { detail: 0 }, true);
         return true;
@@ -3864,7 +3913,7 @@
         const found = [], stack = [records[0]];
         while (stack.length) {
           const rec = stack.pop(), tag = rec.tag;
-          if (tag[0] !== '#' && (rec.attrs.has('tabindex') || rec.attrs.has('contenteditable') || tag.includes('-') || /^(input|textarea|button|select|iframe|summary)$/.test(tag) || (tag === 'a' || tag === 'area') && rec.attrs.has('href'))) { const node = of(rec); if ((/^\s*[+-]?\d/.test(rec.attrs.get('tabindex') ?? '') ? node.tabIndex >= 0 : tag !== 'dialog') && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable)) found.push(node); }
+          if (tag[0] !== '#' && (rec.attrs.has('tabindex') || rec.attrs.has('contenteditable') || tag.includes('-') || /^(input|textarea|button|select|iframe|summary|terminal)$/.test(tag) || (tag === 'a' || tag === 'area') && rec.attrs.has('href'))) { const node = of(rec); if ((/^\s*[+-]?\d/.test(rec.attrs.get('tabindex') ?? '') ? node.tabIndex >= 0 : tag !== 'dialog') && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable)) found.push(node); }
           const assigned = tag === 'slot' && of(rec) instanceof HTMLSlotElement ? call('dom.assignedNodes', rec.id, false) : null, kids = assigned?.length ? assigned.map(id => records[id]) : (rec.shadow ?? rec).kids;
           for (let index = kids.length; index--;) stack.push(kids[index]);
         }
@@ -3887,6 +3936,9 @@
     if (name === 'pointerdown') finishComposition();
     settleCapture(data);
     if (!captures.has(1)) hover(element, mouseInit(data));
+    // A terminal gets the pointer while a button is down, also outside its box, and every move above it.
+    if (terminalDrag && name !== 'pointerdown') { if (terminalOf(terminalDrag)) terminalMouse(terminalOf(terminalDrag), name === 'pointerup' ? 1 : 2, name === 'pointerup' ? [1, 3, 2][data.button ?? 0] ?? 0 : 0, data); if (name === 'pointerup' && !data.buttons) terminalDrag = null; }
+    else if (name === 'pointermove' && terminalOf(element)) terminalMouse(terminalOf(element), 2, 0, data);
     const target = element ?? sliding?.[0] ?? (selectionDrag ? selectionDrag.host : null), button = data.button ?? 0, init = mouseInit(data, name === 'pointermove' ? { button: -1, detail: 0 } : { detail: 0 });
     last = [data.clientX, data.clientY];
     if (name === 'pointerdown' && target) call('dom.active', labeled(path(target)).map(node => node._id));
@@ -3922,7 +3974,8 @@
       if (focus) focus.focus({ preventScroll: true }); else if (button === 0) active?.blur();
       scrollStart = target.nodeType === 1 ? target : target.parentElement;
       if (button === 0 && focus?.localName === 'select') openSelect(focus);
-      if (button === 0 && focus?.localName === 'input' && focus.type === 'range') { sliding = [focus, focus.value]; slide(focus, data.clientX); }
+      if (terminalOf(focus)) { terminalDrag = focus; terminalMouse(terminalOf(focus), 0, [1, 3, 2][button] ?? 0, data); }
+      else if (button === 0 && focus?.localName === 'input' && focus.type === 'range') { sliding = [focus, focus.value]; slide(focus, data.clientX); }
       else if (button === 0 && editable(focus)) {
         const anchor = data.shiftKey ? (__appsEditing()?.start ?? offset) : offset;
         const granularity = data.shiftKey ? 1 : Math.min(3,data.detail ?? 1);

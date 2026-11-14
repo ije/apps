@@ -15,6 +15,7 @@ mod paint;
 mod plan;
 mod resvg;
 pub(crate) mod scrollbar;
+pub(crate) mod terminal;
 pub(crate) mod text;
 
 use crate::style::Prop;
@@ -507,7 +508,7 @@ impl PageView {
                     );
                 }
                 queue_layout(view.clone(), window);
-                let (mut target, mut wheel) = (None, false);
+                let (mut target, mut wheel, mut terminal) = (None, false, None);
                 if let Ok(host) = view.host.try_borrow() {
                     let viewport = *host.viewports.get(&view.id).unwrap_or(&[800., 600.]);
                     if let (Some(page), Some(state)) = (host.pages.get(&view.id), host.dom.get(&view.id)) {
@@ -521,6 +522,9 @@ impl PageView {
                             let mut chain = Vec::new();
                             let mut node = Some(target);
                             while let Some(id) = node {
+                                if terminal.is_none() && page.doc.nodes[id].tag == "terminal" {
+                                    terminal = Some((id, state.terminals.clone()));
+                                }
                                 chain.extend(state.scroll.get(&id).cloned());
                                 node = seen.as_ref().and_then(|computed| crate::dom::flat_parent(&page.doc, state, computed, id));
                             }
@@ -535,7 +539,18 @@ impl PageView {
                     (fields["deltaX"], fields["deltaY"]) = ((-delta.x).into(), (-delta.y).into());
                     if !Desktop::dispatch(view.runtime.clone(), view.id, "wheel", target.as_slice(), fields, Some(window), cx) {
                         cx.stop_event();
+                        return;
                     }
+                }
+                // A terminal scrolls its own rows, or sends the wheel to its program.
+                if let Some((node, terminals)) = terminal
+                    && let Some(terminal) = terminals.borrow_mut().shown(node)
+                {
+                    let mods = u32::from(modifiers.shift()) | u32::from(modifiers.ctrl()) << 1 | u32::from(modifiers.alt()) << 2 | u32::from(modifiers.command()) << 3;
+                    let rows = delta.y * if lines { 16. } else { 1. };
+                    terminal.wheel(-rows, mods, position.x.into(), position.y.into());
+                    cx.stop_event();
+                    window.refresh();
                 }
             });
         }).absolute().size_full();
@@ -2110,6 +2125,7 @@ impl PageView {
                 reserved: page_space,
                 borders: [0.; 4],
                 origin: [0.; 2],
+                quiet: false,
             }))
             .children(crate::desktop::mcp::profiling().then(|| {
                 renderer::canvas(

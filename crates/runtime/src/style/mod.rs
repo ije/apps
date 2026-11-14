@@ -84,6 +84,7 @@ head,script,style,title,meta,link,template,noscript,datalist,base,param,[hidden]
 audio:not([controls]),embed:not([src]):not([type]){display:none!important}
 audio{width:300px;height:54px}
 video{object-fit:contain}
+terminal{display:inline-block;width:80ch;height:24lh;overflow:hidden;font:13px ui-monospace,Menlo,Consolas,monospace;cursor:text;user-select:none}
 slot{display:contents}
 [dir=rtl i]{direction:rtl}
 [dir=ltr i]{direction:ltr}
@@ -1688,6 +1689,22 @@ const INITIAL: &[(&str, &str)] = &[
     ("-macos-glass", "none"),
     ("-macos-glass-interactive", "false"),
     ("-macos-glass-tint-color", "transparent"),
+    ("-terminal-black", "auto"),
+    ("-terminal-blue", "auto"),
+    ("-terminal-bright-black", "auto"),
+    ("-terminal-bright-blue", "auto"),
+    ("-terminal-bright-cyan", "auto"),
+    ("-terminal-bright-green", "auto"),
+    ("-terminal-bright-magenta", "auto"),
+    ("-terminal-bright-red", "auto"),
+    ("-terminal-bright-white", "auto"),
+    ("-terminal-bright-yellow", "auto"),
+    ("-terminal-cyan", "auto"),
+    ("-terminal-green", "auto"),
+    ("-terminal-magenta", "auto"),
+    ("-terminal-red", "auto"),
+    ("-terminal-white", "auto"),
+    ("-terminal-yellow", "auto"),
     ("accent-color", "auto"),
     ("align-content", "normal"),
     ("align-items", "normal"),
@@ -2701,7 +2718,10 @@ pub(crate) fn resolved(
             _ => &value,
         }
         .to_owned(),
-        _ if name.ends_with("color") || matches!(name, "fill" | "stroke") => {
+        _ if name.ends_with("color")
+            || name.starts_with("-terminal-")
+            || matches!(name, "fill" | "stroke") =>
+        {
             if value == "auto" {
                 value
             } else {
@@ -8612,7 +8632,9 @@ fn resolve_style(
         true
     });
     style.retain(|prop, value| {
-        if (prop.name().ends_with("color") || matches!(prop, Prop::FILL | Prop::STROKE))
+        if (prop.name().ends_with("color")
+            || prop.name().starts_with("-terminal-")
+            || matches!(prop, Prop::FILL | Prop::STROKE))
             && value
                 .as_bytes()
                 .first()
@@ -8652,7 +8674,9 @@ fn resolve_style(
     style.retain(|prop, value| {
         if prop != Prop::COLOR
             && !prop.is_custom()
-            && (prop.name().ends_with("color") || matches!(prop, Prop::FILL | Prop::STROKE))
+            && (prop.name().ends_with("color")
+                || prop.name().starts_with("-terminal-")
+                || matches!(prop, Prop::FILL | Prop::STROKE))
             && let Some(converted) = convert(value, &current)
         {
             *value = converted.into();

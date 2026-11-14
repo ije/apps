@@ -624,7 +624,13 @@ impl renderer::View for PageView {
                 .unwrap_or(at);
             return Some(Rect::new(at, size(to.x - at.x, layout.line_height())));
         }
-        let bounds = dom.bounds.get(&id)?;
+        // A terminal composes text at its cursor.
+        let caret = dom
+            .terminals
+            .borrow_mut()
+            .shown(id)
+            .map(|terminal| terminal.drawn.caret);
+        let bounds = caret.as_ref().or_else(|| dom.bounds.get(&id))?;
         Some(Rect::new(
             point(px(bounds[0]), px(bounds[1])),
             size(px(bounds[2]), px(bounds[3])),

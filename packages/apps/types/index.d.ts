@@ -767,6 +767,22 @@ export declare const webUtils: {
   getPathForFile(file: File): string
 }
 
+export interface TerminalSessionOptions {
+  /** A string is a command line for the login shell, an array is the program and its arguments. The default is the login shell. */
+  command?: string | string[] | null
+  cwd?: string
+  /** The environment of the program. The default is the environment of the app. */
+  env?: Record<string, string>
+  /** Start no program: show data with `output()` and read the input from `data` events. */
+  manual?: boolean
+}
+
+/** Preload only. Sessions for the `<terminal>` elements of the page. It needs the `terminal` feature. */
+export declare const terminal: {
+  /** Starts the program at once, in a terminal of 80 by 24 cells. The element that shows the session gives it its size. */
+  Session: { new (options?: TerminalSessionOptions): TerminalSession; prototype: TerminalSession }
+}
+
 /** Always reports a zoom of 1, and its setters do nothing. */
 export declare const webFrame: {
   getZoomFactor(): number
@@ -1234,5 +1250,6 @@ declare const apps: {
   desktopCapturer: typeof desktopCapturer
   ClipboardItem: typeof ClipboardItem
   utilityProcess: typeof utilityProcess
+  terminal: typeof terminal
 }
 export default apps

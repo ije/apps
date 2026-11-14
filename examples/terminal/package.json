@@ -1,0 +1,12 @@
+{
+  "name": "terminal",
+  "productName": "Terminal",
+  "private": true,
+  "main": "main.ts",
+  "preload": "preload.ts",
+  "features": ["terminal"],
+  "scripts": {
+    "dev": "apps run --watch",
+    "build": "apps build"
+  }
+}

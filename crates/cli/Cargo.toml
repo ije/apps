@@ -39,4 +39,5 @@ zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2
 [dev-dependencies]
 apps-audio = { path = "../media/audio" }
 apps-media = { path = "../media" }
+apps-terminal = { path = "../terminal" }
 apps-webgpu = { path = "../webgpu" }

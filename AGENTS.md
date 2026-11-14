@@ -9,6 +9,10 @@ A tiny, high performance, memory-safe electron alternative with compatible API.
 - Fast launch (less than 300ms)
 - Low memory usage
 
+## Important Rules
+
+- Don't use workaroud/trick to match the rendering result with chrome, fix the runtime.
+
 ## Architecture
 
 @ARCHITECTURE.md

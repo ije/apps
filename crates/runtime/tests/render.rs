@@ -3557,3 +3557,138 @@ fn blocks_with_margins_beside_a_float_wrap_their_lines_like_chrome() {
         "as in Chrome: {text}"
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn terminals_draw_their_grid_and_take_input() {
+    run_hidden(
+        r#"
+        await load('term.html');
+        const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+        const input = body => fetch(MCP + '/input', { method: 'POST', body: JSON.stringify({ window: win.id, ...body }) }).then(response => response.text());
+        // Counts the pixels of a row of cells by color: [red, green, blue, dark].
+        const colors = async row => {
+            const bytes = (await win.webContents.capturePage({ x: 10, y: 10 + row * 20, width: 200, height: 20 })).toBitmap();
+            const count = [0, 0, 0, 0];
+            for (let i = 0; i < bytes.length; i += 4) {
+                const [b, g, r] = [bytes[i], bytes[i + 1], bytes[i + 2]];
+                if (r > 200 && g < 60 && b < 60) count[0]++;
+                else if (g > 200 && r < 60 && b < 60) count[1]++;
+                else if (b > 200 && r < 60 && g < 60) count[2]++;
+                else if (r < 60 && g < 60 && b < 60) count[3]++;
+            }
+            return count;
+        };
+        const size = await run('[t.cols, t.rows].join()');
+        if (size !== '20,5') fail('size ' + size);
+        await run(String.raw`t.output('\x1b[41m    \x1b[0m\r\n\x1b[31mXXXX\x1b[0m plain\r\n\x1b[7m  \x1b[0m\r\n')`);
+        const [fill, text, inverse] = [await colors(0), await colors(1), await colors(2)];
+        const cell = fill[0] / 4;
+        if (cell < 100 || fill[1] || fill[3]) fail('red cells: ' + fill);
+        if (text[0] < 40 || text[0] > cell * 2 || text[3] < 40) fail('red and plain text: ' + text);
+        if (Math.abs(inverse[3] - cell * 2) > cell / 4) fail('inverse cells: ' + inverse + ' cell ' + cell);
+        // Without a session, the element is an empty box.
+        await run('el.session = null');
+        const empty = await colors(0);
+        if (empty[0] || empty[3]) fail('element without a session: ' + empty);
+        await run('el.session = t');
+        if ((await colors(0))[0] !== fill[0]) fail('session again: ' + await colors(0));
+        // The theme follows the palette properties and the colors of the element.
+        const computed = await run("[getComputedStyle(el).getPropertyValue('-terminal-red'), getComputedStyle(el).getPropertyValue('-terminal-blue'), CSS.supports('-terminal-red', 'red'), CSS.supports('-terminal-red', '1px')].join()");
+        if (computed !== 'rgb(255, 0, 0),auto,true,false') fail('computed ' + computed);
+        await run("el.style.setProperty('-terminal-red', '#00ff00'); el.style.color = '#0000ff'");
+        const themed = [await colors(0), await colors(1), await colors(2)];
+        if (themed[0][1] !== fill[0] || themed[0][0]) fail('themed cells: ' + themed[0]);
+        if (themed[1][1] < 40 || themed[1][2] < 40 || themed[1][0] || themed[1][3]) fail('themed text: ' + themed[1]);
+        if (Math.abs(themed[2][2] - cell * 2) > cell / 4) fail('themed inverse cells: ' + themed[2]);
+        // A session with a program gets the size of its element.
+        for (let i = 0; i < 100 && !(await run('p.text')).includes('in /'); i++) await wait(20);
+        const program = await run("[p.text, p.pid > 0, p.cols, p.rows].join()");
+        if (program !== 'in /,true,20,2') fail('program ' + program);
+        // The grid follows the box of the element.
+        // The first frame gave the terminal its size.
+        if (await run('events.splice(0).join()') !== 'resize') fail('first size');
+        await run("el.style.width = '30ch'; el.style.height = '6lh'");
+        await win.webContents.capturePage();
+        await wait(50);
+        const resized = await run('[t.cols, t.rows, events.join()].join()');
+        if (resized !== '30,6,resize') fail('resized ' + resized);
+        // A click moves the focus to the terminal, and keys go to the program.
+        await run("events.length = 0; t.addEventListener('data', event => events.push(JSON.stringify(event.data)))");
+        await input({ action: 'click', x: 150, y: 40 });
+        await wait(50);
+        if (await run('document.activeElement === el') !== true) fail('focus');
+        await input({ action: 'key', key: 'x shift-y enter up ctrl-c tab' });
+        await input({ action: 'type', text: 'é' });
+        await wait(50);
+        const typed = await run('events.join()');
+        if (typed !== String.raw`"x","Y","\r","\u001b[A","\u0003","\t","é"`) fail('typed ' + typed);
+        // A drag selects text, and the wheel scrolls the scrollback.
+        await input({ action: 'drag', x: 11, y: 40, to_x: 49, to_y: 40 });
+        await wait(50);
+        const selected = await run('t.selectedText');
+        if (selected !== 'XXXX') fail('selected ' + JSON.stringify(selected));
+        const marked = await colors(1);
+        await run('t.clearSelection()');
+        const cleared = await colors(1);
+        if (marked[1] <= cleared[1]) fail('selection colors: ' + marked + ' then ' + cleared);
+        await run(String.raw`t.output('\r\n1\r\n2\r\n3\r\n4\r\n5\r\n\x1b[42m \x1b[0m')`);
+        const bottom = await colors(5);
+        await input({ action: 'scroll', x: 50, y: 40, delta_x: 0, delta_y: -60 });
+        await wait(50);
+        const scrolled = await colors(5);
+        if (!bottom[1] || scrolled[1]) fail('scrolled: ' + bottom + ' then ' + scrolled);
+        // The bar of the scrollback shows after a scroll, and its knob scrolls the rows.
+        const knob = async () => {
+            const image = await win.webContents.capturePage({ x: 300, y: 0, width: 20, height: 140 });
+            const bytes = image.toBitmap(), { width, height } = image.getSize();
+            let [first, last] = [-1, -1];
+            for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+                const i = (y * width + x) * 4;
+                if (bytes[i] > 90 && bytes[i] < 170 && Math.abs(bytes[i] - bytes[i + 1]) < 8 && Math.abs(bytes[i] - bytes[i + 2]) < 8) { if (first < 0) first = y; last = y; }
+            }
+            return [first, last].map(y => y * 140 / height);
+        };
+        const [start, end] = await knob();
+        if (start < 0 || end - start < 20 || end > 120) fail('bar after a scroll: ' + [start, end]);
+        await input({ action: 'drag', x: 305, y: (start + end) / 2, to_x: 305, to_y: 139 });
+        await wait(50);
+        const dragged = [await colors(5), await knob()];
+        if (!dragged[0][1] || dragged[1][1] < 130) fail('dragged knob: ' + dragged.join(' / '));
+        await input({ action: 'scroll', x: 50, y: 40, delta_x: 0, delta_y: -60 });
+        await wait(50);
+        await run('t.scrollToBottom()');
+        if (!(await colors(5))[1]) fail('scrolled back');
+        // Images of the Kitty graphics protocol: RGBA pixels, and a PNG file.
+        await run(String.raw`{
+            t.reset();
+            const canvas = document.createElement('canvas');
+            canvas.width = canvas.height = 2;
+            const context = canvas.getContext('2d');
+            context.fillStyle = '#00ff00';
+            context.fillRect(0, 0, 2, 2);
+            t.output('\x1b_Ga=T,f=32,s=1,v=1,c=4,r=1;AAD//w==\x1b\\\r\n\x1b_Ga=T,f=100,c=2,r=1;' + canvas.toDataURL().split(',')[1] + '\x1b\\');
+        }`);
+        const [pixels, png] = [await colors(0), await colors(1)];
+        if (Math.abs(pixels[2] - cell * 4) > cell / 4 || pixels[1]) fail('image of pixels: ' + pixels + ' cell ' + cell);
+        if (Math.abs(png[1] - cell * 2) > cell / 4) fail('PNG image: ' + png + ' cell ' + cell);
+        await run(String.raw`t.output('\x1b_Ga=d\x1b\\')`);
+        if ((await colors(0))[2] > cell / 4) fail('deleted image');
+        "#,
+        &[
+            (
+                "term.html",
+                "<style>:root{-terminal-red:#ff0000;-terminal-green:#00ff00}body{margin:0;background:white}\
+                 terminal{display:block;font:16px/20px Menlo;width:20ch;height:5lh;padding:10px;color:#000}\
+                 terminal::selection{background:#00ff00}</style>\
+                 <terminal id=t></terminal><terminal id=p style='height:2lh'></terminal>\
+                 <script type=preload>__apps.contextBridge.exposeInMainWorld('create', options => new __apps.terminal.Session(options));</script>\
+                 <script>globalThis.el = document.getElementById('t'); globalThis.t = create({ manual: true }); el.session = t;\
+                 globalThis.events = []; t.addEventListener('resize', () => events.push('resize'));\
+                 globalThis.p = create({ command: ['/bin/sh', '-c', 'printf \"in $PWD\"; sleep 9'], cwd: '/' });\
+                 document.getElementById('p').session = p;</script>",
+            ),
+            ("package.json", r#"{"features":["terminal"]}"#),
+        ],
+    );
+}

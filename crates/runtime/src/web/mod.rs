@@ -5,6 +5,7 @@ pub(crate) mod platform;
 pub(crate) mod serve;
 pub(crate) mod storage;
 pub(crate) mod tcp;
+pub mod terminal;
 pub(crate) mod websocket;
 pub(crate) mod worker;
 

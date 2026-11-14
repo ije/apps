@@ -36,6 +36,9 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     if(typeof value==='number'&&!Number.isSafeInteger(value)||Object.is(value,-0))return{type:'number',value:Object.is(value,-0)?'-0':String(value)};
     if(typeof value==='symbol')uncloneable();
     if(value===null||typeof value!=='object')return{type:'value',value};
+    // A terminal session crosses between a preload script and its page as an ID. The other side has its own object for it.
+    const session=hooks.session?.(value);
+    if(session!==undefined){if(peer(target)==='main')uncloneable();return{type:'terminal',id:session};}
     if(seen.has(value))return{type:'reference',id:seen.get(value)};
     const id=seen.size;seen.set(value,id);
     if(value instanceof Date)return{type:'date',id,value:String(value.getTime())};
@@ -57,6 +60,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     if(value.type==='json')return value.value instanceof Uint8Array?JSON.parse(jsonDecoder.decode(value.value)):value.value;
     if(value.type==='value')return value.value;
     if(value.type==='reference')return seen.get(value.id);
+    if(value.type==='terminal')return hooks.adopt?.(value.id)??null;
     let result;
     if(value.type==='promise')result=new Promise((resolve,reject)=>rpc(target,{kind:'call',function:value.then,args:{type:'array',id:0,items:[{type:'function',id:capability((ok,v)=>ok?resolve(v):reject(v),target,true)}]}}));
     else if(value.type==='date')result=new Date(Number(value.value));
@@ -108,7 +112,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   const out=value=>{
     if(typeof value==='function')return{$method:1};
     if(Array.isArray(value))return value.map(out);
-    if(value===null||typeof value!=='object'||Object.getPrototypeOf(value)===Object.prototype)return value;
+    if(value===null||typeof value!=='object'||Object.getPrototypeOf(value)===Object.prototype||hooks.session?.(value)!==undefined)return value;
     let ref=refIds.get(value);
     if(ref===undefined){ref=++lastRef;refs.set(ref,value);refIds.set(value,ref);}
     return{$ref:ref};

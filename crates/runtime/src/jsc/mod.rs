@@ -935,6 +935,7 @@ const ACCESS: &[(&str, u8)] = &[
     ("dom.", PAGE),
     ("gpu.", PAGE),
     ("media.", PAGE),
+    ("terminal.", PAGE | PRELOAD),
     ("web.serve.", MAIN),
     ("web.tcp.", NODE),
     ("web.", ALL),
@@ -1450,6 +1451,15 @@ fn dispatch(
         host.try_borrow_mut()
             .context("Host is busy")?
             .media(id, op, &args)
+    } else if let (Role::Renderer(id) | Role::Preload(id), Some(op)) =
+        (role, op.strip_prefix("terminal."))
+    {
+        host.try_borrow_mut().context("Host is busy")?.terminal(
+            id,
+            matches!(role, Role::Preload(_)),
+            op,
+            &args,
+        )
     } else if let (Role::Renderer(id), "dom.contextMenu") = (role, op) {
         if let Some(link) = host.try_borrow().context("Host is busy")?.link.clone() {
             link.event(
