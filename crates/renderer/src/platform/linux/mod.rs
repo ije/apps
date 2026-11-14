@@ -121,6 +121,7 @@ trait Native {
     fn active(&self) -> bool;
     fn want_frames(&self);
     fn draw(&self, scene: &Scene, capture: bool) -> Capture;
+    fn take_snapshots(&self) -> Vec<crate::Snapshot>;
     fn release(&self);
     fn act(&self, action: Action);
     fn handle(&self) -> RawWindowHandle;
@@ -361,6 +362,10 @@ impl Window {
         soon(move || {
             calls.frame();
         });
+    }
+
+    pub fn take_snapshots(&self) -> Vec<crate::Snapshot> {
+        self.native.take_snapshots()
     }
 
     pub fn draw(&self, scene: &Scene, capture: bool) -> Capture {

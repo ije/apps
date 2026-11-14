@@ -361,6 +361,57 @@ impl renderer::View for PageView {
         self.render_page(tree, window, cx)
     }
 
+    fn drawn(&mut self, snapshots: Vec<renderer::Snapshot>, window: &mut Window, cx: &mut App) {
+        if snapshots.is_empty() && !self.paint.take() {
+            return;
+        }
+        let mut changed = Vec::with_capacity(snapshots.len());
+        {
+            let mut host = self.host.borrow_mut();
+            let host = &mut *host;
+            let dom = host.dom.entry(self.id).or_default();
+            // An element that is no longer drawable gives its pixels back.
+            if let Some(page) = host.pages.get(&self.id).filter(|_| !snapshots.is_empty()) {
+                let drawable = |id: &usize| {
+                    (page.doc.nodes.get(*id))
+                        .is_some_and(|node| node.attrs.contains_key("drawable"))
+                };
+                dom.snapshots.retain(|id, _| drawable(id));
+                dom.drawn.retain(|id, _| drawable(id));
+            }
+            for renderer::Snapshot { key, size, pixels } in snapshots {
+                if let Some(pixels) = tiny_skia::IntSize::from_wh(size[0], size[1])
+                    .and_then(|size| tiny_skia::Pixmap::from_vec(pixels, size))
+                {
+                    dom.snapshots
+                        .insert(key as usize, (Rc::new(pixels), window.scale_factor()));
+                    changed.push(key);
+                }
+            }
+        }
+        self.paint.set(false);
+        // The script can lay out the page, which needs the view that this call holds.
+        let view = self.0.clone();
+        cx.defer(move |cx| {
+            cx.update_window(view.window, |window, cx| {
+                let renderer = view.runtime.try_borrow().ok().and_then(|app| {
+                    app.views
+                        .get(&view.id)
+                        .and_then(|view| view.renderer.clone())
+                });
+                if let Some(renderer) = renderer
+                    && let Err(error) = super::scripted(cx, Some(window), || {
+                        renderer.eval(&format!("__appsPaint({changed:?})"), "apps:paint")
+                    })
+                {
+                    eprintln!("apps: {error}");
+                }
+                let runtime = view.runtime.clone();
+                cx.defer(move |cx| Desktop::drive(runtime, cx));
+            });
+        });
+    }
+
     fn window_changed(&mut self, window: &mut Window, cx: &mut App) {
         self.origin.set(None);
         if let Ok(mut host) = self.host.try_borrow_mut() {

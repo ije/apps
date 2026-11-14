@@ -1,0 +1,13 @@
+{
+  "name": "html_in_canvas",
+  "productName": "HTML in Canvas",
+  "private": true,
+  "main": "main.ts",
+  "features": [
+    "webgpu"
+  ],
+  "scripts": {
+    "dev": "apps run --watch",
+    "build": "apps build"
+  }
+}

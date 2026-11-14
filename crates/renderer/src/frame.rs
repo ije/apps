@@ -85,6 +85,8 @@ pub struct RenderFrame {
     pub skip: Vec<usize>,
     pub content: Vec<usize>,
     pub promoted: Vec<(usize, Target, [i32; 4])>,
+    // The snapshot layers to read: the key, the target and the region that it holds.
+    pub shots: Vec<(u64, Target, [i32; 4])>,
 }
 
 // The layer textures of a backend. A texture that no frame used for this many frames is dropped.
@@ -179,6 +181,21 @@ impl RenderFrame {
             let target = self.acquire(region, 1);
             self.record_layer(scene, layer, target, true, 1);
             self.promoted.push((layer, target, region));
+        }
+        self.shots.clear();
+        for shot in scene.shots.iter().filter(|shot| shot.read) {
+            let [x, y, width, height] = shot.region;
+            let region = [
+                x,
+                y,
+                width.min(max_texture as i32),
+                height.min(max_texture as i32),
+            ];
+            if region[2] > 0 && region[3] > 0 {
+                let target = self.acquire(region, 1);
+                self.record_layer(scene, shot.layer, target, true, 1);
+                self.shots.push((shot.key, target, region));
+            }
         }
         // Shelf textures grow while the frame is recorded, so composites read their final size.
         if !self.shelves.is_empty() {
@@ -862,6 +879,27 @@ mod tests {
                 .any(|composite| composite.opacity == 0.25)
         );
         frame
+    }
+
+    #[test]
+    fn snapshot_layers_draw_into_their_own_target_when_they_are_read() {
+        let mask = Clip::from(bounds([0., 0., 100., 100.]));
+        let mut scene: Scene = Default::default();
+        scene.push(Instance::new(BOX, bounds([0., 0., 10., 10.]), mask));
+        scene.push_offscreen();
+        scene.push(Instance::new(BOX, bounds([20., 20., 30., 10.]), mask));
+        scene.pop_offscreen(Some((7, bounds([20., 20., 30., 10.]))));
+        let mut frame = RenderFrame::default();
+        frame.record(&scene, [100, 100], 4096, true);
+        assert!(frame.shots.is_empty());
+        assert_eq!(frame.instances.len(), 1, "the window draws the layer");
+        scene.shots[0].read = true;
+        frame.record(&scene, [100, 100], 4096, true);
+        let [(7, target, [20, 20, 30, 10])] = frame.shots[..] else {
+            panic!("the layer is not read");
+        };
+        assert_eq!(frame.instances.len(), 2);
+        assert_eq!(frame.origin(target), [20, 20]);
     }
 
     #[test]

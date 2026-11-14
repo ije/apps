@@ -1718,11 +1718,16 @@ fn create(
     }
     let flow = !matches!(display, "flex" | "inline-flex" | "grid" | "inline-grid");
     let mut flat = Vec::new();
-    let mut pending: Vec<usize> = if symbol.is_some()
+    let drawable = style::drawable_canvas(node, style);
+    let mut pending: Vec<usize> = if drawable {
+        let boxes = |child: &&usize| !doc.nodes[**child].tag.starts_with('#');
+        node.children.iter().rev().filter(boxes).copied().collect()
+    } else if symbol.is_some()
         || matches!(
             node.tag.as_str(),
             "svg" | "canvas" | "iframe" | "progress" | "meter" | "terminal"
-        ) {
+        )
+    {
         Vec::new()
     } else {
         node.children.iter().rev().copied().collect()
@@ -5770,6 +5775,31 @@ fn create(
             }
             el = el.child(wrapper);
         }
+    } else if drawable {
+        // The children of a canvas with drawable content lay out as blocks at its content box, and take no room
+        // in the canvas. The window doesn't show them: the page draws them with `drawElementImage()`.
+        let mut content = content_box();
+        for axis in 0..2 {
+            if style
+                .get([Prop::WIDTH, Prop::HEIGHT][axis])
+                .is_none_or(|value| value == "auto")
+                && let Some(natural) = natural
+            {
+                content[axis] = natural[axis];
+            }
+        }
+        let boxes = flat
+            .iter()
+            .map(|&child| element(build, child, content, container, None));
+        let holder = renderer::node()
+            .absolute()
+            .flex()
+            .flex_col()
+            .top(px(padding[0]))
+            .right(px(padding[1]))
+            .left(px(padding[3]))
+            .children(boxes);
+        el = el.child(holder.hooks(super::paint::Undrawn(view.clone())));
     } else if !node.children.is_empty()
         && node.tag != "canvas"
         && node.tag != "terminal"
@@ -6948,6 +6978,9 @@ fn create(
     };
     let hooks = DomBox {
         text_clip,
+        drawn: node.attrs.contains_key("drawable")
+            && style.get(Prop::CANVAS_CONTENT) == Some("drawable")
+            && !drawable,
         placed: Default::default(),
         offset: Default::default(),
         frame: node.tag == "iframe",
@@ -7079,6 +7112,7 @@ fn create(
                 hooks.revision,
                 hooks.sides,
                 hooks.margin,
+                hooks.drawn,
             ),
             (
                 hooks.cell,

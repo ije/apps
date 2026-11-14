@@ -1,11 +1,29 @@
-use crate::{Clip, Color, Pixels, Point, Radii, Rect, Size, atlas::Tile, gpu::Instance, point};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use crate::{
+    Clip, Color, Pixels, Point, Radii, Rect, Size,
+    atlas::Tile,
+    gpu::{Instance, SHADOW, bytes},
+    point,
+};
+use std::{
+    hash::{Hash, Hasher},
+    mem, slice,
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
+};
 
 pub struct Scene {
     pub(crate) layers: Vec<SceneLayer>,
     active: Vec<usize>,
     spare: Vec<SceneLayer>,
     keyed: Vec<(u64, usize)>,
+    pub(crate) shots: Vec<Shot>,
+}
+
+// A layer of `push_offscreen` whose pixels the backend reads when `read` is set.
+pub(crate) struct Shot {
+    pub key: u64,
+    pub layer: usize,
+    pub region: [i32; 4],
+    pub read: bool,
 }
 
 #[derive(Default)]
@@ -38,6 +56,7 @@ impl Default for Scene {
             active: Vec::new(),
             spare: Vec::new(),
             keyed: Vec::new(),
+            shots: Vec::new(),
         }
     }
 }
@@ -59,6 +78,7 @@ impl Scene {
     pub fn clear(&mut self) {
         self.active.clear();
         self.keyed.clear();
+        self.shots.clear();
         for mut layer in self.layers.drain(1..) {
             layer.clear();
             self.spare.push(layer);
@@ -180,6 +200,92 @@ impl Scene {
             bounds,
             clip,
         });
+    }
+
+    // A layer that no parent shows. Pair with pop_offscreen.
+    pub(crate) fn push_offscreen(&mut self) {
+        self.active.push(self.layers.len());
+        self.layers.push(self.spare.pop().unwrap_or_default());
+    }
+
+    pub(crate) fn pop_offscreen(&mut self, shot: Option<(u64, Rect<f32>)>) {
+        if let (Some(layer), Some((key, bounds))) = (self.active.pop(), shot) {
+            self.shots.push(Shot {
+                key,
+                layer,
+                region: crate::frame::region(bounds),
+                read: false,
+            });
+        }
+    }
+
+    // A hash of what a layer draws in `region`, with places relative to it, so a layer that only moved keeps it.
+    pub(crate) fn digest(&self, layer: usize, region: Rect<f32>, hasher: &mut impl Hasher) {
+        let content = &self.layers[layer];
+        let place = |[x, y, w, h]: [f32; 4]| {
+            [x - region.origin.x, y - region.origin.y, w, h]
+                .map(|value| (value * 16.).round() as i32)
+        };
+        // A clip counts only inside the region, since an open clip is no place of the layer.
+        let clip = |clip: [f32; 4]| place(crate::gpu::rect(clip).intersect(region).to_array());
+        for instance in &content.instances {
+            let mut rest = *instance;
+            (rest.rect, rest.clip, rest.round) = ([0.; 4], [0.; 4], [0.; 4]);
+            // A clip without round corners has no rounded box to move.
+            let round = (instance.round_radii != [0.; 8]).then(|| place(instance.round));
+            (place(instance.rect), clip(instance.clip), round).hash(hasher);
+            // The caster of a shadow is a place too.
+            if instance.kind() == SHADOW {
+                place(mem::take(&mut rest.aux)).hash(hasher);
+            }
+            bytes(slice::from_ref(&rest)).hash(hasher);
+        }
+        for nested in &content.nested {
+            let inner = &self.layers[nested.layer];
+            (
+                nested.at,
+                place(nested.bounds.to_array()),
+                clip(nested.clip.bounds.to_array()),
+                (nested.clip.radii != Default::default())
+                    .then(|| place(nested.clip.rounded.to_array())),
+                nested.clip.radii.to_array().map(f32::to_bits),
+            )
+                .hash(hasher);
+            if let Some(effect) = &inner.effect {
+                let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                (
+                    effect.transform.map(|matrix| bits(&matrix)),
+                    effect.opacity.to_bits(),
+                    effect.color_matrix.map(|matrix| bits(&matrix)),
+                    effect.blur.to_bits(),
+                    effect.blend_mode as u32,
+                )
+                    .hash(hasher);
+                (
+                    effect.shadow.map(|(by, sigma, color)| {
+                        bits(&[by.x, by.y, sigma, color.r, color.g, color.b, color.a])
+                    }),
+                    effect
+                        .clip
+                        .map(|(bounds, radii)| (place(bounds.to_array()), bits(&radii.to_array()))),
+                    effect.mask.as_ref().map(|(tile, bounds)| {
+                        (
+                            tile.page,
+                            bits(&tile.rect.map(|value| value as f32).to_array()),
+                            place(bounds.to_array()),
+                        )
+                    }),
+                    effect.backdrop.as_ref().map(|backdrop| {
+                        (place(backdrop.bounds.to_array()), backdrop.blur.to_bits())
+                    }),
+                )
+                    .hash(hasher);
+                if let Some(text) = effect.text_mask {
+                    self.digest(text, region, hasher);
+                }
+            }
+            self.digest(nested.layer, region, hasher);
+        }
     }
 
     pub(crate) fn keyed(&self, key: u64) -> Option<usize> {
@@ -536,6 +642,30 @@ mod tests {
         scene.pop_effect();
         assert!(scene.covers(step + 1, caret), "an effect over it");
         assert!(scene.at_root());
+    }
+
+    #[test]
+    fn digests_follow_what_a_layer_draws_and_not_where() {
+        let digest = |at: f32, red: f32| {
+            // Like the window, the layer has an open clip.
+            let mask = Clip::from(bounds([-1e6, -1e6, 2e6, 2e6]));
+            let mut scene: Scene = Default::default();
+            scene.push_offscreen();
+            let mut instance = Instance::new(BOX, bounds([at + 5., 5., 10., 10.]), mask);
+            instance.color = [red, 0., 0., 1.];
+            scene.push(instance);
+            scene.push_effect(effect(mask), None);
+            scene.push(Instance::new(BOX, bounds([at + 6., 6., 2., 2.]), mask));
+            scene.pop_effect();
+            let region = bounds([at, 0., 100., 100.]);
+            scene.pop_offscreen(Some((1, region)));
+            assert!(scene.layers[0].nested.is_empty(), "the window shows it");
+            let mut hasher = rustc_hash::FxHasher::default();
+            scene.digest(scene.shots[0].layer, region, &mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(digest(0., 1.), digest(40., 1.));
+        assert_ne!(digest(0., 1.), digest(0., 0.5));
     }
 
     #[test]

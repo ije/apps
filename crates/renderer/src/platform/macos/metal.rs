@@ -163,6 +163,7 @@ pub(crate) struct Renderer {
     restacked: bool,
     committed: u64,
     completed: Arc<AtomicU64>,
+    pub snapshots: Vec<crate::Snapshot>,
 }
 
 type Rendered = (
@@ -376,6 +377,7 @@ impl Renderer {
             restacked: false,
             committed: 0,
             completed: Arc::default(),
+            snapshots: Vec::new(),
         })
     }
 
@@ -785,6 +787,38 @@ impl Renderer {
         };
         let readback =
             (capture && !native_capture).then(|| self.read_back(&commands, &frame_texture, window));
+        let shots: Vec<_> = (self.frame.shots.iter())
+            .filter_map(|&(key, target, region)| {
+                let size = [region[2] as u32, region[3] as u32];
+                let layer = self.pool.get(&self.frame, target)?;
+                // A blit encoder keeps much memory in the Apple GPU driver, so there a draw copies the layer
+                // into a texture that the CPU can read.
+                let read = if self.atlas.pages.borrow().shared {
+                    new_texture(
+                        &self.device,
+                        size.map(|side| side as usize),
+                        FORMAT,
+                        MTLTextureUsage::RenderTarget,
+                        MTLStorageMode::Shared,
+                    )
+                    .and_then(|copy| {
+                        let area = [0, 0, region[2], region[3]];
+                        let load = MTLLoadAction::DontCare;
+                        (self.pipelines).copy(&commands, layer, [0, 0], &copy, area, load)?;
+                        Ok(Ok(copy))
+                    })
+                } else {
+                    self.read_back(&commands, layer, size).map(Err)
+                };
+                match read {
+                    Ok(read) => Some((key, size, read)),
+                    Err(error) => {
+                        eprintln!("apps: failed to read a layer: {error:#}");
+                        None
+                    }
+                }
+            })
+            .collect();
         if transact {
             commands.commit();
             commands.waitUntilScheduled();
@@ -807,6 +841,39 @@ impl Renderer {
             commands.commit();
         }
         self.glass_update = native_transaction;
+        if !shots.is_empty() {
+            commands.waitUntilCompleted();
+        }
+        for (key, size, read) in shots {
+            let row = size[0] as usize * 4;
+            let mut pixels = vec![0u8; row * size[1] as usize];
+            match read {
+                // SAFETY: the GPU finished the texture, and `pixels` holds every row of it.
+                Ok(texture) => unsafe {
+                    texture.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                        NonNull::from(&mut pixels[..]).cast::<c_void>(),
+                        row,
+                        MTLRegion {
+                            origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                            size: MTLSize {
+                                width: size[0] as usize,
+                                height: size[1] as usize,
+                                depth: 1,
+                            },
+                        },
+                        0,
+                    )
+                },
+                // SAFETY: the GPU finished writing the shared buffer, which is as long as `pixels`.
+                Err(buffer) => pixels.copy_from_slice(unsafe {
+                    slice::from_raw_parts(buffer.contents().as_ptr().cast::<u8>(), buffer.length())
+                }),
+            }
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+            self.snapshots.push(crate::Snapshot { key, size, pixels });
+        }
         readback
             .map(|buffer| {
                 let buffer = buffer?;

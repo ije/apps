@@ -239,6 +239,13 @@ impl Window {
         });
     }
 
+    pub fn take_snapshots(&self) -> Vec<crate::Snapshot> {
+        match self.shared.drawing.try_borrow_mut() {
+            Ok(mut renderer) => std::mem::take(&mut renderer.snapshots),
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn draw(&self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
         self.shared.quiet.take();
         match self.shared.drawing.try_borrow_mut() {

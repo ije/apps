@@ -259,6 +259,145 @@ fn background_images_decode_and_draw() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn canvases_draw_their_drawable_elements() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const frames = async (done, what) => {
+            for (let n = 0; n < 60; n++) { await win.webContents.capturePage(); if (await run(done)) return; }
+            fail(what + ': ' + JSON.stringify(await run('state()')));
+        };
+        const shot = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()].slice(0, 3).reverse().join();
+        await frames('paints > 0 && pixel(110, 50) === "255,0,0,255"', 'the element did not draw');
+        const first = await run('state()');
+        if (first.changed !== 'box,field' || first.empty !== '0,0,0,0') fail('first paint: ' + JSON.stringify(first));
+        // The window shows the drawing of the canvas, not the boxes of its children.
+        await frames('true', '');
+        if (await shot(110, 50) !== '255,0,0' || await shot(10, 10) !== '255,255,255' || await shot(10, 40) !== '255,255,255') fail('window pixels: ' + [await shot(110, 50), await shot(10, 10), await shot(10, 40)].join(' '));
+        await frames('at(110, 50) === "box" && at(10, 10) === "c"', 'the pointer misses the drawn element');
+        const drawn = await run('state()');
+        if (drawn.rect !== '100,40,50,30' || drawn.matrix !== '100,40' || drawn.plain !== 'InvalidStateError' || drawn.size !== '50,30') fail('geometry: ' + JSON.stringify(drawn));
+        // A paint follows a change of the element, and no paint follows a frame without one.
+        const paints = drawn.paints;
+        await run('box.style.background = "rgb(0,128,0)"');
+        await frames('pixel(110, 50) === "0,128,0,255"', 'the change did not draw');
+        for (let n = 0; n < 5; n++) await win.webContents.capturePage();
+        const settled = await run('state()');
+        if (settled.paints !== paints + 1 || settled.changed !== 'box') fail('paints after a change: ' + (settled.paints - paints) + ' ' + settled.changed);
+        await run('c.requestPaint()');
+        await frames('paints === ' + (paints + 2), 'requestPaint did not paint');
+        if ((await run('state()')).changed !== '') fail('requestPaint listed a changed element');
+        // The drawn field takes the pointer and the keyboard, and what the user types paints.
+        const input = body => fetch(MCP + '/input', { method: 'POST', body: JSON.stringify({ window: win.id, ...body }) }).then(response => response.text());
+        await input({ action: 'click', x: 110, y: 50 });
+        await input({ action: 'click', x: 60, y: 85 });
+        await frames('clicks === 1 && document.activeElement.id === "field"', 'the click missed the drawn field');
+        await input({ action: 'type', text: 'ab' });
+        await frames('field.value === "ab" && changed === "field"', 'typed text did not paint');
+        // A clip leaves only a part of the element to the pointer.
+        await run('c.updateElementGeometry(box, { canvasClip: { x: 100, y: 40, width: 20, height: 30 } })');
+        await frames('at(110, 50) === "box" && at(130, 50) === "c"', 'the clip of the geometry');
+        await run('c.clearElementGeometry(box)');
+        await frames('at(110, 50) === "c"', 'cleared geometry still takes the pointer');
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0;background:white'>\
+             <canvas id=c width=200 height=100 content=drawable style='display:block;width:200px;height:100px'>\
+             <div id=box drawable style='width:50px;height:30px;background:rgb(255,0,0)'></div>\
+             <div id=plain style='width:50px;height:30px;background:rgb(0,0,255)'></div>\
+             <input id=field drawable style='display:block;box-sizing:border-box;width:80px;height:20px;margin:0'></canvas>\
+             <script>\
+             var c = document.getElementById('c'), box = document.getElementById('box'), field = document.getElementById('field'), ctx = c.getContext('2d'), paints = 0, changed = null, clicks = 0;\
+             box.onclick = () => clicks++;\
+             var pixel = (x, y) => ctx.getImageData(x, y, 1, 1).data.join();\
+             var at = (x, y) => document.elementFromPoint(x, y).id;\
+             var state = () => { const r = box.getBoundingClientRect(), m = c.getElementTransform(box), size = c.getElementImageDefaultSize(box); let plain = ''; try { ctx.drawElementImage(document.getElementById('plain'), 0, 0); } catch (error) { plain = error.name; }\
+               return { paints, changed, empty: pixel(10, 10), rect: [r.x, r.y, r.width, r.height].join(), matrix: m.e + ',' + m.f, plain, size: size.width + ',' + size.height }; };\
+             c.onpaint = event => { paints++; changed = event.changedElements.map(element => element.id).join(); ctx.reset(); ctx.drawElementImage(box, 100, 40); ctx.drawElementImage(field, 20, 75); };\
+             </script></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn drawable_elements_nest_scroll_and_go_to_workers_and_textures() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const frames = async (done, what) => {
+            for (let n = 0; n < 60; n++) { await win.webContents.capturePage(); if (await run(done)) return; }
+            fail(what + ': ' + JSON.stringify(await run('state()')));
+        };
+        // A drawable element inside another one draws by itself, and the outer one draws without it.
+        await frames('pixel(20, 58) === "255,0,0,255" && pixel(105, 55) === "0,0,255,255"', 'nested elements');
+        await frames('at(20, 60) === "outer" && at(110, 55) === "inner"', 'the pointer on nested elements');
+        // The elements move with the canvas, which needs no new drawing.
+        const paints = (await run('state()')).paints;
+        await run('scrollTo(0, 40)');
+        await frames('at(20, 20) === "outer" && at(110, 15) === "inner"', 'the pointer after a scroll');
+        for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+        if ((await run('state()')).paints !== paints) fail('a scroll painted the canvas');
+        await run('scrollTo(0, 0)');
+        // An OffscreenCanvas of the page places its elements in a microtask and tells the canvas.
+        await frames('updated === "para" && at(50, 120) === "para"', 'the geometry of an OffscreenCanvas');
+        if (await run('d.getElementTransform(para).e') !== 40) fail('the transform of an OffscreenCanvas');
+        // A worker draws a captured element, and the page has no use of the image after the transfer.
+        const worked = await run(`new Promise(resolve => {
+            const code = 'onmessage = event => { const context = new OffscreenCanvas(8, 8).getContext("2d"); context.drawElementImage(event.data, 0, 0); postMessage(context.getImageData(1, 1, 1, 1).data.join()); }';
+            const worker = new Worker(URL.createObjectURL(new Blob([code]))), image = c.captureElementImage(outer);
+            worker.onmessage = event => { let closed = ''; try { ctx.drawElementImage(image, 0, 0); } catch (error) { closed = error.name; } resolve(event.data + ' ' + closed); };
+            worker.postMessage(image, [image]);
+        })`);
+        if (worked !== '255,0,0,255 InvalidStateError') fail('the worker drew ' + worked);
+        const texel = await run(`(async () => {
+            const device = await (await navigator.gpu.requestAdapter()).requestDevice();
+            const texture = device.createTexture({ size: [4, 4], format: 'rgba8unorm', usage: GPUTextureUsage.COPY_SRC | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT });
+            device.queue.drawElementImageToTexture({ source: para }, { texture, size: [4, 4] });
+            const buffer = device.createBuffer({ size: 1024, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }), encoder = device.createCommandEncoder();
+            encoder.copyTextureToBuffer({ texture }, { buffer, bytesPerRow: 256 }, [4, 4]);
+            device.queue.submit([encoder.finish()]);
+            await buffer.mapAsync(GPUMapMode.READ);
+            return new Uint8Array(buffer.getMappedRange()).slice(0, 4).join();
+        })()`);
+        if (texel !== '0,128,0,255') fail('the texture holds ' + texel);
+        // An animation inside a drawable element paints the canvas frame by frame.
+        await frames('alphas.size > 3', 'an animation did not paint');
+        "#,
+        &[
+            (
+                "page.html",
+                "<body style='margin:0;background:white;height:2000px'>\
+                 <canvas id=c width=200 height=100 content=drawable style='display:block;width:200px;height:100px'>\
+                 <div id=outer drawable style='width:60px;height:40px;background:rgb(255,0,0)'>\
+                 <span id=inner drawable style='width:20px;height:10px;margin:5px;background:rgb(0,0,255)'></span></div></canvas>\
+                 <canvas id=d width=100 height=50 content=drawable style='display:block;width:100px;height:50px'>\
+                 <p id=para drawable style='margin:0;width:30px;height:20px;background:rgb(0,128,0)'></p></canvas>\
+                 <style>@keyframes fade { to { opacity: 0 } }</style>\
+                 <canvas id=e width=20 height=20 content=drawable style='display:block;width:20px;height:20px'><div id=pulse drawable>\
+                 <div style='width:20px;height:20px;background:black;animation:fade 1s linear infinite alternate'></div></div></canvas>\
+                 <script>\
+                 var c = document.getElementById('c'), d = document.getElementById('d'), ctx = c.getContext('2d'), paints = 0, updated = '';\
+                 var [outer, inner, para] = ['outer', 'inner', 'para'].map(id => document.getElementById(id));\
+                 var pixel = (x, y) => ctx.getImageData(x, y, 1, 1).data.join();\
+                 var at = (x, y) => document.elementFromPoint(x, y).id;\
+                 var state = () => ({ paints, updated, alphas: [...alphas].join(), rect: JSON.stringify(inner.getBoundingClientRect()) });\
+                 c.onpaint = () => { paints++; ctx.reset(); ctx.drawElementImage(outer, 10, 50); ctx.drawElementImage(inner, 100, 50); };\
+                 var offscreen = d.transferControlToOffscreen().getContext('2d');\
+                 d.onpaint = () => { offscreen.reset(); offscreen.drawElementImage(para, 40, 10); };\
+                 d.onelementgeometryupdate = event => { updated = event.elements.map(element => element.id).join(); };\
+                 var e = document.getElementById('e'), faded = e.getContext('2d'), alphas = new Set();\
+                 e.onpaint = () => { faded.reset(); faded.drawElementImage(document.getElementById('pulse'), 0, 0); alphas.add(faded.getImageData(5, 5, 1, 1).data[3]); };\
+                 </script></body>",
+            ),
+            ("package.json", r#"{"features":["webgpu"]}"#),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn stretched_images_keep_their_size_when_they_restyle_in_place() {
     run_hidden(
         r#"

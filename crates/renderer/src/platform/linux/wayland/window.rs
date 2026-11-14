@@ -410,6 +410,13 @@ impl Native for Surface {
         capture
     }
 
+    fn take_snapshots(&self) -> Vec<crate::Snapshot> {
+        match &mut *self.renderer.borrow_mut() {
+            Some(renderer) => std::mem::take(&mut renderer.snapshots),
+            None => Vec::new(),
+        }
+    }
+
     fn release(&self) {
         if let Some(renderer) = &mut *self.renderer.borrow_mut() {
             renderer.release();

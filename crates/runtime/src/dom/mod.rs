@@ -803,6 +803,21 @@ pub struct State {
     pub(crate) blocks: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
     pub(crate) cull: crate::render::cull::Cull,
     pub top_layer: Vec<usize>,
+    // The last drawing of each drawable element of a canvas, with its device pixels per CSS pixel.
+    pub(crate) snapshots: rustc_hash::FxHashMap<usize, (Rc<tiny_skia::Pixmap>, f32)>,
+    pub(crate) drawn: rustc_hash::FxHashMap<usize, Drawn>,
+    drawn_order: u32,
+    pub(crate) paint_requested: bool,
+}
+
+// Where a canvas drew a drawable element, which takes the pointer there.
+pub(crate) struct Drawn {
+    // From the border box of the element to the content box of the canvas, in CSS pixels.
+    pub(crate) matrix: [f32; 16],
+    // The part of the content box of the canvas that shows the element.
+    pub(crate) clip: Option<[f32; 4]>,
+    // Elements drawn later take the pointer first.
+    pub(crate) order: u32,
 }
 
 impl State {
@@ -1039,6 +1054,9 @@ pub(crate) type CanvasSource = (
     Option<Rc<str>>,
     Rc<tiny_skia::Pixmap>,
 );
+
+// Added to the node of a drawable element, this draws its snapshot and not the image of the node.
+const SNAPSHOT: usize = 1 << 32;
 
 fn source_pixels(
     state: &State,
@@ -1372,6 +1390,11 @@ pub fn call(
         state.dirty = true;
         return Ok(json!(state.text_system.is_some()));
     }
+    if op == "dom.requestPaint" {
+        state.paint_requested = true;
+        state.dirty = true;
+        return Ok(Value::Null);
+    }
     if op == "dom.mediaMatches" {
         let query = args[0].as_str().context("Expected a media query")?;
         let source = format!("@media {query} {{}}");
@@ -1565,6 +1588,8 @@ pub fn call(
                         .map(|canvas| canvas.image),
                 );
                 state.placeholders.remove(&id);
+                state.snapshots.remove(&id);
+                state.drawn.remove(&id);
                 state.retired.extend(
                     state
                         .svgs
@@ -2456,7 +2481,12 @@ pub fn call(
                     &ops,
                     args[2].as_str().unwrap_or(""),
                     &data,
-                    &|(source, size)| source_pixels(state, source, Some(size)),
+                    &|(source, size)| match source.checked_sub(SNAPSHOT) {
+                        Some(element) => state.snapshots.get(&element).map(|(pixels, _)| {
+                            crate::render::canvas::Source::Shared(pixels.clone())
+                        }),
+                        None => source_pixels(state, source, Some(size)),
+                    },
                     state
                         .text_system
                         .as_deref()
@@ -2590,6 +2620,62 @@ pub fn call(
             state.created += canvas.pixels.data().len() >> 16;
             state.canvases.insert(id, canvas);
             Ok(Value::Null)
+        }
+        // The size of the last drawing of a drawable element in CSS pixels. With a node, that canvas gets a copy.
+        "dom.snapshot" => {
+            let Some((pixels, scale)) = state.snapshots.get(&id).cloned() else {
+                return Ok(Value::Null);
+            };
+            if let Some(to) = args[1].as_u64() {
+                let mut canvas =
+                    crate::render::canvas::Canvas::new(pixels.width(), pixels.height())?;
+                canvas.pixels = (*pixels).clone();
+                state.created += canvas.pixels.data().len() >> 16;
+                state.canvases.insert(to as usize, canvas);
+            }
+            Ok(json!([
+                pixels.width() as f32 / scale,
+                pixels.height() as f32 / scale,
+                pixels.width(),
+                pixels.height()
+            ]))
+        }
+        // Where a canvas drew a drawable element: `get`, `clear`, or `set` with a matrix and a clip, each of
+        // which stays as it is when null.
+        "dom.drawn" => {
+            let floats = |value: &Value| {
+                let list = value.as_array()?.iter().map(|v| Some(v.as_f64()? as f32));
+                list.collect::<Option<Vec<f32>>>()
+            };
+            match args[1].as_str() {
+                Some("get") => Ok(json!(state.drawn.get(&id).map(|drawn| drawn.matrix))),
+                Some("clear") => {
+                    state.dirty |= state.drawn.remove(&id).is_some();
+                    Ok(Value::Null)
+                }
+                _ => {
+                    let matrix = floats(&args[2]).and_then(|list| <[f32; 16]>::try_from(list).ok());
+                    let clip = floats(&args[3]).and_then(|list| <[f32; 4]>::try_from(list).ok());
+                    let old = state.drawn.remove(&id);
+                    if !(args[4] == true && old.is_some()) {
+                        state.drawn_order += 1;
+                    }
+                    let new = Drawn {
+                        matrix: matrix
+                            .or(old.as_ref().map(|old| old.matrix))
+                            .unwrap_or(crate::render::effects::IDENTITY),
+                        clip: clip.or(old.as_ref().and_then(|old| old.clip)),
+                        order: match &old {
+                            Some(old) if args[4] == true => old.order,
+                            _ => state.drawn_order,
+                        },
+                    };
+                    // The boxes take the pointer at their new place after the next frame.
+                    state.dirty |= old.is_none_or(|old| old.matrix != new.matrix);
+                    state.drawn.insert(id, new);
+                    Ok(Value::Null)
+                }
+            }
         }
         "dom.canvasLink" => {
             static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -3453,14 +3539,16 @@ pub(crate) fn hit_test(
                 && std::iter::successors(Some(id), |&id| up(id)).last() == Some(0)
         })
         .collect();
-    let mut pending = vec![(0, screen, false, 0)];
-    pending.extend(top.iter().map(|&id| (id, screen, false, 0)));
+    // The last field is 1 in the drawable content of a canvas, which takes no pointer, and 2 in an element
+    // that the canvas drew.
+    let mut pending = vec![(0, screen, false, 0, 0u8)];
+    pending.extend(top.iter().map(|&id| (id, screen, false, 0, 0)));
     let mut hits = Vec::new();
     // The ancestors of the current node with the clips inside them and, once read, the containing blocks they
     // make: 1 when read, 2 for absolute and 4 for fixed boxes.
     let mut path: Vec<(usize, [f32; 4], u8)> = Vec::new();
     let inside = |clip: [f32; 4]| x >= clip[0] && x < clip[2] && y >= clip[1] && y < clip[3];
-    while let Some((id, mut clip, hit, depth)) = pending.pop() {
+    while let Some((id, mut clip, hit, depth, mut drawn)) = pending.pop() {
         if hit {
             hits.push(id);
             continue;
@@ -3487,6 +3575,37 @@ pub(crate) fn hit_test(
             continue;
         }
         path.truncate(depth);
+        if drawn != 0 {
+            drawn = match state.drawn.get(&id) {
+                Some(place) => {
+                    // The clip is in the content box of the canvas.
+                    let canvas =
+                        (path.iter().rev()).find(|(id, ..)| doc.nodes[*id].tag == "canvas");
+                    if let (Some([x, y, width, height]), Some(&(canvas, ..))) = (place.clip, canvas)
+                        && let Some(&[left, top, wide, _]) = state.bounds.get(&canvas)
+                    {
+                        let (style, units) = (&computed.values[canvas], &computed.lengths[canvas]);
+                        let (border, padding) = (
+                            units.borders(style, wide),
+                            units.edges(style, style::PADDING, wide),
+                        );
+                        let [x, y] = [
+                            x + left + border[3] + padding[3],
+                            y + top + border[0] + padding[0],
+                        ];
+                        clip = [
+                            clip[0].max(x),
+                            clip[1].max(y),
+                            clip[2].min(x + width),
+                            clip[3].min(y + height),
+                        ];
+                    }
+                    2
+                }
+                None if node.attrs.contains_key("drawable") => 1,
+                None => drawn,
+            };
+        }
         // An out-of-flow box gets only the clip of its containing block, as the renderer draws it. That clip
         // holds the clip of each box between, so a box without a clip keeps it.
         if clip != screen
@@ -3507,6 +3626,7 @@ pub(crate) fn hit_test(
                 })
                 .unwrap_or(screen);
         }
+        let canvas = style::drawable_canvas(node, style);
         if inside(clip)
             && let Some(&[left, top, width, height]) = state.bounds.get(&id)
         {
@@ -3540,18 +3660,29 @@ pub(crate) fn hit_test(
                         }),
                 }
                 && selectable
+                && drawn != 1
             {
-                pending.push((id, clip, true, depth));
+                pending.push((id, clip, true, depth, drawn));
+            }
+            // A canvas shows its drawable content only inside its box.
+            if canvas {
+                drawn = 1;
             }
             for (axis, prop) in [(0, Prop::OVERFLOW_X), (1, Prop::OVERFLOW_Y)] {
-                if style
-                    .get(prop)
-                    .is_some_and(|value| matches!(value, "hidden" | "clip" | "auto" | "scroll"))
+                if canvas
+                    || drawn != 1
+                        && style.get(prop).is_some_and(|value| {
+                            matches!(value, "hidden" | "clip" | "auto" | "scroll")
+                        })
                 {
                     clip[axis] = clip[axis].max([left, top][axis]);
                     clip[axis + 2] = clip[axis + 2].min([left + width, top + height][axis]);
                 }
             }
+        }
+        // The fallback content of a canvas has no boxes.
+        if node.tag == "canvas" && !canvas {
+            continue;
         }
         path.push((id, clip, 0));
         pending.extend(
@@ -3561,15 +3692,28 @@ pub(crate) fn hit_test(
                 .unwrap_or(&doc.nodes[id].children)
                 .iter()
                 .filter(|child| !top.contains(child))
-                .map(|&child| (child, clip, false, depth + 1)),
+                .map(|&child| (child, clip, false, depth + 1, drawn)),
         );
     }
     hits.sort_by_cached_key(|&id| {
-        std::cmp::Reverse(
+        let painted = |id: usize| {
             std::iter::successors(Some(id), |&id| doc.nodes[id].parent)
                 .find_map(|id| state.painted.get(id).copied().filter(|&order| order > 0))
-                .unwrap_or(0),
-        )
+                .unwrap_or(0)
+        };
+        // Elements that a canvas drew are above the canvas, the last one drawn first.
+        let drawn = std::iter::successors(Some(id), |&id| doc.nodes[id].parent)
+            .filter(|_| !state.drawn.is_empty())
+            .find_map(|at| Some((at, state.drawn.get(&at)?.order)));
+        std::cmp::Reverse(match drawn {
+            Some((element, order)) => {
+                let canvas =
+                    std::iter::successors(doc.nodes[element].parent, |&id| doc.nodes[id].parent)
+                        .find(|&id| doc.nodes[id].tag == "canvas");
+                (canvas.map_or(0, painted), order, painted(id))
+            }
+            None => (painted(id), 0, 0),
+        })
     });
     for &id in top.iter().rev() {
         if hits.first().is_some_and(|&hit| {

@@ -265,6 +265,8 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
     // A float can hang out of its block into the boxes after it, so no block around it becomes a spacer.
     let blocked = moved
         || replaced(tag)
+        // The page can draw all of a drawable element, also the parts far from the view.
+        || style.get(Prop::CANVAS_CONTENT) == Some("drawable")
         || matches!(position, "absolute" | "fixed" | "sticky")
         || style.get(Prop::FLOAT).is_some_and(|value| value != "none")
         || style

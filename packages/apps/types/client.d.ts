@@ -141,6 +141,85 @@ interface HTMLElementTagNameMap {
   terminal: HTMLTerminalElement
 }
 
+/** The last drawing of a drawable element of a canvas, from `captureElementImage()`. It can go to a worker. */
+interface ElementImage {
+  close(): void
+}
+
+interface CanvasPaintEvent extends Event {
+  /** The drawable elements that look different since the last `paint` event. */
+  readonly changedElements: readonly Element[]
+}
+
+interface ElementGeometryUpdateEvent extends Event {
+  readonly elements: readonly Element[]
+}
+
+interface UpdateElementGeometryOptions {
+  /** Keeps the place of the element in the hit order. Without it, the element comes above the others. */
+  preserveHitTestOrder?: boolean
+  /** The part of the canvas that shows the element, in CSS pixels of the canvas. */
+  canvasClip?: DOMRectInit
+  /** From the border box of the element to the content box of the canvas, in CSS pixels. */
+  canvasTransform?: DOMMatrixInit
+}
+
+/**
+ * HTML in canvas (https://github.com/WICG/html-in-canvas). A canvas with `content="drawable"` lays out its
+ * children, and the page draws the ones with a `drawable` attribute in a `paint` event.
+ */
+interface HTMLCanvasElement {
+  content: 'fallback' | 'drawable'
+  /** Fires after a frame in which a drawable element changed, and after `requestPaint()`. */
+  onpaint: ((this: HTMLCanvasElement, event: CanvasPaintEvent) => any) | null
+  /** Fires after an `OffscreenCanvas` of this canvas placed its elements. */
+  onelementgeometryupdate: ((this: HTMLCanvasElement, event: ElementGeometryUpdateEvent) => any) | null
+  /** Fires one `paint` event after the next frame. */
+  requestPaint(): void
+  captureElementImage(element: Element): ElementImage
+  /** Tells the page where the canvas drew an element, so the element takes the pointer there. */
+  updateElementGeometry(element: Element | ElementImage, options?: UpdateElementGeometryOptions): void
+  clearElementGeometry(element: Element | ElementImage): void
+  getElementTransform(element: Element): DOMMatrix
+  /** The size of an element in pixels of the canvas, as `drawElementImage()` draws it without a size. */
+  getElementImageDefaultSize(element: Element | ElementImage): { width: number; height: number }
+}
+
+interface OffscreenCanvas {
+  updateElementGeometry(element: Element | ElementImage, options?: UpdateElementGeometryOptions): void
+  clearElementGeometry(element: Element | ElementImage): void
+  getElementImageDefaultSize(element: Element | ElementImage): { width: number; height: number }
+}
+
+interface DrawElementImageOptions {
+  /** Draws the element without a change of its geometry. */
+  preserveElementGeometry?: boolean
+}
+
+interface CanvasDrawElementImage {
+  /** Draws the last drawing of a drawable element. The source rectangle is in CSS pixels of the element. */
+  drawElementImage(element: Element | ElementImage, dx: number, dy: number, options?: DrawElementImageOptions): void
+  drawElementImage(element: Element | ElementImage, dx: number, dy: number, dwidth: number, dheight: number, options?: DrawElementImageOptions): void
+  drawElementImage(element: Element | ElementImage, sx: number, sy: number, swidth: number, sheight: number, dx: number, dy: number, options?: DrawElementImageOptions): void
+  drawElementImage(element: Element | ElementImage, sx: number, sy: number, swidth: number, sheight: number, dx: number, dy: number, dwidth: number, dheight: number, options?: DrawElementImageOptions): void
+}
+
+interface CanvasRenderingContext2D extends CanvasDrawElementImage {}
+interface OffscreenCanvasRenderingContext2D extends CanvasDrawElementImage {}
+
+interface GPUQueue {
+  /** Draws a drawable element of a canvas, or a part of it, as large as `size`. */
+  drawElementImageToTexture(
+    source: { source: Element | ElementImage; sourceX?: number; sourceY?: number; sourceWidth?: number; sourceHeight?: number },
+    destination: { texture: GPUTexture; size?: [number, number] | { width: number; height: number }; premultipliedAlpha?: boolean; [key: string]: any },
+  ): void
+}
+
+interface HTMLElementEventMap {
+  paint: CanvasPaintEvent
+  elementgeometryupdate: ElementGeometryUpdateEvent
+}
+
 declare module '*?raw' {
   const text: string
   export default text

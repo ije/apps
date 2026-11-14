@@ -190,6 +190,14 @@
       if (format.startsWith('bgra')) for (let i = 0; i < pixels.length; i += 4) { const red = pixels[i]; pixels[i] = pixels[i + 2]; pixels[i + 2] = red; }
       this.writeTexture(destination, pixels, { bytesPerRow: row, rowsPerImage: height }, [width, height]);
     }
+    // Draws a drawable element of a canvas, or a part of it, as large as `size`.
+    drawElementImageToTexture({ source, sourceX = 0, sourceY = 0, sourceWidth, sourceHeight }, { size, ...destination }) {
+      const image = __appsElementImage(source), [width, height, pixelWidth, pixelHeight] = image._size;
+      const canvas = new OffscreenCanvas(size?.width ?? size?.[0] ?? pixelWidth, size?.height ?? size?.[1] ?? pixelHeight);
+      canvas.getContext('2d').drawElementImage(image, sourceX, sourceY, sourceWidth ?? width, sourceHeight ?? height, 0, 0, canvas.width, canvas.height);
+      this.copyExternalImageToTexture({ source: canvas }, destination, [canvas.width, canvas.height]);
+      if (image !== source) image.close();
+    }
   }
   class GPUDevice {
     constructor(info, adapterInfo) {

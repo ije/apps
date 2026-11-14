@@ -358,6 +358,10 @@ impl Window {
         self.renderer.set_drawable_size(pixels);
     }
 
+    pub fn take_snapshots(&mut self) -> Vec<crate::Snapshot> {
+        std::mem::take(&mut self.renderer.snapshots)
+    }
+
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
         self.control.native.wait();
         self.quiet = None;

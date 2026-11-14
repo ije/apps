@@ -2481,6 +2481,23 @@
       this._op(25,image===this.canvas?-1:image._id,iw,ih,left,top,right-left,bottom-top,dx,dy,dw,dh);
       if (image instanceof ImageBitmap) bitmapDraws.add(this); else if (image._context && image!==this.canvas) this._flush();
     }
+    // The source rectangle is in CSS pixels from the border box of the element. Without a size, the element draws as
+    // large as the page would show it.
+    drawElementImage(element, ...args) {
+      const options = args.length % 2 ? args.pop() : undefined, image = element instanceof ElementImage, canvas = this.canvas instanceof OffscreenCanvas ? this.canvas._node : this.canvas;
+      if (![2, 4, 6, 8].includes(args.length)) throw new TypeError('Invalid drawElementImage arguments');
+      const size = snapshotOf(canvas, element), [width, height] = size, [kx, ky] = gridScale(canvas, size);
+      let sx = 0, sy = 0, sw = width, sh = height, dx, dy, dw, dh;
+      if (args.length < 6) [dx, dy, dw, dh] = args; else [sx, sy, sw, sh, dx, dy, dw, dh] = args;
+      dw ??= sw * kx; dh ??= sh * ky;
+      const target = image ? element._element : element, to = !options?.preserveElementGeometry && target?.isConnected && this.getTransform().translateSelf(dx, dy).scaleSelf(dw / sw, dh / sh).translateSelf(-sx, -sy);
+      if (to) placeElement(this.canvas, target, { canvasTransform: new DOMMatrix().scaleSelf(1 / kx, 1 / ky).multiplySelf(to) });
+      if (sw < 0) { sx += sw; sw = -sw; } if (sh < 0) { sy += sh; sh = -sh; } if (dw < 0) { dx += dw; dw = -dw; } if (dh < 0) { dy += dh; dh = -dh; }
+      const left = Math.max(sx, 0), top = Math.max(sy, 0), right = Math.min(sx + sw, width), bottom = Math.min(sy + sh, height), fx = dw / sw, fy = dh / sh;
+      if (right <= left || bottom <= top) return;
+      this._op(25, image ? element._node._id : SNAPSHOT + element._id, width, height, left, top, right - left, bottom - top, dx + (left - sx) * fx, dy + (top - sy) * fy, (right - left) * fx, (bottom - top) * fy);
+      if (image) bitmapDraws.add(this);
+    }
 
     beginPath() { this._op(11); }
     fill(path, rule) { if (path instanceof Path2D) this._op(42, this._path(path), 18, fillRule(rule)); else this._op(18, fillRule(path)); }
@@ -2558,7 +2575,68 @@
     toBlob(callback, type, quality) { if (typeof callback !== 'function') throw new TypeError('Expected a callback'); this._context?._flush?.(); const [bytes, mime] = call('dom.canvasURL', this._id, true, String(type).toLowerCase(), quality); setTimeout(() => callback(new Blob([bytes], { type: mime }))); }
     getContext(type, options) { if (this._offscreen) throw transferred(); if (['webgl','webgl2','experimental-webgl','experimental-webgl2'].includes(type))throw new DOMException('WebGL is not supported; use WebGPU or Canvas 2D','NotSupportedError'); return canvasContext(this, type, options, CanvasRenderingContext2D); }
     transferControlToOffscreen() { if (this._contextType || this._offscreen) throw new DOMException('The canvas has a context or was already transferred', 'InvalidStateError'); this._offscreen = true; const offscreen = new OffscreenCanvas(0, 0); offscreen._node = this; return offscreen; }
+    get content() { return this.getAttribute('content')?.toLowerCase() === 'drawable' ? 'drawable' : 'fallback'; } set content(value) { this.setAttribute('content', value); }
+    requestPaint() { paintRequests.add(this); host('dom.requestPaint'); }
+    captureElementImage(element) { const node = canvasNode(0, 0), size = snapshotOf(this, element, node._id); node.setAttribute('width', size[2]); node.setAttribute('height', size[3]); return Object.assign(Object.create(ElementImage.prototype), { _node: node, _size: size, _element: element }); }
+    updateElementGeometry(element, options = {}) { placeElement(this, drawnElement(this, element), options); }
+    clearElementGeometry(element) { call('dom.drawn', drawnElement(this, element)._id, 'clear'); }
+    getElementTransform(element) { return new DOMMatrix(call('dom.drawn', drawnElement(this, element)._id, 'get') ?? undefined); }
+    getElementImageDefaultSize(element) { const size = snapshotOf(this, element), [kx, ky] = gridScale(this, size); return { width: size[0] * kx, height: size[1] * ky }; }
   }
+  // html-in-canvas: a canvas with `content="drawable"` lays out its children, and the page draws those with a
+  // `drawable` attribute. The native side keeps a snapshot of each one, and SNAPSHOT plus its node draws it.
+  const SNAPSHOT = 2 ** 32, paintRequests = new Set(), geometryUpdates = new Map();
+  const canvasOf = element => { const canvas = element.hasAttribute('drawable') ? element.parentElement?.closest('canvas') : null; return canvas?.content === 'drawable' ? canvas : null; };
+  const drawnElement = (canvas, element) => {
+    const target = element instanceof ElementImage ? element._element : element;
+    if (!(target instanceof Element)) throw new TypeError('Expected an element or an ElementImage of this page');
+    if (canvasOf(target) !== canvas) throw new DOMException('The element is not a drawable element of this canvas', 'InvalidStateError');
+    return target;
+  };
+  // The size of the snapshot of an element in CSS pixels, then in its own pixels.
+  const snapshotOf = (canvas, element, copy) => {
+    if (element instanceof ElementImage) { if (!element._node) throw new DOMException('The ElementImage is closed', 'InvalidStateError'); return element._size; }
+    const size = call('dom.snapshot', drawnElement(canvas, element)._id, copy);
+    if (!size) throw new DOMException('The element has no snapshot yet. Draw it in a paint event', 'InvalidStateError');
+    return size;
+  };
+  // Canvas pixels per CSS pixel. A canvas that the page doesn't show draws a snapshot pixel for pixel.
+  const gridScale = (canvas, [width, height, pixelWidth, pixelHeight]) => {
+    if (canvas instanceof HTMLCanvasElement && canvas.isConnected) { const [, , clientWidth, clientHeight, top, right, bottom, left] = client(canvas), w = clientWidth - left - right, h = clientHeight - top - bottom; if (w > 0 && h > 0) return [canvas.width / w, canvas.height / h]; }
+    return [pixelWidth / width, pixelHeight / height];
+  };
+  // An OffscreenCanvas places its elements together in a microtask, then tells its canvas element.
+  const placeElement = (canvas, element, { canvasTransform, canvasClip, preserveHitTestOrder } = {}) => {
+    const place = () => call('dom.drawn', element._id, 'set', canvasTransform == null ? null : DOMMatrix.fromMatrix(canvasTransform)._m, canvasClip == null ? null : [canvasClip.x ?? 0, canvasClip.y ?? 0, canvasClip.width ?? 0, canvasClip.height ?? 0], !!preserveHitTestOrder);
+    if (canvas instanceof HTMLCanvasElement) return place();
+    const owner = canvas._node;
+    if (!(owner instanceof HTMLCanvasElement)) return;
+    if (!geometryUpdates.has(owner)) microtask(() => { const updates = geometryUpdates.get(owner); geometryUpdates.delete(owner); for (const update of updates.values()) update(); owner.dispatchEvent(new ElementGeometryUpdateEvent('elementgeometryupdate', { elements: [...updates.keys()].filter(element => element.isConnected) })); });
+    (geometryUpdates.get(owner) ?? geometryUpdates.set(owner, new Map()).get(owner)).set(element, place);
+  };
+  class ElementImage {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    close() { if (!this._node) return; for (const context of bitmapDraws) context._flush(); call('dom.canvas', this._node._id, null); this._node = null; }
+    _detach() { this.close(); }
+    _wire() { if (!this._node) throw new DOMException('The ElementImage is closed', 'DataCloneError'); return [this._size, call('dom.canvasPixels', this._node._id, 0, 0, this._size[2], this._size[3], true)]; }
+    static _revive(size, bytes) { const node = canvasNode(size[2], size[3]); call('dom.canvasAdopt', node._id, bytes); return Object.assign(Object.create(ElementImage.prototype), { _node: node, _size: size }); }
+  }
+  class CanvasPaintEvent extends Event { constructor(type, options = {}) { super(type, options); this.changedElements = Object.freeze([...options.changedElements ?? []]); } }
+  class ElementGeometryUpdateEvent extends Event { constructor(type, options = {}) { super(type, options); this.elements = Object.freeze([...options.elements ?? []]); } }
+  // Runs after a frame with the drawable elements that draw otherwise than before. Canvases inside others paint first.
+  globalThis.__appsPaint = ids => {
+    const changed = new Map();
+    for (const canvas of paintRequests) changed.set(canvas, []);
+    paintRequests.clear();
+    for (const id of ids) { const element = wrap(id), canvas = element?.isConnected ? canvasOf(element) : null; if (canvas) (changed.get(canvas) ?? changed.set(canvas, []).get(canvas)).push(element); }
+    for (const [canvas, changedElements] of [...changed].sort(([a], [b]) => a.compareDocumentPosition(b) & 4 ? 1 : -1)) canvas.dispatchEvent(new CanvasPaintEvent('paint', { changedElements }));
+  };
+  globalThis.__appsElementImage = source => {
+    if (source instanceof ElementImage) return source;
+    const canvas = source instanceof Element ? canvasOf(source) : null;
+    if (!canvas) throw new DOMException('The source is not a drawable element of a canvas', 'InvalidStateError');
+    return canvas.captureElementImage(source);
+  };
   const transferred = () => new DOMException('The canvas was transferred', 'InvalidStateError');
   const canvasContext = (canvas, type, options, Context2D) => { if (canvas._contextType && canvas._contextType !== type) return null; if (!['webgpu','2d','bitmaprenderer'].includes(type)) return null; canvas._contextType = type; return canvas._context ??= type === '2d' ? new Context2D(canvas, options) : type === 'bitmaprenderer' ? new ImageBitmapRenderingContext(canvas) : new GPUCanvasContext(canvas, canvas._id); };
   // Flush queued draws before bitmap closure. A flush per draw redraws the canvas for every sprite.
@@ -2597,6 +2675,9 @@
     set width(value) { this._node?.setAttribute('width', offscreenSize(value)); this._context?._resize(); }
     set height(value) { this._node?.setAttribute('height', offscreenSize(value)); this._context?._resize(); }
     getContext(type, options) { if (!this._node) throw transferred(); return canvasContext(this, type, options, OffscreenCanvasRenderingContext2D); }
+    updateElementGeometry(element, options = {}) { const target = element instanceof ElementImage ? element._element : element; if (target instanceof Element) placeElement(this, drawnElement(this._node, target), options); }
+    clearElementGeometry(element) { const target = element instanceof ElementImage ? element._element : element; if (target instanceof Element) this._node.clearElementGeometry(target); }
+    getElementImageDefaultSize(element) { const size = snapshotOf(this._node, element), [kx, ky] = gridScale(this._node, size); return { width: size[0] * kx, height: size[1] * ky }; }
     transferToImageBitmap() {
       const { width, height } = this;
       if (!this._context || !width || !height) throw new DOMException('The canvas has no context or no pixels', 'InvalidStateError');
@@ -2750,7 +2831,7 @@
   globalThis.window = globalThis; globalThis.self = globalThis;
   selection = new Selection(); attachDeclarative();
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) globalThis[name] = Node.prototype[name].bind(globalThis);
-  Object.assign(globalThis, { ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, AudioNode, GainNode, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent, StaticRange, customElements, ShadowRoot, CSSStyleSheet, DOMParser, CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration, AnimationEvent, BeforeUnloadEvent, ElementInternals, FormDataEvent, HashChangeEvent, PageTransitionEvent, PopStateEvent, RadioNodeList, StorageEvent, TransitionEvent });
+  Object.assign(globalThis, { ElementImage, CanvasPaintEvent, ElementGeometryUpdateEvent, ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, AudioNode, GainNode, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent, StaticRange, customElements, ShadowRoot, CSSStyleSheet, DOMParser, CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration, AnimationEvent, BeforeUnloadEvent, ElementInternals, FormDataEvent, HashChangeEvent, PageTransitionEvent, PopStateEvent, RadioNodeList, StorageEvent, TransitionEvent });
   Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'styleSheets', { configurable: true, get() { return styleSheetsOf(this); } });
@@ -2780,9 +2861,10 @@
   for (const name of globalHandlers) for (const target of [HTMLElement.prototype, SVGElement.prototype, Document.prototype]) handler(target, name);
   handler(Document.prototype, 'readystatechange'); handler(Document.prototype, 'visibilitychange');
   handler(Screen.prototype, 'change'); handler(ScreenOrientation.prototype, 'change');
+  handler(HTMLCanvasElement.prototype, 'paint'); handler(HTMLCanvasElement.prototype, 'elementgeometryupdate');
   for (const name of ['fullscreenchange', 'fullscreenerror']) for (const target of [Element.prototype, Document.prototype]) handler(target, name);
   for (const name of [...globalHandlers, ...'afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pagehide pageshow popstate rejectionhandled storage unhandledrejection unload'.split(' ')]) if (!Object.hasOwn(globalThis, 'on' + name)) handler(globalThis, name);
-  for (const [name, Type] of Object.entries(globalThis)) if (typeof Type === 'function' && Type.prototype && (Type.prototype instanceof Node || Type === Event || Type.prototype instanceof Event || /^(HTML|SVG|DOM|Node|Text|Comment|Attr|Range|Selection|Tree|Mutation|Resize|Intersection|Validity|Static|XML|CSS|ShadowRoot|Custom|Image|Canvas|Font|Media|Data|Clipboard|Drag|Composition|Input|Focus|Keyboard|Mouse|Pointer|Wheel|UI|Toggle|Command|Submit|Offscreen|Screen)/.test(name)) && !Object.hasOwn(Type.prototype, Symbol.toStringTag)) Object.defineProperty(Type.prototype, Symbol.toStringTag, { configurable: true, value: name === 'HTMLDocument' ? 'Document' : name });
+  for (const [name, Type] of Object.entries(globalThis)) if (typeof Type === 'function' && Type.prototype && (Type.prototype instanceof Node || Type === Event || Type.prototype instanceof Event || /^(HTML|SVG|DOM|Node|Text|Comment|Attr|Range|Selection|Tree|Mutation|Resize|Intersection|Validity|Static|XML|CSS|ShadowRoot|Custom|Image|Canvas|Font|Media|Data|Clipboard|Drag|Composition|Input|Focus|Keyboard|Mouse|Pointer|Wheel|UI|Toggle|Command|Submit|Offscreen|Screen|ElementImage)/.test(name)) && !Object.hasOwn(Type.prototype, Symbol.toStringTag)) Object.defineProperty(Type.prototype, Symbol.toStringTag, { configurable: true, value: name === 'HTMLDocument' ? 'Document' : name });
   Object.defineProperty(globalThis, Symbol.toStringTag, { configurable: true, value: 'Window' });
   globalThis.__appsScript = node => { currentScript = node ?? null; };
   globalThis.__appsLoaded = () => {

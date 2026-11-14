@@ -48,6 +48,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take) => 
       else if (Array.isArray(value)) node = ['array', value.map(visit)];
       else if (globalThis.CryptoKey && value instanceof CryptoKey) node = ['crypto', cryptoCodec.encode(value)];
       else if (globalThis.ImageBitmap && value instanceof ImageBitmap) { const [width, height, bytes] = value._wire(); fresh.add(bytes.buffer); node = ['bitmap', width, height, visit(bytes.buffer)]; }
+      else if (globalThis.ElementImage && value instanceof ElementImage) { const [size, bytes] = value._wire(); fresh.add(bytes.buffer); node = ['element', size, visit(bytes.buffer)]; }
       else if (globalThis.OffscreenCanvas && value instanceof OffscreenCanvas) { if (!transfer?.includes(value)) throw new DOMException('An OffscreenCanvas must be transferred', 'DataCloneError'); node = ['offscreen', ...value._wire()]; }
       else if (value instanceof ArrayBuffer) node = ['buffer', buffers ? buffers.push(value) - 1 : new Uint8Array(value).toBase64()];
       else if (shared(value)) node = ['buffer', buffers ? buffers.push(value) - 1 : uncloneable()];
@@ -86,6 +87,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take) => 
         case 'crypto': result = cryptoCodec.decode(node[1]); break;
         case 'bitmap': result = ImageBitmap._revive(node[1], node[2], new Uint8Array(visit(node[3]))); break;
         case 'offscreen': result = OffscreenCanvas._revive(node[1], node[2], node[3]); break;
+        case 'element': result = ElementImage._revive(node[1], new Uint8Array(visit(node[2]))); break;
         case 'buffer': result = typeof node[1] === 'number' ? (received ??= buffers())[node[1]].buffer : (typeof node[1] === 'string' ? decodeBytes(node[1]) : new Uint8Array(node[1])).buffer; break;
         case 'view': { const buffer = visit(node[2]), Type = globalThis[node[1]]; result = node[1] === 'DataView' ? new DataView(buffer, node[3], node[4]) : new Type(buffer, node[3], node[4] / Type.BYTES_PER_ELEMENT); break; }
         case 'date': result = new Date(node[1]); break;
@@ -112,7 +114,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take) => 
   };
   const transfers = options => {
     const values = Array.from(Array.isArray(options) ? options : options?.transfer ?? []);
-    if (new Set(values).size !== values.length || values.some(v => !(v instanceof ArrayBuffer && typeof v.transfer === 'function') && !(globalThis.ImageBitmap && v instanceof ImageBitmap) && !(globalThis.OffscreenCanvas && v instanceof OffscreenCanvas))) throw new DOMException('Only ArrayBuffer, ImageBitmap and OffscreenCanvas can be transferred', 'DataCloneError');
+    if (new Set(values).size !== values.length || values.some(v => !(v instanceof ArrayBuffer && typeof v.transfer === 'function') && !(globalThis.ImageBitmap && v instanceof ImageBitmap) && !(globalThis.OffscreenCanvas && v instanceof OffscreenCanvas) && !(globalThis.ElementImage && v instanceof ElementImage))) throw new DOMException('Only ArrayBuffer, ImageBitmap, ElementImage and OffscreenCanvas can be transferred', 'DataCloneError');
     return values;
   };
   // Memory that the sender gives up, and shared memory, go as a number from `take`. The native side copies other

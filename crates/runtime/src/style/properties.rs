@@ -34,6 +34,7 @@ fn known(name: &str) -> Option<Prop> {
 // Keep sorted: lookups binary-search the names. Only properties that apply have a grammar, which `@supports` and the
 // parser check values against.
 props! {
+    CANVAS_CONTENT "-canvas-content" inherited "fallback|drawable",
     MACOS_GLASS "-macos-glass" "none|regular|clear",
     MACOS_GLASS_INTERACTIVE "-macos-glass-interactive" "false|true",
     MACOS_GLASS_TINT_COLOR "-macos-glass-tint-color" "<color>",

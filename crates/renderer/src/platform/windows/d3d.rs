@@ -472,6 +472,7 @@ pub(crate) struct Renderer {
     surface: Option<Surface>,
     pool: Pool<Image>,
     frame: RenderFrame,
+    pub snapshots: Vec<crate::Snapshot>,
 }
 
 impl Renderer {
@@ -488,6 +489,7 @@ impl Renderer {
             surface: Some(surface),
             pool: Pool::default(),
             frame: RenderFrame::default(),
+            snapshots: Vec::new(),
         })
     }
 
@@ -572,6 +574,18 @@ impl Renderer {
         let mut frame = mem::take(&mut self.frame);
         frame.record(scene, self.size, self.gpu.max_texture, true);
         let encoded = self.encode(&frame);
+        if encoded.is_ok() {
+            for &(key, target, region) in &frame.shots {
+                let size = [region[2] as u32, region[3] as u32];
+                let Some(layer) = self.pool.get(&frame, target) else {
+                    continue;
+                };
+                match read_back(&self.gpu, &layer.pixels, size) {
+                    Ok(pixels) => self.snapshots.push(crate::Snapshot { key, size, pixels }),
+                    Err(error) => eprintln!("apps: failed to read a layer: {error:#}"),
+                }
+            }
+        }
         self.frame = frame;
         encoded?;
         let surface = self.surface.as_ref().context("no surface")?;
@@ -747,10 +761,19 @@ impl Renderer {
     }
 }
 
+// Reads the top left `size` pixels of a texture.
 fn read_back(gpu: &Gpu, source: &ID3D11Texture2D, size: [u32; 2]) -> Result<Vec<u8>> {
     let copy = texture(&gpu.device, size, FORMAT, D3D11_BIND_FLAG(0))?;
-    // SAFETY: the copy has the size and format of the source.
-    unsafe { gpu.context.CopyResource(&copy, source) };
+    let part = D3D11_BOX {
+        left: 0,
+        top: 0,
+        front: 0,
+        right: size[0],
+        bottom: size[1],
+        back: 1,
+    };
+    // SAFETY: the copy has the format of the source, which is at least as large.
+    unsafe { (gpu.context).CopySubresourceRegion(&copy, 0, 0, 0, 0, source, 0, Some(&part)) };
     let open = map(&gpu.context, &copy, D3D11_MAP_READ)?;
     let row = size[0] as usize * 4;
     let mut pixels = vec![0u8; row * size[1] as usize];

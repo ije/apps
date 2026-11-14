@@ -433,7 +433,11 @@ pub(super) struct Renderer {
     sources: (u64, FxHashMap<[Option<u32>; 2], BindGroup>),
     staging: Vec<u8>,
     frame: RenderFrame,
+    pub snapshots: Vec<crate::Snapshot>,
 }
+
+// The buffers that a frame fills: the window for a capture, and each snapshot layer with its key and size.
+type Reads = (Option<Result<Buffer>>, Vec<(u64, [u32; 2], Buffer)>);
 
 impl Renderer {
     pub fn new(
@@ -461,6 +465,7 @@ impl Renderer {
             sources: (u64::MAX, FxHashMap::default()),
             staging: Vec::new(),
             frame: RenderFrame::default(),
+            snapshots: Vec::new(),
         })
     }
 
@@ -524,8 +529,8 @@ impl Renderer {
             Next::Validation => return (Drawn::Skipped, failed("The window surface is not valid")),
         };
         let size = [output.texture.width(), output.texture.height()];
-        let read = match self.encode(scene, &output.texture, capture) {
-            Ok(read) => read,
+        let (read, shots) = match self.encode(scene, &output.texture, capture) {
+            Ok(reads) => reads,
             Err(error) => {
                 eprintln!("apps: drawing failed: {error:#}");
                 // Queue writes wait for a submit, which also releases them when the frame fails.
@@ -534,6 +539,12 @@ impl Renderer {
             }
         };
         self.gpu.queue.present(output);
+        for (key, size, buffer) in shots {
+            match self.read(buffer, size) {
+                Ok((size, pixels)) => (self.snapshots).push(crate::Snapshot { key, size, pixels }),
+                Err(error) => eprintln!("apps: failed to read a layer: {error:#}"),
+            }
+        }
         (Drawn::Shown, read.map(|buffer| self.read(buffer?, size)))
     }
 
@@ -669,12 +680,7 @@ impl Renderer {
         Ok(strides.map(|stride| stride as u64))
     }
 
-    fn encode(
-        &mut self,
-        scene: &Scene,
-        output: &Texture,
-        capture: bool,
-    ) -> Result<Option<Result<Buffer>>> {
+    fn encode(&mut self, scene: &Scene, output: &Texture, capture: bool) -> Result<Reads> {
         // Copies read the frame, which needs a surface that allows them.
         let copies = self.config.usage.contains(TextureUsages::COPY_SRC);
         let mut frame = std::mem::take(&mut self.frame);
@@ -696,7 +702,7 @@ impl Renderer {
         output: &Texture,
         strides: [u64; 3],
         capture: bool,
-    ) -> Result<Option<Result<Buffer>>> {
+    ) -> Result<Reads> {
         let gpu = self.gpu.clone();
         let pages = self.atlas.pages.borrow();
         if self.sources.0 != pages.generation {
@@ -866,14 +872,10 @@ impl Renderer {
             }
         }
         drop(pass);
-        let read = capture.then(|| {
-            let readable = self.config.usage.contains(TextureUsages::COPY_SRC);
-            ensure!(readable, "The window surface can't be read");
-            let row = (output.width() * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-            let buffer = gpu.buffer(
-                u64::from(row) * u64::from(output.height()),
-                BufferUsages::MAP_READ,
-            );
+        // Copies the top left `size` pixels of a texture into a buffer that the CPU can read.
+        let mut copy = |from: &Texture, [width, height]: [u32; 2]| {
+            let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+            let buffer = gpu.buffer(u64::from(row) * u64::from(height), BufferUsages::MAP_READ);
             let layout = wgpu::TexelCopyBufferLayout {
                 bytes_per_row: Some(row),
                 ..Default::default()
@@ -882,11 +884,28 @@ impl Renderer {
                 buffer: &buffer,
                 layout,
             };
-            encoder.copy_texture_to_buffer(output.as_image_copy(), into, output.size());
-            Ok(buffer)
+            let size = Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            };
+            encoder.copy_texture_to_buffer(from.as_image_copy(), into, size);
+            buffer
+        };
+        let read = capture.then(|| {
+            let readable = self.config.usage.contains(TextureUsages::COPY_SRC);
+            ensure!(readable, "The window surface can't be read");
+            Ok(copy(output, [output.width(), output.height()]))
         });
+        let shots = (frame.shots.iter())
+            .filter_map(|&(key, target, region)| {
+                let size = [region[2] as u32, region[3] as u32];
+                let (layer, _) = pool.get(frame, target)?;
+                Some((key, size, copy(layer, size)))
+            })
+            .collect();
         gpu.queue.submit([encoder.finish()]);
-        Ok(read)
+        Ok((read, shots))
     }
 }
 

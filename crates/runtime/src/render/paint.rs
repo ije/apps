@@ -108,6 +108,24 @@ impl Hooks for Effected {
     }
 }
 
+// The children of a canvas with drawable content. The window doesn't show them, and they take no pointer
+// until the page draws them.
+pub(super) struct Undrawn(pub(super) Rc<super::PageState>);
+
+impl Hooks for Undrawn {
+    fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        // The drawable boxes inside find the content box of their canvas here.
+        let outer = self.0.drawing.replace(cx.bounds.origin);
+        cx.window.with_hit_base(cx.bounds, |window| {
+            window.with_hits_at(None, |window| inner(window))
+        });
+        self.0.drawing.set(outer);
+    }
+    fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        cx.window.with_snapshot(None, cx.bounds, inner);
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum Source {
     Element,
@@ -222,6 +240,8 @@ pub(super) struct DomBox {
     pub(super) offset: Cell<Point<Pixels>>,
     pub(super) frame: bool,
     pub(super) text_clip: bool,
+    // A drawable element of a canvas, which paints into a snapshot for `drawElementImage()`.
+    pub(super) drawn: bool,
 }
 
 // With its counts, a box's `Rc` must stay within the small blocks of the runtime's allocator.
@@ -375,7 +395,7 @@ impl DomBox {
 
 impl Hooks for DomBox {
     fn bounded(&self) -> bool {
-        self.placed.get().1.is_none() && self.effects.is_none()
+        self.placed.get().1.is_none() && self.effects.is_none() && !self.drawn
     }
 
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
@@ -554,8 +574,10 @@ impl Hooks for DomBox {
                 let [ox, oy, _] = super::effects::origin(origin, &self.units, [width, height]);
                 Some((*distance, [x + ox, y + oy]))
             });
-        let mut matrix = super::effects::transform(&self.style, &self.units, bounds, perspective);
-        if self.transformed {
+        // A canvas draws a drawable element as it is before its transform.
+        let mut matrix = super::effects::transform(&self.style, &self.units, bounds, perspective)
+            .filter(|_| !self.drawn);
+        if self.transformed && !self.drawn {
             matrix.get_or_insert(super::effects::IDENTITY);
             self.view
                 .composited_transforms
@@ -682,6 +704,21 @@ impl Hooks for DomBox {
             self.unions();
         };
         match matrix {
+            _ if self.drawn => {
+                // The box takes the pointer where its canvas drew it.
+                let view = &*self.view;
+                let content = view.drawing.get();
+                let drawn = view.host.borrow().dom.get(&view.id).and_then(|dom| {
+                    let to_canvas = dom.drawn.get(&self.id)?.matrix;
+                    let [x, y] = [bounds.origin.x, bounds.origin.y].map(f32::from);
+                    let from_box = super::effects::translate(-x, -y, 0.);
+                    let to_window =
+                        super::effects::translate(content.x.into(), content.y.into(), 0.);
+                    let placed = super::effects::multiply(&to_canvas, &from_box);
+                    Some(super::effects::multiply(&to_window, &placed))
+                });
+                window.with_hits_at(drawn, &mut prepaint)
+            }
             Some(matrix) => window.with_keyed_hit_transform(
                 matrix,
                 self.transformed.then_some(self.id as u64),
@@ -693,7 +730,8 @@ impl Hooks for DomBox {
         self.offset.set(offset);
     }
     fn volatile(&self) -> bool {
-        self.anchor.is_some()
+        self.drawn
+            || self.anchor.is_some()
             || self.sticky.is_some()
             || self.fixed
             || self.container.is_some()
@@ -747,7 +785,22 @@ impl Hooks for DomBox {
     }
 
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        let window = &mut *cx.window;
+        if !self.drawn {
+            return self.draw(cx.window, inner);
+        }
+        // A new page or a new node with this number has no snapshot of the box yet.
+        let view = &*self.view;
+        let host = view.host.borrow();
+        let fresh =
+            (host.dom.get(&view.id)).is_none_or(|dom| !dom.snapshots.contains_key(&self.id));
+        drop(host);
+        let key = Some((self.id as u64, fresh));
+        (cx.window).with_snapshot(key, self.placed.get().0, |window| self.draw(window, inner));
+    }
+}
+
+impl DomBox {
+    fn draw(&self, window: &mut Window, inner: &mut dyn FnMut(&mut Window)) {
         let (bounds, matrix) = self.placed.get();
         super::native::paint(&self.view, self.id, bounds, &self.style, window);
         {
@@ -782,9 +835,7 @@ impl Hooks for DomBox {
         };
         nest_effects(&mut layers, window, &mut paint);
     }
-}
 
-impl DomBox {
     fn effects(
         &self,
         bounds: Rect<Pixels>,

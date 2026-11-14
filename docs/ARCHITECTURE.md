@@ -196,6 +196,8 @@ On macOS, `ns-*` inputs use AppKit controls and Liquid Glass uses `NSGlassEffect
 
 `OffscreenCanvas` and `ImageBitmap` store pixels in detached canvas nodes. Page workers have a hidden document for these resources. A transferred canvas sends its latest frame to the page through a single slot, so a slow page does not accumulate frames.
 
+A canvas with `content="drawable"` builds its children in a box that takes no room, and the window does not show them. Each child with the `drawable` attribute paints into a layer of its own. After a frame, the renderer compares a hash of each such layer with the hash of the last frame. It reads the layers that changed back from the GPU, and the page gets a `paint` event. `drawElementImage()` then draws these pixels like an image. The place where a canvas drew an element goes back to the renderer as a hit transform. So the element takes the pointer there, and the layout mirror has its bounds there.
+
 [WebGPU](crates/runtime/src/web/gpu.rs) uses `apps-webgpu`. macOS and Windows load it as an optional shared library. Linux links it into the runtime because the page renderer already uses wgpu. WebGPU canvas frames reach the page renderer through CPU readback.
 
 [Media](crates/runtime/src/web/media.rs) uses the optional `apps-media` shared library. The library uses FFmpeg for media decode and cpal for audio output. [build-ffmpeg.sh](scripts/build-ffmpeg.sh) produces a shared FFmpeg library without GPL or nonfree components. App packages include that library and `FFmpeg.LICENSE` when the `media` feature is enabled.

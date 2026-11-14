@@ -81,6 +81,10 @@ pub(crate) struct PageState {
     #[cfg(target_os = "macos")]
     canvas: Cell<(u32, u8)>,
     canvas_layers: Cell<Option<u64>>,
+    // The content box of the canvas whose drawable content prepaints.
+    drawing: Cell<renderer::Point<renderer::Pixels>>,
+    // The page asked for a `paint` event after the frame.
+    paint: Cell<bool>,
 }
 
 pub(crate) struct Frame {
@@ -386,6 +390,8 @@ impl PageView {
             #[cfg(target_os = "macos")]
             canvas: Cell::default(),
             canvas_layers: Cell::default(),
+            drawing: Cell::default(),
+            paint: Cell::default(),
             kept_frame: RefCell::default(),
             mismatched: RefCell::default(),
             layout_queued: Cell::default(),
@@ -612,6 +618,9 @@ impl PageView {
             }
         }
         dom.retired_canvases.clear();
+        if std::mem::take(&mut dom.paint_requested) {
+            self.paint.set(true);
+        }
         let cached = dom.computed.clone();
         let mut styles = crate::dom::styles(&mut doc, dom, [width, height]);
         if cached.is_none_or(|cached| !std::rc::Rc::ptr_eq(&cached, &styles))
@@ -801,6 +810,9 @@ impl PageView {
             .filter(|(id, style, layout)| {
                 !layout
                     && !flat.contains(id)
+                    // A canvas draws its content from snapshots, which only full frames make.
+                    && (styles.values[*id].get(Prop::CANVAS_CONTENT) != Some("drawable")
+                        || doc.nodes[*id].tag == "canvas")
                     && composites(style, &styles.values[*id])
                     && [Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER]
                         .into_iter()

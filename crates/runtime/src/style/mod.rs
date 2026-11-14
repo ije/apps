@@ -79,6 +79,8 @@ const UA: &str = "
 html,body,address,blockquote,center,dialog,div,figure,figcaption,footer,form,header,hr,legend,main,p,pre,search,article,aside,h1,h2,h3,h4,h5,h6,hgroup,nav,section,dd,dl,dt,menu,ol,ul,details,summary,fieldset,optgroup,option{display:block}
 li{display:list-item}
 img,svg,canvas,video,audio,iframe,embed,object,input,button,select,textarea,progress,meter{display:inline-block}
+canvas[content=drawable i]{-canvas-content:drawable}
+canvas[content=drawable i] [drawable]{isolation:isolate;contain:layout}
 :-internal-sf-symbol{display:inline-block;width:1em;height:1em;vertical-align:middle;flex-shrink:0}
 head,script,style,title,meta,link,template,noscript,datalist,base,param,[hidden],input[type=hidden],dialog:not([open]){display:none}
 audio:not([controls]),embed:not([src]):not([type]){display:none!important}
@@ -5330,7 +5332,7 @@ pub(crate) fn compute_styles(
                 matches!(
                     display,
                     Some("flex" | "inline-flex" | "grid" | "inline-grid")
-                ),
+                ) || at.is_some_and(|at| drawable_canvas(&doc.nodes[at], &styles[at])),
                 at.is_some_and(|at| table_box(style_flags[at] >> 8)),
             )
         };
@@ -8719,6 +8721,11 @@ fn border_spacing(style: &mut Style) {
             }
         }
     }
+}
+
+// A canvas that lays out its children as blocks, for the page to draw them with `drawElementImage()`.
+pub(crate) fn drawable_canvas(node: &crate::dom::Node, style: &Style) -> bool {
+    node.tag == "canvas" && style.get(Prop::CANVAS_CONTENT) == Some("drawable")
 }
 
 fn blockify(style: &mut Style, item: bool, table_item: bool) {

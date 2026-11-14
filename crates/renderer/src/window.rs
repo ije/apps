@@ -36,6 +36,8 @@ pub trait View: 'static {
     fn window_changed(&mut self, window: &mut Window, app: &mut App);
     /// Pointer events go to hit regions, not here.
     fn event(&mut self, event: &Event, window: &mut Window, app: &mut App);
+    /// Runs after each frame, with the layers of `Window::with_snapshot` that changed.
+    fn drawn(&mut self, _snapshots: Vec<Snapshot>, _window: &mut Window, _app: &mut App) {}
 
     fn selection(&mut self, window: &mut Window, app: &mut App) -> Option<Utf16Selection>;
     fn composition(&mut self, window: &mut Window, app: &mut App) -> Option<Range<usize>>;
@@ -150,6 +152,13 @@ pub enum Scope {
     Clip(Option<Clip<Pixels>>),
     Offset(Point<Pixels>),
     Opacity(Option<f32>),
+}
+
+/// The pixels of a layer of `Window::with_snapshot`, as premultiplied RGBA.
+pub struct Snapshot {
+    pub key: u64,
+    pub size: [u32; 2],
+    pub pixels: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -429,6 +438,10 @@ pub struct Window {
     offsets: Vec<Point<Pixels>>,
     pub(crate) font_smoothing: bool,
     hit_transform: Option<Rc<HitTransform>>,
+    // The transforms and the clip of each `with_hit_base` around the current box.
+    hit_bases: Vec<(Option<Rc<HitTransform>>, Rect)>,
+    // The digest and the size of each snapshot layer of the last frame.
+    shots: FxHashMap<u64, (u64, [i32; 2])>,
     opacity: f32,
     // The mask layer and effect depth of `with_text_clip`.
     pub(crate) text_clip: Option<(usize, usize)>,
@@ -495,6 +508,8 @@ impl Window {
             offsets: Vec::new(),
             font_smoothing: true,
             hit_transform: None,
+            hit_bases: Vec::new(),
+            shots: FxHashMap::default(),
             opacity: 1.,
             text_clip: None,
             states: FxHashMap::default(),
@@ -940,7 +955,27 @@ impl Window {
         #[cfg(target_os = "macos")]
         self.platform
             .set_drawable_size(self.native.0, self.native.1);
+        // A snapshot layer is read only when it draws otherwise than in the last frame.
+        let mut shots = FxHashMap::default();
+        for at in 0..self.scene.shots.len() {
+            let (key, layer) = (self.scene.shots[at].key, self.scene.shots[at].layer);
+            let [x, y, width, height] = self.scene.shots[at].region;
+            let mut hasher = rustc_hash::FxHasher::default();
+            let region = crate::rect(x as f32, y as f32, width as f32, height as f32);
+            self.scene.digest(layer, region, &mut hasher);
+            let now = (std::hash::Hasher::finish(&hasher), [width, height]);
+            self.scene.shots[at].read = self.shots.get(&key) != Some(&now);
+            shots.insert(key, now);
+        }
+        self.shots = shots;
         let mut frame = self.platform.draw(&self.scene, !captures.is_empty());
+        let snapshots = self.platform.take_snapshots();
+        // A layer that the backend could not read is read with the next frame.
+        for shot in &mut self.scene.shots {
+            if mem::take(&mut shot.read) && !snapshots.iter().any(|read| read.key == shot.key) {
+                self.shots.remove(&shot.key);
+            }
+        }
         if let Some(tree) = &mut self.tree {
             tree.bury();
         }
@@ -957,6 +992,7 @@ impl Window {
             capture(result, app);
         }
         self.update_cursor(app);
+        self.with_view(app, |view, window, app| view.drawn(snapshots, window, app));
     }
 
     fn build(
@@ -1314,6 +1350,93 @@ impl Window {
             Scope::Offset(_) => drop(self.offsets.pop()),
             Scope::Opacity(_) => self.opacity = outer,
         }
+        result
+    }
+
+    /// Draws what `f` paints into a layer of its own, which the window doesn't show. With a key, the pixels of
+    /// `bounds` go to `View::drawn` after each frame in which they changed, or after this frame when `fresh`.
+    pub fn with_snapshot<R>(
+        &mut self,
+        key: Option<(u64, bool)>,
+        bounds: Rect,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let key = key.map(|(key, fresh)| {
+            if fresh {
+                self.shots.remove(&key);
+            }
+            key
+        });
+        self.scene.push_offscreen();
+        // The layer is no part of the page, so the clips and the opacity around it don't apply.
+        self.push_content_mask(unbounded_mask());
+        let (opacity, text_clip) = (mem::replace(&mut self.opacity, 1.), self.text_clip.take());
+        let result = f(self);
+        (self.opacity, self.text_clip) = (opacity, text_clip);
+        self.content_masks.pop();
+        let shot = key.map(|key| (key, self.snap_bounds(bounds)));
+        self.scene.pop_offscreen(shot);
+        result
+    }
+
+    /// Makes the transforms of this place the space of `with_hits_at`, where regions miss outside `clip`.
+    pub fn with_hit_base<R>(&mut self, clip: Rect, f: impl FnOnce(&mut Self) -> R) -> R {
+        let clip = clip.intersect(self.content_mask().bounds);
+        self.hit_bases.push((self.hit_transform.clone(), clip));
+        let result = f(self);
+        self.hit_bases.pop();
+        result
+    }
+
+    /// The regions that `f` adds take the pointer where `matrix` puts them in the space of `with_hit_base`,
+    /// whatever transforms and clips lie between. Without a matrix they stay where they are and take no pointer.
+    pub fn with_hits_at<R>(
+        &mut self,
+        matrix: Option<[f32; 16]>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        const SAME: Plane = [1., 0., 0., 0., 1., 0., 0., 0., 1.];
+        let (base, clip) = self.hit_bases.last().cloned().unwrap_or_default();
+        let placed = matrix.and_then(|matrix| {
+            let local = plane_of(&matrix);
+            let to_window = match &base {
+                Some(base) => compose(&base.to_window.get(), &local),
+                None => local,
+            };
+            Some((local, to_window, invert(&to_window)?))
+        });
+        let placed = match placed {
+            Some((local, to_window, from_window)) => HitTransform {
+                key: None,
+                area: base.as_ref().map_or(clip, |base| base.area),
+                outer: base,
+                local: Cell::new(local),
+                to_window: Cell::new(to_window),
+                from_window: Cell::new(from_window),
+            },
+            // An empty area takes no pointer.
+            None => HitTransform {
+                key: None,
+                area: Rect::default(),
+                local: Cell::new(SAME),
+                to_window: Cell::new(
+                    self.hit_transform
+                        .as_ref()
+                        .map_or(SAME, |outer| outer.to_window.get()),
+                ),
+                from_window: Cell::new(
+                    self.hit_transform
+                        .as_ref()
+                        .map_or(SAME, |outer| outer.from_window.get()),
+                ),
+                outer: self.hit_transform.clone(),
+            },
+        };
+        let outer = self.hit_transform.replace(Rc::new(placed));
+        self.push_content_mask(unbounded_mask());
+        let result = f(self);
+        self.content_masks.pop();
+        self.hit_transform = outer;
         result
     }
 
