@@ -2,16 +2,10 @@ use super::gpu::{Alloc, Output, alloc, drop_waker, wake, waker};
 use anyhow::{Context, Result, anyhow};
 use std::{ffi::c_void, mem::MaybeUninit, path::Path, ptr::NonNull, sync::OnceLock};
 
-const ABI: u32 = 2;
-
-#[repr(C)]
-struct Host {
-    waker: extern "C" fn() -> *mut c_void,
-    wake: extern "C" fn(*mut c_void),
-    drop_waker: extern "C" fn(*mut c_void),
-    alloc: extern "C" fn(usize) -> *mut u8,
-    free: extern "C" fn(*mut u8, usize),
-}
+// The source of the media library, compiled here without FFmpeg: the built-in player of WAV files.
+#[path = "../../../media/src/lib.rs"]
+mod audio;
+use audio::{ABI, Frame, Host};
 
 static HOST: Host = Host {
     waker,
@@ -40,13 +34,6 @@ extern "C" fn free_pixels(bytes: *mut u8, length: usize) {
     });
 }
 
-#[repr(C)]
-struct Frame {
-    pixels: *mut u8,
-    width: u32,
-    height: u32,
-}
-
 struct Library {
     new: unsafe extern "C" fn(*const c_void) -> *mut c_void,
     free: unsafe extern "C" fn(*mut c_void),
@@ -59,15 +46,23 @@ struct Library {
     recycle: unsafe extern "C" fn(*mut c_void, u64, *mut u8, u32, u32),
 }
 
-// The audio library is the media library without FFmpeg. It plays only WAV files.
-pub fn library_name(platform: &str, ffmpeg: bool) -> &'static str {
-    match (platform, ffmpeg) {
-        ("macos", true) => "libapps_media.dylib",
-        ("macos", false) => "libapps_audio.dylib",
-        ("windows", true) => "apps_media.dll",
-        ("windows", false) => "apps_audio.dll",
-        (_, true) => "libapps_media.so",
-        (_, false) => "libapps_audio.so",
+static BUILTIN: Library = Library {
+    new: audio::apps_media_new,
+    free: audio::apps_media_free,
+    open: audio::apps_media_open,
+    control: audio::apps_media_control,
+    close: audio::apps_media_close,
+    time: audio::apps_media_time,
+    poll: audio::apps_media_poll,
+    frame: audio::apps_media_frame,
+    recycle: audio::apps_media_recycle,
+};
+
+pub fn library_name(platform: &str) -> &'static str {
+    match platform {
+        "macos" => "libapps_media.dylib",
+        "windows" => "apps_media.dll",
+        _ => "libapps_media.so",
     }
 }
 
@@ -79,9 +74,9 @@ pub fn ffmpeg_name(platform: &str) -> &'static str {
     }
 }
 
-fn load(ffmpeg: bool) -> Result<Library> {
+fn load() -> Result<Library> {
     let library = super::gpu::library(
-        library_name(std::env::consts::OS, ffmpeg),
+        library_name(std::env::consts::OS),
         "media",
         b"apps_media_abi\0",
         ABI,
@@ -111,11 +106,15 @@ impl Media {
         if let Some(raw) = self.raw {
             return Ok(raw);
         }
-        static LIBRARY: [OnceLock<Result<Library, String>>; 2] = [OnceLock::new(), OnceLock::new()];
-        let library = LIBRARY[ffmpeg as usize]
-            .get_or_init(|| load(ffmpeg).map_err(|error| format!("{error:#}")))
-            .as_ref()
-            .map_err(|error| anyhow!("{error}"))?;
+        static LIBRARY: OnceLock<Result<Library, String>> = OnceLock::new();
+        let library = if ffmpeg {
+            LIBRARY
+                .get_or_init(|| load().map_err(|error| format!("{error:#}")))
+                .as_ref()
+                .map_err(|error| anyhow!("{error}"))?
+        } else {
+            &BUILTIN
+        };
         let raw = NonNull::new(unsafe { (library.new)((&raw const HOST).cast()) })
             .context("Cannot create the media state")?;
         Ok(*self.raw.insert((raw, library)))

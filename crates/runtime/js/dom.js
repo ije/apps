@@ -1517,12 +1517,12 @@
   };
   globalThis.__appsImages = root => { find(root._m, rec => { if (rec.tag === 'img' && rec.attrs.has('src')) { const image = of(rec); if (!image._loading) image._loadImage?.(); } else if ((rec.tag === 'video' || rec.tag === 'audio') && !of(rec)._network) of(rec)._select(); return false; }); };
   // Retain playing media after page code drops it, as browsers do.
-  const players = new Map(), playing = new Set(), mediaFeatures = globalThis.__appsMedia ?? {};
+  const players = new Map(), playing = new Set(), mediaFeature = globalThis.__appsMedia;
   delete globalThis.__appsMedia;
   const [PLAY, PAUSE, SEEK, VOLUME, MUTED, SPEED] = [0, 1, 2, 3, 4, 5];
   const control = (el, op, value = 0) => { if (el._open) call('media.control', el._id, op, +value); };
-  // Without the media feature, simpleAudio plays only PCM WAV.
-  const mediaTypes = mediaFeatures.media ? /^(video|audio)\/(mp4|webm|ogg|quicktime|x-matroska|mpeg|mp3|x-m4a|aac|flac|x-flac|wav|wave|x-wav)$/ : /^audio\/(wav|wave|x-wav)$/, mediaCodecs = mediaFeatures.media ? /^(avc[13]|hvc1|hev1|vp8|vp9|vp09|av01|mp4a|mp3|opus|vorbis|flac|alac|1)(\.|$)/ : /^1$/;
+  // Without the media feature, the built-in player plays only PCM WAV in <audio>.
+  const mediaTypes = mediaFeature ? /^(video|audio)\/(mp4|webm|ogg|quicktime|x-matroska|mpeg|mp3|x-m4a|aac|flac|x-flac|wav|wave|x-wav)$/ : /^audio\/(wav|wave|x-wav)$/, mediaCodecs = mediaFeature ? /^(avc[13]|hvc1|hev1|vp8|vp9|vp09|av01|mp4a|mp3|opus|vorbis|flac|alac|1)(\.|$)/ : /^1$/;
   globalThis.__appsMediaPoll = () => {
     if (!players.size) return;
     for (const el of playing) if (el._connected && !el.isConnected) el.pause();
@@ -1554,7 +1554,7 @@
       const [mime, ...params] = String(type).toLowerCase().split(';').map(part => part.trim()), codecs = params.find(part => part.startsWith('codecs='))?.slice(7).replace(/"/g, '');
       return !mediaTypes.test(mime) ? '' : codecs === undefined ? 'maybe' : codecs.split(',').every(codec => mediaCodecs.test(codec.trim())) ? 'probably' : '';
     }
-    get _enabled() { return mediaFeatures.media || (mediaFeatures.simpleAudio && this.localName === 'audio'); }
+    get _enabled() { return mediaFeature || this.localName === 'audio'; }
     setAttribute(name, value) { super.setAttribute(name, value); if (name === 'src') this._select(); else if (name === 'poster') this._poster(); }
     insertBefore(child, before) { const node = super.insertBefore(child, before); if (!this._network) this._select(); return node; }
     load() { this._select(true); }
@@ -1599,7 +1599,7 @@
       this._poster();
       if (!element) return;
       this._fire('loadstart');
-      if (!this._enabled) return this._fail(4, `The media feature is disabled. Add "media"${this.localName === 'audio' ? ' or, for WAV files only, "simpleAudio"' : ''} to "features" in package.json`);
+      if (!this._enabled) return this._fail(4, 'The media feature is disabled. Add "media" to "features" in package.json');
       if (!this._source) return this._fail(4, 'The media has no source');
       if (this.preload === 'none' && !this.autoplay && !force) { this._network = 1; this._fire('suspend'); return; }
       resource(this._source, 'Media').then(data => {

@@ -84,7 +84,6 @@ name = "apps"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "apps-audio",
  "apps-media",
  "apps-runtime",
  "apps-terminal",
@@ -111,13 +110,6 @@ dependencies = [
  "tempfile",
  "url",
  "zip",
-]
-
-[[package]]
-name = "apps-audio"
-version = "0.0.0"
-dependencies = [
- "cpal",
 ]
 
 [[package]]
@@ -185,7 +177,6 @@ name = "apps-runtime"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "apps-audio",
  "apps-devtools",
  "apps-media",
  "apps-renderer",
@@ -197,6 +188,7 @@ dependencies = [
  "bbtree",
  "bytes",
  "cc",
+ "cpal",
  "cssparser",
  "flate2",
  "futures-util",

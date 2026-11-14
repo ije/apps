@@ -210,7 +210,7 @@ fn absurd_pixel_aspect_ratios_fit_the_frame_size_limit() {
 }
 
 #[test]
-fn media_features_are_disabled_by_default() {
+fn videos_need_the_media_feature() {
     let (_host, engine, base) = page(apps_runtime::bundle::disabled_features(None).unwrap());
     engine
         .eval(&format!("globalThis.media = document.createElement('video'); {EVENTS} media.src = '{base}clip.mp4'; globalThis.rejected = ''; media.play().catch(error => rejected = error.name)"), "media-test")
@@ -231,10 +231,8 @@ fn media_features_are_disabled_by_default() {
 }
 
 #[test]
-fn simple_audio_plays_only_wave_files() {
-    let package = r#"{"features":["simpleAudio"]}"#;
-    let (_host, engine, base) =
-        page(apps_runtime::bundle::disabled_features(Some(package)).unwrap());
+fn audio_plays_only_wave_files_without_the_media_feature() {
+    let (_host, engine, base) = page(apps_runtime::bundle::disabled_features(None).unwrap());
     engine
         .eval(
             &format!("globalThis.media = new Audio('{base}tone.wav'); {EVENTS} media.currentTime = 0.2; media.play()"),
@@ -263,11 +261,7 @@ fn simple_audio_plays_only_wave_files() {
         "0.1"
     );
     for (element, file, message) in [
-        (
-            "audio",
-            "tone.mp3",
-            "simpleAudio feature plays only PCM WAV",
-        ),
+        ("audio", "tone.mp3", "Only PCM WAV files play"),
         ("video", "clip.mp4", r#"Add "media" to "features""#),
     ] {
         engine

@@ -636,10 +636,9 @@ impl Host {
         match op {
             "open" => {
                 let video = args[2].as_bool().unwrap_or(false);
-                let enabled = |feature| disabled & crate::bundle::feature_bit(feature) == 0;
-                let ffmpeg = enabled("media");
+                let ffmpeg = disabled & crate::bundle::feature_bit("media") == 0;
                 ensure!(
-                    ffmpeg || !video && enabled("simpleAudio"),
+                    ffmpeg || !video,
                     "The media feature is disabled. Add \"media\" to \"features\" in package.json"
                 );
                 if args[1].is_string() {

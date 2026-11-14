@@ -6,6 +6,7 @@ use std::{env, fs, path::PathBuf};
 fn main() {
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     napi_exports::export_symbols(&root.join("src/node/napi.rs"));
+    println!("cargo:rustc-check-cfg=cfg(ffmpeg)");
     let target = env::var("CARGO_CFG_TARGET_OS").unwrap();
     // Debug layout uses about 500 KB of stack per DOM level. The default 8 MB main stack is too small.
     match (target.as_str(), env::var("CARGO_CFG_TARGET_ENV").as_deref()) {

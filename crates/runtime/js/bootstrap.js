@@ -353,7 +353,7 @@
     Object.defineProperty(globalThis, '__appsExecuted', { value: (id, value, failed) => (failed ? Promise.reject(value) : Promise.resolve(value)).then(value => executed(id, { value })).catch(error => executed(id, { error: String(error?.message ?? error) })) });
     if (!disabled.has('webgpu')) globalThis.__appsGPU = call;
     else { globalThis.navigator.gpu = feature('webgpu'); globalThis.GPUCanvasContext = feature('webgpu'); }
-    globalThis.__appsMedia = { media: !disabled.has('media'), simpleAudio: !disabled.has('simpleAudio') };
+    globalThis.__appsMedia = !disabled.has('media');
     globalThis.__appsTerminal = sessionId;
     return;
   }

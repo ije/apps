@@ -43,7 +43,7 @@ fs.writeFileSync("Cargo.toml", cargo.replace(pattern, `$1"${version}"`))' "$vers
 cargo build --release --workspace
 
 bin=packages/apps-$os-$cpu/bin
-files=("apps$exe" "apps-runtime$exe" "${lib}apps_media$ext" "${lib}apps_audio$ext" "${lib}ffmpeg$ext" FFmpeg.LICENSE "${lib}apps_devtools$ext")
+files=("apps$exe" "apps-runtime$exe" "${lib}apps_media$ext" "${lib}ffmpeg$ext" FFmpeg.LICENSE "${lib}apps_devtools$ext")
 jsc=target/bun-jsc/$system-$arch
 jscs=("${lib}JavaScriptCore$ext" JavaScriptCore.LICENSE)
 # Linux links WebGPU into the runtime, and apps build --aot works only on macOS arm64.

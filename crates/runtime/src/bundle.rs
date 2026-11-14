@@ -181,10 +181,9 @@ pub fn package_metadata(source: Option<&str>) -> Result<(String, String, String,
 }
 
 // Every feature is off unless package.json turns it on.
-pub const FEATURES: [&str; 8] = [
+pub const FEATURES: [&str; 7] = [
     "webgpu",
     "media",
-    "simpleAudio",
     "jsExecute",
     "httpImport",
     "localNetwork",
@@ -711,20 +710,20 @@ mod tests {
     #[test]
     fn package_features_enable_and_disable_in_order() {
         for (features, disabled) in [
-            (None, 255),
-            (Some(json!([])), 255),
-            (Some(json!(["webgpu"])), 254),
+            (None, 127),
+            (Some(json!([])), 127),
+            (Some(json!(["webgpu"])), 126),
             (Some(json!(["*"])), 0),
-            (Some(json!(["-*"])), 255),
+            (Some(json!(["-*"])), 127),
             (Some(json!(["*", "-webgpu"])), 1),
-            (Some(json!(["-*", "webgpu"])), 254),
-            (Some(json!(["webgpu", "-webgpu"])), 255),
-            (Some(json!(["media", "simpleAudio"])), 249),
-            (Some(json!(["*", "-simpleAudio"])), 4),
-            (Some(json!(["jsExecute", "httpImport"])), 231),
-            (Some(json!(["localNetwork"])), 223),
-            (Some(json!(["reactCompiler"])), 191),
-            (Some(json!(["terminal"])), 127),
+            (Some(json!(["-*", "webgpu"])), 126),
+            (Some(json!(["webgpu", "-webgpu"])), 127),
+            (Some(json!(["webgpu", "media"])), 124),
+            (Some(json!(["*", "-media"])), 2),
+            (Some(json!(["jsExecute", "httpImport"])), 115),
+            (Some(json!(["localNetwork"])), 111),
+            (Some(json!(["reactCompiler"])), 95),
+            (Some(json!(["terminal"])), 63),
         ] {
             let package = features.map_or(json!({}), |features| json!({ "features": features }));
             assert_eq!(

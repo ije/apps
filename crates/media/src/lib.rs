@@ -121,6 +121,7 @@ unsafe extern "C" {
 }
 
 // Decodes PCM WAV files in place of `native/ffmpeg.c`, with the same functions, in builds without FFmpeg.
+// The runtime compiles this file that way as its built-in audio player.
 #[cfg(not(ffmpeg))]
 mod wave {
     use super::*;
@@ -311,7 +312,7 @@ mod wave {
                 "FFmpeg is missing from this build, so only PCM WAV files play. Run bash scripts/build-ffmpeg.sh".into()
             }
             Ok(None) => {
-                "The simpleAudio feature plays only PCM WAV files. Add \"media\" to \"features\" in package.json".into()
+                "Only PCM WAV files play without the media feature. Add \"media\" to \"features\" in package.json".into()
             }
             Err(message) => message,
         };
