@@ -152,7 +152,7 @@ pub(crate) fn pixels(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, usize, usize)> {
     })
 }
 
-// WARNING: png's default level and its adaptive filter are several times slower than these, and
+// png's default level and its adaptive filter are several times slower than these, and
 // `capturePage()` and `toDataURL()` encode a whole frame per call.
 pub(crate) fn encode_png(image: &tiny_skia::Pixmap) -> anyhow::Result<Vec<u8>> {
     let mut straight = image.data().to_vec();

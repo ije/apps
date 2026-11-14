@@ -789,7 +789,7 @@ impl Renderer {
                 }
                 // A target is cleared at once, since a later pass can draw into it.
                 Command::Pass(target, wipe) => {
-                    // WARNING: end the old pass first. Two open passes put the encoder in an error state.
+                    // end the old pass first. Two open passes put the encoder in an error state.
                     drop(pass.take());
                     pass = wipe.then(|| open(&mut encoder, target, true));
                     current = (target, false);

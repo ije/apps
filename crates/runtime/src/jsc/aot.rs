@@ -124,7 +124,7 @@ impl Image {
             if function.is_null() {
                 return ptr::null_mut();
             }
-            // WARNING: entries read `process`, `require` and such from this argument. See the CLI's aot.rs.
+            // entries read `process`, `require` and such from this argument. See the CLI's aot.rs.
             (api.invoke)(ctx, function, this, 1, &(api.global)(ctx), exception)
         }
     }

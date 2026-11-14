@@ -679,7 +679,7 @@ impl Terminal {
         let files = unsafe { libc::getdtablesize() }.min(65536);
         let stdio = || slave.try_clone().map_err(|e| error(&e));
         command.stdin(stdio()?).stdout(stdio()?).stderr(slave);
-        // WARNING: this runs in the new process before the program, where only system calls are safe.
+        // this runs in the new process before the program, where only system calls are safe.
         unsafe {
             command.pre_exec(move || {
                 // The program gets the default signals, its own session with the PTY as its terminal, and

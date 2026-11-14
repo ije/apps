@@ -63,7 +63,7 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
             *front.get::<Free>(b"apps_aot_free\0")?,
         )
     };
-    // WARNING: the front end writes Bun's IR and built-in IDs. The compiler reads them without a version check.
+    // the front end writes Bun's IR and built-in IDs. The compiler reads them without a version check.
     let revisions = unsafe {
         [
             compiler.get::<Revision>(b"JSGetAOTCompilerRevision\0"),
@@ -128,7 +128,7 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
             skipped.push(name);
             continue;
         }
-        // WARNING: the front end is built without Bun's built-in sources, which hold the helper of its own
+        // the front end is built without Bun's built-in sources, which hold the helper of its own
         // `using`. So `using` becomes try and finally blocks here, with the helper in using.js.
         let mut lowered = String::new();
         if source.contains("using ") {
@@ -204,7 +204,7 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
             }
         }
         let (scoping, nodes) = (semantic.semantic.scoping(), semantic.semantic.nodes());
-        // WARNING: Bun's front end takes `process` and `Bun` for objects that always exist, also on `globalThis`,
+        // Bun's front end takes `process` and `Bun` for objects that always exist, also on `globalThis`,
         // and a .cjs entry binds the other names. apps has no global `Bun`, and a page has none of these names.
         // So the runtime passes the global object of the realm as the `globalThis` parameter, and each free
         // reference reads from it: `typeof Bun` is `undefined`.

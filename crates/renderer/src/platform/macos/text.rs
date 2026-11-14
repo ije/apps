@@ -1220,7 +1220,7 @@ impl Book {
             (piece, rest) = rest.split_at(span.len);
             let start = string.length();
             // SAFETY: the string is live and the range is its end.
-            // WARNING: a CFString drops some code points, like a leading byte order mark, so measure the length after the append.
+            // a CFString drops some code points, like a leading byte order mark, so measure the length after the append.
             unsafe {
                 CFMutableAttributedString::replace_string(
                     Some(&string),

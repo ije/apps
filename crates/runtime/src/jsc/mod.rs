@@ -418,7 +418,7 @@ impl JavaScriptCore {
         }
     }
 
-    // WARNING: JSC keeps pointing at `source` and `bytecode`, so both must outlive the VM.
+    // JSC keeps pointing at `source` and `bytecode`, so both must outlive the VM.
     unsafe fn evaluate_latin1(
         &self,
         ctx: Ptr,

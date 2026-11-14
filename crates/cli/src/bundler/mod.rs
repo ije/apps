@@ -957,7 +957,7 @@ impl<'a> Linker<'a, '_> {
                         if specifier.starts_with('.') {
                             return Some(folder.join(specifier));
                         }
-                        // WARNING: other names are packages, not files next to this one.
+                        // other names are packages, not files next to this one.
                         match self.builder.locate(&folder, specifier, true) {
                             Ok((path, None)) if path.is_file() => Some(path),
                             _ => None,

@@ -193,7 +193,7 @@ fn key(native: &NSEvent, flags: Flags) -> (Key, Modifiers) {
     (key, modifiers)
 }
 
-// WARNING: key names depend on the layout. A key pressed with cmd, and any key of a layout that types no
+// key names depend on the layout. A key pressed with cmd, and any key of a layout that types no
 // ASCII letters, takes its name from the cmd layer. Shift stays in the modifiers only for a-z. When changing
 // this, check a non-Latin layout, a layout that switches with cmd, and layouts with digits on the shift layer.
 fn by_layout(code: u16, mut modifiers: Modifiers) -> (Key, Modifiers) {

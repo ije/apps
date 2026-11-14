@@ -67,7 +67,7 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take) => 
     };
     return { value: visit(value), nodes };
   };
-  // WARNING: the plain form holds the value itself, not a copy, so serialize the result at once.
+  // the plain form holds the value itself, not a copy, so serialize the result at once.
   const encode = (value, buffers, transfer) => plain(value) ? { p: value } : graph(value, buffers, transfer);
   const failure = (name, message) => Object.assign(new (/^(Eval|Range|Reference|Syntax|Type|URI)Error$/.test(name) ? globalThis[name] : Error)(message), { name });
   const decode = (wire, buffers) => {

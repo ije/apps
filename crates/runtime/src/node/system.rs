@@ -552,7 +552,7 @@ pub(crate) fn call(op: &str, args: &Value) -> Result<Value> {
                     #[cfg_attr(target_os = "linux", link_name = "__res_nclose")]
                     fn res_ndestroy(state: *mut u64);
                 }
-                // WARNING: glibc 2.34 moved `__res_nsend` into libc as `res_nsend`, so neither name links on
+                // glibc 2.34 moved `__res_nsend` into libc as `res_nsend`, so neither name links on
                 // every glibc. Look it up once at run time.
                 #[cfg(target_os = "linux")]
                 let res_nsend = {
