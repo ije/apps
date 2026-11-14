@@ -15,8 +15,8 @@ A tiny, high performance, memory-safe electron alternative with compatible API.
 
 ## Architecture
 
-@ARCHITECTURE.md
+@docs/ARCHITECTURE.md
 
 ## Compatibility
 
-@COMPATIBILITY.md
+@docs/COMPATIBILITY.md

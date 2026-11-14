@@ -13,7 +13,7 @@
 | [crates/renderer](crates/renderer) | Native windows, input, retained box trees, Taffy layout, text, atlases, and GPU backends |
 | [crates/webview](crates/webview) | System web views and their native bridge |
 | [crates/webgpu](crates/webgpu) | The optional WebGPU API through wgpu |
-| [crates/media](crates/media) | The optional audio and video player through FFmpeg and cpal, and its build without FFmpeg in [audio](crates/media/audio) |
+| [crates/media](crates/media) | The audio and video player through FFmpeg and cpal. The optional media library has FFmpeg, and the runtime compiles the same source without it for WAV files |
 | [crates/terminal](crates/terminal) | The optional terminal for `<terminal>`: libghostty-vt, the PTY of the program, and the program status records |
 | [crates/devtools](crates/devtools) | The development tools library: the devtools panel page, the devtools server, and the FPS HUD |
 | [packages](packages) | npm launcher, TypeScript declarations, and packages for each platform and architecture |
@@ -129,8 +129,7 @@ The `features` array in `package.json` controls optional behavior. All entries i
 | `httpImport` | Permits remote JavaScript and CSS imports |
 | `localNetwork` | Permits page access to private network addresses |
 | `webgpu` | Enables the WebGPU API |
-| `media` | Enables the media player for `<video>` and `<audio>` |
-| `simpleAudio` | Enables `<audio>` for WAV files only, without FFmpeg |
+| `media` | Enables `<video>`, and the audio formats of FFmpeg for `<audio>`. Without it, `<audio>` plays only WAV files |
 | `reactCompiler` | Enables the Oxc React compiler for app page modules |
 | `terminal` | Enables the `<terminal>` element and its sessions, which let preload scripts run programs |
 
@@ -201,7 +200,7 @@ On macOS, `ns-*` inputs use AppKit controls and Liquid Glass uses `NSGlassEffect
 
 [Media](crates/runtime/src/web/media.rs) uses the optional `apps-media` shared library. The library uses FFmpeg for media decode and cpal for audio output. [build-ffmpeg.sh](scripts/build-ffmpeg.sh) produces a shared FFmpeg library without GPL or nonfree components. App packages include that library and `FFmpeg.LICENSE` when the `media` feature is enabled.
 
-`apps-audio` compiles the source of `apps-media` without FFmpeg. A WAV decoder takes the place of the FFmpeg functions, so the player and the mixer are the same. The runtime loads it for the `simpleAudio` feature when `media` is disabled, and the app package then has no FFmpeg.
+The runtime also compiles the source of `apps-media` into itself, without FFmpeg. A WAV decoder takes the place of the FFmpeg functions, so the player and the mixer are the same. This built-in player plays `<audio>` when the `media` feature is disabled, and the app package then has no media library and no FFmpeg.
 
 ## Terminal
 
