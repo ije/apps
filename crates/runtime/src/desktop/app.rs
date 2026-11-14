@@ -39,6 +39,11 @@ pub fn library_exe(name: &str) -> std::io::Result<std::path::PathBuf> {
             .split('.')
             .next()
             .unwrap_or(name);
+        let package = if package == "Ghostty" {
+            "apps-terminal"
+        } else {
+            package
+        };
         let modified =
             |path: &std::path::Path| path.metadata().and_then(|file| file.modified()).ok();
         let target = profile.join(name);

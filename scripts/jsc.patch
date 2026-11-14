@@ -1385,3 +1385,62 @@ index 236626fb..4ef33ef8 100644
      set(CMAKE_POSITION_INDEPENDENT_CODE False)
  endif ()
  
+diff --git a/Source/JavaScriptCore/aot/runtime/AOTModuleInstances.cpp b/Source/JavaScriptCore/aot/runtime/AOTModuleInstances.cpp
+index 25d6d00e..7104bddf 100644
+--- a/Source/JavaScriptCore/aot/runtime/AOTModuleInstances.cpp
++++ b/Source/JavaScriptCore/aot/runtime/AOTModuleInstances.cpp
+@@ -854,7 +854,7 @@ auto Modules::findMockForField(ModuleID module, unsigned index, Environment* ins
+         if (passed.size() > m_table.size()) [[unlikely]]
+             break;
+         if (ModuleNamespace* word = link ? mockWord(*link, instance) : nullptr) {
+-            found = { word, reexported->importName, m_table.exports(module)[index].isFromStarExport };
++            found = { word, reexported->importName, static_cast<bool>(m_table.exports(module)[index].isFromStarExport) };
+             break;
+         }
+         std::optional<unsigned> next = hasNoLinks || link->hasLink ? m_table.findExport(named, identifier(reexported->importName).impl()) : std::nullopt;
+@@ -1016,7 +1016,7 @@ auto Modules::resolveVariable(ModuleID module, unsigned index, Environment* inst
+         passed.append({ instance, index });
+         resolved.isFollowed = true;
+         if (ModuleNamespace* word = mockWord(*link, instance)) {
+-            resolved = { true, word, reexported->importName, m_table.exports(module)[index].isFromStarExport };
++            resolved = { true, word, reexported->importName, static_cast<bool>(m_table.exports(module)[index].isFromStarExport) };
+             break;
+         }
+         std::optional<unsigned> next = m_table.findExport(link->targetModule(), identifier(reexported->importName).impl());
+diff --git a/Source/JavaScriptCore/aot/runtime/AOTModules.cpp b/Source/JavaScriptCore/aot/runtime/AOTModules.cpp
+index 1cf58285..ad5a3e23 100644
+--- a/Source/JavaScriptCore/aot/runtime/AOTModules.cpp
++++ b/Source/JavaScriptCore/aot/runtime/AOTModules.cpp
+@@ -10420,7 +10420,7 @@ auto ModuleRecord::resolveOwnExport(JSGlobalObject* globalObject, const Identifi
+         return absent;
+     auto follow = [&](AbstractModuleRecord* record, const Identifier& name) {
+         auto* compiled = dynamicDowncast<ModuleRecord>(record);
+-        statement = { record, name, compiled && compiled->resolvesPerReexporter() ? this : nullptr, entry->isFromStarExport };
++        statement = { record, name, compiled && compiled->resolvesPerReexporter() ? this : nullptr, static_cast<bool>(entry->isFromStarExport) };
+         return Resolution::notFound();
+     };
+     auto mockOfModule = keepsToModule() ? Modules::MockMode::Bypass : Modules::MockMode::Use;
+diff --git a/Source/JavaScriptCore/runtime/TypedArrayController.h b/Source/JavaScriptCore/runtime/TypedArrayController.h
+index 8d0361de..5cbfd80d 100644
+--- a/Source/JavaScriptCore/runtime/TypedArrayController.h
++++ b/Source/JavaScriptCore/runtime/TypedArrayController.h
+@@ -41,14 +41,14 @@ class JSGlobalObject;
+ 
+ class JS_EXPORT TypedArrayController : public RefCounted<TypedArrayController> {
+ public:
+-    JS_EXPORT TypedArrayController();
++    TypedArrayController();
+     virtual ~TypedArrayController();
+     
+-    JS_EXPORT virtual JSArrayBuffer* toJS(JSGlobalObject*, JSGlobalObject*, ArrayBuffer&) = 0;
+-    JS_EXPORT virtual void registerWrapper(JSGlobalObject*, ArrayBuffer&, JSArrayBuffer&) = 0;
+-    JS_EXPORT virtual bool isAtomicsWaitAllowedOnCurrentThread() = 0;
++    virtual JSArrayBuffer* toJS(JSGlobalObject*, JSGlobalObject*, ArrayBuffer&) = 0;
++    virtual void registerWrapper(JSGlobalObject*, ArrayBuffer&, JSArrayBuffer&) = 0;
++    virtual bool isAtomicsWaitAllowedOnCurrentThread() = 0;
+ 
+-    JS_EXPORT virtual bool isWebCoreTypedArrayController() const { return false; }
++    virtual bool isWebCoreTypedArrayController() const { return false; }
+ };
+ 
+ } // namespace JSC

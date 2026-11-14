@@ -754,6 +754,12 @@ impl Desktop {
                         }
                         let preload = preload?.map(Rc::new);
                         let renderer = Rc::new(renderer?);
+                        if cx.is_none() {
+                            renderer.eval(
+                                "addEventListener('error', event => queueMicrotask(() => { if (!event.defaultPrevented) __appsTrackModule(Promise.reject(event.error)); }))",
+                                "apps:check",
+                            )?;
+                        }
                         for (kind, script) in &scripts {
                             if *kind == "preload"
                                 && let Some(preload) = &preload
@@ -2313,21 +2319,36 @@ mod tests {
 
     #[test]
     fn check_reports_page_script_errors() {
-        let files = BBTreeMap::from([(
-            "app.js".into(),
-            format!(
-                "$appsDefine({});",
-                serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":"__apps.app.whenReady().then(()=>new __apps.BrowserWindow().load(`<script>throw Error('page failure')</script>`))"})
+        for (script, fails) in [
+            ("throw Error('page failure')", true),
+            ("reportError(Error('page failure'))", true),
+            (
+                "queueMicrotask(() => { throw Error('page failure'); })",
+                true,
             ),
-        )]);
-        assert!(
-            Desktop::new(&files)
-                .unwrap()
-                .check()
-                .unwrap_err()
-                .to_string()
-                .contains("page failure")
-        );
+            (
+                "addEventListener('error', event => event.preventDefault()); reportError(Error('page failure'));",
+                false,
+            ),
+            ("console.error('page failure')", false),
+        ] {
+            let files = BBTreeMap::from([(
+                "app.js".into(),
+                format!(
+                    "$appsDefine({});",
+                    serde_json::json!({"id":0,"imports":[],"exports":[],"stars":[],"code":format!("__apps.app.whenReady().then(()=>new __apps.BrowserWindow().load({}))", serde_json::json!(format!("<script>{script}</script>")))})
+                ),
+            )]);
+            let result = Desktop::new(&files).unwrap().check();
+            if fails {
+                assert!(
+                    result.unwrap_err().to_string().contains("page failure"),
+                    "{script}"
+                );
+            } else {
+                assert_eq!(result.unwrap(), 0, "{script}");
+            }
+        }
     }
 
     #[test]
