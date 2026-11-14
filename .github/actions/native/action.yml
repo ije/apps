@@ -1,0 +1,96 @@
+name: Native libraries
+description: Restores JavaScriptCore, FFmpeg and libghostty-vt from the cache, or builds them.
+inputs:
+  aot:
+    description: Set to true to also build the AOT libraries. macOS arm64 only.
+runs:
+  using: composite
+  steps:
+    - if: runner.os == 'Linux'
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y clang-19 ninja-build ruby nasm libicu-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libfontconfig1-dev libfreetype6-dev libasound2-dev libudev-dev libglib2.0-dev libwebkit2gtk-4.1-dev libvulkan-dev xvfb xauth
+
+    # Each cache is saved right after its build, so a later failure of the job doesn't lose it.
+    # The caches hold only the build results. The source and build folders stay out.
+    - uses: actions/cache/restore@v4
+      id: jsc
+      with:
+        path: target/bun-jsc/*-*/*.*
+        key: jsc-${{ runner.os }}-${{ runner.arch }}-${{ inputs.aot == 'true' && format('aot-{0}', hashFiles('scripts/build-jsc.sh', 'scripts/jsc*')) || hashFiles('scripts/build-jsc.sh', 'scripts/jsc.patch', 'scripts/jsc.exports', 'scripts/jsc-cc.sh') }}
+    - if: steps.jsc.outputs.cache-hit != 'true' && runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+    - if: steps.jsc.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        case $RUNNER_OS in
+          Linux) options='-DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19' ;;
+          Windows)
+            # msvc-dev-cmd makes rustc take link.exe from PATH, where bash steps find the one of Git first.
+            rm -f /usr/bin/link.exe
+            triplet=${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}-windows-static-md
+            vcpkg install icu:$triplet
+            options="-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DICU_ROOT=$VCPKG_INSTALLATION_ROOT/installed/$triplet"
+            ;;
+        esac
+        if [[ '${{ inputs.aot }}' == true ]]; then
+          # Use the Bun release that Bun's CI builds build-jsc.sh's Bun revision with: `bun.version` in Bun's
+          # scripts/build/ci-images/spec.ts.
+          npm install --prefix "$RUNNER_TEMP/bun" @oven/bun-darwin-aarch64@1.4.4
+          export APPS_BUN=$RUNNER_TEMP/bun/node_modules/@oven/bun-darwin-aarch64/bin/bun
+          aot=--aot
+        fi
+        bash scripts/build-jsc.sh ${aot-} -- ${options-}
+    - if: steps.jsc.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: target/bun-jsc/*-*/*.*
+        key: ${{ steps.jsc.outputs.cache-primary-key }}
+
+    - uses: actions/cache/restore@v4
+      id: ffmpeg
+      with:
+        path: target/ffmpeg/*-*
+        key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ffmpeg.sh', 'crates/media/native/ffmpeg.c') }}
+    - if: steps.ffmpeg.outputs.cache-hit != 'true' && runner.os == 'Windows'
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: ${{ runner.arch == 'ARM64' && 'CLANGARM64' || 'MINGW64' }}
+        install: make diffutils curl xz
+        pacboy: toolchain:p ${{ runner.arch == 'X64' && 'nasm:p' || '' }}
+    - if: steps.ffmpeg.outputs.cache-hit != 'true' && runner.os == 'Windows'
+      shell: msys2 {0}
+      run: bash scripts/build-ffmpeg.sh
+    - if: steps.ffmpeg.outputs.cache-hit != 'true' && runner.os != 'Windows'
+      shell: bash
+      run: |
+        [[ $RUNNER_OS-$RUNNER_ARCH != macOS-X64 ]] || brew install nasm
+        bash scripts/build-ffmpeg.sh
+    - if: steps.ffmpeg.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: target/ffmpeg/*-*
+        key: ${{ steps.ffmpeg.outputs.cache-primary-key }}
+
+    # libghostty-vt builds with Zig. Windows has no terminal library yet.
+    - if: runner.os != 'Windows'
+      uses: actions/cache/restore@v4
+      id: ghostty
+      with:
+        path: target/ghostty/*-*
+        key: ghostty-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ghostty.sh') }}
+    - if: runner.os != 'Windows' && steps.ghostty.outputs.cache-hit != 'true'
+      uses: mlugg/setup-zig@v2
+      with:
+        version: 0.17.0
+        # build-ghostty.sh uses a new Zig cache for each build.
+        use-cache: false
+    - if: runner.os != 'Windows' && steps.ghostty.outputs.cache-hit != 'true'
+      shell: bash
+      run: bash scripts/build-ghostty.sh
+    - if: runner.os != 'Windows' && steps.ghostty.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: target/ghostty/*-*
+        key: ${{ steps.ghostty.outputs.cache-primary-key }}
