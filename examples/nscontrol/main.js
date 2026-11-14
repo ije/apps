@@ -1,8 +1,11 @@
-import { app, BrowserWindow } from '@pierre/apps';
+import { BrowserWindow } from '@pierre/apps';
 
-app.whenReady().then(() => {
-  const window = new BrowserWindow({ width: 560, height: 600, title: 'NSControl' });
-  window.loadFile('index.html');
-});
-
-app.on('window-all-closed', () => app.quit());
+export default {
+  ready() {
+    const window = new BrowserWindow({ width: 560, height: 600, title: 'NSControl' });
+    window.loadFile('index.html');
+  },
+  windowClose(app) {
+    if (!app.hasWindows) app.quit();
+  },
+};
