@@ -77,10 +77,10 @@ pub fn build(root: &Path, entry: &Path, release: bool, target: BuildTarget) -> R
         name = apps_runtime::bundle::package_metadata(Some(&package))?.0;
         let sdk = std::env::var_os("APPS_RUST_SDK")
             .map(PathBuf::from)
-            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime"));
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
         let sdk = sdk
             .canonicalize()
-            .context("Set APPS_RUST_SDK to the apps-runtime crate directory")?;
+            .context("Set APPS_RUST_SDK to the pierre-apps crate directory")?;
         let directory = root.join(".apps/cargo");
         fs::create_dir_all(&directory)?;
         manifest = directory.join("Cargo.toml");
@@ -88,7 +88,7 @@ pub fn build(root: &Path, entry: &Path, release: bool, target: BuildTarget) -> R
             .split_once("[profile.release]")
             .context("The workspace Cargo.toml has no release profile")?;
         let source = format!(
-            "[workspace]\n[package]\nname = {}\nversion = \"0.0.0\"\nedition = \"2024\"\n[[bin]]\nname = {}\npath = {}\n[dependencies]\napps = {{ package = \"apps-runtime\", path = {} }}\n[profile.release]{profiles}",
+            "[workspace]\n[package]\nname = {}\nversion = \"0.0.0\"\nedition = \"2024\"\n[[bin]]\nname = {}\npath = {}\n[dependencies]\npierre-apps = {{ path = {} }}\n[profile.release]{profiles}",
             json!(name),
             json!(name),
             json!(entry),

@@ -1,6 +1,6 @@
-use apps::{BrowserWindow, WindowOptions, app};
+use pierre_apps::{BrowserWindow, WindowOptions, app};
 
-fn main() -> apps::Result<()> {
+fn main() -> pierre_apps::Result<()> {
     app::run(|app| {
         app.handle("greet", |_window, args| {
             let name = args.first().and_then(|arg| arg.as_str()).unwrap_or("world");

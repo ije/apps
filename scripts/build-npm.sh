@@ -36,9 +36,12 @@ for (const dir of fs.readdirSync("packages")) {
   for (const name in pkg.optionalDependencies) pkg.optionalDependencies[name] = version
   fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n")
 }
-const cargo = fs.readFileSync("Cargo.toml", "utf8"), pattern = /(\[workspace\.package\]\nversion = )"[^"]*"/
-if (!pattern.test(cargo)) throw new Error("Cannot find the workspace version in Cargo.toml")
-fs.writeFileSync("Cargo.toml", cargo.replace(pattern, `$1"${version}"`))' "$version"
+let cargo = fs.readFileSync("Cargo.toml", "utf8")
+for (const pattern of [/(\[workspace\.package\]\nversion = )"[^"]*"/, /(apps-runtime = \{ version = )"[^"]*"/]) {
+  if (!pattern.test(cargo)) throw new Error("Cannot find the crate version in Cargo.toml")
+  cargo = cargo.replace(pattern, `$1"${version}"`)
+}
+fs.writeFileSync("Cargo.toml", cargo)' "$version"
 
 cargo build --release --workspace
 

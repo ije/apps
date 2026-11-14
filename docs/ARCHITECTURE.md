@@ -8,6 +8,7 @@
 
 | Path | Responsibility |
 |---|---|
+| [src](src) | The public `pierre-apps` crate for Rust apps |
 | [crates/cli](crates/cli) | The `apps` command, module bundler, development loop, app packages, and AOT compiler integration |
 | [crates/runtime](crates/runtime) | App lifecycle, JavaScriptCore, Electron and Node APIs, DOM, CSS, and page rendering |
 | [crates/renderer](crates/renderer) | Native windows, input, retained box trees, Taffy layout, text, atlases, and GPU backends |
@@ -40,7 +41,7 @@ The [bundler](crates/cli/src/bundler/mod.rs) uses Oxc to parse, transform, and m
 
 The bundler maps `electron` and `@pierre/apps` imports to runtime APIs. Literal `import.meta.resolve()` calls identify pages or script chunks. A `new Worker()` or `fork()` call with a path that the bundler can read from the code makes that file a script chunk. Literal `loadFile()` calls in main code also include the target HTML and its dependencies in the bundle.
 
-JavaScript apps use `apps-runtime` as their executable and `app.js` as their main entry. Apps with `"type": "rust"` use a Cargo binary linked to `apps-runtime`. Their entry calls `app::run()`, creates windows, and registers native handlers through the [Rust app API](crates/runtime/src/desktop/app.rs).
+JavaScript apps use `apps-runtime` as their executable and `app.js` as their main entry. Apps with `"type": "rust"` use a Cargo binary linked to `pierre-apps`, which exposes the `apps-runtime` app API. Their entry calls `app::run()`, creates windows, and registers native handlers through the [Rust app API](crates/runtime/src/desktop/app.rs).
 
 ### Module execution
 

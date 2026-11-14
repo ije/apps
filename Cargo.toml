@@ -7,17 +7,30 @@ resolver = "3"
 version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0"
-publish = false
+
+[package]
+name = "pierre-apps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "A tiny, fast, memory-safe Electron alternative with a compatible API"
+repository = "https://github.com/ije/apps"
+readme = "README.md"
+publish = ["crates-io"]
+include = ["/src/**", "/README.md", "/LICENSE.md"]
+
+[dependencies]
+apps-runtime = { version = "0.0.0", path = "crates/runtime" }
 
 [workspace.dependencies]
 anyhow = "1.0.104"
-bbtree = "=0.2.1"
+bbtree = "0.2.1"
 block2 = "0.6.2"
 core-foundation = "0.10.1"
 core-foundation-sys = "0.8.7"
 dispatch2 = { version = "0.3.1", default-features = false, features = ["std"] }
 etagere = "0.3.0"
-image = { version = "=0.25.10", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "webp"] }
+image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "webp"] }
 libc = "0.2.191"
 objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
@@ -40,9 +53,9 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "block2",
     "objc2-core-foundation",
 ] }
-objc2-core-foundation = { version = "=0.3.2", default-features = false }
+objc2-core-foundation = { version = "0.3.2", default-features = false }
 objc2-core-text = { version = "0.3.2", default-features = false, features = ["std", "CTFont", "CTFontDescriptor"] }
-objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "NSArray",
     "NSAttributedString",
     "NSGeometry",
@@ -58,14 +71,14 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "std",
 ] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColorSpace", "objc2"] }
-objc2-quartz-core = { version = "=0.3.2", default-features = false, features = ["std", "CALayer", "CAMetalLayer"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "CAMetalLayer"] }
 pollster = "1.0.1"
 raw-window-handle = "0.6.2"
 rustc-hash = "2.1.3"
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 swash = "0.2.10"
-taffy = { version = "=0.15.1", default-features = false }
+taffy = { version = "0.15.1", default-features = false }
 tiny-skia = "0.12.0"
 url = "2.5.8"
 usvg = { version = "0.49.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "svgz"] }
@@ -86,19 +99,19 @@ xkbcommon = { version = "0.9.0", default-features = false }
 
 # Use the bundler's crates.io oxc dependencies for oxc_react_compiler.
 [patch."https://github.com/oxc-project/oxc"]
-oxc_allocator = "=0.158.0"
-oxc_ast = "=0.158.0"
-oxc_ast_macros = "=0.158.0"
-oxc_ast_visit = "=0.158.0"
-oxc_data_structures = "=0.158.0"
-oxc_diagnostics = "=0.158.0"
-oxc_ecmascript = "=0.158.0"
-oxc_estree = "=0.158.0"
-oxc_regular_expression = "=0.158.0"
-oxc_semantic = "=0.158.0"
-oxc_span = "=0.158.0"
-oxc_str = "=0.158.0"
-oxc_syntax = "=0.158.0"
+oxc_allocator = "0.158.0"
+oxc_ast = "0.158.0"
+oxc_ast_macros = "0.158.0"
+oxc_ast_visit = "0.158.0"
+oxc_data_structures = "0.158.0"
+oxc_diagnostics = "0.158.0"
+oxc_ecmascript = "0.158.0"
+oxc_estree = "0.158.0"
+oxc_regular_expression = "0.158.0"
+oxc_semantic = "0.158.0"
+oxc_span = "0.158.0"
+oxc_str = "0.158.0"
+oxc_syntax = "0.158.0"
 
 # Rust apps copy the profiles from here to the end of the file.
 [profile.release]
