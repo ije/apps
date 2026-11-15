@@ -13,6 +13,7 @@ A tiny, high performance, and low memory usage electron alternative with compati
 
 - When working on renderer, compare with chrome.
 - Don't use workaroud/trick in testings/examples to make falsely the rendering look same as chrome.
+- Build npm bin for current platform after cli/runtime/libs change.
 
 ## Code Style
 
