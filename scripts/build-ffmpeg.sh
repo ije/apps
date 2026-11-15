@@ -69,7 +69,12 @@ case "$system" in
     )
     ;;
   windows)
-    options+=(--enable-d3d11va --enable-hwaccel=h264_d3d11va2,hevc_d3d11va2,vp9_d3d11va2,av1_d3d11va2)
+    # FFmpeg compiles the code of a d3d11va2 hwaccel only when its d3d11va hwaccel is enabled.
+    options+=(
+      --enable-d3d11va
+      --enable-hwaccel=h264_d3d11va,hevc_d3d11va,vp9_d3d11va,av1_d3d11va
+      --enable-hwaccel=h264_d3d11va2,hevc_d3d11va2,vp9_d3d11va2,av1_d3d11va2
+    )
     # configure reads the arch from uname, and CLANGARM64 has no gcc.
     [[ $arch == aarch64 ]] && options+=(--cc=clang --arch=aarch64)
     ;;

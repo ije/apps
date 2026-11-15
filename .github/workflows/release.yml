@@ -18,7 +18,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: darwin-arm64, os: macos-15, aot: true }
+          # Bun's AOT sources need the Clang 21 of this image. The Clang 17 of macos-15 rejects them.
+          - { target: darwin-arm64, os: macos-26, aot: true }
           - { target: darwin-x64, os: macos-15-intel }
           - { target: linux-x64, os: ubuntu-24.04 }
           - { target: linux-arm64, os: ubuntu-24.04-arm }
