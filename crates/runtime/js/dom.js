@@ -83,8 +83,8 @@
   const extent = (node, axis) => {
     const box = client(node), i = slot(node);
     if (i < 0 || marks[node._id] & 2) return Math.round(box[2 + axis] + (i < 0 ? 0 : geometry[i + 6 + axis]));
-    // The bounds of the children of a transformed box are transformed too, so its own size is used.
-    if (marks[node._id] & 128) return Math.round(box[2 + axis]);
+    // The bounds of the children of a scaled box are scaled too, so its own size is used.
+    if (marks[node._id] & 128 && (box[8] !== geometry[i + 2] || box[9] !== geometry[i + 3])) return Math.round(box[2 + axis]);
     if (!box[2] && !box[3] && !box[4] && !box[5] && !box[6] && !box[7] && /^(inline|contents)$/.test(getComputedStyle(node).display)) return 0;
     const start = geometry[i + axis] + box[axis], pending = [...(node._m.shadow ?? node._m).kids];
     let end = 0;

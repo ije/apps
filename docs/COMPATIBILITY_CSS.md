@@ -14,7 +14,7 @@ These parts differ from browsers. The ones that don't work show an error in the 
 | `background-attachment: fixed` | Works on the background of the page (`html`, or `body` when `html` has none). On other elements the layer scrolls with its box |
 | `vector-effect: non-scaling-stroke` | Undoes the `viewBox` scale of the `<svg>`, but not transforms inside it |
 | `line-height`, `vertical-align` in `::first-letter` and `::first-line` | Ignored. Sizes, colors and font styles work |
-| `::before`, `::after` | Are not grid items when their grid has other items. Their `clip-path` shapes, `mask` and `outline` are not drawn, their background stays inside their border, and a floated one in a box that holds only inline content goes to its side of the first line, where text doesn't flow around it |
+| `::before`, `::after` | Their `clip-path` shapes and `outline` are not drawn, their background stays inside their border, and a floated one in a box that holds only inline content goes to its side of the first line, where text doesn't flow around it |
 | Default font | Pages without a `font-family` use the system font, where browsers use Times. `ui-serif` and `ui-rounded` are the system font too |
 | Text decoration | `text-decoration-skip-ink` is not applied: lines cross descenders. Wavy, dotted and double lines have slightly different shapes |
 | `font-variant` | Only `normal` and `small-caps`. Small caps are capitals at 70% of the size |
@@ -35,7 +35,7 @@ These parts differ from browsers. The ones that don't work show an error in the 
 | `mask-composite` | `intersect` works when all layers are axis-aligned linear gradients at their default size, which is how Tailwind builds masks. Other masks add their layers |
 | `@font-face` | `local()` matches installed family names, not full or PostScript names. A face with `unicode-range` loads when the page text uses one of its characters. Subset faces of one font don't combine per character: the face that covers the most page text draws all of it. The `font-weight`, `font-style`, `font-stretch` and `font-display` descriptors are ignored, so a face is used with its own weight and style. Faces load before the page first draws or when `document.fonts` is read. Color fonts draw in one color, so sources with a color `tech()` are skipped |
 | `border-radius` | Percentages in the corners of `<img>` content use the box's `width` and `height` properties, so they are off on images that are sized by their content |
-| `aspect-ratio` | Applies to the border box, so a box with `box-sizing: content-box` and padding or borders gets another height |
+| `aspect-ratio` | Applies to the border box of boxes other than grids, so such a box with `box-sizing: content-box` and padding or borders gets another height |
 | `direction: rtl` | Logical properties, text alignment, floats, flex rows, grid columns and block boxes follow the direction. Text that mixes directions is not reordered |
 | `@scope` | `@scope` without a selector applies to the whole page, not to the parent of its `<style>`. Scope proximity doesn't affect the cascade |
 | `:host-context()` | Not supported, like in Safari |

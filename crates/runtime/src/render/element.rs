@@ -197,9 +197,7 @@ fn parent_style<'b>(
     id: usize,
     prop: Prop,
 ) -> Option<&'b str> {
-    doc.nodes[id]
-        .parent
-        .and_then(|parent| styles.values[parent].get(prop))
+    box_parent(doc, styles, id).and_then(|parent| styles.values[parent].get(prop))
 }
 
 fn row_fill(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<(u32, u8)> {
@@ -364,7 +362,7 @@ fn shrinks(doc: &Document, styles: &ComputedStyles, id: usize, first: bool) -> (
         {
             break (true, child);
         }
-        let Some(parent) = doc.nodes[child].parent else {
+        let Some(parent) = box_parent(doc, styles, child) else {
             break (false, child);
         };
         let style = &styles.values[parent];
@@ -2021,6 +2019,8 @@ fn create(
             strut_due = true;
         }
     }
+    // The content of replaced elements paints above the background layers, which are built later.
+    let mut content_layers: Vec<Child> = Vec::new();
     if node.tag == "canvas" {
         let picture = |source| {
             renderer::node().size_full().hooks(super::paint::Picture {
@@ -2039,7 +2039,7 @@ fn create(
         let mut presented = picture(super::paint::Source::Presented)
             .child(picture(super::paint::Source::Drawn).absolute());
         presented.style().aspect_ratio = natural_ratio;
-        el = el.child(presented);
+        content_layers.push(presented.into());
     }
     let mut grid_bar = None;
     if node.tag == "terminal" {
@@ -2063,13 +2063,18 @@ fn create(
                 origin: [0.; 2],
                 quiet: true,
             });
-            el = el.child(renderer::node().size_full().hooks(super::terminal::Grid {
-                id,
-                view: view.clone(),
-                terminals: state.terminals.clone(),
-                look: Rc::new(look),
-                edges: insets(styles, id, true, containing[0]),
-            }));
+            content_layers.push(
+                renderer::node()
+                    .size_full()
+                    .hooks(super::terminal::Grid {
+                        id,
+                        view: view.clone(),
+                        terminals: state.terminals.clone(),
+                        look: Rc::new(look),
+                        edges: insets(styles, id, true, containing[0]),
+                    })
+                    .into(),
+            );
         }
     }
     let mut picture = None;
@@ -2115,7 +2120,7 @@ fn create(
                 picture = Some(fit);
             } else {
                 let padding = units.edges(style, style::PADDING, containing[0]);
-                el = el.child(svg_layer(id, false, view.clone(), padding));
+                content_layers.push(svg_layer(id, false, view.clone(), padding));
             }
         }
         if image.is_none() && natural_ratio.is_some() {
@@ -2420,7 +2425,8 @@ fn create(
                 .insert(id, ("".into(), names, [0.; 2], Vec::new(), [0.; 4]));
             state.svg_sources.insert(id, source);
         }
-        el = el.w(px(width)).h(px(height)).child(svg_layer(
+        el = el.w(px(width)).h(px(height));
+        content_layers.push(svg_layer(
             id,
             true,
             view.clone(),
@@ -3413,6 +3419,13 @@ fn create(
     {
         inner_shadows = units.shadows(value, true);
     }
+    // The left and right insets of a positioned box take room from its width.
+    let inset_x = [Prop::LEFT, Prop::RIGHT].map(|prop| {
+        style
+            .get(prop)
+            .filter(|_| matches!(position, "absolute" | "fixed"))
+            .and_then(|v| units.resolve(v, containing[0]))
+    });
     let percentage = |value: &str| {
         value
             .strip_suffix('%')
@@ -3463,6 +3476,7 @@ fn create(
                     || prop == Prop::WIDTH
                         && value == "fit-content"
                         && matches!(position, "absolute" | "fixed")
+                        && inset_x.contains(&None)
                 {
                     renderer::Length::Auto
                 } else if prop == Prop::WIDTH
@@ -3507,7 +3521,9 @@ fn create(
                     let size = match value {
                         "min-content" => min,
                         "max-content" => max,
-                        _ => max.min(min.max(containing[0])),
+                        _ => {
+                            max.min(min.max(containing[0] - inset_x.iter().flatten().sum::<f32>()))
+                        }
                     };
                     let size = layout_ceil((size - margin[1] - margin[3]).max(0.), pixel_ratio);
                     intrinsic_width = Some(size);
@@ -4203,6 +4219,7 @@ fn create(
             .left(px(padding[3])),
         );
     }
+    el = el.children(content_layers);
     if let Some(fit) = picture {
         let inset = |side: usize| px(borders[side] + padding[side]);
         let corners = radius
@@ -4836,6 +4853,15 @@ fn create(
                 content[axis] = value;
             } else if axis == 0 {
                 content[axis] -= margin[1] + margin[3];
+                content[axis] -= inset_x.iter().flatten().sum::<f32>();
+            } else if let Some(ratio) = style
+                .get(Prop::ASPECT_RATIO)
+                .filter(|value| !(value.contains("auto") && natural_ratio.is_some()))
+                .and_then(aspect_ratio)
+            {
+                // Like the layout, the ratio applies to the border box.
+                content[1] =
+                    (content[0] + padding[1] + padding[3] + borders[1] + borders[3]) / ratio;
             }
             if let Some(value) = style
                 .get(max)
@@ -4898,7 +4924,9 @@ fn create(
             size
         });
     let mut after = Vec::new();
-    let mut pseudo_items = false;
+    // In-flow pseudo-elements of a grid or flex box are its first and last items, which the grid places and
+    // flex orders among the children.
+    let mut items = [None, None];
     if let Some(pseudos) = styles.pseudos.get(&id) {
         let mut units = units;
         units.container = own.or(units.container);
@@ -5012,10 +5040,9 @@ fn create(
                     .top(px(padding[0]))
                     .right(px(padding[1]));
             }
-            if absolute {
+            let grid_item = !absolute && matches!(display, "grid" | "inline-grid");
+            if absolute || grid_item {
                 decoration = decoration.absolute();
-            } else {
-                pseudo_items = true;
             }
             // Percentages of a pseudo-element take the width of its element, the padding box when absolute.
             let base = content_box()[0]
@@ -5396,6 +5423,18 @@ fn create(
                     });
                 }
             }
+            if [Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]
+                .into_iter()
+                .find_map(|prop| pseudo.get(prop))
+                .is_some_and(|value| value != "none")
+            {
+                decoration = decoration.hooks(super::paint::Masked {
+                    view: view.clone(),
+                    key: (id, index as u8 + 1),
+                    style: Rc::new(pseudo.clone()),
+                    units: pseudo_units,
+                });
+            }
             if let Some(value) = pseudo
                 .get(Prop::MIX_BLEND_MODE)
                 .filter(|value| *value != "normal")
@@ -5449,9 +5488,10 @@ fn create(
                 .and_then(|value| value.parse::<i32>().ok())
                 .unwrap_or(0);
             let decoration = if order != 0
-                && pseudo
-                    .get(Prop::POSITION)
-                    .is_some_and(|value| value != "static")
+                && (grid_item
+                    || pseudo
+                        .get(Prop::POSITION)
+                        .is_some_and(|value| value != "static"))
             {
                 decoration.z_index(order)
             } else {
@@ -5478,7 +5518,9 @@ fn create(
             } else {
                 flex_order
             };
-            if index == 0 && flex_order <= 0 || index == 1 && flex_order < 0 {
+            if grid_item || flexbox && !absolute {
+                items[index] = Some((flex_order, decoration, pseudo_margin));
+            } else if index == 0 && flex_order <= 0 || index == 1 && flex_order < 0 {
                 if std::mem::take(&mut strut_due) {
                     el = el.child(strut());
                 }
@@ -5487,30 +5529,6 @@ fn create(
                 after.push((flex_order, decoration));
             }
         }
-    }
-    // Without other items, a pseudo-element fills the one cell of the grid, so the column places it.
-    if pseudo_items
-        && matches!(display, "grid" | "inline-grid")
-        && !flat.iter().any(|&child| in_flow(doc, info, child))
-    {
-        el = el.flex().flex_col();
-        let pick = |props: [Prop; 2]| {
-            props
-                .into_iter()
-                .filter_map(|prop| style.get(prop)?.split_whitespace().last())
-                .find(|value| !matches!(*value, "normal" | "auto" | "legacy"))
-        };
-        el.style().align_items = Some(match pick([Prop::JUSTIFY_ITEMS, Prop::JUSTIFY_CONTENT]) {
-            Some("center") => renderer::AlignItems::Center,
-            Some("end" | "flex-end" | "self-end" | "right") => renderer::AlignItems::FlexEnd,
-            Some("start" | "flex-start" | "self-start" | "left") => renderer::AlignItems::FlexStart,
-            _ => renderer::AlignItems::Stretch,
-        });
-        el.style().justify_content = Some(match pick([Prop::ALIGN_ITEMS, Prop::ALIGN_CONTENT]) {
-            Some("center") => renderer::AlignContent::Center,
-            Some("end" | "flex-end" | "self-end") => renderer::AlignContent::FlexEnd,
-            _ => renderer::AlignContent::FlexStart,
-        });
     }
     let preserve = style
         .get(Prop::WHITE_SPACE)
@@ -5800,7 +5818,7 @@ fn create(
             .left(px(padding[3]))
             .children(boxes);
         el = el.child(holder.hooks(super::paint::Undrawn(view.clone())));
-    } else if !node.children.is_empty()
+    } else if (!node.children.is_empty() || items.iter().any(Option::is_some))
         && node.tag != "canvas"
         && node.tag != "terminal"
         && node.tag != "iframe"
@@ -5809,27 +5827,46 @@ fn create(
     {
         let mut content = content_box();
         let container = own.unwrap_or(container);
+        // Content-sized heights size a grid like `auto`.
+        let auto_height = style
+            .get(Prop::HEIGHT)
+            .is_none_or(|v| matches!(v, "auto" | "fit-content" | "max-content" | "min-content"));
         let flexed = style
             .get(Prop::DISPLAY)
             .is_some_and(|v| v.ends_with("grid"))
             && slot.is_none()
-            && style.get(Prop::HEIGHT).is_none_or(|v| v == "auto")
+            && auto_height
             && reader
                 .parent(id, Prop::DISPLAY)
                 .is_some_and(|v| v.ends_with("flex"))
-            && reader
+            && if reader
                 .parent(id, Prop::FLEX_DIRECTION)
                 .is_some_and(|v| v.starts_with("column"))
-            && (style
-                .get(Prop::FLEX_GROW)
-                .and_then(|v| v.parse::<f32>().ok())
-                .is_some_and(|v| v > 0.)
-                || style
-                    .get(Prop::FLEX_BASIS)
-                    .is_some_and(|v| v != "auto" && v != "content"));
+            {
+                style
+                    .get(Prop::FLEX_GROW)
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .is_some_and(|v| v > 0.)
+                    || style
+                        .get(Prop::FLEX_BASIS)
+                        .is_some_and(|v| v != "auto" && v != "content")
+            } else {
+                // A flex row stretches the item to its line.
+                let stretched = match style.get(Prop::ALIGN_SELF).unwrap_or("auto") {
+                    "auto" => reader
+                        .parent(id, Prop::ALIGN_ITEMS)
+                        .is_none_or(|v| matches!(v, "normal" | "stretch")),
+                    value => matches!(value, "normal" | "stretch"),
+                };
+                stretched
+                    && [Prop::MARGIN_TOP, Prop::MARGIN_BOTTOM]
+                        .into_iter()
+                        .all(|prop| style.get(prop) != Some("auto"))
+            };
         let shrunk = style.get(Prop::DISPLAY).is_some_and(|v| v == "grid")
             && slot.is_none()
-            && (style::table_box(style::role(styles, id))
+            && ((style::table_box(style::role(styles, id))
+                || matches!(position, "absolute" | "fixed"))
                 && style.get(Prop::WIDTH) == Some("fit-content")
                 || style.get(Prop::WIDTH).is_none_or(|v| v == "auto") && {
                     let (shrunk, farthest) = shrinks(doc, styles, id, true);
@@ -5861,6 +5898,8 @@ fn create(
                 }
                 _ => false,
             };
+        // The height that insets or a ratio give a grid, which holds even without rows.
+        let mut definite = 0f32;
         let grid = if let Some(display) = style
             .get(Prop::DISPLAY)
             .filter(|v| matches!(*v, "grid" | "inline-grid"))
@@ -5951,14 +5990,40 @@ fn create(
                     .get(prop)
                     .and_then(|value| units.resolve(value, containing[1]))
             };
-            let stretched = matches!(position, "absolute" | "fixed")
-                .then(|| Some(inset(Prop::TOP)? + inset(Prop::BOTTOM)?))
-                .flatten();
+            let stretched = (matches!(position, "absolute" | "fixed")
+                && style.get(Prop::HEIGHT).is_none_or(|v| v == "auto"))
+            .then(|| Some(inset(Prop::TOP)? + inset(Prop::BOTTOM)?))
+            .flatten();
+            // Like Chrome, a ratio sizes the box of `box-sizing` from the used width, and the rows can make it taller.
+            let ratio = style
+                .get(Prop::ASPECT_RATIO)
+                .filter(|_| auto_height && slot.is_none())
+                .and_then(aspect_ratio)
+                .map(|ratio| {
+                    let border_box = style.get(Prop::BOX_SIZING) == Some("border-box");
+                    let extra = if border_box {
+                        [horizontal, vertical]
+                    } else {
+                        [0.; 2]
+                    };
+                    let height = (content[0] + extra[0]) / ratio;
+                    let limit = |prop| {
+                        style
+                            .get(prop)
+                            .and_then(|v| units.resolve(v, containing[1]))
+                    };
+                    let height = height.min(limit(Prop::MAX_HEIGHT).unwrap_or(f32::INFINITY));
+                    (height.max(limit(Prop::MIN_HEIGHT).unwrap_or(0.)) - extra[1]).max(0.)
+                });
             let height =
-                if slot.is_some() || style.get(Prop::HEIGHT).is_some_and(|v| v != "auto") {
+                if slot.is_some() || !auto_height {
                     Some(content[1])
+                } else if ratio.is_some() {
+                    definite = ratio.unwrap_or_default();
+                    ratio
                 } else if let Some(insets) = stretched {
-                    Some((containing[1] - insets - margin[0] - margin[2] - vertical).max(0.))
+                    definite = (containing[1] - insets - margin[0] - margin[2] - vertical).max(0.);
+                    Some(definite)
                 } else if flexed {
                     let height =
                         view.host.borrow().dom.get(&view.id).and_then(|state| {
@@ -6041,6 +6106,28 @@ fn create(
         };
         if let Some(grid) = &grid {
             el = el.flex().flex_col();
+            for (index, item) in items.iter_mut().enumerate() {
+                let key = !(id * 2 + index);
+                let Ok(at) = grid.cells.binary_search_by_key(&key, |cell| cell.0) else {
+                    continue;
+                };
+                let Some((order, decoration, margin)) = item.take() else {
+                    continue;
+                };
+                let mut bounds = grid.cells[at].2;
+                bounds[0] += padding[3];
+                bounds[1] += padding[0];
+                let Child::Node(placed) = place(decoration.into(), margin, pixel_ratio, bounds)
+                else {
+                    continue;
+                };
+                // `::after` paints after the children.
+                if index == 0 {
+                    el = el.child(*placed);
+                } else {
+                    *item = Some((order, *placed, margin));
+                }
+            }
             el = match widest {
                 Some(widest) => el.child(renderer::node().measure(
                     widest,
@@ -6062,12 +6149,13 @@ fn create(
                     + borders[1]
                     + borders[3])),
             };
-            let auto = style.get(Prop::HEIGHT).is_none_or(|v| v == "auto");
-            let rows = grid.rows.iter().sum::<f32>()
-                + grid.rows.len().saturating_sub(1) as f32 * grid.gap[1];
+            let rows = (grid.rows.iter().sum::<f32>()
+                + grid.rows.len().saturating_sub(1) as f32 * grid.gap[1])
+                .max(definite);
             let vertical = padding[0] + padding[2] + borders[0] + borders[2];
-            if auto && !flexed && !(pseudo_items && grid.cells.is_empty()) {
+            if auto_height && !flexed {
                 el = el.h(px(rows + vertical));
+                el.style().aspect_ratio = None;
             }
             // Absolute grid items need an in-flow content-height box for flex basis and min-height: auto.
             // Previously stretched rows cannot provide it.
@@ -6098,7 +6186,7 @@ fn create(
                     id,
                     [
                         content[0] + padding[1] + padding[3],
-                        if auto { rows } else { content[1] } + padding[0] + padding[2],
+                        if auto_height { rows } else { content[1] } + padding[0] + padding[2],
                     ],
                 );
             }
@@ -6193,13 +6281,16 @@ fn create(
             && !all_inline
             && display != "inline"
             && if flexbox {
-                wrap || style
-                    .get(Prop::FLEX_DIRECTION)
-                    .is_some_and(|v| v == "column")
-                    && style.get(Prop::FLEX_WRAP).is_none_or(|v| v == "nowrap")
-                    && style
-                        .get(Prop::JUSTIFY_CONTENT)
-                        .is_none_or(|v| matches!(v, "normal" | "flex-start" | "start" | "stretch"))
+                // An ordered pseudo-element goes between the children, maybe inside a run.
+                items.iter().flatten().all(|(order, ..)| *order == 0)
+                    && (wrap
+                        || style
+                            .get(Prop::FLEX_DIRECTION)
+                            .is_some_and(|v| v == "column")
+                            && style.get(Prop::FLEX_WRAP).is_none_or(|v| v == "nowrap")
+                            && style.get(Prop::JUSTIFY_CONTENT).is_none_or(|v| {
+                                matches!(v, "normal" | "flex-start" | "start" | "stretch")
+                            }))
             } else {
                 // Floats are uncullable, so a run of blocks becomes a spacer only between them.
                 flow
@@ -6325,6 +6416,9 @@ fn create(
         if let (Some(grid), Some(zone)) = (&grid, &build.zone) {
             if let Some(dom) = view.host.borrow().dom.get(&view.id) {
                 for &(child, _, [x, y, width, height], _) in &grid.cells {
+                    if super::grid::pseudo_item(child).is_some() {
+                        continue;
+                    }
                     let placed = dom.cull.placed.get(child).copied().unwrap_or_default();
                     let [top, right, bottom, left] = placed.2;
                     // Compare unsnapped cell sizes: layout snaps them later.
@@ -6411,6 +6505,29 @@ fn create(
         let mut item_margins = rustc_hash::FxHashMap::<*const style::Style, [f32; 4]>::default();
         let (mut scanned, mut last_flow, mut seen, mut flowed) = (0, None, 0, false);
         for (index, &child) in children.iter().enumerate() {
+            // Flex places a pseudo-element before the children of a higher order, and `::before` also before
+            // those of its own.
+            if flexbox && items.iter().any(Option::is_some) {
+                let order = styles.values[child]
+                    .get(Prop::ORDER)
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(0);
+                let first = usize::from(
+                    items[1]
+                        .as_ref()
+                        .zip(items[0].as_ref())
+                        .is_some_and(|((after, ..), (before, ..))| after < before),
+                );
+                for pending in [first, 1 - first] {
+                    if items[pending]
+                        .as_ref()
+                        .is_some_and(|(own, ..)| *own < order || pending == 0 && *own == order)
+                        && let Some((_, decoration, _)) = items[pending].take()
+                    {
+                        place!(decoration, None);
+                    }
+                }
+            }
             if index != joined && shown(index) {
                 if let Some((slots, runs, then, zone)) = plan.as_mut()
                     && let Some(&slot) = slots.get(index).filter(|&&slot| slot > 0)
@@ -6490,7 +6607,21 @@ fn create(
                     .as_ref()
                     .filter(|_| view.patches.borrow().contains_key(&child))
                     .cloned();
-                let child_element = element(build, child, content, container, placement);
+                // The containing block of a positioned child is the padding box.
+                let positioned = match styles.values[child].get(Prop::POSITION) {
+                    Some("absolute") => made.absolute,
+                    Some("fixed") => made.fixed,
+                    _ => false,
+                };
+                let containing = if positioned {
+                    [
+                        content[0] + padding[1] + padding[3],
+                        content[1] + padding[0] + padding[2],
+                    ]
+                } else {
+                    content
+                };
+                let child_element = element(build, child, containing, container, placement);
                 if bounds.is_some()
                     && let Child::Kept(_) = child_element
                     && let Some(patch) = view.patches.borrow_mut().get_mut(&child)
@@ -6768,10 +6899,19 @@ fn create(
         }
         el = el.children(floating);
     }
+    after.extend(
+        items
+            .into_iter()
+            .flatten()
+            .map(|(order, decoration, _)| (order, decoration)),
+    );
     after.sort_by_key(|(order, _)| *order);
     el = el.children(after.into_iter().map(|(_, decoration)| decoration));
-    if slot.is_some() && flow && style::role(styles, id) == style::CELL {
+    let cell = slot.is_some() && style::role(styles, id) == style::CELL;
+    // As in browsers, a button centers its content in its height.
+    if flow && (cell || node.tag == "button") {
         let align = match style.get(Prop::VERTICAL_ALIGN) {
+            _ if !cell => Some(renderer::AlignContent::Center),
             Some("middle") => Some(renderer::AlignContent::Center),
             Some("bottom") => Some(renderer::AlignContent::FlexEnd),
             _ => None,
@@ -7389,6 +7529,10 @@ pub(super) fn pseudo_content(
                 );
             }
         }
+    }
+    if let Some(mode) = pseudo.get(Prop::TEXT_TRANSFORM) {
+        let len = text.len();
+        style::text_transform(&mut text, 0..len, mode);
     }
     text
 }

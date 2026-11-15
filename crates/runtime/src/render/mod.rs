@@ -628,7 +628,7 @@ impl PageView {
         {
             styles = crate::dom::styles(&mut doc, dom, [width, height]);
         }
-        let children: Vec<_> = styles
+        let mut children: Vec<_> = styles
             .children
             .iter()
             .map(|(&node, children)| (node, doc.nodes.compose_children(node, children.clone())))
@@ -779,7 +779,14 @@ impl PageView {
         let mut lengths = Vec::new();
         if !dom.motion.custom.is_empty() {
             dom.animated = std::mem::take(&mut dom.motion.custom);
+            // Styles match the light tree, so the composed children step aside for this pass.
+            for (node, light) in children.iter_mut().rev() {
+                *light = doc.nodes.compose_children(*node, std::mem::take(light));
+            }
             let restyled = crate::dom::styles(&mut doc, dom, [width, height]);
+            for (node, composed) in children.iter_mut() {
+                *composed = doc.nodes.compose_children(*node, std::mem::take(composed));
+            }
             lengths = (0..restyled.values.len().min(styles.values.len()))
                 .filter_map(|id| {
                     let new = *restyled.lengths.get(id)?;
@@ -1280,20 +1287,32 @@ impl PageView {
                     }
                     _ => cull::content(node),
                 };
-                let restyled =
-                    old.is_none_or(|old| !Rc::ptr_eq(&old.style, style) || old.shape != shape);
+                let pseudos = styles.pseudos.get(&id);
+                let repseudoed = |old: &crate::dom::LayoutNode| match (&old.pseudos, pseudos) {
+                    (Some(old), Some(new)) => !Rc::ptr_eq(old, new),
+                    (old, new) => old.is_some() != new.is_some(),
+                };
+                let restyled = old.is_none_or(|old| {
+                    !Rc::ptr_eq(&old.style, style) || repseudoed(old) || old.shape != shape
+                });
                 let own = restyled || old.is_some_and(|old| old.attrs != attrs);
+                // Pseudo-elements are boxes of the element, and grid items.
                 let reshaped = old.is_none_or(|old| {
                     old.shape != shape
                         || !Rc::ptr_eq(&old.style, style)
                             && (old.units != units(&styles.lengths[id])
                                 || !cull::cosmetic(&old.style, style))
+                        || repseudoed(old)
+                            && !old.pseudos.as_ref().zip(pseudos).is_some_and(|(old, new)| {
+                                old.iter()
+                                    .zip(new.iter())
+                                    .all(|(old, new)| cull::cosmetic(old, new))
+                            })
                 });
                 let (flags, marks) = match old {
                     Some(old) if !restyled => (old.flags, old.marks),
                     _ => {
                         let flags = own_flags(&node.tag, style, id);
-                        let pseudos = styles.pseudos.get(&id);
                         // List every tag with unrecorded sibling, row, counter or quote dependencies.
                         let framed = matches!(
                             node.tag.as_str(),
@@ -1379,6 +1398,7 @@ impl PageView {
                         attrs,
                         seen: revision,
                         style: style.clone(),
+                        pseudos: pseudos.cloned(),
                         units: units(&styles.lengths[id]),
                         list,
                         kids,
@@ -1393,6 +1413,7 @@ impl PageView {
                     old.seen = revision;
                     if repainted {
                         old.style = style.clone();
+                        old.pseudos = pseudos.cloned();
                     }
                 }
                 let layout = dom.layout_nodes[id].as_ref();
@@ -2684,13 +2705,25 @@ fn drop_hidden_images(
             false
         }
     });
-    dom.masks.retain(|id, (_, image)| {
-        visible.get(*id) == Some(&true) || {
-            if let Some(image) = image {
-                release(image.clone());
+    dom.masks.retain(|&(id, slot), (_, image)| {
+        visible.get(id) == Some(&true)
+            && (slot == 0
+                || styles
+                    .pseudos
+                    .get(&id)
+                    .and_then(|pseudos| pseudos.get(usize::from(slot) - 1))
+                    .and_then(|style| {
+                        [Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]
+                            .into_iter()
+                            .find_map(|prop| style.get(prop))
+                    })
+                    .is_some_and(|value| value != "none"))
+            || {
+                if let Some(image) = image {
+                    release(image.clone());
+                }
+                false
             }
-            false
-        }
     });
     for (id, canvas) in &dom.canvases {
         if canvas.present && visible.get(*id) != Some(&true) {
@@ -2860,14 +2893,15 @@ mod tests {
         };
         let decoded = image(4);
         dom.svgs.insert(img, ("a.svg".into(), image(200)));
-        dom.masks.insert(span, ("m.svg".into(), Some(image(8))));
+        dom.masks
+            .insert((span, 0), ("m.svg".into(), Some(image(8))));
         dom.backgrounds
             .insert((span, 0), ("b.png".into(), decoded.clone()));
         dom.bitmaps.insert("b.png".into(), decoded);
         let ids = |dom: &crate::dom::State| {
             [
                 dom.svgs[&img].1.id,
-                dom.masks[&span].1.as_ref().unwrap().id,
+                dom.masks[&(span, 0)].1.as_ref().unwrap().id,
                 dom.backgrounds[&(span, 0)].1.id,
             ]
         };

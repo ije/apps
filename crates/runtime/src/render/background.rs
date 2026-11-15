@@ -571,7 +571,7 @@ pub(super) fn css_background(
         else {
             continue;
         };
-        let strip = super::effects::gradient_axis(&kind, &body);
+        let strip = super::effects::gradient_axis(&kind, &body, &units);
         let view = view.clone();
         layers.push(layer(paint(canvas, move |bounds, _, window| {
             let (bounds, clip) = areas(bounds, window);

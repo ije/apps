@@ -3498,6 +3498,476 @@ fn table_parts_without_a_table_get_an_anonymous_table_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn buttons_center_their_content_in_a_set_height() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        console.log('TOPS ' + await run("JSON.stringify([...document.querySelectorAll('button')].map(button => button.firstElementChild.getBoundingClientRect().y - button.getBoundingClientRect().y))"));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0'><style>button{height:44px;padding:0;border:0;font:10px/12px Helvetica}\
+             i,b{display:block;height:12px}u{display:inline-block;width:10px;height:12px;vertical-align:top}</style>\
+             <button><i></i></button><button style='display:block'><u></u></button>\
+             <button style='display:block'><i></i><b></b></button><button style='display:flex'><i></i></button>\
+             <button style='display:grid'><i></i></button><button style='display:block;height:auto'><i></i></button></body>",
+        )],
+    );
+    let tops = text
+        .lines()
+        .find_map(|line| line.strip_prefix("TOPS "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's values: a flex or grid button aligns its content like other flex and grid boxes.
+    assert_eq!(tops, "[16,16,10,0,0,0]");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn flex_items_behind_contents_boxes_size_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        const boxes = "[...document.querySelectorAll('[id]')].map(e => { const r = e.getBoundingClientRect(); return e.id + ':' + r.x + '+' + r.width }).join(' ')";
+        const out = [await run(boxes)];
+        for (const change of ["w.insertAdjacentHTML('beforeend', '<div id=e class=g><i></i></div>')", "w.style.display = 'block'", "w.style.display = ''"]) {
+            await run("{ const w = document.getElementById('w'); " + change + " }");
+            await win.webContents.capturePage();
+            out.push(await run(boxes));
+        }
+        console.log('BOXES ' + out.join(' | '));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0'><style>.c{display:contents}.g{display:grid}.g>i{display:block;width:72px;height:10px}.f{display:flex}</style>\
+             <div class=f><div class=c><div class=c><div id=a><div class=g><i></i></div></div></div></div><div id=b style='width:50px;height:10px'></div></div>\
+             <div class=f><div class=c id=w><div id=c class=g><i></i></div></div><div id=d style='width:50px;height:10px'></div></div></body>",
+        )],
+    );
+    let boxes = text
+        .lines()
+        .find_map(|line| line.strip_prefix("BOXES "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's values: a flex item sizes by its content whether or not a contents box wraps it.
+    assert_eq!(
+        boxes,
+        "a:0+72 b:72+50 w:0+0 c:0+72 d:72+50 | a:0+72 b:72+50 w:0+0 c:0+72 e:72+72 d:144+50 | \
+         a:0+72 b:72+50 w:0+72 c:0+72 e:0+72 d:72+50 | a:0+72 b:72+50 w:0+0 c:0+72 e:72+72 d:144+50"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn grids_with_content_sized_heights_fit_their_rows_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        const boxes = "[...document.querySelectorAll('[id]')].map(e => { const r = e.getBoundingClientRect(); return e.id + ':' + [r.y, r.width, r.height].join(',') }).join(' ')";
+        const out = [await run(boxes)];
+        await run("document.getElementById('a').append(document.createElement('i'))");
+        await win.webContents.capturePage();
+        out.push(await run(boxes));
+        console.log('BOXES ' + out.join(' | '));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0'><style>.g{display:grid}i{display:block;width:40px;height:30px}</style>\
+             <div id=a class=g style='height:fit-content'><i></i></div>\
+             <div id=b class=g style='height:max-content;grid-template-columns:auto auto;gap:5px 7px;padding:3px 4px'><i></i><i></i><i></i></div>\
+             <div id=c class=g style='height:min-content;width:max-content;gap:4px'><i></i><i></i></div>\
+             <div id=d class=g style='height:fit-content;width:fit-content;padding:2px'><i></i></div>\
+             <div id=e class=g style='height:max-content;width:min-content;grid-template-columns:auto auto;gap:3px'><i></i><i></i></div></body>",
+        )],
+    );
+    let boxes = text
+        .lines()
+        .find_map(|line| line.strip_prefix("BOXES "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's values: these heights size a grid like `auto`.
+    assert_eq!(
+        boxes,
+        "a:0,400,30 b:30,400,71 c:101,40,64 d:165,44,34 e:199,83,30 | \
+         a:0,400,60 b:60,400,71 c:131,40,64 d:195,44,34 e:229,83,30"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn positioned_grids_and_popovers_size_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        const boxes = "[...document.querySelectorAll('[id]')].map(e => { const r = e.getBoundingClientRect(); return e.id + ':' + [r.x, r.y, r.width, r.height].join(',') }).join(' ')";
+        console.log('BOXES ' + await run(boxes));
+        await run("document.getElementById('p').remove()");
+        const bytes = (await win.webContents.capturePage({ x: 20, y: 180, width: 1, height: 1 })).toBitmap();
+        console.log('REMOVED ' + [bytes[2], bytes[1], bytes[0]].join(','));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0'><style>.g{display:grid;position:absolute}i{display:block;width:40px;height:30px}\
+             [popover]{margin:0;padding:0;border:0;inset:10px auto auto 8px;background:red}</style>\
+             <div style='position:relative;width:300px;height:200px'>\
+             <div id=a class=g style='left:10px;top:5px'><i></i><i></i></div>\
+             <div id=b class=g style='left:20px;right:30px;top:5px'><i></i></div>\
+             <div id=c class=g style='right:10px;bottom:10px'><i></i></div>\
+             <div id=d class=g style='left:20px;right:30px;top:5px;bottom:15px;width:fit-content;height:fit-content'><i></i></div>\
+             <div id=e class=g style='left:50px;top:20px;bottom:30px'><i></i></div>\
+             <div id=f class=g style='left:60px;top:20px;bottom:30px;height:max-content'><i></i></div></div>\
+             <div id=p popover style='display:grid;height:fit-content;top:150px'><i></i><i></i></div>\
+             <div id=q popover style='display:flex'><i></i><i></i></div>\
+             <div id=r popover style='display:block'><i></i><i></i></div>\
+             <script>for (const id of 'pqr') document.getElementById(id).showPopover()</script></body>",
+        )],
+    );
+    let line = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name))
+            .unwrap_or_else(|| panic!("{text}"))
+    };
+    // Chrome's values: a fit-content grid shrinks to its items, and insets take room from a stretched grid.
+    assert_eq!(
+        line("BOXES "),
+        "a:10,5,40,60 b:20,5,250,30 c:250,160,40,30 d:20,5,40,30 e:50,20,40,150 f:60,20,40,30 \
+         p:8,150,40,60 q:8,10,80,30 r:8,10,40,60"
+    );
+    assert_eq!(line("REMOVED "), "255,255,255");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn replaced_content_paints_above_gradient_backgrounds_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        await run('redraw()');
+        await win.webContents.capturePage();
+        const out = [];
+        for (const [x, y] of [[20, 20], [50, 5], [20, 60], [50, 75], [28, 108], [5, 92], [1, 100], [20, 156], [50, 140], [20, 196], [50, 180]]) {
+            const bytes = (await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap();
+            out.push([bytes[2], bytes[1], bytes[0]].map(value => value > 200 ? 'f' : value < 60 ? '0' : '?').join(''));
+        }
+        console.log('COLORS ' + out.join(' '));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0;background:#fff'><style>canvas,svg{display:block;width:60px;height:40px}</style>\
+             <canvas id=a width=60 height=40 style='background:linear-gradient(#00f,#00f),radial-gradient(#0f0,#0f0)'></canvas>\
+             <canvas id=b width=60 height=40 style='background:linear-gradient(90deg,#00f,#00f) 0 0/20px 20px,#0f0'></canvas>\
+             <canvas id=c width=60 height=40 style='padding:5px;border:3px solid #000;background:linear-gradient(#00f,#00f)'></canvas>\
+             <svg style='background:linear-gradient(#00f,#00f)'><rect x=10 y=10 width=20 height=20 fill=red /></svg>\
+             <canvas id=d width=60 height=40 style='background:conic-gradient(#00f 0 100%)'></canvas>\
+             <script>const draw = (id, color) => { const ctx = document.getElementById(id).getContext('2d'); ctx.fillStyle = color; ctx.fillRect(10, 10, 20, 20) };\
+             for (const id of 'abcd') draw(id, '#f00'); globalThis.redraw = () => { draw('a', '#ff0'); draw('c', '#ff0') }</script></body>",
+        )],
+    );
+    let colors = text
+        .lines()
+        .find_map(|line| line.strip_prefix("COLORS "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's colors: canvas and SVG pixels cover the background layers, also after a redraw.
+    assert_eq!(colors, "ff0 00f f00 00f ff0 00f 000 f00 00f f00 00f");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn svg_grid_items_size_by_their_view_box_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        console.log('SIZES ' + await run("[...'abcde'].map(id => { const r = document.getElementById(id).getBoundingClientRect(); return r.width + 'x' + r.height }).join(' ')"));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0'><style>.g{display:grid;grid-template-columns:auto 1fr}</style>\
+             <div class=g><svg id=a viewBox='-50 -50 100 100' style='width:128px;height:auto'><circle r='40'/></svg><div>x</div></div>\
+             <div class=g><svg id=b viewBox='0 0 100 50' style='width:60px'></svg></div>\
+             <div class=g><svg id=c viewBox='0 0 100 50' width=40></svg></div>\
+             <div class=g><svg id=d viewBox='0 0 100 50' style='height:10px'></svg></div>\
+             <div class=g><svg id=e width=30 height=20></svg></div></body>",
+        )],
+    );
+    let sizes = text
+        .lines()
+        .find_map(|line| line.strip_prefix("SIZES "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's values: the CSS size and the view box ratio give the other side.
+    assert_eq!(sizes, "128x128 60x30 40x20 20x10 30x20");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn offsets_leave_out_transforms_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        console.log('OFFSETS ' + await run("[...'abcde'].map(id => { const e = document.getElementById(id); return [e.offsetLeft, e.offsetTop] }).join(' ') + ' ' + document.getElementById('f').scrollWidth"));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0;font:10px/12px Helvetica'><div style='position:relative;padding:3px'>\
+             <b id=a style='display:block;translate:24px 0'>x</b><b id=b style='display:block;transform:translate(10px,7px)'>x</b>\
+             <b id=c style='display:block;width:20px;scale:2;translate:0 5px'>x</b>\
+             <b id=d style='display:block;width:20px;rotate:180deg;translate:4px 4px'>x</b>\
+             <div style='display:flex;translate:5px 6px'><b id=e style='margin-left:7px'>x</b></div>\
+             <div id=f style='width:100px;translate:3px 0'><i style='display:block;width:500px;height:1px'></i></div></div></body>",
+        )],
+    );
+    let offsets = text
+        .lines()
+        .find_map(|line| line.strip_prefix("OFFSETS "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's values: offsets are layout positions, and a translated box still reaches its children.
+    assert_eq!(offsets, "3,3 3,15 3,27 3,39 7,0 500");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn positioned_boxes_fill_aspect_ratio_and_padding_boxes_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        console.log('SIZES ' + await run("[...'abcdefg'].map(id => { const r = document.getElementById(id).getBoundingClientRect(); return r.width + 'x' + r.height }).join(' ')"));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0'><style>.r{position:relative}.a{position:absolute;inset:0;display:grid}.a>i{display:block;height:22px}</style>\
+             <div class=r style='width:100px;aspect-ratio:1/1'><div id=a class=a><i></i></div></div>\
+             <div class=r style='width:200px;aspect-ratio:2;padding:5px;border:3px solid;box-sizing:border-box'><div id=b class=a style='bottom:10px'><i></i></div></div>\
+             <div class=r style='width:100px;aspect-ratio:1/2;max-height:150px'><div id=c class=a></div></div>\
+             <div class=r style='width:100px;aspect-ratio:1/1'><div id=d style='height:50%'></div></div>\
+             <div class=r style='width:200px;height:60px;padding:10px 20px'><div id=e style='position:absolute;width:50%;height:50%'></div><div id=f class=a></div></div>\
+             <div style='width:152px'><div class=r style='aspect-ratio:1/1'><div id=g class=a style='box-sizing:border-box;padding:16px'><b style='display:none'></b></div></div></div></body>",
+        )],
+    );
+    let sizes = text
+        .lines()
+        .find_map(|line| line.strip_prefix("SIZES "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's values: an aspect ratio gives a height, positioned children fill the padding box, and a grid
+    // without rows keeps the height of its insets.
+    assert_eq!(sizes, "100x100 194x84 100x150 100x50 120x40 240x80 152x152");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn conic_gradients_take_math_angles_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        const out = [];
+        for (const box of [0, 100, 200]) for (const [x, y] of [[75, 25], [25, 25], [25, 75], [75, 75]]) {
+            const bytes = (await win.webContents.capturePage({ x: box + x, y, width: 1, height: 1 })).toBitmap();
+            out.push([bytes[2], bytes[1], bytes[0]].map(value => value > 200 ? 'f' : value < 60 ? '0' : '?').join(''));
+        }
+        console.log('COLORS ' + out.join(' '));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0;background:#fff'><style>div>i{display:block;width:100px;height:100px}</style><div style='display:flex'>\
+             <i style='background:conic-gradient(red calc(0.25 * 360deg), transparent 0)'></i>\
+             <i style='background:conic-gradient(red calc(0.25 * 360deg - 0.4deg), transparent calc(0.25 * 360deg + 0.4deg))'></i>\
+             <i style='--share:0.25;background:conic-gradient(red calc(var(--share) * 360deg), transparent 0)'></i></div></body>",
+        )],
+    );
+    let colors = text
+        .lines()
+        .find_map(|line| line.strip_prefix("COLORS "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's colors: red fills the first quarter of the turn only.
+    assert_eq!(colors, ["f00 fff fff fff"; 3].join(" "));
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn animated_custom_properties_restyle_slotted_children() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        for (let n = 0; n < 4; n++) await win.webContents.capturePage();
+        console.log('WIDTH ' + await run("document.getElementById('a').getBoundingClientRect().width"));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0'><style>@property --w{syntax:'<length>';inherits:false;initial-value:0px}\
+             @keyframes grow{from{--w:10px}to{--w:90px}}#a{display:block;height:20px;width:var(--w);animation:grow 1s linear infinite}</style>\
+             <div id=h><span id=a></span></div>\
+             <script>document.getElementById('h').attachShadow({mode:'open'}).innerHTML='<p><slot></slot></p>'</script></body>",
+        )],
+    );
+    let width: f32 = text
+        .lines()
+        .find_map(|line| line.strip_prefix("WIDTH "))
+        .and_then(|width| width.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!((10. ..=90.).contains(&width), "{text}");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn pseudo_elements_are_grid_and_flex_items_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        const colors = async points => {
+            const out = [];
+            for (const [x, y] of points) {
+                const bytes = (await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap();
+                out.push([bytes[2], bytes[1], bytes[0]].map(value => value > 200 ? 'f' : value < 60 ? '0' : '?').join(''));
+            }
+            return out.join(' ');
+        };
+        const before = await colors([[20, 20], [70, 10], [70, 30], [120, 10], [120, 35], [155, 20], [185, 20], [205, 5], [235, 5], [235, 35], [205, 35], [15, 55], [15, 75], [105, 70], [115, 70], [125, 70], [135, 70], [155, 70]]);
+        const toggled = [];
+        for (const change of ["remove('n')", "add('n')"]) {
+            await run("document.getElementById('t').classList." + change);
+            await win.webContents.capturePage();
+            toggled.push(await colors([[70, 55], [70, 85]]));
+        }
+        console.log('COLORS ' + before + ' | ' + toggled.join(' | '));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0;background:#fff;font:10px/12px Helvetica'><style>.g{display:grid;width:40px;height:40px;float:left;margin:0 10px 10px 0;background:#eee}\
+             .g::before{content:'';background:#f00}.g>i,.f>i{display:block;background:#00f}.h{grid-template-rows:1fr 1fr}\
+             .d::before{grid-row:1/3;grid-column:1}.d>i{grid-row:1;grid-column:1;margin:5px;height:10px;z-index:1;background:#ff0}.d>b{grid-row:2;grid-column:1;display:block;height:10px}\
+             .c{grid-template-columns:1fr 1fr}.o::before{order:1}.e::before{grid-column:2;grid-row:2}.e::after{content:'';background:#0c0;grid-area:1/1}.n::before{content:none}\
+             .ig{display:inline-grid;float:left;margin:0 20px 10px 0}.ig::before{content:'';width:30px;height:20px;background:#f00}.ig>i{display:block;width:30px;height:10px;background:#00f}\
+             .f{display:flex;width:40px;height:40px;float:left;margin:0 10px 10px 0;background:#eee}.f::before{content:'';background:#f00;width:10px;order:1}\
+             .f::after{content:'';background:#0c0;width:10px;order:-1}.f>i{width:10px}</style>\
+             <div class=g></div><div class='g h'><i></i></div><div class='g d'><i></i><b></b></div><div class='g c o'><i></i></div><div class='g c h e'><i></i></div>\
+             <div style='clear:both'></div><span class=ig><i></i></span><div id=t class='g h n'><i></i></div><div class=f><i></i></div><div class='g c'>x</div></body>",
+        )],
+    );
+    let colors = text
+        .lines()
+        .find_map(|line| line.strip_prefix("COLORS "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's colors: `::before` and `::after` are the first and last items, and take the grid and flex
+    // properties. A grid with only a pseudo-element fills its cell with it.
+    assert_eq!(
+        colors,
+        "f00 f00 00f ff0 f00 00f f00 0f0 00f f00 fff f00 00f 0f0 00f f00 fff f00 | f00 00f | 00f fff"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn grids_stretch_in_flex_rows_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        console.log('BOXES ' + await run("[...'abcde'].map(id => { const r = document.getElementById(id).getBoundingClientRect(); return r.y + '+' + r.height }).join(' ')"));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0'><style>i{display:block;height:10px}</style>\
+             <div style='display:flex;height:100px'><div id=a style='display:grid'><i></i></div>\
+             <div id=b style='display:inline-grid;grid-template-rows:1fr 1fr'><i></i><i id=c></i></div>\
+             <div id=d style='display:grid;align-self:center'><i></i></div></div>\
+             <div style='display:flex'><div id=e style='display:grid'><i></i></div><div style='height:40px;width:5px'></div></div></body>",
+        )],
+    );
+    let boxes = text
+        .lines()
+        .find_map(|line| line.strip_prefix("BOXES "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's values: `align-items: normal` stretches a grid to its line, and its rows fill it.
+    assert_eq!(boxes, "0+100 0+100 50+10 45+10 100+40");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn grids_take_their_height_from_aspect_ratio_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        console.log('BOXES ' + await run("[...'abcde'].map(id => { const r = document.getElementById(id).getBoundingClientRect(); return r.y + ':' + r.width + 'x' + r.height }).join(' ')"));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0'><style>i{display:block;height:10px}</style><div style='width:300px'>\
+             <div id=a style='display:grid;aspect-ratio:2.5/1'><i></i></div><div id=b style='display:grid;aspect-ratio:2/1;padding:10px'><i></i></div>\
+             <div id=c style='display:grid;aspect-ratio:3/1;grid-template-rows:1fr 1fr'><i></i><i id=d></i></div>\
+             <div id=e style='display:grid;aspect-ratio:4/1;width:100px'><i style='height:40px'></i></div></div></body>",
+        )],
+    );
+    let boxes = text
+        .lines()
+        .find_map(|line| line.strip_prefix("BOXES "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's values: the width gives the height of the content box, and taller rows make the box taller.
+    assert_eq!(
+        boxes,
+        "0:300x120 120:300x160 280:300x100 330:300x10 380:100x40"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn pseudo_element_text_transforms_and_fits_its_content_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        const widths = await run("[...'abcdef'].map(id => Math.round(document.getElementById(id).getBoundingClientRect().width)).join(' ')");
+        const out = [];
+        for (const x of [75, 80, 88, 93]) {
+            const bytes = (await win.webContents.capturePage({ x, y: 145, width: 1, height: 1 })).toBitmap();
+            out.push([bytes[2], bytes[1], bytes[0]].map(value => value > 200 ? 'f' : value < 60 ? '0' : '?').join(''));
+        }
+        console.log('RESULT ' + widths + ' | ' + out.join(' '));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0;background:#fff'><style>.f{float:left;clear:left;font:20px Helvetica}.u::before{content:'off';text-transform:uppercase}\
+             .l::before{content:'OFF';text-transform:lowercase}.c::before{content:'ab cd';text-transform:capitalize}\
+             .s{position:relative;clear:left;margin-left:100px;width:50px;height:20px;background:#ccc}\
+             .s::before{content:'XX';position:absolute;top:0;right:calc(100% + 10px);font:10px monospace;color:transparent;background:#f00}</style>\
+             <div id=a class='f u'></div><div id=b class='f l'></div><div id=c class='f c'></div>\
+             <div id=d class='f'>OFF</div><div id=e class='f'>off</div><div id=f class='f'>Ab Cd</div><div class=s></div></body>",
+        )],
+    );
+    let result = text
+        .lines()
+        .find_map(|line| line.strip_prefix("RESULT "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's values: the content takes `text-transform`, and a box outside the left edge keeps its text.
+    assert_eq!(result, "40 22 56 40 22 56 | fff f00 f00 fff");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn masks_place_and_repeat_image_layers_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        const out = [];
+        for (const [x, y] of [[15, 5], [100, 5], [185, 5], [15, 25], [100, 25], [185, 25], [15, 45], [28, 45], [40, 45], [50, 45], [100, 45]]) {
+            const bytes = (await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap();
+            out.push([bytes[2], bytes[1], bytes[0]].map(value => value > 200 ? 'f' : value < 60 ? '0' : '?').join(''));
+        }
+        console.log('COLORS ' + out.join(' '));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0;background:#fff'><style>.m{position:relative;width:200px;height:10px;margin-bottom:10px}\
+             .b,.p::before{position:absolute;inset:2px 8px;background:#f00;\
+             mask:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 22 6'%3E%3Cpath d='M0 0H22V6H0Z'/%3E%3C/svg%3E\") left center / 22px 6px no-repeat,\
+             url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 22 6'%3E%3Cpath d='M0 0H22V6H0Z'/%3E%3C/svg%3E\") right center / 22px 6px no-repeat}\
+             .p::before{content:''}.r{position:absolute;inset:2px 8px;background:#00f;\
+             mask:url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 22 6'%3E%3Cpath d='M0 0H11V6H0Z'/%3E%3C/svg%3E\") 4px 0 / 22px 6px repeat-x}</style>\
+             <div class=m><div class=b></div></div><div class='m p'></div><div class=m><div class=r></div></div></body>",
+        )],
+    );
+    let colors = text
+        .lines()
+        .find_map(|line| line.strip_prefix("COLORS "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's colors: each image layer has its size, place and repeat, also on a pseudo-element.
+    assert_eq!(colors, "f00 fff f00 f00 fff f00 00f fff 00f fff 00f");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn border_images_replace_the_border_and_follow_changes_like_chrome() {
     run_hidden(
         r#"

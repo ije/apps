@@ -49,6 +49,9 @@ pub(crate) type SvgBoxes = (
     [f32; 4],
 );
 
+// The mask of a box, 0, or of its `::before` or `::after`, 1 and 2: its inputs and its image.
+pub(crate) type Mask = (String, Option<Arc<renderer::RenderImage>>);
+
 type Decoded = Result<Result<renderer::RenderImage, (String, [f32; 2])>>;
 
 pub(crate) struct LayoutNode {
@@ -56,6 +59,7 @@ pub(crate) struct LayoutNode {
     pub attrs: u64,
     pub seen: u64,
     pub style: Rc<style::Style>,
+    pub pseudos: Option<Rc<[style::Style; 2]>>,
     pub units: u64,
     pub list: u64,
     pub kids: u64,
@@ -509,7 +513,7 @@ const MIRROR_POSITIONED: u8 = 8;
 const MIRROR_HIDDEN: u8 = 16;
 const MIRROR_FIXED: u8 = 32;
 const MIRROR_INERT: u8 = 64;
-// The box or an ancestor has a transform that changes its size, so the bounds are not its layout box.
+// The box has a transform, or an ancestor has one that changes its size, so the bounds are not its layout box.
 const MIRROR_TRANSFORMED: u8 = 128;
 const HIDDEN: u8 = 1;
 const EDITABLE: u8 = 2;
@@ -769,7 +773,7 @@ pub struct State {
     pub(crate) svg_boxes: rustc_hash::FxHashMap<usize, SvgBoxes>,
     pub(crate) svg_trees: rustc_hash::FxHashMap<usize, usvg::Tree>,
     pub(crate) svg_images: rustc_hash::FxHashMap<usize, (Rc<str>, [f32; 2])>,
-    pub(crate) masks: rustc_hash::FxHashMap<usize, (String, Option<Arc<renderer::RenderImage>>)>,
+    pub(crate) masks: rustc_hash::FxHashMap<(usize, u8), Mask>,
     pub(crate) svgs: rustc_hash::FxHashMap<usize, (Rc<str>, Arc<renderer::RenderImage>)>,
     pub(crate) svg_cache: HashMap<
         Rc<str>,
@@ -1597,9 +1601,11 @@ pub fn call(
                         .map(|(_, image)| image)
                         .filter(|image| Arc::strong_count(image) == 1),
                 );
-                state
-                    .retired
-                    .extend(state.masks.remove(&id).and_then(|(_, image)| image));
+                for slot in 0..3 {
+                    state
+                        .retired
+                        .extend(state.masks.remove(&(id, slot)).and_then(|(_, image)| image));
+                }
                 state.svg_sources.remove(&id);
                 state.svg_boxes.remove(&id);
                 state.svg_trees.remove(&id);

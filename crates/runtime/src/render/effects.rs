@@ -795,14 +795,13 @@ pub(crate) fn corners(radii: [f32; 4]) -> Corners<Pixels> {
     }
 }
 
-fn angle(value: &str) -> Option<f32> {
-    let number = |unit: &str| value.strip_suffix(unit).and_then(|v| v.parse::<f32>().ok());
-    number("deg")
-        .or_else(|| number("grad").map(|v| v * 0.9))
-        .or_else(|| number("rad").map(f32::to_degrees))
-        .or_else(|| number("turn").map(|v| v * 360.))
-        .or((value == "0").then_some(0.))
-        .filter(|v| v.is_finite())
+fn angle(value: &str, units: &Lengths) -> Option<f32> {
+    units
+        .math(value, 0., &[])
+        .filter(|(value, kind)| {
+            *kind == parser::Kind::Angle || *kind == parser::Kind::Number && *value == 0.
+        })
+        .map(|(value, _)| value as f32)
 }
 
 fn first_argument(body: &str) -> (String, Option<String>) {
@@ -829,7 +828,7 @@ fn first_argument(body: &str) -> (String, Option<String>) {
     }
 }
 
-pub(crate) fn gradient_axis(kind: &str, body: &str) -> Option<usize> {
+pub(crate) fn gradient_axis(kind: &str, body: &str, units: &Lengths) -> Option<usize> {
     if kind.trim_start_matches("repeating-") != "linear-gradient" {
         return None;
     }
@@ -842,7 +841,7 @@ pub(crate) fn gradient_axis(kind: &str, body: &str) -> Option<usize> {
             "left" => 270.,
             _ => return None,
         },
-        None => angle(&first).unwrap_or(180.),
+        None => angle(&first, units).unwrap_or(180.),
     };
     match degrees.rem_euclid(180.) {
         0. => Some(1),
@@ -977,7 +976,7 @@ fn gradient_stops<S: AsRef<str>>(
             // A lone position between two colors moves their midpoint.
             if let [token] = tokens.as_slice()
                 && !stops.is_empty()
-                && let Some(offset) = units.resolve(token, extent).or_else(|| angle(token))
+                && let Some(offset) = units.resolve(token, extent).or_else(|| angle(token, units))
             {
                 hints.push(stops.len());
                 stops.push((Some(offset), (0, 0)));
@@ -987,7 +986,7 @@ fn gradient_stops<S: AsRef<str>>(
         let offsets: Vec<f32> = tokens
             .iter()
             .filter(|token| style::color(token).is_none())
-            .filter_map(|token| units.resolve(token, extent).or_else(|| angle(token)))
+            .filter_map(|token| units.resolve(token, extent).or_else(|| angle(token, units)))
             .take(2)
             .collect();
         if offsets.is_empty() {
@@ -1176,7 +1175,7 @@ pub(crate) fn gradient_svg(
                     (_, _, true, _) => 270.,
                     _ => 90.,
                 }
-            } else if let Some(degrees) = angle(first) {
+            } else if let Some(degrees) = angle(first, &units) {
                 prelude = true;
                 degrees
             } else if space.is_some() && !first.is_empty() {
@@ -1261,7 +1260,7 @@ pub(crate) fn gradient_svg(
                 from = start
                     .trim()
                     .strip_prefix("from")
-                    .and_then(|v| angle(v.trim()))
+                    .and_then(|v| angle(v.trim(), &units))
                     .unwrap_or(0.);
                 let [cx, cy, _] = origin(at, &units, [tw, th]);
                 center = (cx, cy);
@@ -1402,7 +1401,15 @@ pub(crate) fn gradient_svg(
             )
         }
     };
-    let body = match repeat.split_whitespace().next().unwrap_or("repeat") {
+    let body = tiled(repeat, [tw, th], [x, y], &content);
+    Some(format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{body}</svg>"
+    ))
+}
+
+/// SVG that repeats `content`, a tile of `size` at `at`, over the area.
+pub(super) fn tiled(repeat: &str, [tw, th]: [f32; 2], [x, y]: [f32; 2], content: &str) -> String {
+    match repeat.split_whitespace().next().unwrap_or("repeat") {
         "no-repeat" => format!("<g transform=\"translate({x} {y})\">{content}</g>"),
         kind => {
             let rect = match kind {
@@ -1414,10 +1421,7 @@ pub(crate) fn gradient_svg(
                 "<defs><pattern id=\"p\" patternUnits=\"userSpaceOnUse\" width=\"{tw}\" height=\"{th}\" x=\"{x}\" y=\"{y}\">{content}</pattern></defs><rect {rect} fill=\"url(#p)\"/>"
             )
         }
-    };
-    Some(format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{body}</svg>"
-    ))
+    }
 }
 
 pub(super) fn push_bits(key: &mut String, size: [f32; 2], units: &Lengths) {
@@ -1750,12 +1754,35 @@ mod tests {
                 "to top, red, blue 9px",
                 Some(1),
             ),
+            ("linear-gradient", "calc(0.25 * 360deg), red, blue", Some(0)),
             ("linear-gradient", "45deg, red, blue", None),
             ("linear-gradient", "to bottom right, red, blue", None),
             ("radial-gradient", "red, blue", None),
         ] {
-            assert_eq!(gradient_axis(kind, body), axis, "{kind}({body})");
+            let units = Lengths::new(16., 800., 600.);
+            assert_eq!(gradient_axis(kind, body, &units), axis, "{kind}({body})");
         }
+    }
+
+    #[test]
+    fn gradient_stops_take_math_angles() {
+        let units = Lengths::new(16., 800., 600.);
+        let offsets = |parts: &[&str]| {
+            gradient_stops(parts, false, &units, 360.)
+                .unwrap()
+                .iter()
+                .map(|(offset, _)| offset.round())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(offsets(&["red calc(0.25 * 360deg)", "blue 0"]), [90., 90.]);
+        assert_eq!(
+            offsets(&[
+                "red calc(0.25 * 360deg - 1deg)",
+                "blue calc(0.5turn + 1deg)"
+            ]),
+            [89., 181.]
+        );
+        assert_eq!(offsets(&["red 0", "blue 25%", "green"]), [0., 90., 360.]);
     }
 
     #[test]

@@ -534,6 +534,19 @@ pub(crate) fn intrinsic(
     text: &renderer::TextSystem,
     measured: &mut Measurements,
 ) -> [f32; 4] {
+    if let Some((parent, index)) = pseudo_item(id) {
+        return pseudo_size(
+            doc,
+            parent,
+            index,
+            styles,
+            width.unwrap_or(0.),
+            width,
+            text,
+            measured.pixel_ratio,
+        )
+        .unwrap_or_default();
+    }
     let key = (id, width.map(f32::to_bits), height.map(f32::to_bits));
     if let Some(value) = measured.sizes.get(&key) {
         return *value;
@@ -656,25 +669,24 @@ pub(crate) fn intrinsic(
         content = [width, width, height];
     } else if node.tag == "svg" {
         let [width, height] = [0, 1].map(|axis| {
-            node.attrs
-                .get(["width", "height"][axis])
-                .and_then(|v| super::element::dimension(v, false))
-                .unwrap_or(24.)
+            [used[0], vertical[0]][axis].or_else(|| {
+                node.attrs
+                    .get(["width", "height"][axis])
+                    .and_then(|v| super::element::dimension(v, false))
+            })
         });
-        let ratio = (!node.attrs.contains_key("width"))
-            .then(|| node.attrs.get("viewBox"))
-            .flatten()
-            .and_then(|view| {
-                let mut parts = view
-                    .split(|c: char| c == ',' || c.is_whitespace())
-                    .filter(|part| !part.is_empty())
-                    .filter_map(|part| part.parse::<f32>().ok())
-                    .skip(2);
-                Some(parts.next()? / parts.next().filter(|height| *height > 0.)?)
-            });
-        let width = match (ratio, vertical[0]) {
-            (Some(ratio), Some(height)) => height * ratio,
-            _ => width,
+        let ratio = node.attrs.get("viewBox").and_then(|view| {
+            let mut parts = view
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .filter(|part| !part.is_empty())
+                .filter_map(|part| part.parse::<f32>().ok())
+                .skip(2);
+            Some(parts.next()? / parts.next().filter(|height| *height > 0.)?)
+        });
+        let [width, height] = match (width, height, ratio) {
+            (None, Some(height), Some(ratio)) => [height * ratio, height],
+            (Some(width), None, Some(ratio)) => [width, width / ratio],
+            _ => [width.unwrap_or(24.), height.unwrap_or(24.)],
         };
         content = [width, width, height];
     } else if super::element::text_field(node) {
@@ -1308,95 +1320,27 @@ pub(crate) fn intrinsic(
         }
         content = [content[0].max(low), content[1] + sum, content[2].max(tall)];
     }
-    if let Some(pseudos) = styles.pseudos.get(&id).filter(|_| {
-        !matches!(
+    // A grid lays out its pseudo-elements as items.
+    if !matches!(display, "grid" | "inline-grid")
+        && !matches!(
             node.tag.as_str(),
             "img" | "svg" | "canvas" | "video" | "input" | "textarea" | "select"
         )
-    }) {
-        for pseudo in pseudos.iter() {
-            let Some(value) = pseudo
-                .get(Prop::CONTENT)
-                .filter(|value| !matches!(*value, "none" | "normal"))
-            else {
+    {
+        for index in 0..2 {
+            let Some([_, width, _, height]) = pseudo_size(
+                doc,
+                id,
+                index,
+                styles,
+                base,
+                None,
+                text,
+                measured.pixel_ratio,
+            ) else {
                 continue;
             };
-            if pseudo.get(Prop::DISPLAY) == Some("none")
-                || pseudo
-                    .get(Prop::POSITION)
-                    .is_some_and(|value| matches!(value, "absolute" | "fixed"))
-            {
-                continue;
-            }
-            let units =
-                super::element::pseudo_lengths(units, style, pseudo, text, measured.pixel_ratio);
-            let [padding, margin] =
-                [style::PADDING, style::MARGIN].map(|edges| units.edges(pseudo, edges, base));
-            let border = units.borders(pseudo, base);
-            let sides = |axis: usize| {
-                let inner =
-                    padding[1 - axis] + padding[3 - axis] + border[1 - axis] + border[3 - axis];
-                let outer = margin[1 - axis] + margin[3 - axis];
-                match pseudo.get(Prop::BOX_SIZING) {
-                    Some("border-box") => [outer, outer + inner],
-                    _ => [inner + outer; 2],
-                }
-            };
-            let string = super::element::pseudo_content(doc, id, pseudo, value);
-            let [width, height] = [Prop::WIDTH, Prop::HEIGHT].map(|prop| {
-                pseudo
-                    .get(prop)
-                    .and_then(|value| units.resolve(value, base))
-            });
-            let width = match width {
-                Some(width) => width + sides(0)[0],
-                None if string.is_empty() => sides(0)[1],
-                None => {
-                    let run = style::text_run(pseudo, &units, string.len());
-                    let shaped = text.shape_text(
-                        &string,
-                        renderer::px(units.font.em),
-                        &[run],
-                        &renderer::Wrapping {
-                            word_break: style::word_break(pseudo),
-                            ..Default::default()
-                        },
-                    );
-                    shaped
-                        .iter()
-                        .map(|line| f32::from(line.line.width))
-                        .fold(0., f32::max)
-                        + sides(0)[1]
-                }
-            };
-            // Like the render, blank content of a block-level pseudo-element makes no line.
-            let line = if string.trim_ascii().is_empty()
-                && pseudo
-                    .get(Prop::DISPLAY)
-                    .is_some_and(|v| !v.starts_with("inline"))
-                && pseudo
-                    .get(Prop::WHITE_SPACE)
-                    .is_none_or(|v| !matches!(v, "pre" | "pre-wrap" | "pre-line" | "break-spaces"))
-            {
-                0.
-            } else {
-                units.font.lh
-            };
-            let height = height.map_or(line + sides(1)[1], |height| height + sides(1)[0]);
-            let [width, height] = [(width, 0), (height, 1)].map(|(size, axis)| {
-                let [min, max] = [
-                    [Prop::MIN_WIDTH, Prop::MAX_WIDTH],
-                    [Prop::MIN_HEIGHT, Prop::MAX_HEIGHT],
-                ][axis]
-                    .map(|prop| {
-                        pseudo
-                            .get(prop)
-                            .and_then(|value| units.resolve(value, base))
-                            .map(|limit| limit + sides(axis)[0])
-                    });
-                size.min(max.unwrap_or(f32::INFINITY))
-                    .max(min.unwrap_or(0.))
-            });
+            let pseudo = &styles.pseudos[&id][index];
             if matches!(display, "flex" | "inline-flex")
                 && style
                     .get(Prop::FLEX_DIRECTION)
@@ -1496,6 +1440,127 @@ pub(crate) fn intrinsic(
     measured.sizes.insert(key, result);
     measured.margins.insert(key, sets);
     result
+}
+
+/// The pseudo-element of an item key from `layout`: its element and its index, 0 for `::before`.
+pub(crate) fn pseudo_item(child: usize) -> Option<(usize, usize)> {
+    (child > usize::MAX / 2).then_some((!child / 2, !child % 2))
+}
+
+/// The sizes of an in-flow pseudo-element like `intrinsic`, with percentages of `base`. A `width` is the room of
+/// its grid area, which an `auto` width fills.
+#[allow(clippy::too_many_arguments)]
+fn pseudo_size(
+    doc: &Document,
+    id: usize,
+    index: usize,
+    styles: &ComputedStyles,
+    base: f32,
+    width: Option<f32>,
+    text: &renderer::TextSystem,
+    pixel_ratio: f32,
+) -> Option<[f32; 4]> {
+    let style = &styles.values[id];
+    let pseudo = &styles.pseudos.get(&id)?[index];
+    let value = pseudo
+        .get(Prop::CONTENT)
+        .filter(|value| !matches!(*value, "none" | "normal"))?;
+    if pseudo.get(Prop::DISPLAY) == Some("none")
+        || pseudo
+            .get(Prop::POSITION)
+            .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+    {
+        return None;
+    }
+    let units =
+        super::element::pseudo_lengths(&styles.lengths[id], style, pseudo, text, pixel_ratio);
+    let [padding, margin] =
+        [style::PADDING, style::MARGIN].map(|edges| units.edges(pseudo, edges, base));
+    let border = units.borders(pseudo, base);
+    // The frame of each axis as [outside the size, outside the content].
+    let sides = |axis: usize| {
+        let inner = padding[1 - axis] + padding[3 - axis] + border[1 - axis] + border[3 - axis];
+        let outer = margin[1 - axis] + margin[3 - axis];
+        match pseudo.get(Prop::BOX_SIZING) {
+            Some("border-box") => [outer, outer + inner],
+            _ => [inner + outer; 2],
+        }
+    };
+    let limits = |props: [Prop; 2], axis: usize| {
+        props.map(|prop| {
+            pseudo
+                .get(prop)
+                .and_then(|value| units.resolve(value, base))
+                .map(|limit| limit + sides(axis)[0])
+        })
+    };
+    let clamp = |size: f32, [min, max]: [Option<f32>; 2]| {
+        size.min(max.unwrap_or(f32::INFINITY))
+            .max(min.unwrap_or(0.))
+    };
+    let string = super::element::pseudo_content(doc, id, pseudo, value);
+    let [fixed, tall] = [Prop::WIDTH, Prop::HEIGHT].map(|prop| {
+        pseudo
+            .get(prop)
+            .and_then(|value| units.resolve(value, base))
+    });
+    let run = style::text_run(pseudo, &units, string.len());
+    let wraps = pseudo
+        .get(Prop::WHITE_SPACE)
+        .is_none_or(|v| !matches!(v, "nowrap" | "pre"));
+    let shape = |width: Option<f32>| {
+        text.shape_text(
+            &string,
+            renderer::px(units.font.em),
+            std::slice::from_ref(&run),
+            &renderer::Wrapping {
+                width: width.filter(|_| wraps).map(renderer::px),
+                word_break: style::word_break(pseudo),
+                ..Default::default()
+            },
+        )
+    };
+    let lines = (fixed.is_none() && !string.is_empty()).then(|| shape(None));
+    let [min, max] = match (fixed, &lines) {
+        (Some(fixed), _) => [fixed + sides(0)[0]; 2],
+        (None, None) => [sides(0)[1]; 2],
+        (None, Some(lines)) => [
+            f32::from(renderer::widest_piece(lines, renderer::px(0.))),
+            lines
+                .iter()
+                .map(|line| f32::from(line.line.width))
+                .fold(0., f32::max),
+        ]
+        .map(|size| size + sides(0)[1]),
+    }
+    .map(|size| clamp(size, limits([Prop::MIN_WIDTH, Prop::MAX_WIDTH], 0)));
+    let used = match (fixed, width) {
+        (None, Some(width)) => clamp(width, limits([Prop::MIN_WIDTH, Prop::MAX_WIDTH], 0)),
+        _ => max,
+    };
+    // Like the render, blank content of a block-level pseudo-element makes no line.
+    let rows = if string.trim_ascii().is_empty()
+        && pseudo
+            .get(Prop::DISPLAY)
+            .is_some_and(|v| !v.starts_with("inline"))
+        && pseudo
+            .get(Prop::WHITE_SPACE)
+            .is_none_or(|v| !matches!(v, "pre" | "pre-wrap" | "pre-line" | "break-spaces"))
+    {
+        0
+    } else if used < max && wraps {
+        shape(Some(used - sides(0)[1]))
+            .iter()
+            .map(|line| line.rows())
+            .sum()
+    } else {
+        1
+    };
+    let height = tall.map_or(rows as f32 * units.font.lh + sides(1)[1], |height| {
+        height + sides(1)[0]
+    });
+    let height = clamp(height, limits([Prop::MIN_HEIGHT, Prop::MAX_HEIGHT], 1));
+    Some([min, max, used, height])
 }
 
 /// Margin, border and padding of each side: top, right, bottom, left.
@@ -1660,8 +1725,7 @@ pub(crate) fn layout(
                 .get([Prop::MIN_WIDTH, Prop::MIN_HEIGHT][axis])
                 .is_some_and(|v| v == "0" || v == "0px")
     };
-    let alignment = |child: usize, axis: usize, replaced: bool| {
-        let own = &styles.values[child];
+    let alignment = |own: &style::Style, axis: usize, replaced: bool| {
         let margins = [
             [Prop::MARGIN_LEFT, Prop::MARGIN_RIGHT],
             [Prop::MARGIN_TOP, Prop::MARGIN_BOTTOM],
@@ -1708,14 +1772,24 @@ pub(crate) fn layout(
         .then(|| super::element::legend(doc, styles, id))
         .flatten()
         .map(|(legend, ..)| legend);
+    let pseudos = styles.pseudos.get(&id).filter(|_| !table);
+    let item_style = |child: usize| match pseudo_item(child) {
+        Some((_, index)) => &pseudos.expect("a pseudo-element item")[index],
+        None => &*styles.values[child],
+    };
     let mut read = |child: usize| -> Item {
-        let style = &styles.values[child];
-        let replaced = doc.nodes[child].tag == "svg"
-            || doc.nodes[child].tag != "input"
-                && super::element::natural_size(doc, child, measured.naturals.get(&child).copied())
-                    .is_some();
+        let style = item_style(child);
+        let replaced = pseudo_item(child).is_none()
+            && (doc.nodes[child].tag == "svg"
+                || doc.nodes[child].tag != "input"
+                    && super::element::natural_size(
+                        doc,
+                        child,
+                        measured.naturals.get(&child).copied(),
+                    )
+                    .is_some());
         let mut item = *memo
-            .entry((std::rc::Rc::as_ptr(style), replaced))
+            .entry((std::ptr::from_ref(style), replaced))
             .or_insert_with(|| {
                 let flowed = !style.get(Prop::DISPLAY).is_some_and(|v| v == "none")
                     && !style
@@ -1748,12 +1822,13 @@ pub(crate) fn layout(
                 };
                 let shrink = [0, 1].map(|axis| shrinks(style, axis));
                 let subgrid = [0, 1].map(|axis| {
-                    style
-                        .get([Prop::GRID_TEMPLATE_COLUMNS, Prop::GRID_TEMPLATE_ROWS][axis])
-                        .is_some_and(|v| v.starts_with("subgrid"))
+                    pseudo_item(child).is_none()
+                        && style
+                            .get([Prop::GRID_TEMPLATE_COLUMNS, Prop::GRID_TEMPLATE_ROWS][axis])
+                            .is_some_and(|v| v.starts_with("subgrid"))
                 });
                 let [(column, _), (row, baseline)] =
-                    [0, 1].map(|axis| alignment(child, axis, replaced));
+                    [0, 1].map(|axis| alignment(style, axis, replaced));
                 Item {
                     flowed,
                     order,
@@ -1774,13 +1849,20 @@ pub(crate) fn layout(
                         .is_some_and(|v| v.starts_with("table-column"))));
         item
     };
-    let mut children: Vec<(usize, Item)> = doc.nodes[id]
-        .children
-        .iter()
-        .filter(|&&child| {
-            !(doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty())
+    // Pseudo-elements are the first and last items, keyed by `pseudo_item`.
+    let shown = |index: usize| {
+        pseudos.is_some_and(|pseudos| {
+            pseudos[index]
+                .get(Prop::CONTENT)
+                .is_some_and(|value| !matches!(value, "none" | "normal"))
         })
-        .map(|&child| (child, read(child)))
+    };
+    let mut children: Vec<(usize, Item)> = (shown(0).then_some(!(id * 2)).into_iter())
+        .chain(doc.nodes[id].children.iter().copied().filter(|&child| {
+            !(doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty())
+        }))
+        .chain(shown(1).then_some(!(id * 2 + 1)))
+        .map(|child| (child, read(child)))
         .filter(|(_, item)| item.flowed)
         .collect();
     if table {
@@ -2404,10 +2486,10 @@ pub(crate) fn layout(
         } {
             height = area;
         }
-        let y = match styles.values[child].get(Prop::CAPTION_SIDE) {
-            _ if !caption => y,
-            Some("bottom") => y,
-            _ => y - gap[1],
+        let y = if caption && styles.values[child].get(Prop::CAPTION_SIDE) != Some("bottom") {
+            y - gap[1]
+        } else {
+            y
         };
         let shim = shims.get(index).copied().unwrap_or(0.);
         grid.cells.push((

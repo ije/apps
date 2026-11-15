@@ -108,6 +108,42 @@ impl Hooks for Effected {
     }
 }
 
+// The mask layers of a pseudo-element.
+pub(super) struct Masked {
+    pub(super) view: Rc<super::PageState>,
+    pub(super) key: (usize, u8),
+    pub(super) style: Rc<style::Style>,
+    pub(super) units: style::Lengths,
+}
+
+impl Hooks for Masked {
+    fn volatile(&self) -> bool {
+        false
+    }
+
+    fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let mask = {
+            let mut host = self.view.host.borrow_mut();
+            let host = &mut *host;
+            mask(
+                host.dom.entry(self.view.id).or_default(),
+                &host.assets,
+                self.key,
+                &self.style,
+                self.units,
+                None,
+                cx.bounds,
+                cx.window,
+            )
+        };
+        let effect = renderer::PaintEffect {
+            mask,
+            ..Default::default()
+        };
+        cx.window.with_effect(effect, inner);
+    }
+}
+
 // The children of a canvas with drawable content. The window doesn't show them, and they take no pointer
 // until the page draws them.
 pub(super) struct Undrawn(pub(super) Rc<super::PageState>);
@@ -299,7 +335,11 @@ impl DomBox {
         mirror.transformed(
             self.id,
             scaled(window_bounds.size.width, size.width)
-                || scaled(window_bounds.size.height, size.height),
+                || scaled(window_bounds.size.height, size.height)
+                || !self.drawn
+                    && [Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE, Prop::TRANSFORM]
+                        .into_iter()
+                        .any(|prop| self.style.get(prop).is_some_and(|value| value != "none")),
         );
         // Like Chrome, a box that columns split reports the union of its parts.
         if let Some(union) = parts.iter().copied().reduce(|all, part| all.union(part)) {
@@ -877,90 +917,16 @@ impl DomBox {
             Some(Clip::Shape(shape)) => shapes = Some(shape),
             None => {}
         }
-        let base = host.dom.get(&view.id).and_then(|state| state.base.clone());
-        let images = [Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]
-            .into_iter()
-            .find_map(|prop| style.get(prop))
-            .filter(|value| !value.is_empty() && *value != "none");
-        let mask = (shapes.is_some() || images.is_some()).then(|| {
-            let mut inputs = String::new();
-            for part in [
-                Prop::MASK_IMAGE,
-                Prop::WEBKIT_MASK_IMAGE,
-                Prop::MASK_SIZE,
-                Prop::WEBKIT_MASK_SIZE,
-                Prop::MASK_POSITION,
-                Prop::WEBKIT_MASK_POSITION,
-                Prop::MASK_REPEAT,
-                Prop::WEBKIT_MASK_REPEAT,
-                Prop::MASK_COMPOSITE,
-            ]
-            .map(|prop| style.get(prop).unwrap_or(""))
-            .into_iter()
-            .chain(shapes.as_deref())
-            {
-                inputs.push_str(part);
-                inputs.push('\0');
-            }
-            super::effects::push_bits(&mut inputs, size, &units);
-            let [width, height] = size;
-            let scale = window.scale_factor();
-            let raster = [width, height].map(|extent| (extent * scale).ceil().clamp(1., 4096.) as u32);
-            let masks = &mut host.dom.entry(view.id).or_default().masks;
-            if masks.get(&self.id).is_none_or(|(old, image)| {
-                *old != inputs
-                    || image.as_ref().is_some_and(|image| {
-                        (image.size().width as u32) != raster[0]
-                            || (image.size().height as u32) != raster[1]
-                    })
-            }) {
-                let image = if shapes.is_none()
-                    && let Some([across, down]) =
-                        super::effects::axis_mask(style, &units, size, raster)
-                {
-                    let opaque = |alpha: &f32| *alpha >= 0.999;
-                    (!across.iter().all(opaque) || !down.iter().all(opaque)).then(|| {
-                        let mut bytes = vec![0; across.len() * down.len() * 4];
-                        for (row, y) in bytes.chunks_exact_mut(across.len() * 4).zip(&down) {
-                            for (pixel, x) in row.as_chunks_mut::<4>().0.iter_mut().zip(&across) {
-                                pixel[3] = (x * y * 255. + 0.5) as u8;
-                            }
-                        }
-                        std::sync::Arc::new(renderer::RenderImage::new(raster[0], raster[1], bytes))
-                    })
-                } else {
-                    let source = match (shapes, mask_svg(style, units, size, base.as_ref(), &host.assets)) {
-                        (Some(shape), Some(layers)) => format!(
-                            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"><defs><clipPath id=\"apps-clip\">{shape}</clipPath></defs><g clip-path=\"url(#apps-clip)\">{layers}</g></svg>"
-                        ),
-                        (Some(shape), None) => format!(
-                            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{shape}</svg>"
-                        ),
-                        (None, Some(layers)) => format!(
-                            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{layers}</svg>"
-                        ),
-                        (None, None) => return None,
-                    };
-                    // The mask names the image files itself, so they may be read.
-                    match super::canvas::svg_tree(&source, true).and_then(|tree| {
-                        super::canvas::render_svg(&tree, raster[0], raster[1], None)
-                    }) {
-                        Ok(image) => Some(image),
-                        // Keep the failure too, or every paint builds and reports the same mask again.
-                        Err(error) => {
-                            eprintln!("apps: mask: {error}");
-                            None
-                        }
-                    }
-                };
-                if let Some((_, Some(old))) = masks.insert(self.id, (inputs, image)) {
-                    window.release_image(old);
-                }
-            }
-            masks
-                .get(&self.id)
-                .and_then(|(_, image)| image.clone().map(|image| (image, bounds)))
-        });
+        let mask = mask(
+            host.dom.entry(view.id).or_default(),
+            &host.assets,
+            (self.id, 0),
+            style,
+            units,
+            shapes.as_deref(),
+            bounds,
+            window,
+        );
         let shown = self.effects.unwrap_or(1.) > 0.
             && style
                 .get(Prop::VISIBILITY)
@@ -1014,7 +980,7 @@ impl DomBox {
                 .map_or(renderer::BlendMode::Normal, |value| {
                     effects::blend_mode(value)
                 }),
-            mask: mask.flatten(),
+            mask,
             backdrop,
             glass,
             key: self.composited.then_some(self.id as u64),
@@ -1053,6 +1019,106 @@ impl DomBox {
         }
         (clip, layers)
     }
+}
+
+/// The mask image of a box or a pseudo-element `key` from its mask layers and its clip path shapes.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn mask(
+    dom: &mut crate::dom::State,
+    assets: &HashMap<String, std::path::PathBuf>,
+    key: (usize, u8),
+    style: &style::Style,
+    units: style::Lengths,
+    shapes: Option<&str>,
+    bounds: Rect<Pixels>,
+    window: &mut Window,
+) -> Option<(std::sync::Arc<renderer::RenderImage>, Rect<Pixels>)> {
+    let size = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
+    let base = dom.base.clone();
+    let images = [Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]
+        .into_iter()
+        .find_map(|prop| style.get(prop))
+        .filter(|value| !value.is_empty() && *value != "none");
+    (shapes.is_some() || images.is_some()).then(|| {
+        let mut inputs = String::new();
+        for part in [
+            Prop::MASK_IMAGE,
+            Prop::WEBKIT_MASK_IMAGE,
+            Prop::MASK_SIZE,
+            Prop::WEBKIT_MASK_SIZE,
+            Prop::MASK_POSITION,
+            Prop::WEBKIT_MASK_POSITION,
+            Prop::MASK_REPEAT,
+            Prop::WEBKIT_MASK_REPEAT,
+            Prop::MASK_COMPOSITE,
+        ]
+        .map(|prop| style.get(prop).unwrap_or(""))
+        .into_iter()
+        .chain(shapes)
+        {
+            inputs.push_str(part);
+            inputs.push('\0');
+        }
+        super::effects::push_bits(&mut inputs, size, &units);
+        let [width, height] = size;
+        let scale = window.scale_factor();
+        let raster = [width, height].map(|extent| (extent * scale).ceil().clamp(1., 4096.) as u32);
+        let masks = &mut dom.masks;
+        if masks.get(&key).is_none_or(|(old, image)| {
+            *old != inputs
+                || image.as_ref().is_some_and(|image| {
+                    (image.size().width as u32) != raster[0]
+                        || (image.size().height as u32) != raster[1]
+                })
+        }) {
+            let image = if shapes.is_none()
+                && let Some([across, down]) =
+                    super::effects::axis_mask(style, &units, size, raster)
+            {
+                let opaque = |alpha: &f32| *alpha >= 0.999;
+                (!across.iter().all(opaque) || !down.iter().all(opaque)).then(|| {
+                    let mut bytes = vec![0; across.len() * down.len() * 4];
+                    for (row, y) in bytes.chunks_exact_mut(across.len() * 4).zip(&down) {
+                        for (pixel, x) in row.as_chunks_mut::<4>().0.iter_mut().zip(&across) {
+                            pixel[3] = (x * y * 255. + 0.5) as u8;
+                        }
+                    }
+                    std::sync::Arc::new(renderer::RenderImage::new(raster[0], raster[1], bytes))
+                })
+            } else {
+                let source = match (shapes, mask_svg(style, units, size, base.as_ref(), assets)) {
+                    (Some(shape), Some(layers)) => format!(
+                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"><defs><clipPath id=\"apps-clip\">{shape}</clipPath></defs><g clip-path=\"url(#apps-clip)\">{layers}</g></svg>"
+                    ),
+                    (Some(shape), None) => format!(
+                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{shape}</svg>"
+                    ),
+                    (None, Some(layers)) => format!(
+                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{layers}</svg>"
+                    ),
+                    (None, None) => return None,
+                };
+                // The mask names the image files itself, so they may be read.
+                match super::canvas::svg_tree(&source, true).and_then(|tree| {
+                    super::canvas::render_svg(&tree, raster[0], raster[1], None)
+                }) {
+                    Ok(image) => Some(image),
+                    // Keep the failure too, or every paint builds and reports the same mask again.
+                    Err(error) => {
+                        eprintln!("apps: mask: {error}");
+                        None
+                    }
+                }
+            };
+            if let Some((_, Some(old))) = masks.insert(key, (inputs, image)) {
+                window.release_image(old);
+            }
+        }
+        masks
+            .get(&key)
+            .and_then(|(_, image)| image.clone().map(|image| (image, bounds)))
+    })
+    .flatten()
 }
 
 fn nest_effects(
@@ -1094,55 +1160,65 @@ fn mask_svg<'a>(
     let mut content = String::new();
     for (index, image) in style::components(images, ',').into_iter().enumerate().rev() {
         let image = image.trim();
-        if let Some(source) = image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
+        let [size, position, repeat] = [
+            (pick(&sizes, index), "auto"),
+            (pick(&positions, index), "0% 0%"),
+            (pick(&repeats, index), "repeat"),
+        ]
+        .map(|(value, initial)| if value.is_empty() { initial } else { value });
+        let layer = if let Some(source) =
+            image.strip_prefix("url(").and_then(|v| v.strip_suffix(')'))
+        {
             let Some(path) = super::image::url_file(source, base, assets) else {
                 continue;
             };
-            let aspect = match pick(&sizes, index) {
+            let aspect = match size {
                 "cover" => "xMidYMid slice",
                 "contain" => "xMidYMid meet",
                 _ => "none",
             };
-            content.push_str(&format!(
-                "<image href=\"{}\" width=\"{width}\" height=\"{height}\" preserveAspectRatio=\"{aspect}\"/>",
-                crate::dom::escape(&path.to_string_lossy())
-            ));
-            continue;
-        }
-        let Some((kind, body)) = image
-            .split_once('(')
-            .filter(|(kind, _)| kind.ends_with("-gradient"))
-            .and_then(|(kind, body)| Some((kind, body.strip_suffix(')')?)))
-        else {
-            continue;
+            let [[tw, th], at] = super::effects::tile(size, position, &units, width, height, None);
+            super::effects::tiled(
+                repeat,
+                [tw, th],
+                at,
+                &format!(
+                    "<image href=\"{}\" width=\"{tw}\" height=\"{th}\" preserveAspectRatio=\"{aspect}\"/>",
+                    crate::dom::escape(&path.to_string_lossy())
+                ),
+            )
+        } else {
+            let Some((kind, body)) = image
+                .split_once('(')
+                .filter(|(kind, _)| kind.ends_with("-gradient"))
+                .and_then(|(kind, body)| Some((kind, body.strip_suffix(')')?)))
+            else {
+                continue;
+            };
+            let Some(svg) = super::effects::gradient_svg(
+                kind,
+                body,
+                size,
+                position,
+                repeat,
+                units,
+                width,
+                height,
+                [0., 0., width, height],
+            ) else {
+                continue;
+            };
+            let (Some(start), Some(end)) = (svg.find('>'), svg.rfind("</svg>")) else {
+                continue;
+            };
+            svg[start + 1..end].to_owned()
         };
-        let size = pick(&sizes, index);
-        let position = pick(&positions, index);
-        let repeat = pick(&repeats, index);
-        if let Some(svg) = super::effects::gradient_svg(
-            kind,
-            body,
-            if size.is_empty() { "auto" } else { size },
-            if position.is_empty() {
-                "0% 0%"
-            } else {
-                position
-            },
-            if repeat.is_empty() { "repeat" } else { repeat },
-            units,
-            width,
-            height,
-            [0., 0., width, height],
-        ) && let Some(start) = svg.find('>')
-            && let Some(end) = svg.rfind("</svg>")
-        {
-            // Each layer is its own SVG document, so its `id`s must not collide.
-            content.push_str(
-                &svg[start + 1..end]
-                    .replace("id=\"", &format!("id=\"m{index}"))
-                    .replace("url(#", &format!("url(#m{index}")),
-            );
-        }
+        // Each layer is its own SVG document, so its `id`s must not collide.
+        content.push_str(
+            &layer
+                .replace("id=\"", &format!("id=\"m{index}"))
+                .replace("url(#", &format!("url(#m{index}")),
+        );
     }
     (!content.is_empty()).then_some(content)
 }

@@ -352,6 +352,11 @@ impl TextState {
         }
         if min_content {
             size.width = widest_piece(&lines, float - top - style.text_indent);
+        } else if wrap_width.is_some() && !truncated {
+            // Like CSS, a box that fits its content in the available width is never narrower than its widest word.
+            size.width = size
+                .width
+                .max(widest_piece(&lines, float - top - style.text_indent));
         }
         if let Some(banded) = &banded {
             size.height = px(banded.y);
