@@ -4,14 +4,22 @@ A tiny, high performance, and low memory usage electron alternative with compati
 
 ## Goals
 
-- 120FPS, 0 FPS when idle, low CPU load
+- 120FPS vsync, 0 FPS when idle, low CPU load
 - Small runtime size (less than 10MB)
 - Fast launch (less than 300ms)
-- Low memory usage
+- Low memory usage (simple project less then 80mb)
 
 ## Important Rules
 
-- Don't use workaroud/trick to match the rendering result with chrome, fix the runtime.
+- When working on renderer, compare with chrome.
+- Don't use workaroud/trick in testings/examples to make falsely the rendering look same as chrome.
+
+## Code Style
+
+- Add comments in code only it's vary important.
+- Use Simple Tech English.
+- Check code format and lint always.
+- Use two spance indent.
 
 ## Architecture
 
