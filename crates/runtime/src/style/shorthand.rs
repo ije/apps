@@ -245,6 +245,25 @@ pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 .into(),
             1,
         ),
+        "corner-shape" => (
+            ["top-left", "top-right", "bottom-right", "bottom-left"]
+                .map(|corner| format!("corner-{corner}-shape"))
+                .into(),
+            0,
+        ),
+        "corner-top-shape" | "corner-right-shape" | "corner-bottom-shape" | "corner-left-shape" => {
+            (
+                match key {
+                    "corner-top-shape" => ["top-left", "top-right"],
+                    "corner-right-shape" => ["top-right", "bottom-right"],
+                    "corner-bottom-shape" => ["bottom-left", "bottom-right"],
+                    _ => ["top-left", "bottom-left"],
+                }
+                .map(|corner| format!("corner-{corner}-shape"))
+                .into(),
+                2,
+            )
+        }
         "margin-inline"
         | "padding-inline"
         | "margin-block"

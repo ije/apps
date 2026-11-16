@@ -1,4 +1,4 @@
-use super::{Lengths, Prop, Style, color, parser};
+use super::{Lengths, Prop, Style, paint, parser};
 
 // A style holds longhands only: the cascade expands every shorthand.
 pub(crate) const PADDING: [Prop; 4] = [
@@ -13,6 +13,31 @@ pub(crate) const MARGIN: [Prop; 4] = [
     Prop::MARGIN_BOTTOM,
     Prop::MARGIN_LEFT,
 ];
+
+// The superellipse parameter of a `corner-shape` value, like 2 for `squircle`.
+pub(crate) fn corner_shape(value: &str) -> Option<f64> {
+    let lower = value.trim().to_ascii_lowercase();
+    Some(match lower.as_str() {
+        "round" => 1.,
+        "squircle" => 2.,
+        "square" => f64::INFINITY,
+        "bevel" => 0.,
+        "scoop" => -1.,
+        "notch" => f64::NEG_INFINITY,
+        _ => match lower
+            .strip_prefix("superellipse(")?
+            .strip_suffix(')')?
+            .trim()
+        {
+            "infinity" => f64::INFINITY,
+            "-infinity" => f64::NEG_INFINITY,
+            inner => match Lengths::new(16., 100., 100.).math(inner, f32::NAN, &[])? {
+                (k, parser::Kind::Number) if !k.is_nan() => k,
+                _ => return None,
+            },
+        },
+    })
+}
 
 pub(crate) const BORDERS: [[Prop; 3]; 4] = [
     [
@@ -234,13 +259,13 @@ impl Lengths {
         let mut shadows = Vec::new();
         'parse: for shadow in components(value, ',').into_iter().rev() {
             let mut lengths = Vec::new();
-            let mut ink = (0, 255);
+            let mut ink = renderer::Color::BLACK;
             let parts = components(shadow, ' ');
             if parts.contains(&"inset") != inset {
                 continue;
             }
             for part in parts.into_iter().filter(|part| *part != "inset") {
-                if let Some(color) = color(part) {
+                if let Some(color) = paint(part) {
                     ink = color;
                 } else if let Some(value) = self.resolve(part, self.viewport[0]) {
                     lengths.push(value);
@@ -254,7 +279,7 @@ impl Lengths {
                 break 'parse;
             }
             shadows.push(renderer::BoxShadow {
-                color: renderer::Color::hex((ink.0 << 8) | u32::from(ink.1)),
+                color: ink,
                 offset: renderer::point(renderer::px(lengths[0]), renderer::px(lengths[1])),
                 // The renderer uses the blur radius as the Gaussian sigma, which is half the CSS blur radius.
                 blur_radius: renderer::px(lengths.get(2).copied().unwrap_or(0.).max(0.) / 2.),

@@ -6,7 +6,7 @@ use crate::{
     node::{Child, Content, Events, MeasureFn, Measurement, Node, NodeCx, NodeKey, NodeStyle},
     point, px, size,
     text::{TextState, same_shaping},
-    window::Placement,
+    window::{PaintKey, PaintSpan, Placement},
 };
 use rustc_hash::{FxHashMap, FxHasher};
 use std::{
@@ -53,12 +53,14 @@ struct Slot {
     bounds: Rect<Pixels>,
     painted: Rect<Pixels>,
     exact: Rect<Pixels>,
-    hitbox: u32,
+    region: Option<Region>,
     listed: bool,
     free: [bool; 2],
     placed: Option<(u32, Point<f32>, Placement)>,
     below: bool,
     volatile: bool,
+    // A volatile box is in it, so a keep of the box prepaints that box.
+    lively: bool,
     reach: Option<Rect<Pixels>>,
     escaped: Option<Clip<Pixels>>,
     // The size that the measure function gave in the last layout, which can overflow the box.
@@ -72,6 +74,34 @@ struct Slot {
     banded: bool,
     // The floats that the box placed in the context of its parent when no other float reached it, from its origin.
     spill: Option<Box<Spill>>,
+    // The prepaint pass that kept the box and all boxes in it where they were, and the first pass of the run
+    // of such passes.
+    calm: u32,
+    since: u32,
+    // What the last paint of the box drew, which a paint of a calm box copies.
+    chunk: Option<Chunk>,
+    // The window regions of the last prepaint of the box, which a calm box copies when `skips`, and the boxes
+    // in `touched` of that pass.
+    regions: Option<(u32, [u32; 2])>,
+    touched: [u32; 2],
+    // All hooks in the box allow a skip, and no box in it is listed in a stacking context outside it.
+    skips: bool,
+    // The prepaint pass that skipped the box.
+    skipped: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Chunk {
+    pass: u32,
+    // The prepaint pass that the paint followed.
+    prepass: u32,
+    key: PaintKey,
+    unbounded: bool,
+    span: PaintSpan,
+    // Where the box was, the mask around it, and the area in device pixels of a span that can move with it.
+    at: Point<Pixels>,
+    mask: Clip<Pixels>,
+    area: Option<Rect<f32>>,
 }
 
 // Where a column set puts a box of its flow, in layout units.
@@ -119,12 +149,13 @@ impl Slot {
             bounds: Rect::default(),
             painted: Rect::default(),
             exact: Rect::default(),
-            hitbox: NONE,
+            region: None,
             listed: false,
             free: [true; 2],
             placed: None,
             below: false,
             volatile: false,
+            lively: false,
             reach: None,
             escaped: None,
             measured: taffy::Size::ZERO,
@@ -133,6 +164,13 @@ impl Slot {
             floats: false,
             banded: false,
             spill: None,
+            calm: 0,
+            since: 0,
+            chunk: None,
+            regions: None,
+            touched: [0; 2],
+            skips: false,
+            skipped: 0,
         }
     }
 }
@@ -169,14 +207,17 @@ impl Slot {
         self.floats = false;
         self.banded = false;
         self.spill = None;
-        self.hitbox = NONE;
+        self.region = None;
         self.listed = false;
         self.free = [true; 2];
         self.placed = None;
         self.below = false;
         self.volatile = false;
+        self.lively = false;
         self.escaped = None;
         self.split = None;
+        self.chunk = None;
+        self.regions = None;
     }
 
     fn taffy(&self) -> &taffy::Style {
@@ -213,7 +254,6 @@ pub struct Tree {
     root: Option<u32>,
     measured_with: (f32, usize),
     stretch: Option<Size<Pixels>>,
-    hitboxes: Vec<Region>,
     layers: FxHashMap<u32, Vec<(i32, u32, Clip<Pixels>)>>,
     kids: Vec<NodeId>,
     initial: Rc<TextStyle>,
@@ -226,7 +266,6 @@ pub struct Tree {
     blocks: Vec<(u8, Clip<Pixels>)>,
     painting: Vec<u32>,
     unbounded: u32,
-    previous: Vec<Region>,
     prepaints: u32,
     full: bool,
     graveyard: Vec<Remains>,
@@ -235,6 +274,19 @@ pub struct Tree {
     floated: bool,
     // Floats wait to paint after the blocks of their formatting context, like in CSS.
     deferred: Vec<u32>,
+    // Whether the boxes that `keep` visits stay where they were, and allow a skip.
+    still: bool,
+    skips: bool,
+    // The outermost containing block that an out-of-flow box in the current box reads: its place in `blocks` plus
+    // one, or 0 for the viewport. A box can skip only if no such block is outside it.
+    escapes: Option<usize>,
+    // The move of the box that `keep` visits when its layout stayed and only the scroll offset moved it.
+    delta: Option<Point<Pixels>>,
+    // The boxes whose hooks skip also inside a skipped box, in this pass and the last one.
+    touched: Vec<u32>,
+    last_touched: (u32, Vec<u32>),
+    // The paint pass, and the last one whose chunks this pass can copy.
+    paints: (u32, Option<u32>),
 }
 
 fn identity(id: Option<NodeKey>, scope: u64) -> u64 {
@@ -538,7 +590,6 @@ impl Tree {
         slot.style = styled;
         slot.stretched = stretched;
         slot.volatile = hooks.as_ref().is_some_and(|hooks| hooks.volatile())
-            || slot.style.escape & !Escape::OUTLINE != 0
             || events
                 .as_ref()
                 .is_some_and(|events| events.scroll.is_some());
@@ -584,7 +635,11 @@ impl Tree {
             });
         let below = self.slots[index as usize].children.iter().any(|&child| {
             let child = &self.slots[index_of(child) as usize];
-            child.placed.is_none() || child.below || child.volatile
+            child.placed.is_none() || child.below
+        });
+        let lively = self.slots[index as usize].children.iter().any(|&child| {
+            let child = &self.slots[index_of(child) as usize];
+            child.volatile || child.lively
         });
         let floats = self.slots[index as usize].children.iter().any(|&child| {
             let child = &self.slots[index_of(child) as usize];
@@ -593,7 +648,7 @@ impl Tree {
         });
         self.floated |= floats;
         let slot = &mut self.slots[index as usize];
-        (slot.free, slot.below) = (free, below);
+        (slot.free, slot.below, slot.lively) = (free, below, lively);
         let relaid = mem::replace(&mut slot.floats, floats) != floats || relaid;
         if relaid {
             self.dirty(index);
@@ -694,7 +749,6 @@ impl Tree {
         self.root = self.root.map(|root| moved[root as usize]);
         self.slots = slots;
         self.free.clear();
-        self.hitboxes.clear();
         self.layers.clear();
     }
 
@@ -766,13 +820,15 @@ impl Tree {
 
     pub(crate) fn prepaint(&mut self, root: NodeId, window: &mut Window) {
         self.prepaints = self.prepaints.wrapping_add(1);
-        mem::swap(&mut self.previous, &mut self.hitboxes);
-        self.hitboxes.clear();
+        window.begin_prepaint(self.prepaints);
+        mem::swap(&mut self.touched, &mut self.last_touched.1);
+        self.last_touched.0 = self.prepaints.wrapping_sub(1);
+        self.touched.clear();
         self.stacks.clear();
         self.blocks.clear();
         #[cfg(debug_assertions)]
         let start = window.region_places().len();
-        self.prepaint_node(index_of(root), Point::default(), window);
+        self.prepaint_node(index_of(root), Point::default(), false, window);
         #[cfg(debug_assertions)]
         if !window.redraws() {
             let boxes = |tree: &Tree| {
@@ -790,8 +846,8 @@ impl Tree {
                 boxes
             };
             let places = |tree: &Tree| {
-                let place = |hitbox: &Region| (hitbox.bounds, hitbox.hit);
-                tree.hitboxes.iter().map(place).collect::<Vec<_>>()
+                let place = |slot: &Slot| slot.region.map(|region| (region.bounds, region.hit));
+                tree.slots.iter().map(place).collect::<Vec<_>>()
             };
             let kept = (
                 boxes(self),
@@ -800,11 +856,10 @@ impl Tree {
                 self.layers.clone(),
             );
             window.truncate_regions(start);
-            self.hitboxes.clear();
             self.stacks.clear();
             self.blocks.clear();
             self.full = true;
-            self.prepaint_node(index_of(root), Point::default(), window);
+            self.prepaint_node(index_of(root), Point::default(), false, window);
             self.full = false;
             let full = (
                 boxes(self),
@@ -838,7 +893,14 @@ impl Tree {
         }
     }
 
-    fn prepaint_node(&mut self, index: u32, parent: Point<f32>, window: &mut Window) {
+    // `covered`: a skip in the last pass kept the box as it was, though its stamp is older.
+    fn prepaint_node(
+        &mut self,
+        index: u32,
+        parent: Point<f32>,
+        covered: bool,
+        window: &mut Window,
+    ) {
         let prepaints = self.prepaints;
         let slot = &mut self.slots[index as usize];
         let location = slot.layout.location;
@@ -851,39 +913,25 @@ impl Tree {
             && !slot.below
             && !slot.volatile
             && slot.placed.is_some_and(|(pass, _, placed)| {
-                pass == prepaints.wrapping_sub(1)
-                    && (placed.mask, placed.transform) == (placement.mask, placement.transform)
+                (covered || pass == prepaints.wrapping_sub(1))
+                    && placed.transform == placement.transform
             })
         {
             self.keep(index, parent, window);
             return;
         }
-        // An out-of-flow box is volatile, so its ancestors are never kept and its containing block pushed its
-        // clip to `blocks` in this pass.
-        let (escape, parent) = (slot.style.escape, slot.parent);
-        // An outline takes the clip of its box, not the overflow clip inside it.
-        let outline = (escape == Escape::OUTLINE)
-            .then(|| self.slots[parent as usize].placed)
-            .flatten()
-            .map(|(_, _, placed)| placed.mask);
-        let slot = &mut self.slots[index as usize];
-        slot.escaped = outline.or_else(|| {
-            (escape != 0).then(|| {
-                self.blocks
-                    .iter()
-                    .rev()
-                    .find(|(contains, _)| contains & escape != 0)
-                    .map_or_else(
-                        || Clip::from(Rect::new(Point::default(), window.viewport_size())),
-                        |(_, mask)| *mask,
-                    )
-            })
-        });
-        // The mask from the containing block's layer replaces intermediate clips.
-        if let Some(mask) = slot.escaped {
-            window.push_content_mask(mask);
-        }
+        // The boxes inside a box that a skip kept in the last pass are as they were.
+        let covered = !self.full
+            && slot.placed.is_some()
+            && (covered || slot.skipped == prepaints.wrapping_sub(1));
+        let outer = (
+            mem::replace(&mut self.skips, true),
+            self.escapes.take(),
+            self.escape(index, window),
+        );
+        let (regions, touched) = (window.regions_len(), self.touched.len() as u32);
         let placement = window.placement();
+        let slot = &mut self.slots[index as usize];
         slot.placed = Some((prepaints, origin, placement));
         slot.origin = origin;
         // A listed box comes before the listed boxes inside it, which paint above it at the same z-index.
@@ -896,19 +944,88 @@ impl Tree {
         let [bounds, exact] = self.bounds(index, origin, window);
         let slot = &mut self.slots[index as usize];
         (slot.bounds, slot.exact) = (bounds, exact);
+        let listed = self.stacks.last().map(Vec::len);
         self.visit(
             index,
             window,
             |hooks, cx, inner| hooks.prepaint(cx, inner),
-            |tree, style, window| tree.prepaint_box(index, style, window),
+            |tree, style, window| tree.prepaint_box(index, style, covered, window),
         );
         self.reach(index, window.scale_factor());
         if self.slots[index as usize].escaped.is_some() {
             window.pop_content_mask();
         }
+        self.recorded(index, [regions, touched], listed, outer, window);
     }
 
-    fn prepaint_box(&mut self, index: u32, style: &Style, window: &mut Window) {
+    // Pushes the mask of the containing block of an out-of-flow box, which replaces intermediate clips. Returns
+    // the place of that block for `escapes`.
+    fn escape(&mut self, index: u32, window: &mut Window) -> Option<usize> {
+        let slot = &self.slots[index as usize];
+        let escape = slot.style.escape;
+        // An outline takes the clip of its box, not the overflow clip inside it.
+        let (escaped, depth) = if escape == Escape::OUTLINE {
+            let placed = self.slots[slot.parent as usize].placed;
+            (placed.map(|(_, _, placed)| placed.mask), None)
+        } else if escape != 0 {
+            let at = self
+                .blocks
+                .iter()
+                .rposition(|(contains, _)| contains & escape != 0);
+            let mask = at.map_or_else(
+                || Clip::from(Rect::new(Point::default(), window.viewport_size())),
+                |at| self.blocks[at].1,
+            );
+            (Some(mask), Some(at.map_or(0, |at| at + 1)))
+        } else {
+            (None, None)
+        };
+        if let Some(mask) = escaped {
+            window.push_content_mask(mask);
+        }
+        self.slots[index as usize].escaped = escaped;
+        depth
+    }
+
+    fn calm(&mut self, index: u32) {
+        let slot = &mut self.slots[index as usize];
+        if slot.calm != self.prepaints.wrapping_sub(1) {
+            slot.since = self.prepaints;
+        }
+        slot.calm = self.prepaints;
+    }
+
+    // Keeps what a prepaint of a box gave, for a skip of the box in a later pass.
+    fn recorded(
+        &mut self,
+        index: u32,
+        [regions, touched]: [u32; 2],
+        listed: Option<usize>,
+        (outer, escapes, own): (bool, Option<usize>, Option<usize>),
+        window: &Window,
+    ) {
+        let slot = &mut self.slots[index as usize];
+        let min = |a: Option<usize>, b: Option<usize>| a.zip(b).map(|(a, b)| a.min(b)).or(a).or(b);
+        let inner = self.escapes;
+        self.escapes = min(min(escapes, own), inner);
+        let skips = mem::replace(&mut self.skips, outer)
+            && inner.is_none_or(|at| at > self.blocks.len())
+            && self.stacks.last().map(Vec::len) == listed
+            && slot.hooks.as_ref().is_none_or(|hooks| hooks.skippable());
+        if slot
+            .hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.skips_inside())
+        {
+            self.touched.push(index);
+        }
+        slot.skips = skips;
+        slot.regions = Some((self.prepaints, [regions, window.regions_len()]));
+        slot.touched = [touched, self.touched.len() as u32];
+        self.skips &= skips;
+    }
+
+    fn prepaint_box(&mut self, index: u32, style: &Style, covered: bool, window: &mut Window) {
         let origin = self.slots[index as usize].origin;
         let [bounds, _] = self.place(index, origin, window);
         let scale = window.scale_factor();
@@ -927,7 +1044,7 @@ impl Tree {
             .next()
             .unwrap_or(bounds);
         window.scope(Scope::Clip(style.overflow_mask(bounds)), |window| {
-            let hitbox = needs_hitbox.then(|| window.add_region(first, Hit::Pass));
+            let region = needs_hitbox.then(|| window.add_region(first, Hit::Pass));
             let offset = match &scroll {
                 Some(handle) => {
                     handle.drive(window);
@@ -935,13 +1052,7 @@ impl Tree {
                 }
                 None => Point::default(),
             };
-            self.slots[index as usize].hitbox = match hitbox {
-                Some(hitbox) => {
-                    self.hitboxes.push(hitbox);
-                    (self.hitboxes.len() - 1) as u32
-                }
-                None => NONE,
-            };
+            self.slots[index as usize].region = region;
             if style.display != Display::None {
                 if style.stacking {
                     let mut list = self.layers.remove(&index).unwrap_or_default();
@@ -955,7 +1066,7 @@ impl Tree {
                     for child in 0..self.slots[index as usize].children.len() {
                         let child = index_of(self.slots[index as usize].children[child]);
                         if self.slots[child as usize].style.escape != Escape::OUTLINE {
-                            self.prepaint_node(child, origin, window);
+                            self.prepaint_node(child, origin, covered, window);
                         }
                     }
                 });
@@ -963,7 +1074,7 @@ impl Tree {
                 for child in 0..self.slots[index as usize].children.len() {
                     let child = index_of(self.slots[index as usize].children[child]);
                     if self.slots[child as usize].style.escape == Escape::OUTLINE {
-                        self.prepaint_node(child, origin, window);
+                        self.prepaint_node(child, origin, covered, window);
                     }
                 }
                 if style.contains != 0 {
@@ -978,9 +1089,14 @@ impl Tree {
         });
         let below = self.slots[index as usize].children.iter().any(|&child| {
             let child = &self.slots[index_of(child) as usize];
-            child.below || child.volatile
+            child.below
         });
-        self.slots[index as usize].below = below;
+        let lively = self.slots[index as usize].children.iter().any(|&child| {
+            let child = &self.slots[index_of(child) as usize];
+            child.volatile || child.lively
+        });
+        let slot = &mut self.slots[index as usize];
+        (slot.below, slot.lively) = (below, lively);
     }
 
     // The far corner of a box and of the overflow that it doesn't clip, in the layout units of its parent. Without
@@ -1129,10 +1245,14 @@ impl Tree {
         if let Some(split) = &slot.split {
             origin += split.shift;
         }
+        let (escapes, own) = (self.escapes.take(), self.escape(index, window));
         let placement = window.placement();
-        let moved = slot
-            .placed
-            .is_none_or(|(_, at, placed)| (at, placed.offset) != (origin, placement.offset));
+        let slot = &mut self.slots[index as usize];
+        let (moved, clipped, delta) = slot.placed.map_or((true, true, None), |(_, at, placed)| {
+            let moved = (at, placed.offset) != (origin, placement.offset);
+            let delta = (at == origin).then(|| placement.offset - placed.offset);
+            (moved, moved || placed.mask != placement.mask, delta)
+        });
         slot.placed = Some((self.prepaints, origin, placement));
         if moved {
             slot.origin = origin;
@@ -1145,15 +1265,77 @@ impl Tree {
         {
             list.push((order, index, window.content_mask()));
         }
+        // A box whose boxes all stay where they were copies its regions, and its hooks keep what it gave
+        // its ancestors.
+        let slot = &self.slots[index as usize];
+        let [first, last] = slot.touched.map(|at| at as usize);
+        if !clipped
+            && slot.skips
+            && let Some((pass, regions)) = slot.regions
+            && (first == last || pass == self.last_touched.0 && last <= self.last_touched.1.len())
+            && let Some(start) = window.copy_regions(pass, regions)
+        {
+            let skip = |slot: &Slot, window: &mut Window| {
+                (slot.hooks.clone()).is_some_and(|hooks| hooks.skip(slot.exact, window))
+            };
+            if skip(slot, window) {
+                let touched = self.touched.len() as u32;
+                for at in first..last {
+                    let inside = self.last_touched.1[at];
+                    self.touched.push(inside);
+                    if inside != index {
+                        skip(&self.slots[inside as usize], window);
+                    }
+                }
+                self.calm(index);
+                let slot = &mut self.slots[index as usize];
+                slot.regions = Some((self.prepaints, [start, window.regions_len()]));
+                slot.touched = [touched, self.touched.len() as u32];
+                slot.skipped = self.prepaints;
+                if slot.escaped.is_some() {
+                    window.pop_content_mask();
+                }
+                self.escapes = escapes.zip(own).map(|(a, b)| a.min(b)).or(escapes).or(own);
+                self.still &= delta == self.delta;
+                return;
+            }
+            window.truncate_regions(start as usize);
+        }
+        let (outer, still, parent) = (
+            mem::replace(&mut self.skips, true),
+            mem::replace(&mut self.still, delta.is_some()),
+            mem::replace(&mut self.delta, delta),
+        );
+        let (regions, listed) = (window.regions_len(), self.stacks.last().map(Vec::len));
+        let touched = self.touched.len() as u32;
         self.visit(
             index,
             window,
             |hooks, cx, inner| hooks.kept(cx, inner),
             |tree, style, window| tree.keep_box(index, style, moved, window),
         );
-        if moved {
+        // The volatile boxes inside can reach elsewhere.
+        if moved || self.slots[index as usize].lively {
             self.reach(index, window.scale_factor());
         }
+        if self.slots[index as usize].escaped.is_some() {
+            window.pop_content_mask();
+        }
+        self.delta = parent;
+        // A calm box and all boxes in it stayed, or moved together with the scroll offset. An out-of-flow box
+        // takes the clip of its containing block, which can change while its parent stays.
+        let calm = mem::replace(&mut self.still, still) && !(own.is_some() && clipped);
+        if calm {
+            self.calm(index);
+        }
+        self.still &= calm && delta == parent;
+        self.recorded(
+            index,
+            [regions, touched],
+            listed,
+            (outer, escapes, own),
+            window,
+        );
     }
 
     fn keep_box(&mut self, index: u32, style: &Style, moved: bool, window: &mut Window) {
@@ -1168,9 +1350,8 @@ impl Tree {
             .unwrap_or(bounds);
         window.scope(Scope::Clip(style.overflow_mask(bounds)), |window| {
             let slot = &mut self.slots[index as usize];
-            if let Some(hitbox) = self.previous.get(slot.hitbox as usize) {
-                self.hitboxes.push(window.move_region(hitbox, first));
-                slot.hitbox = (self.hitboxes.len() - 1) as u32;
+            if let Some(region) = &slot.region {
+                slot.region = Some(window.move_region(region, first));
             }
             if style.display != Display::None {
                 if style.stacking {
@@ -1178,9 +1359,25 @@ impl Tree {
                     list.clear();
                     self.stacks.push(list);
                 }
-                for child in 0..self.slots[index as usize].children.len() {
-                    let child = index_of(self.slots[index as usize].children[child]);
-                    self.keep(child, origin, window);
+                if style.contains != 0 {
+                    self.blocks.push((style.contains, window.content_mask()));
+                }
+                // Volatile boxes prepaint again, and outlines go after the content, as in `prepaint_box`.
+                for outlines in [false, true] {
+                    for child in 0..self.slots[index as usize].children.len() {
+                        let child = index_of(self.slots[index as usize].children[child]);
+                        let slot = &self.slots[child as usize];
+                        if (slot.style.escape == Escape::OUTLINE) != outlines {
+                        } else if slot.volatile {
+                            self.prepaint_node(child, origin, false, window);
+                            (self.still, self.skips) = (false, false);
+                        } else {
+                            self.keep(child, origin, window);
+                        }
+                    }
+                }
+                if style.contains != 0 {
+                    self.blocks.pop();
                 }
                 if style.stacking {
                     let mut list = self.stacks.pop().unwrap_or_default();
@@ -1263,6 +1460,7 @@ impl Tree {
     }
 
     pub(crate) fn paint(&mut self, root: NodeId, window: &mut Window) {
+        self.paints = window.begin_paint();
         self.painting.clear();
         self.deferred.clear();
         self.unbounded = 0;
@@ -1280,7 +1478,62 @@ impl Tree {
                     !reach.intersects(escaped.unwrap_or_else(|| window.content_mask()).bounds)
                 })
         {
+            if slot.listed == listed {
+                window.cull();
+            }
             return;
+        }
+        // A box whose boxes all stayed where they were draws as in the last paint under the same window state. One
+        // whose boxes all moved by the same whole device pixels draws it moved, if its paint cut nothing.
+        // Debug builds paint it and check that the copy would draw the same.
+        let (key, outside) = (window.paint_key(), self.unbounded > 0);
+        let (at, mask) = (slot.bounds.origin, escaped.unwrap_or(key.mask));
+        // An out-of-flow box takes the clip of its containing block, so the boxes around it can't move a copy of it.
+        let foreign = slot.style.escape & !Escape::OUTLINE != 0;
+        // No prepaint since the chunk's paint went through the box.
+        let copy = slot
+            .chunk
+            .filter(|chunk| {
+                slot.calm == self.prepaints
+                    && slot.since <= chunk.prepass.wrapping_add(1)
+                    && Some(chunk.pass) == self.paints.1
+                    && chunk.unbounded == outside
+            })
+            .and_then(|chunk| match chunk.area {
+                _ if (chunk.key, chunk.at) == (key, at) => Some((chunk, None)),
+                Some(area)
+                    if chunk.key.same_paint(&key) && window.movable(area, at - chunk.at, mask) =>
+                {
+                    Some((chunk, Some((at - chunk.at, chunk.mask, mask))))
+                }
+                _ => None,
+            });
+        #[cfg(not(debug_assertions))]
+        if let Some((chunk, moved)) = copy
+            && let Some(span) = window.replay(&chunk.span, moved)
+        {
+            let area = moved.map_or(chunk.area, |(by, ..)| {
+                chunk
+                    .area
+                    .map(|area| area + by.scale(window.scale_factor()))
+            });
+            self.slots[index as usize].chunk = Some(Chunk {
+                pass: self.paints.0,
+                span,
+                key,
+                at,
+                mask,
+                area,
+                ..chunk
+            });
+            if foreign {
+                window.cull();
+            }
+            return;
+        }
+        let (mark, deferred) = (window.paint_mark(), self.deferred.len());
+        if slot.hooks.as_ref().is_some_and(|hooks| !hooks.cached()) {
+            window.paint_volatile();
         }
         if let Some(mask) = escaped {
             window.push_content_mask(mask);
@@ -1299,6 +1552,40 @@ impl Tree {
         window.font_smoothing = smoothing;
         if escaped.is_some() {
             window.pop_content_mask();
+        }
+        // Floats that the box leaves to an ancestor are not in its chunk.
+        let span = (self.deferred.len() <= deferred)
+            .then(|| window.paint_span(mark))
+            .flatten();
+        #[cfg(debug_assertions)]
+        if let Some((chunk, moved)) = copy {
+            let now = (span.as_ref()).map(|span| window.span_records(span, false, None));
+            let last = window.span_records(&chunk.span, true, moved);
+            assert!(
+                now.as_ref().is_some_and(|now| same_records(now, &last)),
+                "box {index} would draw a copy that differs from its paint: {:?}",
+                now.map(|now| (now.iter().zip(&last))
+                    .find(|(now, last)| now != last)
+                    .map_or_else(
+                        || format!("{} records != {}", now.len(), last.len()),
+                        |pair| format!("{pair:?}")
+                    ))
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = copy;
+        self.slots[index as usize].chunk = span.map(|span| Chunk {
+            pass: self.paints.0,
+            prepass: self.prepaints,
+            key,
+            unbounded: outside,
+            at,
+            mask,
+            area: window.plain(&span, mark, mask),
+            span,
+        });
+        if foreign {
+            window.cull();
         }
     }
 
@@ -1362,7 +1649,7 @@ impl Tree {
             let mask = style.overflow_mask(bounds);
             window.scope(Scope::Clip(mask), |window| {
                 let slot = &self.slots[index as usize];
-                if let Some(hitbox) = self.hitboxes.get(slot.hitbox as usize) {
+                if let Some(hitbox) = &slot.region {
                     if let Some(cursor) = style.cursor {
                         window.set_cursor(hitbox, cursor);
                     }
@@ -3975,6 +4262,34 @@ impl LayoutGridContainer for LayoutTree<'_> {
     fn get_grid_child_style(&self, node: NodeId) -> &taffy::Style {
         self.slots[usize::from(node)].taffy()
     }
+}
+
+// Records of a paint and of a copy match, but for the rounding of a transform that turns about a moved point.
+#[cfg(debug_assertions)]
+fn same_records(now: &[String], last: &[String]) -> bool {
+    let split = |text: &str| {
+        let (mut words, mut numbers) = (String::new(), Vec::new());
+        for part in
+            text.split(|char: char| !(char.is_ascii_digit() || matches!(char, '.' | '-' | 'e')))
+        {
+            match part.parse::<f64>() {
+                Ok(number) => numbers.push(number),
+                Err(_) => words.push_str(part),
+            }
+            words.push('|');
+        }
+        (words, numbers)
+    };
+    now.len() == last.len()
+        && now.iter().zip(last).all(|(now, last)| {
+            let ((a, x), (b, y)) = (split(now), split(last));
+            now == last
+                || a == b
+                    && x.len() == y.len()
+                    && x.iter()
+                        .zip(&y)
+                        .all(|(x, y)| (x - y).abs() <= 1e-3 * (1. + x.abs()))
+        })
 }
 
 #[cfg(test)]

@@ -289,7 +289,8 @@ const D50: [f64; 3] = [0.3457 / 0.3585, 1., (1. - 0.3457 - 0.3585) / 0.3585];
 const KAPPA: f64 = 24389. / 27.;
 const EPSILON: f64 = 216. / 24389.;
 
-type Rgb = Option<(u32, u8)>;
+// The 8-bit sRGB color, and the channels of a color outside the sRGB gamut.
+type Rgb = Option<((u32, u8), Option<[f32; 3]>)>;
 
 thread_local! {
     static COLORS: std::cell::RefCell<rustc_hash::FxHashMap<Box<str>, Rgb>> = Default::default();
@@ -299,18 +300,63 @@ pub fn rgba((rgb, alpha): (u32, u8)) -> renderer::Color {
     renderer::Color::hex(rgb << 8 | alpha as u32)
 }
 
+// Clipped to the sRGB gamut.
 pub fn color(value: &str) -> Option<(u32, u8)> {
+    lookup(value).map(|(rgb, _)| rgb)
+}
+
+// Like `rgba(color(value))`, but a color outside the sRGB gamut keeps its channels outside 0 to 1, so the
+// renderer draws it in the gamut of the screen.
+pub fn paint(value: &str) -> Option<renderer::Color> {
+    let (rgb, wide) = lookup(value)?;
+    Some(wide.map_or_else(
+        || rgba(rgb),
+        |[r, g, b]| renderer::Color::new(r, g, b, rgb.1 as f32 / 255.),
+    ))
+}
+
+pub fn wide(value: &str) -> bool {
+    lookup(value).is_some_and(|(_, wide)| wide.is_some())
+}
+
+// The 8-bit Display P3 color, clipped to its gamut.
+pub fn p3(value: &str) -> Option<(u32, u8)> {
+    let (space, channels, alpha) = parse(value.trim(), 0)?;
+    let [r, g, b] = convert(space, channels, Space::DisplayP3)
+        .map(|v| ((v as f32).clamp(0., 1.) * 255.).round() as u32);
+    Some((
+        r << 16 | g << 8 | b,
+        (alpha.clamp(0., 1.) * 255.).round() as u8,
+    ))
+}
+
+// sRGB with 10 bits a channel from -0.5 to 1.5, which holds Display P3 and more.
+pub fn wide_rgb(value: &str) -> Option<(u32, u8)> {
+    let (space, channels, alpha) = parse(value.trim(), 0)?;
+    let [r, g, b] = convert(space, channels, Space::Srgb)
+        .map(|v| (((v as f32 + 0.5) / 2.).clamp(0., 1.) * 1023.).round() as u32);
+    Some((
+        r << 20 | g << 10 | b,
+        (alpha.clamp(0., 1.) * 255.).round() as u8,
+    ))
+}
+
+fn lookup(value: &str) -> Rgb {
     let value = value.trim();
     if let Some(color) = COLORS.with_borrow(|colors| colors.get(value).copied()) {
         return color;
     }
     let color = parse(value, 0).map(|(space, channels, alpha)| {
-        let rgb = convert(space, channels, Space::Srgb);
+        let rgb = convert(space, channels, Space::Srgb).map(|v| v as f32);
         // Browsers keep channels as f32, so 0.1 * 255 rounds up to 26.
-        let [r, g, b] = rgb.map(|v| ((v as f32).clamp(0., 1.) * 255.).round() as u32);
+        let [r, g, b] = rgb.map(|v| (v.clamp(0., 1.) * 255.).round() as u32);
+        let wide = rgb.iter().any(|v| (v - v.clamp(0., 1.)).abs() * 255. > 0.5);
         (
-            r << 16 | g << 8 | b,
-            (alpha.clamp(0., 1.) * 255.).round() as u8,
+            (
+                r << 16 | g << 8 | b,
+                (alpha.clamp(0., 1.) * 255.).round() as u8,
+            ),
+            wide.then_some(rgb),
         )
     });
     COLORS.with_borrow_mut(|colors| {

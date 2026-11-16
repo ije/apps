@@ -67,7 +67,9 @@ impl Window {
         let clip = self.snapped_content_mask();
         let widths = border.widths.map(|width| self.snap_stroke(width));
         let mut instance = Instance::new(BOX, rect, clip);
-        instance.radii = radii.into().scale(self.scale_factor).to_array();
+        let radii = radii.into();
+        instance.radii = radii.scale(self.scale_factor).to_array();
+        [instance.shape[0], instance.shape[1]] = radii.shape_array();
         instance.color = fill.fade(self.opacity).to_array();
         instance.border_color = border.color.fade(self.opacity).to_array();
         instance.aux = [widths.top, widths.right, widths.bottom, widths.left];
@@ -94,12 +96,19 @@ impl Window {
         // A border alone draws as four strips around the largest box it leaves empty, so the empty pixels
         // run no shader. Where the radii reach further in than the widths, the box keeps clear of them.
         let r = &instance.radii;
+        // A concave corner draws its border up to a width past its radius.
+        let past = if radii.shape.is_zero() {
+            0.
+        } else {
+            instance.aux.into_iter().fold(0., f32::max)
+        };
         let reach = [
             r[4].max(r[5]),
             r[1].max(r[2]),
             r[6].max(r[7]),
             r[0].max(r[3]),
-        ];
+        ]
+        .map(|reach| reach + past);
         // One side alone draws inside its own band.
         if border.sides.is_power_of_two() {
             let side = border.sides.trailing_zeros() as usize;
@@ -181,6 +190,7 @@ impl Window {
         let clip = self.snapped_content_mask();
         let caster = self.cover_bounds(bounds).to_array();
         let caster_radii = radii.scale(scale).to_array();
+        let [top, bottom] = radii.shape_array();
         for shadow in shadows.iter().filter(|shadow| shadow.inset == inset) {
             let spread = shadow.spread_radius;
             let (shape, shape_radii) = if inset {
@@ -201,19 +211,20 @@ impl Window {
                         radius + spread * (1. + (radius / spread - 1.).powi(3))
                     })
                 };
-                (
-                    (bounds + shadow.offset).outset(shadow.spread_radius),
-                    Radii {
-                        x: radii.x.map(grow),
-                        y: radii.y.map(grow),
-                    },
-                )
+                let grown = Radii {
+                    x: radii.x.map(grow),
+                    y: radii.y.map(grow),
+                    shape: radii.shape,
+                };
+                let grown = radii.moved_out(shadow.spread_radius, grown);
+                ((bounds + shadow.offset).outset(shadow.spread_radius), grown)
             };
             let mut instance = Instance::new(SHADOW, self.cover_bounds(shape), clip);
             instance.radii = shape_radii.scale(scale).to_array();
             instance.color = shadow.color.fade(self.opacity).to_array();
             instance.aux = caster;
             instance.aux_radii = caster_radii;
+            [instance.shape[0], instance.shape[1]] = [top, bottom];
             instance.info[1] = f32::from(u8::from(inset));
             instance.info[2] = shadow.blur_radius.scale(scale);
             self.scene.push(instance);
@@ -523,15 +534,14 @@ impl Window {
             self.snapped_content_mask(),
             tile,
         );
-        instance.radii = radii
-            .into()
-            .fit(visible.size)
-            .scale(self.scale_factor)
-            .to_array();
+        let radii = radii.into().fit(visible.size);
+        instance.radii = radii.scale(self.scale_factor).to_array();
+        [instance.shape[0], instance.shape[1]] = radii.shape_array();
         instance.info[1] = f32::from(
             u8::from(grayscale)
                 | u8::from(image.is_premultiplied()) << 1
-                | u8::from(pixelated) << 2,
+                | u8::from(pixelated) << 2
+                | u8::from(image.is_display_p3()) << 3,
         );
         self.scene.push(instance);
     }

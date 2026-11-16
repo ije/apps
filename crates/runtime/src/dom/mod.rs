@@ -729,7 +729,8 @@ pub struct State {
     pub(crate) layout_nodes: Vec<Option<LayoutNode>>,
     pub(crate) measurements: crate::render::grid::Measurements,
     pub painted: Vec<u64>,
-    pub(crate) paint_count: u64,
+    // A hash of the state that paint reads outside the boxes: images and the selection.
+    pub(crate) paint_inputs: u64,
     pub(crate) layout_revision: u64,
     style_epoch: u64,
     layout_epoch: u64,
@@ -774,6 +775,8 @@ pub struct State {
     >,
     pub(crate) backgrounds: HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>,
     pub(crate) bitmaps: HashMap<String, Arc<renderer::RenderImage>>,
+    // The decoded source of each background layer, kept while the layer keeps its raster, so `retire` keeps it.
+    pub(crate) layer_sources: HashMap<(usize, usize), Arc<renderer::RenderImage>>,
     pub(crate) gradients: Vec<(String, Arc<renderer::RenderImage>)>,
     pub(crate) font_aliases: HashMap<String, String>,
     pub(crate) fonts: HashMap<String, Option<String>>,
@@ -2005,7 +2008,7 @@ pub fn call(
                 .contains_key(&id)
                 .then(|| {
                     let now = std::time::Instant::now();
-                    state.motion.timeline(id, &styles, &[now], &[]).pop()
+                    state.motion.timeline(id, 0, &styles, &[now], &[]).pop()
                 })
                 .flatten();
             let mut sampled = None;

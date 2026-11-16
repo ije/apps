@@ -537,7 +537,7 @@ impl Renderer {
 
     // Layers go; the swap chain keeps the last frame on screen.
     pub fn release(&mut self) {
-        self.pool.clear();
+        self.pool.clear(&mut self.frame);
     }
 
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
@@ -567,7 +567,7 @@ impl Renderer {
         if !Rc::ptr_eq(&gpu, &self.gpu) || self.surface.is_none() {
             // The old composition target must go before the window takes a new one.
             self.surface = None;
-            self.pool.clear();
+            self.pool.clear(&mut self.frame);
             self.gpu = gpu;
             self.surface = Some(Surface::new(&self.gpu, self.hwnd, self.size, self.opaque)?);
         }

@@ -1438,6 +1438,19 @@ pub fn svg(source: &str, width: u32, height: u32) -> Result<Arc<renderer::Render
     render_svg(&svg_tree(source, false)?, width, height, None)
 }
 
+// The image of `effects::gradient_svg`.
+pub fn svg_gradient(
+    (source, p3): (String, bool),
+    width: u32,
+    height: u32,
+) -> Option<Arc<renderer::RenderImage>> {
+    let image = svg(&source, width, height).ok()?;
+    match p3 {
+        true => Some(Arc::new(Arc::into_inner(image)?.display_p3())),
+        false => Some(image),
+    }
+}
+
 // usvg reads any file that an SVG names in an image. Page content must not reach files this way: a canvas
 // hands their pixels to the page, and a UNC path sends the user's credentials to its host. Only SVG that the
 // runtime wrote itself may name `files`.

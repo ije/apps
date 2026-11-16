@@ -60,6 +60,9 @@ struct Entry {
     used: Cell<u32>,
 }
 
+// A tile at the place of a freed one: (color page, page, texels).
+pub(crate) type Fresh = (bool, u32, Rect<i32>);
+
 pub(crate) struct Atlas<B> {
     tiles: RefCell<FxHashMap<TileKey, Entry>>,
     retired: RefCell<Vec<(u32, Tile)>>,
@@ -67,6 +70,12 @@ pub(crate) struct Atlas<B> {
     glyph_pixels: Cell<usize>,
     swept: Cell<u32>,
     pub(crate) pages: RefCell<B>,
+    // The area of each page that freed tiles held, and the new tiles there since `take_fresh`. `None`
+    // when all pages changed.
+    freed: RefCell<FxHashMap<(bool, u32), Rect<i32>>>,
+    fresh: RefCell<Option<Vec<Fresh>>>,
+    // Tiles that a copy of the last paint can read were freed.
+    evicted: Cell<bool>,
 }
 
 pub(crate) type Raster<B> = (Rect<i32>, Size<i32>, B);
@@ -86,7 +95,27 @@ impl<B: PageStore> Atlas<B> {
             glyph_pixels: Cell::new(0),
             swept: Cell::new(0),
             pages: RefCell::new(pages),
+            freed: RefCell::default(),
+            fresh: RefCell::new(Some(Vec::new())),
+            evicted: Cell::new(false),
         }
+    }
+
+    pub fn take_evicted(&self) -> bool {
+        self.evicted.replace(false)
+    }
+
+    // Instances that read new pixels in the place of old ones look the same, so they must draw again.
+    pub fn take_fresh(&self) -> Option<Vec<Fresh>> {
+        self.fresh.replace(Some(Vec::new()))
+    }
+
+    fn free(&self, pages: &mut B, tile: Tile) {
+        let key = (matches!(tile.kind, PageKind::Color), tile.page);
+        let mut freed = self.freed.borrow_mut();
+        let area = freed.entry(key).or_insert(tile.rect);
+        *area = area.union(tile.rect);
+        pages.remove(tile);
     }
 
     pub fn get_or_insert_with(
@@ -117,6 +146,15 @@ impl<B: PageStore> Atlas<B> {
                             id,
                             rect,
                         });
+                if let Some(tile) = tile {
+                    let key = (matches!(kind, PageKind::Color), tile.page);
+                    if (self.freed.borrow().get(&key))
+                        .is_some_and(|area| area.intersects(tile.rect))
+                        && let Some(fresh) = self.fresh.borrow_mut().as_mut()
+                    {
+                        fresh.push((key.0, key.1, tile.rect));
+                    }
+                }
                 if let (Some(tile), TileKey::Glyph(_)) = (tile, key) {
                     self.glyph_pixels
                         .set(self.glyph_pixels.get() + pixels(&tile));
@@ -142,6 +180,7 @@ impl<B: PageStore> Atlas<B> {
         }) = self.tiles.borrow_mut().remove(key)
         {
             self.retired.borrow_mut().push((self.frame.get(), tile));
+            self.evicted.set(true);
         }
     }
 
@@ -153,7 +192,7 @@ impl<B: PageStore> Atlas<B> {
             retired.retain(|(removed, tile)| {
                 let keep = frame.wrapping_sub(*removed) < IN_FLIGHT;
                 if !keep {
-                    pages.remove(*tile);
+                    self.free(&mut pages, *tile);
                 }
                 keep
             });
@@ -172,7 +211,8 @@ impl<B: PageStore> Atlas<B> {
             }
             if let Some(tile) = entry.tile {
                 glyph_pixels -= pixels(&tile);
-                pages.remove(tile);
+                self.free(&mut pages, tile);
+                self.evicted.set(true);
             }
             false
         });
@@ -188,7 +228,7 @@ impl<B: PageStore> Atlas<B> {
         wait();
         let mut pages = self.pages.borrow_mut();
         for (_, tile) in retired.drain(..) {
-            pages.remove(tile);
+            self.free(&mut pages, tile);
         }
     }
 
@@ -202,6 +242,7 @@ impl<B: PageStore> Atlas<B> {
                 return true;
             }
             retired.extend(entry.tile.map(|tile| (frame, tile)));
+            self.evicted.set(true);
             false
         });
     }
@@ -211,6 +252,9 @@ impl<B: PageStore> Atlas<B> {
         self.tiles.borrow_mut().clear();
         self.retired.borrow_mut().clear();
         self.glyph_pixels.set(0);
+        self.freed.borrow_mut().clear();
+        *self.fresh.borrow_mut() = None;
+        self.evicted.set(true);
         *self.pages.borrow_mut() = pages;
     }
 }

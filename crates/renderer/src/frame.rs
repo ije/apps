@@ -14,8 +14,9 @@ pub(crate) const IDENTITY: [f32; 16] = [
 
 const HALF_RESOLUTION_SIGMA: f32 = 8.;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Default)]
 pub enum Target {
+    #[default]
     Frame,
     Layer(usize),
 }
@@ -84,16 +85,50 @@ pub struct RenderFrame {
     copy: bool,
     pub skip: Vec<usize>,
     pub content: Vec<usize>,
+    // With regions, only the window content that reaches each is drawn, then copied over the last frame.
+    pub damage: Vec<[i32; 4]>,
+    // The targets of the window content.
+    pub bases: Vec<Target>,
+    cull: Option<Rect<f32>>,
+    // For each texture, the id of the cached layer that it keeps, or 0.
+    pub kept: Vec<u64>,
+    cache: Vec<Cached>,
+    // Cached layers draw again, for a frame that is drawn twice in different color spaces.
+    pub fresh: bool,
+    // Layer keys drawn lately, by frame. A layer is kept when it draws the same in a later frame.
+    seen: rustc_hash::FxHashMap<u64, u32>,
+    count: u32,
+    ids: u64,
     pub promoted: Vec<(usize, Target, [i32; 4])>,
     // The snapshot layers to read: the key, the target and the region that it holds.
     pub shots: Vec<(u64, Target, [i32; 4])>,
+    // The commands of the snapshot layers start here.
+    pub shot_commands: usize,
 }
+
+// The pixels of a layer from an earlier frame, which draw again while its digest and place stay.
+struct Cached {
+    key: u64,
+    digest: u64,
+    id: u64,
+    size: [u32; 2],
+    region: [i32; 4],
+    idle: u8,
+    used: bool,
+}
+
+// Cached layers hold at most this many window areas.
+const CACHE_WINDOWS: u64 = 2;
 
 // The layer textures of a backend. A texture that no frame used for this many frames is dropped.
 const SPARE_FRAMES: u8 = 3;
+// Frames with damage regions use few layers, so they age the others this much slower.
+const DAMAGED_FRAMES: u8 = 16;
+const TAKEN: u8 = u8::MAX;
 
+// Each texture has its size, its idle frames and the id of the cached layer it keeps, or 0.
 pub(crate) struct Pool<T> {
-    textures: Vec<(T, [u32; 2], u8)>,
+    textures: Vec<(T, [u32; 2], u8, u64)>,
     slots: Vec<usize>,
 }
 
@@ -112,25 +147,47 @@ impl<T> Pool<T> {
         frame: &RenderFrame,
         mut make: impl FnMut([u32; 2]) -> anyhow::Result<T>,
     ) -> anyhow::Result<()> {
-        for (.., idle) in &mut self.textures {
-            *idle = idle.saturating_add(1);
+        // The textures of dropped layers go back to the others.
+        for (.., idle, id) in &mut self.textures {
+            if *id != 0 && !frame.cache.iter().any(|cached| cached.id == *id) {
+                (*idle, *id) = (0, 0);
+            }
         }
-        self.textures.retain(|(.., idle)| *idle <= SPARE_FRAMES);
+        let age = match frame.damage.is_empty() {
+            true => DAMAGED_FRAMES,
+            false => 1,
+        };
+        for (.., idle, id) in &mut self.textures {
+            if *id == 0 {
+                *idle = idle.saturating_add(age);
+            }
+        }
+        self.textures
+            .retain(|(.., idle, _)| *idle <= SPARE_FRAMES * DAMAGED_FRAMES);
         self.slots.clear();
-        for &size in &frame.textures {
-            let index = match self
-                .textures
-                .iter()
-                .position(|(_, kept, idle)| *idle > 0 && *kept == size)
-            {
+        for (&size, &id) in frame.textures.iter().zip(&frame.kept) {
+            let found = match id {
+                0 => None,
+                _ => self.textures.iter().position(|texture| texture.3 == id),
+            };
+            let index = match found.or_else(|| {
+                self.textures.iter().position(|(_, kept, idle, other)| {
+                    *idle != TAKEN && *other == 0 && *kept == size
+                })
+            }) {
                 Some(index) => index,
                 None => {
-                    self.textures.push((make(size)?, size, 0));
+                    self.textures.push((make(size)?, size, 0, 0));
                     self.textures.len() - 1
                 }
             };
-            self.textures[index].2 = 0;
+            (self.textures[index].2, self.textures[index].3) = (TAKEN, id);
             self.slots.push(index);
+        }
+        for (.., idle, _) in &mut self.textures {
+            if *idle == TAKEN {
+                *idle = 0;
+            }
         }
         Ok(())
     }
@@ -142,9 +199,11 @@ impl<T> Pool<T> {
         Some(&self.textures[self.slots[frame.layers[index].texture]].0)
     }
 
-    pub fn clear(&mut self) {
+    // The frame forgets the cached layers too, since their pixels go.
+    pub fn clear(&mut self, frame: &mut RenderFrame) {
         self.textures.clear();
         self.slots.clear();
+        frame.cache.clear();
     }
 }
 
@@ -155,6 +214,68 @@ pub fn region(bounds: Rect<f32>) -> [i32; 4] {
         (bounds.origin.y + bounds.size.height).ceil(),
     ];
     [x as i32, y as i32, (right - x) as i32, (bottom - y) as i32]
+}
+
+// The window regions to draw again, or `None` for the whole window. A layer that reads the pixels
+// below it draws whole when a region reaches it, since it reads only what the frame drew again.
+#[cfg(any(target_os = "macos", test))]
+pub fn damage_regions(
+    scene: &Scene,
+    window: [u32; 2],
+    extra: &[[i32; 4]],
+) -> Option<Vec<[i32; 4]>> {
+    if scene.damage.whole {
+        return None;
+    }
+    let bounds = Rect::new(
+        Point::default(),
+        Size::new(window[0] as f32, window[1] as f32),
+    );
+    let meets = |a: [i32; 4], b: [i32; 4]| {
+        a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+    };
+    let join = |a: [i32; 4], b: [i32; 4]| {
+        let [x, y] = [a[0].min(b[0]), a[1].min(b[1])];
+        let [right, bottom] = [
+            (a[0] + a[2]).max(b[0] + b[2]),
+            (a[1] + a[3]).max(b[1] + b[3]),
+        ];
+        [x, y, right - x, bottom - y]
+    };
+    let mut regions: Vec<[i32; 4]> = Vec::new();
+    let add = |regions: &mut Vec<[i32; 4]>, mut region: [i32; 4]| {
+        while let Some(at) = regions.iter().position(|other| meets(*other, region)) {
+            region = join(regions.swap_remove(at), region);
+        }
+        regions.push(region);
+    };
+    // Edges blend into the pixel next to them.
+    for rect in &scene.damage.rects {
+        let rect = rect.outset(1.).intersect(bounds);
+        if !rect.is_empty() {
+            add(&mut regions, region(rect));
+        }
+    }
+    for &region in extra {
+        add(&mut regions, region);
+    }
+    let reads: Vec<[i32; 4]> = (scene.reads.iter())
+        .map(|read| read.intersect(bounds))
+        .filter(|read| !read.is_empty())
+        .map(region)
+        .collect();
+    while let Some(&read) = reads.iter().find(|read| {
+        regions.iter().any(|region| meets(*region, **read))
+            && !regions
+                .iter()
+                .any(|region| join(*region, **read) == *region)
+    }) {
+        add(&mut regions, read);
+    }
+    let area: i64 = (regions.iter())
+        .map(|region| i64::from(region[2]) * i64::from(region[3]))
+        .sum();
+    (area * 2 <= i64::from(window[0]) * i64::from(window[1])).then_some(regions)
 }
 
 impl RenderFrame {
@@ -170,7 +291,40 @@ impl RenderFrame {
         self.window = window;
         self.max_texture = max_texture as f32;
         self.copy = copy;
-        self.record_layer(scene, 0, Target::Frame, true, 0);
+        self.kept.clear();
+        self.bases.clear();
+        self.count = self.count.wrapping_add(1);
+        let count = self.count;
+        self.seen
+            .retain(|_, seen| count.wrapping_sub(*seen) <= u32::from(SPARE_FRAMES));
+        self.cache
+            .retain(|cached| !scene.stale.contains(&cached.digest));
+        for cached in &mut self.cache {
+            cached.used = false;
+        }
+        if self.damage.is_empty() {
+            self.bases.push(Target::Frame);
+            self.record_layer(scene, 0, Target::Frame, true, 0);
+        }
+        for at in 0..self.damage.len() {
+            let region = self.damage[at];
+            let base = self.acquire(region, 1);
+            // Layers take the same place as in a whole frame.
+            if let Target::Layer(index) = base {
+                self.layers[index].bounds = [0., 0., window[0] as f32, window[1] as f32];
+            }
+            self.bases.push(base);
+            let [x, y, width, height] = region.map(|value| value as f32);
+            self.cull = Some(Rect::new(Point::new(x, y), Size::new(width, height)));
+            self.record_layer(scene, 0, base, true, 0);
+            self.cull = None;
+            self.commands.push(Command::Copy {
+                src: base,
+                dst: Target::Frame,
+                region,
+            });
+            self.release(base);
+        }
         self.promoted.clear();
         for index in 0..self.content.len() {
             let layer = self.content[index];
@@ -183,6 +337,7 @@ impl RenderFrame {
             self.promoted.push((layer, target, region));
         }
         self.shots.clear();
+        self.shot_commands = self.commands.len();
         for shot in scene.shots.iter().filter(|shot| shot.read) {
             let [x, y, width, height] = shot.region;
             let region = [
@@ -197,6 +352,20 @@ impl RenderFrame {
                 self.shots.push((shot.key, target, region));
             }
         }
+        // Layers that the frame could have used and didn't age. A damage region could use only some.
+        let damage = &self.damage;
+        for cached in &mut self.cache {
+            let [x, y, width, height] = cached.region;
+            if !cached.used
+                && (damage.is_empty()
+                    || damage.iter().any(|&[left, top, w, h]| {
+                        x < left + w && left < x + width && y < top + h && top < y + height
+                    }))
+            {
+                cached.idle += 1;
+            }
+        }
+        self.cache.retain(|cached| cached.idle <= SPARE_FRAMES);
         // Shelf textures grow while the frame is recorded, so composites read their final size.
         if !self.shelves.is_empty() {
             for command in 0..self.commands.len() {
@@ -250,7 +419,8 @@ impl RenderFrame {
         Globals {
             viewport: self.rect(target),
             text_contrast,
-            pad: [0.; 3],
+            wide: 0.,
+            pad: [0.; 2],
         }
     }
 
@@ -275,6 +445,7 @@ impl RenderFrame {
                 let max = self.max_texture as u32;
                 self.textures
                     .push(size.map(|value| (value.div_ceil(256) * 256).min(max)));
+                self.kept.push(0);
                 self.textures.len() - 1
             }
         };
@@ -310,6 +481,7 @@ impl RenderFrame {
             Some(shelf) => shelf,
             slot => {
                 self.textures.push([0, 0]);
+                self.kept.push(0);
                 clear = true;
                 slot.insert(Shelf {
                     texture: self.textures.len() - 1,
@@ -364,10 +536,58 @@ impl RenderFrame {
         }
     }
 
+    // A cached layer keeps its texture.
     fn release(&mut self, target: Target) {
-        if let Target::Layer(index) = target {
+        if let Target::Layer(index) = target
+            && self.kept[self.layers[index].texture] == 0
+        {
             self.free.push(self.layers[index].texture);
         }
+    }
+
+    // The pixels of a layer that drew the same in an earlier frame, now at `region`.
+    fn reuse(&mut self, key: u64, region: [i32; 4]) -> Option<Target> {
+        if self.fresh {
+            return None;
+        }
+        let cached = self.cache.iter_mut().find(|cached| cached.key == key)?;
+        (cached.used, cached.idle, cached.region) = (true, 0, region);
+        self.textures.push(cached.size);
+        self.kept.push(cached.id);
+        self.layers.push(Layer {
+            texture: self.textures.len() - 1,
+            origin: [region[0], region[1]],
+            scale: 1.,
+            bounds: region.map(|value| value as f32),
+        });
+        Some(Target::Layer(self.layers.len() - 1))
+    }
+
+    // Keeps the pixels of a layer for later frames, within the budget of the cache.
+    fn keep(&mut self, target: Target, key: u64, digest: u64, region: [i32; 4]) {
+        let Target::Layer(index) = target else {
+            return;
+        };
+        let texture = self.layers[index].texture;
+        let size = self.textures[texture];
+        let pixels = |size: [u32; 2]| u64::from(size[0]) * u64::from(size[1]);
+        // Small windows still keep a few small layers, since textures are at least 256 by 256 pixels.
+        let budget = CACHE_WINDOWS * pixels(self.window) + (1 << 20);
+        let held: u64 = self.cache.iter().map(|cached| pixels(cached.size)).sum();
+        if self.kept[texture] != 0 || held + pixels(size) > budget {
+            return;
+        }
+        self.ids += 1;
+        self.kept[texture] = self.ids;
+        self.cache.push(Cached {
+            key,
+            digest,
+            id: self.ids,
+            size,
+            region,
+            idle: 0,
+            used: true,
+        });
     }
 
     fn record_layer(
@@ -465,6 +685,9 @@ impl RenderFrame {
             }
             let mut instance = *instance;
             let mut bounds = instance.reach();
+            if layer == 0 && self.cull.is_some_and(|cull| !cull.intersects(bounds)) {
+                continue;
+            }
             let trim = instance.kind() == BOX && instance.round_radii == [0.; 8];
             if !visible(at, &mut bounds, trim) {
                 continue;
@@ -513,7 +736,10 @@ impl RenderFrame {
         target: Target,
         depth: usize,
     ) {
-        if layer != 0 || !self.skip.contains(&nested.layer) {
+        if layer != 0
+            || !self.skip.contains(&nested.layer)
+                && self.cull.is_none_or(|cull| cull.intersects(nested.reach()))
+        {
             self.record_effect(scene, nested, target, depth);
         }
     }
@@ -643,6 +869,10 @@ impl RenderFrame {
             shadow: [0.; 4],
             source_rect: [0.; 4],
             backdrop_rect: [0.; 4],
+            shapes: {
+                let [top, bottom] = nested.clip.radii.shape_array();
+                [0., 0., top, bottom]
+            },
             opacity: 1.,
             blur: 0.,
             flags: 0,
@@ -665,8 +895,10 @@ impl RenderFrame {
         if copies || blurs {
             self.flush(target, depth);
         }
+        // A backdrop with no blur and no color change draws its backdrop again as it is.
         if let Some(backdrop) = &effect.backdrop
             && self.copy
+            && (backdrop.blur > 0.25 || backdrop.color_matrix.is_some())
             && let Some(region) = self.region(backdrop.bounds, visible)
         {
             let copy = self.acquire(region, 1);
@@ -686,6 +918,7 @@ impl RenderFrame {
             composite.bounds = backdrop.bounds.to_array();
             composite.clip = composite.bounds;
             composite.clip_radii = backdrop.corner_radii.to_array();
+            [composite.shapes[0], composite.shapes[1]] = backdrop.corner_radii.shape_array();
             composite.blur = sigma;
             // A backdrop composite has no shadow, so `shadow` holds the edge for the blur.
             composite.shadow = region.map(|value| value as f32);
@@ -722,7 +955,30 @@ impl RenderFrame {
         // Tiles must hold all their content, since drawing past a tile would reach the next one.
         let whole = Some(region)
             == self.region(content, [f32::MIN, f32::MIN, f32::INFINITY, f32::INFINITY]);
-        let tile = (!copies && !blurs && whole && effect.text_mask.is_none())
+        // A layer that draws as in an earlier frame takes the pixels of then. One that draws the same in
+        // two frames keeps them.
+        let digest = (scene.digests.get(nested.layer).copied())
+            .filter(|digest| *digest != 0 && effect.text_mask.is_none());
+        // The pixels are the same at another place, so the key holds the region relative to the layer.
+        let origin = crate::scene::origin(layer).map(|value| value as i32);
+        let bordered = [region[0] - 1, region[1] - 1, region[2] + 2, region[3] + 2];
+        let key = digest.map(|digest| {
+            [
+                region[0] - origin.x,
+                region[1] - origin.y,
+                region[2],
+                region[3],
+            ]
+            .iter()
+            .fold(digest, |key, value| crate::scene::mix(key, *value as u64))
+        });
+        let cached = key.and_then(|key| self.reuse(key, bordered));
+        let count = self.count;
+        let seen = cached.is_none()
+            && key.is_some_and(|key| {
+                (self.seen.insert(key, count)).is_some_and(|seen| seen != count)
+            });
+        let tile = (cached.is_none() && !seen && !copies && !blurs && whole)
             .then(|| self.tile(region, target, depth))
             .flatten();
         if tile.is_none() {
@@ -733,17 +989,18 @@ impl RenderFrame {
             self.record_layer(scene, text, texture, true, depth + 1);
             texture
         });
-        let texture = match tile {
-            Some((tile, clear)) => {
+        let texture = match (cached, tile) {
+            (Some(cached), _) => cached,
+            (None, Some((tile, clear))) => {
                 self.record_layer(scene, nested.layer, tile, clear, depth + 1);
                 tile
             }
-            None => {
-                let texture = self.acquire(
-                    [region[0] - 1, region[1] - 1, region[2] + 2, region[3] + 2],
-                    1,
-                );
+            (None, None) => {
+                let texture = self.acquire(bordered, 1);
                 self.record_layer(scene, nested.layer, texture, true, depth + 1);
+                if let (true, Some(key), Some(digest)) = (seen, key, digest) {
+                    self.keep(texture, key, digest, bordered);
+                }
                 texture
             }
         };
@@ -755,6 +1012,7 @@ impl RenderFrame {
             base.flags |= COMPOSITE_CLIP;
             base.clip = bounds.to_array();
             base.clip_radii = corners.to_array();
+            [base.shapes[0], base.shapes[1]] = corners.shape_array();
         }
         let mask_texture = effect.mask.as_ref().map(|(tile, bounds)| {
             base.flags |= COMPOSITE_MASK;
@@ -851,7 +1109,7 @@ mod tests {
     use crate::{
         Clip,
         gpu::{BOX, GLYPH, IMAGE, Instance, bytes, rect as bounds},
-        scene::{EffectState, Scene, effect},
+        scene::{BackdropState, EffectState, Scene, effect},
     };
 
     fn record(window: [u32; 2], quad: [f32; 4], scale: f32) -> RenderFrame {
@@ -869,7 +1127,7 @@ mod tests {
         scene.pop_effect();
         let mut frame = RenderFrame::default();
         frame.record(&scene, window, 16384, true);
-        assert!(scene.patch(7, 0.25, None) && !scene.patch(8, 0.25, None));
+        assert!(scene.patch(7, 0.25, None, [None; 2]) && !scene.patch(8, 0.25, None, [None; 2]));
         let mut patched = RenderFrame::default();
         patched.record(&scene, window, 16384, true);
         assert!(
@@ -1074,9 +1332,82 @@ mod tests {
         };
         for matrix in [turn(30.), shift(100., 40.), shift(-90., 0.)] {
             let mut patched = scene(turn(0.));
-            assert!(patched.patch(9, 1., Some(matrix)));
+            assert!(patched.patch(9, 1., Some(matrix), [None; 2]));
             assert_eq!(draw(&patched), draw(&scene(matrix)));
         }
+    }
+
+    #[test]
+    fn patched_blurs_draw_like_new_frames() {
+        let mask = Clip::from(bounds([0., 0., 800., 600.]));
+        let scene = |blur: f32, backdrop: f32, around: bool| {
+            let mut scene = Scene::default();
+            scene.push(Instance::new(BOX, bounds([0., 0., 400., 300.]), mask));
+            if around {
+                let state = EffectState {
+                    opacity: 0.5,
+                    ..effect(mask)
+                };
+                scene.push_effect(state, None);
+            }
+            let state = EffectState {
+                blur,
+                backdrop: Some(BackdropState {
+                    bounds: bounds([100., 100., 100., 100.]),
+                    corner_radii: Default::default(),
+                    blur: backdrop,
+                    color_matrix: None,
+                }),
+                ..effect(mask)
+            };
+            scene.push_effect(state, Some(9));
+            scene.push(Instance::new(BOX, bounds([100., 100., 100., 100.]), mask));
+            scene.pop_effect();
+            if around {
+                scene.pop_effect();
+            }
+            scene
+        };
+        let draw = |scene: &Scene| {
+            let mut frame = RenderFrame::default();
+            frame.record(scene, [800, 600], 16384, true);
+            let order: Vec<_> = frame
+                .commands
+                .iter()
+                .map(|command| match command {
+                    Command::Pass(..) => "pass".into(),
+                    Command::Draw { instances, .. } => format!("draw {instances:?}"),
+                    Command::Blur { index, .. } => format!("blur {index}"),
+                    Command::Copy { region, .. } => format!("copy {region:?}"),
+                    Command::Composite { index, .. } => format!("composite {index}"),
+                })
+                .collect();
+            (
+                order,
+                bytes(&frame.instances).to_vec(),
+                bytes(&frame.composites).to_vec(),
+                bytes(&frame.blurs).to_vec(),
+                scene.layers[0].nested[0].bounds,
+            )
+        };
+        for (blur, backdrop) in [(8., 0.), (0., 6.), (12., 4.), (0., 0.)] {
+            let mut patched = scene(2., 0., false);
+            patched.drawn();
+            assert!(patched.patch(9, 1., None, [Some(blur), Some(backdrop)]));
+            assert_eq!(draw(&patched), draw(&scene(blur, backdrop, false)));
+            // The redrawn region holds the old and the new reach of the blur.
+            let reach = bounds([100., 100., 100., 100.]).outset(blur.max(2.) * 3.);
+            let [damage] = patched.damage.rects[..] else {
+                panic!("one region")
+            };
+            assert_eq!(damage.intersect(reach), reach);
+        }
+        // A layer inside another can't grow past the reach it was drawn with. Its parent keeps the old reach.
+        let mut nested = scene(8., 0., true);
+        assert!(nested.patch(9, 1., None, [Some(2.), None]));
+        let (drawn, fresh) = (draw(&nested), draw(&scene(2., 0., true)));
+        assert_eq!((drawn.0, drawn.3), (fresh.0, fresh.3));
+        assert!(!nested.patch(9, 1., None, [Some(12.), None]));
     }
 
     #[test]
@@ -1212,5 +1543,105 @@ mod tests {
             .map(|instance| instance.rect[0])
             .collect();
         assert_eq!(order, [0., 10., 20., 30., 40., 300., 50.]);
+    }
+
+    #[test]
+    fn layers_that_draw_as_before_keep_their_pixels() {
+        let mask = Clip::from(bounds([0., 0., 400., 300.]));
+        let scene = |red: f32, opacity: f32| {
+            let mut scene = Scene::default();
+            scene.push(Instance::new(BOX, bounds([0., 0., 400., 300.]), mask));
+            scene.push_effect(
+                EffectState {
+                    opacity,
+                    ..effect(mask)
+                },
+                None,
+            );
+            let mut instance = Instance::new(BOX, bounds([10., 10., 50., 50.]), mask);
+            instance.color = [red, 0., 0., 1.];
+            scene.push(instance);
+            scene.pop_effect();
+            scene.diff(Some(&[]));
+            scene
+        };
+        let (mut frame, mut pool, mut made) = (RenderFrame::default(), super::Pool::default(), 0);
+        let mut draw = |frame: &mut RenderFrame, scene: &Scene| {
+            frame.record(scene, [400, 300], 16384, true);
+            pool.fill(frame, |_| {
+                made += 1;
+                Ok(made)
+            })
+            .unwrap();
+            let target = frame.commands.iter().find_map(|command| match command {
+                Command::Composite { src, .. } => Some(*src),
+                _ => None,
+            });
+            (
+                frame.instances.len(),
+                target.and_then(|target| pool.get(frame, target)).copied(),
+            )
+        };
+        let (drawn, _) = draw(&mut frame, &scene(1., 0.5));
+        assert_eq!(drawn, 2);
+        let (drawn, kept) = draw(&mut frame, &scene(1., 0.5));
+        assert_eq!(drawn, 2, "the second frame keeps the layer");
+        let (drawn, reused) = draw(&mut frame, &scene(1., 0.25));
+        assert_eq!(
+            (drawn, reused),
+            (1, kept),
+            "a new opacity draws the kept pixels"
+        );
+        let mut stale = scene(1., 0.5);
+        stale.stale = stale.digests.clone();
+        assert_eq!(draw(&mut frame, &stale).0, 2, "a stale layer draws again");
+        for red in 0..12 {
+            for _ in 0..2 {
+                draw(&mut frame, &scene(red as f32 / 12., 0.5));
+            }
+        }
+        assert!(frame.cache.len() <= 5, "unused layers go");
+        assert!(made <= 8, "the textures of dropped layers are used again");
+    }
+
+    #[test]
+    fn layers_that_read_below_draw_whole_with_damage_that_reaches_them() {
+        let mask = Clip::from(bounds([0., 0., 400., 300.]));
+        let mut scene = Scene::default();
+        scene.push(Instance::new(BOX, bounds([0., 0., 400., 300.]), mask));
+        scene.push_effect(
+            EffectState {
+                backdrop: Some(BackdropState {
+                    bounds: bounds([100., 100., 100., 50.]),
+                    corner_radii: Default::default(),
+                    blur: 4.,
+                    color_matrix: None,
+                }),
+                ..effect(mask)
+            },
+            None,
+        );
+        scene.pop_effect();
+        scene.diff(Some(&[]));
+        scene.drawn();
+        let regions = |scene: &mut Scene, rect: [f32; 4]| {
+            scene.damage.add(bounds(rect));
+            let regions = super::damage_regions(scene, [400, 300], &[]);
+            scene.damage = Default::default();
+            regions
+        };
+        assert_eq!(
+            regions(&mut scene, [10., 10., 8., 8.]),
+            Some(vec![[9, 9, 10, 10]])
+        );
+        assert_eq!(
+            regions(&mut scene, [190., 140., 20., 20.]),
+            Some(vec![[100, 100, 111, 61]])
+        );
+        assert_eq!(
+            regions(&mut scene, [0., 0., 300., 300.]),
+            None,
+            "most of the window"
+        );
     }
 }

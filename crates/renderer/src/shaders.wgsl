@@ -9,13 +9,17 @@
 //   group 2  binding 0  `composite`  uniform Composite, set per composite draw
 //            binding 1  `blur`       uniform Blur, set per blur draw
 //            binding 2  `copy`       uniform Copy, set per copy draw
-// Instances arrive as 13 vec4 vertex attributes, one step per instance. Every pipeline draws a 4-vertex
+// Instances arrive as 14 vec4 vertex attributes, one step per instance. Every pipeline draws a 4-vertex
 // triangle strip.
 // Metal (see build.rs): instances in buffer 0, globals in buffer 1, the group 2 block in buffer 2,
 // textures 0-2, and an inline sampler.
 //
 // Colors come in with straight alpha. Every fragment returns premultiplied alpha, which blends with
 // one and one minus source alpha.
+//
+// Colors and images are sRGB, or Display P3 for images with flag 8. A color outside the sRGB gamut has
+// channels outside 0 to 1. `globals.wide` targets are Display P3, so the vertex stage converts colors, and
+// image fragments their pixels. Layers hold target pixels.
 
 const BOX: u32 = 0u;
 const SHADOW: u32 = 1u;
@@ -39,10 +43,21 @@ const COMPOSITE_BLEND: u32 = 32u;
 
 const PI: f32 = 3.14159265;
 const REC709: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
+const SRGB_TO_P3: mat3x3<f32> = mat3x3<f32>(
+    vec3<f32>(0.8224619687, 0.0331941989, 0.0170826307),
+    vec3<f32>(0.1775380313, 0.9668058011, 0.0723974407),
+    vec3<f32>(0.0, 0.0, 0.9105199293),
+);
+const P3_TO_SRGB: mat3x3<f32> = mat3x3<f32>(
+    vec3<f32>(1.2249401763, -0.0420569547, -0.0196375546),
+    vec3<f32>(-0.2249401763, 1.0420569547, -0.0786360456),
+    vec3<f32>(0.0, 0.0, 1.0982736001),
+);
 
 struct Globals {
     viewport: vec4<f32>,
     text_contrast: f32,
+    wide: f32,
 }
 
 struct Composite {
@@ -63,6 +78,7 @@ struct Composite {
     shadow: vec4<f32>,
     source_rect: vec4<f32>,
     backdrop_rect: vec4<f32>,
+    shapes: vec4<f32>,
     opacity: f32,
     blur: f32,
     flags: u32,
@@ -105,9 +121,10 @@ struct Instance {
     @location(10) aux_rx: vec4<f32>,
     @location(11) aux_ry: vec4<f32>,
     @location(12) info: vec4<f32>,
+    @location(13) shape: vec4<f32>,
 }
 
-// 13 vectors, within the 15 of GL ES 3.
+// 14 vectors, within the 15 of GL ES 3.
 struct Varyings {
     @builtin(position) position: vec4<f32>,
     @location(0) texel: vec2<f32>,
@@ -123,6 +140,7 @@ struct Varyings {
     @location(10) @interpolate(flat) round: vec4<f32>,
     @location(11) @interpolate(flat) round_rx: vec4<f32>,
     @location(12) @interpolate(flat) round_ry: vec4<f32>,
+    @location(13) @interpolate(flat) shape: vec4<f32>,
 }
 
 fn strip_corner(index: u32) -> vec2<f32> {
@@ -136,6 +154,27 @@ fn to_clip_space(at: vec2<f32>) -> vec4<f32> {
 
 fn premultiply(color: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(color.rgb * color.a, color.a);
+}
+
+// Between sRGB and Display P3, which have the same transfer curve. Channels keep their sign.
+fn gamut(c: vec3<f32>, to: mat3x3<f32>) -> vec3<f32> {
+    let a = abs(c);
+    let linear = to * (sign(c) * select(pow((a + 0.055) / 1.055, vec3<f32>(2.4)), a / 12.92, a <= vec3<f32>(0.04045)));
+    let b = abs(linear);
+    // `pow` of 0 is not defined in Metal.
+    let curve = 1.055 * pow(max(b, vec3<f32>(1e-6)), vec3<f32>(1.0 / 2.4)) - 0.055;
+    return saturate(sign(linear) * select(curve, b * 12.92, b <= vec3<f32>(0.0031308)));
+}
+
+fn to_p3(c: vec3<f32>) -> vec3<f32> {
+    return gamut(c, SRGB_TO_P3);
+}
+
+fn target_color(color: vec4<f32>) -> vec4<f32> {
+    if globals.wide != 0.0 {
+        return vec4<f32>(to_p3(color.rgb), saturate(color.a));
+    }
+    return saturate(color);
 }
 
 // Corners are numbered 0 top left, 1 top right, 2 bottom right, 3 bottom left. `from_center` picks the
@@ -163,14 +202,46 @@ fn radius_of(corner: u32, rx: vec4<f32>, ry: vec4<f32>) -> vec2<f32> {
     return select(vec2<f32>(0.0), radius, all(radius > vec2<f32>(0.0)));
 }
 
+// The `corner-shape` code of a corner: 0 for round, else 2048 plus 128 times the superellipse parameter.
+// `shape` holds two corners of 12 bits in each float.
+fn shape_code(corner: u32, shape: vec2<f32>) -> u32 {
+    return (u32(shape[corner >> 1u]) >> ((corner & 1u) * 12u)) & 4095u;
+}
+
+// The superellipse exponent 2^|k| of a code, at most 1000 like in Chromium.
+fn exponent(code: u32) -> f32 {
+    return exp2(min(abs(f32(code) - 2048.0) / 128.0, 9.97));
+}
+
+// Signed distance to a corner curve that is not round, negative inside. `curve` points from the center of
+// the corner toward its outer point. The curve is |x|^n + |y|^n = 1 in the corner box, and a concave one
+// (code below 2048) is the convex one mirrored into the outer point.
+fn corner_curve(curve: vec2<f32>, radius: vec2<f32>, code: u32) -> f32 {
+    if code == 2048u {
+        return (dot(curve / radius, vec2<f32>(1.0)) - 1.0) / length(1.0 / radius);
+    }
+    let n = exponent(code);
+    let concave = code < 2048u;
+    let u = max(select(curve, radius - curve, concave) / radius, vec2<f32>(0.0));
+    let m = max(max(u.x, u.y), 1e-6);
+    let g = m * pow(dot(pow(max(u / m, vec2<f32>(1e-6)), vec2<f32>(n)), vec2<f32>(1.0)), 1.0 / n);
+    let slope = pow(max(u / g, vec2<f32>(1e-6)), vec2<f32>(n - 1.0)) / radius;
+    let d = (g - 1.0) / length(slope);
+    return select(d, -d, concave);
+}
+
 // Signed distance, negative inside.
-fn box_distance(p: vec2<f32>, box: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>) -> f32 {
+fn box_distance(p: vec2<f32>, box: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, shape: vec2<f32>) -> f32 {
     let half = box.zw * 0.5;
     let from_center = p - box.xy - half;
     let corner = pick(from_center, half, rx, ry);
     let radius = radius_of(corner, rx, ry);
     let edge = from_center * mirror(corner) - half;
     let curve = edge + radius;
+    let code = shape_code(corner, shape);
+    if code != 0u && all(radius > vec2<f32>(0.0)) {
+        return max(max(edge.x, edge.y), corner_curve(curve, radius, code));
+    }
     if all(radius > vec2<f32>(0.0)) && all(curve > vec2<f32>(0.0)) {
         let scaled = length(curve / radius);
         return scaled * (scaled - 1.0) / length(curve / (radius * radius));
@@ -178,11 +249,11 @@ fn box_distance(p: vec2<f32>, box: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>) -> f
     return max(edge.x, edge.y);
 }
 
-fn rounded_clip(p: vec2<f32>, box: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>) -> f32 {
+fn rounded_clip(p: vec2<f32>, box: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, shape: vec2<f32>) -> f32 {
     if all(rx == vec4<f32>(0.0)) {
         return 1.0;
     }
-    return saturate(0.5 - box_distance(p, box, rx, ry));
+    return saturate(0.5 - box_distance(p, box, rx, ry, shape));
 }
 
 fn either_speed(a: f32, b: f32) -> f32 {
@@ -334,8 +405,8 @@ fn side_coverage(local: vec2<f32>, size: vec2<f32>, widths: vec4<f32>, sides: u3
     return coverage;
 }
 
-fn box_color(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, fill: vec4<f32>, border: vec4<f32>, widths: vec4<f32>, flags: u32) -> vec4<f32> {
-    let outer = box_distance(p, rect, rx, ry);
+fn box_color(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, shape: vec2<f32>, fill: vec4<f32>, border: vec4<f32>, widths: vec4<f32>, flags: u32) -> vec4<f32> {
+    let outer = box_distance(p, rect, rx, ry, shape);
     let base = premultiply(fill) * saturate(0.5 - outer);
     if all(widths == vec4<f32>(0.0)) {
         return base;
@@ -343,7 +414,41 @@ fn box_color(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, fill: 
     // A side without a border moves half a pixel out, so its edge gets no border color.
     let w = select(widths, vec4<f32>(-0.5), widths == vec4<f32>(0.0));
     let padding = vec4<f32>(rect.xy + w.wx, rect.zw - w.wx - w.yz);
-    let inner = box_distance(p, padding, max(rx - w.wyyw, vec4<f32>(0.0)), max(ry - w.xxzz, vec4<f32>(0.0)));
+    var inner_rx = max(rx - w.wyyw, vec4<f32>(0.0));
+    var inner_ry = max(ry - w.xxzz, vec4<f32>(0.0));
+    var concave = false;
+    if any(shape != vec2<f32>(0.0)) {
+        // Like Chromium, a bevel moves in by the border widths at its two ends, so it reaches the padding box
+        // further out than a round curve.
+        let side = max(w.wyyw, vec4<f32>(0.0));
+        let edge = max(w.xxzz, vec4<f32>(0.0));
+        let reach = sqrt(1.0 / (rx * rx) + 1.0 / (ry * ry));
+        let bevel_rx = max(rx * (1.0 + edge * reach - edge / ry) - side, vec4<f32>(0.0));
+        let bevel_ry = max(ry * (1.0 + side * reach - side / rx) - edge, vec4<f32>(0.0));
+        for (var corner = 0u; corner < 4u; corner++) {
+            let code = shape_code(corner, shape);
+            if code == 2048u && rx[corner] > 0.0 && ry[corner] > 0.0 {
+                inner_rx[corner] = bevel_rx[corner];
+                inner_ry[corner] = bevel_ry[corner];
+            }
+            concave = concave || (code != 0u && code < 2048u);
+        }
+    }
+    var inner = box_distance(p, padding, inner_rx, inner_ry, shape);
+    if concave {
+        // A concave inner edge is the outer curve moved in by the border width.
+        let half = rect.zw * 0.5;
+        let from_center = p - rect.xy - half;
+        let corner = pick(from_center, half, rx, ry);
+        let code = shape_code(corner, shape);
+        let radius = radius_of(corner, rx, ry);
+        if code != 0u && code < 2048u && all(radius > vec2<f32>(0.0)) {
+            let flip = mirror(corner);
+            let near = max(vec2<f32>(select(w.y, w.w, flip.x < 0.0), select(w.z, w.x, flip.y < 0.0)), vec2<f32>(0.0));
+            let sides = box_distance(p, padding, vec4<f32>(0.0), vec4<f32>(0.0), vec2<f32>(0.0));
+            inner = max(sides, corner_curve(from_center * flip - half + radius, radius, code) + (near.x + near.y) * 0.5);
+        }
+    }
     let ring = saturate(0.5 + inner);
     if ring <= 0.0 {
         return base;
@@ -375,19 +480,35 @@ fn erf(x: vec2<f32>) -> vec2<f32> {
     return sign(x) * (1.0 - 1.0 / (q2 * q2));
 }
 
-// Exact across each row, sampled at 4 rows within 3 sigma.
-fn blurred_box(p: vec2<f32>, box: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, sigma: f32) -> f32 {
+// Exact across each row, sampled at 4 rows within 3 sigma, or 16 at a corner shape whose width can jump.
+fn blurred_box(p: vec2<f32>, box: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, shape: vec2<f32>, sigma: f32) -> f32 {
     let half = box.zw * 0.5;
     let from_center = p - box.xy - half;
-    let radius = radius_of(pick(from_center, half, rx, ry), rx, ry);
+    let corner = pick(from_center, half, rx, ry);
+    let radius = radius_of(corner, rx, ry);
+    let code = shape_code(corner, shape);
+    let n = exponent(code);
     let low = clamp(-3.0 * sigma, from_center.y - half.y, from_center.y + half.y);
     let high = clamp(3.0 * sigma, from_center.y - half.y, from_center.y + half.y);
-    let step = (high - low) * 0.25;
+    let rows = select(4u, 16u, code != 0u);
+    let step = (high - low) / f32(rows);
     var sum = 0.0;
-    for (var row = 0u; row < 4u; row++) {
+    for (var row = 0u; row < rows; row++) {
         let y = low + (f32(row) + 0.5) * step;
         let into = min(half.y - radius.y - abs(from_center.y - y), 0.0);
-        let bulge = select(0.0, radius.x * sqrt(max(0.0, 1.0 - into * into / (radius.y * radius.y))), radius.y > 0.0);
+        var bulge = select(0.0, radius.x * sqrt(max(0.0, 1.0 - into * into / (radius.y * radius.y))), radius.y > 0.0);
+        if code != 0u && radius.y > 0.0 {
+            // How far the curve reaches out at this row, as in `corner_curve`.
+            let t = min(-into / radius.y, 1.0);
+            let concave = code < 2048u;
+            let rest = 1.0 - pow(max(select(t, 1.0 - t, concave), 1e-6), n);
+            // `pow` of 0 is not defined in Metal, and a `select` does not keep its NaN out.
+            var reach = 0.0;
+            if rest > 0.0 {
+                reach = pow(rest, 1.0 / n);
+            }
+            bulge = radius.x * select(reach, 1.0 - reach, concave);
+        }
         let extent = half.x - radius.x + bulge;
         let span = erf((from_center.x + vec2<f32>(-extent, extent)) * (0.70710678 / sigma));
         sum += (span.y - span.x) * exp(-0.5 * y * y / (sigma * sigma));
@@ -425,8 +546,8 @@ fn draw_vertex(@builtin(vertex_index) index: u32, instance: Instance) -> Varying
     out.rect = instance.rect;
     out.rx = instance.rx;
     out.ry = instance.ry;
-    out.color = instance.color;
-    out.border_color = instance.border_color;
+    out.color = target_color(instance.color);
+    out.border_color = target_color(instance.border_color);
     out.aux = instance.aux;
     out.aux_rx = instance.aux_rx;
     out.aux_ry = instance.aux_ry;
@@ -434,6 +555,7 @@ fn draw_vertex(@builtin(vertex_index) index: u32, instance: Instance) -> Varying
     out.round = instance.round;
     out.round_rx = instance.round_rx;
     out.round_ry = instance.round_ry;
+    out.shape = instance.shape;
     let zero = vec4<f32>(0.0);
     if kind == BOX && all(instance.rx == zero) && all(instance.aux == zero) && all(instance.round_rx == zero) {
         out.info.x = f32(FILL);
@@ -452,16 +574,16 @@ fn draw_fragment(v: Varyings) -> @location(0) vec4<f32> {
     var color: vec4<f32>;
     switch kind {
         case BOX: {
-            color = box_color(p, v.rect, v.rx, v.ry, v.color, v.border_color, v.aux, flags);
+            color = box_color(p, v.rect, v.rx, v.ry, v.shape.xy, v.color, v.border_color, v.aux, flags);
         }
         case SHADOW: {
             var shape = 0.0;
             if v.info.z < 0.25 {
-                shape = saturate(0.5 - box_distance(p, v.rect, v.rx, v.ry));
+                shape = saturate(0.5 - box_distance(p, v.rect, v.rx, v.ry, v.shape.xy));
             } else {
-                shape = blurred_box(p, v.rect, v.rx, v.ry, v.info.z);
+                shape = blurred_box(p, v.rect, v.rx, v.ry, v.shape.xy, v.info.z);
             }
-            let caster = saturate(0.5 - box_distance(p, v.aux, v.aux_rx, v.aux_ry));
+            let caster = saturate(0.5 - box_distance(p, v.aux, v.aux_rx, v.aux_ry, v.shape.xy));
             color = premultiply(v.color) * select(shape * (1.0 - caster), (1.0 - shape) * caster, (flags & 1u) != 0u);
         }
         case LINE: {
@@ -484,22 +606,30 @@ fn draw_fragment(v: Varyings) -> @location(0) vec4<f32> {
             if (flags & 2u) != 0u && pixel.a > 0.0 {
                 pixel = vec4<f32>(pixel.rgb / pixel.a, pixel.a);
             }
+            let p3 = (flags & 8u) != 0u;
+            if globals.wide != 0.0 && !p3 {
+                pixel = vec4<f32>(to_p3(pixel.rgb), pixel.a);
+            } else if globals.wide == 0.0 && p3 {
+                pixel = vec4<f32>(gamut(pixel.rgb, P3_TO_SRGB), pixel.a);
+            }
             if (flags & 1u) != 0u {
                 pixel = vec4<f32>(vec3<f32>(dot(pixel.rgb, REC709)), pixel.a);
             }
             var alpha = pixel.a * v.info.z;
             if any(v.rx != vec4<f32>(0.0)) {
-                alpha *= saturate(0.5 - box_distance(p, v.rect, v.rx, v.ry));
+                alpha *= saturate(0.5 - box_distance(p, v.rect, v.rx, v.ry, v.shape.xy));
             }
             color = vec4<f32>(pixel.rgb * alpha, alpha);
         }
     }
-    return color * rounded_clip(p, v.round, v.round_rx, v.round_ry);
+    return color * rounded_clip(p, v.round, v.round_rx, v.round_ry, v.shape.zw);
 }
 
 struct Placed {
     @builtin(position) position: vec4<f32>,
     @location(0) local: vec2<f32>,
+    // The premultiplied shadow color of the target.
+    @location(1) @interpolate(flat) shadow: vec4<f32>,
 }
 
 @vertex
@@ -510,6 +640,11 @@ fn composite_vertex(@builtin(vertex_index) index: u32) -> Placed {
     var out: Placed;
     out.position = vec4<f32>(at.x / globals.viewport.z * 2.0 - q.w, q.w - at.y / globals.viewport.w * 2.0, 0.0, q.w);
     out.local = local;
+    let shadow = composite.shadow_color;
+    out.shadow = shadow;
+    if globals.wide != 0.0 && shadow.a > 0.0 {
+        out.shadow = premultiply(vec4<f32>(to_p3(shadow.rgb / shadow.a), shadow.a));
+    }
     return out;
 }
 
@@ -625,7 +760,7 @@ fn composite_fragment(v: Placed) -> @location(0) vec4<f32> {
     if (c.flags & COMPOSITE_BACKDROP) != 0u {
         color = gaussian(t0, p, vec2<f32>(0.0, 1.0), c.blur, 1.0, c.source_rect, c.shadow);
     } else if (c.flags & COMPOSITE_SHADOW) != 0u {
-        color = c.shadow_color * gaussian(t0, v.local - c.shadow.xy, vec2<f32>(0.0, 1.0), c.blur, 1.0, c.source_rect, vec4<f32>(0.0)).a;
+        color = v.shadow * gaussian(t0, v.local - c.shadow.xy, vec2<f32>(0.0, 1.0), c.blur, 1.0, c.source_rect, vec4<f32>(0.0)).a;
     } else {
         color = gaussian(t0, v.local, vec2<f32>(0.0, 1.0), c.blur, 1.0, c.source_rect, vec4<f32>(0.0));
     }
@@ -633,9 +768,9 @@ fn composite_fragment(v: Placed) -> @location(0) vec4<f32> {
         let mapped = saturate(c.color_matrix * vec4<f32>(color.rgb / color.a, color.a) + c.color_offset);
         color = premultiply(mapped);
     }
-    var coverage = c.opacity * rounded_clip(p, c.rounded_mask, c.rounded_rx, c.rounded_ry);
+    var coverage = c.opacity * rounded_clip(p, c.rounded_mask, c.rounded_rx, c.rounded_ry, c.shapes.zw);
     if (c.flags & COMPOSITE_CLIP) != 0u {
-        coverage *= saturate(0.5 - box_distance(v.local, c.clip, c.clip_rx, c.clip_ry));
+        coverage *= saturate(0.5 - box_distance(v.local, c.clip, c.clip_rx, c.clip_ry, c.shapes.xy));
     }
     if (c.flags & COMPOSITE_MASK) != 0u {
         let at = (v.local - c.mask_rect.xy) / c.mask_rect.zw;

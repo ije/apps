@@ -200,12 +200,12 @@ fn parent_style<'b>(
     box_parent(doc, styles, id).and_then(|parent| styles.values[parent].get(prop))
 }
 
-fn row_fill(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<(u32, u8)> {
+fn row_fill(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<Color> {
     let fill = |node: usize| {
         styles.values[node]
             .get(Prop::BACKGROUND_COLOR)
-            .and_then(style::color)
-            .filter(|(_, alpha)| *alpha > 0)
+            .and_then(style::paint)
+            .filter(|color| color.a > 0.)
     };
     let mut table = None;
     for row in std::iter::successors(doc.nodes[id].parent, |&parent| doc.nodes[parent].parent) {
@@ -618,7 +618,9 @@ impl<'a> Build<'a> {
             }
             Query::Look(node) => hashed(doc.nodes[node as usize].state & LOOK),
             Query::Boxless(node) => hashed(boxless(doc, node as usize).map(|select| select.1)),
-            Query::RowFill => hashed(row_fill(doc, styles, id)),
+            Query::RowFill => {
+                hashed(row_fill(doc, styles, id).map(|fill| fill.to_array().map(f32::to_bits)))
+            }
             Query::Collapse => hashed(collapses(doc, styles, id)),
             Query::Value(node) => hashed(&doc.nodes[node as usize].value),
             Query::Viewport => hashed(styles.lengths[id].viewport.map(f32::to_bits)),
@@ -1696,6 +1698,7 @@ fn create(
                         .is_some_and(|dom| dom.selection_caret == Some(id))
                 });
                 if caret {
+                    window.paint_volatile();
                     super::input::paint_caret(
                         &painter,
                         [id, 0, 0],
@@ -2483,7 +2486,7 @@ fn create(
         let [padding, margin] =
             [style::PADDING, style::MARGIN].map(|sides| units.edges(part, sides, 0.));
         let borders = units.borders(part, 0.);
-        let color = |prop| part.get(prop).and_then(style::color).map(style::rgba);
+        let color = |prop| part.get(prop).and_then(style::paint);
         let radius = part
             .get(Prop::BORDER_TOP_LEFT_RADIUS)
             .and_then(|value| units.resolve(value, 0.))
@@ -2581,21 +2584,18 @@ fn create(
         let line_height = units.font.lh;
         let text_color = style
             .get(Prop::COLOR)
-            .and_then(style::color)
-            .map(style::rgba)
+            .and_then(style::paint)
             .unwrap_or(renderer::Color::BLACK);
         let caret_color = style
             .get(Prop::CARET_COLOR)
-            .and_then(style::color)
-            .map(style::rgba)
+            .and_then(style::paint)
             .unwrap_or(text_color);
         let pseudo = styles
             .text_pseudos
             .get(&id)
             .and_then(|pseudos| pseudos[3].as_ref());
         let mut placeholder_color = pseudo
-            .and_then(|pseudo| style::color(pseudo.get(Prop::COLOR)?))
-            .map(style::rgba)
+            .and_then(|pseudo| style::paint(pseudo.get(Prop::COLOR)?))
             .unwrap_or(Color::hex(0x757575ff));
         placeholder_color.a *= pseudo
             .and_then(|pseudo| pseudo.get(Prop::OPACITY)?.parse::<f32>().ok())
@@ -2699,10 +2699,10 @@ fn create(
     if hit.is_none()
         && let Some(ink) = style
             .get(Prop::WEBKIT_TEXT_FILL_COLOR)
-            .and_then(style::color)
+            .and_then(style::paint)
             .or(parsed.ink)
     {
-        el = el.text_color(style::rgba(ink));
+        el = el.text_color(ink);
     }
     let inline_box = display == "inline"
         && !node.tag.starts_with('#')
@@ -2735,11 +2735,10 @@ fn create(
         reader.log(
             Query::RowFill,
             table.map_or(0, |table| reader.scope_of(id, table)),
-            hashed(cell_background),
+            hashed(cell_background.map(|fill| fill.to_array().map(f32::to_bits))),
         );
     }
     if let Some(color) = cell_background {
-        let color = style::rgba(color);
         let blended = style
             .get(Prop::BACKGROUND_BLEND_MODE)
             .is_some_and(|value| value.split(',').any(|mode| mode.trim() != "normal"))
@@ -2908,7 +2907,7 @@ fn create(
     {
         el = el.ml_auto();
     }
-    let ink = parsed.ink.map_or(Color::hex(0x000000ff), style::rgba);
+    let ink = parsed.ink.unwrap_or(Color::BLACK);
     let mut borders = parsed
         .borders
         .unwrap_or_else(|| units.borders(style, containing[0]));
@@ -2959,9 +2958,11 @@ fn create(
                         for line in 0..lines {
                             let top = start + step * line as f32;
                             if top > mask.bottom() {
+                                window.cull();
                                 break;
                             }
                             if top + quad.height < mask.top() {
+                                window.cull();
                                 continue;
                             }
                             window.draw_box(
@@ -4165,7 +4166,7 @@ fn create(
             } else {
                 radius
             },
-            [borders, padding],
+            [borders, padding, [0.; 4]],
             view.clone(),
             base.as_ref(),
             &view.host.borrow().assets,
@@ -4223,6 +4224,7 @@ fn create(
             image.style().corner_radii = renderer::Radii {
                 x: corners.x.map(renderer::Length::Px),
                 y: corners.y.map(renderer::Length::Px),
+                shape: corners.shape,
             };
         }
         el = el.child(image);
@@ -4283,8 +4285,8 @@ fn create(
                 .unwrap_or(0.);
         let color = style
             .get(Prop::OUTLINE_COLOR)
-            .and_then(style::color)
-            .map_or(ink, style::rgba);
+            .and_then(style::paint)
+            .unwrap_or(ink);
         let kind = border_style(style.get(Prop::OUTLINE_STYLE).unwrap_or("solid"));
         // Like the border box, the outline is square at corners without a radius.
         let mut outline = renderer::canvas(
@@ -4307,10 +4309,14 @@ fn create(
                         outer.origin - point(px(grow), px(grow)),
                         outer.bottom_right() + point(px(grow), px(grow)),
                     ),
-                    renderer::Radii {
-                        x: corners.x.map(grown),
-                        y: corners.y.map(grown),
-                    },
+                    corners.moved_out(
+                        px(grow),
+                        renderer::Radii {
+                            x: corners.x.map(grown),
+                            y: corners.y.map(grown),
+                            shape: corners.shape,
+                        },
+                    ),
                     renderer::Color::TRANSPARENT,
                     renderer::Border {
                         widths: renderer::Edges::all(px(width)),
@@ -4413,7 +4419,7 @@ fn create(
                 let part = parts.and_then(|parts| parts[slot].as_ref());
                 let get = |prop| part.and_then(|part| part.get(prop));
                 let length = |prop| get(prop).and_then(|value| units.resolve(value, f32::NAN));
-                let color = |prop| get(prop).and_then(style::color).map(style::rgba);
+                let color = |prop| get(prop).and_then(style::paint);
                 let native = range
                     && slot == 2
                     && [Prop::APPEARANCE, Prop::WEBKIT_APPEARANCE]
@@ -4733,8 +4739,8 @@ fn create(
             let color = marker_style
                 .unwrap_or(style)
                 .get(Prop::COLOR)
-                .and_then(style::color)
-                .map_or(Color::hex(0x000000ff), style::rgba);
+                .and_then(style::paint)
+                .unwrap_or(Color::hex(0x000000ff));
             let [ascent, descent, _] = metrics;
             let offset = (ascent * 2. / 3.).floor();
             let leading = ((line * pixel_ratio - ascent - descent) / 2.).floor();
@@ -4907,6 +4913,7 @@ fn create(
     if let Some(pseudos) = styles.pseudos.get(&id) {
         let mut units = units;
         units.container = own.or(units.container);
+        let keyed = info[id].flags & cull::COMPOSITED_PSEUDO != 0;
         for (index, pseudo) in pseudos.iter().enumerate() {
             let Some(content) = pseudo
                 .get(Prop::CONTENT)
@@ -5066,12 +5073,8 @@ fn create(
             };
             let pseudo_radius = super::effects::radii(pseudo, &pseudo_units, || containing);
             decoration.style().corner_radii = pseudo_radius;
-            let colors = sides.map(|(_, _, color)| {
-                pseudo
-                    .get(color)
-                    .and_then(style::color)
-                    .map_or(ink, style::rgba)
-            });
+            let colors =
+                sides.map(|(_, _, color)| pseudo.get(color).and_then(style::paint).unwrap_or(ink));
             let border_image = super::background::border_image(
                 pseudo,
                 pseudo_units,
@@ -5247,11 +5250,11 @@ fn create(
                         decoration.style().visibility = renderer::Visibility::Hidden;
                     }
                     Prop::BACKGROUND_COLOR => {
-                        if let Some(color) = style::color(value) {
-                            decoration = decoration.bg(style::rgba(color));
+                        if let Some(color) = style::paint(value) {
+                            decoration = decoration.bg(color);
                         }
                     }
-                    Prop::OPACITY => {
+                    Prop::OPACITY if !keyed => {
                         decoration = decoration.opacity(super::effects::opacity(pseudo));
                     }
                     Prop::BOX_SHADOW => {
@@ -5284,7 +5287,7 @@ fn create(
                     index + 1,
                     pseudo_radius,
                     // Pseudo-element borders paint below their layers, so the layers keep out of them.
-                    [[0.; 4], pseudo_padding],
+                    [[0.; 4], pseudo_padding, pseudo_borders],
                     view.clone(),
                     base.as_ref(),
                     &view.host.borrow().assets,
@@ -5424,6 +5427,17 @@ fn create(
                     backdrop: None,
                 });
             }
+            // An opacity animation keeps one keyed layer, so its frames only patch the layer's opacity.
+            if keyed {
+                decoration = decoration.hooks(super::paint::Effected {
+                    effect: renderer::PaintEffect {
+                        opacity: super::effects::opacity(pseudo),
+                        key: Some(super::pseudo_key(id, index as u8 + 1)),
+                        ..Default::default()
+                    },
+                    backdrop: None,
+                });
+            }
             let decoration = match [Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER]
                 .into_iter()
                 .find_map(|prop| pseudo.get(prop))
@@ -5456,6 +5470,7 @@ fn create(
                     style: Rc::new(pseudo.clone()),
                     units: pseudo_units,
                     matrix: Default::default(),
+                    local: Default::default(),
                 })
             } else {
                 decoration
@@ -7096,6 +7111,8 @@ fn create(
             && style.get(Prop::CANVAS_CONTENT) == Some("drawable")
             && !drawable,
         placed: Default::default(),
+        reached_at: Default::default(),
+        local: Default::default(),
         offset: Default::default(),
         frame: node.tag == "iframe",
         anchor,
@@ -7150,7 +7167,7 @@ fn create(
                 });
                 let first = texts.next()?;
                 Some((
-                    [first, texts.next_back().unwrap_or(first)],
+                    [first, texts.next_back().unwrap_or(first)].map(|id| id as u32),
                     [padding[0] + borders[0], padding[2] + borders[2]],
                 ))
             })
@@ -8263,8 +8280,8 @@ fn columns(
                 .unwrap_or(0.);
             let color = rule_color
                 .or_else(|| style.get(Prop::COLOR))
-                .and_then(style::color)
-                .map_or(renderer::Color::BLACK, style::rgba);
+                .and_then(style::paint)
+                .unwrap_or(renderer::Color::BLACK);
             (width, color, border_style(kind))
         })
         .filter(|(width, ..)| *width > 0.);
@@ -8418,6 +8435,8 @@ fn fieldset_border(
     renderer::canvas(
         |_, _| (),
         move |bounds, _, window| {
+            // The legend can move without a new box here.
+            window.paint_volatile();
             let gap = view
                 .host
                 .borrow()
@@ -8622,7 +8641,7 @@ fn inset_shadows(
     radius: renderer::Radii<renderer::Length>,
     borders: [f32; 4],
 ) -> Child {
-    renderer::canvas(
+    let mut node = renderer::canvas(
         |_, _| (),
         move |bounds, _, window| {
             let outer = size(
@@ -8641,8 +8660,10 @@ fn inset_shadows(
     .absolute()
     .top_0()
     .left_0()
-    .size_full()
-    .into()
+    .size_full();
+    // Like the background, the shadow doesn't scroll with the content or add to its scroll range.
+    node.style().escape = renderer::Escape::OUTLINE;
+    node.into()
 }
 
 /// `padding` places the drawing in the content box, as the layer is absolute in the padding box.

@@ -15,6 +15,8 @@ pub(crate) const CHILDREN_CHANGED: u16 = 256;
 pub(crate) const READS_VIEWPORT: u16 = 512;
 pub(crate) const COMPOSITED: u16 = 1024;
 pub(crate) const TRANSFORMED: u16 = 2048;
+// A `::before` or `::after` of the node animates only its opacity, so frames patch its layer.
+pub(crate) const COMPOSITED_PSEUDO: u16 = 4096;
 pub(crate) const ANIMATED: u16 = 8192;
 pub(crate) const READS_LAST_FRAME: u16 = 16384;
 pub(crate) const READS_HEIGHT: u16 = 32768;

@@ -1516,6 +1516,8 @@
   globalThis.__appsImages = root => { find(root._m, rec => { if (rec.tag === 'img' && rec.attrs.has('src')) { const image = of(rec); if (!image._loading) image._loadImage?.(); } else if ((rec.tag === 'video' || rec.tag === 'audio') && !of(rec)._network) of(rec)._select(); return false; }); };
   // Retain playing media after page code drops it, as browsers do.
   const players = new Map(), playing = new Set(), mediaFeature = globalThis.__appsMedia;
+  // Node ids can come back, so a collected element closes its player only when no live element has the id.
+  const released = new FinalizationRegistry(id => { if (!players.get(id)?.deref()) { players.delete(id); call('media.close', id); } });
   delete globalThis.__appsMedia;
   const [PLAY, PAUSE, SEEK, VOLUME, MUTED, SPEED] = [0, 1, 2, 3, 4, 5];
   const control = (el, op, value = 0) => { if (el._open) call('media.control', el._id, op, +value); };
@@ -1588,9 +1590,9 @@
     _select(force = false) {
       const element = this.getAttribute('src') === null ? [...this.children].find(child => child.localName === 'source' && child.hasAttribute('src') && (!child.type || this.canPlayType(child.type))) : this;
       if (!element && !this._network) return;
+      this._close();
       const token = this._token = {};
       if (this._network) this._fire('emptied');
-      if (this._open) { this._open = false; call('media.close', this._id); }
       if (!this.paused) { this._paused = true; playing.delete(this); this._fire('pause'); }
       this._settle(new DOMException('The play() request was interrupted by a new load request', 'AbortError'));
       Object.assign(this, { _ready: 0, _time: 0, _seeking: false, _ended: false, _error: null, _duration: NaN, _size: null, _source: element?.src ?? '', _network: element ? 2 : 0 });
@@ -1603,6 +1605,7 @@
       resource(this._source, 'Media').then(data => {
         if (this._token !== token) return;
         call('media.open', this._id, data, this.localName === 'video');
+        if (!players.has(this._id)) released.register(this, this._id);
         this._open = true; players.set(this._id, new WeakRef(this));
         if (this.volume !== 1) control(this, VOLUME, this.volume);
         if (this.muted) control(this, MUTED, 1);
@@ -1611,6 +1614,8 @@
         else if (!this.paused) control(this, PLAY);
       }).catch(error => { if (this._token === token) this._fail(4, error.message); });
     }
+    // Frees the native player and its thread. A later play() or load() opens it again.
+    _close() { this._token = null; if (this._open) { this._open = false; call('media.close', this._id); } }
     _event(kind, values) {
       if (kind === 'meta') {
         const [duration, width, height] = values; this._duration = duration ?? Infinity; this._size = [width, height]; this._ready = 1;
@@ -2305,10 +2310,10 @@
   const intersectionObservers=new Set();
   class IntersectionObserver {
     constructor(callback,options={}){if(typeof callback!=='function')throw new TypeError('Expected a callback');this.callback=callback;this.root=options.root??null;if(this.root!==null&&!(this.root instanceof Element||this.root instanceof Document))throw new TypeError('Expected an Element or Document root');const margins=String(options.rootMargin??'0px').trim().split(/\s+/).map(value=>{const match=/^([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)(px|%)?$/i.exec(value);if(!match||!match[2]&&+match[1]!==0)throw new DOMException('Invalid rootMargin','SyntaxError');return [+match[1],match[2]==='%'];});if(margins.length>4)throw new DOMException('Invalid rootMargin','SyntaxError');const [top,right=top,bottom=top,left=right]=margins;this._margins=[top,right,bottom,left];this.rootMargin=this._margins.map(([v,p])=>v+(p?'%':'px')).join(' ');this.thresholds=[...new Set(Array.isArray(options.threshold)?options.threshold:[options.threshold??0])].sort((a,b)=>a-b);if(this.thresholds.some(v=>v<0||v>1))throw new RangeError('Invalid intersection threshold');this.targets=new Map();this.records=[];this._ref=null;}
-    observe(target){watch(this,target,null,intersectionObservers);host('dom.requestFrame');}unobserve(target){unwatch(this,target,intersectionObservers);}disconnect(){unwatchAll(this,intersectionObservers);this.records=[];}takeRecords(){return this.records.splice(0);}
+    observe(target){if(this.targets.has(target._m.ref))return;watch(this,target,null,intersectionObservers);host('dom.requestFrame');}unobserve(target){unwatch(this,target,intersectionObservers);}disconnect(){unwatchAll(this,intersectionObservers);this.records=[];}takeRecords(){return this.records.splice(0);}
   }
   const resizeObservers = new Set();
-  class ResizeObserver { constructor(callback) { this.callback = callback; this.targets = new Map(); this._ref = null; } observe(target) { watch(this, target, null, resizeObservers); host('dom.requestFrame'); } unobserve(target) { unwatch(this, target, resizeObservers); } disconnect() { unwatchAll(this, resizeObservers); } }
+  class ResizeObserver { constructor(callback) { this.callback = callback; this.targets = new Map(); this._ref = null; } observe(target, options) { const box = String(options?.box ?? 'content-box'); if (this.targets.has(target._m.ref) && (this._boxes ??= new WeakMap()).get(target) === box) return; (this._boxes ??= new WeakMap()).set(target, box); watch(this, target, null, resizeObservers); host('dom.requestFrame'); } unobserve(target) { unwatch(this, target, resizeObservers); } disconnect() { unwatchAll(this, resizeObservers); } }
   const breakout = /^(b|big|blockquote|body|br|center|code|dd|div|dl|dt|em|embed|h[1-6]|head|hr|i|img|li|listing|menu|meta|nobr|ol|p|pre|ruby|s|small|span|strong|strike|sub|sup|table|tt|u|ul|var)$/;
   const wrap = id => {
     let rec = records[id], node = rec?.ref?.deref();
@@ -2528,34 +2533,270 @@
     _spec(id) { const { a, b, c, d, e, f } = this._matrix; return 'pattern:' + JSON.stringify([id, ...this._size, ...this._repeat.map(Number), a, b, c, d, e, f]); }
   }
   class TextMetrics {}
-  class AudioNode { constructor(context) { this.context = context; this._target = null; } connect(target) { this._target = target; return target; } disconnect() { this._target = null; } }
-  class GainNode extends AudioNode { gain = { value: 1 }; }
-  class AudioDestinationNode extends AudioNode {}
-  class AudioBuffer { constructor(url, duration) { this._url = url; this.duration = duration; } }
-  class AudioBufferSourceNode extends AudioNode {
-    buffer = null; loop = false; onended = null; playbackRate = { value: 1 };
-    start(when = 0, offset = 0) {
-      if (!this.buffer) return;
-      let volume = 1, node = this._target;
-      while (node && !(node instanceof AudioDestinationNode)) { volume *= node.gain?.value ?? 1; node = node._target; }
-      const audio = this._audio = new Audio(this.buffer._url);
-      audio.volume = node ? Math.min(1, Math.max(0, volume)) : 0; audio.loop = this.loop; audio.playbackRate = this.playbackRate.value; audio.currentTime = offset;
-      audio.addEventListener('ended', () => this.onended?.(new Event('ended')));
-      setTimeout(() => audio.play().catch(() => {}), Math.max(0, when - this.context.currentTime) * 1000);
+  // Web Audio: sources started in one task render to one PCM WAV, played by the <audio> player. Gain and biquad
+  // nodes are linear, so each source renders along its own paths and the results add up.
+  const audioCap = 10, audioTail = 0.1;
+  class AudioParam {
+    constructor(context, value, min = -3.4028234663852886e38, max = 3.4028234663852886e38) { this._context = context; this.defaultValue = this._value = value; this.minValue = min; this.maxValue = max; this.automationRate = 'a-rate'; this._events = []; }
+    get value() { return this._events.length ? this._at(this._context.currentTime) : this._value; }
+    set value(value) { value = +value; if (!Number.isFinite(value)) throw new TypeError('The value is not finite'); if (this._events.length) this.setValueAtTime(value, this._context.currentTime); else this._value = value; }
+    _add(kind, value, time, extra) {
+      value = +value; time = +time;
+      if (!Number.isFinite(value) || !Number.isFinite(time) || time < 0) throw new RangeError('The value or time is not valid');
+      const at = this._events.findLastIndex(event => event[1] <= time) + 1;
+      this._events.splice(at, 0, [kind, time, value, extra]); return this;
     }
-    stop() { this._audio?.pause(); }
+    setValueAtTime(value, time) { return this._add(0, value, time); }
+    linearRampToValueAtTime(value, time) { return this._add(1, value, time); }
+    exponentialRampToValueAtTime(value, time) { if (!+value) throw new RangeError('The value must not be 0'); return this._add(2, value, time); }
+    setTargetAtTime(value, time, constant) { if (!(+constant >= 0)) throw new RangeError('The time constant must not be negative'); return this._add(3, value, time, +constant); }
+    setValueCurveAtTime(values, time, duration) { values = [...values]; this._add(0, values[0], time); values.forEach((value, i) => i && this._add(1, value, time + duration * i / (values.length - 1))); return this; }
+    cancelScheduledValues(time) { this._events = this._events.filter(event => event[1] < time); return this; }
+    cancelAndHoldAtTime(time) { const value = this._at(time); this.cancelScheduledValues(time); return this._add(0, value, time); }
+    // The value at a time, as the spec's automation timeline gives it.
+    _at(time) {
+      let value = this._value, from = 0, target = null;
+      const settled = at => target ? target[2] + (value - target[2]) * (target[3] ? Math.exp(-(at - target[1]) / target[3]) : 0) : value;
+      for (const event of this._events) {
+        const [kind, at, to] = event;
+        if (time < at) {
+          if (kind === 1 || kind === 2) { const start = settled(from), t = (time - from) / (at - from); return kind === 1 ? start + (to - start) * t : start * to > 0 ? start * (to / start) ** t : start; }
+          return settled(time);
+        }
+        value = kind === 3 ? settled(at) : to; target = kind === 3 ? event : null; from = at;
+      }
+      return Math.min(this.maxValue, Math.max(this.minValue, settled(time)));
+    }
+    // The values of a run of frames.
+    _run(start, rate, length) { const out = new Float32Array(length); if (!this._events.length) return out.fill(this._value); for (let i = 0; i < length; i++) out[i] = this._at(start + i / rate); return out; }
   }
+  class AudioNode extends EventTarget {
+    constructor(context) { super(); this.context = context; this._outputs = new Set(); this.channelCount = 2; this.channelCountMode = 'max'; this.channelInterpretation = 'speakers'; }
+    get numberOfInputs() { return 1; } get numberOfOutputs() { return 1; }
+    // Connections to an AudioParam do nothing.
+    connect(target) { if (target instanceof AudioNode) this._outputs.add(target); return target; }
+    disconnect(target) { if (target === undefined) this._outputs.clear(); else this._outputs.delete(target); }
+    _process(channels) { return channels; }
+  }
+  const audioOptions = (node, options = {}) => { for (const [key, value] of Object.entries(options)) if (node[key] instanceof AudioParam) node[key].value = value; else if (key in node) node[key] = value; return node; };
+  class GainNode extends AudioNode {
+    constructor(context, options) { super(context); this.gain = new AudioParam(context, 1); audioOptions(this, options); }
+    _process(channels, start, rate) { const gain = this.gain._run(start, rate, channels[0].length); for (const data of channels) for (let i = 0; i < data.length; i++) data[i] *= gain[i]; return channels; }
+  }
+  const filterTypes = ['lowpass', 'highpass', 'bandpass', 'lowshelf', 'highshelf', 'peaking', 'notch', 'allpass'];
+  class BiquadFilterNode extends AudioNode {
+    constructor(context, options) { super(context); this._type = 'lowpass'; Object.assign(this, { frequency: new AudioParam(context, 350, 0, context.sampleRate / 2), detune: new AudioParam(context, 0), Q: new AudioParam(context, 1), gain: new AudioParam(context, 0) }); audioOptions(this, options); }
+    get type() { return this._type; } set type(value) { if (filterTypes.includes(value)) this._type = value; }
+    // The coefficients of the spec, from the Audio EQ Cookbook, b0 b1 b2 a1 a2 over a0.
+    _coefficients(frequency, detune, q, gain, rate) {
+      const f = Math.min(frequency * 2 ** (detune / 1200), rate / 2) / rate, w = 2 * Math.PI * f, cos = Math.cos(w), sin = Math.sin(w), A = 10 ** (gain / 40);
+      if (f <= 0 || f >= 0.5) { const open = this._type === 'lowpass' ? f > 0 : this._type === 'highpass' ? f <= 0 : true; return [open ? 1 : 0, 0, 0, 0, 0]; }
+      const qdb = sin / (2 * 10 ** (q / 20)), aq = sin / (2 * Math.max(q, 1e-4)), as = sin / 2 * Math.SQRT2, root = 2 * Math.sqrt(A) * as;
+      const [b0, b1, b2, a0, a1, a2] = {
+        lowpass: [(1 - cos) / 2, 1 - cos, (1 - cos) / 2, 1 + qdb, -2 * cos, 1 - qdb],
+        highpass: [(1 + cos) / 2, -(1 + cos), (1 + cos) / 2, 1 + qdb, -2 * cos, 1 - qdb],
+        bandpass: [aq, 0, -aq, 1 + aq, -2 * cos, 1 - aq],
+        notch: [1, -2 * cos, 1, 1 + aq, -2 * cos, 1 - aq],
+        allpass: [1 - aq, -2 * cos, 1 + aq, 1 + aq, -2 * cos, 1 - aq],
+        peaking: [1 + aq * A, -2 * cos, 1 - aq * A, 1 + aq / A, -2 * cos, 1 - aq / A],
+        lowshelf: [A * (A + 1 - (A - 1) * cos + root), 2 * A * (A - 1 - (A + 1) * cos), A * (A + 1 - (A - 1) * cos - root), A + 1 + (A - 1) * cos + root, -2 * (A - 1 + (A + 1) * cos), A + 1 + (A - 1) * cos - root],
+        highshelf: [A * (A + 1 + (A - 1) * cos + root), -2 * A * (A - 1 + (A + 1) * cos), A * (A + 1 + (A - 1) * cos - root), A + 1 - (A - 1) * cos + root, 2 * (A - 1 - (A + 1) * cos), A + 1 - (A - 1) * cos - root],
+      }[this._type];
+      return [b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0];
+    }
+    _process(channels, start, rate) {
+      const length = channels[0].length, params = [this.frequency, this.detune, this.Q, this.gain].map(param => param._run(start, rate, length));
+      for (const data of channels) {
+        let x1 = 0, x2 = 0, y1 = 0, y2 = 0, c;
+        for (let i = 0; i < length; i++) {
+          // New coefficients for each block of 128 frames, as browsers compute them.
+          if (i % 128 === 0) c = this._coefficients(params[0][i], params[1][i], params[2][i], params[3][i], rate);
+          const x = data[i], y = c[0] * x + c[1] * x1 + c[2] * x2 - c[3] * y1 - c[4] * y2;
+          x2 = x1; x1 = x; y2 = y1; y1 = Math.abs(y) < 1e-30 ? 0 : y; data[i] = y1;
+        }
+      }
+      return channels;
+    }
+    getFrequencyResponse(frequencies, magnitudes, phases) {
+      const rate = this.context.sampleRate, [b0, b1, b2, a1, a2] = this._coefficients(this.frequency.value, this.detune.value, this.Q.value, this.gain.value, rate);
+      frequencies.forEach((frequency, i) => {
+        const w = 2 * Math.PI * frequency / rate, [c1, s1, c2, s2] = [Math.cos(w), -Math.sin(w), Math.cos(2 * w), -Math.sin(2 * w)];
+        const [nr, ni, dr, di] = [b0 + b1 * c1 + b2 * c2, b1 * s1 + b2 * s2, 1 + a1 * c1 + a2 * c2, a1 * s1 + a2 * s2], d = dr * dr + di * di;
+        const [re, im] = [(nr * dr + ni * di) / d, (ni * dr - nr * di) / d];
+        magnitudes[i] = Math.hypot(re, im); phases[i] = Math.atan2(im, re);
+      });
+    }
+  }
+  class AudioDestinationNode extends AudioNode { get maxChannelCount() { return 2; } }
+  class AudioBuffer {
+    constructor(options, duration) {
+      // Decoded files keep their encoded data, so the <audio> player plays them whole.
+      if (typeof options === 'string') { this._url = options; this.duration = duration; this.length = Math.round(duration * 48000); this.sampleRate = 48000; this.numberOfChannels = 2; return; }
+      const { numberOfChannels = 1, length, sampleRate } = options;
+      if (!(numberOfChannels >= 1 && numberOfChannels <= 32 && length >= 1 && sampleRate >= 3000 && sampleRate <= 768000)) throw new DOMException('The buffer size is not supported', 'NotSupportedError');
+      Object.assign(this, { numberOfChannels, length: length >>> 0, sampleRate, duration: (length >>> 0) / sampleRate });
+      this._data = Array.from({ length: numberOfChannels }, () => new Float32Array(this.length));
+    }
+    _channel(channel) { if (!this._data) throw new DOMException('A decoded buffer has no samples', 'NotSupportedError'); const data = this._data[channel]; if (!data) throw new DOMException('The channel does not exist', 'IndexSizeError'); return data; }
+    getChannelData(channel) { return this._channel(channel); }
+    copyFromChannel(destination, channel, start = 0) { destination.set(this._channel(channel).subarray(start, start + destination.length)); }
+    copyToChannel(source, channel, start = 0) { this._channel(channel).set(source.subarray(0, this.length - start), start); }
+  }
+  class AudioScheduledSourceNode extends AudioNode {
+    onended = null;
+    start(when = 0) {
+      if (this._start !== undefined) throw new DOMException('The source has already started', 'InvalidStateError');
+      this._start = Math.max(+when, this.context.currentTime); this.context._schedule(this);
+    }
+    stop(when = 0) {
+      if (this._start === undefined) throw new DOMException('The source has not started', 'InvalidStateError');
+      this._stop = Math.max(+when, this._start); this._audio?._close(); this._audio = null;
+    }
+    _ended() { const event = new Event('ended'); this.onended?.(event); this.dispatchEvent(event); }
+  }
+  const waveTypes = ['sine', 'square', 'sawtooth', 'triangle'];
+  class PeriodicWave { constructor(context, { real = [], imag = [], disableNormalization = false } = {}) { this._real = Float32Array.from(real); this._imag = Float32Array.from(imag); const peak = this._real.reduce((sum, _, i) => sum + Math.hypot(this._real[i] ?? 0, this._imag[i] ?? 0), 0) || 1; this._scale = disableNormalization ? 1 : 1 / peak; } }
+  class OscillatorNode extends AudioScheduledSourceNode {
+    constructor(context, options) { super(context); this._type = 'sine'; this.frequency = new AudioParam(context, 440, -context.sampleRate / 2, context.sampleRate / 2); this.detune = new AudioParam(context, 0); audioOptions(this, options); }
+    get type() { return this._type; }
+    set type(value) { if (value === 'custom') throw new DOMException('Use setPeriodicWave()', 'InvalidStateError'); if (waveTypes.includes(value)) { this._type = value; this._wave = null; } }
+    setPeriodicWave(wave) { this._wave = wave; this._type = 'custom'; }
+    _render(rate, length, frames) {
+      const out = new Float32Array(length), frequency = this.frequency._run(this._start, rate, frames), detune = this.detune._run(this._start, rate, frames), wave = this._wave;
+      // Square and sawtooth waves smooth their steps (polyBLEP), so they don't alias.
+      const blep = (t, dt) => t < dt ? (t /= dt, t + t - t * t - 1) : t > 1 - dt ? (t = (t - 1) / dt, t * t + t + t + 1) : 0;
+      let phase = 0;
+      for (let i = 0; i < frames; i++) {
+        const dt = Math.min(0.5, Math.abs(frequency[i] * 2 ** (detune[i] / 1200) / rate)), t = phase;
+        let value;
+        switch (wave ? 'custom' : this._type) {
+          case 'sine': value = Math.sin(2 * Math.PI * t); break;
+          case 'square': value = (t < 0.5 ? 1 : -1) + blep(t, dt) - blep((t + 0.5) % 1, dt); break;
+          case 'sawtooth': value = 2 * t - 1 - blep(t, dt); break;
+          case 'triangle': value = 1 - 4 * Math.abs(t - 0.5); break;
+          default: value = 0; for (let k = 1; k < Math.min(wave._real.length, 1 / (2 * dt)); k++) value += (wave._real[k] ?? 0) * Math.cos(2 * Math.PI * k * t) + (wave._imag[k] ?? 0) * Math.sin(2 * Math.PI * k * t); value *= wave._scale;
+        }
+        out[i] = value; phase = (phase + Math.sign(frequency[i]) * dt + 1) % 1;
+      }
+      return [out];
+    }
+  }
+  class AudioBufferSourceNode extends AudioScheduledSourceNode {
+    buffer = null; loop = false; loopStart = 0; loopEnd = 0;
+    constructor(context, options) { super(context); this.playbackRate = new AudioParam(context, 1); this.detune = new AudioParam(context, 0); audioOptions(this, options); }
+    start(when = 0, offset = 0, duration) {
+      this._offset = Math.max(0, +offset || 0);
+      super.start(when);
+      if (duration !== undefined) this._stop = this._start + Math.max(0, +duration);
+    }
+    _render(rate, length, frames) {
+      const buffer = this.buffer, speed = this.playbackRate._run(this._start, rate, frames), detune = this.detune._run(this._start, rate, frames), step = buffer.sampleRate / rate;
+      const [low, high] = this.loop && this.loopEnd > this.loopStart ? [this.loopStart * buffer.sampleRate, Math.min(this.loopEnd * buffer.sampleRate, buffer.length)] : [0, buffer.length];
+      const input = buffer._data.slice(0, 2), out = input.map(() => new Float32Array(length));
+      let at = this._offset * buffer.sampleRate;
+      for (let i = 0; i < frames; i++) {
+        if (this.loop && at >= high) at = low + (at - low) % Math.max(1, high - low);
+        if (at >= buffer.length || at < 0) break;
+        const index = at | 0, t = at - index;
+        for (let c = 0; c < input.length; c++) { const data = input[c]; out[c][i] = data[index] + ((data[index + 1] ?? (this.loop ? data[low | 0] : 0)) - data[index]) * t; }
+        at += step * speed[i] * 2 ** (detune[i] / 1200);
+      }
+      return out;
+    }
+    // The playing time of the source, or undefined when it plays until stopped.
+    get _length() { const buffer = this.buffer; return !buffer || this.loop ? undefined : (buffer.duration - this._offset) / Math.max(1e-3, this.playbackRate.value); }
+  }
+  // A 32-bit float WAV file of interleaved channels.
+  const wav = (channels, rate) => {
+    const frames = channels[0].length, bytes = new DataView(new ArrayBuffer(44 + frames * channels.length * 4)), text = (at, value) => [...value].forEach((char, i) => bytes.setUint8(at + i, char.charCodeAt(0)));
+    text(0, 'RIFF'); bytes.setUint32(4, 36 + frames * channels.length * 4, true); text(8, 'WAVEfmt '); bytes.setUint32(16, 16, true);
+    bytes.setUint16(20, 3, true); bytes.setUint16(22, channels.length, true); bytes.setUint32(24, rate, true); bytes.setUint32(28, rate * channels.length * 4, true);
+    bytes.setUint16(32, channels.length * 4, true); bytes.setUint16(34, 32, true); text(36, 'data'); bytes.setUint32(40, frames * channels.length * 4, true);
+    for (let i = 0, at = 44; i < frames; i++) for (const data of channels) { bytes.setFloat32(at, data[i], true); at += 4; }
+    return bytes.buffer;
+  };
   class AudioContext extends EventTarget {
-    state = 'running'; sampleRate = 48000; _start = performance.now(); destination = new AudioDestinationNode(this);
+    state = 'running'; sampleRate = 48000; baseLatency = 0.01; outputLatency = 0.02; onstatechange = null; _start = performance.now(); _pending = [];
+    constructor(options) { super(); if (options?.sampleRate) this.sampleRate = +options.sampleRate; this.destination = new AudioDestinationNode(this); this.listener = {}; }
     get currentTime() { return (performance.now() - this._start) / 1000; }
-    _set(state) { this.state = state; this.dispatchEvent(new Event('statechange')); return Promise.resolve(); }
+    _set(state) { if (this.state === 'closed') return Promise.reject(new DOMException('The context is closed', 'InvalidStateError')); this.state = state; const event = new Event('statechange'); this.onstatechange?.(event); this.dispatchEvent(event); return Promise.resolve(); }
     resume() { return this.state === 'running' ? Promise.resolve() : this._set('running'); } suspend() { return this._set('suspended'); } close() { return this._set('closed'); }
+    getOutputTimestamp() { return { contextTime: this.currentTime, performanceTime: performance.now() }; }
     createGain() { return new GainNode(this); } createBufferSource() { return new AudioBufferSourceNode(this); }
+    createOscillator() { return new OscillatorNode(this); } createBiquadFilter() { return new BiquadFilterNode(this); }
+    createBuffer(numberOfChannels, length, sampleRate) { return new AudioBuffer({ numberOfChannels, length, sampleRate }); }
+    createPeriodicWave(real, imag, options) { return new PeriodicWave(this, { real, imag, ...options }); }
     decodeAudioData(data, done, failed) {
       const url = URL.createObjectURL(new Blob([data])), audio = new Audio(url);
-      const result = new Promise((resolve, reject) => { audio.addEventListener('loadedmetadata', () => resolve(new AudioBuffer(url, audio.duration))); audio.addEventListener('error', () => reject(new DOMException('The audio cannot be decoded', 'EncodingError'))); audio.load(); });
+      const result = new Promise((resolve, reject) => { audio.addEventListener('loadedmetadata', () => { audio._close(); resolve(new AudioBuffer(url, audio.duration)); }); audio.addEventListener('error', () => reject(new DOMException('The audio cannot be decoded', 'EncodingError'))); audio.load(); });
       if (done || failed) result.then(done, failed);
       return result;
+    }
+    _schedule(source) {
+      if (source.buffer?._url) return this._playFile(source);
+      if (source instanceof AudioBufferSourceNode && !source.buffer) return;
+      if (!this._pending.length) queueMicrotask(() => this._render());
+      this._pending.push(source);
+    }
+    _playFile(source) {
+      let volume = 1, node = [...source._outputs][0];
+      while (node && !(node instanceof AudioDestinationNode)) { volume *= node.gain?.value ?? 1; node = [...node._outputs][0]; }
+      const audio = source._audio = new Audio(source.buffer._url);
+      audio.volume = node ? Math.min(1, Math.max(0, volume)) : 0; audio.loop = source.loop; audio.playbackRate = source.playbackRate.value; audio.currentTime = source._offset;
+      audio.addEventListener('ended', () => { audio._close(); source._ended(); });
+      setTimeout(() => source._audio === audio && audio.play().catch(() => {}), Math.max(0, source._start - this.currentTime) * 1000);
+    }
+    // Renders the sources that started in this task into one sound.
+    _render() {
+      const sources = this._pending, rate = this.sampleRate; this._pending = [];
+      const begin = Math.min(...sources.map(source => source._start));
+      const ends = sources.map(source => source._start + Math.min(audioCap, (source._stop ?? Infinity) - source._start, source._length ?? Infinity));
+      const [mix, heard] = this._mix(sources, ends, begin, Math.ceil((Math.max(...ends) + audioTail - begin) * rate), 2);
+      sources.forEach((source, i) => setTimeout(() => source._ended(), Math.max(0, ends[i] - this.currentTime) * 1000));
+      if (!heard || this.state === 'closed') return;
+      const url = URL.createObjectURL(new Blob([wav(mix, rate)], { type: 'audio/wav' })), audio = new Audio(url);
+      const done = () => { audio._close(); URL.revokeObjectURL(url); };
+      audio.addEventListener('ended', done);
+      setTimeout(() => audio.play().catch(done), Math.max(0, begin - this.currentTime) * 1000);
+    }
+    // Adds each source along its paths to the destination, into channels of `length` frames from `begin`.
+    _mix(sources, ends, begin, length, count) {
+      const rate = this.sampleRate, mix = Array.from({ length: count }, () => new Float32Array(length));
+      let heard = false;
+      const walk = (node, channels, start, depth = 0) => {
+        if (depth > 64) return;
+        if (node instanceof AudioDestinationNode) {
+          heard = true; const at = Math.round((start - begin) * rate);
+          mix.forEach((data, c) => { const input = channels[Math.min(c, channels.length - 1)]; for (let i = Math.max(0, -at); i < input.length && at + i < data.length; i++) data[at + i] += input[i]; });
+          return;
+        }
+        const outputs = [...node._outputs];
+        outputs.forEach((next, i) => walk(next, next._process(i < outputs.length - 1 ? channels.map(data => data.slice()) : channels, start, rate), start, depth + 1));
+      };
+      sources.forEach((source, i) => {
+        const frames = Math.max(0, Math.round((ends[i] - source._start) * rate));
+        walk(source, source._render(rate, frames + Math.round(audioTail * rate), frames), source._start);
+      });
+      return [mix, heard];
+    }
+  }
+  class OfflineAudioContext extends AudioContext {
+    oncomplete = null;
+    constructor(channels, length, sampleRate) {
+      const options = typeof channels === 'object' ? channels : { numberOfChannels: channels, length, sampleRate };
+      super(options); this.length = options.length >>> 0; this._channels = options.numberOfChannels ?? 1; this.state = 'suspended';
+    }
+    get currentTime() { return 0; }
+    _schedule(source) { if (source.buffer?._url) throw new DOMException('Decoded files cannot render offline', 'NotSupportedError'); if (source instanceof OscillatorNode || source.buffer) this._pending.push(source); }
+    startRendering() {
+      const sources = this._pending, end = this.length / this.sampleRate; this._pending = [];
+      const ends = sources.map(source => Math.min(end, source._stop ?? end, source._start + (source._length ?? end)));
+      const buffer = new AudioBuffer({ numberOfChannels: this._channels, length: this.length, sampleRate: this.sampleRate });
+      buffer._data = this._mix(sources, ends, 0, this.length, this._channels)[0];
+      this.state = 'closed';
+      const event = Object.assign(new Event('complete'), { renderedBuffer: buffer });
+      setTimeout(() => { sources.forEach(source => source._ended()); this.oncomplete?.(event); this.dispatchEvent(event); });
+      return Promise.resolve(buffer);
     }
   }
   class ImageData {
@@ -2829,7 +3070,7 @@
   globalThis.window = globalThis; globalThis.self = globalThis;
   selection = new Selection(); attachDeclarative();
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) globalThis[name] = Node.prototype[name].bind(globalThis);
-  Object.assign(globalThis, { ElementImage, CanvasPaintEvent, ElementGeometryUpdateEvent, ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, AudioNode, GainNode, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent, StaticRange, customElements, ShadowRoot, CSSStyleSheet, DOMParser, CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration, AnimationEvent, BeforeUnloadEvent, ElementInternals, FormDataEvent, HashChangeEvent, PageTransitionEvent, PopStateEvent, RadioNodeList, StorageEvent, TransitionEvent });
+  Object.assign(globalThis, { ElementImage, CanvasPaintEvent, ElementGeometryUpdateEvent, ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, OfflineAudioContext, AudioNode, AudioParam, AudioScheduledSourceNode, GainNode, BiquadFilterNode, OscillatorNode, PeriodicWave, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent, StaticRange, customElements, ShadowRoot, CSSStyleSheet, DOMParser, CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration, AnimationEvent, BeforeUnloadEvent, ElementInternals, FormDataEvent, HashChangeEvent, PageTransitionEvent, PopStateEvent, RadioNodeList, StorageEvent, TransitionEvent });
   Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'styleSheets', { configurable: true, get() { return styleSheetsOf(this); } });

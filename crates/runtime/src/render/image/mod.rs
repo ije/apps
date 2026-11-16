@@ -211,8 +211,20 @@ pub(crate) fn url_file(
 }
 
 pub(crate) fn data_file(url: &str) -> Option<std::path::PathBuf> {
-    use std::hash::{Hash, Hasher};
+    use std::hash::{BuildHasher, Hash, Hasher};
+    type Files = rustc_hash::FxHashMap<u64, (Box<str>, std::path::PathBuf)>;
+    thread_local!(static FILES: std::cell::RefCell<Files> = Default::default());
     let (header, payload) = url.strip_prefix("data:")?.split_once(',')?;
+    // Boxes build again on many frames: decode and write each URL once.
+    let key = rustc_hash::FxBuildHasher.hash_one(url);
+    if let Some(path) = FILES.with_borrow(|files| {
+        files
+            .get(&key)
+            .filter(|(known, path)| **known == *url && path.exists())
+            .map(|(_, path)| path.clone())
+    }) {
+        return Some(path);
+    }
     let bytes = if header.ends_with(";base64") {
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload.trim()).ok()?
     } else {
@@ -248,5 +260,11 @@ pub(crate) fn data_file(url: &str) -> Option<std::path::PathBuf> {
             }
         }
     }
+    FILES.with_borrow_mut(|files| {
+        if files.len() >= 64 {
+            files.clear();
+        }
+        files.insert(key, (url.into(), path.clone()));
+    });
     Some(path)
 }

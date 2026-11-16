@@ -15,8 +15,8 @@ use objc2::{
     runtime::{AnyObject, NSObjectProtocol, ProtocolObject},
 };
 use objc2_app_kit::{
-    NSApp, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor, NSDragOperation,
-    NSDraggingInfo, NSScreen, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSApp, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSColor, NSDisplayGamut,
+    NSDragOperation, NSDraggingInfo, NSScreen, NSTrackingArea, NSTrackingAreaOptions, NSView,
     NSViewLayerContentsPlacement, NSViewLayerContentsRedrawPolicy, NSVisualEffectBlendingMode,
     NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow, NSWindowButton,
     NSWindowCollectionBehavior, NSWindowDelegate, NSWindowOcclusionState, NSWindowOrderingMode,
@@ -532,7 +532,11 @@ impl AppsWindow {
 
     pub fn update_size(&self) {
         let (scale, content) = (self.scale(), self.content_size());
-        self.view().ivars().layer.setContentsScale(scale as f64);
+        let layer = &self.view().ivars().layer;
+        layer.setContentsScale(scale as f64);
+        let p3 = (self.screen())
+            .is_some_and(|screen| screen.canRepresentDisplayGamut(NSDisplayGamut::P3));
+        super::metal::set_gamut(layer, p3);
         self.refresh();
         self.ivars().callbacks.resized(content, scale);
     }

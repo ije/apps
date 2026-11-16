@@ -43,6 +43,9 @@ fn run_hidden(main: &str, pages: &[(&str, &str)]) -> String {
     if main.contains("BUILT") {
         command.env("APPS_TRACE_BUILDS", "1");
     }
+    if main.contains("FORCE_P3") {
+        command.env("APPS_FORCE_COLOR_PROFILE", "display-p3");
+    }
     let mut child = command
         .arg("--bundle-stdin")
         .args(port.map(|port| format!("--devtools-mcp={port}")))
@@ -367,7 +370,7 @@ fn stretched_images_keep_their_size_when_they_restyle_in_place() {
         const before = await look();
         await input({ action: 'move', x: 10, y: 10 });
         const hover = await look();
-        if (!before.startsWith('0,0,48,48 | 48,0,') || hover !== before.replace(/ 1$/, ' .8')) fail('hover: ' + before + ' then ' + hover);
+        if (!before.startsWith('0,0,48,48 | 48,0,') || hover !== before.replace(/ 1$/, ' 0.8')) fail('hover: ' + before + ' then ' + hover);
         "#,
         &[(
             "page.html",
@@ -1715,6 +1718,42 @@ fn long_pages_keep_their_rows_while_they_scroll() {
         "{fast:?}"
     );
     assert_eq!(built(&text, "still"), [""; 0]);
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn out_of_flow_boxes_follow_the_clip_of_their_containing_block() {
+    // The box with `overflow: hidden` stays where it was while the clip of the scroller around it changes.
+    let page = "<body style='margin:0'><div id=s style='height:200px;overflow:auto'>\
+        <div style='position:relative;height:400px'><div style='overflow:hidden;width:100px;height:50px'>\
+        <div id=a style='position:absolute;left:0;top:0;width:300px;height:300px;background:red;cursor:pointer'>\
+        </div></div></div></div></body>";
+    let text = run_hidden(
+        &format!(
+            r#"{STEPS}
+            await load('page.html');
+            const s = 'document.getElementById("s")';
+            for (const [name, code, y] of [['short', `${{s}}.style.height = '120px'`, 110], ['tall', `${{s}}.style.height = '250px'`, 240], ['scroll', `${{s}}.scrollTop = 30`, 240]]) {{
+                await step(name, () => run(code));
+                console.log('PIXELS ' + name + ' ' + await pixel(150, y) + ' ' + await pixel(150, y + 15));
+            }}
+            "#
+        ),
+        &[("page.html", page)],
+    );
+    let pixels: Vec<_> = text
+        .lines()
+        .filter(|line| line.starts_with("PIXELS"))
+        .collect();
+    assert_eq!(
+        pixels,
+        [
+            "PIXELS short 0,0,255 255,255,255",
+            "PIXELS tall 0,0,255 255,255,255",
+            "PIXELS scroll 0,0,255 255,255,255",
+        ],
+        "{text}"
+    );
 }
 
 #[test]
@@ -3736,6 +3775,46 @@ fn conic_gradients_take_math_angles_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn conic_gradients_keep_thin_stops_and_masks_composite_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        const out = [];
+        for (const box of [0, 100, 200, 300]) for (const [x, y] of [[80, 20], [20, 20], [58, 42], [42, 58]]) {
+            const bytes = (await win.webContents.capturePage({ x: box + x, y, width: 1, height: 1 })).toBitmap();
+            out.push([bytes[2], bytes[1], bytes[0]].map(value => value > 200 ? 'f' : value < 60 ? '0' : '?').join(''));
+        }
+        const ticks = (await win.webContents.capturePage({ x: 0, y: 100, width: 100, height: 100 })).toBitmap();
+        let red = 0;
+        for (let at = 0; at < ticks.length; at += 4) if (ticks[at + 2] > 200 && ticks[at + 1] < 100) red++;
+        console.log('COLORS ' + out.join(' ') + ' TICKS ' + red / (ticks.length / 4));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0;background:#fff'><style>div>i{display:block;width:100px;height:100px;background:red;\
+             mask:radial-gradient(closest-side, transparent 60%, #000 60%), conic-gradient(#000 90deg, transparent 0)}</style>\
+             <div style='display:flex'><i style='mask-composite:intersect'></i><i style='mask-composite:subtract'></i>\
+             <i style='mask-composite:exclude'></i><i></i></div>\
+             <b style='display:block;width:100px;height:100px;background:repeating-conic-gradient(from -0.15deg, red 0deg 0.3deg, transparent 0.3deg 6deg)'></b></body>",
+        )],
+    );
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("COLORS "))
+        .unwrap_or_else(|| panic!("{text}"));
+    let (colors, ticks) = line.split_once(" TICKS ").unwrap();
+    // Chrome's colors: a point in the ring and the quarter, in the ring only, in the quarter only, and in neither.
+    assert_eq!(
+        colors,
+        "f00 fff fff fff fff f00 fff fff fff f00 f00 fff f00 f00 f00 fff"
+    );
+    // Lines of 0.3deg every 6deg cover 5% of the turn.
+    let ticks: f32 = ticks.parse().unwrap();
+    assert!((0.025..0.08).contains(&ticks), "{ticks}");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn animated_custom_properties_restyle_slotted_children() {
     let text = run_hidden(
         r#"
@@ -4256,5 +4335,246 @@ fn terminals_draw_their_grid_and_take_input() {
             ),
             ("package.json", r#"{"features":["terminal"]}"#),
         ],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn inset_shadows_stay_out_of_the_scroll_range_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        await run("document.getElementById('p').showPopover(); document.getElementById('s').scrollTop = 100");
+        for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+        const sizes = await run("[...document.querySelectorAll('.c')].map(c => [c.scrollWidth, c.clientWidth, c.scrollHeight, c.clientHeight].join(',')).join(' ')");
+        const bytes = (await win.webContents.capturePage({ x: 205, y: 205, width: 1, height: 1 })).toBitmap();
+        console.log('SIZES ' + sizes + ' EDGE ' + [bytes[2], bytes[1], bytes[0]].map(value => value > 200 ? 'f' : value < 60 ? '0' : '?').join(''));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0'><style>.c{width:190px;padding:8px;box-sizing:border-box;overflow:auto;box-shadow:inset 0 1px 3px #000,0 0 0 5px #eee}.c i{display:block;height:30px}</style>\
+             <div class=c style='display:grid;gap:1px'>\n <i></i><i></i>\n</div>\
+             <div class=c id=p popover=manual style='display:grid;gap:1px;position:fixed;inset:20px auto auto 200px;margin:0;border:0'><i></i><i></i></div>\
+             <div class=c id=s style='position:absolute;left:200px;top:200px;width:80px;height:60px;padding:0;background:#fff;box-shadow:inset 0 0 0 8px #f00'><i style='height:300px'></i></div></body>",
+        )],
+    );
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("SIZES "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's values: the children fit, so the boxes don't scroll, and the shadow of a scrolled box stays at its edge.
+    assert_eq!(line, "190,190,77,77 190,190,77,77 80,80,300,60 EDGE f00");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn pseudo_element_layers_follow_the_inner_border_corner_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        const out = [];
+        for (const [x, y] of [[16, 16], [3, 30], [50, 30]]) {
+            const bytes = (await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap();
+            out.push([bytes[2], bytes[1], bytes[0]].map(value => value > 200 ? 'f' : value < 60 ? '0' : '?').join(''));
+        }
+        console.log('COLORS ' + out.join(' '));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0;background:#fff'><style>p{margin:0}p::before{content:'';display:block;width:84px;height:44px;\
+             border:8px solid red;border-radius:30px;background:linear-gradient(#000,#000)}</style><p></p></body>",
+        )],
+    );
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("COLORS "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's colors: inside the inner corner curve, in the left border, and in the middle.
+    assert_eq!(line, "000 f00 000");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn observing_a_target_again_reports_nothing_new_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        await run(`globalThis.counts = [0, 0];
+            const el = document.getElementById('a');
+            const resize = new ResizeObserver(() => { counts[0]++; resize.observe(el); });
+            const seen = new IntersectionObserver(() => { counts[1]++; seen.observe(el); });
+            resize.observe(el); seen.observe(el); 1`);
+        for (let n = 0; n < 8; n++) await win.webContents.capturePage();
+        console.log('COUNTS ' + await run("counts.join(',')"));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0'><div id=a style='width:50px;height:50px'></div></body>",
+        )],
+    );
+    let counts = text
+        .lines()
+        .find_map(|line| line.strip_prefix("COUNTS "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's counts: one first report each, as the targets are already observed when the callbacks observe them.
+    assert_eq!(counts, "1,1");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn fading_pseudo_elements_draw_at_their_animated_opacity_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        const color = async () => {
+            for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+            const bytes = (await win.webContents.capturePage({ x: 20, y: 20, width: 1, height: 1 })).toBitmap();
+            return [bytes[2], bytes[1], bytes[0]].map(value => Math.round(value / 32)).join('.');
+        };
+        const first = await color();
+        await run("document.getElementById('a').classList.add('on')");
+        const changed = await color();
+        console.log('LOOK ' + first + ' ' + changed + ' ' + await run("getComputedStyle(document.getElementById('a'), '::before').opacity"));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0;background:#fff'><style>@keyframes f{from,to{opacity:.5}}@keyframes g{from,to{opacity:.25}}\
+             #a::before{content:'';position:absolute;inset:0;background:#f00;animation:f 1s infinite}#a.on::before{animation-name:g}</style>\
+             <div id=a style='position:relative;width:60px;height:60px'></div></body>",
+        )],
+    );
+    let look = text
+        .lines()
+        .find_map(|line| line.strip_prefix("LOOK "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's look: red at half opacity, then at a quarter, and the computed opacity follows the animation.
+    assert_eq!(look, "8.4.4 8.6.6 0.25");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn blur_animations_draw_their_animated_blur_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+        const shades = [];
+        for (const [x, y] of [[10, 40], [16, 40], [20, 40], [24, 40], [30, 40], [140, 50], [146, 50], [150, 50], [154, 50], [160, 50], [146, 90]]) {
+            const bytes = (await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap();
+            shades.push([bytes[2], bytes[1], bytes[0]]);
+        }
+        console.log('SHADES ' + JSON.stringify(shades));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0;background:#fff'><style>@keyframes f{from{filter:blur(0)}to{filter:blur(8px)}}\
+             @keyframes g{from{backdrop-filter:blur(0)}to{backdrop-filter:blur(12px)}}\
+             #s{position:absolute;left:20px;top:20px;width:40px;height:40px;background:#000;filter:blur(0);animation:f 1000s linear -500s}\
+             #p{position:absolute;left:100px;top:0;width:100px;height:100px;background:linear-gradient(90deg,red 50%,blue 50%)}\
+             #b{position:absolute;left:100px;top:20px;width:100px;height:60px;backdrop-filter:blur(0);animation:g 1000s linear -500s}</style>\
+             <div id=s></div><div id=p></div><div id=b></div></body>",
+        )],
+    );
+    let shades: Vec<[i32; 3]> = text
+        .lines()
+        .find_map(|line| line.strip_prefix("SHADES "))
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome halfway through: the square blurred by 4px, and the edge of the stripes under the backdrop by 6px.
+    let chrome = [
+        [253, 253, 253],
+        [206, 206, 206],
+        [115, 115, 115],
+        [33, 33, 33],
+        [1, 1, 1],
+        [240, 0, 15],
+        [184, 0, 71],
+        [119, 0, 136],
+        [58, 0, 197],
+        [10, 0, 245],
+        [255, 0, 0],
+    ];
+    for (shade, chrome) in shades.iter().zip(chrome) {
+        assert!(
+            shade.iter().zip(chrome).all(|(a, b)| (a - b).abs() <= 16),
+            "{shades:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn corner_shapes_draw_like_chrome() {
+    // Points that Chromium draws black (inside) or white (outside) for these shapes.
+    run_hidden(
+        r#"
+        await load('page.html');
+        const shade = async (x, y) => (await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()[1];
+        const points = [
+            ['squircle in', 10, 10, true], ['squircle out', 4, 4, false],
+            ['bevel out', 125, 15, false], ['bevel in', 135, 25, true],
+            ['scoop out', 245, 25, false], ['scoop in', 255, 35, true], ['scoop side', 222, 50, true],
+            ['notch out', 30, 140, false], ['notch in', 45, 120, true], ['notch side', 10, 155, true],
+            ['round out', 120, 120, false], ['round in', 125, 125, true],
+        ];
+        for (const [name, x, y, inside] of points) {
+            const value = await shade(x, y);
+            if ((value < 128) !== inside) fail(name + ' ' + value);
+        }
+        const style = await run(`(() => {
+            const cs = getComputedStyle(document.querySelector('div'));
+            return [cs.cornerShape, cs.cornerTopLeftShape, CSS.supports('corner-shape', 'superellipse(-2.5)'), CSS.supports('corner-shape', 'blob')].join();
+        })()`);
+        if (style !== 'superellipse(2),superellipse(2),true,false') fail(style);
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0;background:white'><style>div{position:absolute;top:0;width:100px;height:100px;\
+             background:black;border-radius:40px}</style><div style='left:0;corner-shape:squircle'></div>\
+             <div style='left:110px;corner-shape:bevel'></div><div style='left:220px;corner-shape:scoop'></div>\
+             <div style='left:0;top:110px;corner-shape:notch'></div><div style='left:110px;top:110px'></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn wide_gamut_colors_draw_in_display_p3() {
+    // Values of Chromium with `--force-color-profile` srgb and display-p3-d65.
+    let page = "<body style='margin:0;background:white'><style>body>*{position:absolute;width:100px;height:100px}</style>\
+        <div style='left:0;top:0;background:#f00'></div>\
+        <div style='left:100px;top:0;background:rgb(200,100,50)'></div>\
+        <div style='left:200px;top:0;background:oklch(0.64 0.31 48)'></div>\
+        <div style='left:300px;top:0;background:color(display-p3 0 1 0)'></div>\
+        <div style='left:0;top:100px;background:blue'><div style='height:100%;background:rgba(255,0,0,.5)'></div></div>\
+        <div style='left:100px;top:100px;background:linear-gradient(90deg,#f00,#00f)'></div>\
+        <svg style='left:200px;top:100px'><rect width='100' height='100' fill='#f00'/></svg>\
+        <div style='left:300px;top:100px;box-sizing:border-box;border:50px solid oklch(0.64 0.31 48)'></div>\
+        <div style='left:0;top:200px;background:blue'><div style='height:100%;background:oklch(0.64 0.31 48 / .5)'></div></div>\
+        <div style='left:100px;top:200px;background:linear-gradient(90deg,oklch(0.64 0.31 48),#00f)'></div></body>";
+    let main = |expected: &str| {
+        format!(
+            r#"
+        await load('page.html');
+        const points = [[50, 50], [150, 50], [250, 50], [350, 50], [50, 150], [150, 150], [250, 150], [350, 150], [50, 250], [150, 250]];
+        const expected = {expected};
+        const got = [];
+        for (const [x, y] of points) got.push([...(await win.webContents.capturePage({{ x, y, width: 1, height: 1 }})).toBitmap()].slice(0, 3).reverse());
+        if (got.some((pixel, at) => pixel.some((value, channel) => Math.abs(value - expected[at][channel]) > 2))) fail(JSON.stringify(got));
+        "#
+        )
+    };
+    let page = [("page.html", page)];
+    run_hidden(
+        &main(
+            "[[255,0,0],[200,100,50],[255,0,0],[0,255,0],[128,0,127],[126,0,128],[255,0,0],[255,0,0],[128,0,127],[145,90,136]]",
+        ),
+        &page,
+    );
+    run_hidden(
+        &(main(
+            "[[234,51,35],[187,105,62],[249,36,0],[0,255,0],[117,26,140],[115,20,124],[234,51,35],[249,36,0],[124,18,123],[137,92,133]]",
+        ) + "// FORCE_P3"),
+        &page,
     );
 }

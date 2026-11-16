@@ -14,8 +14,8 @@ pub(super) struct Plan {
     pub(super) line_height: f32,
     pub(super) spacing: [Pixels; 2],
     pub(super) smoothing: bool,
-    pub(super) ink: Option<(u32, u8)>,
-    pub(super) background: Option<(u32, u8)>,
+    pub(super) ink: Option<Color>,
+    pub(super) background: Option<Color>,
     pub(super) selection: (Option<u32>, u32),
     pub(super) padding: Option<[f32; 4]>,
     pub(super) borders: Option<[f32; 4]>,
@@ -31,10 +31,8 @@ impl Plan {
                 .iter()
                 .any(|&prop| style.get(prop).is_some_and(|value| value.contains('%')))
         };
-        let ink = style.get(Prop::COLOR).and_then(style::color);
-        let text = ink.map_or(Color::hex(0x000000ff), |(ink, alpha)| {
-            crate::style::rgba((ink, alpha))
-        });
+        let ink = style.get(Prop::COLOR).and_then(style::paint);
+        let text = ink.unwrap_or(Color::BLACK);
         let borders = units.borders(style, 0.);
         let corners = [
             Prop::BORDER_TOP_LEFT_RADIUS,
@@ -66,8 +64,8 @@ impl Plan {
             ink,
             background: style
                 .get(Prop::BACKGROUND_COLOR)
-                .and_then(style::color)
-                .filter(|(_, alpha)| *alpha > 0),
+                .and_then(style::paint)
+                .filter(|color| color.a > 0.),
             selection: style::selection_colors(style, None),
             padding: (!relative(&style::PADDING)).then(|| {
                 units
@@ -75,12 +73,8 @@ impl Plan {
                     .map(|value| value.max(0.))
             }),
             borders: (!relative(&style::BORDERS.map(|[width, ..]| width))).then_some(borders),
-            border_colors: style::BORDERS.map(|[_, _, name]| {
-                style
-                    .get(name)
-                    .and_then(style::color)
-                    .map_or(text, crate::style::rgba)
-            }),
+            border_colors: style::BORDERS
+                .map(|[_, _, name]| style.get(name).and_then(style::paint).unwrap_or(text)),
             radii: (!relative(&corners)).then(|| effects::radii(style, units, || [0.; 2])),
             shareable: matches!(
                 style.get(Prop::DISPLAY),

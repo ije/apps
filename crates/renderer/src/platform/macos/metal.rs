@@ -1,15 +1,15 @@
 use crate::{
     Color, Rect, Size,
     atlas::{self, PageKind, PageList, PageStore, Tile},
-    frame::{Command, Mask, Pool, RenderFrame, Target},
-    gpu::{ATTRIBUTES, Instance, bytes},
+    frame::{self, Command, Mask, Pool, RenderFrame, Target},
+    gpu::{ATTRIBUTES, Globals, Instance, bytes},
     scene::Scene,
 };
 use anyhow::{Context as _, Result, ensure};
 use block2::RcBlock;
 use objc2::{MainThreadMarker, rc::Retained, runtime::ProtocolObject};
-use objc2_core_foundation::CGSize;
-use objc2_core_graphics::{CGColorSpace, kCGColorSpaceSRGB};
+use objc2_core_foundation::{CFRetained, CGSize};
+use objc2_core_graphics::{CGColorSpace, kCGColorSpaceDisplayP3, kCGColorSpaceSRGB};
 use objc2_foundation::{NSArray, NSNumber, NSRange, NSString, NSValue, ns_string};
 use objc2_metal::{
     MTLBlendFactor, MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer,
@@ -164,6 +164,15 @@ pub(crate) struct Renderer {
     committed: u64,
     completed: Arc<AtomicU64>,
     pub snapshots: Vec<crate::Snapshot>,
+    // The drawable of the last frame, which a frame with a damage region copies.
+    last: Option<Texture>,
+    // The layer is Display P3.
+    wide: bool,
+    // Recent drawables with the frame that each holds, and the regions of recent frames, `None` when
+    // whole. A drawable that comes back draws only what changed since its frame.
+    drawables: Vec<(Texture, u64)>,
+    regions: Vec<(u64, Option<Vec<[i32; 4]>>)>,
+    frames: u64,
 }
 
 type Rendered = (
@@ -324,7 +333,8 @@ impl Renderer {
             }
         };
         let device = device.clone();
-        let layer = metal_layer(&device, !transparent);
+        let wide = forced_p3() == Some(true);
+        let layer = metal_layer(&device, !transparent, wide);
         layer.setMaximumDrawableCount(3);
         layer.setAllowsNextDrawableTimeout(false);
         layer.setNeedsDisplayOnBoundsChange(true);
@@ -378,6 +388,11 @@ impl Renderer {
             committed: 0,
             completed: Arc::default(),
             snapshots: Vec::new(),
+            last: None,
+            wide,
+            drawables: Vec::new(),
+            regions: Vec::new(),
+            frames: 0,
         })
     }
 
@@ -407,7 +422,7 @@ impl Renderer {
         {
             Some(at) => at,
             None => {
-                let sublayer = metal_layer(&self.device, false);
+                let sublayer = metal_layer(&self.device, false, self.wide);
                 sublayer.setPresentsWithTransaction(true);
                 sublayer.setContentsScale(scale);
                 sublayer.setDrawableSize(CGSize::new(region[2] as f64, region[3] as f64));
@@ -641,6 +656,8 @@ impl Renderer {
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
+        self.last = None;
+        self.drawables.clear();
         self.opaque = !transparent;
         self.layer.setOpaque(!transparent);
     }
@@ -665,7 +682,9 @@ impl Renderer {
         for list in &mut self.atlas.pages.borrow_mut().pages {
             list.trim();
         }
-        self.pool.clear();
+        self.pool.clear(&mut self.frame);
+        self.last = None;
+        self.drawables.clear();
         BUFFERS.with(|buffers| buffers.borrow_mut().reset(MIN_INSTANCE_BUFFER));
         // Change size to release spare drawables. The layer keeps its last frame until the next draw restores
         // the size.
@@ -682,6 +701,22 @@ impl Renderer {
         }
         if self.layer.drawableSize() != size {
             self.layer.setDrawableSize(size);
+        }
+        let wide =
+            (self.layer.colorspace()).is_some_and(|space| ptr::eq(&*space, color_space(true)));
+        if wide != self.wide {
+            self.wide = wide;
+            // Kept pixels are in the old color space.
+            self.last = None;
+            self.drawables.clear();
+            self.pool.clear(&mut self.frame);
+            let space = Some(color_space(wide));
+            for promoted in &self.promoted {
+                promoted.sublayer.setColorspace(space);
+            }
+            for glass in &self.glass {
+                glass.surface.layer.setColorspace(space);
+            }
         }
         let had_glass = !self.glass.is_empty();
         let scale = self.layer.contentsScale();
@@ -729,7 +764,7 @@ impl Renderer {
                 {
                     Some(at) => self.glass.swap_remove(at).surface.layer,
                     None => {
-                        let sublayer = metal_layer(&self.device, false);
+                        let sublayer = metal_layer(&self.device, false, self.wide);
                         sublayer.setPresentsWithTransaction(true);
                         // Match the window's drawable count so an uncommitted frame cannot block the next
                         // one.
@@ -762,6 +797,31 @@ impl Renderer {
         if capture && !native_capture {
             self.demote();
         }
+        let window = [size.width as u32, size.height as u32];
+        let last = self.last.take().filter(|last| {
+            !capture
+                && !self.in_transaction
+                && !self.restacked
+                && !native_transaction
+                && self.glass.is_empty()
+                && [last.width() as u32, last.height() as u32] == window
+        });
+        let damage = (last.as_ref()).and_then(|_| frame::damage_regions(scene, window, &[]));
+        // Nothing changed, so the window keeps its last frame.
+        if damage.as_ref().is_some_and(Vec::is_empty)
+            && self.promoted.iter().all(|promoted| promoted.drawn)
+            && (self.promoted.iter().map(|promoted| promoted.index)).eq(self
+                .frame
+                .skip
+                .iter()
+                .copied())
+            && !scene.shots.iter().any(|shot| shot.read)
+        {
+            self.last = last;
+            return None;
+        }
+        let damage = damage.unwrap_or_default();
+        let last = last.filter(|_| !damage.is_empty());
         // Present the frame in the same transaction that adds or removes promoted sublayers.
         let resizing = self.in_transaction;
         let transact = resizing || mem::take(&mut self.restacked) || native_transaction;
@@ -773,20 +833,76 @@ impl Renderer {
             false => 0,
         };
         let Some(drawable) = next else {
+            self.last = None;
+            self.drawables.clear();
             eprintln!("apps: no drawable for a {size:?} window");
             return capture.then(|| Err(anyhow::anyhow!("No drawable")));
         };
         let frame_texture = drawable.texture();
-        let window = [frame_texture.width() as u32, frame_texture.height() as u32];
-        let (commands, sublayers) = match self.render_frame(scene, &frame_texture, window) {
+        let drawn = [frame_texture.width() as u32, frame_texture.height() as u32];
+        let (window, mut damage, mut last) = match drawn == window {
+            true => (window, damage, last),
+            false => (drawn, Vec::new(), None),
+        };
+        // A drawable still holds its own frame, so it needs no copy of the last one when the frames
+        // since then have regions too.
+        let since = (self.drawables.iter())
+            .find(|(texture, _)| ptr::eq(&**texture, &*frame_texture))
+            .map(|(_, frame)| *frame);
+        if !damage.is_empty()
+            && let Some(since) = since
+            && let Some(extra) = (since + 1..=self.frames)
+                .map(|frame| {
+                    let (_, regions) = self.regions.iter().find(|(at, _)| *at == frame)?;
+                    regions.as_ref()
+                })
+                .collect::<Option<Vec<_>>>()
+        {
+            let extra: Vec<_> = extra.into_iter().flatten().copied().collect();
+            if let Some(regions) = frame::damage_regions(scene, window, &extra) {
+                (damage, last) = (regions, None);
+            }
+        }
+        // Captures are sRGB, so a Display P3 frame draws once more for them. A forced profile captures its pixels.
+        let srgb = (capture && !native_capture && self.wide && forced_p3().is_none())
+            .then(|| {
+                let usage = MTLTextureUsage::RenderTarget;
+                let size = window.map(|side| side as usize);
+                new_texture(&self.device, size, FORMAT, usage, MTLStorageMode::Private)
+            })
+            .transpose();
+        let srgb = match srgb {
+            Ok(srgb) => srgb,
+            Err(error) => return Some(Err(error)),
+        };
+        let rendered = self.render_frame(
+            scene,
+            &frame_texture,
+            window,
+            damage,
+            last.as_deref(),
+            srgb.as_deref(),
+        );
+        self.last = Some(frame_texture.clone());
+        self.frames += 1;
+        let frames = self.frames;
+        self.drawables
+            .retain(|(texture, frame)| !ptr::eq(&**texture, &*frame_texture) && frames - frame < 4);
+        self.drawables.push((frame_texture.clone(), frames));
+        self.regions.retain(|(frame, _)| frames - frame < 4);
+        let regions = (!self.frame.damage.is_empty()).then(|| self.frame.damage.clone());
+        self.regions.push((frames, regions));
+        let (commands, sublayers) = match rendered {
             Ok(commands) => commands,
             Err(error) => {
+                self.last = None;
+                self.drawables.clear();
                 eprintln!("apps: failed to render: {error:#}");
                 return capture.then(|| Err(error));
             }
         };
-        let readback =
-            (capture && !native_capture).then(|| self.read_back(&commands, &frame_texture, window));
+        let readback = (capture && !native_capture)
+            .then(|| self.read_back(&commands, srgb.as_deref().unwrap_or(&frame_texture), window));
         let shots: Vec<_> = (self.frame.shots.iter())
             .filter_map(|&(key, target, region)| {
                 let size = [region[2] as u32, region[3] as u32];
@@ -939,9 +1055,12 @@ impl Renderer {
         scene: &Scene,
         drawable: &ProtocolObject<dyn MTLTexture>,
         window: [u32; 2],
+        damage: Vec<[i32; 4]>,
+        last: Option<&ProtocolObject<dyn MTLTexture>>,
+        srgb: Option<&ProtocolObject<dyn MTLTexture>>,
     ) -> Result<Rendered> {
         let mut frame = mem::take(&mut self.frame);
-        frame.skip.clear();
+        let skipped = mem::take(&mut frame.skip);
         frame.content.clear();
         for promoted in &self.promoted {
             frame.skip.push(promoted.index);
@@ -953,6 +1072,12 @@ impl Renderer {
             frame.skip.push(glass.index);
             frame.content.push(glass.index);
         }
+        // A layer that left or joined Core Animation draws otherwise in the whole window.
+        frame.damage = match frame.skip == skipped {
+            true => damage,
+            false => Vec::new(),
+        };
+        frame.fresh = srgb.is_some();
         frame.record(scene, window, MAX_TEXTURE_SIZE, true);
         let device = &self.device;
         self.pool.fill(&frame, |size| {
@@ -974,7 +1099,23 @@ impl Renderer {
             })
             .transpose()?;
         let commands = self.queue.commandBuffer().context("no command buffer")?;
-        let result = self.encode(&frame, &commands, drawable, instances.as_deref());
+        // The pool can give back the drawable of the last frame, which holds it already.
+        if !frame.damage.is_empty()
+            && let Some(last) = last.filter(|last| !ptr::eq(*last, drawable))
+        {
+            let area = [0, 0, window[0] as i32, window[1] as i32];
+            let load = MTLLoadAction::DontCare;
+            self.pipelines
+                .copy(&commands, last, [0, 0], drawable, area, load)?;
+        }
+        // The sRGB copy draws first, so layers keep the pixels of the window.
+        let result = srgb
+            .map_or(Ok(()), |srgb| {
+                self.encode(&frame, &commands, srgb, instances.as_deref(), false)
+            })
+            .and_then(|()| {
+                self.encode(&frame, &commands, drawable, instances.as_deref(), self.wide)
+            });
         let mut sublayers = Vec::new();
         if result.is_ok() {
             for &(index, target, region) in &frame.promoted {
@@ -1042,6 +1183,7 @@ impl Renderer {
         commands: &ProtocolObject<dyn MTLCommandBuffer>,
         drawable: &ProtocolObject<dyn MTLTexture>,
         instances: Option<&ProtocolObject<dyn MTLBuffer>>,
+        wide: bool,
     ) -> Result<()> {
         let texture = |target: Target| {
             self.pool
@@ -1065,7 +1207,12 @@ impl Renderer {
                     encoder.setFragmentBytes_length_atIndex(data, length, slot);
                 }
             };
-        let globals = |target: Target| frame.globals(target, 0.);
+        // Snapshots are sRGB, like the canvases that draw them.
+        let wide = Cell::new(wide);
+        let globals = |target: Target| Globals {
+            wide: f32::from(u8::from(wide.get())),
+            ..frame.globals(target, 0.)
+        };
         let begin = |target: Target, clear: bool| -> Result<_> {
             let descriptor = MTLRenderPassDescriptor::new();
             // SAFETY: index zero is within the color attachment array.
@@ -1078,7 +1225,7 @@ impl Renderer {
                     red: 0.,
                     green: 0.,
                     blue: 0.,
-                    alpha: f64::from(u8::from(self.opaque && target == Target::Frame)),
+                    alpha: f64::from(u8::from(self.opaque && frame.bases.contains(&target))),
                 });
             } else {
                 attachment.setLoadAction(MTLLoadAction::Load);
@@ -1108,7 +1255,10 @@ impl Renderer {
             };
         }
         let pipelines = self.pipelines;
-        for command in &frame.commands {
+        for (at, command) in frame.commands.iter().enumerate() {
+            if at == frame.shot_commands && wide.replace(false) {
+                end!();
+            }
             match command {
                 Command::Pass(target, false)
                     if let Some(encoder) = &encoder
@@ -1219,14 +1369,53 @@ impl Renderer {
     }
 }
 
-// Every Metal layer draws in sRGB, so wide-gamut displays don't oversaturate CSS colors.
-fn metal_layer(device: &ProtocolObject<dyn MTLDevice>, opaque: bool) -> Retained<CAMetalLayer> {
+// Like Chrome's `--force-color-profile`, `APPS_FORCE_COLOR_PROFILE` is `srgb` or `display-p3`.
+fn forced_p3() -> Option<bool> {
+    static FORCED: OnceLock<Option<bool>> = OnceLock::new();
+    *FORCED.get_or_init(
+        || match std::env::var("APPS_FORCE_COLOR_PROFILE").as_deref() {
+            Ok("srgb") => Some(false),
+            Ok("display-p3") => Some(true),
+            _ => None,
+        },
+    )
+}
+
+fn color_space(p3: bool) -> &'static CGColorSpace {
+    struct Spaces([CFRetained<CGColorSpace>; 2]);
+    // SAFETY: color spaces are immutable.
+    unsafe impl Send for Spaces {}
+    // SAFETY: as above.
+    unsafe impl Sync for Spaces {}
+    static SPACES: OnceLock<Spaces> = OnceLock::new();
+    let spaces = SPACES.get_or_init(|| {
+        // SAFETY: constants of Core Graphics.
+        Spaces(
+            unsafe { [kCGColorSpaceSRGB, kCGColorSpaceDisplayP3] }
+                .map(|name| CGColorSpace::with_name(Some(name)).expect("a named color space")),
+        )
+    });
+    &spaces.0[usize::from(p3)]
+}
+
+// Like Chrome, a window draws in Display P3 on a wide-gamut screen. Main sets it, and the render thread
+// reads it from the layer.
+pub(crate) fn set_gamut(layer: &CAMetalLayer, p3: bool) {
+    let space = color_space(forced_p3().unwrap_or(p3));
+    if !layer.colorspace().is_some_and(|old| ptr::eq(&*old, space)) {
+        layer.setColorspace(Some(space));
+    }
+}
+
+fn metal_layer(
+    device: &ProtocolObject<dyn MTLDevice>,
+    opaque: bool,
+    wide: bool,
+) -> Retained<CAMetalLayer> {
     let surface = CAMetalLayer::new();
     surface.setDevice(Some(device));
     surface.setPixelFormat(FORMAT);
-    // SAFETY: a constant of Core Graphics.
-    let srgb = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }));
-    surface.setColorspace(srgb.as_deref());
+    surface.setColorspace(Some(color_space(wide)));
     surface.setFramebufferOnly(false);
     surface.setOpaque(opaque);
     surface
@@ -1427,5 +1616,388 @@ mod tests {
         assert_eq!(sublayers(&renderer.overlay), [caret]);
         renderer.set_caret(None);
         assert!(sublayers(&renderer.overlay).is_empty());
+    }
+
+    #[test]
+    fn opacity_patches_redraw_only_their_region_like_a_full_frame() {
+        use crate::{
+            Clip,
+            gpu::{BOX, Instance, rect},
+            scene::{EffectState, Scene, effect},
+        };
+        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
+        let (send, receive) = std::sync::mpsc::channel();
+        let job = move || {
+            let mut renderer = super::Renderer::new(false).unwrap();
+            renderer.set_drawable_size(objc2_core_foundation::CGSize::new(200., 120.));
+            let mask = Clip::from(rect([0., 0., 200., 120.]));
+            let quad = |bounds: [f32; 4], color: [f32; 4]| {
+                let mut instance = Instance::new(BOX, rect(bounds), mask);
+                instance.color = color;
+                instance
+            };
+            let mut scene = Scene::default();
+            scene.push(quad([0., 0., 200., 120.], [0.9, 0.9, 0.85, 1.]));
+            scene.push(quad([150., 10., 40., 40.], [0.2, 0.4, 0.8, 1.]));
+            let state = EffectState {
+                opacity: 0.8,
+                ..effect(mask)
+            };
+            scene.push_effect(state, Some(7));
+            scene.push(quad([20., 20., 30., 30.], [0.9, 0.1, 0.1, 1.]));
+            scene.pop_effect();
+            scene.push(quad([40., 30., 50., 10.], [0.1, 0.1, 0.1, 0.7]));
+            renderer.draw(&scene, false);
+            scene.drawn();
+            for opacity in [0.3, 0.55] {
+                scene.patch(7, opacity, None, [None; 2]);
+                renderer.draw(&scene, false);
+                scene.drawn();
+                let (damage, drawn) = (
+                    renderer.frame.damage.clone(),
+                    renderer.frame.instances.len(),
+                );
+                let last = renderer.last.clone().unwrap();
+                let commands = renderer.queue.commandBuffer().unwrap();
+                let buffer = renderer.read_back(&commands, &last, [200, 120]).unwrap();
+                commands.commit();
+                commands.waitUntilCompleted();
+                // SAFETY: the GPU finished writing the shared buffer.
+                let mut pixels = unsafe {
+                    std::slice::from_raw_parts(
+                        buffer.contents().as_ptr().cast::<u8>(),
+                        buffer.length(),
+                    )
+                }
+                .to_vec();
+                for pixel in pixels.as_chunks_mut::<4>().0 {
+                    pixel.swap(0, 2);
+                }
+                let (_, full) = renderer.draw(&scene, true).unwrap().unwrap();
+                send.send((damage, drawn, pixels == full)).unwrap();
+            }
+            super::super::threads::end_thread();
+        };
+        super::super::threads::spawn_render(job, || {});
+        for _ in 0..2 {
+            let (damage, drawn, same) = receive.recv().unwrap();
+            assert_eq!(damage, [[19, 19, 32, 32]]);
+            assert!(drawn < 4, "the far box is not drawn again");
+            assert!(same, "the region matches a full frame");
+        }
+    }
+
+    #[test]
+    fn rebuilt_scenes_redraw_only_what_changed_like_a_full_frame() {
+        use crate::{
+            Clip,
+            atlas::TileKey,
+            gpu::{BOX, IMAGE, Instance, rect},
+            scene::{BackdropState, EffectState, Scene, effect},
+        };
+        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
+        #[derive(Clone, Copy)]
+        struct Step {
+            name: &'static str,
+            box_color: f32,
+            box_at: [f32; 2],
+            inner: f32,
+            opacity: f32,
+            image: usize,
+            turned: f32,
+            shift: f32,
+        }
+        let first = Step {
+            name: "first",
+            box_color: 0.8,
+            box_at: [150., 10.],
+            inner: 0.1,
+            opacity: 0.8,
+            image: 0,
+            turned: 0.2,
+            shift: 0.,
+        };
+        let steps = [
+            first,
+            Step {
+                name: "same",
+                ..first
+            },
+            Step {
+                name: "box color",
+                box_color: 0.3,
+                ..first
+            },
+            Step {
+                name: "moved box",
+                box_color: 0.3,
+                box_at: [120., 14.],
+                ..first
+            },
+            Step {
+                name: "layer content",
+                box_color: 0.3,
+                box_at: [120., 14.],
+                inner: 0.6,
+                ..first
+            },
+            Step {
+                name: "layer opacity",
+                box_color: 0.3,
+                box_at: [120., 14.],
+                inner: 0.6,
+                opacity: 0.5,
+                ..first
+            },
+            Step {
+                name: "image",
+                box_color: 0.3,
+                box_at: [120., 14.],
+                inner: 0.6,
+                opacity: 0.5,
+                image: 1,
+                ..first
+            },
+            Step {
+                name: "turned layer content",
+                box_color: 0.3,
+                box_at: [120., 14.],
+                inner: 0.6,
+                opacity: 0.5,
+                image: 1,
+                turned: 0.9,
+                ..first
+            },
+            Step {
+                name: "below a backdrop",
+                box_color: 0.3,
+                box_at: [100., 50.],
+                inner: 0.6,
+                opacity: 0.5,
+                image: 1,
+                turned: 0.9,
+                shift: 0.,
+            },
+            Step {
+                name: "moved layer",
+                box_color: 0.3,
+                box_at: [100., 50.],
+                inner: 0.6,
+                opacity: 0.5,
+                image: 1,
+                turned: 0.9,
+                shift: 3.,
+            },
+        ];
+        let (send, receive) = std::sync::mpsc::channel();
+        let job = move || {
+            let mut renderer = super::Renderer::new(false).unwrap();
+            renderer.set_drawable_size(objc2_core_foundation::CGSize::new(200., 120.));
+            let mask = Clip::from(rect([0., 0., 200., 120.]));
+            let quad = |bounds: [f32; 4], color: [f32; 4]| {
+                let mut instance = Instance::new(BOX, rect(bounds), mask);
+                instance.color = color;
+                instance
+            };
+            let tiles = [[230, 40, 40, 255], [40, 200, 90, 255]].map(|pixel: [u8; 4]| {
+                let side = crate::size(4, 4);
+                (renderer.atlas())
+                    .get_or_insert_with(&TileKey::Image(u64::from(pixel[0])), &mut || {
+                        let bytes = pixel.repeat(16).into();
+                        Ok(Some((Rect::new(Default::default(), side), side, bytes)))
+                    })
+                    .unwrap()
+                    .0
+            });
+            let build = |scene: &mut Scene, step: Step| {
+                scene.push(quad([0., 0., 200., 120.], [0.9, 0.9, 0.85, 1.]));
+                let [x, y] = step.box_at;
+                scene.push(quad([x, y, 40., 40.], [0.2, 0.4, step.box_color, 1.]));
+                let state = EffectState {
+                    opacity: step.opacity,
+                    ..effect(mask)
+                };
+                scene.push_effect(state, Some(7));
+                let shift = step.shift;
+                let inner = [0.9, step.inner, 0.1, 1.];
+                scene.push(quad([20. + shift, 20. + shift, 30., 30.], inner));
+                scene.push(quad(
+                    [24. + shift, 60. + shift, 20., 10.],
+                    [0.1, 0.5, 0.5, 1.],
+                ));
+                scene.pop_effect();
+                scene.push(quad([40., 30., 50., 10.], [0.1, 0.1, 0.1, 0.7]));
+                let tile = tiles[step.image];
+                let mut image = Instance::new(IMAGE, rect([60., 84., 16., 16.]), mask);
+                image.aux = tile.rect.map(|value| value as f32).to_array();
+                (image.info[2], image.info[3]) = (1., tile.page as f32);
+                scene.push(image);
+                let (sin, cos) = 0.3f32.sin_cos();
+                let mut turn = crate::frame::IDENTITY;
+                [turn[0], turn[1], turn[4], turn[5], turn[12], turn[13]] =
+                    [cos, sin, -sin, cos, 10., -20.];
+                let state = EffectState {
+                    transform: Some(turn),
+                    ..effect(mask)
+                };
+                scene.push_effect(state, None);
+                scene.push(quad([150., 60., 20., 20.], [step.turned, 0.2, 0.6, 1.]));
+                scene.pop_effect();
+                let state = EffectState {
+                    backdrop: Some(BackdropState {
+                        bounds: rect([96., 64., 50., 40.]),
+                        corner_radii: Default::default(),
+                        blur: 3.,
+                        color_matrix: None,
+                    }),
+                    ..effect(mask)
+                };
+                scene.push_effect(state, None);
+                scene.push(quad([96., 64., 50., 40.], [1., 1., 1., 0.3]));
+                scene.pop_effect();
+            };
+            let read = |renderer: &super::Renderer| {
+                let last = renderer.last.clone().unwrap();
+                let commands = renderer.queue.commandBuffer().unwrap();
+                let buffer = renderer.read_back(&commands, &last, [200, 120]).unwrap();
+                commands.commit();
+                commands.waitUntilCompleted();
+                // SAFETY: the GPU finished writing the shared buffer.
+                let mut pixels = unsafe {
+                    std::slice::from_raw_parts(
+                        buffer.contents().as_ptr().cast::<u8>(),
+                        buffer.length(),
+                    )
+                }
+                .to_vec();
+                for pixel in pixels.as_chunks_mut::<4>().0 {
+                    pixel.swap(0, 2);
+                }
+                pixels
+            };
+            let mut scene = Scene::default();
+            for step in steps {
+                scene.clear();
+                build(&mut scene, step);
+                scene.diff(Some(&[]));
+                let committed = renderer.committed;
+                renderer.draw(&scene, false);
+                scene.drawn();
+                let drawn = (renderer.committed != committed).then(|| {
+                    let frame = &renderer.frame;
+                    (frame.damage.clone(), frame.instances.len())
+                });
+                let pixels = read(&renderer);
+                let (_, full) = renderer.draw(&scene, true).unwrap().unwrap();
+                send.send((step.name, drawn, pixels == full)).unwrap();
+                // The next rebuild draws again where a patch drew, though its scene draws as before.
+                if step.name == "layer opacity" {
+                    scene.patch(7, 0.25, None, [None; 2]);
+                    renderer.draw(&scene, false);
+                    scene.drawn();
+                    let drawn = Some((renderer.frame.damage.clone(), 0));
+                    let pixels = read(&renderer);
+                    let (_, full) = renderer.draw(&scene, true).unwrap().unwrap();
+                    send.send(("patched", drawn, pixels == full)).unwrap();
+                }
+            }
+            super::super::threads::end_thread();
+        };
+        super::super::threads::spawn_render(job, || {});
+        for _ in 0..=steps.len() {
+            let (name, drawn, same) = receive.recv().unwrap();
+            assert!(same, "{name}: the frame matches a full frame");
+            let expect: Option<(&[[i32; 4]], usize)> = match name {
+                "first" => Some((&[], 8)),
+                "same" => None,
+                "box color" => Some((&[[149, 9, 42, 42]], 2)),
+                "moved box" => Some((&[[119, 9, 72, 46]], 2)),
+                // The layer draws its boxes again, the window its background and the bar over it.
+                "layer content" => Some((&[[19, 19, 32, 32]], 4)),
+                // The layer keeps its pixels.
+                "layer opacity" => Some((&[[19, 19, 32, 52]], 2)),
+                "patched" => Some((&[[19, 19, 32, 52]], 0)),
+                // The patched layer draws again, and joins the image in one region.
+                "image" => Some((&[[19, 19, 58, 82]], 3)),
+                // The layer turns into the backdrop, which reads all of its region again.
+                "turned layer content" => Some((&[[96, 64, 60, 44]], 2)),
+                "below a backdrop" => Some((&[[96, 13, 65, 91]], 2)),
+                // The layer moves with its pixels.
+                "moved layer" => Some((&[[19, 19, 35, 55]], 2)),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                drawn.as_ref().map(|(damage, drawn)| (&damage[..], *drawn)),
+                expect,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn returned_drawables_draw_what_changed_since_their_frame() {
+        use crate::{
+            Clip,
+            gpu::{BOX, Instance, rect},
+            scene::Scene,
+        };
+        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
+        let (send, receive) = std::sync::mpsc::channel();
+        let job = move || {
+            let size = objc2_core_foundation::CGSize::new(200., 120.);
+            let [mut renderer, mut reference] = [(), ()].map(|_| {
+                let mut renderer = super::Renderer::new(false).unwrap();
+                renderer.set_drawable_size(size);
+                renderer
+            });
+            let mask = Clip::from(rect([0., 0., 200., 120.]));
+            let quad = |bounds: [f32; 4], color: [f32; 4]| {
+                let mut instance = Instance::new(BOX, rect(bounds), mask);
+                instance.color = color;
+                instance
+            };
+            let mut scene = Scene::default();
+            let mut uncopied = 0;
+            for frame in 0..12 {
+                scene.clear();
+                scene.push(quad([0., 0., 200., 120.], [0.9, 0.9, 0.85, 1.]));
+                let x = 10. + 12. * frame as f32;
+                scene.push(quad([x, 10., 10., 10.], [0.2, 0.4, 0.8, 1.]));
+                let shade = (frame / 3) as f32 / 4.;
+                scene.push(quad([150., 80., 20., 20.], [shade, 0.5, 0.2, 1.]));
+                scene.diff(Some(&[]));
+                renderer.draw(&scene, false);
+                scene.drawn();
+                let damaged = !renderer.frame.damage.is_empty();
+                // A drawable from frames ago draws the steps of the box since then.
+                uncopied += u32::from(renderer.frame.damage.iter().any(|region| region[2] > 40));
+                let last = renderer.last.clone().unwrap();
+                let commands = renderer.queue.commandBuffer().unwrap();
+                let buffer = renderer.read_back(&commands, &last, [200, 120]).unwrap();
+                commands.commit();
+                commands.waitUntilCompleted();
+                // SAFETY: the GPU finished writing the shared buffer.
+                let mut pixels = unsafe {
+                    std::slice::from_raw_parts(
+                        buffer.contents().as_ptr().cast::<u8>(),
+                        buffer.length(),
+                    )
+                }
+                .to_vec();
+                for pixel in pixels.as_chunks_mut::<4>().0 {
+                    pixel.swap(0, 2);
+                }
+                let (_, full) = reference.draw(&scene, true).unwrap().unwrap();
+                send.send((frame, damaged, pixels == full)).unwrap();
+            }
+            send.send((u32::MAX, uncopied > 4, true)).unwrap();
+            super::super::threads::end_thread();
+        };
+        super::super::threads::spawn_render(job, || {});
+        for _ in 0..=12 {
+            let (frame, damaged, same) = receive.recv().unwrap();
+            assert!(same, "frame {frame} matches a full frame");
+            assert!(damaged || frame == 0, "frame {frame} draws its damage");
+        }
     }
 }

@@ -6,6 +6,8 @@ use crate::{
 use renderer::{BlendMode, Color, Corners, Length, PaintEffect, Pixels, Radii, Rect, point, px};
 
 pub(crate) type Matrix = [f32; 16];
+// A transform at the origin and the size it is for.
+pub(crate) type Local = std::cell::Cell<Option<Box<([f32; 2], Option<Matrix>)>>>;
 
 // Find IDs through the tree walk. The arena includes removed nodes and can greatly exceed the live page.
 #[derive(Default)]
@@ -302,6 +304,41 @@ pub(crate) fn transform(
         .filter(|result| *result != IDENTITY)
 }
 
+// The matrix of a box moved by `[x, y]`: `translate(x, y) * matrix * translate(-x, -y)`, without the rounding of
+// a move there and back, so a plain translation stays exact.
+pub(crate) fn placed(m: &Matrix, [x, y]: [f32; 2]) -> Matrix {
+    let mut n = *m;
+    for column in 0..3 {
+        n[column * 4] += x * m[column * 4 + 3];
+        n[column * 4 + 1] += y * m[column * 4 + 3];
+    }
+    let w = x * m[3] + y * m[7];
+    n[12] = m[12] + x * (m[15] - m[0]) - y * m[4] - x * w;
+    n[13] = m[13] + y * (m[15] - m[5]) - x * m[1] - y * w;
+    n[14] = m[14] - x * m[2] - y * m[6];
+    n[15] = m[15] - w;
+    n
+}
+
+// The transform of a box at its place, from a cache of the transform at the origin for its size.
+pub(crate) fn transform_at(
+    cache: &Local,
+    style: &Style,
+    units: &Lengths,
+    bounds: Rect<Pixels>,
+) -> Option<Matrix> {
+    let size = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
+    let mut kept = cache.take().filter(|kept| kept.0 == size);
+    let local = kept
+        .get_or_insert_with(|| {
+            let origin = Rect::new(renderer::Point::default(), bounds.size);
+            Box::new((size, transform(style, units, origin, None)))
+        })
+        .1;
+    cache.set(kept);
+    local.map(|local| placed(&local, [bounds.origin.x, bounds.origin.y].map(f32::from)))
+}
+
 pub(crate) fn translation(matrix: &Matrix) -> Option<[f32; 2]> {
     let plain = translate(matrix[12], matrix[13], 0.);
     (*matrix == plain).then_some([matrix[12], matrix[13]])
@@ -523,6 +560,15 @@ fn svg_filter(reference: &str, units: &Lengths, doc: &Document, ids: &Ids) -> Ve
     effects
 }
 
+/// The argument of a filter list that is one `blur()`.
+pub(crate) fn lone_blur(value: Option<&str>) -> Option<&str> {
+    let [part] = *components(value?, ' ') else {
+        return None;
+    };
+    let (name, args) = part.strip_suffix(')')?.split_once('(')?;
+    name.eq_ignore_ascii_case("blur").then_some(args.trim())
+}
+
 pub(crate) fn backdrop(value: &str, units: &Lengths) -> Option<(Pixels, Option<[f32; 20]>)> {
     let mut blur = px(0.);
     let mut matrix: Option<[f32; 20]> = None;
@@ -726,26 +772,34 @@ pub(crate) fn clip(
 
 pub(crate) fn radii(style: &Style, units: &Lengths, basis: impl Fn() -> [f32; 2]) -> Radii<Length> {
     let mut radii = Radii::default();
-    for (prop, x, y) in [
+    for (prop, shape, x, y, code) in [
         (
             Prop::BORDER_TOP_LEFT_RADIUS,
+            Prop::CORNER_TOP_LEFT_SHAPE,
             &mut radii.x.top_left,
             &mut radii.y.top_left,
+            &mut radii.shape.top_left,
         ),
         (
             Prop::BORDER_TOP_RIGHT_RADIUS,
+            Prop::CORNER_TOP_RIGHT_SHAPE,
             &mut radii.x.top_right,
             &mut radii.y.top_right,
+            &mut radii.shape.top_right,
         ),
         (
             Prop::BORDER_BOTTOM_RIGHT_RADIUS,
+            Prop::CORNER_BOTTOM_RIGHT_SHAPE,
             &mut radii.x.bottom_right,
             &mut radii.y.bottom_right,
+            &mut radii.shape.bottom_right,
         ),
         (
             Prop::BORDER_BOTTOM_LEFT_RADIUS,
+            Prop::CORNER_BOTTOM_LEFT_SHAPE,
             &mut radii.x.bottom_left,
             &mut radii.y.bottom_left,
+            &mut radii.shape.bottom_left,
         ),
     ] {
         let Some(value) = style.get(prop) else {
@@ -782,6 +836,12 @@ pub(crate) fn radii(style: &Style, units: &Lengths, basis: impl Fn() -> [f32; 2]
             None if first.contains('%') => length(first, 1),
             None => *x,
         };
+        match style.get(shape).and_then(style::corner_shape) {
+            // Like Chrome, a corner of 16 or more is square, with no radius.
+            Some(k) if k >= 16. => (*x, *y) = (Length::Px(px(0.)), Length::Px(px(0.))),
+            Some(k) => *code = renderer::corner_shape(k as f32),
+            None => {}
+        }
     }
     radii
 }
@@ -967,12 +1027,14 @@ fn gradient_stops<S: AsRef<str>>(
     prelude: bool,
     units: &Lengths,
     extent: f32,
+    wide: bool,
 ) -> Option<Vec<(f32, (u32, u8))>> {
+    let color = if wide { style::wide_rgb } else { style::color };
     let mut stops: Vec<(Option<f32>, (u32, u8))> = Vec::new();
     let mut hints = Vec::new();
     for stop in parts.iter().map(AsRef::as_ref).skip(usize::from(prelude)) {
         let tokens = style::components(stop.trim(), ' ');
-        let Some(ink) = tokens.iter().find_map(|token| style::color(token)) else {
+        let Some(ink) = tokens.iter().find_map(|token| color(token)) else {
             // A lone position between two colors moves their midpoint.
             if let [token] = tokens.as_slice()
                 && !stops.is_empty()
@@ -1047,8 +1109,13 @@ fn gradient_stops<S: AsRef<str>>(
             let t = step as f32 / 16.;
             let p = t.powf(exponent);
             let mix = |a: u32, b: u32| (a as f32 + (b as f32 - a as f32) * p).round() as u32;
-            let ink = [16, 8, 0]
-                .map(|shift| mix(ink_a >> shift & 255, ink_b >> shift & 255) << shift)
+            let (shifts, mask) = if wide {
+                ([20, 10, 0], 1023)
+            } else {
+                ([16, 8, 0], 255)
+            };
+            let ink = shifts
+                .map(|shift| mix(ink_a >> shift & mask, ink_b >> shift & mask) << shift)
                 .into_iter()
                 .fold(0, |ink, channel| ink | channel);
             result.push((
@@ -1114,7 +1181,7 @@ pub(super) fn axis_mask(
             _ => return None,
         };
         let extent = [width, height][axis];
-        let stops = gradient_stops(&parts, prelude, units, extent)?;
+        let stops = gradient_stops(&parts, prelude, units, extent, false)?;
         let count = raster[axis] as usize;
         for (index, alpha) in axes[axis].iter_mut().enumerate() {
             let at = (index as f32 + 0.5) * extent / count as f32;
@@ -1149,7 +1216,7 @@ pub(crate) fn gradient_svg(
     width: f32,
     height: f32,
     area: [f32; 4],
-) -> Option<String> {
+) -> Option<(String, bool)> {
     let [[tw, th], [x, y]] = tile(size, position, &units, area[2], area[3], None);
     let [x, y] = [x + area[0], y + area[1]];
     let parts = style::components(body, ',');
@@ -1269,7 +1336,30 @@ pub(crate) fn gradient_svg(
         }
         _ => return None,
     };
-    let stops = gradient_stops(&parts, prelude, &units, extent)?;
+    // Like Chrome on a wide-gamut screen, colors outside sRGB keep their gamut. Then stops are `style::wide_rgb`, and
+    // the image is Display P3.
+    let wide = cfg!(target_os = "macos")
+        && (parts.iter()).any(|part| {
+            style::components(part, ' ')
+                .iter()
+                .any(|token| style::wide(token))
+        });
+    let (color, shifts, mask) = match wide {
+        true => (style::wide_rgb as fn(&str) -> _, [20, 10, 0], 1023),
+        false => (style::color as fn(&str) -> _, [16, 8, 0], 255),
+    };
+    let css = |ink: u32, alpha: u8| match wide {
+        true => {
+            let [r, g, b] = shifts.map(|shift| (ink >> shift & mask) as f32 / 511.5 - 0.5);
+            format!("color(srgb {r} {g} {b} / {})", alpha as f32 / 255.)
+        }
+        false => format!("#{ink:06x}{alpha:02x}"),
+    };
+    let output = |ink: u32, alpha: u8| match wide {
+        true => style::p3(&css(ink, alpha)).map_or(ink, |(ink, _)| ink),
+        false => ink,
+    };
+    let stops = gradient_stops(&parts, prelude, &units, extent, wide)?;
     // Gradients mix premultiplied colors, and SVG mixes straight ones. So a transparent stop takes the color of
     // each neighbor, and other alpha changes get mixed stops.
     let mut offsets = Vec::with_capacity(stops.len() + 2);
@@ -1299,13 +1389,14 @@ pub(crate) fn gradient_svg(
                 continue;
             }
             let space = space.as_deref().unwrap_or("srgb");
+            let [a_css, b_css] = [css(ink_a, alpha_a), css(ink_b, alpha_b)];
             for step in 1..8 {
                 let t = step as f32 / 8.;
                 let mix = format!(
-                    "color-mix(in {space}, #{ink_a:06x}{alpha_a:02x} {}%, #{ink_b:06x}{alpha_b:02x})",
+                    "color-mix(in {space}, {a_css} {}%, {b_css})",
                     (1. - t) * 100.
                 );
-                if let Some(ink) = style::color(&mix) {
+                if let Some(ink) = color(&mix) {
                     mixed.push((a + (b - a) * t, ink));
                 }
             }
@@ -1330,11 +1421,12 @@ pub(crate) fn gradient_svg(
     let spread = if repeating { "repeat" } else { "pad" };
     let svg_stops = offsets
         .iter()
-        .map(|(offset, (ink, alpha))| {
+        .map(|&(offset, (ink, alpha))| {
             format!(
-                "<stop offset=\"{}\" stop-color=\"#{ink:06x}\" stop-opacity=\"{}\"/>",
+                "<stop offset=\"{}\" stop-color=\"#{:06x}\" stop-opacity=\"{}\"/>",
                 ((offset - start) / period).clamp(0., 1.),
-                *alpha as f32 / 255.
+                output(ink, alpha),
+                alpha as f32 / 255.
             )
         })
         .collect::<String>();
@@ -1361,9 +1453,43 @@ pub(crate) fn gradient_svg(
         _ => {
             let (cx, cy) = center;
             let reach = tw.hypot(th) * 2.;
+            // Wedges end at each stop, so thin and hard stops keep their angles, and are at most 2deg wide.
+            let mut cuts = vec![0f32, 360.];
+            let repeats = if repeating {
+                (360. / period).ceil() + 1.
+            } else {
+                1.
+            };
+            if repeats * offsets.len() as f32 <= 4096. {
+                let first = if repeating {
+                    ((-start) / period).floor()
+                } else {
+                    0.
+                };
+                for turn in 0..repeats as i32 + 1 {
+                    let shift = (first + turn as f32) * if repeating { period } else { 0. };
+                    cuts.extend(
+                        offsets
+                            .iter()
+                            .map(|(offset, _)| offset + shift)
+                            .filter(|angle| (0. ..360.).contains(angle)),
+                    );
+                }
+            } else {
+                cuts.extend((1..1440).map(|step| step as f32 / 4.));
+            }
+            cuts.sort_by(f32::total_cmp);
+            cuts.dedup_by(|b, a| *b - *a < 1e-3);
+            let mut pieces = Vec::with_capacity(cuts.len() * 2);
+            for pair in cuts.windows(2) {
+                let count = ((pair[1] - pair[0]) / 2.).ceil().max(1.);
+                let width = (pair[1] - pair[0]) / count;
+                pieces.extend((0..count as u32).map(|n| pair[0] + n as f32 * width));
+            }
+            pieces.push(360.);
             let mut paths = String::new();
-            for step in 0..180 {
-                let at = (step as f32 + 0.5) * 2.;
+            for wedge in pieces.windows(2) {
+                let at = (wedge[0] + wedge[1]) / 2.;
                 let angle = if repeating {
                     start + (at - start).rem_euclid(period)
                 } else {
@@ -1380,14 +1506,14 @@ pub(crate) fn gradient_svg(
                     1.
                 };
                 let mix = |shift: u32| {
-                    ((((a.1).0 >> shift) & 255) as f32 * (1. - t)
-                        + (((b.1).0 >> shift) & 255) as f32 * t)
+                    ((((a.1).0 >> shift) & mask) as f32 * (1. - t)
+                        + (((b.1).0 >> shift) & mask) as f32 * t)
                         .round() as u32
                 };
-                let ink = mix(16) << 16 | mix(8) << 8 | mix(0);
                 let alpha = ((a.1).1 as f32 * (1. - t) + (b.1).1 as f32 * t) / 255.;
-                let [start, end] =
-                    [from + step as f32 * 2., from + step as f32 * 2. + 2.].map(f32::to_radians);
+                let ink = shifts.map(|shift| mix(shift) << shift);
+                let ink = output(ink[0] | ink[1] | ink[2], (alpha * 255.) as u8);
+                let [start, end] = [from + wedge[0], from + wedge[1]].map(f32::to_radians);
                 paths.push_str(&format!(
                     "<path d=\"M{cx} {cy}L{} {}L{} {}Z\" fill=\"#{ink:06x}\" fill-opacity=\"{alpha}\"/>",
                     cx + reach * start.sin(),
@@ -1402,8 +1528,11 @@ pub(crate) fn gradient_svg(
         }
     };
     let body = tiled(repeat, [tw, th], [x, y], &content);
-    Some(format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{body}</svg>"
+    Some((
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{body}</svg>"
+        ),
+        wide,
     ))
 }
 
@@ -1768,7 +1897,7 @@ mod tests {
     fn gradient_stops_take_math_angles() {
         let units = Lengths::new(16., 800., 600.);
         let offsets = |parts: &[&str]| {
-            gradient_stops(parts, false, &units, 360.)
+            gradient_stops(parts, false, &units, 360., false)
                 .unwrap()
                 .iter()
                 .map(|(offset, _)| offset.round())
@@ -1788,7 +1917,7 @@ mod tests {
     #[test]
     fn gradient_hints_move_the_midpoint_like_chrome() {
         let units = Lengths::new(16., 800., 600.);
-        let stops = gradient_stops(&["red", "80%", "blue"], false, &units, 100.).unwrap();
+        let stops = gradient_stops(&["red", "80%", "blue"], false, &units, 100., false).unwrap();
         // Chrome mixes half and half at the hint, and less blue before it: t ^ (ln 0.5 / ln 0.8).
         let at = |offset: f32| {
             stops

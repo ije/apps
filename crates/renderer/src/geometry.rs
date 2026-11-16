@@ -505,12 +505,32 @@ impl From<Pixels> for Corners {
 pub struct Radii<T = Pixels> {
     pub x: Corners<T>,
     pub y: Corners<T>,
+    /// The CSS `corner-shape` of each corner, made by `corner_shape()`. 0 is round.
+    pub shape: Corners<u16>,
 }
 
 impl<T: Copy> From<Corners<T>> for Radii<T> {
     fn from(x: Corners<T>) -> Self {
-        Self { x, y: x }
+        Self {
+            x,
+            y: x,
+            shape: Corners::default(),
+        }
     }
+}
+
+/// The code of a corner shape with the superellipse parameter `k`: 1 is round, 2 squircle, 0 bevel, -1
+/// scoop. Codes keep `k` in steps of 1/128 from -16 to 16, and 0 stands for round.
+pub fn corner_shape(k: f32) -> u16 {
+    if k == 1. {
+        return 0;
+    }
+    (2048. + (k.clamp(-16., 16.) * 128.).round()).clamp(1., 4095.) as u16
+}
+
+// The superellipse parameter of a code that is not round.
+fn shape_parameter(code: u16) -> f64 {
+    (f64::from(code) - 2048.) / 128.
 }
 
 impl From<Pixels> for Radii {
@@ -522,6 +542,17 @@ impl From<Pixels> for Radii {
 impl<T: Copy + Default + PartialEq> Radii<T> {
     pub fn is_zero(&self) -> bool {
         self.x.is_zero() && self.y.is_zero()
+    }
+}
+
+impl<T> Radii<T> {
+    // The shapes as the shaders read them: two corners of 12 bits in each float, exact up to 2^24.
+    pub(crate) fn shape_array(&self) -> [f32; 2] {
+        let s = &self.shape;
+        [
+            (u32::from(s.top_left) | u32::from(s.top_right) << 12) as f32,
+            (u32::from(s.bottom_right) | u32::from(s.bottom_left) << 12) as f32,
+        ]
     }
 }
 
@@ -537,6 +568,7 @@ impl Radii {
         Radii {
             x: self.x.scale(factor),
             y: self.y.scale(factor),
+            shape: self.shape,
         }
     }
 
@@ -569,24 +601,103 @@ impl Radii {
         Self {
             x: corners(x),
             y: corners(y),
+            shape: self.shape,
         }
     }
 
-    pub fn inset(self, top: Pixels, right: Pixels, bottom: Pixels, left: Pixels) -> Self {
-        let less = |radius: Pixels, by: Pixels| (radius - by).max(Pixels::ZERO);
+    // `grown` with its bevel and concave corners moved out by `by` the way `inset` moves them in, like Chromium
+    // does for shadow spreads and outlines.
+    pub fn moved_out(self, by: Pixels, grown: Self) -> Self {
+        let shapes = self.shape.to_array();
+        let angled = |at: usize| (1..=2048).contains(&shapes[at]);
+        if by.is_zero() || !(0..4).any(angled) {
+            return grown;
+        }
+        let moved = self.inset(-by, -by, -by, -by);
+        let pick = |grown: Corners<Pixels>, moved: Corners<Pixels>| {
+            let ([a, b, c, d], [e, f, g, h]) = (grown.to_array(), moved.to_array());
+            Corners {
+                top_left: if angled(0) { e } else { a },
+                top_right: if angled(1) { f } else { b },
+                bottom_right: if angled(2) { g } else { c },
+                bottom_left: if angled(3) { h } else { d },
+            }
+        };
         Self {
-            x: Corners {
-                top_left: less(self.x.top_left, left),
-                top_right: less(self.x.top_right, right),
-                bottom_right: less(self.x.bottom_right, right),
-                bottom_left: less(self.x.bottom_left, left),
-            },
-            y: Corners {
-                top_left: less(self.y.top_left, top),
-                top_right: less(self.y.top_right, top),
-                bottom_right: less(self.y.bottom_right, bottom),
-                bottom_left: less(self.y.bottom_left, bottom),
-            },
+            x: pick(grown.x, moved.x),
+            y: pick(grown.y, moved.y),
+            shape: self.shape,
+        }
+    }
+
+    // The radii of the box inside borders of these widths. Like Chrome, a curve that meets its sides at an
+    // angle (bevel and concave shapes) keeps an even thickness, so its radii shrink less or grow.
+    pub fn inset(self, top: Pixels, right: Pixels, bottom: Pixels, left: Pixels) -> Self {
+        let (mut x, mut y) = (self.x.to_array(), self.y.to_array());
+        let shapes = self.shape.to_array();
+        for corner in 0..4 {
+            let (side, edge) = match corner {
+                0 => (left, top),
+                1 => (right, top),
+                2 => (right, bottom),
+                _ => (left, bottom),
+            };
+            let (a, b, k) = (x[corner].0, y[corner].0, shape_parameter(shapes[corner]));
+            if shapes[corner] == 0 || k > 0. || a <= 0. || b <= 0. {
+                x[corner] = (x[corner] - side).max(Pixels::ZERO);
+                y[corner] = (y[corner] - edge).max(Pixels::ZERO);
+                continue;
+            }
+            let (a, b, side, edge) = (
+                f64::from(a),
+                f64::from(b),
+                f64::from(side.0),
+                f64::from(edge.0),
+            );
+            if k == 0. {
+                // A bevel moves as a line, which can cross the inner sides outside its corner box.
+                let reach = a.recip().hypot(b.recip());
+                x[corner] = Pixels((a * (1. + edge * reach - edge / b) - side).max(0.) as f32);
+                y[corner] = Pixels((b * (1. + side * reach - side / a) - edge).max(0.) as f32);
+                continue;
+            }
+            // A concave curve is (X/a)^n + (Y/b)^n = 1 around the outer point, with `X` along the horizontal
+            // side and `Y` along the vertical one. Its point at angle `t` moves in along its normal by `by`, and
+            // bisection finds where that crosses the inner side.
+            let n = 2f64.powf(k.abs().min(9.97));
+            let cross = |by: f64, depth: f64, vertical: bool| {
+                let along = |t: f64| {
+                    let (c, s) = (t.cos().max(0.).powf(2. / n), t.sin().max(0.).powf(2. / n));
+                    let (nx, ny) = (c.powf(n - 1.) / a, s.powf(n - 1.) / b);
+                    let length = nx.hypot(ny).max(1e-12);
+                    let (px, py) = (a * c + by * nx / length, b * s + by * ny / length);
+                    if vertical { (px, py) } else { (py, px) }
+                };
+                let (mut low, mut high) = (0., std::f64::consts::FRAC_PI_2);
+                let rising = along(high).0 > along(low).0;
+                for _ in 0..40 {
+                    let middle = (low + high) * 0.5;
+                    if (along(middle).0 < depth) == rising {
+                        low = middle;
+                    } else {
+                        high = middle;
+                    }
+                }
+                along((low + high) * 0.5).1
+            };
+            x[corner] = Pixels((cross(edge, edge, false) - side).max(0.) as f32);
+            y[corner] = Pixels((cross(side, side, true) - edge).max(0.) as f32);
+        }
+        let corners = |[top_left, top_right, bottom_right, bottom_left]: [Pixels; 4]| Corners {
+            top_left,
+            top_right,
+            bottom_right,
+            bottom_left,
+        };
+        Self {
+            x: corners(x),
+            y: corners(y),
+            shape: self.shape,
         }
     }
 }

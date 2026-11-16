@@ -6,7 +6,7 @@
 //   t0  t1  t2       group 1 bindings 0 to 2
 //   b1  composite    group 2 binding 0
 //   b2  blur         group 2 binding 1
-// Instances arrive as 13 float4 attributes with the semantics I0 to I12, in the order of gpu.rs, one step per
+// Instances arrive as 14 float4 attributes with the semantics I0 to I13, in the order of gpu.rs, one step per
 // instance. Copies use CopySubresourceRegion, so the WGSL copy entry points have no port.
 
 static const uint BOX = 0u;
@@ -54,6 +54,7 @@ struct Composite {
     float4 shadow;
     float4 source_rect;
     float4 backdrop_rect;
+    float4 shapes;
     float opacity;
     float blur;
     uint flags;
@@ -91,6 +92,7 @@ struct Instance {
     float4 aux_rx : I10;
     float4 aux_ry : I11;
     float4 info : I12;
+    float4 shape : I13;
 };
 
 struct Varyings {
@@ -108,6 +110,7 @@ struct Varyings {
     nointerpolation float4 rounded : TEXCOORD10;
     nointerpolation float4 rounded_rx : TEXCOORD11;
     nointerpolation float4 rounded_ry : TEXCOORD12;
+    nointerpolation float4 shape : TEXCOORD13;
 };
 
 float2 strip_corner(uint index) {
@@ -151,13 +154,39 @@ float2 radius_of(uint corner, float4 rx, float4 ry) {
     return all(radius > 0.0) ? radius : float2(0.0, 0.0);
 }
 
-float box_distance(float2 p, float4 box, float4 rx, float4 ry) {
+uint shape_code(uint corner, float2 shape) {
+    return ((uint)shape[corner >> 1u] >> ((corner & 1u) * 12u)) & 4095u;
+}
+
+float exponent(uint code) {
+    return exp2(min(abs(float(code) - 2048.0) / 128.0, 9.97));
+}
+
+float corner_curve(float2 curve, float2 radius, uint code) {
+    if (code == 2048u) {
+        return (dot(curve / radius, (float2)1.0) - 1.0) / length(1.0 / radius);
+    }
+    float n = exponent(code);
+    bool concave = code < 2048u;
+    float2 u = max((concave ? radius - curve : curve) / radius, (float2)0.0);
+    float m = max(max(u.x, u.y), 1e-6);
+    float g = m * pow(dot(pow(max(u / m, (float2)1e-6), (float2)n), (float2)1.0), 1.0 / n);
+    float2 slope = pow(max(u / g, (float2)1e-6), (float2)(n - 1.0)) / radius;
+    float d = (g - 1.0) / length(slope);
+    return concave ? -d : d;
+}
+
+float box_distance(float2 p, float4 box, float4 rx, float4 ry, float2 shape) {
     float2 hs = box.zw * 0.5;
     float2 from_center = p - box.xy - hs;
     uint corner = pick(from_center, hs, rx, ry);
     float2 radius = radius_of(corner, rx, ry);
     float2 edge = from_center * mirror(corner) - hs;
     float2 curve = edge + radius;
+    uint code = shape_code(corner, shape);
+    if (code != 0u && all(radius > 0.0)) {
+        return max(max(edge.x, edge.y), corner_curve(curve, radius, code));
+    }
     if (all(radius > 0.0) && all(curve > 0.0)) {
         float scaled = length(curve / radius);
         return scaled * (scaled - 1.0) / length(curve / (radius * radius));
@@ -165,11 +194,11 @@ float box_distance(float2 p, float4 box, float4 rx, float4 ry) {
     return max(edge.x, edge.y);
 }
 
-float rounded_clip(float2 p, float4 box, float4 rx, float4 ry) {
+float rounded_clip(float2 p, float4 box, float4 rx, float4 ry, float2 shape) {
     if (all(rx == 0.0)) {
         return 1.0;
     }
-    return saturate(0.5 - box_distance(p, box, rx, ry));
+    return saturate(0.5 - box_distance(p, box, rx, ry, shape));
 }
 
 float either_speed(float a, float b) {
@@ -310,15 +339,46 @@ float side_coverage(float2 local, float2 size, float4 widths, uint sides) {
     return coverage;
 }
 
-float4 box_color(float2 p, float4 rect, float4 rx, float4 ry, float4 fill, float4 border, float4 widths, uint flags) {
-    float outer = box_distance(p, rect, rx, ry);
+float4 box_color(float2 p, float4 rect, float4 rx, float4 ry, float2 shape, float4 fill, float4 border, float4 widths, uint flags) {
+    float outer = box_distance(p, rect, rx, ry, shape);
     float4 base = premultiply(fill) * saturate(0.5 - outer);
     if (all(widths == 0.0)) {
         return base;
     }
     float4 w = widths == 0.0 ? (float4)-0.5 : widths;
     float4 padding = float4(rect.xy + w.wx, rect.zw - w.wx - w.yz);
-    float inner = box_distance(p, padding, max(rx - w.wyyw, (float4)0.0), max(ry - w.xxzz, (float4)0.0));
+    float4 inner_rx = max(rx - w.wyyw, (float4)0.0);
+    float4 inner_ry = max(ry - w.xxzz, (float4)0.0);
+    bool concave = false;
+    if (any(shape != 0.0)) {
+        float4 side = max(w.wyyw, (float4)0.0);
+        float4 edge = max(w.xxzz, (float4)0.0);
+        float4 reach = sqrt(1.0 / (rx * rx) + 1.0 / (ry * ry));
+        float4 bevel_rx = max(rx * (1.0 + edge * reach - edge / ry) - side, (float4)0.0);
+        float4 bevel_ry = max(ry * (1.0 + side * reach - side / rx) - edge, (float4)0.0);
+        [unroll] for (uint corner = 0u; corner < 4u; corner++) {
+            uint code = shape_code(corner, shape);
+            if (code == 2048u && rx[corner] > 0.0 && ry[corner] > 0.0) {
+                inner_rx[corner] = bevel_rx[corner];
+                inner_ry[corner] = bevel_ry[corner];
+            }
+            concave = concave || (code != 0u && code < 2048u);
+        }
+    }
+    float inner = box_distance(p, padding, inner_rx, inner_ry, shape);
+    if (concave) {
+        float2 hs = rect.zw * 0.5;
+        float2 from_center = p - rect.xy - hs;
+        uint corner = pick(from_center, hs, rx, ry);
+        uint code = shape_code(corner, shape);
+        float2 radius = radius_of(corner, rx, ry);
+        if (code != 0u && code < 2048u && all(radius > 0.0)) {
+            float2 flip = mirror(corner);
+            float2 near = max(float2(flip.x < 0.0 ? w.w : w.y, flip.y < 0.0 ? w.x : w.z), (float2)0.0);
+            float sides = box_distance(p, padding, (float4)0.0, (float4)0.0, (float2)0.0);
+            inner = max(sides, corner_curve(from_center * flip - hs + radius, radius, code) + (near.x + near.y) * 0.5);
+        }
+    }
     float ring = saturate(0.5 + inner);
     if (ring <= 0.0) {
         return base;
@@ -350,18 +410,32 @@ float2 erf(float2 x) {
     return sign(x) * (1.0 - 1.0 / (q2 * q2));
 }
 
-float blurred_box(float2 p, float4 box, float4 rx, float4 ry, float sigma) {
+float blurred_box(float2 p, float4 box, float4 rx, float4 ry, float2 shape, float sigma) {
     float2 hs = box.zw * 0.5;
     float2 from_center = p - box.xy - hs;
-    float2 radius = radius_of(pick(from_center, hs, rx, ry), rx, ry);
+    uint corner = pick(from_center, hs, rx, ry);
+    float2 radius = radius_of(corner, rx, ry);
+    uint code = shape_code(corner, shape);
+    float n = exponent(code);
     float low = clamp(-3.0 * sigma, from_center.y - hs.y, from_center.y + hs.y);
     float high = clamp(3.0 * sigma, from_center.y - hs.y, from_center.y + hs.y);
-    float stride = (high - low) * 0.25;
+    uint rows = code != 0u ? 16u : 4u;
+    float stride = (high - low) / float(rows);
     float sum = 0.0;
-    [unroll] for (uint row = 0u; row < 4u; row++) {
+    [loop] for (uint row = 0u; row < rows; row++) {
         float y = low + (float(row) + 0.5) * stride;
         float into = min(hs.y - radius.y - abs(from_center.y - y), 0.0);
         float bulge = radius.y > 0.0 ? radius.x * sqrt(max(0.0, 1.0 - into * into / (radius.y * radius.y))) : 0.0;
+        if (code != 0u && radius.y > 0.0) {
+            float t = min(-into / radius.y, 1.0);
+            bool concave = code < 2048u;
+            float rest = 1.0 - pow(max(concave ? 1.0 - t : t, 1e-6), n);
+            float reach = 0.0;
+            if (rest > 0.0) {
+                reach = pow(rest, 1.0 / n);
+            }
+            bulge = radius.x * (concave ? 1.0 - reach : reach);
+        }
         float extent = hs.x - radius.x + bulge;
         float2 span = erf((from_center.x + float2(-extent, extent)) * (0.70710678 / sigma));
         sum += (span.y - span.x) * exp(-0.5 * y * y / (sigma * sigma));
@@ -398,8 +472,9 @@ Varyings draw_vertex(uint index : SV_VertexID, Instance instance) {
     o.rect = instance.rect;
     o.rx = instance.rx;
     o.ry = instance.ry;
-    o.color = instance.color;
-    o.border_color = instance.border_color;
+    // Colors outside the sRGB gamut clip to it.
+    o.color = saturate(instance.color);
+    o.border_color = saturate(instance.border_color);
     o.aux = instance.aux;
     o.aux_rx = instance.aux_rx;
     o.aux_ry = instance.aux_ry;
@@ -407,6 +482,7 @@ Varyings draw_vertex(uint index : SV_VertexID, Instance instance) {
     o.rounded = instance.rounded;
     o.rounded_rx = instance.rounded_rx;
     o.rounded_ry = instance.rounded_ry;
+    o.shape = instance.shape;
     if (kind == BOX && all(instance.rx == 0.0) && all(instance.aux == 0.0) && all(instance.rounded_rx == 0.0)) {
         o.info.x = float(FILL);
     }
@@ -422,15 +498,15 @@ float4 draw_fragment(Varyings v) : SV_Target {
     uint flags = (uint)v.info.y;
     float4 color;
     if (kind == BOX) {
-        color = box_color(p, v.rect, v.rx, v.ry, v.color, v.border_color, v.aux, flags);
+        color = box_color(p, v.rect, v.rx, v.ry, v.shape.xy, v.color, v.border_color, v.aux, flags);
     } else if (kind == SHADOW) {
         float shape;
         if (v.info.z < 0.25) {
-            shape = saturate(0.5 - box_distance(p, v.rect, v.rx, v.ry));
+            shape = saturate(0.5 - box_distance(p, v.rect, v.rx, v.ry, v.shape.xy));
         } else {
-            shape = blurred_box(p, v.rect, v.rx, v.ry, v.info.z);
+            shape = blurred_box(p, v.rect, v.rx, v.ry, v.shape.xy, v.info.z);
         }
-        float caster = saturate(0.5 - box_distance(p, v.aux, v.aux_rx, v.aux_ry));
+        float caster = saturate(0.5 - box_distance(p, v.aux, v.aux_rx, v.aux_ry, v.shape.xy));
         color = premultiply(v.color) * ((flags & 1u) != 0u ? (1.0 - shape) * caster : shape * (1.0 - caster));
     } else if (kind == LINE) {
         color = premultiply(v.color);
@@ -455,11 +531,11 @@ float4 draw_fragment(Varyings v) : SV_Target {
         }
         float alpha = pixel.a * v.info.z;
         if (any(v.rx != 0.0)) {
-            alpha *= saturate(0.5 - box_distance(p, v.rect, v.rx, v.ry));
+            alpha *= saturate(0.5 - box_distance(p, v.rect, v.rx, v.ry, v.shape.xy));
         }
         color = float4(pixel.rgb * alpha, alpha);
     }
-    return color * rounded_clip(p, v.rounded, v.rounded_rx, v.rounded_ry);
+    return color * rounded_clip(p, v.rounded, v.rounded_rx, v.rounded_ry, v.shape.zw);
 }
 
 struct Placed {
@@ -594,9 +670,9 @@ float4 composite_fragment(Placed v) : SV_Target {
         float4 mapped = saturate(mul(c.color_matrix, float4(color.rgb / color.a, color.a)) + c.color_offset);
         color = premultiply(mapped);
     }
-    float coverage = c.opacity * rounded_clip(p, c.rounded_mask, c.rounded_rx, c.rounded_ry);
+    float coverage = c.opacity * rounded_clip(p, c.rounded_mask, c.rounded_rx, c.rounded_ry, c.shapes.zw);
     if ((c.flags & COMPOSITE_CLIP) != 0u) {
-        coverage *= saturate(0.5 - box_distance(v.local, c.clip_box, c.clip_rx, c.clip_ry));
+        coverage *= saturate(0.5 - box_distance(v.local, c.clip_box, c.clip_rx, c.clip_ry, c.shapes.xy));
     }
     if ((c.flags & COMPOSITE_MASK) != 0u) {
         float2 at = (v.local - c.mask_rect.xy) / c.mask_rect.zw;

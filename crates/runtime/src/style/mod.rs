@@ -17,7 +17,7 @@ mod value;
 pub(crate) use chunked::Chunked;
 
 pub(crate) use animation::{Animation, Easing, Motion, Scripted};
-pub use color::{color, rgba};
+pub use color::{color, p3, paint, rgba, wide, wide_rgb};
 pub(crate) use parser::{DROPPED, FontUnits, Lengths, NodeLengths};
 use shorthand::{BORDER_IMAGE, BORDER_IMAGE_INITIAL, expand};
 pub(crate) use text::{
@@ -26,7 +26,8 @@ pub(crate) use text::{
 };
 pub use value::length;
 pub(crate) use value::{
-    BORDERS, Filter, MARGIN, PADDING, area_cells, clip_path, components, number, write_number,
+    BORDERS, Filter, MARGIN, PADDING, area_cells, clip_path, components, corner_shape, number,
+    write_number,
 };
 
 pub use properties::Style;
@@ -1775,6 +1776,10 @@ const INITIAL: &[(&str, &str)] = &[
     ("container-name", "none"),
     ("container-type", "normal"),
     ("content", "normal"),
+    ("corner-bottom-left-shape", "round"),
+    ("corner-bottom-right-shape", "round"),
+    ("corner-top-left-shape", "round"),
+    ("corner-top-right-shape", "round"),
     ("counter-increment", "none"),
     ("counter-reset", "none"),
     ("cursor", "auto"),
@@ -1908,6 +1913,31 @@ const INITIAL: &[(&str, &str)] = &[
 ];
 
 const SHORTHANDS: &[(&str, &[&str])] = &[
+    (
+        "corner-shape",
+        &[
+            "corner-top-left-shape",
+            "corner-top-right-shape",
+            "corner-bottom-right-shape",
+            "corner-bottom-left-shape",
+        ],
+    ),
+    (
+        "corner-top-shape",
+        &["corner-top-left-shape", "corner-top-right-shape"],
+    ),
+    (
+        "corner-right-shape",
+        &["corner-top-right-shape", "corner-bottom-right-shape"],
+    ),
+    (
+        "corner-bottom-shape",
+        &["corner-bottom-left-shape", "corner-bottom-right-shape"],
+    ),
+    (
+        "corner-left-shape",
+        &["corner-top-left-shape", "corner-bottom-left-shape"],
+    ),
     (
         "border-color",
         &[
@@ -2353,7 +2383,11 @@ pub(crate) fn resolved(
                 let parts = components(item, ' ');
                 let found = parts.into_iter().find(|part| {
                     let time = part.ends_with('s')
-                        && part.trim_end_matches(['m', 's']).parse::<f32>().is_ok();
+                        && part.trim_end_matches(['m', 's']).parse::<f32>().is_ok()
+                        || part.ends_with(')')
+                            && units
+                                .math(part, f32::NAN, &[])
+                                .is_some_and(|(_, kind)| kind == parser::Kind::Time);
                     times += usize::from(time);
                     match key {
                         "duration" => time && times == 1,
@@ -2464,6 +2498,14 @@ pub(crate) fn resolved(
             .is_none_or(|value| matches!(value, "none" | "hidden"))
     };
     match name {
+        // Like Chrome, keywords compute to their superellipse.
+        _ if name.starts_with("corner-") => match corner_shape(&value) {
+            Some(k) if k.is_infinite() => {
+                format!("superellipse({}infinity)", if k < 0. { "-" } else { "" })
+            }
+            Some(k) => format!("superellipse({})", self::value::number(k)),
+            None => value,
+        },
         "border-top-width" if none(Prop::BORDER_TOP_STYLE) => "0px".into(),
         "border-right-width" if none(Prop::BORDER_RIGHT_STYLE) => "0px".into(),
         "border-bottom-width" if none(Prop::BORDER_BOTTOM_STYLE) => "0px".into(),
@@ -2524,6 +2566,11 @@ pub(crate) fn resolved(
             .into_iter()
             .map(|time| {
                 let time = time.trim();
+                if time.ends_with(')')
+                    && let Some((seconds, parser::Kind::Time)) = units.math(time, f32::NAN, &[])
+                {
+                    return format!("{}s", self::value::number(seconds));
+                }
                 match time
                     .strip_suffix("ms")
                     .map(|ms| (ms, 1000.))
@@ -2542,7 +2589,7 @@ pub(crate) fn resolved(
                 Some(percent) => percent
                     .parse::<f32>()
                     .map_or(value.clone(), |percent| number(percent / 100.)),
-                None => value,
+                None => value.parse::<f32>().map_or(value.clone(), number),
             }
         }
         "transform" if value != "none" => {
@@ -8040,7 +8087,7 @@ fn physical<V: AsRef<str>>(cascade: &mut BBTreeMap<Prop, (CascadeRank, V)>, pare
     }
 }
 
-const LOGICAL: [(Prop, Prop, Prop); 16] = [
+const LOGICAL: [(Prop, Prop, Prop); 20] = [
     (
         Prop::MARGIN_INLINE_START,
         Prop::MARGIN_LEFT,
@@ -8097,6 +8144,26 @@ const LOGICAL: [(Prop, Prop, Prop); 16] = [
         Prop::BORDER_START_START_RADIUS,
         Prop::BORDER_TOP_LEFT_RADIUS,
         Prop::BORDER_TOP_RIGHT_RADIUS,
+    ),
+    (
+        Prop::CORNER_START_START_SHAPE,
+        Prop::CORNER_TOP_LEFT_SHAPE,
+        Prop::CORNER_TOP_RIGHT_SHAPE,
+    ),
+    (
+        Prop::CORNER_START_END_SHAPE,
+        Prop::CORNER_TOP_RIGHT_SHAPE,
+        Prop::CORNER_TOP_LEFT_SHAPE,
+    ),
+    (
+        Prop::CORNER_END_START_SHAPE,
+        Prop::CORNER_BOTTOM_LEFT_SHAPE,
+        Prop::CORNER_BOTTOM_RIGHT_SHAPE,
+    ),
+    (
+        Prop::CORNER_END_END_SHAPE,
+        Prop::CORNER_BOTTOM_RIGHT_SHAPE,
+        Prop::CORNER_BOTTOM_LEFT_SHAPE,
     ),
     (
         Prop::BORDER_START_END_RADIUS,
@@ -8323,6 +8390,7 @@ fn syntax_matches(syntax: &str, value: &str) -> bool {
                     "<transform-function>" | "<transform-list>" => value.contains('('),
                     "<string>" => value.starts_with(['"', '\'']),
                     "<easing-function>" => Easing::parse(value).is_some(),
+                    "<corner-shape>" => corner_shape(value).is_some(),
                     "*" => !value.is_empty(),
                     _ if kind.ends_with('(') => {
                         value.len() > kind.len()

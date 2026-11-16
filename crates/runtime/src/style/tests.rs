@@ -651,7 +651,7 @@ fn inline_runs_keep_node_ranges_and_reject_independent_boxes() {
     let inline = inline_text(&doc, &computed, id).unwrap();
     assert_eq!(&*inline.text, "A😀BC");
     assert_eq!(inline.boxes.len(), 1);
-    assert_eq!(inline.boxes[0].fill, 0xffee00ff);
+    assert_eq!(inline.boxes[0].fill, renderer::Color::hex(0xffee00ff));
     assert_eq!(
         inline.runs.iter().map(|run| run.len).sum::<usize>(),
         inline.text.len()
@@ -728,7 +728,7 @@ fn rounded_inline_highlights_keep_one_text_layout_when_tokens_split() {
             assert_eq!(&actual, expected);
         } else {
             assert_eq!(&*actual.0, "  state: ReviewState | 'all'");
-            assert_eq!(actual.1, vec![(9..28, 0xabcdefff)]);
+            assert_eq!(actual.1, vec![(9..28, renderer::Color::hex(0xabcdefff))]);
             expected = Some(actual);
         }
     }
@@ -793,7 +793,10 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
     assert_eq!(inline.runs[1].color, ink(0x111111ff));
     assert_eq!(
         *inline.shadows,
-        [(0., 0., 3., 0x111111ff), (1., 2., 0., 0xff0000ff)]
+        [
+            (0., 0., 3., renderer::Color::hex(0x111111ff)),
+            (1., 2., 0., renderer::Color::hex(0xff0000ff))
+        ]
     );
     let (base, pseudo, mode) = inline.first_line.as_deref().unwrap();
     assert_eq!(mode, &None);
@@ -2357,6 +2360,7 @@ fn animations_leave_important_declarations() {
             &styles,
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
             start + std::time::Duration::from_secs_f64(seconds),
             false,
             &mut Vec::new(),
@@ -4863,6 +4867,21 @@ fn invalid_declarations_are_dropped_at_parse_time() {
         ("display", "table", Some(true)),
         ("display", "-moz-box", Some(false)),
         ("animation-duration", "calc(1s + 1s)", Some(true)),
+        ("corner-shape", "squircle", Some(true)),
+        (
+            "corner-shape",
+            "bevel scoop notch superellipse(-0.5)",
+            Some(true),
+        ),
+        ("corner-shape", "round round round round round", Some(false)),
+        ("corner-shape", "superellipse(2px)", Some(false)),
+        (
+            "corner-top-left-shape",
+            "superellipse(-infinity)",
+            Some(true),
+        ),
+        ("corner-top-left-shape", "bevel round", Some(false)),
+        ("corner-top-shape", "bevel round", Some(true)),
     ] {
         assert_eq!(supports(name, value), expected, "{name}: {value}");
     }
@@ -5361,4 +5380,40 @@ fn border_shorthands_set_and_reset_border_images_like_chrome() {
     assert_eq!(get("#b", "border-image-repeat").as_deref(), Some("round"));
     assert_eq!(get("#c", "border-image-slice").as_deref(), Some("30"));
     assert_eq!(get("#d", "border-image-slice").as_deref(), Some("20 fill"));
+}
+
+#[test]
+fn computed_times_resolve_math_like_chrome() {
+    let doc = Document::parse(
+        "<style>i{--i:2;animation:spin calc(420ms + var(--i) * 37ms) infinite;animation-delay:calc(var(--i) * -91ms);transition-duration:max(1s, 200ms)}</style><i id=a></i>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let id = element(&doc, "#a");
+    let get = |name| {
+        resolved(
+            &computed.values[id],
+            &computed.lengths[id],
+            name,
+            None,
+            &|| [800., 600.],
+            &Registry::default(),
+        )
+    };
+    assert_eq!(
+        [
+            "animation-duration",
+            "animation-delay",
+            "transition-duration"
+        ]
+        .map(get),
+        ["0.494s", "-0.182s", "1s"]
+    );
 }

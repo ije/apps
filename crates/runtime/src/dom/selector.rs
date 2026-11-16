@@ -459,7 +459,10 @@ impl SelectorCache {
                 .filter_map(|(key, value)| {
                     let selected = key.starts_with("data-")
                         || key.starts_with("aria-")
-                        || matches!(key.as_str(), "key" | "title" | "role" | "tabindex");
+                        || matches!(
+                            key.as_str(),
+                            "key" | "title" | "role" | "tabindex" | "inert"
+                        );
                     (key.as_str() != "style"
                         && (key.as_str() != "class" || self.attributes.names.contains("class"))
                         && (!selected || self.attributes.names.contains(key.as_str())))

@@ -164,6 +164,164 @@ fn audio_plays_to_the_end_and_loops() {
 }
 
 #[test]
+fn web_audio_renders_oscillators_filters_and_automation_like_chrome() {
+    let (_host, engine, _base) = page(apps_runtime::bundle::disabled_features(None).unwrap());
+    let script = "(async () => {
+        const offline = new OfflineAudioContext(1, 9600, 48000);
+        const osc = offline.createOscillator(), gain = offline.createGain();
+        osc.frequency.value = 1000;
+        gain.gain.setValueAtTime(0, 0);
+        gain.gain.linearRampToValueAtTime(1, 0.05);
+        osc.connect(gain).connect(offline.destination);
+        osc.start(0);
+        osc.stop(0.1);
+        const high = offline.createOscillator(), filter = offline.createBiquadFilter();
+        high.frequency.value = 8000;
+        filter.frequency.value = 500;
+        high.connect(filter).connect(offline.destination);
+        high.start(0.15);
+        const data = (await offline.startRendering()).getChannelData(0);
+        const peak = data.slice(8400).reduce((max, value) => Math.max(max, Math.abs(value)), 0);
+        const param = new AudioContext().createGain().gain;
+        param.setValueAtTime(0, 1).linearRampToValueAtTime(1, 2).exponentialRampToValueAtTime(0.01, 3);
+        const response = [new Float32Array(1), new Float32Array(1)], probe = offline.createBiquadFilter();
+        probe.frequency.value = 1000;
+        probe.Q.value = 0;
+        probe.getFrequencyResponse(Float32Array.of(1000), ...response);
+        const live = new AudioContext(), tone = live.createOscillator();
+        tone.connect(live.destination);
+        tone.onended = () => globalThis.ended = true;
+        tone.start();
+        tone.stop(live.currentTime + 0.05);
+        globalThis.result = [data[12], data[2412], peak < 0.05, param._at(0.5), param._at(1.5), param._at(2.5), response[0][0]].map(value => typeof value === 'number' ? value.toFixed(3) : value).join();
+    })(); 'started'";
+    assert_eq!(engine.eval(script, "media-test").unwrap(), "started");
+    // Chrome's values: the ramp's start and end on the crests of the sine, a filtered tone, the automation timeline and
+    // the gain of a low-pass filter at its cutoff.
+    assert_eq!(
+        wait(
+            &engine,
+            "globalThis.result && globalThis.ended ? result : 'pending'"
+        ),
+        "0.005,1.000,true,1.000,0.500,0.100,1.000"
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn media_threads() -> usize {
+    let pid = std::process::id() as i32;
+    let mut ids = vec![0u64; 4096];
+    let size = (ids.len() * 8) as i32;
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            6, // PROC_PIDLISTTHREADS
+            0,
+            ids.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    ids[..bytes.max(0) as usize / 8]
+        .iter()
+        .filter(|&&id| {
+            let mut info = unsafe { std::mem::zeroed::<libc::proc_threadinfo>() };
+            let size = std::mem::size_of_val(&info) as i32;
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTHREADINFO,
+                    id,
+                    (&raw mut info).cast(),
+                    size,
+                )
+            };
+            read == size
+                && unsafe { std::ffi::CStr::from_ptr(info.pth_name.as_ptr()) }.to_bytes()
+                    == b"apps-media"
+        })
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+fn media_threads() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter(|task| {
+            std::fs::read_to_string(task.as_ref().unwrap().path().join("comm"))
+                .is_ok_and(|name| name.trim() == "apps-media")
+        })
+        .count()
+}
+
+#[cfg(not(windows))]
+#[test]
+fn web_audio_sounds_free_their_players() {
+    let (_host, engine, _base) = page(apps_runtime::bundle::disabled_features(None).unwrap());
+    engine
+        .eval(
+            "globalThis.ended = 0; const live = new AudioContext();
+            for (let i = 0; i < 40; i++) setTimeout(() => { const tone = live.createOscillator(); tone.connect(live.destination); tone.onended = () => ended++; tone.start(); tone.stop(live.currentTime + 0.02); }, i * 5)",
+            "media-test",
+        )
+        .unwrap();
+    wait(&engine, "ended === 40 ? 'done' : 'pending'");
+    // Other tests in this binary can hold a few players at the same time.
+    for _ in 0..2500 {
+        engine.tick().unwrap();
+        if media_threads() < 20 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!(
+        "{} media threads stay after the sounds end",
+        media_threads()
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn paused_players_hold_no_threads() {
+    let (_host, engine, base) = page(0);
+    engine
+        .eval(
+            &format!("globalThis.sounds = Array.from({{ length: 40 }}, () => new Audio('{base}tone.mp3'))"),
+            "media-test",
+        )
+        .unwrap();
+    wait(
+        &engine,
+        "sounds.every(sound => sound.readyState === 4) ? 'ready' : 'pending'",
+    );
+    // Other tests in this binary can hold a few players at the same time.
+    for _ in 0..2500 {
+        engine.tick().unwrap();
+        if media_threads() < 20 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        media_threads() < 20,
+        "{} media threads for paused players",
+        media_threads()
+    );
+    engine
+        .eval(
+            "sounds[0].currentTime = 0.5; sounds[0].play(); sounds[1].play()",
+            "media-test",
+        )
+        .unwrap();
+    assert_eq!(
+        wait(
+            &engine,
+            "sounds[0].ended && sounds[1].ended ? [sounds[0].error, sounds[1].currentTime > 0.9].join() : 'pending'"
+        ),
+        ",true"
+    );
+}
+
+#[test]
 fn audio_survives_layout_and_rate_changes() {
     let (_host, engine, base) = page(0);
     engine

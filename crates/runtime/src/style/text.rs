@@ -36,7 +36,7 @@ pub(crate) struct InlineText {
     pub boxes: Vec<InlineBox>,
     pub atoms: Vec<Atom>,
     pub cursors: Vec<(usize, renderer::Cursor)>,
-    pub shadows: Vec<(f32, f32, f32, u32)>,
+    pub shadows: Vec<(f32, f32, f32, renderer::Color)>,
     pub first_line: Option<Box<(renderer::TextRun, renderer::TextRun, Option<String>)>>,
     pub line_heights: Vec<(usize, LineHeight)>,
     /// A run has another font, size or line height than the block, so rows can grow around it.
@@ -53,10 +53,10 @@ pub(crate) struct Atom {
 #[derive(Clone, Copy)]
 pub(crate) struct InlineBox {
     pub index: usize,
-    pub fill: u32,
+    pub fill: renderer::Color,
     pub edges: [f32; 4],
     pub borders: [f32; 4],
-    pub border: u32,
+    pub border: renderer::Color,
     pub lead: f32,
     pub trail: f32,
 }
@@ -244,14 +244,13 @@ fn styled_run(style: &Rc<Style>, units: &Lengths, len: usize) -> renderer::TextR
 }
 
 pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::TextRun {
-    let (ink, alpha) = style.get(Prop::COLOR).and_then(color).unwrap_or((0, 255));
-    let ink: renderer::Color = super::rgba((ink, alpha));
+    let ink = (style.get(Prop::COLOR).and_then(super::paint)).unwrap_or(renderer::Color::BLACK);
     let lines = style.get(Prop::TEXT_DECORATION_LINE).unwrap_or("");
     let decoration = style
         .get(Prop::TEXT_DECORATION_COLOR)
         .filter(|value| !value.eq_ignore_ascii_case("currentcolor"))
-        .and_then(color)
-        .map_or(ink, |(ink, alpha)| super::rgba((ink, alpha)));
+        .and_then(super::paint)
+        .unwrap_or(ink);
     let length = |prop: Prop| {
         style
             .get(prop)
@@ -843,8 +842,8 @@ pub(crate) fn inline_text(
         let inherited_background = background;
         let background = style
             .get(Prop::BACKGROUND_COLOR)
-            .and_then(color::color)
-            .filter(|(_, alpha)| *alpha != 0)
+            .and_then(super::paint)
+            .filter(|color| color.a != 0.)
             .or(background);
         if node.tag != "#text" {
             let units = &styles.lengths[child];
@@ -854,9 +853,9 @@ pub(crate) fn inline_text(
             let fill = (background != inherited_background)
                 .then_some(background)
                 .flatten()
-                .map_or(0, |(color, alpha)| color << 8 | alpha as u32);
+                .unwrap_or_default();
             let edges: [f32; 4] = std::array::from_fn(|side| padding[side] + borders[side]);
-            if fill != 0 || edges != [0.; 4] || margin[1] != 0. || margin[3] != 0. {
+            if !fill.is_transparent() || edges != [0.; 4] || margin[1] != 0. || margin[3] != 0. {
                 opening += margin[3];
                 marks.push((opening, None));
                 opening += edges[3];
@@ -869,8 +868,8 @@ pub(crate) fn inline_text(
                         .iter()
                         .enumerate()
                         .filter(|(side, _)| borders[*side] > 0.)
-                        .find_map(|(_, [_, _, color])| style.get(*color).and_then(self::color))
-                        .map_or(0, |(color, alpha)| color << 8 | alpha as u32),
+                        .find_map(|(_, [_, _, color])| style.get(*color).and_then(super::paint))
+                        .unwrap_or_default(),
                     lead: f32::NAN,
                     trail: f32::NAN,
                 });
@@ -1016,8 +1015,8 @@ pub(crate) fn inline_text(
     }
     let ink = parent
         .get(Prop::COLOR)
-        .and_then(color)
-        .map_or(0xff, |(ink, alpha)| ink << 8 | alpha as u32);
+        .and_then(super::paint)
+        .unwrap_or(renderer::Color::BLACK);
     let shadows = parent
         .get(Prop::TEXT_SHADOW)
         .filter(|value| *value != "none")
@@ -1028,8 +1027,8 @@ pub(crate) fn inline_text(
                 .filter_map(|shadow| {
                     let (mut ink, mut lengths) = (ink, Vec::new());
                     for part in components(shadow, ' ') {
-                        match color(part) {
-                            Some((color, alpha)) => ink = color << 8 | alpha as u32,
+                        match super::paint(part) {
+                            Some(color) => ink = color,
                             None if part.eq_ignore_ascii_case("currentcolor") => {}
                             None => lengths.push(styles.lengths[id].resolve(part, 0.)?),
                         }

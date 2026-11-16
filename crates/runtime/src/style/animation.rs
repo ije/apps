@@ -29,6 +29,9 @@ const PAINT: &[Prop] = &[
     Prop::VISIBILITY,
     Prop::Z_INDEX,
     Prop::FILTER,
+    Prop::WEBKIT_FILTER,
+    Prop::BACKDROP_FILTER,
+    Prop::WEBKIT_BACKDROP_FILTER,
 ];
 
 #[derive(Clone, Debug)]
@@ -98,7 +101,7 @@ impl Animation {
                 let mut values = ["none", "0s", "0s", "1", "normal", "none", "ease", "running"];
                 let mut times = 0;
                 for part in components(shorthand[index % shorthand.len()], ' ') {
-                    let slot = if part.ends_with('s') && time(part).is_some() {
+                    let slot = if time(part).is_some() {
                         times += 1;
                         if times == 1 { 1 } else { 2 }
                     } else if part == "infinite" || part.parse::<f64>().is_ok() {
@@ -269,6 +272,7 @@ impl Animation {
         )
     }
 
+    // `coarse` scales the visible step of colors and opacity, which small boxes show less.
     pub fn sample(
         &self,
         elapsed: f64,
@@ -276,6 +280,7 @@ impl Animation {
         base: &Style,
         registry: &Registry,
         out: &mut Style,
+        coarse: f64,
     ) -> (Option<f64>, bool) {
         let length = self.active();
         let end = (self.delay + length + self.end_delay).max(0.);
@@ -437,10 +442,81 @@ impl Animation {
                 } else {
                     None
                 };
-                wake = wake.map(|wake| match edge {
-                    Some(edge) => wake
+                // A smooth value wakes when it moves by a visible step: 1% of opacity, a color level, a quarter
+                // pixel or a tenth of a degree. Values that can't be read wake each frame.
+                let step = edge.is_none().then(|| {
+                    fn numbers(text: &str) -> Option<Vec<(f64, &str)>> {
+                        let mut list: Vec<(f64, &str)> = Vec::new();
+                        let mut rest = text;
+                        while let Some(at) = rest.find(|c: char| c.is_ascii_digit() || c == '.') {
+                            let sign = rest[..at].ends_with('-');
+                            let end = at
+                                + rest[at..]
+                                    .find(|c: char| !c.is_ascii_digit() && c != '.')
+                                    .unwrap_or(rest.len() - at);
+                            let unit = end
+                                + rest[end..]
+                                    .find(|c: char| !c.is_ascii_alphabetic() && c != '%')
+                                    .unwrap_or(rest.len() - end);
+                            let value: f64 = rest[at..end].parse().ok()?;
+                            list.push((if sign { -value } else { value }, &rest[end..unit]));
+                            rest = &rest[unit..];
+                        }
+                        (!text.contains('#')).then_some(list)
+                    }
+                    let (a, b) = (numbers(from.1)?, numbers(to.1)?);
+                    if a.len() != b.len() {
+                        return None;
+                    }
+                    let mut step: f64 = 1.;
+                    for (&(a, unit), &(b, other)) in a.iter().zip(&b) {
+                        let range = (b - a).abs();
+                        if unit != other || range == 0. {
+                            continue;
+                        }
+                        let visible = match unit {
+                            "px" => 0.25,
+                            "deg" => 0.1,
+                            "rad" => 0.0017,
+                            "turn" => 0.0003,
+                            "grad" => 0.11,
+                            "%" => 0.1,
+                            "em" | "rem" => 0.015,
+                            "" if *property == Prop::OPACITY => 0.01 * coarse,
+                            "" if a.abs().max(b.abs()) > 2. => 0.5 * coarse,
+                            "" => 0.001,
+                            _ => return None,
+                        };
+                        step = step.min(visible / range);
+                    }
+                    let forward = !reverse;
+                    let limit = if forward { 1. - local } else { local }.max(0.);
+                    let moved = |by: f64| {
+                        let at = if forward { local + by } else { local - by };
+                        (timing.at(at, false) - eased).abs() >= step
+                    };
+                    let (mut low, mut high) = (0., (step / 8.).max(1e-4).min(limit));
+                    while high < limit && !moved(high) {
+                        (low, high) = (high, (high * 2.).min(limit));
+                    }
+                    if !moved(high) {
+                        return Some(limit);
+                    }
+                    for _ in 0..6 {
+                        let middle = (low + high) / 2.;
+                        if moved(middle) {
+                            high = middle;
+                        } else {
+                            low = middle;
+                        }
+                    }
+                    Some(low)
+                });
+                wake = wake.map(|wake| match (edge, step) {
+                    (Some(edge), _) => wake
                         .min((edge.clamp(0., 1.) - local).abs() * (to.0 - from.0) * self.duration),
-                    None => 0.,
+                    (None, Some(Some(by))) => wake.min(by * (to.0 - from.0) * self.duration),
+                    (None, _) => 0.,
                 });
             }
             let value = value.unwrap_or_else(|| if eased < 0.5 { from.1 } else { to.1 }.into());
@@ -813,6 +889,7 @@ impl Scripted {
         styles: &ComputedStyles,
         now: Instant,
         out: impl FnOnce() -> &'a mut Style,
+        coarse: f64,
     ) -> Option<Option<f64>> {
         let (owner, style): (Rc<dyn std::any::Any>, &Style) = match self.effect.pseudo {
             0 => (styles.values[id].clone(), &*styles.values[id]),
@@ -840,7 +917,7 @@ impl Scripted {
         let (local, paused) = (self.playback.at(now), self.playback.rate == 0.);
         Some(
             self.effect
-                .sample(local, paused, &base, &styles.registry, out())
+                .sample(local, paused, &base, &styles.registry, out(), coarse)
                 .0,
         )
     }
@@ -886,36 +963,52 @@ impl Motion {
             .filter(|(effect, clock)| effect.name == clock.name)
     }
 
+    /// The styles of a node, or of its `::before` (`slot` 1) or `::after` (`slot` 2), at each time.
     pub fn timeline(
         &self,
         id: usize,
+        slot: u8,
         styles: &ComputedStyles,
         times: &[Instant],
         props: &[Prop],
     ) -> Vec<Style> {
         let registry = &*styles.registry;
-        let base = &*styles.values[id];
+        let base = match slot {
+            0 => &*styles.values[id],
+            slot => match styles.pseudos.get(&id) {
+                Some(pair) => &pair[usize::from(slot) - 1],
+                None => return Vec::new(),
+            },
+        };
         times
             .iter()
             .map(|&at| {
                 let mut out = Style::default();
                 for (effect, clock) in self.pairs(id, styles) {
-                    if clock.phase != Phase::Canceled && effect.pseudo == 0 {
+                    if clock.phase != Phase::Canceled && effect.pseudo == slot {
                         let paused = clock.playback.rate == 0.;
-                        effect.sample(clock.playback.at(at), paused, base, registry, &mut out);
+                        effect.sample(clock.playback.at(at), paused, base, registry, &mut out, 1.);
                     }
                 }
                 for animation in self.scripted.get(&id).into_iter().flatten() {
-                    if animation.effect.pseudo == 0 {
+                    if animation.effect.pseudo == slot {
                         let (local, paused) =
                             (animation.playback.at(at), animation.playback.rate == 0.);
                         animation
                             .effect
-                            .sample(local, paused, base, registry, &mut out);
+                            .sample(local, paused, base, registry, &mut out, 1.);
                     }
                 }
-                drop_important(styles, id, &mut out);
-                for transition in self.transitions.get(&id).into_iter().flatten() {
+                if slot == 0 {
+                    drop_important(styles, id, &mut out);
+                }
+                for transition in self
+                    .transitions
+                    .get(&id)
+                    .into_iter()
+                    .flatten()
+                    .filter(|_| slot == 0)
+                {
                     if let Some(progress) = transition.progress(at) {
                         out.insert(transition.property, transition.value(progress));
                     }
@@ -933,16 +1026,19 @@ impl Motion {
             .collect()
     }
 
+    /// The loop of the one animation of a node, or of its `::before` (`slot` 1) or `::after` (`slot` 2).
     pub fn period(
         &self,
         id: usize,
+        slot: u8,
         styles: &ComputedStyles,
         now: Instant,
     ) -> Option<(f64, f64, f64, Option<String>)> {
-        if self
-            .transitions
-            .get(&id)
-            .is_some_and(|list| !list.is_empty())
+        if slot == 0
+            && self
+                .transitions
+                .get(&id)
+                .is_some_and(|list| !list.is_empty())
         {
             return None;
         }
@@ -953,11 +1049,12 @@ impl Motion {
             .filter(|(_, clock)| clock.phase != Phase::Canceled)
             .map(|(effect, clock)| (effect, &clock.playback))
             .chain(scripted.map(|animation| (&animation.effect, &animation.playback)))
+            .filter(|(effect, _)| effect.pseudo == slot)
         {
             effects += 1;
             let local = playback.at(now);
             let stop = effect.delay + effect.active() + effect.end_delay.min(0.);
-            if effect.pseudo != 0 || playback.rate == 0. || local >= stop {
+            if playback.rate == 0. || local >= stop {
                 continue;
             }
             if running.is_some()
@@ -1318,7 +1415,7 @@ impl Motion {
             .take_while(|animation| animation.id <= upto)
             .filter(|animation| animation.effect.pseudo == pseudo)
         {
-            animation.sample(node, styles, now, || &mut out);
+            animation.sample(node, styles, now, || &mut out, 1.);
         }
         if pseudo == 0 {
             drop_important(styles, node, &mut out);
@@ -1333,11 +1430,14 @@ impl Motion {
         styles: &ComputedStyles,
         visible: &[bool],
         shown: &dyn Fn(usize) -> bool,
+        // The shorter side of a box on the page, in CSS pixels.
+        side: &dyn Fn(usize) -> f32,
         now: Instant,
         repass: bool,
         events: &mut Events,
     ) -> (Animated, Option<Instant>) {
         let registry = &*styles.registry;
+        let coarse = |id: usize| f64::from((48. / side(id).max(1.)).clamp(1., 4.));
         events.append(&mut self.queued);
         let mut revealed = Vec::new();
         for (&id, list) in &mut self.scripted {
@@ -1352,7 +1452,7 @@ impl Motion {
                         .iter()
                         .any(|(_, rule, _)| rule.contains(Prop::DISPLAY))
             }) {
-                animation.sample(id, styles, now, || &mut out);
+                animation.sample(id, styles, now, || &mut out, 1.);
             }
             if out.get(Prop::DISPLAY).is_some_and(|value| value != "none") {
                 revealed.push(id);
@@ -1604,7 +1704,7 @@ impl Motion {
                         )
                     }
                 };
-                let (wake, ended) = effect.sample(elapsed, paused, base, registry, out);
+                let (wake, ended) = effect.sample(elapsed, paused, base, registry, out, coarse(id));
                 let active = elapsed - effect.delay;
                 let iteration = if effect.duration > 0. {
                     (active / effect.duration).floor().max(0.)
@@ -1665,10 +1765,16 @@ impl Motion {
             }
             for animation in list.iter_mut() {
                 let slot = animation.effect.pseudo;
-                let Some(wake) = animation.sample(id, styles, now, || match slot {
-                    0 => animated.entry(id).or_default(),
-                    slot => pseudo.entry((id, slot)).or_default(),
-                }) else {
+                let Some(wake) = animation.sample(
+                    id,
+                    styles,
+                    now,
+                    || match slot {
+                        0 => animated.entry(id).or_default(),
+                        slot => pseudo.entry((id, slot)).or_default(),
+                    },
+                    coarse(id),
+                ) else {
                     continue;
                 };
                 let rate = animation.playback.rate;
@@ -2888,6 +2994,12 @@ fn timing_function(part: &str) -> bool {
 }
 
 fn time(value: &str) -> Option<f64> {
+    if value.ends_with(')') {
+        return super::Lengths::new(16., 100., 100.)
+            .math(value, f32::NAN, &[])
+            .filter(|(value, kind)| *kind == super::parser::Kind::Time && value.is_finite())
+            .map(|(value, _)| value);
+    }
     let (value, scale) = value
         .strip_suffix("ms")
         .map(|value| (value, 0.001))
@@ -3145,8 +3257,14 @@ mod tests {
         let base = styles.values[id].clone();
         let sample = |effect: &Animation, elapsed: f64| {
             let mut out = Style::new();
-            let (wake, _) =
-                effect.sample(elapsed, effect.paused, &base, &Default::default(), &mut out);
+            let (wake, _) = effect.sample(
+                elapsed,
+                effect.paused,
+                &base,
+                &Default::default(),
+                &mut out,
+                1.,
+            );
             (
                 out.get(Prop::OPACITY)
                     .map(|value| value.parse::<f64>().unwrap()),
@@ -3191,6 +3309,7 @@ mod tests {
                 &styles.values[id],
                 &Default::default(),
                 out,
+                1.,
             )
         };
         sample(div, 1., &mut out);
@@ -3345,6 +3464,7 @@ mod tests {
                 &styles,
                 &visible,
                 &|_| true,
+                &|_| f32::INFINITY,
                 start + Duration::from_secs_f64(seconds),
                 false,
                 &mut Vec::new(),
@@ -3377,6 +3497,7 @@ mod tests {
                     styles,
                     &visible,
                     &|_| true,
+                    &|_| f32::INFINITY,
                     at(time),
                     false,
                     &mut events,
@@ -3432,6 +3553,7 @@ mod tests {
             &styles,
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
             start,
             false,
             &mut Vec::new(),
@@ -3442,6 +3564,7 @@ mod tests {
             &styles,
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
             at,
             false,
             &mut Vec::new(),
@@ -3467,12 +3590,22 @@ mod tests {
         assert_eq!(styles.values[div].get(Prop::WIDTH), Some("0px"));
         doc.nodes[p].attrs.insert("class".into(), "on".into());
         let on = computed_styles(&doc);
-        motion.update(&doc, &on, &visible, &|_| true, at, false, &mut Vec::new());
         motion.update(
             &doc,
             &on,
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
+            at,
+            false,
+            &mut Vec::new(),
+        );
+        motion.update(
+            &doc,
+            &on,
+            &visible,
+            &|_| true,
+            &|_| f32::INFINITY,
             at + Duration::from_millis(500),
             false,
             &mut Vec::new(),
@@ -3501,6 +3634,7 @@ mod tests {
             &styles,
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
             start,
             false,
             &mut events,
@@ -3510,6 +3644,7 @@ mod tests {
             &styles,
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
             start + Duration::from_millis(500),
             false,
             &mut events,
@@ -3527,6 +3662,7 @@ mod tests {
             &computed_styles(&doc),
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
             start + Duration::from_secs(2),
             false,
             &mut events,
@@ -3537,6 +3673,7 @@ mod tests {
             &computed_styles(&doc),
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
             start + Duration::from_secs(3),
             false,
             &mut events,
@@ -3546,6 +3683,7 @@ mod tests {
             &computed_styles(&doc),
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
             start + Duration::from_millis(3250),
             false,
             &mut events,
@@ -3577,6 +3715,7 @@ mod tests {
                 &computed_styles(doc),
                 &visible,
                 &|_| true,
+                &|_| f32::INFINITY,
                 start + Duration::from_secs_f64(time),
                 false,
                 &mut events,
@@ -3627,6 +3766,7 @@ mod tests {
                 &styles,
                 &visible,
                 &|_| true,
+                &|_| f32::INFINITY,
                 now,
                 false,
                 &mut Vec::new(),
@@ -3644,7 +3784,35 @@ mod tests {
     fn animations_wake_the_view_only_when_their_output_can_change() {
         let close = |a: Option<f64>, b: f64| a.is_some_and(|a| (a - b).abs() < 1e-6);
         let (count, wakes) = frames("<p style='animation:spin 1s linear infinite'></p>", 1.);
-        assert_eq!((count, wakes[0]), (120, Some(0.)));
+        assert!(count == 120 && wakes[0].is_some_and(|wake| wake < 1. / 120.));
+        // A slow fade wakes when its opacity moves by 1%, so less often than the display.
+        let (count, _) = frames(
+            "<p style='animation:breathe 1.6s infinite'></p><style>@keyframes breathe{50%{opacity:.35}}</style>",
+            1.6,
+        );
+        assert!((60..120).contains(&count), "{count} frames");
+        // A small box shows a coarser opacity step, so its fade wakes less often.
+        let doc = Document::parse(
+            "<style>@keyframes breathe{50%{opacity:.35}}</style><p style='animation:breathe 1.6s infinite'></p>",
+        );
+        let styles = computed_styles(&doc);
+        let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
+        let wake = |coarse| {
+            let effect = &styles.animations[&p][0];
+            let mut out = Style::new();
+            effect
+                .sample(
+                    0.2,
+                    false,
+                    &styles.values[p],
+                    &Default::default(),
+                    &mut out,
+                    coarse,
+                )
+                .0
+                .unwrap()
+        };
+        assert!(wake(4.) > wake(1.) * 3.);
         let (count, wakes) = frames(
             "<p style='animation:blink 1.2s steps(1) infinite'></p>",
             2.4,
@@ -3665,7 +3833,8 @@ mod tests {
             "<p style='visibility:hidden;animation:grow 1s infinite'></p>",
             "<p style='opacity:0;animation:show 1s infinite'></p>",
         ] {
-            assert_eq!(frames(shown, 0.1).1[0], Some(0.), "{shown}");
+            let wake = frames(shown, 0.1).1[0];
+            assert!(wake.is_some_and(|wake| wake < 0.1), "{shown}");
         }
         let (_, wakes) = frames(
             "<p style='visibility:hidden;animation:spin 2s linear'></p>",
@@ -3702,6 +3871,7 @@ mod tests {
                 &styles,
                 &visible,
                 &|_| false,
+                &|_| f32::INFINITY,
                 start,
                 false,
                 &mut Vec::new(),
@@ -3721,6 +3891,7 @@ mod tests {
             &styles,
             &visible,
             &|_| false,
+            &|_| f32::INFINITY,
             start,
             false,
             &mut Vec::new(),
@@ -3731,6 +3902,7 @@ mod tests {
             &styles,
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
             later,
             false,
             &mut Vec::new(),
@@ -3757,6 +3929,7 @@ mod tests {
                     &computed_styles(doc),
                     &visible,
                     &|_| true,
+                    &|_| f32::INFINITY,
                     start + Duration::from_millis(time),
                     false,
                     &mut Vec::new(),
@@ -3801,6 +3974,7 @@ mod tests {
                     &computed_styles(doc),
                     &visible,
                     &|_| true,
+                    &|_| f32::INFINITY,
                     start + Duration::from_millis(time),
                     false,
                     &mut Vec::new(),
@@ -3835,6 +4009,7 @@ mod tests {
                 &styles,
                 &visible,
                 &|_| true,
+                &|_| f32::INFINITY,
                 now,
                 false,
                 &mut Vec::new(),
@@ -3870,7 +4045,7 @@ mod tests {
             let mut out = Style::new();
             animation
                 .effect
-                .sample(local, true, &base, &Default::default(), &mut out);
+                .sample(local, true, &base, &Default::default(), &mut out, 1.);
             out.get(Prop::OPACITY)
                 .map(|value| (value.parse::<f64>().unwrap() * 1e4).round() / 1e4)
         };
@@ -3924,6 +4099,7 @@ mod tests {
             &styles,
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
             Instant::now(),
             false,
             &mut Vec::new(),
@@ -3947,6 +4123,7 @@ mod tests {
             &styles,
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
             Instant::now(),
             false,
             &mut Vec::new(),
@@ -4009,6 +4186,7 @@ mod tests {
             &styles,
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
             Instant::now(),
             false,
             &mut events,
@@ -4048,6 +4226,7 @@ mod tests {
             &styles,
             &visible,
             &|_| true,
+            &|_| f32::INFINITY,
             Instant::now(),
             false,
             &mut events,
@@ -4148,8 +4327,16 @@ mod tests {
             .map(|id| styles.values[id].get(Prop::DISPLAY) != Some("none"))
             .collect();
         let mut events = Vec::new();
-        let (animated, next) =
-            motion.update(doc, styles, &visible, &|_| true, at, false, &mut events);
+        let (animated, next) = motion.update(
+            doc,
+            styles,
+            &visible,
+            &|_| true,
+            &|_| f32::INFINITY,
+            at,
+            false,
+            &mut events,
+        );
         let animated = animated
             .into_iter()
             .map(|(id, style, layout)| (id, (style, layout)))
@@ -4159,6 +4346,15 @@ mod tests {
 
     fn node(doc: &Document, tag: &str) -> usize {
         doc.nodes.iter().position(|node| node.tag == tag).unwrap()
+    }
+
+    #[test]
+    fn times_resolve_math_like_chrome() {
+        assert_eq!(time("calc(420ms + 2 * 37ms)"), Some(0.494));
+        assert_eq!(time("calc(2 * -91ms)"), Some(-0.182));
+        assert_eq!(time("max(1s, 200ms)"), Some(1.));
+        assert_eq!(time("calc(2 * 3)"), None);
+        assert_eq!(time("calc(4px)"), None);
     }
 
     #[test]
@@ -4194,7 +4390,7 @@ mod tests {
             step(&mut motion, &doc, &styles, at);
             for id in nodes.iter().copied() {
                 motion.next_event(id, &styles, at);
-                motion.timeline(id, &styles, &[at], &[]);
+                motion.timeline(id, 0, &styles, &[at], &[]);
             }
         }
         assert_eq!(after(start, 1e19), None);
@@ -4248,7 +4444,7 @@ mod tests {
         assert_eq!(motion.next_event(div, &styles, at(1.1)), None);
         let period = |id: usize, seconds: f64| {
             motion
-                .period(id, &styles, at(seconds))
+                .period(id, 0, &styles, at(seconds))
                 .map(|(period, phase, left, shape)| {
                     let round = |value: f64| (value * 1e6).round() / 1e6;
                     (period, round(phase), left, shape.is_some())
@@ -4585,6 +4781,7 @@ mod tests {
                 &styles,
                 &visible,
                 &|_| true,
+                &|_| f32::INFINITY,
                 start + Duration::from_secs_f64(seconds),
                 false,
                 &mut events,
@@ -4688,6 +4885,7 @@ mod tests {
                 &styles,
                 &visible,
                 &|_| true,
+                &|_| f32::INFINITY,
                 at(seconds),
                 false,
                 &mut events,
@@ -4813,7 +5011,7 @@ mod tests {
             let mut out = Style::new();
             animation
                 .effect
-                .sample(local, true, &base, &Default::default(), &mut out);
+                .sample(local, true, &base, &Default::default(), &mut out, 1.);
             out.get(Prop::OPACITY).map(str::to_owned)
         };
         assert_eq!(

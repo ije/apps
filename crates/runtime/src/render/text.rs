@@ -71,6 +71,7 @@ pub(super) fn paint_text(
                 (glyph.index as usize, glyph.x)
             });
             if !shown(row) {
+                window.cull();
                 start = end;
                 left = right;
                 continue;
@@ -241,6 +242,7 @@ pub(super) fn paint_text(
         )
         .intersects(window.content_mask().bounds)
         {
+            window.cull();
             continue;
         }
         window.draw_glyph(
@@ -597,6 +599,10 @@ pub(super) struct AtomBox {
 pub(super) struct AtomRest(pub(super) Rc<std::cell::Cell<Pixels>>);
 
 impl renderer::Hooks for AtomRest {
+    fn cached(&self) -> bool {
+        true
+    }
+
     fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         self.0.set(cx.exact.size.width);
         inner(cx.window);
@@ -604,6 +610,10 @@ impl renderer::Hooks for AtomRest {
 }
 
 impl renderer::Hooks for AtomBox {
+    fn cached(&self) -> bool {
+        true
+    }
+
     fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let slot = &self.slots[self.index];
         let offset = slot.at.get() - cx.bounds.origin;
@@ -845,6 +855,29 @@ impl InlineText {
 
 impl renderer::Hooks for InlineText {
     fn bounded(&self) -> bool {
+        true
+    }
+
+    fn cached(&self) -> bool {
+        true
+    }
+
+    fn skippable(&self) -> bool {
+        true
+    }
+
+    fn skips_inside(&self) -> bool {
+        true
+    }
+
+    // The layouts go back into the mirror, which each frame clears.
+    fn skip(&self, _: Rect<Pixels>, _: &mut Window) -> bool {
+        let view = &*self.view;
+        let mut host = view.host.borrow_mut();
+        let dom = host.dom.entry(view.id).or_default();
+        for (id, entry) in self.prepainted.borrow().layouts.iter() {
+            dom.text_layouts.insert(*id, entry.clone());
+        }
         true
     }
 
@@ -1332,7 +1365,9 @@ impl renderer::Hooks for InlineText {
                     window.scale_factor(),
                 );
                 for inline in &self.data.boxes {
-                    if inline.fill == 0 && (inline.border == 0 || inline.borders == [0.; 4]) {
+                    if inline.fill.is_transparent()
+                        && (inline.border.is_transparent() || inline.borders == [0.; 4])
+                    {
                         continue;
                     }
                     let (id, range) = &self.data.ranges[inline.index];
@@ -1415,7 +1450,7 @@ impl renderer::Hooks for InlineText {
                                     bottom_right: if right_side { radii[2] } else { px(0.) },
                                     bottom_left: if left_side { radii[3] } else { px(0.) },
                                 },
-                                Color::hex(inline.fill),
+                                inline.fill,
                                 renderer::Border {
                                     widths: renderer::Edges {
                                         top: width_above,
@@ -1423,7 +1458,7 @@ impl renderer::Hooks for InlineText {
                                         bottom: width_below,
                                         left: if left_side { width_left } else { px(0.) },
                                     },
-                                    color: Color::hex(inline.border),
+                                    color: inline.border,
                                     style: renderer::BorderStyle::Solid,
                                     sides: 0,
                                 },
@@ -1435,6 +1470,8 @@ impl renderer::Hooks for InlineText {
                     let Some([start, end]) = dom.selection.get(id) else {
                         continue;
                     };
+                    // A selection changes without a new box, so this text draws again in each frame.
+                    window.paint_volatile();
                     if styles.user_select[*id].0 == style::UserSelect::None || dom.inert(*id) {
                         continue;
                     }
@@ -1477,7 +1514,7 @@ impl renderer::Hooks for InlineText {
             .data
             .shadows
             .iter()
-            .map(|&(x, y, blur, color)| (point(px(x), px(y)), Some(Color::hex(color)), blur))
+            .map(|&(x, y, blur, color)| (point(px(x), px(y)), Some(color), blur))
             .chain([(point(px(0.), px(0.)), None, 0.)]);
         for (shift, ink, blur) in passes {
             let paint = |window: &mut Window| {
@@ -1489,6 +1526,7 @@ impl renderer::Hooks for InlineText {
                     let count = line.rows();
                     let height = line.extent(layout.line_height()).height;
                     if origin.y > mask.bottom() && !split {
+                        window.cull();
                         break;
                     }
                     // Taller rows above push this line down: the next row's drop says how far.
@@ -1511,6 +1549,8 @@ impl renderer::Hooks for InlineText {
                             strut,
                             window,
                         );
+                    } else {
+                        window.cull();
                     }
                     row += count;
                     offset += line.len() + 1;

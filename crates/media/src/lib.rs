@@ -92,7 +92,7 @@ struct Info {
     audio: c_int,
 }
 
-#[cfg(ffmpeg)]
+#[cfg(all(ffmpeg, not(test)))]
 unsafe extern "C" {
     fn apps_ffmpeg_open(
         path: *const c_char,
@@ -122,7 +122,7 @@ unsafe extern "C" {
 
 // Decodes PCM WAV files in place of `native/ffmpeg.c`, with the same functions, in builds without FFmpeg.
 // The runtime compiles this file that way as its built-in audio player.
-#[cfg(not(ffmpeg))]
+#[cfg(any(not(ffmpeg), test))]
 mod wave {
     use super::*;
     use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -369,7 +369,7 @@ mod wave {
         drop(unsafe { Box::from_raw(media.cast::<Wave>()) });
     }
 }
-#[cfg(not(ffmpeg))]
+#[cfg(any(not(ffmpeg), test))]
 use wave::*;
 
 static PLAYING: [AtomicPtr<Sound>; 64] = [const { AtomicPtr::new(std::ptr::null_mut()) }; 64];
@@ -690,6 +690,7 @@ struct State {
     woken: bool,
     events: Vec<String>,
     duration: Option<f64>,
+    parked: Option<Decoder>,
 }
 
 struct Shared {
@@ -699,6 +700,14 @@ struct Shared {
 }
 
 impl Shared {
+    // An idle player parks its decoder and its thread ends, so a new thread takes it back here.
+    fn wake(self: &Arc<Self>, state: &mut State) {
+        match state.parked.take() {
+            Some(decoder) => spawn(self, state, move |shared| run(shared, decoder)),
+            None => self.signal.notify_one(),
+        }
+    }
+
     fn update(&self, state: &State) {
         let running = state.playing && state.ready && !state.closed;
         if lock(&self.sound.clock).running != running {
@@ -744,21 +753,52 @@ enum Source {
     Bytes(Vec<u8>),
 }
 
-fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
-    let output = mixer().map(|mixer| (mixer.rate, mixer.channels));
-    let (rate, channels) = output.unwrap_or((8000, 1));
+// The decoder and its progress, kept while the player has no thread.
+struct Decoder {
+    media: *mut c_void,
+    waker: Waker,
+    duration: f64,
+    has_video: bool,
+    has_audio: bool,
+    video_done: bool,
+    audio_done: bool,
+    speed: f64,
+    generation: u64,
+    audio_end: f64,
+    last_frame: f64,
+    target: Option<f64>,
+    loaded: bool,
+    pending: Vec<f32>,
+    pending_time: f64,
+    pending_step: f64,
+    skipped: Option<(f64, c_int, c_int, c_int)>,
+    blocked: c_int,
+    failures: u32,
+    converted: f64,
+    tick: Instant,
+}
+
+// SAFETY: only one player thread at a time uses the FFmpeg context.
+unsafe impl Send for Decoder {}
+
+fn spawn(shared: &Arc<Shared>, state: &mut State, work: impl FnOnce(Arc<Shared>) + Send + 'static) {
+    let player = shared.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("apps-media".into())
+        .spawn(move || work(player))
+    {
+        state
+            .events
+            .push(format!("\"error\",4,{}", json(&error.to_string())));
+    }
+}
+
+fn open(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
+    let (rate, channels) = mixer().map_or((8000, 1), |mixer| (mixer.rate, mixer.channels));
     let event = |text: String| {
         lock(&shared.state).events.push(text);
         waker.wake();
     };
-    let fail = |message: String| {
-        let mut state = lock(&shared.state);
-        state.ready = false;
-        shared.update(&state);
-        state.events.push(format!("\"error\",3,{}", json(&message)));
-        waker.wake();
-    };
-    let sound = &shared.sound;
     let mut info = Info::default();
     let mut error = [0 as c_char; 256];
     let (path, data, size) = match &source {
@@ -802,17 +842,69 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
     if has_audio {
         let length = ((rate as usize * channels) as f64 * AHEAD) as usize;
         let ring = (0..length.next_power_of_two()).map(|_| AtomicU32::new(0));
-        sound.ring.get_or_init(|| (ring.collect(), channels));
+        shared.sound.ring.get_or_init(|| (ring.collect(), channels));
     }
+    let decoder = Decoder {
+        media,
+        waker,
+        duration,
+        has_video,
+        has_audio,
+        video_done: !has_video,
+        audio_done: !has_audio,
+        speed: 1.,
+        generation: 0,
+        audio_end: 0.,
+        last_frame: -1. / 30.,
+        target: Some(0.),
+        loaded: false,
+        pending: Vec::new(),
+        pending_time: 0.,
+        pending_step: 0.,
+        skipped: None,
+        blocked: 0,
+        failures: 0,
+        converted: f64::NEG_INFINITY,
+        tick: Instant::now(),
+    };
+    run(shared, decoder);
+}
+
+fn run(shared: Arc<Shared>, decoder: Decoder) {
+    let Decoder {
+        media,
+        waker,
+        duration,
+        has_video,
+        has_audio,
+        mut video_done,
+        mut audio_done,
+        mut speed,
+        mut generation,
+        mut audio_end,
+        mut last_frame,
+        mut target,
+        mut loaded,
+        mut pending,
+        mut pending_time,
+        mut pending_step,
+        mut skipped,
+        mut blocked,
+        mut failures,
+        mut converted,
+        mut tick,
+    } = decoder;
+    let output = mixer().map(|mixer| (mixer.rate, mixer.channels));
+    let (rate, channels) = output.unwrap_or((8000, 1));
+    let fail = |message: String| {
+        let mut state = lock(&shared.state);
+        state.ready = false;
+        shared.update(&state);
+        state.events.push(format!("\"error\",3,{}", json(&message)));
+        waker.wake();
+    };
+    let sound = &shared.sound;
     let samples_per_second = (rate as usize * channels).max(1) as f64;
-    let (mut video_done, mut audio_done) = (!has_video, !has_audio);
-    let (mut speed, mut generation) = (1., 0);
-    let (mut audio_end, mut last_frame) = (0., -1. / 30.);
-    let (mut target, mut loaded) = (Some(0.), false);
-    let (mut pending, mut pending_time, mut pending_step) = (Vec::<f32>::new(), 0., 0.);
-    let mut skipped = None;
-    let (mut blocked, mut failures, mut converted) = (0, 0, f64::NEG_INFINITY);
-    let mut tick = Instant::now();
     loop {
         let mut state = lock(&shared.state);
         if state.closed {
@@ -1010,22 +1102,41 @@ fn run(shared: Arc<Shared>, source: Source, video: bool, waker: Waker) {
             state.woken = true;
             waker.wake();
         }
-        drop(match wait {
-            Some(wait) => {
-                shared
-                    .signal
-                    .wait_timeout(
-                        state,
-                        Duration::try_from_secs_f64(wait).unwrap_or(Duration::MAX),
-                    )
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0
-            }
-            None => shared
+        let Some(wait) = wait else {
+            state.parked = Some(Decoder {
+                media,
+                waker,
+                duration,
+                has_video,
+                has_audio,
+                video_done,
+                audio_done,
+                speed,
+                generation,
+                audio_end,
+                last_frame,
+                target,
+                loaded,
+                pending,
+                pending_time,
+                pending_step,
+                skipped,
+                blocked,
+                failures,
+                converted,
+                tick,
+            });
+            return;
+        };
+        drop(
+            shared
                 .signal
-                .wait(state)
+                .wait_timeout(
+                    state,
+                    Duration::try_from_secs_f64(wait).unwrap_or(Duration::MAX),
+                )
                 .unwrap_or_else(PoisonError::into_inner),
-        });
+        );
     }
     unsafe { apps_ffmpeg_close(media) };
 }
@@ -1038,7 +1149,7 @@ impl Media {
             state.frames.clear();
             state.spare.clear();
             player.shared.update(&state);
-            player.shared.signal.notify_one();
+            player.shared.wake(&mut state);
         }
     }
 }
@@ -1094,15 +1205,9 @@ pub unsafe extern "C" fn apps_media_open(
         sound: Arc::new(Sound::new()),
     });
     let waker = Waker((host().waker)());
-    let player = shared.clone();
-    if let Err(error) = std::thread::Builder::new()
-        .name("apps-media".into())
-        .spawn(move || run(player, source, video, waker))
-    {
-        lock(&shared.state)
-            .events
-            .push(format!("\"error\",4,{}", json(&error.to_string())));
-    }
+    spawn(&shared, &mut lock(&shared.state), move |shared| {
+        open(shared, source, video, waker)
+    });
     media.players.insert(
         id,
         Player {
@@ -1169,7 +1274,7 @@ pub unsafe extern "C" fn apps_media_control(media: *mut c_void, id: u64, op: u32
         _ => {}
     }
     shared.update(&state);
-    shared.signal.notify_one();
+    shared.wake(&mut state);
 }
 
 /// # Safety
@@ -1244,7 +1349,7 @@ pub unsafe extern "C" fn apps_media_frame(media: *mut c_void, id: u64, frame: *m
         }
     }
     state.woken = false;
-    player.shared.signal.notify_one();
+    player.shared.wake(&mut state);
     let Some(pixels) = shown else {
         return false;
     };
@@ -1351,7 +1456,6 @@ mod tests {
         assert!((7. ..7.25).contains(&sound.time().0));
     }
 
-    #[cfg(not(ffmpeg))]
     #[test]
     fn wave_files_decode_resample_and_seek() {
         let file = |tag: u16, channels: u16, rate: u32, width: u16, data: &[u8]| {

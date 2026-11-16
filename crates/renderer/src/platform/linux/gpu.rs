@@ -490,7 +490,7 @@ impl Renderer {
 
     // The atlas stays, since the last frame still reads it.
     pub fn release(&mut self) {
-        self.pool.clear();
+        self.pool.clear(&mut self.frame);
         self.instances = None;
         self.uniforms = None;
         self.staging = Vec::new();

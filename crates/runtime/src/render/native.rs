@@ -111,6 +111,8 @@ pub(super) fn paint(
     let (Some(&(key, seen)), Some(sink)) = (controls.shown.get(&id), &controls.sink) else {
         return;
     };
+    // Native controls are placed again in each frame.
+    window.paint_volatile();
     let host = view.host.borrow();
     let Some(node) = host
         .pages

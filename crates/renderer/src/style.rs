@@ -70,6 +70,7 @@ impl Radii<Length> {
         Radii {
             x: self.x.map(|length| length.of(size.width)),
             y: self.y.map(|length| length.of(size.height)),
+            shape: self.shape,
         }
     }
 
@@ -395,10 +396,59 @@ impl Style {
         if radii.is_zero() {
             return Some(Clip::from(clip));
         }
-        let mut mask = Clip::rounded(
-            inner,
-            radii.inset(border.top, border.right, border.bottom, border.left),
+        let inset = radii.inset(border.top, border.right, border.bottom, border.left);
+        // A bevel or concave inner curve is the outer one moved in, which a curve of the padding box can't
+        // match. When every curved corner is such a one and both axes clip, the curves come from the border box
+        // and the clip bounds cut the padding box.
+        let (x, y, shapes) = (
+            radii.x.to_array(),
+            radii.y.to_array(),
+            radii.shape.to_array(),
         );
+        if clips.x
+            && clips.y
+            && (0..4)
+                .all(|at| (1..=2048).contains(&shapes[at]) || x[at].is_zero() || y[at].is_zero())
+        {
+            let (ix, iy) = (inset.x.to_array(), inset.y.to_array());
+            let (mut gx, mut gy) = (x, y);
+            for at in 0..4 {
+                let side = if at == 0 || at == 3 {
+                    border.left
+                } else {
+                    border.right
+                };
+                let edge = if at < 2 { border.top } else { border.bottom };
+                (gx[at], gy[at]) = if shapes[at] < 2048 {
+                    (x[at] + side, y[at] + edge)
+                } else if ix[at].is_zero() || iy[at].is_zero() {
+                    (Pixels::ZERO, Pixels::ZERO)
+                } else {
+                    // The inner bevel line, from where it meets the padding box out to the border box.
+                    (
+                        side + ix[at] + edge * (ix[at] / iy[at]),
+                        edge + iy[at] + side * (iy[at] / ix[at]),
+                    )
+                };
+            }
+            let corners =
+                |[top_left, top_right, bottom_right, bottom_left]: [Pixels; 4]| crate::Corners {
+                    top_left,
+                    top_right,
+                    bottom_right,
+                    bottom_left,
+                };
+            return Some(Clip {
+                bounds: clip,
+                rounded: bounds,
+                radii: Radii {
+                    x: corners(gx),
+                    y: corners(gy),
+                    shape: radii.shape,
+                },
+            });
+        }
+        let mut mask = Clip::rounded(inner, inset);
         mask.bounds = clip;
         Some(mask)
     }

@@ -178,9 +178,12 @@ impl renderer::Hooks for FieldText {
         for line in layout.lines().iter() {
             let height = line_height * line.rows();
             if origin.y >= mask.bottom() {
+                window.cull();
                 break;
             }
-            if origin.y + height > mask.top() {
+            if origin.y + height <= mask.top() {
+                window.cull();
+            } else {
                 super::text::paint_text(
                     line,
                     origin,
@@ -362,6 +365,22 @@ impl renderer::View for PageView {
     }
 
     fn drawn(&mut self, snapshots: Vec<renderer::Snapshot>, window: &mut Window, cx: &mut App) {
+        // The paint order of boxes, which hit tests sort by.
+        if let Ok(mut host) = self.host.try_borrow_mut() {
+            let dom = host.dom.entry(self.id).or_default();
+            dom.painted.fill(0);
+            let page = self.id;
+            for (order, &mark) in window.marks().iter().enumerate() {
+                let id = (mark & u64::from(u32::MAX)) as usize;
+                if mark >> 32 != page {
+                    continue;
+                }
+                if dom.painted.len() <= id {
+                    dom.painted.resize(id + 1, 0);
+                }
+                dom.painted[id] = order as u64 + 1;
+            }
+        }
         if snapshots.is_empty() && !self.paint.take() {
             return;
         }

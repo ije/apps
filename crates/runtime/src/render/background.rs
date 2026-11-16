@@ -28,6 +28,7 @@ fn redraw_when_decoded(
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_some()
         {
+            window.repaint();
             window.refresh();
         } else {
             window.next_frame(redraw_when_decoded(decoding));
@@ -133,7 +134,8 @@ pub(super) fn css_background(
     id: usize,
     slot: usize,
     radius: renderer::Radii<renderer::Length>,
-    [borders, padding]: [[f32; 4]; 2],
+    // `under` is a border that the layers keep out of, while their corners follow its inner edge.
+    [borders, padding, under]: [[f32; 4]; 3],
     view: Rc<super::PageState>,
     base: Option<&url::Url>,
     assets: &HashMap<String, std::path::PathBuf>,
@@ -167,7 +169,7 @@ pub(super) fn css_background(
     // Canvas layers paint outside their box.
     fn paint(
         canvas: bool,
-        draw: impl Fn(renderer::Rect<renderer::Pixels>, (), &mut renderer::Window) + 'static,
+        draw: impl Fn(renderer::Rect<renderer::Pixels>, &(), &mut renderer::Window) + 'static,
     ) -> renderer::Node {
         if canvas {
             renderer::canvas(|_, _| (), draw)
@@ -185,7 +187,11 @@ pub(super) fn css_background(
         );
         let fixed = canvas && pick(&attachments, index).trim() == "fixed";
         // The positioning and painting areas of a layer. A fixed layer is placed in the viewport.
-        let areas = move |bounds: renderer::Rect<renderer::Pixels>, window: &renderer::Window| {
+        let areas = move |bounds: renderer::Rect<renderer::Pixels>,
+                          window: &mut renderer::Window| {
+            if canvas {
+                window.cull();
+            }
             let mask = window.content_mask().bounds;
             (
                 if fixed { mask } else { bounds },
@@ -208,7 +214,8 @@ pub(super) fn css_background(
             clip[1] + clip[3] - origin[1] - origin[3],
             clip[0] + clip[2] - origin[0] - origin[2],
         ];
-        let inset = std::array::from_fn::<_, 4, _>(|side| px(clip[side] + borders[side]));
+        let inset =
+            std::array::from_fn::<_, 4, _>(|side| px(clip[side] + borders[side] + under[side]));
         let corners = move |bounds: renderer::Rect<renderer::Pixels>| {
             let outer = renderer::size(
                 bounds.size.width + inset[1] + inset[3],
@@ -231,6 +238,16 @@ pub(super) fn css_background(
                 let file = path.to_string_lossy().into_owned();
                 let view = view.clone();
                 let natural = std::cell::Cell::new(None::<[f32; 2]>);
+                // The tiles of the last size, which most frames draw again.
+                type Tiles = (
+                    [f32; 2],
+                    [f32; 2],
+                    [f32; 2],
+                    [[f32; 2]; 2],
+                    [u32; 2],
+                    String,
+                );
+                let laid = std::cell::RefCell::new(None::<([u32; 5], Tiles)>);
                 layers.push(layer(paint(
                     canvas,
                     move |bounds, _, window| {
@@ -244,7 +261,8 @@ pub(super) fn css_background(
                         let view = &*view;
                         let mut host = view.host.borrow_mut();
                         let dom = host.dom.entry(view.id).or_default();
-                        let (backgrounds, bitmaps) = (&mut dom.backgrounds, &mut dom.bitmaps);
+                        let (backgrounds, bitmaps, sources) =
+                            (&mut dom.backgrounds, &mut dom.bitmaps, &mut dom.layer_sources);
                         let scale = window.scale_factor();
                         let key = (id, slot * 64 + index);
                         let words: Vec<&str> = repeat.split_whitespace().collect();
@@ -256,7 +274,7 @@ pub(super) fn css_background(
                             [] => ["repeat", "repeat"],
                         };
                         let limit = super::canvas::RASTER_MAX as f32;
-                        let layout = |natural: [f32; 2]| {
+                        let tiles = |natural: [f32; 2]| {
                             let extent = [width + area[2], height + area[3]];
                             let [mut tile, mut at] = super::effects::tile(
                                 &size,
@@ -320,6 +338,14 @@ pub(super) fn css_background(
                                 cell,
                                 source,
                             )
+                        };
+                        let layout = |natural: [f32; 2]| {
+                            let key = [width, height, natural[0], natural[1], scale].map(f32::to_bits);
+                            let mut laid = laid.borrow_mut();
+                            match &*laid {
+                                Some((old, tiles)) if *old == key => tiles.clone(),
+                                _ => laid.insert((key, tiles(natural))).1.clone(),
+                            }
                         };
                         let fixed = |bitmaps: &Bitmaps, image: &Arc<renderer::RenderImage>| {
                             bitmaps
@@ -409,7 +435,7 @@ pub(super) fn css_background(
                                                 Err(_) => return,
                                             }
                                         }
-                                        None => bitmap,
+                                        None => bitmap.clone(),
                                     };
                                     let image = match super::canvas::pixmap(&image)
                                         .filter(|_| nx * ny > 1.)
@@ -488,6 +514,7 @@ pub(super) fn css_background(
                             {
                                 window.release_image(old);
                             }
+                            sources.insert(key, bitmap);
                         }
                         let Some((_, image)) = backgrounds.get(&key) else {
                             return;
@@ -495,6 +522,9 @@ pub(super) fn css_background(
                         // Calculate visible tile indices directly. Iteration from distant origins or across
                         // tiny tiles can run indefinitely.
                         let visible = window.content_mask().bounds.intersect(clip);
+                if visible != clip {
+                    window.cull();
+                }
                         let [width, height] = [tile_width * nx, tile_height * ny];
                         let [step_x, step_y] = [width + gap[0], height + gap[1]];
                         let snap = |at: f32| (at * scale).round() / scale;
@@ -673,7 +703,7 @@ pub(super) fn css_background(
                     let image = super::effects::gradient_svg(
                         &kind, &body, &size, position, &repeat, units, width, height, within,
                     )
-                    .and_then(|source| super::canvas::svg(&source, rw, rh).ok())?;
+                    .and_then(|source| super::canvas::svg_gradient(source, rw, rh))?;
                     const LIMIT: u32 = 8 << 20;
                     if new && rw * rh * 4 <= LIMIT / 4 {
                         dom.gradients.push((inputs.clone(), image.clone()));
@@ -707,6 +737,9 @@ pub(super) fn css_background(
             {
                 // Tiles snap to device pixels, so their edges never sample other atlas tiles.
                 let visible = window.content_mask().bounds.intersect(clip);
+                if visible != clip {
+                    window.cull();
+                }
                 let start = |edge, at: f32, side: f32, cell: f32, low| {
                     let at = f32::from(edge) + at - if at > 0. { side } else { 0. };
                     let at = (at * scale).round() / scale;
@@ -751,11 +784,8 @@ pub(super) fn css_background(
         return layers.into_iter().map(Into::into).collect();
     }
     let mut group = renderer::node().absolute().top_0().left_0().size_full();
-    if let Some((ink, alpha)) = style.get(Prop::BACKGROUND_COLOR).and_then(style::color) {
-        let mut color = renderer::node()
-            .absolute()
-            .size_full()
-            .bg(crate::style::rgba((ink, alpha)));
+    if let Some(ink) = style.get(Prop::BACKGROUND_COLOR).and_then(style::paint) {
+        let mut color = renderer::node().absolute().size_full().bg(ink);
         color.style().corner_radii = radius;
         group = group.child(color);
     }
@@ -1037,7 +1067,7 @@ pub(super) fn border_image(
                             h,
                             [0., 0., w, h],
                         )
-                        .and_then(|source| super::canvas::svg(&source, rw, rh).ok())
+                        .and_then(|source| super::canvas::svg_gradient(source, rw, rh))
                     }
                     // Each part draws at the size of its tiles, into one image of three rows and columns, so
                     // tiles show no pixels of other parts at their edges, and SVG stays sharp.

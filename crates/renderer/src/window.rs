@@ -5,7 +5,7 @@ use crate::{
     atlas::TileKey,
     geometry::{snap, snap_width},
     platform, point, px,
-    scene::{BackdropState, EffectState, Scene},
+    scene::{self, BackdropState, EffectState, Scene},
     size,
     text::{DecorationStyle, FontId, GlyphId, GlyphRaster, SUBPIXEL_STEPS, TextSystem},
 };
@@ -15,7 +15,7 @@ use rustc_hash::FxHashMap;
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
-    cell::Cell,
+    cell::{Cell, RefCell},
     mem,
     ops::Range,
     rc::Rc,
@@ -269,6 +269,7 @@ impl HitTransform {
     }
 }
 
+#[derive(Clone)]
 struct Placed {
     region: Region,
     clip: Clip<Pixels>,
@@ -300,7 +301,7 @@ pub(crate) struct Placement {
     pub(crate) transform: usize,
 }
 
-type Listener = Box<dyn FnMut(&Event, &mut Window, &mut App)>;
+type Listener = Rc<RefCell<dyn FnMut(&Event, &mut Window, &mut App)>>;
 pub(crate) type FrameCallback = Box<dyn FnOnce(&mut Window, &mut App)>;
 pub(crate) type CaptureCallback = Box<dyn FnOnce(Result<([u32; 2], Vec<u8>)>, &mut App)>;
 
@@ -310,6 +311,44 @@ struct Input {
     listeners: Vec<(bool, Listener)>,
     cursors: Vec<(u64, Cursor)>,
     drag_areas: Vec<u64>,
+    // The tokens of `Window::mark` in paint order.
+    marks: Vec<u64>,
+    // The paint pass that made the paint records, and the prepaint pass that made the regions.
+    pass: Option<u32>,
+    prepass: Option<u32>,
+}
+
+// Where a paint span starts: in the scene and in the paint records of the input.
+#[derive(Clone, Copy)]
+pub(crate) struct PaintMark {
+    scene: scene::Mark,
+    input: [u32; 4],
+    volatile: u32,
+    culled: u32,
+}
+
+// The output of a paint span, which a later paint can copy while it paints under the same `PaintKey`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PaintSpan {
+    scene: scene::Span,
+    input: [[u32; 2]; 4],
+}
+
+// What paint reads from the window around a span.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PaintKey {
+    pub(crate) mask: Clip<Pixels>,
+    offset: Point<Pixels>,
+    opacity: f32,
+    smoothing: bool,
+    scale: f32,
+}
+
+impl PaintKey {
+    // Paint under both keys differs only by the place and clip of the content.
+    pub(crate) fn same_paint(&self, other: &Self) -> bool {
+        (self.opacity, self.smoothing, self.scale) == (other.opacity, other.smoothing, other.scale)
+    }
 }
 
 impl Input {
@@ -318,6 +357,19 @@ impl Input {
         self.listeners.clear();
         self.cursors.clear();
         self.drag_areas.clear();
+        self.marks.clear();
+        self.pass = None;
+        self.prepass = None;
+    }
+
+    fn lens(&self) -> [u32; 4] {
+        [
+            self.listeners.len(),
+            self.cursors.len(),
+            self.drag_areas.len(),
+            self.marks.len(),
+        ]
+        .map(|len| len as u32)
     }
 
     fn turn(&self, key: u64, matrix: &[f32; 16]) {
@@ -431,6 +483,14 @@ pub struct Window {
     // `pending` is being built; `live` is on screen and takes the input.
     pending: Input,
     live: Input,
+    // The regions of an earlier prepaint that `pending` held, which a skip in the next prepaint copies.
+    spare: (Option<u32>, Vec<Placed>),
+    paints: u32,
+    // Paint calls `paint_volatile` for content that it can't copy into the next frame.
+    volatile: u32,
+    // The next paint draws all boxes again.
+    repaint: bool,
+    generation: usize,
     under: Vec<u64>,
     hovered: usize,
     next_region: u64,
@@ -499,6 +559,11 @@ impl Window {
             scene: Scene::default(),
             pending: Input::default(),
             live: Input::default(),
+            spare: (None, Vec::new()),
+            paints: 0,
+            volatile: 0,
+            repaint: true,
+            generation: 0,
             under: Vec::new(),
             hovered: 0,
             next_region: 0,
@@ -614,9 +679,17 @@ impl Window {
         self.drawing || self.dirty || !self.captures.is_empty()
     }
 
-    pub fn patch_effect(&mut self, key: u64, opacity: f32, transform: Option<[f32; 16]>) -> bool {
+    // `blurs` are new radii of the filter blur and the backdrop blur, in pixels.
+    pub fn patch_effect(
+        &mut self,
+        key: u64,
+        opacity: f32,
+        transform: Option<[f32; 16]>,
+        blurs: [Option<f32>; 2],
+    ) -> bool {
         let device = transform.map(|matrix| device_matrix(matrix, self.scale_factor));
-        if !self.scene.patch(key, opacity.clamp(0., 1.), device) {
+        let blurs = blurs.map(|blur| blur.map(|blur| blur.max(0.) * self.scale_factor));
+        if !self.scene.patch(key, opacity.clamp(0., 1.), device, blurs) {
             return false;
         }
         if let Some(matrix) = &transform {
@@ -742,6 +815,7 @@ impl Window {
         }
         // The atlas and text caches keep their frame, so the tiles this scene reads stay.
         let _ = self.platform.draw(&self.scene, false);
+        self.scene.drawn();
         true
     }
 
@@ -875,7 +949,7 @@ impl Window {
         loop {
             self.dirty = false;
             self.drawing = true;
-            self.pending.clear();
+            self.clear_pending();
             self.scene.clear();
             #[cfg(target_os = "macos")]
             {
@@ -926,6 +1000,9 @@ impl Window {
             break;
         }
         mem::swap(&mut self.live, &mut self.pending);
+        if self.live.pass.is_none() {
+            self.scene.forget();
+        }
         mem::swap(&mut self.states, &mut self.next_states);
         #[cfg(target_os = "macos")]
         {
@@ -964,7 +1041,10 @@ impl Window {
             shots.insert(key, now);
         }
         self.shots = shots;
+        let fresh = self.platform.atlas().take_fresh();
+        self.scene.diff(fresh.as_deref());
         let mut frame = self.platform.draw(&self.scene, !captures.is_empty());
+        self.scene.drawn();
         let snapshots = self.platform.take_snapshots();
         // A layer that the backend could not read is read with the next frame.
         for shot in &mut self.scene.shots {
@@ -1021,7 +1101,7 @@ impl Window {
         self.drawing = true;
         let mut again = false;
         for _ in 0..2 {
-            self.pending.clear();
+            self.clear_pending();
             let mut tree = self.tree.take().unwrap_or_default();
             if let Some(root) = self.build(&mut tree, app, &mut render) {
                 tree.layout(root, self.viewport_size, self);
@@ -1143,21 +1223,21 @@ impl Window {
         self.hovered = self.live.probe(self.pointer, &mut self.under);
         self.update_cursor(app);
         // Capture listeners run in paint order, then bubble listeners in reverse, until one takes the event.
-        let mut listeners = mem::take(&mut self.live.listeners);
+        // A frame drawn by a listener has its own listeners, and the next paint copies from them.
+        let listeners = self.live.listeners.clone();
         let count = listeners.len();
         let order = (0..count).map(|i| (i, true));
         for (i, capture) in order.chain((0..count).rev().map(|i| (i, false))) {
-            let (phase, listener) = &mut listeners[i];
-            if *phase == capture {
+            let (phase, listener) = &listeners[i];
+            // A listener that runs again inside itself is skipped.
+            if *phase == capture
+                && let Ok(mut listener) = listener.try_borrow_mut()
+            {
                 listener(&event, self, app);
                 if app.event_stopped {
                     break;
                 }
             }
-        }
-        // A frame drawn by a listener has its own listeners.
-        if self.live.listeners.is_empty() {
-            self.live.listeners = listeners;
         }
         if let Event::Wheel { phase, .. } = event
             && let Some((handle, rest)) = self.gesture.edge.take()
@@ -1254,11 +1334,183 @@ impl Window {
     }
 
     pub fn on_capture(&mut self, listener: impl FnMut(&Event, &mut Window, &mut App) + 'static) {
-        self.pending.listeners.push((true, Box::new(listener)));
+        (self.pending.listeners).push((true, Rc::new(RefCell::new(listener))));
     }
 
     pub fn on_bubble(&mut self, listener: impl FnMut(&Event, &mut Window, &mut App) + 'static) {
-        self.pending.listeners.push((false, Box::new(listener)));
+        (self.pending.listeners).push((false, Rc::new(RefCell::new(listener))));
+    }
+
+    /// Records a token in paint order, which `marks` returns after the frame. Copied paint keeps its tokens.
+    pub fn mark(&mut self, token: u64) {
+        self.pending.marks.push(token);
+    }
+
+    /// The tokens of `mark` in the last frame.
+    pub fn marks(&self) -> &[u64] {
+        &self.live.marks
+    }
+
+    /// The content that paint draws now reads state outside the tree, so it can't be copied into later frames.
+    pub fn paint_volatile(&mut self) {
+        self.volatile += 1;
+    }
+
+    /// Paint left out or placed content by the content mask, so a copy can't move with its box.
+    pub fn cull(&mut self) {
+        self.scene.culled += 1;
+    }
+
+    /// The next frame paints all boxes again, as state that paint reads outside the tree changed.
+    pub fn repaint(&mut self) {
+        self.repaint = true;
+    }
+
+    // Returns the pass, and the pass whose spans can be copied.
+    pub(crate) fn begin_paint(&mut self) -> (u32, Option<u32>) {
+        self.paints = self.paints.wrapping_add(1);
+        let generation = self.text_system.generation();
+        let evicted = self.platform.atlas().take_evicted();
+        let fresh = mem::take(&mut self.repaint) || evicted || generation != self.generation;
+        self.generation = generation;
+        self.scene.begin_paint(self.paints);
+        self.pending.pass = Some(self.paints);
+        let last = self
+            .live
+            .pass
+            .filter(|_| !fresh && self.scene.last_pass == self.live.pass);
+        (self.paints, last)
+    }
+
+    pub(crate) fn paint_key(&self) -> PaintKey {
+        PaintKey {
+            mask: self.content_mask(),
+            offset: self.offset(),
+            opacity: self.opacity,
+            smoothing: self.font_smoothing,
+            scale: self.scale_factor,
+        }
+    }
+
+    pub(crate) fn paint_mark(&self) -> PaintMark {
+        PaintMark {
+            scene: self.scene.mark(),
+            input: self.pending.lens(),
+            volatile: self.volatile,
+            culled: self.scene.culled,
+        }
+    }
+
+    // The area in device pixels that a span drew in `mask`, when the span can move with its box: its paint cut
+    // nothing and drew nothing outside the mask or in layers.
+    pub(crate) fn plain(
+        &self,
+        span: &PaintSpan,
+        mark: PaintMark,
+        mask: Clip<Pixels>,
+    ) -> Option<Rect<f32>> {
+        (self.scene.culled == mark.culled)
+            .then(|| self.scene.plain(&span.scene, &self.snap_mask(mask)))
+            .flatten()
+    }
+
+    // Whether a plain span that drew `area` can move by `by` and draw in `mask`, as a paint there would draw.
+    pub(crate) fn movable(&self, area: Rect<f32>, by: Point<Pixels>, mask: Clip<Pixels>) -> bool {
+        let by = by.scale(self.scale_factor);
+        let whole = |value: f32| value == value.round();
+        whole(by.x) && whole(by.y) && scene::within(area + by, self.snap_mask(mask).bounds)
+    }
+
+    // What a span drew. `last` reads a span of the last paint.
+    #[cfg(debug_assertions)]
+    pub(crate) fn span_records(
+        &self,
+        span: &PaintSpan,
+        last: bool,
+        moved: Option<(Point<Pixels>, Clip<Pixels>, Clip<Pixels>)>,
+    ) -> Vec<String> {
+        let moved = moved.map(|(by, old, now)| {
+            (
+                by.scale(self.scale_factor),
+                self.snap_mask(old),
+                self.snap_mask(now),
+            )
+        });
+        let mut out = self.scene.records(&span.scene, last, moved);
+        let input = if last { &self.live } else { &self.pending };
+        let range = |[start, end]: [u32; 2]| start as usize..end as usize;
+        let [listeners, cursors, drags, marks] = span.input.map(range);
+        let phases: Vec<_> = input.listeners[listeners]
+            .iter()
+            .map(|(phase, _)| *phase)
+            .collect();
+        out.push(format!("listeners {phases:?}"));
+        // The prepaint check of debug builds gives regions new keys.
+        let kinds: Vec<_> = input.cursors[cursors]
+            .iter()
+            .map(|(_, cursor)| *cursor)
+            .collect();
+        out.push(format!("cursors {kinds:?}"));
+        out.push(format!("drag areas {}", input.drag_areas[drags].len()));
+        out.push(format!("marks {:?}", &input.marks[marks]));
+        out
+    }
+
+    // `None` when paint read state outside the tree, or wrote where a copy can't follow.
+    pub(crate) fn paint_span(&self, mark: PaintMark) -> Option<PaintSpan> {
+        if self.volatile != mark.volatile || self.text_clip.is_some() {
+            return None;
+        }
+        let ends = self.pending.lens();
+        Some(PaintSpan {
+            scene: self.scene.span(mark.scene)?,
+            input: std::array::from_fn(|at| [mark.input[at], ends[at]]),
+        })
+    }
+
+    // Copies a span of the last paint.
+    // Debug builds paint instead, to check the copy.
+    #[cfg_attr(debug_assertions, allow(dead_code))]
+    pub(crate) fn replay(
+        &mut self,
+        span: &PaintSpan,
+        moved: Option<(Point<Pixels>, Clip<Pixels>, Clip<Pixels>)>,
+    ) -> Option<PaintSpan> {
+        let ([listeners, cursors, drags, marks], live) = (span.input, &self.live);
+        let range = |[start, end]: [u32; 2]| start as usize..end as usize;
+        if self.text_clip.is_some()
+            || live
+                .lens()
+                .iter()
+                .zip(&span.input)
+                .any(|(len, [_, end])| end > len)
+        {
+            return None;
+        }
+        let start = self.pending.lens();
+        let scene = match moved {
+            Some((by, old, now)) => {
+                let (old, now) = (self.snap_mask(old), self.snap_mask(now));
+                (self.scene).replay_moved(&span.scene, by.scale(self.scale_factor), &old, &now)?
+            }
+            None => self.scene.replay(&span.scene)?,
+        };
+        let pending = &mut self.pending;
+        pending
+            .listeners
+            .extend_from_slice(&live.listeners[range(listeners)]);
+        pending
+            .cursors
+            .extend_from_slice(&live.cursors[range(cursors)]);
+        pending
+            .drag_areas
+            .extend_from_slice(&live.drag_areas[range(drags)]);
+        pending.marks.extend_from_slice(&live.marks[range(marks)]);
+        let ends = pending.lens();
+        Some(PaintSpan {
+            scene,
+            input: std::array::from_fn(|at| [start[at], ends[at]]),
+        })
     }
 
     // Kept subtrees reuse their regions only while this is unchanged.
@@ -1293,9 +1545,37 @@ impl Window {
         self.again
     }
 
-    #[cfg(debug_assertions)]
     pub(crate) fn truncate_regions(&mut self, len: usize) {
         self.pending.regions.truncate(len);
+    }
+
+    fn clear_pending(&mut self) {
+        if self.pending.prepass.is_some() {
+            mem::swap(&mut self.spare.1, &mut self.pending.regions);
+            self.spare.0 = self.pending.prepass;
+        }
+        self.pending.clear();
+    }
+
+    pub(crate) fn begin_prepaint(&mut self, pass: u32) {
+        self.pending.prepass = Some(pass);
+    }
+
+    pub(crate) fn regions_len(&self) -> u32 {
+        self.pending.regions.len() as u32
+    }
+
+    // Copies regions of the prepaint pass `pass`, and returns where they start.
+    pub(crate) fn copy_regions(&mut self, pass: u32, [start, end]: [u32; 2]) -> Option<u32> {
+        let source = match (self.live.prepass, self.spare.0) {
+            (Some(live), _) if live == pass => &self.live.regions,
+            (_, Some(spare)) if spare == pass => &self.spare.1,
+            _ => return None,
+        };
+        let copied = source.get(start as usize..end as usize)?;
+        let at = self.pending.regions.len() as u32;
+        self.pending.regions.extend_from_slice(copied);
+        Some(at)
     }
 
     pub fn keyed<S: Default + 'static>(&mut self, key: NodeKey) -> &mut S {

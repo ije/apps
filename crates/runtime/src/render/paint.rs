@@ -43,6 +43,23 @@ impl Turned {
 }
 
 impl Hooks for Turned {
+    fn cached(&self) -> bool {
+        true
+    }
+
+    // The matrix follows the bounds, so a kept box places its hit transform again.
+    fn volatile(&self) -> bool {
+        false
+    }
+
+    fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        self.prepaint(cx, inner)
+    }
+
+    fn skippable(&self) -> bool {
+        true
+    }
+
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let matrix = self.matrix(cx.bounds.origin);
         self.matrix.set(matrix);
@@ -61,11 +78,29 @@ pub(super) struct Transformed {
     pub(super) style: Rc<style::Style>,
     pub(super) units: style::Lengths,
     pub(super) matrix: Cell<Option<super::effects::Matrix>>,
+    pub(super) local: super::effects::Local,
 }
 
 impl Hooks for Transformed {
+    fn cached(&self) -> bool {
+        true
+    }
+
+    // The matrix follows the bounds, so a kept box places its hit transform again.
+    fn volatile(&self) -> bool {
+        false
+    }
+
+    fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        self.prepaint(cx, inner)
+    }
+
+    fn skippable(&self) -> bool {
+        true
+    }
+
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        let matrix = super::effects::transform(&self.style, &self.units, cx.bounds, None);
+        let matrix = super::effects::transform_at(&self.local, &self.style, &self.units, cx.bounds);
         self.matrix.set(matrix);
         match matrix {
             Some(matrix) => cx.window.with_keyed_hit_transform(matrix, None, inner),
@@ -96,6 +131,19 @@ impl Hooks for Effected {
         false
     }
 
+    fn skippable(&self) -> bool {
+        true
+    }
+
+    fn skip(&self, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+
+    // Frames patch the layers of composited animations.
+    fn cached(&self) -> bool {
+        self.effect.key.is_none()
+    }
+
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let mut effect = self.effect.clone();
         if let Some(backdrop) = effect.backdrop.as_mut()
@@ -119,6 +167,18 @@ pub(super) struct Masked {
 impl Hooks for Masked {
     fn volatile(&self) -> bool {
         false
+    }
+
+    fn skippable(&self) -> bool {
+        true
+    }
+
+    fn skip(&self, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+
+    fn cached(&self) -> bool {
+        true
     }
 
     fn paint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
@@ -183,6 +243,19 @@ pub(super) struct Picture {
 impl Hooks for Picture {
     fn volatile(&self) -> bool {
         false
+    }
+
+    fn skippable(&self) -> bool {
+        true
+    }
+
+    fn skip(&self, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+
+    // Canvases and video frames change without a new box. A new image repaints the window.
+    fn cached(&self) -> bool {
+        matches!(self.source, Source::Element)
     }
 
     fn bounded(&self) -> bool {
@@ -271,13 +344,17 @@ pub(super) struct DomBox {
     pub(super) shared: Option<[f32; 4]>,
     pub(super) leading: Option<[f32; 3]>,
     pub(super) boxless: bool,
-    pub(super) text: Option<([usize; 2], [f32; 2])>,
+    pub(super) text: Option<([u32; 2], [f32; 2])>,
     pub(super) placed: Cell<(Rect<Pixels>, Option<super::effects::Matrix>)>,
+    // The window bounds and cull flags of the last prepaint, which a skip gives to `merge`.
+    pub(super) reached_at: Cell<(Rect<Pixels>, u16)>,
     pub(super) offset: Cell<Point<Pixels>>,
     pub(super) frame: bool,
     pub(super) text_clip: bool,
     // A drawable element of a canvas, which paints into a snapshot for `drawElementImage()`.
     pub(super) drawn: bool,
+    // The transform at the origin for a size, which a moved box places again.
+    pub(super) local: super::effects::Local,
 }
 
 // With its counts, a box's `Rc` must stay within the small blocks of the runtime's allocator.
@@ -365,9 +442,11 @@ impl DomBox {
         if let Some(([first, last], [above, below])) = self.text {
             let mut host = view.host.borrow_mut();
             let bounds = &mut host.dom.entry(view.id).or_default().bounds;
-            if let (Some(&[x, _, width, _]), Some(&[_, top, ..]), Some(&[_, y, _, height])) =
-                (bounds.get(&self.id), bounds.get(&first), bounds.get(&last))
-                && width > 0.
+            if let (Some(&[x, _, width, _]), Some(&[_, top, ..]), Some(&[_, y, _, height])) = (
+                bounds.get(&self.id),
+                bounds.get(&(first as usize)),
+                bounds.get(&(last as usize)),
+            ) && width > 0.
             {
                 bounds.insert(
                     self.id,
@@ -408,16 +487,27 @@ impl DomBox {
     }
 
     fn reached(&self, window_bounds: Rect<Pixels>, flags: u16) {
+        self.reached_at.set((window_bounds, flags));
         let view = &*self.view;
-        let mut reaching = view.reaching.borrow_mut();
         let none = [f32::INFINITY, f32::NEG_INFINITY];
-        let found = reaching.pop().map_or(none, |(reach, _)| reach);
+        let found = view
+            .reaching
+            .borrow_mut()
+            .pop()
+            .map_or(none, |(reach, _)| reach);
         let reach = if self.plans == u8::MAX { none } else { found };
         let mut reached = view.reach.borrow_mut();
         if reached.len() <= self.id {
             reached.resize(self.id + 1, [f32::NAN; 2]);
         }
         reached[self.id] = reach;
+        drop(reached);
+        self.merge(reach, window_bounds, flags);
+    }
+
+    // Adds the reach of the box to the box around it.
+    fn merge(&self, reach: [f32; 2], window_bounds: Rect<Pixels>, flags: u16) {
+        let mut reaching = self.view.reaching.borrow_mut();
         if let Some(([bottom, top], plans)) = reaching.last_mut() {
             *bottom = bottom.min(reach[0]);
             *top = top.max(reach[1]);
@@ -615,8 +705,11 @@ impl Hooks for DomBox {
                 Some((*distance, [x + ox, y + oy]))
             });
         // A canvas draws a drawable element as it is before its transform.
-        let mut matrix = super::effects::transform(&self.style, &self.units, bounds, perspective)
-            .filter(|_| !self.drawn);
+        let mut matrix = match perspective {
+            Some(_) => super::effects::transform(&self.style, &self.units, bounds, perspective),
+            None => super::effects::transform_at(&self.local, &self.style, &self.units, bounds),
+        }
+        .filter(|_| !self.drawn);
         if self.transformed && !self.drawn {
             matrix.get_or_insert(super::effects::IDENTITY);
             self.view
@@ -769,6 +862,26 @@ impl Hooks for DomBox {
         self.placed.set((bounds, matrix));
         self.offset.set(offset);
     }
+    // A drawn box is a snapshot that the page reads, a composited box has layers that frames patch, and filters
+    // or clips can read elements elsewhere in the page.
+    fn cached(&self) -> bool {
+        !self.drawn
+            && !self.composited
+            && !self.frame
+            && [
+                Prop::FILTER,
+                Prop::WEBKIT_FILTER,
+                Prop::CLIP_PATH,
+                Prop::WEBKIT_CLIP_PATH,
+            ]
+            .into_iter()
+            .all(|prop| {
+                self.style
+                    .get(prop)
+                    .is_none_or(|value| !value.contains("url("))
+            })
+    }
+
     fn volatile(&self) -> bool {
         self.drawn
             || self.anchor.is_some()
@@ -781,16 +894,36 @@ impl Hooks for DomBox {
             || self.frame
     }
 
+    fn skippable(&self) -> bool {
+        true
+    }
+
+    fn skip(&self, exact: Rect<Pixels>, _: &mut Window) -> bool {
+        if Rect::new(exact.origin + self.offset.get(), exact.size) != self.placed.get().0 {
+            return false;
+        }
+        let none = [f32::INFINITY, f32::NEG_INFINITY];
+        let reach = (self.view.reach.borrow().get(self.id).copied()).unwrap_or(none);
+        let (window_bounds, flags) = self.reached_at.get();
+        self.merge(reach, window_bounds, flags);
+        true
+    }
+
     fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        let parts: Vec<_> = cx.fragments().collect();
-        let (placed, matrix) = self.placed.get();
+        let (placed, mut matrix) = self.placed.get();
         let offset = self.offset.get();
         let bounds = Rect::new(cx.exact.origin + offset, cx.exact.size);
         let moved = bounds != placed;
-        if moved && matrix.is_some() {
-            return self.prepaint(cx, inner);
-        }
+        let parts: Vec<_> = match moved {
+            true => cx.fragments().collect(),
+            false => Vec::new(),
+        };
         if moved {
+            // A kept box has its size, so its transform only turns about the new place.
+            if matrix.is_some() {
+                matrix =
+                    super::effects::transform_at(&self.local, &self.style, &self.units, bounds);
+            }
             self.block(cx.exact, offset);
             self.placed.set((bounds, matrix));
         }
@@ -843,15 +976,7 @@ impl DomBox {
     fn draw(&self, window: &mut Window, inner: &mut dyn FnMut(&mut Window)) {
         let (bounds, matrix) = self.placed.get();
         super::native::paint(&self.view, self.id, bounds, &self.style, window);
-        {
-            let mut host = self.view.host.borrow_mut();
-            let dom = host.dom.entry(self.view.id).or_default();
-            if dom.painted.len() <= self.id {
-                dom.painted.resize(self.id + 1, 0);
-            }
-            dom.paint_count += 1;
-            dom.painted[self.id] = dom.paint_count;
-        }
+        window.mark(self.view.id << 32 | self.id as u64);
         let inner = &mut |window: &mut Window| match self.text_clip {
             true => window.with_text_clip(|window| inner(window)),
             false => inner(window),
@@ -927,13 +1052,20 @@ impl DomBox {
             bounds,
             window,
         );
-        let shown = self.effects.unwrap_or(1.) > 0.
-            && style
-                .get(Prop::VISIBILITY)
-                .is_none_or(|value| value == "visible");
+        let visible = style
+            .get(Prop::VISIBILITY)
+            .is_none_or(|value| value == "visible");
+        let shown = self.effects.unwrap_or(1.) > 0. && visible;
+        // A composited box keeps its backdrop also at no opacity or blur, so frames can patch them.
         let backdrop = value(&[Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER])
-            .filter(|_| shown)
-            .and_then(|value| effects::backdrop(value, &units))
+            .filter(|_| shown || self.composited && visible)
+            .and_then(|value| {
+                effects::backdrop(value, &units).or_else(|| {
+                    effects::lone_blur(Some(value))
+                        .filter(|_| self.composited)
+                        .map(|_| (px(0.), None))
+                })
+            })
             .map(|(blur, color_matrix)| renderer::Backdrop {
                 bounds,
                 corner_radii: effects::radii(style, &units, || size).resolve(bounds.size),
@@ -1157,7 +1289,12 @@ fn mask_svg<'a>(
             .copied()
             .unwrap_or("")
     };
-    let mut content = String::new();
+    let composites = style::components(style.get(Prop::MASK_COMPOSITE).unwrap_or(""), ',');
+    // Layers go from the bottom up, and each one joins the layers below it by its `mask-composite`.
+    let (mut defs, mut below) = (String::new(), None::<String>);
+    let area = format!(
+        "maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"{width}\" height=\"{height}\""
+    );
     for (index, image) in style::components(images, ',').into_iter().enumerate().rev() {
         let image = image.trim();
         let [size, position, repeat] = [
@@ -1195,7 +1332,7 @@ fn mask_svg<'a>(
             else {
                 continue;
             };
-            let Some(svg) = super::effects::gradient_svg(
+            let Some((svg, _)) = super::effects::gradient_svg(
                 kind,
                 body,
                 size,
@@ -1214,11 +1351,47 @@ fn mask_svg<'a>(
             svg[start + 1..end].to_owned()
         };
         // Each layer is its own SVG document, so its `id`s must not collide.
-        content.push_str(
-            &layer
-                .replace("id=\"", &format!("id=\"m{index}"))
-                .replace("url(#", &format!("url(#m{index}")),
-        );
+        let layer = layer
+            .replace("id=\"", &format!("id=\"m{index}"))
+            .replace("url(#", &format!("url(#m{index}"));
+        let Some(under) = below.take() else {
+            below = Some(layer);
+            continue;
+        };
+        // `source-*` and `xor` are the `-webkit-mask-composite` names.
+        let joined = match pick(&composites, index).trim() {
+            "intersect" | "source-in" => {
+                defs.push_str(&format!(
+                    "<mask id=\"apps-in{index}\" mask-type=\"alpha\" {area}>{under}</mask>"
+                ));
+                format!("<g mask=\"url(#apps-in{index})\">{layer}</g>")
+            }
+            op @ ("subtract" | "source-out" | "exclude" | "xor") => {
+                // An inverted alpha mask: white, with the shape drawn black over it.
+                let out = |id: &str, shape: &str| {
+                    format!(
+                        "<mask id=\"{id}\" {area}><rect width=\"{width}\" height=\"{height}\" fill=\"#fff\"/><g filter=\"url(#apps-black)\">{shape}</g></mask>"
+                    )
+                };
+                defs.push_str(&out(&format!("apps-out{index}"), &under));
+                let mut joined = format!("<g mask=\"url(#apps-out{index})\">{layer}</g>");
+                if matches!(op, "exclude" | "xor") {
+                    defs.push_str(&out(&format!("apps-back{index}"), &layer));
+                    joined.push_str(&format!("<g mask=\"url(#apps-back{index})\">{under}</g>"));
+                }
+                joined
+            }
+            _ => under + &layer,
+        };
+        below = Some(joined);
     }
-    (!content.is_empty()).then_some(content)
+    let content = below?;
+    if defs.contains("apps-black") {
+        defs.push_str(&format!("<filter id=\"apps-black\" filterUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"{width}\" height=\"{height}\"><feColorMatrix values=\"0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0\"/></filter>"));
+    }
+    Some(if defs.is_empty() {
+        content
+    } else {
+        format!("<defs>{defs}</defs>{content}")
+    })
 }

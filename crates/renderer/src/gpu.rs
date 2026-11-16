@@ -9,7 +9,7 @@ pub(crate) const LINE: u32 = 2;
 pub(crate) const GLYPH: u32 = 3;
 pub(crate) const IMAGE: u32 = 4;
 
-// One box, shadow, line, glyph or image in device pixels. The shader reads it as 13 `vec4` vertex
+// One box, shadow, line, glyph or image in device pixels. The shader reads it as 14 `vec4` vertex
 // attributes, one step per instance. Radii hold the x radius of the four corners, then the y radius,
 // in the order top left, top right, bottom right, bottom left. Colors have straight alpha.
 #[derive(Clone, Copy, Default)]
@@ -33,20 +33,25 @@ pub(crate) struct Instance {
     // shadow: flag 1 inset, blur sigma
     // line: flag 1 wavy, thickness
     // glyph: -, atlas page
-    // image: flag 1 grayscale, flag 2 premultiplied source, opacity, atlas page
+    // image: flag 1 grayscale, flag 2 premultiplied source, flag 4 pixelated, flag 8 Display P3 source, opacity,
+    // atlas page
     pub info: [f32; 4],
+    // Corner shapes from `Radii::shape_array`: of `radii` (and `aux_radii`), then of `round_radii`.
+    pub shape: [f32; 4],
 }
 
 pub(crate) const ATTRIBUTES: usize = mem::size_of::<Instance>() / 16;
 
 impl Instance {
     pub fn new(kind: u32, rect: Rect<f32>, clip: Clip<f32>) -> Self {
+        let [top, bottom] = clip.radii.shape_array();
         Self {
             rect: rect.to_array(),
             clip: clip.bounds.to_array(),
             round: clip.rounded.to_array(),
             round_radii: clip.radii.to_array(),
             info: [kind as f32, 0., 0., 0.],
+            shape: [0., 0., top, bottom],
             ..Default::default()
         }
     }
@@ -64,8 +69,9 @@ impl Instance {
         }
     }
 
-    pub fn reach(&self) -> Rect<f32> {
-        let area = match self.kind() {
+    // Where the instance draws, before its clip.
+    pub fn area(&self) -> Rect<f32> {
+        rect(match self.kind() {
             SHADOW if self.info[1] as u32 & 1 != 0 => self.aux,
             // The shader draws the blur up to 3 sigma outside the shadow box.
             SHADOW => {
@@ -74,8 +80,11 @@ impl Instance {
                 [x - spread, y - spread, w + spread * 2., h + spread * 2.]
             }
             _ => self.rect,
-        };
-        rect(area).intersect(rect(self.clip))
+        })
+    }
+
+    pub fn reach(&self) -> Rect<f32> {
+        self.area().intersect(rect(self.clip))
     }
 }
 
@@ -89,7 +98,9 @@ pub struct Globals {
     pub viewport: [f32; 4],
     // Glyph coverage moves toward the ink by this much. Targets that blend in sRGB need it.
     pub text_contrast: f32,
-    pub pad: [f32; 3],
+    // 1 for a Display P3 target, 0 for sRGB.
+    pub wide: f32,
+    pub pad: [f32; 2],
 }
 
 pub(crate) const COMPOSITE_MATRIX: u32 = 1;
@@ -117,6 +128,8 @@ pub struct Composite {
     pub shadow: [f32; 4],
     pub source_rect: [f32; 4],
     pub backdrop_rect: [f32; 4],
+    // Corner shapes of `clip_radii`, then of `rounded_radii`.
+    pub shapes: [f32; 4],
     pub opacity: f32,
     pub blur: f32,
     pub flags: u32,
@@ -211,6 +224,6 @@ mod tests {
         }
         locations.sort_unstable();
         assert!(locations.into_iter().eq(0..ATTRIBUTES as u32));
-        assert_eq!(mem::size_of::<Instance>(), 13 * 16);
+        assert_eq!(mem::size_of::<Instance>(), 14 * 16);
     }
 }

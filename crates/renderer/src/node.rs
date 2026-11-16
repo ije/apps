@@ -206,6 +206,24 @@ pub trait Hooks: 'static {
     fn paint_content(&self, _cx: &mut NodeCx<'_>) -> bool {
         false
     }
+    // Return true only if paint reads nothing outside the tree, so a box that stays where it was can draw as
+    // in the last frame. Paint that sometimes reads more calls `Window::paint_volatile`.
+    fn cached(&self) -> bool {
+        false
+    }
+    // Return true only if a box whose boxes all stay where they were needs no prepaint, nor `kept`.
+    fn skippable(&self) -> bool {
+        false
+    }
+    // Called instead of the prepaint of a box whose boxes all stay where they were, with its exact bounds.
+    // Return true if it gave its ancestors what `kept` gives, so the boxes inside are skipped too.
+    fn skip(&self, _exact: Rect, _window: &mut Window) -> bool {
+        false
+    }
+    // Return true if `skip` must run also when a box around this one skips.
+    fn skips_inside(&self) -> bool {
+        false
+    }
 }
 
 // Two hooks of one node: the outer one wraps the inner one.
@@ -266,6 +284,23 @@ impl Hooks for Chain {
 
     fn paint_content(&self, cx: &mut NodeCx<'_>) -> bool {
         self.0.paint_content(cx) || self.1.paint_content(cx)
+    }
+
+    fn cached(&self) -> bool {
+        self.0.cached() && self.1.cached()
+    }
+
+    fn skippable(&self) -> bool {
+        self.0.skippable() && self.1.skippable()
+    }
+
+    fn skip(&self, exact: Rect, window: &mut Window) -> bool {
+        let outer = self.0.skip(exact, window);
+        self.1.skip(exact, window) && outer
+    }
+
+    fn skips_inside(&self) -> bool {
+        self.0.skips_inside() || self.1.skips_inside()
     }
 }
 
@@ -473,10 +508,11 @@ pub fn text(text: impl Into<SharedString>, runs: Option<Vec<TextRun>>) -> Node {
     node
 }
 
-/// It may draw outside its box.
+/// It may draw outside its box. Paint must read only its captured data and the prepaint value, or call
+/// `Window::paint_volatile`, as a box that stays where it was draws as in the last frame.
 pub fn canvas<T: 'static>(
     prepaint: impl Fn(Rect, &mut Window) -> T + 'static,
-    paint: impl Fn(Rect, T, &mut Window) + 'static,
+    paint: impl Fn(Rect, &T, &mut Window) + 'static,
 ) -> Node {
     node().hooks(Canvas {
         prepaint,
@@ -489,7 +525,7 @@ pub fn canvas<T: 'static>(
 /// Drawing must stay inside the box.
 pub fn canvas_within<T: 'static>(
     prepaint: impl Fn(Rect, &mut Window) -> T + 'static,
-    paint: impl Fn(Rect, T, &mut Window) + 'static,
+    paint: impl Fn(Rect, &T, &mut Window) + 'static,
 ) -> Node {
     node().hooks(Canvas {
         prepaint,
@@ -509,12 +545,34 @@ struct Canvas<P, F, T> {
 impl<T: 'static, P, F> Hooks for Canvas<P, F, T>
 where
     P: Fn(Rect, &mut Window) -> T + 'static,
-    F: Fn(Rect, T, &mut Window) + 'static,
+    F: Fn(Rect, &T, &mut Window) + 'static,
 {
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window);
         self.prepared
             .set(Some((self.prepaint)(cx.exact, cx.window)));
+    }
+
+    fn volatile(&self) -> bool {
+        false
+    }
+
+    fn cached(&self) -> bool {
+        true
+    }
+
+    // The prepaint value stays for paint.
+    fn skippable(&self) -> bool {
+        true
+    }
+
+    fn skip(&self, _: Rect, _: &mut Window) -> bool {
+        true
+    }
+
+    // A kept canvas prepares its paint again, at its kept place.
+    fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        self.prepaint(cx, inner)
     }
 
     fn bounded(&self) -> bool {
@@ -529,8 +587,9 @@ where
         let bounds = cx.bounds;
         cx.window
             .scope(Scope::Clip(cx.style.overflow_mask(bounds)), |window| {
-                (self.paint)(bounds, prepared, window)
+                (self.paint)(bounds, &prepared, window)
             });
+        self.prepared.set(Some(prepared));
     }
 }
 

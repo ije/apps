@@ -28,6 +28,8 @@ use renderer::{App, Color, Event, Window, WindowId};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
+    hash::Hash,
+    mem,
     path::PathBuf,
     rc::Rc,
     sync::Arc,
@@ -267,7 +269,7 @@ impl PageState {
         tree: &renderer::Tree,
         near: Option<[f32; 2]>,
         id: usize,
-    ) -> bool {
+    ) -> Result<(), usize> {
         let kept = self.kept.borrow();
         let mut node = id;
         let place = loop {
@@ -299,14 +301,12 @@ impl PageState {
             #[cfg(debug_assertions)]
             self.around.borrow_mut().extend(_ancestors.iter());
         }
-        if place.is_some() {
-            let mut path = Some(id);
-            while let Some(at) = path {
-                texts.remove(&at);
-                path = doc.nodes[at].parent.filter(|_| at != node);
-            }
+        let mut path = Some(id);
+        while let Some(at) = path {
+            texts.remove(&at);
+            path = doc.nodes[at].parent.filter(|_| at != node);
         }
-        place.is_some()
+        place.map(|_| ()).ok_or(node)
     }
 
     fn screen(&self, window: &Window, at: renderer::Point<renderer::Pixels>) -> [f32; 2] {
@@ -418,10 +418,44 @@ impl PageView {
             state.window = window.window_state();
             state.sync_scroll();
             state.bounds.touch();
+            let hash = |value: &dyn Fn(&mut rustc_hash::FxHasher)| {
+                let mut hasher = rustc_hash::FxHasher::default();
+                value(&mut hasher);
+                std::hash::Hasher::finish(&hasher)
+            };
+            // Images that load or decode later change paint without a new box.
+            let images = (state.images.iter())
+                .map(|(id, image)| hash(&|h| (id, Arc::as_ptr(image)).hash(h)))
+                .chain(
+                    state
+                        .bitmaps
+                        .values()
+                        .map(|image| Arc::as_ptr(image) as u64),
+                )
+                .chain((state.backgrounds.values()).map(|(_, image)| Arc::as_ptr(image) as u64))
+                .chain(
+                    state
+                        .layer_sources
+                        .values()
+                        .map(|image| Arc::as_ptr(image) as u64),
+                )
+                .chain(
+                    (state.svg_images.iter())
+                        .map(|(id, (source, _))| hash(&|h| (id, Rc::as_ptr(source)).hash(h))),
+                )
+                .fold(0u64, u64::wrapping_add);
+            let selection = (state.selection.iter())
+                .map(|entry| hash(&|h| entry.hash(h)))
+                .fold(0u64, u64::wrapping_add);
+            let inputs = hash(&|h| (images, selection, state.selection_caret).hash(h));
+            if mem::replace(&mut state.paint_inputs, inputs) != inputs {
+                window.repaint();
+            }
         }
         let data = self.0.clone();
         // Presses go to the page in the bubble phase, after drag areas and scrollbars could stop them.
         let pointer_events = renderer::canvas(|_, _| (), move |_, _, window| {
+            window.paint_volatile();
             let parked = data.parked.take();
             let size = window.viewport_size();
             if !parked.is_empty()
@@ -720,11 +754,17 @@ impl PageView {
         let mut events = Vec::new();
         let now = std::time::Instant::now();
         let bounds = &dom.bounds;
+        let side = |id| {
+            bounds
+                .get(&id)
+                .map_or(f32::INFINITY, |rect| rect[2].min(rect[3]))
+        };
         let (mut animated, next) = dom.motion.update(
             &doc,
             &styles,
             &visible,
             &|id| in_view(bounds, [width, height], id, clips(&doc, &styles, id)),
+            &side,
             now,
             dom.container_pass,
             &mut events,
@@ -821,9 +861,11 @@ impl PageView {
                     && (styles.values[*id].get(Prop::CANVAS_CONTENT) != Some("drawable")
                         || doc.nodes[*id].tag == "canvas")
                     && composites(style, &styles.values[*id])
-                    && [Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER]
-                        .into_iter()
-                        .all(|prop| style.get(prop).is_none_or(|value| value == "none"))
+                    // A step that draws like the base style builds in place, like other paint changes.
+                    && !style.iter().eq(styles.values[*id].iter())
+                    && filter(style, 1).is_none_or(|value| {
+                        value == "none" || effects::lone_blur(Some(value)).is_some()
+                    })
                     && style.get(Prop::BACKFACE_VISIBILITY) != Some("hidden")
             })
             .map(|(id, style, _)| {
@@ -836,9 +878,22 @@ impl PageView {
             })
             .collect();
         drop(flat);
+        // Pseudo-elements that animate only their opacity keep keyed layers, which frames patch.
+        let pseudo_layers: Vec<usize> = dom
+            .motion
+            .pseudos
+            .iter()
+            .filter(|(id, pair)| {
+                styles
+                    .pseudos
+                    .get(id)
+                    .is_some_and(|base| fades_only(base, pair))
+            })
+            .map(|(id, _)| *id)
+            .collect();
         let compositing = !animated.is_empty()
             && composited.len() == animated.len()
-            && dom.motion.pseudos.is_empty()
+            && pseudo_layers.len() == dom.motion.pseudos.len()
             && backdrops.is_empty();
         animate(&self.0, dom, next, now, compositing, window, cx);
         // Restore cascade values and pseudos after the frame: animations replace them temporarily.
@@ -1089,6 +1144,10 @@ impl PageView {
         dom.layout_nodes.resize_with(doc.nodes.len(), || None);
         let frame = [width, height, window.scale_factor(), dom.font_loads as f32];
         let mut changed = Vec::new();
+        // The nodes that changed, when the tree and the focus didn't.
+        let mut sources = None;
+        // A box built in place that others read without a record, like a row for its cells.
+        let mut framed = false;
         let near = dom.cull.enabled.then(|| {
             let moved = dom.cull.scrolled.get(&0).copied().unwrap_or(0.);
             [moved - height, moved + 2. * height]
@@ -1107,6 +1166,7 @@ impl PageView {
             | cull::CHILDREN_CHANGED
             | cull::GEOMETRY_CHANGED
             | cull::COMPOSITED
+            | cull::COMPOSITED_PSEUDO
             | cull::TRANSFORMED
             | cull::ANIMATED;
         let mut fresh = match dom.cull.fresh.take() {
@@ -1185,9 +1245,13 @@ impl PageView {
                 let changed = walk.changed_since(serial).into_iter().flatten();
                 let joined = touched.into_iter().flatten();
                 let joined = joined.filter(|&&id| info[id as usize].subtree == 0);
-                let patched = changed.chain(joined).map(|&id| id as usize);
-                let newer = doc.nodes.changed_since(*latest);
-                for id in newer.chain(patched).filter(|&id| walk.contains(id)) {
+                let patched: Vec<usize> = changed.chain(joined).map(|&id| id as usize).collect();
+                let mut newer: Vec<usize> = doc.nodes.changed_since(*latest).collect();
+                for &id in newer
+                    .iter()
+                    .chain(&patched)
+                    .filter(|&&id| walk.contains(id))
+                {
                     mark(id);
                 }
                 for id in styles.values.differing(&computed.values).flatten() {
@@ -1198,8 +1262,10 @@ impl PageView {
                             .is_some_and(|old| Rc::ptr_eq(old, &styles.values[id]))
                     {
                         mark(id);
+                        newer.push(id);
                     }
                 }
+                sources = (patched.is_empty() && *focus == dom.focus).then_some(newer);
                 for id in [*focus, dom.focus]
                     .into_iter()
                     .flatten()
@@ -1376,15 +1442,18 @@ impl PageView {
                             && old.kids == kids
                             && (old.flags, old.marks) == (flags, marks)
                     })
-                    && self.place(
-                        &doc,
-                        &styles,
-                        &mut dom.measurements.texts,
-                        &dom.bounds,
-                        tree,
-                        near,
-                        id,
-                    );
+                    && self
+                        .place(
+                            &doc,
+                            &styles,
+                            &mut dom.measurements.texts,
+                            &dom.bounds,
+                            tree,
+                            near,
+                            id,
+                        )
+                        .is_ok();
+                framed |= repainted && (flags | marks) & cull::READS_LAST_FRAME != 0;
                 let mut relisted = false;
                 if own && !repainted || old.is_some_and(|old| old.out != out || old.kids != kids) {
                     relisted = old.is_none_or(|old| old.list != list);
@@ -1443,12 +1512,35 @@ impl PageView {
             }
             dom.cull.marked = marked;
         }
+        // Changes built in place move no box, so boxes that read the last frame can keep it, also in a reflow.
+        let quiet = (unchanged
+            || sources
+                .is_some_and(|ids: Vec<usize>| ids.iter().all(|&id| dom.cull.walk.contains(id))))
+            && !relaid
+            && !flipped
+            && !framed
+            && changed.is_empty()
+            && !dom.container_pass
+            && paint
+                .iter()
+                .map(|(id, _)| *id)
+                .chain(restore_pseudos.iter().map(|(id, _)| *id))
+                .all(|id| {
+                    dom.layout_nodes
+                        .get(id)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|node| (node.flags | node.marks) & cull::READS_LAST_FRAME == 0)
+                });
         self.composited_transforms.borrow_mut().clear();
         self.promote.set(
             (!composited.is_empty()).then(|| (now + std::time::Duration::from_millis(300), false)),
         );
         for &(id, turns) in &composited {
             info[id].flags |= cull::COMPOSITED | (u16::from(turns) * cull::TRANSFORMED);
+            fresh.iter_mut().for_each(|fresh| fresh.push(id));
+        }
+        for &id in &pseudo_layers {
+            info[id].flags |= cull::COMPOSITED_PSEUDO;
             fresh.iter_mut().for_each(|fresh| fresh.push(id));
         }
         let mut animate = |info: &mut [cull::Info], id: usize| {
@@ -1465,22 +1557,33 @@ impl PageView {
         for &(id, _) in &composited {
             animate(&mut info, id);
         }
+        // A box that can't build in place builds again with its ancestors. It then keeps a record, so the
+        // next frames build it in place.
+        let mut unplaced = |info: &mut [cull::Info], node: usize| {
+            self.repaint.borrow_mut().insert(node);
+            if let Some(parent) = doc.nodes[node].parent {
+                animate(info, parent);
+            }
+        };
         let mut placed = std::mem::take(&mut *self.animated.borrow_mut());
         placed.retain(|&id| {
             id < doc.nodes.len()
                 && painting(&paint, id).is_none()
-                && self.place(
-                    &doc,
-                    &styles,
-                    &mut dom.measurements.texts,
-                    &dom.bounds,
-                    tree,
-                    near,
-                    id,
-                )
+                && self
+                    .place(
+                        &doc,
+                        &styles,
+                        &mut dom.measurements.texts,
+                        &dom.bounds,
+                        tree,
+                        near,
+                        id,
+                    )
+                    .map_err(|node| unplaced(&mut info, node))
+                    .is_ok()
         });
         for (id, _) in &paint {
-            if self.place(
+            if let Err(node) = self.place(
                 &doc,
                 &styles,
                 &mut dom.measurements.texts,
@@ -1489,15 +1592,35 @@ impl PageView {
                 near,
                 *id,
             ) {
-                self.animated.borrow_mut().push(*id);
-            } else {
-                animate(&mut info, *id);
+                unplaced(&mut info, node);
             }
+            self.animated.borrow_mut().push(*id);
         }
-        placed.extend(self.animated.borrow().iter());
-        for &(id, _) in &restore_pseudos {
+        // Pseudo-elements that only fade build their element in place too. Others can move its boxes.
+        for &(id, _) in restore_pseudos
+            .iter()
+            .filter(|(id, _)| pseudo_layers.contains(id))
+        {
+            if let Err(node) = self.place(
+                &doc,
+                &styles,
+                &mut dom.measurements.texts,
+                &dom.bounds,
+                tree,
+                near,
+                id,
+            ) {
+                unplaced(&mut info, node);
+            }
+            self.animated.borrow_mut().push(id);
+        }
+        for &(id, _) in restore_pseudos
+            .iter()
+            .filter(|(id, _)| !pseudo_layers.contains(id))
+        {
             animate(&mut info, id);
         }
+        placed.extend(self.animated.borrow().iter());
         let mut recolored = std::mem::take(&mut dom.recolored);
         if !paint.is_empty() {
             let values = &mut Rc::make_mut(&mut styles).values;
@@ -1508,9 +1631,21 @@ impl PageView {
                 restore.push((id, std::mem::replace(&mut values[id], style)));
             }
         }
-        if !same || !restore.is_empty() {
-            dom.blocks
-                .retain(|&id, _| shown(id) && effects::establishes(&styles.values[id]).absolute);
+        let establishes =
+            |id: usize| shown(id) && effects::establishes(&styles.values[id]).absolute;
+        if !same {
+            dom.blocks.retain(|&id, _| establishes(id));
+        } else {
+            // Only animated boxes, now or in the last frame, can stop being containing blocks.
+            let ids = restore
+                .iter()
+                .map(|(id, _)| *id)
+                .chain(dom.animating.keys().copied());
+            for id in ids.collect::<Vec<_>>() {
+                if !establishes(id) {
+                    dom.blocks.remove(&id);
+                }
+            }
         }
         recolored.extend(&dom.recolored);
         placed.sort_unstable();
@@ -1817,8 +1952,9 @@ impl PageView {
             build.epoch = epoch + u64::from(!same || swapped || last || kept.0 != frame);
             self.epoch.set((build.epoch, swapped));
             build.resized = kept.0[..2] != frame[..2];
-            build.settled =
-                settled && !build.resized && !window.redrawing() && !self.reflowing.get();
+            build.settled = (settled && !self.reflowing.get() || quiet)
+                && !build.resized
+                && !window.redrawing();
             kept.0 = frame;
         }
         #[cfg(debug_assertions)]
@@ -1845,10 +1981,9 @@ impl PageView {
                     .get(Prop::VISIBILITY)
                     .is_none_or(|value| value == "visible")
                 {
-                    if let Some((color, alpha)) =
-                        backdrop.get(Prop::BACKGROUND_COLOR).and_then(style::color)
+                    if let Some(color) = backdrop.get(Prop::BACKGROUND_COLOR).and_then(style::paint)
                     {
-                        el = el.bg(crate::style::rgba((color, alpha)));
+                        el = el.bg(color);
                     }
                     if backdrop.get(Prop::OPACITY).is_some() {
                         el = el.opacity(effects::opacity(backdrop));
@@ -1864,7 +1999,7 @@ impl PageView {
                             id,
                             3,
                             Default::default(),
-                            [[0.; 4]; 2],
+                            [[0.; 4]; 3],
                             self.0.clone(),
                             host.dom.get(&self.id).and_then(|state| state.base.as_ref()),
                             &host.assets,
@@ -2163,7 +2298,10 @@ impl PageView {
             .children(crate::desktop::mcp::profiling().then(|| {
                 renderer::canvas(
                     |_, _| (),
-                    move |_, _, _| crate::desktop::mcp::frame(id, started),
+                    move |_, _, window| {
+                        window.paint_volatile();
+                        crate::desktop::mcp::frame(id, started)
+                    },
                 )
                 .absolute()
             }))
@@ -2171,8 +2309,14 @@ impl PageView {
                 let inspect = self.inspect.get();
                 (inspect.hover.is_some() || inspect.selected.is_some()).then(|| {
                     let data = self.0.clone();
-                    renderer::canvas(|_, _| (), move |_, _, window| inspect::paint(&data, window))
-                        .absolute()
+                    renderer::canvas(
+                        |_, _| (),
+                        move |_, _, window| {
+                            window.paint_volatile();
+                            inspect::paint(&data, window)
+                        },
+                    )
+                    .absolute()
                 })
             })
             .children(self.hud.borrow().is_some().then(|| {
@@ -2180,6 +2324,7 @@ impl PageView {
                 renderer::canvas(
                     |_, _| (),
                     move |_, _, window| {
+                        window.paint_volatile();
                         if let Some(hud) = &*data.hud.borrow() {
                             hud.paint(window);
                         }
@@ -2210,11 +2355,51 @@ const COMPOSITED_PROPS: [Prop; 6] = [
     Prop::SCALE,
     Prop::TRANSFORM_ORIGIN,
 ];
+// The filter and the backdrop filter, in the order paint reads them.
+const BLURS: [[Prop; 2]; 2] = [
+    [Prop::FILTER, Prop::WEBKIT_FILTER],
+    [Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER],
+];
 
+/// The filter (0) or backdrop filter (1) of a style.
+fn filter(style: &style::Style, which: usize) -> Option<&str> {
+    BLURS[which].iter().find_map(|&prop| style.get(prop))
+}
+
+/// The layer key of the `::before` (slot 1) or `::after` (slot 2) of a node. Element layers use the node id.
+pub(super) fn pseudo_key(id: usize, slot: u8) -> u64 {
+    id as u64 | u64::from(slot) << 56
+}
+
+/// Whether an animated pair of pseudo-element styles differs from its base pair only in opacity.
+fn fades_only(base: &[style::Style; 2], pair: &[style::Style; 2]) -> bool {
+    let rest = |(prop, _): &(Prop, &Rc<str>)| *prop != Prop::OPACITY;
+    base.iter()
+        .zip(pair.iter())
+        .all(|(a, b)| a.iter().filter(rest).eq(b.iter().filter(rest)))
+}
+
+/// Whether two styles differ only in what patches change: opacity, transforms and filters that are one `blur()`.
 fn composites(a: &style::Style, b: &style::Style) -> bool {
-    let rest =
-        |(prop, _): &(Prop, &Rc<str>)| *prop != Prop::OPACITY && !TRANSFORM_PROPS.contains(prop);
+    let rest = |(prop, _): &(Prop, &Rc<str>)| {
+        *prop != Prop::OPACITY
+            && !TRANSFORM_PROPS.contains(prop)
+            && !BLURS.as_flattened().contains(prop)
+    };
+    // A clip path keeps a filter in a layer of its own, which patches don't reach.
+    let clipped = [Prop::CLIP_PATH, Prop::WEBKIT_CLIP_PATH]
+        .into_iter()
+        .any(|prop| a.get(prop).is_some_and(|value| value != "none"));
     a.iter().filter(rest).eq(b.iter().filter(rest))
+        && [(0, clipped), (1, false)]
+            .into_iter()
+            .all(|(which, clipped)| {
+                BLURS[which].iter().all(|&prop| a.get(prop) == b.get(prop))
+                    || !clipped
+                        && [a, b]
+                            .into_iter()
+                            .all(|style| effects::lone_blur(filter(style, which)).is_some())
+            })
 }
 
 fn animate(
@@ -2318,11 +2503,17 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     let now = std::time::Instant::now();
     let bounds = &dom.bounds;
     let shown = |id| in_view(bounds, viewport, id, clips(doc, &styles, id));
+    let side = |id| {
+        bounds
+            .get(&id)
+            .map_or(f32::INFINITY, |rect| rect[2].min(rect[3]))
+    };
     let (animated, next) = dom.motion.update(
         doc,
         &styles,
         &dom.cull.visible,
         &shown,
+        &side,
         now,
         false,
         &mut events,
@@ -2335,8 +2526,14 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
         .collect();
     let composited_transforms = view.composited_transforms.borrow();
     let mut changes = Vec::new();
+    let pseudos = std::mem::take(&mut dom.motion.pseudos);
     let eligible = dom.motion.custom.is_empty()
-        && dom.motion.pseudos.is_empty()
+        && pseudos.iter().all(|(id, pair)| {
+            styles
+                .pseudos
+                .get(id)
+                .is_some_and(|base| fades_only(base, pair))
+        })
         && dom.motion.backdrops.is_empty()
         && animated.len() == dom.animating.len()
         && animated.iter().all(|(id, style, layout)| {
@@ -2357,7 +2554,17 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
                 None if turns => return false,
                 None => None,
             };
-            changes.push((*id, effects::opacity(style), matrix));
+            let blurs = [0, 1].map(|which| {
+                let value = filter(style, which);
+                (filter(old, which) != value)
+                    .then(|| effects::lone_blur(value))
+                    .flatten()
+                    .map(|args| match args {
+                        "" => 0.,
+                        args => styles.lengths[*id].resolve(args, 0.).unwrap_or(0.),
+                    })
+            });
+            changes.push((*id, effects::opacity(style), matrix, blurs));
             !layout && composites(old, style)
         });
     let renew = now + std::time::Duration::from_millis(1750);
@@ -2369,97 +2576,138 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
                 fresh = true;
                 let mut looped = true;
                 let mut shared = rustc_hash::FxHashMap::default();
-                let on = animated.iter().all(|(id, ..)| {
-                    let base = &styles.values[*id];
-                    let transformed = composited_transforms.get(id);
-                    let origin = transformed
-                        .filter(|(_, perspective)| perspective.is_none())
-                        .map(|(bounds, ..)| bounds.origin);
-                    let mut timing = (1. / 120., 240, 1., now, None);
-                    match dom.motion.period(*id, &styles, now) {
-                        Some((period, phase, left, shape)) => {
-                            let count = (period * 120.).round().max(2.);
-                            let step = period / count;
-                            timing = (step, count as u32, left, now, None);
-                            if let Some(shape) = shape.filter(|_| left >= 2. - phase / period)
-                                && let Some(start) =
-                                    now.checked_sub(std::time::Duration::from_secs_f64(phase))
-                            {
-                                let values = COMPOSITED_PROPS.map(|prop| base.get(prop));
-                                let units = &styles.lengths[*id];
-                                let size = transformed.map(|(bounds, perspective)| match origin {
-                                    Some(_) => format!("{:?}", bounds.size),
-                                    None => format!("{bounds:?}{perspective:?}"),
-                                });
-                                let key = format!("{shape}{values:?}{units:?}{size:?}");
-                                timing =
-                                    (step, count as u32, left + phase / period, start, Some(key));
+                // Hands the timeline of one layer to Core Animation: an element (slot 0), or its `::before` or
+                // `::after`.
+                let mut promote =
+                    |key: u64,
+                     id: &usize,
+                     slot: u8,
+                     base: &style::Style,
+                     transformed: Option<&CompositedTransform>| {
+                        let origin = transformed
+                            .filter(|(_, perspective)| perspective.is_none())
+                            .map(|(bounds, ..)| bounds.origin);
+                        let mut timing = (1. / 120., 240, 1., now, None);
+                        match dom.motion.period(*id, slot, &styles, now) {
+                            Some((period, phase, left, shape)) => {
+                                let count = (period * 120.).round().max(2.);
+                                let step = period / count;
+                                timing = (step, count as u32, left, now, None);
+                                if let Some(shape) = shape.filter(|_| left >= 2. - phase / period)
+                                    && let Some(start) =
+                                        now.checked_sub(std::time::Duration::from_secs_f64(phase))
+                                {
+                                    let values = COMPOSITED_PROPS.map(|prop| base.get(prop));
+                                    let units = &styles.lengths[*id];
+                                    let size =
+                                        transformed.map(|(bounds, perspective)| match origin {
+                                            Some(_) => format!("{:?}", bounds.size),
+                                            None => format!("{bounds:?}{perspective:?}"),
+                                        });
+                                    let shape_key =
+                                        format!("{slot}{shape}{values:?}{units:?}{size:?}");
+                                    timing = (
+                                        step,
+                                        count as u32,
+                                        left + phase / period,
+                                        start,
+                                        Some(shape_key),
+                                    );
+                                }
                             }
+                            None => looped = false,
                         }
-                        None => looped = false,
-                    }
-                    let (step, count, repeat, start, key) = timing;
-                    let first = match key {
-                        Some(_) => {
-                            start + std::time::Duration::from_secs_f64(step * f64::from(count))
-                        }
-                        None => start,
-                    };
-                    let local = key.is_some() && origin.is_some();
-                    let sample = || {
-                        let times: Vec<_> = (0..=count)
-                            .map(|k| {
-                                first + std::time::Duration::from_secs_f64(f64::from(k) * step)
-                            })
-                            .collect();
-                        let timeline = dom.motion.timeline(*id, &styles, &times, &COMPOSITED_PROPS);
-                        let opacities: Vec<f32> = timeline.iter().map(effects::opacity).collect();
-                        let transforms: Option<Vec<_>> =
-                            transformed.map(|(bounds, perspective)| {
-                                let bounds = match local {
-                                    true => renderer::Rect::new(Default::default(), bounds.size),
-                                    false => *bounds,
-                                };
-                                timeline
+                        let (step, count, repeat, start, shape_key) = timing;
+                        let first = match shape_key {
+                            Some(_) => {
+                                start + std::time::Duration::from_secs_f64(step * f64::from(count))
+                            }
+                            None => start,
+                        };
+                        let local = shape_key.is_some() && origin.is_some();
+                        let sample = || {
+                            let times: Vec<_> = (0..=count)
+                                .map(|k| {
+                                    first + std::time::Duration::from_secs_f64(f64::from(k) * step)
+                                })
+                                .collect();
+                            let timeline =
+                                dom.motion
+                                    .timeline(*id, slot, &styles, &times, &COMPOSITED_PROPS);
+                            let opacities: Vec<f32> =
+                                timeline.iter().map(effects::opacity).collect();
+                            let transforms: Option<Vec<_>> =
+                                transformed.map(|(bounds, perspective)| {
+                                    let bounds = match local {
+                                        true => {
+                                            renderer::Rect::new(Default::default(), bounds.size)
+                                        }
+                                        false => *bounds,
+                                    };
+                                    timeline
+                                        .iter()
+                                        .map(|style| {
+                                            effects::transform(
+                                                style,
+                                                &styles.lengths[*id],
+                                                bounds,
+                                                *perspective,
+                                            )
+                                            .unwrap_or(effects::IDENTITY)
+                                        })
+                                        .collect()
+                                });
+                            // Core Animation can't play blurs.
+                            let still = timeline.windows(2).all(|pair| {
+                                BLURS
+                                    .as_flattened()
                                     .iter()
-                                    .map(|style| {
-                                        effects::transform(
-                                            style,
-                                            &styles.lengths[*id],
-                                            bounds,
-                                            *perspective,
-                                        )
-                                        .unwrap_or(effects::IDENTITY)
+                                    .all(|&prop| pair[0].get(prop) == pair[1].get(prop))
+                            });
+                            Rc::new((opacities, transforms, still))
+                        };
+                        let mut samples = match shape_key {
+                            Some(shape_key) => {
+                                shared.entry(shape_key).or_insert_with(sample).clone()
+                            }
+                            None => sample(),
+                        };
+                        if let Some(origin) = origin.filter(|_| local) {
+                            let [x, y] = [f32::from(origin.x), f32::from(origin.y)];
+                            let (there, back) =
+                                (effects::translate(x, y, 0.), effects::translate(-x, -y, 0.));
+                            let moved = samples.1.as_ref().map(|list: &Vec<effects::Matrix>| {
+                                list.iter()
+                                    .map(|matrix| {
+                                        effects::multiply(&there, &effects::multiply(matrix, &back))
                                     })
                                     .collect()
                             });
-                        Rc::new((opacities, transforms))
+                            samples = Rc::new((samples.0.clone(), moved, samples.2));
+                        }
+                        samples.2
+                            && (window.promote(
+                                key,
+                                start,
+                                step as f32,
+                                repeat as f32,
+                                &samples.0,
+                                samples.1.as_deref(),
+                            ) || samples.1.is_none() && !shown(*id))
                     };
-                    let mut samples = match key {
-                        Some(key) => shared.entry(key).or_insert_with(sample).clone(),
-                        None => sample(),
-                    };
-                    if let Some(origin) = origin.filter(|_| local) {
-                        let [x, y] = [f32::from(origin.x), f32::from(origin.y)];
-                        let (there, back) =
-                            (effects::translate(x, y, 0.), effects::translate(-x, -y, 0.));
-                        let moved = samples.1.as_ref().map(|list: &Vec<effects::Matrix>| {
-                            list.iter()
-                                .map(|matrix| {
-                                    effects::multiply(&there, &effects::multiply(matrix, &back))
-                                })
-                                .collect()
-                        });
-                        samples = Rc::new((samples.0.clone(), moved));
-                    }
-                    window.promote(
-                        *id as u64,
-                        start,
-                        step as f32,
-                        repeat as f32,
-                        &samples.0,
-                        samples.1.as_deref(),
-                    ) || samples.1.is_none() && !shown(*id)
+                let on = animated.iter().all(|(id, style, _)| {
+                    let base = &styles.values[*id];
+                    // A node listed only for its pseudo-elements has no animation of its own.
+                    Rc::ptr_eq(style, base) && dom.motion.period(*id, 0, &styles, now).is_none()
+                        || promote(*id as u64, id, 0, base, composited_transforms.get(id))
+                }) && pseudos.iter().all(|(id, _)| {
+                    styles.pseudos.get(id).is_some_and(|pair| {
+                        pair.iter().zip(1..).all(|(base, slot)| {
+                            base.get(Prop::CONTENT)
+                                .is_none_or(|content| matches!(content, "none" | "normal"))
+                                || promote(pseudo_key(*id, slot), id, slot, base, None)
+                        })
+                    })
                 });
                 // Demote all layers if any promotion fails, or previously promoted layers stop with their
                 // timeline.
@@ -2478,11 +2726,25 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     let mut flat = view.flat.borrow_mut();
     let patched = eligible
         && (promoted
-            || changes.into_iter().all(|(id, opacity, matrix)| {
-                window.patch_effect(id as u64, opacity, matrix) || !shown(id) || {
+            || changes.into_iter().all(|(id, opacity, matrix, blurs)| {
+                window.patch_effect(id as u64, opacity, matrix, blurs) || !shown(id) || {
                     flat.insert(id);
                     false
                 }
+            }) && pseudos.iter().all(|(id, pair)| {
+                pair.iter().zip(1..).all(|(style, slot)| {
+                    // Only a pseudo-element with content has a box and a layer.
+                    style
+                        .get(Prop::CONTENT)
+                        .is_none_or(|content| matches!(content, "none" | "normal"))
+                        || window.patch_effect(
+                            pseudo_key(*id, slot),
+                            effects::opacity(style),
+                            None,
+                            [None; 2],
+                        )
+                        || !shown(*id)
+                })
             }));
     if patched
         && composited_transforms
@@ -2495,6 +2757,7 @@ fn composite(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     if patched {
         dom.animating
             .extend(animated.into_iter().map(|(id, style, _)| (id, style)));
+        dom.animating_pseudos.extend(pseudos);
     }
     let next = match view.promote.get() {
         Some((until, true)) if promoted => {
@@ -2764,6 +3027,9 @@ fn drop_hidden_images(
         }
         keep
     });
+    let backgrounds = &dom.backgrounds;
+    dom.layer_sources
+        .retain(|key, _| backgrounds.contains_key(key));
     dom.bitmaps.retain(|_, image| {
         Arc::strong_count(image) > 1 || {
             release(image.clone());
@@ -2858,6 +3124,10 @@ mod tests {
             .insert((second, 0), ("a".into(), shared.clone()));
         dom.bitmaps.insert("a".into(), shared);
         dom.backgrounds.insert((second, 64), ("b".into(), image(2)));
+        // A tiled layer draws a raster of its own, and keeps its decoded source.
+        let tile = image(3);
+        dom.bitmaps.insert("t".into(), tile.clone());
+        dom.layer_sources.insert((second, 0), tile);
         let mut released = Vec::new();
         let mut visible = vec![false; doc.nodes.len()];
         (visible[0], visible[second]) = (true, true);
@@ -2868,12 +3138,75 @@ mod tests {
         assert!(dom.backgrounds.contains_key(&(second, 0)));
         assert!(!dom.backgrounds.contains_key(&(first, 0)));
         assert!(!dom.backgrounds.contains_key(&(second, 64)));
+        assert!(dom.bitmaps.contains_key("t"));
         released.clear();
         for _ in 0..2 {
             drop_hidden_images(&mut dom, &[], &styles, |image| released.push(image.id));
         }
-        assert!(dom.backgrounds.is_empty() && dom.bitmaps.is_empty());
+        assert!(
+            dom.backgrounds.is_empty() && dom.bitmaps.is_empty() && dom.layer_sources.is_empty()
+        );
         assert!(dom.canvases.contains_key(&canvas));
+    }
+
+    #[test]
+    fn pseudo_layers_patch_only_opacity_changes() {
+        let style = |props: &[(&str, &str)]| {
+            let mut style = style::Style::default();
+            for (name, value) in props {
+                style.insert(Prop::find(name).unwrap(), Rc::from(*value));
+            }
+            style
+        };
+        let base = [style(&[("content", "''"), ("opacity", "1")]), style(&[])];
+        let faded = [style(&[("content", "''"), ("opacity", "0.4")]), style(&[])];
+        let painted = [
+            style(&[("content", "''"), ("opacity", "0.4"), ("color", "red")]),
+            style(&[]),
+        ];
+        assert!(fades_only(&base, &faded));
+        assert!(!fades_only(&base, &painted));
+        assert_ne!(pseudo_key(7, 1), pseudo_key(7, 2));
+        assert_ne!(pseudo_key(7, 1), 7);
+    }
+
+    #[test]
+    fn blur_changes_patch_layers() {
+        let style = |props: &[(&str, &str)]| {
+            let mut style = style::Style::default();
+            for (name, value) in props {
+                style.insert(Prop::find(name).unwrap(), Rc::from(*value));
+            }
+            style
+        };
+        let base = style(&[
+            ("filter", "blur(8px)"),
+            ("backdrop-filter", "blur(0)"),
+            ("opacity", "0"),
+        ]);
+        let blurs = |filter, backdrop| {
+            style(&[
+                ("filter", filter),
+                ("backdrop-filter", backdrop),
+                ("opacity", "0.5"),
+            ])
+        };
+        assert!(composites(&base, &blurs("blur(2.5px)", "blur(3px)")));
+        assert!(composites(&base, &blurs("blur(0)", "blur(6px)")));
+        assert!(!composites(
+            &base,
+            &blurs("blur(2px) grayscale(1)", "blur(3px)")
+        ));
+        assert!(!composites(&base, &blurs("blur(2px)", "saturate(2)")));
+        assert!(!composites(&base, &blurs("none", "blur(3px)")));
+        let mut clipped = base.clone();
+        clipped.insert(Prop::CLIP_PATH, Rc::from("inset(2px)"));
+        let mut moved = blurs("blur(2px)", "blur(0)");
+        moved.insert(Prop::CLIP_PATH, Rc::from("inset(2px)"));
+        assert!(!composites(&clipped, &moved));
+        assert_eq!(effects::lone_blur(Some("BLUR( 4px )")), Some("4px"));
+        assert_eq!(effects::lone_blur(Some("blur()")), Some(""));
+        assert_eq!(effects::lone_blur(Some("blur(1px) blur(2px)")), None);
     }
 
     #[test]
@@ -2922,6 +3255,7 @@ mod tests {
                     &styles,
                     &visible,
                     &|_| true,
+                    &|_| f32::INFINITY,
                     at,
                     false,
                     &mut Vec::new(),
