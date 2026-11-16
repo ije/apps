@@ -11,7 +11,8 @@ A tiny, high performance, and low memory usage electron alternative with compati
 
 ## Important Rules
 
-- Redesign bad architecture/algo/api if needed, the project is under development.
+- Redesign bad architecture/algorithm/api without asking, the project is under development.
+- Use devtools skill @skills/apps-devtools/SKILL.md for profile/debugger.
 - When working on renderer, compare with chrome.
 - Don't use workaroud/trick in testings/examples to make falsely the rendering look same as chrome.
 - Build npm bin for current platform after cli/runtime/libs change.
