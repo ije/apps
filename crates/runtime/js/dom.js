@@ -76,6 +76,11 @@
   };
   const slot = node => { layout(); const i = 4 + node._id * 8; if (i >= limit || marks[node._id] & 16) return -1; if (node._placed !== version) { if (!node.isConnected) return -1; node._placed = version; } return i; };
   const metric = (node, k) => { const i = slot(node); return i < 0 ? 0 : geometry[i + k]; };
+  // A box that was never scrolled reads 0 without a layout.
+  const scrollOf = (node, k) => {
+    if (rootElement(node)) { if (pageScroller(node)) node = document; } else if ((stale || geometry[3]) && !observing && !call('dom.scrolled', node._id)) return 0;
+    return metric(node, k);
+  };
   // Do not cache client boxes from observer reads: they use the previous frame's styles.
   const client = node => { if (slot(node) < 0) return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; if (observing) return call('dom.client', node._id, true); const cached = node._client; if (cached?.[12] === geometry[2] && cached[13] === version) return cached; return node._client = [...call('dom.client', node._id), geometry[2], version]; };
   // Only scroll boxes have a scroll range, so other boxes take the border boxes of their children as their
@@ -901,8 +906,8 @@
     getClientRects() { return slot(this) < 0 ? listOf(DOMRectList, []) : listOf(DOMRectList, [this.getBoundingClientRect()]); }
     get clientWidth() { return rootElement(this) ? innerWidth : Math.round(client(this)[2]); } get clientHeight() { return rootElement(this) ? innerHeight : Math.round(client(this)[3]); }
     get clientLeft() { return Math.round(client(this)[0]); } get clientTop() { return Math.round(client(this)[1]); }
-    get scrollTop() { return metric(pageScroller(this) ? document : this, 5); } set scrollTop(value) { call('dom.scroll', this._id, null, Number(value)); }
-    get scrollLeft() { return metric(pageScroller(this) ? document : this, 4); } set scrollLeft(value) { call('dom.scroll', this._id, Number(value), null); }
+    get scrollTop() { return scrollOf(this, 5); } set scrollTop(value) { call('dom.scroll', this._id, null, Number(value)); }
+    get scrollLeft() { return scrollOf(this, 4); } set scrollLeft(value) { call('dom.scroll', this._id, Number(value), null); }
     get scrollWidth() { return pageScroller(this) ? Math.round(innerWidth + metric(document, 6)) : extent(this, 0); } get scrollHeight() { return pageScroller(this) ? Math.round(innerHeight + metric(document, 7)) : extent(this, 1); }
     scrollTo(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); call('dom.scroll', this._id, left ?? null, top ?? null, behavior); }
     scroll(left, top) { this.scrollTo(left, top); }
@@ -3580,9 +3585,11 @@
     commitStyles: { value() { const target = cssData.get(this).effect.target, computed = getComputedStyle(target); for (const frame of effects.get(cssData.get(this).effect).frames) for (const [name] of frame.props) target.style.setProperty(name, computed.getPropertyValue(name)); }, writable: true, configurable: true },
   });
   const cssOf = (node, subtree) => {
-    // Animations and transitions start when styles change, which the layout pass applies.
-    layout();
-    const list = call('dom.cssAnimations', node._id, subtree, subtree).map(([serial, id, kind, name, time, state, timing, direction, fill, easing, frames, pseudo]) => {
+    // Animations and transitions start when styles change, which the layout pass applies. Without a
+    // style that can start one, the styles alone answer.
+    let found = call('dom.cssAnimations', node._id, subtree, subtree, true);
+    if (found === null) { layout(); found = call('dom.cssAnimations', node._id, subtree, subtree, false); }
+    const list = found.map(([serial, id, kind, name, time, state, timing, direction, fill, easing, frames, pseudo]) => {
       let animation = cssAnimations.get(serial);
       if (!animation) {
         animation = new (kind === 'animation' ? CSSAnimation : CSSTransition)(cssToken);

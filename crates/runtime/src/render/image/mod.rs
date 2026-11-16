@@ -212,16 +212,32 @@ pub(crate) fn url_file(
 
 pub(crate) fn data_file(url: &str) -> Option<std::path::PathBuf> {
     use std::hash::{BuildHasher, Hash, Hasher};
-    type Files = rustc_hash::FxHashMap<u64, (Box<str>, std::path::PathBuf)>;
+    type Files = rustc_hash::FxHashMap<
+        u64,
+        (
+            Box<str>,
+            std::path::PathBuf,
+            std::cell::Cell<std::time::Instant>,
+        ),
+    >;
     thread_local!(static FILES: std::cell::RefCell<Files> = Default::default());
     let (header, payload) = url.strip_prefix("data:")?.split_once(',')?;
-    // Boxes build again on many frames: decode and write each URL once.
+    // Boxes build again on many frames: decode and write each URL once, and check that its file still
+    // exists at most once a second.
     let key = rustc_hash::FxBuildHasher.hash_one(url);
+    let now = std::time::Instant::now();
     if let Some(path) = FILES.with_borrow(|files| {
         files
             .get(&key)
-            .filter(|(known, path)| **known == *url && path.exists())
-            .map(|(_, path)| path.clone())
+            .filter(|(known, path, checked)| {
+                **known == *url
+                    && (now.duration_since(checked.get()).as_secs() < 1
+                        || path.exists() && {
+                            checked.set(now);
+                            true
+                        })
+            })
+            .map(|(_, path, _)| path.clone())
     }) {
         return Some(path);
     }
@@ -261,10 +277,10 @@ pub(crate) fn data_file(url: &str) -> Option<std::path::PathBuf> {
         }
     }
     FILES.with_borrow_mut(|files| {
-        if files.len() >= 64 {
+        if files.len() >= 256 {
             files.clear();
         }
-        files.insert(key, (url.into(), path.clone()));
+        files.insert(key, (url.into(), path.clone(), now.into()));
     });
     Some(path)
 }

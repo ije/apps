@@ -1196,6 +1196,29 @@ impl Motion {
         Some((node, animation))
     }
 
+    /// Whether the next frame starts no CSS animation or transition on these nodes: none has a new style
+    /// that can start one.
+    pub fn settled(&self, nodes: &[usize], styles: &ComputedStyles) -> bool {
+        let moves = |style: &Style| {
+            TRANSITIONS.iter().any(|&prop| style.contains(prop))
+                || [Prop::ANIMATION, Prop::ANIMATION_NAME]
+                    .iter()
+                    .any(|&prop| style.get(prop).is_some_and(|value| value != "none"))
+        };
+        nodes.iter().all(|&id| {
+            styles.values.get(id).is_none_or(|style| {
+                self.previous
+                    .get(id)
+                    .is_some_and(|previous| Rc::ptr_eq(previous, style))
+                    || !moves(style)
+                        && styles
+                            .pseudos
+                            .get(&id)
+                            .is_none_or(|pseudos| !pseudos.iter().any(moves))
+            })
+        })
+    }
+
     pub fn css(
         &self,
         nodes: &[usize],

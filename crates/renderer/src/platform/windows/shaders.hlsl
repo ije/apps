@@ -500,14 +500,19 @@ float4 draw_fragment(Varyings v) : SV_Target {
     if (kind == BOX) {
         color = box_color(p, v.rect, v.rx, v.ry, v.shape.xy, v.color, v.border_color, v.aux, flags);
     } else if (kind == SHADOW) {
+        float caster = saturate(0.5 - box_distance(p, v.aux, v.aux_rx, v.aux_ry, v.shape.xy));
+        bool inset = (flags & 1u) != 0u;
+        // An outer shadow is hidden under its box, which most of its quad covers.
+        if (!inset && caster >= 1.0) {
+            return float4(0.0, 0.0, 0.0, 0.0);
+        }
         float shape;
         if (v.info.z < 0.25) {
             shape = saturate(0.5 - box_distance(p, v.rect, v.rx, v.ry, v.shape.xy));
         } else {
             shape = blurred_box(p, v.rect, v.rx, v.ry, v.shape.xy, v.info.z);
         }
-        float caster = saturate(0.5 - box_distance(p, v.aux, v.aux_rx, v.aux_ry, v.shape.xy));
-        color = premultiply(v.color) * ((flags & 1u) != 0u ? (1.0 - shape) * caster : shape * (1.0 - caster));
+        color = premultiply(v.color) * (inset ? (1.0 - shape) * caster : shape * (1.0 - caster));
     } else if (kind == LINE) {
         color = premultiply(v.color);
         if ((flags & 1u) != 0u) {

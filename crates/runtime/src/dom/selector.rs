@@ -1,6 +1,7 @@
 use super::Document;
 use serde::{Deserialize, Serialize};
 use std::{
+    borrow::Cow,
     hash::{BuildHasher, Hash, Hasher},
     rc::Rc,
 };
@@ -36,7 +37,7 @@ fn feature(bloom: &mut Bloom, kind: u8, value: &str) {
     }
 }
 
-fn lowercase(value: &str) -> std::borrow::Cow<'_, str> {
+fn lowercase(value: &str) -> Cow<'_, str> {
     match value.bytes().any(|c| c.is_ascii_uppercase()) {
         true => value.to_ascii_lowercase().into(),
         false => value.into(),
@@ -1379,44 +1380,66 @@ impl Selector {
             .as_ref()
     }
 
-    pub(crate) fn key(&self) -> Option<(u8, &str)> {
+    // A node can match only if it has one of these keys. Empty means any node can match. Kind 4 is an exact
+    // attribute value, keyed as `name=value`.
+    pub(crate) fn keys(&self) -> Vec<(u8, Cow<'_, str>)> {
+        if let Some(key) = self.own_key() {
+            return vec![key];
+        }
+        for part in &self.simple {
+            let alternatives = match part {
+                SimpleSelector::Parent(selectors, _) => selectors.as_slice(),
+                SimpleSelector::Pseudo(name, _, selectors, _)
+                    if matches!(name.as_str(), "is" | "where") =>
+                {
+                    &selectors[..]
+                }
+                _ => continue,
+            };
+            let mut keys: Vec<(u8, Cow<str>)> = Vec::new();
+            for selector in alternatives {
+                let more = selector.keys();
+                if more.is_empty() {
+                    keys.clear();
+                    break;
+                }
+                for key in more {
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+            if !keys.is_empty() && keys.len() <= 32 {
+                return keys;
+            }
+        }
+        Vec::new()
+    }
+
+    fn own_key(&self) -> Option<(u8, Cow<'_, str>)> {
         self.simple
             .iter()
             .filter_map(|selector| match selector {
-                SimpleSelector::Id(id) => Some((0, id.as_str())),
-                SimpleSelector::Class(class) => Some((1, class.as_str())),
+                SimpleSelector::Id(id) => Some((0, Cow::Borrowed(id.as_str()))),
+                SimpleSelector::Class(class) => Some((1, Cow::Borrowed(class.as_str()))),
                 // Keys compare exactly, so mixed-case names, which also match lowercase HTML names, must get
                 // no key.
                 SimpleSelector::Tag(name) if !name.bytes().any(|c| c.is_ascii_uppercase()) => {
-                    Some((2, name.as_str()))
+                    Some((2, Cow::Borrowed(name.as_str())))
+                }
+                SimpleSelector::Attribute(name, operator, value, 0)
+                    if operator == "=" && !name.bytes().any(|c| c.is_ascii_uppercase()) =>
+                {
+                    Some((4, Cow::Owned(format!("{name}={value}"))))
                 }
                 SimpleSelector::Attribute(name, ..)
                     if !name.bytes().any(|c| c.is_ascii_uppercase()) =>
                 {
-                    Some((3, name.as_str()))
+                    Some((3, Cow::Borrowed(name.as_str())))
                 }
                 _ => None,
             })
-            .min_by_key(|(kind, _)| *kind)
-            .or_else(|| {
-                self.simple.iter().find_map(|part| {
-                    let alternatives = match part {
-                        SimpleSelector::Parent(selectors, _) => selectors.as_slice(),
-                        SimpleSelector::Pseudo(name, _, selectors, _)
-                            if matches!(name.as_str(), "is" | "where") =>
-                        {
-                            &selectors[..]
-                        }
-                        _ => return None,
-                    };
-                    // A second call for the first selector doubles the cost at each level of nesting.
-                    let key = alternatives.first()?.key()?;
-                    alternatives[1..]
-                        .iter()
-                        .all(|selector| selector.key() == Some(key))
-                        .then_some(key)
-                })
-            })
+            .min_by_key(|(kind, _)| [0, 1, 3, 4, 2][*kind as usize])
     }
 
     pub(crate) fn source(&self) -> String {

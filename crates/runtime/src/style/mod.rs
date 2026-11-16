@@ -641,7 +641,7 @@ struct CachedStyle {
     keyword: bool,
 }
 
-type Key = Option<(u8, String)>;
+type Key = Box<[(u8, String)]>;
 
 struct Share {
     from: usize,
@@ -663,7 +663,7 @@ struct StyleScope {
     pseudos: Vec<(usize, Selector, usize, Key)>,
     arguments: FxHashMap<usize, (Rc<str>, SelectorList, usize)>,
     elements: Vec<Vec<(usize, Key)>>,
-    buckets: [FxHashMap<String, Vec<usize>>; 4],
+    buckets: [FxHashMap<String, Vec<usize>>; 5],
     universal: Vec<usize>,
     containers: Vec<Option<ContainerQuery>>,
     blocks: Vec<Rc<MediaBlock>>,
@@ -741,26 +741,38 @@ impl StyleScope {
                             self.arguments
                                 .insert(self.pseudos.len(), (argument.into(), compound, target));
                         }
-                        let key: Key = pseudo.key().map(|(kind, name)| (kind, name.into()));
+                        let key: Key = pseudo
+                            .keys()
+                            .into_iter()
+                            .map(|(kind, name)| (kind, name.into_owned()))
+                            .collect();
                         let index = PSEUDO | self.pseudos.len();
-                        match &key {
-                            Some((kind, name)) => self.buckets[*kind as usize]
+                        for (kind, name) in &key {
+                            self.buckets[*kind as usize]
                                 .entry(name.clone())
                                 .or_default()
-                                .push(index),
-                            None => self.universal.push(index),
+                                .push(index);
+                        }
+                        if key.is_empty() {
+                            self.universal.push(index);
                         }
                         self.pseudos.push((kind, pseudo, order, key));
                         return None;
                     }
-                    let key: Key = selector.key().map(|(kind, name)| (kind, name.into()));
+                    let key: Key = selector
+                        .keys()
+                        .into_iter()
+                        .map(|(kind, name)| (kind, name.into_owned()))
+                        .collect();
                     let entry = order << SELECTOR | index;
-                    match &key {
-                        Some((kind, name)) => self.buckets[*kind as usize]
+                    for (kind, name) in &key {
+                        self.buckets[*kind as usize]
                             .entry(name.clone())
                             .or_default()
-                            .push(entry),
-                        None => self.universal.push(entry),
+                            .push(entry);
+                    }
+                    if key.is_empty() {
+                        self.universal.push(entry);
                     }
                     Some((index, key))
                 })
@@ -834,17 +846,18 @@ impl StyleScope {
             .clone()
             .any(|pseudo| matches!(pseudo.0, SLOTTED | PART));
         let keys = self.elements[start..].iter().flatten().map(|(_, key)| key);
-        let mut names: [rustc_hash::FxHashSet<&str>; 4] = Default::default();
+        let mut names: [rustc_hash::FxHashSet<&str>; 5] = Default::default();
         for key in keys.chain(added.map(|pseudo| &pseudo.3)) {
-            match key {
-                Some((kind, name)) => names[*kind as usize].insert(name),
-                None => {
-                    self.nodes.clear();
-                    return false;
-                }
-            };
+            if key.is_empty() {
+                self.nodes.clear();
+                return false;
+            }
+            for (kind, name) in key {
+                names[*kind as usize].insert(name);
+            }
         }
-        let [ids, classes, tags, attributes] = &names;
+        let [ids, classes, tags, attributes, values] = &names;
+        let mut pair = String::new();
         for (id, node) in doc.nodes.iter().enumerate() {
             let class = |name: &String| {
                 name.split_ascii_whitespace()
@@ -856,6 +869,14 @@ impl StyleScope {
                         .attrs
                         .keys()
                         .any(|name| attributes.contains(name.as_str()))
+                || !values.is_empty()
+                    && node.attrs.iter().any(|(name, value)| {
+                        pair.clear();
+                        pair.push_str(name);
+                        pair.push('=');
+                        pair.push_str(value);
+                        values.contains(pair.as_str())
+                    })
                 || !classes.is_empty() && node.attrs.get("class").is_some_and(class)
                 || !ids.is_empty()
                     && node
@@ -1204,20 +1225,14 @@ impl StyleCache {
         if *sizes == self.containers {
             return false;
         }
-        if self
+        // Styles with container units are not shared, so only the nodes in a resized container need a new style.
+        let mut flipped: Vec<usize> = self
             .sized
             .iter()
-            .any(|id| sizes.get(id) != self.containers.get(id))
-        {
-            self.units = true;
-            self.full = true;
-            self.sized.clear();
-            self.queries.clear();
-            self.uncache();
-            self.containers = sizes.clone();
-            return true;
-        }
-        let mut flipped = Vec::new();
+            .copied()
+            .filter(|id| sizes.get(id) != self.containers.get(id))
+            .collect();
+        self.units = !flipped.is_empty();
         for (&(scope, order, index, container), &(inline, matched, lengths)) in &self.queries {
             let query = self
                 .scopes
@@ -4321,6 +4336,7 @@ pub(crate) fn compute_styles(
     context: Option<&StyleContext>,
 ) -> ComputedStyles {
     let mut out = ComputedStyles::default();
+    let mut unique = rustc_hash::FxHashSet::default();
     let (reduced_motion, native_theme) = context.map_or_else(
         || (reduced_motion(), crate::desktop::native::theme_state()),
         |context| (context.reduced_motion, context.theme),
@@ -4614,6 +4630,15 @@ pub(crate) fn compute_styles(
                         }
                         gone.extend(removed.iter().map(|&index| (base.clone(), index)));
                     }
+                    // A sheet in the place of one that left, like a `<style>` with new text, loses all old rules.
+                    Some(previous)
+                        if !sheets.iter().any(|sheet| Rc::ptr_eq(sheet, previous))
+                            && !old.iter().any(|previous| Rc::ptr_eq(previous, sheet)) =>
+                    {
+                        next += 1;
+                        flags.fill(true);
+                        gone.extend((0..previous.0.len()).map(|index| (previous.clone(), index)));
+                    }
                     _ if old.iter().any(|previous| Rc::ptr_eq(previous, sheet)) => return None,
                     _ => flags.fill(true),
                 }
@@ -4747,10 +4772,8 @@ pub(crate) fn compute_styles(
                         blocks,
                         ..
                     } = std::mem::replace(&mut collected, blank());
-                    let plain = local
-                        && deleted.is_empty()
-                        && cached.keyframes == keyframes
-                        && cached.properties == properties;
+                    let plain =
+                        local && cached.keyframes == keyframes && cached.properties == properties;
                     // The dirty marks stand for the new rules in the last stored pass.
                     match style_cache.styled.as_mut().filter(|_| plain) {
                         Some(styled) => {
@@ -4772,17 +4795,37 @@ pub(crate) fn compute_styles(
                                     .iter()
                                     .any(|&index| deleted.contains(&cached.pseudos[index].2))
                         };
-                        for matched in &mut cached.nodes {
+                        // A fast pass styles these nodes again by their dirty marks.
+                        for (id, matched) in cached.nodes.iter_mut().enumerate() {
                             if matched
                                 .as_ref()
                                 .is_some_and(|matched| stale(&matched.rules, &matched.pseudos))
                             {
                                 *matched = None;
+                                style_cache.matches.mark(id, false);
                             }
                         }
                         style_cache.values.retain(|key, _| {
                             key.scope != cached.id || !stale(&key.rules.0, &key.pseudos)
                         });
+                        // The interaction states come from the rules that are left.
+                        let mut lists: Vec<_> = (cached.rules.iter())
+                            .filter(|rule| rule.2.origin != DELETED)
+                            .map(|rule| rule.0.clone())
+                            .collect();
+                        let (mut seen, mut parents, mut subject) =
+                            (std::collections::HashSet::new(), Vec::new(), true);
+                        cached.states = 0;
+                        while let Some(list) = lists.pop().or_else(|| {
+                            subject = false;
+                            parents.pop()
+                        }) {
+                            if seen.insert((Rc::as_ptr(&list), subject)) {
+                                for selector in list.iter() {
+                                    cached.states |= selector.states(&mut parents);
+                                }
+                            }
+                        }
                     }
                     if cached.keyframes != keyframes {
                         let animated = |value: &CachedStyle| {
@@ -4919,9 +4962,54 @@ pub(crate) fn compute_styles(
                 .map(|(&prop, value)| (prop, value.clone())),
         );
         if registry != *style_cache.environment.registry {
+            let old = &*style_cache.environment.registry;
+            let changed: rustc_hash::FxHashSet<Prop> = registry
+                .iter()
+                .filter(|(prop, value)| old.get(prop) != Some(value))
+                .map(|(prop, _)| *prop)
+                .chain(
+                    old.keys()
+                        .filter(|prop| !registry.contains_key(prop))
+                        .copied(),
+                )
+                .collect();
+            // A registration changes only the styles that hold the name or read it, as `var()` reads initial values.
+            let holds = |vars: &Vars| vars.iter().any(|(prop, _)| changed.contains(prop));
+            let touched =
+                |value: &CachedStyle| {
+                    let vars = value.vars.borrow();
+                    value.animations.is_some()
+                        || value.reads.as_ref().is_none_or(|reads| {
+                            reads.iter().any(|(prop, _)| changed.contains(prop))
+                        })
+                        || value.missing.iter().any(|name| {
+                            Prop::find(name).is_some_and(|prop| changed.contains(&prop))
+                        })
+                        || vars.0.as_ref().is_some_and(holds)
+                        || holds(&vars.1)
+                };
+            style_cache.values.retain(|_, values| {
+                values.retain(|value| !touched(value));
+                !values.is_empty()
+            });
+            for scope in &mut style_cache.scopes {
+                for (id, node) in scope.nodes.iter_mut().enumerate() {
+                    let Some(node) = node else { continue };
+                    if node.cached.as_ref().is_none_or(|cached| {
+                        touched(&cached.value)
+                            || cached.inherited.as_ref().is_some_and(holds)
+                            || holds(&cached.vars)
+                    }) {
+                        node.cached = None;
+                        style_cache.matches.mark(id, false);
+                    }
+                }
+            }
             style_cache.environment.registry = Rc::new(registry);
             style_cache.inheritable.clear();
-            style_cache.uncache();
+            if let Some(styled) = &mut style_cache.styled {
+                styled.environment.registry = style_cache.environment.registry.clone();
+            }
         }
     }
     if scheme != style_cache.environment.scheme {
@@ -5441,7 +5529,7 @@ pub(crate) fn compute_styles(
                     .map(|&index| index & !PSEUDO)
                     .filter(|&index| {
                         let (kind, selector, _, key) = &inner.pseudos[index];
-                        key.is_none()
+                        key.is_empty()
                             && *kind != 12
                             && selector.matches_cached(doc, root, None, matches)
                     })
@@ -5729,6 +5817,18 @@ pub(crate) fn compute_styles(
                             candidates.extend(list);
                         }
                     }
+                    if !scoped.buckets[4].is_empty() {
+                        let mut pair = String::new();
+                        for (name, value) in node.attrs.iter() {
+                            pair.clear();
+                            pair.push_str(name);
+                            pair.push('=');
+                            pair.push_str(value);
+                            if let Some(list) = scoped.buckets[4].get(pair.as_str()) {
+                                candidates.extend(list);
+                            }
+                        }
+                    }
                     let fresh = scoped.nodes[id].is_none();
                     let ancestors = matches.ancestors(doc, id);
                     let mut read = 0u16;
@@ -5788,8 +5888,12 @@ pub(crate) fn compute_styles(
                     }
                     let style = matches.reads(id, 6);
                     matches.depend(id, 6);
+                    // Each candidate selector reads the node again, so most entries repeat: drop them before sorting.
+                    unique.clear();
+                    matches
+                        .dependencies
+                        .retain(|dependency| unique.insert(*dependency));
                     matches.dependencies.sort_unstable();
-                    matches.dependencies.dedup();
                     matches.register(id);
                     let shared = intern(&mut scoped.lists, &matched);
                     let matched_pseudos = if matched_pseudos.is_empty() {

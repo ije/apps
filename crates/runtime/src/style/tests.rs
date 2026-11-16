@@ -3530,6 +3530,43 @@ fn pseudo_elements_match_through_buckets() {
 }
 
 #[test]
+fn selectors_match_through_value_and_alternative_buckets() {
+    let doc = Document::parse(
+        "<style>[data-k=a]{color:red}[data-k=A]{color:blue}[data-k=b i]{color:green}:is([data-k=c],.d){color:navy}.p{&.q,&[data-k=e]{color:teal}}:where(x-a:not([hidden]),x-a[hidden=until-found]){color:gray}</style><i data-k=a></i><u data-k=B></u><s data-k=c></s><s class=d></s><b class='p q'></b><b class=p data-k=e></b><b class=q></b><x-a></x-a><x-a hidden=until-found></x-a>",
+    );
+    let computed = styles(&doc, 800., 600.);
+    let color = |selector: &str| {
+        (0..doc.nodes.len())
+            .filter(|&id| doc.matches(id, selector))
+            .map(|id| computed[id].get("color").cloned().unwrap_or_default())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(color("i"), ["red"]);
+    assert_eq!(color("u"), ["green"]);
+    assert_eq!(color("s"), ["navy"; 2]);
+    assert_eq!(color("b"), ["teal", "teal", "#000000"]);
+    assert_eq!(color("x-a"), ["gray"; 2]);
+}
+
+#[test]
+fn quoted_strings_split_like_the_tokenizer() {
+    for (value, separator) in [
+        ("url(\"data:a,b c\"), url( 'x)y' ), none", ','),
+        ("\"a b\" 'c,d' e", ' '),
+        ("url(\"a\")url(b)", ' '),
+        ("url(a b)", ' '),
+        ("\"a\\\"b\", c", ','),
+        ("\"open, x", ','),
+    ] {
+        assert_eq!(
+            value::components(value, separator),
+            value::tokenized(value, separator),
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn light_dark_picks_nested_and_repeated_arguments_in_one_pass() {
     let many = vec!["light-dark(red, blue)"; 20_000].join(",");
     let doc = Document::parse(&format!(
@@ -4324,7 +4361,7 @@ fn host_rules_query_the_containers_of_the_flat_tree() {
     sizes.insert(slot, [50., 50.]);
     check(&sizes);
     #[cfg(debug_assertions)]
-    assert_eq!(cache.incremental, 2);
+    assert_eq!(cache.incremental, 4);
 }
 
 #[test]

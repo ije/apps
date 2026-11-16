@@ -113,6 +113,8 @@ struct Cached {
     id: u64,
     size: [u32; 2],
     region: [i32; 4],
+    scale: f32,
+    extent: [f32; 2],
     idle: u8,
     used: bool,
 }
@@ -552,13 +554,14 @@ impl RenderFrame {
         }
         let cached = self.cache.iter_mut().find(|cached| cached.key == key)?;
         (cached.used, cached.idle, cached.region) = (true, 0, region);
+        let (scale, [width, height]) = (cached.scale, cached.extent);
         self.textures.push(cached.size);
         self.kept.push(cached.id);
         self.layers.push(Layer {
             texture: self.textures.len() - 1,
             origin: [region[0], region[1]],
-            scale: 1.,
-            bounds: region.map(|value| value as f32),
+            scale,
+            bounds: [region[0] as f32, region[1] as f32, width, height],
         });
         Some(Target::Layer(self.layers.len() - 1))
     }
@@ -568,7 +571,12 @@ impl RenderFrame {
         let Target::Layer(index) = target else {
             return;
         };
-        let texture = self.layers[index].texture;
+        let Layer {
+            texture,
+            scale,
+            bounds,
+            ..
+        } = self.layers[index];
         let size = self.textures[texture];
         let pixels = |size: [u32; 2]| u64::from(size[0]) * u64::from(size[1]);
         // Small windows still keep a few small layers, since textures are at least 256 by 256 pixels.
@@ -585,6 +593,8 @@ impl RenderFrame {
             id: self.ids,
             size,
             region,
+            scale,
+            extent: [bounds[2], bounds[3]],
             idle: 0,
             used: true,
         });
@@ -601,46 +611,45 @@ impl RenderFrame {
         self.commands.push(Command::Pass(target, clear));
         let content = &scene.layers[layer];
         // Skip what a later opaque box hides, since stacked page backgrounds can fill the window many
-        // times. An effect that reads the target could see the hidden pixels, so then nothing is skipped.
-        let mut occluders: Vec<(usize, Rect<f32>, f32)> = Vec::new();
-        if !content.nested.iter().any(|nested| {
-            scene.layers[nested.layer]
-                .effect
-                .as_ref()
-                .is_some_and(|effect| {
+        // times. An effect that reads the target sees the pixels drawn before it, so a box after the effect
+        // hides only the boxes after the effect too.
+        let reads: Vec<usize> = (content.nested.iter())
+            .filter(|nested| {
+                (scene.layers[nested.layer].effect.as_ref()).is_some_and(|effect| {
                     effect.backdrop.is_some() || effect.blend_mode != BlendMode::Normal
                 })
-        }) {
-            let min = self.window[0] as f32 * self.window[1] as f32 / 64.;
-            occluders.extend(
-                content
-                    .instances
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, instance)| {
-                        instance.kind() == BOX
-                            && instance.color[3] >= 1.
-                            && instance.aux == [0.; 4]
-                            && instance.radii == [0.; 8]
-                            && instance.round_radii == [0.; 8]
-                    })
-                    .filter_map(|(at, instance)| {
-                        let bounds = instance.reach();
-                        let area = bounds.size.width * bounds.size.height;
-                        (area >= min).then_some((at, bounds, area))
-                    }),
-            );
-            if occluders.len() > 16 {
-                occluders.select_nth_unstable_by(16, |a, b| b.2.total_cmp(&a.2));
-                occluders.truncate(16);
-            }
-            occluders.sort_unstable_by_key(|occluder| std::cmp::Reverse(occluder.0));
+            })
+            .map(|nested| nested.at as usize)
+            .collect();
+        let min = self.window[0] as f32 * self.window[1] as f32 / 64.;
+        let mut occluders: Vec<(usize, Rect<f32>, f32, usize)> = (content.instances.iter())
+            .enumerate()
+            .filter(|(_, instance)| {
+                instance.kind() == BOX
+                    && instance.color[3] >= 1.
+                    && instance.aux == [0.; 4]
+                    && instance.radii == [0.; 8]
+                    && instance.round_radii == [0.; 8]
+            })
+            .filter_map(|(at, instance)| {
+                let bounds = instance.reach();
+                let area = bounds.size.width * bounds.size.height;
+                let read = reads.partition_point(|&read| read <= at);
+                let floor = read.checked_sub(1).map_or(0, |read| reads[read]);
+                (area >= min).then_some((at, bounds, area, floor))
+            })
+            .collect();
+        if occluders.len() > 16 {
+            occluders.select_nth_unstable_by(16, |a, b| b.2.total_cmp(&a.2));
+            occluders.truncate(16);
         }
+        occluders.sort_unstable_by_key(|occluder| std::cmp::Reverse(occluder.0));
         // With `trim`, an occluder that spans the box cuts off the side it covers. Cuts repeat until none
         // applies, since one cut can make another occluder span the rest.
         let visible = |at: usize, bounds: &mut Rect<f32>, trim: bool| loop {
             let before = *bounds;
-            for (_, over, _) in occluders.iter().take_while(|occluder| occluder.0 > at) {
+            let occluders = occluders.iter().take_while(|occluder| occluder.0 > at);
+            for (_, over, ..) in occluders.filter(|occluder| occluder.3 <= at) {
                 let (left, top, right, bottom) = (
                     bounds.origin.x,
                     bounds.origin.y,
@@ -785,6 +794,43 @@ impl RenderFrame {
         self.blur_pass(horizontal, both, region, sigma, [0., 1.], mirror);
         self.release(horizontal);
         (both, 0.)
+    }
+
+    // A layer that draws as before keeps its blur too. `key` is the key of the layer and the kind of blur.
+    fn blurred(
+        &mut self,
+        src: Target,
+        region: [i32; 4],
+        sigma: f32,
+        release: bool,
+        key: Option<(u64, u64, bool)>,
+    ) -> (Target, f32) {
+        let key = key.map(|(key, digest, keep)| {
+            (
+                crate::scene::mix(key, u64::from(sigma.to_bits())),
+                digest,
+                keep,
+            )
+        });
+        let [x, y, width, height] = self.rect(src).map(|value| value as i32);
+        if let Some(hit) = key.and_then(|(key, ..)| self.reuse(key, [x, y, width, height])) {
+            if release {
+                self.release(src);
+            }
+            return (
+                hit,
+                if sigma >= HALF_RESOLUTION_SIGMA {
+                    0.
+                } else {
+                    sigma
+                },
+            );
+        }
+        let (blurred, left) = self.blur(src, region, sigma, release, false);
+        if let Some((key, digest, true)) = key {
+            self.keep(blurred, key, digest, [x, y, width, height]);
+        }
+        (blurred, left)
     }
 
     fn blur_pass(
@@ -989,6 +1035,8 @@ impl RenderFrame {
             self.record_layer(scene, text, texture, true, depth + 1);
             texture
         });
+        // Blurs keep their pixels when the layer does.
+        let keeps = cached.is_some() || seen;
         let texture = match (cached, tile) {
             (Some(cached), _) => cached,
             (None, Some((tile, clear))) => {
@@ -1031,9 +1079,13 @@ impl RenderFrame {
         };
         let region_rect = region.map(|value| value as f32);
 
+        let kept = |kind: u64| {
+            key.zip(digest)
+                .map(|(key, digest)| (crate::scene::mix(key, kind), digest, keeps))
+        };
         if let Some((offset, sigma, color)) = effect.shadow {
             let (src, left) = if sigma > 0.25 {
-                self.blur(texture, region, sigma, false, false)
+                self.blurred(texture, region, sigma, false, kept(1))
             } else {
                 (texture, 0.)
             };
@@ -1065,7 +1117,7 @@ impl RenderFrame {
         }
 
         let (src, sigma) = if effect.blur > 0.25 {
-            self.blur(texture, region, effect.blur, true, false)
+            self.blurred(texture, region, effect.blur, true, kept(2))
         } else {
             (texture, 0.)
         };
@@ -1233,6 +1285,43 @@ mod tests {
                 [0., 0., 100., 20.],
                 [0., 20., 30., 80.]
             ]
+        );
+    }
+
+    #[test]
+    fn opaque_boxes_hide_only_what_backdrops_read_before_them() {
+        let mask = Clip::from(bounds([0., 0., 100., 100.]));
+        let mut scene = Scene::default();
+        let page = |scene: &mut Scene, red: f32| {
+            let mut instance = Instance::new(BOX, bounds([0., 0., 100., 100.]), mask);
+            instance.color = [red, 0., 0., 1.];
+            scene.push(instance);
+        };
+        page(&mut scene, 0.1);
+        page(&mut scene, 0.2);
+        let state = EffectState {
+            backdrop: Some(BackdropState {
+                bounds: bounds([0., 0., 50., 50.]),
+                corner_radii: Default::default(),
+                blur: 4.,
+                color_matrix: None,
+            }),
+            ..effect(mask)
+        };
+        scene.push_effect(state, None);
+        scene.push(Instance::new(BOX, bounds([0., 0., 50., 50.]), mask));
+        scene.pop_effect();
+        page(&mut scene, 0.3);
+        page(&mut scene, 0.4);
+        let mut frame = RenderFrame::default();
+        frame.record(&scene, [100, 100], 16384, true);
+        let reds: Vec<_> = (frame.instances.iter())
+            .map(|instance| instance.color[0])
+            .collect();
+        assert_eq!(
+            reds,
+            [0.2, 0., 0.4],
+            "the backdrop reads the second page, and the last page hides the third"
         );
     }
 
@@ -1602,6 +1691,50 @@ mod tests {
         }
         assert!(frame.cache.len() <= 5, "unused layers go");
         assert!(made <= 8, "the textures of dropped layers are used again");
+    }
+
+    #[test]
+    fn layers_that_draw_as_before_keep_their_blurs() {
+        let mask = Clip::from(bounds([0., 0., 800., 600.]));
+        let scene = |x: f32, sigma: f32| {
+            let mut scene = Scene::default();
+            scene.push(Instance::new(BOX, bounds([0., 0., 800., 600.]), mask));
+            let state = EffectState {
+                blur: sigma,
+                shadow: Some((crate::point(4., 4.), 12., crate::Color::BLACK)),
+                ..effect(mask)
+            };
+            scene.push_effect(state, None);
+            scene.push(Instance::new(BOX, bounds([x, 100., 100., 100.]), mask));
+            scene.pop_effect();
+            scene.diff(Some(&[]));
+            scene
+        };
+        let mut frame = RenderFrame::default();
+        let mut blurs = |scene: &Scene| {
+            frame.record(scene, [800, 600], 16384, true);
+            let blurs = frame.commands.iter();
+            blurs
+                .filter(|command| matches!(command, Command::Blur { .. }))
+                .count()
+        };
+        assert_eq!(
+            blurs(&scene(100., 2.)),
+            3,
+            "a half resolution shadow and a blur"
+        );
+        assert_eq!(
+            blurs(&scene(100., 2.)),
+            3,
+            "the second frame keeps the blurs"
+        );
+        assert_eq!(
+            blurs(&scene(100., 2.)),
+            0,
+            "the third frame draws the kept blurs"
+        );
+        assert_eq!(blurs(&scene(160., 2.)), 0, "a moved layer keeps its blurs");
+        assert_eq!(blurs(&scene(160., 3.)), 1, "another blur draws again");
     }
 
     #[test]

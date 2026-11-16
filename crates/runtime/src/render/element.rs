@@ -4094,30 +4094,32 @@ fn create(
         let inset = std::array::from_fn::<_, 4, _>(|side| {
             px(borders[side] + if content { padding[side] } else { 0. })
         });
-        el = el.child(
-            renderer::canvas(
-                |_, _| (),
-                move |bounds, _, window| {
-                    let outer = Rect::between(
-                        bounds.origin - point(px(borders[3]), px(borders[0])),
-                        bounds.bottom_right() + point(px(borders[1]), px(borders[2])),
-                    );
-                    let fill = Rect::between(
-                        outer.origin + point(inset[3], inset[0]),
-                        outer.bottom_right() - point(inset[1], inset[2]),
-                    );
-                    let corners = radius
-                        .resolve(outer.size)
-                        .inset(inset[0], inset[1], inset[2], inset[3])
-                        .fit(fill.size);
-                    window.draw_box(fill, corners, color, renderer::Border::default());
-                },
-            )
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full(),
-        );
+        let mut fill = renderer::canvas(
+            |_, _| (),
+            move |bounds, _, window| {
+                let outer = Rect::between(
+                    bounds.origin - point(px(borders[3]), px(borders[0])),
+                    bounds.bottom_right() + point(px(borders[1]), px(borders[2])),
+                );
+                let fill = Rect::between(
+                    outer.origin + point(inset[3], inset[0]),
+                    outer.bottom_right() - point(inset[1], inset[2]),
+                );
+                let corners = radius
+                    .resolve(outer.size)
+                    .inset(inset[0], inset[1], inset[2], inset[3])
+                    .fit(fill.size);
+                window.draw_box(fill, corners, color, renderer::Border::default());
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        if boxed {
+            fill.style().escape = renderer::Escape::OUTLINE;
+        }
+        el = el.child(fill);
     }
     let layers = canvas.map_or(style, |source| &styles.values[source]);
     let mut background = Vec::new();
@@ -4172,6 +4174,20 @@ fn create(
             &view.host.borrow().assets,
             canvas.is_some(),
         ));
+    }
+    // As in Chrome, the background of a scroll container doesn't scroll with the content or add to its scroll
+    // range, unless it is `local`.
+    if boxed
+        && !text_clip
+        && !layers
+            .get(Prop::BACKGROUND_ATTACHMENT)
+            .is_some_and(|value| value.contains("local"))
+    {
+        for layer in &mut background {
+            if let Child::Node(node) = layer {
+                node.style().escape = renderer::Escape::OUTLINE;
+            }
+        }
     }
     if text_clip {
         el = el.child(
@@ -8641,7 +8657,7 @@ fn inset_shadows(
     radius: renderer::Radii<renderer::Length>,
     borders: [f32; 4],
 ) -> Child {
-    let mut node = renderer::canvas(
+    let mut node = renderer::canvas_within(
         |_, _| (),
         move |bounds, _, window| {
             let outer = size(

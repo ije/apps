@@ -4368,6 +4368,34 @@ fn inset_shadows_stay_out_of_the_scroll_range_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn backgrounds_stay_out_of_the_scroll_range_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        await run("document.getElementById('s').scrollTop = 100");
+        for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+        const sizes = await run("[...document.querySelectorAll('.c')].map(c => [c.scrollWidth, c.clientWidth, c.scrollHeight, c.clientHeight].join(',')).join(' ')");
+        const bytes = (await win.webContents.capturePage({ x: 205, y: 205, width: 1, height: 1 })).toBitmap();
+        console.log('SIZES ' + sizes + ' EDGE ' + [bytes[2], bytes[1], bytes[0]].map(value => value > 200 ? 'f' : value < 60 ? '0' : '?').join(''));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0'><style>.c{width:120px;height:60px;padding:14px 16px;box-sizing:border-box;overflow-x:auto}.c i{display:block;height:20px}</style>\
+             <div class=c style='background:radial-gradient(#111,#000)'><i></i></div>\
+             <div class=c style='background:#000;background-clip:padding-box'><i></i></div>\
+             <div class=c id=s style='position:absolute;left:200px;top:200px;padding:0;background:linear-gradient(#f00 0 20px,#fff 0)'><i style='height:300px'></i></div></body>",
+        )],
+    );
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("SIZES "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's values: the child fits, so the boxes don't scroll, and the background of a scrolled box stays in place.
+    assert_eq!(line, "120,120,60,60 120,120,60,60 120,120,300,60 EDGE f00");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn pseudo_element_layers_follow_the_inner_border_corner_like_chrome() {
     let text = run_hidden(
         r#"

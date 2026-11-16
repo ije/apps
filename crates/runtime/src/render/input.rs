@@ -151,6 +151,10 @@ impl renderer::Hooks for FieldText {
         self.selected.set(selected);
     }
 
+    fn bounded(&self) -> bool {
+        true
+    }
+
     fn paint(&self, cx: &mut renderer::NodeCx<'_>, _: &mut dyn FnMut(&mut Window)) {
         let Some(layout) = cx.text_layout().cloned() else {
             return;

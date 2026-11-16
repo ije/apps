@@ -577,14 +577,19 @@ fn draw_fragment(v: Varyings) -> @location(0) vec4<f32> {
             color = box_color(p, v.rect, v.rx, v.ry, v.shape.xy, v.color, v.border_color, v.aux, flags);
         }
         case SHADOW: {
+            let caster = saturate(0.5 - box_distance(p, v.aux, v.aux_rx, v.aux_ry, v.shape.xy));
+            let inset = (flags & 1u) != 0u;
+            // An outer shadow is hidden under its box, which most of its quad covers.
+            if !inset && caster >= 1.0 {
+                return vec4<f32>(0.0);
+            }
             var shape = 0.0;
             if v.info.z < 0.25 {
                 shape = saturate(0.5 - box_distance(p, v.rect, v.rx, v.ry, v.shape.xy));
             } else {
                 shape = blurred_box(p, v.rect, v.rx, v.ry, v.shape.xy, v.info.z);
             }
-            let caster = saturate(0.5 - box_distance(p, v.aux, v.aux_rx, v.aux_ry, v.shape.xy));
-            color = premultiply(v.color) * select(shape * (1.0 - caster), (1.0 - shape) * caster, (flags & 1u) != 0u);
+            color = premultiply(v.color) * select(shape * (1.0 - caster), (1.0 - shape) * caster, inset);
         }
         case LINE: {
             color = premultiply(v.color);

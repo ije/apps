@@ -1132,7 +1132,7 @@ pub(super) fn axis_mask(
     units: &Lengths,
     [width, height]: [f32; 2],
     raster: [u32; 2],
-) -> Option<[Vec<f32>; 2]> {
+) -> Option<Option<Vec<u8>>> {
     let get =
         |[prop, webkit]: [Prop; 2]| style.get(prop).or_else(|| style.get(webkit)).unwrap_or("");
     let plain = |value: &str, defaults: &[&str]| {
@@ -1151,18 +1151,13 @@ pub(super) fn axis_mask(
         return None;
     }
     let images = style::components(get([Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]), ',');
-    if images.len() > 1
-        && !style::components(style.get(Prop::MASK_COMPOSITE)?, ',')
-            .iter()
-            .all(|part| part.trim() == "intersect")
-    {
-        return None;
-    }
-    let mut axes = [
-        vec![1f32; raster[0] as usize],
-        vec![1f32; raster[1] as usize],
-    ];
+    let composites = style::components(style.get(Prop::MASK_COMPOSITE).unwrap_or(""), ',');
+    let mut layers = Vec::with_capacity(images.len());
     for image in &images {
+        let mut axes = [
+            vec![1f32; raster[0] as usize],
+            vec![1f32; raster[1] as usize],
+        ];
         let body = image
             .trim()
             .strip_prefix("linear-gradient(")?
@@ -1177,7 +1172,14 @@ pub(super) fn axis_mask(
             "to top" | "0deg" => (1, true, true),
             "to right" | "90deg" => (0, false, true),
             "to left" | "270deg" => (0, true, true),
-            other if style::color(other).is_some() || other.is_empty() => (1, false, false),
+            other
+                if other.is_empty()
+                    || style::components(other, ' ')
+                        .first()
+                        .is_some_and(|part| style::color(part).is_some()) =>
+            {
+                (1, false, false)
+            }
             _ => return None,
         };
         let extent = [width, height][axis];
@@ -1201,8 +1203,46 @@ pub(super) fn axis_mask(
                 (None, None) => 1.,
             };
         }
+        layers.push(axes);
     }
-    Some(axes)
+    // As in `mask_svg`, layers go from the bottom up, and each joins the layers below it by its `mask-composite`.
+    let [width, height] = raster.map(|side| side as usize);
+    let (last, above) = layers.split_last()?;
+    let ops: Vec<u8> = (0..above.len())
+        .map(|index| {
+            let composite = composites.get(index % composites.len().max(1));
+            match composite.map_or("", |value| value.trim()) {
+                "intersect" | "source-in" => 1,
+                "subtract" | "source-out" => 2,
+                "exclude" | "xor" => 3,
+                _ => 0,
+            }
+        })
+        .collect();
+    let mut alpha = Vec::with_capacity(width * height);
+    for y in 0..height {
+        for x in 0..width {
+            let mut below = last[0][x] * last[1][y];
+            for ([across, down], op) in above.iter().zip(&ops).rev() {
+                let layer = across[x] * down[y];
+                below = match op {
+                    1 => layer * below,
+                    2 => layer * (1. - below),
+                    3 => layer * (1. - below) + below * (1. - layer),
+                    _ => layer + below * (1. - layer),
+                };
+            }
+            alpha.push(below);
+        }
+    }
+    if alpha.iter().all(|alpha| *alpha >= 0.999) {
+        return Some(None);
+    }
+    let mut bytes = vec![0; width * height * 4];
+    for (pixel, alpha) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(alpha) {
+        pixel[3] = (alpha * 255. + 0.5) as u8;
+    }
+    Some(Some(bytes))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1751,22 +1791,83 @@ mod tests {
         }
     }
 
+    // The SVG draws the two parts of `exclude` one over the other, so it matches the XOR of the standard only
+    // where alpha is 0 or 1.
     #[test]
-    fn gradient_masks_that_intersect_multiply_along_their_axes() {
+    fn axis_masks_draw_as_their_svg() {
+        let units = Lengths::new(16., 800., 600.);
+        for (image, composite) in [
+            (
+                "linear-gradient(#000 0 0), linear-gradient(#000 0 0)",
+                "exclude",
+            ),
+            (
+                "linear-gradient(to right, black 30%, transparent 70%), linear-gradient(to top, transparent, black)",
+                "subtract",
+            ),
+            (
+                "linear-gradient(to right, black 30%, transparent 70%), linear-gradient(to top, transparent, black)",
+                "intersect",
+            ),
+            (
+                "linear-gradient(to left, black, transparent), linear-gradient(to bottom, transparent 20%, black)",
+                "add",
+            ),
+            (
+                "linear-gradient(to left, black, transparent), linear-gradient(black 40%, transparent), linear-gradient(to right, transparent 10%, black)",
+                "subtract, add",
+            ),
+        ] {
+            let style = style(&[("mask-image", image), ("mask-composite", composite)]);
+            let fast = axis_mask(&style, &units, [100., 50.], [100, 50]).unwrap();
+            let layers = super::super::paint::mask_svg(
+                &style,
+                units,
+                [100., 50.],
+                None,
+                &Default::default(),
+            )
+            .unwrap();
+            let source = format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\">{layers}</svg>"
+            );
+            let tree = super::super::canvas::svg_tree(&source, false).unwrap();
+            let slow = super::super::canvas::svg_pixels(&tree, 100, 50, None).unwrap();
+            let fast = fast.unwrap_or_else(|| vec![255; 100 * 50 * 4]);
+            let worst = fast
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(slow.pixels())
+                .map(|(fast, slow)| fast[3].abs_diff(slow.alpha()))
+                .max();
+            assert!(worst <= Some(8), "{image} {composite}: {worst:?}");
+        }
+    }
+
+    #[test]
+    fn gradient_masks_composite_along_their_axes() {
         let units = Lengths::new(16., 800., 600.);
         let mask = |image: &str, composite: Option<&str>, raster: [u32; 2]| {
             let mut props = vec![("mask-image", image)];
             props.extend(composite.map(|value| ("mask-composite", value)));
             axis_mask(&style(&props), &units, [100., 50.], raster)
         };
+        let alpha = |bytes: &[u8], x: usize, y: usize| bytes[(y * 100 + x) * 4 + 3];
         let opaque = "linear-gradient(to left, black calc(100% - min(12px, 0px)), transparent 100%), linear-gradient(#fff, #fff)";
-        let [x, y] = mask(opaque, Some("intersect"), [100, 50]).unwrap();
-        assert!(x.iter().chain(&y).all(|alpha| *alpha >= 0.999));
+        assert_eq!(mask(opaque, Some("intersect"), [100, 50]), Some(None));
         let fades = "linear-gradient(to right, transparent, black 10px), linear-gradient(to top, transparent, black 10px)";
-        let [x, y] = mask(fades, Some("intersect"), [100, 50]).unwrap();
-        assert!(x[0] < 0.1 && x[50] >= 0.999);
-        assert!(y[0] >= 0.999 && y[49] < 0.1);
-        assert!(mask(fades, None, [100, 50]).is_none());
+        let bytes = mask(fades, Some("intersect"), [100, 50]).unwrap().unwrap();
+        assert!(alpha(&bytes, 0, 0) < 26 && alpha(&bytes, 50, 0) == 255);
+        assert!(alpha(&bytes, 50, 49) < 26);
+        let bytes = mask(fades, None, [100, 50]).unwrap().unwrap();
+        assert!(alpha(&bytes, 0, 0) == 255 && alpha(&bytes, 0, 49) < 26);
+        let halves =
+            "linear-gradient(to right, black 50%, transparent 50%), linear-gradient(#000 0 0)";
+        let bytes = mask(halves, Some("exclude"), [100, 50]).unwrap().unwrap();
+        assert!(alpha(&bytes, 10, 10) == 0 && alpha(&bytes, 90, 10) == 255);
+        let bytes = mask(halves, Some("subtract"), [100, 50]).unwrap().unwrap();
+        assert!(bytes.iter().all(|byte| *byte == 0));
         assert!(
             mask(
                 "linear-gradient(45deg, black, transparent)",

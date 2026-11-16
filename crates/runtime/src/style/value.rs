@@ -86,8 +86,12 @@ pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
     let bytes = value.as_bytes();
     let mut parts = Vec::new();
     let (mut open, mut depth, mut start, mut closed) = (0u64, 0u32, 0, false);
+    let mut quote_end = 0;
     let simple = 'scan: {
         for (index, &byte) in bytes.iter().enumerate() {
+            if index < quote_end {
+                continue;
+            }
             // The tokenizer ends a value after a block, as in `rotate(1deg)scale(2)`, so this fast scan must
             // give up there.
             if std::mem::take(&mut closed)
@@ -98,13 +102,28 @@ pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
                 break 'scan false;
             }
             match byte {
-                b'"' | b'\'' | b'\\' => break 'scan false,
+                // A string without escapes or newlines is one token, so the scan can skip it.
+                b'"' | b'\'' => {
+                    match bytes[index + 1..]
+                        .iter()
+                        .position(|&c| c == byte || matches!(c, b'\\' | b'\n' | b'\r' | b'\x0c'))
+                    {
+                        Some(end) if bytes[index + 1 + end] == byte => quote_end = index + end + 2,
+                        _ => break 'scan false,
+                    }
+                }
+                b'\\' => break 'scan false,
                 b'/' if bytes.get(index + 1) == Some(&b'*') => break 'scan false,
                 b'(' | b'[' | b'{' => {
+                    // `url(` without a quote is an unquoted URL token, which needs the tokenizer.
                     if depth == 32
                         || byte == b'('
                             && index >= 3
                             && bytes[index - 3..index].eq_ignore_ascii_case(b"url")
+                            && !matches!(
+                                bytes[index + 1..].iter().find(|c| !c.is_ascii_whitespace()),
+                                Some(b'"' | b'\'')
+                            )
                     {
                         break 'scan false;
                     }
@@ -139,7 +158,7 @@ pub(crate) fn components(value: &str, separator: char) -> Vec<&str> {
     tokenized(value, separator)
 }
 
-fn tokenized(value: &str, separator: char) -> Vec<&str> {
+pub(super) fn tokenized(value: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut input = cssparser::Parser::new(value);
     let mut start = input.position();

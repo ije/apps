@@ -1970,6 +1970,10 @@ pub fn call(
                     pending.extend(state.shadows.get(&node));
                 }
             }
+            // Without a layout, answer only when the frame would start nothing here.
+            if args[3].as_bool() == Some(true) && !state.motion.settled(&nodes, &styles) {
+                return Ok(Value::Null);
+            }
             Ok(json!(state.motion.css(
                 &nodes,
                 args[2].as_bool() == Some(true),
@@ -2409,6 +2413,11 @@ pub fn call(
                 Some(&range)
             )))
         }
+        // The renderer doesn't snap, so a box with no scroll offset, and none to come, is at 0 after any layout.
+        "dom.scrolled" => Ok(json!(state.scroll.get(&id).is_some_and(|handle| {
+            handle.offset() != renderer::Point::default()
+                || handle.target() != renderer::Point::default()
+        }))),
         "dom.scroll" => {
             let page = doc.nodes[id].parent == Some(0)
                 && doc.nodes[id].tag == "html"
@@ -4772,10 +4781,10 @@ mod tests {
             assert_eq!(result, "true", "{step}");
             passes.push(host.borrow().dom[&1].style_cache.incremental > before);
         }
-        // A rule that any node can match, and a deleted rule, need a full pass.
+        // A rule that any node can match needs a full pass.
         assert_eq!(
             passes,
-            [true, true, true, true, true, true, true, true, false, false]
+            [true, true, true, true, true, true, true, true, false, true]
         );
     }
 
@@ -5022,6 +5031,57 @@ mod tests {
         styles(&mut doc, &mut state, [800., 600.]);
         assert_eq!(state.sheets.len(), 199);
         assert!(!state.sheets.contains_key(".replacement{color:blue}"));
+    }
+
+    #[test]
+    fn registrations_restyle_the_nodes_that_read_them() {
+        let mut doc = Document::parse(
+            "<style>p{width:var(--w,5px)}b{--x:1}b span{height:var(--x,2px)}i{color:red}</style><p>x</p><b><span>y</span></b><i>z</i>",
+        );
+        let mut state = State::default();
+        styles(&mut doc, &mut state, [800., 600.]);
+        for (name, initial) in [("--w", "initial-value:7px"), ("--x", "")] {
+            let rule = format!("@property {name}{{syntax:\"*\";inherits:false;{initial}}}");
+            let value = style::Stylesheet::parse(&rule).property().unwrap();
+            state
+                .style_cache
+                .scripted
+                .insert(style::Prop::new(name), value);
+        }
+        state.invalidate();
+        let computed = styles(&mut doc, &mut state, [800., 600.]);
+        let find = |tag: &str| doc.nodes.iter().position(|node| node.tag == tag).unwrap();
+        assert_eq!(&computed.values[find("p")]["width"], "7px");
+        assert_eq!(&computed.values[find("span")]["height"], "2px");
+        assert_eq!(&computed.values[find("i")]["color"], "red");
+    }
+
+    #[test]
+    fn replaced_style_text_keeps_the_other_sheets() {
+        let mut doc = Document::parse(
+            "<style>p{color:red}</style><style>.a{color:green}.a+p{width:1px}</style><style>b{color:black}</style><p class=a>x</p><p>y</p><b>z</b><i>w</i>",
+        );
+        let find = |doc: &Document, tag: &str, nth: usize| {
+            let mut found = doc
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| node.tag == tag);
+            found.nth(nth).unwrap().0
+        };
+        let mut state = State::default();
+        styles(&mut doc, &mut state, [800., 600.]);
+        let sheet = find(&doc, "style", 1);
+        let text = doc.nodes[sheet].children[0];
+        doc.nodes[text].text = ".a{color:blue}".into();
+        doc.nodes[sheet].stylesheet = None;
+        state.invalidate();
+        let computed = styles(&mut doc, &mut state, [800., 600.]);
+        let [a, p, b] = [find(&doc, "p", 0), find(&doc, "p", 1), find(&doc, "b", 0)];
+        assert_eq!(&computed.values[a]["color"], "blue");
+        assert_eq!(&computed.values[p]["color"], "red");
+        assert_eq!(computed.values[p].get(Prop::WIDTH), None);
+        assert_eq!(&computed.values[b]["color"], "black");
     }
 
     #[test]

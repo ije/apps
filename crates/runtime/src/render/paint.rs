@@ -169,6 +169,11 @@ impl Hooks for Masked {
         false
     }
 
+    // Nothing draws outside the mask image.
+    fn bounded(&self) -> bool {
+        true
+    }
+
     fn skippable(&self) -> bool {
         true
     }
@@ -524,8 +529,14 @@ impl DomBox {
 }
 
 impl Hooks for DomBox {
+    // Of the effect layers, only filters draw outside the boxes inside.
     fn bounded(&self) -> bool {
-        self.placed.get().1.is_none() && self.effects.is_none() && !self.drawn
+        self.placed.get().1.is_none()
+            && !self.drawn
+            && (self.effects.is_none()
+                || [Prop::FILTER, Prop::WEBKIT_FILTER]
+                    .into_iter()
+                    .all(|prop| self.style.get(prop).is_none_or(|value| value == "none")))
     }
 
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
@@ -1204,17 +1215,9 @@ pub(super) fn mask(
                 })
         }) {
             let image = if shapes.is_none()
-                && let Some([across, down]) =
-                    super::effects::axis_mask(style, &units, size, raster)
+                && let Some(bytes) = super::effects::axis_mask(style, &units, size, raster)
             {
-                let opaque = |alpha: &f32| *alpha >= 0.999;
-                (!across.iter().all(opaque) || !down.iter().all(opaque)).then(|| {
-                    let mut bytes = vec![0; across.len() * down.len() * 4];
-                    for (row, y) in bytes.chunks_exact_mut(across.len() * 4).zip(&down) {
-                        for (pixel, x) in row.as_chunks_mut::<4>().0.iter_mut().zip(&across) {
-                            pixel[3] = (x * y * 255. + 0.5) as u8;
-                        }
-                    }
+                bytes.map(|bytes| {
                     std::sync::Arc::new(renderer::RenderImage::new(raster[0], raster[1], bytes))
                 })
             } else {
@@ -1264,7 +1267,7 @@ fn nest_effects(
     }
 }
 
-fn mask_svg<'a>(
+pub(super) fn mask_svg<'a>(
     style: &'a style::Style,
     units: style::Lengths,
     [width, height]: [f32; 2],

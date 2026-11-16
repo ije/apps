@@ -6,7 +6,7 @@ A tiny, high performance, and low memory usage electron alternative with compati
 
 - 120FPS vsync, 0 FPS when idle, low CPU load
 - Small runtime size (less than 10MB)
-- Fast launch (less than 300ms)
+- Fast launch (FCP less than 300ms)
 - Low memory usage (simple project less then 80mb)
 
 ## Important Rules
