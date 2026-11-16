@@ -455,8 +455,6 @@ pub struct Window {
     #[cfg(target_os = "macos")]
     caret_covered: bool,
     #[cfg(target_os = "macos")]
-    symbols: platform::symbols::Cache,
-    #[cfg(target_os = "macos")]
     controls: (Vec<crate::NativeControl>, Option<crate::ControlSink>),
     pub(crate) dirty: bool,
     drawing: bool,
@@ -521,8 +519,6 @@ impl Window {
             caret: None,
             #[cfg(target_os = "macos")]
             caret_covered: false,
-            #[cfg(target_os = "macos")]
-            symbols: platform::symbols::Cache::default(),
             #[cfg(target_os = "macos")]
             controls: Default::default(),
             dirty: false,

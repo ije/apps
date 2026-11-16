@@ -218,13 +218,13 @@ pub(super) fn cosmetic(old: &style::Style, new: &style::Style) -> bool {
     }
 }
 
-pub(super) fn content(node: &crate::dom::Node) -> (u64, u64) {
+pub(super) fn content(node: &crate::dom::Node, style: &crate::style::Style) -> (u64, u64) {
     use std::hash::{BuildHasher, Hash, Hasher};
     let mut shape = rustc_hash::FxHasher::default();
     node.tag.hash(&mut shape);
     node.text.hash(&mut shape);
     // Exclude field values from revisions: element::Patch rebuilds changed fields in place.
-    if !super::element::text_field(node) {
+    if !super::element::text_field(node, style) {
         node.value.hash(&mut shape);
     }
     (node.state & (crate::dom::CHECKED | crate::dom::DIRTY | crate::dom::BROKEN)).hash(&mut shape);
@@ -815,6 +815,7 @@ mod tests {
                     .filter(|node| !node.attrs.iter().next().is_none())
                     .nth(index)
                     .unwrap(),
+                &crate::style::Style::default(),
             )
             .0
         };
@@ -825,20 +826,21 @@ mod tests {
 
     #[test]
     fn content_hash_tells_what_can_resize_a_box() {
+        let style = crate::style::Style::default();
         let (mut doc, ..) = page("<p class=x data-v=1 id=a>text</p>");
         let id = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
-        let start = content(&doc.nodes[id]);
+        let start = content(&doc.nodes[id], &style);
         doc.nodes[id].attrs.set("class", "y");
         doc.nodes[id].attrs.set("data-v", "2");
-        let cosmetic = content(&doc.nodes[id]);
+        let cosmetic = content(&doc.nodes[id], &style);
         assert_eq!(cosmetic.0, start.0);
         assert_ne!(cosmetic.1, start.1);
         doc.nodes[id].attrs.set("colspan", "2");
-        assert_ne!(content(&doc.nodes[id]).0, start.0);
+        assert_ne!(content(&doc.nodes[id], &style).0, start.0);
         doc.nodes[id].attrs.remove("colspan");
-        assert_eq!(content(&doc.nodes[id]), cosmetic);
+        assert_eq!(content(&doc.nodes[id], &style), cosmetic);
         doc.nodes[id].value = Some("v".into());
-        assert_ne!(content(&doc.nodes[id]).0, start.0);
+        assert_ne!(content(&doc.nodes[id], &style).0, start.0);
         let (doc, ..) = page("<input id=f><input id=r type=range>");
         for (index, kind) in [(0, false), (1, true)] {
             let mut node = doc
@@ -848,10 +850,10 @@ mod tests {
                 .nth(index)
                 .unwrap()
                 .clone();
-            let old = content(&node);
+            let old = content(&node, &style);
             node.value = Some("5".into());
             assert_eq!(
-                content(&node) != old,
+                content(&node, &style) != old,
                 kind,
                 "only controls that draw their value resize with it"
             );

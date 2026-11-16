@@ -1500,35 +1500,6 @@ fn cycles_reexports_and_missing_exports() {
 }
 
 #[test]
-fn sf_symbol_tags_keep_siblings_and_tailwind_sizes() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("style.css"), "@import 'tailwindcss';").unwrap();
-    let path = dir.path().join("index.html");
-    fs::write(
-        &path,
-        "<link rel='stylesheet' href='./style.css'><main><sf-symbol-folder-fill class='size-16'/><span>After</span><sf-symbol-xmark /></main>",
-    )
-    .unwrap();
-    let source = html(&path, &Rc::default()).unwrap();
-    let doc = apps_runtime::bundle::page(&source);
-    let [symbol, after, close] = ["sf-symbol-folder-fill", "span", "sf-symbol-xmark"]
-        .map(|tag| doc.nodes.iter().position(|node| node.tag == tag).unwrap());
-    assert!(doc.nodes[symbol].children.is_empty());
-    assert!(doc.nodes[close].children.is_empty());
-    assert_eq!(
-        doc.nodes[doc.nodes[symbol].parent.unwrap()].children,
-        [symbol, after, close]
-    );
-    let styles = apps_runtime::style::styles(&doc, 800., 600.);
-    for property in ["width", "height"] {
-        assert_eq!(
-            apps_runtime::style::length(&styles[symbol][property], 0., 16., 800., 600.),
-            64.
-        );
-    }
-}
-
-#[test]
 fn glass_classes_work_with_nested_css_and_no_glass_import() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("style.css"), "@import './base.css';").unwrap();

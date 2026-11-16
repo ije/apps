@@ -2215,40 +2215,6 @@ fn range_inputs_sanitize_slide_and_step() {
 }
 
 #[test]
-fn sf_symbols_parse_and_serialize_as_void_elements() {
-    let (host, engine) = checked_page(
-        "<main id='symbols'><sf-symbol-folder/><span>Open</span><sf-symbol-doc-text /></main>",
-        r#"
-        const box = document.getElementById('symbols');
-        check('literal self closing symbols', () => box.children.length === 3 && box.children[1].localName === 'span' && !box.firstChild.hasChildNodes());
-        check('symbol outerHTML', () => box.firstChild.outerHTML === '<sf-symbol-folder/>');
-        const saved = box.innerHTML;
-        box.innerHTML = saved;
-        check('symbol innerHTML roundtrip', () => box.innerHTML === saved && box.children.length === 3);
-        box.firstChild.outerHTML = '<sf-symbol-square-and-arrow-up/>';
-        check('symbol outerHTML replacement', () => box.children.length === 3 && box.firstChild.localName === 'sf-symbol-square-and-arrow-up');
-        const created = document.createElement('sf-symbol-checkmark-circle-fill');
-        created.className = 'size-4';
-        box.append(created);
-        check('created symbol serialization', () => created.outerHTML === '<sf-symbol-checkmark-circle-fill class="size-4"/>');
-        const invalid = document.createElement('sf-symbol-folder--fill');
-        check('invalid suffix stays ordinary', () => invalid.outerHTML === '<sf-symbol-folder--fill></sf-symbol-folder--fill>');
-        "#,
-    );
-    let source = engine
-        .eval("document.getElementById('symbols').outerHTML", "test")
-        .unwrap();
-    let host = host.borrow();
-    let doc = &host.pages[&1].doc;
-    let id = doc
-        .nodes
-        .iter()
-        .position(|node| node.attrs.get("id").is_some_and(|id| id == "symbols"))
-        .unwrap();
-    assert_eq!(doc.serialize(id), source);
-}
-
-#[test]
 fn cssom_edits_keep_the_engine_and_detached_rules_apart() {
     let (_, engine) = css_page(
         "<html><head><style id=s>#a{color:red} @media all{#b{color:green}} @keyframes k{from{opacity:0}to{opacity:1}} @font-face{font-family:A;src:local(Arial)} @media not all{#c{color:blue}}</style></head><body><p id=a>a</p><p id=b>b</p><p id=c>c</p></body></html>",
@@ -2351,20 +2317,38 @@ fn focus_editing_fonts_and_xml_follow_the_standard() {
 }
 
 #[test]
-fn native_control_types_behave_as_their_fallbacks() {
+fn computed_appearance_follows_chrome() {
     checked_page(
-        "<form id='form'><input id='switch' name='wifi' type='ns-switch'><input id='range' type='NS-Range' value='250'><input id='text' type='ns-text' value='a'><input id='date' type='ns-date'><input id='button' type='ns-button' value='Go'></form>",
+        "<p>x</p>",
+        r#"
+        check('appearance follows chrome', () => {
+          const kinds = ['text', 'hidden', 'image', 'file', 'checkbox', 'radio', 'range', 'button'].map(type => { const input = document.createElement('input'); input.type = type; return input; });
+          const elements = [...kinds, ...['button', 'select', 'textarea', 'meter', 'progress', 'div', 'a', 'option', 'img'].map(tag => document.createElement(tag))];
+          document.body.append(...elements);
+          const values = elements.map(element => getComputedStyle(element).appearance).join();
+          elements.forEach(element => element.remove());
+          return values === 'auto,none,none,none,auto,auto,auto,auto,auto,auto,auto,auto,auto,none,none,none,none';
+        });
+        "#,
+    );
+}
+
+#[test]
+fn system_appearance_inputs_keep_their_types() {
+    checked_page(
+        "<style>input{appearance:system;padding:4px;border:2px solid red}</style><form id='form'><input id='switch' name='wifi' type='checkbox' switch><input id='range' type='range' value='250'><input id='text' value='a'><input id='date' type='date'><input id='button' type='button' value='Go'><input id='radio' type='radio'></form>",
         r#"
         const $ = id => document.getElementById(id);
-        check('fallback types', () => [...document.querySelectorAll('input')].map(input => input.type).join() === 'checkbox,range,text,date,button');
-        check('attribute keeps the native type', () => $('switch').getAttribute('type') === 'ns-switch' && $('switch').matches('[type=ns-switch]'));
+        check('types', () => [...document.querySelectorAll('input')].map(input => input.type).join() === 'checkbox,range,text,date,button,radio');
+        check('appearance', () => getComputedStyle($('text')).appearance === 'system');
         let events = '';
         for (const id of ['switch', 'range', 'text', 'button']) for (const type of ['input', 'change', 'click']) $(id).addEventListener(type, () => events += `${id}:${type} `);
         $('switch').click();
         check('switch toggles like a checkbox', () => $('switch').checked && $('switch').matches(':checked') && new FormData($('form')).get('wifi') === 'on');
         check('range sanitizes', () => $('range').value === '100');
         const mac = navigator.platform.startsWith('Mac');
-        check('native boxes draw nothing on macOS', () => getComputedStyle($('text')).borderTopWidth === (mac ? '0px' : '2px'));
+        check('native boxes draw nothing on macOS', () => getComputedStyle($('text')).borderTopWidth === (mac ? '0px' : '2px') && getComputedStyle($('text')).paddingLeft === (mac ? '0px' : '4px'));
+        check('other types keep their box', () => getComputedStyle($('radio')).borderTopWidth === '2px');
         events = '';
         __appsNativeControl($('text')._id, 'hello', false);
         __appsNativeControl($('text')._id, 'hello', true);

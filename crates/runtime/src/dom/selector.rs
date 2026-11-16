@@ -2225,7 +2225,6 @@ impl Selector {
                             memo.depend(id, 5);
                             node.state & super::DEFINED != 0
                                 || !node.tag.contains('-')
-                                || node.tag.starts_with("sf-symbol-")
                                 || matches!(
                                     node.tag.as_str(),
                                     "annotation-xml"
@@ -2353,8 +2352,6 @@ impl Selector {
                             node.tag == "dialog"
                                 && node.state & (super::MODAL | super::MODAL << 5) != 0
                         }
-                        "-internal-sf-symbol" => node.sf_symbol().is_some(),
-                        "-internal-native-control" => node.native_control().is_some(),
                         "disabled" | "enabled" => {
                             matches!(
                                 node.tag.as_str(),
@@ -3301,7 +3298,7 @@ mod tests {
     #[test]
     fn form_states_follow_fieldsets_and_pushed_bits() {
         let mut doc = Document::parse(
-            "<style>:disabled{color:red}:invalid{color:blue}:not(:defined){color:green}:indeterminate,:default{color:gray}</style><form><fieldset id=fs disabled><legend id=lg><input id=a></legend><input id=b><legend id=lg2><input id=c></legend></fieldset><select><optgroup id=og disabled><option id=o1>x</option></optgroup><option id=o2 selected>y</option></select><input id=cb type=CheckBox checked><input id=sub type=submit><button id=btn></button><x-el id=x></x-el><sf-symbol-star id=sf></sf-symbol-star><input id=t readonly></form><button id=out></button><p dir=RTL id=p></p><svg><feColorMatrix id=m type=Saturate></feColorMatrix></svg>",
+            "<style>:disabled{color:red}:invalid{color:blue}:not(:defined){color:green}:indeterminate,:default{color:gray}</style><form><fieldset id=fs disabled><legend id=lg><input id=a></legend><input id=b><legend id=lg2><input id=c></legend></fieldset><select><optgroup id=og disabled><option id=o1>x</option></optgroup><option id=o2 selected>y</option></select><input id=cb type=CheckBox checked><input id=sub type=submit><button id=btn></button><x-el id=x></x-el><input id=t readonly></form><button id=out></button><p dir=RTL id=p></p><svg><feColorMatrix id=m type=Saturate></feColorMatrix></svg>",
         );
         let find = |doc: &Document, id: &str| {
             (0..doc.nodes.len())

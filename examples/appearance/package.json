@@ -1,6 +1,6 @@
 {
-  "name": "nscontrol",
-  "productName": "NSControl",
+  "name": "appearance",
+  "productName": "Appearance",
   "private": true,
   "main": "main.js",
   "scripts": {

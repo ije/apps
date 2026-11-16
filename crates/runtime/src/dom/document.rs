@@ -1504,9 +1504,7 @@ impl Builder {
                     self.reconstruct();
                 }
                 let id = self.element(tag, attrs);
-                if self.nodes[id].sf_symbol().is_none() {
-                    self.push(id, false, None);
-                }
+                self.push(id, false, None);
                 Content::Markup
             }
         }
@@ -2291,10 +2289,6 @@ impl Document {
                         result.push('"');
                     }
                 }
-                if node.sf_symbol().is_some() {
-                    result.push_str("/>");
-                    continue;
-                }
                 result.push('>');
             }
             if !foreign && matches!(node.tag.as_str(), "script" | "style") {
@@ -2506,56 +2500,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn sf_symbols_are_void_html_elements_and_roundtrip() {
-        for symbol in [
-            "<sf-symbol-folder/>",
-            "<sf-symbol-folder />",
-            "<sf-symbol-folder>",
-            "<SF-SYMBOL-FOLDER></SF-SYMBOL-FOLDER>",
-        ] {
-            let source = format!(
-                "<button>{symbol}<span>Open</span><sf-symbol-doc-text class='size-4'/><b>End</b></button>"
-            );
-            for doc in [
-                Document::parse(&source),
-                Document::fragment(&source, "body"),
-            ] {
-                let button = find(&doc, "button");
-                assert_eq!(
-                    doc.nodes[button]
-                        .children
-                        .iter()
-                        .map(|&id| doc.nodes[id].tag.as_str())
-                        .collect::<Vec<_>>(),
-                    ["sf-symbol-folder", "span", "sf-symbol-doc-text", "b"]
-                );
-                assert!(
-                    doc.nodes[find(&doc, "sf-symbol-folder")]
-                        .children
-                        .is_empty()
-                );
-                assert!(doc.matches(find(&doc, "sf-symbol-folder"), ":-internal-sf-symbol"));
-                assert!(!doc.matches(find(&doc, "span"), ":-internal-sf-symbol"));
-                let source = doc.serialize(button);
-                assert_eq!(
-                    source,
-                    "<button><sf-symbol-folder/><span>Open</span><sf-symbol-doc-text class=\"size-4\"/><b>End</b></button>"
-                );
-                let again = Document::parse(&source);
-                assert_eq!(tree(&doc, button), tree(&again, find(&again, "button")));
-            }
-        }
-        let doc = Document::parse(
-            "<x-card/><span>inside</span></x-card><sf-symbol-folder--fill/><b>inside</b></sf-symbol-folder--fill><i>after</i>",
-        );
-        assert_eq!(parent(&doc, "span"), "x-card");
-        assert_eq!(parent(&doc, "b"), "sf-symbol-folder--fill");
-        assert_eq!(parent(&doc, "i"), "body");
-        let doc = Document::parse("<svg><sf-symbol-folder/><path d='M0 0'/></svg>");
-        assert_eq!(tree(&Document::parse(&doc.serialize(0)), 0), tree(&doc, 0));
     }
 
     #[test]

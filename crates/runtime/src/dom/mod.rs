@@ -461,16 +461,6 @@ pub(crate) const TOP_LAYER: u16 = MODAL | POPOVER | FULLSCREEN;
 pub(crate) const LEAVING: u16 = TOP_LAYER << 5;
 
 impl Node {
-    pub(crate) fn sf_symbol(&self) -> Option<&str> {
-        let name = self.tag.strip_prefix("sf-symbol-")?;
-        (!name.is_empty()
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-            && !name.split('-').any(str::is_empty))
-        .then_some(name)
-    }
-
     pub(crate) fn checked(&self) -> bool {
         if self.state & DIRTY != 0 {
             self.state & CHECKED != 0
@@ -4355,30 +4345,6 @@ mod tests {
             "{patches} {}",
             walk.nodes.len()
         );
-    }
-
-    #[test]
-    fn sf_symbol_names_require_nonempty_ascii_segments() {
-        for (tag, expected) in [
-            ("sf-symbol-folder", Some("folder")),
-            ("sf-symbol-square-and-arrow-up", Some("square-and-arrow-up")),
-            ("sf-symbol-4k-tv", Some("4k-tv")),
-            ("sf-symbol-arrow_uturn-right", Some("arrow_uturn-right")),
-            ("sf-symbol-", None),
-            ("sf-symbol--folder", None),
-            ("sf-symbol-folder-", None),
-            ("sf-symbol-folder--fill", None),
-            ("sf-symbol-folder.fill", None),
-            ("sf-symbol-étoile", None),
-            ("sf-icon-folder", None),
-            ("span", None),
-        ] {
-            let node = super::Node {
-                tag: tag.into(),
-                ..Default::default()
-            };
-            assert_eq!(node.sf_symbol(), expected, "{tag}");
-        }
     }
 
     #[test]

@@ -478,51 +478,6 @@ impl Window {
             .map(|(tile, _)| tile)
     }
 
-    pub fn draw_symbol(&mut self, name: &str, bounds: Rect<Pixels>, color: Color) {
-        if self.opacity <= 0. {
-            return;
-        }
-        #[cfg(target_os = "macos")]
-        {
-            if bounds.is_empty() || color.a <= 0. {
-                return;
-            }
-            let rect = self.snap_bounds(bounds);
-            let [width, height] = [rect.size.width, rect.size.height];
-            if !width.is_finite() || !height.is_finite() || width <= 0. || height <= 0. {
-                return;
-            }
-            let scale = (1024. / width.max(height)).min(1.);
-            let pixels = [
-                (width * scale).ceil() as u16,
-                (height * scale).ceil() as u16,
-            ];
-            let image = self.symbols.get(name, pixels, self.frames_drawn);
-            for id in self.symbols.retired.drain(..) {
-                self.platform.atlas().remove(&TileKey::Symbol(id));
-            }
-            let Some(image) = image else { return };
-            let tile =
-                self.platform
-                    .atlas()
-                    .get_or_insert_with(&TileKey::Symbol(image.id), &mut || {
-                        let size = size(i32::from(image.size[0]), i32::from(image.size[1]));
-                        Ok(Some((
-                            Rect::new(Point::default(), size),
-                            size,
-                            Cow::Borrowed(&image.bytes),
-                        )))
-                    });
-            if let Some((tile, _)) = tile {
-                let mut instance = self.sprite(GLYPH, rect, self.snapped_content_mask(), tile);
-                instance.color = color.fade(self.opacity).to_array();
-                self.scene.push(instance);
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = (name, bounds, color);
-    }
-
     pub fn draw_image(
         &mut self,
         bounds: Rect<Pixels>,

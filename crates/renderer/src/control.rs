@@ -1,6 +1,6 @@
 use crate::{Pixels, Rect};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ControlKind {
     Button,
     Switch,

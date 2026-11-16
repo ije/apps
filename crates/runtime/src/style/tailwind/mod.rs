@@ -661,6 +661,7 @@ const STATIC: &[(&str, &str)] = &[
     ),
     ("appearance-auto", "appearance:auto"),
     ("appearance-none", "appearance:none"),
+    ("appearance-system", "appearance:system"),
     (
         "backdrop-filter-none",
         "-webkit-backdrop-filter:none;backdrop-filter:none",

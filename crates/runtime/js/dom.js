@@ -332,7 +332,7 @@
     }
     return allowed;
   };
-  const rawText = /^(style|script|xmp|iframe|noembed|noframes|plaintext|noscript)$/, voids = /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr|sf-symbol-[a-zA-Z0-9_]+(?:-[a-zA-Z0-9_]+)*)$/, escapes = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\u00a0': '&nbsp;' };
+  const rawText = /^(style|script|xmp|iframe|noembed|noframes|plaintext|noscript)$/, voids = /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/, escapes = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\u00a0': '&nbsp;' };
   const integration = /^(foreignObject|desc|title)$/, inSvg = rec => !!rec && rec.tag[0] !== '#' && of(rec) instanceof SVGElement && !integration.test(rec.tag);
   // Use a stack, not recursion: deep trees overflow the JavaScript stack.
   const serialize = (root, inner = false) => {
@@ -348,7 +348,6 @@
       if (tag[0] !== '#') {
         let attrs = '';
         for (const [name, value] of rec.attrs) attrs += ' ' + name + '="' + value.replace(/[&"<>\u00a0]/g, c => escapes[c]) + '"';
-        if (tag.startsWith('sf-symbol-') && voids.test(tag)) { out += '<' + tag + attrs + '/>'; continue; }
         out += '<' + tag + attrs + '>';
         if (voids.test(tag)) continue;
         if (tag === 'template') { out += of(rec).innerHTML + '</template>'; continue; }
@@ -1039,7 +1038,6 @@
     assignedElements(options = {}) { return this.assignedNodes(options).filter(node => node.nodeType === 1); }
   }
   const inputTypes = new Set(['hidden','text','search','tel','url','email','password','date','month','week','time','datetime-local','number','range','color','checkbox','radio','file','submit','image','reset','button']);
-  const nativeTypes = new Map([['ns-button','button'],['ns-switch','checkbox'],['ns-range','range'],['ns-text','text'],['ns-search','search'],['ns-color','color'],['ns-date','date']]);
   const editable = node => node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement && /^(text|search|tel|url|email|password|number)$/.test(node.type);
   const sanitize = (type, value) => type === 'number' ? /^-?(\d+(\.\d+)?|\.\d+)([eE][-+]?\d+)?$/.test(value) ? value : '' : type === 'color' ? /^#[\da-f]{6}$/i.test(value) ? value.toLowerCase() : '#000000' : /^(text|search|tel|password|url|email)$/.test(type) ? (value = value.replace(/[\r\n]/g, ''), type === 'url' || type === 'email' ? value.trim() : value) : value;
   const assign = (node, value) => { const old = node.value; setValue(node, value); if (value !== old) { node._start = node._end = value.length; node._direction = 'none'; if (active === node) call('dom.selection', node._id, value.length, value.length); } };
@@ -1152,7 +1150,7 @@
     get name() { return this.getAttribute('name') ?? ''; }, set name(value) { this.setAttribute('name', value); },
   };
   class HTMLInputElement extends HTMLElement {
-    get type() { const type = (this.getAttribute('type') ?? '').toLowerCase(); return inputTypes.has(type) ? type : nativeTypes.get(type) ?? 'text'; } set type(value) { this.setAttribute('type', value); }
+    get type() { const type = (this.getAttribute('type') ?? '').toLowerCase(); return inputTypes.has(type) ? type : 'text'; } set type(value) { this.setAttribute('type', value); }
     get value() { const type = this.type; return /^(hidden|submit|image|reset|button)$/.test(type) ? this.getAttribute('value') ?? '' : type === 'checkbox' || type === 'radio' ? this.getAttribute('value') ?? 'on' : type === 'file' ? '' : type === 'range' ? rangeValue(this, this._value ?? this.getAttribute('value')) : this._value ?? sanitize(type, this.getAttribute('value') ?? ''); }
     set value(value) { value = String(value ?? ''); if (/^(hidden|submit|image|reset|button|checkbox|radio)$/.test(this.type)) this.setAttribute('value', value); else if (this.type !== 'file' || !value) { if (!value) this._files = null; assign(this, sanitize(this.type, value)); } }
     get defaultValue() { return this.getAttribute('value') ?? ''; } set defaultValue(value) { this.setAttribute('value', value); }

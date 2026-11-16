@@ -80,49 +80,6 @@ fn run_hidden(main: &str, pages: &[(&str, &str)]) -> String {
 
 #[test]
 #[ignore = "requires the macOS window server"]
-fn sf_symbol_elements_paint_and_follow_css() {
-    run_hidden(
-        r#"
-        await load('symbols.html');
-        const bounds = JSON.parse(await run(`JSON.stringify(['icon', 'next', 'inline', 'block'].map(id => {
-            const r = document.getElementById(id).getBoundingClientRect(); return [r.x, r.y, r.width, r.height];
-        }))`));
-        if (bounds[0][2] !== 32 || bounds[0][3] !== 32 || bounds[1][0] < 40 || bounds[2][2] !== 40 || bounds[2][3] !== 40 || Math.abs(bounds[2][1] - bounds[3][1]) > 1)
-            fail('symbol bounds: ' + JSON.stringify(bounds));
-        const colors = async (inset = 0) => {
-            const bytes = (await win.webContents.capturePage({ x: bounds[0][0] + inset, y: bounds[0][1] + inset, width: 32, height: 32 })).toBitmap();
-            let red = 0, green = 0;
-            for (let i = 0; i < bytes.length; i += 4) {
-                if (bytes[i + 2] > 180 && bytes[i + 1] < 80 && bytes[i] < 80) red++;
-                if (bytes[i + 1] > 180 && bytes[i + 2] < 80 && bytes[i] < 80) green++;
-            }
-            return [red, green];
-        };
-        const before = await colors();
-        if (before[0] < 100 || before[1] !== 0) fail('missing red symbol: ' + before);
-        await run("Object.assign(document.getElementById('icon').style, {boxSizing:'content-box', padding:'4px', border:'2px solid blue'})");
-        const padded = await colors(6);
-        if (padded[0] !== before[0]) fail('symbol content changed with padding: ' + padded + ' before ' + before);
-        await run("document.body.style.color = '#00e600'");
-        const after = await colors(6);
-        if (after[1] < 100 || after[0] !== 0) fail('symbol did not inherit color: ' + after);
-        await run("document.getElementById('icon').style.visibility = 'hidden'");
-        const hidden = await colors(6);
-        if (hidden[0] !== 0 || hidden[1] !== 0) fail('hidden symbol still paints: ' + hidden);
-        "#,
-        &[(
-            "symbols.html",
-            "<style>@import 'tailwindcss';body{margin:0;color:#e60000;background:white}</style>\
-             <div style='display:flex;align-items:center;gap:8px'><sf-symbol-square-fill id=icon class=size-8 />\
-             <button id=next>Next</button></div>\
-             <p style='font-size:20px;line-height:20px'>X<sf-symbol-info-circle id=inline style='display:inline;width:40px;height:40px' />\
-             <sf-symbol-info-circle id=block style='width:40px;height:40px' />Y</p>",
-        )],
-    );
-}
-
-#[test]
-#[ignore = "requires the macOS window server"]
 fn reloads_never_show_boxes_of_the_old_page() {
     run_hidden(
         r#"

@@ -8,7 +8,6 @@ mod metal;
 mod nsview;
 mod nswindow;
 mod open_type;
-pub(crate) mod symbols;
 mod text;
 mod threads;
 mod vsync;

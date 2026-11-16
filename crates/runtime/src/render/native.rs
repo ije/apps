@@ -5,42 +5,45 @@ use crate::{
 use renderer::{ControlEvent, ControlKind, ControlSink, NativeControl, Pixels, Rect};
 use std::sync::{Arc, Mutex, PoisonError};
 
-const FALLBACKS: [(&str, &str); 7] = [
-    ("ns-button", "button"),
-    ("ns-switch", "checkbox"),
-    ("ns-range", "range"),
-    ("ns-text", "text"),
-    ("ns-search", "search"),
-    ("ns-color", "color"),
-    ("ns-date", "date"),
-];
-
 impl Node {
     pub(crate) fn input_type(&self) -> &str {
-        let kind = self.attrs.get("type").map_or("text", String::as_str);
-        FALLBACKS
-            .iter()
-            .find(|(name, _)| kind.eq_ignore_ascii_case(name))
-            .map_or(kind, |(_, fallback)| fallback)
+        self.attrs.get("type").map_or("text", String::as_str)
     }
 
-    pub(crate) fn native_control(&self) -> Option<ControlKind> {
+    pub(crate) fn button_label(&self) -> &str {
+        self.attrs.get("value").map_or(
+            match self.input_type().to_ascii_lowercase().as_str() {
+                "submit" => "Submit",
+                "reset" => "Reset",
+                _ => "",
+            },
+            String::as_str,
+        )
+    }
+
+    /// The AppKit control of an input with `appearance: system`, on macOS.
+    pub(crate) fn native_control(&self, style: &style::Style) -> Option<ControlKind> {
+        if style.get(Prop::APPEARANCE) != Some("system") {
+            return None;
+        }
+        self.system_control()
+    }
+
+    /// The AppKit control that `appearance: system` gives this element, on macOS.
+    pub(crate) fn system_control(&self) -> Option<ControlKind> {
         if !cfg!(target_os = "macos") || self.tag != "input" {
             return None;
         }
-        let kind = self.attrs.get("type")?;
-        let index = FALLBACKS
-            .iter()
-            .position(|(name, _)| kind.eq_ignore_ascii_case(name))?;
-        Some(match index {
-            0 => ControlKind::Button,
-            1 => ControlKind::Switch,
-            2 if self.attrs.contains_key("step") => ControlKind::Stepper,
-            2 => ControlKind::Slider,
-            3 => ControlKind::Text,
-            4 => ControlKind::Search,
-            5 => ControlKind::Color,
-            _ => ControlKind::Date,
+        Some(match self.input_type().to_ascii_lowercase().as_str() {
+            "button" | "submit" | "reset" => ControlKind::Button,
+            "checkbox" if self.attrs.contains_key("switch") => ControlKind::Switch,
+            "range" => ControlKind::Slider,
+            "number" => ControlKind::Stepper,
+            "text" | "email" | "url" | "tel" => ControlKind::Text,
+            "search" => ControlKind::Search,
+            "color" => ControlKind::Color,
+            "date" => ControlKind::Date,
+            _ => return None,
         })
     }
 }
@@ -81,13 +84,18 @@ pub(super) fn register(controls: &std::cell::RefCell<Controls>, id: usize) {
     }
 }
 
-pub(super) fn sync(controls: &std::cell::RefCell<Controls>, doc: &Document) {
+pub(super) fn sync(
+    controls: &std::cell::RefCell<Controls>,
+    doc: &Document,
+    styles: &style::Chunked<std::rc::Rc<style::Style>>,
+) {
     let mut controls = controls.borrow_mut();
     if !controls.shown.is_empty() {
         controls.shown.retain(|&id, _| {
             doc.nodes
                 .get(id)
-                .is_some_and(|node| node.native_control().is_some())
+                .zip(styles.get(id))
+                .is_some_and(|(node, style)| node.native_control(style).is_some())
         });
     }
 }
@@ -111,7 +119,7 @@ pub(super) fn paint(
     else {
         return;
     };
-    let Some(kind) = node.native_control() else {
+    let Some(kind) = node.native_control(style) else {
         return;
     };
     let attr = |name: &str| node.attrs.get(name).cloned().unwrap_or_default();
@@ -129,7 +137,7 @@ pub(super) fn paint(
             (_, dark) => Some(dark),
         },
         value: match kind {
-            ControlKind::Button => attr("value"),
+            ControlKind::Button => node.button_label().to_owned(),
             _ => node.current_value().unwrap_or("").to_owned(),
         },
         placeholder: attr("placeholder"),

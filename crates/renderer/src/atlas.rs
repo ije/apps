@@ -18,15 +18,11 @@ const MIN_TEXTURE_SIDE: i32 = 1024;
 pub(crate) enum TileKey {
     Glyph(GlyphRaster),
     Image(u64),
-    #[cfg(target_os = "macos")]
-    Symbol(u64),
 }
 
 impl TileKey {
     fn kind(&self) -> PageKind {
         match self {
-            #[cfg(target_os = "macos")]
-            Self::Symbol(_) => PageKind::Mask,
             Self::Glyph(params) if !params.emoji => PageKind::Mask,
             _ => PageKind::Color,
         }

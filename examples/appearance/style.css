@@ -1,0 +1,14 @@
+/* Utilities without preflight, so the `auto` column keeps the default look of each input. */
+@import "tailwindcss/theme";
+@import "tailwindcss/utilities";
+
+:root {
+  color-scheme: light dark;
+  font-family: system-ui;
+  font-size: 13px;
+}
+
+/* Plain CSS: every input in the box gets its AppKit control on macOS. */
+.system input {
+  appearance: system;
+}

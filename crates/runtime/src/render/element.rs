@@ -1094,7 +1094,7 @@ pub(super) fn element(
     if !checking && !build.view.repaint.borrow().is_empty() {
         build.view.built.borrow_mut().insert(id);
     }
-    let patch = text_field(&build.doc.nodes[id]).then(|| Patch {
+    let patch = text_field(&build.doc.nodes[id], &build.styles.values[id]).then(|| Patch {
         ancestors: build.ancestors.clone(),
         containing,
         container,
@@ -1377,7 +1377,6 @@ fn create(
     let depth = ancestors.len();
     let mark = reads.borrow().len();
     let node = &doc.nodes[id];
-    let symbol = node.sf_symbol();
     let style = &styles.values[id];
     let display =
         style
@@ -1720,12 +1719,10 @@ fn create(
     let mut pending: Vec<usize> = if drawable {
         let boxes = |child: &&usize| !doc.nodes[**child].tag.starts_with('#');
         node.children.iter().rev().filter(boxes).copied().collect()
-    } else if symbol.is_some()
-        || matches!(
-            node.tag.as_str(),
-            "svg" | "canvas" | "iframe" | "progress" | "meter" | "terminal"
-        )
-    {
+    } else if matches!(
+        node.tag.as_str(),
+        "svg" | "canvas" | "iframe" | "progress" | "meter" | "terminal"
+    ) {
         Vec::new()
     } else {
         node.children.iter().rev().copied().collect()
@@ -1798,7 +1795,8 @@ fn create(
     // width.
     let (mut natural, mut natural_ratio) = match node.tag.as_str() {
         "img" | "video" => (None, None),
-        _ => natural_size(doc, id, None).map_or((None, None), |(size, ratio)| (Some(size), ratio)),
+        _ => natural_size(doc, id, None, style)
+            .map_or((None, None), |(size, ratio)| (Some(size), ratio)),
     };
     #[cfg(debug_assertions)]
     let checking = reader.checking;
@@ -1812,8 +1810,7 @@ fn create(
         && natural.is_none()
         && id != 0
         && !broken
-        && symbol.is_none()
-        && node.native_control().is_none()
+        && node.native_control(style).is_none()
         && !styles.pseudos.contains_key(&id)
         && !top_layer.contains(&id)
         && matches!(
@@ -2002,8 +1999,7 @@ fn create(
             el.style().align_content = Some(renderer::AlignContent::FlexStart);
             el.style().inline = renderer::Inline::Lines;
         }
-        let merged = !text_field(node)
-            && symbol.is_none()
+        let merged = !text_field(node, style)
             && !matches!(node.tag.as_str(), "svg" | "canvas" | "iframe" | "terminal")
             && inline_text().is_some();
         if display != "inline"
@@ -2106,6 +2102,7 @@ fn create(
                     [size.width as u32 as f32, size.height as u32 as f32]
                 })
                 .or(vector.as_ref().map(|(_, natural)| *natural)),
+            style,
         )
         .map_or((None, None), |(size, ratio)| (Some(size), ratio));
         if image.is_some() || vector.is_some() {
@@ -2455,14 +2452,14 @@ fn create(
                 .is_none_or(|value| matches!(value, "normal" | "stretch"))
     };
     let input = (node.tag == "input").then(|| node.input_type());
-    let appkit = node.native_control();
+    let appkit = node.native_control(style);
     if appkit.is_some() {
         super::native::register(&view.controls, id);
     }
     let check = input.is_some_and(|kind| {
         kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
     });
-    let editable = text_field(node);
+    let editable = text_field(node, style);
     let dark = || {
         if style
             .get(Prop::COLOR_SCHEME)
@@ -2525,7 +2522,7 @@ fn create(
     if appkit == Some(renderer::ControlKind::Button) {
         let [padding, height] = super::native::size(renderer::ControlKind::Button);
         if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
-            let label = node.attrs.get("value").map_or("", String::as_str);
+            let label = node.button_label();
             let run = style::text_run(style, &units, label.len());
             let width = text.shape_line(label, px(units.font.em), &run).line.width;
             el = el.w(px(layout_ceil(f32::from(width) + padding, pixel_ratio)));
@@ -2708,7 +2705,6 @@ fn create(
         el = el.text_color(style::rgba(ink));
     }
     let inline_box = display == "inline"
-        && symbol.is_none()
         && !node.tag.starts_with('#')
         && !flex_parent
         && slot.is_none()
@@ -3882,7 +3878,6 @@ fn create(
         }
     }
     let replaced = natural.is_some()
-        || symbol.is_some()
         || matches!(
             node.tag.as_str(),
             "svg" | "input" | "button" | "select" | "textarea" | "progress" | "meter"
@@ -3952,7 +3947,7 @@ fn create(
         let align = style.get(Prop::VERTICAL_ALIGN).unwrap_or("baseline");
         let middle = match el.style().size.height {
             _ if align != "middle" => None,
-            _ if display == "inline" && symbol.is_none() => Some(units.font.lh),
+            _ if display == "inline" => Some(units.font.lh),
             renderer::Length::Px(height) => Some(f32::from(height) + margin[0] - margin[2]),
             _ => None,
         };
@@ -3969,22 +3964,20 @@ fn create(
             font.lh - f32::from(text.baseline(face, px(font.em), px(font.lh), pixel_ratio))
         };
         let line = styles.lengths[parent].font;
-        let replaced = symbol.is_some()
-            || matches!(
-                node.tag.as_str(),
-                "img"
-                    | "svg"
-                    | "canvas"
-                    | "video"
-                    | "audio"
-                    | "iframe"
-                    | "embed"
-                    | "object"
-                    | "progress"
-                    | "meter"
-                    | "textarea"
-            )
-            || check
+        let replaced = matches!(
+            node.tag.as_str(),
+            "img"
+                | "svg"
+                | "canvas"
+                | "video"
+                | "audio"
+                | "iframe"
+                | "embed"
+                | "object"
+                | "progress"
+                | "meter"
+                | "textarea"
+        ) || check
             || display == "inline-block"
                 && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
                     .into_iter()
@@ -4203,22 +4196,6 @@ fn create(
     }
     el = el.children(border_image);
     el = el.children(field_layer);
-    if cfg!(target_os = "macos")
-        && let Some(symbol) = symbol
-    {
-        let symbol = symbol.replace('-', ".");
-        el = el.child(
-            renderer::canvas(
-                |_, _| (),
-                move |bounds, _, window| window.draw_symbol(&symbol, bounds, ink),
-            )
-            .absolute()
-            .top(px(padding[0]))
-            .right(px(padding[1]))
-            .bottom(px(padding[2]))
-            .left(px(padding[3])),
-        );
-    }
     el = el.children(content_layers);
     if let Some(fit) = picture {
         let inset = |side: usize| px(borders[side] + padding[side]);
@@ -5535,8 +5512,7 @@ fn create(
         .is_some_and(|v| matches!(v, "pre" | "pre-wrap" | "break-spaces"))
         || node.tag == "pre";
     if hit.is_none()
-        && (node.tag == "#text"
-            || display == "inline" && symbol.is_none() && !flex_parent && slot.is_none())
+        && (node.tag == "#text" || display == "inline" && !flex_parent && slot.is_none())
         && style
             .get(Prop::WHITE_SPACE)
             .is_none_or(|value| !matches!(value, "pre" | "nowrap"))
@@ -5546,24 +5522,22 @@ fn create(
     if preserve && node.text == "\n" {
         el = el.min_h(px(units.font.lh));
     }
-    let inline = if editable
-        || symbol.is_some()
-        || matches!(node.tag.as_str(), "svg" | "canvas" | "iframe" | "terminal")
-    {
-        None
-    } else {
-        inline_text().filter(|data| {
-            !data.text.is_empty() || {
-                let found = content_editable(doc, id);
-                reader.log(
-                    Query::Editable,
-                    found.map_or(1, |node| reader.scope_of(id, node)),
-                    hashed(found.is_some()),
-                );
-                found.is_some()
-            }
-        })
-    };
+    let inline =
+        if editable || matches!(node.tag.as_str(), "svg" | "canvas" | "iframe" | "terminal") {
+            None
+        } else {
+            inline_text().filter(|data| {
+                !data.text.is_empty() || {
+                    let found = content_editable(doc, id);
+                    reader.log(
+                        Query::Editable,
+                        found.map_or(1, |node| reader.scope_of(id, node)),
+                        hashed(found.is_some()),
+                    );
+                    found.is_some()
+                }
+            })
+        };
     let hit_test = inline.is_some();
     let drag = style
         .get(Prop::APP_REGION)
@@ -7607,10 +7581,10 @@ pub(crate) fn dimension(value: &str, integer: bool) -> Option<f32> {
         .filter(|value| value.is_finite())
 }
 
-pub(super) fn text_field(node: &crate::dom::Node) -> bool {
+pub(super) fn text_field(node: &crate::dom::Node, style: &style::Style) -> bool {
     node.tag == "textarea"
         || node.tag == "input"
-            && node.native_control().is_none()
+            && node.native_control(style).is_none()
             && ![
                 "checkbox", "radio", "button", "submit", "reset", "image", "file", "color",
                 "range", "hidden",
@@ -7623,6 +7597,7 @@ pub(super) fn natural_size(
     doc: &Document,
     id: usize,
     decoded: Option<[f32; 2]>,
+    style: &style::Style,
 ) -> Option<([f32; 2], Option<f32>)> {
     let node = &doc.nodes[id];
     let attr = |name: &str, default: f32| {
@@ -7643,7 +7618,7 @@ pub(super) fn natural_size(
         ""
     };
     if let Some(native) = node
-        .native_control()
+        .native_control(style)
         .filter(|native| *native != renderer::ControlKind::Button)
     {
         return Some((super::native::size(native), None));
@@ -8049,7 +8024,6 @@ fn margin_collapses_through(build: &Build<'_>, id: usize, side: usize, width: f3
         ]
     };
     id != 0
-        && doc.nodes[id].sf_symbol().is_none()
         && !matches!(
             doc.nodes[id].tag.as_str(),
             "html"

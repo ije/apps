@@ -937,7 +937,7 @@ impl PageView {
                     shown(id)
                         && id != 0
                         && !matches!(doc.nodes[id].tag.as_str(), "html" | "body")
-                        && !element::text_field(&doc.nodes[id])
+                        && !element::text_field(&doc.nodes[id], &styles.values[id])
                         && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
                             .into_iter()
                             .all(|prop| {
@@ -953,7 +953,7 @@ impl PageView {
                 dom.bounds.unscroll(id);
             }
         }
-        native::sync(&self.controls, &doc);
+        native::sync(&self.controls, &doc, &styles.values);
         let iframes = &dom.cull.iframes;
         let frame_nodes = || iframes.iter().copied().filter(|&id| visible[id]);
         let mut frames = self.frames.borrow_mut();
@@ -1280,12 +1280,12 @@ impl PageView {
                 let (shape, attrs) = match old {
                     Some(old) if old.seen == revision => {
                         debug_assert!(
-                            (old.shape, old.attrs) == cull::content(node),
+                            (old.shape, old.attrs) == cull::content(node, style),
                             "node {id} changed without a new revision"
                         );
                         (old.shape, old.attrs)
                     }
-                    _ => cull::content(node),
+                    _ => cull::content(node, style),
                 };
                 let pseudos = styles.pseudos.get(&id);
                 let repseudoed = |old: &crate::dom::LayoutNode| match (&old.pseudos, pseudos) {

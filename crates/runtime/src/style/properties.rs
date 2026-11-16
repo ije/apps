@@ -91,7 +91,7 @@ props! {
     ANIMATION_PLAY_STATE "animation-play-state" "[running|paused]#",
     ANIMATION_TIMING_FUNCTION "animation-timing-function" "[<easing-function>]#",
     APP_REGION "app-region" inherited "none|drag|no-drag",
-    APPEARANCE "appearance" "none|auto|menulist-button|textfield|button|checkbox|radio|searchfield|textarea|menulist|listbox|meter|progress-bar|push-button|square-button|slider-horizontal|base-select",
+    APPEARANCE "appearance" "none|auto|system|menulist-button|textfield|button|checkbox|radio|searchfield|textarea|menulist|listbox|meter|progress-bar|push-button|square-button|slider-horizontal|base-select",
     ASPECT_RATIO "aspect-ratio" "*",
     BACKDROP_FILTER "backdrop-filter" "none|[blur(|brightness(|contrast(|drop-shadow(|grayscale(|hue-rotate(|invert(|opacity(|saturate(|sepia(|url(]+",
     BACKFACE_VISIBILITY "backface-visibility" "visible|hidden",

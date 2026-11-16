@@ -189,7 +189,7 @@ System web views sit above the GPU page. Their engines are WKWebView on macOS, W
 
 The runtime tracks `<webview>` and `<iframe>` bounds and routes view events back to their DOM elements. `webContents.debugger` supports only commands with an equivalent in the system web view.
 
-On macOS, `ns-*` inputs use AppKit controls and Liquid Glass uses `NSGlassEffectView`. The render thread sends bounds and state to main. Main retains only the latest queued updates. Glass frames need a main-thread presentation transaction, and `capturePage()` cannot capture native glass.
+On macOS, inputs with `appearance: system` use AppKit controls and Liquid Glass uses `NSGlassEffectView`. The render thread sends bounds and state to main. Main retains only the latest queued updates. Glass frames need a main-thread presentation transaction, and `capturePage()` cannot capture native glass.
 
 ## Canvas, WebGPU, and media
 

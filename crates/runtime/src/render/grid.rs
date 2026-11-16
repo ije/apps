@@ -644,7 +644,7 @@ pub(crate) fn intrinsic(
     let mut content = [0f32; 3];
     let mut collapsed = None;
     let natural = (node.tag != "svg")
-        .then(|| super::element::natural_size(doc, id, measured.naturals.get(&id).copied()))
+        .then(|| super::element::natural_size(doc, id, measured.naturals.get(&id).copied(), style))
         .flatten();
     if let Some((natural, ratio)) = natural {
         let hint = [0, 1].map(|axis| {
@@ -689,7 +689,7 @@ pub(crate) fn intrinsic(
             _ => [width.unwrap_or(24.), height.unwrap_or(24.)],
         };
         content = [width, width, height];
-    } else if super::element::text_field(node) {
+    } else if super::element::text_field(node, style) {
         let [width, height] = super::element::field_size(
             doc,
             id,
@@ -735,7 +735,7 @@ pub(crate) fn intrinsic(
                 .width,
         );
         content = [width, width, units.font.lh];
-        if node.native_control().is_some() {
+        if node.native_control(style).is_some() {
             let [padding, height] = super::native::size(renderer::ControlKind::Button);
             content = [width + padding, width + padding, height];
         }
@@ -777,6 +777,7 @@ pub(crate) fn intrinsic(
                 doc,
                 atom.node,
                 measured.naturals.get(&atom.node).copied(),
+                &styles.values[atom.node],
             )
             .is_some()
             {
@@ -1220,6 +1221,7 @@ pub(crate) fn intrinsic(
                                 doc,
                                 child,
                                 measured.naturals.get(&child).copied(),
+                                child_style,
                             )
                             .is_some())
                     {
@@ -1786,6 +1788,7 @@ pub(crate) fn layout(
                         doc,
                         child,
                         measured.naturals.get(&child).copied(),
+                        &styles.values[child],
                     )
                     .is_some());
         let mut item = *memo
