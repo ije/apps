@@ -654,8 +654,29 @@ fn mixer() -> Option<&'static Mixer> {
                     match stream {
                         Ok((stream, rate, channels)) => {
                             let _ = ready.send(Some((rate, channels)));
-                            for play in commands {
-                                let _ = if play { stream.play() } else { stream.pause() };
+                            // Stopping and starting the device for each short sound pops and delays the next
+                            // sound, so the output keeps running for a while after the last one.
+                            let mut stopping = false;
+                            loop {
+                                let play = if stopping {
+                                    match commands.recv_timeout(Duration::from_secs(2)) {
+                                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                                            let _ = stream.pause();
+                                            stopping = false;
+                                            continue;
+                                        }
+                                        command => command.ok(),
+                                    }
+                                } else {
+                                    commands.recv().ok()
+                                };
+                                match play {
+                                    Some(true) if !std::mem::take(&mut stopping) => {
+                                        let _ = stream.play();
+                                    }
+                                    Some(play) => stopping = !play,
+                                    None => break,
+                                }
                             }
                         }
                         Err(error) => {
