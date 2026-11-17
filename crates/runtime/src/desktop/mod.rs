@@ -1356,7 +1356,14 @@ impl Desktop {
                 }
                 mcp::logs(&logs);
             }
-            if mcp && mcp::poll(&app, cx) {
+            // Page scripts that the tools run can force a layout, like other page tasks.
+            let raw: *mut App = cx;
+            // SAFETY: a forced layout uses `cx` only inside a script call, while `poll` waits for it.
+            if mcp
+                && crate::render::scripted(unsafe { &mut *raw }, None, || {
+                    mcp::poll(&app, unsafe { &mut *raw })
+                })
+            {
                 delay = delay.min(0);
             }
             app.pump(Some(cx), Some(&runtime))?;

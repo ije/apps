@@ -2232,10 +2232,50 @@ fn create(
             })
             .filter(|parts| parts.len() == 4 && parts[2] > 0. && parts[3] > 0.);
         let ratio = view_box.as_ref().map(|parts| parts[2] / parts[3]);
+        // Like browsers: an SVG with a ratio and no size fills the available width, and one with neither is
+        // 300 by 150.
+        let available = || {
+            let margins = units.edges(style, style::MARGIN, containing[0]);
+            let insets = if matches!(position, "absolute" | "fixed") {
+                [Prop::LEFT, Prop::RIGHT].map(|prop| {
+                    style
+                        .get(prop)
+                        .and_then(|value| units.resolve(value, containing[0]))
+                        .unwrap_or(0.)
+                })
+            } else {
+                [0.; 2]
+            };
+            containing[0] - margins[1] - margins[3] - insets[0] - insets[1]
+        };
         let [width, height] = match (width, height, ratio) {
             (None, Some(height), Some(ratio)) => [height * ratio, height],
             (Some(width), None, Some(ratio)) => [width, width / ratio],
-            _ => [width.unwrap_or(24.), height.unwrap_or(24.)],
+            // A stretched flex item in a row of definite height takes that height.
+            (None, None, Some(ratio))
+                if flex_parent
+                    && reader
+                        .parent(id, Prop::FLEX_DIRECTION)
+                        .is_none_or(|value| value.starts_with("row"))
+                    && reader
+                        .parent(id, Prop::HEIGHT)
+                        .is_some_and(|value| value.ends_with("px"))
+                    && style
+                        .get(Prop::ALIGN_SELF)
+                        .filter(|value| *value != "auto")
+                        .or_else(|| reader.parent(id, Prop::ALIGN_ITEMS))
+                        .is_none_or(|value| matches!(value, "normal" | "stretch"))
+                    && containing[1] > 0. =>
+            {
+                let margins = units.edges(style, style::MARGIN, containing[0]);
+                let height = containing[1] - margins[0] - margins[2];
+                [height * ratio, height]
+            }
+            (None, None, Some(ratio)) => {
+                let width = available();
+                [width, width / ratio]
+            }
+            _ => [width.unwrap_or(300.), height.unwrap_or(150.)],
         }
         .map(|value| value.clamp(1., 4096.));
         // The drawing fills the content box, which border-box sizing makes smaller than the CSS size.
@@ -2771,6 +2811,20 @@ fn create(
             "visible"
         })
     });
+    let overflow = if node.tag == "body"
+        && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+            .into_iter()
+            .all(|prop| {
+                reader
+                    .parent(id, prop)
+                    .is_none_or(|value| value == "visible")
+            })
+        && body_overflow_moves(doc, styles, id)
+    {
+        ["visible"; 2]
+    } else {
+        overflow
+    };
     let page = matches!(node.tag.as_str(), "html" | "body");
     let boxed = !page
         && overflow
@@ -4926,6 +4980,8 @@ fn create(
     // In-flow pseudo-elements of a grid or flex box are its first and last items, which the grid places and
     // flex orders among the children.
     let mut items = [None, None];
+    // Pseudo-elements that are atoms of the element's text, built here and placed with the text below.
+    let mut pseudo_atoms: [Option<renderer::Node>; 2] = [None, None];
     if let Some(pseudos) = styles.pseudos.get(&id) {
         let mut units = units;
         units.container = own.or(units.container);
@@ -4943,7 +4999,20 @@ fn create(
             {
                 continue;
             }
-            let words = pseudo_content(doc, id, pseudo, content);
+            // The text holds an inline pseudo-element: plain text as runs, a box as an atom.
+            let merged = !editable
+                && !matches!(node.tag.as_str(), "svg" | "canvas" | "iframe" | "terminal")
+                && inline_text().is_some_and(|data| data.pseudos[index]);
+            let atom = merged
+                && inline_text().is_some_and(|data| {
+                    data.atoms
+                        .iter()
+                        .any(|atom| usize::from(atom.pseudo) == index + 1)
+                });
+            if merged && !atom {
+                continue;
+            }
+            let words = style::pseudo_content(doc, id, pseudo, content);
             let pseudo_units = pseudo_lengths(&units, style, pseudo, text, pixel_ratio);
             let face = style::font(pseudo);
             let own = pseudo.get(Prop::DISPLAY).unwrap_or("inline");
@@ -5328,7 +5397,8 @@ fn create(
             }
             // Vertical alignment in a line. A line aligns text baselines, or the bottom border edge of a box
             // without one, so a relative offset moves the box and margins make room for it in the line.
-            if !absolute && own.starts_with("inline") && (all_inline || display == "inline") {
+            if !absolute && own.starts_with("inline") && (all_inline || display == "inline" || atom)
+            {
                 let align = pseudo.get(Prop::VERTICAL_ALIGN).unwrap_or("baseline");
                 let height = match decoration.style().size.height {
                     renderer::Length::Px(height) => Some(f32::from(height)),
@@ -5526,7 +5596,9 @@ fn create(
             } else {
                 flex_order
             };
-            if grid_item || flexbox && !absolute {
+            if atom {
+                pseudo_atoms[index] = Some(decoration);
+            } else if grid_item || flexbox && !absolute {
                 items[index] = Some((flex_order, decoration, pseudo_margin));
             } else if index == 0 && flex_order <= 0 || index == 1 && flex_order < 0 {
                 if std::mem::take(&mut strut_due) {
@@ -5614,7 +5686,13 @@ fn create(
         let mut atom_elements: Vec<renderer::Child> = data
             .atoms
             .iter()
-            .map(|atom| element(build, atom.node, atom_containing, container, None))
+            .map(|atom| match atom.pseudo {
+                0 => element(build, atom.node, atom_containing, container, None),
+                pseudo => pseudo_atoms[usize::from(pseudo - 1)]
+                    .take()
+                    .unwrap_or_default()
+                    .into(),
+            })
             .collect();
         let atom_slots: Rc<[super::text::AtomSlot]> = data
             .atoms
@@ -5626,13 +5704,26 @@ fn create(
                     .borrow()
                     .dom
                     .get(&view.id)
-                    .and_then(|dom| dom.atoms.get(&atom.node).copied());
+                    .and_then(|dom| dom.atoms.get(&atom.key()).copied());
                 reader.log(
-                    Query::Atom(atom.node as u32),
+                    Query::Atom(atom.key() as u32),
                     0,
                     hashed(last.map(|size| size.map(f32::to_bits))),
                 );
                 let size = last.unwrap_or_else(|| {
+                    if atom.pseudo != 0 {
+                        return super::grid::pseudo_atom(
+                            doc,
+                            id,
+                            usize::from(atom.pseudo - 1),
+                            styles,
+                            content_box()[0],
+                            Some(containing[0]),
+                            text,
+                            pixel_ratio,
+                        )
+                        .unwrap_or_default();
+                    }
                     let [_, max, _, height] = super::grid::intrinsic(
                         doc,
                         atom.node,
@@ -5767,10 +5858,14 @@ fn create(
                 .flex_row();
             wrapper.style().align_items = Some(renderer::AlignItems::Baseline);
             // A box that shrinks to its atom gives percent sizes of the atom nothing to resolve against.
+            let atom_style = match atom.pseudo {
+                0 => &*styles.values[atom.node],
+                pseudo => &styles.pseudos[&id][usize::from(pseudo - 1)],
+            };
             let rest = [Prop::WIDTH, Prop::MIN_WIDTH, Prop::MAX_WIDTH]
                 .iter()
                 .any(|&prop| {
-                    styles.values[atom.node]
+                    atom_style
                         .get(prop)
                         .is_some_and(|value| value.contains('%'))
                 })
@@ -5783,7 +5878,7 @@ fn create(
                 .hooks(super::text::AtomBox {
                     slots: atom_slots.clone(),
                     index,
-                    node: atom.node,
+                    node: atom.key(),
                     view: view.clone(),
                     rest: rest.clone(),
                 })
@@ -7470,80 +7565,6 @@ pub(super) fn pseudo_lengths(
     lengths
 }
 
-pub(super) fn pseudo_content(
-    doc: &Document,
-    id: usize,
-    pseudo: &style::Style,
-    content: &str,
-) -> String {
-    let node = &doc.nodes[id];
-    let mut text = String::new();
-    for part in style::components(content, ' ') {
-        if let Some(name) = part.strip_prefix("attr(").and_then(|v| v.strip_suffix(')')) {
-            text.push_str(node.attrs.get(name.trim()).map_or("", String::as_str));
-        } else if let Some(close) = match part {
-            "open-quote" => Some(false),
-            "close-quote" => Some(true),
-            _ => None,
-        } {
-            let depth = std::iter::successors(node.parent, |&parent| doc.nodes[parent].parent)
-                .filter(|&parent| doc.nodes[parent].tag == "q")
-                .count();
-            let quotes: Vec<String> = match pseudo.get(Prop::QUOTES) {
-                None | Some("auto") => ["\u{201c}", "\u{201d}", "\u{2018}", "\u{2019}"]
-                    .map(str::to_owned)
-                    .to_vec(),
-                Some(value) => style::components(value, ' ')
-                    .into_iter()
-                    .filter_map(|part| {
-                        let mut input = cssparser::Parser::new(part);
-                        input.expect_string().ok().map(|string| string.to_string())
-                    })
-                    .collect(),
-            };
-            let pair = (depth * 2).min(quotes.len().saturating_sub(2));
-            text.push_str(
-                quotes
-                    .get(pair + usize::from(close))
-                    .map_or("", String::as_str),
-            );
-        } else if let Some(string) = part
-            .strip_prefix(['"', '\''])
-            .and_then(|v| v.strip_suffix(['"', '\'']))
-        {
-            let mut chars = string.chars().peekable();
-            while let Some(c) = chars.next() {
-                if c != '\\' {
-                    text.push(c);
-                    continue;
-                }
-                let mut code = String::new();
-                while code.len() < 6
-                    && let Some(digit) = chars.next_if(char::is_ascii_hexdigit)
-                {
-                    code.push(digit);
-                }
-                if code.is_empty() {
-                    text.extend(chars.next());
-                    continue;
-                }
-                chars.next_if_eq(&' ');
-                text.push(
-                    u32::from_str_radix(&code, 16)
-                        .ok()
-                        .and_then(char::from_u32)
-                        .unwrap_or('\u{fffd}'),
-                );
-            }
-        }
-    }
-    if let Some(mode) = pseudo.get(Prop::TEXT_TRANSFORM) {
-        let len = text.len();
-        style::text_transform(&mut text, 0..len, mode);
-    }
-    text
-}
-
 // Taffy applies min/max constraints through aspect ratio even with an explicit opposite size. Prevent
 // max-width from changing explicit image heights.
 fn only_auto_ratio(mut el: renderer::Node, style: &style::Style) -> renderer::Node {
@@ -8034,6 +8055,21 @@ fn container(build: &Build<'_>, id: usize) -> bool {
         })
 }
 
+// The overflow of the body goes to the viewport when the html box has none, so the body itself doesn't clip.
+fn body_overflow_moves(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
+    doc.nodes[id].tag == "body"
+        && doc.nodes[id].parent.is_some_and(|parent| {
+            doc.nodes[parent].tag == "html"
+                && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                    .into_iter()
+                    .all(|prop| {
+                        styles.values[parent]
+                            .get(prop)
+                            .is_none_or(|value| value == "visible")
+                    })
+        })
+}
+
 fn margin_collapses_through(build: &Build<'_>, id: usize, side: usize, width: f32) -> bool {
     let (doc, styles) = (build.doc, build.styles);
     let style = &styles.values[id];
@@ -8093,9 +8129,10 @@ fn margin_collapses_through(build: &Build<'_>, id: usize, side: usize, width: f3
                     .get(Prop::POSITION)
                     .is_some_and(|value| matches!(value, "absolute" | "fixed"))
         })
-        && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
-            .into_iter()
-            .all(|key| style.get(key).is_none_or(|value| value == "visible"))
+        && (body_overflow_moves(doc, styles, id)
+            || [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                .into_iter()
+                .all(|key| style.get(key).is_none_or(|value| value == "visible")))
         // A multi-column box holds the margins of its content.
         && [Prop::COLUMN_COUNT, Prop::COLUMN_WIDTH]
             .into_iter()

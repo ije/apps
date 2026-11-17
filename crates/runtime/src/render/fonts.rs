@@ -158,16 +158,26 @@ pub(crate) fn load(
                         name
                     }
                     None => {
-                        let result = crate::host::local_file(assets, state, value)
-                            .and_then(|path| {
-                                path.ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "Font is not a bundled asset or local file: {value}"
-                                    )
+                        let result = match value
+                            .strip_prefix("data:")
+                            .and_then(|data| data.split_once(";base64,"))
+                        {
+                            Some((_, payload)) => base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                payload.trim(),
+                            )
+                            .map_err(anyhow::Error::from),
+                            None => crate::host::local_file(assets, state, value)
+                                .and_then(|path| {
+                                    path.ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "Font is not a bundled asset or local file: {value}"
+                                        )
+                                    })
                                 })
-                            })
-                            .and_then(|path| Ok(std::fs::read(path)?))
-                            .and_then(|bytes| crate::dom::add_font(state, family, bytes));
+                                .and_then(|path| Ok(std::fs::read(path)?)),
+                        }
+                        .and_then(|bytes| crate::dom::add_font(state, family, bytes));
                         if let Err(error) = &result {
                             eprintln!("apps: @font-face {family}: {error}");
                         }
@@ -268,7 +278,8 @@ mod tests {
         );
         assert_eq!(state.fonts["missing.woff2"], None);
         assert!(!state.fonts.contains_key("cyrillic.woff2"));
-        assert_eq!(state.font_aliases["Ranked"], "H2O Test CFF");
+        // Added faces go under their CSS family, so no alias is needed.
+        assert!(!state.font_aliases.contains_key("Ranked"));
         let width = |state: &State, font: &str, text: &str| {
             crate::render::canvas::line(&system, &state.font_aliases, font, text, [0.; 2])
                 .0
@@ -285,7 +296,7 @@ mod tests {
             crate::style::Prop::FONT_FAMILY,
             "Missing, Brand, sans-serif".into(),
         )]));
-        assert_eq!(&*font.family, "H2O Test");
+        assert_eq!(&*font.family, "Brand");
         assert!(!load(&mut doc, &mut state).0);
         assert_eq!(state.font_text.1.len(), 0x110000 / 64);
         let text = doc

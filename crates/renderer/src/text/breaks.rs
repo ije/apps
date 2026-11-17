@@ -217,18 +217,24 @@ fn even_out(rows: Vec<u32>, chances: &[Chance], max: f32, wrapping: &Wrapping) -
         _ => max - 45.,
     };
     let pretty = wrap == TextWrap::Pretty;
-    if pretty && (1..=last).any(|at| span(at - 1, at) > ideal) {
+    if pretty && (1..=last).any(|at| span(at - 1, at) > max) {
         return rows;
     }
+    // Like Chromium, pretty acts only on a last row of one word, and moves only the breaks of the last 4 rows.
+    if pretty && (count < 2 || greedy[count - 1] + 1 != last) {
+        return rows;
+    }
+    let kept = if pretty { count.saturating_sub(4) } else { 0 };
+    let start = greedy[kept];
     // Balance keeps the row count of the greedy result: a layer per row count. Pretty needs only "reached".
     let exact = wrap == TextWrap::Balance && count <= 12;
     let layers = if exact { count + 1 } else { 2 };
     let cell = |at: usize, layer: usize| at * layers + layer;
     let mut cost = vec![f32::INFINITY; chances.len() * layers];
     let mut came = vec![0; chances.len() * layers];
-    cost[0] = 0.;
-    let (mut first, mut reached) = (0, 0);
-    for to in 1..=last {
+    cost[cell(start, 0)] = 0.;
+    let (mut first, mut reached) = (start, start);
+    for to in start + 1..=last {
         while first < to && span(first, to) > max {
             first += 1;
         }
@@ -244,16 +250,20 @@ fn even_out(rows: Vec<u32>, chances: &[Chance], max: f32, wrapping: &Wrapping) -
         }
         for from in first..to {
             let width = span(from, to);
-            let row = if pretty && to + 5 <= last && (width - ideal).abs() > 45. {
-                f32::INFINITY
-            } else {
-                100. * ((width - ideal) / 15.).abs().powi(3)
+            // Pretty scores the slack of each row but the last, which only needs two words.
+            let row = match (pretty, to == last) {
+                (true, true) if from + 1 == to => f32::INFINITY,
+                (true, true) => 0.,
+                (true, false) => (max - width).powi(2),
+                _ => 100. * ((width - ideal) / 15.).abs().powi(3),
             };
             for layer in 0..if exact { layers - 1 } else { layers } {
                 let next = if exact { layer + 1 } else { 1 };
                 let total = cost[cell(from, layer)] + row;
                 let current = cost[cell(to, next)];
+                // On a tie, pretty keeps the earlier rows long, as Chromium does.
                 if total < current
+                    || pretty && total.is_finite() && total == current
                     || exact && total.is_finite() && total - current <= current * 1e-6
                 {
                     cost[cell(to, next)] = total;
@@ -269,11 +279,12 @@ fn even_out(rows: Vec<u32>, chances: &[Chance], max: f32, wrapping: &Wrapping) -
     }
     let mut picked = Vec::new();
     let mut at = came[cell(last, layer)];
-    while at > 0 {
+    while at > start {
         picked.push(chances[at].glyph);
         layer = if exact { layer - 1 } else { 1 };
         at = came[cell(at, layer)];
     }
+    picked.extend(rows[..kept].iter().rev());
     picked.reverse();
     picked
 }
@@ -407,7 +418,8 @@ mod tests {
         for (wrap, starts) in [
             (TextWrap::Wrap, [20, 40]),
             (TextWrap::Balance, [15, 30]),
-            (TextWrap::Pretty, [15, 30]),
+            // Like Chromium: the greedy last row holds one word, so the last rows take a word from the rows above.
+            (TextWrap::Pretty, [20, 35]),
         ] {
             assert_eq!(
                 breaks(&line, &text, &wrapping(200., wrap), &[]),

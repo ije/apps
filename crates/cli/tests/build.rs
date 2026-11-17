@@ -136,9 +136,9 @@ fn bundles_electron_pages_and_rejects_unsupported_exports() {
     assert!(
         std::str::from_utf8(&main)
             .unwrap()
-            .contains("apps:///page-0.html")
+            .contains("apps:///index.html")
     );
-    let doc = &apps_runtime::bundle::unpack_page(&bundle.pages["page-0.html"]).unwrap();
+    let doc = &apps_runtime::bundle::unpack_page(&bundle.pages["index.html"]).unwrap();
     let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
     assert_eq!(
         apps_runtime::style::styles(doc, 800., 600.)[p]["color"],

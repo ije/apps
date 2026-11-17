@@ -642,6 +642,8 @@ pub(crate) fn intrinsic(
                 .is_none_or(|v| !matches!(v, "absolute" | "fixed"))
     };
     let mut content = [0f32; 3];
+    // The pseudo-elements that are in the text of the element.
+    let mut taken = [false; 2];
     let mut collapsed = None;
     let natural = (node.tag != "svg")
         .then(|| super::element::natural_size(doc, id, measured.naturals.get(&id).copied(), style))
@@ -739,13 +741,14 @@ pub(crate) fn intrinsic(
             let [padding, height] = super::native::size(renderer::ControlKind::Button);
             content = [width + padding, width + padding, height];
         }
-    } else if let Some((source, mut runs, atoms, heights, mixed)) = match alt {
+    } else if let Some((source, mut runs, atoms, heights, mixed, pseudos)) = match alt {
         Some(alt) => Some((
             renderer::SharedString::from(alt.clone()),
             vec![style::text_run(style, units, alt.len())],
             Vec::new(),
             Vec::new(),
             false,
+            [false; 2],
         )),
         None => measured
             .texts
@@ -759,11 +762,29 @@ pub(crate) fn intrinsic(
                     inline.atoms.clone(),
                     inline.line_heights.clone(),
                     inline.mixed,
+                    inline.pseudos,
                 )
             }),
     } {
+        taken = pseudos;
         let mut boxes = Vec::with_capacity(atoms.len());
         for atom in &atoms {
+            if atom.pseudo != 0 {
+                let [width, height, baseline] = pseudo_atom(
+                    doc,
+                    id,
+                    usize::from(atom.pseudo - 1),
+                    styles,
+                    base,
+                    available,
+                    text,
+                    measured.pixel_ratio,
+                )
+                .unwrap_or_default();
+                runs[atom.run].inset[1] = renderer::px(width);
+                boxes.push((atom.at, [width, height, baseline], None));
+                continue;
+            }
             let [_, max, used, height] =
                 intrinsic(doc, atom.node, styles, available, None, text, measured);
             // A percent width takes its share of the line, so the box can wrap to a line of its own.
@@ -1329,7 +1350,7 @@ pub(crate) fn intrinsic(
             "img" | "svg" | "canvas" | "video" | "input" | "textarea" | "select"
         )
     {
-        for index in 0..2 {
+        for index in (0..2).filter(|&index| !taken[index]) {
             let Some([_, width, _, height]) = pseudo_size(
                 doc,
                 id,
@@ -1500,7 +1521,7 @@ fn pseudo_size(
         size.min(max.unwrap_or(f32::INFINITY))
             .max(min.unwrap_or(0.))
     };
-    let string = super::element::pseudo_content(doc, id, pseudo, value);
+    let string = style::pseudo_content(doc, id, pseudo, value);
     let [fixed, tall] = [Prop::WIDTH, Prop::HEIGHT].map(|prop| {
         pseudo
             .get(prop)
@@ -1563,6 +1584,50 @@ fn pseudo_size(
     });
     let height = clamp(height, limits([Prop::MIN_HEIGHT, Prop::MAX_HEIGHT], 1));
     Some([min, max, used, height])
+}
+
+/// The width, height and baseline of an inline-level pseudo-element that is an atom of its element's text.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pseudo_atom(
+    doc: &Document,
+    id: usize,
+    index: usize,
+    styles: &ComputedStyles,
+    base: f32,
+    available: Option<f32>,
+    text: &renderer::TextSystem,
+    pixel_ratio: f32,
+) -> Option<[f32; 3]> {
+    let [_, max, used, height] =
+        pseudo_size(doc, id, index, styles, base, None, text, pixel_ratio)?;
+    let pseudo = &styles.pseudos[&id][index];
+    let units = super::element::pseudo_lengths(
+        &styles.lengths[id],
+        &styles.values[id],
+        pseudo,
+        text,
+        pixel_ratio,
+    );
+    let blank = pseudo.get(Prop::CONTENT).is_some_and(|value| {
+        style::pseudo_content(doc, id, pseudo, value)
+            .trim_ascii()
+            .is_empty()
+    });
+    // An inline-block without lines sits on its bottom margin edge, others on their last line.
+    let baseline = if blank {
+        height
+    } else {
+        let [ascent, descent, _] = text
+            .line_metrics(
+                text.face(&style::font(pseudo)),
+                renderer::px(units.font.em * pixel_ratio),
+            )
+            .map(|v| f32::from(v) / pixel_ratio);
+        let below = units.font.lh - ascent - ((units.font.lh - ascent - descent) / 2.);
+        height - frame(pseudo, &units, base)[2] - below
+    };
+    let percent = available.is_some() && pseudo.get(Prop::WIDTH).is_some_and(|v| v.contains('%'));
+    Some([if percent { used } else { max }, height, baseline])
 }
 
 /// Margin, border and padding of each side: top, right, bottom, left.

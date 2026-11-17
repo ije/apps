@@ -4532,6 +4532,31 @@ fn blur_animations_draw_their_animated_blur_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn transform_animations_draw_content_that_moves_far_into_view() {
+    // The animated belt is 1000px left of its place, so the box at 1050px shows at 50px.
+    run_hidden(
+        r#"
+        await load('t.html');
+        for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+        for (const [id, y] of [['run', 30], ['stop', 130]]) {
+            const shade = async x => (await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()[1];
+            const [box, beside] = [await shade(100), await shade(250)];
+            if (box > 64 || beside < 192) fail(id + ' ' + box + ' ' + beside);
+        }
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0;background:#fff'><style>@keyframes f{to{transform:translateX(-2000px)}}\
+             .w{overflow:hidden;height:60px;margin-bottom:40px}.b{width:3000px;height:60px;position:relative;animation:f 1000s linear -500s}\
+             .b>i{position:absolute;left:1050px;top:0;width:100px;height:60px;background:#000}</style>\
+             <div class=w><div class=b><i></i></div></div>\
+             <div class=w><div class=b style='animation-play-state:paused'><i></i></div></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn corner_shapes_draw_like_chrome() {
     // Points that Chromium draws black (inside) or white (outside) for these shapes.
     run_hidden(

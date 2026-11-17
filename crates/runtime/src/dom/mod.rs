@@ -1624,7 +1624,9 @@ pub fn call(
                     doc.target = None;
                 }
                 state.selection.remove(&id);
-                state.atoms.remove(&id);
+                for pseudo in 0..3 {
+                    state.atoms.remove(&crate::style::atom_key(id, pseudo));
+                }
                 if state.selection_caret == Some(id) {
                     state.selection_caret = None;
                 }
@@ -2723,6 +2725,23 @@ pub fn call(
                 None => json!(add_font(state, family, crate::web::bytes(&args[2])?)?),
             })
         }
+        // As a canvas serializes a color: `#rrggbb`, or `rgba()` with the shortest alpha that rounds back.
+        "dom.canvasColor" => Ok(match crate::style::color(args[1].as_str().unwrap_or("")) {
+            Some((rgb, 255)) => json!(format!("#{:06x}", rgb & 0xff_ffff)),
+            Some((rgb, alpha)) => {
+                let [_, r, g, b] = rgb.to_be_bytes();
+                let value = (1..=3)
+                    .map(|digits| format!("{:.*}", digits, f64::from(alpha) / 255.))
+                    .find(|text| {
+                        text.parse::<f64>()
+                            .is_ok_and(|v| (v * 255.).round() as u8 == alpha)
+                    })
+                    .unwrap_or_else(|| format!("{:.3}", f64::from(alpha) / 255.));
+                let value = value.trim_end_matches('0').trim_end_matches('.');
+                json!(format!("rgba({r}, {g}, {b}, {value})"))
+            }
+            None => Value::Null,
+        }),
         "dom.fontSources" => Ok(json!(crate::render::fonts::sources(
             args[1].as_str().context("Expected font sources")?
         ))),
@@ -2887,8 +2906,8 @@ pub fn call(
                 underline: None,
                 strikethrough: None,
                 overline: None,
-                letter_spacing: renderer::px(0.),
-                word_spacing: renderer::px(0.),
+                letter_spacing: style::spacing(style, units, Prop::LETTER_SPACING),
+                word_spacing: style::spacing(style, units, Prop::WORD_SPACING),
                 font_size: None,
                 inset: Default::default(),
                 nowrap: false,
@@ -3234,19 +3253,18 @@ pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Resul
     let ids = database.load_font_source(usvg::fontdb::Source::Binary(std::sync::Arc::new(
         bytes.clone(),
     )));
-    let face = ids
+    let mut info = ids
         .first()
         .and_then(|id| database.face(*id))
-        .context("Unsupported or invalid font data")?;
-    let name = face
-        .families
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(family))
-        .or(face.families.first())
-        .context("Font has no family name")?
-        .0
+        .context("Unsupported or invalid font data")?
         .clone();
-    system.add_font(bytes)?;
+    let name = system.add_font(bytes, family)?;
+    // Faces are found by the family of their `@font-face`, as in CSS.
+    for &id in &ids {
+        database.remove_face(id);
+    }
+    info.families = vec![(name.clone(), usvg::fontdb::Language::English_UnitedStates)];
+    database.push_face_info(info);
     use_font(state, family, &name, true);
     Ok(name)
 }

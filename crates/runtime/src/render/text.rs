@@ -432,7 +432,14 @@ pub(crate) fn text_rects(
     let mut rects = Vec::new();
     for (index, &row) in starts.iter().enumerate() {
         let next = starts.get(index + 1).copied().unwrap_or(text.len());
-        let (from, to) = (start.max(row), end.min(next));
+        let (from, mut to) = (start.max(row), end.min(next));
+        // As in browsers, the spaces at a soft wrap hang, so a row's rectangle ends before them.
+        if to == next
+            && index + 1 < starts.len()
+            && let Some(row) = text.get(from..to)
+        {
+            to = from + row.trim_end_matches(' ').len();
+        }
         if from >= to {
             continue;
         }

@@ -985,10 +985,49 @@ impl RenderFrame {
             return;
         }
         let (w, h) = (self.window[0] as f32, self.window[1] as f32);
-        let reach = if effect.transform.is_some() {
-            [-w, -h, 3. * w, 3. * h]
-        } else {
-            visible
+        // The region of a transformed layer is in its own space: the visible part mapped back through the
+        // transform. A composited transform moves the layer without a repaint, so the region keeps a window
+        // of room on each side and moves in steps of a window, and small moves keep its pixels.
+        let reach = match &effect.transform {
+            Some(transform) => {
+                let [x, y, width, height] = visible;
+                let back = crate::window::invert(&crate::window::plane_of(transform));
+                let seen = back.and_then(|m| {
+                    [
+                        [x, y],
+                        [x + width, y],
+                        [x, y + height],
+                        [x + width, y + height],
+                    ]
+                    .into_iter()
+                    .try_fold(
+                        [f32::MAX, f32::MAX, f32::MIN, f32::MIN],
+                        |at, [x, y]| {
+                            let [u, v, q] =
+                                [0, 1, 2].map(|row| m[row] * x + m[3 + row] * y + m[6 + row]);
+                            (q > 1e-6).then(|| {
+                                let [u, v] = [u / q, v / q];
+                                [at[0].min(u), at[1].min(v), at[2].max(u), at[3].max(v)]
+                            })
+                        },
+                    )
+                });
+                match seen {
+                    Some([left, top, right, bottom]) => {
+                        // At most 4 windows on a side, around the middle of the visible part.
+                        let span = |low: f32, high: f32, step: f32| {
+                            let from = (low / step).floor() * step - step;
+                            let to = (high / step).ceil() * step + step;
+                            let mid = ((low + high) / 2. / step).round() * step;
+                            [from.max(mid - 2. * step), to.min(mid + 2. * step)]
+                        };
+                        let ([x0, x1], [y0, y1]) = (span(left, right, w), span(top, bottom, h));
+                        [x0, y0, x1 - x0, y1 - y0]
+                    }
+                    None => [-w, -h, 3. * w, 3. * h],
+                }
+            }
+            None => visible,
         };
         let spread = effect
             .blur
@@ -1423,6 +1462,36 @@ mod tests {
             let mut patched = scene(turn(0.));
             assert!(patched.patch(9, 1., Some(matrix), [None; 2]));
             assert_eq!(draw(&patched), draw(&scene(matrix)));
+        }
+    }
+
+    #[test]
+    fn transformed_layers_draw_content_that_moves_into_view() {
+        let mask = Clip::from(bounds([0., 0., 800., 600.]));
+        for shift in [-1700., -5000., 0.] {
+            let mut scene = Scene::default();
+            let mut matrix = super::IDENTITY;
+            matrix[12] = shift;
+            let state = EffectState {
+                transform: Some(matrix),
+                ..effect(mask)
+            };
+            scene.push_effect(state, Some(9));
+            let inside = Clip::from(bounds([-1e6, -1e6, 2e6, 2e6]));
+            let quad = bounds([100. - shift, 100., 100., 100.]);
+            scene.push(Instance::new(BOX, quad, inside));
+            scene.pop_effect();
+            let mut frame = RenderFrame::default();
+            frame.record(&scene, [800, 600], 16384, true);
+            let source = frame.commands.iter().find_map(|command| match command {
+                Command::Composite { index, .. } => Some(frame.composites[*index as usize].bounds),
+                _ => None,
+            });
+            let [x, _, width, _] = source.expect("the layer draws");
+            assert!(
+                x <= 100. - shift && 200. - shift <= x + width,
+                "{shift}: {source:?}"
+            );
         }
     }
 

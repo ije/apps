@@ -268,7 +268,7 @@ mod tests {
         let again = window.shape_line("cached", px(16.), &run(0xff0000ff));
         assert!(Rc::ptr_eq(&first.line, &again.line));
         let bytes = std::fs::read("/System/Library/Fonts/Supplemental/Chalkduster.ttf").unwrap();
-        text.add_font(bytes).unwrap();
+        text.add_font(bytes, "Chalkduster").unwrap();
         assert!(text.families().iter().any(|family| family == "Chalkduster"));
         let fresh = window.shape_line("cached", px(16.), &run(0));
         assert!(!Rc::ptr_eq(&first.line, &fresh.line));

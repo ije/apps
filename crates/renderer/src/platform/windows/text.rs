@@ -770,7 +770,8 @@ impl IDWriteTextRenderer_Impl for Collector_Impl {
 }
 
 impl TextSystem {
-    pub fn add_font(&self, bytes: Vec<u8>) -> Result<()> {
+    /// DirectWrite finds a face by the family in its name table, so that family is returned.
+    pub fn add_font(&self, bytes: Vec<u8>, _family: &str) -> Result<String> {
         let library = &mut *self.0.borrow_mut();
         // SAFETY: DirectWrite copies the data, since the reference has no owner object.
         unsafe {
@@ -794,8 +795,9 @@ impl TextSystem {
             library.added = library
                 .dwrite
                 .CreateFontCollectionFromFontSet(&library.added_faces.CreateFontSet()?)?;
+            localized(&first.CreateFontFace()?.GetFamilyNames()?, &library.locale)
+                .context("Font has no family name")
         }
-        Ok(())
     }
 
     pub fn families(&self) -> Vec<String> {

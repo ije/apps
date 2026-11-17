@@ -39,10 +39,16 @@ pub type FontWeight = f32;
 
 pub type Features = Rc<[(String, u32)]>;
 
+/// Axis tags and values, sorted by tag. `wght` here wins over `weight`.
+pub type Variations = Rc<[([u8; 4], f32)]>;
+
 #[derive(Clone, PartialEq)]
 pub struct Font {
     pub family: Rc<str>,
     pub features: Features,
+    pub variations: Variations,
+    /// `opsz` for faces with that axis, from `font-optical-sizing: auto`: the font size in CSS pixels.
+    pub optical_size: Option<f32>,
     pub weight: FontWeight,
     pub style: FontStyle,
 }
@@ -57,6 +63,8 @@ impl Font {
         Self {
             family: family.into(),
             features: Features::default(),
+            variations: Variations::default(),
+            optical_size: None,
             weight: 400.,
             style: FontStyle::Normal,
         }
@@ -79,8 +87,12 @@ impl Hash for Font {
             &self.features,
             self.weight.to_bits(),
             self.style,
+            self.optical_size.map(f32::to_bits),
         )
             .hash(state);
+        for (tag, value) in self.variations.iter() {
+            (tag, value.to_bits()).hash(state);
+        }
     }
 }
 
@@ -129,6 +141,8 @@ impl Fonts {
         let same = |kept: &Font| {
             Rc::ptr_eq(&kept.family, &font.family)
                 && Rc::ptr_eq(&kept.features, &font.features)
+                && Rc::ptr_eq(&kept.variations, &font.variations)
+                && kept.optical_size == font.optical_size
                 && kept.weight == font.weight
                 && kept.style == font.style
         };
@@ -309,12 +323,13 @@ impl TextSystem {
         self.fonts.generation.get()
     }
 
-    pub fn add_font(&self, bytes: Vec<u8>) -> Result<()> {
-        self.platform.add_font(bytes)?;
+    /// Adds a face to `family` and returns the family name that finds it.
+    pub fn add_font(&self, bytes: Vec<u8>, family: &str) -> Result<String> {
+        let name = self.platform.add_font(bytes, family)?;
         self.resolved.borrow_mut().clear();
         self.recent.borrow_mut().clear();
         self.fonts.generation.set(self.fonts.generation.get() + 1);
-        Ok(())
+        Ok(name)
     }
 
     fn cache(&self) -> &Cache {

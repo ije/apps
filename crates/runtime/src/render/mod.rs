@@ -617,6 +617,7 @@ impl PageView {
         // Clear node-ID caches on reload or navigation: the new DOM reuses IDs. Stamp its layout revision on
         // the first frame.
         if dom.layout_revision == 0 {
+            window.forget_states();
             self.kept.take();
             self.patches.take();
             self.kept_frame.take();
@@ -1666,6 +1667,8 @@ impl PageView {
         }
         if dom.container_pass && dom.style_cache.units || dom.cull.frame != frame {
             dom.measurements.sizes.clear();
+            // Text keeps the fonts that it resolved, so a font load must build it again.
+            dom.measurements.texts.clear();
             dom.grids.clear();
             self.walked.borrow_mut().clear();
             self.adjoined.borrow_mut().clear();

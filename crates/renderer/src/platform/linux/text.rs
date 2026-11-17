@@ -50,14 +50,17 @@ struct Face {
     weight: fontdb::Weight,
     features: FontFeatures,
     coords: Vec<i16>,
-    wght: Option<f32>,
+    axes: Vec<([u8; 4], f32)>,
     color: bool,
 }
+
+/// Face, weight, features and axis value bits.
+type FaceKey = (fontdb::ID, u16, Features, Vec<([u8; 4], u32)>);
 
 struct Shelf {
     library: Library,
     faces: Vec<Face>,
-    known: FxHashMap<(fontdb::ID, u16, Features), FontId>,
+    known: FxHashMap<FaceKey, FontId>,
     added: Vec<fontdb::ID>,
     scaler: ScaleContext,
     scratch: ShapeBuffer,
@@ -92,12 +95,27 @@ fn read_i16(table: &[u8], at: usize) -> Option<f32> {
 }
 
 impl Shelf {
-    fn face(&mut self, id: fontdb::ID, weight: f32, features: &Features) -> Option<FontId> {
-        let key = (id, weight as u16, features.clone());
+    fn face(&mut self, id: fontdb::ID, weight: f32, font: &Font) -> Option<FontId> {
+        let system = self.library.get();
+        let data = system.get_font(id, fontdb::Weight(weight as u16))?;
+        let mut axes = Vec::new();
+        for axis in data.as_swash().variations() {
+            let tag = axis.tag().to_be_bytes();
+            let set = font.variations.iter().find(|(name, _)| *name == tag);
+            let value = set.map(|&(_, value)| value).or(match &tag {
+                b"wght" => Some(weight),
+                b"opsz" => font.optical_size,
+                _ => None,
+            });
+            if let Some(value) = value {
+                axes.push((tag, value.clamp(axis.min_value(), axis.max_value())));
+            }
+        }
+        let bits = axes.iter().map(|&(tag, value)| (tag, value.to_bits()));
+        let key = (id, weight as u16, font.features.clone(), bits.collect());
         if let Some(&known) = self.known.get(&key) {
             return Some(known);
         }
-        let system = self.library.get();
         let info = system.db().face(id)?;
         let (family, style, stretch, fixed) = (
             info.families.first()?.0.clone(),
@@ -105,17 +123,20 @@ impl Shelf {
             info.stretch,
             info.weight,
         );
-        let font = system.get_font(id, fontdb::Weight(weight as u16))?;
+        let features = &font.features;
+        let font = data;
         let swash = font.as_swash();
-        let wght = swash.variations().find_by_tag(tag_from_bytes(b"wght"));
-        let wght = wght.map(|axis| weight.clamp(axis.min_value(), axis.max_value()));
-        let coords = match wght {
-            Some(value) => swash
-                .variations()
-                .normalized_coords([("wght", value)])
-                .collect(),
-            None => Vec::new(),
-        };
+        let wght = axes
+            .iter()
+            .find(|(tag, _)| tag == b"wght")
+            .map(|&(_, value)| value);
+        let coords = swash
+            .variations()
+            .normalized_coords(
+                axes.iter()
+                    .map(|(tag, value)| (tag_from_bytes(tag), *value)),
+            )
+            .collect();
         let color = swash.table(tag_from_bytes(b"COLR")).is_some()
             || swash.color_strikes().next().is_some();
         let mut settings = FontFeatures::new();
@@ -133,7 +154,7 @@ impl Shelf {
             stretch,
             features: settings,
             coords,
-            wght,
+            axes,
             color,
         });
         self.known.insert(key, face);
@@ -148,9 +169,11 @@ impl Shelf {
             .builder(swash)
             .size(glyph.size.0 * glyph.scale)
             .hint(true);
-        if let Some(value) = face.wght {
-            builder = builder.variations([("wght", value)]);
-        }
+        builder = builder.variations(
+            face.axes
+                .iter()
+                .map(|(tag, value)| (tag_from_bytes(tag), *value)),
+        );
         let mut scaler = builder.build();
         let sources: &[Source] = match glyph.emoji {
             true => &[
@@ -228,7 +251,7 @@ impl Shelf {
                     self.face(
                         glyph.font_id,
                         f32::from(glyph.font_weight.0),
-                        &Features::default(),
+                        &Font::default(),
                     )
                 }) else {
                     continue;
@@ -250,7 +273,8 @@ impl Shelf {
 }
 
 impl TextSystem {
-    pub fn add_font(&self, bytes: Vec<u8>) -> Result<()> {
+    /// Adds a face to `family`, as CSS groups faces by the family of their `@font-face`. Returns the family.
+    pub fn add_font(&self, bytes: Vec<u8>, family: &str) -> Result<String> {
         let shelf = &mut *self.0.borrow_mut();
         let db = shelf.library.get().db_mut();
         let ids = db.load_font_source(fontdb::Source::Binary(Arc::new(bytes)));
@@ -260,8 +284,15 @@ impl TextSystem {
         for &other in rest {
             db.remove_face(other);
         }
-        shelf.added.push(first);
-        Ok(())
+        let mut info = db
+            .face(first)
+            .context("Unsupported or invalid font data")?
+            .clone();
+        db.remove_face(first);
+        info.families = vec![(family.to_owned(), fontdb::Language::English_UnitedStates)];
+        let id = db.push_face_info(info);
+        shelf.added.push(id);
+        Ok(family.to_owned())
     }
 
     pub fn families(&self) -> Vec<String> {
@@ -321,7 +352,7 @@ impl TextSystem {
             })
             .collect();
         let at = best(&traits, font.weight, font.style)?;
-        shelf.face(faces[at], traits[at].0, &font.features)
+        shelf.face(faces[at], traits[at].0, font)
     }
 
     pub fn metrics(&self, font: FontId) -> FaceMetrics {
@@ -370,9 +401,11 @@ impl TextSystem {
         let shelf = &mut *self.0.borrow_mut();
         let face = &shelf.faces[font as usize];
         let mut builder = shelf.scaler.builder(face.font.as_swash()).size(size);
-        if let Some(value) = face.wght {
-            builder = builder.variations([("wght", value)]);
-        }
+        builder = builder.variations(
+            face.axes
+                .iter()
+                .map(|(tag, value)| (tag_from_bytes(tag), *value)),
+        );
         let outline = builder.build().scale_outline(glyph)?;
         let bounds = outline.bounds();
         Some([bounds.min.x, bounds.max.x, bounds.max.y, bounds.min.y])

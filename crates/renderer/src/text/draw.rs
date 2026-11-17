@@ -199,10 +199,14 @@ impl TextLine {
                     draw(window, start, pen.x - start.x, &style);
                 }
                 let at = pen + point(px(0.), baseline) + point(px(0.), glyph.y);
-                if glyphs
-                    && Rect::new(at + ink.lift, ink.size).intersects(window.content_mask().bounds)
+                if !glyphs {
+                } else if Rect::new(at + ink.lift, ink.size)
+                    .intersects(window.content_mask().bounds)
                 {
                     window.draw_glyph(at, glyph.font, glyph.id, glyph.size, color, glyph.emoji);
+                } else {
+                    // A copy of this paint can't move: it lacks the glyph.
+                    window.cull();
                 }
             }
             let half = ink.size.width.half();

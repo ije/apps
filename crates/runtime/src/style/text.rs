@@ -39,6 +39,8 @@ pub(crate) struct InlineText {
     pub shadows: Vec<(f32, f32, f32, renderer::Color)>,
     pub first_line: Option<Box<(renderer::TextRun, renderer::TextRun, Option<String>)>>,
     pub line_heights: Vec<(usize, LineHeight)>,
+    /// The `::before` and `::after` that are in the text, as runs or atoms.
+    pub pseudos: [bool; 2],
     /// A run has another font, size or line height than the block, so rows can grow around it.
     pub mixed: bool,
 }
@@ -48,6 +50,19 @@ pub(crate) struct Atom {
     pub node: usize,
     pub at: usize,
     pub run: usize,
+    /// 1 for `::before` and 2 for `::after` of `node`, else 0.
+    pub pseudo: u8,
+}
+
+impl Atom {
+    /// The key of the atom's measured size: the node, or the node with its pseudo-element in the high bits.
+    pub fn key(&self) -> usize {
+        atom_key(self.node, self.pseudo)
+    }
+}
+
+pub(crate) fn atom_key(node: usize, pseudo: u8) -> usize {
+    node | usize::from(pseudo) << 30
 }
 
 #[derive(Clone, Copy)]
@@ -548,6 +563,7 @@ fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
                         | Prop::LINE_HEIGHT
                         | Prop::LETTER_SPACING
                         | Prop::WORD_SPACING
+                        | Prop::TRANSITION
                         | Prop::TRANSITION_PROPERTY
                         | Prop::TRANSITION_DURATION
                         | Prop::TRANSITION_TIMING_FUNCTION
@@ -612,7 +628,24 @@ pub(crate) fn inline_text(
 ) -> Option<InlineText> {
     let parent = &styles.values[id];
     let own = doc.nodes[id].tag == "#text";
-    if !own && doc.nodes[id].children.is_empty()
+    // An element with no children is a line of its own only through an in-flow inline pseudo-element.
+    let pseudo_line = || {
+        styles.pseudos.get(&id).is_some_and(|pseudos| {
+            pseudos.iter().any(|pseudo| {
+                pseudo
+                    .get(Prop::CONTENT)
+                    .is_some_and(|value| !matches!(value, "none" | "normal"))
+                    && pseudo
+                        .get(Prop::DISPLAY)
+                        .is_none_or(|value| value.starts_with("inline"))
+                    && pseudo.get(Prop::FLOAT).is_none_or(|value| value == "none")
+                    && !pseudo
+                        .get(Prop::POSITION)
+                        .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+            })
+        })
+    };
+    if !own && doc.nodes[id].children.is_empty() && !pseudo_line()
         || matches!(
             doc.nodes[id].tag.as_str(),
             "select" | "optgroup" | "progress" | "meter"
@@ -666,38 +699,75 @@ pub(crate) fn inline_text(
     let mut marks: Vec<(f32, Option<(usize, f32)>)> = Vec::new();
     let mut led = 0;
     let mut cursors = Vec::new();
-    let [before, after] = [0, 1].map(|index| {
-        !own && styles.pseudos.get(&id).is_some_and(|pseudos| {
-            let pseudo = &pseudos[index];
-            pseudo
-                .get(Prop::CONTENT)
-                .is_some_and(|value| !matches!(value, "none" | "normal"))
-                && pseudo
-                    .get(Prop::DISPLAY)
-                    .is_none_or(|value| value.starts_with("inline"))
-                && !pseudo
-                    .get(Prop::POSITION)
-                    .is_some_and(|value| matches!(value, "absolute" | "fixed"))
-        })
+    // In-flow inline `::before` and `::after` are a part of the text: plain text as runs, and boxes as atoms.
+    let parts: [Option<(String, bool)>; 2] = [0, 1].map(|index| {
+        let pseudo = &styles.pseudos.get(&id).filter(|_| atomic_allowed)?[index];
+        let content = pseudo
+            .get(Prop::CONTENT)
+            .filter(|value| !matches!(*value, "none" | "normal"))?;
+        let display = pseudo.get(Prop::DISPLAY).unwrap_or("inline");
+        if !display.starts_with("inline")
+            || pseudo.get(Prop::FLOAT).is_some_and(|value| value != "none")
+            || pseudo
+                .get(Prop::POSITION)
+                .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+        {
+            return None;
+        }
+        let units = &styles.lengths[id];
+        let boxed = display != "inline"
+            || [super::PADDING, super::MARGIN]
+                .iter()
+                .any(|edges| units.edges(pseudo, *edges, 0.) != [0.; 4])
+            || units.borders(pseudo, 0.) != [0.; 4]
+            || pseudo
+                .get(Prop::BACKGROUND_COLOR)
+                .and_then(super::paint)
+                .is_some_and(|color| color.a != 0.)
+            || pseudo
+                .get(Prop::VERTICAL_ALIGN)
+                .is_some_and(|value| value != "baseline")
+            || pseudo.get(Prop::OPACITY).is_some_and(|value| value != "1")
+            || pseudo
+                .get(Prop::POSITION)
+                .is_some_and(|value| value != "static")
+            || [
+                Prop::BACKGROUND_IMAGE,
+                Prop::BOX_SHADOW,
+                Prop::TRANSFORM,
+                Prop::TRANSLATE,
+                Prop::ROTATE,
+                Prop::SCALE,
+                Prop::FILTER,
+                Prop::WEBKIT_FILTER,
+                Prop::MASK_IMAGE,
+                Prop::WEBKIT_MASK_IMAGE,
+                Prop::BACKDROP_FILTER,
+                Prop::WEBKIT_BACKDROP_FILTER,
+            ]
+            .into_iter()
+            .any(|prop| pseudo.get(prop).is_some_and(|value| value != "none"))
+            || pseudo
+                .get(Prop::MIX_BLEND_MODE)
+                .is_some_and(|value| value != "normal");
+        Some((pseudo_content(doc, id, pseudo, content), boxed))
     });
-    let trailing = trailing || after;
-    let mut space = !before
-        && !inline_sibling(siblings.get(..position).and_then(|rest| {
-            rest.iter()
-                .rev()
-                .find(|&&sibling| !makes_no_line(doc, styles, sibling))
-        }));
+    let mut space = !inline_sibling(siblings.get(..position).and_then(|rest| {
+        rest.iter()
+            .rev()
+            .find(|&&sibling| !makes_no_line(doc, styles, sibling))
+    }));
+    // A pseudo-element is the node `usize::MAX - index` here.
     let mut pending: Vec<_> = if own {
         vec![(id, None, None)]
     } else {
-        doc.nodes[id]
-            .children
-            .iter()
-            .rev()
-            .map(|&child| (child, None, None))
+        (parts[1].is_some().then_some(usize::MAX - 1).into_iter())
+            .chain(doc.nodes[id].children.iter().rev().copied())
+            .chain(parts[0].is_some().then_some(usize::MAX))
+            .map(|child| (child, None, None))
             .collect()
     };
-    while let Some((child, end, background)) = pending.pop() {
+    'nodes: while let Some((child, end, background)) = pending.pop() {
         if let Some(index) = end {
             let (_, range): &mut (usize, std::ops::Range<usize>) = &mut ranges[index];
             range.end = text.len();
@@ -715,68 +785,178 @@ pub(crate) fn inline_text(
                     runs[last].inset[1] += renderer::px(margin);
                 }
             }
-            continue;
+            continue 'nodes;
         }
-        let node = &doc.nodes[child];
-        let style = &styles.values[child];
-        if node.tag == "#comment"
-            || !node.tag.starts_with('#') && style.get(Prop::DISPLAY) == Some("none")
-        {
-            continue;
-        }
-        // A float of the block is a box beside the paragraph, not a part of it.
-        if atomic_allowed
-            && style.get(Prop::FLOAT).is_some_and(|value| value != "none")
-            && style
-                .get(Prop::POSITION)
-                .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
-        {
-            if node.parent == Some(id) {
-                continue;
+        let pseudo = parts
+            .get(usize::MAX - child)
+            .and_then(Option::as_ref)
+            .map(|(words, boxed)| (usize::MAX - child, words.as_str(), *boxed));
+        // A pseudo-element's text gets the font size of the pseudo-element.
+        let (node_text, style, own_style, units, atom): (
+            &str,
+            &Style,
+            Option<&Rc<Style>>,
+            Lengths,
+            Option<usize>,
+        ) = 'source: {
+            if let Some((index, words, boxed)) = pseudo {
+                let style = &styles.pseudos[&id][index];
+                let mut units = styles.lengths[id];
+                if let Some(size) = style
+                    .get(Prop::FONT_SIZE)
+                    .and_then(|value| units.resolve(value, units.font.em))
+                {
+                    units.font.em = size;
+                }
+                break 'source (words, style, None, units, boxed.then_some(id));
             }
-            return None;
-        }
-        if node.tag == "br" {
-            if text.ends_with(' ')
-                && !style
-                    .get(Prop::WHITE_SPACE)
-                    .is_some_and(|value| matches!(value, "pre" | "pre-wrap" | "break-spaces"))
+            let node = &doc.nodes[child];
+            let style = &styles.values[child];
+            let units = styles.lengths[child];
+            if node.tag == "#comment"
+                || !node.tag.starts_with('#') && style.get(Prop::DISPLAY) == Some("none")
             {
-                pop(&mut text, &mut runs, &mut ranges);
+                continue 'nodes;
             }
-            ranges.push((child, text.len()..text.len()));
-            text.push('\n');
-            runs.push(text_run(style, &styles.lengths[child], 1));
-            line_heights.push((text.len(), line_height(style)));
-            space = true;
-            continue;
-        }
-        let display = style.get(Prop::DISPLAY);
-        if atomic_allowed
-            && (display.is_some_and(|value| value.starts_with("inline-"))
-                || display.is_none_or(|value| value == "inline")
-                    && matches!(
+            // A float of the block is a box beside the paragraph, not a part of it.
+            if atomic_allowed
+                && style.get(Prop::FLOAT).is_some_and(|value| value != "none")
+                && style
+                    .get(Prop::POSITION)
+                    .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
+            {
+                if node.parent == Some(id) {
+                    continue 'nodes;
+                }
+                return None;
+            }
+            if node.tag == "br" {
+                if text.ends_with(' ')
+                    && !style
+                        .get(Prop::WHITE_SPACE)
+                        .is_some_and(|value| matches!(value, "pre" | "pre-wrap" | "break-spaces"))
+                {
+                    pop(&mut text, &mut runs, &mut ranges);
+                }
+                ranges.push((child, text.len()..text.len()));
+                text.push('\n');
+                runs.push(text_run(style, &styles.lengths[child], 1));
+                line_heights.push((text.len(), line_height(style)));
+                space = true;
+                continue 'nodes;
+            }
+            let display = style.get(Prop::DISPLAY);
+            if atomic_allowed
+                && (display.is_some_and(|value| value.starts_with("inline-"))
+                    || display.is_none_or(|value| value == "inline")
+                        && matches!(
+                            node.tag.as_str(),
+                            "img"
+                                | "svg"
+                                | "canvas"
+                                | "video"
+                                | "audio"
+                                | "iframe"
+                                | "object"
+                                | "embed"
+                                | "input"
+                                | "button"
+                                | "select"
+                                | "textarea"
+                                | "progress"
+                                | "meter"
+                        ))
+                && style
+                    .get(Prop::POSITION)
+                    .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
+                && style.get(Prop::FLOAT).is_none_or(|value| value == "none")
+            {
+                break 'source ("", &**style, None, units, Some(child));
+            }
+            if node.tag != "#text"
+                && (style
+                    .get(Prop::DISPLAY)
+                    .is_some_and(|value| value != "inline")
+                    || matches!(
                         node.tag.as_str(),
                         "img"
                             | "svg"
                             | "canvas"
-                            | "video"
-                            | "audio"
-                            | "iframe"
-                            | "object"
-                            | "embed"
                             | "input"
                             | "button"
                             | "select"
                             | "textarea"
+                            | "iframe"
+                            | "video"
+                            | "audio"
+                            | "object"
+                            | "embed"
                             | "progress"
                             | "meter"
                     ))
-            && style
-                .get(Prop::POSITION)
-                .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
-            && style.get(Prop::FLOAT).is_none_or(|value| value == "none")
-        {
+                || styles.pseudos.contains_key(&child)
+                || styles.animations.contains_key(&child)
+                || splits(style, parent)
+            {
+                return None;
+            }
+            let index = ranges.len();
+            ranges.push((child, text.len()..text.len()));
+            if node.tag != "#text"
+                && let Some(style) = style
+                    .get(Prop::CURSOR)
+                    .filter(|value| Some(*value) != parent.get(Prop::CURSOR))
+                    .and_then(cursor)
+            {
+                cursors.push((index, style));
+            }
+            let inherited_background = background;
+            let background = style
+                .get(Prop::BACKGROUND_COLOR)
+                .and_then(super::paint)
+                .filter(|color| color.a != 0.)
+                .or(background);
+            if node.tag != "#text" {
+                let units = &styles.lengths[child];
+                let padding = units.edges(style, super::PADDING, 0.);
+                let margin = units.edges(style, super::MARGIN, 0.);
+                let borders = units.borders(style, 0.);
+                let fill = (background != inherited_background)
+                    .then_some(background)
+                    .flatten()
+                    .unwrap_or_default();
+                let edges: [f32; 4] = std::array::from_fn(|side| padding[side] + borders[side]);
+                if !fill.is_transparent() || edges != [0.; 4] || margin[1] != 0. || margin[3] != 0.
+                {
+                    opening += margin[3];
+                    marks.push((opening, None));
+                    opening += edges[3];
+                    boxes.push(InlineBox {
+                        index,
+                        fill,
+                        edges,
+                        borders,
+                        border: super::BORDERS
+                            .iter()
+                            .enumerate()
+                            .filter(|(side, _)| borders[*side] > 0.)
+                            .find_map(|(_, [_, _, color])| style.get(*color).and_then(super::paint))
+                            .unwrap_or_default(),
+                        lead: f32::NAN,
+                        trail: f32::NAN,
+                    });
+                }
+            }
+            pending.push((child, Some(index), background));
+            pending.extend(
+                node.children
+                    .iter()
+                    .rev()
+                    .map(|&child| (child, None, background)),
+            );
+            (node.text.as_str(), &**style, Some(style), units, None)
+        };
+        if let Some(node) = atom {
             let at = text.len();
             text.push('\u{fffc}');
             let mut run = text_run(parent, &styles.lengths[id], '\u{fffc}'.len_utf8());
@@ -793,96 +973,17 @@ pub(crate) fn inline_text(
             led = boxes.len();
             opening = 0.;
             atoms.push(Atom {
-                node: child,
+                node,
                 at,
                 run: runs.len(),
+                pseudo: pseudo.map_or(0, |(index, ..)| index as u8 + 1),
             });
             runs.push(run);
             line_heights.push((text.len(), LineHeight::Fixed(0.)));
             space = false;
             continue;
         }
-        if node.tag != "#text"
-            && (style
-                .get(Prop::DISPLAY)
-                .is_some_and(|value| value != "inline")
-                || matches!(
-                    node.tag.as_str(),
-                    "img"
-                        | "svg"
-                        | "canvas"
-                        | "input"
-                        | "button"
-                        | "select"
-                        | "textarea"
-                        | "iframe"
-                        | "video"
-                        | "audio"
-                        | "object"
-                        | "embed"
-                        | "progress"
-                        | "meter"
-                ))
-            || styles.pseudos.contains_key(&child)
-            || styles.animations.contains_key(&child)
-            || splits(style, parent)
-        {
-            return None;
-        }
-        let index = ranges.len();
-        ranges.push((child, text.len()..text.len()));
-        if node.tag != "#text"
-            && let Some(style) = style
-                .get(Prop::CURSOR)
-                .filter(|value| Some(*value) != parent.get(Prop::CURSOR))
-                .and_then(cursor)
-        {
-            cursors.push((index, style));
-        }
-        let inherited_background = background;
-        let background = style
-            .get(Prop::BACKGROUND_COLOR)
-            .and_then(super::paint)
-            .filter(|color| color.a != 0.)
-            .or(background);
-        if node.tag != "#text" {
-            let units = &styles.lengths[child];
-            let padding = units.edges(style, super::PADDING, 0.);
-            let margin = units.edges(style, super::MARGIN, 0.);
-            let borders = units.borders(style, 0.);
-            let fill = (background != inherited_background)
-                .then_some(background)
-                .flatten()
-                .unwrap_or_default();
-            let edges: [f32; 4] = std::array::from_fn(|side| padding[side] + borders[side]);
-            if !fill.is_transparent() || edges != [0.; 4] || margin[1] != 0. || margin[3] != 0. {
-                opening += margin[3];
-                marks.push((opening, None));
-                opening += edges[3];
-                boxes.push(InlineBox {
-                    index,
-                    fill,
-                    edges,
-                    borders,
-                    border: super::BORDERS
-                        .iter()
-                        .enumerate()
-                        .filter(|(side, _)| borders[*side] > 0.)
-                        .find_map(|(_, [_, _, color])| style.get(*color).and_then(super::paint))
-                        .unwrap_or_default(),
-                    lead: f32::NAN,
-                    trail: f32::NAN,
-                });
-            }
-        }
-        pending.push((child, Some(index), background));
-        pending.extend(
-            node.children
-                .iter()
-                .rev()
-                .map(|&child| (child, None, background)),
-        );
-        if !node.text.is_empty() {
+        if !node_text.is_empty() {
             let start = text.len();
             let mode = style.get(Prop::WHITE_SPACE).unwrap_or("normal");
             let preserve = matches!(mode, "pre" | "pre-wrap" | "break-spaces");
@@ -891,8 +992,8 @@ pub(crate) fn inline_text(
             let caps = style.get(Prop::FONT_VARIANT) == Some("small-caps");
             let mut lowered: Vec<std::ops::Range<usize>> = Vec::new();
             let mut word = true;
-            text.reserve(node.text.len());
-            for c in node.text.chars() {
+            text.reserve(node_text.len());
+            for c in node_text.chars() {
                 if c.is_ascii_whitespace() && !preserve && !(c == '\n' && mode == "pre-line") {
                     if !space {
                         text.push(' ');
@@ -917,8 +1018,11 @@ pub(crate) fn inline_text(
                 word = !c.is_alphanumeric();
             }
             if text.len() > start {
-                let mut run = styled_run(style, &styles.lengths[child], text.len() - start);
-                let size = styles.lengths[child].font.em;
+                let mut run = match own_style {
+                    Some(style) => styled_run(style, &units, text.len() - start),
+                    None => text_run(style, &units, text.len() - start),
+                };
+                let size = units.font.em;
                 if (size - styles.lengths[id].font.em).abs() > 0.01 {
                     run.font_size = Some(renderer::px(size));
                 }
@@ -965,7 +1069,11 @@ pub(crate) fn inline_text(
     if text.is_empty() {
         return None;
     }
-    if !atoms.is_empty() && text.chars().all(|c| c == '\u{fffc}' || c.is_whitespace()) {
+    // A line of element boxes only lays out as boxes. Pseudo-element boxes only exist in the text.
+    if !atoms.is_empty()
+        && atoms.iter().all(|atom| atom.pseudo == 0)
+        && text.chars().all(|c| c == '\u{fffc}' || c.is_whitespace())
+    {
         return None;
     }
     let pseudo_run = |style: &Style| {
@@ -1067,6 +1175,7 @@ pub(crate) fn inline_text(
         cursors,
         shadows,
         line_heights,
+        pseudos: [parts[0].is_some(), parts[1].is_some()],
         first_line: pseudos.and_then(|pseudos| pseudos[2].as_ref()).map(|line| {
             Box::new((
                 text_run(parent, &styles.lengths[id], 0),
@@ -1077,6 +1186,75 @@ pub(crate) fn inline_text(
             ))
         }),
     })
+}
+
+pub(crate) fn pseudo_content(doc: &Document, id: usize, pseudo: &Style, content: &str) -> String {
+    let node = &doc.nodes[id];
+    let mut text = String::new();
+    for part in components(content, ' ') {
+        if let Some(name) = part.strip_prefix("attr(").and_then(|v| v.strip_suffix(')')) {
+            text.push_str(node.attrs.get(name.trim()).map_or("", String::as_str));
+        } else if let Some(close) = match part {
+            "open-quote" => Some(false),
+            "close-quote" => Some(true),
+            _ => None,
+        } {
+            let depth = std::iter::successors(node.parent, |&parent| doc.nodes[parent].parent)
+                .filter(|&parent| doc.nodes[parent].tag == "q")
+                .count();
+            let quotes: Vec<String> = match pseudo.get(Prop::QUOTES) {
+                None | Some("auto") => ["\u{201c}", "\u{201d}", "\u{2018}", "\u{2019}"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                Some(value) => components(value, ' ')
+                    .into_iter()
+                    .filter_map(|part| {
+                        let mut input = cssparser::Parser::new(part);
+                        input.expect_string().ok().map(|string| string.to_string())
+                    })
+                    .collect(),
+            };
+            let pair = (depth * 2).min(quotes.len().saturating_sub(2));
+            text.push_str(
+                quotes
+                    .get(pair + usize::from(close))
+                    .map_or("", String::as_str),
+            );
+        } else if let Some(string) = part
+            .strip_prefix(['"', '\''])
+            .and_then(|v| v.strip_suffix(['"', '\'']))
+        {
+            let mut chars = string.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '\\' {
+                    text.push(c);
+                    continue;
+                }
+                let mut code = String::new();
+                while code.len() < 6
+                    && let Some(digit) = chars.next_if(char::is_ascii_hexdigit)
+                {
+                    code.push(digit);
+                }
+                if code.is_empty() {
+                    text.extend(chars.next());
+                    continue;
+                }
+                chars.next_if_eq(&' ');
+                text.push(
+                    u32::from_str_radix(&code, 16)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .unwrap_or('\u{fffd}'),
+                );
+            }
+        }
+    }
+    if let Some(mode) = pseudo.get(Prop::TEXT_TRANSFORM) {
+        let len = text.len();
+        text_transform(&mut text, 0..len, mode);
+    }
+    text
 }
 
 pub(crate) fn word_break(style: &Style) -> renderer::WordBreak {
@@ -1219,6 +1397,34 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
     }
     if !features.is_empty() {
         font.features = features.into();
+    }
+    let mut axes: Vec<([u8; 4], f32)> = Vec::new();
+    for setting in style
+        .get(Prop::FONT_VARIATION_SETTINGS)
+        .filter(|value| *value != "normal")
+        .map(|value| components(value, ','))
+        .unwrap_or_default()
+    {
+        let mut parts = setting.split_ascii_whitespace();
+        let tag = parts.next().map(|tag| tag.trim_matches(['"', '\'']));
+        let (Some(Ok(tag)), Some(Ok(value))) = (
+            tag.map(|tag| <[u8; 4]>::try_from(tag.as_bytes())),
+            parts.next().map(str::parse::<f32>),
+        ) else {
+            continue;
+        };
+        // The last setting of an axis wins.
+        axes.retain(|(name, _)| *name != tag);
+        axes.push((tag, value));
+    }
+    if !axes.is_empty() {
+        axes.sort_unstable_by_key(|(tag, _)| *tag);
+        font.variations = axes.into();
+    }
+    if style.get(Prop::FONT_OPTICAL_SIZING) != Some("none") {
+        font.optical_size = style
+            .get(Prop::FONT_SIZE)
+            .and_then(|size| size.strip_suffix("px")?.parse().ok());
     }
     font
 }

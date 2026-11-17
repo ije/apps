@@ -118,6 +118,7 @@ impl TextStyle {
             features,
             weight,
             style,
+            ..Font::default()
         }
     }
 

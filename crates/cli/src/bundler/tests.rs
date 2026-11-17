@@ -485,7 +485,7 @@ fn html_and_css_images_become_bundled_assets() {
         assets[&icon],
         dir.path().join("img/icon.svg").canonicalize().unwrap()
     );
-    let page = &files["page-0.html"];
+    let page = &files["web/index.html"];
     assert_eq!(page.matches(&format!("apps:///{logo}")).count(), 3);
     for name in ["clip.mp4", "clip.webm", "tone.mp3"] {
         let media = asset_name(&root, &root.join("img").join(name)).unwrap();
@@ -505,6 +505,53 @@ fn html_and_css_images_become_bundled_assets() {
     let resolved: std::collections::BTreeMap<String, PathBuf> =
         serde_json::from_str(&bundle.files["assets.json"]).unwrap();
     assert_eq!(resolved[&logo], out.canonicalize().unwrap().join(&logo));
+}
+
+#[test]
+fn page_script_asset_paths_become_bundled_assets() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("app");
+    fs::create_dir_all(app.join("assets")).unwrap();
+    fs::write(app.join("assets/cover.jpg"), b"jpg").unwrap();
+    fs::write(app.join("assets/font.woff2"), b"woff2").unwrap();
+    fs::write(dir.path().join("outside.png"), b"png").unwrap();
+    fs::write(
+        app.join("page.js"),
+        "const o = {'/assets/cover.jpg': 1}; document.body.title = ['/assets/cover.jpg', `/assets/font.woff2`, './assets/font.woff2', '/assets/missing.png', '/../outside.png', '/assets/data.json', o].join();",
+    )
+    .unwrap();
+    fs::write(
+        app.join("index.html"),
+        "<script type='module' src='./page.js'></script>",
+    )
+    .unwrap();
+    let entry = app.join("main.js");
+    fs::write(
+        &entry,
+        "console.log(import.meta.resolve('./index.html'), '/assets/cover.jpg');",
+    )
+    .unwrap();
+    let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
+    let root = app.canonicalize().unwrap();
+    let cover = asset_name(&root, &root.join("assets/cover.jpg")).unwrap();
+    let font = asset_name(&root, &root.join("assets/font.woff2")).unwrap();
+    let assets: std::collections::BTreeMap<String, PathBuf> =
+        serde_json::from_str(&files["assets.json"]).unwrap();
+    assert!(assets.contains_key(&cover) && assets.contains_key(&font) && assets.len() == 2);
+    let output = files.values().cloned().collect::<String>();
+    assert_eq!(output.matches(&format!("apps:///{cover}")).count(), 1);
+    assert!(output.contains(&format!("apps:///{font}")));
+    // A `./` string is relative to the page when it runs, not to the module, so it stays.
+    for kept in [
+        "./assets/font.woff2",
+        "/assets/missing.png",
+        "/../outside.png",
+        "/assets/data.json",
+        "'/assets/cover.jpg': 1",
+    ] {
+        assert!(output.contains(kept), "{kept}");
+    }
+    assert!(files["app.js"].contains("/assets/cover.jpg"));
 }
 
 #[test]
@@ -1665,9 +1712,12 @@ fn load_file_literals_bundle_plain_electron_pages() {
         let entry = dir.path().join("main.js");
         fs::write(&entry, "import {app, BrowserWindow} from 'electron'; const page = 'missing.html'; app.whenReady().then(() => { new BrowserWindow().loadFile('index.html', {hash: 'top'}); new BrowserWindow().webContents.loadFile('./index.html'); globalThis.missing = new BrowserWindow().loadFile(page).catch(() => {}); });").unwrap();
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
-        assert!(files.contains_key("page-0.html") && !files.contains_key("page-1.html"));
+        assert!(
+            files.contains_key("index.html")
+                && files.keys().filter(|name| name.ends_with(".html")).count() == 1
+        );
         let app = apps_runtime::bundle::script_source(&files, false);
-        assert!(app.matches("apps:///page-0.html").count() == 2 && app.contains("missing.html"));
+        assert!(app.matches("apps:///index.html").count() == 2 && app.contains("missing.html"));
         assert_eq!(
             apps_runtime::desktop::Desktop::new(&files)
                 .unwrap()
@@ -1741,7 +1791,7 @@ fn resolved_html_survives_relocation() {
             files.keys().filter(|name| name.ends_with(".html")).count(),
             1
         );
-        assert!(files["page-0.html"].contains("#123456"));
+        assert!(files["nested/index.html"].contains("#123456"));
         let output = tempfile::tempdir().unwrap();
         apps_runtime::bundle::write(&output.path().join("app.bundle"), &files, &[]).unwrap();
         dir.close().unwrap();
@@ -2753,7 +2803,7 @@ fn tsconfig_paths_and_css_package_exports() {
     }
     let entry = dir.path().join("app.ts");
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
-    assert!(files["page-0.html"].contains(".kit{color:red}"));
+    assert!(files["index.html"].contains(".kit{color:red}"));
     let engine = apps_runtime::jsc::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         Rc::default(),
@@ -2830,7 +2880,7 @@ fn stylesheets_cannot_close_style_or_read_other_files() {
     fs::write(&entry, "console.log(import.meta.resolve('./index.html'));").unwrap();
     fs::write(&page, "<style>@import './node_modules/theme/screen.css'; body { margin: 0 }</style><link rel='stylesheet' media='print' href='./node_modules/theme/base.css'>").unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
-    let doc = Document::parse(&files["page-0.html"]);
+    let doc = Document::parse(&files["index.html"]);
     let [style, link] =
         ["style", "link"].map(|tag| doc.nodes.iter().position(|node| node.tag == tag).unwrap());
     let style = doc.text(style);
@@ -2840,7 +2890,7 @@ fn stylesheets_cannot_close_style_or_read_other_files() {
         doc.nodes[link].attrs.get("media").map(String::as_str),
         Some("print")
     );
-    assert!(linked_css(&files["page-0.html"]).contains("#123456"));
+    assert!(linked_css(&files["index.html"]).contains("#123456"));
     for (html, message) in [
         (
             "<link rel='stylesheet' href='./node_modules/theme/evil.css'>",
@@ -2891,7 +2941,7 @@ fn backslash_paths_are_root_relative_and_stay_in_the_app() {
     )
     .unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
-    let page = &files["page-0.html"];
+    let page = &files["index.html"];
     assert!(linked_css(page).contains("#123456"), "{page}");
     assert!(page.contains("src=\"apps:///assets/"), "{page}");
     assert!(page.contains(r"\..\outside.png"), "{page}");
@@ -3048,7 +3098,7 @@ fn package_folders_css_packages_and_asset_urls() {
     )
     .unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
-    assert!(files["page-0.html"].contains(".spin{color:red}"));
+    assert!(files["index.html"].contains(".spin{color:red}"));
     let assets: std::collections::BTreeMap<String, PathBuf> =
         serde_json::from_str(&files["assets.json"]).unwrap();
     assert_eq!(assets.len(), 1);
@@ -3149,7 +3199,7 @@ fn pages_keep_a_leading_newline_in_pre_and_textarea() {
     let entry = dir.path().join("app.ts");
     fs::write(&entry, "import {app, BrowserWindow} from '@pierre/apps'; app.whenReady().then(() => new BrowserWindow().loadFile(import.meta.resolve('./index.html')));").unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap();
-    let page = Document::parse(&files["page-0.html"]);
+    let page = Document::parse(&files["index.html"]);
     let text = |id: &str| {
         let node = (0..page.nodes.len())
             .find(|&node| page.nodes[node].attrs.get("id").map(String::as_str) == Some(id))
@@ -3182,7 +3232,7 @@ fn page_scripts_share_one_module_graph_per_realm() {
                 .count(),
             2
         );
-        let page = Document::parse(&files["page-0.html"]);
+        let page = Document::parse(&files["index.html"]);
         let sources: Vec<_> = (0..page.nodes.len())
             .filter(|&id| page.nodes[id].tag == "script")
             .map(|id| {
@@ -3642,7 +3692,7 @@ fn main_workers_share_pages_and_skip_package_metadata() {
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
         let pages: Vec<_> = files
             .iter()
-            .filter(|(name, _)| name.starts_with("page-"))
+            .filter(|(name, _)| name.ends_with(".html"))
             .collect();
         assert_eq!(pages.len(), 3, "production={production}");
         let (other, _) = pages
@@ -3870,7 +3920,7 @@ fn css_imports_keep_layer_supports_and_media_conditions() {
     let entry = dir.path().join("app.ts");
     fs::write(&entry, "console.log(import.meta.resolve('./index.html'));").unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
-    let page = &files["page-0.html"];
+    let page = &files["index.html"];
     for expected in [
         "@layer base{.a{}}",
         "@layer{.b{}}",
@@ -3950,7 +4000,7 @@ fn http_imports_download_with_the_feature() {
     for production in [false, true] {
         let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
         if production {
-            let css = linked_css(&files["page-0.html"]);
+            let css = linked_css(&files["index.html"]);
             assert!(
                 css.contains(".b{color:red}") && css.contains(&format!("\"{origin}/img/a.png\"")),
                 "{css}"
@@ -4152,7 +4202,7 @@ fn css_urls_skip_comments_and_strings_and_asset_names_are_stable() {
     )
     .unwrap();
     let files = compile(&entry, Realm::Main, None, Rc::default(), true, None).unwrap();
-    let page = &files["page-0.html"];
+    let page = &files["web/index.html"];
     assert!(
         page.contains(&format!(
             "srcset=\"apps:///{a} 1x,apps:///{b}, data:image/png;base64,AA== 3x\""

@@ -2515,6 +2515,7 @@
   for (const [name, code] of [['fillStyle', 4], ['strokeStyle', 5], ['font', 6], ['textAlign', 7], ['textBaseline', 8], ['globalAlpha', 9], ['lineWidth', 10]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { get() { return this._state[name]; }, set(value) {
     if (code < 6 && (value instanceof CanvasGradient || value instanceof CanvasPattern)) { this._state[name] = value; const image = value._image; image?._context?._flush?.(); const text = value._spec(image === this.canvas ? -1 : image?._id); this._texts.push(text); this._op(code, text.length); if (image instanceof ImageBitmap) bitmapDraws.add(this); else if (image?._context && image !== this.canvas) this._flush(); return; }
     if (code < 9) value = String(value); else if (value = Number(value), !(code === 9 ? value >= 0 && value <= 1 : value > 0 && value < Infinity)) return;
+    if (code < 6 && !/currentcolor/i.test(value)) { const color = call('dom.canvasColor', 0, value); if (color === null) return; if (!/^\s*(oklch|oklab|lab|lch|color)\(/i.test(value)) value = color; }
     if (this._state[name] === value) return;
     this._state[name] = value; if (code < 9) { this._texts.push(alone(value)); this._op(code, value.length); } else this._op(code, value);
   } });
@@ -2526,7 +2527,9 @@
     value = name === 'shadowColor' ? String(value) : Number(value); if (!valid(value)) return;
     const state = this._state; state[name] = value; this._texts.push(state.shadowColor); this._op(43, state.shadowColor.length, state.shadowBlur, state.shadowOffsetX, state.shadowOffsetY);
   } });
-  for (const name of ['imageSmoothingQuality', 'filter', 'fontKerning', 'fontStretch', 'fontVariantCaps', 'textRendering', 'direction', 'lang']) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { this._state[name] = value; } });
+  // Of the filter functions, only `blur()` draws: other values keep their text and draw without a filter.
+  Object.defineProperty(CanvasRenderingContext2D.prototype, 'filter', { configurable: true, enumerable: true, get() { return this._state.filter; }, set(value) { value = String(value); const blur = /^\s*blur\(\s*([\d.]+)(px)?\s*\)\s*$/i.exec(value); if (value.trim() !== 'none' && !blur && !CSS.supports('filter', value)) return; this._state.filter = value; this._op(44, blur ? Number(blur[1]) : 0); } });
+  for (const name of ['imageSmoothingQuality', 'fontKerning', 'fontStretch', 'fontVariantCaps', 'textRendering', 'direction', 'lang']) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { this._state[name] = value; } });
   class CanvasGradient {
     constructor(shape) { this._shape = shape.map(Number); this._stops = []; }
     addColorStop(offset, color) { offset = Number(offset); if (!(offset >= 0 && offset <= 1)) throw new DOMException('The offset is out of range', 'IndexSizeError'); this._stops.push([offset, String(color)]); }
@@ -2809,6 +2812,7 @@
   }
   // Match render's dimension(): leading HTML non-negative integers after whitespace and an optional +.
   const canvasSize = (value, fallback) => { const digits = /^[\t\n\f\r ]*\+?(\d+)/.exec(value ?? '')?.[1], size = digits ? Number(digits) : NaN; return size <= 2147483647 ? size : fallback; };
+  let webglWarned = false;
   class HTMLCanvasElement extends HTMLElement {
     get clientWidth(){const width=this.getBoundingClientRect().width;if(width)return width;const value=getComputedStyle(this).width;return /^\d+(?:\.\d+)?px$/.test(value)?parseFloat(value):this.width;}
     get clientHeight(){const height=this.getBoundingClientRect().height;if(height)return height;const value=getComputedStyle(this).height;return /^\d+(?:\.\d+)?px$/.test(value)?parseFloat(value):this.height;}
@@ -2817,7 +2821,7 @@
     setAttribute(name, value) { super.setAttribute(name, value); if (name === 'width' || name === 'height') this._context?._resize(); }
     toDataURL(type, quality) { this._context?._flush?.(); return call('dom.canvasURL', this._id, false, String(type).toLowerCase(), quality); }
     toBlob(callback, type, quality) { if (typeof callback !== 'function') throw new TypeError('Expected a callback'); this._context?._flush?.(); const [bytes, mime] = call('dom.canvasURL', this._id, true, String(type).toLowerCase(), quality); setTimeout(() => callback(new Blob([bytes], { type: mime }))); }
-    getContext(type, options) { if (this._offscreen) throw transferred(); if (['webgl','webgl2','experimental-webgl','experimental-webgl2'].includes(type))throw new DOMException('WebGL is not supported; use WebGPU or Canvas 2D','NotSupportedError'); return canvasContext(this, type, options, CanvasRenderingContext2D); }
+    getContext(type, options) { if (this._offscreen) throw transferred(); if (['webgl','webgl2','experimental-webgl','experimental-webgl2'].includes(type)) { if (!webglWarned) { webglWarned = true; console.warn('WebGL is not supported: getContext() returns null. Use WebGPU or Canvas 2D'); } return null; } return canvasContext(this, type, options, CanvasRenderingContext2D); }
     transferControlToOffscreen() { if (this._contextType || this._offscreen) throw new DOMException('The canvas has a context or was already transferred', 'InvalidStateError'); this._offscreen = true; const offscreen = new OffscreenCanvas(0, 0); offscreen._node = this; return offscreen; }
     get content() { return this.getAttribute('content')?.toLowerCase() === 'drawable' ? 'drawable' : 'fallback'; } set content(value) { this.setAttribute('content', value); }
     requestPaint() { paintRequests.add(this); host('dom.requestPaint'); }

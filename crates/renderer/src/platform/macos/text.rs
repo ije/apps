@@ -58,7 +58,12 @@ type Faces = Option<Vec<(Shared, String)>>;
 static SYSTEM_FACES: Process<(String, Vec<(String, u32)>), Faces> = Process::new();
 /// Keyed by font pointer. The faces stay alive in `SYSTEM_FACES`.
 static AXES: Process<usize, Option<f32>> = Process::new();
-static WEIGHTS: Process<(usize, u32), Option<(Shared, String)>> = Process::new();
+/// Axis tags and value bits.
+type Coords = Vec<(u32, u32)>;
+/// Tags with minimum, default and maximum.
+type Axes = Rc<[(u32, [f32; 3])]>;
+
+static INSTANCES: Process<(usize, Coords), (Shared, String)> = Process::new();
 
 static FAMILIES: LazyLock<Vec<String>> = LazyLock::new(|| {
     // SAFETY: CoreText returns an array of strings.
@@ -81,6 +86,7 @@ struct Face {
     mono: bool,
     units: OnceCell<Units>,
     matching: OnceCell<(f32, FontStyle, f32)>,
+    axes: OnceCell<Axes>,
 }
 
 /// In font units, computed as font-kit did, so layout keeps its numbers.
@@ -109,7 +115,14 @@ impl Face {
             local,
             units: OnceCell::new(),
             matching: OnceCell::new(),
+            axes: OnceCell::new(),
         }
+    }
+
+    fn axes(&self) -> Axes {
+        self.axes
+            .get_or_init(|| open_type::axes(&self.font).into())
+            .clone()
     }
 
     fn units(&self) -> Units {
@@ -251,7 +264,7 @@ struct Added {
 #[derive(Default)]
 struct Book {
     faces: Vec<Face>,
-    /// PostScript names, plus `#wght<weight>` for weight instances.
+    /// PostScript names, plus axis values for instances.
     names: FxHashMap<String, FontId>,
     families: FxHashMap<(SharedString, Features), Rc<[FontId]>>,
     /// Sorted by family, stable.
@@ -285,22 +298,22 @@ impl Default for TextSystem {
 }
 
 impl TextSystem {
-    pub fn add_font(&self, bytes: Vec<u8>) -> Result<()> {
+    /// Adds a face to `family`, as CSS groups faces by the family of their `@font-face`. Returns the family.
+    pub fn add_font(&self, bytes: Vec<u8>, family: &str) -> Result<String> {
         // SAFETY: CoreText parses the data and returns an array of descriptors.
         let descriptor = unsafe {
             let all = CTFontManagerCreateFontDescriptorsFromData(&CFData::from_bytes(&bytes));
             all.cast_unchecked::<CTFontDescriptor>().get(0)
         }
         .context("Unsupported or invalid font data")?;
-        // SAFETY: the descriptor comes from CoreText.
-        let family =
-            unsafe { CTFont::with_font_descriptor(&descriptor, 16., ptr::null()).family_name() }
-                .to_string();
         let book = &mut *self.0.borrow_mut();
-        book.added.push(Added { family, descriptor });
+        book.added.push(Added {
+            family: family.to_owned(),
+            descriptor,
+        });
         book.added.sort_by(|a, b| a.family.cmp(&b.family));
         book.families.clear();
-        Ok(())
+        Ok(family.to_owned())
     }
 
     pub fn families(&self) -> Vec<String> {
@@ -563,18 +576,47 @@ impl Book {
             .iter()
             .map(|&id| self.face(id).matching())
             .collect();
-        let mut id = candidates[best(&matching, font.weight, font.style)?];
+        let id = candidates[best(&matching, font.weight, font.style)?];
         let face = self.face(id);
+        let axes = face.axes();
+        if axes.is_empty() {
+            return Some(id);
+        }
         let default = if face.local {
             open_type::default_weight(&face.font)
         } else {
             let pointer = CFRetained::as_ptr(&face.font).as_ptr() as usize;
             AXES.get(pointer, || open_type::default_weight(&face.font))
         };
-        if default.is_some() && open_type::weight(&face.font).or(default) != Some(font.weight) {
-            id = self.weighted(id, font.weight);
+        let current = open_type::variation(&face.font);
+        let mut wanted = Vec::new();
+        let mut same = true;
+        for &(tag, [min, initial, max]) in axes.iter() {
+            let set = font
+                .variations
+                .iter()
+                .find(|(name, _)| u32::from_be_bytes(*name) == tag)
+                .map(|&(_, value)| value);
+            let value = set.or(match tag {
+                open_type::WGHT if default.is_some() => Some(font.weight),
+                // Like Chromium, web fonts follow the font size. CoreText sizes system fonts itself.
+                open_type::OPSZ if face.local => font.optical_size,
+                _ => None,
+            });
+            if let Some(value) = value {
+                let value = value.clamp(min, max);
+                let now = current
+                    .iter()
+                    .find(|(name, _)| *name == tag)
+                    .map_or(initial, |&(_, value)| value);
+                same &= value == now;
+                wanted.push((tag, value));
+            }
         }
-        Some(id)
+        if wanted.is_empty() || same && !face.local {
+            return Some(id);
+        }
+        Some(self.instance(id, wanted))
     }
 
     fn load(&mut self, family: &str, features: &[(String, u32)]) -> Option<Vec<FontId>> {
@@ -620,27 +662,24 @@ impl Book {
         )
     }
 
-    fn weighted(&mut self, id: FontId, weight: f32) -> FontId {
+    fn instance(&mut self, id: FontId, axes: Vec<(u32, f32)>) -> FontId {
         let face = self.face(id);
         let local = face.local;
+        let pointer = CFRetained::as_ptr(&face.font).as_ptr() as usize;
         let make = || {
-            let font = open_type::with_weight(&face.font, weight);
-            // SAFETY: a plain CoreText query.
-            let name = format!(
-                "{}#wght{}",
-                unsafe { font.post_script_name() },
-                open_type::weight(&font)?
-            );
-            Some((Shared(font), name))
+            let font = open_type::with_variations(&face.font, &axes);
+            // The base pointer keeps instances of faces with other features apart.
+            let mut name = format!("{}#{pointer:x}", unsafe { font.post_script_name() });
+            for (tag, value) in &axes {
+                name += &format!("#{tag:x}={value}");
+            }
+            (Shared(font), name)
         };
-        let made = if local {
+        let (font, name) = if local {
             make()
         } else {
-            let pointer = CFRetained::as_ptr(&face.font).as_ptr() as usize;
-            WEIGHTS.get((pointer, weight.to_bits()), make)
-        };
-        let Some((font, name)) = made else {
-            return id;
+            let key = axes.iter().map(|&(tag, value)| (tag, value.to_bits()));
+            INSTANCES.get((pointer, key.collect()), make)
         };
         match self.names.get(&name) {
             Some(&known) => known,
@@ -650,10 +689,11 @@ impl Book {
 
     fn native(&mut self, font: &CTFont) -> FontId {
         // SAFETY: plain CoreText queries.
-        let name = unsafe { font.post_script_name() }.to_string();
-        let instance = open_type::weight(font)
-            .and_then(|weight| self.names.get(&format!("{name}#wght{weight}")));
-        if let Some(&id) = instance.or_else(|| self.names.get(&name)) {
+        let mut name = unsafe { font.post_script_name() }.to_string();
+        for (tag, value) in open_type::variation(font) {
+            name += &format!("#native{tag:x}={value}");
+        }
+        if let Some(&id) = self.names.get(&name) {
             return id;
         }
         // SAFETY: the graphics font comes from a live CoreText font.
@@ -1215,6 +1255,8 @@ impl Book {
         let string =
             CFMutableAttributedString::new(None, 0).expect("CFAttributedStringCreateMutable");
         let (mut rest, mut nudge) = (text, false);
+        // Instances share a PostScript name, so runs map back to their span font by pointer.
+        let mut own = Vec::with_capacity(spans.len());
         for span in spans {
             let piece;
             (piece, rest) = rest.split_at(span.len);
@@ -1237,6 +1279,7 @@ impl Book {
                 span.size.0
             };
             let font = self.sized(span.font, size);
+            own.push((CFRetained::as_ptr(&font).as_ptr() as usize, span.font));
             // SAFETY: the range is inside the string, and the value is a font.
             unsafe {
                 CFMutableAttributedString::set_attribute(
@@ -1275,13 +1318,16 @@ impl Book {
                 self.natives.clear();
             }
             let key = CFRetained::as_ptr(&font).as_ptr() as usize;
-            let id = match self.natives.get(&key) {
+            let id = match own.iter().find(|(pointer, _)| *pointer == key) {
                 Some(&(_, id)) => id,
-                None => {
-                    let id = self.native(&font);
-                    self.natives.insert(key, (font.clone(), id));
-                    id
-                }
+                None => match self.natives.get(&key) {
+                    Some(&(_, id)) => id,
+                    None => {
+                        let id = self.native(&font);
+                        self.natives.insert(key, (font.clone(), id));
+                        id
+                    }
+                },
             };
             let emoji = self.face(id).emoji;
             // The emoji font that system fonts fall back to has wider advances than Chromium's.
@@ -1598,7 +1644,7 @@ mod tests {
         };
         let [first, second] = [TextSystem::default(), TextSystem::default()];
         let bold = names(&first, 600.);
-        assert!(bold.ends_with("#wght600"), "{bold}");
+        assert!(bold.ends_with("#77676874=600"), "{bold}");
         assert_eq!(
             [names(&second, 400.), names(&second, 600.)],
             [names(&first, 400.), bold]
@@ -1630,7 +1676,7 @@ mod tests {
     fn fonts_from_memory_stay_with_their_text_system() {
         let bytes = std::fs::read("/System/Library/Fonts/Supplemental/Chalkduster.ttf").unwrap();
         let text = TextSystem::default();
-        text.add_font(bytes).unwrap();
+        text.add_font(bytes, "Chalkduster").unwrap();
         assert!(text.families().iter().any(|family| family == "Chalkduster"));
         let id = text.font(&Font::new("Chalkduster")).unwrap();
         assert!(text.0.borrow().face(id).local);

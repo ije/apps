@@ -26,6 +26,8 @@ struct State {
     baseline: u8,
     clip: Option<Rc<skia::Mask>>,
     shadow: (skia::Color, f32, [f32; 2]),
+    /// The standard deviation of `filter: blur()`, in canvas pixels.
+    blur: f32,
 }
 
 impl State {
@@ -174,9 +176,9 @@ pub struct Canvas {
 }
 
 // The codes and argument counts must match `CanvasRenderingContext2D` and `Path2D` in `dom.js`.
-const ARGS: [usize; 44] = [
+const ARGS: [usize; 45] = [
     0, 0, 6, 6, 1, 1, 1, 1, 1, 1, 1, 0, 0, 2, 2, 4, 6, 4, 1, 0, 1, 4, 4, 4, 4, 11, 5, 4, 6, 8, 5,
-    12, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 4,
+    12, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 4, 1,
 ];
 
 type GlyphKey = (u32, u16, u32, u32, u8, bool);
@@ -690,6 +692,7 @@ impl Canvas {
                 baseline: 0,
                 clip: None,
                 shadow: (skia::Color::TRANSPARENT, 0., [0.; 2]),
+                blur: 0.,
             },
             stack: Vec::new(),
             path: skia::PathBuilder::new(),
@@ -714,7 +717,10 @@ impl Canvas {
         // canvas. A new canvas-sized buffer costs page faults, so one batch reuses its layer through `spare`.
         let (mut covered, mut spare): (Option<skia::Pixmap>, Option<skia::Pixmap>) = (None, None);
         let finish = |pixels: &mut skia::Pixmap, saved: skia::Pixmap, state: &State| {
-            let layer = std::mem::replace(pixels, saved);
+            let mut layer = std::mem::replace(pixels, saved);
+            if state.blur > 0. {
+                super::resvg::blur(&mut layer, state.blur.min(256.));
+            }
             if let Some((shadow, x, y)) = shadow(&layer, state.shadow).filter(|_| state.shadowed())
             {
                 pixels.draw_pixmap(
@@ -778,6 +784,7 @@ impl Canvas {
             };
             let blend = if matches!(code as u8, 18 | 19 | 21 | 22 | 24 | 25 | 27)
                 && (self.state.shadowed()
+                    || self.state.blur > 0.
                     || matches!(
                         self.state.blend,
                         skia::BlendMode::SourceIn
@@ -1318,6 +1325,7 @@ impl Canvas {
                     }
                 }
                 38 => state.spacing[0] = a[0] as f32,
+                44 => state.blur = (a[0] as f32).max(0.),
                 39 => state.spacing[1] = a[0] as f32,
                 40 => state.smoothing = a[0] != 0.,
                 43 => {

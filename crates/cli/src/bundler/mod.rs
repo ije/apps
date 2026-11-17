@@ -850,7 +850,18 @@ impl<'a> Linker<'a, '_> {
             None => {
                 shared.files.borrow_mut().insert(target.clone());
                 // Reserve the name first: the page's own workers can resolve the page again.
-                let name = format!("page-{}.html", shared.pages.borrow().len());
+                // Keep the app path, so `location.pathname` is what routers expect.
+                let name = target
+                    .strip_prefix(&shared.root)
+                    .ok()
+                    .and_then(|path| path.to_str())
+                    .map(|path| path.replace('\\', "/"))
+                    .filter(|path| {
+                        path.bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"._-/".contains(&byte))
+                            && !path.split('/').any(|part| part.is_empty() || part == "..")
+                    })
+                    .unwrap_or_else(|| format!("page-{}.html", shared.pages.borrow().len()));
                 shared
                     .pages
                     .borrow_mut()
@@ -1013,12 +1024,45 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
         }
     }
 
+    fn visit_property_key(&mut self, key: &mut PropertyKey<'a>) {
+        if !matches!(
+            key,
+            PropertyKey::StringLiteral(_) | PropertyKey::TemplateLiteral(_)
+        ) {
+            walk_mut::walk_property_key(self, key);
+        }
+    }
+
     fn visit_expression(&mut self, expression: &mut Expression<'a>) {
         if self.error.is_some() {
             return;
         }
         let result = (|| -> Result<()> {
             let span = expression.span();
+            if self.builder.realm == Realm::Renderer
+                && let Some(value) = match &*expression {
+                    Expression::StringLiteral(literal) => literal.value.as_str(),
+                    Expression::TemplateLiteral(template) if template.expressions.is_empty() => {
+                        template.quasis[0]
+                            .value
+                            .cooked
+                            .as_ref()
+                            .and_then(|v| v.as_str())
+                    }
+                    _ => None,
+                }
+                && let Some(file) = value.strip_prefix('/')
+                && Path::new(file).extension().is_some_and(is_asset)
+                && !is_remote(self.path)
+                && let Ok(path) = self.builder.shared.root.join(file).canonicalize()
+                && path.starts_with(&self.builder.shared.root)
+                && let Some(url) = self.builder.url_of(&path)?
+            {
+                self.cacheable = false;
+                let value = self.allocator.alloc_str(&url);
+                *expression = Expression::new_string_literal(span, value, None, &self.ast);
+                return Ok(());
+            }
             let (scoping, aliases) = (self.scoping, &self.aliases);
             let name = |callee: &Expression<'a>| match callee.get_inner_expression() {
                 Expression::Identifier(name) => Some(
@@ -3777,44 +3821,51 @@ fn resolve_file(path: &Path) -> Result<PathBuf> {
     bail!("Cannot resolve {}", path.display())
 }
 
+fn is_asset(extension: &std::ffi::OsStr) -> bool {
+    extension.to_str().is_some_and(|extension| {
+        matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "avif"
+                | "bmp"
+                | "ico"
+                | "svg"
+                | "ttf"
+                | "otf"
+                | "woff"
+                | "woff2"
+                | "mp4"
+                | "m4v"
+                | "m4a"
+                | "mov"
+                | "webm"
+                | "mkv"
+                | "ogg"
+                | "oga"
+                | "ogv"
+                | "opus"
+                | "mp3"
+                | "wav"
+                | "flac"
+                | "aac"
+                | "wasm"
+                | "glb"
+                | "bcmap"
+                | "pfb"
+        )
+    })
+}
+
 fn asset_name(root: &Path, path: &Path) -> Option<String> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    if !matches!(
-        extension.as_str(),
-        "png"
-            | "jpg"
-            | "jpeg"
-            | "gif"
-            | "webp"
-            | "avif"
-            | "bmp"
-            | "ico"
-            | "svg"
-            | "ttf"
-            | "otf"
-            | "woff"
-            | "woff2"
-            | "mp4"
-            | "m4v"
-            | "m4a"
-            | "mov"
-            | "webm"
-            | "mkv"
-            | "ogg"
-            | "oga"
-            | "ogv"
-            | "opus"
-            | "mp3"
-            | "wav"
-            | "flac"
-            | "aac"
-            | "wasm"
-            | "glb"
-            | "bcmap"
-            | "pfb"
-    ) {
-        return None;
-    }
+    let extension = path
+        .extension()
+        .filter(|e| is_asset(e))?
+        .to_str()?
+        .to_ascii_lowercase();
     let hash = app_relative(root, path)
         .as_os_str()
         .as_encoded_bytes()

@@ -30,10 +30,9 @@ fn canvas_identity_and_webgl_errors() {
         canvas.width = 64; canvas.height = 32; canvas.style.width = '128px';
         if (canvas.width !== 64 || canvas.height !== 32 || canvas.clientWidth !== 128) throw Error('Canvas sizing failed');
         if (canvas.getContext('webgpu') !== canvas.getContext('webgpu')) throw Error('Context identity changed');
+        // As in browsers without WebGL, the context is null, so pages can fall back.
         for (const type of ['webgl', 'webgl2', 'experimental-webgl', 'experimental-webgl2']) {
-            let rejected = false;
-            try { canvas.getContext(type); } catch (e) { rejected = e.message.includes('WebGL is not supported'); }
-            if (!rejected) throw Error(type + ' was accepted');
+            if (canvas.getContext(type) !== null) throw Error(type + ' was accepted');
         }
         let unconfigured = false;
         try { canvas.getContext('webgpu').getCurrentTexture(); } catch { unconfigured = true; }

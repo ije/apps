@@ -186,9 +186,9 @@ impl Region {
 }
 
 // Column-major 3x3 matrices of the z = 0 plane of a CSS transform.
-type Plane = [f32; 9];
+pub(crate) type Plane = [f32; 9];
 
-fn plane_of(m: &[f32; 16]) -> Plane {
+pub(crate) fn plane_of(m: &[f32; 16]) -> Plane {
     [m[0], m[1], m[3], m[4], m[5], m[7], m[12], m[13], m[15]]
 }
 
@@ -201,7 +201,7 @@ fn compose(outer: &Plane, inner: &Plane) -> Plane {
     out
 }
 
-fn invert(m: &Plane) -> Option<Plane> {
+pub(crate) fn invert(m: &Plane) -> Option<Plane> {
     let cross = |a: &[f32], b: &[f32]| {
         [
             a[1] * b[2] - a[2] * b[1],
@@ -1576,6 +1576,12 @@ impl Window {
         let at = self.pending.regions.len() as u32;
         self.pending.regions.extend_from_slice(copied);
         Some(at)
+    }
+
+    /// Drops the state that `keyed` keeps, as for a new document whose nodes reuse the old keys.
+    pub fn forget_states(&mut self) {
+        self.states.clear();
+        self.next_states.clear();
     }
 
     pub fn keyed<S: Default + 'static>(&mut self, key: NodeKey) -> &mut S {
