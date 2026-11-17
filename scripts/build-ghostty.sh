@@ -24,7 +24,9 @@ output=$root/target/ghostty/$system-$arch
 mkdir -p "$sources"
 
 for name in libghostty-vt-$version libghostty-vt-$version-deps; do
-  [[ -d $sources/$name ]] && continue
+  # rust-cache saves target/, also with a source that a cancelled job extracted only in part.
+  [[ -f $sources/$name/.extracted ]] && continue
+  rm -rf "${sources:?}/$name"
   archive=$sources/$name.tar.gz
   if [[ ! -f $archive ]]; then
     curl -fL --retry 5 -o "$archive.part" "https://release.files.ghostty.org/libghostty-vt/$version/$name.tar.gz"
@@ -37,6 +39,7 @@ for name in libghostty-vt-$version libghostty-vt-$version-deps; do
     exit 1
   fi
   tar -xzf "$archive" -C "$sources"
+  touch "$sources/$name/.extracted"
 done
 
 # libghostty-vt converts image pixels only to RGBA, so the conversions of wuffs to other formats stay out.

@@ -26,7 +26,9 @@ output=$root/target/ffmpeg/$system-$arch
 build=$output.build
 mkdir -p "$sources"
 
-if [[ ! -d $source_dir ]]; then
+# rust-cache saves target/, also with a source that a cancelled job extracted only in part.
+if [[ ! -f $source_dir/.extracted ]]; then
+  rm -rf "$source_dir"
   archive=$sources/ffmpeg-$version.tar.xz
   if [[ ! -f $archive ]]; then
     curl -fL --retry 5 -o "$archive.part" "https://ffmpeg.org/releases/ffmpeg-$version.tar.xz"
@@ -37,6 +39,7 @@ if [[ ! -d $source_dir ]]; then
     exit 1
   fi
   tar -xf "$archive" -C "$sources"
+  touch "$source_dir/.extracted"
 fi
 
 options=(
