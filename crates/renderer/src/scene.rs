@@ -43,6 +43,57 @@ pub struct Scene {
     // Patched regions since the last diff, which the prior entries don't know.
     patched: Damage,
     salt: u64,
+    // The content of scroll containers in the window layer, in paint order, and those of the last painted scene.
+    scrolls: Vec<Scroll>,
+    last_scrolls: Vec<Scroll>,
+    prior_scrolls: Vec<Scroll>,
+    // Open scrolls of the paint, or `usize::MAX` for one outside the window layer.
+    open: Vec<usize>,
+    cuts: Vec<Cut>,
+    last_cuts: Vec<Cut>,
+    // Open cuts of the paint, or `usize::MAX` for a scroll without one.
+    cutting: Vec<usize>,
+    // The clips that `bake` cut, while the scene is baked.
+    raw: Vec<Raw>,
+    baked: bool,
+    owners: [Vec<u32>; 2],
+    // The window region that shows a scroll container, and how far its content moved since the drawn frame, in
+    // device pixels: the backend copies the last frame moved by it there and draws only `damage`.
+    pub(crate) shift: Option<Shift>,
+}
+
+// A viewport region in device pixels, and how far its content moved.
+pub(crate) type Shift = ([i32; 4], [i32; 2]);
+
+// The instances and nested layers of the window layer that a scroll container paints. `shift` added to their
+// places gives places in the content, which scrolling doesn't change.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Scroll {
+    id: u64,
+    viewport: Clip<f32>,
+    shift: Point<f32>,
+    instances: [u32; 2],
+    nested: [u32; 2],
+    // The scroll around it, or u32::MAX.
+    parent: u32,
+}
+
+// The content of a scroll container that painted in an interest area larger than its viewport, in any layer:
+// `bake` clips it to the viewport.
+#[derive(Clone, Copy, Debug)]
+struct Cut {
+    layer: u32,
+    instances: [u32; 2],
+    nested: [u32; 2],
+    viewport: Clip<f32>,
+}
+
+// A clip that `bake` cut to a viewport, to put back before the scene is a source of copies.
+#[derive(Clone, Copy)]
+enum Raw {
+    Instance(u32, u32, [f32; 4]),
+    Nested(u32, u32, Rect<f32>),
+    Effect(u32, Rect<f32>),
 }
 
 // The window region to draw again: a few rectangles, or the whole window.
@@ -52,7 +103,7 @@ pub(crate) struct Damage {
     pub whole: bool,
 }
 
-const DAMAGE_RECTS: usize = 4;
+const DAMAGE_RECTS: usize = 8;
 // A rectangle joins another when their union adds at most this many pixels.
 const DAMAGE_SLACK: f32 = 64. * 64.;
 
@@ -98,6 +149,8 @@ struct Entry {
     layer: u32,
     // The instance index, or NESTED with the nested layer.
     item: u32,
+    // The innermost scroll that holds the entry, plus one, or 0.
+    scroll: u32,
 }
 
 const NESTED: u32 = 1 << 31;
@@ -240,13 +293,22 @@ fn inside(rect: Rect<f32>, outer: Rect<f32>) -> bool {
         && rect.bottom() < outer.bottom()
 }
 
-fn instance_hash(instance: &Instance, origin: Point<f32>) -> u64 {
+// In a scroll, the mask around the content stays where the content moves, so a clip that is only that mask
+// counts as the place of the instance itself.
+fn instance_hash(instance: &Instance, origin: Point<f32>, viewport: Option<&Clip<f32>>) -> u64 {
     let mut copy = *instance;
     let shift = |[x, y, width, height]: [f32; 4]| [x - origin.x, y - origin.y, width, height];
+    let masked = viewport.is_some_and(|viewport| instance.clip == viewport.bounds.to_array());
     copy.rect = shift(instance.rect);
-    copy.clip = shift(instance.reach().to_array());
+    copy.clip = shift(match masked {
+        true => instance.area().to_array(),
+        false => instance.reach().to_array(),
+    });
     copy.round = match instance.round_radii == [0.; 8] {
         true => [0.; 4],
+        false if viewport.is_some_and(|viewport| instance.round == viewport.rounded.to_array()) => {
+            [f32::MIN; 4]
+        }
         false => shift(instance.round),
     };
     if instance.kind() == SHADOW {
@@ -321,6 +383,8 @@ pub(crate) struct Mark {
     layers: u32,
     keyed: u32,
     shots: u32,
+    scrolls: u32,
+    cuts: u32,
 }
 
 // What a paint span added to the scene: instances and nested layers of its layer, and the layers it made.
@@ -330,6 +394,8 @@ pub(crate) struct Span {
     instances: [u32; 2],
     nested: [u32; 2],
     layers: [u32; 2],
+    scrolls: [u32; 2],
+    cuts: [u32; 2],
 }
 
 impl Nested {
@@ -365,6 +431,17 @@ impl Default for Scene {
             patched: Damage::default(),
             culled: 0,
             salt: 0,
+            scrolls: Vec::new(),
+            last_scrolls: Vec::new(),
+            prior_scrolls: Vec::new(),
+            open: Vec::new(),
+            cuts: Vec::new(),
+            last_cuts: Vec::new(),
+            cutting: Vec::new(),
+            raw: Vec::new(),
+            baked: false,
+            owners: Default::default(),
+            shift: None,
         }
     }
 }
@@ -384,14 +461,22 @@ impl SceneLayer {
 
 impl Scene {
     pub fn clear(&mut self) {
+        self.unbake();
         self.active.clear();
         self.keyed.clear();
         self.shots.clear();
         self.damage.clear();
         self.damage.whole = true;
+        self.shift = None;
         self.diffed = Some(false);
+        self.open.clear();
+        self.cutting.clear();
         // A painted scene stays as the source of the next paint's spans.
         if let Some(pass) = self.pass.take() {
+            mem::swap(&mut self.last_scrolls, &mut self.scrolls);
+            self.scrolls.clear();
+            mem::swap(&mut self.last_cuts, &mut self.cuts);
+            self.cuts.clear();
             mem::swap(&mut self.last, &mut self.layers);
             // In reverse, so the next paint takes each layer's buffers back in order and the large root buffer
             // goes to the root. Else large buffers move to small layers and all spare layers grow to the largest.
@@ -408,10 +493,229 @@ impl Scene {
             self.spare.push(layer);
         }
         self.layers[0].clear();
+        self.scrolls.clear();
+        self.cuts.clear();
+    }
+
+    // The paint of a scroll container's content starts. `by` is its scroll offset in device pixels, and `viewport`
+    // the mask around its content. Only the window layer keeps scrolls.
+    pub(crate) fn begin_scroll(
+        &mut self,
+        id: u64,
+        viewport: Clip<f32>,
+        by: Point<f32>,
+        open: bool,
+    ) {
+        let layer = self.active.last().copied().unwrap_or(0);
+        self.cutting.push(match open {
+            true => self.cuts.len(),
+            false => usize::MAX,
+        });
+        if open {
+            let layer = &self.layers[layer];
+            self.cuts.push(Cut {
+                layer: self.active.last().copied().unwrap_or(0) as u32,
+                instances: [layer.instances.len() as u32, u32::MAX],
+                nested: [layer.nested.len() as u32, u32::MAX],
+                viewport,
+            });
+        }
+        if !self.active.is_empty() {
+            return self.open.push(usize::MAX);
+        }
+        let parent = self.outer();
+        let outer = (parent != u32::MAX).then(|| self.scrolls[parent as usize].shift);
+        let layer = &self.layers[0];
+        self.open.push(self.scrolls.len());
+        self.scrolls.push(Scroll {
+            id,
+            viewport,
+            shift: outer.unwrap_or_default() + by,
+            instances: [layer.instances.len() as u32, u32::MAX],
+            nested: [layer.nested.len() as u32, u32::MAX],
+            parent,
+        });
+    }
+
+    // Ends the open cuts after the first `depth` scrolls, for content that escapes their viewports.
+    pub(crate) fn pause_cuts(&mut self, depth: usize) {
+        for at in depth..self.cutting.len() {
+            if let Some(cut) = self.cuts.get_mut(self.cutting[at]) {
+                let layer = &self.layers[cut.layer as usize];
+                cut.instances[1] = layer.instances.len() as u32;
+                cut.nested[1] = layer.nested.len() as u32;
+            }
+        }
+    }
+
+    // Starts the cuts that `pause_cuts` ended again.
+    pub(crate) fn resume_cuts(&mut self, depth: usize) {
+        for at in depth..self.cutting.len() {
+            if let Some(&cut) = self.cuts.get(self.cutting[at]) {
+                let layer = &self.layers[cut.layer as usize];
+                self.cutting[at] = self.cuts.len();
+                self.cuts.push(Cut {
+                    instances: [layer.instances.len() as u32, u32::MAX],
+                    nested: [layer.nested.len() as u32, u32::MAX],
+                    ..cut
+                });
+            }
+        }
+    }
+
+    // Clips the content of open scrolls to their viewports, for the backend.
+    fn bake(&mut self) {
+        if mem::replace(&mut self.baked, true) {
+            return;
+        }
+        let raw = &mut self.raw;
+        for cut in &self.cuts {
+            let (viewport, index) = (cut.viewport.bounds, cut.layer);
+            let [start, end] = cut.instances.map(|at| at as usize);
+            let layer = &mut self.layers[index as usize];
+            for (at, instance) in (start..).zip(&mut layer.instances[start..end]) {
+                let clip = rect(instance.clip);
+                if !within(clip, viewport) {
+                    raw.push(Raw::Instance(index, at as u32, instance.clip));
+                    instance.clip = clip.intersect(viewport).to_array();
+                }
+            }
+            let [start, end] = cut.nested.map(|at| at as usize);
+            for at in start..end {
+                let nested = &mut self.layers[index as usize].nested[at];
+                if !within(nested.clip.bounds, viewport) {
+                    raw.push(Raw::Nested(index, at as u32, nested.clip.bounds));
+                    nested.clip.bounds = nested.clip.bounds.intersect(viewport);
+                }
+                let index = nested.layer;
+                if let Some(effect) = self.layers[index].effect.as_mut()
+                    && !within(effect.content_mask.bounds, viewport)
+                {
+                    raw.push(Raw::Effect(index as u32, effect.content_mask.bounds));
+                    effect.content_mask.bounds = effect.content_mask.bounds.intersect(viewport);
+                }
+            }
+        }
+    }
+
+    fn unbake(&mut self) {
+        self.baked = false;
+        for raw in self.raw.drain(..).rev() {
+            match raw {
+                Raw::Instance(layer, at, clip) => {
+                    self.layers[layer as usize].instances[at as usize].clip = clip;
+                }
+                Raw::Nested(layer, at, bounds) => {
+                    self.layers[layer as usize].nested[at as usize].clip.bounds = bounds;
+                }
+                Raw::Effect(at, bounds) => {
+                    if let Some(effect) = self.layers[at as usize].effect.as_mut() {
+                        effect.content_mask.bounds = bounds;
+                    }
+                }
+            }
+        }
+    }
+
+    // The innermost open scroll of the window layer, or u32::MAX.
+    fn outer(&self) -> u32 {
+        (self.open.iter().rev())
+            .find(|&&at| at != usize::MAX)
+            .map_or(u32::MAX, |&at| at as u32)
+    }
+
+    pub(crate) fn end_scroll(&mut self) {
+        if let Some(at) = self.cutting.pop().filter(|&at| at != usize::MAX) {
+            let cut = &mut self.cuts[at];
+            let layer = &self.layers[cut.layer as usize];
+            cut.instances[1] = layer.instances.len() as u32;
+            cut.nested[1] = layer.nested.len() as u32;
+        }
+        if let Some(at) = self.open.pop().filter(|&at| at != usize::MAX) {
+            let layer = &self.layers[0];
+            let scroll = &mut self.scrolls[at];
+            scroll.instances[1] = layer.instances.len() as u32;
+            scroll.nested[1] = layer.nested.len() as u32;
+        }
+    }
+
+    // Copies the scrolls that a span of the last paint made, moved by `by`.
+    fn replay_scrolls(
+        &mut self,
+        span: &Span,
+        mark: Mark,
+        moved: Option<(Point<f32>, &Clip<f32>, &Clip<f32>)>,
+    ) {
+        let [first, end] = span.scrolls;
+        if first == end || self.last_scrolls.len() < end as usize {
+            return;
+        }
+        let outer = self.outer();
+        let rebase =
+            |[start, stop]: [u32; 2], from: u32, to: u32| [start - from + to, stop - from + to];
+        for at in first..end {
+            let scroll = self.last_scrolls[at as usize];
+            let (viewport, shift) = match moved {
+                Some((by, old, now)) => {
+                    (moved_clip(scroll.viewport, by, old, now), scroll.shift - by)
+                }
+                None => (scroll.viewport, scroll.shift),
+            };
+            self.scrolls.push(Scroll {
+                viewport,
+                shift,
+                instances: rebase(scroll.instances, span.instances[0], mark.instances),
+                nested: rebase(scroll.nested, span.nested[0], mark.nested),
+                parent: match (first..end).contains(&scroll.parent) {
+                    true => scroll.parent - first + mark.scrolls,
+                    false => outer,
+                },
+                ..scroll
+            });
+        }
+    }
+
+    // Copies the cuts that a span of the last paint made, moved by `by`.
+    fn replay_cuts(
+        &mut self,
+        span: &Span,
+        mark: Mark,
+        moved: Option<(Point<f32>, &Clip<f32>, &Clip<f32>)>,
+    ) {
+        let [first, end] = span.cuts;
+        if first == end || self.last_cuts.len() < end as usize {
+            return;
+        }
+        for at in first..end {
+            let cut = self.last_cuts[at as usize];
+            let rebase = |[start, stop]: [u32; 2], from: u32, to: u32| match cut.layer == span.layer
+            {
+                true => [start - from + to, stop - from + to],
+                false => [start, stop],
+            };
+            self.cuts.push(Cut {
+                layer: match cut.layer == span.layer {
+                    true => mark.layer,
+                    false => cut.layer + mark.layers - span.layers[0],
+                },
+                instances: rebase(cut.instances, span.instances[0], mark.instances),
+                nested: rebase(cut.nested, span.nested[0], mark.nested),
+                viewport: match moved {
+                    Some((by, old, now)) => moved_clip(cut.viewport, by, old, now),
+                    None => cut.viewport,
+                },
+            });
+        }
     }
 
     pub(crate) fn begin_paint(&mut self, pass: u32) {
         self.pass = Some(pass);
+    }
+
+    // This paint stops, so the last one stays the source of copies.
+    #[cfg_attr(debug_assertions, allow(dead_code))]
+    pub(crate) fn abort(&mut self) {
+        self.pass = None;
     }
 
     // Spans of the last paint can't be copied anymore.
@@ -428,6 +732,8 @@ impl Scene {
             layers: self.layers.len() as u32,
             keyed: self.keyed.len() as u32,
             shots: self.shots.len() as u32,
+            scrolls: self.scrolls.len() as u32,
+            cuts: self.cuts.len() as u32,
         }
     }
 
@@ -442,6 +748,8 @@ impl Scene {
                 instances: [mark.instances, self.layers[layer].instances.len() as u32],
                 nested: [mark.nested, self.layers[layer].nested.len() as u32],
                 layers: [mark.layers, self.layers.len() as u32],
+                scrolls: [mark.scrolls, self.scrolls.len() as u32],
+                cuts: [mark.cuts, self.cuts.len() as u32],
             })
     }
 
@@ -563,6 +871,8 @@ impl Scene {
                 ..*nested
             });
         }
+        self.replay_scrolls(span, mark, None);
+        self.replay_cuts(span, mark, None);
         self.span(mark)
     }
 
@@ -570,17 +880,7 @@ impl Scene {
     // paint there would: its clips are the mask around it, with all it draws inside the mask, or clips inside
     // the mask, and its layers have no effects that read the pixels below or turn in perspective.
     pub(crate) fn plain(&self, span: &Span, clip: &Clip<f32>) -> Option<Rect<f32>> {
-        let fixed = |effect: &Option<EffectState>| {
-            effect.as_ref().is_none_or(|effect| {
-                effect.backdrop.is_some()
-                    || effect.glass.is_some()
-                    || effect.text_mask.is_some()
-                    || effect
-                        .transform
-                        .is_some_and(|m| (m[3], m[7], m[11], m[15]) != (0., 0., 0., 1.))
-            })
-        };
-        if (span.layers[0]..span.layers[1]).any(|at| fixed(&self.layers[at as usize].effect)) {
+        if !self.translatable(span) {
             return None;
         }
         let layer = &self.layers[span.layer as usize];
@@ -611,6 +911,24 @@ impl Scene {
                 Some(Some(all.map_or(area, |all| all.union(area))))
             })
             .map(|all| all.unwrap_or_default())
+    }
+
+    // Whether the layers of a span have no effects that read the pixels below or a mask layer, or turn in
+    // perspective, so a copy of the span can move.
+    pub(crate) fn translatable(&self, span: &Span) -> bool {
+        (span.layers[0]..span.layers[1]).all(|at| {
+            self.layers[at as usize]
+                .effect
+                .as_ref()
+                .is_some_and(|effect| {
+                    effect.backdrop.is_none()
+                        && effect.glass.is_none()
+                        && effect.text_mask.is_none()
+                        && effect
+                            .transform
+                            .is_none_or(|m| (m[3], m[7], m[11], m[15]) == (0., 0., 0., 1.))
+                })
+        })
     }
 
     // Copies a plain span of the last paint moved by `by` device pixels, from the mask `old` into `now`.
@@ -670,6 +988,8 @@ impl Scene {
                 ..nested
             });
         }
+        self.replay_scrolls(span, mark, Some((by, old, now)));
+        self.replay_cuts(span, mark, Some((by, old, now)));
         self.span(mark)
     }
 
@@ -793,6 +1113,8 @@ impl Scene {
                 .is_ok();
         let reach = if moves { clip.bounds } else { bounds }.intersect(clip.bounds);
         if reach.is_empty() {
+            // The mask hides the layer, so a copy that moves can't show it.
+            self.culled += u32::from(!bounds.is_empty());
             return;
         }
         let parent = self.current();
@@ -998,8 +1320,27 @@ impl Scene {
     // Finds what changed since the drawn window, and the digest of each layer. `fresh` holds atlas tiles
     // that got new pixels in a place that another tile used before: (color page, page, texels).
     pub(crate) fn diff(&mut self, fresh: Option<&[crate::atlas::Fresh]>) {
+        self.bake();
+        let mut owners = mem::take(&mut self.owners);
+        let window = &self.layers[0];
+        for (owner, len) in owners
+            .iter_mut()
+            .zip([window.instances.len(), window.nested.len()])
+        {
+            owner.clear();
+            owner.resize(len, u32::MAX);
+        }
+        // Inner scrolls come later.
+        for (at, scroll) in self.scrolls.iter().enumerate() {
+            for (owner, [start, end]) in owners.iter_mut().zip([scroll.instances, scroll.nested]) {
+                let end = (end as usize).min(owner.len());
+                owner[(start as usize).min(end)..end].fill(at as u32);
+            }
+        }
         let mut walk = Walk {
             layers: &self.layers,
+            scrolls: &self.scrolls,
+            owners,
             entries: mem::take(&mut self.entries),
             maps: mem::take(&mut self.maps),
             digests: mem::take(&mut self.digests),
@@ -1011,15 +1352,137 @@ impl Scene {
         walk.maps.resize(self.layers.len(), Map::default());
         walk.digests.clear();
         walk.digests.resize(self.layers.len(), 0);
-        walk.layer(0, 0);
-        (self.entries, self.maps, self.digests, self.reads) =
-            (walk.entries, walk.maps, walk.digests, walk.reads);
+        walk.layer(0, 0, None);
+        (
+            self.entries,
+            self.maps,
+            self.digests,
+            self.reads,
+            self.owners,
+        ) = (
+            walk.entries,
+            walk.maps,
+            walk.digests,
+            walk.reads,
+            walk.owners,
+        );
         self.diffed = Some(true);
         let mut damage = mem::take(&mut self.patched);
         damage.whole |= !self.drawn;
-        let changes = |damage: &mut Damage, entries: &[Entry], maps: &[Map], at: usize| {
+        // Scrolls whose content moved since the drawn frame: (scroll, its prior one, how far).
+        let mut moved: Vec<(usize, usize, Point<f32>)> = Vec::new();
+        if !damage.whole {
+            for (at, scroll) in self.scrolls.iter().enumerate() {
+                let Some(prior) = self
+                    .prior_scrolls
+                    .iter()
+                    .position(|prior| prior.id == scroll.id)
+                else {
+                    continue;
+                };
+                let by = scroll.shift - self.prior_scrolls[prior].shift;
+                if by != Point::default() {
+                    moved.push((at, prior, by));
+                }
+            }
+        }
+        // The backend can copy the last frame moved when one scroll and the scrolls inside it moved together, by whole
+        // device pixels, in a viewport that stayed and has square corners.
+        let within = |scrolls: &[Scroll], inner: usize, outer: usize| {
+            let mut at = inner as u32;
+            while at != u32::MAX {
+                if at as usize == outer {
+                    return true;
+                }
+                at = scrolls[at as usize].parent;
+            }
+            false
+        };
+        let copy = moved.first().copied().filter(|&(at, prior, by)| {
+            let viewport = self.scrolls[at].viewport;
+            let bounds = viewport.bounds;
+            let whole = |value: f32| (value - value.round()).abs() < 1e-3;
+            moved
+                .iter()
+                .all(|&(inner, _, other)| other == by && within(&self.scrolls, inner, at))
+                && viewport.bounds == self.prior_scrolls[prior].viewport.bounds
+                && viewport.radii == Default::default()
+                && [
+                    bounds.origin.x,
+                    bounds.origin.y,
+                    bounds.size.width,
+                    bounds.size.height,
+                    by.x,
+                    by.y,
+                ]
+                .into_iter()
+                .all(whole)
+                && by.x.abs() < bounds.size.width
+                && by.y.abs() < bounds.size.height
+        });
+        if copy.is_none() {
+            for &(at, prior, _) in &moved {
+                damage.add(self.scrolls[at].viewport.bounds);
+                damage.add(self.prior_scrolls[prior].viewport.bounds);
+            }
+        }
+        // Content of the copied scroll moved by `-by` in the window. Everything else that the viewport shows moved with
+        // it too, so it draws again where it is and where the copy put it.
+        let (viewport, by) = copy.map_or((Rect::default(), Point::default()), |(at, _, by)| {
+            (self.scrolls[at].viewport.bounds, by)
+        });
+        let inside_new: Vec<bool> = (0..self.scrolls.len())
+            .map(|at| copy.is_some_and(|(outer, ..)| within(&self.scrolls, at, outer)))
+            .collect();
+        let inside_old: Vec<bool> = (0..self.prior_scrolls.len())
+            .map(|at| copy.is_some_and(|(_, outer, _)| within(&self.prior_scrolls, at, outer)))
+            .collect();
+        let copied = |damage: &mut Damage, reach: Rect<f32>| {
+            damage.add((reach - by).intersect(viewport));
+        };
+        if copy.is_some() {
+            let patched = damage.rects.clone();
+            for rect in patched {
+                copied(&mut damage, rect);
+            }
+            // The edges that the copy has no pixels for.
+            let [x, y, width, height] = [
+                viewport.origin.x,
+                viewport.origin.y,
+                viewport.size.width,
+                viewport.size.height,
+            ];
+            if by.y > 0. {
+                damage.add(Rect::new(
+                    point(x, y + height - by.y),
+                    Size::new(width, by.y),
+                ));
+            } else if by.y < 0. {
+                damage.add(Rect::new(point(x, y), Size::new(width, -by.y)));
+            }
+            if by.x > 0. {
+                damage.add(Rect::new(
+                    point(x + width - by.x, y),
+                    Size::new(by.x, height),
+                ));
+            } else if by.x < 0. {
+                damage.add(Rect::new(point(x, y), Size::new(-by.x, height)));
+            }
+        }
+        let added = |damage: &mut Damage, entries: &[Entry], maps: &[Map], at: usize| {
             let entry = &entries[at];
             damage.add(window_reach(maps, entry.layer, entry.reach));
+        };
+        let removed = |damage: &mut Damage, entries: &[Entry], maps: &[Map], at: usize| {
+            let entry = &entries[at];
+            let reach = window_reach(maps, entry.layer, entry.reach);
+            let inside = entry.scroll != 0 && inside_old[entry.scroll as usize - 1];
+            if !inside {
+                damage.add(reach);
+            }
+            if copy.is_some() {
+                copied(damage, reach);
+            }
         };
         let (old, new) = (&self.prior, &self.entries);
         let mut index: Option<(FxHashMap<u64, u32>, Vec<u32>)> = None;
@@ -1057,11 +1520,11 @@ impl Scene {
                 .zip(old.get(next))
                 .is_some_and(|(new, old)| new.hash == old.hash);
             if found == u32::MAX || (found as usize) < next || inserted {
-                changes(&mut damage, new, &self.maps, at);
+                added(&mut damage, new, &self.maps, at);
                 continue;
             }
             for skipped in next..found as usize {
-                changes(&mut damage, old, &self.prior_maps, skipped);
+                removed(&mut damage, old, &self.prior_maps, skipped);
             }
             next = found as usize + 1;
         }
@@ -1069,14 +1532,54 @@ impl Scene {
             if damage.whole {
                 break;
             }
-            changes(&mut damage, old, &self.prior_maps, skipped);
+            removed(&mut damage, old, &self.prior_maps, skipped);
         }
+        // What the viewport shows outside the copied scroll moved with the copy, unless it is one color all over.
+        if copy.is_some() {
+            for entry in &self.entries {
+                if damage.whole {
+                    break;
+                }
+                if entry.scroll != 0 && inside_new[entry.scroll as usize - 1] {
+                    continue;
+                }
+                let reach = window_reach(&self.maps, entry.layer, entry.reach);
+                if !reach.intersects(viewport) {
+                    continue;
+                }
+                if entry.layer == 0 && entry.item & NESTED == 0 {
+                    let instance = &self.layers[0].instances[entry.item as usize];
+                    let plain = instance.kind() == crate::gpu::BOX
+                        && instance.radii == [0.; 8]
+                        && instance.round_radii == [0.; 8]
+                        && (instance.aux == [0.; 4] || instance.border_color[3] == 0.);
+                    if plain && reach.intersect(viewport) == viewport {
+                        continue;
+                    }
+                }
+                damage.add(reach.intersect(viewport));
+                copied(&mut damage, reach);
+            }
+        }
+        self.shift = (copy.is_some() && !damage.whole).then(|| {
+            let region = [
+                viewport.origin.x,
+                viewport.origin.y,
+                viewport.size.width,
+                viewport.size.height,
+            ];
+            (
+                region.map(|value| value.round() as i32),
+                [by.x.round() as i32, by.y.round() as i32],
+            )
+        });
         // The same instance can read a tile with new pixels. Its layers can't keep their pixels either.
         self.stale.clear();
         let Some(fresh) = fresh else {
             damage.whole = true;
             self.stale.extend_from_slice(&self.digests);
             self.damage = damage;
+            self.shift = None;
             return;
         };
         if !fresh.is_empty() {
@@ -1108,6 +1611,9 @@ impl Scene {
                 }
             }
         }
+        if damage.whole {
+            self.shift = None;
+        }
         self.damage = damage;
     }
 
@@ -1119,6 +1625,7 @@ impl Scene {
         if self.diffed.take() == Some(true) {
             mem::swap(&mut self.prior, &mut self.entries);
             self.prior_maps.clone_from(&self.maps);
+            self.prior_scrolls.clone_from(&self.scrolls);
         }
     }
 
@@ -1168,6 +1675,9 @@ fn effect_bounds(layer: &SceneLayer) -> Option<Rect<f32>> {
 
 struct Walk<'a> {
     layers: &'a [SceneLayer],
+    scrolls: &'a [Scroll],
+    // The innermost scroll of each instance and nested layer of the window layer, or u32::MAX.
+    owners: [Vec<u32>; 2],
     entries: Vec<Entry>,
     maps: Vec<Map>,
     digests: Vec<u64>,
@@ -1175,42 +1685,159 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
-    // Lists the entries of a layer and returns its digest. `context` stands for the layers around it.
-    fn layer(&mut self, layer: usize, context: u64) -> u64 {
+    // Lists the entries of a layer and returns its digest. `context` stands for the layers around it, and `scroll`
+    // holds a nested layer in a scroll.
+    fn layer(&mut self, layer: usize, context: u64, scroll: Option<usize>) -> u64 {
         let content = &self.layers[layer];
         let origin = match layer {
             0 => Point::default(),
             _ => origin(content),
         };
-        let context = mix(context, place(origin));
+        let shift = scroll.map_or_else(Point::default, |at| self.scrolls[at].shift);
+        let context = mix(context, place(origin + shift));
         let mut digest = 1;
-        let mut nested = content.nested.iter().peekable();
+        let mut nested = content.nested.iter().enumerate().peekable();
         for (at, instance) in content.instances.iter().enumerate() {
-            while let Some(inner) = nested.next_if(|inner| inner.at as usize <= at) {
-                digest = mix(digest, self.nested(layer, origin, inner, context));
+            while let Some((index, inner)) = nested.next_if(|(_, inner)| inner.at as usize <= at) {
+                let scroll = self.find(layer, index, true).or(scroll);
+                digest = mix(digest, self.nested(layer, origin, inner, context, scroll));
             }
-            let hash = instance_hash(instance, origin);
+            // A scroll viewport cut it away, so it draws nothing.
+            if instance.reach().is_empty() {
+                continue;
+            }
+            let scroll = self.find(layer, at, false).or(scroll);
+            // The window layer has no digest, so its entries in a scroll hash only their place in the content.
+            let hash = match (layer, scroll) {
+                (0, Some(_)) => 0,
+                _ => instance_hash(instance, origin, None),
+            };
             digest = mix(digest, hash);
+            let entry = match scroll {
+                Some(at) => {
+                    let scroll = &self.scrolls[at];
+                    let base = if layer == 0 {
+                        origin - scroll.shift
+                    } else {
+                        origin
+                    };
+                    mix(
+                        instance_hash(instance, base, Some(&scroll.viewport)),
+                        scroll.id,
+                    )
+                }
+                None => hash,
+            };
             self.entries.push(Entry {
-                hash: mix(hash, context),
+                hash: mix(entry, context),
                 reach: instance.reach(),
                 layer: layer as u32,
                 item: at as u32,
+                scroll: scroll.map_or(0, |at| at as u32 + 1),
             });
         }
-        for inner in nested {
-            digest = mix(digest, self.nested(layer, origin, inner, context));
+        for (index, inner) in nested {
+            let scroll = self.find(layer, index, true).or(scroll);
+            digest = mix(digest, self.nested(layer, origin, inner, context, scroll));
         }
         self.digests[layer] = digest;
         digest
     }
 
+    // The innermost scroll that holds an instance or a nested layer of the window layer. Inner scrolls come later.
+    fn find(&self, layer: usize, at: usize, nested: bool) -> Option<usize> {
+        if layer != 0 {
+            return None;
+        }
+        let owner = self.owners[usize::from(nested)][at];
+        (owner != u32::MAX).then_some(owner as usize)
+    }
+
     // Places are relative to `base`, the origin of the parent.
-    fn nested(&mut self, parent: usize, base: Point<f32>, nested: &Nested, context: u64) -> u64 {
+    fn nested(
+        &mut self,
+        parent: usize,
+        base: Point<f32>,
+        nested: &Nested,
+        context: u64,
+        scroll: Option<usize>,
+    ) -> u64 {
         let layers = self.layers;
         let Some(effect) = &layers[nested.layer].effect else {
             return 0;
         };
+        // In a scroll, the entry hashes its place in the content, with the mask around the content as its own place.
+        let entry = scroll.map(|at| {
+            let scroll = &self.scrolls[at];
+            let shift = scroll.shift;
+            let base = if parent == 0 { base - shift } else { base };
+            let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            let rect = |rect: Rect<f32>| {
+                bits(&[
+                    rect.origin.x - base.x,
+                    rect.origin.y - base.y,
+                    rect.size.width,
+                    rect.size.height,
+                ])
+            };
+            let spreads = effect.blur != 0. || effect.shadow.is_some() || effect.backdrop.is_some();
+            let masked = nested.clip.bounds == scroll.viewport.bounds && !spreads;
+            let mut hasher = rustc_hash::FxHasher::default();
+            (
+                effect.transform.map(|matrix| {
+                    let mut m = matrix;
+                    let [x, y] = [shift.x, shift.y];
+                    m[12] += x - (m[0] * x + m[4] * y);
+                    m[13] += y - (m[1] * x + m[5] * y);
+                    m[14] -= m[2] * x + m[6] * y;
+                    bits(&m)
+                }),
+                effect.opacity.to_bits(),
+                effect.color_matrix.map(|matrix| bits(&matrix)),
+                effect.blur.to_bits(),
+                effect.blend_mode as u32,
+                effect.shadow.map(|(by, sigma, color)| {
+                    bits(&[by.x, by.y, sigma, color.r, color.g, color.b, color.a])
+                }),
+                effect
+                    .clip
+                    .map(|(bounds, radii)| (rect(bounds), bits(&radii.to_array()), radii.shape)),
+            )
+                .hash(&mut hasher);
+            (
+                effect
+                    .mask
+                    .as_ref()
+                    .map(|(tile, bounds)| (tile.page, tile.id, rect(*bounds))),
+                effect
+                    .backdrop
+                    .as_ref()
+                    .map(|backdrop| (rect(backdrop.bounds), backdrop.blur.to_bits())),
+                effect
+                    .glass
+                    .as_ref()
+                    .map(|glass| (glass.key, rect(glass.bounds))),
+                match masked {
+                    true => rect(nested.bounds),
+                    false => rect(nested.clip.bounds.intersect(nested.bounds)),
+                },
+                (nested.clip.radii != Default::default()).then(|| {
+                    match nested.clip.rounded == scroll.viewport.rounded {
+                        true => Vec::new(),
+                        false => rect(nested.clip.rounded),
+                    }
+                }),
+                bits(&nested.clip.radii.to_array()),
+                scroll.id,
+            )
+                .hash(&mut hasher);
+            if let Some(text) = effect.text_mask {
+                for instance in &layers[text].instances {
+                    instance_hash(instance, base, Some(&scroll.viewport)).hash(&mut hasher);
+                }
+            }
+            hasher.finish()
+        });
         let mut hasher = rustc_hash::FxHasher::default();
         let rect = |rect: Rect<f32>| {
             bits([
@@ -1276,15 +1903,18 @@ impl Walk<'_> {
             .hash(&mut hasher);
         if let Some(text) = effect.text_mask {
             for instance in &layers[text].instances {
-                instance_hash(instance, base).hash(&mut hasher);
+                instance_hash(instance, base, None).hash(&mut hasher);
             }
         }
         let own = hasher.finish();
+        // The inner layer's entries hash only what doesn't change in a scroll, and its digest doesn't hold them.
+        let inner_context = entry.unwrap_or(own);
         self.entries.push(Entry {
-            hash: mix(own, context),
+            hash: mix(inner_context, context),
             reach: nested.reach(),
             layer: parent as u32,
             item: nested.layer as u32 | NESTED,
+            scroll: scroll.map_or(0, |at| at as u32 + 1),
         });
         self.maps[nested.layer] = Map {
             parent: parent as u32,
@@ -1301,7 +1931,7 @@ impl Walk<'_> {
         let offset = place(point(inner.x - base.x, inner.y - base.y));
         mix(
             mix(own, offset),
-            self.layer(nested.layer, mix(own, context)),
+            self.layer(nested.layer, mix(inner_context, context), scroll),
         )
     }
 }
@@ -1578,6 +2208,63 @@ mod tests {
         assert_eq!(scene.layers.len(), 4);
         assert_eq!(scene.layers[1].bounds, Some(bounds([20., 20., 50., 50.])));
         assert_eq!(scene.layers[0].nested[0].layer, 1);
+    }
+
+    #[test]
+    fn layers_that_the_mask_hides_count_as_cut() {
+        let mask = Clip::from(bounds([0., 0., 100., 100.]));
+        let open = Clip::from(bounds([-1e6, -1e6, 2e6, 2e6]));
+        let mut scene = Scene::default();
+        scene.begin_paint(1);
+        for (x, culled) in [(10., 0), (300., 1)] {
+            scene.push_effect(effect(mask), None);
+            scene.push(Instance::new(BOX, bounds([x, x, 10., 10.]), open));
+            scene.pop_effect();
+            assert_eq!(scene.culled, culled);
+        }
+        assert_eq!(scene.layers[0].nested.len(), 1);
+    }
+
+    #[test]
+    fn copied_spans_keep_their_scrolls_once() {
+        let mask = Clip::from(bounds([0., 0., 200., 200.]));
+        let at = |y: f32| Instance::new(BOX, bounds([0., y, 10., 10.]), mask);
+        let mut spans: Vec<Span> = Vec::new();
+        let mut scene = Scene::default();
+        for pass in 1..6 {
+            scene.begin_paint(pass);
+            let last = mem::take(&mut spans);
+            // A scroll with content, an empty scroll, and a box next to them, each in its own span.
+            let paint = |scene: &mut Scene, index: usize, y: f32| match index {
+                0 => {
+                    scene.begin_scroll(1, mask, point(0., 30.), false);
+                    scene.push(at(y));
+                    scene.end_scroll();
+                }
+                1 => {
+                    scene.begin_scroll(2, mask, point(0., 0.), false);
+                    scene.end_scroll();
+                }
+                _ => scene.push(at(y + 40.)),
+            };
+            for index in 0..3 {
+                let mark = scene.mark();
+                let span = match last.get(index) {
+                    Some(span) => scene.replay(span).unwrap(),
+                    None => {
+                        paint(&mut scene, index, 0.);
+                        scene.span(mark).unwrap()
+                    }
+                };
+                spans.push(span);
+            }
+            assert_eq!(scene.scrolls.len(), 2, "pass {pass}");
+            assert_eq!(scene.scrolls[0].shift, point(0., 30.));
+            assert_eq!(scene.scrolls[0].instances, [0, 1]);
+            scene.diff(Some(&[]));
+            scene.drawn();
+            scene.clear();
+        }
     }
 
     #[test]

@@ -148,7 +148,22 @@ impl renderer::Hooks for FieldText {
                 window.redraw();
             }
         }
-        self.selected.set(selected);
+        // A focused field draws its caret in each frame.
+        if self.selected.replace(selected) != selected || selected.is_some() {
+            window.unsettle();
+        }
+    }
+
+    fn volatile(&self) -> bool {
+        false
+    }
+
+    fn kept(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        self.prepaint(cx, inner);
+    }
+
+    fn cached(&self) -> bool {
+        true
     }
 
     fn bounded(&self) -> bool {
@@ -161,6 +176,9 @@ impl renderer::Hooks for FieldText {
         };
         let window = &mut *cx.window;
         let selected = self.selected.get();
+        if selected.is_some() {
+            window.paint_volatile();
+        }
         let text = &*self.text;
         let line_height = layout.line_height();
         let selected = selected.map(|[a, b]| {

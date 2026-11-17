@@ -41,6 +41,57 @@ impl Window {
         }
     }
 
+    // The content of a scroll container, which `offset` moved, paints between these two calls.
+    // The content of a scroll container paints in an interest area around its viewport, which stays put in the
+    // content until the viewport nears its edge, so copies of the content can move with a scroll. The scene
+    // clips the content to the viewport after paint. Prepaint uses the same masks.
+    // Whether a scroll container here paints its content in an interest area.
+    pub(crate) fn opens_interest(&self) -> bool {
+        self.content_mask().radii == Default::default()
+    }
+
+    pub(crate) fn begin_interest(&mut self, offset: Point<Pixels>) -> bool {
+        let mask = self.content_mask();
+        let open = self.opens_interest();
+        self.viewports.push(open.then_some(mask.bounds));
+        if open {
+            // `offset` moves the content, so a place in the content is a place in the window less `offset`.
+            let axis = |start: Pixels, length: Pixels, offset: Pixels| {
+                let step = (length.0 / 2.).max(256.).round();
+                let base = ((start - offset).0 / step).floor() * step;
+                (px(base - step) + offset, px(length.0 + step * 3.))
+            };
+            let (x, width) = axis(mask.bounds.origin.x, mask.bounds.size.width, offset.x);
+            let (y, height) = axis(mask.bounds.origin.y, mask.bounds.size.height, offset.y);
+            self.push_content_mask(Clip::from(Rect::new(point(x, y), size(width, height))));
+        }
+        open
+    }
+
+    pub(crate) fn end_interest(&mut self) {
+        if self.viewports.pop().flatten().is_some() {
+            self.pop_content_mask();
+        }
+    }
+
+    // The content of a scroll container, which `offset` moved, paints between these two calls.
+    pub(crate) fn begin_scroll(&mut self, id: u64, offset: Point<Pixels>) {
+        let viewport = self.snap_mask(self.content_mask());
+        let scale = self.scale_factor;
+        let open = self.begin_interest(offset);
+        self.scene.begin_scroll(
+            id,
+            viewport,
+            Point::new(-offset.x.0 * scale, -offset.y.0 * scale),
+            open,
+        );
+    }
+
+    pub(crate) fn end_scroll(&mut self) {
+        self.end_interest();
+        self.scene.end_scroll();
+    }
+
     pub(super) fn snap_mask(&self, mask: Clip<Pixels>) -> Clip<f32> {
         Clip {
             bounds: self.cover_bounds(mask.bounds),

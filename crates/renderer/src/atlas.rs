@@ -103,6 +103,10 @@ impl<B: PageStore> Atlas<B> {
         }
     }
 
+    pub(crate) fn evicted(&self) -> bool {
+        self.evicted.get()
+    }
+
     pub fn take_evicted(&self) -> bool {
         self.evicted.replace(false)
     }

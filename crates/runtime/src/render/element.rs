@@ -6842,7 +6842,8 @@ fn create(
                                 (positive + negative - used).max(0.)
                             });
                     let entity = view.clone();
-                    let mut placeholder = renderer::canvas(
+                    // Its place in the window goes to `anchors`, so each move prepares it again.
+                    let mut placeholder = renderer::canvas_watching(
                         move |mut bounds, _| {
                             bounds.origin.y += px(pending);
                             let view = &*entity;

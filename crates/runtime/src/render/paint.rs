@@ -48,6 +48,11 @@ impl Hooks for Turned {
         true
     }
 
+    // Inside a box that a scroll moved, the renderer moves its hit transform.
+    fn shifts(&self) -> bool {
+        true
+    }
+
     // The matrix follows the bounds, so a kept box places its hit transform again.
     fn volatile(&self) -> bool {
         false
@@ -84,6 +89,11 @@ pub(super) struct Transformed {
 
 impl Hooks for Transformed {
     fn cached(&self) -> bool {
+        true
+    }
+
+    // Inside a box that a scroll moved, the renderer moves its hit transform.
+    fn shifts(&self) -> bool {
         true
     }
 
@@ -140,6 +150,14 @@ impl Hooks for Effected {
         true
     }
 
+    fn shift(&self, _: Point<Pixels>, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+
+    fn shifts(&self) -> bool {
+        true
+    }
+
     // Frames patch the layers of composited animations.
     fn cached(&self) -> bool {
         self.effect.key.is_none()
@@ -180,6 +198,14 @@ impl Hooks for Masked {
     }
 
     fn skip(&self, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+
+    fn shift(&self, _: Point<Pixels>, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+
+    fn shifts(&self) -> bool {
         true
     }
 
@@ -257,6 +283,14 @@ impl Hooks for Picture {
     }
 
     fn skip(&self, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+
+    fn shift(&self, _: Point<Pixels>, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+
+    fn shifts(&self) -> bool {
         true
     }
 
@@ -908,6 +942,79 @@ impl Hooks for DomBox {
     }
 
     fn skippable(&self) -> bool {
+        true
+    }
+
+    fn shifts(&self) -> bool {
+        true
+    }
+
+    // Moves the layout mirror, containing blocks, fragments and cull reach of the nodes below the box.
+    fn shift(&self, by: Point<Pixels>, exact: Rect<Pixels>, _: &mut Window) -> bool {
+        let (placed, matrix) = self.placed.get();
+        let bounds = Rect::new(exact.origin + self.offset.get(), exact.size);
+        let near = |a: Pixels, b: Pixels| (a - b).0.abs() < 0.01;
+        if !near(placed.origin.x + by.x, bounds.origin.x)
+            || !near(placed.origin.y + by.y, bounds.origin.y)
+            || placed.size != bounds.size
+        {
+            return false;
+        }
+        let view = &*self.view;
+        let mut host = view.host.borrow_mut();
+        let dom = host.dom.entry(view.id).or_default();
+        let walk = &dom.style_walk;
+        let Some(start) = walk.place(self.id) else {
+            return false;
+        };
+        let range = start as usize..start as usize + walk.span(self.id);
+        let inside = |id: usize| {
+            walk.place(id)
+                .is_some_and(|at| range.contains(&(at as usize)))
+        };
+        // Top layer boxes paint at the root, outside this box.
+        if dom.top_layer.iter().any(|&node| inside(node)) {
+            return false;
+        }
+        let [x, y] = [by.x, by.y].map(f32::from);
+        let nodes = walk.nodes.clone();
+        let mut reach = view.reach.borrow_mut();
+        for &(id, _) in &nodes[range] {
+            let id = id as usize;
+            if let Some(parts) = dom.fragments.get_mut(&id) {
+                parts
+                    .iter_mut()
+                    .for_each(|part| (part[0], part[1]) = (part[0] + x, part[1] + y));
+            }
+            if let Some(block) = dom.blocks.get_mut(&id) {
+                block.origin += by;
+            }
+            // A node without a box keeps an empty rectangle at the origin.
+            if let Some(rect) = dom.bounds.get_mut(&id)
+                && *rect != [0.; 4]
+            {
+                (rect[0], rect[1]) = (rect[0] + x, rect[1] + y);
+            }
+            if let Some(reach) = reach.get_mut(id)
+                && reach[0].is_finite()
+            {
+                (reach[0], reach[1]) = (reach[0] + y, reach[1] + y);
+            }
+        }
+        let reach = reach
+            .get(self.id)
+            .copied()
+            .unwrap_or([f32::INFINITY, f32::NEG_INFINITY]);
+        drop((host, nodes));
+        // A transform turns about the new place.
+        let matrix = matrix.and_then(|_| {
+            super::effects::transform_at(&self.local, &self.style, &self.units, bounds)
+        });
+        self.placed.set((bounds, matrix));
+        let (window_bounds, flags) = self.reached_at.get();
+        let window_bounds = Rect::new(window_bounds.origin + by, window_bounds.size);
+        self.reached_at.set((window_bounds, flags));
+        self.merge(reach, window_bounds, flags);
         true
     }
 

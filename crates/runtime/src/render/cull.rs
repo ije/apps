@@ -556,7 +556,8 @@ pub(super) fn spacer(
     } = run;
     let parent = path.last().copied().unwrap_or_default();
     let (first, last) = (Cell::new(None), Cell::new([left, top]));
-    let mut spacer = renderer::canvas_within(
+    // It wakes the blocks that it stands for, and moves their places, so each move prepares it again.
+    let mut spacer = renderer::canvas_watching(
         move |bounds, window| {
             let view = &*view;
             let mut host = view.host.borrow_mut();
@@ -622,7 +623,7 @@ pub(super) fn anchor(
     view: Rc<super::PageState>,
 ) -> Child {
     let first = Cell::new(None);
-    renderer::canvas_within(
+    renderer::canvas_watching(
         move |bounds, window| {
             let view = &*view;
             let mut host = view.host.borrow_mut();

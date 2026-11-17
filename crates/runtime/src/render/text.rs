@@ -878,6 +878,15 @@ impl renderer::Hooks for InlineText {
     }
 
     // The layouts go back into the mirror, which each frame clears.
+    fn shifts(&self) -> bool {
+        true
+    }
+
+    // The renderer moved the text layouts.
+    fn shift(&self, _: Point<Pixels>, exact: Rect<Pixels>, window: &mut Window) -> bool {
+        self.skip(exact, window)
+    }
+
     fn skip(&self, _: Rect<Pixels>, _: &mut Window) -> bool {
         let view = &*self.view;
         let mut host = view.host.borrow_mut();

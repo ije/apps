@@ -578,6 +578,17 @@ impl Paragraph {
         state.layout
     }
 
+    pub(crate) fn shift(&self, by: Point<Pixels>) {
+        if let Some(bounds) = self
+            .0
+            .borrow_mut()
+            .as_mut()
+            .and_then(|inner| inner.bounds.as_mut())
+        {
+            bounds.origin += by;
+        }
+    }
+
     pub(crate) fn place(&self, bounds: Rect<Pixels>) {
         if let Some(inner) = self.0.borrow_mut().as_mut() {
             inner.bounds = Some(bounds);

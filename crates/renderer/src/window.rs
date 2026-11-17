@@ -238,11 +238,70 @@ struct HitTransform {
     local: Cell<Plane>,
     to_window: Cell<Plane>,
     from_window: Cell<Plane>,
-    // The window clip when the outermost transform began. Points outside it miss.
+    // The window clip when the outermost transform began, and the scroll viewports around it, which a scroll
+    // doesn't move. Points outside them miss.
     area: Rect,
+    view: Rect,
+    // Equal for transforms that place boxes alike, so a box under a new one that maps the same stays kept.
+    id: u64,
 }
 
 impl HitTransform {
+    // The same transform for content that a scroll moved by `by`. `moved` holds the ones made so far.
+    fn shifted(
+        self: &Rc<Self>,
+        by: Point<Pixels>,
+        moved: &mut Vec<(*const Self, Rc<Self>)>,
+    ) -> Rc<Self> {
+        if let Some((_, done)) = moved.iter().find(|(old, _)| *old == Rc::as_ptr(self)) {
+            return done.clone();
+        }
+        let [x, y] = [by.x.0, by.y.0];
+        let turn = |plane: Plane| {
+            let there = compose(&[1., 0., 0., 0., 1., 0., x, y, 1.], &plane);
+            compose(&there, &[1., 0., 0., 0., 1., 0., -x, -y, 1.])
+        };
+        let to_window = turn(self.to_window.get());
+        let area = match self.area.size.width.0 >= OPEN {
+            true => self.area,
+            false => self.area + by,
+        };
+        let shifted = Rc::new(HitTransform {
+            key: self.key,
+            outer: (self.outer.as_ref()).map(|outer| outer.shifted(by, moved)),
+            local: Cell::new(turn(self.local.get())),
+            to_window: Cell::new(to_window),
+            from_window: Cell::new(turn(self.from_window.get())),
+            area,
+            view: self.view,
+            id: HitTransform::id(self.key, &to_window, area, self.view),
+        });
+        moved.push((Rc::as_ptr(self), shifted.clone()));
+        shifted
+    }
+
+    fn id(key: Option<u64>, to_window: &Plane, area: Rect, view: Rect) -> u64 {
+        use std::hash::{Hash, Hasher};
+        static KEYED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if key.is_some() {
+            // Composited animations change keyed transforms in place.
+            return KEYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) | 1 << 63;
+        }
+        let mut hasher = rustc_hash::FxHasher::default();
+        to_window.map(f32::to_bits).hash(&mut hasher);
+        for rect in [area, view] {
+            [
+                rect.origin.x,
+                rect.origin.y,
+                rect.size.width,
+                rect.size.height,
+            ]
+            .map(|value| value.0.to_bits())
+            .hash(&mut hasher);
+        }
+        hasher.finish() | 1
+    }
+
     fn chain(self: &Rc<Self>) -> impl Iterator<Item = &Rc<Self>> {
         std::iter::successors(Some(self), |inner| inner.outer.as_ref())
     }
@@ -272,7 +331,9 @@ impl HitTransform {
 #[derive(Clone)]
 struct Placed {
     region: Region,
+    // The content mask, which moves with a scroll, and the scroll viewports around it, which stay.
     clip: Clip<Pixels>,
+    view: Rect,
     transform: Option<Rc<HitTransform>>,
 }
 
@@ -280,7 +341,7 @@ impl Placed {
     fn contains(&self, at: Point<Pixels>) -> bool {
         let local = match &self.transform {
             None => Some(at),
-            Some(transform) if transform.area.contains(at) => {
+            Some(transform) if transform.area.intersect(transform.view).contains(at) => {
                 project(&transform.from_window.get(), at)
             }
             Some(_) => None,
@@ -289,6 +350,7 @@ impl Placed {
             self.region
                 .bounds
                 .intersect(self.clip.bounds)
+                .intersect(self.view)
                 .contains(local)
         })
     }
@@ -298,7 +360,11 @@ impl Placed {
 pub(crate) struct Placement {
     pub(crate) offset: Point<Pixels>,
     pub(crate) mask: Clip<Pixels>,
-    pub(crate) transform: usize,
+    // What the window shows of the mask, which hit regions take.
+    pub(crate) visible: Rect<Pixels>,
+    // The count of scroll viewports around it.
+    pub(crate) depth: u32,
+    pub(crate) transform: u64,
 }
 
 type Listener = Rc<RefCell<dyn FnMut(&Event, &mut Window, &mut App)>>;
@@ -494,11 +560,16 @@ pub struct Window {
     volatile: u32,
     // The next paint draws all boxes again.
     repaint: bool,
+    pub(crate) unsettled: u32,
+    // The count of hit transforms that prepaint made.
+    pub(crate) transforms: u32,
     generation: usize,
     under: Vec<u64>,
     hovered: usize,
     next_region: u64,
     content_masks: Vec<(Clip<Pixels>, Clip<f32>)>,
+    // The viewports of the scrolls whose content paints in a larger interest area, or `None` for other scrolls.
+    viewports: Vec<Option<Rect<Pixels>>>,
     offsets: Vec<Point<Pixels>>,
     pub(crate) font_smoothing: bool,
     hit_transform: Option<Rc<HitTransform>>,
@@ -572,6 +643,9 @@ impl Window {
             hovered: 0,
             next_region: 0,
             content_masks: Vec::new(),
+            viewports: Vec::new(),
+            unsettled: 0,
+            transforms: 0,
             offsets: Vec::new(),
             font_smoothing: true,
             hit_transform: None,
@@ -900,7 +974,7 @@ impl Window {
     ) -> bool {
         #[cfg(target_os = "macos")]
         {
-            let mask = self.snapped_content_mask();
+            let mask = self.snap_mask(self.visible_mask());
             let visible = self.snap_bounds(bounds).intersect(mask.bounds);
             if !self.scene.at_root()
                 || self.opacity < 1.
@@ -937,7 +1011,7 @@ impl Window {
         {
             // Native views are placed in window points.
             let mut control = control;
-            control.clip = self.content_mask().bounds * self.zoom;
+            control.clip = self.visible_mask().bounds * self.zoom;
             control.bounds = control.bounds * self.zoom;
             self.controls.0.push(control);
             self.controls.1.get_or_insert_with(|| sink.clone());
@@ -1314,6 +1388,11 @@ impl Window {
         self.pending.regions.push(Placed {
             region,
             clip: self.content_mask(),
+            // Under a transform, places are local and the transform's area holds the viewports.
+            view: match self.hit_transform {
+                Some(_) => unbounded_mask().bounds,
+                None => self.visible_mask().bounds,
+            },
             transform: self.hit_transform.clone(),
         });
         region
@@ -1365,9 +1444,30 @@ impl Window {
         self.scene.culled += 1;
     }
 
+    // The frame starts again after this paint, which the next paint doesn't copy.
+    #[cfg_attr(debug_assertions, allow(dead_code))]
+    pub(crate) fn restart_frame(&mut self) {
+        self.restart = true;
+        self.scene.abort();
+    }
+
+    /// The prepaint of the current box read state outside the tree that changed, so its last paint can't be copied.
+    pub fn unsettle(&mut self) {
+        self.unsettled = self.unsettled.wrapping_add(1);
+    }
+
     /// The next frame paints all boxes again, as state that paint reads outside the tree changed.
     pub fn repaint(&mut self) {
         self.repaint = true;
+    }
+
+    // Whether the next paint can copy spans of the last one.
+    pub(crate) fn copies(&self) -> bool {
+        !self.repaint
+            && !self.platform.atlas().evicted()
+            && self.text_system.generation() == self.generation
+            && self.live.pass.is_some()
+            && self.scene.last_pass == self.live.pass
     }
 
     // Returns the pass, and the pass whose spans can be copied.
@@ -1423,6 +1523,34 @@ impl Window {
         let by = by.scale(self.scale_factor);
         let whole = |value: f32| value == value.round();
         whole(by.x) && whole(by.y) && scene::within(area + by, self.snap_mask(mask).bounds)
+    }
+
+    // Whether `now` is the mask `old` moved by whole device pixels.
+    pub(crate) fn translated(
+        &self,
+        old: Clip<Pixels>,
+        now: Clip<Pixels>,
+        by: Point<Pixels>,
+    ) -> bool {
+        let by = by.scale(self.scale_factor);
+        let [old, now] = [old, now].map(|mask| self.snap_mask(mask));
+        let near =
+            |a: Point<f32>, b: Point<f32>| (a.x - b.x).abs() < 1e-3 && (a.y - b.y).abs() < 1e-3;
+        let whole = |value: f32| value == value.round();
+        whole(by.x)
+            && whole(by.y)
+            && near(old.bounds.origin + by, now.bounds.origin)
+            && near(old.bounds.bottom_right() + by, now.bounds.bottom_right())
+            && (old.rounded.size == Size::default() && now.rounded.size == Size::default()
+                || near(old.rounded.origin + by, now.rounded.origin)
+                    && near(old.rounded.bottom_right() + by, now.rounded.bottom_right()))
+            && old.radii == now.radii
+    }
+
+    // Whether a copy of a span can move with its box: its layers don't read pixels below or a mask layer, or
+    // turn in perspective.
+    pub(crate) fn translatable(&self, span: &PaintSpan) -> bool {
+        self.scene.translatable(&span.scene)
     }
 
     // What a span drew. `last` reads a span of the last paint.
@@ -1517,13 +1645,12 @@ impl Window {
 
     // Kept subtrees reuse their regions only while this is unchanged.
     pub(crate) fn placement(&self) -> Placement {
-        let transform = self
-            .hit_transform
-            .as_ref()
-            .map_or(0, |transform| Rc::as_ptr(transform) as usize);
+        let transform = (self.hit_transform.as_ref()).map_or(0, |transform| transform.id);
         Placement {
             offset: self.offset(),
             mask: self.content_mask(),
+            visible: self.visible_mask().bounds,
+            depth: self.depth() as u32,
             transform,
         }
     }
@@ -1534,7 +1661,10 @@ impl Window {
             let region = placed.region;
             (
                 region.bounds,
-                placed.clip,
+                Clip {
+                    bounds: placed.clip.bounds.intersect(placed.view),
+                    ..placed.clip
+                },
                 region.hit,
                 placed.transform.is_some(),
             )
@@ -1565,6 +1695,31 @@ impl Window {
 
     pub(crate) fn regions_len(&self) -> u32 {
         self.pending.regions.len() as u32
+    }
+
+    // Copies regions of the prepaint pass `pass` moved by a scroll offset `by`, and returns where they start.
+    pub(crate) fn shift_regions(
+        &mut self,
+        pass: u32,
+        range: [u32; 2],
+        by: Point<Pixels>,
+    ) -> Option<u32> {
+        let at = self.copy_regions(pass, range)?;
+        let mut moved = Vec::new();
+        for placed in &mut self.pending.regions[at as usize..] {
+            placed.region.bounds.origin += by;
+            // The open mask inside a transform stays.
+            if placed.clip.bounds.size.width.0 < OPEN {
+                placed.clip.bounds.origin += by;
+            }
+            if placed.clip.rounded.size != Size::default() {
+                placed.clip.rounded.origin += by;
+            }
+            if let Some(transform) = &placed.transform {
+                placed.transform = Some(transform.shifted(by, &mut moved));
+            }
+        }
+        Some(at)
     }
 
     // Copies regions of the prepaint pass `pass`, and returns where they start.
@@ -1608,6 +1763,70 @@ impl Window {
             || Clip::from(Rect::new(Point::default(), self.viewport_size)),
             |(mask, _)| *mask,
         )
+    }
+
+    // The part of the content mask that the window shows. In a scroll the content mask is a larger area.
+    pub(crate) fn visible_mask(&self) -> Clip<Pixels> {
+        let mut mask = self.content_mask();
+        mask.bounds = mask.bounds.intersect(self.viewport_bounds());
+        mask
+    }
+
+    // The viewports of the scrolls around the current box, whose content paints in a larger area.
+    fn viewport_bounds(&self) -> Rect {
+        (self.viewports.iter().flatten()).fold(unbounded_mask().bounds, |all, viewport| {
+            all.intersect(*viewport)
+        })
+    }
+
+    // The count of scroll viewports around the current box.
+    pub(crate) fn depth(&self) -> usize {
+        self.viewports.len()
+    }
+
+    // The content mask cut by the scroll viewports inside the first `depth`.
+    pub(crate) fn visible_below(&self, depth: usize) -> Clip<Pixels> {
+        let mut mask = self.content_mask();
+        for viewport in self.viewports[depth.min(self.viewports.len())..]
+            .iter()
+            .flatten()
+        {
+            mask.bounds = mask.bounds.intersect(*viewport);
+        }
+        mask
+    }
+
+    // `mask` cut by the scroll viewports from `from` to `to`.
+    pub(crate) fn cut_between(
+        &self,
+        mut mask: Clip<Pixels>,
+        from: usize,
+        to: usize,
+    ) -> Clip<Pixels> {
+        for viewport in self.viewports[from..to.min(self.viewports.len())]
+            .iter()
+            .flatten()
+        {
+            mask.bounds = mask.bounds.intersect(*viewport);
+        }
+        mask
+    }
+
+    // Stops the cuts of the scroll viewports inside the first `depth` until `resume_cuts`.
+    pub(crate) fn pause_cuts(&mut self, depth: usize) -> Vec<Option<Rect<Pixels>>> {
+        self.scene.pause_cuts(depth);
+        self.viewports[depth..]
+            .iter_mut()
+            .map(Option::take)
+            .collect()
+    }
+
+    pub(crate) fn resume_cuts(&mut self, paused: Vec<Option<Rect<Pixels>>>) {
+        let depth = self.viewports.len() - paused.len();
+        for (viewport, old) in self.viewports[depth..].iter_mut().zip(paused) {
+            *viewport = old;
+        }
+        self.scene.resume_cuts(depth);
     }
 
     // Pair with pop_content_mask.
@@ -1665,7 +1884,7 @@ impl Window {
 
     /// Makes the transforms of this place the space of `with_hits_at`, where regions miss outside `clip`.
     pub fn with_hit_base<R>(&mut self, clip: Rect, f: impl FnOnce(&mut Self) -> R) -> R {
-        let clip = clip.intersect(self.content_mask().bounds);
+        let clip = clip.intersect(self.visible_mask().bounds);
         self.hit_bases.push((self.hit_transform.clone(), clip));
         let result = f(self);
         self.hit_bases.pop();
@@ -1692,7 +1911,17 @@ impl Window {
         let placed = match placed {
             Some((local, to_window, from_window)) => HitTransform {
                 key: None,
+                id: HitTransform::id(
+                    None,
+                    &to_window,
+                    base.as_ref().map_or(clip, |base| base.area),
+                    base.as_ref()
+                        .map_or(unbounded_mask().bounds, |base| base.view),
+                ),
                 area: base.as_ref().map_or(clip, |base| base.area),
+                view: base
+                    .as_ref()
+                    .map_or(unbounded_mask().bounds, |base| base.view),
                 outer: base,
                 local: Cell::new(local),
                 to_window: Cell::new(to_window),
@@ -1701,7 +1930,9 @@ impl Window {
             // An empty area takes no pointer.
             None => HitTransform {
                 key: None,
+                id: HitTransform::id(None, &[0.; 9], Rect::default(), Rect::default()),
                 area: Rect::default(),
+                view: Rect::default(),
                 local: Cell::new(SAME),
                 to_window: Cell::new(
                     self.hit_transform
@@ -1716,6 +1947,7 @@ impl Window {
                 outer: self.hit_transform.clone(),
             },
         };
+        self.transforms = self.transforms.wrapping_add(1);
         let outer = self.hit_transform.replace(Rc::new(placed));
         self.push_content_mask(unbounded_mask());
         let result = f(self);
@@ -1761,10 +1993,14 @@ impl Window {
         let Some(from_window) = invert(&to_window) else {
             return f(self);
         };
-        let area = match &outer {
-            Some(outer) => outer.area,
-            None => self.content_mask().bounds,
+        let (area, view) = match &outer {
+            Some(outer) => (outer.area, outer.view),
+            None => (self.content_mask().bounds, self.viewport_bounds()),
         };
+        // Composited animations change a keyed transform in place.
+        if key.is_some() {
+            self.transforms = self.transforms.wrapping_add(1);
+        }
         self.hit_transform = Some(Rc::new(HitTransform {
             key,
             outer,
@@ -1772,6 +2008,8 @@ impl Window {
             to_window: Cell::new(to_window),
             from_window: Cell::new(from_window),
             area,
+            view,
+            id: HitTransform::id(key, &to_window, area, view),
         }));
         self.push_content_mask(unbounded_mask());
         let result = f(self);
@@ -1795,6 +2033,9 @@ impl raw_window_handle::HasWindowHandle for Window {
     }
 }
 
+// Masks at least this wide are open.
+const OPEN: f32 = 1e6;
+
 fn unbounded_mask() -> Clip<Pixels> {
     Clip::from(crate::rect(px(-1e6), px(-1e6), px(2e6), px(2e6)))
 }
@@ -1811,6 +2052,7 @@ mod tests {
                 hit,
             },
             clip: Clip::from(clip),
+            view: clip,
             transform,
         }
     }
@@ -1827,6 +2069,8 @@ mod tests {
             to_window: Cell::new(to_window),
             from_window: Cell::new(invert(&to_window).unwrap()),
             area,
+            view: unbounded_mask().bounds,
+            id: 1,
         })
     }
 

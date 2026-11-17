@@ -224,6 +224,17 @@ pub trait Hooks: 'static {
     fn skips_inside(&self) -> bool {
         false
     }
+    // Called instead of the prepaint of a box whose boxes all moved together by the scroll offset `by`, with its
+    // exact bounds there. Return true if it moved what they gave the page, so the boxes inside are skipped. Boxes
+    // in it with `skips_inside` get it too.
+    fn shift(&self, _by: Point<Pixels>, _exact: Rect, _window: &mut Window) -> bool {
+        false
+    }
+    // Return true only if `shift`, or nothing for a box inside the box that a scroll moved, keeps what prepaint
+    // would give.
+    fn shifts(&self) -> bool {
+        false
+    }
 }
 
 // Two hooks of one node: the outer one wraps the inner one.
@@ -297,6 +308,14 @@ impl Hooks for Chain {
     fn skip(&self, exact: Rect, window: &mut Window) -> bool {
         let outer = self.0.skip(exact, window);
         self.1.skip(exact, window) && outer
+    }
+
+    fn shift(&self, by: Point<Pixels>, exact: Rect, window: &mut Window) -> bool {
+        self.0.shift(by, exact, window) && self.1.shift(by, exact, window)
+    }
+
+    fn shifts(&self) -> bool {
+        self.0.shifts() && self.1.shifts()
     }
 
     fn skips_inside(&self) -> bool {
@@ -519,6 +538,7 @@ pub fn canvas<T: 'static>(
         paint,
         prepared: Cell::new(None),
         within: false,
+        watches: false,
     })
 }
 
@@ -532,6 +552,22 @@ pub fn canvas_within<T: 'static>(
         paint,
         prepared: Cell::new(None),
         within: true,
+        watches: false,
+    })
+}
+
+/// Like `canvas_within`, for a canvas whose prepaint must run in each frame that moves it, as one that watches
+/// its place in the window.
+pub fn canvas_watching<T: 'static>(
+    prepaint: impl Fn(Rect, &mut Window) -> T + 'static,
+    paint: impl Fn(Rect, &T, &mut Window) + 'static,
+) -> Node {
+    node().hooks(Canvas {
+        prepaint,
+        paint,
+        prepared: Cell::new(None),
+        within: true,
+        watches: true,
     })
 }
 
@@ -540,6 +576,7 @@ struct Canvas<P, F, T> {
     paint: F,
     prepared: Cell<Option<T>>,
     within: bool,
+    watches: bool,
 }
 
 impl<T: 'static, P, F> Hooks for Canvas<P, F, T>
@@ -568,6 +605,14 @@ where
 
     fn skip(&self, _: Rect, _: &mut Window) -> bool {
         true
+    }
+
+    fn shift(&self, _: Point<Pixels>, _: Rect, _: &mut Window) -> bool {
+        true
+    }
+
+    fn shifts(&self) -> bool {
+        !self.watches
     }
 
     // A kept canvas prepares its paint again, at its kept place.
@@ -781,6 +826,8 @@ impl Wheel {
 #[derive(Default)]
 struct ScrollState {
     offset: Point<Pixels>,
+    // The offset of the last prepaint, in whole device pixels like Chrome, so a scroll moves content by whole pixels.
+    painted: Point<Pixels>,
     max_offset: Point<Pixels>,
     bounds: Rect,
     animation: Option<Animation>,
@@ -1015,6 +1062,10 @@ impl ScrollRef {
         self.0.borrow().stretch
     }
 
+    pub(crate) fn painted(&self) -> Point<Pixels> {
+        self.0.borrow().painted
+    }
+
     pub fn max_offset(&self) -> Point<Pixels> {
         self.0.borrow().max_offset
     }
@@ -1147,7 +1198,9 @@ impl ScrollRef {
         }
         scroll.max_offset = max;
         scroll.bounds = bounds;
-        scroll.offset + scroll.stretch
+        let snap = |value: Pixels| px((value.0 * scale).round() / scale);
+        scroll.painted = (scroll.offset + scroll.stretch).map(snap);
+        scroll.painted
     }
 }
 

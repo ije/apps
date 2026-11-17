@@ -260,13 +260,37 @@ type Prepainted = Option<(Rc<RefCell<State>>, Rc<[Option<Bar>; 2]>)>;
 struct Bars(Scrollbar, RefCell<Prepainted>);
 
 impl renderer::Hooks for Bars {
+    fn volatile(&self) -> bool {
+        false
+    }
+    // Bars that show draw again in each frame.
+    fn cached(&self) -> bool {
+        true
+    }
     fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window);
-        *self.1.borrow_mut() = self.0.bars(cx.window);
+        let bars = self.0.bars(cx.window);
+        // Custom bars always draw, and a terminal shows its bars in its paint, after this.
+        let custom = self.0.quiet
+            || self
+                .0
+                .look
+                .as_ref()
+                .is_some_and(|look| look.custom.is_some());
+        if bars
+            .as_ref()
+            .is_some_and(|(state, _)| custom || state.borrow().visible())
+        {
+            cx.window.unsettle();
+        }
+        *self.1.borrow_mut() = bars;
+    }
+    fn kept(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        self.prepaint(cx, inner);
     }
     fn paint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window);
-        self.0.draw(self.1.take(), cx.window);
+        self.0.draw(self.1.borrow().clone(), cx.window);
     }
 }
 
@@ -405,6 +429,9 @@ impl Scrollbar {
         } else {
             0.
         };
+        if look.custom.is_some() || alpha > 0. {
+            window.paint_volatile();
+        }
         let [bar_width, idle, wide] = OVERLAY[usize::from(look.thin)];
         let hairline = px(1. / window.scale_factor());
         let (knob, knob_edge, track, track_edge) = if look.dark {

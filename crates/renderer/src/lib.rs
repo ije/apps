@@ -20,8 +20,8 @@ pub use control::*;
 pub use geometry::*;
 pub use input::*;
 pub use node::{
-    AvailableSpace, Child, Hooks, Node, NodeCx, NodeKey, ScrollRef, canvas, canvas_within, layers,
-    node, shared, text,
+    AvailableSpace, Child, Hooks, Node, NodeCx, NodeKey, ScrollRef, canvas, canvas_watching,
+    canvas_within, layers, node, shared, text,
 };
 pub(crate) use scene::Scene;
 pub use scene::{Backdrop, BlendMode, BorderStyle, Glass, PaintEffect, RenderImage};

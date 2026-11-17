@@ -276,11 +276,25 @@ impl Pipelines {
         &self,
         commands: &ProtocolObject<dyn MTLCommandBuffer>,
         source: &ProtocolObject<dyn MTLTexture>,
-        [dx, dy]: [i32; 2],
+        by: [i32; 2],
         target: &ProtocolObject<dyn MTLTexture>,
-        [x, y, width, height]: [i32; 4],
+        area: [i32; 4],
         load: MTLLoadAction,
     ) -> Result<()> {
+        let encoder = self.copy_pass(commands, target, load)?;
+        self.copy_draw(&encoder, source, by, area);
+        encoder.endEncoding();
+        Ok(())
+    }
+
+    // A pass that copies into `target`. Each pass loads and stores the whole target, so copies into one target
+    // share a pass.
+    fn copy_pass(
+        &self,
+        commands: &ProtocolObject<dyn MTLCommandBuffer>,
+        target: &ProtocolObject<dyn MTLTexture>,
+        load: MTLLoadAction,
+    ) -> Result<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> {
         let descriptor = MTLRenderPassDescriptor::new();
         // SAFETY: index zero is within the color attachment array.
         let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
@@ -291,6 +305,17 @@ impl Pipelines {
             .renderCommandEncoderWithDescriptor(&descriptor)
             .context("no render encoder")?;
         encoder.setRenderPipelineState(&self.copy);
+        Ok(encoder)
+    }
+
+    // Copies `area` of the target from `source`, `[dx, dy]` further.
+    fn copy_draw(
+        &self,
+        encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+        source: &ProtocolObject<dyn MTLTexture>,
+        [dx, dy]: [i32; 2],
+        [x, y, width, height]: [i32; 4],
+    ) {
         let [x, y, width, height] = [x, y, width, height].map(|value| value as usize);
         encoder.setScissorRect(MTLScissorRect {
             x,
@@ -309,10 +334,11 @@ impl Pipelines {
             encoder.setFragmentTexture_atIndex(Some(source), 0);
             encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::TriangleStrip, 0, 4);
         }
-        encoder.endEncoding();
-        Ok(())
     }
 }
+
+// A copy that starts a frame: the source, its offset and the area.
+type Prelude<'a> = (&'a ProtocolObject<dyn MTLTexture>, [i32; 2], [i32; 4]);
 
 impl Renderer {
     pub fn new(transparent: bool) -> Result<Self> {
@@ -853,7 +879,10 @@ impl Renderer {
         let since = (self.drawables.iter())
             .find(|(texture, _)| ptr::eq(&**texture, &*frame_texture))
             .map(|(_, frame)| *frame);
+        // A scroll copies the last frame moved, so the regions of earlier frames don't tell what a drawable lacks.
+        let shift = scene.shift.filter(|_| !damage.is_empty() && last.is_some());
         if !damage.is_empty()
+            && shift.is_none()
             && let Some(since) = since
             && let Some(extra) = (since + 1..=self.frames)
                 .map(|frame| {
@@ -884,7 +913,7 @@ impl Renderer {
             &frame_texture,
             window,
             damage,
-            last.as_deref(),
+            last.as_deref().map(|last| (last, shift)),
             srgb.as_deref(),
         );
         self.last = Some(frame_texture.clone());
@@ -894,7 +923,8 @@ impl Renderer {
             .retain(|(texture, frame)| !ptr::eq(&**texture, &*frame_texture) && frames - frame < 4);
         self.drawables.push((frame_texture.clone(), frames));
         self.regions.retain(|(frame, _)| frames - frame < 4);
-        let regions = (!self.frame.damage.is_empty()).then(|| self.frame.damage.clone());
+        let regions =
+            (!self.frame.damage.is_empty() && shift.is_none()).then(|| self.frame.damage.clone());
         self.regions.push((frames, regions));
         let (commands, sublayers) = match rendered {
             Ok(commands) => commands,
@@ -1069,7 +1099,7 @@ impl Renderer {
         drawable: &ProtocolObject<dyn MTLTexture>,
         window: [u32; 2],
         damage: Vec<[i32; 4]>,
-        last: Option<&ProtocolObject<dyn MTLTexture>>,
+        last: Option<(&ProtocolObject<dyn MTLTexture>, Option<crate::scene::Shift>)>,
         srgb: Option<&ProtocolObject<dyn MTLTexture>>,
     ) -> Result<Rendered> {
         let mut frame = mem::take(&mut self.frame);
@@ -1091,6 +1121,7 @@ impl Renderer {
             false => Vec::new(),
         };
         frame.fresh = srgb.is_some();
+        self.pool.spare(&mut frame.spare);
         frame.record(scene, window, MAX_TEXTURE_SIZE, true);
         let device = &self.device;
         self.pool.fill(&frame, |size| {
@@ -1112,22 +1143,79 @@ impl Renderer {
             })
             .transpose()?;
         let commands = self.queue.commandBuffer().context("no command buffer")?;
-        // The pool can give back the drawable of the last frame, which holds it already.
+        // The pool can give back the drawable of the last frame, which holds it already. Else the frame starts as a
+        // copy of the last one, and a scroll copies the viewport from the pixels that were `by` further. The scene
+        // damaged the edges that they don't cover.
+        let mut prelude: Vec<Prelude> = Vec::new();
+        let mut kept = None;
         if !frame.damage.is_empty()
-            && let Some(last) = last.filter(|last| !ptr::eq(*last, drawable))
+            && let Some((last, shift)) = last
         {
-            let area = [0, 0, window[0] as i32, window[1] as i32];
-            let load = MTLLoadAction::DontCare;
-            self.pipelines
-                .copy(&commands, last, [0, 0], drawable, area, load)?;
+            let whole = [0, 0, window[0] as i32, window[1] as i32];
+            let moved = shift.map(|([x, y, width, height], by)| {
+                let area = [
+                    x + (-by[0]).max(0),
+                    y + (-by[1]).max(0),
+                    width - by[0].abs(),
+                    height - by[1].abs(),
+                ];
+                (by, area)
+            });
+            let source = match ptr::eq(last, drawable) {
+                false => last,
+                // The last drawable can't read itself, so its pixels move through a copy.
+                true if moved.is_some() => {
+                    let size = [window[0] as usize, window[1] as usize];
+                    let usage = MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead;
+                    let copy =
+                        new_texture(&self.device, size, FORMAT, usage, MTLStorageMode::Private)?;
+                    (self.pipelines).copy(
+                        &commands,
+                        last,
+                        [0, 0],
+                        &copy,
+                        whole,
+                        MTLLoadAction::DontCare,
+                    )?;
+                    &**kept.insert(copy)
+                }
+                true => drawable,
+            };
+            match moved {
+                Some((by, area)) if area[2] > 0 && area[3] > 0 => {
+                    // Only the parts of the window outside the moved area copy in place.
+                    let [x, y, width, height] = area;
+                    let [right, bottom] = [whole[2], whole[3]];
+                    for part in [
+                        [0, 0, right, y],
+                        [0, y + height, right, bottom - y - height],
+                        [0, y, x, height],
+                        [x + width, y, right - x - width, height],
+                    ] {
+                        if part[2] > 0 && part[3] > 0 && !ptr::eq(source, drawable) {
+                            prelude.push((source, [0, 0], part));
+                        }
+                    }
+                    prelude.push((source, by, area));
+                }
+                _ if !ptr::eq(source, drawable) => prelude.push((source, [0, 0], whole)),
+                _ => {}
+            }
         }
         // The sRGB copy draws first, so layers keep the pixels of the window.
         let result = srgb
             .map_or(Ok(()), |srgb| {
-                self.encode(&frame, &commands, srgb, instances.as_deref(), false)
+                self.encode(&frame, &commands, srgb, instances.as_deref(), false, &[])
             })
             .and_then(|()| {
-                self.encode(&frame, &commands, drawable, instances.as_deref(), self.wide)
+                self.encode(
+                    &frame,
+                    &commands,
+                    drawable,
+                    instances.as_deref(),
+                    self.wide,
+                    &prelude,
+                )
             });
         let mut sublayers = Vec::new();
         if result.is_ok() {
@@ -1198,6 +1286,8 @@ impl Renderer {
         drawable: &ProtocolObject<dyn MTLTexture>,
         instances: Option<&ProtocolObject<dyn MTLBuffer>>,
         wide: bool,
+        // Copies that start the frame, drawn when its first pass begins: (source, offset, area).
+        prelude: &[Prelude],
     ) -> Result<()> {
         let texture = |target: Target| {
             self.pool
@@ -1227,13 +1317,32 @@ impl Renderer {
             wide: f32::from(u8::from(wide.get())),
             ..frame.globals(target, 0.)
         };
+        // The first pass into the drawable draws the prelude, which covers all of it.
+        let pending = Cell::new(!prelude.is_empty());
+        let starts = |target: Target| pending.get() && ptr::eq(texture(target), drawable);
+        let draw_prelude = |encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>| {
+            pending.set(false);
+            encoder.setRenderPipelineState(&self.pipelines.copy);
+            for &(source, by, area) in prelude {
+                self.pipelines.copy_draw(encoder, source, by, area);
+            }
+            encoder.setScissorRect(MTLScissorRect {
+                x: 0,
+                y: 0,
+                width: drawable.width(),
+                height: drawable.height(),
+            });
+        };
         let begin = |target: Target, clear: bool| -> Result<_> {
             let descriptor = MTLRenderPassDescriptor::new();
             // SAFETY: index zero is within the color attachment array.
             let attachment = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
             attachment.setTexture(Some(texture(target)));
             attachment.setStoreAction(MTLStoreAction::Store);
-            if clear {
+            let first = starts(target);
+            if first && !clear {
+                attachment.setLoadAction(MTLLoadAction::DontCare);
+            } else if clear {
                 attachment.setLoadAction(MTLLoadAction::Clear);
                 attachment.setClearColor(MTLClearColor {
                     red: 0.,
@@ -1247,6 +1356,10 @@ impl Renderer {
             let encoder = commands
                 .renderCommandEncoderWithDescriptor(&descriptor)
                 .context("no render encoder")?;
+            if first && !clear {
+                draw_prelude(&encoder);
+            }
+            pending.set(pending.get() && !first);
             uniforms(&encoder, bytes(&[globals(target)]), 1);
             Ok(encoder)
         };
@@ -1269,9 +1382,16 @@ impl Renderer {
             };
         }
         let pipelines = self.pipelines;
+        // The target of the open copy pass.
+        let mut copying: Option<Target> = None;
         for (at, command) in frame.commands.iter().enumerate() {
             if at == frame.shot_commands && wide.replace(false) {
                 end!();
+                copying = None;
+            }
+            if copying.is_some() && !matches!(command, Command::Copy { .. }) {
+                end!();
+                copying = None;
             }
             match command {
                 Command::Pass(target, false)
@@ -1333,18 +1453,31 @@ impl Renderer {
                     current.1 = false;
                 }
                 Command::Copy { src, dst, region } => {
-                    end!();
-                    current.1 = false;
+                    if copying.is_none_or(|open| frame.texture(open) != frame.texture(*dst)) {
+                        end!();
+                        current.1 = false;
+                        // A pooled texture can hold other layers, so the rest of it is loaded.
+                        let first = starts(*dst);
+                        let load = if first {
+                            MTLLoadAction::DontCare
+                        } else {
+                            MTLLoadAction::Load
+                        };
+                        let open = pipelines.copy_pass(commands, texture(*dst), load)?;
+                        if first {
+                            draw_prelude(&open);
+                            open.setRenderPipelineState(&pipelines.copy);
+                        }
+                        encoder = Some(open);
+                        copying = Some(*dst);
+                    }
                     let (from, to) = (frame.origin(*src), frame.origin(*dst));
-                    // A pooled texture can hold other layers, so the rest of it is loaded.
-                    pipelines.copy(
-                        commands,
+                    pipelines.copy_draw(
+                        encoder.as_deref().unwrap(),
                         texture(*src),
                         [to[0] - from[0], to[1] - from[1]],
-                        texture(*dst),
                         [region[0] - to[0], region[1] - to[1], region[2], region[3]],
-                        MTLLoadAction::Load,
-                    )?;
+                    );
                 }
                 Command::Composite {
                     src,
@@ -1379,6 +1512,11 @@ impl Renderer {
             }
         }
         end!();
+        if pending.get() {
+            let open = pipelines.copy_pass(commands, drawable, MTLLoadAction::DontCare)?;
+            draw_prelude(&open);
+            open.endEncoding();
+        }
         Ok(())
     }
 }
@@ -2012,6 +2150,122 @@ mod tests {
             let (frame, damaged, same) = receive.recv().unwrap();
             assert!(same, "frame {frame} matches a full frame");
             assert!(damaged || frame == 0, "frame {frame} draws its damage");
+        }
+    }
+
+    #[test]
+    fn scrolled_content_copies_the_last_frame_moved() {
+        use crate::{
+            Clip,
+            gpu::{BOX, Instance, rect},
+            point,
+            scene::Scene,
+        };
+        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
+        let (send, receive) = std::sync::mpsc::channel();
+        // Scroll offsets in device pixels. A part of a pixel can't be copied, and a change inside the content draws it.
+        let steps: [(f32, bool); 8] = [
+            (0., false),
+            (6., false),
+            (12., false),
+            (30., false),
+            (30.5, false),
+            (40., false),
+            (52., true),
+            (46., false),
+        ];
+        let job = move || {
+            let size = objc2_core_foundation::CGSize::new(200., 120.);
+            let [mut renderer, mut reference] = [(), ()].map(|_| {
+                let mut renderer = super::Renderer::new(false).unwrap();
+                renderer.set_drawable_size(size);
+                renderer
+            });
+            let window = Clip::from(rect([0., 0., 200., 120.]));
+            let viewport = Clip::from(rect([10., 10., 180., 100.]));
+            let quad = |bounds: [f32; 4], clip: Clip<f32>, color: [f32; 4]| {
+                let mut instance = Instance::new(BOX, rect(bounds), clip);
+                instance.color = color;
+                instance
+            };
+            let read = |renderer: &super::Renderer| {
+                let last = renderer.last.clone().unwrap();
+                let commands = renderer.queue.commandBuffer().unwrap();
+                let buffer = renderer.read_back(&commands, &last, [200, 120]).unwrap();
+                commands.commit();
+                commands.waitUntilCompleted();
+                // SAFETY: the GPU finished writing the shared buffer.
+                let mut pixels = unsafe {
+                    std::slice::from_raw_parts(
+                        buffer.contents().as_ptr().cast::<u8>(),
+                        buffer.length(),
+                    )
+                }
+                .to_vec();
+                for pixel in pixels.as_chunks_mut::<4>().0 {
+                    pixel.swap(0, 2);
+                }
+                pixels
+            };
+            let mut scene = Scene::default();
+            for (offset, changed) in steps {
+                scene.clear();
+                scene.push(quad([0., 0., 200., 120.], window, [0.9, 0.9, 0.85, 1.]));
+                scene.begin_scroll(7, viewport, point(0., offset), false);
+                for row in 0..12 {
+                    let y = 14. + 22. * row as f32 - offset;
+                    let shade = row as f32 / 12.;
+                    let color = match (changed, row) {
+                        (true, 4) => [0.9, 0.1, 0.1, 1.],
+                        _ => [shade, 0.4, 1. - shade, 1.],
+                    };
+                    scene.push(quad([20., y, 120., 16.], viewport, color));
+                    scene.push(quad(
+                        [150., y + 4., 30., 8.],
+                        viewport,
+                        [0.2, 0.2, 0.2, 0.5],
+                    ));
+                }
+                scene.end_scroll();
+                // A bar that stays over the top of the viewport.
+                scene.push(quad([0., 0., 200., 24.], window, [0.1, 0.5, 0.3, 0.8]));
+                scene.diff(Some(&[]));
+                let shifted = scene.shift;
+                renderer.draw(&scene, false);
+                scene.drawn();
+                let area: i32 = renderer
+                    .frame
+                    .damage
+                    .iter()
+                    .map(|region| region[2] * region[3])
+                    .sum();
+                let pixels = read(&renderer);
+                let (_, full) = reference.draw(&scene, true).unwrap().unwrap();
+                send.send((offset, shifted, area, pixels == full)).unwrap();
+            }
+            super::super::threads::end_thread();
+        };
+        super::super::threads::spawn_render(job, || {});
+        let mut last = 0.;
+        for (offset, changed) in steps {
+            let (got, shifted, area, same) = receive.recv().unwrap();
+            assert_eq!(got, offset);
+            assert!(same, "offset {offset}: the frame matches a full frame");
+            let by = offset - last;
+            let copies = by != 0. && by.fract() == 0. && last.fract() == 0.;
+            assert_eq!(
+                shifted.map(|(_, by)| by),
+                copies.then_some([0, by as i32]),
+                "offset {offset}"
+            );
+            if copies && !changed {
+                // The edge, and the bar where it is and where the copy put it.
+                assert!(
+                    area <= 200 * (24 + 2) * 2 + 182 * (by.abs() as i32 + 2),
+                    "offset {offset}: {area}"
+                );
+            }
+            last = offset;
         }
     }
 }

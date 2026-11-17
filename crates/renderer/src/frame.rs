@@ -92,6 +92,8 @@ pub struct RenderFrame {
     cull: Option<Rect<f32>>,
     // For each texture, the id of the cached layer that it keeps, or 0.
     pub kept: Vec<u64>,
+    // Sizes of the backend's spare textures, which new layers take before other sizes.
+    pub spare: Vec<[u32; 2]>,
     cache: Vec<Cached>,
     // Cached layers draw again, for a frame that is drawn twice in different color spaces.
     pub fresh: bool,
@@ -155,7 +157,15 @@ impl<T> Pool<T> {
                 (*idle, *id) = (0, 0);
             }
         }
-        let age = match frame.damage.is_empty() {
+        // Damage regions take textures of other sizes each frame, as in a scroll, so above two windows of pixels the
+        // pool ages as fast as in whole frames.
+        let pixels = |[width, height]: [u32; 2]| u64::from(width) * u64::from(height);
+        let pooled: u64 = self
+            .textures
+            .iter()
+            .map(|(_, size, ..)| pixels(*size))
+            .sum();
+        let age = match frame.damage.is_empty() || pooled > 2 * pixels(frame.window) {
             true => DAMAGED_FRAMES,
             false => 1,
         };
@@ -192,6 +202,17 @@ impl<T> Pool<T> {
             }
         }
         Ok(())
+    }
+
+    // The sizes of textures that hold no cached layer.
+    #[cfg(any(target_os = "macos", test))]
+    pub fn spare(&self, sizes: &mut Vec<[u32; 2]>) {
+        sizes.clear();
+        sizes.extend(
+            (self.textures.iter())
+                .filter(|texture| texture.3 == 0)
+                .map(|texture| texture.1),
+        );
     }
 
     pub fn get(&self, frame: &RenderFrame, target: Target) -> Option<&T> {
@@ -445,8 +466,20 @@ impl RenderFrame {
             Some(index) => self.free.swap_remove(index),
             None => {
                 let max = self.max_texture as u32;
-                self.textures
-                    .push(size.map(|value| (value.div_ceil(256) * 256).min(max)));
+                let area = |[width, height]: [u32; 2]| u64::from(width) * u64::from(height);
+                // Damage regions change size each frame, so a spare texture up to twice as large saves a new one.
+                let spare = (self.spare.iter().enumerate())
+                    .filter(|(_, spare)| {
+                        spare[0] >= size[0]
+                            && spare[1] >= size[1]
+                            && area(**spare) <= 2 * area(size).max(1 << 16)
+                    })
+                    .min_by_key(|(_, spare)| area(**spare))
+                    .map(|(at, _)| at);
+                self.textures.push(match spare {
+                    Some(at) => self.spare.swap_remove(at),
+                    None => size.map(|value| (value.div_ceil(256) * 256).min(max)),
+                });
                 self.kept.push(0);
                 self.textures.len() - 1
             }
@@ -694,7 +727,8 @@ impl RenderFrame {
             }
             let mut instance = *instance;
             let mut bounds = instance.reach();
-            if layer == 0 && self.cull.is_some_and(|cull| !cull.intersects(bounds)) {
+            // A scroll viewport can cut an instance away.
+            if bounds.is_empty() || layer == 0 && self.cull.is_some_and(|cull| !cull.intersects(bounds)) {
                 continue;
             }
             let trim = instance.kind() == BOX && instance.round_radii == [0.; 8];
@@ -745,9 +779,10 @@ impl RenderFrame {
         target: Target,
         depth: usize,
     ) {
-        if layer != 0
-            || !self.skip.contains(&nested.layer)
-                && self.cull.is_none_or(|cull| cull.intersects(nested.reach()))
+        if !nested.reach().is_empty()
+            && (layer != 0
+                || !self.skip.contains(&nested.layer)
+                    && self.cull.is_none_or(|cull| cull.intersects(nested.reach())))
         {
             self.record_effect(scene, nested, target, depth);
         }
@@ -781,15 +816,33 @@ impl RenderFrame {
             Target::Layer(_) => self.rect(src).map(|value| value as i32),
             Target::Frame => region,
         };
-        let scale = if sigma >= HALF_RESOLUTION_SIGMA { 2 } else { 1 };
-        let horizontal = self.acquire(covered, scale);
-        self.blur_pass(src, horizontal, region, sigma, [1., 0.], mirror);
-        if release {
-            self.release(src);
-        }
-        if scale == 1 {
+        if sigma < HALF_RESOLUTION_SIGMA {
+            let horizontal = self.acquire(covered, 1);
+            self.blur_pass(src, horizontal, region, sigma, [1., 0.], mirror);
+            if release {
+                self.release(src);
+            }
             return (horizontal, sigma);
         }
+        // Like Skia, a wide blur halves the pixels until about 4 of them are left per sigma, blurs there, and the
+        // composite scales it back up. A sample between 4 pixels averages them, so each half is a box filter.
+        let halves = (sigma / 4.).log2().floor().clamp(1., 5.) as u32;
+        let (mut source, mut owned) = (src, release);
+        for half in 1..=halves {
+            let target = self.acquire(covered, 1 << half);
+            self.blur_pass(source, target, region, 0., [1., 0.], mirror);
+            if owned {
+                self.release(source);
+            }
+            (source, owned) = (target, true);
+        }
+        // The box filters blurred by (4^halves - 1) / 12 square pixels already.
+        let boxed = ((1u32 << (2 * halves)) - 1) as f32 / 12.;
+        let sigma = (sigma * sigma - boxed).max(0.).sqrt();
+        let scale = 1 << halves;
+        let horizontal = self.acquire(covered, scale);
+        self.blur_pass(source, horizontal, region, sigma, [1., 0.], mirror);
+        self.release(source);
         let both = self.acquire(covered, scale);
         self.blur_pass(horizontal, both, region, sigma, [0., 1.], mirror);
         self.release(horizontal);
@@ -1569,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_blurs_draw_both_passes_at_half_resolution() {
+    fn wide_blurs_draw_at_a_fraction_of_the_pixels() {
         let blurred = |sigma: f32| {
             let mask = Clip::from(bounds([0., 0., 800., 600.]));
             let mut scene = Scene::default();
@@ -1592,19 +1645,25 @@ mod tests {
         };
         assert_eq!((blur.direction, blur.scale), ([1., 0.], 1.));
         assert_eq!(narrow.composites[0].blur, 4.);
+        // Two halves leave 5 pixels per sigma, where both passes blur.
         let wide = blurred(20.);
-        let [across, down] = wide.blurs[..] else {
-            panic!("two blur passes")
+        let [half, quarter, across, down] = wide.blurs[..] else {
+            panic!("two halves and two blur passes")
         };
-        assert_eq!((across.direction, across.scale), ([1., 0.], 2.));
-        assert_eq!((down.direction, down.scale), ([0., 1.], 2.));
+        assert_eq!(
+            (half.sigma, half.scale, quarter.sigma, quarter.scale),
+            (0., 2., 0., 4.)
+        );
+        assert_eq!((across.direction, across.scale), ([1., 0.], 4.));
+        assert_eq!((down.direction, down.scale), ([0., 1.], 4.));
+        assert!((across.sigma - (400f32 - 15. / 12.).sqrt()).abs() < 1e-4);
         let composite = wide.composites[0];
         assert_eq!(composite.blur, 0.);
         let Some(Command::Composite { src, .. }) = wide.commands.last() else {
             panic!("a composite last")
         };
         let [width, height] = wide.pixels(*src);
-        assert_eq!(composite.source_rect[2..], [width * 2., height * 2.]);
+        assert_eq!(composite.source_rect[2..], [width * 4., height * 4.]);
     }
 
     #[test]
@@ -1789,12 +1848,12 @@ mod tests {
         };
         assert_eq!(
             blurs(&scene(100., 2.)),
-            3,
-            "a half resolution shadow and a blur"
+            4,
+            "a shadow at half resolution, its half, and a blur"
         );
         assert_eq!(
             blurs(&scene(100., 2.)),
-            3,
+            4,
             "the second frame keeps the blurs"
         );
         assert_eq!(
