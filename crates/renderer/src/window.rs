@@ -308,7 +308,8 @@ pub(crate) type CaptureCallback = Box<dyn FnOnce(Result<([u32; 2], Vec<u8>)>, &m
 #[derive(Default)]
 struct Input {
     regions: Vec<Placed>,
-    listeners: Vec<(bool, Listener)>,
+    // Shared, so an event can run the listeners of its frame without a copy while listeners draw new frames.
+    listeners: Rc<Vec<(bool, Listener)>>,
     cursors: Vec<(u64, Cursor)>,
     drag_areas: Vec<u64>,
     // The tokens of `Window::mark` in paint order.
@@ -354,7 +355,10 @@ impl PaintKey {
 impl Input {
     fn clear(&mut self) {
         self.regions.clear();
-        self.listeners.clear();
+        match Rc::get_mut(&mut self.listeners) {
+            Some(listeners) => listeners.clear(),
+            None => self.listeners = Rc::default(),
+        }
         self.cursors.clear();
         self.drag_areas.clear();
         self.marks.clear();
@@ -1334,11 +1338,11 @@ impl Window {
     }
 
     pub fn on_capture(&mut self, listener: impl FnMut(&Event, &mut Window, &mut App) + 'static) {
-        (self.pending.listeners).push((true, Rc::new(RefCell::new(listener))));
+        Rc::make_mut(&mut self.pending.listeners).push((true, Rc::new(RefCell::new(listener))));
     }
 
     pub fn on_bubble(&mut self, listener: impl FnMut(&Event, &mut Window, &mut App) + 'static) {
-        (self.pending.listeners).push((false, Rc::new(RefCell::new(listener))));
+        Rc::make_mut(&mut self.pending.listeners).push((false, Rc::new(RefCell::new(listener))));
     }
 
     /// Records a token in paint order, which `marks` returns after the frame. Copied paint keeps its tokens.
@@ -1496,9 +1500,7 @@ impl Window {
             None => self.scene.replay(&span.scene)?,
         };
         let pending = &mut self.pending;
-        pending
-            .listeners
-            .extend_from_slice(&live.listeners[range(listeners)]);
+        Rc::make_mut(&mut pending.listeners).extend_from_slice(&live.listeners[range(listeners)]);
         pending
             .cursors
             .extend_from_slice(&live.cursors[range(cursors)]);

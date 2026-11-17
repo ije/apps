@@ -14,6 +14,7 @@ mod path;
 mod render;
 
 pub use filter::blur;
+pub use image::{decoded, stub};
 
 pub fn render(
     tree: &usvg::Tree,

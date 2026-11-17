@@ -98,7 +98,8 @@ pub struct Frame {
     /// All images of the screen, in the order to draw them.
     pub placements: *const Placement,
     pub placed: u32,
-    /// The time in ms until an animated image has its next picture, or 0.
+    /// The time in ms until an animated image has its next picture, or 0. In a frame without data, the
+    /// time until the program stops holding the screen.
     pub wait: u32,
     /// In rows: all rows with the scrollback, the first row of the screen, and the rows of the screen.
     pub scroll: [u32; 3],
@@ -735,9 +736,12 @@ impl Terminal {
                 .map_err(|e| error(&e))
         };
         let shared = self.shared.clone();
+        // Dropped when the reader ends, so `exit` can come after the last output.
+        let (read, drained) = mpsc::channel::<()>();
         thread(
             "apps-terminal-read",
             Box::new(move || {
+                let _read = read;
                 let mut bytes = vec![0; 65536];
                 let mut fds = [reader.as_raw_fd(), stopped.as_raw_fd()].map(|fd| libc::pollfd {
                     fd,
@@ -795,6 +799,8 @@ impl Terminal {
                     && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
                 {
                 }
+                // Another process can keep the PTY open, so the wait has a limit.
+                let _ = drained.recv_timeout(Duration::from_millis(100));
                 let Some(shared) = shared.upgrade() else {
                     let _ = child.wait();
                     return;
@@ -810,6 +816,9 @@ impl Terminal {
                     return;
                 }
                 state.forget([WORKING, BLOCKED]);
+                if state.held.take().is_some() {
+                    state.changed = true;
+                }
                 let _ = match status
                     .as_ref()
                     .map(|status| (status.signal(), status.code()))
@@ -1228,7 +1237,8 @@ pub unsafe extern "C" fn apps_terminal_text(
 }
 
 /// Reads the rows that changed since the last frame. Returns false when the frame has no data, which is
-/// also the case while the program holds the screen for a synchronized update.
+/// also the case while the program holds the screen for a synchronized update. Then `wait` of the frame is
+/// the time in ms until the hold ends.
 ///
 /// # Safety
 /// `terminal` comes from `apps_terminal_new`, `frame` points to a `Frame`, and only one thread calls this.
@@ -1237,10 +1247,12 @@ pub unsafe extern "C" fn apps_terminal_frame(terminal: *mut Terminal, frame: *mu
     let terminal = unsafe { &*terminal };
     let state = terminal.shared.state();
     // A program that never ends its update must not freeze the screen.
-    if state
+    if let Some(left) = state
         .held
-        .is_some_and(|since| since.elapsed() < Duration::from_secs(1))
+        .and_then(|since| Duration::from_secs(1).checked_sub(since.elapsed()))
+        .filter(|left| !left.is_zero())
     {
+        unsafe { (*frame).wait = left.as_millis() as u32 + 1 };
         return false;
     }
     unsafe { vt_frame_begin(state.vt, terminal.start.elapsed().as_millis() as u64) };

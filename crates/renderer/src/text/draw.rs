@@ -98,6 +98,18 @@ impl TextLine {
         }
     }
 
+    /// How far the ink of a glyph reaches above or below its row.
+    pub(crate) fn reach(&self, line_height: Pixels, window: &Window) -> Pixels {
+        let line = &*self.line;
+        let baseline = (line_height - line.ascent - line.descent) / 2. + line.ascent;
+        let mut ink = Ink::default();
+        line.glyphs.iter().fold(px(0.), |reach, glyph| {
+            ink.update(glyph, window);
+            let top = baseline + glyph.y + ink.lift.y;
+            reach.max(-top).max(top + ink.size.height - line_height)
+        })
+    }
+
     pub fn paint(
         &self,
         origin: Point<Pixels>,
@@ -106,8 +118,30 @@ impl TextLine {
         width: Option<Pixels>,
         window: &mut Window,
     ) {
+        self.paint_rows(origin, line_height, align, width, 0..self.rows(), window);
+    }
+
+    /// Glyphs draw only in `visible` rows.
+    pub(crate) fn paint_rows(
+        &self,
+        origin: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        width: Option<Pixels>,
+        visible: std::ops::Range<usize>,
+        window: &mut Window,
+    ) {
         let rows = self.placed(origin, align, width);
         let line = &*self.line;
+        let row_glyph = |row: usize| match row {
+            0 => 0,
+            _ => (rows.breaks.get(row - 1)).map_or(line.glyphs.len(), |&at| at as usize),
+        };
+        let shown = row_glyph(visible.start)..row_glyph(visible.end);
+        if shown.len() < line.glyphs.len() {
+            // A copy of this paint can't move: it lacks the glyphs of the other rows.
+            window.cull();
+        }
         let decorated = self
             .looks
             .iter()
@@ -136,10 +170,16 @@ impl TextLine {
             let mut ink = Ink::default();
             let mut kept: [Option<(Point<Pixels>, Decoration)>; 2] = [None; 2];
             let mut color = Color::BLACK;
-            let (mut row, mut last_x) = (0, px(0.));
-            let mut pen = point(rows.left(px(0.), 0), origin.y);
+            // The glyph pass starts at the break before the first visible row, which places the pen.
+            let (from, to, first) = match glyphs {
+                true => (shown.start, shown.end, visible.start.saturating_sub(1)),
+                false => (0, line.glyphs.len(), 0),
+            };
+            let (mut row, mut last_x) = (first, px(0.));
+            let mut pen = point(rows.left(px(0.), 0), origin.y + line_height * first);
             let mut first_x = origin.x;
-            for (at, glyph) in line.glyphs.iter().enumerate() {
+            for (at, glyph) in line.glyphs[from..to].iter().enumerate() {
+                let at = at + from;
                 ink.update(glyph, window);
                 let half = ink.size.width.half();
                 pen.x += glyph.x - last_x;

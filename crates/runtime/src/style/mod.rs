@@ -1194,6 +1194,7 @@ impl StyleCache {
                 }
             }
             self.matches.forget(id);
+            self.sized.remove(&id);
         }
     }
 
@@ -1206,6 +1207,7 @@ impl StyleCache {
             scope.lists = Default::default();
         }
         self.matches.trim(len);
+        self.sized.retain(|&id| id < len);
     }
 
     fn uncache(&mut self) {
@@ -1227,7 +1229,7 @@ impl StyleCache {
             return false;
         }
         // Styles with container units are not shared, so only the nodes in a resized container need a new style.
-        let mut flipped: Vec<usize> = self
+        let mut flipped: rustc_hash::FxHashSet<usize> = self
             .sized
             .iter()
             .copied()
@@ -1251,7 +1253,7 @@ impl StyleCache {
                     ) == Some(true)
                 }) != matched
             }) {
-                flipped.push(container);
+                flipped.insert(container);
             }
         }
         self.containers = sizes.clone();
@@ -1260,12 +1262,20 @@ impl StyleCache {
         }
         self.queries
             .retain(|&(_, _, _, container), _| !flipped.contains(&container));
-        let mut pending = flipped;
-        while let Some(id) = pending.pop() {
-            let Some(node) = doc.nodes.get(id) else {
+        let mut pending: Vec<_> = flipped.iter().map(|&id| (id, true)).collect();
+        while let Some((id, root)) = pending.pop() {
+            // A flipped container inside another one is walked once, as its own root.
+            let Some(node) = doc.nodes.get(id).filter(|_| root || !flipped.contains(&id)) else {
                 continue;
             };
-            pending.extend(self.shadows.composed.get(&id).unwrap_or(&node.children));
+            pending.extend(
+                self.shadows
+                    .composed
+                    .get(&id)
+                    .unwrap_or(&node.children)
+                    .iter()
+                    .map(|&child| (child, false)),
+            );
             for scope in &mut self.scopes {
                 if let Some(Some(node)) = scope.nodes.get_mut(id) {
                     node.cached = None;
@@ -4235,6 +4245,8 @@ pub(crate) struct ComputedStyles {
     anonymous: FxHashMap<usize, u16>,
     containers: Chunked<Option<Rc<Container>>>,
     counted: bool,
+    // The node revision of the document that this pass styled.
+    revision: u64,
 }
 
 pub(crate) type Shadowed = Rc<Vec<Passed>>;
@@ -5164,8 +5176,10 @@ pub(crate) fn compute_styles(
         anonymous,
         containers,
         counted,
+        revision,
         ..
     } = &mut out;
+    *revision = doc.nodes.latest();
     macro_rules! unstyle {
         ($id:expr) => {
             pseudos.remove(&$id);
@@ -5197,6 +5211,10 @@ pub(crate) fn compute_styles(
         };
     }
     let mut counters = false;
+    // A fast pass numbers the counters again only when one of their inputs changed.
+    let mut recount = false;
+    let item = |style: &Style| style.get(Prop::DISPLAY) == Some("list-item");
+    let listed = |id: usize| matches!(doc.nodes[id].tag.as_str(), "ol" | "ul" | "menu" | "li");
     let html: Vec<usize> = walk.special[0]
         .iter()
         .copied()
@@ -5211,6 +5229,15 @@ pub(crate) fn compute_styles(
             .as_ref()
             .filter(|old| !Rc::ptr_eq(&old.nodes, &walk.walk.nodes))
         {
+            // Text and comments that move need no new count.
+            let changed = walk.walk.changed_since(old.serial).map_or(0, <[u32]>::len);
+            recount = walk.walk.since(old.serial).is_none_or(|touched| {
+                touched[..touched.len() - changed].iter().any(|&id| {
+                    doc.nodes
+                        .get(id as usize)
+                        .is_none_or(|node| !node.tag.starts_with('#'))
+                })
+            });
             const GONE: u32 = u32::MAX - 1;
             const KEPT: u32 = u32::MAX - 2;
             let root = |tree: &[u32], trees: &[(usize, usize)], id: usize| {
@@ -5343,6 +5370,16 @@ pub(crate) fn compute_styles(
                     | u8::from(pointer(previous.exported.get(&id)) != pointer(exported.get(&id)))
                         * DEEP);
                 all |= (id == 0 || html.contains(&id)) && font != Some(root);
+                if !recount {
+                    let old = previous.anonymous.get(&id).or(previous.flags.get(id));
+                    let old = old.copied().unwrap_or(0);
+                    let before = previous.authored.get(&id).or(previous.values.get(id));
+                    recount = (old | style_flags[id]) & COUNTED != 0
+                        || (old ^ style_flags[id]) & DISPLAY_NONE != 0
+                        || listed(id)
+                        || item(&styles[id])
+                        || before.is_some_and(|before| item(before));
+                }
             }
             counters |= style_flags[id] & COUNTED != 0;
             if matches!(style_flags[id] >> 8, CELL | CAPTION | 10..=12)
@@ -7450,7 +7487,25 @@ pub(crate) fn compute_styles(
             scopes: used,
         });
     }
-    if counters || previous.is_some_and(|previous| fast && previous.counted) {
+    let reused = previous
+        .filter(|previous| fast && previous.counted)
+        .filter(|previous| {
+            // Attributes like `start`, `reversed` and `value` can change without a new style.
+            !recount
+                && !doc.nodes.changed_since(previous.revision).any(|id| {
+                    listed(id)
+                        || item(&styles[id])
+                        || previous.values.get(id).is_some_and(|old| item(old))
+                        || doc.nodes[id]
+                            .children
+                            .iter()
+                            .any(|&child| item(&styles[child]))
+                })
+        });
+    if let Some(previous) = reused {
+        *counted = true;
+        list_items.clone_from(&previous.list_items);
+    } else if counters || previous.is_some_and(|previous| fast && previous.counted) {
         *counted = true;
         let list = |value: Option<&str>, default: i64| -> Vec<(String, i64)> {
             let parts = value.map_or_else(Vec::new, |value| components(value, ' '));
@@ -7494,7 +7549,7 @@ pub(crate) fn compute_styles(
             }
             for (name, step) in increments {
                 match counters.iter_mut().rfind(|counter| counter.0 == name) {
-                    Some(counter) => counter.1 += step,
+                    Some(counter) => counter.1 = counter.1.saturating_add(step),
                     None => counters.push((name, step, parent)),
                 }
             }
@@ -7605,9 +7660,9 @@ pub(crate) fn compute_styles(
                         .get("start")
                         .and_then(|value| value.parse::<i64>().ok());
                     let first = if reversed {
-                        start.unwrap_or(items) + 1
+                        start.unwrap_or(items).saturating_add(1)
                     } else {
-                        start.unwrap_or(1) - 1
+                        start.unwrap_or(1).saturating_sub(1)
                     };
                     counters.push(("list-item".into(), first, parent));
                 }

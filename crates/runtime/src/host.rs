@@ -312,6 +312,9 @@ impl Host {
                             prune(doc, id);
                         }
                         let current = &doc.nodes[id];
+                        if current.children.is_empty() && current.text == value {
+                            return Ok(false);
+                        }
                         if !(current.tag == "#text"
                             && current.text.is_empty() == value.is_empty()
                             && current

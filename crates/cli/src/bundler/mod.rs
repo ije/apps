@@ -70,7 +70,6 @@ struct Shared {
 }
 
 struct TsPaths {
-    file: PathBuf,
     base: PathBuf,
     paths: serde_json::Map<String, Value>,
 }
@@ -109,10 +108,21 @@ impl Shared {
         }
         let file = directory.join("tsconfig.json");
         let found = if file.is_file() {
-            let (paths, base) = tsconfig_paths(&file, 0)?;
+            let mut read = Vec::new();
+            let result = tsconfig_paths(&file, 0, &mut read);
+            // Watch the whole `extends` chain, also when it has no `paths` or is invalid.
+            for file in &mut read {
+                if let Ok(path) = file.canonicalize() {
+                    *file = path;
+                }
+            }
+            if let Some(cache) = &self.cache {
+                cache.tsconfigs.borrow_mut().extend(read.iter().cloned());
+            }
+            self.files.borrow_mut().extend(read);
+            let (paths, base) = result?;
             paths.map(|(directory, paths)| {
                 Rc::new(TsPaths {
-                    file,
                     base: base.unwrap_or(directory),
                     paths,
                 })
@@ -137,12 +147,13 @@ type Paths = (
 
 // Returns `paths` with the folder they are relative to without `baseUrl`, and `baseUrl`. Each comes from the nearest
 // config in the `extends` chain that sets it.
-fn tsconfig_paths(file: &Path, depth: usize) -> Result<Paths> {
+fn tsconfig_paths(file: &Path, depth: usize, read: &mut Vec<PathBuf>) -> Result<Paths> {
     ensure!(
         depth < 16,
         "tsconfig.json extends itself: {}",
         file.display()
     );
+    read.push(file.to_owned());
     let source =
         fs::read_to_string(file).with_context(|| format!("Cannot read {}", file.display()))?;
     let mut json = String::with_capacity(source.len());
@@ -200,7 +211,7 @@ fn tsconfig_paths(file: &Path, depth: usize) -> Result<Paths> {
         {
             parent.as_mut_os_string().push(".json");
         }
-        let (inherited, inherited_base) = tsconfig_paths(&parent, depth + 1)?;
+        let (inherited, inherited_base) = tsconfig_paths(&parent, depth + 1, read)?;
         paths = paths.or(inherited);
         base = base.or(inherited_base);
     }
@@ -215,6 +226,8 @@ pub struct Cache {
     disabled: Cell<u32>,
     env: RefCell<Value>,
     pub resolutions: RefCell<HashMap<(Realm, PathBuf, String, bool), Resolved>>,
+    // Cached resolutions skip the tsconfig lookup, so each build watches the configs found before.
+    tsconfigs: RefCell<BTreeSet<PathBuf>>,
 }
 
 type Resolved = (PathBuf, Option<PathBuf>, Option<PathBuf>);
@@ -1780,12 +1793,11 @@ impl Builder {
                 resolve_file(&config.base.join(target), fields).ok()
             })
         {
-            self.shared.files.borrow_mut().insert(config.file.clone());
             if let Some(cache) = cache {
                 cache
                     .resolutions
                     .borrow_mut()
-                    .insert(resolution, (path.clone(), None, Some(config.file.clone())));
+                    .insert(resolution, (path.clone(), None, None));
             }
             return Ok((path, None));
         }
@@ -1978,7 +1990,7 @@ impl Builder {
             self.shared.files.borrow_mut().insert(path.clone());
             let mut valid = true;
             for (base, specifier, require, dep) in &requests {
-                if self.resolve(base, specifier, *require)? != *dep {
+                if self.resolve(base, specifier, *require).ok() != Some(*dep) {
                     valid = false;
                     break;
                 }
@@ -2584,14 +2596,18 @@ impl Builder {
                         .strip_prefix(root)?
                         .to_string_lossy()
                         .replace('\\', "/");
-                    !patterns.iter().filter_map(Value::as_str).any(|pattern| {
-                        let pattern = pattern.trim_start_matches("./");
-                        if pattern.contains('/') {
-                            glob(pattern.as_bytes(), relative.as_bytes())
-                        } else {
-                            glob(format!("**/{pattern}").as_bytes(), relative.as_bytes())
-                        }
-                    })
+                    !patterns
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .flat_map(expand_braces)
+                        .any(|pattern| {
+                            let pattern = pattern.trim_start_matches("./");
+                            if pattern.contains('/') {
+                                glob(pattern.as_bytes(), relative.as_bytes())
+                            } else {
+                                glob(format!("**/{pattern}").as_bytes(), relative.as_bytes())
+                            }
+                        })
                 }
                 _ => false,
             };
@@ -2655,6 +2671,30 @@ fn glob(pattern: &[u8], text: &[u8]) -> bool {
             .take_while(|&i| i == 0 || text[i - 1] != b'/')
             .any(|i| glob(rest, &text[i..])),
         [b'?', rest @ ..] => text.first().is_some_and(|&c| c != b'/') && glob(rest, &text[1..]),
+        [b'[', rest @ ..] => {
+            let negate = matches!(rest.first(), Some(b'!' | b'^'));
+            let class = &rest[usize::from(negate)..];
+            // A `]` right after `[` or `[!` is a literal, and a `[` without `]` matches itself.
+            let Some(end) = class.iter().skip(1).position(|&c| c == b']').map(|i| i + 1) else {
+                return text.first() == Some(&b'[') && glob(rest, &text[1..]);
+            };
+            let Some(&c) = text.first().filter(|&&c| c != b'/') else {
+                return false;
+            };
+            let set = &class[..end];
+            let mut found = false;
+            let mut i = 0;
+            while i < set.len() && !found {
+                if i + 2 < set.len() && set[i + 1] == b'-' {
+                    found = (set[i]..=set[i + 2]).contains(&c);
+                    i += 3;
+                } else {
+                    found = set[i] == c;
+                    i += 1;
+                }
+            }
+            found != negate && glob(&class[end + 1..], &text[1..])
+        }
         [c, rest @ ..] => text.first() == Some(c) && glob(rest, &text[1..]),
     }
 }
@@ -2709,6 +2749,11 @@ pub fn compile(
     files
         .borrow_mut()
         .extend(manifest.iter().cloned().chain([entry.to_owned()]));
+    if let Some(cache) = &cache {
+        files
+            .borrow_mut()
+            .extend(cache.tsconfigs.borrow().iter().cloned());
+    }
     let package = manifest.as_ref().map(fs::read_to_string).transpose()?;
     let metadata: Value =
         serde_json::from_str(package.as_deref().unwrap_or("{}")).context("Invalid package.json")?;
@@ -3852,7 +3897,7 @@ fn resolve_file(path: &Path, fields: &[&str]) -> Result<PathBuf> {
     bail!("Cannot resolve {}", path.display())
 }
 
-fn is_asset(extension: &std::ffi::OsStr) -> bool {
+pub(crate) fn is_asset(extension: &std::ffi::OsStr) -> bool {
     extension.to_str().is_some_and(|extension| {
         matches!(
             extension.to_ascii_lowercase().as_str(),

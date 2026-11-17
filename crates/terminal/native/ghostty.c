@@ -87,6 +87,7 @@ typedef struct {
   bool dark, full;
   uint64_t ticked;
   uint16_t *ys;
+  size_t ys_cap;
   VtCell *cells;
   size_t cells_cap;
   uint32_t *extras;
@@ -754,11 +755,16 @@ bool vt_frame_end(Vt *vt, VtFrame *frame) {
   size_t cols = frame->cols, needed = cols * frame->rows;
   if (needed > vt->cells_cap) {
     VtCell *cells = realloc(vt->cells, needed * sizeof(VtCell));
-    if (cells) vt->cells = cells;
-    uint16_t *ys = realloc(vt->ys, (size_t)frame->rows * sizeof(uint16_t));
-    if (ys) vt->ys = ys;
-    if (!cells || !ys) return false;
+    if (!cells) return false;
+    vt->cells = cells;
     vt->cells_cap = needed;
+  }
+  // Rows can grow while the cell count stays, like 80x24 to 40x48.
+  if (frame->rows > vt->ys_cap) {
+    uint16_t *ys = realloc(vt->ys, (size_t)frame->rows * sizeof(uint16_t));
+    if (!ys) return false;
+    vt->ys = ys;
+    vt->ys_cap = frame->rows;
   }
   vt->extras_len = 0;
   if (ghostty_render_state_get(render, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &vt->row_iter) !=

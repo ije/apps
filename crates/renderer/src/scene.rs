@@ -112,6 +112,10 @@ struct Map {
     transform: Option<[f32; 16]>,
 }
 
+fn bits<const N: usize>(values: [f32; N]) -> [u32; N] {
+    values.map(f32::to_bits)
+}
+
 pub(crate) fn mix(hash: u64, value: u64) -> u64 {
     (hash.rotate_left(5) ^ value).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95)
 }
@@ -853,30 +857,29 @@ impl Scene {
             )
                 .hash(hasher);
             if let Some(effect) = &inner.effect {
-                let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
                 (
-                    effect.transform.map(|matrix| bits(&matrix)),
+                    effect.transform.map(bits),
                     effect.opacity.to_bits(),
-                    effect.color_matrix.map(|matrix| bits(&matrix)),
+                    effect.color_matrix.map(bits),
                     effect.blur.to_bits(),
                     effect.blend_mode as u32,
                 )
                     .hash(hasher);
                 (
                     effect.shadow.map(|(by, sigma, color)| {
-                        bits(&[by.x, by.y, sigma, color.r, color.g, color.b, color.a])
+                        bits([by.x, by.y, sigma, color.r, color.g, color.b, color.a])
                     }),
                     effect.clip.map(|(bounds, radii)| {
                         (
                             place(bounds.to_array()),
-                            bits(&radii.to_array()),
+                            bits(radii.to_array()),
                             radii.shape,
                         )
                     }),
                     effect.mask.as_ref().map(|(tile, bounds)| {
                         (
                             tile.page,
-                            bits(&tile.rect.map(|value| value as f32).to_array()),
+                            bits(tile.rect.map(|value| value as f32).to_array()),
                             place(bounds.to_array()),
                         )
                     }),
@@ -1209,9 +1212,8 @@ impl Walk<'_> {
             return 0;
         };
         let mut hasher = rustc_hash::FxHasher::default();
-        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
         let rect = |rect: Rect<f32>| {
-            bits(&[
+            bits([
                 rect.origin.x - base.x,
                 rect.origin.y - base.y,
                 rect.size.width,
@@ -1219,17 +1221,17 @@ impl Walk<'_> {
             ])
         };
         (
-            effect.transform.map(|matrix| bits(&matrix)),
+            effect.transform.map(bits),
             effect.opacity.to_bits(),
-            effect.color_matrix.map(|matrix| bits(&matrix)),
+            effect.color_matrix.map(bits),
             effect.blur.to_bits(),
             effect.blend_mode as u32,
             effect.shadow.map(|(by, sigma, color)| {
-                bits(&[by.x, by.y, sigma, color.r, color.g, color.b, color.a])
+                bits([by.x, by.y, sigma, color.r, color.g, color.b, color.a])
             }),
             effect
                 .clip
-                .map(|(bounds, radii)| (rect(bounds), bits(&radii.to_array()), radii.shape)),
+                .map(|(bounds, radii)| (rect(bounds), bits(radii.to_array()), radii.shape)),
         )
             .hash(&mut hasher);
         (
@@ -1247,10 +1249,10 @@ impl Walk<'_> {
             effect.backdrop.as_ref().map(|backdrop| {
                 (
                     rect(backdrop.bounds),
-                    bits(&backdrop.corner_radii.to_array()),
+                    bits(backdrop.corner_radii.to_array()),
                     backdrop.corner_radii.shape,
                     backdrop.blur.to_bits(),
-                    backdrop.color_matrix.map(|matrix| bits(&matrix)),
+                    backdrop.color_matrix.map(bits),
                 )
             }),
             effect.glass.as_ref().map(|glass| {
@@ -1260,7 +1262,7 @@ impl Walk<'_> {
                     glass.corner_radius.to_bits(),
                     glass
                         .tint
-                        .map(|tint| bits(&[tint.r, tint.g, tint.b, tint.a])),
+                        .map(|tint| bits([tint.r, tint.g, tint.b, tint.a])),
                     glass.clear,
                     glass.interactive,
                 )
@@ -1268,7 +1270,7 @@ impl Walk<'_> {
             // A clip counts only where the layer reaches.
             rect(nested.clip.bounds.intersect(nested.bounds)),
             (nested.clip.radii != Default::default()).then(|| rect(nested.clip.rounded)),
-            bits(&nested.clip.radii.to_array()),
+            bits(nested.clip.radii.to_array()),
             nested.clip.radii.shape,
         )
             .hash(&mut hasher);

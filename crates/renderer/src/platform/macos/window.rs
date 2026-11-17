@@ -377,8 +377,11 @@ impl Window {
         });
         if let Some(present) = glass {
             // Dropping a present on main shows it there.
-            self.presents
-                .send(present, |latest| drop(lock(&latest.value).take()));
+            // Present outside the lock: the render thread takes it in `draw()`.
+            self.presents.send(present, |latest| {
+                let present = lock(&latest.value).take();
+                drop(present);
+            });
         }
         frame
     }

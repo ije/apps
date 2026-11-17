@@ -317,6 +317,11 @@ fn node_stream_helpers_match_node() {
         assert.deepStrictEqual(await collect(Duplex.from(Promise.resolve('p'))),['p']);
         assert.deepStrictEqual(await collect(Duplex.from({readable:Readable.from(['r']),writable:new PassThrough()})),['r']);
         assert.throws(()=>Duplex.from(5),{code:'ERR_INVALID_ARG_TYPE'});
+        const pulled=parts=>{const r=new Readable({read(){const part=parts.shift();setTimeout(()=>r.push(part),1);}});return r;};
+        const euro=pulled([Buffer.from([0xe2]),Buffer.alloc(0),Buffer.from([0x82,0xac]),null]),flowed=[];euro.setEncoding('utf8');euro.on('data',chunk=>flowed.push(chunk));await new Promise(resolve=>euro.on('end',resolve));assert.deepStrictEqual(flowed,['\u20ac']);
+        const waiting=pulled([Buffer.alloc(0),Buffer.from('x'),null]);let read='';waiting.on('readable',()=>{let chunk;while((chunk=waiting.read())!==null)read+=chunk;});await new Promise(resolve=>waiting.on('end',resolve));assert.strictEqual(read,'x');
+        const codes=[],corked=new Writable({write(){}});corked.cork();corked.write('a',error=>codes.push(error?.code));corked.write('b',error=>codes.push(error?.code));corked.destroy();await sleep(5);assert.deepStrictEqual([codes,corked.writableLength],[['ERR_STREAM_DESTROYED','ERR_STREAM_DESTROYED'],0]);
+        const sink=new Writable({write(){}});sink.cork();const pending=Writable.toWeb(sink).getWriter().write(Buffer.from('a'));await sleep(1);sink.destroy();assert.strictEqual(await pending.then(()=>'resolved',error=>error.code),'ERR_STREAM_DESTROYED');
         const utf16=new Readable({read(){}});utf16.setEncoding('utf16le');for(const part of [[0x61,0],[0x3d],[0xd8,0x00,0xde]])utf16.push(Buffer.from(part));utf16.push(null);assert.strictEqual((await collect(utf16)).join(''),'a\u{1F600}');
     "##);
 }

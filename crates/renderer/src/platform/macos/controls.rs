@@ -1,7 +1,7 @@
-use super::native_sync;
+use super::{native_after, native_sync};
 use crate::{ControlEvent, ControlKind, ControlSink, NativeControl, Pixels, Rect};
 use objc2::{
-    DefinedClass, MainThreadOnly, class, define_class, msg_send,
+    DefinedClass, MainThreadOnly, Message, class, define_class, msg_send,
     rc::Retained,
     runtime::{AnyObject, Bool, NSObject, Sel},
     sel,
@@ -9,7 +9,7 @@ use objc2::{
 use objc2_app_kit::{NSApp, NSEventType, NSView};
 use objc2_foundation::{NSEdgeInsets, NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::CATransaction;
-use std::{cell::RefCell, ptr, sync::OnceLock};
+use std::{cell::RefCell, ptr, sync::OnceLock, time::Duration};
 
 const RING: f64 = 8.;
 
@@ -38,6 +38,9 @@ define_class!(
     impl Target {
         #[unsafe(method(controlAction:))]
         fn action(&self, sender: Option<&AnyObject>) {
+            if self.busy(sel!(controlAction:), sender) {
+                return;
+            }
             let Some(sender) = sender else {
                 return;
             };
@@ -68,6 +71,9 @@ define_class!(
 
         #[unsafe(method(controlTextDidChange:))]
         fn text_changed(&self, notification: Option<&AnyObject>) {
+            if self.busy(sel!(controlTextDidChange:), notification) {
+                return;
+            }
             let Some(field) = field(notification) else {
                 return;
             };
@@ -78,6 +84,9 @@ define_class!(
 
         #[unsafe(method(controlTextDidEndEditing:))]
         fn text_ended(&self, notification: Option<&AnyObject>) {
+            if self.busy(sel!(controlTextDidEndEditing:), notification) {
+                return;
+            }
             let Some(field) = field(notification) else {
                 return;
             };
@@ -90,6 +99,20 @@ define_class!(
 );
 
 impl Target {
+    // AppKit can end editing inside `update()` (a hidden or disabled field), which holds the borrow.
+    // Such a callback runs again on the next run loop turn.
+    fn busy(&self, retry: Sel, object: Option<&AnyObject>) -> bool {
+        if self.ivars().try_borrow_mut().is_ok() {
+            return false;
+        }
+        let (target, object) = (self.retain(), object.map(AnyObject::retain));
+        native_after(Duration::ZERO, move || unsafe {
+            let _: *mut AnyObject =
+                msg_send![&*target, performSelector: retry, withObject: object.as_deref()];
+        });
+        true
+    }
+
     fn view<R>(&self, key: u64, job: impl FnOnce(&mut View) -> R) -> Option<R> {
         let mut shared = self.ivars().borrow_mut();
         shared

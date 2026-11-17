@@ -161,6 +161,14 @@
   const ids = new Map();
   const idAdd = (id, rec) => { const at = ids.get(id); if (!at) ids.set(id, rec); else if (Array.isArray(at)) { if (!at.includes(rec)) at.push(rec); } else if (at !== rec) ids.set(id, [at, rec]); };
   const idDrop = (id, rec) => { const at = ids.get(id); if (at === rec) ids.delete(id); else if (Array.isArray(at)) { const i = at.indexOf(rec); if (i >= 0) at.splice(i, 1); if (at.length === 1) ids.set(id, at[0]); } };
+  // The elements with this id inside `root`, in no order.
+  const idsWithin = (root, id) => {
+    const at = id && ids.get(id);
+    if (!at) return [];
+    const inside = rec => { if (records[rec.id] !== rec || rec.attrs?.get('id') !== id) return false; for (let up = rec.up; up; up = up.up) { if (up === root) return true; if (up.tag === 'template') return false; } return false; };
+    return Array.isArray(at) ? at.filter(inside) : inside(at) ? [at] : [];
+  };
+  const idSelector = /^#(?:--|-?[A-Za-z_\u0080-\uffff])[\w\u0080-\uffff-]*$/;
   const index = rec => { const kids = rec.up.kids; let i = rec.i; if (kids[i] !== rec) rec.i = i = kids[i + 1] === rec ? i + 1 : kids[i - 1] === rec ? i - 1 : kids.indexOf(rec); return i; };
   const own = rec => rec.text ??= host('dom.source', rec.id);
   const text = root => { let value = ''; const stack = [root]; while (stack.length) { const rec = stack.pop(); if (rec !== root && (rec.tag === '#comment' || rec.tag === '#doctype')) continue; value += own(rec); for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]); } return value; };
@@ -461,13 +469,13 @@
     finishComposition();
     const previous = active, ancestors = () => parent?.isConnected ? [...path(previous), ...path(parent)] : undefined; active = null; call('dom.focus', []); if (windowFocused) { dispatch(previous, new FocusEvent('blur', { composed: true }), ancestors()); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true }), ancestors()); }
   };
+  const watched = node => { if (observers.size && !quiet) for (const ref of observers) for (const [key, options] of ref.deref()?.targets ?? []) { const target = key.deref(); if (target && options.childList && (target === node || options.subtree && target.contains(node))) return true; } return false; };
   const ignore = () => {};
   // Call removed after both trees detach the old children, before reinserted children run connected
   // callbacks.
   const replaceAll = scoped((node, replace) => {
     const rec = node._m;
-    let observed = false;
-    if (observers.size && !quiet) scan: for (const ref of observers) for (const [key, options] of ref.deref()?.targets ?? []) { const target = key.deref(); if (target && options.childList && (target === node || options.subtree && target.contains(node))) { observed = true; break scan; } }
+    const observed = watched(node);
     if (!rec.kids.length && !observed && !shadows) { replace(ignore); return; }
     // A wrapper keeps its removed subtree in the arena until a GC, so only an observer's record wraps the old children.
     const kids = definitions.size > 0 && node.isConnected ? rec.kids.slice() : [], old = observed ? rec.kids.map(of) : [];
@@ -560,6 +568,9 @@
     set textContent(value) {
       value = String(value ?? '');
       if (this.nodeType === 3 || this.nodeType === 8) { this.data = value; return; }
+      // Like Chrome, keep a text child with the same text. The standard replaces it, so observers still see that.
+      const kids = this._m.kids;
+      if (value ? kids.length === 1 && kids[0].tag === '#text' && own(kids[0]) === value && !watched(this) : !kids.length && !own(this._m)) return;
       replaceAll(this, () => { release(this); detach(this._m); op(1, this._id, ''); if (value) { const text = document.createTextNode(value); op(2, this._id, text._id, -1); text._m.up = this._m; text._m.i = 0; this._m.kids.push(text._m); hold(this, text); } });
     }
     get nodeValue() { return this.nodeType === 3 || this.nodeType === 8 ? this.textContent : null; }
@@ -569,26 +580,40 @@
       if (!(child instanceof Node)) throw new TypeError('Expected a Node');
       before ??= null;
       if (child.nodeType === 11) {
+        const rec = this._m, frag = child._m, ref = before?._m ?? null;
+        if (this.nodeType !== 1 && this.nodeType !== 11 && this.nodeType !== 9) throw new DOMException('Invalid parent', 'HierarchyRequestError');
+        if (ref && ref.up !== rec) throw new DOMException('Reference is not a child', 'NotFoundError');
+        for (let up = rec; up; up = up.up ?? up.host) if (up === frag) throw new DOMException('Cannot create a DOM cycle', 'HierarchyRequestError');
+        if (this.nodeType === 9) { const elements = frag.kids.filter(kid => kid.tag[0] !== '#').length; if (elements > 1 || frag.kids.some(kid => kid.tag === '#text') || elements && rec.kids.some(kid => kid !== ref && kid.tag[0] !== '#')) throw new DOMException('A document has one element and no text', 'HierarchyRequestError'); }
+        const kids = frag.kids, observed = observers.size > 0 && !quiet;
+        if (!kids.length) return child;
+        // Take all children out at once, as the standard does, so each move doesn't shift the rest. Ranges and
+        // iterators need each removal.
+        const drain = !anchors.size && !iterators.size && !frag.host;
         // Move unwrapped children as records to avoid retaining removed trees. Keep SVG wrapping: wrap infers
         // namespaces from parents.
-        if (!(observers.size > 0 && !quiet) && !anchors.size && !this._shadow && !child._svg && !this._svg && !(this instanceof SVGElement) && (this.nodeType === 1 || this.nodeType === 11 || this._id === 0) && child._m.kids.some(kid => !kid.ref?.deref() && kid.tag !== 'link')) {
-          const rec = this._m, ref = before?._m ?? null;
-          if (ref && ref.up !== rec) throw new DOMException('Reference is not a child', 'NotFoundError');
-          for (let up = rec; up; up = up.up ?? up.host) if (up === child._m) throw new DOMException('Cannot create a DOM cycle', 'HierarchyRequestError');
+        if (drain && !observed && !this._shadow && !child._svg && !this._svg && !(this instanceof SVGElement) && (this.nodeType === 1 || this.nodeType === 11 || this._id === 0) && kids.some(kid => !kid.ref?.deref() && kid.tag !== 'link')) {
           const connected = definitions.size > 0 && this.isConnected, root = shadows ? this.getRootNode() : null;
-          for (const kid of child._m.kids.slice()) {
-            if (kid.ref?.deref() || kid.tag === 'link') { this.insertBefore(of(kid), before); continue; }
+          touch(frag); touch(rec); frag.kids = []; for (const kid of kids) kid.up = null;
+          // Insert each run before `ref` with one copy, not one splice per child.
+          let run = [];
+          const flush = () => {
+            if (ref && run.length) { const at = index(ref), all = rec.kids; rec.kids = all.slice(0, at).concat(run, all.slice(at)); run.forEach((kid, i) => { kid.i = at + i; }); ref.i = at + run.length; }
+            for (const kid of run) { if (connected) reactions(kid, 'connectedCallback'); if (root) slotsIn(root, kid, true); }
+            run = [];
+          };
+          for (const kid of kids) {
+            if (kid.ref?.deref() || kid.tag === 'link') { flush(); this.insertBefore(of(kid), before); continue; }
             op(2, this._id, kid.id, ref ? ref.id : -1);
-            touch(kid.up); touch(rec); kid.up.kids.splice(index(kid), 1); kid.up = rec;
-            if (ref) rec.kids.splice(kid.i = index(ref), 0, kid); else kid.i = rec.kids.push(kid) - 1;
-            if (connected) reactions(kid, 'connectedCallback');
-            if (root) slotsIn(root, kid, true);
+            kid.up = rec; run.push(kid);
+            if (!ref) kid.i = rec.kids.push(kid) - 1;
           }
+          flush();
           forgetRemoved();
           return child;
         }
-        const nodes = child._m.kids.map(of), observed = observers.size > 0 && !quiet;
-        if (!nodes.length) return child;
+        const nodes = kids.map(of);
+        if (drain) { touch(frag); frag.kids = []; for (const kid of kids) kid.up = null; }
         quiet++;
         try { for (const node of nodes) this.insertBefore(node, before); } finally { quiet--; }
         if (observed) { change({ type: 'childList', target: child, removedNodes: listOf(NodeList, nodes) }); change({ type: 'childList', target: this, addedNodes: listOf(NodeList, nodes), previousSibling: nodes[0].previousSibling, nextSibling: before }); }
@@ -696,7 +721,7 @@
       const rec = this._m, value = own(rec); offset >>>= 0; data = String(data);
       if (offset > value.length) throw new DOMException('Invalid offset', 'IndexSizeError');
       count = Math.min(count >>> 0, value.length - offset);
-      rec.text = value.slice(0, offset) + data + value.slice(offset + count); op(1, this._id, rec.text);
+      const next = value.slice(0, offset) + data + value.slice(offset + count); if (next !== value) { rec.text = next; op(1, this._id, next); }
       if (anchors.size) each(rec, range => shift(range, rec, at => at > offset && at <= offset + count, this, () => offset) | shift(range, rec, at => at > offset + count, this, at => at + data.length - count));
       if (observers.size) change({ type: 'characterData', target: this, oldValue: value });
     }
@@ -1985,15 +2010,7 @@
     createEvent(type) { const Type = { event: Event, events: Event, htmlevents: Event, customevent: CustomEvent, uievent: UIEvent, uievents: UIEvent, focusevent: FocusEvent, mouseevent: MouseEvent, mouseevents: MouseEvent, keyboardevent: KeyboardEvent, compositionevent: CompositionEvent, dragevent: DragEvent, messageevent: MessageEvent, storageevent: StorageEvent, hashchangeevent: HashChangeEvent, beforeunloadevent: BeforeUnloadEvent }[String(type).toLowerCase()]; if (!Type) throw new DOMException('Unsupported event interface', 'NotSupportedError'); return new Type(''); }
     importNode(node, deep = false) { return owned(this, node.cloneNode(deep)); }
     adoptNode(node) { if (node.nodeType === 9) throw new DOMException('A document cannot be adopted', 'NotSupportedError'); node.remove(); node._owner = this === document ? undefined : this; return node; }
-    getElementById(id) {
-      id = String(id);
-      const at = id && ids.get(id), root = this._m;
-      if (!at) return null;
-      const inside = rec => { if (records[rec.id] !== rec || rec.attrs?.get('id') !== id) return false; for (let up = rec.up; up; up = up.up) { if (up === root) return true; if (up.tag === 'template') return false; } return false; };
-      if (!Array.isArray(at)) return inside(at) ? of(at) : null;
-      const found = at.filter(inside);
-      return found.length < 2 ? of(found[0]) : find(root, rec => rec.attrs?.get('id') === id);
-    }
+    getElementById(id) { id = String(id); const found = idsWithin(this._m, id); return found.length < 2 ? of(found[0]) : find(this._m, rec => rec.attrs?.get('id') === id); }
     getElementsByName(name) { return this.querySelectorAll('[name=' + quote(name) + ']'); }
     get body() { const html = this._m.kids.find(rec => rec.tag[0] !== '#'); return html?.tag === 'html' ? of(html.kids.find(rec => rec.tag === 'body' || rec.tag === 'frameset')) : null; }
     get head() { const html = this._m.kids.find(rec => rec.tag[0] !== '#'); return html?.tag === 'html' ? of(html.kids.find(rec => rec.tag === 'head')) : null; }
@@ -2054,8 +2071,8 @@
     prepend(...children) { const nodes = convert(children), before = viable(this.firstChild, nodes); insertNodes(this, nodes, before); }
     replaceChildren(...children) { const nodes = convert(children); replaceAll(this, removed => { release(this); detach(this._m); op(1, this._id, ''); removed(); quiet++; try { for (const node of nodes) this.insertBefore(node, null); } finally { quiet--; } }); }
     moveBefore(node, child) { if (!(node instanceof Node) || node.nodeType === 9 || node.nodeType === 11 || node.getRootNode({ composed: true }) !== this.getRootNode({ composed: true })) throw new DOMException('Cannot move the node here', 'HierarchyRequestError'); reactionDepth++; moving = true; try { this.insertBefore(node, child); } finally { moving = false; leave(); } }
-    querySelector(selector) { return wrap(selectors('dom.queryWithin', this._id, selector, true)); }
-    querySelectorAll(selector) { return listOf(NodeList, selectors('dom.queryWithin', this._id, selector).map(wrap)); }
+    querySelector(selector) { selector = String(selector); const found = idSelector.test(selector) && idsWithin(this._m, selector.slice(1)); return found?.length < 2 ? of(found[0]) : wrap(selectors('dom.queryWithin', this._id, selector, true)); }
+    querySelectorAll(selector) { selector = String(selector); const found = idSelector.test(selector) && idsWithin(this._m, selector.slice(1)); return listOf(NodeList, found?.length < 2 ? found.map(of) : selectors('dom.queryWithin', this._id, selector).map(wrap)); }
     getElementsByTagName(name) { name = String(name); const lower = name.toLowerCase(), result = []; find(this._m, rec => { if (rec.tag[0] !== '#' && (name === '*' || rec.tag === lower || rec.tag === name)) result.push(of(rec)); return false; }); return listOf(HTMLCollection, result); }
     getElementsByTagNameNS(namespace, name) { const all = this.getElementsByTagName(name); return namespace === '*' ? all : listOf(HTMLCollection, all.filter(node => node.namespaceURI === (namespace || null))); }
     getElementsByClassName(names) { names = String(names).split(/[\t\n\f\r ]+/).filter(Boolean); return listOf(HTMLCollection, names.length ? this.querySelectorAll(names.map(name => '[class~=' + quote(name) + ']').join('')) : []); }

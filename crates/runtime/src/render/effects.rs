@@ -1826,6 +1826,7 @@ mod tests {
                 [100., 50.],
                 None,
                 &Default::default(),
+                &mut Vec::new(),
             )
             .unwrap();
             let source = format!(

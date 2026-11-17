@@ -8,6 +8,7 @@ use objc2_core_text::{
 use std::ptr;
 
 pub(super) const WGHT: u32 = u32::from_be_bytes(*b"wght");
+pub(super) const WDTH: u32 = u32::from_be_bytes(*b"wdth");
 pub(super) const OPSZ: u32 = u32::from_be_bytes(*b"opsz");
 
 fn descriptor(key: &CFString, value: &CFType) -> CFRetained<CTFontDescriptor> {

@@ -491,3 +491,58 @@ fn closing_hangs_up_the_group_and_frees_the_state() {
     wait(&mut || shared.strong_count() == 0 && unsafe { libc::kill(sleep, 0) } != 0);
     unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
 }
+
+#[test]
+fn a_resize_to_more_rows_with_the_same_cells_draws_them_all() {
+    let test = Test::new(80, 24);
+    assert_eq!(test.frame().1.len(), 24);
+    unsafe { apps_terminal_resize(test.0, 40, 48, 8, 16) };
+    test.feed("\x1b[48;1Hx");
+    let (frame, rows) = test.frame();
+    assert_eq!((frame.cols, frame.rows, frame.full), (40, 48, 1));
+    assert_eq!(
+        rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+        (0..48).collect::<Vec<_>>()
+    );
+    assert_eq!(rows[47].1[0].ch, 'x' as u32);
+}
+
+#[test]
+fn a_held_screen_gives_the_time_until_the_hold_ends() {
+    let test = Test::new(10, 2);
+    test.frame();
+    test.feed("\x1b[?2026hx");
+    let mut frame: Frame = unsafe { std::mem::zeroed() };
+    assert!(!unsafe { apps_terminal_frame(test.0, &mut frame) });
+    assert!((1..=1001).contains(&frame.wait), "{}", frame.wait);
+    test.feed("\x1b[?2026l");
+    assert_eq!(test.frame().1.len(), 1);
+}
+
+#[test]
+fn exit_comes_after_the_last_output_and_ends_the_hold() {
+    let test = Test::new(40, 4);
+    let mut error = Vec::new();
+    let argv = "/bin/sh\0-c\0printf '\\033[?2026hlast'\0";
+    let pid = unsafe {
+        apps_terminal_spawn(
+            test.0,
+            argv.as_ptr(),
+            argv.len(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            (&raw mut error).cast(),
+            alloc,
+        )
+    };
+    assert!(pid > 0, "{}", String::from_utf8_lossy(&error));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !test.poll().contains("exit") {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(test.text(false).is_some_and(|text| text.contains("last")));
+    assert!(test.frame().1.iter().any(|row| row.1[0].ch == 'l' as u32));
+}

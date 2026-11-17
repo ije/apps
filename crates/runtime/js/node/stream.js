@@ -18,8 +18,11 @@ globalThis.__appsNodeStreams = (EventEmitter, Buffer, StringDecoder) => {
     if (this.destroyed) { if (callback) queueMicrotask(() => callback(this.errored)); return this; }
     this.destroyed = true;
     if (reason) this.errored = reason;
-    const finishers = this._writableState?.finishers;
-    if (finishers?.length) queueMicrotask(() => { for (const finisher of finishers.splice(0)) finisher(this.errored ?? error(Error, 'ERR_STREAM_DESTROYED', 'Cannot call end after a stream was destroyed')); });
+    const write = this._writableState;
+    if (write?.buffer.length || write?.finishers.length) queueMicrotask(() => {
+      for (const entry of write.buffer.splice(0)) { write.length -= size(write, entry.chunk); entry.callback?.(this.errored ?? error(Error, 'ERR_STREAM_DESTROYED', 'Cannot call write after a stream was destroyed')); }
+      for (const finisher of write.finishers.splice(0)) finisher(this.errored ?? error(Error, 'ERR_STREAM_DESTROYED', 'Cannot call end after a stream was destroyed'));
+    });
     const emitClose = (this._readableState ?? this._writableState).emitClose;
     this._destroy(reason ?? null, failure => queueMicrotask(() => {
       if (failure) { this.errored = failure; this.emit('error', failure); }
@@ -73,7 +76,9 @@ globalThis.__appsNodeStreams = (EventEmitter, Buffer, StringDecoder) => {
         else if (ArrayBuffer.isView(chunk)) chunk = chunk instanceof Buffer ? chunk : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
         else throw error(TypeError, 'ERR_INVALID_ARG_TYPE', 'The "chunk" argument must be of type string or an instance of Buffer or Uint8Array');
         if (state.decoder) chunk = state.decoder.write(chunk);
-        if (!chunk.length) return state.length < state.highWaterMark;
+        // Like Node's maybeReadMore: an empty chunk brings no data or event, so read again or the stream stalls. A
+        // later turn, so a source that only pushes empty chunks can't spin.
+        if (!chunk.length) { if (state.flowing || state.listening) setImmediate(() => this._pull()); return state.length < state.highWaterMark; }
       }
       state.buffer.push(chunk); state.length += size(state, chunk);
       this._signal();

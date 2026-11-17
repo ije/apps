@@ -125,6 +125,8 @@ pub fn run(
         let mut fresh = true;
         let mut failed = bundle.is_none();
         let mut changed = None;
+        // Asset and addon bytes are not in the bundle text.
+        let (mut asset, mut addon) = (false, false);
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Ok(130);
@@ -209,13 +211,8 @@ pub fn run(
                             };
                             // Write the bundle before launch: ELECTRON_RUN_AS_NODE reads script chunks from
                             // it.
-                            if let Some(path) = &dev_bundle
-                                && bundle.files.keys().any(|name| name.starts_with("script-"))
-                            {
-                                serde_json::to_writer(
-                                    BufWriter::new(std::fs::File::create(path)?),
-                                    &bundle,
-                                )?;
+                            if let Some(path) = &dev_bundle {
+                                write_dev_bundle(path, &bundle)?;
                             }
                             let mut stdin = BufWriter::new(stdin);
                             serde_json::to_writer(&mut stdin, &bundle)?;
@@ -280,6 +277,11 @@ pub fn run(
                         }
                     }
                     let files = files.borrow();
+                    for path in event.paths.iter().filter(|path| files.contains(*path)) {
+                        let extension = path.extension().unwrap_or_default();
+                        addon |= extension == "node";
+                        asset |= bundler::is_asset(extension);
+                    }
                     let cargo = |path: &PathBuf| {
                         rust.is_some()
                             && (path.extension().is_some_and(|e| e == "rs")
@@ -328,7 +330,10 @@ pub fn run(
                         files = next_files;
                         failed = false;
                         // Main keeps its code. Only page-exclusive code can change without a restart.
-                        let pages = child.is_some()
+                        let (assets, addons) =
+                            (std::mem::take(&mut asset), std::mem::take(&mut addon));
+                        let pages = !addons
+                            && child.is_some()
                             && binary.is_some()
                             && running.as_ref().is_some_and(|running| {
                                 let chunks: BTreeSet<_> = main_chunks(running)
@@ -342,6 +347,7 @@ pub fn run(
                                 running.iter().filter(main).eq(next.iter().filter(main))
                             });
                         if pages
+                            && !assets
                             && running
                                 .as_ref()
                                 .is_some_and(|running| running.iter().eq(next.iter()))
@@ -355,6 +361,11 @@ pub fn run(
                         if pages {
                             if let Some(writer) = writer.take() {
                                 input = writer.join().ok().and_then(Result::ok);
+                            }
+                            if let Some(path) = &dev_bundle
+                                && let Err(error) = write_dev_bundle(path, &next)
+                            {
+                                eprintln!("apps: {error:#}");
                             }
                             let sent = input.as_mut().is_some_and(|input| {
                                 let mut input = BufWriter::new(input);
@@ -409,4 +420,18 @@ pub fn run(
     }
     drop(dev_folder);
     result
+}
+
+// Forked children read script chunks from this file, so replace it whole.
+fn write_dev_bundle(path: &Path, bundle: &Bundle) -> Result<()> {
+    if !bundle.files.keys().any(|name| name.starts_with("script-")) {
+        return Ok(());
+    }
+    let temp = path.with_extension("tmp");
+    let mut file = BufWriter::new(std::fs::File::create(&temp)?);
+    serde_json::to_writer(&mut file, bundle)?;
+    file.flush()?;
+    drop(file);
+    std::fs::rename(temp, path)?;
+    Ok(())
 }

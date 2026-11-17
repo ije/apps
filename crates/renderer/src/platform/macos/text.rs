@@ -271,6 +271,8 @@ struct Book {
     added: Vec<Added>,
     // Each sized copy rebuilds CoreText caches at a cost, so the copies stay.
     sized: FxHashMap<(FontId, u32), CFRetained<CTFont>>,
+    /// Base face and axis values, to the instance face.
+    instances: FxHashMap<(FontId, Coords), FontId>,
     // Keyed by pointer; the kept font keeps the address from being reused.
     natives: FxHashMap<usize, (CFRetained<CTFont>, FontId)>,
     words: Words,
@@ -604,7 +606,15 @@ impl Book {
                 _ => None,
             });
             if let Some(value) = value {
-                let value = value.clamp(min, max);
+                // Each value makes a font, so a transition steps in values that look the same.
+                let value = match tag {
+                    open_type::WGHT | open_type::WDTH => value.round(),
+                    _ if max > min => {
+                        min + ((value - min) * 256. / (max - min)).round() * (max - min) / 256.
+                    }
+                    _ => value,
+                }
+                .clamp(min, max);
                 let now = current
                     .iter()
                     .find(|(name, _)| *name == tag)
@@ -663,6 +673,13 @@ impl Book {
     }
 
     fn instance(&mut self, id: FontId, axes: Vec<(u32, f32)>) -> FontId {
+        let key: Coords = axes
+            .iter()
+            .map(|&(tag, value)| (tag, value.to_bits()))
+            .collect();
+        if let Some(&known) = self.instances.get(&(id, key.clone())) {
+            return known;
+        }
         let face = self.face(id);
         let local = face.local;
         let pointer = CFRetained::as_ptr(&face.font).as_ptr() as usize;
@@ -678,13 +695,19 @@ impl Book {
         let (font, name) = if local {
             make()
         } else {
-            let key = axes.iter().map(|&(tag, value)| (tag, value.to_bits()));
-            INSTANCES.get((pointer, key.collect()), make)
+            let mut all = INSTANCES.0.lock().unwrap_or_else(PoisonError::into_inner);
+            if all.len() >= 4096 {
+                all.clear();
+            }
+            drop(all);
+            INSTANCES.get((pointer, key.clone()), make)
         };
-        match self.names.get(&name) {
+        let instance = match self.names.get(&name) {
             Some(&known) => known,
             None => self.register(font.0, name, local),
-        }
+        };
+        self.instances.insert((id, key), instance);
+        instance
     }
 
     fn native(&mut self, font: &CTFont) -> FontId {
@@ -1688,6 +1711,31 @@ mod tests {
                 .keys()
                 .any(|key| key.0 == "Chalkduster")
         );
+    }
+
+    #[test]
+    fn variable_weights_reuse_their_instances() {
+        let bytes = std::fs::read("/System/Library/Fonts/SFNS.ttf").unwrap();
+        let text = TextSystem::default();
+        text.add_font(bytes, "Variable").unwrap();
+        let font = |weight| {
+            text.font(&Font {
+                weight,
+                ..Font::new("Variable")
+            })
+            .unwrap()
+        };
+        let bold = font(600.);
+        assert_eq!(font(600.2), bold);
+        let faces = text.0.borrow().faces.len();
+        // A transition steps through many values, each time it runs.
+        for _ in 0..3 {
+            for step in 0..=300 {
+                font(400. + step as f32 * 0.37);
+            }
+        }
+        assert!(text.0.borrow().faces.len() - faces <= 112);
+        assert_eq!(font(600.), bold);
     }
 
     #[test]

@@ -3320,6 +3320,93 @@ fn container_units_follow_each_container_and_the_viewport() {
 }
 
 #[test]
+fn nested_containers_with_many_queries_restyle_once_per_resize() {
+    let rules: String = (1..=40)
+        .map(|step| {
+            format!(
+                "@container (width > {}px){{.x{{z-index:{step}}}}}",
+                step * 10
+            )
+        })
+        .collect();
+    let doc = Document::parse(&format!(
+        "<style>{rules}.u{{font-size:10cqi}}</style><div id=a style='container-type:inline-size'><p class=x></p><p class=u></p><div id=b style='container-type:inline-size'><p class=x></p><p class=u></p></div></div>"
+    ));
+    let [a, b] = ["#a", "#b"].map(|selector| element(&doc, selector));
+    let [p, u, q, v] = [
+        doc.nodes[a].children[0],
+        doc.nodes[a].children[1],
+        doc.nodes[b].children[0],
+        doc.nodes[b].children[1],
+    ];
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    let mut compute = |cache: &mut StyleCache| {
+        let computed = compute_styles(&doc, 800., 600., None, &mut sheets, cache, None);
+        cache.finish();
+        computed
+    };
+    compute(&mut cache);
+    for [outer, inner] in [[300., 150.], [405., 205.], [50., 25.]] {
+        assert!(cache.set_containers(
+            &rustc_hash::FxHashMap::from_iter([(a, [outer, 50.]), (b, [inner, 50.])]),
+            &doc
+        ));
+        let computed = compute(&mut cache);
+        let z = |id: usize| computed.values[id].get(Prop::Z_INDEX).map(str::to_owned);
+        let level = |width: f32| ((width / 10.).ceil() as i32 - 1).clamp(0, 40);
+        let expected = |width| (level(width) > 0).then(|| level(width).to_string());
+        assert_eq!([z(p), z(q)], [expected(outer), expected(inner)]);
+        assert_eq!(
+            &computed.values[u]["font-size"],
+            &format!("{}px", outer / 10.)
+        );
+        assert_eq!(
+            &computed.values[v]["font-size"],
+            &format!("{}px", inner / 10.)
+        );
+    }
+}
+
+#[test]
+fn counters_stay_right_after_unrelated_and_list_changes() {
+    let mut doc = Document::parse(
+        "<style>h2{counter-increment:s}h2::before{content:counter(s)}.big{color:red}</style><h2 id=a>a</h2><p id=p>p</p><h2 id=b>b</h2><ol id=o start=3><li id=l1>x</li><li id=l2>y</li></ol>",
+    );
+    let [a, p, b, o, l1, l2] =
+        ["#a", "#p", "#b", "#o", "#l1", "#l2"].map(|selector| element(&doc, selector));
+    let mut cache = StyleCache::default();
+    let mut last = None;
+    let mut check = |doc: &Document, cache: &mut StyleCache, number: &str, items: [i64; 2]| {
+        let out = incremental(doc, cache, &mut last, [800., 600.]);
+        assert_eq!(
+            out.pseudos[&b][0].get(Prop::CONTENT),
+            Some(format!("\"{number}\"").as_str())
+        );
+        assert_eq!([out.list_items[&l1], out.list_items[&l2]], items);
+    };
+    check(&doc, &mut cache, "2", [3, 4]);
+    doc.nodes[p].attrs.insert("class".into(), "big".into());
+    check(&doc, &mut cache, "2", [3, 4]);
+    doc.nodes[o].attrs.insert("start".into(), "10".into());
+    check(&doc, &mut cache, "2", [10, 11]);
+    doc.nodes[l2].attrs.insert("value".into(), "20".into());
+    check(&doc, &mut cache, "2", [10, 20]);
+    doc.nodes[o].attrs.insert("reversed".into(), String::new());
+    doc.nodes[l2].attrs.remove("value");
+    check(&doc, &mut cache, "2", [10, 9]);
+    doc.nodes[a]
+        .attrs
+        .insert("style".into(), "counter-increment:s 5".into());
+    check(&doc, &mut cache, "6", [10, 9]);
+    doc.nodes[o]
+        .attrs
+        .insert("start".into(), i64::MAX.to_string());
+    doc.nodes[o].attrs.remove("reversed");
+    check(&doc, &mut cache, "6", [i64::MAX, i64::MAX]);
+}
+
+#[test]
 fn a_container_query_flip_restyles_only_inside_its_container() {
     let doc = Document::parse(
         "<style>@container (width > 400px){.x{color:red}}</style><div id=a style='container-type:inline-size'><p class=x></p></div><div id=b style='container-type:inline-size'><p class=x></p></div>",

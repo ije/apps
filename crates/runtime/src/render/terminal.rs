@@ -400,6 +400,14 @@ impl Grid {
                     }
                 }
             }
+        } else if frame.wait > 0 {
+            // The program holds the screen: draw again when the hold ends.
+            terminal.drawn.animation = Some(
+                cx.window
+                    .timer(Duration::from_millis(frame.wait.into()), |window, _| {
+                        window.refresh()
+                    }),
+            );
         }
         let window = &mut *cx.window;
         let origin = bounds.origin;

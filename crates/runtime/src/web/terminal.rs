@@ -34,26 +34,50 @@ extern "C" fn decode_png(
     alloc: Alloc,
 ) -> bool {
     let bytes = unsafe { std::slice::from_raw_parts(data, length) };
-    if !bytes.starts_with(b"\x89PNG") {
-        return false;
-    }
-    let Ok((pixels, width, height)) = crate::render::image::pixels(bytes) else {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let Ok(mut reader) = decoder.read_info() else {
         return false;
     };
-    let target = alloc(output, pixels.len());
+    let (width, height) = reader.info().size();
+    if width > 16384 || height > 16384 || width as usize * height as usize > 64 << 20 {
+        return false;
+    }
+    let channels = reader.output_color_type().0.samples();
+    let length = width as usize * height as usize * 4;
+    let Some(needed) = reader.output_buffer_size() else {
+        return false;
+    };
+    let target = alloc(output, length);
     if target.is_null() {
         return false;
     }
-    let target = unsafe { std::slice::from_raw_parts_mut(target, pixels.len()) };
-    for (to, &[b, g, r, a]) in target
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(pixels.as_chunks::<4>().0)
-    {
-        *to = [r, g, b, a];
+    let target = unsafe { std::slice::from_raw_parts_mut(target, length) };
+    // RGBA decodes in place. Other layouts expand to RGBA in one pass.
+    if channels == 4 && needed == length {
+        if reader.next_frame(target).is_err() {
+            return false;
+        }
+    } else {
+        let mut pixels = vec![0; needed];
+        if reader.next_frame(&mut pixels).is_err() {
+            return false;
+        }
+        let to = target.as_chunks_mut::<4>().0.iter_mut();
+        match channels {
+            4 => to
+                .zip(pixels.as_chunks::<4>().0)
+                .for_each(|(to, from)| *to = *from),
+            3 => to
+                .zip(pixels.as_chunks::<3>().0)
+                .for_each(|(to, &[r, g, b])| *to = [r, g, b, 255]),
+            2 => to
+                .zip(pixels.as_chunks::<2>().0)
+                .for_each(|(to, &[l, a])| *to = [l, l, l, a]),
+            _ => to.zip(&pixels).for_each(|(to, &l)| *to = [l, l, l, 255]),
+        }
     }
-    unsafe { size.copy_from([width as u32, height as u32].as_ptr(), 2) };
+    unsafe { size.copy_from([width, height].as_ptr(), 2) };
     true
 }
 
@@ -123,7 +147,8 @@ pub(crate) struct Frame {
     /// All images of the screen, in the order to draw them.
     pub placements: *const Placement,
     pub placed: u32,
-    /// The time in ms until an animated image has its next picture, or 0.
+    /// The time in ms until an animated image has its next picture, or 0. In a frame without data, the
+    /// time until the program stops holding the screen.
     pub wait: u32,
     /// In rows: all rows with the scrollback, the first row of the screen, and the rows of the screen.
     pub scroll: [u32; 3],

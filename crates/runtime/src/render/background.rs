@@ -13,7 +13,7 @@ type Bitmaps = HashMap<String, Arc<renderer::RenderImage>>;
 
 pub(super) type Decoding = Arc<Mutex<Option<renderer::RenderImage>>>;
 // A decoded image, and for SVG its tree and whether its view box keeps its ratio.
-type Source = (Arc<renderer::RenderImage>, Option<(usvg::Tree, bool)>);
+pub(super) type Source = (Arc<renderer::RenderImage>, Option<(usvg::Tree, bool)>);
 // The slice and target of a border image part on one axis, and its first tile, step, tile count and tile size.
 type Part = [([f32; 4], (f32, f32, usize, f32)); 2];
 
@@ -38,7 +38,7 @@ fn redraw_when_decoded(
 
 // The decoded bitmap of a file and, for SVG, its tree and whether its view box keeps its ratio. `None` while the file
 // decodes, and the window redraws when it is done.
-fn load(
+pub(super) fn load(
     view: &super::PageState,
     bitmaps: &mut Bitmaps,
     id: usize,

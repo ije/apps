@@ -25,6 +25,8 @@ pub(super) struct Build<'a> {
     pub(super) measured: &'a RefCell<super::grid::Measurements>,
     pub(super) perspective: Option<(f32, String)>,
     pub(super) siblings: &'a RefCell<HashMap<usize, Rc<Siblings>>>,
+    // The index of each child of a parent with a `<br>`.
+    pub(super) breaks: &'a RefCell<rustc_hash::FxHashMap<usize, Siblings>>,
     pub(super) walks: &'a RefCell<rustc_hash::FxHashMap<usize, Used>>,
     pub(super) adjoins: &'a RefCell<rustc_hash::FxHashMap<usize, Sets>>,
     pub(super) blocks: &'a RefCell<rustc_hash::FxHashMap<usize, [f32; 2]>>,
@@ -295,10 +297,25 @@ fn padding_left(styles: &ComputedStyles, parent: usize, width: f32) -> f32 {
     styles.lengths[parent].edges(&styles.values[parent], style::PADDING, width)[3].max(0.)
 }
 
-fn starts_line(doc: &Document, id: usize) -> bool {
+fn starts_line(build: &Build<'_>, id: usize) -> bool {
+    let doc = build.doc;
     doc.nodes[id].parent.is_none_or(|parent| {
         let siblings = &doc.nodes[parent].children;
-        siblings[..siblings.iter().position(|&child| child == id).unwrap_or(0)]
+        let index = build
+            .breaks
+            .borrow_mut()
+            .entry(parent)
+            .or_insert_with(|| {
+                siblings
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &child)| (child, index))
+                    .collect()
+            })
+            .get(&id)
+            .copied()
+            .unwrap_or(0);
+        siblings[..index]
             .iter()
             .rfind(|&&child| {
                 let node = &doc.nodes[child];
@@ -549,7 +566,7 @@ impl<'a> Build<'a> {
                     insets(styles, parent, true, width).map(f32::to_bits),
                 )
             })),
-            Query::Break => hashed(starts_line(doc, id)),
+            Query::Break => hashed(starts_line(self, id)),
             Query::UserSelect => hashed(styles.user_select[id].0 as u8),
             Query::Positioner(fixed) => hashed(positioner(
                 if fixed { "fixed" } else { "absolute" },
@@ -1659,7 +1676,7 @@ fn create(
     let mut strut_due = false;
     let mut strut_next = false;
     if node.tag == "br" {
-        let empty = starts_line(doc, id);
+        let empty = starts_line(build, id);
         reader.log(Query::Break, depth, hashed(empty));
         let painter = view.clone();
         let ink = [Prop::CARET_COLOR, Prop::COLOR]

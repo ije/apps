@@ -1,3 +1,4 @@
+use super::background;
 use crate::style;
 use crate::style::Prop;
 use renderer::{Child, Hooks, NodeCx, Pixels, Point, Rect, Size, Window, point, px};
@@ -191,6 +192,7 @@ impl Hooks for Masked {
             let mut host = self.view.host.borrow_mut();
             let host = &mut *host;
             mask(
+                &self.view,
                 host.dom.entry(self.view.id).or_default(),
                 &host.assets,
                 self.key,
@@ -1054,6 +1056,7 @@ impl DomBox {
             None => {}
         }
         let mask = mask(
+            view,
             host.dom.entry(view.id).or_default(),
             &host.assets,
             (self.id, 0),
@@ -1167,6 +1170,7 @@ impl DomBox {
 /// The mask image of a box or a pseudo-element `key` from its mask layers and its clip path shapes.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn mask(
+    view: &super::PageState,
     dom: &mut crate::dom::State,
     assets: &HashMap<String, std::path::PathBuf>,
     key: (usize, u8),
@@ -1221,7 +1225,35 @@ pub(super) fn mask(
                     std::sync::Arc::new(renderer::RenderImage::new(raster[0], raster[1], bytes))
                 })
             } else {
-                let source = match (shapes, mask_svg(style, units, size, base.as_ref(), assets)) {
+                let mut files = Vec::new();
+                let layers = mask_svg(style, units, size, base.as_ref(), assets, &mut files);
+                // Hold the decoded files: `retire` drops the bitmaps that nothing holds.
+                let mut sources = view.mask_sources.borrow_mut();
+                let held = sources.entry(key).or_default();
+                held.retain(|(file, _)| files.iter().any(|path| path.to_string_lossy() == *file));
+                let mut kinds = Vec::with_capacity(files.len());
+                let mut decoded = Vec::new();
+                for path in &files {
+                    let file = path.to_string_lossy();
+                    let source = match held.iter().position(|(held, _)| *held == file) {
+                        Some(index) => Some(&held[index].1),
+                        None => background::load(view, &mut dom.bitmaps, key.0, &file, path, window)
+                            .map(|source| &held.push_mut((file.into_owned(), source)).1),
+                    };
+                    // A file that still decodes is a transparent layer until the window redraws.
+                    kinds.push(source.map(|(bitmap, tree)| match tree {
+                        Some((tree, _)) => usvg::ImageKind::SVG(tree.clone()),
+                        None => {
+                            let stub = super::resvg::stub(bitmap);
+                            decoded.push((stub.clone(), bitmap.clone()));
+                            usvg::ImageKind::PNG(stub)
+                        }
+                    }));
+                }
+                if kinds.iter().any(Option::is_none) {
+                    inputs.push_str("\0decoding");
+                }
+                let source = match (shapes, layers) {
                     (Some(shape), Some(layers)) => format!(
                         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"><defs><clipPath id=\"apps-clip\">{shape}</clipPath></defs><g clip-path=\"url(#apps-clip)\">{layers}</g></svg>"
                     ),
@@ -1233,10 +1265,17 @@ pub(super) fn mask(
                     ),
                     (None, None) => return None,
                 };
-                // The mask names the image files itself, so they may be read.
-                match super::canvas::svg_tree(&source, true).and_then(|tree| {
-                    super::canvas::render_svg(&tree, raster[0], raster[1], None)
-                }) {
+                let mut options = super::canvas::svg_options(false, false);
+                options.image_href_resolver.resolve_string = Box::new(move |href, _| {
+                    kinds.get(href.strip_prefix("apps-mask:")?.parse::<usize>().ok()?)?.clone()
+                });
+                match usvg::Tree::from_str(&source, &options)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|tree| {
+                        super::resvg::decoded(decoded, || {
+                            super::canvas::render_svg(&tree, raster[0], raster[1], None)
+                        })
+                    }) {
                     Ok(image) => Some(image),
                     // Keep the failure too, or every paint builds and reports the same mask again.
                     Err(error) => {
@@ -1273,6 +1312,8 @@ pub(super) fn mask_svg<'a>(
     [width, height]: [f32; 2],
     base: Option<&url::Url>,
     assets: &HashMap<String, std::path::PathBuf>,
+    // The files of the `url()` layers, which the SVG names as `apps-mask:<index>`.
+    files: &mut Vec<std::path::PathBuf>,
 ) -> Option<String> {
     let get =
         |[prop, webkit]: [Prop; 2]| style.get(prop).or_else(|| style.get(webkit)).unwrap_or("");
@@ -1318,13 +1359,14 @@ pub(super) fn mask_svg<'a>(
                 _ => "none",
             };
             let [[tw, th], at] = super::effects::tile(size, position, &units, width, height, None);
+            files.push(path);
             super::effects::tiled(
                 repeat,
                 [tw, th],
                 at,
                 &format!(
-                    "<image href=\"{}\" width=\"{tw}\" height=\"{th}\" preserveAspectRatio=\"{aspect}\"/>",
-                    crate::dom::escape(&path.to_string_lossy())
+                    "<image href=\"apps-mask:{}\" width=\"{tw}\" height=\"{th}\" preserveAspectRatio=\"{aspect}\"/>",
+                    files.len() - 1
                 ),
             )
         } else {

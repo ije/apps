@@ -30,6 +30,8 @@ struct ParagraphState {
     bounds: Option<Rect<Pixels>>,
     // The widest line or unbreakable piece, which can overflow the box. Found when a scroll container asks.
     overflow: Cell<Option<Pixels>>,
+    // How far the ink of a glyph reaches outside its row. Found at the first paint.
+    reach: Cell<Option<Pixels>>,
 }
 
 pub(crate) struct TextState {
@@ -390,6 +392,7 @@ impl TextState {
                 baselines,
                 bounds: None,
                 overflow: Cell::new(None),
+                reach: Cell::new(None),
             });
         }
         (size, Some(baselines))
@@ -464,10 +467,31 @@ impl Paragraph {
         };
         let mut origin = bounds.origin + Point::new(px(0.), inner.top);
         let width = Some(bounds.size.width);
+        let line_height = inner.line_height;
+        let reach = inner.reach.get().unwrap_or_else(|| {
+            let reach = (inner.lines.iter())
+                .map(|line| line.reach(line_height, window))
+                .fold(px(0.), Pixels::max);
+            inner.reach.set(Some(reach));
+            reach
+        });
+        let mask = window.content_mask().bounds;
+        let (top, bottom) = (mask.top() - reach, mask.bottom() + reach);
         for line in inner.lines.iter() {
-            line.paint_background(origin, inner.line_height, align, width, window);
-            line.paint(origin, inner.line_height, align, width, window);
-            origin.y += line.extent(inner.line_height).height;
+            let height = line.extent(line_height).height;
+            let rows = line.rows();
+            let first = (((top - origin.y) / line_height).floor().max(0.) as usize).min(rows);
+            let last = (((bottom - origin.y) / line_height).ceil().max(0.) as usize).min(rows);
+            if first >= last {
+                if !line.line.glyphs.is_empty() {
+                    // A copy of this paint can't move: it lacks the line.
+                    window.cull();
+                }
+            } else {
+                line.paint_background(origin, line_height, align, width, window);
+                line.paint_rows(origin, line_height, align, width, first..last, window);
+            }
+            origin.y += height;
         }
     }
 
@@ -601,15 +625,13 @@ fn truncate_text(
             let mut start = 0;
             let mut found = None;
             for line in &lines {
-                let layout = &line.line;
-                let ends = (line.breaks.iter())
-                    .map(|&at| layout.glyphs[at as usize].index as usize)
-                    .chain([layout.len]);
+                let glyphs = line.line.glyphs.len();
+                let ends = line.breaks.iter().map(|&at| at as usize).chain([glyphs]);
                 let mut row_start = 0;
                 for end in ends {
                     rows += 1;
-                    if rows == max && (end < layout.len || line.text.len() + start < text.len()) {
-                        found = Some((start, layout.clone(), row_start, end, wrap));
+                    if rows == max && (end < glyphs || line.text.len() + start < text.len()) {
+                        found = Some((start, line.line.clone(), row_start..end, wrap));
                         break;
                     }
                     row_start = end;
@@ -624,9 +646,9 @@ fn truncate_text(
         None => lines
             .first()
             .filter(|line| lines.len() > 1 || line.line.width > width)
-            .map(|line| (0, line.line.clone(), 0, line.len(), width)),
+            .map(|line| (0, line.line.clone(), 0..line.line.glyphs.len(), width)),
     };
-    let Some((offset, layout, row_start, row_end, room)) = cut else {
+    let Some((offset, layout, row, room)) = cut else {
         return unchanged();
     };
     let affix_run = runs
@@ -640,11 +662,27 @@ fn truncate_text(
         })
         .unwrap_or_else(|| style.run(affix.len()));
     let affix_width = system.shape_line(affix, font_size, &affix_run).line.width;
-    let left = layout.x_at(row_start);
-    let index = layout
-        .index_at(left + (room - affix_width).max(px(0.)))
-        .unwrap_or(row_end)
-        .clamp(row_start, row_end);
+    // Rows wrap glyphs in visual order, so a right-to-left line has falling text indexes. Its cut keeps the text
+    // from its logical start that is as wide as the rows before the cut row and the room in that row.
+    let glyphs = &layout.glyphs;
+    let rtl = (glyphs.first())
+        .zip(glyphs.last())
+        .is_some_and(|(first, last)| first.index > last.index);
+    let left = glyphs.get(row.start).map_or(px(0.), |glyph| glyph.x);
+    let room = left + (room - affix_width).max(px(0.));
+    let mut used = if rtl { px(0.) } else { left };
+    let fits = |at: usize| {
+        used += glyphs.get(at + 1).map_or(layout.width, |next| next.x) - glyphs[at].x;
+        (used > room).then_some(glyphs[at].index as usize)
+    };
+    let index = if rtl {
+        (0..glyphs.len()).rev().find_map(fits).unwrap_or(layout.len)
+    } else {
+        let row_end = glyphs
+            .get(row.end)
+            .map_or(layout.len, |glyph| glyph.index as usize);
+        row.into_iter().find_map(fits).unwrap_or(row_end)
+    };
     let end = offset + index;
     let mut kept = String::with_capacity(end + affix.len());
     kept.push_str(text[..end].trim_end());
@@ -673,6 +711,30 @@ mod tests {
     use crate::Color;
 
     #[test]
+    fn line_clamp_cuts_right_to_left_text() {
+        let system = crate::TextSystem::new();
+        let style = TextStyle {
+            line_clamp: Some(2),
+            ..TextStyle::default()
+        };
+        for text in [
+            "שלום עולם זהו טקסט ארוך בעברית שעובר כמה שורות",
+            "hello world this is a long text that wraps on rows",
+        ] {
+            let text: SharedString = text.into();
+            let runs = [style.run(text.len())];
+            let (kept, _, truncated) =
+                truncate_text(&system, &style, &text, &runs, "…", px(60.), Some(px(60.)));
+            let head = kept.strip_suffix('…').unwrap();
+            assert!(
+                truncated && !head.is_empty() && text.starts_with(head),
+                "{kept}"
+            );
+            assert!(head.len() < text.len() / 2, "{kept}");
+        }
+    }
+
+    #[test]
     fn paint_changes_keep_the_measure() {
         let style = TextStyle::default();
         let run = |len: usize, color: u32| TextRun {
@@ -693,6 +755,7 @@ mod tests {
             baselines: [px(0.); 2],
             bounds: None,
             overflow: Cell::new(None),
+            reach: Cell::new(None),
         });
         assert!(old.keep(&state(vec![run(2, 0xff0000ff), run(3, 0x0000ffff)])));
         assert!(old.layout.0.borrow().is_some() && !old.repaint.get());

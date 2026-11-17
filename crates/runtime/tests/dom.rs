@@ -4402,3 +4402,57 @@ fn border_images_parse_and_serialize_like_chrome() {
         "#,
     );
 }
+
+#[test]
+fn same_text_writes_large_fragments_and_id_queries() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: Document::parse("<body><p id=label>a</p><div id=empty></div></body>"),
+            dirty: false,
+        },
+    );
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
+    let dirty = |source: &str| {
+        engine.tick().unwrap();
+        host.borrow_mut().pages.get_mut(&1).unwrap().dirty = false;
+        engine.eval(source, "test").unwrap();
+        engine.tick().unwrap();
+        host.borrow().pages[&1].dirty
+    };
+    assert!(!dirty(
+        "const label = document.getElementById('label'), text = label.firstChild; label.textContent = 'a'; text.data = 'a'; text.replaceData(0, 1, 'a'); document.getElementById('empty').textContent = ''; document.getElementById('empty').replaceChildren(); if (label.firstChild !== text) throw Error('kept text')"
+    ));
+    assert!(dirty("label.textContent = 'b'"));
+    assert!(dirty("label.firstChild.data = 'c'"));
+    let result = engine.eval(r#"
+        const fails = [], check = (name, fn) => { try { if (!fn()) fails.push(name); } catch (error) { fails.push(name + ': ' + error); } };
+        check('observed same text', () => { const observer = new MutationObserver(() => {}); observer.observe(label, { childList: true, characterData: true, subtree: true }); const old = label.firstChild; old.data = 'c'; label.textContent = 'c'; const records = observer.takeRecords(); observer.disconnect(); return records.map(r => r.type).join() === 'characterData,childList' && records[1].removedNodes[0] === old && label.firstChild !== old && label.textContent === 'c'; });
+        const n = 5000;
+        const list = document.createElement('ul'); document.body.append(list);
+        let fragment = document.createDocumentFragment(); for (let i = 0; i < n; i++) { const li = document.createElement('li'); li.id = 'i' + i; fragment.append(li); }
+        list.append(fragment);
+        check('wrapped fragment', () => !fragment.firstChild && list.childNodes.length === n && list.children[0].id === 'i0' && list.lastChild.id === 'i' + (n - 1) && list.children[777].previousSibling.id === 'i776');
+        const template = document.createElement('template'); template.innerHTML = '<li>x</li>'.repeat(n);
+        const marker = list.children[1]; list.insertBefore(template.content, marker);
+        check('parsed fragment', () => list.childNodes.length === 2 * n && list.children[1].textContent === 'x' && list.children[n].textContent === 'x' && list.children[n + 1] === marker && marker.previousSibling.textContent === 'x');
+        while (list.firstChild) list.removeChild(list.firstChild);
+        check('mixed fragment', () => { const parsed = document.createElement('template'); parsed.innerHTML = '<b>1</b><b id=m>2</b><link><b>4</b>'; const content = parsed.content, kept = content.getElementById('m'), into = document.createElement('p'); into.innerHTML = '<i>0</i><i>5</i>'; into.insertBefore(content, into.lastChild); return into.innerHTML === '<i>0</i><b>1</b><b id="m">2</b><link><b>4</b><i>5</i>' && kept.parentNode === into && kept.nextSibling.nextSibling.textContent === '4' && into.lastChild.previousSibling.textContent === '4' && !content.firstChild; });
+        check('removed', () => !list.firstChild && !list.childNodes.length);
+        check('document fragment', () => { const parsed = document.createElement('template'); parsed.innerHTML = '<a></a>'; const two = parsed.content; try { document.appendChild(two); } catch (error) { return error.name === 'HierarchyRequestError' && two.childNodes.length === 1; } });
+        document.body.insertAdjacentHTML('beforeend', '<section id=scope><b id=dup></b><i id=dup></i></section><b id=dup></b><template><b id=inner></b></template>');
+        const scope = document.getElementById('scope');
+        check('id query', () => document.querySelector('#scope') === scope && scope.querySelector('#scope') === null && scope.querySelector('#dup') === scope.firstChild && scope.querySelectorAll('#dup').length === 2 && document.querySelectorAll('#dup').length === 3 && document.querySelector('#dup') === scope.firstChild && document.querySelector('#inner') === null && document.querySelector('#missing') === null && document.querySelectorAll('#missing').length === 0);
+        check('id query order', () => { const late = document.createElement('i'); late.id = 'order'; const early = document.createElement('i'); early.id = 'order'; scope.append(late); scope.prepend(early); return scope.querySelector('#order') === early && scope.querySelectorAll('#order')[0] === early; });
+        check('id query shadow', () => { const shadow = scope.attachShadow({ mode: 'open' }); shadow.innerHTML = '<p id=deep></p>'; return document.querySelector('#deep') === null && shadow.querySelector('#deep') === shadow.firstChild; });
+        check('bad id selector', () => { try { document.querySelector('#1a'); } catch (error) { return error.name === 'SyntaxError'; } });
+        fails.join('\n') || 'ok'
+    "#, "test").unwrap();
+    assert_eq!(result, "ok");
+}

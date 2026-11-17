@@ -1929,6 +1929,8 @@ fn index_of(node: NodeId) -> u32 {
 
 struct Interned<T> {
     values: FxHashMap<u64, Vec<Rc<T>>>,
+    // The number of stored values in all buckets, which bounds memory and the cost of a bucket scan.
+    count: usize,
     limit: usize,
 }
 
@@ -1936,6 +1938,7 @@ impl<T> Default for Interned<T> {
     fn default() -> Self {
         Self {
             values: FxHashMap::default(),
+            count: 0,
             limit: 1024,
         }
     }
@@ -1979,6 +1982,25 @@ impl Fingerprint for Style {
                 .hash(hasher);
         }
         self.border_widths.top.0.to_bits().hash(hasher);
+        length(hasher, self.corner_radii.x.top_left);
+        (
+            self.opacity.map(f32::to_bits),
+            self.z_index,
+            self.border_style as u8,
+            self.box_shadow.len(),
+        )
+            .hash(hasher);
+        if let Some(shadow) = self.box_shadow.first() {
+            [
+                shadow.offset.x.0,
+                shadow.offset.y.0,
+                shadow.blur_radius.0,
+                shadow.spread_radius.0,
+                shadow.color.a,
+            ]
+            .map(f32::to_bits)
+            .hash(hasher);
+        }
         self.text
             .font_size
             .map(|size| size.0.to_bits())
@@ -2086,12 +2108,16 @@ impl<T> Interned<T> {
         }
         let value = Rc::new(make(value));
         list.push(value.clone());
-        if self.values.len() > self.limit {
+        self.count += 1;
+        if self.count > self.limit {
+            let mut count = 0;
             self.values.retain(|_, list| {
                 list.retain(|value| Rc::strong_count(value) > 1);
+                count += list.len();
                 !list.is_empty()
             });
-            self.limit = (self.values.len() * 2).max(1024);
+            self.count = count;
+            self.limit = (count * 2).max(1024);
         }
         value
     }
@@ -4303,6 +4329,27 @@ mod tests {
 
     fn slot(tree: &Tree, id: usize) -> &super::Slot {
         &tree.slots[tree.index(id.into()).unwrap() as usize]
+    }
+
+    #[test]
+    fn interned_styles_stay_bounded() {
+        let mut styles = super::Interned::<super::Styled>::default();
+        let kept = styles.styled(crate::Style::default(), 2.);
+        let mut style = crate::Style {
+            box_shadow: vec![Default::default(); 2],
+            ..Default::default()
+        };
+        // An animated value that the fingerprint skips lands in one bucket.
+        for frame in 0..10_000 {
+            style.box_shadow[1].blur_radius = px(frame as f32);
+            styles.styled(style.clone(), 2.);
+        }
+        let stored: usize = styles.values.values().map(Vec::len).sum();
+        assert!(stored == styles.count && stored <= 1024, "{stored}");
+        assert!(std::rc::Rc::ptr_eq(
+            &kept,
+            &styles.styled(crate::Style::default(), 2.)
+        ));
     }
 
     #[test]

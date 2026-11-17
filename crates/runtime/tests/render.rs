@@ -4004,6 +4004,39 @@ fn masks_place_and_repeat_image_layers_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn bitmap_masks_draw_again_at_new_sizes() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const look = async (...xs) => {
+            for (let n = 0; n < 3; n++) await win.webContents.capturePage();
+            const out = [];
+            for (const x of xs) {
+                const bytes = (await win.webContents.capturePage({ x, y: 5, width: 1, height: 1 })).toBitmap();
+                out.push([bytes[2], bytes[1], bytes[0]].map(value => value > 200 ? 'f' : value < 60 ? '0' : '?').join(''));
+            }
+            return out.join(' ');
+        };
+        let first = '';
+        for (let n = 0; n < 40 && first !== 'f00 fff'; n++) first = await look(3, 37);
+        if (first !== 'f00 fff') fail('first frame: ' + first);
+        await run("document.getElementById('m').style.width = '80px'");
+        const wide = await look(5, 15, 75);
+        if (wide !== 'f00 f00 fff') fail('after resize: ' + wide);
+        await run("document.getElementById('m').style.maskImage = 'none'");
+        const plain = await look(5, 75);
+        if (plain !== 'f00 f00') fail('without mask: ' + plain);
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0;background:#fff'><div id=m style='width:40px;height:10px;background:#f00;\
+             mask:url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAD0lEQVR4nGNgYGD4D8QMAAUEAQCwBUiSAAAAAElFTkSuQmCC) 0 0 / 100% 100% no-repeat'></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn border_images_replace_the_border_and_follow_changes_like_chrome() {
     run_hidden(
         r#"

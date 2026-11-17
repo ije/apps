@@ -70,6 +70,25 @@ struct Keyframe {
     value: String,
     timing: Option<Easing>,
     lerp: Option<Rc<Lerp>>,
+    implicit: Implicit,
+}
+
+// The keys of a track without frames at 0 and 1, for the last value under it. This is a cache, so `Debug` skips it.
+#[derive(Clone, Default)]
+struct Implicit(std::cell::RefCell<Option<Rc<Filled>>>);
+
+impl std::fmt::Debug for Implicit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("_")
+    }
+}
+
+struct Filled {
+    under: Option<String>,
+    composite: u8,
+    // Offset, value and the index of the frame that gives the timing.
+    keys: Vec<(f64, String, Option<usize>)>,
+    lerps: Vec<Option<Rc<Lerp>>>,
 }
 
 // A duration or delay alone transitions `all`, the initial `transition-property`.
@@ -228,6 +247,7 @@ fn tracks(
                 value: value.to_owned(),
                 timing: timing.clone(),
                 lerp: None,
+                implicit: Implicit::default(),
             };
             match tracks.iter_mut().find(|(name, _)| *name == key) {
                 Some((_, frames)) => {
@@ -335,49 +355,76 @@ impl Animation {
             }
         }
         let replace = self.composite == 0;
-        let mut keys: Vec<(f64, Cow<str>, Option<&Easing>)> = Vec::new();
         for (property, frames) in &self.tracks {
             // Keyframes at 0 and 1 replace the value under them, so their stored segments apply.
             let fixed = replace && frames[0].at <= 0. && frames[frames.len() - 1].at >= 1.;
-            if !fixed {
-                keys.clear();
-                keys.extend(frames.iter().map(|frame| {
-                    (
-                        frame.at,
-                        Cow::Borrowed(frame.value.as_str()),
-                        frame.timing.as_ref(),
-                    )
-                }));
+            let filled = (!fixed).then(|| {
                 let under = out
                     .get(*property)
-                    .or_else(|| computed(base, *property, registry))
-                    .map(str::to_owned);
+                    .or_else(|| computed(base, *property, registry));
+                let cache = &frames[0].implicit.0;
+                if let Some(filled) = cache.borrow().as_ref().filter(|filled| {
+                    filled.under.as_deref() == under && filled.composite == self.composite
+                }) {
+                    return filled.clone();
+                }
+                let mut keys: Vec<(f64, String, Option<usize>)> = frames
+                    .iter()
+                    .enumerate()
+                    .map(|(index, frame)| (frame.at, frame.value.clone(), Some(index)))
+                    .collect();
                 if let Some(under) = under {
                     if !replace {
                         for key in &mut keys {
                             if let Some(sum) =
-                                add(property.name(), &under, &key.1, self.composite == 2)
+                                add(property.name(), under, &key.1, self.composite == 2)
                             {
-                                key.1 = Cow::Owned(sum);
+                                key.1 = sum;
                             }
                         }
                     }
                     if keys[0].0 > 0. {
-                        keys.insert(0, (0., Cow::Owned(under.clone()), None));
+                        keys.insert(0, (0., under.to_owned(), None));
                     }
                     if keys[keys.len() - 1].0 < 1. {
-                        keys.push((1., Cow::Owned(under), None));
+                        keys.push((1., under.to_owned(), None));
                     }
                 }
-            }
-            let count = if fixed { frames.len() } else { keys.len() };
-            let key = |index: usize| {
-                if fixed {
+                let last = keys.len() - 1;
+                let lerps = if property.is_custom() && !animatable(*property, registry) {
+                    Vec::new()
+                } else {
+                    (0..last.max(1))
+                        .map(|index| {
+                            lerp(
+                                property.name(),
+                                &keys[index].1,
+                                &keys[(index + 1).min(last)].1,
+                            )
+                        })
+                        .collect()
+                };
+                let filled = Rc::new(Filled {
+                    under: under.map(str::to_owned),
+                    composite: self.composite,
+                    keys,
+                    lerps,
+                });
+                *cache.borrow_mut() = Some(filled.clone());
+                filled
+            });
+            let count = filled
+                .as_ref()
+                .map_or(frames.len(), |filled| filled.keys.len());
+            let key = |index: usize| match &filled {
+                None => {
                     let frame = &frames[index];
                     (frame.at, frame.value.as_str(), frame.timing.as_ref())
-                } else {
-                    let (at, value, timing) = &keys[index];
-                    (*at, &**value, *timing)
+                }
+                Some(filled) => {
+                    let (at, value, frame) = &filled.keys[index];
+                    let timing = frame.and_then(|frame| frames[frame].timing.as_ref());
+                    (*at, value.as_str(), timing)
                 }
             };
             let index = (0..count)
@@ -399,15 +446,12 @@ impl Animation {
             let eased = timing.at(local, false);
             let value = if property.is_custom() && !animatable(*property, registry) {
                 None
-            } else if fixed {
-                interpolate(frames[index].lerp.as_deref(), from.1, to.1, eased)
             } else {
-                interpolate(
-                    lerp(property.name(), from.1, to.1).as_deref(),
-                    from.1,
-                    to.1,
-                    eased,
-                )
+                let lerp = match &filled {
+                    None => frames[index].lerp.as_deref(),
+                    Some(filled) => filled.lerps[index].as_deref(),
+                };
+                interpolate(lerp, from.1, to.1, eased)
             };
             if active && to.0 > from.0 {
                 let steps = |count: f64| {
@@ -2283,17 +2327,24 @@ fn lerp(property: &str, from: &str, to: &str) -> Option<Rc<Lerp>> {
     }
     let key = std::hash::BuildHasher::hash_one(&rustc_hash::FxBuildHasher, (property, from, to));
     LERPS.with_borrow_mut(|lerps| {
-        if !lerps
-            .get(&key)
-            .is_some_and(|(p, a, b, _)| p == property && a == from && b == to)
-        {
-            if lerps.len() >= 1024 {
-                lerps.clear();
-            }
-            let lerp = Lerp::new(property, from, to).map(Rc::new);
-            lerps.insert(key, (property.into(), from.into(), to.into(), lerp));
+        let same =
+            |(p, a, b, _): &(String, String, String, _)| p == property && a == from && b == to;
+        if let Some(entry) = lerps[0].get(&key).filter(|entry| same(entry)) {
+            return entry.3.clone();
         }
-        lerps[&key].3.clone()
+        // Two generations: a full one becomes the old one, and a hit in the old one moves to the new one.
+        let entry = lerps[1].remove(&key).filter(same).unwrap_or_else(|| {
+            let lerp = Lerp::new(property, from, to).map(Rc::new);
+            (property.into(), from.into(), to.into(), lerp)
+        });
+        if lerps[0].len() >= 512 {
+            let [new, old] = lerps;
+            std::mem::swap(new, old);
+            new.clear();
+        }
+        let lerp = entry.3.clone();
+        lerps[0].insert(key, entry);
+        lerp
     })
 }
 
@@ -2315,7 +2366,7 @@ fn interpolate(lerp: Option<&Lerp>, from: &str, to: &str, t: f64) -> Option<Rc<s
     })
 }
 
-type Lerps = rustc_hash::FxHashMap<u64, (String, String, String, Option<Rc<Lerp>>)>;
+type Lerps = [rustc_hash::FxHashMap<u64, (String, String, String, Option<Rc<Lerp>>)>; 2];
 
 #[derive(Debug)]
 enum Lerp {
@@ -3345,6 +3396,42 @@ mod tests {
         out = Style::new();
         sample(p, 0.25, &mut out);
         assert_eq!(&out["transform"], "rotate(90deg)");
+    }
+
+    #[test]
+    fn implicit_end_frames_follow_the_value_under_them() {
+        let doc = Document::parse(
+            "<style>@keyframes grow{to{width:100px}}div{width:0px;animation:grow 1s linear}</style><div></div>",
+        );
+        let styles = computed_styles(&doc);
+        let div = doc.nodes.iter().position(|node| node.tag == "div").unwrap();
+        let effect = &styles.animations[&div][0];
+        let sample = |under: Option<&str>| {
+            let mut out = Style::new();
+            if let Some(under) = under {
+                out.insert(Prop::WIDTH, under);
+            }
+            effect.sample(
+                0.5,
+                false,
+                &styles.values[div],
+                &Default::default(),
+                &mut out,
+                1.,
+            );
+            out["width"].to_owned()
+        };
+        let filled = || effect.tracks[0].1[0].implicit.0.borrow().clone().unwrap();
+        assert_eq!(sample(None), "50px");
+        let first = filled();
+        assert_eq!(sample(None), "50px");
+        assert!(Rc::ptr_eq(&first, &filled()));
+        assert_eq!(sample(Some("20px")), "60px");
+        assert_eq!(sample(None), "50px");
+        for index in 0..2000 {
+            lerp("width", &format!("{index}px"), "1px");
+        }
+        assert_eq!(sample(Some("40px")), "70px");
     }
 
     #[test]

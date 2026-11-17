@@ -35,6 +35,8 @@ use std::{
     sync::Arc,
 };
 
+type MaskSources = Vec<(String, background::Source)>;
+
 pub(crate) struct PageState {
     pub(crate) id: u64,
     queued: Cell<bool>,
@@ -47,6 +49,8 @@ pub(crate) struct PageState {
     svgs: RefCell<HashMap<usize, element::Svg>>,
     fields: RefCell<HashMap<usize, input::Caret>>,
     decoding: RefCell<HashMap<String, (usize, background::Decoding)>>,
+    // The decoded files of each mask, so a new mask size doesn't decode them again.
+    mask_sources: RefCell<rustc_hash::FxHashMap<(usize, u8), MaskSources>>,
     moving: Cell<bool>,
     dropped: RefCell<Vec<PathBuf>>,
     buttons: Cell<u8>,
@@ -358,6 +362,7 @@ impl PageView {
             svgs: RefCell::default(),
             fields: RefCell::default(),
             decoding: RefCell::default(),
+            mask_sources: RefCell::default(),
             moving: Cell::new(false),
             dropped: RefCell::default(),
             buttons: Cell::new(0),
@@ -939,6 +944,9 @@ impl PageView {
         // can reuse their IDs.
         let shown = |id: usize| visible.get(id) == Some(&true);
         drop_hidden_images(dom, &visible, &styles, |image| window.release_image(image));
+        self.mask_sources
+            .borrow_mut()
+            .retain(|key, _| dom.masks.contains_key(key));
         for id in flips.into_iter().filter(|&id| !shown(id)) {
             self.svgs.borrow_mut().remove(&id);
             self.kept.borrow_mut().remove(&id);
@@ -1913,6 +1921,7 @@ impl PageView {
             measured: &measured,
             perspective: None,
             siblings: &RefCell::default(),
+            breaks: &RefCell::default(),
             walks: &RefCell::default(),
             adjoins: &RefCell::default(),
             blocks: &RefCell::default(),
@@ -2972,18 +2981,26 @@ fn drop_hidden_images(
         }
     });
     dom.masks.retain(|&(id, slot), (_, image)| {
+        let masked = |style: &style::Style, props: &[Prop]| {
+            props
+                .iter()
+                .find_map(|&prop| style.get(prop))
+                .is_some_and(|value| !value.is_empty() && value != "none")
+        };
+        let images = [Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE];
         visible.get(id) == Some(&true)
-            && (slot == 0
-                || styles
+            && match slot {
+                // A clip path shape also makes a mask of the box.
+                0 => styles.values.get(id).is_some_and(|style| {
+                    masked(style, &images)
+                        || masked(style, &[Prop::CLIP_PATH, Prop::WEBKIT_CLIP_PATH])
+                }),
+                _ => styles
                     .pseudos
                     .get(&id)
                     .and_then(|pseudos| pseudos.get(usize::from(slot) - 1))
-                    .and_then(|style| {
-                        [Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]
-                            .into_iter()
-                            .find_map(|prop| style.get(prop))
-                    })
-                    .is_some_and(|value| value != "none"))
+                    .is_some_and(|style| masked(style, &images)),
+            }
             || {
                 if let Some(image) = image {
                     release(image.clone());
@@ -3150,6 +3167,27 @@ mod tests {
             dom.backgrounds.is_empty() && dom.bitmaps.is_empty() && dom.layer_sources.is_empty()
         );
         assert!(dom.canvases.contains_key(&canvas));
+    }
+
+    #[test]
+    fn masks_release_their_image_when_the_box_has_no_mask() {
+        let doc = crate::dom::Document::parse(
+            "<i style='mask-image:url(m.png)'></i><b style='clip-path:circle()'></b><u></u>",
+        );
+        let mut dom = crate::dom::State::default();
+        let styles = crate::dom::styles(&mut doc.clone(), &mut dom, [800., 600.]);
+        let ids =
+            ["i", "b", "u"].map(|tag| doc.nodes.iter().position(|node| node.tag == tag).unwrap());
+        for id in ids {
+            let image = Arc::new(renderer::RenderImage::new(1, 1, vec![0; 4]));
+            dom.masks.insert((id, 0), (String::new(), Some(image)));
+        }
+        let mut released = Vec::new();
+        drop_hidden_images(&mut dom, &vec![true; doc.nodes.len()], &styles, |image| {
+            released.push(image.id)
+        });
+        assert_eq!(released.len(), 1);
+        assert!(dom.masks.contains_key(&(ids[0], 0)) && dom.masks.contains_key(&(ids[1], 0)));
     }
 
     #[test]

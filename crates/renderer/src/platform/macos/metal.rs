@@ -164,6 +164,8 @@ pub(crate) struct Renderer {
     committed: u64,
     completed: Arc<AtomicU64>,
     pub snapshots: Vec<crate::Snapshot>,
+    // Copies of the snapshot layers of the last frame that read them, for the next one with the same sizes.
+    shot_copies: Vec<Texture>,
     // The drawable of the last frame, which a frame with a damage region copies.
     last: Option<Texture>,
     // The layer is Display P3.
@@ -388,6 +390,7 @@ impl Renderer {
             committed: 0,
             completed: Arc::default(),
             snapshots: Vec::new(),
+            shot_copies: Vec::new(),
             last: None,
             wide,
             drawables: Vec::new(),
@@ -672,6 +675,7 @@ impl Renderer {
 
     pub fn release(&mut self, scene: &crate::Scene) {
         self.atlas.release_images(scene);
+        self.shot_copies.clear();
         // An empty command buffer waits for earlier frames on the same queue.
         self.atlas.free_retired(|| {
             if let Some(commands) = self.queue.commandBuffer() {
@@ -903,6 +907,7 @@ impl Renderer {
         };
         let readback = (capture && !native_capture)
             .then(|| self.read_back(&commands, srgb.as_deref().unwrap_or(&frame_texture), window));
+        let mut copies = mem::take(&mut self.shot_copies);
         let shots: Vec<_> = (self.frame.shots.iter())
             .filter_map(|&(key, target, region)| {
                 let size = [region[2] as u32, region[3] as u32];
@@ -910,19 +915,24 @@ impl Renderer {
                 // A blit encoder keeps much memory in the Apple GPU driver, so there a draw copies the layer
                 // into a texture that the CPU can read.
                 let read = if self.atlas.pages.borrow().shared {
-                    new_texture(
-                        &self.device,
-                        size.map(|side| side as usize),
-                        FORMAT,
-                        MTLTextureUsage::RenderTarget,
-                        MTLStorageMode::Shared,
-                    )
-                    .and_then(|copy| {
-                        let area = [0, 0, region[2], region[3]];
-                        let load = MTLLoadAction::DontCare;
-                        (self.pipelines).copy(&commands, layer, [0, 0], &copy, area, load)?;
-                        Ok(Ok(copy))
-                    })
+                    let kept = (copies.iter())
+                        .position(|copy| [copy.width() as u32, copy.height() as u32] == size);
+                    kept.map(|at| Ok(copies.swap_remove(at)))
+                        .unwrap_or_else(|| {
+                            new_texture(
+                                &self.device,
+                                size.map(|side| side as usize),
+                                FORMAT,
+                                MTLTextureUsage::RenderTarget,
+                                MTLStorageMode::Shared,
+                            )
+                        })
+                        .and_then(|copy| {
+                            let area = [0, 0, region[2], region[3]];
+                            let load = MTLLoadAction::DontCare;
+                            (self.pipelines).copy(&commands, layer, [0, 0], &copy, area, load)?;
+                            Ok(Ok(copy))
+                        })
                 } else {
                     self.read_back(&commands, layer, size).map(Err)
                 };
@@ -963,7 +973,7 @@ impl Renderer {
         for (key, size, read) in shots {
             let row = size[0] as usize * 4;
             let mut pixels = vec![0u8; row * size[1] as usize];
-            match read {
+            match &read {
                 // SAFETY: the GPU finished the texture, and `pixels` holds every row of it.
                 Ok(texture) => unsafe {
                     texture.getBytes_bytesPerRow_fromRegion_mipmapLevel(
@@ -989,6 +999,9 @@ impl Renderer {
                 pixel.swap(0, 2);
             }
             self.snapshots.push(crate::Snapshot { key, size, pixels });
+            if let Ok(texture) = read {
+                self.shot_copies.push(texture);
+            }
         }
         readback
             .map(|buffer| {
@@ -1148,8 +1161,9 @@ impl Renderer {
                 sublayers.push(sublayer);
             }
         }
-        self.frame = frame;
+        // A frame that fails is never committed, so it keeps no cached layers for the next one.
         result?;
+        self.frame = frame;
         // Metal completes on its own thread, while the buffers belong to the drawing thread.
         let done = Cell::new(instances.map(super::Sendable::new));
         let thread = super::app_thread();

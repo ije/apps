@@ -3578,7 +3578,7 @@ fn production_drops_unused_modules_of_side_effect_free_packages() {
     let dir = tempfile::tempdir().unwrap();
     let icons = dir.path().join("node_modules/icons");
     fs::create_dir_all(icons.join("dist/icons")).unwrap();
-    fs::write(icons.join("package.json"), r#"{"name":"icons","type":"module","main":"dist/index.js","sideEffects":["./dist/register.js","*.effect.js"]}"#).unwrap();
+    fs::write(icons.join("package.json"), r#"{"name":"icons","type":"module","main":"dist/index.js","sideEffects":["./dist/register.js","*.{fx,effect}.js"]}"#).unwrap();
     fs::write(icons.join("dist/index.js"), "export {default as Used} from './icons/used.js'; export {default as Unused} from './icons/unused.js'; export * from './icons/starred.js'; import './register.js'; import './tag.effect.js'; import './plain.js'; export {empty} from './empty.js';").unwrap();
     fs::write(
         icons.join("dist/icons/used.js"),
@@ -3651,6 +3651,12 @@ fn production_drops_unused_modules_of_side_effect_free_packages() {
             && glob(b"**/x.js", b"x.js")
             && !glob(b"dist/*.js", b"dist/a/x.js")
             && glob(b"dist/**", b"dist/a/x.js")
+            && glob(b"[a-c]?.js", b"b1.js")
+            && !glob(b"[!a-c].js", b"b.js")
+            && glob(b"[^a-c].js", b"d.js")
+            && glob(b"[]x].js", b"].js")
+            && glob(b"a[.js", b"a[.js")
+            && !glob(b"a[/]b", b"a/b")
     );
 }
 
@@ -4342,7 +4348,11 @@ fn watch_cache_keeps_css_imports_and_assets() {
         assert!(files["app.js"].contains(color), "{color}");
         let root = dir.path().canonicalize().unwrap();
         for name in ["theme.css", "bg.png"] {
-            assert!(watched.borrow().contains(&root.join(name)), "{name}");
+            assert!(
+                watched.borrow().contains(&root.join(name)),
+                "{name} {:?}",
+                watched.borrow()
+            );
         }
     }
 }
@@ -4449,4 +4459,108 @@ fn fallback_page_names_do_not_collide() {
             "{marker}"
         );
     }
+}
+
+#[test]
+fn watch_cache_reparses_modules_whose_optional_dependency_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    for (path, source) in [
+        (
+            "node_modules/wrap/index.js",
+            "let value; try { value = require('opt'); } catch { value = 'none'; } module.exports = value;",
+        ),
+        ("node_modules/wrap/package.json", "{}"),
+        ("node_modules/opt/package.json", "{}"),
+        ("node_modules/opt/index.js", "module.exports = 'opt';"),
+        (
+            "app.js",
+            "import value from 'wrap'; globalThis.result = value;",
+        ),
+    ] {
+        fs::create_dir_all(dir.path().join(path).parent().unwrap()).unwrap();
+        fs::write(dir.path().join(path), source).unwrap();
+    }
+    let entry = dir.path().join("app.js");
+    let cache = Rc::new(Cache::default());
+    let run = || {
+        let files = compile(
+            &entry,
+            Realm::Main,
+            None,
+            Rc::default(),
+            false,
+            Some(cache.clone()),
+        )
+        .unwrap();
+        let engine = apps_runtime::jsc::JsContext::new(
+            apps_runtime::jsc::JavaScriptCore::load().unwrap(),
+            Rc::default(),
+            apps_runtime::host::Role::Main,
+        )
+        .unwrap();
+        engine.load_bundle(&files, "app.js").unwrap();
+        engine.eval("result", "test").unwrap()
+    };
+    assert_eq!(run(), "opt");
+    fs::remove_dir_all(dir.path().join("node_modules/opt")).unwrap();
+    cache.resolutions.borrow_mut().clear();
+    assert_eq!(run(), "none");
+}
+
+#[test]
+fn watch_includes_the_tsconfig_chain_without_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    for (path, source) in [
+        (
+            "tsconfig.base.json",
+            r#"{"compilerOptions":{"strict":true}}"#,
+        ),
+        ("tsconfig.json", r#"{"extends":"./tsconfig.base"}"#),
+        ("src/a.ts", "export const dep = 'A_MARKER';"),
+        (
+            "node_modules/dep/package.json",
+            r#"{"type":"module","main":"index.js"}"#,
+        ),
+        ("node_modules/dep/index.js", "export const dep = 'dep';"),
+        (
+            "app.ts",
+            "import { dep } from 'dep'; globalThis.result = dep;",
+        ),
+    ] {
+        fs::create_dir_all(dir.path().join(path).parent().unwrap()).unwrap();
+        fs::write(dir.path().join(path), source).unwrap();
+    }
+    let root = dir.path().canonicalize().unwrap();
+    let entry = dir.path().join("app.ts");
+    let cache = Rc::new(Cache::default());
+    let build = || {
+        let watched = Rc::<RefCell<BTreeSet<PathBuf>>>::default();
+        let files = compile(
+            &entry,
+            Realm::Main,
+            None,
+            watched.clone(),
+            false,
+            Some(cache.clone()),
+        )
+        .unwrap();
+        for name in ["tsconfig.json", "tsconfig.base.json"] {
+            assert!(
+                watched.borrow().contains(&root.join(name)),
+                "{name} {:?}",
+                watched.borrow()
+            );
+        }
+        files
+    };
+    build();
+    // Cached resolutions skip the tsconfig lookup.
+    build();
+    fs::write(
+        dir.path().join("tsconfig.base.json"),
+        r#"{"compilerOptions":{"paths":{"dep":["./src/a.ts"]}}}"#,
+    )
+    .unwrap();
+    cache.resolutions.borrow_mut().clear();
+    assert!(build()["app.js"].contains("A_MARKER"));
 }
