@@ -2725,6 +2725,9 @@ pub fn call(
                 None => json!(add_font(state, family, crate::web::bytes(&args[2])?)?),
             })
         }
+        "dom.canvasFont" => Ok(json!(crate::render::canvas::font(
+            args[1].as_str().unwrap_or("")
+        ))),
         // As a canvas serializes a color: `#rrggbb`, or `rgba()` with the shortest alpha that rounds back.
         "dom.canvasColor" => Ok(match crate::style::color(args[1].as_str().unwrap_or("")) {
             Some((rgb, 255)) => json!(format!("#{:06x}", rgb & 0xff_ffff)),

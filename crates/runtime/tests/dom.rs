@@ -1253,6 +1253,7 @@ fn canvas_paths_matrices_patterns_and_shadows() {
     let (.., result) = offscreen_page(
         r#"
         const canvas = new OffscreenCanvas(20, 20), ctx = canvas.getContext('2d'), at = (x, y) => [...ctx.getImageData(x, y, 1, 1).data];
+        ctx.font = 'bold 12pt/2 Arial'; const font = ctx.font; ctx.font = 'bogus'; same([font, ctx.font], ['bold 16px Arial', 'bold 16px Arial'], 'font');
         const square = new Path2D('M2 2h6v6H2z'), copy = new Path2D(square); copy.rect(12, 2, 6, 6);
         ctx.beginPath(); ctx.rect(0, 12, 4, 4); ctx.fillStyle = '#ff0000'; ctx.fill(copy); ctx.translate(0, 10); ctx.fill(square, 'evenodd'); ctx.resetTransform();
         same([at(5, 5), at(15, 5), at(5, 15), at(1, 13)], [[255, 0, 0, 255], [255, 0, 0, 255], [255, 0, 0, 255], [0, 0, 0, 0]], 'Path2D fill');

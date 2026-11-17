@@ -6,7 +6,12 @@ let binary
 try {
   binary = (await import(name)).default
 } catch {
-  console.error(`apps: ${name} is missing. Reinstall @pierre/apps with optional dependencies.`)
+  const musl = process.platform === 'linux' && !process.report.getReport().header.glibcVersionRuntime
+  console.error(
+    musl
+      ? 'apps: Linux with musl libc is not supported. Use a glibc Linux.'
+      : `apps: ${name} is missing. Reinstall @pierre/apps with optional dependencies.`,
+  )
   process.exit(1)
 }
 // apps stops the app on Ctrl+C, so Node must outlive it.

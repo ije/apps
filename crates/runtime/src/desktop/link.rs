@@ -560,7 +560,26 @@ impl Main {
                             eprintln!("apps: {error:#}");
                         }
                     }
-                    None => host.browsers.defer_attach(browser, parent),
+                    None if self.windows.borrow().contains_key(&parent)
+                        || self
+                            .link
+                            .0
+                            .main
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .iter()
+                            .any(
+                                |message| matches!(message, ToMain::Spawn(id) if *id == parent),
+                            ) =>
+                    {
+                        host.browsers.defer_attach(browser, parent)
+                    }
+                    // The parent closed, so the attach would wait forever.
+                    None => {
+                        if let Err(error) = host.browsers.close_window(parent) {
+                            eprintln!("apps: {error:#}");
+                        }
+                    }
                 }
             }
         }
@@ -914,6 +933,9 @@ impl Main {
                     .spawn(move || {
                         while let Ok(Ok(job)) = receiver.lock().map(|receiver| receiver.recv()) {
                             job();
+                            // Threads wait in turn for the receiver, so return cached blocks now.
+                            #[cfg(target_os = "macos")]
+                            crate::malloc::flush();
                         }
                     });
             }

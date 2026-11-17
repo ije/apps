@@ -8846,6 +8846,13 @@ fn svg_layer(id: usize, inline: bool, view: Rc<super::PageState>, padding: [f32;
                             && raster[1] <= 96
                             && let Some((_, images)) = state.svg_cache.get_mut(&source)
                         {
+                            // Keep the rasters of the last few sizes, so a resized icon doesn't grow the list.
+                            if images.len() >= 4 {
+                                let old = images.remove(0);
+                                if Arc::strong_count(&old) == 1 {
+                                    window.release_image(old);
+                                }
+                            }
                             images.push(image.clone());
                         }
                         if let Some((_, old)) = state.svgs.insert(id, (source, image))

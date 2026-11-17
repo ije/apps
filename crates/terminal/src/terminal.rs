@@ -274,6 +274,8 @@ struct State {
     input: Option<mpsc::Sender<Vec<u8>>>,
     // The side of the PTY that the terminal reads and writes.
     master: Option<File>,
+    // The write end of a pipe. Closing it stops the read thread, because another process can keep the PTY open.
+    stop: Option<OwnedFd>,
     // Of the program, until it is reaped.
     pid: Option<u32>,
     // Counts the programs, so the threads of an old program stop.
@@ -476,14 +478,15 @@ impl State {
         json
     }
 
-    // Sends the hangup signal to a program that still runs.
+    // Sends the hangup signal to the process group of a program that still runs.
     fn hang_up(&mut self) {
         self.program += 1;
         self.held = None;
         self.input = None;
         self.master = None;
+        self.stop = None;
         if let Some(pid) = self.pid.take() {
-            unsafe { libc::kill(pid as i32, libc::SIGHUP) };
+            unsafe { libc::kill(-(pid as i32), libc::SIGHUP) };
         }
     }
 }
@@ -603,6 +606,7 @@ impl Terminal {
                     effects,
                     input: None,
                     master: None,
+                    stop: None,
                     pid: None,
                     program: 0,
                     records: Vec::new(),
@@ -641,8 +645,14 @@ impl Terminal {
             return Err(error(&std::io::Error::last_os_error()));
         }
         let (master, slave) = unsafe { (File::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-        // Other programs of the app must not get the PTY.
-        for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+        let mut pipe = [0; 2];
+        if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+            return Err(error(&std::io::Error::last_os_error()));
+        }
+        let (stopped, stop) =
+            unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
+        // Other programs of the app must not get the PTY or the pipe.
+        for fd in [master.as_raw_fd(), slave.as_raw_fd(), pipe[0], pipe[1]] {
             unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
         }
         let home = std::env::var("HOME").unwrap_or_default();
@@ -714,6 +724,7 @@ impl Terminal {
         let mut writer = master.try_clone().map_err(|e| error(&e))?;
         let (input, bytes) = mpsc::channel::<Vec<u8>>();
         state.master = Some(master);
+        state.stop = Some(stop);
         state.input = Some(input);
         state.pid = Some(pid);
         let program = state.program;
@@ -728,7 +739,25 @@ impl Terminal {
             "apps-terminal-read",
             Box::new(move || {
                 let mut bytes = vec![0; 65536];
-                while let Ok(count @ 1..) = reader.read(&mut bytes) {
+                let mut fds = [reader.as_raw_fd(), stopped.as_raw_fd()].map(|fd| libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                loop {
+                    if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
+                        return;
+                    }
+                    if fds[1].revents != 0 {
+                        return;
+                    }
+                    let Ok(count @ 1..) = reader.read(&mut bytes) else {
+                        return;
+                    };
                     let mut state = shared.reading();
                     if state.program != program {
                         return;
@@ -749,17 +778,37 @@ impl Terminal {
                 }
             }),
         )?;
-        let shared = self.shared.clone();
+        let shared = Arc::downgrade(&self.shared);
         thread(
             "apps-terminal-wait",
             Box::new(move || {
-                let status = child.wait();
+                // Wait without reaping: the PID stays ours until `state.pid` is cleared.
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                while unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as _,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                } != 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                }
+                let Some(shared) = shared.upgrade() else {
+                    let _ = child.wait();
+                    return;
+                };
                 let mut state = shared.state();
-                if state.program != program {
+                let current = state.program == program;
+                // Never signal a reaped child; its PID may belong to another process.
+                if current {
+                    state.pid = None;
+                }
+                let status = child.wait();
+                if !current {
                     return;
                 }
-                // Never signal a reaped child; its PID may belong to another process.
-                state.pid = None;
                 state.forget([WORKING, BLOCKED]);
                 let _ = match status
                     .as_ref()

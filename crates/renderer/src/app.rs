@@ -407,7 +407,12 @@ impl Callbacks {
     }
 
     pub fn release(&self) {
-        self.queue(|window, _| window.platform.release());
+        self.queue(|window, _| {
+            #[cfg(target_os = "macos")]
+            window.platform.release(&window.scene);
+            #[cfg(not(target_os = "macos"))]
+            window.platform.release();
+        });
     }
 
     #[cfg(windows)]

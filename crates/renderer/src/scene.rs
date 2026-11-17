@@ -669,6 +669,21 @@ impl Scene {
         self.span(mark)
     }
 
+    // The atlas texels that this scene reads: (color page, page, texels). Copies of its spans read them again.
+    pub(crate) fn texels(&self) -> impl Iterator<Item = (bool, u32, Rect<f32>)> + '_ {
+        self.layers.iter().flat_map(|layer| {
+            let mask = (layer.effect.as_ref())
+                .and_then(|effect| effect.mask.as_ref())
+                .map(|(tile, _)| (true, tile.page, tile.rect.map(|value| value as f32)));
+            (layer.instances.iter())
+                .filter_map(|instance| {
+                    let (color, page) = instance.page()?;
+                    Some((color, page, rect(instance.aux)))
+                })
+                .chain(mask)
+        })
+    }
+
     fn current(&mut self) -> &mut SceneLayer {
         let index = self.active.last().copied().unwrap_or(0);
         &mut self.layers[index]

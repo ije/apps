@@ -27,13 +27,17 @@ enum Event {
 }
 
 struct Parent {
-    events: mpsc::SyncSender<Event>,
+    events: mpsc::Sender<Event>,
     wake: crate::host::Waker,
     data: Value,
     id: u64,
     stop: Arc<AtomicBool>,
     received: Vec<bytes::Bytes>,
     code: Option<i32>,
+}
+
+pub(crate) fn in_worker() -> bool {
+    PARENT.with(|parent| parent.borrow().is_some())
 }
 
 pub(crate) fn exit(code: i32) -> bool {
@@ -269,6 +273,12 @@ impl State {
                 let received = buffers(args.as_array().and_then(|args| args.get(5..)))?;
                 ensure!(self.workers.len() < 64, "Too many workers");
                 let source = args[0].as_str().context("Expected worker source")?;
+                ensure!(
+                    args[1] == true
+                        || args[2] == true
+                        || self.disabled & crate::bundle::feature_bit("jsExecute") == 0,
+                    "Page workers from data: and blob: URLs need the jsExecute feature"
+                );
                 let source: bytes::Bytes = if args[2] == true {
                     let name = source
                         .strip_prefix("apps:///")
@@ -290,7 +300,7 @@ impl State {
                 let scripts = self.scripts.clone();
                 let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                 let (input, inbox) = mpsc::channel::<Payload>();
-                let (output, events) = mpsc::sync_channel::<Event>(64);
+                let (output, events) = mpsc::channel::<Event>();
                 let stop = Arc::new(AtomicBool::new(false));
                 let cancelled = stop.clone();
                 let running = Running::default();

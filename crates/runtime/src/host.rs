@@ -1015,6 +1015,11 @@ impl Host {
                 Ok(json!(*cwd))
             }
             "chdir" => {
+                // The cwd belongs to the whole process, and preloads and workers are threads in it.
+                ensure!(
+                    matches!(role, Role::Main) && !crate::web::worker::in_worker(),
+                    "process.chdir() is only available in the main process"
+                );
                 let mut cwd = CWD.lock().unwrap_or_else(|error| error.into_inner());
                 *cwd = None;
                 std::env::set_current_dir(args[0].as_str().context("Expected path")?)?;

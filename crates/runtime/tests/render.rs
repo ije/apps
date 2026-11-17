@@ -351,7 +351,7 @@ fn drawable_elements_nest_scroll_and_go_to_workers_and_textures() {
                  e.onpaint = () => { faded.reset(); faded.drawElementImage(document.getElementById('pulse'), 0, 0); alphas.add(faded.getImageData(5, 5, 1, 1).data[3]); };\
                  </script></body>",
             ),
-            ("package.json", r#"{"features":["webgpu"]}"#),
+            ("package.json", r#"{"features":["webgpu","jsExecute"]}"#),
         ],
     );
 }

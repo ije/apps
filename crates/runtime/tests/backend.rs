@@ -244,3 +244,23 @@ fn durable_browser_storage_crypto_keys_and_transactions() {
         let denied=false;try{await crypto.subtle.exportKey('jwk',pair.privateKey)}catch{denied=true}assert(denied,'Persisted private key still nonextractable');db.close();
     "#);
 }
+
+#[test]
+fn workers_never_block_on_post_and_own_no_process_state() {
+    run(r#"
+        const assert=(v,m)=>{if(!v)throw Error(m)};
+        const {Worker}=__apps.worker_threads,fs=__apps.fs;
+        const shared=new Int32Array(new SharedArrayBuffer(4));
+        const flood=new Worker(`const {parentPort,workerData}=require('node:worker_threads');for(let i=0;i<500;i++)parentPort.postMessage(i);Atomics.store(workerData,0,1);Atomics.notify(workerData,0)`,{eval:true,workerData:shared});
+        assert(Atomics.wait(shared,0,0,5000)==='ok','Worker blocked on unread messages');
+        await flood.terminate();
+        const dir=fs.mkdtempSync(__apps.os.tmpdir()+'/apps-fds-');fs.writeFileSync(dir+'/a','a');fs.writeFileSync(dir+'/b','b');
+        const fd=fs.openSync(dir+'/a','r');
+        const probe=new Worker(`const {parentPort,workerData}=require('node:worker_threads');const fs=require('node:fs');const own=fs.openSync(workerData.dir+'/b','r');let code;try{fs.readSync(workerData.fd,Buffer.alloc(1))}catch(error){code=error.code}let chdir;try{process.chdir('/')}catch(error){chdir=error.code}parentPort.postMessage({own,code,chdir})`,{eval:true,workerData:{fd,dir}});
+        const reply=await new Promise((resolve,reject)=>{probe.on('message',resolve);probe.on('error',reject)});
+        assert(reply.own!==fd&&reply.code==='EBADF','Foreign fd: '+JSON.stringify(reply));
+        assert(reply.chdir==='ERR_WORKER_UNSUPPORTED_OPERATION','Worker chdir: '+reply.chdir);
+        await probe.terminate();fs.closeSync(fd);fs.rmSync(dir,{recursive:true});
+        process.chdir(process.cwd());
+    "#);
+}

@@ -60,14 +60,9 @@ fn load(
                     decoding.insert(file.into(), (id, slot.clone()));
                     let (path, done) = (path.to_path_buf(), slot.clone());
                     super::image::decode_later(Box::new(move || {
-                        let image = (|| -> anyhow::Result<_> {
-                            anyhow::ensure!(
-                                std::fs::metadata(&path)?.len() <= 64 * 1024 * 1024,
-                                "Image is too large"
-                            );
-                            super::image::decode(&std::fs::read(&path)?)
-                        })()
-                        .unwrap_or_else(|_| renderer::RenderImage::new(0, 0, Vec::new()));
+                        let image = super::image::read(&path)
+                            .and_then(|bytes| super::image::decode(&bytes))
+                            .unwrap_or_else(|_| renderer::RenderImage::new(0, 0, Vec::new()));
                         *done.lock().unwrap_or_else(PoisonError::into_inner) = Some(image);
                     }));
                     window.next_frame(redraw_when_decoded(slot));
@@ -83,8 +78,8 @@ fn load(
     // Undecodable files are SVG or broken, and SVG draws at each size.
     let tree = (bitmap.size().width as u32 == 0)
         .then(|| {
-            std::fs::read_to_string(path)
-                .map_err(anyhow::Error::from)
+            super::image::read(path)
+                .and_then(|bytes| Ok(String::from_utf8(bytes)?))
                 .and_then(|text| {
                     // A view box keeps its ratio in other tiles.
                     let kept = text.contains("viewBox")
@@ -832,8 +827,11 @@ pub(super) fn border_image(
         Some(url) => {
             let host = view.host.borrow();
             let base = host.dom.get(&view.id).and_then(|state| state.base.clone());
-            let path = super::image::url_file(url, base.as_ref(), &host.assets)
-                .filter(|path| path.is_file())?;
+            let path = super::image::url_file(url, base.as_ref(), &host.assets).filter(|path| {
+                path.to_str()
+                    .is_some_and(|path| path.starts_with(super::image::DATA_PREFIX))
+                    || path.is_file()
+            })?;
             (path, None)
         }
         None => {

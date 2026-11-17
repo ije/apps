@@ -301,10 +301,12 @@ fn call(tool: &str, args: Value) -> Result<Value> {
     {
         None
     } else {
-        let wanted = args["window"]
-            .as_u64()
-            .filter(|window| pages.contains_key(window))
-            .or((paused > 0).then(|| paused - 1));
+        let wanted = match args["window"].as_u64() {
+            Some(window) if pages.contains_key(&window) => Some(window),
+            Some(window) => bail!("No window {window}"),
+            None if !args["window"].is_null() => bail!("No window {}", args["window"]),
+            None => (paused > 0).then(|| paused - 1),
+        };
         Some(
             wanted
                 .or_else(|| pages.keys().next().copied())
@@ -1569,7 +1571,7 @@ impl SourceMap {
             bytes
         };
         let map: Value = serde_json::from_slice(&json).ok()?;
-        let sources = map["sources"]
+        let sources: Vec<String> = map["sources"]
             .as_array()?
             .iter()
             .map(|source| source.as_str().unwrap_or("").to_owned())
@@ -1588,6 +1590,9 @@ impl SourceMap {
                         b'+' => 62,
                         _ => 63,
                     } as i64;
+                    if shift > 55 {
+                        return None;
+                    }
                     value += (digit & 31) << shift;
                     if digit & 32 != 0 {
                         shift += 5;
@@ -1604,6 +1609,9 @@ impl SourceMap {
                 if count >= 4 {
                     (source, line, column) =
                         (source + values[1], line + values[2], column + values[3]);
+                    if !(0..sources.len() as i64).contains(&source) || line < 0 || column < 0 {
+                        return None;
+                    }
                     mappings.push([
                         generated as u32,
                         generated_column as u32,
@@ -1659,5 +1667,6 @@ mod tests {
         assert_eq!(map.generated(0, 0, 3), Some((1, 4)));
         assert_eq!(map.generated(0, 1, 0), Some((2, 0)));
         assert_eq!(map.generated(0, 2, 0), None);
+        assert!(SourceMap::parse(r#"data:,{"sources":["a"],"mappings":"ACAA"}"#).is_none());
     }
 }

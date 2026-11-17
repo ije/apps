@@ -116,9 +116,11 @@ pub fn run(
     let mut writer = None;
     let mut input: Option<ChildStdin> = None;
     let mut running: Option<BBTreeMap<String, String>> = None;
-    let dev_bundle = rust
-        .is_none()
-        .then(|| std::env::temp_dir().join(format!("apps-bundle-{}.json", std::process::id())));
+    // A private folder (0700), so no other user can read the bundle or plant a link. Drop removes it.
+    let dev_folder = rust.is_none().then(tempfile::tempdir).transpose()?;
+    let dev_bundle = dev_folder
+        .as_ref()
+        .map(|folder| folder.path().join("bundle.json"));
     let result = (|| -> Result<i32> {
         let mut fresh = true;
         let mut failed = bundle.is_none();
@@ -398,9 +400,6 @@ pub fn run(
             }
         }
     })();
-    if let Some(path) = &dev_bundle {
-        let _ = std::fs::remove_file(path);
-    }
     if let Some(mut process) = child {
         let _ = process.kill();
         let _ = process.wait();
@@ -408,5 +407,6 @@ pub fn run(
     if let Some(writer) = writer {
         let _ = writer.join();
     }
+    drop(dev_folder);
     result
 }

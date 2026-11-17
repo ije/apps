@@ -348,8 +348,8 @@ impl Window {
         self.quiet = Some(release);
     }
 
-    pub(crate) fn release(&mut self) {
-        self.renderer.release();
+    pub(crate) fn release(&mut self, scene: &crate::Scene) {
+        self.renderer.release(scene);
     }
 
     pub(crate) fn set_drawable_size(&mut self, size: Size<Pixels>, scale: f32) {

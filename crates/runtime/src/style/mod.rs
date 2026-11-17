@@ -8,7 +8,7 @@ mod chunked;
 mod color;
 pub(crate) mod parser;
 mod properties;
-mod shorthand;
+pub(crate) mod shorthand;
 mod tailwind;
 #[cfg(test)]
 mod tests;
@@ -4694,21 +4694,23 @@ pub(crate) fn compute_styles(
                     }
                 }
                 let cached = &mut style_cache.scopes[index];
-                let deleted: Vec<usize> = (0..cached.rules.len())
-                    .filter(|&order| {
-                        removed
-                            .rules
-                            .iter()
-                            .any(|rule| Rc::ptr_eq(rule.0, &cached.rules[order].0))
-                    })
+                let removed: rustc_hash::FxHashSet<_> = removed
+                    .rules
+                    .iter()
+                    .map(|rule| Rc::as_ptr(rule.0))
+                    .collect();
+                let mut deleted: Vec<bool> = (cached.rules.iter())
+                    .map(|rule| removed.contains(&Rc::as_ptr(&rule.0)))
                     .collect();
                 // Preserve deleted rule positions with DELETED origin and no declarations or keys.
                 let mut author: Vec<usize> = (0..cached.rules.len())
                     .filter(|&order| {
-                        !matches!(cached.rules[order].2.origin, AGENT | DELETED)
-                            && !deleted.contains(&order)
+                        !matches!(cached.rules[order].2.origin, AGENT | DELETED) && !deleted[order]
                     })
                     .collect();
+                let dead = (cached.rules.iter().zip(&deleted))
+                    .filter(|(rule, deleted)| **deleted || rule.2.origin == DELETED)
+                    .count();
                 author.sort_by_key(|&order| cached.keys[order]);
                 let old = new.iter().filter(|flag| !**flag).count();
                 let same = old == author.len()
@@ -4722,7 +4724,8 @@ pub(crate) fn compute_styles(
                         .all(|(((selectors, ..), _), &order)| {
                             Rc::ptr_eq(selectors, &cached.rules[order].0)
                         });
-                let mut room = same;
+                // A scope with more deleted rules than live ones is built again, so it does not grow.
+                let mut room = same && dead * 2 <= cached.rules.len() + new.len() - old;
                 let mut keys = Vec::new();
                 let mut inserted = Vec::new();
                 let mut pending = Vec::new();
@@ -4784,17 +4787,32 @@ pub(crate) fn compute_styles(
                         }
                         None => fast = false,
                     }
-                    if !deleted.is_empty() {
-                        for &order in &deleted {
+                    if deleted.contains(&true) {
+                        deleted.resize(cached.rules.len(), false);
+                        for order in (0..deleted.len()).filter(|&order| deleted[order]) {
                             cached.rules[order].1 = Rc::new([]);
                             cached.rules[order].2.origin = DELETED;
                             cached.elements[order].clear();
                         }
+                        let gone = |entry: &usize| {
+                            if *entry >= PSEUDO {
+                                deleted[cached.pseudos[entry & !PSEUDO].2]
+                            } else {
+                                deleted[entry >> SELECTOR]
+                            }
+                        };
+                        for bucket in &mut cached.buckets {
+                            bucket.retain(|_, list| {
+                                list.retain(|entry| !gone(entry));
+                                !list.is_empty()
+                            });
+                        }
+                        cached.universal.retain(|entry| !gone(entry));
                         let stale = |rules: &[(usize, [usize; 3])], pseudos: &[usize]| {
-                            rules.iter().any(|(order, _)| deleted.contains(order))
+                            rules.iter().any(|&(order, _)| deleted[order])
                                 || pseudos
                                     .iter()
-                                    .any(|&index| deleted.contains(&cached.pseudos[index].2))
+                                    .any(|&index| deleted[cached.pseudos[index].2])
                         };
                         // A fast pass styles these nodes again by their dirty marks.
                         for (id, matched) in cached.nodes.iter_mut().enumerate() {
@@ -8620,11 +8638,8 @@ impl Substitution<'_> {
                         let reached = self.cycle;
                         self.depth = depth;
                         self.cycle = outer.min(if reached < depth { reached } else { usize::MAX });
-                        if reached <= depth {
-                            self.state[index] = (2, depth, None);
-                            return None;
-                        }
-                        value = ok.then(|| out.into());
+                        // A cycle is invalid at computed-value time, so a registered property in it is unset.
+                        value = (ok && reached > depth).then(|| out.into());
                     }
                 }
                 match (value, registered) {

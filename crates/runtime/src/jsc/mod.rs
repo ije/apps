@@ -1330,12 +1330,13 @@ fn dispatch(
                 && (!name.starts_with("__apps") || op == "bridge.preload"),
             "Reserved bridge name"
         );
-        host.try_borrow_mut()
-            .context("Host is busy")?
-            .bridge
-            .entry(id)
-            .or_default()
-            .insert(name.to_owned(), payload::Payload::snapshot(value.clone()));
+        let mut host = host.try_borrow_mut().context("Host is busy")?;
+        let exposed = host.bridge.entry(id).or_default();
+        anyhow::ensure!(
+            op == "bridge.preload" || !exposed.contains_key(name),
+            "Cannot bind an API on top of an existing property on the window object"
+        );
+        exposed.insert(name.to_owned(), payload::Payload::snapshot(value.clone()));
         return Ok(serde_json::Value::Null);
     }
     if op == "bridge.file" {
@@ -1368,7 +1369,10 @@ fn dispatch(
         if let Role::Renderer(id) = role {
             anyhow::ensure!(
                 target["preload"] == id
-                    && matches!(values[1]["kind"].as_str(), Some("call" | "reply")),
+                    && matches!(
+                        values[1]["kind"].as_str(),
+                        Some("call" | "reply" | "release")
+                    ),
                 "Page bridge calls must target their preload"
             );
         }

@@ -3,6 +3,7 @@ pub mod avif;
 
 use anyhow::Context;
 use std::io::Cursor;
+use std::sync::{Arc, Mutex, PoisonError};
 
 fn fits(width: usize, height: usize) -> bool {
     width <= 16384 && height <= 16384 && width * height <= 64 << 20
@@ -173,7 +174,6 @@ pub(crate) fn encode_png(image: &tiny_skia::Pixmap) -> anyhow::Result<Vec<u8>> {
 }
 
 pub(crate) fn decode_later(job: Box<dyn FnOnce() + Send>) {
-    use std::sync::{Mutex, PoisonError};
     type Job = Box<dyn FnOnce() + Send>;
     static JOBS: Mutex<(std::collections::VecDeque<Job>, usize)> =
         Mutex::new((std::collections::VecDeque::new(), 0));
@@ -210,77 +210,92 @@ pub(crate) fn url_file(
     })
 }
 
+// A `data:` URL stays in memory under a short name, so boxes that build again on each frame cost a hash, and its
+// payload decodes on the decode thread. The most recent URLs stay, up to 256 of them and 64 MB.
+type DataUrls = (rustc_hash::FxHashMap<u64, (Arc<str>, u64)>, u64, usize);
+static DATA_URLS: Mutex<Option<DataUrls>> = Mutex::new(None);
+pub(crate) const DATA_PREFIX: &str = "apps-data:";
+
 pub(crate) fn data_file(url: &str) -> Option<std::path::PathBuf> {
-    use std::hash::{BuildHasher, Hash, Hasher};
-    type Files = rustc_hash::FxHashMap<
-        u64,
-        (
-            Box<str>,
-            std::path::PathBuf,
-            std::cell::Cell<std::time::Instant>,
-        ),
-    >;
-    thread_local!(static FILES: std::cell::RefCell<Files> = Default::default());
-    let (header, payload) = url.strip_prefix("data:")?.split_once(',')?;
-    // Boxes build again on many frames: decode and write each URL once, and check that its file still
-    // exists at most once a second.
+    use std::hash::BuildHasher;
+    url.strip_prefix("data:")?.split_once(',')?;
     let key = rustc_hash::FxBuildHasher.hash_one(url);
-    let now = std::time::Instant::now();
-    if let Some(path) = FILES.with_borrow(|files| {
-        files
-            .get(&key)
-            .filter(|(known, path, checked)| {
-                **known == *url
-                    && (now.duration_since(checked.get()).as_secs() < 1
-                        || path.exists() && {
-                            checked.set(now);
-                            true
-                        })
-            })
-            .map(|(_, path, _)| path.clone())
-    }) {
-        return Some(path);
-    }
-    let bytes = if header.ends_with(";base64") {
-        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload.trim()).ok()?
-    } else {
-        let input = payload.as_bytes();
-        let mut bytes = Vec::with_capacity(input.len());
-        let mut index = 0;
-        while index < input.len() {
-            let hex = (input[index] == b'%')
-                .then(|| input.get(index + 1..index + 3))
-                .flatten()
-                .and_then(|hex| std::str::from_utf8(hex).ok())
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok());
-            bytes.push(hex.unwrap_or(input[index]));
-            index += if hex.is_some() { 3 } else { 1 };
-        }
-        bytes
-    };
-    let mut hasher = std::hash::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    let directory = std::env::temp_dir().join("apps-data-images");
-    let extension = if header.contains("svg") { "svg" } else { "bin" };
-    let path = directory.join(format!("{:016x}.{extension}", hasher.finish()));
-    if !path.exists() {
-        std::fs::create_dir_all(&directory).ok()?;
-        // Other windows and other apps read this file, so it must appear complete.
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let count = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let partial = path.with_extension(format!("{}-{count}.tmp", std::process::id()));
-        if std::fs::write(&partial, bytes).is_err() || std::fs::rename(&partial, &path).is_err() {
-            let _ = std::fs::remove_file(&partial);
-            if !path.exists() {
-                return None;
+    let mut urls = DATA_URLS.lock().unwrap_or_else(PoisonError::into_inner);
+    let (urls, tick, bytes) = urls.get_or_insert_default();
+    *tick += 1;
+    match urls.get_mut(&key) {
+        Some((known, _)) if **known != *url => return None,
+        Some((_, used)) => *used = *tick,
+        None => {
+            while !urls.is_empty() && (urls.len() >= 256 || *bytes + url.len() > 64 << 20) {
+                let oldest = *urls.iter().min_by_key(|(_, (_, used))| *used)?.0;
+                *bytes -= urls.remove(&oldest).map_or(0, |(url, _)| url.len());
             }
+            *bytes += url.len();
+            urls.insert(key, (url.into(), *tick));
         }
     }
-    FILES.with_borrow_mut(|files| {
-        if files.len() >= 256 {
-            files.clear();
+    Some(format!("{DATA_PREFIX}{key:016x}").into())
+}
+
+// The bytes of a file, or of a `data:` URL that `data_file()` named.
+pub(crate) fn read(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    let Some(key) = path
+        .to_str()
+        .and_then(|path| path.strip_prefix(DATA_PREFIX))
+    else {
+        anyhow::ensure!(
+            std::fs::metadata(path)?.len() <= 64 * 1024 * 1024,
+            "Image is too large"
+        );
+        return Ok(std::fs::read(path)?);
+    };
+    let url = DATA_URLS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .and_then(|(urls, ..)| Some(urls.get(&u64::from_str_radix(key, 16).ok()?)?.0.clone()))
+        .context("Image data is gone")?;
+    let (header, payload) = url
+        .strip_prefix("data:")
+        .and_then(|url| url.split_once(','))
+        .context("Invalid data URL")?;
+    if header.ends_with(";base64") {
+        return Ok(base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            payload.trim(),
+        )?);
+    }
+    let input = payload.as_bytes();
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        let hex = (input[index] == b'%')
+            .then(|| input.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        bytes.push(hex.unwrap_or(input[index]));
+        index += if hex.is_some() { 3 } else { 1 };
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn data_urls_stay_in_memory_and_the_oldest_leave() {
+        let first = super::data_file("data:text/plain;base64,aGk=").unwrap();
+        assert_eq!(super::read(&first).unwrap(), b"hi");
+        let svg = super::data_file("data:image/svg+xml,%3Csvg%3E").unwrap();
+        assert_eq!(super::read(&svg).unwrap(), b"<svg>");
+        for index in 0..300 {
+            super::data_file(&format!("data:,{index}")).unwrap();
         }
-        files.insert(key, (url.into(), path.clone(), now.into()));
-    });
-    Some(path)
+        assert!(super::read(&first).is_err());
+        assert_eq!(
+            super::read(&super::data_file("data:,299").unwrap()).unwrap(),
+            b"299"
+        );
+    }
 }

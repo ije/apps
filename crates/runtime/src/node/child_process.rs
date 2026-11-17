@@ -92,11 +92,17 @@ impl Drop for Process {
             reader.unpark();
         }
         if self.status.is_none()
-            && !(self.detached && self.unreferenced)
-            && let Some(child) = &mut self.child
+            && let Some(mut child) = self.child.take()
         {
-            let _ = child.kill();
-            let _ = child.wait();
+            if self.detached && self.unreferenced {
+                // Nothing reaps the child after this, so it would stay a zombie.
+                let _ = std::thread::Builder::new()
+                    .name("apps-exit".into())
+                    .spawn(move || child.wait());
+            } else {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
     }
 }
@@ -351,6 +357,11 @@ impl State {
                                 .map_or_else(|| value.to_string(), str::to_owned),
                         );
                     }
+                }
+                // Without the setting, a child of this executable starts once more to set it.
+                #[cfg(target_os = "macos")]
+                if std::env::current_exe().is_ok_and(|exe| exe.as_os_str() == command) {
+                    builder.env("MallocSpaceEfficient", "1");
                 }
                 #[cfg(unix)]
                 {
@@ -613,17 +624,7 @@ impl State {
                         .with_context(|| format!("Unknown signal: {signal}"))?
                         .1;
                     // Only signal a child that this context owns and has not reaped.
-                    if unsafe {
-                        libc::kill(
-                            if process.detached {
-                                -(child.id() as libc::pid_t)
-                            } else {
-                                child.id() as libc::pid_t
-                            },
-                            number,
-                        )
-                    } != 0
-                    {
+                    if unsafe { libc::kill(child.id() as libc::pid_t, number) } != 0 {
                         let error = io::Error::last_os_error();
                         if error.raw_os_error() == Some(libc::ESRCH) {
                             return Ok(json!(false));

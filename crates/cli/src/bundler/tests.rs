@@ -3718,7 +3718,7 @@ fn main_workers_share_pages_and_skip_package_metadata() {
             "production={production}"
         );
         for (_, source) in &files {
-            for (at, _) in source.match_indices("apps:///page-") {
+            for (at, _) in source.match_indices("apps:///page~") {
                 let name = &source[at + 8..];
                 let name = &name[..name.find(".html").unwrap() + 5];
                 assert!(files.contains_key(name), "{name} production={production}");
@@ -4311,6 +4311,142 @@ fn builtin_table_matches_the_runtime() {
         assert!(
             table == BUILTINS,
             "The runtime's built-in modules changed. Run APPS_UPDATE_BUILTINS=1 cargo test -p apps builtin_table"
+        );
+    }
+}
+
+#[test]
+fn watch_cache_keeps_css_imports_and_assets() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("page.ts");
+    fs::write(&entry, "import './a.css';").unwrap();
+    fs::write(
+        dir.path().join("a.css"),
+        "@import './theme.css'; .a{background:url(./bg.png)}",
+    )
+    .unwrap();
+    fs::write(dir.path().join("bg.png"), b"png").unwrap();
+    let cache = Rc::new(Cache::default());
+    for color in ["red", "blue"] {
+        fs::write(dir.path().join("theme.css"), format!(".t{{color:{color}}}")).unwrap();
+        let watched = Rc::new(RefCell::new(BTreeSet::new()));
+        let files = compile(
+            &entry,
+            Realm::Renderer,
+            None,
+            watched.clone(),
+            false,
+            Some(cache.clone()),
+        )
+        .unwrap();
+        assert!(files["app.js"].contains(color), "{color}");
+        let root = dir.path().canonicalize().unwrap();
+        for name in ["theme.css", "bg.png"] {
+            assert!(watched.borrow().contains(&root.join(name)), "{name}");
+        }
+    }
+}
+
+#[test]
+fn watch_cache_follows_package_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("app.ts");
+    fs::write(&entry, "globalThis.x = import.meta.env.X;").unwrap();
+    let cache = Rc::new(Cache::default());
+    for value in ["first-env", "second-env"] {
+        fs::write(
+            dir.path().join("package.json"),
+            json!({"env": {"X": value}}).to_string(),
+        )
+        .unwrap();
+        cache.resolutions.borrow_mut().clear();
+        let files = compile(
+            &entry,
+            Realm::Main,
+            None,
+            Rc::default(),
+            false,
+            Some(cache.clone()),
+        )
+        .unwrap();
+        assert!(files["app.js"].contains(value), "{value}");
+    }
+}
+
+#[test]
+fn failed_builds_still_watch_package_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("app.ts");
+    fs::write(&entry, "").unwrap();
+    fs::write(dir.path().join("package.json"), "{").unwrap();
+    let watched = Rc::new(RefCell::new(BTreeSet::new()));
+    assert!(compile(&entry, Realm::Main, None, watched.clone(), false, None).is_err());
+    let root = dir.path().canonicalize().unwrap();
+    assert!(watched.borrow().contains(&root.join("package.json")));
+    assert!(watched.borrow().contains(&entry));
+}
+
+#[test]
+fn worker_query_imports_bundle_the_worker() {
+    for production in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("app.ts");
+        fs::write(&entry, "import W from './w.ts?worker'; globalThis.w = W;").unwrap();
+        fs::write(dir.path().join("w.ts"), "globalThis.WORKER_MARKER = 1;").unwrap();
+        let files = compile(&entry, Realm::Main, None, Rc::default(), production, None).unwrap();
+        assert!(
+            files
+                .iter()
+                .any(|(name, source)| name.starts_with("script-")
+                    && source.contains("WORKER_MARKER")),
+            "production={production}"
+        );
+    }
+}
+
+#[test]
+fn require_of_a_folder_uses_main() {
+    let dir = tempfile::tempdir().unwrap();
+    let package = dir.path().join("node_modules/pkg");
+    fs::create_dir_all(package.join("lib")).unwrap();
+    fs::write(package.join("package.json"), r#"{"main":"./index.js"}"#).unwrap();
+    fs::write(
+        package.join("index.js"),
+        "module.exports = require('./lib');",
+    )
+    .unwrap();
+    fs::write(
+        package.join("lib/package.json"),
+        r#"{"main":"./cjs.js","module":"./esm.js"}"#,
+    )
+    .unwrap();
+    fs::write(package.join("lib/cjs.js"), "module.exports = 'CJS_MARKER';").unwrap();
+    fs::write(package.join("lib/esm.js"), "export default 'ESM_MARKER';").unwrap();
+    let entry = dir.path().join("app.ts");
+    fs::write(&entry, "import value from 'pkg'; globalThis.value = value;").unwrap();
+    let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
+    assert!(files["app.js"].contains("CJS_MARKER"));
+    assert!(!files["app.js"].contains("ESM_MARKER"));
+}
+
+#[test]
+fn fallback_page_names_do_not_collide() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a b.html"), "<p>spaced-page</p>").unwrap();
+    fs::write(dir.path().join("page-0.html"), "<p>named-page</p>").unwrap();
+    let entry = dir.path().join("app.ts");
+    fs::write(
+        &entry,
+        "globalThis.pages = [import.meta.resolve('./a b.html'), import.meta.resolve('./page-0.html')];",
+    )
+    .unwrap();
+    let files = compile(&entry, Realm::Main, None, Rc::default(), false, None).unwrap();
+    for marker in ["spaced-page", "named-page"] {
+        assert!(
+            files
+                .iter()
+                .any(|(name, source)| name.ends_with(".html") && source.contains(marker)),
+            "{marker}"
         );
     }
 }

@@ -95,8 +95,8 @@
     },
   });
   // Keep timer deadlines immutable and monotonic. Refresh and intervals create new objects. Only the object
-  // in timers is live.
-  const timers = new Map(), heap = [];
+  // in timers is live. A fired Timeout keeps its data in spent, so refresh() starts it again, as in Node.
+  const timers = new Map(), heap = [], spent = new WeakMap();
   let timerID = 0, refs = 0, nesting = 0, limit = 0;
   const before = (a, b) => a.at < b.at || (a.at === b.at && a.id < b.id);
   const pop = () => {
@@ -125,13 +125,18 @@
   class Timeout {
     #id;
     constructor(id) { this.#id = id; }
-    ref() { const timer = timers.get(this.#id); if (timer && !timer.ref) { timer.ref = true; refs++; } return this; }
-    unref() { const timer = timers.get(this.#id); if (timer?.ref) { timer.ref = false; refs--; } return this; }
-    hasRef() { return timers.get(this.#id)?.ref ?? false; }
-    refresh() { const timer = timers.get(this.#id); if (timer) schedule({ ...timer, at: clock() + timer.delay }); return this; }
-    close() { clearTimeout(this.#id); return this; }
+    ref() { const timer = timers.get(this.#id) ?? spent.get(this); if (timer && !timer.ref) { timer.ref = true; if (timers.has(this.#id)) refs++; } return this; }
+    unref() { const timer = timers.get(this.#id) ?? spent.get(this); if (timer?.ref) { timer.ref = false; if (timers.has(this.#id)) refs--; } return this; }
+    hasRef() { return (timers.get(this.#id) ?? spent.get(this))?.ref ?? false; }
+    refresh() {
+      let timer = timers.get(this.#id);
+      if (!timer && (timer = spent.get(this))) { spent.delete(this); if (timer.ref) refs++; }
+      if (timer) schedule({ ...timer, at: clock() + timer.delay });
+      return this;
+    }
+    close() { clearTimeout(this); return this; }
     [Symbol.toPrimitive]() { return this.#id; }
-    [Symbol.dispose]() { clearTimeout(this.#id); }
+    [Symbol.dispose]() { clearTimeout(this); }
   }
   const start = (fn, delay, args, interval) => {
     if (typeof fn !== 'function') throw new TypeError('Expected a timer function');
@@ -141,11 +146,12 @@
     if (nodeRole && delay < 1) delay = 1;
     else if (!nodeRole && nesting > 5 && delay < 4) delay = 4;
     refs++;
-    schedule({ id, fn, args, delay, at: clock() + delay, ref: true, level: nesting + 1, interval: interval ? Math.max(1, delay) : 0 });
-    return nodeRole ? new Timeout(id) : id;
+    const handle = nodeRole ? new Timeout(id) : undefined;
+    schedule({ id, fn, args, delay, at: clock() + delay, ref: true, level: nesting + 1, interval: interval ? Math.max(1, delay) : 0, handle });
+    return handle ?? id;
   };
   globalThis.setTimeout = (fn, delay = 0, ...args) => start(fn, delay, args, false);
-  globalThis.clearTimeout = id => remove(+id);
+  globalThis.clearTimeout = id => { if (id instanceof Timeout) spent.delete(id); remove(+id); };
   globalThis.setInterval = (fn, delay = 0, ...args) => start(fn, delay, args, true);
   globalThis.clearInterval = clearTimeout;
   const task = fn => { refs++; schedule({ id: ++timerID, fn, args: [], delay: 0, at: clock(), ref: true, level: 0, interval: 0 }); };
@@ -179,7 +185,7 @@
     promise.then(() => { modulesPending--; }, error => { modulesPending--; moduleErrors.push(error); });
   };
   let children, servers, node, pty, browsers, net, nativeShell, uncaught = () => false;
-  const workers = globalThis.__appsWorkers(call, nodeRole, task, fail, pollWeb.blob, value => native('web.buffer.take', value));
+  const workers = globalThis.__appsWorkers(call, nodeRole, task, fail, pollWeb.blob, value => native('web.buffer.take', value), !disabled.has('jsExecute'));
   delete globalThis.__appsWorkers;
   globalThis.__appsBrowserEnvironment(call, task);
   delete globalThis.__appsBrowserEnvironment;
@@ -249,7 +255,7 @@
       const timer = pop();
       nesting = timer.level;
       if (timer.interval) { const interval = !nodeRole && timer.level > 5 && timer.interval < 4 ? 4 : timer.interval; schedule({ ...timer, interval, level: timer.level + 1, at: clock() + interval }); }
-      else remove(timer.id);
+      else { remove(timer.id); if (timer.handle) spent.set(timer.handle, timer); }
       try { timer.fn(...timer.args); } catch (error) { fail(error); } finally { nesting = 0; }
       runTicks();
       return -2;
@@ -453,7 +459,11 @@
     platform: info.platform, arch: info.arch, pid: info.pid, title: info.appName, type: info.node ? undefined : role === 'main' ? 'browser' : 'renderer',
     version: 'v' + nodeVersion, versions: Object.freeze({ node: nodeVersion, electron: electronVersion, apps: info.version, javascriptcore: info.javascriptcore, napi: '8' }), release: Object.freeze({ name: 'node' }),
     argv: [info.execPath ?? info.argv[0], ...info.argv.slice(1)], argv0: info.argv[0], execArgv: [], env, execPath: info.execPath, exitCode: undefined,
-    cwd: () => call('cwd'), chdir: path => call('chdir', path),
+    cwd: () => call('cwd'),
+    chdir: path => {
+      if (role !== 'main' || !workers.api.isMainThread) throw Object.assign(new TypeError(`process.chdir() is not supported in ${role === 'main' ? 'workers' : 'preload scripts'}`), { code: 'ERR_WORKER_UNSUPPORTED_OPERATION' });
+      call('chdir', path);
+    },
     nextTick: (fn, ...args) => { callable(fn, 'callback'); ticks.push([fn, args]); },
     exit, kill: (pid, signal = 'SIGTERM') => { call('process.kill', pid, signal); return true; },
     hrtime: previous => { const now = performance.now() * 1e6, value = [Math.floor(now / 1e9), Math.floor(now % 1e9)]; if (previous) { value[0] -= previous[0]; value[1] -= previous[1]; if (value[1] < 0) { value[0]--; value[1] += 1e9; } } return value; },

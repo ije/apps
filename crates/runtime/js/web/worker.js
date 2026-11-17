@@ -1,4 +1,4 @@
-globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take) => {
+globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take, jsExecute) => {
   const cryptoCodec = globalThis.__appsCryptoCodec, { decode: decodeBytes } = globalThis.__appsBytes;
   const stringify = JSON.stringify.bind(JSON), parse = JSON.parse.bind(JSON);
   delete globalThis.__appsCryptoCodec;
@@ -194,10 +194,13 @@ globalThis.__appsWorkers = (call, nativeAccess, task, fail, blobBytes, take) => 
       if (options.eval && nativeAccess) start(url);
       // A bundled worker starts at once, so that `threadId` is known. Its load error still comes as an event.
       else if (url.startsWith('apps:')) try { start(url, true); } catch (error) { Promise.resolve().then(() => failed(error)); }
-      else if (/^(?:data|blob):/.test(url)) Promise.resolve().then(async () => {
-        if (url.startsWith('blob:')) return start(await (await fetch(url)).text());
-        const comma = url.indexOf(','); start(url.slice(0, comma).endsWith(';base64') ? new TextDecoder().decode(Uint8Array.fromBase64(url.slice(comma + 1))) : decodeURIComponent(url.slice(comma + 1)));
-      }).catch(failed);
+      else if (/^(?:data|blob):/.test(url)) {
+        if (!nativeAccess && !jsExecute) throw new DOMException(`Workers from ${url.slice(0, url.indexOf(':'))} URLs need the jsExecute feature. Add "jsExecute" to "features" in package.json`, 'SecurityError');
+        Promise.resolve().then(async () => {
+          if (url.startsWith('blob:')) return start(await (await fetch(url)).text());
+          const comma = url.indexOf(','); start(url.slice(0, comma).endsWith(';base64') ? new TextDecoder().decode(Uint8Array.fromBase64(url.slice(comma + 1))) : decodeURIComponent(url.slice(comma + 1)));
+        }).catch(failed);
+      }
       else if (nativeAccess && !/^[a-z][a-z0-9+.-]+:/i.test(url.replace(/^file:/, ''))) start(__apps.fs.readFileSync(url.startsWith('file:') ? decodeURIComponent(new URL(url).pathname) : url, 'utf8'));
       else throw new DOMException('Workers can only load bundled or local scripts', 'SecurityError');
     }

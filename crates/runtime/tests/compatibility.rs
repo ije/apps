@@ -704,6 +704,92 @@ fn renderer_cannot_forge_native_worker_requests() {
 }
 
 #[test]
+fn page_workers_from_strings_need_js_execute() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().disabled = apps_runtime::bundle::feature_bit("jsExecute");
+    host.borrow_mut().pages.insert(
+        1,
+        Page {
+            doc: Document::parse("<body></body>"),
+            dirty: false,
+        },
+    );
+    let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    assert_eq!(page.eval("[`data:text/javascript,postMessage(1)`,URL.createObjectURL(new Blob(['postMessage(1)']))].map(url=>{try{new Worker(url);return 'started'}catch(e){return e.name}}).join()", "test").unwrap(), "SecurityError,SecurityError");
+}
+
+#[test]
+fn context_bridge_releases_collected_functions_and_rejects_taken_names() {
+    let (host, _main, preload) = contexts();
+    preload.eval("globalThis.errors=[];__apps.contextBridge.exposeInMainWorld('early',1);try{__apps.contextBridge.exposeInMainWorld('early',2)}catch(e){errors.push(e.message)}", "test").unwrap();
+    let page = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    page.eval("globalThis.released=[];const receive=__appsBridgeReceive;__appsBridgeReceive=message=>{if(message.kind==='release')released.push(...message.ids);return receive(message)};", "test").unwrap();
+    preload.eval(r#"
+        const {contextBridge} = __apps;
+        globalThis.ids = [];
+        const receive = __appsBridgeReceive;
+        __appsBridgeReceive = message => { if (message.kind === 'call') ids.push(...message.args.items.filter(item => item?.type === 'function').map(item => item.id)); return receive(message); };
+        contextBridge.exposeInMainWorld('api', { call: fn => fn(), keep: fn => { globalThis.kept = fn; } });
+        for (const name of ['api', 'fetch', 'document']) try { contextBridge.exposeInMainWorld(name, 1); } catch (error) { errors.push(error.message); }
+    "#, "test").unwrap();
+    assert_eq!(
+        preload.eval("errors.length+':'+errors.every(m=>m==='Cannot bind an API on top of an existing property on the window object')", "test").unwrap(),
+        "4:true"
+    );
+    page.eval(
+        "const same=()=>2;api.keep(same);api.call(same);for(let i=0;i<200;i++)api.call(()=>i)",
+        "test",
+    )
+    .unwrap();
+    for _ in 0..3 {
+        preload.collect_garbage();
+        preload.tick().unwrap();
+        page.tick().unwrap();
+    }
+    assert_eq!(
+        preload.eval("ids[1]===ids[0]", "test").unwrap(),
+        "true",
+        "A function sent twice keeps its id"
+    );
+    let released: usize = page
+        .eval("released.length", "test")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(released > 100, "{released}");
+    let kept = serde_json::to_string(&preload.eval("ids[0]", "test").unwrap()).unwrap();
+    let call = |id: &str| {
+        page.eval(&format!("(()=>{{try{{__appsBridgeReceive({{kind:'call',function:{id},sender:{{preload:1}},args:{{type:'array',id:0,items:[]}}}});return 'live'}}catch(e){{return e.message}}}})()"), "test").unwrap()
+    };
+    assert_eq!(call(&kept), "live", "A function with a live proxy stays");
+    assert!(call(&format!("released.find(id=>id!=={kept})")).contains("unavailable"));
+}
+
+#[test]
+fn node_timeout_refresh_restarts_a_fired_timer() {
+    run(r#"
+        const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+        let fired = 0;
+        const timer = setTimeout(() => fired++, 1);
+        await wait(20);
+        timer.refresh();
+        if (!timer.hasRef()) throw Error('Refreshed timer lost its ref');
+        await wait(20);
+        if (fired !== 2) throw Error('Refresh after firing did not restart: ' + fired);
+        timer.refresh(); clearTimeout(timer);
+        await wait(20);
+        if (fired !== 2) throw Error('Cleared timer ran');
+        timer.refresh();
+        await wait(20);
+        if (fired !== 2) throw Error('Refresh restarted a cleared timer');
+        let runs = 0;
+        const again = setTimeout(() => { if (++runs < 3) again.refresh(); }, 1);
+        await wait(40);
+        if (runs !== 3) throw Error('Refresh inside the callback failed: ' + runs);
+    "#);
+}
+
+#[test]
 fn workers_terminate_with_queued_messages() {
     run(r#"
         for(let n=0;n<4;n++){

@@ -213,6 +213,7 @@ pub struct Cache {
     graphs: RefCell<HashMap<(Realm, PathBuf), Graph>>,
     loaders: RefCell<Option<Rc<Loaders>>>,
     disabled: Cell<u32>,
+    env: RefCell<Value>,
     pub resolutions: RefCell<HashMap<(Realm, PathBuf, String, bool), Resolved>>,
 }
 
@@ -861,7 +862,8 @@ impl<'a> Linker<'a, '_> {
                             .all(|byte| byte.is_ascii_alphanumeric() || b"._-/".contains(&byte))
                             && !path.split('/').any(|part| part.is_empty() || part == "..")
                     })
-                    .unwrap_or_else(|| format!("page-{}.html", shared.pages.borrow().len()));
+                    // `~` can't be in an app path above, so this name is unique.
+                    .unwrap_or_else(|| format!("page~{}.html", shared.pages.borrow().len()));
                 shared
                     .pages
                     .borrow_mut()
@@ -893,6 +895,16 @@ impl<'a> Linker<'a, '_> {
 
     fn local_path(&mut self, expression: &Expression<'a>) -> Option<PathBuf> {
         let folder = self.folder.to_owned();
+        // A `?worker` stub module has the path of its worker file with the query.
+        let file = || {
+            self.path
+                .to_str()
+                .and_then(|path| {
+                    path.strip_suffix("?worker")
+                        .or_else(|| path.strip_suffix("?sharedworker"))
+                })
+                .map_or_else(|| self.path.to_owned(), PathBuf::from)
+        };
         let meta = |object: &Expression<'a>| {
             matches!(object.get_inner_expression(), Expression::ImportMeta(_))
         };
@@ -905,12 +917,12 @@ impl<'a> Linker<'a, '_> {
         };
         match expression.get_inner_expression() {
             Expression::Identifier(name) if self.global(name) => match name.name.as_str() {
-                "__filename" => Some(self.path.to_owned()),
+                "__filename" => Some(file()),
                 "__dirname" => Some(folder),
                 _ => None,
             },
             Expression::StaticMemberExpression(member) => match member.property.name.as_str() {
-                "url" | "filename" if meta(&member.object) => Some(self.path.to_owned()),
+                "url" | "filename" if meta(&member.object) => Some(file()),
                 "dirname" if meta(&member.object) => Some(folder),
                 "href" | "pathname" => self.local_path(&member.object),
                 _ => None,
@@ -1091,8 +1103,11 @@ impl<'a> VisitMut<'a> for Linker<'a, '_> {
                 && let Some(source) = arguments.first().and_then(Argument::as_expression)
                 && let Some(path) = self.local_path(source)
             {
-                let path = resolve_file(&path)
-                    .with_context(|| format!("Cannot find the worker {}", path.display()))?;
+                let path = resolve_file(
+                    &path,
+                    entry_fields(self.builder.realm == Realm::Renderer, false),
+                )
+                .with_context(|| format!("Cannot find the worker {}", path.display()))?;
                 self.cacheable = false;
                 let index = self.builder.script_chunk(path)?;
                 let value = self
@@ -1620,6 +1635,7 @@ impl Builder {
         specifier: &str,
         require: bool,
     ) -> Result<(PathBuf, Option<String>)> {
+        let fields = entry_fields(self.realm == Realm::Renderer, require);
         let builtin = |name: &str| {
             BUILTINS
                 .lines()
@@ -1728,7 +1744,7 @@ impl Builder {
         if specifier.starts_with('.') || Path::new(specifier).is_absolute() {
             let path = base.join(specifier);
             let package = in_packages(&path);
-            let path = resolve_file(&path)?;
+            let path = resolve_file(&path, fields)?;
             let root = path.parent().filter(|_| package).map(Path::to_owned);
             self.package_roots.extend(root.clone());
             if let Some(cache) = cache {
@@ -1761,7 +1777,7 @@ impl Builder {
                 let target = target.as_str()?;
                 let target =
                     star.map_or_else(|| target.to_owned(), |star| target.replace('*', star));
-                resolve_file(&config.base.join(target)).ok()
+                resolve_file(&config.base.join(target), fields).ok()
             })
         {
             self.shared.files.borrow_mut().insert(config.file.clone());
@@ -1867,25 +1883,18 @@ impl Builder {
         } else if key != "." {
             key
         } else {
-            // Node ignores `module`. Like esbuild, node realms prefer `main` and require() never uses `module`.
-            let fields: &[&str] = match (self.realm == Realm::Renderer, require) {
-                (true, true) => &["browser", "main"],
-                (true, false) => &["browser", "module", "main"],
-                (false, true) => &["main"],
-                (false, false) => &["main", "module"],
-            };
             fields
                 .iter()
                 .find_map(|field| {
                     metadata
                         .get(*field)
                         .and_then(Value::as_str)
-                        .filter(|entry| resolve_file(&directory.join(entry)).is_ok())
+                        .filter(|entry| resolve_file(&directory.join(entry), fields).is_ok())
                 })
                 .unwrap_or("index.js")
                 .to_owned()
         };
-        let target = resolve_file(&directory.join(entry))?;
+        let target = resolve_file(&directory.join(entry), fields)?;
         // Only package exports must stay inside their folder. App imports can reach symlinked packages.
         ensure!(
             imports || target.starts_with(&directory),
@@ -2208,7 +2217,9 @@ impl Builder {
             path: &path,
             folder,
             commonjs,
-            cacheable: stamp.is_some() && !path.extension().is_some_and(|e| e == "html"),
+            // CSS keeps no record of its `@import` and `url()` files, so it can't be cached.
+            cacheable: stamp.is_some()
+                && !path.extension().is_some_and(|e| e == "html" || e == "css"),
             imported: Vec::new(),
             required: Vec::new(),
             requires: Vec::new(),
@@ -2694,6 +2705,10 @@ pub fn compile(
         .ancestors()
         .map(|directory| directory.join("package.json"))
         .find(|path| path.is_file());
+    // Watch these even when the build fails below.
+    files
+        .borrow_mut()
+        .extend(manifest.iter().cloned().chain([entry.to_owned()]));
     let package = manifest.as_ref().map(fs::read_to_string).transpose()?;
     let metadata: Value =
         serde_json::from_str(package.as_deref().unwrap_or("{}")).context("Invalid package.json")?;
@@ -2714,8 +2729,11 @@ pub fn compile(
                 .as_str()
                 .filter(|value| !value.is_empty())
                 .context("package.json preload must be a non-empty string")?;
-            resolve_file(&manifest.as_ref().unwrap().parent().unwrap().join(value))
-                .context("Cannot resolve package.json preload")
+            resolve_file(
+                &manifest.as_ref().unwrap().parent().unwrap().join(value),
+                entry_fields(false, false),
+            )
+            .context("Cannot resolve package.json preload")
         })
         .transpose()?;
     let aliases = metadata
@@ -2822,6 +2840,7 @@ pub fn compile(
             }
         });
     }
+    let meta_env = meta_env(production, metadata.get("env"));
     if let Some(cache) = &cache {
         let previous = cache.loaders.replace(loaders.clone());
         // Loader or feature changes must invalidate cached modules.
@@ -2831,7 +2850,9 @@ pub fn compile(
                 .borrow_mut()
                 .retain(|(_, entry), _| entry.ends_with("package.json#loaders"));
         }
-        if cache.disabled.replace(disabled) != disabled {
+        // Cached modules inline `import.meta.env`.
+        if cache.disabled.replace(disabled) != disabled || *cache.env.borrow() != meta_env {
+            cache.env.replace(meta_env.clone());
             cache.graphs.borrow_mut().clear();
         }
     }
@@ -2840,7 +2861,7 @@ pub fn compile(
         aliases,
         preload,
         loaders,
-        meta_env: meta_env(production, metadata.get("env")),
+        meta_env,
         root,
         files,
         production,
@@ -3764,7 +3785,17 @@ fn native_specifier(path: &Path) -> Result<String> {
     ))
 }
 
-fn resolve_file(path: &Path) -> Result<PathBuf> {
+// Node ignores `module`. Like esbuild, node realms prefer `main` and require() never uses `module`.
+fn entry_fields(renderer: bool, require: bool) -> &'static [&'static str] {
+    match (renderer, require) {
+        (true, true) => &["browser", "main"],
+        (true, false) => &["browser", "module", "main"],
+        (false, true) => &["main"],
+        (false, false) => &["main", "module"],
+    }
+}
+
+fn resolve_file(path: &Path, fields: &[&str]) -> Result<PathBuf> {
     if path.is_file() {
         return Ok(path.canonicalize()?);
     }
@@ -3794,11 +3825,11 @@ fn resolve_file(path: &Path) -> Result<PathBuf> {
     if path.is_dir() {
         if let Ok(source) = fs::read_to_string(path.join("package.json"))
             && let Ok(metadata) = serde_json::from_str::<Value>(&source)
-            && let Some(entry) = ["module", "main"]
+            && let Some(entry) = fields
                 .iter()
-                .find_map(|key| metadata.get(key).and_then(Value::as_str))
+                .find_map(|key| metadata.get(*key).and_then(Value::as_str))
             && !matches!(entry.trim_end_matches('/'), "" | ".")
-            && let Ok(target) = resolve_file(&path.join(entry))
+            && let Ok(target) = resolve_file(&path.join(entry), fields)
         {
             return Ok(target);
         }

@@ -5454,3 +5454,89 @@ fn computed_times_resolve_math_like_chrome() {
         ["0.494s", "-0.182s", "1s"]
     );
 }
+
+#[test]
+fn registered_properties_in_var_cycles_are_unset() {
+    let doc = Document::parse(
+        "<style>@property --a{syntax:'<length>';inherits:true;initial-value:1px}@property --b{syntax:'<length>';inherits:false;initial-value:2px}#p{--a:5px;--b:6px}#c{--a:var(--b);--b:var(--a);--u:var(--v);--v:var(--u);width:var(--a);height:var(--b);min-width:var(--u,7px)}</style><div id=p><div id=c></div></div>",
+    );
+    assert_eq!(styles_of(&doc, "#c", "width").as_deref(), Some("5px"));
+    assert_eq!(styles_of(&doc, "#c", "height").as_deref(), Some("2px"));
+    assert_eq!(styles_of(&doc, "#c", "min-width").as_deref(), Some("7px"));
+}
+
+#[test]
+fn capitalize_follows_words_across_inline_text() {
+    let doc = Document::parse(
+        "<p style='text-transform:capitalize'>foo<b>bar</b> don't 3d x.y a-b _c<i> e</i>f</p>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let inline = inline_text(&doc, &computed, element(&doc, "p")).unwrap();
+    assert_eq!(&*inline.text, "Foobar Don't 3d X.y A-B _c Ef");
+    let mut text = "ab cd".to_owned();
+    text_transform(&mut text, 1..5, "capitalize");
+    assert_eq!(text, "ab Cd");
+}
+
+#[test]
+fn rewritten_style_text_drops_old_rules_from_the_scope() {
+    let rules = |step: usize| {
+        (0..200)
+            .map(|index| format!(".c{index}{{width:{}px}}", index + step))
+            .collect::<String>()
+    };
+    let mut doc = Document::parse(&format!(
+        "<html><head><style id=s>{}</style></head><body><p class=c5 id=p>a</p></body></html>",
+        rules(0)
+    ));
+    let style = element(&doc, "#s");
+    let text = doc.nodes[style].children[0];
+    let (mut sheets, mut cache) = (HashMap::new(), StyleCache::default());
+    compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+    cache.finish();
+    let live = cache.scopes[0].rules.len();
+    let mut ids = vec![cache.scopes[0].id];
+    for step in 1..40 {
+        doc.nodes[text].text = rules(step);
+        let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+        cache.finish();
+        let fresh = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut HashMap::new(),
+            &mut StyleCache::default(),
+            None,
+        );
+        assert_eq!(cached.values, fresh.values, "{step}");
+        let width = format!("{}px", 5 + step);
+        assert_eq!(
+            cached.values[element(&doc, "#p")].get(Prop::WIDTH),
+            Some(width.as_str())
+        );
+        let scope = cache.scopes.last().unwrap();
+        assert!(scope.rules.len() <= live * 2 + 200, "{step}");
+        let deleted =
+            |entry: &usize| *entry < PSEUDO && scope.rules[entry >> SELECTOR].2.origin == DELETED;
+        assert!(
+            !scope
+                .buckets
+                .iter()
+                .flat_map(|bucket| bucket.values().flatten())
+                .any(deleted)
+        );
+        ids.push(scope.id);
+    }
+    ids.dedup();
+    // Most rewrites update the scope in place, and some build it again.
+    assert!(ids.len() > 1 && ids.len() < 30, "{ids:?}");
+}

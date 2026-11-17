@@ -7,7 +7,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   const send=(target,message)=>call('bridge.dispatch',target,message);
   const uncloneable=()=>{throw new Error('An object could not be cloned.');};
   const jsonEncoder=new TextEncoder(),jsonDecoder=new TextDecoder();
-  const capability=(action,target,once)=>{const id=random();functions.set(id,{action,recipient:peer(target),persistent:!once,once});return id;};
+  const capability=(action,target,once)=>{const id=random();functions.set(id,{action,recipient:peer(target),persistent:!once,once,count:1});return id;};
   // Use JSON only for lossless data: finite numbers except -0, no undefined or holes, plain prototypes and no
   // repeated objects.
   let floats=false;
@@ -30,7 +30,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
       if(plain(value,new Set())){const text=JSON.stringify(value);return floats||text.length>4096?{type:'json',value:jsonEncoder.encode(text)}:{type:'json',value};}
     }
     const next=v=>encode(v,target,strict,persistent,seen);
-    if(typeof value==='function'){if(strict)uncloneable();const recipient=peer(target);if(!recipient)throw new TypeError('Invalid bridge target');let ids=functionIds.get(value);if(!ids){ids=new Map();functionIds.set(value,ids);}let id=ids.get(recipient);if(!functions.has(id)){id=random();functions.set(id,{action:value,recipient,persistent});ids.set(recipient,id);}else if(persistent)functions.get(id).persistent=true;return{type:'function',id};}
+    if(typeof value==='function'){if(strict)uncloneable();const recipient=peer(target);if(!recipient)throw new TypeError('Invalid bridge target');let ids=functionIds.get(value);if(!ids){ids=new Map();functionIds.set(value,ids);}let id=ids.get(recipient),entry=functions.get(id);if(!entry){id=random();functions.set(id,entry={action:value,recipient,persistent,count:0});ids.set(recipient,id);}else if(persistent)entry.persistent=true;entry.count++;return{type:'function',id};}
     if(value===undefined)return{type:'undefined'};
     if(typeof value==='bigint')return{type:'bigint',value:String(value)};
     if(typeof value==='number'&&!Number.isSafeInteger(value)||Object.is(value,-0))return{type:'number',value:Object.is(value,-0)?'-0':String(value)};
@@ -52,8 +52,12 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     if(Array.isArray(value)){const items=[];for(let i=0;i<value.length;i++)items.push(i in value?next(value[i]):null);return{type:'array',id,items};}
     return{type:'object',id,items:Object.fromEntries(Object.entries(value).map(([k,v])=>[k,next(v)]))};
   };
+  // Each encode of a function counts one proxy on the other side. The proxy sends a release when it is collected,
+  // and the owner drops the function when no proxy is left.
+  const releases=new Map(),flushReleases=()=>{for(const[target,ids]of releases.values())try{send(target,{kind:'release',ids});}catch{}releases.clear();};
+  const proxies=new __appsFinalizers(([target,id])=>{const key=peer(target);if(!releases.size)queueMicrotask(flushReleases);if(releases.has(key))releases.get(key)[1].push(id);else releases.set(key,[target,[id]]);});
   const decode=(value,target,seen=new Map())=>{
-    if(value.type==='function')return(...args)=>rpc(target,{kind:'call',function:value.id,args:encode(args,target,false)});
+    if(value.type==='function'){const proxy=(...args)=>rpc(target,{kind:'call',function:value.id,args:encode(args,target,false)});proxies.register(proxy,[target,value.id]);return proxy;}
     if(value.type==='undefined')return undefined;
     if(value.type==='bigint')return BigInt(value.value);
     if(value.type==='number')return Number(value.value);
@@ -76,8 +80,9 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     return result;
   };
   const answer=(response,target)=>{if(response?.thrown)throw decode(response.thrown,target);return decode(response.immediate,target);};
+  let lastCall=0;
   const rpc=(target,message)=>{
-    const id=random();let resolve,reject;
+    const id=++lastCall;let resolve,reject;
     const promise=new Promise((a,b)=>{resolve=a;reject=b;});
     pending.set(id,{resolve,reject,recipient:peer(target)});
     let response;
@@ -121,7 +126,8 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     if(message.kind==='reply'){if(queue.length)enqueue(()=>settle(message));else settle(message);return null;}
     if(message.kind==='event'){if(emitter)enqueue(message);return null;}
     if(message.kind==='sync'){drain();const eventObject=event(message.sender);try{emit(message.channel,eventObject,...decode(message.args,message.sender));}catch(error){report(error);}return encode(eventObject.returnValue,message.sender);}
-    if(message.kind==='expose'){__appsSyncBridge();return null;}
+    if(message.kind==='expose'){if(message.name!==undefined)return message.name in globalThis;__appsSyncBridge();return null;}
+    if(message.kind==='release'){const recipient=peer(message.sender);for(const id of message.ids){const entry=functions.get(id);if(entry?.recipient===recipient&&!entry.persistent&&--entry.count<=0)functions.delete(id);}return null;}
     if(message.kind==='dom'){
       if(typeof role!=='object'||!('renderer'in role)||message.sender?.preload!==role.renderer)throw new Error('DOM access is only available to the preload');
       try{const[op,ref,key,value]=decode(message.args,message.sender),object=ref?refs.get(ref):globalThis.document;if(op==='release'){for(const id of value){refIds.delete(refs.get(id));refs.delete(id);}return{immediate:encode(undefined,message.sender)};}if(!object)throw new Error('Unknown DOM object');return{immediate:encode(op==='set'?void(object[key]=value):out(op==='call'?object[key](...value):object[key]),message.sender)};}
@@ -149,7 +155,13 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
   };
   const preload=typeof role==='object'&&'preload'in role,page={renderer:role?.preload};
   if(preload)globalThis.__appsPublishPreload=value=>{call('bridge.preload',encode(value,page,false,true));try{send(page,{kind:'expose'});}catch{}};
-  const contextBridge={exposeInMainWorld(name,value){if(!preload)throw new Error('contextBridge requires a preload context');call('bridge.expose',String(name),encode(value,page,false,true));try{send(page,{kind:'expose'});}catch{}}};
+  const contextBridge={exposeInMainWorld(name,value){
+    if(!preload)throw new Error('contextBridge requires a preload context');
+    name=String(name);let taken=false;
+    try{taken=send(page,{kind:'expose',name});}catch{}
+    if(taken)throw new Error('Cannot bind an API on top of an existing property on the window object');
+    call('bridge.expose',name,encode(value,page,false,true));try{send(page,{kind:'expose'});}catch{}
+  }};
   const ipcMain=emitter;
   if(role==='main')Object.assign(ipcMain,{handle(channel,fn){if(handlers.has(channel))throw new Error(`Attempted to register a second handler for '${channel}'`);handlers.set(channel,fn);},handleOnce(channel,fn){this.handle(channel,(...args)=>{handlers.delete(channel);return fn(...args);});},removeHandler:channel=>handlers.delete(channel)});
   const ipcRenderer=emitter;

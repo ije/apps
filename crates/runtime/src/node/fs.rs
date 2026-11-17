@@ -149,14 +149,14 @@ fn open_options(flag: &Value, fallback: &str, mode: &Value) -> Result<OpenOption
 }
 
 #[derive(Default)]
-pub(super) struct Files(Mutex<(u64, HashMap<u64, Arc<File>>)>);
+pub(super) struct Files(Mutex<HashMap<u64, Arc<File>>>);
 
 impl Files {
     fn file(&self, id: &Value) -> Result<Arc<File>> {
         let id = id.as_u64().context("Expected descriptor")?;
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut files = self.0.lock().unwrap();
-        if let Some(file) = files.1.get(&id) {
+        if let Some(file) = files.get(&id) {
             return Ok(file.clone());
         }
         #[cfg(unix)]
@@ -165,7 +165,7 @@ impl Files {
             let copy = unsafe { libc::fcntl(id as libc::c_int, libc::F_DUPFD_CLOEXEC, 64) };
             if copy >= 0 {
                 let file = Arc::new(unsafe { File::from_raw_fd(copy) });
-                files.1.insert(id, file.clone());
+                files.insert(id, file.clone());
                 return Ok(file);
             }
         }
@@ -547,15 +547,17 @@ impl Files {
             }
             "open" => {
                 let file = Arc::new(open_options(&args[1], "r", &args[2])?.open(path()?)?);
-                let mut files = self.0.lock().unwrap();
-                files.0 = files.0.max(FIRST_HANDLE) + 1;
-                let id = files.0;
-                files.1.insert(id, file);
+                // Each context has its own table, so handles are unique in the process:
+                // a handle from another context fails with EBADF, not with another file.
+                static NEXT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(FIRST_HANDLE);
+                let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.0.lock().unwrap().insert(id, file);
                 Ok(json!(id))
             }
             "close" => {
                 let id = args[0].as_u64().context("Expected descriptor")?;
-                let removed = self.0.lock().unwrap().1.remove(&id).is_some();
+                let removed = self.0.lock().unwrap().remove(&id).is_some();
                 #[cfg(unix)]
                 let closed = id < FIRST_HANDLE && unsafe { libc::close(id as libc::c_int) } == 0;
                 #[cfg(not(unix))]

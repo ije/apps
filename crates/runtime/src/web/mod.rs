@@ -30,9 +30,10 @@ static ROOTS: OnceLock<Arc<NativeRoots>> = OnceLock::new();
 
 pub(crate) fn network() -> Result<&'static tokio::runtime::Runtime> {
     if NETWORK.get().is_none() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+        let mut builder = tokio::runtime::Builder::new_current_thread();
+        #[cfg(target_os = "macos")]
+        builder.on_thread_park(crate::malloc::flush);
+        let runtime = builder.enable_all().build()?;
         // A current-thread runtime runs its tasks and IO only while a thread waits in its `block_on`.
         if NETWORK.set(runtime).is_ok() {
             std::thread::Builder::new()

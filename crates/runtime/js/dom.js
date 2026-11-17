@@ -2514,7 +2514,7 @@
   }
   for (const [name, code] of [['fillStyle', 4], ['strokeStyle', 5], ['font', 6], ['textAlign', 7], ['textBaseline', 8], ['globalAlpha', 9], ['lineWidth', 10]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { get() { return this._state[name]; }, set(value) {
     if (code < 6 && (value instanceof CanvasGradient || value instanceof CanvasPattern)) { this._state[name] = value; const image = value._image; image?._context?._flush?.(); const text = value._spec(image === this.canvas ? -1 : image?._id); this._texts.push(text); this._op(code, text.length); if (image instanceof ImageBitmap) bitmapDraws.add(this); else if (image?._context && image !== this.canvas) this._flush(); return; }
-    if (code < 9) value = String(value); else if (value = Number(value), !(code === 9 ? value >= 0 && value <= 1 : value > 0 && value < Infinity)) return;
+    if (code === 6) { value = call('dom.canvasFont', 0, String(value)); if (value === null) return; } else if (code < 9) value = String(value); else if (value = Number(value), !(code === 9 ? value >= 0 && value <= 1 : value > 0 && value < Infinity)) return;
     if (code < 6 && !/currentcolor/i.test(value)) { const color = call('dom.canvasColor', 0, value); if (color === null) return; if (!/^\s*(oklch|oklab|lab|lch|color)\(/i.test(value)) value = color; }
     if (this._state[name] === value) return;
     this._state[name] = value; if (code < 9) { this._texts.push(alone(value)); this._op(code, value.length); } else this._op(code, value);

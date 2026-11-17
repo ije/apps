@@ -187,6 +187,72 @@ type Glyph = (renderer::Point<i32>, renderer::Size<i32>, Vec<u8>);
 
 type Path2D = (Vec<f64>, [f64; 6], Option<skia::Path>);
 
+// A `font` value as a canvas keeps it, like Chrome: the style, weight and small caps that are not normal, the size
+// in px and the families. `em` and `%` resolve against 10px, the default canvas font. `None` keeps the old font.
+pub fn font(value: &str) -> Option<String> {
+    let mut longhands = Vec::new();
+    crate::style::shorthand::expand("font", value.trim(), &mut longhands);
+    let get = |name: &str| {
+        longhands
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    let size = match get("font-size")? {
+        "xx-small" => 9.,
+        "x-small" => 10.,
+        "small" => 13.,
+        "medium" => 16.,
+        "large" => 18.,
+        "x-large" => 24.,
+        "xx-large" => 32.,
+        "xxx-large" => 48.,
+        "larger" => 12.,
+        "smaller" => 10. / 1.2,
+        size => crate::style::Lengths::new(10., 0., 0.)
+            .resolve(size, 10.)
+            .filter(|size| *size >= 0.)?,
+    };
+    let mut out = String::new();
+    if get("font-style")? == "italic" {
+        out.push_str("italic ");
+    }
+    match get("font-weight")? {
+        "normal" | "400" => {}
+        "bold" | "bolder" | "700" => out.push_str("bold "),
+        "lighter" => out.push_str("100 "),
+        weight => {
+            let weight = weight
+                .parse::<f32>()
+                .ok()
+                .filter(|w| (1. ..=1000.).contains(w))?;
+            crate::style::write_number(f64::from(weight), &mut out);
+            out.push(' ');
+        }
+    }
+    if get("font-variant")? == "small-caps" {
+        out.push_str("small-caps ");
+    }
+    crate::style::write_number(f64::from(size), &mut out);
+    out.push_str("px");
+    for (index, family) in crate::style::components(get("font-family")?, ',')
+        .into_iter()
+        .enumerate()
+    {
+        let family = family.trim().trim_matches(['"', '\'']);
+        if family.is_empty() || matches!(family, "inherit" | "initial" | "unset" | "default") {
+            return None;
+        }
+        out.push_str(if index == 0 { " " } else { ", " });
+        if family.contains(' ') {
+            out.push_str(&format!("\"{family}\""));
+        } else {
+            out.push_str(family);
+        }
+    }
+    Some(out)
+}
+
 pub fn line(
     system: &renderer::TextSystem,
     aliases: &std::collections::HashMap<String, String>,
@@ -284,7 +350,10 @@ fn gradient(spec: &str) -> Option<skia::Shader<'static>> {
         })
         .collect();
     let identity = skia::Transform::identity();
+    // tiny-skia paints a solid color for these, where the spec paints nothing.
     match shape[..] {
+        [x0, y0, x1, y1] if x0 == x1 && y0 == y1 => None,
+        [x0, y0, r0, x1, y1, r1] if x0 == x1 && y0 == y1 && r0 == r1 => None,
         [x0, y0, x1, y1] => skia::LinearGradient::new(
             (x0, y0).into(),
             (x1, y1).into(),
@@ -401,15 +470,23 @@ fn arc(
     [cx, cy, rx, ry, rotation, start, end, counter]: [f64; 8],
 ) {
     use std::f64::consts::{FRAC_PI_2, TAU};
+    // As Chrome's `AdjustEndAngle`: a sweep against the direction goes the other way around, and a sweep of
+    // a whole turn or more draws the whole circle.
     let sweep = end - start;
-    let sweep = if counter == 0. && sweep >= TAU {
-        TAU
-    } else if counter != 0. && sweep <= -TAU {
+    let sweep = if counter == 0. {
+        if sweep >= TAU {
+            TAU
+        } else if sweep < 0. {
+            TAU - -sweep % TAU
+        } else {
+            sweep
+        }
+    } else if sweep <= -TAU {
         -TAU
-    } else if counter != 0. {
-        sweep.rem_euclid(TAU) - TAU * f64::from(sweep.rem_euclid(TAU) > 0.)
+    } else if sweep > 0. {
+        sweep % TAU - TAU
     } else {
-        sweep.rem_euclid(TAU)
+        sweep
     };
     let (sin, cos) = rotation.sin_cos();
     let at = |x: f64, y: f64| {
@@ -753,6 +830,15 @@ impl Canvas {
             strings = rest;
             part
         };
+        // A call that draws nothing must not clear the canvas, so a covering mode puts the canvas back.
+        macro_rules! skip {
+            ($pixels:expr) => {{
+                if let Some(saved) = covered.take() {
+                    spare = Some(std::mem::replace(&mut $pixels, saved));
+                }
+                continue;
+            }};
+        }
         let identity = skia::Transform::identity();
         let mut sources = rustc_hash::FxHashMap::default();
         let [width, height] = [self.pixels.width(), self.pixels.height()];
@@ -924,7 +1010,10 @@ impl Canvas {
                     };
                     if code != 18. {
                         fill_area(&mut self.pixels, t, [a[0], a[1], a[2], a[3]], &paint, mask);
-                    } else if let Some(path) = shape.unwrap_or_else(|| self.path.clone().finish()) {
+                    } else {
+                        let Some(path) = shape.unwrap_or_else(|| self.path.clone().finish()) else {
+                            skip!(self.pixels)
+                        };
                         let rule = if a[0] == 1. {
                             skia::FillRule::EvenOdd
                         } else {
@@ -939,34 +1028,39 @@ impl Canvas {
                     } else {
                         quad(t, [a[0], a[1], a[2], a[3]])
                     };
-                    if let Some((linear, shift)) = stroke_space(t)
-                        && let Some(path) = path.and_then(|path| path.transform(linear.invert()?))
-                    {
-                        self.pixels.stroke_path(
-                            &path,
-                            &paint(&state.stroke, state.smoothing, state.alpha, blend, shift),
-                            &skia::Stroke {
-                                width: state.width,
-                                miter_limit: state.miter,
-                                line_cap: state.cap,
-                                line_join: state.join,
-                                dash: skia::StrokeDash::new(state.dash.clone(), state.dash_offset),
-                            },
-                            linear,
-                            strip(&state.stroke, state.clip.as_deref(), t, [width, height])
-                                .as_deref(),
-                        );
-                    }
+                    let Some((linear, shift)) = stroke_space(t) else {
+                        skip!(self.pixels)
+                    };
+                    let Some(path) = path.and_then(|path| path.transform(linear.invert()?)) else {
+                        skip!(self.pixels)
+                    };
+                    self.pixels.stroke_path(
+                        &path,
+                        &paint(&state.stroke, state.smoothing, state.alpha, blend, shift),
+                        &skia::Stroke {
+                            width: state.width,
+                            miter_limit: state.miter,
+                            line_cap: state.cap,
+                            line_join: state.join,
+                            dash: skia::StrokeDash::new(state.dash.clone(), state.dash_offset),
+                        },
+                        linear,
+                        strip(&state.stroke, state.clip.as_deref(), t, [width, height]).as_deref(),
+                    );
                 }
                 24 | 27 => {
                     let value = string(a[0]);
                     let Some((system, aliases)) =
                         fonts.filter(|_| a[1].is_finite() && a[2].is_finite())
                     else {
-                        continue;
+                        skip!(self.pixels)
                     };
                     let (line, [ascent, descent, em_ascent, em_descent]) =
                         line(system, aliases, &state.font, value, state.spacing);
+                    // As in Chrome, empty text draws nothing, while text outside the canvas still composites.
+                    if line.glyphs.is_empty() {
+                        skip!(self.pixels)
+                    }
                     let advance = f32::from(line.width);
                     let squeeze = if f64::from(advance) > a[3] + 1e-3 {
                         (a[3] / f64::from(advance)) as f32
@@ -988,7 +1082,7 @@ impl Canvas {
                         );
                     let scale = (t.sx * t.sy - t.kx * t.ky).abs().sqrt();
                     if !t.is_finite() || !scale.is_finite() || scale <= 1e-3 {
-                        continue;
+                        skip!(self.pixels)
                     }
                     // Cap glyph rasterization at 1024 pixels per em, then scale, to bound allocations.
                     let mut raster = scale.min(1024. / f32::from(line.font_size));
@@ -1027,7 +1121,7 @@ impl Canvas {
                     };
                     let Some(visible) = to_canvas.invert().and_then(|t| canvas?.transform(t))
                     else {
-                        continue;
+                        skip!(self.pixels)
                     };
                     if self.glyph_bytes > 4 << 20 {
                         self.glyphs.clear();
@@ -1093,12 +1187,7 @@ impl Canvas {
                         .then(|| skia::Pixmap::new((right - left) as u32, (bottom - top) as u32))
                         .flatten()
                     else {
-                        // A covering mode moved the canvas into `covered`, so it must be put back before
-                        // skipping.
-                        if let Some(saved) = covered.take() {
-                            spare = Some(std::mem::replace(&mut self.pixels, saved));
-                        }
-                        continue;
+                        skip!(self.pixels)
                     };
                     let stride = layer.width() as usize;
                     let out = layer.pixels_mut();
@@ -1224,11 +1313,7 @@ impl Canvas {
                     } else {
                         let key = (a[0] as usize, size);
                         let Some(fetched) = sources.entry(key).or_insert_with(|| image(key)) else {
-                            // No image is no draw, so a covering mode must not clear the canvas.
-                            if let Some(saved) = covered.take() {
-                                spare = Some(std::mem::replace(&mut self.pixels, saved));
-                            }
-                            continue;
+                            skip!(self.pixels)
                         };
                         &**fetched
                     };
@@ -1266,11 +1351,7 @@ impl Canvas {
                         state.clip.as_deref(),
                     );
                 }
-                25 => {
-                    if let Some(saved) = covered.take() {
-                        spare = Some(std::mem::replace(&mut self.pixels, saved));
-                    }
-                }
+                25 => skip!(self.pixels),
                 32 => {
                     state.cap = match string(a[0]) {
                         "round" => skia::LineCap::Round,
@@ -1467,9 +1548,23 @@ pub fn svg_options(text: bool, files: bool) -> usvg::Options<'static> {
         fontdb: fonts(text).0.clone(),
         ..Default::default()
     };
-    if !files {
-        options.image_href_resolver.resolve_string = Box::new(|_, _| None);
-    }
+    options.image_href_resolver.resolve_string = if files {
+        // The runtime names the `data:` URLs of CSS images by `super::image::data_file()`.
+        let file = usvg::ImageHrefResolver::default_string_resolver();
+        Box::new(move |href, options| {
+            if !href.starts_with(super::image::DATA_PREFIX) {
+                return file(href, options);
+            }
+            let bytes = super::image::read(std::path::Path::new(href)).ok()?;
+            (usvg::ImageHrefResolver::default_data_resolver())(
+                "text/plain",
+                Arc::new(bytes),
+                options,
+            )
+        })
+    } else {
+        Box::new(|_, _| None)
+    };
     options
 }
 
@@ -1714,6 +1809,87 @@ mod tests {
         );
         let [left, right] = [pixel(&canvas, 2, 5), pixel(&canvas, 97, 5)];
         assert!(left[0] > 240 && left[2] < 15 && right[2] > 240 && right[0] < 15);
+    }
+
+    #[test]
+    fn whole_turn_arcs_against_their_direction_draw_a_circle() {
+        use std::f64::consts::TAU;
+        for [start, end, counter] in [[0., TAU, 1.], [TAU, 0., 0.], [0., 3. * TAU, 1.]] {
+            let mut canvas = Canvas::new(40, 40).unwrap();
+            draw(
+                &mut canvas,
+                &[11., 28., 20., 20., 15., start, end, counter, 18., 0.],
+                "",
+            );
+            assert_eq!(pixel(&canvas, 20, 20), [0, 0, 0, 255], "{start} {end}");
+        }
+        // A sweep against the direction goes the other way around: here three quarters of the circle.
+        let mut canvas = Canvas::new(40, 40).unwrap();
+        draw(
+            &mut canvas,
+            &[11., 28., 20., 20., 15., 0., TAU / 4., 1., 18., 0.],
+            "",
+        );
+        assert_eq!(pixel(&canvas, 10, 10)[3], 255);
+        assert_eq!(pixel(&canvas, 30, 30)[3], 0);
+    }
+
+    #[test]
+    fn gradients_with_equal_points_or_circles_paint_nothing() {
+        for shape in [vec![10, 5, 10, 5], vec![20, 20, 10, 20, 20, 10]] {
+            let spec = format!(
+                "gradient:{}",
+                serde_json::json!([shape, [[0, "#ff0000"], [1, "#0000ff"]]])
+            );
+            let mut canvas = Canvas::new(40, 40).unwrap();
+            draw(
+                &mut canvas,
+                &[4., spec.len() as f64, 21., 0., 0., 40., 40.],
+                &spec,
+            );
+            assert_eq!(pixel(&canvas, 20, 20)[3], 0, "{shape:?}");
+        }
+    }
+
+    #[test]
+    fn canvas_fonts_resolve_like_chrome_and_reject_bad_values() {
+        for (value, font_value) in [
+            ("12pt Arial", Some("16px Arial")),
+            ("1.5em serif", Some("15px serif")),
+            ("150% serif", Some("15px serif")),
+            ("large sans-serif", Some("18px sans-serif")),
+            ("bold 16px/20px Arial", Some("bold 16px Arial")),
+            (
+                "italic 600 10px a, 'Times New Roman'",
+                Some("italic 600 10px a, \"Times New Roman\""),
+            ),
+            ("16px", None),
+            ("bogus", None),
+            ("foo Arial", None),
+            ("-1px Arial", None),
+            ("inherit", None),
+        ] {
+            assert_eq!(font(value).as_deref(), font_value, "{value}");
+        }
+    }
+
+    #[test]
+    fn calls_that_draw_nothing_keep_the_canvas_in_covering_modes() {
+        let system = renderer::TextSystem::new();
+        let aliases = std::collections::HashMap::new();
+        for tail in [
+            &[11., 19.][..],
+            &[11., 18., 0.],
+            &[24., 0., 5., 5., f64::INFINITY],
+        ] {
+            let mut canvas = Canvas::new(10, 10).unwrap();
+            let mut ops = vec![21., 0., 0., 10., 10., 37., 4.];
+            ops.extend(tail);
+            canvas
+                .draw(&ops, "copy", &[], &|_| None, Some((&system, &aliases)))
+                .unwrap();
+            assert_eq!(pixel(&canvas, 5, 5)[3], 255, "{tail:?}");
+        }
     }
 
     #[test]

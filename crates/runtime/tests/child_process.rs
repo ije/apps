@@ -465,3 +465,48 @@ fn child_process_options_stdio_and_sync_errors() {
         assert(limit.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' && limit.message === 'stdout maxBuffer length exceeded' && output === '12', 'maxBuffer truncates');
     "#);
 }
+
+#[test]
+fn preloads_cannot_change_the_process_cwd() {
+    run(r#"
+        try { process.chdir('/'); } catch (error) { if (error.code === 'ERR_WORKER_UNSUPPORTED_OPERATION') return; throw error; }
+        throw Error('chdir worked in a preload');
+    "#);
+}
+
+#[cfg(unix)]
+#[test]
+fn detached_children_get_signals_alone_and_are_reaped() {
+    run(r#"
+        const { spawn } = __apps.child_process, { once } = __apps.events;
+        const child = spawn('/bin/sh', ['-c', 'sleep 30 & echo $!; wait'], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+        const [line] = await once(child.stdout, 'data');
+        const grandchild = Number(String(line).trim());
+        child.kill();
+        await once(child, 'exit');
+        let alive = true;
+        try { process.kill(grandchild, 0); } catch { alive = false; }
+        process.kill(grandchild, 'SIGKILL');
+        if (!alive) throw Error('kill() signaled the whole process group');
+    "#);
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        Rc::new(RefCell::new(Host::default())),
+        Role::Main,
+    )
+    .unwrap();
+    let pid: libc::pid_t = engine
+        .eval(
+            "const child = __apps.child_process.spawn('/bin/sleep', ['0.05'], { stdio: 'ignore', detached: true }); child.unref(); child.pid",
+            "detached-reap",
+        )
+        .unwrap()
+        .parse()
+        .unwrap();
+    drop(engine);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        assert!(Instant::now() < deadline, "Detached child stayed a zombie");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

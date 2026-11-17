@@ -479,7 +479,7 @@ pub struct Window {
     pub(crate) zoom: f32,
     native: (Size<Pixels>, f32),
     tree: Option<Tree>,
-    scene: Scene,
+    pub(crate) scene: Scene,
     // `pending` is being built; `live` is on screen and takes the input.
     pending: Input,
     live: Input,
@@ -1056,7 +1056,7 @@ impl Window {
             tree.bury();
         }
         self.text_system.end_frame();
-        self.platform.atlas().finish_frame();
+        self.platform.atlas().finish_frame(&self.scene);
         let last = captures.len().wrapping_sub(1);
         for (index, capture) in captures.into_iter().enumerate() {
             let result = match &mut frame {

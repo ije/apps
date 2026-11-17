@@ -670,8 +670,8 @@ impl Renderer {
         }
     }
 
-    pub fn release(&mut self) {
-        self.atlas.release_images();
+    pub fn release(&mut self, scene: &crate::Scene) {
+        self.atlas.release_images(scene);
         // An empty command buffer waits for earlier frames on the same queue.
         self.atlas.free_retired(|| {
             if let Some(commands) = self.queue.commandBuffer() {

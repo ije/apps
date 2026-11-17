@@ -155,16 +155,29 @@ pub(crate) fn text_transform(text: &mut String, range: std::ops::Range<usize>, m
     let Some(source) = text.get(range.clone()) else {
         return;
     };
-    let mut word = true;
+    let mut last = text[..range.start].chars().rev();
+    let (mut prev, mut before) = (last.next().unwrap_or(' '), last.next().unwrap_or(' '));
     let mapped: String = source
         .chars()
         .map(|c| {
-            let mapped = case(c, mode, word);
-            word = !c.is_alphanumeric();
+            let mapped = case(c, mode, starts_word(before, prev, c));
+            (before, prev) = (prev, c);
             mapped
         })
         .collect();
     text.replace_range(range, &mapped);
+}
+
+// Like the ICU word breaks of Chrome: letters, digits and `_` join, and so does an apostrophe or a period between two letters or two digits.
+fn starts_word(before: char, prev: char, c: char) -> bool {
+    !(prev.is_alphanumeric()
+        || prev == '_'
+        || matches!(prev, '\'' | '\u{2019}' | '.' | ':' | '\u{b7}')
+            && before.is_alphabetic()
+            && c.is_alphabetic()
+        || matches!(prev, '\'' | '\u{2019}' | '.' | ',' | ';')
+            && before.is_numeric()
+            && c.is_numeric())
 }
 
 // Only mappings to one char of the same UTF-8 length apply, so text ranges stay valid.
@@ -991,18 +1004,20 @@ pub(crate) fn inline_text(
             // Like Chromium, small caps are capitals at 70% of the size, where the letter was lowercase.
             let caps = style.get(Prop::FONT_VARIANT) == Some("small-caps");
             let mut lowered: Vec<std::ops::Range<usize>> = Vec::new();
-            let mut word = true;
+            let mut last = text.chars().rev();
+            let (mut prev, mut before) = (last.next().unwrap_or(' '), last.next().unwrap_or(' '));
             text.reserve(node_text.len());
             for c in node_text.chars() {
                 if c.is_ascii_whitespace() && !preserve && !(c == '\n' && mode == "pre-line") {
                     if !space {
                         text.push(' ');
+                        (before, prev) = (prev, ' ');
                     }
                     space = true;
-                    word = true;
                     continue;
                 }
-                let c = case(c, transform, word);
+                let c = case(c, transform, starts_word(before, prev, c));
+                (before, prev) = (prev, c);
                 let c = match c.to_uppercase().next() {
                     Some(upper) if caps && c.is_lowercase() && upper.len_utf8() == c.len_utf8() => {
                         match lowered.last_mut() {
@@ -1015,7 +1030,6 @@ pub(crate) fn inline_text(
                 };
                 text.push(c);
                 space = c == '\n';
-                word = !c.is_alphanumeric();
             }
             if text.len() > start {
                 let mut run = match own_style {

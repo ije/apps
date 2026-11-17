@@ -229,13 +229,33 @@ pub(crate) fn blocking(job: impl FnOnce() + Send + 'static) -> std::io::Result<(
                 let mut pool = POOL
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut busy = false;
                 loop {
                     if let Some(job) = pool.jobs.pop_front() {
                         drop(pool);
                         job();
+                        busy = true;
                         pool = POOL
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    } else if busy {
+                        pool.idle += 1;
+                        let (next, wait) = READY
+                            .wait_timeout(pool, std::time::Duration::from_secs(1))
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        pool = next;
+                        pool.idle -= 1;
+                        if wait.timed_out() {
+                            busy = false;
+                            #[cfg(target_os = "macos")]
+                            {
+                                drop(pool);
+                                crate::malloc::flush();
+                                pool = POOL
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            }
+                        }
                     } else {
                         pool.idle += 1;
                         pool = READY
@@ -467,7 +487,11 @@ impl State {
                         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
                             return Err(std::io::Error::last_os_error().into());
                         }
-                        unsafe { libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK) };
+                        unsafe {
+                            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+                            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+                            libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
+                        }
                         std::thread::Builder::new()
                             .name("apps-signal".into())
                             .spawn(move || {
@@ -482,7 +506,9 @@ impl State {
                                                     .is_ok();
                                                 wake.wake();
                                                 open
-                                            })
+                                            });
+                                            #[cfg(target_os = "macos")]
+                                            crate::malloc::flush();
                                         }
                                         _ => {}
                                     }

@@ -1,6 +1,6 @@
-use crate::{Rect, Size, text::GlyphRaster};
+use crate::{Rect, Scene, Size, text::GlyphRaster};
 use anyhow::{Context, Result};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
@@ -63,6 +63,9 @@ struct Entry {
 // A tile at the place of a freed one: (color page, page, texels).
 pub(crate) type Fresh = (bool, u32, Rect<i32>);
 
+// The area that freed tiles held on each page, with the frame of the last free there.
+type Freed = FxHashMap<(bool, u32), (Rect<i32>, u32)>;
+
 pub(crate) struct Atlas<B> {
     tiles: RefCell<FxHashMap<TileKey, Entry>>,
     retired: RefCell<Vec<(u32, Tile)>>,
@@ -70,9 +73,8 @@ pub(crate) struct Atlas<B> {
     glyph_pixels: Cell<usize>,
     swept: Cell<u32>,
     pub(crate) pages: RefCell<B>,
-    // The area of each page that freed tiles held, and the new tiles there since `take_fresh`. `None`
-    // when all pages changed.
-    freed: RefCell<FxHashMap<(bool, u32), Rect<i32>>>,
+    // The freed areas, and the new tiles there since `take_fresh`. `None` when all pages changed.
+    freed: RefCell<Freed>,
     fresh: RefCell<Option<Vec<Fresh>>>,
     // Tiles that a copy of the last paint can read were freed.
     evicted: Cell<bool>,
@@ -113,8 +115,8 @@ impl<B: PageStore> Atlas<B> {
     fn free(&self, pages: &mut B, tile: Tile) {
         let key = (matches!(tile.kind, PageKind::Color), tile.page);
         let mut freed = self.freed.borrow_mut();
-        let area = freed.entry(key).or_insert(tile.rect);
-        *area = area.union(tile.rect);
+        let (area, at) = freed.entry(key).or_insert((tile.rect, 0));
+        (*area, *at) = (area.union(tile.rect), self.frame.get());
         pages.remove(tile);
     }
 
@@ -149,7 +151,7 @@ impl<B: PageStore> Atlas<B> {
                 if let Some(tile) = tile {
                     let key = (matches!(kind, PageKind::Color), tile.page);
                     if (self.freed.borrow().get(&key))
-                        .is_some_and(|area| area.intersects(tile.rect))
+                        .is_some_and(|(area, _)| area.intersects(tile.rect))
                         && let Some(fresh) = self.fresh.borrow_mut().as_mut()
                     {
                         fresh.push((key.0, key.1, tile.rect));
@@ -184,7 +186,8 @@ impl<B: PageStore> Atlas<B> {
         }
     }
 
-    pub fn finish_frame(&self) {
+    // `scene` is the scene of this frame, which the next paint copies spans from.
+    pub fn finish_frame(&self, scene: &Scene) {
         let frame = self.frame.replace(self.frame.get().wrapping_add(1));
         let mut retired = self.retired.borrow_mut();
         if !retired.is_empty() {
@@ -197,23 +200,54 @@ impl<B: PageStore> Atlas<B> {
                 keep
             });
         }
-        drop(retired);
+        // Freed places matter while the window or cached layers can still show their old pixels.
+        let mut freed = self.freed.borrow_mut();
+        if !freed.is_empty() {
+            let now = self.frame.get();
+            freed.retain(|_, (_, at)| now.wrapping_sub(*at) < MAX_AGE);
+        }
+        drop(freed);
         let mut glyph_pixels = self.glyph_pixels.get();
         // Glyphs used in the last frames stay, so a sweep that frees too little isn't repeated at once.
         if glyph_pixels <= MAX_GLYPH_PIXELS || frame.wrapping_sub(self.swept.get()) < MAX_AGE / 4 {
             return;
         }
         self.swept.set(frame);
-        let mut pages = self.pages.borrow_mut();
-        self.tiles.borrow_mut().retain(|key, entry| {
-            if !matches!(key, TileKey::Glyph(_)) || frame.wrapping_sub(entry.used.get()) < MAX_AGE {
+        let mut tiles = self.tiles.borrow_mut();
+        let old = |key: &TileKey, entry: &Entry| {
+            matches!(key, TileKey::Glyph(_)) && frame.wrapping_sub(entry.used.get()) >= MAX_AGE
+        };
+        // Glyph instances read whole tiles, so a tile origin finds them. Copied spans read tiles without
+        // asking the atlas, so the scene keeps its tiles.
+        let place = |tile: Tile| {
+            (
+                matches!(tile.kind, PageKind::Color),
+                tile.page,
+                tile.rect.origin,
+            )
+        };
+        let mut unread: FxHashSet<_> = (tiles.iter())
+            .filter(|(key, entry)| old(key, entry))
+            .filter_map(|(_, entry)| entry.tile.map(place))
+            .collect();
+        if !unread.is_empty() {
+            for (color, page, texels) in scene.texels() {
+                unread.remove(&(color, page, texels.origin.map(|value| value as i32)));
+            }
+        }
+        tiles.retain(|key, entry| {
+            if !old(key, entry) {
                 return true;
             }
-            if let Some(tile) = entry.tile {
-                glyph_pixels -= pixels(&tile);
-                self.free(&mut pages, tile);
-                self.evicted.set(true);
+            let Some(tile) = entry.tile else {
+                return false;
+            };
+            if !unread.contains(&place(tile)) {
+                entry.used.set(frame);
+                return true;
             }
+            glyph_pixels -= pixels(&tile);
+            retired.push((frame, tile));
             false
         });
         self.glyph_pixels.set(glyph_pixels);
@@ -232,17 +266,39 @@ impl<B: PageStore> Atlas<B> {
         }
     }
 
-    // The scene still reads the tiles of the last frame, so they must stay.
+    // The tiles of the last frame and of `scene`, whose spans the next paint can copy, must stay.
     #[cfg(target_os = "macos")]
-    pub fn release_images(&self) {
+    pub fn release_images(&self, scene: &Scene) {
         let frame = self.frame.get();
+        let mut tiles = self.tiles.borrow_mut();
+        let old = |key: &TileKey, entry: &Entry| {
+            matches!(key, TileKey::Image(_)) && frame.wrapping_sub(entry.used.get()) > 1
+        };
+        // Images can draw a part of their tile.
+        let mut unread: Vec<_> = (tiles.iter())
+            .filter(|(key, entry)| old(key, entry))
+            .filter_map(|(_, entry)| entry.tile)
+            .map(|tile| (tile.page, tile.rect))
+            .collect();
+        for (color, page, texels) in scene.texels() {
+            if unread.is_empty() {
+                break;
+            }
+            let texels = texels.map(|value| value as i32);
+            unread.retain(|&(at, rect)| !color || at != page || !rect.intersects(texels));
+        }
         let mut retired = self.retired.borrow_mut();
-        self.tiles.borrow_mut().retain(|key, entry| {
-            if !matches!(key, TileKey::Image(_)) || frame.wrapping_sub(entry.used.get()) <= 1 {
+        tiles.retain(|key, entry| {
+            if !old(key, entry) {
                 return true;
             }
-            retired.extend(entry.tile.map(|tile| (frame, tile)));
-            self.evicted.set(true);
+            let Some(tile) = entry.tile else {
+                return false;
+            };
+            if !unread.contains(&(tile.page, tile.rect)) {
+                return true;
+            }
+            retired.push((frame, tile));
             false
         });
     }
@@ -398,6 +454,7 @@ impl Packer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::{GLYPH, IMAGE, Instance};
 
     #[derive(Default)]
     struct Fake {
@@ -458,9 +515,9 @@ mod tests {
             assert_eq!(*page, Size::new(width, height));
         }
         atlas.remove(&TileKey::Image(1));
-        atlas.finish_frame();
-        atlas.finish_frame();
-        atlas.finish_frame();
+        atlas.finish_frame(&Scene::default());
+        atlas.finish_frame(&Scene::default());
+        atlas.finish_frame(&Scene::default());
         let backend = atlas.pages.borrow();
         assert!(backend.list.is_empty(big.page as usize));
     }
@@ -477,10 +534,10 @@ mod tests {
         };
         insert(1);
         insert(2);
-        atlas.finish_frame();
+        atlas.finish_frame(&Scene::default());
         let shown = insert(2);
-        atlas.finish_frame();
-        atlas.release_images();
+        atlas.finish_frame(&Scene::default());
+        atlas.release_images(&Scene::default());
         atlas.free_retired(|| {});
         let freed = &atlas.pages.borrow().freed;
         assert_eq!(freed.len(), 1);
@@ -501,7 +558,7 @@ mod tests {
                 .unwrap()
                 .0;
             inserted.push(tile);
-            atlas.finish_frame();
+            atlas.finish_frame(&Scene::default());
             let backend = atlas.pages.borrow();
             assert!(backend.freed.len() as u64 <= frame.saturating_sub(IN_FLIGHT as u64));
             let key = |tile: &Tile| (tile.page, tile.id, tile.rect);
@@ -523,6 +580,104 @@ mod tests {
         assert_eq!(*texture, Size::new(1024, 1024));
     }
 
+    fn sprite(kind: u32, tile: Tile) -> Instance {
+        Instance {
+            rect: [0., 0., 10., 10.],
+            clip: [0., 0., 100., 100.],
+            aux: tile.rect.map(|value| value as f32).to_array(),
+            info: [kind as f32, 0., 1., tile.page as f32],
+            ..Default::default()
+        }
+    }
+
+    fn glyph(id: u16) -> TileKey {
+        TileKey::Glyph(GlyphRaster {
+            font: 0,
+            glyph: id,
+            size: crate::Pixels(12.),
+            scale: 2.,
+            subpixel: 0,
+            emoji: false,
+            dilation: 0,
+        })
+    }
+
+    // Release builds copy spans of the last paint, which read tiles without asking the atlas.
+    #[test]
+    fn copied_spans_keep_their_tiles() {
+        let atlas = Atlas::new(Fake::default());
+        let insert = |key: &TileKey| {
+            (atlas.get_or_insert_with(key, &mut || Ok(raster(8, 8))))
+                .unwrap()
+                .0
+        };
+        let (shown, gone) = (insert(&glyph(1)), insert(&glyph(2)));
+        let (photo, hidden) = (insert(&TileKey::Image(1)), insert(&TileKey::Image(2)));
+        let mut scene = Scene::default();
+        scene.begin_paint(0);
+        let mark = scene.mark();
+        scene.push(sprite(GLYPH, shown));
+        let mut cropped = sprite(IMAGE, photo);
+        let origin = photo.rect.origin.map(|value| value as f32 + 2.);
+        cropped.aux = [origin.x, origin.y, 4., 4.];
+        scene.push(cropped);
+        let mut span = scene.span(mark).unwrap();
+        scene.push(sprite(GLYPH, gone));
+        scene.push(sprite(IMAGE, hidden));
+        atlas.finish_frame(&scene);
+        let mut retired_at = None;
+        for pass in 1..=MAX_AGE * 2 {
+            scene.clear();
+            scene.begin_paint(pass);
+            span = scene.replay(&span).unwrap();
+            atlas.glyph_pixels.set(MAX_GLYPH_PIXELS + 1);
+            atlas.finish_frame(&scene);
+            let freed = (atlas.pages.borrow().freed.iter()).any(|tile| tile.id == gone.id);
+            if atlas.tiles.borrow().get(&glyph(2)).is_none() {
+                let at = *retired_at.get_or_insert(pass);
+                assert_eq!(
+                    freed,
+                    pass - at >= IN_FLIGHT,
+                    "freed after frames in flight"
+                );
+            }
+        }
+        assert!(retired_at.is_some());
+        assert!(atlas.tiles.borrow().get(&glyph(1)).is_some());
+        assert!(!atlas.take_evicted(), "copies never read the swept glyph");
+        #[cfg(target_os = "macos")]
+        {
+            atlas.release_images(&scene);
+            atlas.free_retired(|| {});
+            let tiles = atlas.tiles.borrow();
+            assert!(tiles.get(&TileKey::Image(1)).is_some());
+            assert!(tiles.get(&TileKey::Image(2)).is_none());
+            assert!(!atlas.take_evicted());
+        }
+    }
+
+    #[test]
+    fn freed_places_are_fresh_for_a_while() {
+        let atlas = Atlas::new(Fake::default());
+        let scene = Scene::default();
+        let insert = |id| {
+            (atlas.get_or_insert_with(&TileKey::Image(id), &mut || Ok(raster(8, 8))))
+                .unwrap()
+                .0
+        };
+        let old = insert(1);
+        atlas.remove(&TileKey::Image(1));
+        for _ in 0..=IN_FLIGHT {
+            atlas.finish_frame(&scene);
+        }
+        assert_eq!(insert(2).rect, old.rect);
+        assert_eq!(atlas.take_fresh().unwrap().len(), 1);
+        for _ in 0..MAX_AGE {
+            atlas.finish_frame(&scene);
+        }
+        assert!(atlas.freed.borrow().is_empty());
+    }
+
     #[test]
     fn glyph_sweeps_that_free_nothing_wait() {
         let atlas = Atlas::new(Fake::default());
@@ -530,7 +685,7 @@ mod tests {
         let mut sweeps = Vec::new();
         for _ in 0..46 {
             let before = atlas.swept.get();
-            atlas.finish_frame();
+            atlas.finish_frame(&Scene::default());
             if atlas.swept.get() != before {
                 sweeps.push(atlas.swept.get());
             }
@@ -553,7 +708,7 @@ mod tests {
                 Err(anyhow::anyhow!("no pixels"))
             });
             assert!(tile.is_none());
-            atlas.finish_frame();
+            atlas.finish_frame(&Scene::default());
         }
         assert_eq!(builds.get(), 2);
         assert_eq!(atlas.pages.borrow().made, 0);

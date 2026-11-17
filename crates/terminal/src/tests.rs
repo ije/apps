@@ -440,3 +440,54 @@ fn a_program_runs_in_a_pty() {
     wait(&mut || test.text(false).is_some_and(|text| text.contains("got hi")));
     assert!(test.info().contains(r#""pid":null"#));
 }
+
+#[cfg(unix)]
+#[test]
+fn closing_hangs_up_the_group_and_frees_the_state() {
+    let test = Test::new(40, 4);
+    let mut error = Vec::new();
+    // The leader ignores the hangup and keeps the PTY open. The other sleep is an orphan, so it is reaped
+    // when it ends.
+    let argv =
+        "/bin/sh\0-c\0trap '' HUP; ((trap - HUP; exec sleep 30) & echo \"bg $!\"); exec sleep 30\0";
+    let pid = unsafe {
+        apps_terminal_spawn(
+            test.0,
+            argv.as_ptr(),
+            argv.len(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            (&raw mut error).cast(),
+            alloc,
+        )
+    };
+    assert!(pid > 0, "{}", String::from_utf8_lossy(&error));
+    let wait = |what: &mut dyn FnMut() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !what() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let mut sleep = 0;
+    wait(&mut || {
+        sleep = test
+            .text(false)
+            .and_then(|text| {
+                text.split("bg ")
+                    .nth(1)?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(0);
+        sleep > 0
+    });
+    let shared = Arc::downgrade(&unsafe { &*test.0 }.shared);
+    drop(test);
+    wait(&mut || shared.strong_count() == 0 && unsafe { libc::kill(sleep, 0) } != 0);
+    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+}

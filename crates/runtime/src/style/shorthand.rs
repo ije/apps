@@ -120,7 +120,7 @@ pub(crate) fn border_image(value: &str) -> Option<[String; 5]> {
     }))
 }
 
-pub(super) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) -> bool {
+pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) -> bool {
     let alias = match key {
         "inline-size" => "width",
         "block-size" => "height",
