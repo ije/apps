@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-revision=6fc709c298409fe433a60f6aff328a45a8974532
-bun_revision=ccb3611f2ade6226369384e0f14b5e8f16207710
+revision=a8d825d8a049a7957b8aac6dab1716a18c05ec3f
+bun_revision=4ce14ba8b150c3c7315284f3df8480eb4158b38a
 
 aot=0
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -216,7 +216,7 @@ if ((aot)); then
   name=libJavaScriptCoreAOT.dylib
   xcrun clang++ -dynamiclib -arch arm64 -mmacosx-version-min=13.0 -o "$output/.$name" -Wl,-install_name,"@rpath/$name" \
     -Wl,-dead_strip -Wl,-x -Wl,-exported_symbols_list,"$root/scripts/jsc.exports" -Wl,-all_load \
-    "$build/lib/libJavaScriptCore.a" "$build/lib/libWTF.a" "$build/lib/libbmalloc.a" -licucore -lobjc -lcompression
+    "$build/lib/libJavaScriptCore.a" "$build/lib/libWTF.a" "$build/lib/libbmalloc.a" -licucore -lobjc
   mv -f "$output/.$name" "$output/$name"
 
   # Build the AOT front end with Bun's nightly toolchain.

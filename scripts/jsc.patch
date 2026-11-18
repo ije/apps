@@ -1,5 +1,5 @@
 diff --git a/Source/JavaScriptCore/API/APICallbackFunction.h b/Source/JavaScriptCore/API/APICallbackFunction.h
-index 2eec0af7..fa882521 100644
+index 2eec0af71a6..fa882521192 100644
 --- a/Source/JavaScriptCore/API/APICallbackFunction.h
 +++ b/Source/JavaScriptCore/API/APICallbackFunction.h
 @@ -65,10 +65,9 @@ EncodedJSValue APICallbackFunction::callImpl(JSGlobalObject* globalObject, CallF
@@ -17,7 +17,7 @@ index 2eec0af7..fa882521 100644
          throwException(globalObject, scope, toJS(globalObject, exception));
          return JSValue::encode(jsUndefined());
 diff --git a/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp b/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
-index 81101c17..b5e73048 100644
+index 81101c17f7a..b5e730482e7 100644
 --- a/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
 +++ b/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
 @@ -27,11 +27,33 @@
@@ -190,7 +190,7 @@ index 81101c17..b5e73048 100644
      : Base(vm, structure, globalObjectMethodTable())
  {
 diff --git a/Source/JavaScriptCore/API/JSAPIGlobalObject.h b/Source/JavaScriptCore/API/JSAPIGlobalObject.h
-index a530e481..aee05f9a 100644
+index a530e481c76..aee05f9ac1b 100644
 --- a/Source/JavaScriptCore/API/JSAPIGlobalObject.h
 +++ b/Source/JavaScriptCore/API/JSAPIGlobalObject.h
 @@ -55,7 +55,13 @@ public:
@@ -208,7 +208,7 @@ index a530e481..aee05f9a 100644
      JSAPIGlobalObject(VM&, Structure*);
  
 diff --git a/Source/JavaScriptCore/API/JSBase.cpp b/Source/JavaScriptCore/API/JSBase.cpp
-index f96eb07c..023862c1 100644
+index f96eb07c459..023862c184b 100644
 --- a/Source/JavaScriptCore/API/JSBase.cpp
 +++ b/Source/JavaScriptCore/API/JSBase.cpp
 @@ -29,6 +29,8 @@
@@ -346,7 +346,7 @@ index f96eb07c..023862c1 100644
      auto typeCounts = vm.heap.objectTypeCounts();
      JSObject* objectTypeCounts = constructEmptyObject(globalObject);
 diff --git a/Source/JavaScriptCore/API/JSContextRef.cpp b/Source/JavaScriptCore/API/JSContextRef.cpp
-index b8e3b261..a6c7a603 100644
+index b8e3b2619e2..a6c7a603d9e 100644
 --- a/Source/JavaScriptCore/API/JSContextRef.cpp
 +++ b/Source/JavaScriptCore/API/JSContextRef.cpp
 @@ -43,7 +43,9 @@
@@ -531,7 +531,7 @@ index b8e3b261..a6c7a603 100644
      JSObject* object = toJS(function);
      if (!object->isCallable()) {
 diff --git a/Source/JavaScriptCore/API/JSContextRefPrivate.h b/Source/JavaScriptCore/API/JSContextRefPrivate.h
-index c009bb5a..b4550eda 100644
+index c009bb5a2e5..b4550edaee4 100644
 --- a/Source/JavaScriptCore/API/JSContextRefPrivate.h
 +++ b/Source/JavaScriptCore/API/JSContextRefPrivate.h
 @@ -69,6 +69,139 @@ JS_EXPORT JSStringRef JSContextCreateBacktrace(JSContextRef ctx, unsigned maxSta
@@ -675,7 +675,7 @@ index c009bb5a..b4550eda 100644
  @function
  @abstract Sets the script execution time limit.
 diff --git a/Source/JavaScriptCore/API/JSTypedArray.cpp b/Source/JavaScriptCore/API/JSTypedArray.cpp
-index fb7313c3..a801e0a3 100644
+index fb7313c3685..a801e0a3598 100644
 --- a/Source/JavaScriptCore/API/JSTypedArray.cpp
 +++ b/Source/JavaScriptCore/API/JSTypedArray.cpp
 @@ -26,14 +26,23 @@
@@ -938,7 +938,7 @@ index fb7313c3..a801e0a3 100644
 +    delete static_cast<TakenContents*>(contents);
 +}
 diff --git a/Source/JavaScriptCore/API/JSValueRef.cpp b/Source/JavaScriptCore/API/JSValueRef.cpp
-index cad19029..8cf9d0ef 100644
+index cad1902955b..8cf9d0efda3 100644
 --- a/Source/JavaScriptCore/API/JSValueRef.cpp
 +++ b/Source/JavaScriptCore/API/JSValueRef.cpp
 @@ -25,6 +25,7 @@
@@ -1042,7 +1042,7 @@ index cad19029..8cf9d0ef 100644
 +    return simdutf::convert_utf16le_to_utf8(static_cast<const char16_t*>(characters), length, output);
 +}
 diff --git a/Source/JavaScriptCore/CMakeLists.txt b/Source/JavaScriptCore/CMakeLists.txt
-index 7b18917e..06f78246 100644
+index 7b18917e1c5..06f78246ce0 100644
 --- a/Source/JavaScriptCore/CMakeLists.txt
 +++ b/Source/JavaScriptCore/CMakeLists.txt
 @@ -2119,6 +2119,15 @@ set(JavaScriptCore_PRIVATE_FRAMEWORK_HEADERS
@@ -1071,7 +1071,7 @@ index 7b18917e..06f78246 100644
  endif()
  
 diff --git a/Source/JavaScriptCore/aot/AOT.cmake b/Source/JavaScriptCore/aot/AOT.cmake
-index e7faae89..f1693f60 100644
+index b493f6763b4..d1990400485 100644
 --- a/Source/JavaScriptCore/aot/AOT.cmake
 +++ b/Source/JavaScriptCore/aot/AOT.cmake
 @@ -36,7 +36,7 @@ list(APPEND JavaScriptCore_SOURCES
@@ -1084,10 +1084,20 @@ index e7faae89..f1693f60 100644
  endif ()
  
 diff --git a/Source/JavaScriptCore/aot/image/AOTFunctionSources.cpp b/Source/JavaScriptCore/aot/image/AOTFunctionSources.cpp
-index f96f80c4..24128e18 100644
+index 9d629a7b3ac..2a363fc2965 100644
 --- a/Source/JavaScriptCore/aot/image/AOTFunctionSources.cpp
 +++ b/Source/JavaScriptCore/aot/image/AOTFunctionSources.cpp
-@@ -444,7 +444,9 @@ static void collectModuleQuotedSources(const TableEncoder& encoder, const Quoted
+@@ -156,7 +156,8 @@ static Vector<ClosureFunctionWithSource> collectClosureFunctionsWithSource(const
+     const FunctionNumbers& numbers = encoder.numbers.functions();
+     return collectInParallel<ClosureFunctionWithSource>(encoder.build.parallelLoops(), static_cast<unsigned>(program.functions.size()), [&](unsigned index, Vector<ClosureFunctionWithSource>& functions) {
+         const Typed::Function& function = program.functions[index];
+-        if (function.sourceRange.start >= function.sourceRange.end || !shouldEmbedFunctionSource(program, function))
++        // apps gives no source for its runtime scripts: their functions show `[native code]`, like Node's built-ins.
++        if (function.sourceRange.start >= function.sourceRange.end || !shouldEmbedFunctionSource(program, function) || !functionSourceSizes[function.module.index()])
+             return;
+         FunctionID id(index);
+         std::optional<FunctionID> closureEntry = encoder.findEntrypoint(id);
+@@ -374,7 +375,9 @@ static void collectModuleQuotedSources(const TableEncoder& encoder, const Quoted
              encoder.fail("QuotedSourceOutOfBounds"_s, ModuleID(index));
              continue;
          }
@@ -1099,10 +1109,10 @@ index f96f80c4..24128e18 100644
          uint64_t location = locations[text];
          result.quoted.append({ static_cast<uint32_t>(location >> 32), static_cast<uint32_t>(location), quoted.start, quoted.end });
 diff --git a/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp b/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp
-index bfae38ab..d352b651 100644
+index f949a45aaec..36257d785fe 100644
 --- a/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp
 +++ b/Source/JavaScriptCore/aot/image/AOTImageLoading.cpp
-@@ -26,7 +26,7 @@
+@@ -27,7 +27,7 @@
  #include <signal.h>
  #include <sys/mman.h>
  #if OS(DARWIN)
@@ -1111,7 +1121,7 @@ index bfae38ab..d352b651 100644
  #include <mach-o/loader.h>
  #include <mach/mach.h>
  #include <mach/mach_vm.h>
-@@ -319,7 +319,10 @@ static constexpr bool dataHasSegmentsOfItsOwn = false;
+@@ -320,7 +320,10 @@ static constexpr bool dataHasSegmentsOfItsOwn = false;
  
  static std::optional<SegmentOfExecutable> findSegmentOfExecutable(const uint8_t* address)
  {
@@ -1124,7 +1134,7 @@ index bfae38ab..d352b651 100644
          return std::nullopt;
      auto findSegment = [&](auto&& isWanted) -> const segment_command_64* {
 diff --git a/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp b/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp
-index 5e945a35..365013bd 100644
+index 6b72f859352..b74c3bb6f46 100644
 --- a/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp
 +++ b/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp
 @@ -370,10 +370,7 @@ static JSFunction* makeFunctionOfMissingHost(JSGlobalObject* realm, const Builti
@@ -1139,8 +1149,43 @@ index 5e945a35..365013bd 100644
          return nullptr;
      VM& vm = realm->vm();
      return JSFunction::create(vm, realm, 0, table.identifierOf(vm, table.at(key.builtin()).name).string(), exitForFunctionOfMissingHost, ImplementationVisibility::Public);
+diff --git a/Source/JavaScriptCore/aot/runtime/AOTModuleInstances.cpp b/Source/JavaScriptCore/aot/runtime/AOTModuleInstances.cpp
+index 7d306887dd3..3fe5d456b47 100644
+--- a/Source/JavaScriptCore/aot/runtime/AOTModuleInstances.cpp
++++ b/Source/JavaScriptCore/aot/runtime/AOTModuleInstances.cpp
+@@ -874,7 +874,7 @@ auto Modules::findMockForField(ModuleID module, unsigned index, Environment* ins
+         if (passed.size() > m_table.size()) [[unlikely]]
+             break;
+         if (ModuleNamespace* word = link ? mockWord(*link, instance) : nullptr) {
+-            found = { word, reexported->importName, m_table.exports(module)[index].isFromStarExport };
++            found = { word, reexported->importName, static_cast<bool>(m_table.exports(module)[index].isFromStarExport) };
+             break;
+         }
+         std::optional<unsigned> next = hasNoLinks || link->hasLink ? m_table.findExport(named, identifier(reexported->importName).impl()) : std::nullopt;
+@@ -1036,7 +1036,7 @@ auto Modules::resolveVariable(ModuleID module, unsigned index, Environment* inst
+         passed.append({ instance, index });
+         resolved.isFollowed = true;
+         if (ModuleNamespace* word = mockWord(*link, instance)) {
+-            resolved = { true, word, reexported->importName, m_table.exports(module)[index].isFromStarExport };
++            resolved = { true, word, reexported->importName, static_cast<bool>(m_table.exports(module)[index].isFromStarExport) };
+             break;
+         }
+         std::optional<unsigned> next = m_table.findExport(link->targetModule(), identifier(reexported->importName).impl());
+diff --git a/Source/JavaScriptCore/aot/runtime/AOTModules.cpp b/Source/JavaScriptCore/aot/runtime/AOTModules.cpp
+index cbe9b16ac97..64458b95811 100644
+--- a/Source/JavaScriptCore/aot/runtime/AOTModules.cpp
++++ b/Source/JavaScriptCore/aot/runtime/AOTModules.cpp
+@@ -10873,7 +10873,7 @@ auto ModuleRecord::resolveOwnExport(JSGlobalObject* globalObject, const Identifi
+         return absent;
+     auto follow = [&](AbstractModuleRecord* record, const Identifier& name) {
+         auto* compiled = dynamicDowncast<ModuleRecord>(record);
+-        statement = { record, name, compiled && compiled->resolvesPerReexporter() ? this : nullptr, entry->isFromStarExport };
++        statement = { record, name, compiled && compiled->resolvesPerReexporter() ? this : nullptr, static_cast<bool>(entry->isFromStarExport) };
+         return Resolution::notFound();
+     };
+     auto mockOfModule = keepsToModule() ? Modules::MockMode::Bypass : Modules::MockMode::Use;
 diff --git a/Source/JavaScriptCore/aot/runtime/AOTRemovableFeature.h b/Source/JavaScriptCore/aot/runtime/AOTRemovableFeature.h
-index 7316d4ee..5fa790e5 100644
+index 7316d4ee7ed..5fa790e56d7 100644
 --- a/Source/JavaScriptCore/aot/runtime/AOTRemovableFeature.h
 +++ b/Source/JavaScriptCore/aot/runtime/AOTRemovableFeature.h
 @@ -96,6 +96,10 @@ ALWAYS_INLINE FeatureRemoval removalOf(RemovableFeature feature)
@@ -1195,7 +1240,7 @@ index 7316d4ee..5fa790e5 100644
          if (isFeatureRemoved(feature)) [[unlikely]]
              return resultForRemovedFeature<feature, stub, Result>(realm);
 diff --git a/Source/JavaScriptCore/inspector/InspectorAgentRegistry.cpp b/Source/JavaScriptCore/inspector/InspectorAgentRegistry.cpp
-index 8efc3dca..7fdee2ca 100644
+index 8efc3dcab2f..7fdee2ca1bc 100644
 --- a/Source/JavaScriptCore/inspector/InspectorAgentRegistry.cpp
 +++ b/Source/JavaScriptCore/inspector/InspectorAgentRegistry.cpp
 @@ -39,6 +39,10 @@ AgentRegistry::~AgentRegistry()
@@ -1210,7 +1255,7 @@ index 8efc3dca..7fdee2ca 100644
  
  void AgentRegistry::append(UniqueRef<InspectorAgentBase>&& agent)
 diff --git a/Source/JavaScriptCore/runtime/JSGlobalObject.h b/Source/JavaScriptCore/runtime/JSGlobalObject.h
-index 72b4bf59..9ec4f8bf 100644
+index 72b4bf59581..9ec4f8bf939 100644
 --- a/Source/JavaScriptCore/runtime/JSGlobalObject.h
 +++ b/Source/JavaScriptCore/runtime/JSGlobalObject.h
 @@ -546,6 +546,9 @@ public:
@@ -1224,7 +1269,7 @@ index 72b4bf59..9ec4f8bf 100644
  
      const Ref<WatchpointSet> m_masqueradesAsUndefinedWatchpointSet;
 diff --git a/Source/JavaScriptCore/runtime/JSLock.cpp b/Source/JavaScriptCore/runtime/JSLock.cpp
-index 0fa9323d..a37ba6cf 100644
+index 0fa9323dc1a..a37ba6cf1c3 100644
 --- a/Source/JavaScriptCore/runtime/JSLock.cpp
 +++ b/Source/JavaScriptCore/runtime/JSLock.cpp
 @@ -53,16 +53,29 @@ JSLockHolder::JSLockHolder(VM* vm)
@@ -1259,7 +1304,7 @@ index 0fa9323d..a37ba6cf 100644
  
  JSLock::JSLock(VM* vm)
 diff --git a/Source/JavaScriptCore/runtime/JSLock.h b/Source/JavaScriptCore/runtime/JSLock.h
-index d17aae8d..75ea228a 100644
+index d17aae8df6f..75ea228a426 100644
 --- a/Source/JavaScriptCore/runtime/JSLock.h
 +++ b/Source/JavaScriptCore/runtime/JSLock.h
 @@ -68,6 +68,7 @@ public:
@@ -1271,7 +1316,7 @@ index d17aae8d..75ea228a 100644
  
  class JSLock : public ThreadSafeRefCounted<JSLock> {
 diff --git a/Source/JavaScriptCore/runtime/JSMicrotask.cpp b/Source/JavaScriptCore/runtime/JSMicrotask.cpp
-index 6f11099a..afe07a86 100644
+index 443ee3906eb..2ff4aef51a1 100644
 --- a/Source/JavaScriptCore/runtime/JSMicrotask.cpp
 +++ b/Source/JavaScriptCore/runtime/JSMicrotask.cpp
 @@ -700,6 +700,14 @@ static void asyncGeneratorDrainQueue(JSGlobalObject* globalObject, JSAsyncGenera
@@ -1290,7 +1335,7 @@ index 6f11099a..afe07a86 100644
  {
      if (Bun__reportUnhandledError)
 diff --git a/Source/JavaScriptCore/runtime/Options.cpp b/Source/JavaScriptCore/runtime/Options.cpp
-index b817789c..a31b4575 100644
+index 3827dcbbb3b..f7a1f3deff8 100644
 --- a/Source/JavaScriptCore/runtime/Options.cpp
 +++ b/Source/JavaScriptCore/runtime/Options.cpp
 @@ -812,7 +812,9 @@ double Options::sizeClassProgressionWithAOT()
@@ -1314,7 +1359,7 @@ index b817789c..a31b4575 100644
  #undef OVERRIDE_OPTION_WITH_HEURISTICS
  
 diff --git a/Source/JavaScriptCore/runtime/Options.h b/Source/JavaScriptCore/runtime/Options.h
-index dd204021..edfcff92 100644
+index dd204021e1f..edfcff925e0 100644
 --- a/Source/JavaScriptCore/runtime/Options.h
 +++ b/Source/JavaScriptCore/runtime/Options.h
 @@ -137,6 +137,29 @@ public:
@@ -1363,65 +1408,8 @@ index dd204021..edfcff92 100644
      ALWAYS_INLINE static bool runsCompiledImage() { return useAOT(); }
  #else
      static constexpr bool runsCompiledImage() { return false; }
-diff --git a/Source/cmake/OptionsJSCOnly.cmake b/Source/cmake/OptionsJSCOnly.cmake
-index 236626fb..4ef33ef8 100644
---- a/Source/cmake/OptionsJSCOnly.cmake
-+++ b/Source/cmake/OptionsJSCOnly.cmake
-@@ -41,7 +41,7 @@ WEBKIT_OPTION_END()
- if(USE_BUN_JSC_ADDITIONS)
-     SET_AND_EXPOSE_TO_BUILD(USE_BUN_JSC_ADDITIONS 1)
- 
--    if(WIN32)
-+    if(WIN32 AND ENABLE_STATIC_JSC)
-         SET_AND_EXPOSE_TO_BUILD(JS_NO_EXPORT 1)
-     endif()
- 
-@@ -127,7 +127,7 @@ if (NOT ENABLE_STATIC_JSC)
-     set(WebCore_LIBRARY_TYPE SHARED)
- endif ()
- 
--if (USE_BUN_JSC_ADDITIONS)
-+if (USE_BUN_JSC_ADDITIONS AND ENABLE_STATIC_JSC AND NOT APPS_JSC_AOT_RUNTIME)
-     set(CMAKE_POSITION_INDEPENDENT_CODE False)
- endif ()
- 
-diff --git a/Source/JavaScriptCore/aot/runtime/AOTModuleInstances.cpp b/Source/JavaScriptCore/aot/runtime/AOTModuleInstances.cpp
-index 25d6d00e..7104bddf 100644
---- a/Source/JavaScriptCore/aot/runtime/AOTModuleInstances.cpp
-+++ b/Source/JavaScriptCore/aot/runtime/AOTModuleInstances.cpp
-@@ -854,7 +854,7 @@ auto Modules::findMockForField(ModuleID module, unsigned index, Environment* ins
-         if (passed.size() > m_table.size()) [[unlikely]]
-             break;
-         if (ModuleNamespace* word = link ? mockWord(*link, instance) : nullptr) {
--            found = { word, reexported->importName, m_table.exports(module)[index].isFromStarExport };
-+            found = { word, reexported->importName, static_cast<bool>(m_table.exports(module)[index].isFromStarExport) };
-             break;
-         }
-         std::optional<unsigned> next = hasNoLinks || link->hasLink ? m_table.findExport(named, identifier(reexported->importName).impl()) : std::nullopt;
-@@ -1016,7 +1016,7 @@ auto Modules::resolveVariable(ModuleID module, unsigned index, Environment* inst
-         passed.append({ instance, index });
-         resolved.isFollowed = true;
-         if (ModuleNamespace* word = mockWord(*link, instance)) {
--            resolved = { true, word, reexported->importName, m_table.exports(module)[index].isFromStarExport };
-+            resolved = { true, word, reexported->importName, static_cast<bool>(m_table.exports(module)[index].isFromStarExport) };
-             break;
-         }
-         std::optional<unsigned> next = m_table.findExport(link->targetModule(), identifier(reexported->importName).impl());
-diff --git a/Source/JavaScriptCore/aot/runtime/AOTModules.cpp b/Source/JavaScriptCore/aot/runtime/AOTModules.cpp
-index 1cf58285..ad5a3e23 100644
---- a/Source/JavaScriptCore/aot/runtime/AOTModules.cpp
-+++ b/Source/JavaScriptCore/aot/runtime/AOTModules.cpp
-@@ -10420,7 +10420,7 @@ auto ModuleRecord::resolveOwnExport(JSGlobalObject* globalObject, const Identifi
-         return absent;
-     auto follow = [&](AbstractModuleRecord* record, const Identifier& name) {
-         auto* compiled = dynamicDowncast<ModuleRecord>(record);
--        statement = { record, name, compiled && compiled->resolvesPerReexporter() ? this : nullptr, entry->isFromStarExport };
-+        statement = { record, name, compiled && compiled->resolvesPerReexporter() ? this : nullptr, static_cast<bool>(entry->isFromStarExport) };
-         return Resolution::notFound();
-     };
-     auto mockOfModule = keepsToModule() ? Modules::MockMode::Bypass : Modules::MockMode::Use;
 diff --git a/Source/JavaScriptCore/runtime/TypedArrayController.h b/Source/JavaScriptCore/runtime/TypedArrayController.h
-index 8d0361de..5cbfd80d 100644
+index 8d0361de015..5cbfd80d166 100644
 --- a/Source/JavaScriptCore/runtime/TypedArrayController.h
 +++ b/Source/JavaScriptCore/runtime/TypedArrayController.h
 @@ -41,14 +41,14 @@ class JSGlobalObject;
@@ -1444,3 +1432,25 @@ index 8d0361de..5cbfd80d 100644
  };
  
  } // namespace JSC
+diff --git a/Source/cmake/OptionsJSCOnly.cmake b/Source/cmake/OptionsJSCOnly.cmake
+index 236626fbf25..4ef33ef89f3 100644
+--- a/Source/cmake/OptionsJSCOnly.cmake
++++ b/Source/cmake/OptionsJSCOnly.cmake
+@@ -41,7 +41,7 @@ WEBKIT_OPTION_END()
+ if(USE_BUN_JSC_ADDITIONS)
+     SET_AND_EXPOSE_TO_BUILD(USE_BUN_JSC_ADDITIONS 1)
+ 
+-    if(WIN32)
++    if(WIN32 AND ENABLE_STATIC_JSC)
+         SET_AND_EXPOSE_TO_BUILD(JS_NO_EXPORT 1)
+     endif()
+ 
+@@ -127,7 +127,7 @@ if (NOT ENABLE_STATIC_JSC)
+     set(WebCore_LIBRARY_TYPE SHARED)
+ endif ()
+ 
+-if (USE_BUN_JSC_ADDITIONS)
++if (USE_BUN_JSC_ADDITIONS AND ENABLE_STATIC_JSC AND NOT APPS_JSC_AOT_RUNTIME)
+     set(CMAKE_POSITION_INDEPENDENT_CODE False)
+ endif ()
+ 

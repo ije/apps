@@ -15,6 +15,9 @@ use std::{
     process::Command,
 };
 
+// The front end stores no source for entries that start with this, so their functions show `[native code]`.
+const NO_SOURCE: &str = "/*apps:no-source*/";
+
 pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<tempfile::TempDir> {
     let library = apps_runtime::jsc::library_path(runtime, "macos")?;
     ensure!(
@@ -235,6 +238,9 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
             .first()
             .map_or(result, |statement| statement.span().start as usize);
         let mut text = String::with_capacity(end - at + edits.len() * 16 + 64);
+        if name.starts_with("apps:") {
+            text.push_str(NO_SOURCE);
+        }
         text.push_str("module.exports=function(globalThis){");
         if using {
             text.push_str(include_str!("using.js"));
@@ -274,7 +280,8 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         );
     }
     // This entry only declares host globals for Bun. It never runs.
-    let mut host = "const unknown=JSON.parse('{}',function(){return this;});\n".to_owned();
+    let mut host =
+        NO_SOURCE.to_owned() + "const unknown=JSON.parse('{}',function(){return this;});\n";
     if !wasm.is_empty() {
         let mut wasm_paths = Vec::with_capacity(wasm.len());
         for (index, bytes) in wasm.iter().enumerate() {

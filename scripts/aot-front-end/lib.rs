@@ -41,7 +41,10 @@ fn front_end(directory: &[u8], entries: &[&[u8]]) -> Result<Vec<u8>, String> {
     let mut program = linked.program;
     for (index, module) in program.modules.iter_mut().enumerate() {
         if let Some(source) = linked.summary.texts.get(ModuleId::new(index)) {
-            module.function_source = source.function_source();
+            let text = source.function_source();
+            if !text.starts_with(b"/*apps:no-source*/") {
+                module.function_source = text;
+            }
         }
     }
     let functions = LinkedFunctions::of_program_functions(std::mem::take(&mut program.functions));

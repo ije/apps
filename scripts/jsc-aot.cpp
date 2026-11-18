@@ -25,7 +25,6 @@
 #include "JSObjectInlines.h"
 #include "Options.h"
 #include "ObjectConstructor.h"
-#include <compression.h>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -136,9 +135,6 @@ extern constinit const AOT::ModuleHost appsAOTModuleHost {
     .createModuleNotFoundError = [](JSGlobalObject* global, const String& specifier, const String&, bool) -> JSValue {
         return createTypeError(global, makeString("Cannot find AOT module: "_s, specifier));
     },
-    .decompressSource = [](std::span<uint8_t> text, std::span<const uint8_t> compressed) {
-        return compression_decode_buffer(text.data(), text.size(), compressed.data(), compressed.size(), nullptr, COMPRESSION_ZLIB) == text.size();
-    },
 };
 }
 
@@ -146,7 +142,7 @@ extern constinit const AOT::ModuleHost appsAOTModuleHost {
 // Match build-jsc.sh's bun_revision: Bun's IR and built-in table must match this compiler.
 extern "C" JS_EXPORT const char* JSGetAOTCompilerRevision()
 {
-    return "ccb3611f2ade6226369384e0f14b5e8f16207710";
+    return "4ce14ba8b150c3c7315284f3df8480eb4158b38a";
 }
 
 extern "C" JS_EXPORT bool JSCompileAOT(const uint8_t* bytes, size_t size, const char* path, uint32_t* entries, size_t count, size_t* layout, char* error, size_t capacity)
@@ -158,12 +154,7 @@ extern "C" JS_EXPORT bool JSCompileAOT(const uint8_t* bytes, size_t size, const 
     // Use wide references to disable the cell cage, which keeps heap blocks resident (110 MB on DiffsHub's
     // stress test).
     options.target.referenceWidth = AOT::Wire::ReferenceWidth::Wide;
-    AOT::ProgramOwner owner;
-    owner.functionSources.maxCompressedSize = [](size_t size) { return size + size / 8 + 64; };
-    owner.functionSources.compress = [](std::span<uint8_t> compressed, std::span<const uint8_t> text) {
-        return compression_encode_buffer(compressed.data(), compressed.size(), text.data(), text.size(), nullptr, COMPRESSION_ZLIB);
-    };
-    auto output = AOT::compileProgram({ bytes, size }, options, nullptr, owner);
+    auto output = AOT::compileProgram({ bytes, size }, options);
     auto image = output->section(AOT::Wire::ResultSection::Image);
     if (image.empty()) {
         auto text = output->section(AOT::Wire::ResultSection::Text);

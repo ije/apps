@@ -107,6 +107,7 @@ assert.equal(sloppy(), true);
 assert.equal(typeof Bun !== 'undefined' ? Bun.version : typeof process + typeof require + typeof module, 'objectundefinedundefined');
 function aotSource(value) { return 918273645 + value; }
 assert.ok(aotSource.toString().includes(aotSource(0)));
+console.log('native-runtime:' + /\{ \[native code\] \}$/.test(ipcMain.on.toString()));
 assert.throws(() => globalThis.aotMissing.call918(), /evaluating 'globalThis\.aotMissing\.call918'/);
 const entries = [];
 for (const [key, value] of Object.entries(JSON.parse('{"left":3,"right":4}'))) entries.push(key, value);
@@ -258,11 +259,11 @@ setTimeout(async () => {
     }
     assert_eq!(
         u32::from_le_bytes(native[header + 72..header + 76].try_into().unwrap()),
-        4
+        5
     );
     assert!(
-        !native.windows(9).any(|bytes| bytes == b"918273645"),
-        "function source must be compressed"
+        native.windows(9).any(|bytes| bytes == b"918273645"),
+        "function source must be stored as it is"
     );
     assert!(
         u32::from_le_bytes(native[header + 352..header + 356].try_into().unwrap()) > 0,
@@ -336,7 +337,8 @@ setTimeout(async () => {
         );
     }
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("aot-ok"),
+        String::from_utf8_lossy(&output.stdout).contains("native-runtime:true\n")
+            && String::from_utf8_lossy(&output.stdout).contains("aot-ok"),
         "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -417,7 +419,8 @@ setTimeout(async () => {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("aot-ok"),
+        String::from_utf8_lossy(&output.stdout).contains("native-runtime:false\n")
+            && String::from_utf8_lossy(&output.stdout).contains("aot-ok"),
         "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
