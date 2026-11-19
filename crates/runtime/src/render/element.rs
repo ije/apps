@@ -1152,7 +1152,9 @@ pub(super) fn element(
                 record.print
             }
         });
-        Some(close || inside)
+        // A record with culled boxes can come from a debug build in a zone, which a check without a zone can't
+        // repeat. The zone checks of `plan` cover such boxes.
+        Some(close || inside || record.culled)
     };
     if let Some(_close) = keep {
         #[cfg(debug_assertions)]
