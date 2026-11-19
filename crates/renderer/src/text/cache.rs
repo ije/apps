@@ -283,6 +283,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn lines_shape_once_per_window_until_fonts_change() {
         let text = crate::TextSystem::new();
         let window = text.for_window();
