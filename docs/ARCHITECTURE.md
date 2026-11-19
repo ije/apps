@@ -69,8 +69,9 @@ The runtime loads its own JavaScriptCore library from Bun's WebKit fork. [build-
 
 | Mode | Execution |
 |---|---|
-| Default | JavaScriptCore compiles source at runtime. Runtime scripts share a bytecode cache across VMs. |
-| `--bytecode` | The build stores bytecode for runtime scripts, main code, and eligible chunks in `app.bundle`. |
+| Default | A build for this machine stores bytecode for runtime scripts, main code, and eligible chunks in `app.bundle`. A build for another target has no bytecode. |
+| `--no-bytecode` | JavaScriptCore compiles source at runtime. Runtime scripts share a bytecode cache across VMs. |
+| `--bytecode` | Like the default, but the build fails when this machine can't make the bytecode. |
 | `--aot` | The build compiles app code and runtime scripts into `app.dylib` on macOS or `app.so` on Linux, paired with `libJavaScriptCoreAOT`. |
 
 AOT requires a native build: macOS arm64, Linux x64, or Linux arm64. It needs a JavaScript or TypeScript main entry. The CLI rejects `--aot` and `--bytecode` together. If `jsExecute` or `httpImport` is enabled, the CLI warns and uses the default build mode.

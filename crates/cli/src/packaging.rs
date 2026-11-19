@@ -3,6 +3,20 @@ use anyhow::{Context, Result, ensure};
 use bbtree::unsync::BBTreeMap;
 use std::{fs, path::Path};
 
+// Bytecode comes from the JavaScriptCore of this process, so it must be the library that the app ships.
+pub fn makes_bytecode(runtime: &Path, target: BuildTarget) -> Result<bool> {
+    let jsc = apps_runtime::jsc::library_path(runtime, target.platform)?;
+    Ok(
+        target == BuildTarget::new(std::env::consts::OS, std::env::consts::ARCH)?
+            && jsc
+                == apps_runtime::jsc::library_path(
+                    &std::env::current_exe()?,
+                    std::env::consts::OS,
+                )?
+            && apps_runtime::jsc::JavaScriptCore::load().is_ok(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn package_app(
     out: &Path,
@@ -143,10 +157,7 @@ pub fn package_app(
         .then(|| apps_runtime::bundle::script_source(files, true));
     let bytecode = if bytecode {
         ensure!(
-            jsc == apps_runtime::jsc::library_path(
-                &std::env::current_exe()?,
-                std::env::consts::OS
-            )?,
+            makes_bytecode(runtime, target)?,
             "--bytecode needs the runtime and JavaScriptCore next to apps, built for this machine"
         );
         let app: Vec<_> = files

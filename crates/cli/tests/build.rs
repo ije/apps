@@ -409,3 +409,38 @@ fn accepts_universal_macos_runtimes_and_target_aliases() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("has no arm64 binary"));
 }
+
+#[test]
+fn packs_bytecode_by_default_for_this_machine() {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = dir.path().join("app.js");
+    let runtime = dir.path().join("runtime");
+    let arch = if std::env::consts::ARCH == "aarch64" {
+        "arm64"
+    } else {
+        "x64"
+    };
+    fs::write(&entry, "console.log('hello');").unwrap();
+    fs::write(&runtime, binary(std::env::consts::OS, arch)).unwrap();
+    let size = |flags: &[&str]| {
+        let mut command = apps(&entry, &runtime);
+        command.env_remove("APPS_JSC_LIBRARY").args(flags);
+        let result = command.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let bundle = [
+            "dist/App.app/Contents/Resources/app.bundle",
+            "dist/app.bundle",
+        ]
+        .iter()
+        .map(|path| dir.path().join(path))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("no app.bundle in {}", dir.path().display()));
+        fs::metadata(bundle).unwrap().len()
+    };
+    let [packed, plain] = [size(&[]), size(&["--no-bytecode"])];
+    assert!(packed > plain + 1_000_000, "{packed} {plain}");
+}

@@ -12,7 +12,7 @@ pub fn run(
     runtime: &Path,
     rust: Option<&Path>,
     target: BuildTarget,
-    bytecode: bool,
+    bytecode: Option<bool>,
     aot: bool,
 ) -> Result<()> {
     let started = Instant::now();
@@ -72,6 +72,11 @@ pub fn run(
     let compiled = (aot && dynamic.is_none())
         .then(|| crate::aot::compile(&mut files, runtime))
         .transpose()?;
+    // Without --bytecode or --no-bytecode, a build packs bytecode when this machine can make it for the target.
+    let bytecode = match bytecode {
+        Some(bytecode) => bytecode,
+        None => compiled.is_none() && rust.is_none() && packaging::makes_bytecode(runtime, target)?,
+    };
     let bytes = packaging::package_app(
         out,
         &files,
