@@ -2,10 +2,6 @@ name: Release
 on:
   push:
     tags: ['v*']
-    # Tags can reuse only main's caches. Build the native libraries on main when their scripts change.
-    branches: [main]
-    paths: ['scripts/**', crates/media/native/ffmpeg.c, '.github/actions/**', .github/workflows/release.yml]
-  workflow_dispatch:
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
