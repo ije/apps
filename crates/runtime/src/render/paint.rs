@@ -1487,6 +1487,7 @@ pub(super) fn mask_svg<'a>(
                 steps,
                 [tw, th],
                 at,
+                [width, height],
                 &format!(
                     "<image href=\"apps-mask:{}\" width=\"{tw}\" height=\"{th}\" preserveAspectRatio=\"{aspect}\"/>",
                     files.len() - 1

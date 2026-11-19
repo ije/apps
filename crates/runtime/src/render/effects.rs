@@ -1457,7 +1457,7 @@ pub(crate) fn gradient_svg(
             )
         }
     };
-    let body = tiled(gradient.steps, [tw, th], [x, y], &content);
+    let body = tiled(gradient.steps, [tw, th], [x, y], [width, height], &content);
     Some((
         format!(
             "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{body}</svg>"
@@ -1883,10 +1883,25 @@ pub(super) fn tiled(
     steps: [Option<f32>; 2],
     [tw, th]: [f32; 2],
     [x, y]: [f32; 2],
+    area: [f32; 2],
     content: &str,
 ) -> String {
-    if steps == [None; 2] {
-        return format!("<g transform=\"translate({x} {y})\">{content}</g>");
+    // A pattern renders its tile, then samples it for each pixel. A few copies of the tile draw each pixel once.
+    let starts = |step: Option<f32>, at: f32, extent: f32| match step {
+        Some(step) if step > 0. => {
+            let first = at - (at / step).ceil() * step;
+            let count = ((extent - first) / step).ceil().max(0.) as usize;
+            (count <= 3).then(|| (0..count).map(|n| first + n as f32 * step).collect())
+        }
+        Some(_) => None,
+        None => Some(vec![at]),
+    };
+    if let (Some(xs), Some(ys)) = (starts(steps[0], x, area[0]), starts(steps[1], y, area[1])) {
+        return ys
+            .iter()
+            .flat_map(|y| xs.iter().map(move |x| (x, y)))
+            .map(|(x, y)| format!("<g transform=\"translate({x} {y})\">{content}</g>"))
+            .collect();
     }
     let span = |step: Option<f32>, at: f32, side: f32| match step {
         Some(_) => ("0".to_owned(), "100%".to_owned()),
