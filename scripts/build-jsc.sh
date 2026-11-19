@@ -6,6 +6,11 @@ bun_revision=4ce14ba8b150c3c7315284f3df8480eb4158b38a
 
 aot=0
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+# CMake splits linker flags and launchers at spaces.
+if [[ $root == *[[:space:]]* ]]; then
+  printf '%s\n' 'The checkout path must not contain spaces' >&2
+  exit 1
+fi
 
 jobs=${NUMBER_OF_PROCESSORS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1\n')}
 if ((jobs > 8)); then
@@ -144,9 +149,40 @@ case "$system" in
   windows)
     options+=('-DCMAKE_CXX_FLAGS=-DENABLE_AOT=0 -DAPPS_JSC_AOT_RUNTIME=0 -DU_STATIC_IMPLEMENTATION')
     ;;
+  linux)
+    # Keep only the JS* C API exported, so --gc-sections can drop the JS_EXPORT_PRIVATE code.
+    mkdir -p "$build"
+    version_script=$build/jsc.version
+    {
+      printf '%s\n' '{' '  global:'
+      while IFS= read -r symbol || [[ -n $symbol ]]; do
+        [[ -z $symbol || $symbol == \#* ]] && continue
+        printf '    %s;\n' "${symbol#_}"
+      done < "$root/scripts/jsc.exports"
+      printf '%s\n' '  local:' '    *;' '};'
+    } > "$version_script"
+    options+=(
+      '-DCMAKE_C_FLAGS=-DENABLE_AOT=0 -DAPPS_JSC_AOT_RUNTIME=0 -ffunction-sections -fdata-sections'
+      '-DCMAKE_CXX_FLAGS=-DENABLE_AOT=0 -DAPPS_JSC_AOT_RUNTIME=0 -ffunction-sections -fdata-sections'
+      '-DCMAKE_C_FLAGS_RELEASE=-Os -DNDEBUG'
+      '-DCMAKE_CXX_FLAGS_RELEASE=-Os -DNDEBUG'
+      -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON
+      "-DCMAKE_C_COMPILER_LAUNCHER=$root/scripts/jsc-cc.sh"
+      "-DCMAKE_CXX_COMPILER_LAUNCHER=$root/scripts/jsc-cc.sh"
+      "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,--gc-sections -Wl,--version-script,$version_script"
+    )
+    ;;
 esac
 
 cmake -S "$source_dir" -B "$build" -G Ninja "${options[@]}" "$@"
+if [[ $system == linux ]]; then
+  # GCC before 12 has no -Oz. Probe the compiler that CMake picked.
+  cxx=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$build/CMakeCache.txt")
+  if ! printf 'void f() {}\n' | "$cxx" -x c++ -Oz -c -o /dev/null - >/dev/null 2>&1; then
+    cmake -B "$build" "-DCMAKE_C_COMPILER_LAUNCHER=$root/scripts/jsc-cc.sh;-Os" \
+      "-DCMAKE_CXX_COMPILER_LAUNCHER=$root/scripts/jsc-cc.sh;-Os"
+  fi
+fi
 cmake --build "$build" --target JavaScriptCore --parallel "$jobs"
 
 case "$system" in
@@ -170,6 +206,21 @@ if [[ $system == macos ]]; then
   install_name_tool -id "@rpath/$name" "$output/.$name"
   xcrun strip -x "$output/.$name"
   codesign --force --sign - "$output/.$name"
+elif [[ $system == linux ]]; then
+  strip --strip-unneeded "$output/.$name"
+  dynamic=$(nm -D --defined-only "$output/.$name" | awk '{ print $NF }' | LC_ALL=C sort -u)
+  required=$(grep -oE 'b"JS[A-Za-z0-9_]+\\0"' "$root/crates/runtime/src/jsc/mod.rs" | sed 's/^b"//; s/\\0"$//' |
+    LC_ALL=C sort -u)
+  missing=$(LC_ALL=C comm -23 <(printf '%s\n' "$required") <(printf '%s\n' "$dynamic"))
+  # GNU ld can keep its own section symbols in the dynamic table.
+  extra=$(grep -vE '^(JS.*|_init|_fini|_edata|_end|__bss_start(__)?|_?_bss_end__|__end__)$' <<<"$dynamic" || true)
+  if [[ -n $missing || -n $extra ]]; then
+    rm -f "$output/.$name"
+    [[ -z $missing ]] || printf '%s does not export:\n%s\n' "$name" "$missing" >&2
+    [[ -z $extra ]] || printf '%s exports symbols outside the JS C API:\n%s\n' "$name" "$extra" >&2
+    exit 1
+  fi
+  printf '%s: %s bytes, %s exported symbols\n' "$name" "$(stat -c %s "$output/.$name")" "$(wc -l <<<"$dynamic")"
 fi
 mv -f "$output/.$name" "$output/$name"
 
