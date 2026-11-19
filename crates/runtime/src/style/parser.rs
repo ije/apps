@@ -210,7 +210,16 @@ impl<'i> DeclarationParser<'i> for Rules {
 // Sheets and `var()` results repeat declarations, so each `property:value` is checked once.
 pub(super) fn invalid(name: &str, plain: &str) -> bool {
     VALID.with_borrow_mut(|(key, valid)| {
+        // An exact key starts with a zero byte. A miss also tries the shared key that follows it.
         key.clear();
+        key.push(0);
+        key.extend_from_slice(name.as_bytes());
+        key.push(b':');
+        key.extend_from_slice(plain.as_bytes());
+        if let Some(&result) = valid.get(key.as_slice()) {
+            return result;
+        }
+        let exact = key.len();
         key.extend_from_slice(name.as_bytes());
         key.push(b':');
         // Validity never depends on which nonzero digits a number with a unit has, so `1px` and `27px` share an
@@ -250,17 +259,20 @@ pub(super) fn invalid(name: &str, plain: &str) -> bool {
                 || byte == b'-' && word;
             key.push(byte);
         }
-        if let Some(&result) = valid.get(key.as_slice()) {
-            return result;
-        }
-        let result = !["env(", "attr(", "theme(", "--spacing(", "--alpha("]
-            .iter()
-            .any(|function| plain.contains(function))
-            && super::supports(name, plain) == Some(false);
-        if valid.len() > 4096 {
+        let shared = valid.get(&key[exact..]).copied();
+        let result = shared.unwrap_or_else(|| {
+            !["env(", "attr(", "theme(", "--spacing(", "--alpha("]
+                .iter()
+                .any(|function| plain.contains(function))
+                && super::supports(name, plain) == Some(false)
+        });
+        if valid.len() > 8192 {
             valid.clear();
         }
-        valid.insert(key.as_slice().into(), result);
+        if shared.is_none() || valid.is_empty() {
+            valid.insert(key[exact..].into(), result);
+        }
+        valid.insert(key[..exact].into(), result);
         result
     })
 }

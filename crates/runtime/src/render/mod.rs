@@ -1763,13 +1763,38 @@ impl PageView {
                 });
             }
         }
-        if dom.container_pass && dom.style_cache.units || dom.cull.frame != frame {
+        if dom.cull.frame != frame {
             dom.measurements.sizes.clear();
             // Text keeps the fonts that it resolved, so a font load must build it again.
             dom.measurements.texts.clear();
             dom.grids.clear();
             self.walked.borrow_mut().clear();
             self.adjoined.borrow_mut().clear();
+        } else if dom.container_pass && !dom.style_cache.units.is_empty() {
+            // Container units change the boxes in the resized containers, and the sizes of the boxes around them.
+            let mut nodes = rustc_hash::FxHashSet::default();
+            for &container in &dom.style_cache.units {
+                let mut node = crate::dom::flat_parent(&doc, dom, &styles, container);
+                while let Some(id) = node.filter(|&id| nodes.insert(id)) {
+                    node = crate::dom::flat_parent(&doc, dom, &styles, id);
+                }
+                let mut pending = vec![container];
+                while let Some(id) = pending.pop() {
+                    if id < doc.nodes.len() && nodes.insert(id) {
+                        pending.extend(&doc.nodes[id].children);
+                        pending.extend(dom.shadows.get(&id));
+                    }
+                }
+            }
+            let measured = &mut dom.measurements;
+            measured.sizes.retain(|(id, ..), _| !nodes.contains(id));
+            let (mut walked, mut adjoined) = (self.walked.borrow_mut(), self.adjoined.borrow_mut());
+            for id in &nodes {
+                measured.texts.remove(id);
+                dom.grids.remove(id);
+                walked.remove(id);
+                adjoined.remove(id);
+            }
         }
         let mut stale = false;
         let mut around = rustc_hash::FxHashSet::default();

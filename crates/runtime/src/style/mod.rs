@@ -1086,7 +1086,8 @@ pub(crate) struct StyleCache {
     containers: FxHashMap<usize, [f32; 2]>,
     sized: std::collections::HashSet<usize>,
     queries: QueryCache,
-    pub(crate) units: bool,
+    // Resized containers with nodes that use container units.
+    pub(crate) units: Vec<usize>,
     changed: Vec<u64>,
     stamp: u64,
     tables: FxHashMap<usize, CollapsedTable>,
@@ -1302,7 +1303,7 @@ impl StyleCache {
         sizes: &FxHashMap<usize, [f32; 2]>,
         doc: &Document,
     ) -> bool {
-        self.units = false;
+        self.units.clear();
         if *sizes == self.containers {
             return false;
         }
@@ -1313,7 +1314,7 @@ impl StyleCache {
             .copied()
             .filter(|id| sizes.get(id) != self.containers.get(id))
             .collect();
-        self.units = !flipped.is_empty();
+        self.units.extend(&flipped);
         for (&(scope, order, index, container), &(inline, matched, lengths)) in &self.queries {
             let query = self
                 .scopes
@@ -5367,7 +5368,8 @@ pub(crate) fn compute_styles(
     context: Option<&StyleContext>,
 ) -> ComputedStyles {
     let mut out = ComputedStyles::default();
-    let mut unique = rustc_hash::FxHashSet::default();
+    // The generation and revision of each dependency key in the list of the current node.
+    let (mut unique, mut generation) = (Vec::<(u32, u32)>::new(), 0u32);
     let (reduced_motion, native_theme) = context.map_or_else(
         || (reduced_motion(), crate::desktop::native::theme_state()),
         |context| (context.reduced_motion, context.theme),
@@ -6969,10 +6971,19 @@ pub(crate) fn compute_styles(
                     let style = matches.reads(id, 6);
                     matches.depend(id, 6);
                     // Each candidate selector reads the node again, so most entries repeat: drop them before sorting.
-                    unique.clear();
-                    matches
-                        .dependencies
-                        .retain(|dependency| unique.insert(*dependency));
+                    generation = generation.wrapping_add(1);
+                    if generation == 0 {
+                        unique.fill((0, 0));
+                        generation = 1;
+                    }
+                    matches.dependencies.retain(|&(key, revision)| {
+                        let key = key as usize;
+                        if key >= unique.len() {
+                            unique.resize(key + 1, (0, 0));
+                        }
+                        let seen = std::mem::replace(&mut unique[key], (generation, revision));
+                        seen != (generation, revision)
+                    });
                     matches.dependencies.sort_unstable();
                     matches.register(id);
                     let shared = intern(&mut scoped.lists, &matched);

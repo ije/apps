@@ -7,7 +7,9 @@ use std::collections::HashMap;
 
 #[derive(Default)]
 pub(crate) struct Measurements {
-    pub(crate) sizes: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), [f32; 4]>,
+    // The last key field marks the column and row extents of a grid layout, which intrinsic sizes repeat.
+    #[allow(clippy::type_complexity)]
+    pub(crate) sizes: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>, bool), [f32; 4]>,
     // The top and bottom margins of each measured box, as [positive, negative] after they collapse with the
     // margins of children that they adjoin.
     #[allow(clippy::type_complexity)]
@@ -597,7 +599,7 @@ pub(crate) fn intrinsic(
         .unwrap_or_default();
     }
     let key = (id, width.map(f32::to_bits), height.map(f32::to_bits));
-    if let Some(value) = measured.sizes.get(&key) {
+    if let Some(value) = measured.sizes.get(&(key.0, key.1, key.2, false)) {
         return *value;
     }
     let node = &doc.nodes[id];
@@ -1014,40 +1016,26 @@ pub(crate) fn intrinsic(
             .into_iter()
             .any(|name| style.get(name).is_some_and(|v| v.starts_with("subgrid")))
     {
-        let extent = |grid: &Grid| {
-            [(&grid.columns, grid.gap[0]), (&grid.rows, grid.gap[1])].map(|(sizes, gap)| {
-                sizes.iter().sum::<f32>() + sizes.len().saturating_sub(1) as f32 * gap
-            })
+        let mut extent = |width: Option<f32>, height: Option<f32>| {
+            let key = (id, width.map(f32::to_bits), height.map(f32::to_bits), true);
+            if let Some(&[columns, rows, ..]) = measured.sizes.get(&key) {
+                return [columns, rows];
+            }
+            let grid = layout(doc, id, styles, width, height, None, None, text, measured);
+            let [columns, rows] =
+                [(&grid.columns, grid.gap[0]), (&grid.rows, grid.gap[1])].map(|(sizes, gap)| {
+                    sizes.iter().sum::<f32>() + sizes.len().saturating_sub(1) as f32 * gap
+                });
+            measured.sizes.insert(key, [columns, rows, 0., 0.]);
+            [columns, rows]
         };
-        let [min, _] = extent(&layout(
-            doc,
-            id,
-            styles,
-            Some(0.),
-            None,
-            None,
-            None,
-            text,
-            measured,
-        ));
-        let [max, natural] = extent(&layout(
-            doc, id, styles, None, None, None, None, text, measured,
-        ));
+        let [min, _] = extent(Some(0.), None);
+        let [max, natural] = extent(None, None);
         content = [min, max, natural];
         if available.is_some() || vertical[0].is_some() {
             let fit = style.get(Prop::WIDTH) == Some("fit-content");
-            let grid = layout(
-                doc,
-                id,
-                styles,
-                available.map(|width| if fit { width.min(max).max(min) } else { width }),
-                vertical[0],
-                None,
-                None,
-                text,
-                measured,
-            );
-            content[2] = extent(&grid)[1];
+            let width = available.map(|width| if fit { width.min(max).max(min) } else { width });
+            content[2] = extent(width, vertical[0])[1];
         }
     } else {
         let inline = !node.children.is_empty()
@@ -1590,7 +1578,7 @@ pub(crate) fn intrinsic(
         measured.sizes.clear();
         measured.margins.clear();
     }
-    measured.sizes.insert(key, result);
+    measured.sizes.insert((key.0, key.1, key.2, false), result);
     measured.margins.insert(key, sets);
     result
 }
