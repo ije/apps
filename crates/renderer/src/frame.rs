@@ -26,6 +26,9 @@ pub struct Layer {
     pub origin: [i32; 2],
     scale: f32,
     bounds: [f32; 4],
+    // The texels of the texture that the layer holds. A pooled texture can be larger, or hold other tiles.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    scissor: [u32; 4],
 }
 
 struct Shelf {
@@ -438,6 +441,15 @@ impl RenderFrame {
         }
     }
 
+    /// The texels that draws into `target` may change, or `None` for the whole window.
+    #[cfg(target_os = "macos")]
+    pub fn scissor(&self, target: Target) -> Option<[u32; 4]> {
+        match target {
+            Target::Frame => None,
+            Target::Layer(index) => Some(self.layers[index].scissor),
+        }
+    }
+
     pub fn globals(&self, target: Target, text_contrast: f32) -> Globals {
         Globals {
             viewport: self.rect(target),
@@ -484,6 +496,7 @@ impl RenderFrame {
                 self.textures.len() - 1
             }
         };
+        let scissor = [0, 0, size[0], size[1]];
         let size = self.textures[texture];
         self.layers.push(Layer {
             texture,
@@ -495,6 +508,7 @@ impl RenderFrame {
                 (size[0] * scale as u32) as f32,
                 (size[1] * scale as u32) as f32,
             ],
+            scissor,
         });
         Target::Layer(self.layers.len() - 1)
     }
@@ -547,6 +561,7 @@ impl RenderFrame {
             origin: [region[0] - offset[0], region[1] - offset[1]],
             scale: 1.,
             bounds: region.map(|value| value as f32),
+            scissor: [offset[0] - 1, offset[1] - 1, w, h].map(|value| value as u32),
         });
         Some((Target::Layer(self.layers.len() - 1), clear))
     }
@@ -595,6 +610,7 @@ impl RenderFrame {
             origin: [region[0], region[1]],
             scale,
             bounds: [region[0] as f32, region[1] as f32, width, height],
+            scissor: [0, 0, cached.size[0], cached.size[1]],
         });
         Some(Target::Layer(self.layers.len() - 1))
     }
@@ -728,7 +744,9 @@ impl RenderFrame {
             let mut instance = *instance;
             let mut bounds = instance.reach();
             // A scroll viewport can cut an instance away.
-            if bounds.is_empty() || layer == 0 && self.cull.is_some_and(|cull| !cull.intersects(bounds)) {
+            if bounds.is_empty()
+                || layer == 0 && self.cull.is_some_and(|cull| !cull.intersects(bounds))
+            {
                 continue;
             }
             let trim = instance.kind() == BOX && instance.round_radii == [0.; 8];
@@ -784,7 +802,15 @@ impl RenderFrame {
                 || !self.skip.contains(&nested.layer)
                     && self.cull.is_none_or(|cull| cull.intersects(nested.reach())))
         {
+            // The cull region is in window space, and a transformed layer draws in its own.
+            let cull = self.cull;
+            if (scene.layers[nested.layer].effect.as_ref())
+                .is_some_and(|effect| effect.transform.is_some())
+            {
+                self.cull = None;
+            }
             self.record_effect(scene, nested, target, depth);
+            self.cull = cull;
         }
     }
 
@@ -981,12 +1007,25 @@ impl RenderFrame {
             Target::Frame => self.rect(target),
             Target::Layer(index) => self.layers[index].bounds,
         };
-        let visible = mask
-            .intersect(Rect::new(
-                Point::new(target_rect[0], target_rect[1]),
-                Size::new(target_rect[2], target_rect[3]),
-            ))
-            .to_array();
+        let spread = effect
+            .blur
+            .max(effect.shadow.map_or(0., |(_, sigma, _)| sigma))
+            * 3.;
+        let full = mask.intersect(Rect::new(
+            Point::new(target_rect[0], target_rect[1]),
+            Size::new(target_rect[2], target_rect[3]),
+        ));
+        // A damage region draws only the part of a changed layer that reaches it.
+        let visible = match self.cull {
+            Some(cull) => {
+                let offset = effect
+                    .shadow
+                    .map_or(0., |(offset, ..)| offset.x.abs().max(offset.y.abs()));
+                full.intersect(cull.outset(spread + offset + 1.))
+            }
+            None => full,
+        };
+        let [full, visible] = [full, visible].map(|rect| rect.to_array());
 
         let copies =
             self.copy && (effect.backdrop.is_some() || effect.blend_mode != BlendMode::Normal);
@@ -1041,7 +1080,7 @@ impl RenderFrame {
         // The region of a transformed layer is in its own space: the visible part mapped back through the
         // transform. A composited transform moves the layer without a repaint, so the region keeps a window
         // of room on each side and moves in steps of a window, and small moves keep its pixels.
-        let reach = match &effect.transform {
+        let [reach, full] = match &effect.transform {
             Some(transform) => {
                 let [x, y, width, height] = visible;
                 let back = crate::window::invert(&crate::window::plane_of(transform));
@@ -1065,7 +1104,7 @@ impl RenderFrame {
                         },
                     )
                 });
-                match seen {
+                let reach = match seen {
                     Some([left, top, right, bottom]) => {
                         // At most 4 windows on a side, around the middle of the visible part.
                         let span = |low: f32, high: f32, step: f32| {
@@ -1078,44 +1117,52 @@ impl RenderFrame {
                         [x0, y0, x1 - x0, y1 - y0]
                     }
                     None => [-w, -h, 3. * w, 3. * h],
-                }
+                };
+                [reach; 2]
             }
-            None => visible,
+            None => [visible, full],
         };
-        let spread = effect
-            .blur
-            .max(effect.shadow.map_or(0., |(_, sigma, _)| sigma))
-            * 3.;
         let content = content.outset(spread);
-        let Some(region) = self.region(content, reach) else {
+        let Some(whole_region) = self.region(content, full) else {
             return;
         };
-        // Tiles must hold all their content, since drawing past a tile would reach the next one.
-        let whole = Some(region)
-            == self.region(content, [f32::MIN, f32::MIN, f32::INFINITY, f32::INFINITY]);
         // A layer that draws as in an earlier frame takes the pixels of then. One that draws the same in
         // two frames keeps them.
         let digest = (scene.digests.get(nested.layer).copied())
             .filter(|digest| *digest != 0 && effect.text_mask.is_none());
         // The pixels are the same at another place, so the key holds the region relative to the layer.
         let origin = crate::scene::origin(layer).map(|value| value as i32);
-        let bordered = [region[0] - 1, region[1] - 1, region[2] + 2, region[3] + 2];
+        let border =
+            |region: [i32; 4]| [region[0] - 1, region[1] - 1, region[2] + 2, region[3] + 2];
         let key = digest.map(|digest| {
             [
-                region[0] - origin.x,
-                region[1] - origin.y,
-                region[2],
-                region[3],
+                whole_region[0] - origin.x,
+                whole_region[1] - origin.y,
+                whole_region[2],
+                whole_region[3],
             ]
             .iter()
             .fold(digest, |key, value| crate::scene::mix(key, *value as u64))
         });
-        let cached = key.and_then(|key| self.reuse(key, bordered));
+        let cached = key.and_then(|key| self.reuse(key, border(whole_region)));
         let count = self.count;
         let seen = cached.is_none()
             && key.is_some_and(|key| {
                 (self.seen.insert(key, count)).is_some_and(|seen| seen != count)
             });
+        // A layer that changed draws only what the damage region reaches, and isn't kept.
+        let (region, key, visible) = match cached.is_some() || seen {
+            true => (whole_region, key, full),
+            false => match self.region(content, reach) {
+                Some(region) if region == whole_region => (region, key, full),
+                Some(region) => (region, None, visible),
+                None => return,
+            },
+        };
+        let bordered = border(region);
+        // Tiles must hold all their content, since drawing past a tile would reach the next one.
+        let whole = Some(region)
+            == self.region(content, [f32::MIN, f32::MIN, f32::INFINITY, f32::INFINITY]);
         let tile = (cached.is_none() && !seen && !copies && !blurs && whole)
             .then(|| self.tile(region, target, depth))
             .flatten();

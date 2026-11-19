@@ -1,6 +1,8 @@
 globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter, StringDecoder, webcrypto, inspect, codec }) => {
-  const input = (value, encoding) => typeof value === 'string' ? Buffer.from(value, encoding) : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : value instanceof ArrayBuffer ? new Uint8Array(value) : (() => { throw Object.assign(new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView'), { code: 'ERR_INVALID_ARG_TYPE' }); })();
-  const output = data => Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  // The first `.buffer` read of a new array makes JSC allocate an ArrayBuffer, so own byte arrays pass as they are.
+  // Kept values stay fixed views: a length-tracking view would follow later resizes. Empty ones may be detached.
+  const input = (value, encoding, kept) => typeof value === 'string' ? Buffer.from(value, encoding) : ArrayBuffer.isView(value) ? (!kept && value instanceof Uint8Array && value.length && (Object.getPrototypeOf(value) === Buffer.prototype || Object.getPrototypeOf(value) === Uint8Array.prototype) ? value : new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) : value instanceof ArrayBuffer ? new Uint8Array(value) : (() => { throw Object.assign(new TypeError('The "data" argument must be of type string or an instance of Buffer, TypedArray, or DataView'), { code: 'ERR_INVALID_ARG_TYPE' }); })();
+  const output = data => Object.getPrototypeOf(data) === Uint8Array.prototype ? Object.setPrototypeOf(data, Buffer.prototype) : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
   const encoded = (data, encoding) => encoding && encoding !== 'buffer' ? data.toString(encoding) : data;
 
   const zlibError = error => Object.assign(error, /^Cannot create a Buffer/.test(error.message) ? { code: 'ERR_BUFFER_TOO_LARGE' } : /^unexpected end of file/.test(error.message) ? { code: 'Z_BUF_ERROR', errno: -5 } : { code: 'Z_DATA_ERROR', errno: -3 });
@@ -55,6 +57,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
   zlib.crc32 = (data, value = 0) => {
     table ??= Int32Array.from({ length: 256 }, (_, n) => { for (let k = 0; k < 8; k++) n = n & 1 ? 0xEDB88320 ^ (n >>> 1) : n >>> 1; return n; });
     const bytes = input(data, 'utf8');
+    if (bytes.length > 512) return sync('zlib.crc32', bytes, value >>> 0);
     let crc = ~value;
     for (let i = 0; i < bytes.length; i++) crc = table[(crc ^ bytes[i]) & 255] ^ (crc >>> 8);
     return ~crc >>> 0;
@@ -177,7 +180,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
       super();
       const match = /^(?:aes-(128|256)-gcm|(chacha20-poly1305))$/i.exec(algorithm), bits = match?.[1] ?? 256;
       if (!match) throw Object.assign(new Error('Unknown cipher'), { code: 'ERR_CRYPTO_UNKNOWN_CIPHER' });
-      this.#decrypt = decrypt; this.#key = secret(key); this.#iv = input(iv); this.#mode = match[2] ? 'chacha20-poly1305' : null;
+      this.#decrypt = decrypt; this.#key = secret(key); this.#iv = input(iv, undefined, true); this.#mode = match[2] ? 'chacha20-poly1305' : null;
       if (this.#key.length * 8 !== Number(bits)) throw Object.assign(new RangeError('Invalid key length'), { code: 'ERR_CRYPTO_INVALID_KEYLEN' });
       if (this.#iv.length !== 12) throw Object.assign(new TypeError('Invalid initialization vector'), { code: 'ERR_CRYPTO_INVALID_IV' });
       // ring verifies only 16-byte tags, so a decipher rejects the shorter tags that Node also takes.
@@ -215,7 +218,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
       this.#tag = sealed.subarray(sealed.length - 16);
       return tail;
     }
-    setAAD(data) { this.#aad = input(data); return this; }
+    setAAD(data) { this.#aad = input(data, undefined, true); return this; }
     getAuthTag() { if (this.#decrypt || !this.#tag) throw invalidState('getAuthTag'); return Buffer.from(this.#tag.subarray(0, this.#tagLength)); }
     setAuthTag(tag) {
       if (!this.#decrypt || this.#tag || this.#done) throw invalidState('setAuthTag');
@@ -406,7 +409,7 @@ globalThis.__appsNodeIO = ({ call, sync, asyncCall, Buffer, stream, EventEmitter
   const arrayBuffer = data => data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
   const key = value => typeof value === 'string' ? Buffer.from(value) : secret(value);
   const pbkdf2 = (password, salt, iterations, length, name) => [key(password), key(salt), iterations, length, digest(name)];
-  const fill = (target, offset = 0, size) => { const bytes = input(target); size ??= bytes.length - offset; for (let at = offset; at < offset + size; at += 65536) webcrypto.getRandomValues(bytes.subarray(at, Math.min(at + 65536, offset + size))); return target; };
+  const fill = (target, offset = 0, size) => { const bytes = input(target, undefined, true); size ??= bytes.length - offset; for (let at = offset; at < offset + size; at += 65536) webcrypto.getRandomValues(bytes.subarray(at, Math.min(at + 65536, offset + size))); return target; };
   const crypto = {
     webcrypto, subtle: webcrypto.subtle, getRandomValues: array => webcrypto.getRandomValues(array),
     createHash: algorithm => new Hash(algorithm),

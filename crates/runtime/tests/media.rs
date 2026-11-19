@@ -164,6 +164,28 @@ fn audio_plays_to_the_end_and_loops() {
 }
 
 #[test]
+fn audio_params_clamp_and_periodic_waves_check_their_arrays() {
+    let (_host, engine, _base) = page(apps_runtime::bundle::disabled_features(None).unwrap());
+    let script = "(() => {
+        const context = new OfflineAudioContext(1, 128, 8000), frequency = context.createOscillator().frequency;
+        frequency.setValueAtTime(100, 0).linearRampToValueAtTime(10000, 1);
+        const values = [frequency._at(0.25), frequency._at(0.5), ...frequency._run(0, 4, 4)];
+        frequency.cancelScheduledValues(0); frequency.value = 99999; values.push(frequency.value);
+        const error = fn => { try { fn(); return 'none'; } catch (e) { return e.name; } };
+        const wave = new PeriodicWave(context), real = new PeriodicWave(context, { real: [5, 2, 3] });
+        const osc = context.createOscillator(), filter = context.createBiquadFilter();
+        values.push(osc.detune.maxValue, -osc.detune.minValue, filter.detune.maxValue, filter.gain.maxValue.toFixed(3), filter.gain.minValue < -1e38);
+        osc.detune.value = 1e6; values.push(osc.detune.value);
+        values.push((1 / new PeriodicWave(context, { imag: [0, 1, 1] })._scale).toFixed(3), new PeriodicWave(context, { imag: [0, 1, 1], disableNormalization: true })._scale);
+        return [...values, error(() => context.createPeriodicWave(new Float32Array(3), new Float32Array(4))), error(() => context.createPeriodicWave([0], [1])), error(() => new PeriodicWave(context, { imag: [1] })), error(() => context.createPeriodicWave(undefined, undefined)), error(() => context.createPeriodicWave([0, NaN], [0, 1])), (1 / new PeriodicWave(context, { imag: Array.from({ length: 40 }, (_, k) => k && 1 / k) })._scale).toFixed(3), ...wave._real, ...wave._imag, ...real._real, ...real._imag].join();
+    })()";
+    assert_eq!(
+        engine.eval(script, "media-test").unwrap(),
+        "2575,4000,100,2575,4000,4000,4000,153600,153600,153600,1541.274,true,153600,1.760,1,IndexSizeError,IndexSizeError,IndexSizeError,TypeError,TypeError,1.812,0,0,0,1,0,2,3,0,0,0"
+    );
+}
+
+#[test]
 fn web_audio_renders_oscillators_filters_and_automation_like_chrome() {
     let (_host, engine, _base) = page(apps_runtime::bundle::disabled_features(None).unwrap());
     let script = "(async () => {

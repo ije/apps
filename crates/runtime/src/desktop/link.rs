@@ -31,7 +31,7 @@ impl HasWindowHandle for NativeHandle {
 }
 
 pub(crate) enum ToMain {
-    Event(String, &'static str),
+    Event(&'static str, Vec<String>, &'static str),
     Bridge(Payload),
     Sync(Payload, Answer),
     Open(u64, Value, Answer),
@@ -202,8 +202,15 @@ impl Link {
         self.wake_main();
     }
 
-    pub(crate) fn event(&self, source: String, url: &'static str) {
-        self.main(ToMain::Event(source, url));
+    // Main calls the function with these JSON arguments.
+    pub(crate) fn call(&self, function: &'static str, args: Vec<String>, url: &'static str) {
+        self.main(ToMain::Event(function, args, url));
+    }
+
+    pub(crate) fn event(&self, name: &str, id: u64, data: Option<Value>, url: &'static str) {
+        let mut args = vec![Value::from(name).to_string(), id.to_string()];
+        args.extend(data.map(|data| data.to_string()));
+        self.call("__appsEvent", args, url);
     }
 
     pub(crate) fn page(&self, message: ToPage) {
@@ -479,8 +486,9 @@ impl Main {
                 continue;
             }
             match (message, &self.engine) {
-                (ToMain::Event(source, url), Some(engine)) => {
-                    if let Err(error) = engine.eval(&source, url) {
+                (ToMain::Event(function, args, url), Some(engine)) => {
+                    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                    if let Err(error) = engine.call_logged(function, &args, url) {
                         eprintln!("apps: {error}");
                     }
                 }
@@ -597,9 +605,12 @@ impl Main {
                     .map(|(_, control)| (control.state(), control.is_active()));
                 match state {
                     Some((Some(state), focused)) => {
-                        let event =
-                            format!("__appsEvent('state',{id},{})", state_json(&state, focused));
-                        if let Err(error) = engine.eval(&event, "apps:state") {
+                        let (id, state) = (id.to_string(), state_json(&state, focused).to_string());
+                        if let Err(error) = engine.call_logged(
+                            "__appsEvent",
+                            &["\"state\"", &id, &state],
+                            "apps:state",
+                        ) {
                             eprintln!("apps: {error}");
                         }
                     }
@@ -732,9 +743,9 @@ impl Main {
                 drop(changed);
                 self.link.wake_main();
             }
-            WindowEvent::CloseRequested if self.engine.is_some() => self
-                .link
-                .event(format!("__appsEvent('close',{id})"), "apps:close"),
+            WindowEvent::CloseRequested if self.engine.is_some() => {
+                self.link.event("close", id, None, "apps:close")
+            }
             WindowEvent::CloseRequested => self.native(json!({"op":"window","args":["close",id]})),
         }
     }
@@ -785,8 +796,7 @@ impl Main {
             if let Some(pages) = &mut *self.link.pages() {
                 pages.remove(&id);
             }
-            self.link
-                .event(format!("__appsEvent('closed',{id})"), "apps:closed");
+            self.link.event("closed", id, None, "apps:closed");
             let mut windows = self.windows.borrow_mut();
             windows.remove(&id);
             if self.engine.is_none() && windows.is_empty() {
@@ -1109,20 +1119,54 @@ mod tests {
     }
 
     #[test]
+    fn events_call_main_with_their_values_and_drain_microtasks_after_each() {
+        let api = JavaScriptCore::load().unwrap();
+        let host = Rc::new(RefCell::new(Host::default()));
+        let engine = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
+        engine
+            .eval(
+                "globalThis.runs=[];globalThis.__appsEvent=function(name,id,data){if(name==='bad')throw new Error('bad event');runs.push(name+id+data+arguments.length);queueMicrotask(()=>runs.push('micro'))}",
+                "test",
+            )
+            .unwrap();
+        let link = Link::new();
+        let main = Main::new(Some(engine), host, link.clone(), api);
+        link.event(
+            "title",
+            1,
+            Some("it's \"q\" \u{2028} \u{1f600}".into()),
+            "test",
+        );
+        link.event("bad", 2, None, "test");
+        link.event("close", 3, None, "test");
+        main.receive();
+        let runs = main
+            .engine
+            .as_ref()
+            .unwrap()
+            .eval("runs.join('|')", "test")
+            .unwrap();
+        assert_eq!(
+            runs,
+            "title1it's \"q\" \u{2028} \u{1f600}3|micro|close3undefined2|micro"
+        );
+    }
+
+    #[test]
     fn nested_loops_defer_main_scripts_and_closed_windows_lose_their_messages() {
         let api = JavaScriptCore::load().unwrap();
         let host = Rc::new(RefCell::new(Host::default()));
         let engine = JsContext::new(api.clone(), host.clone(), Role::Main).unwrap();
         engine
             .eval(
-                "globalThis.runs=[];globalThis.__appsWindowOpen=id=>{runs.push('open'+id);return 'null'}",
+                "globalThis.runs=[];globalThis.pushEvent=()=>runs.push('event');globalThis.__appsWindowOpen=id=>{runs.push('open'+id);return 'null'}",
                 "test",
             )
             .unwrap();
         let link = Link::new();
         let main = Main::new(Some(engine), host, link.clone(), api);
         link.main(ToMain::Spawn(901));
-        link.event("runs.push('event')".into(), "test");
+        link.call("pushEvent", Vec::new(), "test");
         link.main(ToMain::Spawn(902));
         main.driving.set(true);
         main.receive();

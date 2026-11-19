@@ -1128,6 +1128,16 @@ impl Motion {
         })
     }
 
+    /// A CSS animation or transition of the node itself sets `prop`.
+    pub fn animates(&self, id: usize, styles: &ComputedStyles, prop: Prop) -> bool {
+        self.transitions
+            .get(&id)
+            .is_some_and(|list| list.iter().any(|transition| transition.property == prop))
+            || self.pairs(id, styles).any(|(effect, _)| {
+                effect.pseudo == 0 && effect.tracks.iter().any(|(track, _)| *track == prop)
+            })
+    }
+
     pub fn next_event(&self, id: usize, styles: &ComputedStyles, now: Instant) -> Option<Instant> {
         let animations = self.pairs(id, styles).filter_map(|(effect, clock)| {
             if clock.playback.rate == 0. || matches!(clock.phase, Phase::Ended | Phase::Canceled) {

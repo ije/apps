@@ -331,7 +331,7 @@ impl HitTransform {
 #[derive(Clone)]
 struct Placed {
     region: Region,
-    // The content mask, which moves with a scroll, and the scroll viewports around it, which stay.
+    // The content mask, which moves with a scroll, and its part in the scroll viewports around it.
     clip: Clip<Pixels>,
     view: Rect,
     transform: Option<Rc<HitTransform>>,
@@ -1705,12 +1705,17 @@ impl Window {
         by: Point<Pixels>,
     ) -> Option<u32> {
         let at = self.copy_regions(pass, range)?;
+        // The viewports of scrolls around the box can move with an outer scroll, so its regions see them anew.
+        let viewports = self.viewport_bounds();
         let mut moved = Vec::new();
         for placed in &mut self.pending.regions[at as usize..] {
             placed.region.bounds.origin += by;
             // The open mask inside a transform stays.
             if placed.clip.bounds.size.width.0 < OPEN {
                 placed.clip.bounds.origin += by;
+            }
+            if placed.transform.is_none() {
+                placed.view = placed.clip.bounds.intersect(viewports);
             }
             if placed.clip.rounded.size != Size::default() {
                 placed.clip.rounded.origin += by;

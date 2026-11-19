@@ -1613,6 +1613,9 @@ fn data_urls_load_binary_wasm_without_a_server() {
     run(r#"
         const raw=await fetch('data:application/octet-stream,%00%FF%23#ignored');
         if(new Uint8Array(await raw.arrayBuffer()).join(',')!=='0,255,35')throw Error('data bytes');
+        for(const [url,text] of [['data:,abc#','abc'],['data:,abc#x','abc'],['data:;base64,YWJj#','abc'],['data:,a%23b#c','a#b'],['data:,#','']])if(await(await fetch(url)).text()!==text)throw Error(url);
+        const blob=URL.createObjectURL(new Blob(['b'])),urls=[(await fetch('data:,abc#x')).url,(await fetch('data:,abc')).url,(await fetch(blob+'#f')).url];
+        if(urls.join()!==['data:,abc','data:,abc',blob].join())throw Error('response urls '+urls);
         const result=await WebAssembly.instantiateStreaming(fetch('data:application/wasm;base64,AGFzbQEAAAA='));
         if(!(result.instance instanceof WebAssembly.Instance))throw Error('Wasm data URL');
     "#);

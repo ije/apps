@@ -184,7 +184,13 @@ impl Shelf {
             false => &[Source::Bitmap(StrikeWith::ExactSize), Source::Outline],
         };
         let shift = f32::from(glyph.subpixel) / f32::from(crate::SUBPIXEL_STEPS);
-        Render::new(sources)
+        // Bitmaps have no outline to stroke. Strokes join with miters up to 4 times the width, like Skia.
+        let stroked = glyph.stroke > 0.;
+        let mut render = Render::new(if stroked { &[Source::Outline] } else { sources });
+        if stroked {
+            render.style(swash::zeno::Stroke::new(glyph.stroke * glyph.scale));
+        }
+        render
             .format(Format::Alpha)
             .offset(Vector::new(shift, 0.))
             .render(&mut scaler, glyph.glyph)

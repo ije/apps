@@ -1,6 +1,8 @@
 globalThis.__appsCrypto = (call, decodeBytes, base) => {
   const keys = new WeakMap();
-  const bytes = value => value instanceof ArrayBuffer ? new Uint8Array(value) : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : (() => { throw new TypeError('Expected bytes'); })();
+  // The first `.buffer` read of a new array makes JSC allocate an ArrayBuffer, so plain byte arrays go to native calls as they are.
+  // Kept values stay plain views: they are read with array methods. Empty ones may be detached.
+  const bytes = (value, kept) => value instanceof ArrayBuffer ? new Uint8Array(value) : ArrayBuffer.isView(value) ? (!kept && value instanceof Uint8Array && value.length && Object.getPrototypeOf(value) === Uint8Array.prototype ? value : new Uint8Array(value.buffer, value.byteOffset, value.byteLength)) : (() => { throw new TypeError('Expected bytes'); })();
   const encode = value => value.toBase64({ alphabet: 'base64url', omitPadding: true });
   const decode = value => Uint8Array.fromBase64(value.replaceAll('-', '+').replaceAll('_', '/'));
   const names = ['HMAC', 'AES-GCM', 'ECDSA', 'Ed25519', 'RSASSA-PKCS1-v1_5', 'RSA-PSS', 'PBKDF2', 'HKDF', 'SHA-1', 'SHA-256', 'SHA-384', 'SHA-512'];
@@ -66,7 +68,7 @@ globalThis.__appsCrypto = (call, decodeBytes, base) => {
       const kind = name(algorithm), kdf = kind === 'PBKDF2' || kind === 'HKDF'; usages = Array.from(usages);
       let data, allowed;
       if (kind === 'HMAC' || kind === 'AES-GCM' || kdf) {
-        const secret = format === 'raw' ? bytes(input) : format === 'jwk' && !kdf && input.kty === 'oct' ? decode(input.k) : fail('Unsupported secret key format');
+        const secret = format === 'raw' ? bytes(input, true) : format === 'jwk' && !kdf && input.kty === 'oct' ? decode(input.k) : fail('Unsupported secret key format');
         if (!secret.length || (kind === 'AES-GCM' && ![16, 32].includes(secret.length))) fail('Invalid key length', 'DataError');
         if (kdf && extractable) fail('Derivation keys are not extractable', 'SyntaxError');
         allowed = kind === 'HMAC' ? ['sign', 'verify'] : kdf ? ['deriveBits', 'deriveKey'] : ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'];
@@ -75,7 +77,7 @@ globalThis.__appsCrypto = (call, decodeBytes, base) => {
         const rsa = kind.startsWith('RSA'), curve = kind === 'ECDSA' ? algorithm.namedCurve : undefined, size = curves[curve]?.[1], hash = name(algorithm.hash);
         if ((kind === 'ECDSA' && !size) || (rsa && !sizes[hash])) fail('Unsupported key parameters');
         try {
-          const source = format === 'jwk' ? input : bytes(input);
+          const source = format === 'jwk' ? input : bytes(input, true);
           if (format === 'raw' && !rsa) data = { type: 'public', public: source.slice() };
           else if (format === 'jwk') {
             const field = key => decode(input[key]), type = input.d === undefined ? 'public' : 'private';

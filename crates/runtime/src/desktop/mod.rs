@@ -245,7 +245,7 @@ impl Desktop {
                     };
                     let line = text.shape_line("Ag", renderer::px(13.), &run);
                     if let Some(glyph) = line.line.glyphs.first() {
-                        text.glyph_pixels(glyph.font, glyph.id, glyph.size, 2., 0, false);
+                        text.glyph_pixels(glyph.font, glyph.id, glyph.size, 2., 0, false, 0.);
                     }
                     text.face(&Font {
                         weight: 600.,
@@ -662,10 +662,7 @@ impl Desktop {
                                     );
                                 }
                                 let event = serde_json::json!({"request":request,"url":url,"code":code,"description":description});
-                                self.link.event(
-                                    format!("__appsEvent('failed',{id},{event})"),
-                                    "apps:failed",
-                                );
+                                self.link.event("failed", id, Some(event), "apps:failed");
                                 continue;
                             }
                         };
@@ -837,8 +834,7 @@ impl Desktop {
                             cx.refresh_window(handle);
                         }
                         let event = serde_json::json!({"request":request,"url":location});
-                        self.link
-                            .event(format!("__appsEvent('loaded',{id},{event})"), "apps:loaded");
+                        self.link.event("loaded", id, Some(event), "apps:loaded");
                     }
                     "deliver" => {
                         let name = match args[2].as_str() {
@@ -1039,7 +1035,7 @@ impl Desktop {
                             cx.update_window(handle, |window, _| {
                                 window.next_frame(|window, _| {
                                     window.next_frame(move |_, _| {
-                                        link.event("__appsInitMenu()".into(), "apps:menu")
+                                        link.call("__appsInitMenu", Vec::new(), "apps:menu")
                                     })
                                 })
                             });
@@ -1063,7 +1059,7 @@ impl Desktop {
                                     };
                                     // The window is busy drawing here, so a capture requested by the reply must wait for the next drive.
                                     cx.defer(move |cx| {
-                                        link.event(format!("__appsEvent('captured',{id},{data})"), "apps:capture");
+                                        link.event("captured", id, Some(data), "apps:capture");
                                         Desktop::drive(runtime, cx);
                                     });
                                 });
@@ -1086,10 +1082,9 @@ impl Desktop {
                         };
                         if let Some(data) = result {
                             self.link.event(
-                                format!(
-                                    "__appsEvent('executed',{id},{})",
-                                    serde_json::json!({"request":request,"data":data})
-                                ),
+                                "executed",
+                                id,
+                                Some(serde_json::json!({"request":request,"data":data})),
                                 "apps:executed",
                             );
                         }
@@ -1111,10 +1106,8 @@ impl Desktop {
                             });
                         }
                         view.fullscreen = on.then_some([was, was]);
-                        self.link.event(
-                            format!("__appsEvent('html-full-screen',{id},{on})"),
-                            "apps:fullscreen",
-                        );
+                        self.link
+                            .event("html-full-screen", id, Some(on.into()), "apps:fullscreen");
                     }
                     "background" => {
                         let color = args[2]
@@ -1184,10 +1177,8 @@ impl Desktop {
             let text = title.as_deref().unwrap_or("");
             view.title = title.clone();
             if !self.host.borrow().rust_main {
-                self.link.event(
-                    format!("__appsEvent('title',{id},{})", serde_json::json!(text)),
-                    "apps:title",
-                );
+                self.link
+                    .event("title", id, Some(text.into()), "apps:title");
             } else if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
                 cx.update_window(handle, |window, _| window.control().set_title(text));
             }
@@ -1218,12 +1209,8 @@ impl Desktop {
                     .and_then(|view| view.handle)
                     .and_then(|handle| cx.update_window(handle, |window, _| window.zoom()))
                     .unwrap_or(1.);
-                let event = format!(
-                    "__appsEvent('resize',{id},{{width:{},height:{}}})",
-                    (width * zoom).round(),
-                    (height * zoom).round()
-                );
-                app.link.event(event, "apps:resize");
+                let size = serde_json::json!({"width": (width * zoom).round(), "height": (height * zoom).round()});
+                app.link.event("resize", id, Some(size), "apps:resize");
                 if let Some(renderer) = app.views.get(&id).and_then(|v| v.renderer.as_ref())
                     && let Err(error) = crate::render::scripted(cx, None, || {
                         renderer.eval("__appsDispatch('window:resize',[0])", "apps:resize")
@@ -1278,7 +1265,9 @@ impl Desktop {
                             eprintln!("apps: {error}");
                         }
                         app.link.event(
-                            format!("__appsEvent('html-full-screen',{id},false)"),
+                            "html-full-screen",
+                            id,
+                            Some(false.into()),
                             "apps:fullscreen",
                         );
                     }
@@ -1617,10 +1606,9 @@ impl Desktop {
             });
             let reopen = main.clone();
             renderer::native::on_reopen(move |visible| {
-                reopen.link().event(
-                    format!("__appsEvent('activate',0,{visible})"),
-                    "apps:activate",
-                );
+                reopen
+                    .link()
+                    .event("activate", 0, Some(visible.into()), "apps:activate");
                 reopen.drive();
             });
             let terminate = main.clone();
@@ -1647,17 +1635,15 @@ impl Desktop {
             let opened = main.clone();
             renderer::native::on_open_urls(move |list| {
                 for url in list {
-                    let event = match url::Url::parse(&url)
+                    let (name, data) = match url::Url::parse(&url)
                         .ok()
                         .filter(|url| url.scheme() == "file")
                         .and_then(|url| url.to_file_path().ok())
                     {
-                        Some(path) => {
-                            format!("__appsEvent('open-file',0,{})", serde_json::json!(path))
-                        }
-                        None => format!("__appsEvent('open-url',0,{})", serde_json::json!(url)),
+                        Some(path) => ("open-file", serde_json::json!(path)),
+                        None => ("open-url", serde_json::json!(url)),
                     };
-                    opened.link().event(event, "apps:open");
+                    opened.link().event(name, 0, Some(data), "apps:open");
                 }
                 opened.drive();
             });
@@ -1724,7 +1710,7 @@ impl Desktop {
                     id,
                     serde_json::json!({"op":"window","args":["menuAfterFrame",id]}),
                 )),
-                None => link.event("__appsInitMenu()".into(), "apps:menu"),
+                None => link.call("__appsInitMenu", Vec::new(), "apps:menu"),
             }
             renderer::native::activate(true);
             std::mem::forget(main);

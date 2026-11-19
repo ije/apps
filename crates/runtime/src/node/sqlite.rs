@@ -584,36 +584,48 @@ impl State {
                     if args[3] == true {
                         bind(rest(4))?;
                     }
-                    let result = (|| -> Result<Value> {
+                    // The rows go to JavaScript as JSON text, written here without a Value tree.
+                    let result = (|| -> Result<(Value, usize)> {
+                        use std::io::Write;
                         let mut code = ffi::sqlite3_step(raw);
                         database.check(code)?;
-                        let columns: Vec<_> = (0..ffi::sqlite3_column_count(raw))
-                            .map(|index| {
-                                CStr::from_ptr(ffi::sqlite3_column_name(raw, index))
-                                    .to_string_lossy()
-                                    .into_owned()
-                            })
-                            .collect();
-                        let mut rows = Vec::new();
+                        let count = ffi::sqlite3_column_count(raw);
+                        let mut out = b"{\"columns\":[".to_vec();
+                        for index in 0..count {
+                            if index > 0 {
+                                out.push(b',');
+                            }
+                            serde_json::to_writer(
+                                &mut out,
+                                &CStr::from_ptr(ffi::sqlite3_column_name(raw, index))
+                                    .to_string_lossy(),
+                            )?;
+                        }
+                        out.extend_from_slice(b"],\"rows\":[");
+                        let (mut rows, mut blobs) = (0, Vec::new());
                         while code == ffi::SQLITE_ROW {
-                            let mut row = Vec::with_capacity(columns.len());
-                            for index in 0..columns.len() as i32 {
-                                row.push(match ffi::sqlite3_column_type(raw, index) {
-                                    ffi::SQLITE_NULL => Value::Null,
+                            out.extend_from_slice(if rows > 0 { b",[" } else { b"[" });
+                            let mut markers = Vec::new();
+                            for index in 0..count {
+                                if index > 0 {
+                                    out.push(b',');
+                                }
+                                match ffi::sqlite3_column_type(raw, index) {
+                                    ffi::SQLITE_NULL => out.extend_from_slice(b"null"),
                                     ffi::SQLITE_INTEGER => {
                                         let value = ffi::sqlite3_column_int64(raw, index);
                                         if !bigints && value.unsigned_abs() < 1 << 53 {
-                                            json!(value)
+                                            write!(out, "{value}")?;
                                         } else {
-                                            json!({"integer": value.to_string()})
+                                            write!(out, "{{\"integer\":\"{value}\"}}")?;
                                         }
                                     }
                                     ffi::SQLITE_FLOAT => {
                                         let value = ffi::sqlite3_column_double(raw, index);
                                         if value.is_finite() {
-                                            json!(value)
+                                            serde_json::to_writer(&mut out, &value)?;
                                         } else {
-                                            json!({"real": value.to_string()})
+                                            write!(out, "{{\"real\":\"{value}\"}}")?;
                                         }
                                     }
                                     kind @ (ffi::SQLITE_TEXT | ffi::SQLITE_BLOB) => {
@@ -634,32 +646,50 @@ impl State {
                                             std::slice::from_raw_parts(data, size)
                                         };
                                         if text {
-                                            json!(String::from_utf8_lossy(bytes))
+                                            serde_json::to_writer(
+                                                &mut out,
+                                                &String::from_utf8_lossy(bytes),
+                                            )?;
                                         } else {
-                                            json!({"blob": crate::jsc::payload::write(bytes.to_vec())})
+                                            let marker = json!({"blob": crate::jsc::payload::write(bytes.to_vec())});
+                                            serde_json::to_writer(&mut out, &marker)?;
+                                            markers.resize(index as usize, Value::Null);
+                                            markers.push(marker);
                                         }
                                     }
                                     _ => bail!("Unsupported SQLite value"),
-                                });
+                                }
                             }
-                            rows.push(row);
+                            out.push(b']');
+                            if !markers.is_empty() {
+                                blobs.resize(rows, Value::Null);
+                                blobs.push(Value::Array(markers));
+                            }
+                            rows += 1;
                             if mode != "all" {
                                 break;
                             }
                             code = ffi::sqlite3_step(raw);
                             database.check(code)?;
                         }
-                        Ok(json!({"columns": columns, "rows": rows}))
+                        out.extend_from_slice(b"]}");
+                        let tree = if blobs.is_empty() {
+                            Value::Null
+                        } else {
+                            json!({"rows": blobs})
+                        };
+                        Ok((
+                            crate::jsc::payload::raw(String::from_utf8(out)?, tree),
+                            rows,
+                        ))
                     })();
-                    let reset = if mode != "next"
-                        || result.as_ref().map_or(true, |value| {
-                            value["rows"].as_array().is_none_or(Vec::is_empty)
-                        }) {
-                        ffi::sqlite3_reset(raw)
-                    } else {
-                        ffi::SQLITE_OK
-                    };
-                    let value = result?;
+                    let reset =
+                        if mode != "next" || result.as_ref().map_or(true, |(_, rows)| *rows == 0) {
+                            ffi::sqlite3_reset(raw)
+                        } else {
+                            ffi::SQLITE_OK
+                        };
+                    let (value, _) = result?;
                     database.check(reset)?;
                     Ok(value)
                 }

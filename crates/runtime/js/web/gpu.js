@@ -1,5 +1,6 @@
 (() => {
-  const call = globalThis.__appsGPU;
+  // `json` skips the search for bytes in the arguments. Only `binary` values hold bytes, and `wire` notes them.
+  const [call, json] = globalThis.__appsGPU, stringify = JSON.stringify.bind(JSON);
   delete globalThis.__appsGPU;
   const objects = new WeakMap(), rawBytes = Symbol();
   const garbage = new __appsFinalizers(({ device, id }) => { try { call('gpu.release', device, [id]); } catch {} });
@@ -10,12 +11,15 @@
   globalThis.__appsGPUPoll = () => {
     if (waiting.size) for (const [token, value] of call('gpu.poll')) { const entry = waiting.get(token); waiting.delete(token); entry?.resolve(value); }
   };
+  let raw = false;
   const wire = (value, refs) => {
+    if (value === null || typeof value !== 'object') return value;
     if (objects.has(value)) { refs?.push(value); return objects.get(value); }
-    if (value?.[rawBytes]) return value[rawBytes];
-    if (Array.isArray(value) || ArrayBuffer.isView(value)) return Array.from(value, v => wire(v, refs));
-    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, wire(v, refs)]));
-    return value;
+    if (value[rawBytes]) { raw = true; return value[rawBytes]; }
+    if (Array.isArray(value) || ArrayBuffer.isView(value)) { const out = new Array(value.length >>> 0); for (let i = 0; i < value.length; i++) out[i] = wire(value[i], refs); return out; }
+    const out = {};
+    for (const key of Object.keys(value)) { const item = wire(value[key], refs); if (key === '__proto__') Object.defineProperty(out, key, { value: item, enumerable: true, writable: true, configurable: true }); else out[key] = item; }
+    return out;
   };
   const bytes = (data, offset = 0, size) => {
     const view = ArrayBuffer.isView(data);
@@ -111,7 +115,9 @@
     constructor(device, desc = {}) { this._device = device; this.label = desc.label ?? ''; this._commands = []; this._refs = []; this._ended = false; }
     _record(name, args) {
       if (this._ended || this._pass) throw new Error('GPU encoder is not open');
-      this._commands.push([name, ...wire(args, this._refs)]);
+      const item = [name];
+      for (let i = 0; i < args.length; i++) item.push(wire(args[i], this._refs));
+      this._commands.push(item);
     }
     setBindGroup(index, group, offsets = [], start = 0, length = offsets.length - start) {
       this._record('setBindGroup', [index, group, Array.from(offsets).slice(start, start + length)]);
@@ -208,7 +214,10 @@
     }
     _call(op, params, wired) {
       if (this._destroyed) throw new Error('GPU device is destroyed');
-      const result = call('gpu.' + op, objects.get(this), wired ? params : wire(params));
+      // A getter in `params` can make another GPU call, which uses `raw` too.
+      const outer = raw; raw = false;
+      const value = wired ? params : wire(params), bytes = raw; raw = outer;
+      const result = !bytes && value !== null && typeof value === 'object' ? json('gpu.' + op, stringify([objects.get(this), value])) : call('gpu.' + op, objects.get(this), value);
       if (result?.gpuError) {
         const error = new (result.kind === 'out-of-memory' ? GPUOutOfMemoryError : GPUValidationError)(result.gpuError);
         const scope = this._scopes.findLast(s => s.filter === result.kind);

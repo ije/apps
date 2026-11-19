@@ -432,19 +432,6 @@ impl State {
                 url::form_urlencoded::parse(args[0].as_str().context("Expected query")?.as_bytes())
                     .collect::<Vec<_>>()
             )),
-            "digest" => {
-                let bytes = crate::node::bytes(&args[1])?;
-                let algorithm = match args[0].as_str().context("Expected algorithm")? {
-                    "SHA-1" => &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-                    "SHA-256" => &ring::digest::SHA256,
-                    "SHA-384" => &ring::digest::SHA384,
-                    "SHA-512" => &ring::digest::SHA512,
-                    _ => bail!("Unsupported digest algorithm"),
-                };
-                Ok(crate::jsc::payload::write(
-                    ring::digest::digest(algorithm, bytes).as_ref().to_vec(),
-                ))
-            }
             "asset" => {
                 let url = Url::parse(args[0].as_str().context("Expected URL")?)?;
                 let name = url.path().trim_start_matches('/');

@@ -566,6 +566,26 @@ impl Host {
                         }
                         true
                     }
+                    // A copy of a node for `cloneNode`: tag, attributes, and the text of text and comments.
+                    10 => {
+                        let (id, from) =
+                            (usize::try_from(a).context("Invalid node")?, node(doc, b)?);
+                        ensure!(state.reserved.remove(&id), "Invalid node");
+                        let from = &doc.nodes[from];
+                        let text = match &from.stylesheet {
+                            Some(sheet) if from.tag == "#text" => sheet.source(),
+                            _ if from.tag.starts_with('#') => from.text.clone(),
+                            _ => Default::default(),
+                        };
+                        let copy = Node {
+                            tag: from.tag.clone(),
+                            text,
+                            attrs: from.attrs.clone(),
+                            ..Node::default()
+                        };
+                        state.place(doc, id, copy);
+                        false
+                    }
                     _ => bail!("Unknown DOM operation"),
                 })
             })();

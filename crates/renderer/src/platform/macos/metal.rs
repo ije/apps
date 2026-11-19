@@ -881,6 +881,8 @@ impl Renderer {
             .map(|(_, frame)| *frame);
         // A scroll copies the last frame moved, so the regions of earlier frames don't tell what a drawable lacks.
         let shift = scene.shift.filter(|_| !damage.is_empty() && last.is_some());
+        // WARNING: later frames add the regions of this frame, so it keeps only its own, or they grow each frame.
+        let own = damage.clone();
         if !damage.is_empty()
             && shift.is_none()
             && let Some(since) = since
@@ -923,8 +925,7 @@ impl Renderer {
             .retain(|(texture, frame)| !ptr::eq(&**texture, &*frame_texture) && frames - frame < 4);
         self.drawables.push((frame_texture.clone(), frames));
         self.regions.retain(|(frame, _)| frames - frame < 4);
-        let regions =
-            (!self.frame.damage.is_empty() && shift.is_none()).then(|| self.frame.damage.clone());
+        let regions = (!self.frame.damage.is_empty() && shift.is_none()).then_some(own);
         self.regions.push((frames, regions));
         let (commands, sublayers) = match rendered {
             Ok(commands) => commands,
@@ -1333,6 +1334,21 @@ impl Renderer {
                 height: drawable.height(),
             });
         };
+        // Draws stay in the texels of their layer, as a pooled texture can be larger.
+        let scissor = |encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>, target: Target| {
+            let full = texture(target);
+            let [x, y, width, height] = frame
+                .scissor(target)
+                .unwrap_or([0, 0, u32::MAX, u32::MAX])
+                .map(|value| value as usize);
+            let [x, y] = [x.min(full.width()), y.min(full.height())];
+            encoder.setScissorRect(MTLScissorRect {
+                x,
+                y,
+                width: width.min(full.width() - x),
+                height: height.min(full.height() - y),
+            });
+        };
         let begin = |target: Target, clear: bool| -> Result<_> {
             let descriptor = MTLRenderPassDescriptor::new();
             // SAFETY: index zero is within the color attachment array.
@@ -1361,6 +1377,7 @@ impl Renderer {
             }
             pending.set(pending.get() && !first);
             uniforms(&encoder, bytes(&[globals(target)]), 1);
+            scissor(&encoder, target);
             Ok(encoder)
         };
         let mut encoder: Option<Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>> = None;
@@ -1399,6 +1416,7 @@ impl Renderer {
                         && frame.texture(*target) == frame.texture(current.0) =>
                 {
                     uniforms(encoder, bytes(&[globals(*target)]), 1);
+                    scissor(encoder, *target);
                     current = (*target, false);
                 }
                 // Targets are cleared right away, since a later pass may draw into them.
@@ -1858,6 +1876,7 @@ mod tests {
             image: usize,
             turned: f32,
             shift: f32,
+            corner: f32,
         }
         let first = Step {
             name: "first",
@@ -1868,6 +1887,7 @@ mod tests {
             image: 0,
             turned: 0.2,
             shift: 0.,
+            corner: 0.2,
         };
         let steps = [
             first,
@@ -1928,7 +1948,7 @@ mod tests {
                 opacity: 0.5,
                 image: 1,
                 turned: 0.9,
-                shift: 0.,
+                ..first
             },
             Step {
                 name: "moved layer",
@@ -1939,6 +1959,18 @@ mod tests {
                 image: 1,
                 turned: 0.9,
                 shift: 3.,
+                ..first
+            },
+            Step {
+                name: "part of a shadowed layer",
+                box_color: 0.3,
+                box_at: [100., 50.],
+                inner: 0.6,
+                opacity: 0.5,
+                image: 1,
+                turned: 0.9,
+                shift: 3.,
+                corner: 0.7,
             },
         ];
         let (send, receive) = std::sync::mpsc::channel();
@@ -1977,6 +2009,31 @@ mod tests {
                     [24. + shift, 60. + shift, 20., 10.],
                     [0.1, 0.5, 0.5, 1.],
                 ));
+                scene.pop_effect();
+                let state = EffectState {
+                    shadow: Some((
+                        crate::point(2., 2.),
+                        2.,
+                        crate::Color {
+                            r: 0.,
+                            g: 0.,
+                            b: 0.,
+                            a: 0.5,
+                        },
+                    )),
+                    ..effect(mask)
+                };
+                scene.push_effect(state, Some(8));
+                scene.push(quad([150., 80., 45., 36.], [0.8, 0.8, 0.8, 1.]));
+                scene.push(quad([186., 106., 6., 6.], [step.corner, 0.3, 0.3, 1.]));
+                scene.pop_effect();
+                // A blend mode reads only the pixel below, so a change below it doesn't draw all of it.
+                let state = EffectState {
+                    blend_mode: crate::BlendMode::Multiply,
+                    ..effect(mask)
+                };
+                scene.push_effect(state, None);
+                scene.push(quad([140., 70., 60., 50.], [0.9, 0.6, 0.9, 0.5]));
                 scene.pop_effect();
                 scene.push(quad([40., 30., 50., 10.], [0.1, 0.1, 0.1, 0.7]));
                 let tile = tiles[step.image];
@@ -2035,6 +2092,17 @@ mod tests {
                 let committed = renderer.committed;
                 renderer.draw(&scene, false);
                 scene.drawn();
+                if step.name == "part of a shadowed layer" {
+                    let frame = &renderer.frame;
+                    // The shadow blurs the region of the layer.
+                    let blurred = (frame.blurs.iter())
+                        .map(|blur| blur.region[2] * blur.region[3])
+                        .fold(0., f32::max);
+                    assert!(
+                        blurred > 0. && blurred < 40. * 30.,
+                        "the layer draws whole: {blurred}"
+                    );
+                }
                 let drawn = (renderer.committed != committed).then(|| {
                     let frame = &renderer.frame;
                     (frame.damage.clone(), frame.instances.len())
@@ -2060,7 +2128,7 @@ mod tests {
             let (name, drawn, same) = receive.recv().unwrap();
             assert!(same, "{name}: the frame matches a full frame");
             let expect: Option<(&[[i32; 4]], usize)> = match name {
-                "first" => Some((&[], 8)),
+                "first" => Some((&[], 11)),
                 "same" => None,
                 "box color" => Some((&[[149, 9, 42, 42]], 2)),
                 "moved box" => Some((&[[119, 9, 72, 46]], 2)),
@@ -2076,6 +2144,8 @@ mod tests {
                 "below a backdrop" => Some((&[[96, 13, 65, 91]], 2)),
                 // The layer moves with its pixels.
                 "moved layer" => Some((&[[19, 19, 35, 55]], 2)),
+                // The layer draws only the part that reaches the region.
+                "part of a shadowed layer" => Some((&[[181, 101, 19, 19]], 3)),
                 _ => unreachable!(),
             };
             assert_eq!(
@@ -2109,7 +2179,7 @@ mod tests {
                 instance
             };
             let mut scene = Scene::default();
-            let mut uncopied = 0;
+            let (mut uncopied, mut widest) = (0, 0);
             for frame in 0..12 {
                 scene.clear();
                 scene.push(quad([0., 0., 200., 120.], [0.9, 0.9, 0.85, 1.]));
@@ -2122,7 +2192,11 @@ mod tests {
                 scene.drawn();
                 let damaged = !renderer.frame.damage.is_empty();
                 // A drawable from frames ago draws the steps of the box since then.
-                uncopied += u32::from(renderer.frame.damage.iter().any(|region| region[2] > 40));
+                // One frame moves the box 12px, so its own region is 24px wide. A drawable comes back after 3
+                // frames at most, so a region never holds more than 3 moves.
+                uncopied += u32::from(renderer.frame.damage.iter().any(|region| region[2] > 24));
+                widest = (renderer.frame.damage.iter())
+                    .fold(widest, |widest, region| widest.max(region[2]));
                 let last = renderer.last.clone().unwrap();
                 let commands = renderer.queue.commandBuffer().unwrap();
                 let buffer = renderer.read_back(&commands, &last, [200, 120]).unwrap();
@@ -2142,7 +2216,8 @@ mod tests {
                 let (_, full) = reference.draw(&scene, true).unwrap().unwrap();
                 send.send((frame, damaged, pixels == full)).unwrap();
             }
-            send.send((u32::MAX, uncopied > 4, true)).unwrap();
+            send.send((u32::MAX, uncopied > 4 && widest <= 36, true))
+                .unwrap();
             super::super::threads::end_thread();
         };
         super::super::threads::spawn_render(job, || {});

@@ -39,6 +39,8 @@ pub struct TextRun {
     pub nowrap: bool,
     /// Spaces per tab stop, or pixels when negative.
     pub tab_size: f32,
+    /// `-webkit-text-stroke`: the width and color of a line centered on the glyph outlines.
+    pub stroke: Option<(Pixels, Color)>,
 }
 
 /// Declares `TextStyle` and its overrides from one list, so the two cannot drift.
@@ -101,6 +103,8 @@ text_style! {
     letter_spacing set_letter_spacing: Pixels = Pixels::ZERO,
     word_spacing set_word_spacing: Pixels = Pixels::ZERO,
     text_indent set_text_indent: Pixels = Pixels::ZERO,
+    // The part of `text-indent` that is a fraction of the width of the paragraph, from a percentage.
+    text_indent_percent set_text_indent_percent: f32 = 0.,
     float set_float: Pixels = Pixels::ZERO,
     text_wrap set_text_wrap: TextWrap = TextWrap::Wrap,
     word_break set_word_break: WordBreak = WordBreak::Normal,
@@ -146,6 +150,7 @@ impl TextStyle {
             inset: [Pixels::ZERO; 2],
             nowrap: false,
             tab_size: 8.,
+            stroke: None,
         }
     }
 }

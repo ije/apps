@@ -434,7 +434,7 @@ fn container_queries_parse_and_follow_container_sizes() {
             (
                 None,
                 false,
-                "((width > 300px) and (width <= 600px)) or (width > 2000px)".into()
+                "(300px < inline-size <= 600px) or (width > 2000px)".into()
             ),
         ]
     );
@@ -648,7 +648,7 @@ fn inline_runs_keep_node_ranges_and_reject_independent_boxes() {
         &mut StyleCache::default(),
         None,
     );
-    let inline = inline_text(&doc, &computed, id).unwrap();
+    let inline = inline_text(&doc, &computed, id, &[]).unwrap();
     assert_eq!(&*inline.text, "A😀BC");
     assert_eq!(inline.boxes.len(), 1);
     assert_eq!(inline.boxes[0].fill, renderer::Color::hex(0xffee00ff));
@@ -676,7 +676,7 @@ fn inline_runs_keep_node_ranges_and_reject_independent_boxes() {
         &mut StyleCache::default(),
         None,
     );
-    assert!(inline_text(&doc, &computed, id).is_none());
+    assert!(inline_text(&doc, &computed, id, &[]).is_none());
 }
 
 #[test]
@@ -693,7 +693,7 @@ fn inline_boxes_ignore_properties_that_do_not_apply_to_them() {
         &mut StyleCache::default(),
         None,
     );
-    let inline = inline_text(&doc, &computed, element(&doc, "p")).unwrap();
+    let inline = inline_text(&doc, &computed, element(&doc, "p"), &[]).unwrap();
     assert_eq!(&*inline.text, "the /hairline-create skill");
 }
 
@@ -715,7 +715,7 @@ fn rounded_inline_highlights_keep_one_text_layout_when_tokens_split() {
             &mut StyleCache::default(),
             None,
         );
-        let inline = inline_text(&doc, &computed, id).unwrap();
+        let inline = inline_text(&doc, &computed, id, &[]).unwrap();
         let actual = (
             inline.text.clone(),
             inline
@@ -779,7 +779,7 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
     assert_eq!(&marker["color"], "blue");
     assert!(marker.contains(Prop::CONTENT) && marker.contains(Prop::FONT_SIZE));
     assert!(computed.text_pseudos[&p][0].is_none());
-    let inline = inline_text(&doc, &computed, p).unwrap();
+    let inline = inline_text(&doc, &computed, p, &[]).unwrap();
     assert_eq!(&*inline.text, "\"Hi there x");
     assert_eq!(
         inline.runs.iter().map(|run| run.len).sum::<usize>(),
@@ -819,7 +819,7 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
         &mut StyleCache::default(),
         None,
     );
-    assert!(inline_text(&doc, &computed, element(&doc, "p")).is_none());
+    assert!(inline_text(&doc, &computed, element(&doc, "p"), &[]).is_none());
     assert_eq!(
         &computed.values[element(&doc, "td")]["vertical-align"],
         "middle"
@@ -1066,7 +1066,7 @@ fn inline_boxes_and_atoms_stay_in_one_text_layout() {
         &mut StyleCache::default(),
         None,
     );
-    let inline = inline_text(&doc, &computed, element(&doc, "#p")).unwrap();
+    let inline = inline_text(&doc, &computed, element(&doc, "#p"), &[]).unwrap();
     assert_eq!(&*inline.text, "a b \u{fffc} \u{fffc}d e");
     assert_eq!(inline.atoms.len(), 2);
     assert_eq!(inline.boxes.len(), 1);
@@ -1089,8 +1089,8 @@ fn inline_boxes_and_atoms_stay_in_one_text_layout() {
     assert_eq!(run_of("b").inset[1], renderer::px(5.));
     assert!(run_of("d").nowrap);
     assert!(!run_of("e").nowrap);
-    assert!(inline_text(&doc, &computed, element(&doc, "#alone")).is_none());
-    assert!(inline_text(&doc, &computed, element(&doc, "#flex")).is_none());
+    assert!(inline_text(&doc, &computed, element(&doc, "#alone"), &[]).is_none());
+    assert!(inline_text(&doc, &computed, element(&doc, "#flex"), &[]).is_none());
 }
 
 #[test]
@@ -3044,6 +3044,8 @@ fn counters_number_generated_content_and_list_items() {
         [Some(5), Some(10), Some(11)]
     );
     assert_eq!([item("#r1"), item("#r2")], [Some(2), Some(1)]);
+    // Like Chrome, a list with its own `counter-reset` still starts its `list-item` counter.
+    assert_eq!([item("#x"), item("#y")], [Some(1), Some(2)]);
 }
 
 #[test]
@@ -3083,7 +3085,7 @@ fn computed_values_serialize_shorthands_and_color_spaces_like_webkit() {
         ("animation", "2s linear infinite spin"),
         ("list-style", "inside none square"),
         ("columns", "100px 3"),
-        ("flex-flow", "row"),
+        ("flex-flow", "row nowrap"),
     ] {
         assert_eq!(get("#a", name), expected, "{name}");
     }
@@ -3722,7 +3724,7 @@ fn block_in_inline_splits_and_empty_inlines_make_no_line() {
     assert!(makes_no_line(&doc, &computed, id("s")));
     assert!(!makes_no_line(&doc, &computed, id("t")));
     assert!(!makes_no_line(&doc, &computed, id("u")));
-    let inline = inline_text(&doc, &computed, id("q")).unwrap();
+    let inline = inline_text(&doc, &computed, id("q"), &[]).unwrap();
     assert_eq!(&*inline.text, "a b\nc");
     assert_eq!(
         inline.runs.iter().map(|run| run.len).sum::<usize>(),
@@ -5015,7 +5017,7 @@ fn invalid_declarations_are_dropped_at_parse_time() {
 fn integer_and_number_math_folds_to_plain_numbers() {
     let doc = Document::parse(
         "<html><style>@import 'tailwindcss'; #v{--n:3; z-index:calc(var(--n) * -1); flex-shrink:calc(var(--n) / 2)}</style><body>
-        <div id=a class='-z-10 -order-1 relative'></div>
+        <div id=a class='-z-10 -order-1 relative -col-start-1 -row-end-2'></div>
         <div id=b class='z-[calc(1+1)] opacity-[calc(0.25*2)] grow-[calc(1+1)]'></div>
         <div id=v></div></body></html>",
     );
@@ -5042,6 +5044,8 @@ fn integer_and_number_math_folds_to_plain_numbers() {
     for (selector, name, expected) in [
         ("#a", "z-index", "-10"),
         ("#a", "order", "-1"),
+        ("#a", "grid-row-end", "-2"),
+        ("#a", "grid-column-start", "-1"),
         ("#b", "z-index", "2"),
         ("#b", "opacity", "0.5"),
         ("#b", "flex-grow", "2"),
@@ -5092,7 +5096,8 @@ fn grid_column_and_mask_shorthands_expand_to_longhands() {
         ("#b", "grid-row-end", "6"),
         ("#b", "grid-row", "5 / 6"),
         ("#c", "grid-column-end", "main"),
-        ("#c", "grid-area", "main / main / main / main"),
+        // Like Chrome, lines that the first line implies are left out.
+        ("#c", "grid-area", "main"),
         ("#d", "column-count", "3"),
         ("#d", "column-width", "auto"),
         ("#d", "columns", "3"),
@@ -5100,8 +5105,8 @@ fn grid_column_and_mask_shorthands_expand_to_longhands() {
         ("#d", "column-rule-width", "2px"),
         ("#e", "mask-image", "url(m.png)"),
         ("#e", "mask-repeat", "no-repeat"),
-        ("#e", "mask-size", "10px"),
-        ("#f", "grid-auto-flow", "row dense"),
+        ("#e", "mask-size", "10px auto"),
+        ("#f", "grid-auto-flow", "dense"),
         ("#f", "grid-auto-rows", "20px"),
         ("#f", "grid-template-columns", "1fr 1fr"),
         ("#g", "grid-row-start", "span 2"),
@@ -5304,7 +5309,7 @@ fn small_caps_are_smaller_capitals_like_chrome() {
         None,
     );
     let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
-    let inline = inline_text(&doc, &computed, p).unwrap();
+    let inline = inline_text(&doc, &computed, p, &[]).unwrap();
     assert_eq!(&*inline.text, "AB CD 1");
     let runs: Vec<_> = inline
         .runs
@@ -5566,7 +5571,7 @@ fn capitalize_follows_words_across_inline_text() {
         &mut StyleCache::default(),
         None,
     );
-    let inline = inline_text(&doc, &computed, element(&doc, "p")).unwrap();
+    let inline = inline_text(&doc, &computed, element(&doc, "p"), &[]).unwrap();
     assert_eq!(&*inline.text, "Foobar Don't 3d X.y A-B _c Ef");
     let mut text = "ab cd".to_owned();
     text_transform(&mut text, 1..5, "capitalize");
@@ -5626,4 +5631,344 @@ fn rewritten_style_text_drops_old_rules_from_the_scope() {
     ids.dedup();
     // Most rewrites update the scope in place, and some build it again.
     assert!(ids.len() > 1 && ids.len() < 30, "{ids:?}");
+}
+
+#[test]
+fn review_cases_follow_chrome() {
+    let doc = Document::parse(
+        "<style>#a{min-width:calc(50% * -1);font-weight:999.9999;line-height:calc(1e40);background-size:12345678px auto;transform:translate(1e-7px, 1234567px);transition-duration:0.1234567s}#b{position:static;top:calc((10% + 5px) * 2);min-width:calc(min(10%, 5px) + 1px);max-width:calc(10% + max(1px, 2px));background-position:calc(1em - 10%) 0;display:none;width:calc(50% * -1)}</style><div id=a></div><div id=b></div><svg><circle id=c r=5 cx=10%></circle><rect id=d x=1 y=2em rx=3 width=10 height=20></rect><rect id=e width=-10 rx=auto></rect><use id=u width=7></use></svg><div id=f style='border:0.3px solid;outline:7.7px solid;outline-offset:-0.3px'></div>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let get = |selector, name| {
+        let id = element(&doc, selector);
+        resolved(
+            &computed.values[id],
+            &computed.lengths[id],
+            name,
+            None,
+            &|| [800., 600.],
+            &Registry::default(),
+        )
+    };
+    for (selector, name, expected) in [
+        ("#a", "min-width", "0%"),
+        ("#a", "font-weight", "999.75"),
+        ("#a", "line-height", "3.40282e+38px"),
+        ("#a", "background-size", "1.23457e+07px auto"),
+        ("#a", "transition-duration", "0.123457s"),
+        ("#b", "top", "calc(20% + 10px)"),
+        ("#b", "min-width", "calc(1px + min(10%, 5px))"),
+        ("#b", "max-width", "calc(10% + 2px)"),
+        ("#b", "background-position", "calc(-10% + 16px) 0px"),
+        ("#b", "width", "0%"),
+        ("#c", "r", "5px"),
+        ("#c", "cx", "10%"),
+        ("#d", "x", "1px"),
+        ("#d", "y", "32px"),
+        ("#d", "rx", "3px"),
+        ("#d", "width", "10px"),
+        ("#e", "rx", "0px"),
+        ("#u", "width", "auto"),
+        ("#f", "border-top-width", "1px"),
+        ("#f", "outline-width", "7px"),
+        ("#f", "outline-offset", "-1px"),
+        ("#f", "border", "1px solid rgb(0, 0, 0)"),
+    ] {
+        assert_eq!(get(selector, name), expected, "{selector} {name}");
+    }
+    for (name, value, expected) in [
+        ("width", "calc(1e7px + 1em)", "calc(1em + 1e+07px)"),
+        ("width", "calc(1e-10px + 1em)", "calc(1em + 1e-10px)"),
+        ("width", "calc(1234567px + 1px)", "calc(1.23457e+06px)"),
+        ("width", "calc(1px\t+\t1em)", "calc(1em + 1px)"),
+        ("width", "calc(e * 1px + 1em)", "calc(1em + 2.71828px)"),
+        (
+            "width",
+            "calc(min(1em,5px)*-1 + 2px)",
+            "calc(2px + (-1 * min(1em, 5px)))",
+        ),
+        ("aspect-ratio", "calc(16 / 9)", "calc(1.77778) / 1"),
+        ("box-shadow", "calc(1px + 1px) 0 red", "red calc(2px) 0px"),
+        ("src", "local(Arial)", "local(\"Arial\")"),
+    ] {
+        assert_eq!(specified(name, value), expected, "{name}: {value}");
+    }
+    for (name, value, valid) in [
+        ("width", "calc(0)", false),
+        ("grid-template-columns", "repeat(2, calc(1fr))", false),
+        (
+            "grid-template-columns",
+            "minmax(calc(10px + 5px), 1fr)",
+            true,
+        ),
+        ("transform", "matrix(1,0,0,1,calc(1px + 2px),0)", false),
+        ("transform", "translate(10%, 0) rotate(0) scale(50%)", true),
+    ] {
+        assert_eq!(supports(name, value), Some(valid), "{name}: {value}");
+    }
+    for (value, weight, size) in [
+        ("0/0 a", "normal", "0"),
+        ("bold 0 serif", "bold", "0"),
+        ("calc(2000) 12px serif", "calc(2000)", "12px"),
+    ] {
+        let mut out = Vec::new();
+        shorthand::expand("font", value, &mut out);
+        let get = |name| {
+            out.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(
+            (get("font-weight"), get("font-size")),
+            (Some(weight), Some(size)),
+            "{value}"
+        );
+    }
+    let mut out = Vec::new();
+    shorthand::expand("font", "bold calc(1px) a", &mut out);
+    assert!(
+        out.iter()
+            .any(|(key, value)| key == "font-size" && value == "calc(1px)")
+    );
+    for (weight, kept) in [
+        ("calc(100 + 50)", true),
+        ("calc(100 + 50) 900", true),
+        ("bolder", false),
+        ("var(--x)", false),
+        ("400 auto", false),
+    ] {
+        let face = Declarations::descriptors(&format!("font-weight:{weight}"));
+        assert_eq!(face.0.len(), usize::from(kept), "{weight}");
+    }
+    for value in ["12px 1001", "bold 900 12px a", "900 bold 12px a"] {
+        let mut out = Vec::new();
+        shorthand::expand("font", value, &mut out);
+        assert!(out.is_empty(), "{value}");
+    }
+}
+
+#[test]
+fn computed_lengths_svg_lengths_weights_and_math_print_like_chrome() {
+    let doc = Document::parse(
+        "<style>#a{line-height:1e6;stroke-width:2;stroke-dasharray:1 2;r:5;font-weight:300;font-weight:1001;min-width:calc((50% + 10px) * 2);max-width:min(10%, 20px)}#b{font-size:13px;line-height:1.15;stroke-dasharray:10%,2px;stroke-dashoffset:3;font-weight:calc(2000);width:calc(100% - (2 * 10px));margin-left:calc(10% + 5px);transform:rotate(90deg);display:none}#c{line-height:1e40;font-weight:300;font-weight:0.5;column-gap:calc(1em + 10%)}#d{line-height:1e-10;font-weight:calc(0.5)}</style><div id=a></div><div id=b></div><div id=c></div><div id=d></div>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let get = |selector, name| {
+        let id = element(&doc, selector);
+        resolved(
+            &computed.values[id],
+            &computed.lengths[id],
+            name,
+            None,
+            &|| [800., 600.],
+            &Registry::default(),
+        )
+    };
+    for (selector, name, expected) in [
+        ("#a", "line-height", "1.6e+07px"),
+        ("#a", "stroke-width", "2px"),
+        ("#a", "stroke-dasharray", "1px, 2px"),
+        ("#a", "r", "5px"),
+        ("#a", "cx", "0px"),
+        ("#a", "rx", "auto"),
+        ("#a", "font-weight", "300"),
+        ("#a", "min-width", "calc(100% + 20px)"),
+        ("#a", "max-width", "min(10%, 20px)"),
+        ("#b", "line-height", "14.95px"),
+        ("#b", "stroke-dasharray", "10%, 2px"),
+        ("#b", "stroke-dashoffset", "3px"),
+        ("#b", "font-weight", "1000"),
+        ("#b", "width", "calc(100% - 20px)"),
+        ("#b", "margin-left", "calc(10% + 5px)"),
+        ("#b", "transform", "none"),
+        ("#c", "line-height", "3.40282e+38px"),
+        ("#c", "font-weight", "300"),
+        ("#c", "column-gap", "calc(10% + 16px)"),
+        ("#d", "line-height", "1.6e-09px"),
+        ("#d", "font-weight", "1"),
+    ] {
+        assert_eq!(get(selector, name), expected, "{selector} {name}");
+    }
+    for (name, value, expected) in [
+        ("width", "calc(1e1px + 2e0%)", "calc(2% + 10px)"),
+        ("width", "calc(2px + 1em + 3px)", "calc(1em + 5px)"),
+        (
+            "width",
+            "calc(10px + 2% - 1vw + 1em + 1rem)",
+            "calc(2% + 1em + 10px + 1rem - 1vw)",
+        ),
+        ("width", "calc((50% + 10px) * 2)", "calc(100% + 20px)"),
+        ("width", "calc(1em - 1em)", "calc(0em)"),
+        ("width", "calc(1in + 1em)", "calc(1em + 96px)"),
+        ("width", "calc(10px/3 + 1em)", "calc(1em + 3.33333px)"),
+        (
+            "width",
+            "calc(0.5 * (1vw + 1vh) - 1px)",
+            "calc(-1px + 0.5vh + 0.5vw)",
+        ),
+        (
+            "width",
+            "calc(10px - min(1em, 5px))",
+            "calc(10px - min(1em, 5px))",
+        ),
+        (
+            "width",
+            "calc(2 * min(1em, 5px))",
+            "calc(2 * min(1em, 5px))",
+        ),
+        (
+            "width",
+            "clamp(1em, 10px + 2%, 3em)",
+            "clamp(1em, 2% + 10px, 3em)",
+        ),
+        (
+            "width",
+            "round(up, 10px + 1em, 1em)",
+            "round(up, 1em + 10px, 1em)",
+        ),
+        ("margin-left", "calc(-1 * (1em + 2px))", "calc(-1em - 2px)"),
+        (
+            "transform",
+            "translate(calc(2px + 1em), calc(10% + 10%))",
+            "translate(calc(1em + 2px), calc(20%))",
+        ),
+        ("padding-left", "CALC(1EM + 2PX)", "calc(1em + 2px)"),
+    ] {
+        assert_eq!(specified(name, value), expected, "{name}: {value}");
+    }
+    for (weight, kept) in [
+        ("1001", false),
+        ("0", false),
+        ("100 1001", false),
+        ("200 900", true),
+        ("1000", true),
+    ] {
+        let face = Declarations::descriptors(&format!("font-weight:{weight}"));
+        assert_eq!(face.0.len(), usize::from(kept), "{weight}");
+    }
+}
+
+#[test]
+fn computed_numbers_print_like_chrome() {
+    let doc = Document::parse(
+        "<style>#a{z-index:1.5e1;order:+5;column-count:03;flex-grow:2e0;flex-shrink:.25;animation-iteration-count:2,3.0}#b{z-index:-0;column-count:2E1;flex-grow:1.0;order:99999999999;opacity:1e-10}#c{z-index:-2147483649;flex-grow:1e40;flex-shrink:1e-10;opacity:1e40}#d{flex-grow:3.4e38;flex-shrink:1234567;order:1e1}#e{flex-grow:1e7;flex-shrink:1e-7;tab-size:0.1234567}#f{flex-grow:0.00001;flex-shrink:0.0001}</style><div id=a></div><div id=b></div><div id=c></div><div id=d></div><div id=e></div><div id=f></div>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let get = |selector, name| {
+        let id = element(&doc, selector);
+        resolved(
+            &computed.values[id],
+            &computed.lengths[id],
+            name,
+            None,
+            &|| [800., 600.],
+            &Registry::default(),
+        )
+    };
+    for (selector, name, expected) in [
+        ("#a", "z-index", "auto"),
+        ("#a", "order", "5"),
+        ("#a", "column-count", "3"),
+        ("#a", "flex-grow", "2"),
+        ("#a", "flex-shrink", "0.25"),
+        ("#a", "animation-iteration-count", "2, 3"),
+        ("#b", "z-index", "0"),
+        ("#b", "column-count", "auto"),
+        ("#b", "flex-grow", "1"),
+        ("#b", "order", "2147483647"),
+        ("#b", "opacity", "1e-10"),
+        ("#c", "z-index", "-2147483648"),
+        ("#c", "flex-grow", "3.40282e+38"),
+        ("#c", "flex-shrink", "1e-10"),
+        ("#c", "opacity", "1"),
+        ("#d", "flex-grow", "3.4e+38"),
+        ("#d", "flex-shrink", "1.23457e+06"),
+        ("#d", "order", "0"),
+        ("#e", "flex-grow", "1e+07"),
+        ("#e", "flex-shrink", "1e-07"),
+        ("#e", "tab-size", "0.123457"),
+        ("#f", "flex-grow", "1e-05"),
+        ("#f", "flex-shrink", "0.0001"),
+    ] {
+        assert_eq!(get(selector, name), expected, "{selector} {name}");
+    }
+}
+
+#[test]
+fn content_visibility_and_intrinsic_sizes_parse_like_chrome() {
+    for (name, value, valid) in [
+        ("content-visibility", "auto", true),
+        ("content-visibility", "foo", false),
+        ("contain-intrinsic-size", "auto 10px", true),
+        ("contain-intrinsic-size", "auto none", true),
+        ("contain-intrinsic-size", "10px 20px 30px", false),
+        ("contain-intrinsic-size", "auto 1px auto 2px", true),
+        ("contain-intrinsic-size", "auto", false),
+        ("contain-intrinsic-width", "auto none", true),
+        ("contain-intrinsic-width", "10px 20px", false),
+        ("contain-intrinsic-height", "-1px", false),
+    ] {
+        assert_eq!(supports(name, value), Some(valid), "{name}: {value}");
+    }
+    let doc = Document::parse(
+        "<style>#a{contain-intrinsic-size:auto 70px}#b{contain-intrinsic-size:80px 40px}#c{contain-intrinsic-block-size:auto 5px;contain-intrinsic-inline-size:none}</style><div id=a></div><div id=b></div><div id=c hidden=until-found></div><div id=d hidden></div><div id=e style='--s:10px 20px;contain-intrinsic-size:var(--s)'></div>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let get = |selector, name| {
+        let id = element(&doc, selector);
+        resolved(
+            &computed.values[id],
+            &computed.lengths[id],
+            name,
+            None,
+            &|| [800., 600.],
+            &Registry::default(),
+        )
+    };
+    for (selector, name, expected) in [
+        ("#a", "contain-intrinsic-size", "auto 70px"),
+        ("#a", "contain-intrinsic-height", "auto 70px"),
+        ("#b", "contain-intrinsic-size", "80px 40px"),
+        ("#c", "contain-intrinsic-size", "none auto 5px"),
+        ("#c", "display", "block"),
+        ("#c", "content-visibility", "hidden"),
+        ("#d", "display", "none"),
+        ("#d", "content-visibility", "visible"),
+        ("#e", "contain-intrinsic-width", "10px"),
+        ("#e", "contain-intrinsic-height", "20px"),
+    ] {
+        assert_eq!(get(selector, name), expected, "{selector} {name}");
+    }
 }

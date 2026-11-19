@@ -27,9 +27,25 @@ pub(crate) fn border_image(value: &str) -> Option<[String; 5]> {
         }
     }
     let units = super::Lengths::new(16., 100., 100.);
-    // 0: number, 1: percentage, 2: length, 3: `auto`.
+    // 0: number, 1: percentage, 2: length, 3: `auto`, 4: a sum of a length and a percentage.
     let kind = |token: &str| -> Option<u8> {
         let lower = token.to_ascii_lowercase();
+        if lower.ends_with(')')
+            && ["calc(", "min(", "max(", "clamp("]
+                .iter()
+                .any(|function| lower.starts_with(function))
+        {
+            return match units.math(&lower, 100., &[])? {
+                (_, super::parser::Kind::Number) => Some(0),
+                (_, super::parser::Kind::Length) if !lower.contains('%') => Some(2),
+                (_, super::parser::Kind::Length) => Some(if units.math(&lower, 0., &[])?.0 == 0. {
+                    1
+                } else {
+                    4
+                }),
+                _ => None,
+            };
+        }
         let (number, kind) = match lower.strip_suffix('%') {
             Some(number) => (number.parse::<f32>().ok(), 1),
             None if lower == "auto" => return Some(3),
@@ -136,10 +152,24 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         "grid-row-gap" => "row-gap",
         "-webkit-background-clip" => "background-clip",
         "grid-column-gap" => "column-gap",
+        "contain-intrinsic-inline-size" => "contain-intrinsic-width",
+        "contain-intrinsic-block-size" => "contain-intrinsic-height",
         _ => "",
     };
     if !alias.is_empty() {
         out.push((alias.into(), value.into()));
+        return true;
+    }
+    if key == "contain-intrinsic-size" {
+        // An `auto` belongs to the length after it: `auto 10px auto 20px` is two values.
+        let split = value
+            .match_indices(' ')
+            .map(|(at, _)| at)
+            .find(|&at| !value[..at].trim().eq_ignore_ascii_case("auto"))
+            .filter(|_| !value.contains("var("));
+        let (width, height) = split.map_or((value, value), |at| value.split_at(at));
+        out.push(("contain-intrinsic-width".into(), width.trim().into()));
+        out.push(("contain-intrinsic-height".into(), height.trim().into()));
         return true;
     }
     if key == "border-image" {
@@ -434,6 +464,12 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 .into(),
             4,
         ),
+        "-webkit-text-stroke" => (
+            ["width", "color"]
+                .map(|part| format!("{key}-{part}"))
+                .into(),
+            14,
+        ),
         _ => return false,
     };
     if matches!(
@@ -669,6 +705,19 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 let mut index = 0;
                 while let Some(&part) = parts.get(index) {
                     match part {
+                        // Like Chrome, a second weight makes the value invalid.
+                        _ if values[2] != "normal"
+                            && (matches!(part, "bold" | "bolder" | "lighter")
+                                || part.parse::<f32>().is_ok_and(|weight| weight != 0.)
+                                || part.starts_with("calc(")
+                                    && super::Lengths::new(16., 100., 100.)
+                                        .math(part, f32::NAN, &[])
+                                        .is_some_and(|(_, kind)| {
+                                            kind == super::parser::Kind::Number
+                                        })) =>
+                        {
+                            return true;
+                        }
                         "italic" => values[0] = part.into(),
                         _ if part.starts_with("oblique") => values[0] = part.into(),
                         "small-caps" => values[1] = part.into(),
@@ -677,7 +726,21 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                             values[3] = part.into()
                         }
                         "normal" => {}
-                        _ if part.parse::<f32>().is_ok() => values[2] = part.into(),
+                        // Like Chrome, `0` is the size, and another weight out of [1, 1000] makes the whole value
+                        // invalid.
+                        _ if let Ok(weight) = part.parse::<f32>() => match weight {
+                            0. => break,
+                            1. ..=1000. => values[2] = part.into(),
+                            _ => return true,
+                        },
+                        // Math keeps its text, and the computed value is clamped to [1, 1000].
+                        _ if part.starts_with("calc(")
+                            && super::Lengths::new(16., 100., 100.)
+                                .math(part, f32::NAN, &[])
+                                .is_some_and(|(_, kind)| kind == super::parser::Kind::Number) =>
+                        {
+                            values[2] = part.into()
+                        }
                         _ => break,
                     }
                     index += 1;
@@ -699,10 +762,20 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                     index += 1;
                 }
                 let family = parts.get(index..).unwrap_or_default().join(" ");
-                if family.is_empty() {
+                // A family name can't start with a digit.
+                if family.is_empty()
+                    || parts[index..]
+                        .iter()
+                        .any(|part| part.starts_with(|c: char| c.is_ascii_digit()))
+                {
                     return true;
                 }
-                values[4] = size.into();
+                values[4] = if size.parse::<f32>() == Ok(0.) {
+                    "0"
+                } else {
+                    size
+                }
+                .into();
                 values[5] = line.unwrap_or_else(|| "normal".into());
                 values.push(family);
                 values
@@ -771,12 +844,21 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
         }
         9 => {
             let mut values = vec!["disc".to_owned(), "outside".to_owned(), "none".to_owned()];
+            let (mut none, mut typed) = (false, false);
             for &part in &parts {
                 match part {
                     "inside" | "outside" => values[1] = part.into(),
+                    // `none` sets the type when no other part does.
+                    "none" => none = true,
                     _ if part.starts_with("url(") => values[2] = part.into(),
-                    _ => values[0] = part.into(),
+                    _ => {
+                        values[0] = part.into();
+                        typed = true;
+                    }
                 }
+            }
+            if none && !typed {
+                values[0] = "none".into();
             }
             values
         }
@@ -896,6 +978,17 @@ pub(crate) fn expand(key: &str, value: &str, out: &mut Vec<(String, String)>) ->
                 }
             }
             values
+        }
+        14 => {
+            let width = parts.iter().find(|part| {
+                matches!(**part, "thin" | "medium" | "thick")
+                    || length(part) && !part.starts_with("var(")
+            });
+            let color = parts.iter().find(|part| Some(*part) != width);
+            vec![
+                width.map_or("0px", |width| width).into(),
+                color.map_or("currentcolor", |color| color).into(),
+            ]
         }
         _ => {
             let (name, kind) = value

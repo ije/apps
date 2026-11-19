@@ -53,14 +53,15 @@ globalThis.__appsFFI = (native, codec) => {
     throw new TypeError('Expected an ArrayBuffer or typed array');
   };
   const getRawPointer = source => BigInt(bridge('pointer', [], bytes(source)));
-  const write = (view, offset, kind, value, keep) => {
+  // With `slots`, the native call writes the address of string and buffer arguments: keep gets the slot and bytes.
+  const write = (view, offset, kind, value, keep, slots) => {
     if (kind === 0) return;
     if (kind === 11) {
       if (value == null) value = 0n;
       else if (typeof value !== 'bigint') {
         const storage = typeof value === 'string' ? encoder.encode(value + '\0') : bytes(value);
-        keep.push(storage);
-        value = getRawPointer(storage);
+        if (slots) { keep.push(offset >> 3, storage); value = 0n; }
+        else { keep.push(storage); value = getRawPointer(storage); }
       }
       value = pointer(value);
       if (info.pointerSize === 4) value = Number(value);
@@ -125,16 +126,15 @@ globalThis.__appsFFI = (native, codec) => {
         return cached.function;
       }
       const resolved = bridge('function', [this.#id, name, sig.native]);
-      const request = JSON.stringify({ op: 'invoke', args: [resolved.id] });
       const storage = new Uint8Array((sig.parameters.length + 1) * 8);
       const view = new DataView(storage.buffer);
       const fn = (...args) => {
         this.#open();
         if (args.length !== sig.parameters.length) throw new TypeError('Incorrect number of FFI arguments');
         const keep = [storage, this];
-        for (let index = 0; index < args.length; index++) write(view, (index + 1) * 8, sig.parameters[index].kind, args[index], keep);
+        for (let index = 0; index < args.length; index++) write(view, (index + 1) * 8, sig.parameters[index].kind, args[index], keep, true);
         // Keep must stay a native call argument so string and buffer arguments outlive the call.
-        send(request, storage, keep);
+        send(resolved.id, storage, keep);
         return read(view, 0, sig.result.kind);
       };
       Object.defineProperty(fn, 'pointer', { value: BigInt(resolved.pointer), enumerable: true });

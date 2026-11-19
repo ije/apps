@@ -311,3 +311,67 @@ fn caret_hit_testing_uses_the_nearest_visible_text() {
         );
     }
 }
+
+#[test]
+fn contenteditable_spaces_block_joins_and_typing_style_like_chrome() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><body><div id=a contenteditable>ab</div><div id=b contenteditable><p>one</p><p>two <i>it</i></p></div><div id=c contenteditable>x <b id=cb>bold</b></div><div id=e contenteditable>one <b id=eb>twZo</b> three</div><div id=g contenteditable>x <b>bold</b> rest</div><div id=h contenteditable><p>one</p><p>two</p></div><div id=k contenteditable>start</div><div id=m contenteditable><p>a <b>b</b></p><p>c <i>d</i></p></div><div id=n contenteditable><p id=n0>alpha one</p><p>beta</p><p>gamma</p></div><div id=r contenteditable><p>one</p><p>two</p></div><div id=t contenteditable><p>bee</p></div><div id=q contenteditable>\n<p>one</p>\n<blockquote>\n<p>two</p>\n</blockquote>\n</div></body></html>"),
+        dirty: false,
+    });
+    let engine = JsContext::new(
+        JavaScriptCore::load().unwrap(),
+        host.clone(),
+        Role::Renderer(1),
+    )
+    .unwrap();
+    engine.eval(r#"
+        const assert=(value,message)=>{if(!value)throw Error(message)};
+        const $=id=>document.getElementById(id), s=getSelection(), key=nativeKey=>__appsDispatch('keydown',[],{nativeKey});
+        const steps=(el,list)=>list.map(step=>{if(step.length===1)__appsInput(step);else key(step);return el.innerHTML;}).join('|');
+        $('a').focus();s.collapse($('a').firstChild,2);
+        let got=steps($('a'),[' ',' ','c',' ','backspace','backspace']);
+        assert(got==='ab&nbsp;|ab&nbsp;&nbsp;|ab&nbsp; c|ab&nbsp; c&nbsp;|ab&nbsp; c|ab&nbsp;&nbsp;','Spaces: '+got);
+        $('b').focus();s.collapse($('b').lastChild.firstChild,0);key('backspace');
+        assert($('b').innerHTML==='<p>onetwo <i>it</i></p>'&&s.focusNode===$('b').firstChild.firstChild&&s.focusOffset===3,'Backspace joins blocks: '+$('b').innerHTML);
+        $('c').focus();s.collapse($('cb').firstChild,4);
+        got=steps($('c'),['enter','n']);
+        assert(got==='x <b id="cb">bold</b><div><b><br></b></div>|x <b id="cb">bold</b><div><b>n</b></div>','Enter keeps formatting on an empty line: '+got);
+        $('e').focus();s.collapse($('eb').firstChild,4);
+        got=steps($('e'),['backspace','enter','m']);
+        assert(got==='one <b id="eb">twZ</b>&nbsp;three|one <b id="eb">twZ</b><div>&nbsp;three</div>|one <b id="eb">twZ</b><div><b>m</b> three</div>','Typing style after Enter: '+got);
+        key('left');key('left');
+        assert(s.focusNode===$('eb').firstChild&&s.focusOffset===3,'Left crosses to the previous block');
+        __appsDispatch('keydown',[],{nativeKey:'a',...(navigator.platform.includes('Mac')?{metaKey:true}:{ctrlKey:true})});__appsInput('n');
+        assert($('e').innerHTML==='n','Typing over a selection across blocks: '+$('e').innerHTML);
+        $('g').focus();s.collapse($('g').querySelector('b').firstChild,4);
+        got=steps($('g'),['enter','n','backspace','backspace']);
+        assert(got==='x <b>bold</b><div> rest</div>|x <b>bold</b><div>nrest</div>|x <b>bold</b><div>rest</div>|x <b>bold</b>rest','Enter moves no formatting into text after it: '+got);
+        const primary=navigator.platform.includes('Mac')?{metaKey:true}:{ctrlKey:true}, undo=shiftKey=>__appsDispatch('keydown',[],{nativeKey:'z',shiftKey,...primary});
+        $('h').focus();s.collapse($('h').lastChild.firstChild,0);key('backspace');undo(false);
+        assert($('h').innerHTML==='<p>one</p><p>two</p>','Undo splits joined blocks again: '+$('h').innerHTML);
+        undo(true);
+        assert($('h').innerHTML==='<p>onetwo</p>','Redo joins them: '+$('h').innerHTML);
+        $('k').focus();s.collapse($('k').firstChild,5);steps($('k'),[' ','h','i',' ']);undo(false);
+        assert($('k').innerHTML==='start','Undo after spaces that became no-break spaces: '+$('k').innerHTML);
+        undo(true);
+        assert($('k').innerHTML==='start hi&nbsp;','Redo after spaces: '+$('k').innerHTML);
+        $('m').focus();s.setBaseAndExtent($('m').firstChild.firstChild,0,$('m').querySelector('i').firstChild,1);__appsInput('Z');
+        assert($('m').innerHTML==='<p>Z</p>','A delete removes the inline elements it empties: '+$('m').innerHTML);
+        const n0=$('n0'), word=new Range();word.setStart(n0.firstChild,6);word.setEnd(n0.firstChild,9);
+        $('n').focus();s.collapse(n0.firstChild,5);__appsInput('X');
+        const added=document.createElement('p');added.textContent='page';$('n').prepend(added);$('n').lastChild.remove();
+        undo(false);
+        assert($('n').innerHTML==='<p>page</p><p id="n0">alpha one</p><p>beta</p>'&&$('n').children[1]===n0&&word.toString()==='one','Undo keeps nodes, ranges and page changes: '+$('n').innerHTML+' '+word);
+        s.collapse(n0.firstChild,9);__appsInput('Y');key('enter');__appsInput('y');key('backspace');
+        assert($('n').innerHTML.startsWith('<p>page</p><p id="n0">alpha oneY</p><p><br></p>'),'Backspace leaves an empty line its <br>: '+$('n').innerHTML);
+        $('q').focus();s.collapse($('q').querySelector('blockquote p').firstChild,0);key('backspace');
+        assert($('q').innerHTML==='\n<p>onetwo</p>\n','A join leaves no container with only spaces: '+JSON.stringify($('q').innerHTML));
+        $('r').focus();s.collapse($('r').lastChild.firstChild,0);key('backspace');$('r').firstChild.firstChild.data='oneTWO';undo(false);
+        assert($('r').innerHTML==='<p>oneTWO</p>','An undo that the page broke changes nothing: '+$('r').innerHTML);
+        s.collapse($('r').firstChild.firstChild,0);__appsInput('x',0,0,true);__appsInput('',0,1,true);__appsFinishComposition();
+        $('r').append(document.createElement('hr'));
+        $('t').focus();s.collapse($('t').firstChild.firstChild,3);__appsInput('X');undo(false);
+        assert($('t').innerHTML==='<p>bee</p>'&&$('r').lastChild.localName==='hr','A canceled composition leaves no open step: '+$('t').innerHTML+$('r').innerHTML);
+    "#, "contenteditable-editing").unwrap();
+}

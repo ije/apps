@@ -27,7 +27,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     // data with those numbers, or over 4 KB, as UTF-8 JSON.
     if(!seen.size&&(typeof value==='object'&&value!==null||typeof value==='string')){
       floats=false;
-      if(plain(value,new Set())){const text=JSON.stringify(value);return floats||text.length>4096?{type:'json',value:jsonEncoder.encode(text)}:{type:'json',value};}
+      if(plain(value,new WeakSet())){const text=JSON.stringify(value);return floats||text.length>4096?{type:'json',value:jsonEncoder.encode(text)}:{type:'json',value};}
     }
     const next=v=>encode(v,target,strict,persistent,seen);
     if(typeof value==='function'){if(strict)uncloneable();const recipient=peer(target);if(!recipient)throw new TypeError('Invalid bridge target');let ids=functionIds.get(value);if(!ids){ids=new Map();functionIds.set(value,ids);}let id=ids.get(recipient),entry=functions.get(id);if(!entry){id=random();functions.set(id,entry={action:value,recipient,persistent,count:0});ids.set(recipient,id);}else if(persistent)entry.persistent=true;entry.count++;return{type:'function',id};}

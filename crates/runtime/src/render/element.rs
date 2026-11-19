@@ -85,6 +85,8 @@ pub(super) enum Query {
     Value(u32),
     Viewport,
     Theme,
+    LineBase(u32),
+    Shrinks(u32),
 }
 
 impl Query {
@@ -103,6 +105,8 @@ impl Query {
             Query::Look(node) => Query::Look(at(node)?),
             Query::Boxless(node) => Query::Boxless(at(node)?),
             Query::Value(node) => Query::Value(at(node)?),
+            Query::LineBase(node) => Query::LineBase(at(node)?),
+            Query::Shrinks(node) => Query::Shrinks(at(node)?),
             query => query,
         })
     }
@@ -159,19 +163,34 @@ pub(super) struct Kept {
     // takes its width from it.
     containing: std::cell::Cell<[f32; 2]>,
     pub(super) culled: bool,
+    // The cell of a grid item, so it can build in place.
+    slot: Option<([f32; 4], super::grid::Grid)>,
     #[cfg(debug_assertions)]
     pub(super) print: u64,
+    // The print that the records around hold. It stays when the box builds in place.
+    #[cfg(debug_assertions)]
+    pub(super) seen: std::cell::Cell<u64>,
     #[cfg(debug_assertions)]
     plan: Rc<[usize]>,
 }
 
 impl Kept {
     pub(super) fn in_place(&self) -> Option<&Rc<[usize]>> {
-        (!self.culled && self.call.cell.is_none()).then_some(&self.ancestors)
+        (!self.culled && (self.call.cell.is_none() || self.slot.is_some()))
+            .then_some(&self.ancestors)
+    }
+
+    // The revision of the boxes that the record was built from.
+    pub(super) fn subtree(&self) -> u64 {
+        self.call.subtree
+    }
+
+    pub(super) fn same_reads(&self, other: &Self) -> bool {
+        self.reads == other.reads
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) struct Call {
     subtree: u64,
     containing: [f32; 2],
@@ -642,6 +661,8 @@ impl<'a> Build<'a> {
             Query::Value(node) => hashed(&doc.nodes[node as usize].value),
             Query::Viewport => hashed(styles.lengths[id].viewport.map(f32::to_bits)),
             Query::Theme => hashed(crate::desktop::native::theme_state() & 1),
+            Query::LineBase(node) => hashed(definite_line(doc, styles, node as usize)),
+            Query::Shrinks(node) => hashed(shrinks_around(doc, styles, node as usize)),
         };
         if now == read.value {
             Replay::Same
@@ -710,6 +731,21 @@ const SVG_SOURCE: [Prop; 13] = [
     Prop::WIDTH,
     Prop::HEIGHT,
 ];
+
+// `text-indent` as pixels and a fraction of the width of the paragraph, which the renderer resolves at layout.
+fn text_indent(style: &style::Style, units: &style::Lengths) -> (f32, f32) {
+    let Some(value) = style.get(Prop::TEXT_INDENT) else {
+        return (0., 0.);
+    };
+    let pixels = units.resolve(value, 0.).unwrap_or(0.);
+    match value.contains('%') {
+        true => (
+            pixels,
+            (units.resolve(value, 100.).unwrap_or(pixels) - pixels) / 100.,
+        ),
+        false => (pixels, 0.),
+    }
+}
 
 struct SvgSource<'a> {
     doc: &'a Document,
@@ -1034,7 +1070,19 @@ pub(super) fn element(
             }
         }
         let mut close = false;
-        let held = record.call == call && {
+        // A debug check of a kept box keeps the positioned boxes in it that build in place after the build.
+        #[cfg(debug_assertions)]
+        let inside = build.checking
+            && info.flags & cull::OUT_OF_FLOW != 0
+            && build.view.outs.borrow().contains_key(&id)
+            && Call {
+                subtree: record.call.subtree,
+                cell: call.cell,
+                ..call
+            } == record.call;
+        #[cfg(not(debug_assertions))]
+        let inside = false;
+        let held = (record.call == call || inside) && {
             let fresh = record.epoch.get() == build.epoch;
             let host = build.view.host.borrow();
             let dom = host.dom.get(&build.view.id);
@@ -1095,8 +1143,16 @@ pub(super) fn element(
                 ..*read
             }));
         #[cfg(debug_assertions)]
-        build.prints.borrow_mut().push(record.print);
-        Some(close)
+        build.prints.borrow_mut().push(match inside {
+            true => record.seen.get(),
+            false => {
+                if !build.checking {
+                    record.seen.set(record.print);
+                }
+                record.print
+            }
+        });
+        Some(close || inside)
     };
     if let Some(_close) = keep {
         #[cfg(debug_assertions)]
@@ -1113,7 +1169,9 @@ pub(super) fn element(
     if !checking && !build.view.repaint.borrow().is_empty() {
         build.view.built.borrow_mut().insert(id);
     }
-    let patch = text_field(&build.doc.nodes[id], &build.styles.values[id]).then(|| Patch {
+    let field = text_field(&build.doc.nodes[id], &build.styles.values[id]);
+    let positioned = storable && info.flags & cull::OUT_OF_FLOW != 0;
+    let patch = (field || positioned).then(|| Patch {
         ancestors: build.ancestors.clone(),
         containing,
         container,
@@ -1123,6 +1181,7 @@ pub(super) fn element(
         perspective: build.perspective.clone(),
         value: hashed(&build.doc.nodes[id].value),
     });
+    let cell = slot.clone().filter(|_| storable);
     let child = create(build, id, containing, container, slot);
     #[cfg(debug_assertions)]
     let plan = build.plan.take();
@@ -1167,7 +1226,10 @@ pub(super) fn element(
     #[cfg(debug_assertions)]
     let print = print(build, printed, &child);
     if let Some(patch) = patch.filter(|_| !checking) {
-        build.view.patches.borrow_mut().insert(id, patch);
+        match field {
+            true => build.view.patches.borrow_mut().insert(id, patch),
+            false => build.view.outs.borrow_mut().insert(id, patch),
+        };
     }
     if !text {
         let mut kept = build.view.kept.borrow_mut();
@@ -1182,8 +1244,11 @@ pub(super) fn element(
                         epoch: build.epoch.into(),
                         containing: containing.into(),
                         culled: build.culls.get() != culls,
+                        slot: cell,
                         #[cfg(debug_assertions)]
                         print,
+                        #[cfg(debug_assertions)]
+                        seen: print.into(),
                         #[cfg(debug_assertions)]
                         plan,
                     },
@@ -1220,7 +1285,18 @@ pub(super) fn repaint(build: &Build<'_>, id: usize) -> Option<renderer::Node> {
     };
     #[cfg(debug_assertions)]
     let printed = place.prints.borrow().len();
-    let child = element(&place, id, containing, container, None);
+    let bounds = old.slot.as_ref().map(|(bounds, _)| *bounds);
+    let child = element(&place, id, containing, container, old.slot.clone());
+    // A grid item takes its place in its cell, as its parent would give it.
+    let child = match bounds {
+        Some(bounds) => {
+            let mut units = build.styles.lengths[id];
+            units.container = Some(container);
+            let margin = units.edges(&build.styles.values[id], style::MARGIN, containing[0]);
+            self::place(child, margin, build.pixel_ratio, bounds)
+        }
+        None => child,
+    };
     #[cfg(debug_assertions)]
     place.prints.borrow_mut().truncate(printed);
     build.reads.borrow_mut().truncate(mark);
@@ -1458,6 +1534,13 @@ fn create(
             .as_ref()
             .filter(|_| info[id].flags & (cull::CHANGED | cull::MOVES_CONTENT) == 0)
             .filter(|_| !multicol)
+            // The contents of a box that skips them at times keep no spacers: their records could outlive a skip.
+            .filter(|_| {
+                info[id].flags & cull::SKIPS == 0
+                    || style
+                        .get(Prop::CONTENT_VISIBILITY)
+                        .is_none_or(|value| value == "visible")
+            })
             .and_then(|zone| {
                 if style
                     .get(Prop::OVERFLOW_Y)
@@ -1674,6 +1757,8 @@ fn create(
         (renderer::Child::from(group), None, align.is_some())
     };
     let mut strut_due = false;
+    // Each line has the strut: each box of a line of boxes carries one, or the space that it joins.
+    let mut struts = false;
     let mut strut_next = false;
     if node.tag == "br" {
         let empty = starts_line(build, id);
@@ -1734,9 +1819,41 @@ fn create(
         return br.into();
     }
     let flow = !matches!(display, "flex" | "inline-flex" | "grid" | "inline-grid");
+    // A box that skips its contents sizes as if empty, or as its `contain-intrinsic-size`. For a script that reads
+    // the geometry of the contents, it builds them but keeps the size it had without them.
+    let (skipped, forced, intrinsic, last) = if info[id].flags & cull::SKIPS != 0 {
+        let last = view
+            .host
+            .borrow()
+            .dom
+            .get(&view.id)
+            .and_then(|dom| dom.cull.widths.get(&id).copied());
+        let mut measured = measured.borrow_mut();
+        let skips = cull::skips(info[id].flags, style, id, &measured, false);
+        let forced = skips && measured.forced.contains(&id);
+        // A box remembers the last size it had with its contents.
+        let remembered = measured.remembered.entry(id).or_insert((None, true));
+        let was = remembered.1;
+        if skips && !was {
+            remembered.0 = last.or(remembered.0);
+        }
+        remembered.1 = skips;
+        let remembered = remembered.0;
+        (
+            skips && !forced,
+            forced,
+            skips.then(|| super::grid::intrinsic_size(style, &units, remembered)),
+            // The last size is the size without the contents only if the last build skipped them.
+            last.filter(|_| was),
+        )
+    } else {
+        (false, false, None, None)
+    };
     let mut flat = Vec::new();
     let drawable = style::drawable_canvas(node, style);
-    let mut pending: Vec<usize> = if drawable {
+    let mut pending: Vec<usize> = if skipped {
+        Vec::new()
+    } else if drawable {
         let boxes = |child: &&usize| !doc.nodes[**child].tag.starts_with('#');
         node.children.iter().rev().filter(boxes).copied().collect()
     } else if matches!(
@@ -1790,18 +1907,27 @@ fn create(
             .borrow_mut()
             .texts
             .entry(id)
-            .or_insert_with(|| style::inline_text(doc, styles, id).map(Rc::new))
+            .or_insert_with(|| style::inline_text(doc, styles, id, &[]).map(Rc::new))
             .clone()
     };
     let breaks = display != "inline"
         && flat.iter().any(|&child| doc.nodes[child].tag == "br")
         && inline_text().is_none();
+    // A multi-column box puts its lines into the columns, so its children never make the lines of the box itself.
     let all_inline = flow
+        && !multicol
         && !flat.is_empty()
         && !breaks
         && flat.iter().all(|&child| {
             inline_level(child) || styles.values[child].get(Prop::DISPLAY) == Some("none")
         });
+    // An inline box with only blank text or comments, which can make a line of its own.
+    let empty_inline = || {
+        display == "inline"
+            && node.children.iter().all(|&child| {
+                doc.nodes[child].tag.starts_with('#') && style::makes_no_line(doc, styles, child)
+            })
+    };
     let rtl = style.get(Prop::DIRECTION) == Some("rtl");
     let line_justify = match (style.get(Prop::TEXT_ALIGN), rtl) {
         (Some("right" | "-webkit-right"), _)
@@ -1823,8 +1949,20 @@ fn create(
     #[cfg(not(debug_assertions))]
     let checking = false;
     // Include every shared-style input in the key: plan, call, own reads and child facts.
+    // A box whose children make no line, like spaces and hidden elements, has no baseline of its own.
+    let blank = || {
+        node.children.iter().all(|&child| {
+            let kid = &doc.nodes[child];
+            match kid.tag.as_str() {
+                "#text" => kid.text.trim_ascii().is_empty(),
+                "#comment" => true,
+                _ => styles.values[child].get(Prop::DISPLAY) == Some("none"),
+            }
+        })
+    };
     let share = (parsed.shareable
         && !checking
+        && info[id].flags & cull::SKIPS == 0
         && slot.is_none()
         && parent_perspective.is_none()
         && natural.is_none()
@@ -1876,7 +2014,16 @@ fn create(
             flex_parent,
             columned,
             info[id].flags & !(cull::CHANGED | cull::CHILDREN_CHANGED | cull::GEOMETRY_CHANGED),
-            (all_inline, node.children.is_empty(), texted),
+            (
+                all_inline,
+                node.children.is_empty(),
+                texted,
+                blank(),
+                empty_inline(),
+            ),
+            // A box at the top of a shadow tree takes no floats from outside, so it gets no Flow::BLOCK.
+            node.parent
+                .is_none_or(|parent| doc.nodes[parent].tag.starts_with('#')),
         )
             .hash(&mut hasher);
         hasher.finish()
@@ -1925,6 +2072,10 @@ fn create(
                 "flex" | "inline-flex" | "grid" | "inline-grid" => renderer::Baseline::First,
                 _ => renderer::Baseline::Auto,
             };
+            el.style().block = matches!(
+                display,
+                "block" | "inline-block" | "list-item" | "flow-root"
+            );
             el.style().contains = (u8::from(made.absolute) * renderer::Escape::ABSOLUTE)
                 | (u8::from(made.fixed) * renderer::Escape::FIXED);
             el.style().escape = match position {
@@ -1975,7 +2126,9 @@ fn create(
                         | "meter"
                         | "progress"
                         | "webview"
-                ) {
+                ) || display.starts_with("inline-")
+                {
+                    // Like Chrome, atomic inline boxes are monolithic.
                     el.style().breaks |= Break::WHOLE;
                 }
                 let kept = [Prop::ORPHANS, Prop::WIDOWS].map(|prop| {
@@ -1993,10 +2146,9 @@ fn create(
                 text.set_letter_spacing(parsed.spacing[0]);
                 text.set_word_spacing(parsed.spacing[1]);
                 text.set_font_smoothing(!parsed.smoothing);
-                text.set_text_indent(px(style
-                    .get(Prop::TEXT_INDENT)
-                    .and_then(|value| units.resolve(value, containing[0]))
-                    .unwrap_or(0.)));
+                let (indent, percent) = text_indent(style, &units);
+                text.set_text_indent(px(indent));
+                text.set_text_indent_percent(percent);
             }
             if face.style != renderer::FontStyle::Normal {
                 el.text_style().set_font_style(face.style);
@@ -2022,8 +2174,7 @@ fn create(
         let merged = !text_field(node, style)
             && !matches!(node.tag.as_str(), "svg" | "canvas" | "iframe" | "terminal")
             && inline_text().is_some();
-        if display != "inline"
-            && !merged
+        if !merged
             && flat.iter().any(|&child| {
                 !doc.nodes[child].tag.starts_with('#')
                     && doc.nodes[child].tag != "br"
@@ -2032,7 +2183,7 @@ fn create(
                     && !style::makes_no_line(doc, styles, child)
             })
         {
-            strut_due = true;
+            (strut_due, struts) = (display != "inline", true);
         }
     }
     // The content of replaced elements paints above the background layers, which are built later.
@@ -2227,12 +2378,32 @@ fn create(
         };
     }
     if node.tag == "svg" {
+        // Padding and borders, which the drawing doesn't fill.
+        let frame = {
+            let padding = units.edges(style, style::PADDING, containing[0]);
+            let borders = style::BORDERS.map(|[width, kind, _]| {
+                style
+                    .get(kind)
+                    .filter(|kind| !matches!(*kind, "none" | "hidden"))
+                    .and_then(|_| units.resolve(style.get(width).unwrap_or("3px"), containing[0]))
+                    .unwrap_or(0.)
+                    .max(0.)
+            });
+            [
+                padding[1] + padding[3] + borders[1] + borders[3],
+                padding[0] + padding[2] + borders[0] + borders[2],
+            ]
+        };
+        let border_box = style.get(Prop::BOX_SIZING) == Some("border-box");
         let [width, height] = [(Prop::WIDTH, "width"), (Prop::HEIGHT, "height")]
             .into_iter()
             .enumerate()
-            .map(|(axis, (prop, attr))| match style.get(prop) {
-                Some(value) => units.resolve(value, containing[axis]),
-                None => node.attrs.get(attr).and_then(|v| dimension(v, false)),
+            .map(|(axis, (prop, attr))| {
+                match style.get(prop) {
+                    Some(value) => units.resolve(value, containing[axis]),
+                    None => node.attrs.get(attr).and_then(|v| dimension(v, false)),
+                }
+                .map(|size| if border_box { size - frame[axis] } else { size })
             })
             .collect::<Vec<_>>()[..]
         else {
@@ -2285,35 +2456,18 @@ fn create(
                     && containing[1] > 0. =>
             {
                 let margins = units.edges(style, style::MARGIN, containing[0]);
-                let height = containing[1] - margins[0] - margins[2];
+                let height = containing[1] - margins[0] - margins[2] - frame[1];
                 [height * ratio, height]
             }
             (None, None, Some(ratio)) => {
-                let width = available();
+                let width = available() - frame[0];
                 [width, width / ratio]
             }
             _ => [width.unwrap_or(300.), height.unwrap_or(150.)],
         }
         .map(|value| value.clamp(1., 4096.));
-        // The drawing fills the content box, which border-box sizing makes smaller than the CSS size.
-        let [inner_width, inner_height] = if style.get(Prop::BOX_SIZING) == Some("border-box") {
-            let padding = units.edges(style, style::PADDING, containing[0]);
-            let borders = style::BORDERS.map(|[width, kind, _]| {
-                style
-                    .get(kind)
-                    .filter(|kind| !matches!(*kind, "none" | "hidden"))
-                    .and_then(|_| units.resolve(style.get(width).unwrap_or("3px"), containing[0]))
-                    .unwrap_or(0.)
-                    .max(0.)
-            });
-            [
-                width - padding[1] - padding[3] - borders[1] - borders[3],
-                height - padding[0] - padding[2] - borders[0] - borders[2],
-            ]
-            .map(|value| value.clamp(1., 4096.))
-        } else {
-            [width, height]
-        };
+        let [inner_width, inner_height] = [width, height];
+        let [width, height] = [width + frame[0], height + frame[1]];
         let mut scope = id;
         while let Some(parent) = doc.nodes[scope].parent {
             scope = parent;
@@ -2568,6 +2722,26 @@ fn create(
         if let Some(ink) = color(Prop::COLOR) {
             button = button.text_color(ink);
         }
+        if let Some(size) = part
+            .get(Prop::FONT_SIZE)
+            .and_then(|value| units.resolve(value, units.font.em))
+            .filter(|size| *size != units.font.em)
+        {
+            let text = button.text_style();
+            text.set_font_size(px(size));
+            text.set_line_height(px(units.font.lh * size / units.font.em));
+        }
+        if let Some(weight) = part
+            .get(Prop::FONT_WEIGHT)
+            .filter(|weight| Some(*weight) != style.get(Prop::FONT_WEIGHT))
+            .and_then(|weight| match weight {
+                "bold" => Some(700.),
+                "normal" => Some(400.),
+                weight => weight.parse().ok(),
+            })
+        {
+            button.text_style().set_font_weight(weight);
+        }
         button.style().corner_radii = renderer::Corners::all(px(radius).into()).into();
         el = el
             .flex_row()
@@ -2679,6 +2853,7 @@ fn create(
             inset: Default::default(),
             nowrap: false,
             tab_size: 8.,
+            stroke: None,
         };
         if !single_line && style.get(Prop::FIELD_SIZING) == Some("content") {
             let mut sizer = renderer::text(shown.clone(), Some(vec![run.clone()]))
@@ -2843,6 +3018,17 @@ fn create(
         overflow
     };
     let page = matches!(node.tag.as_str(), "html" | "body");
+    // `content-visibility` contains the paint of the contents, like `overflow: clip`.
+    let overflow = if info[id].flags & cull::SKIPS != 0
+        && !page
+        && style
+            .get(Prop::CONTENT_VISIBILITY)
+            .is_some_and(|v| v != "visible")
+    {
+        overflow.map(|value| if value == "visible" { "clip" } else { value })
+    } else {
+        overflow
+    };
     let boxed = !page
         && overflow
             .iter()
@@ -2993,6 +3179,24 @@ fn create(
         margin[2] = -below;
         if hit.is_none() {
             el = el.mt(px(margin[0])).mb(px(margin[2]));
+            // Like Chrome, an empty inline box with inline margins, padding or borders makes a line, so it
+            // takes the line height and its baseline.
+            if !styles.pseudos.contains_key(&id)
+                && empty_inline()
+                && !style::makes_no_line(doc, styles, id)
+            {
+                let [ascent, descent, _] = text
+                    .line_metrics(text.face(&parsed.face), px(units.font.em * pixel_ratio))
+                    .map(f32::from);
+                let lead = ((units.font.lh * pixel_ratio - ascent - descent) / 2.).floor();
+                let baseline = (lead + ascent) / pixel_ratio;
+                let mut mark = renderer::node()
+                    .h(px(baseline))
+                    .mb(px(-baseline))
+                    .baseline(renderer::Baseline::Bottom);
+                mark.style().baseline_source = true;
+                el = el.min_h(px(units.font.lh + above + below)).child(mark);
+            }
         }
         let same = border_colors.iter().all(|color| *color == border_colors[0]);
         // A border image replaces the normal border.
@@ -3270,6 +3474,7 @@ fn create(
                                 inset: Default::default(),
                                 nowrap: false,
                                 tab_size: 8.,
+                                stroke: None,
                             };
                             widest = widest
                                 .max(f32::from(text.shape_line(&label, size, &run).line.width));
@@ -3357,9 +3562,15 @@ fn create(
         && style
             .get(Prop::BACKGROUND_IMAGE)
             .is_some_and(|value| value != "none")
-        && style::components(style.get(Prop::BACKGROUND_CLIP).unwrap_or(""), ',')
-            .iter()
-            .any(|clip| !matches!(clip.trim(), "padding-box" | "content-box"));
+        && style::components(
+            style
+                .get(Prop::BACKGROUND_CLIP)
+                .filter(|clip| !clip.is_empty())
+                .unwrap_or("border-box"),
+            ',',
+        )
+        .iter()
+        .any(|clip| !matches!(clip.trim(), "padding-box" | "content-box"));
     if hit.is_none()
         && let Some(first) = first
     {
@@ -3500,16 +3711,43 @@ fn create(
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite())
     };
+    // Like Chrome, a box in a line takes percent heights from the height of its block: `Some(true)` when it is a
+    // fixed length, and `Some(false)` when it is `auto`, which makes them `auto` too.
+    let line_base = (display.starts_with("inline-")
+        && [Prop::HEIGHT, Prop::MIN_HEIGHT, Prop::MAX_HEIGHT]
+            .iter()
+            .any(|&prop| style.get(prop).is_some_and(|value| value.contains('%')))
+        && !flex_parent
+        && slot.is_none()
+        && !matches!(position, "absolute" | "fixed"))
+    .then(|| {
+        let definite = definite_line(doc, styles, id);
+        reader.log(Query::LineBase(id as u32), 0, hashed(definite));
+        definite
+    });
+    // The content of a details box is in a slot of auto height, so its percent heights and offsets are `auto`.
+    let in_details = !flex_parent
+        && slot.is_none()
+        && node.tag != "summary"
+        && !matches!(position, "absolute" | "fixed")
+        && parent.is_some_and(|parent| doc.nodes[parent].tag == "details");
     for (prop, value) in style.iter().filter(|_| hit.is_none()) {
         let value: &str = value;
         let vertical = matches!(
             prop,
             Prop::HEIGHT | Prop::MIN_HEIGHT | Prop::MAX_HEIGHT | Prop::TOP | Prop::BOTTOM
         );
+        if in_details && vertical && value.contains('%') {
+            continue;
+        }
         let base = containing[usize::from(vertical)];
         let length = || units.resolve(value, base);
-        // The root element takes percent heights from the viewport, which its parent box does not fix.
-        let page_size = || (vertical && parent == Some(0)).then(viewport).flatten();
+        // The root element takes percent heights from the viewport, which its parent box does not fix. Like
+        // Chrome, an inline-level box takes them from the fixed height of its block, which its line doesn't have.
+        let page_size = || match vertical && parent == Some(0) {
+            true => viewport(),
+            false => (vertical && line_base == Some(true)).then_some(containing),
+        };
         match prop {
             Prop::WIDTH | Prop::HEIGHT if sizeless => {}
             Prop::WIDTH
@@ -3518,6 +3756,9 @@ fn create(
             | Prop::MAX_WIDTH
             | Prop::MIN_HEIGHT
             | Prop::MAX_HEIGHT => {
+                if vertical && line_base == Some(false) && value.contains('%') {
+                    continue;
+                }
                 let axis = usize::from(vertical);
                 let length: renderer::Length = if let Some(percent) = percentage(value) {
                     match block_size.or_else(page_size) {
@@ -3750,15 +3991,32 @@ fn create(
             Prop::LEFT | Prop::RIGHT | Prop::TOP | Prop::BOTTOM
                 if matches!(position, "relative" | "absolute") =>
             {
+                // Like Chrome, a percent offset of a relative box against a parent of auto height is `auto`.
+                let fraction = !(position == "relative"
+                    && vertical
+                    && slot.is_none()
+                    && reader.parent(id, Prop::HEIGHT).is_none_or(|height| {
+                        matches!(
+                            height,
+                            "auto" | "fit-content" | "min-content" | "max-content"
+                        ) || height.contains('%')
+                            && parent.is_none_or(|parent| doc.nodes[parent].parent != Some(0))
+                    }));
                 let length: renderer::Length = if let Some(percent) = percentage(value) {
+                    if !fraction {
+                        continue;
+                    }
                     match block_size {
                         Some(_) => px(percent / 100. * base).into(),
                         None => relative(percent / 100.),
                     }
-                } else if let Some((fraction, offset)) =
+                } else if let Some((share, offset)) =
                     percent_calc(&units, value).filter(|_| block_size.is_none())
                 {
-                    renderer::Length::Calc(fraction, px(offset))
+                    if !fraction {
+                        continue;
+                    }
+                    renderer::Length::Calc(share, px(offset))
                 } else if let Some(length) = length() {
                     px(length).into()
                 } else {
@@ -3840,7 +4098,11 @@ fn create(
             el = el.h(px(height));
         }
         let set = [0, 1].map(|axis| {
-            hint[axis].is_some() || style.get(props[axis]).is_some_and(|value| value != "auto")
+            hint[axis].is_some()
+                || style.get(props[axis]).is_some_and(|value| {
+                    value != "auto"
+                        && !(axis == 1 && line_base == Some(false) && value.contains('%'))
+                })
         });
         let [content_width, content_height] = [0, 1].map(|axis| {
             hint[axis]
@@ -3892,7 +4154,46 @@ fn create(
                 None => Some(natural[0]),
             }
         };
-        if sized {
+        // Like Chrome, a video without a frame has no natural size when CSS gives it a ratio, so it fills the line.
+        if sized
+            && css
+            && natural_ratio.is_none()
+            && node.tag == "video"
+            && !matches!(position, "absolute" | "fixed")
+        {
+            match el.style().aspect_ratio {
+                Some(ratio) => {
+                    // A box around it that shrinks to its content makes it as narrow as its frame.
+                    let shrinks = shrinks_around(doc, styles, id);
+                    reader.log(Query::Shrinks(id as u32), 0, hashed(shrinks));
+                    let limit = |prop| {
+                        style
+                            .get(prop)
+                            .and_then(|value| units.resolve(value, containing[0]))
+                            .map(|value| value + extra[0])
+                    };
+                    let width = if shrinks {
+                        chrome[0]
+                    } else {
+                        containing[0] - margin[1] - margin[3]
+                    }
+                    .min(limit(Prop::MAX_WIDTH).unwrap_or(f32::INFINITY))
+                    .max(limit(Prop::MIN_WIDTH).unwrap_or(0.));
+                    // The ratio of the width and height attributes is for the content box.
+                    let height = if style.get(Prop::BOX_SIZING) == Some("border-box")
+                        && style
+                            .get(Prop::ASPECT_RATIO)
+                            .is_some_and(|v| !v.contains("auto"))
+                    {
+                        width / ratio
+                    } else {
+                        (width - chrome[0]).max(0.) / ratio + chrome[1]
+                    };
+                    el = el.w(px(width)).h(px(height));
+                }
+                None => el = el.w(renderer::Length::Calc(1., px(-margin[1] - margin[3]))),
+            }
+        } else if sized {
             if let Some(width) = width {
                 el = el.w(px(width + chrome[0]));
                 if let Some(min) = floor(0, width + chrome[0]) {
@@ -4061,9 +4362,7 @@ fn create(
                         .iter()
                         .any(|other| kind.eq_ignore_ascii_case(other))
                 })
-                && node.children.iter().all(|&child| {
-                    doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty()
-                });
+                && blank();
         let replaced = replaced && alt.is_none();
         let field = editable && node.tag == "input";
         let swatch = native
@@ -4129,8 +4428,9 @@ fn create(
             "baseline" => lift,
             value => units.resolve(value, units.font.lh).unwrap_or(0.) + lift,
         };
+        // A box with a line of text has its baseline there, also when the text overflows its height.
         let reserve = match (el.style().size.height, el.style().align_self) {
-            (renderer::Length::Px(height), None) if display != "inline" => {
+            (renderer::Length::Px(height), None) if display != "inline" && replaced => {
                 line.lh - parent - f32::from(height)
             }
             (renderer::Length::Auto, None) if field => {
@@ -4354,7 +4654,77 @@ fn create(
             el = el.h(px((viewport[1] - top - bottom).max(0.)));
         }
     }
-    if let Some(width) = style
+    if style.get(Prop::OUTLINE_STYLE) == Some("auto") {
+        // Like Chrome, a focus ring ignores the outline width: a 2px ring of the outline color, centered on the border
+        // edge moved out by `outline-offset`, or 1px inside it with a border, above a 1px ring outside it of white, or
+        // of #101010 in a dark scheme. Its corners follow the border radius, or else have a radius of 3px.
+        let offset = style
+            .get(Prop::OUTLINE_OFFSET)
+            .and_then(|v| units.resolve(v, containing[0]))
+            .unwrap_or(0.)
+            .trunc()
+            - if borders.iter().all(|width| *width >= 1.) {
+                1.
+            } else {
+                0.
+            };
+        let color = style
+            .get(Prop::OUTLINE_COLOR)
+            .and_then(style::paint)
+            .unwrap_or(ink);
+        let under = renderer::Color::hex(if dark() { 0x101010ff } else { 0xffffffff });
+        let mut ring = renderer::canvas(
+            |_, _| (),
+            move |bounds, _, window| {
+                let outer = Rect::between(
+                    bounds.origin - point(px(borders[3]), px(borders[0])),
+                    bounds.bottom_right() + point(px(borders[1]), px(borders[2])),
+                );
+                let corners = radius.resolve(outer.size).fit(outer.size);
+                let corners = if corners.is_zero() {
+                    renderer::Radii::from(px(3.))
+                } else {
+                    let grown = |radius: renderer::Pixels| (radius + px(offset)).max(px(0.));
+                    renderer::Radii {
+                        x: corners.x.map(grown),
+                        y: corners.y.map(grown),
+                        shape: corners.shape,
+                    }
+                };
+                for (at, color) in [(offset + 1., under), (offset, color)] {
+                    let path = Rect::between(
+                        outer.origin - point(px(at), px(at)),
+                        outer.bottom_right() + point(px(at), px(at)),
+                    );
+                    if path.size.width <= px(0.) || path.size.height <= px(0.) {
+                        continue;
+                    }
+                    let rect = Rect::between(
+                        path.origin - point(px(1.), px(1.)),
+                        path.bottom_right() + point(px(1.), px(1.)),
+                    );
+                    let corners = corners.inset(px(-1.), px(-1.), px(-1.), px(-1.));
+                    window.draw_box(
+                        rect,
+                        corners.fit(rect.size),
+                        renderer::Color::TRANSPARENT,
+                        renderer::Border {
+                            widths: renderer::Edges::all(px(2.)),
+                            color,
+                            style: renderer::BorderStyle::Solid,
+                            sides: 0,
+                        },
+                    );
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+        ring.style().escape = renderer::Escape::OUTLINE;
+        el = el.child(ring);
+    } else if let Some(width) = style
         .get(Prop::OUTLINE_STYLE)
         .filter(|kind| !matches!(*kind, "none" | "hidden"))
         .and_then(|_| {
@@ -4374,7 +4744,22 @@ fn create(
             .get(Prop::OUTLINE_COLOR)
             .and_then(style::paint)
             .unwrap_or(ink);
-        let kind = border_style(style.get(Prop::OUTLINE_STYLE).unwrap_or("solid"));
+        let name = style.get(Prop::OUTLINE_STYLE).unwrap_or("solid");
+        let kind = border_style(name);
+        // The top and left sides, then the right and bottom ones, of each band from the outer edge in.
+        let bands: Vec<[renderer::Color; 2]> = match name {
+            "inset" => vec![[true, false].map(|dark| shade_border(color, dark))],
+            "outset" => vec![[false, true].map(|dark| shade_border(color, dark))],
+            "groove" => vec![
+                [true, false].map(|dark| shade_border(color, dark)),
+                [false, true].map(|dark| shade_border(color, dark)),
+            ],
+            "ridge" => vec![
+                [false, true].map(|dark| shade_border(color, dark)),
+                [true, false].map(|dark| shade_border(color, dark)),
+            ],
+            _ => vec![[color; 2]],
+        };
         // Like the border box, the outline is square at corners without a radius.
         let mut outline = renderer::canvas(
             |_, _| (),
@@ -4391,27 +4776,41 @@ fn create(
                         radius
                     }
                 };
-                window.draw_box(
-                    Rect::between(
-                        outer.origin - point(px(grow), px(grow)),
-                        outer.bottom_right() + point(px(grow), px(grow)),
-                    ),
-                    corners.moved_out(
-                        px(grow),
-                        renderer::Radii {
-                            x: corners.x.map(grown),
-                            y: corners.y.map(grown),
-                            shape: corners.shape,
-                        },
-                    ),
-                    renderer::Color::TRANSPARENT,
-                    renderer::Border {
-                        widths: renderer::Edges::all(px(width)),
-                        color,
-                        style: kind,
-                        sides: 0,
+                let corners = corners.moved_out(
+                    px(grow),
+                    renderer::Radii {
+                        x: corners.x.map(grown),
+                        y: corners.y.map(grown),
+                        shape: corners.shape,
                     },
                 );
+                let band = width / bands.len() as f32;
+                for (at, colors) in bands.iter().enumerate() {
+                    let inset = px(band * at as f32 - grow);
+                    let rect = Rect::between(
+                        outer.origin + point(inset, inset),
+                        outer.bottom_right() - point(inset, inset),
+                    );
+                    let inner = px(band * at as f32);
+                    let corners = corners.inset(inner, inner, inner, inner).fit(rect.size);
+                    let split = colors[0] != colors[1];
+                    for (sides, color) in [(if split { 9 } else { 0 }, colors[0]), (6, colors[1])]
+                        .into_iter()
+                        .take(1 + usize::from(split))
+                    {
+                        window.draw_box(
+                            rect,
+                            corners,
+                            renderer::Color::TRANSPARENT,
+                            renderer::Border {
+                                widths: renderer::Edges::all(px(band)),
+                                color,
+                                style: kind,
+                                sides,
+                            },
+                        );
+                    }
+                }
             },
         )
         .absolute()
@@ -4741,10 +5140,8 @@ fn create(
         let inside = style
             .get(Prop::LIST_STYLE_POSITION)
             .is_some_and(|value| value == "inside");
-        let indent = style
-            .get(Prop::TEXT_INDENT)
-            .and_then(|value| units.resolve(value, containing[0]))
-            .unwrap_or(0.);
+        let (indent, percent) = text_indent(style, &units);
+        let indent = indent + percent * containing[0];
         let face = text.face(&style::font(marker_style.unwrap_or(style)));
         let size = marker_style
             .and_then(|marker| marker.get(Prop::FONT_SIZE))
@@ -4815,7 +5212,9 @@ fn create(
             };
             let run = style::text_run(marker_style.unwrap_or(style), &units, marker.len());
             let width = f32::from(text.shape_line(&marker, px(size), &run).line.width);
-            el.text_style().set_text_indent(px(indent + width));
+            el.text_style()
+                .set_text_indent(px(indent + width))
+                .set_text_indent_percent(0.);
             renderer::node()
                 .absolute()
                 .top(px(top))
@@ -4835,7 +5234,8 @@ fn create(
             // Like Chrome, an inside symbol takes its size, 1px and 1em before the text.
             if inside {
                 el.text_style()
-                    .set_text_indent(px(indent + side + 1. + size));
+                    .set_text_indent(px(indent + side + 1. + size))
+                    .set_text_indent_percent(0.);
             }
             let dot = renderer::node()
                 .absolute()
@@ -4977,8 +5377,8 @@ fn create(
         }
         content
     };
-    let own = style
-        .get(Prop::CONTAINER_TYPE)
+    let kind = style.get(Prop::CONTAINER_TYPE);
+    let own = kind
         .is_some_and(|v| matches!(v, "inline-size" | "size"))
         .then(|| {
             let mut host = view.host.borrow_mut();
@@ -4991,15 +5391,22 @@ fn create(
             );
             let size = last.unwrap_or_else(content_box);
             dom.containers.insert(id, size);
-            size
+            // Block-axis units of an inline-size container use the next size container, or the viewport.
+            if kind == Some("inline-size") {
+                [size[0], container[1]]
+            } else {
+                size
+            }
         });
     let mut after = Vec::new();
+    // Inline pseudo-elements of a block that also holds blocks, which join the first and last lines.
+    let mut lines: [Option<renderer::Node>; 2] = [None, None];
     // In-flow pseudo-elements of a grid or flex box are its first and last items, which the grid places and
     // flex orders among the children.
     let mut items = [None, None];
     // Pseudo-elements that are atoms of the element's text, built here and placed with the text below.
     let mut pseudo_atoms: [Option<renderer::Node>; 2] = [None, None];
-    if let Some(pseudos) = styles.pseudos.get(&id) {
+    if let Some(pseudos) = styles.pseudos.get(&id).filter(|_| !skipped) {
         let mut units = units;
         units.container = own.or(units.container);
         let keyed = info[id].flags & cull::COMPOSITED_PSEUDO != 0;
@@ -5617,6 +6024,18 @@ fn create(
                 pseudo_atoms[index] = Some(decoration);
             } else if grid_item || flexbox && !absolute {
                 items[index] = Some((flex_order, decoration, pseudo_margin));
+            } else if flow
+                && !all_inline
+                && display != "inline"
+                && !absolute
+                && own.starts_with("inline")
+                && float_side(pseudo).is_none()
+                && !node.children.is_empty()
+                && !editable
+                && !matches!(node.tag.as_str(), "svg" | "canvas" | "iframe" | "terminal")
+                && inline_text().is_none()
+            {
+                lines[index] = Some(decoration);
             } else if index == 0 && flex_order <= 0 || index == 1 && flex_order < 0 {
                 if std::mem::take(&mut strut_due) {
                     el = el.child(strut());
@@ -5642,22 +6061,24 @@ fn create(
     if preserve && node.text == "\n" {
         el = el.min_h(px(units.font.lh));
     }
-    let inline =
-        if editable || matches!(node.tag.as_str(), "svg" | "canvas" | "iframe" | "terminal") {
-            None
-        } else {
-            inline_text().filter(|data| {
-                !data.text.is_empty() || {
-                    let found = content_editable(doc, id);
-                    reader.log(
-                        Query::Editable,
-                        found.map_or(1, |node| reader.scope_of(id, node)),
-                        hashed(found.is_some()),
-                    );
-                    found.is_some()
-                }
-            })
-        };
+    let inline = if skipped
+        || editable
+        || matches!(node.tag.as_str(), "svg" | "canvas" | "iframe" | "terminal")
+    {
+        None
+    } else {
+        inline_text().filter(|data| {
+            !data.text.is_empty() || {
+                let found = content_editable(doc, id);
+                reader.log(
+                    Query::Editable,
+                    found.map_or(1, |node| reader.scope_of(id, node)),
+                    hashed(found.is_some()),
+                );
+                found.is_some()
+            }
+        })
+    };
     let hit_test = inline.is_some();
     let drag = style
         .get(Prop::APP_REGION)
@@ -5686,20 +6107,95 @@ fn create(
         el = el.cursor(renderer::Cursor::Text);
     }
     let mut plans = 0;
+    // The size of an inline box in a text as of the last frame, or a guess before it has one.
+    let atom_slot =
+        |atom: &style::Atom, child: &mut Child, containing: f32, pseudo: &dyn Fn() -> [f32; 3]| {
+            let last = view
+                .host
+                .borrow()
+                .dom
+                .get(&view.id)
+                .and_then(|dom| dom.atoms.get(&atom.key()).copied());
+            reader.log(
+                Query::Atom(atom.key() as u32),
+                0,
+                hashed(last.map(|size| size.map(f32::to_bits))),
+            );
+            let size = last.unwrap_or_else(|| {
+                if atom.pseudo != 0 {
+                    return pseudo();
+                }
+                let [_, max, _, height] = super::grid::intrinsic(
+                    doc,
+                    atom.node,
+                    styles,
+                    Some(containing),
+                    None,
+                    text,
+                    &mut measured.borrow_mut(),
+                );
+                let line = styles.lengths[atom.node].font.lh;
+                [max, height.max(line), line * 0.8]
+            });
+            super::text::AtomSlot {
+                size,
+                align: align_of(child),
+                at: std::cell::Cell::new(point(px(0.), px(0.))),
+            }
+        };
+    // The box that places an inline box where its text puts it, from the padding box of the text's box.
+    let atom_box = |index: usize,
+                    atom: &style::Atom,
+                    child: Child,
+                    slots: &Rc<[super::text::AtomSlot]>,
+                    padding: [f32; 4]| {
+        let mut wrapper = renderer::node()
+            .absolute()
+            .left(px(padding[3]))
+            .top(px(padding[0]))
+            .flex()
+            .flex_row();
+        wrapper.style().align_items = Some(renderer::AlignItems::Baseline);
+        // A box that shrinks to its atom gives percent sizes of the atom nothing to resolve against.
+        let atom_style = match atom.pseudo {
+            0 => &*styles.values[atom.node],
+            pseudo => &styles.pseudos[&id][usize::from(pseudo - 1)],
+        };
+        let rest = [Prop::WIDTH, Prop::MIN_WIDTH, Prop::MAX_WIDTH]
+            .iter()
+            .any(|&prop| {
+                atom_style
+                    .get(prop)
+                    .is_some_and(|value| value.contains('%'))
+            })
+            .then(Rc::<std::cell::Cell<renderer::Pixels>>::default);
+        wrapper = match &rest {
+            Some(_) => wrapper.right(px(padding[1])),
+            None => wrapper.max_w(renderer::Length::Calc(1., px(-padding[1] - padding[3]))),
+        };
+        wrapper = wrapper
+            .hooks(super::text::AtomBox {
+                slots: slots.clone(),
+                index,
+                node: atom.key(),
+                view: view.clone(),
+                rest: rest.clone(),
+            })
+            .child(child);
+        if let Some(rest) = rest {
+            wrapper = wrapper.child(
+                renderer::node()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .hooks(super::text::AtomRest(rest)),
+            );
+        }
+        wrapper
+    };
     if let Some(data) = inline {
         #[cfg(debug_assertions)]
         reader.extra.set(hashed(&*data.text));
-        let atom_containing = [
-            (containing[0]
-                - margin[1]
-                - margin[3]
-                - padding[1]
-                - padding[3]
-                - borders[1]
-                - borders[3])
-                .max(0.),
-            containing[1],
-        ];
+        let atom_containing = content_box();
         let mut atom_elements: Vec<renderer::Child> = data
             .atoms
             .iter()
@@ -5716,48 +6212,19 @@ fn create(
             .iter()
             .zip(&mut atom_elements)
             .map(|(atom, child)| {
-                let last = view
-                    .host
-                    .borrow()
-                    .dom
-                    .get(&view.id)
-                    .and_then(|dom| dom.atoms.get(&atom.key()).copied());
-                reader.log(
-                    Query::Atom(atom.key() as u32),
-                    0,
-                    hashed(last.map(|size| size.map(f32::to_bits))),
-                );
-                let size = last.unwrap_or_else(|| {
-                    if atom.pseudo != 0 {
-                        return super::grid::pseudo_atom(
-                            doc,
-                            id,
-                            usize::from(atom.pseudo - 1),
-                            styles,
-                            content_box()[0],
-                            Some(containing[0]),
-                            text,
-                            pixel_ratio,
-                        )
-                        .unwrap_or_default();
-                    }
-                    let [_, max, _, height] = super::grid::intrinsic(
+                atom_slot(atom, child, containing[0], &|| {
+                    super::grid::pseudo_atom(
                         doc,
-                        atom.node,
+                        id,
+                        usize::from(atom.pseudo - 1),
                         styles,
+                        content_box()[0],
                         Some(containing[0]),
-                        None,
                         text,
-                        &mut measured.borrow_mut(),
-                    );
-                    let line = styles.lengths[atom.node].font.lh;
-                    [max, height.max(line), line * 0.8]
-                });
-                super::text::AtomSlot {
-                    size,
-                    align: align_of(child),
-                    at: std::cell::Cell::new(point(px(0.), px(0.))),
-                }
+                        pixel_ratio,
+                    )
+                    .unwrap_or_default()
+                })
             })
             .collect();
         let text_box = style.get(Prop::TEXT_BOX).unwrap_or("");
@@ -5867,48 +6334,7 @@ fn create(
             )
         };
         for (index, (atom, child)) in data.atoms.iter().zip(atom_elements).enumerate() {
-            let mut wrapper = renderer::node()
-                .absolute()
-                .left(px(padding[3]))
-                .top(px(padding[0]))
-                .flex()
-                .flex_row();
-            wrapper.style().align_items = Some(renderer::AlignItems::Baseline);
-            // A box that shrinks to its atom gives percent sizes of the atom nothing to resolve against.
-            let atom_style = match atom.pseudo {
-                0 => &*styles.values[atom.node],
-                pseudo => &styles.pseudos[&id][usize::from(pseudo - 1)],
-            };
-            let rest = [Prop::WIDTH, Prop::MIN_WIDTH, Prop::MAX_WIDTH]
-                .iter()
-                .any(|&prop| {
-                    atom_style
-                        .get(prop)
-                        .is_some_and(|value| value.contains('%'))
-                })
-                .then(Rc::<std::cell::Cell<renderer::Pixels>>::default);
-            wrapper = match &rest {
-                Some(_) => wrapper.right(px(padding[1])),
-                None => wrapper.max_w(renderer::Length::Calc(1., px(-padding[1] - padding[3]))),
-            };
-            wrapper = wrapper
-                .hooks(super::text::AtomBox {
-                    slots: atom_slots.clone(),
-                    index,
-                    node: atom.key(),
-                    view: view.clone(),
-                    rest: rest.clone(),
-                })
-                .child(child);
-            if let Some(rest) = rest {
-                wrapper = wrapper.child(
-                    renderer::node()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .hooks(super::text::AtomRest(rest)),
-                );
-            }
-            el = el.child(wrapper);
+            el = el.child(atom_box(index, atom, child, &atom_slots, padding));
         }
     } else if drawable {
         // The children of a canvas with drawable content lay out as blocks at its content box, and take no room
@@ -5936,6 +6362,7 @@ fn create(
             .children(boxes);
         el = el.child(holder.hooks(super::paint::Undrawn(view.clone())));
     } else if (!node.children.is_empty() || items.iter().any(Option::is_some))
+        && !skipped
         && node.tag != "canvas"
         && node.tag != "terminal"
         && node.tag != "iframe"
@@ -6222,6 +6649,18 @@ fn create(
             None
         };
         if let Some(grid) = &grid {
+            let mut host = view.host.borrow_mut();
+            let tracks = &mut host.dom.entry(view.id).or_default().tracks;
+            if tracks
+                .get(&id)
+                .is_none_or(|[columns, rows]| **columns != *grid.columns || **rows != *grid.rows)
+            {
+                tracks.insert(
+                    id,
+                    [grid.columns.as_slice().into(), grid.rows.as_slice().into()],
+                );
+            }
+            drop(host);
             el = el.flex().flex_col();
             for (index, item) in items.iter_mut().enumerate() {
                 let key = !(id * 2 + index);
@@ -6344,9 +6783,31 @@ fn create(
             })
         };
         let multicol = columns(style, &units, content[0]).filter(|_| multicol);
-        let mut line: Option<renderer::Node> = None;
-        let mut lone = (0, None);
         let mut line_strut = false;
+        let open_line = |decoration: renderer::Node, line_strut: &mut bool| {
+            let (first, rest, aligned) = with_strut(decoration.into(), line_justify);
+            *line_strut = aligned;
+            let mut next = renderer::node()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .child(first)
+                .children(rest);
+            next.style().justify_content = line_justify;
+            next.style().align_items = line_align;
+            next.style().inline = renderer::Inline::Lines;
+            next
+        };
+        let [lead, tail] = std::mem::take(&mut lines);
+        let mut line = None;
+        if let Some(lead) = lead {
+            if grid.is_some() {
+                el = el.child(lead);
+            } else {
+                line = Some(open_line(lead, &mut line_strut));
+            }
+        }
+        let mut lone = (0, None);
         let mut joined = usize::MAX;
         let mut floating = Vec::new();
         let columns = multicol.filter(|_| flow && grid.is_none() && !all_inline);
@@ -6621,7 +7082,101 @@ fn create(
         el.reserve(children.len());
         let mut item_margins = rustc_hash::FxHashMap::<*const style::Style, [f32; 4]>::default();
         let (mut scanned, mut last_flow, mut seen, mut flowed) = (0, None, 0, false);
+        // Inline content between the blocks of a box, which lays out as one paragraph.
+        let in_run = |child: usize| {
+            let node = &doc.nodes[child];
+            match node.tag.as_str() {
+                "#text" | "#comment" => true,
+                _ => {
+                    let own = &styles.values[child];
+                    own.get(Prop::DISPLAY) == Some("none")
+                        || inline_level(child)
+                            && !floated(child)
+                            && own
+                                .get(Prop::POSITION)
+                                .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
+                }
+            }
+        };
+        let (mut run_end, mut tried) = (0, 0);
         for (index, &child) in children.iter().enumerate() {
+            if index < run_end {
+                continue;
+            }
+            if index >= tried
+                && flow
+                && !all_inline
+                && !flexbox
+                && grid.is_none()
+                && line.is_none()
+                && plan.is_none()
+                && culled.is_empty()
+                && in_run(child)
+            {
+                let end = index
+                    + children[index..]
+                        .iter()
+                        .take_while(|&&kid| in_run(kid))
+                        .count();
+                tried = end;
+                let run = &children[index..end];
+                if let Some(data) = run
+                    .iter()
+                    .any(|&kid| {
+                        doc.nodes[kid].tag == "#text"
+                            && !doc.nodes[kid].text.trim_ascii().is_empty()
+                    })
+                    .then(|| style::inline_text(doc, styles, id, run))
+                    .flatten()
+                {
+                    #[cfg(debug_assertions)]
+                    reader.extra.set(hashed((reader.extra.get(), &*data.text)));
+                    let data = Rc::new(data);
+                    let content = content_box();
+                    let mut atom_elements: Vec<Child> = data
+                        .atoms
+                        .iter()
+                        .map(|atom| element(build, atom.node, content, container, None))
+                        .collect();
+                    let atom_slots: Rc<[super::text::AtomSlot]> = data
+                        .atoms
+                        .iter()
+                        .zip(&mut atom_elements)
+                        .map(|(atom, child)| atom_slot(atom, child, content[0], &|| [0.; 3]))
+                        .collect();
+                    let mut paragraph = renderer::Node::from(InlineText {
+                        data: data.clone(),
+                        atoms: atom_slots.clone(),
+                        view: view.clone(),
+                        shaped: Default::default(),
+                        prepainted: Default::default(),
+                        justify: style
+                            .get(Prop::TEXT_ALIGN)
+                            .is_some_and(|value| value == "justify")
+                            .then(|| {
+                                style
+                                    .get(Prop::TEXT_ALIGN_LAST)
+                                    .is_some_and(|value| value == "justify")
+                            }),
+                    });
+                    paragraph.style().flow = renderer::Flow::BLOCK;
+                    let mut block = renderer::node()
+                        .flex()
+                        .flex_col()
+                        .child(paragraph.min_w(px(0.)).max_w(relative(1.)).flex_shrink(1.));
+                    for (at, (atom, child)) in data.atoms.iter().zip(atom_elements).enumerate() {
+                        block = block.child(atom_box(at, atom, child, &atom_slots, [0.; 4]));
+                    }
+                    let struts = (
+                        std::mem::take(&mut strut_due),
+                        std::mem::take(&mut strut_next),
+                    );
+                    place!(block, None);
+                    (strut_due, strut_next) = struts;
+                    run_end = end;
+                    continue;
+                }
+            }
             // Flex places a pseudo-element before the children of a higher order, and `::before` also before
             // those of its own.
             if flexbox && items.iter().any(Option::is_some) {
@@ -6735,6 +7290,13 @@ fn create(
                         content[0] + padding[1] + padding[3],
                         content[1] + padding[0] + padding[2],
                     ]
+                } else if let Some((count, gap, _)) = columns {
+                    // Boxes in columns take percentages from the width of a column.
+                    let count = count as f32;
+                    [
+                        ((content[0] - gap * (count - 1.)) / count).max(0.),
+                        content[1],
+                    ]
                 } else {
                     content
                 };
@@ -6745,9 +7307,50 @@ fn create(
                 {
                     patch.slot = field;
                 }
+                // A kept grid item can take another place, which a build in place must keep.
+                if let (Some(bounds), Child::Kept(_)) = (bounds, &child_element)
+                    && let Some(record) = view.kept.borrow_mut().get_mut(&child)
+                    && let Some(slot) = &mut record.slot
+                {
+                    slot.0 = bounds;
+                }
                 let child_element = match bounds {
-                    Some(bounds) => {
+                    Some(mut bounds) => {
                         let style = &styles.values[child];
+                        // Like Chrome, the offsets of a relative grid item take percentages of its grid area.
+                        if style.get(Prop::POSITION) == Some("relative")
+                            && let Some(grid) = &grid
+                            && let Ok(at) = grid.cells.binary_search_by_key(&child, |cell| cell.0)
+                        {
+                            let units = &styles.lengths[child];
+                            let place = grid.cells[at].1;
+                            for (axis, [start, end]) in
+                                [[Prop::LEFT, Prop::RIGHT], [Prop::TOP, Prop::BOTTOM]]
+                                    .into_iter()
+                                    .enumerate()
+                            {
+                                let [first, span] = [place[axis], place[axis + 2]];
+                                let area = [&grid.columns, &grid.rows][axis]
+                                    .get(first..first + span)
+                                    .map_or(0., |tracks| tracks.iter().sum::<f32>())
+                                    + grid.gap[axis] * span.saturating_sub(1) as f32;
+                                let inset = |prop| {
+                                    style.get(prop).and_then(|value| units.resolve(value, area))
+                                };
+                                // With both offsets, `left` wins, and `right` in right-to-left text.
+                                let end = inset(end).map(|value| -value);
+                                bounds[axis] += match end {
+                                    Some(end)
+                                        if axis == 0
+                                            && style.get(Prop::DIRECTION) == Some("rtl") =>
+                                    {
+                                        Some(end)
+                                    }
+                                    _ => inset(start).or(end),
+                                }
+                                .unwrap_or(0.);
+                            }
+                        }
                         let margin = *item_margins.entry(Rc::as_ptr(style)).or_insert_with(|| {
                             let mut units = styles.lengths[child];
                             units.container = Some(container);
@@ -6783,6 +7386,18 @@ fn create(
                         joint.style().align_self = align_of(&mut child_element);
                         joint.style().inline = renderer::Inline::Hangs;
                         joint.child(child_element).child(space).into()
+                    }
+                    // A space of its own also hangs at the end of a line.
+                    _ if hangs
+                        && grid.is_none()
+                        && doc.nodes[child].tag == "#text"
+                        && doc.nodes[child].text.trim_ascii().is_empty() =>
+                    {
+                        let mut space = child_element;
+                        if let renderer::Child::Node(node) = &mut space {
+                            node.style().inline = renderer::Inline::Hangs;
+                        }
+                        space
                     }
                     _ => child_element,
                 };
@@ -6829,7 +7444,7 @@ fn create(
                         pending
                             .filter(|&other| self::block(build, other))
                             .map_or(0., |other| {
-                                let (_, [positive, negative], _) =
+                                let (_, [positive, negative], empty) =
                                     adjoining(build, other, content[0]);
                                 let used = margins(
                                     build,
@@ -6838,7 +7453,9 @@ fn create(
                                     content[0],
                                     false,
                                     false,
-                                )[2];
+                                );
+                                // An empty box passes its top margin on too.
+                                let used = used[2] + if empty { used[0] } else { 0. };
                                 (positive + negative - used).max(0.)
                             });
                     let entity = view.clone();
@@ -6941,6 +7558,147 @@ fn create(
                         line = Some(next);
                     }
                 } else if out_of_flow {
+                    // Like Chrome, an absolute box of a grid without insets takes its place in the padding box by
+                    // its alignment, as the only item of a grid area.
+                    let child_element = if matches!(display, "grid" | "inline-grid")
+                        && made.absolute
+                        && child_style.get(Prop::POSITION) == Some("absolute")
+                        && [[Prop::LEFT, Prop::RIGHT], [Prop::TOP, Prop::BOTTOM]]
+                            .iter()
+                            .any(|axis| {
+                                axis.iter().all(|prop| {
+                                    child_style.get(*prop).is_none_or(|value| value == "auto")
+                                })
+                            }) {
+                        let align = |own: Prop, items: Prop| {
+                            let value = child_style
+                                .get(own)
+                                .filter(|value| *value != "auto")
+                                .or_else(|| style.get(items))
+                                .unwrap_or("normal");
+                            let justify = own == Prop::JUSTIFY_SELF;
+                            let rtl = justify && style.get(Prop::DIRECTION) == Some("rtl");
+                            match value
+                                .trim_start_matches("unsafe ")
+                                .trim_start_matches("safe ")
+                            {
+                                "center" => 1,
+                                "left" if justify => 0,
+                                "right" if justify => 2,
+                                "end" | "flex-end" | "self-end" => 2 * usize::from(!rtl),
+                                _ => 2 * usize::from(rtl),
+                            }
+                        };
+                        let mut area = renderer::node()
+                            .absolute()
+                            .top(px(0.))
+                            .right(px(0.))
+                            .bottom(px(0.))
+                            .left(px(0.))
+                            .flex()
+                            .flex_col();
+                        // Grid lines of the box place its area on the tracks, and `auto` lines take the padding edges.
+                        if let Some(grid) = &grid {
+                            let rtl = style.get(Prop::DIRECTION) == Some("rtl");
+                            for (axis, [start, end], tracks, content_prop) in [
+                                (
+                                    0,
+                                    [Prop::GRID_COLUMN_START, Prop::GRID_COLUMN_END],
+                                    &grid.columns,
+                                    Prop::JUSTIFY_CONTENT,
+                                ),
+                                (
+                                    1,
+                                    [Prop::GRID_ROW_START, Prop::GRID_ROW_END],
+                                    &grid.rows,
+                                    Prop::ALIGN_CONTENT,
+                                ),
+                            ] {
+                                let [start, end] = [start, end]
+                                    .map(|prop| child_style.get(prop).unwrap_or("auto"));
+                                let gap = grid.gap[axis];
+                                let total = tracks.iter().sum::<f32>()
+                                    + gap * tracks.len().saturating_sub(1) as f32;
+                                let free = if axis == 1 && auto_height {
+                                    0.
+                                } else {
+                                    (content[axis] - total).max(0.)
+                                };
+                                let shift = free
+                                    * match style.get(content_prop).unwrap_or("normal") {
+                                        "center" => 0.5,
+                                        "end" | "flex-end" => 1.,
+                                        _ => 0.,
+                                    };
+                                // The distance of a grid line from the start padding edge.
+                                let edge = |line: usize| {
+                                    [padding[3], padding[0]][axis]
+                                        + shift
+                                        + tracks[..line.min(tracks.len())].iter().sum::<f32>()
+                                        + gap * line as f32
+                                };
+                                // Lines past the explicit grid are `auto`.
+                                let (line, span) =
+                                    super::grid::placement(start, end, &[], tracks.len());
+                                let line = line.filter(|line| line + span <= tracks.len());
+                                let first = line.filter(|_| start != "auto").map(edge);
+                                let last = match (line, end) {
+                                    (_, "auto") => None,
+                                    (Some(line), _) => Some(edge(line + span) - gap),
+                                    (None, _) => {
+                                        super::grid::placement(end, "auto", &[], tracks.len())
+                                            .0
+                                            .map(|line| edge(line) - gap)
+                                    }
+                                };
+                                if first.is_none() && last.is_none() {
+                                    continue;
+                                }
+                                let at = first.unwrap_or(0.);
+                                let size = last.map(|last| (last - at).max(0.));
+                                let style = area.style();
+                                let (near, far, length) = match axis {
+                                    0 if rtl => (
+                                        &mut style.inset.right,
+                                        &mut style.inset.left,
+                                        &mut style.size.width,
+                                    ),
+                                    0 => (
+                                        &mut style.inset.left,
+                                        &mut style.inset.right,
+                                        &mut style.size.width,
+                                    ),
+                                    _ => (
+                                        &mut style.inset.top,
+                                        &mut style.inset.bottom,
+                                        &mut style.size.height,
+                                    ),
+                                };
+                                *near = px(at).into();
+                                if let Some(size) = size {
+                                    (*far, *length) = (renderer::Length::Auto, px(size).into());
+                                }
+                            }
+                        }
+                        area.style().align_items = Some(
+                            [
+                                renderer::AlignItems::FlexStart,
+                                renderer::AlignItems::Center,
+                                renderer::AlignItems::FlexEnd,
+                            ][align(Prop::JUSTIFY_SELF, Prop::JUSTIFY_ITEMS)],
+                        );
+                        area.style().justify_content = Some(
+                            [
+                                renderer::AlignContent::FlexStart,
+                                renderer::AlignContent::Center,
+                                renderer::AlignContent::FlexEnd,
+                            ][align(Prop::ALIGN_SELF, Prop::ALIGN_ITEMS)],
+                        );
+                        area.style().contains = renderer::Escape::ABSOLUTE;
+                        area.child(child_element).into()
+                    } else {
+                        child_element
+                    };
                     // In place, out-of-flow boxes paint in tree order with the positioned boxes around them.
                     if line.is_none() && columns.is_none() {
                         el.push(child_element);
@@ -6951,7 +7709,62 @@ fn create(
                     if let Some(line) = line.take() {
                         place!(line, None);
                     }
-                    let (child_element, aligned) = if strut_due && doc.nodes[child].tag != "br" {
+                    // An inline-block with a line of text in the font of the line is as tall as the strut above and
+                    // below its baseline, so it needs none.
+                    let covers = || {
+                        let own = &styles.values[child];
+                        let Some(built) = (match &child_element {
+                            renderer::Child::Node(node) => Some(node.style_ref()),
+                            renderer::Child::Kept(id) | renderer::Child::Placed(id, _) => {
+                                build.tree.style_of(*id)
+                            }
+                        }) else {
+                            return false;
+                        };
+                        let below = |length: renderer::Length| match length {
+                            renderer::Length::Px(value) => value.0 < 0.,
+                            renderer::Length::Calc(fraction, offset) => {
+                                fraction < 0. || offset.0 < 0.
+                            }
+                            renderer::Length::Fraction(fraction) => fraction < 0.,
+                            renderer::Length::Auto => false,
+                        };
+                        own.get(Prop::DISPLAY) == Some("inline-block")
+                            && own
+                                .get(Prop::VERTICAL_ALIGN)
+                                .is_none_or(|value| value == "baseline")
+                            && own
+                                .get(Prop::OVERFLOW_X)
+                                .is_none_or(|value| value == "visible")
+                            && own
+                                .get(Prop::OVERFLOW_Y)
+                                .is_none_or(|value| value == "visible")
+                            && own.get(Prop::CONTAIN).is_none_or(|value| value == "none")
+                            && own
+                                .get(Prop::CONTENT_VISIBILITY)
+                                .is_none_or(|value| value == "visible")
+                            && built.size.height == renderer::Length::Auto
+                            && built.max_size.height == renderer::Length::Auto
+                            && built.aspect_ratio.is_none()
+                            && !below(built.margin.top)
+                            && !below(built.margin.bottom)
+                            && own.get(Prop::FONT_FAMILY) == style.get(Prop::FONT_FAMILY)
+                            && styles.lengths[child].font.em == units.font.em
+                            && styles.lengths[child].font.lh == line_height
+                            && doc.nodes[child].children.iter().any(|&kid| {
+                                doc.nodes[kid].tag == "#text"
+                                    && !doc.nodes[kid].text.trim_ascii().is_empty()
+                            })
+                    };
+                    let (child_element, aligned) = if (strut_due
+                        || struts
+                            && all_inline
+                            && joined != index + 1
+                            && !doc.nodes[child].tag.starts_with('#')
+                            && (display != "inline" || percent_width(&child_element).is_none())
+                            && !covers())
+                        && doc.nodes[child].tag != "br"
+                    {
                         strut_due = false;
                         let (first, rest, aligned) = with_strut(child_element, line_justify);
                         match rest {
@@ -6976,8 +7789,22 @@ fn create(
                 }
             }
         }
-        if let Some(open) = line.take() {
-            place!(open, None);
+        match (line.take(), tail) {
+            (Some(open), Some(tail)) if grid.is_none() => {
+                let (first, rest, _) = with_strut(tail.into(), line_justify);
+                place!(open.child(first).children(rest), None);
+            }
+            (open, tail) => {
+                if let Some(open) = open {
+                    place!(open, None);
+                }
+                if let Some(tail) = tail {
+                    match grid {
+                        Some(_) => place!(tail, None),
+                        None => place!(open_line(tail, &mut line_strut), None),
+                    }
+                }
+            }
         }
         // An inline box around one box with a percent width must not stand between that box and the line.
         if let (1, Some(share)) = lone
@@ -7016,6 +7843,60 @@ fn create(
             }
         }
         el = el.children(floating);
+    }
+    if let Some([width, height]) = intrinsic.filter(|size| skipped && size != &[0.; 2]) {
+        el = el.child(renderer::node().w(px(width)).h(px(height)).flex_shrink_0());
+    }
+    if let Some([_, height]) = intrinsic.filter(|_| forced) {
+        let sides = [
+            padding[1] + padding[3] + borders[1] + borders[3],
+            padding[0] + padding[2] + borders[0] + borders[2],
+        ];
+        // The last frame laid out the box without its contents. Before one, only the height is known.
+        let size = last.map_or([None, Some(height)], |size| size.map(Some));
+        let style = el.style();
+        for (axis, value) in size.into_iter().enumerate() {
+            if let Some(value) = value {
+                let value = renderer::Length::Px(px(value + sides[axis]));
+                let [size, min, max] = if axis == 0 {
+                    [
+                        &mut style.size.width,
+                        &mut style.min_size.width,
+                        &mut style.max_size.width,
+                    ]
+                } else {
+                    [
+                        &mut style.size.height,
+                        &mut style.min_size.height,
+                        &mut style.max_size.height,
+                    ]
+                };
+                (*size, *min, *max) = (value, value, value);
+            }
+        }
+    }
+    if info[id].flags & cull::SKIPS != 0 && style.get(Prop::CONTENT_VISIBILITY) == Some("auto") {
+        let clips = ancestors
+            .iter()
+            .copied()
+            .filter(|&ancestor| {
+                !matches!(doc.nodes[ancestor].tag.as_str(), "html" | "body")
+                    && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                        .into_iter()
+                        .any(|prop| {
+                            styles.values[ancestor]
+                                .get(prop)
+                                .is_some_and(|value| value != "visible")
+                        })
+            })
+            .collect();
+        if let Some(dom) = view.host.borrow_mut().dom.get_mut(&view.id) {
+            let last = dom
+                .autos
+                .get(&id)
+                .map_or((0, [f32::NAN; 2]), |entry| entry.2);
+            dom.autos.insert(id, (chain.clone(), clips, last));
+        }
     }
     after.extend(
         items
@@ -7111,12 +7992,15 @@ fn create(
     });
     let mut anchor = None;
     if position == "absolute" && slot.is_none() && axes.contains(&true) {
+        // A grid places a box that it contains by its alignment.
         if matches!(parent_display, "grid" | "inline-grid") {
-            if axes[0] {
-                el = el.left(px(0.));
-            }
-            if axes[1] {
-                el = el.top(px(0.));
+            if positioner != parent {
+                if axes[0] {
+                    el = el.left(px(0.));
+                }
+                if axes[1] {
+                    el = el.top(px(0.));
+                }
             }
         } else if !matches!(parent_display, "flex" | "inline-flex") {
             let block = !display.starts_with("inline");
@@ -7414,6 +8298,9 @@ fn create(
                 && (el.style_ref().flex_direction == renderer::FlexDirection::Column
                     || el.style_ref().inline == renderer::Inline::Lines)
                 && style.get(Prop::CONTAIN).is_none_or(|value| value == "none")
+                && style
+                    .get(Prop::CONTENT_VISIBILITY)
+                    .is_none_or(|value| value == "visible")
                 && style
                     .get(Prop::COLUMN_COUNT)
                     .is_none_or(|value| value == "auto")
@@ -7898,10 +8785,18 @@ pub(super) fn file_size(
         [style::PADDING, style::MARGIN].map(|sides| units.edges(button, sides, 0.));
     let borders = units.borders(button, 0.);
     let edges = |side: usize| padding[side] + margin[side] + borders[side];
-    let content = width("Choose File") + edges(1) + edges(3) + width("No file chosen");
+    // The button text takes the font size of `::file-selector-button`.
+    let scale = button
+        .get(Prop::FONT_SIZE)
+        .and_then(|value| units.resolve(value, units.font.em))
+        .map_or(1., |size| size / units.font.em);
+    let content = width("Choose File") * scale + edges(1) + edges(3) + width("No file chosen");
     [
         layout_ceil((zero * 34.).max(content), pixel_ratio),
-        units.font.lh.max(units.font.lh + edges(0) + edges(2)),
+        units
+            .font
+            .lh
+            .max(units.font.lh * scale + edges(0) + edges(2)),
     ]
 }
 
@@ -7982,7 +8877,10 @@ fn margins(
             let mut leading = open[0];
             for &child in &children {
                 if !block(build, child) {
-                    (leading, pending, emitted) = (false, [0.; 2], 0.);
+                    // Like Chrome, margins collapse across inline content that makes no line.
+                    if !style::makes_no_line(build.doc, build.styles, child) {
+                        (leading, pending, emitted) = (false, [0.; 2], 0.);
+                    }
                     continue;
                 }
                 let (top, bottom, empty) = adjoining(build, child, width);
@@ -8010,16 +8908,32 @@ fn margins(
                 used.insert(child, sides);
             }
             if open[1] {
+                let mut trailing = Vec::new();
                 for child in children.into_iter().rev() {
-                    let empty = block(build, child) && adjoining(build, child, width).2;
+                    if !block(build, child) && style::makes_no_line(build.doc, build.styles, child)
+                    {
+                        continue;
+                    }
+                    let sets = adjoining(build, child, width);
+                    let empty = block(build, child) && sets.2;
                     let Some(sides) = used.get_mut(&child) else {
                         break;
                     };
                     if empty {
                         *sides = [0.; 2];
+                        trailing.push((child, sets));
                         continue;
                     }
                     sides[1] = 0.;
+                    // Like Chrome, the empty boxes after the last box sit below the margins before them, and
+                    // their margins pass to the parent.
+                    let mut pending = sets.1;
+                    for (child, (top, bottom, _)) in trailing.into_iter().rev() {
+                        pending = [pending[0].max(top[0]), pending[1].min(top[1])];
+                        let at = value(pending);
+                        used.insert(child, [at, -at]);
+                        pending = [pending[0].max(bottom[0]), pending[1].min(bottom[1])];
+                    }
                     break;
                 }
             }
@@ -8049,8 +8963,11 @@ fn flow(build: &Build<'_>, id: usize) -> Vec<usize> {
         .copied()
         .filter(|&child| {
             // A plain block is an element in the flow that doesn't float.
+            // Preserved white space makes a line.
             build.info[child].flags & cull::PLAIN_BLOCK != 0
-                || in_flow(build.doc, build.info, child)
+                || (in_flow(build.doc, build.info, child)
+                    || build.doc.nodes[child].tag == "#text"
+                        && !style::makes_no_line(build.doc, build.styles, child))
                     && float_side(&build.styles.values[child]).is_none()
         })
         .collect()
@@ -8151,7 +9068,10 @@ fn margin_collapses_through(build: &Build<'_>, id: usize, side: usize, width: f3
             || [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
                 .into_iter()
                 .all(|key| style.get(key).is_none_or(|value| value == "visible")))
-        // A multi-column box holds the margins of its content.
+        // A multi-column box and a `content-visibility` box hold the margins of their content.
+        && style
+            .get(Prop::CONTENT_VISIBILITY)
+            .is_none_or(|value| value == "visible")
         && [Prop::COLUMN_COUNT, Prop::COLUMN_WIDTH]
             .into_iter()
             .all(|key| style.get(key).is_none_or(|value| value == "auto"))
@@ -8168,6 +9088,93 @@ fn margin_collapses_through(build: &Build<'_>, id: usize, side: usize, width: f3
                 && style
                     .get(Prop::MIN_HEIGHT)
                     .is_none_or(|value| value == "auto" || edge(Prop::MIN_HEIGHT) == 0.))
+}
+
+// Whether the block around the line of a box has a definite height, which its percent heights resolve against.
+fn definite_line(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
+    let block =
+        std::iter::successors(doc.nodes[id].parent, |&node| doc.nodes[node].parent).find(|&node| {
+            styles.values[node]
+                .get(Prop::DISPLAY)
+                .is_some_and(|value| !matches!(value, "inline" | "contents"))
+        });
+    definite_height(doc, styles, block)
+}
+
+fn definite_height(doc: &Document, styles: &ComputedStyles, id: Option<usize>) -> bool {
+    let Some(id) = id else { return true };
+    let (style, parent) = (&styles.values[id], doc.nodes[id].parent);
+    let parent_style = |prop| parent.and_then(|parent| styles.values[parent].get(prop));
+    let set = |prop| style.get(prop).is_some_and(|value| value != "auto");
+    let stretched = || {
+        style
+            .get(Prop::ALIGN_SELF)
+            .filter(|value| *value != "auto")
+            .or_else(|| parent_style(Prop::ALIGN_ITEMS))
+            .is_none_or(|value| matches!(value, "normal" | "stretch"))
+    };
+    match style.get(Prop::HEIGHT) {
+        // The root element takes percentages from the viewport.
+        Some(height) if height.contains('%') => {
+            parent.is_none_or(|parent| parent == 0) || definite_height(doc, styles, parent)
+        }
+        Some(height) if height != "auto" => styles.lengths[id].resolve(height, 0.).is_some(),
+        _ if style
+            .get(Prop::POSITION)
+            .is_some_and(|value| matches!(value, "absolute" | "fixed")) =>
+        {
+            set(Prop::TOP) && set(Prop::BOTTOM)
+        }
+        // A cell takes the height of its table.
+        _ if style.get(Prop::DISPLAY) == Some("table-cell") => definite_height(
+            doc,
+            styles,
+            std::iter::successors(parent, |&node| doc.nodes[node].parent)
+                .find(|&node| styles.values[node].get(Prop::DISPLAY) == Some("table")),
+        ),
+        // Stretched grid items, and stretched items of a flex row or growing items of a flex column of a definite
+        // height.
+        _ => match parent_style(Prop::DISPLAY) {
+            Some("grid" | "inline-grid") => stretched(),
+            Some("flex" | "inline-flex")
+                if parent_style(Prop::FLEX_DIRECTION)
+                    .is_none_or(|value| value.starts_with("row")) =>
+            {
+                stretched() && definite_height(doc, styles, parent)
+            }
+            Some("flex" | "inline-flex") => {
+                style
+                    .get(Prop::FLEX_GROW)
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .is_some_and(|grow| grow > 0.)
+                    && definite_height(doc, styles, parent)
+            }
+            _ => false,
+        },
+    }
+}
+
+// Whether a box around this one shrinks to its content before a box of a fixed width does.
+fn shrinks_around(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
+    std::iter::successors(doc.nodes[id].parent, |&node| doc.nodes[node].parent)
+        .take_while(|&node| node != 0)
+        .find_map(|node| {
+            let style = &styles.values[node];
+            let width = style.get(Prop::WIDTH).unwrap_or("auto");
+            if styles.lengths[node].resolve(width, 0.).is_some() {
+                return Some(false);
+            }
+            (float_side(style).is_some()
+                || style
+                    .get(Prop::DISPLAY)
+                    .is_some_and(|value| value.starts_with("inline-"))
+                || style
+                    .get(Prop::POSITION)
+                    .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+                || matches!(width, "max-content" | "min-content" | "fit-content"))
+            .then_some(true)
+        })
+        .unwrap_or(false)
 }
 
 fn percent_calc(units: &style::Lengths, value: &str) -> Option<(f32, f32)> {
@@ -8227,6 +9234,9 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> Sets {
                 index
             }];
             if !block(build, child) {
+                if style::makes_no_line(build.doc, build.styles, child) {
+                    continue;
+                }
                 break;
             }
             let (child_top, child_bottom, empty) = adjoining(build, child, width);
@@ -8250,12 +9260,16 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> Sets {
         && style
             .get(Prop::HEIGHT)
             .is_none_or(|value| value == "auto" || units.resolve(value, width) == Some(0.))
-        && children
-            .iter()
-            .all(|&child| block(build, child) && adjoining(build, child, width).2);
+        && children.iter().all(|&child| {
+            if block(build, child) {
+                adjoining(build, child, width).2
+            } else {
+                style::makes_no_line(build.doc, build.styles, child)
+            }
+        });
+    // An empty box keeps its own top set, which places it, and its bottom set holds all its margins.
     if empty {
-        top = [top[0].max(bottom[0]), top[1].min(bottom[1])];
-        bottom = top;
+        bottom = [top[0].max(bottom[0]), top[1].min(bottom[1])];
     }
     build.adjoins.borrow_mut().insert(id, (top, bottom, empty));
     if !animated && !deep {

@@ -235,6 +235,11 @@ pub trait Hooks: 'static {
     fn shifts(&self) -> bool {
         false
     }
+    // The far corner of the rectangle from the origin of a box of `size` to `far` where paint moves it, like a
+    // transform. Scroll containers count it in their scrollable overflow.
+    fn reach(&self, _size: Size<Pixels>, far: Point<Pixels>) -> Point<Pixels> {
+        far
+    }
 }
 
 // Two hooks of one node: the outer one wraps the inner one.
@@ -320,6 +325,10 @@ impl Hooks for Chain {
 
     fn skips_inside(&self) -> bool {
         self.0.skips_inside() || self.1.skips_inside()
+    }
+
+    fn reach(&self, size: Size<Pixels>, far: Point<Pixels>) -> Point<Pixels> {
+        self.0.reach(size, self.1.reach(size, far))
     }
 }
 

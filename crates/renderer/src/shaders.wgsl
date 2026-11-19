@@ -266,12 +266,12 @@ fn either_speed(a: f32, b: f32) -> f32 {
     return min(a, b);
 }
 
-// Like Chromium: dashes are 2 widths long with 1 width gaps, or 3 and 2 below 3 CSS pixels (`thin`), and dots
-// have 1 width gaps. The gaps stretch or shrink to fit whole dashes. A rounded border has a dash centered in
-// each corner.
+// Like Chromium: dashes are 2 widths long with 1 width gaps, or 3 and 2 when thin (below 3 CSS pixels on square
+// borders, 3 device pixels on rounded ones), and dots have 1 width gaps, and are square dashes on rounded borders
+// up to 3 device pixels (`thin`). The gaps stretch or shrink to fit whole dashes.
 fn dash_coverage(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, widths: vec4<f32>, dotted: bool, thin: bool, depth: f32, inner: f32) -> f32 {
-    let period_widths = select(select(3.0, 2.0, dotted), 5.0, thin);
-    let dash = select(select(2.0, 1.0, dotted), 3.0, thin) / period_widths;
+    let period_widths = select(select(3.0, 2.0, dotted), 5.0, thin && !dotted);
+    let dash = select(select(2.0, 1.0, dotted), 3.0, thin && !dotted) / period_widths;
     let local = p - rect.xy;
     let half = rect.zw * 0.5;
     let from_center = local - half;
@@ -282,12 +282,26 @@ fn dash_coverage(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, wi
     var t = 0.0;
     var speed = 0.0;
     var total = 0.0;
+    var closed = false;
     var centered = false;
+    // A dot is as wide as its side and centered in it.
+    var dot_depth = depth;
+    var dot_width = depth + inner;
     if all(rx == vec4<f32>(0.0)) {
-        let width = select(max(widths.y, widths.w), max(widths.x, widths.z), across);
+        // Each side dashes by its own width. Like Chromium, the wider of two sides takes their corner, and sides of
+        // equal width split it on the diagonal.
+        let level = select(widths.z, widths.x, corner < 2u);
+        let upright = select(widths.y, widths.w, corner == 0u || corner == 3u);
+        let in_level = local.y < widths.x || local.y > rect.w - widths.z;
+        let in_upright = local.x < widths.w || local.x > rect.z - widths.y;
+        let along = select(in_level && !(in_upright && upright > level), across, level == upright);
+        let width = select(upright, level, along);
+        let far = select(local.x, rect.z - local.x, corner == 1u || corner == 2u);
+        dot_depth = select(far, select(rect.w - local.y, local.y, corner < 2u), along);
+        dot_width = width;
         speed = 1.0 / (period_widths * width);
-        t = select(local.y, local.x, across) * speed;
-        total = select(rect.w, rect.z, across) * speed - dash;
+        t = select(local.y, local.x, along) * speed;
+        total = select(rect.w, rect.z, along) * speed - dash;
     } else {
         let side_speed = select(vec4<f32>(0.0), 1.0 / (period_widths * widths), widths > vec4<f32>(0.0));
         // Speeds and arc lengths of the corners in the order top right, bottom right, bottom left, top left.
@@ -299,7 +313,10 @@ fn dash_coverage(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, wi
         );
         // Corners measure along the middle of the border.
         let middle = 0.5;
-        let sweep = max(vec4<f32>(0.0), (rx.yzwx + ry.yzwx) * 0.5 - middle * max(widths.xzzx, widths.yyww)) * (PI * 0.5) * corner_speed;
+        let round_sweep = max(vec4<f32>(0.0), (rx.yzwx + ry.yzwx) * 0.5 - middle * max(widths.xzzx, widths.yyww)) * (PI * 0.5) * corner_speed;
+        // A square corner meets its sides at the middle of the border, half a width in from each edge.
+        let square_sweep = -(widths.yzwx * side_speed.xyzw + widths.xyzw * side_speed.yzwx) * 0.5;
+        let sweep = select(round_sweep, square_sweep, rx.yzwx * ry.yzwx == vec4<f32>(0.0));
         let top_end = (rect.z - rx.x - rx.y) * side_speed.x;
         let right_start = top_end + sweep.x;
         let right_end = right_start + (rect.w - ry.y - ry.z) * side_speed.y;
@@ -345,26 +362,49 @@ fn dash_coverage(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, wi
             speed = side_speed.y;
             t = right_start + (local.y - ry.y) * speed;
         }
-        // Each side runs from the middle of one corner to the middle of the next.
-        let ends = vec4<f32>(right_start - sweep.x * 0.5, right_end + sweep.y * 0.5, left_start - sweep.z * 0.5, left_end + sweep.w * 0.5);
-        if t >= ends.w {
-            t -= total;
+        closed = all(rx * ry > vec4<f32>(0.0));
+        if !closed {
+            // With a square corner, each side runs from the middle of one corner to the middle of the next, with a
+            // dash centered in each corner, which keeps square corners solid.
+            let ends = vec4<f32>(right_start - sweep.x * 0.5, right_end + sweep.y * 0.5, left_start - sweep.z * 0.5, left_end + sweep.w * 0.5);
+            if t >= ends.w {
+                t -= total;
+            }
+            var start = ends.z;
+            var end = ends.w;
+            if t < ends.x {
+                start = ends.w - total;
+                end = ends.x;
+            } else if t < ends.y {
+                start = ends.x;
+                end = ends.y;
+            } else if t < ends.z {
+                start = ends.y;
+                end = ends.z;
+            }
+            t -= start;
+            total = end - start;
+            centered = true;
         }
-        var start = ends.z;
-        var end = ends.w;
-        if t < ends.x {
-            start = ends.w - total;
-            end = ends.x;
-        } else if t < ends.y {
-            start = ends.x;
-            end = ends.y;
-        } else if t < ends.z {
-            start = ends.y;
-            end = ends.z;
+    }
+    if closed {
+        // Like Chromium, a rounded border dashes its middle line as one closed path from the end of the top left
+        // corner, clockwise. A whole number of dashes fits, with the gaps nearest to their length, and a short path
+        // is solid.
+        if total <= dash * 2.0 {
+            return 1.0;
         }
-        t -= start;
-        total = end - start;
-        centered = true;
+        let fewer = max(floor(total), 1.0);
+        let more = fewer + 1.0;
+        let period = total / select(fewer, more, total / more > dash && abs(total / more - 1.0) <= abs(total / fewer - 1.0));
+        // Dashes start at the start, and round dots are centered on it.
+        let round_dot = dotted && !thin;
+        let from_start = t - select(dash * 0.5, 0.0, round_dot);
+        let from_dash = from_start - floor(from_start / period + 0.5) * period;
+        if round_dot {
+            return saturate(0.5 - (length(vec2<f32>(from_dash / speed, dot_depth - dot_width * 0.5)) - dot_width * 0.5));
+        }
+        return saturate(0.5 - (abs(from_dash) - dash * 0.5) / speed);
     }
     if total >= 1.0 || centered && total > 0.0 {
         let fewer = max(floor(total), 1.0);
@@ -372,8 +412,7 @@ fn dash_coverage(p: vec2<f32>, rect: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, wi
         let period = total / count;
         let from_dash = (t + select((period - dash) * 0.5, period * 0.5, centered)) % period - period * 0.5;
         if dotted {
-            let width = depth + inner;
-            return saturate(0.5 - (length(vec2<f32>(from_dash / speed, depth - width * 0.5)) - width * 0.5));
+            return saturate(0.5 - (length(vec2<f32>(from_dash / speed, dot_depth - dot_width * 0.5)) - dot_width * 0.5));
         }
         return saturate(0.5 - (abs(from_dash) - dash * 0.5) / speed);
     }
@@ -480,37 +519,60 @@ fn erf(x: vec2<f32>) -> vec2<f32> {
     return sign(x) * (1.0 - 1.0 / (q2 * q2));
 }
 
+// How far the box reaches out from its center on one side, at a row `row_y` below the center. The
+// corners of the side are `top` and `bottom`, and a row between their curves reaches the straight edge.
+fn row_extent(top: u32, bottom: u32, row_y: f32, half: vec2<f32>, rx: vec4<f32>, ry: vec4<f32>, shape: vec2<f32>) -> f32 {
+    var corner = top;
+    var edge = half.y + row_y;
+    if edge >= ry[top] {
+        corner = bottom;
+        edge = half.y - row_y;
+    }
+    let radius = radius_of(corner, rx, ry);
+    if radius.y <= 0.0 {
+        return half.x;
+    }
+    let into = min(edge - radius.y, 0.0);
+    let code = shape_code(corner, shape);
+    var bulge = radius.x * sqrt(max(0.0, 1.0 - into * into / (radius.y * radius.y)));
+    if code != 0u {
+        // How far the curve reaches out at this row, as in `corner_curve`.
+        let n = exponent(code);
+        let t = min(-into / radius.y, 1.0);
+        let concave = code < 2048u;
+        let rest = 1.0 - pow(max(select(t, 1.0 - t, concave), 1e-6), n);
+        // `pow` of 0 is not defined in Metal, and a `select` does not keep its NaN out.
+        var reach = 0.0;
+        if rest > 0.0 {
+            reach = pow(rest, 1.0 / n);
+        }
+        bulge = radius.x * select(reach, 1.0 - reach, concave);
+    }
+    return half.x - radius.x + bulge;
+}
+
 // Exact across each row, sampled at 4 rows within 3 sigma, or 16 at a corner shape whose width can jump.
 fn blurred_box(p: vec2<f32>, box: vec4<f32>, rx: vec4<f32>, ry: vec4<f32>, shape: vec2<f32>, sigma: f32) -> f32 {
     let half = box.zw * 0.5;
     let from_center = p - box.xy - half;
-    let corner = pick(from_center, half, rx, ry);
-    let radius = radius_of(corner, rx, ry);
-    let code = shape_code(corner, shape);
-    let n = exponent(code);
     let low = clamp(-3.0 * sigma, from_center.y - half.y, from_center.y + half.y);
     let high = clamp(3.0 * sigma, from_center.y - half.y, from_center.y + half.y);
-    let rows = select(4u, 16u, code != 0u);
+    let rows = select(4u, 16u, any(shape != vec2<f32>(0.0)));
     let step = (high - low) / f32(rows);
+    // Each side takes its own corners, so boxes with different radii have no seams. A box whose sides
+    // mirror each other measures one side.
+    let codes = vec4<u32>(shape_code(0u, shape), shape_code(1u, shape), shape_code(2u, shape), shape_code(3u, shape));
+    let mirrored = rx.x == rx.y && ry.x == ry.y && rx.w == rx.z && ry.w == ry.z && codes.x == codes.y && codes.w == codes.z;
     var sum = 0.0;
     for (var row = 0u; row < rows; row++) {
         let y = low + (f32(row) + 0.5) * step;
-        let into = min(half.y - radius.y - abs(from_center.y - y), 0.0);
-        var bulge = select(0.0, radius.x * sqrt(max(0.0, 1.0 - into * into / (radius.y * radius.y))), radius.y > 0.0);
-        if code != 0u && radius.y > 0.0 {
-            // How far the curve reaches out at this row, as in `corner_curve`.
-            let t = min(-into / radius.y, 1.0);
-            let concave = code < 2048u;
-            let rest = 1.0 - pow(max(select(t, 1.0 - t, concave), 1e-6), n);
-            // `pow` of 0 is not defined in Metal, and a `select` does not keep its NaN out.
-            var reach = 0.0;
-            if rest > 0.0 {
-                reach = pow(rest, 1.0 / n);
-            }
-            bulge = radius.x * select(reach, 1.0 - reach, concave);
+        let row_y = from_center.y - y;
+        let west = row_extent(0u, 3u, row_y, half, rx, ry, shape);
+        var east = west;
+        if !mirrored {
+            east = row_extent(1u, 2u, row_y, half, rx, ry, shape);
         }
-        let extent = half.x - radius.x + bulge;
-        let span = erf((from_center.x + vec2<f32>(-extent, extent)) * (0.70710678 / sigma));
+        let span = erf((from_center.x + vec2<f32>(-east, west)) * (0.70710678 / sigma));
         sum += (span.y - span.x) * exp(-0.5 * y * y / (sigma * sigma));
     }
     return 0.5 * sum * step / (sqrt(2.0 * PI) * sigma);

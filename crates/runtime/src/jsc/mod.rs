@@ -138,7 +138,7 @@ pub struct JavaScriptCore {
     pub(crate) get: unsafe extern "C" fn(Ptr, Ptr, Ptr, *mut Ptr) -> Ptr,
     rejection_callback: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr),
     module_loader: unsafe extern "C" fn(Ptr, Ptr),
-    set: unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, u32, *mut Ptr),
+    pub(crate) set: unsafe extern "C" fn(Ptr, Ptr, Ptr, Ptr, u32, *mut Ptr),
     pub(crate) undefined: unsafe extern "C" fn(Ptr) -> Ptr,
     pub(crate) null: unsafe extern "C" fn(Ptr) -> Ptr,
     pub(crate) boolean: unsafe extern "C" fn(Ptr, bool) -> Ptr,
@@ -153,8 +153,8 @@ pub struct JavaScriptCore {
     pub(crate) typed_buffer: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr) -> Ptr,
     pub(crate) buffer_bytes: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr) -> Ptr,
     pub(crate) buffer_length: unsafe extern "C" fn(Ptr, Ptr, *mut Ptr) -> usize,
-    get_index: unsafe extern "C" fn(Ptr, Ptr, u32, *mut Ptr) -> Ptr,
-    set_index: unsafe extern "C" fn(Ptr, Ptr, u32, Ptr, *mut Ptr),
+    pub(crate) get_index: unsafe extern "C" fn(Ptr, Ptr, u32, *mut Ptr) -> Ptr,
+    pub(crate) set_index: unsafe extern "C" fn(Ptr, Ptr, u32, Ptr, *mut Ptr),
     make_error: unsafe extern "C" fn(Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
     make_array: unsafe extern "C" fn(Ptr, usize, *const Ptr, *mut Ptr) -> Ptr,
     typed_from_buffer: unsafe extern "C" fn(Ptr, u32, Ptr, *mut Ptr) -> Ptr,
@@ -930,53 +930,40 @@ const PAGE: u8 = 4;
 const NODE: u8 = MAIN | PRELOAD;
 const ALL: u8 = NODE | PAGE;
 
-// Deny unlisted host operations. The first match wins. A trailing `.` matches prefixes. Keep module-level
-// checks too.
-const ACCESS: &[(&str, u8)] = &[
-    ("log", ALL),
-    ("bridge.dispatch", ALL),
-    ("bridge.expose", PRELOAD),
-    ("bridge.preload", PRELOAD),
-    ("bridge.file", PRELOAD),
-    ("bridge.exposures", PAGE),
-    ("dom.open", PAGE | PRELOAD),
-    ("dom.", PAGE),
-    ("gpu.", PAGE),
-    ("media.", PAGE),
-    ("terminal.", PAGE | PRELOAD),
-    ("web.serve.", MAIN),
-    ("web.tcp.", NODE),
-    ("web.", ALL),
-    ("native.clipboard.", NODE),
-    ("native.shell.", NODE),
-    ("native.image", NODE),
-    ("native.", MAIN),
-    ("browser.", MAIN),
-    ("node.", NODE),
-    ("pty.", NODE),
-    ("child.", NODE),
-    ("sqlite.", NODE),
-    ("process.", NODE),
-    ("info", NODE),
-    ("cwd", NODE),
-    ("chdir", NODE),
-    ("app.", MAIN),
-    ("window", MAIN),
-    ("quit", MAIN),
-    ("focus", MAIN),
-];
-
+// Deny unlisted host operations. Keep module-level checks too.
 fn access(role: Role, op: &str) -> Result<()> {
-    let roles = ACCESS
-        .iter()
-        .find(|(name, _)| {
-            if name.ends_with('.') {
-                op.starts_with(name)
-            } else {
-                op == *name
+    let roles = match op.split_once('.') {
+        None => match op {
+            "log" => ALL,
+            "info" | "cwd" | "chdir" => NODE,
+            "window" | "quit" | "focus" => MAIN,
+            _ => 0,
+        },
+        Some((service, rest)) => match service {
+            "bridge" => match rest {
+                "dispatch" => ALL,
+                "expose" | "preload" | "file" => PRELOAD,
+                "exposures" => PAGE,
+                _ => 0,
+            },
+            "dom" if rest == "open" => PAGE | PRELOAD,
+            "dom" | "gpu" | "media" => PAGE,
+            "terminal" => PAGE | PRELOAD,
+            "web" if rest.starts_with("serve.") => MAIN,
+            "web" if rest.starts_with("tcp.") => NODE,
+            "web" => ALL,
+            "native"
+                if rest.starts_with("clipboard.")
+                    || rest.starts_with("shell.")
+                    || rest == "image" =>
+            {
+                NODE
             }
-        })
-        .map_or(0, |&(_, roles)| roles);
+            "native" | "browser" | "app" => MAIN,
+            "node" | "pty" | "child" | "sqlite" | "process" => NODE,
+            _ => 0,
+        },
+    };
     match role {
         Role::Main if roles & MAIN != 0 => Ok(()),
         Role::Preload(_) if roles & PRELOAD != 0 => Ok(()),
@@ -985,6 +972,18 @@ fn access(role: Role, op: &str) -> Result<()> {
         _ if roles == MAIN => bail!("{op} is only available in the main context"),
         _ => bail!("Unsupported host operation: {op}"),
     }
+}
+
+// This matches `JSON.stringify` and serde, so ops see the same integers and non-finite numbers become null.
+fn number_value(number: f64) -> serde_json::Value {
+    if number.fract() == 0. && number.abs() < 1e21 {
+        if (0. ..18446744073709551616.).contains(&number) {
+            return (number as u64).into();
+        } else if number >= -9223372036854775808. {
+            return (number as i64).into();
+        }
+    }
+    number.into()
 }
 
 unsafe extern "C" fn call(
@@ -1161,26 +1160,33 @@ unsafe extern "C" fn call(
                 )
             });
         }
+        // fs.readSync reads straight into the caller's buffer. No JavaScript runs during the read.
+        if op == "node.readInto" {
+            ensure!(values.len() == 6, "Expected read arguments");
+            let arg = |index: usize| match unsafe { (api.value_type)(ctx, values[index]) } {
+                3 => number_value(unsafe { (api.to_number)(ctx, values[index], ptr::null_mut()) }),
+                _ => Value::Null,
+            };
+            let out = api.bytes(ctx, values[2]).context("Expected a buffer")?;
+            let offset = arg(3).as_u64().unwrap_or(0) as usize;
+            let length = arg(4).as_u64().context("Expected read size")? as usize;
+            let out = out
+                .get_mut(offset..offset.saturating_add(length))
+                .context("Expected a buffer range")?;
+            let count = binding
+                .node
+                .try_borrow()
+                .context("Node is busy")?
+                .files
+                .read_into(&arg(1), out, arg(5).as_u64())?;
+            return Ok(unsafe { (api.number)(ctx, count as f64) });
+        }
         let mut buffers = Vec::new();
         let mut args = Vec::with_capacity(values.len() - 1);
         for &value in &values[1..] {
             args.push(match unsafe { (api.value_type)(ctx, value) } {
                 2 => Value::Bool(unsafe { (api.to_boolean)(ctx, value) }),
-                3 => {
-                    let number = unsafe { (api.to_number)(ctx, value, ptr::null_mut()) };
-                    // This matches `JSON.stringify` and serde, so ops see the same integers and non-finite numbers become null.
-                    if number.fract() == 0. && number.abs() < 1e21 {
-                        if (0. ..18446744073709551616.).contains(&number) {
-                            Value::from(number as u64)
-                        } else if number >= -9223372036854775808. {
-                            Value::from(number as i64)
-                        } else {
-                            Value::from(number)
-                        }
-                    } else {
-                        Value::from(number)
-                    }
-                }
+                3 => number_value(unsafe { (api.to_number)(ctx, value, ptr::null_mut()) }),
                 4 => Value::String(api.text(ctx, value)),
                 5 if unsafe { (api.is_function)(ctx, value) } => Value::Null,
                 5 => {
@@ -1475,7 +1481,9 @@ fn dispatch(
     } else if let (Role::Renderer(id), "dom.contextMenu") = (role, op) {
         if let Some(link) = host.try_borrow().context("Host is busy")?.link.clone() {
             link.event(
-                format!("__appsEvent('context-menu',{id},{})", values[0]),
+                "context-menu",
+                id,
+                Some(values[0].clone()),
                 "apps:context-menu",
             );
         }
@@ -1497,10 +1505,7 @@ fn dispatch(
         );
         if let Some(link) = host.try_borrow().context("Host is busy")?.link.clone() {
             let picker = serde_json::json!({"id":picker["id"],"multiple":picker["multiple"],"directory":picker["directory"],"accept":picker["accept"]});
-            link.event(
-                format!("__appsEvent('file-picker',{id},{picker})"),
-                "apps:file-picker",
-            );
+            link.event("file-picker", id, Some(picker), "apps:file-picker");
         }
         Ok(serde_json::Value::Null)
     } else if let (Role::Renderer(id), "dom.selectPopup") = (role, op) {
@@ -1517,10 +1522,7 @@ fn dispatch(
             "Invalid select popup"
         );
         if let Some(link) = host.try_borrow().context("Host is busy")?.link.clone() {
-            link.event(
-                format!("__appsEvent('select-popup',{id},{popup})"),
-                "apps:select-popup",
-            );
+            link.event("select-popup", id, Some(popup.clone()), "apps:select-popup");
         }
         Ok(serde_json::Value::Null)
     } else if let (Role::Renderer(id) | Role::Preload(id), "dom.open") = (role, op) {
@@ -1849,6 +1851,12 @@ unsafe extern "C" fn ffi_call(
         || -> Result<crate::node::ffi::Output> {
             anyhow::ensure!(count > 0, "Missing FFI request");
             let values = unsafe { std::slice::from_raw_parts(args, count) };
+            if unsafe { (api.value_type)(ctx, values[0]) } == 3 {
+                let id = unsafe { (api.to_number)(ctx, values[0], ptr::null_mut()) } as u64;
+                return ffi
+                    .invoke(api, ctx, role, id, &values[1..])
+                    .map(crate::node::ffi::Output::Object);
+            }
             let request = serde_json::from_str(&api.text(ctx, values[0]))?;
             ffi.call(api, ctx, role, &request, &values[1..])
         },
@@ -2368,6 +2376,12 @@ impl JsContext {
             .text(self.ctx, self.checked(url, result, exception)?))
     }
 
+    // Calls a global function with JSON arguments. Unlike a script of new text, it compiles nothing.
+    pub fn call_logged(&self, name: &str, arguments: &[&str], url: &str) -> Result<()> {
+        call_json(&self.api, self.ctx, name, arguments, drop)
+            .inspect_err(|error| self.log(url, &error.to_string()))
+    }
+
     fn log(&self, url: &str, message: &str) {
         HOSTS.with(|hosts| {
             if let Some(binding) = hosts.borrow().get(&(self.ctx as usize))
@@ -2539,6 +2553,57 @@ mod tests {
             },
         );
         host
+    }
+
+    #[test]
+    fn access_follows_roles_and_prefixes() {
+        let (main, preload, page) = (Role::Main, Role::Preload(1), Role::Renderer(1));
+        let check = |role, op: &str| access(role, op).map_err(|error| error.to_string());
+        for op in ["log", "bridge.dispatch", "web.fetch", "web."] {
+            for role in [main, preload, page] {
+                assert!(check(role, op).is_ok(), "{op}");
+            }
+        }
+        for (op, roles) in [
+            ("node.loop", [true, true, false]),
+            ("cwd", [true, true, false]),
+            ("window", [true, false, false]),
+            ("app.x", [true, false, false]),
+            ("native.dialog", [true, false, false]),
+            ("native.clipboard.read", [true, true, false]),
+            ("native.image", [true, true, false]),
+            ("native.imagex", [true, false, false]),
+            ("bridge.expose", [false, true, false]),
+            ("bridge.exposures", [false, false, true]),
+            ("dom.open", [false, true, true]),
+            ("dom.openx", [false, false, true]),
+            ("terminal.write", [false, true, true]),
+            ("web.serve.start", [true, false, false]),
+            ("web.serve", [true, true, true]),
+            ("web.tcp.connect", [true, true, false]),
+        ] {
+            for (role, allowed) in [main, preload, page].into_iter().zip(roles) {
+                assert_eq!(check(role, op).is_ok(), allowed, "{op} {role:?}");
+            }
+        }
+        for op in ["", ".", "x", "dom", "log.x", "bridge.x", "nodex.loop"] {
+            assert_eq!(
+                check(main, op),
+                Err(format!("Unsupported host operation: {op}"))
+            );
+        }
+        assert_eq!(
+            check(page, "node.loop"),
+            Err("node.loop is unavailable in page scripts".into())
+        );
+        assert_eq!(
+            check(preload, "window"),
+            Err("window is only available in the main context".into())
+        );
+        assert_eq!(
+            check(preload, "dom.x"),
+            Err("Unsupported host operation: dom.x".into())
+        );
     }
 
     #[test]

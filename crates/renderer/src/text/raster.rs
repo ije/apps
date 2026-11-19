@@ -12,13 +12,15 @@ pub struct GlyphRaster {
     pub subpixel: u8,
     pub emoji: bool,
     pub dilation: u8,
+    /// The width of a line along the outline, in CSS pixels, for `-webkit-text-stroke` and `strokeText()`. 0 fills.
+    pub stroke: f32,
 }
 
 impl Eq for GlyphRaster {}
 
 impl Hash for GlyphRaster {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let bits = [self.size.0, self.scale].map(f32::to_bits);
+        let bits = [self.size.0, self.scale, self.stroke].map(f32::to_bits);
         (
             self.font,
             self.glyph,
@@ -32,6 +34,7 @@ impl Hash for GlyphRaster {
 
 impl Fonts {
     /// Offset from the pen in device pixels, size, and alpha bytes, or RGBA for emoji.
+    #[allow(clippy::too_many_arguments)]
     pub fn glyph_pixels(
         &self,
         font: FontId,
@@ -40,6 +43,7 @@ impl Fonts {
         scale: f32,
         subpixel: u8,
         emoji: bool,
+        stroke: f32,
     ) -> Option<(Point<i32>, Size<i32>, Vec<u8>)> {
         let raster = GlyphRaster {
             font,
@@ -49,6 +53,7 @@ impl Fonts {
             subpixel,
             emoji,
             dilation: 0,
+            stroke,
         };
         let (shown, size, bytes) = self.raster(&raster, i32::MAX).ok()??;
         Some((shown.origin, size, bytes))
@@ -111,6 +116,7 @@ mod tests {
                 subpixel: 0,
                 emoji: false,
                 dilation,
+                stroke: 0.,
             };
             let (_, size, bytes) = text.raster(&raster, 512).unwrap().unwrap();
             bytes
@@ -137,6 +143,7 @@ mod tests {
             subpixel: 2,
             emoji: false,
             dilation: 0,
+            stroke: 0.,
         };
         let full = text.platform.raster_bounds(&raster).unwrap();
         assert!(full.size.width > 16384);

@@ -148,8 +148,18 @@ fn open_options(flag: &Value, fallback: &str, mode: &Value) -> Result<OpenOption
     Ok(options)
 }
 
+fn read(file: &File, out: &mut [u8], position: Option<u64>) -> std::io::Result<usize> {
+    match position {
+        #[cfg(unix)]
+        Some(position) => std::os::unix::fs::FileExt::read_at(file, out, position),
+        #[cfg(windows)]
+        Some(position) => std::os::windows::fs::FileExt::seek_read(file, out, position),
+        None => (&*file).read(out),
+    }
+}
+
 #[derive(Default)]
-pub(super) struct Files(Mutex<HashMap<u64, Arc<File>>>);
+pub(crate) struct Files(Mutex<HashMap<u64, Arc<File>>>);
 
 impl Files {
     fn file(&self, id: &Value) -> Result<Arc<File>> {
@@ -170,6 +180,15 @@ impl Files {
             }
         }
         Err(std::io::Error::from_raw_os_error(libc::EBADF).into())
+    }
+
+    pub(crate) fn read_into(
+        &self,
+        id: &Value,
+        out: &mut [u8],
+        position: Option<u64>,
+    ) -> Result<usize> {
+        Ok(read(&*self.file(id)?, out, position)?)
     }
 
     pub(super) fn call(&self, op: &str, args: &Value) -> Result<Value> {
@@ -281,12 +300,19 @@ impl Files {
                         );
                     }
                 }
-                Ok(json!(
-                    entries
-                        .iter()
-                        .map(|(name, ty)| json!([name.to_string_lossy(), ty]))
-                        .collect::<Vec<_>>()
-                ))
+                // Names joined by NUL and one char per type: two strings reach JavaScript without JSON.
+                let mut names = String::new();
+                for (index, (name, _)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        names.push('\0');
+                    }
+                    names.push_str(&name.to_string_lossy());
+                }
+                let types: String = entries
+                    .iter()
+                    .map(|&(_, ty)| char::from_u32(ty).unwrap_or('\0'))
+                    .collect();
+                Ok(json!([names, types]))
             }
             "statfs" => {
                 #[cfg(unix)]
@@ -579,20 +605,7 @@ impl Files {
                         data.try_reserve_exact(size)
                             .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
                         data.resize(size, 0);
-                        let count = if let Some(position) = args[2].as_u64() {
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::FileExt;
-                                file.read_at(&mut data, position)?
-                            }
-                            #[cfg(windows)]
-                            {
-                                use std::os::windows::fs::FileExt;
-                                file.seek_read(&mut data, position)?
-                            }
-                        } else {
-                            (&*file).read(&mut data)?
-                        };
+                        let count = read(&file, &mut data, args[2].as_u64())?;
                         data.truncate(count);
                         Ok(crate::jsc::payload::write(data))
                     }

@@ -84,12 +84,20 @@ pub(crate) enum LineHeight {
 }
 
 pub(crate) fn line_height(style: &Style) -> LineHeight {
+    // Like Chrome's layout units, a line is at most 2^25 px tall.
+    const LIMIT: f32 = 33_554_431.;
     match style.get(Prop::LINE_HEIGHT) {
         Some(value) if value.ends_with("px") => value
             .trim_end_matches("px")
-            .parse()
-            .map_or(LineHeight::Normal, LineHeight::Fixed),
-        Some(value) => value.parse().map_or(LineHeight::Normal, LineHeight::Scale),
+            .parse::<f32>()
+            .map_or(LineHeight::Normal, |px| LineHeight::Fixed(px.min(LIMIT))),
+        Some(value) => value.parse::<f32>().map_or(LineHeight::Normal, |scale| {
+            let size = style
+                .get(Prop::FONT_SIZE)
+                .and_then(|size| size.strip_suffix("px")?.parse::<f32>().ok())
+                .unwrap_or(16.);
+            LineHeight::Scale(scale.min(LIMIT / size.max(f32::MIN_POSITIVE)))
+        }),
         None => LineHeight::Normal,
     }
 }
@@ -335,6 +343,14 @@ pub(crate) fn text_run(style: &Style, units: &Lengths, len: usize) -> renderer::
                 .filter(|count| *count >= 0.)
                 .unwrap_or_else(|| -units.resolve(value, units.font.em).unwrap_or(0.).max(0.))
         }),
+        stroke: style
+            .get(Prop::WEBKIT_TEXT_STROKE_WIDTH)
+            .and_then(|value| units.resolve(value, 0.))
+            .filter(|width| *width > 0.)
+            .map(|width| {
+                let color = style.get(Prop::WEBKIT_TEXT_STROKE_COLOR).and_then(color);
+                (renderer::px(width), color.map_or(ink, super::rgba))
+            }),
     }
 }
 
@@ -634,10 +650,12 @@ fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
     split
 }
 
+/// The text of the inline content of `id`, or of `run`, a part of its children between its blocks.
 pub(crate) fn inline_text(
     doc: &Document,
     styles: &ComputedStyles,
     id: usize,
+    run: &[usize],
 ) -> Option<InlineText> {
     let parent = &styles.values[id];
     let own = doc.nodes[id].tag == "#text";
@@ -773,6 +791,12 @@ pub(crate) fn inline_text(
     // A pseudo-element is the node `usize::MAX - index` here.
     let mut pending: Vec<_> = if own {
         vec![(id, None, None)]
+    } else if !run.is_empty() {
+        // The pseudo-elements and first line of the box belong to its first and last lines, not to a run.
+        if parts.iter().any(Option::is_some) || styles.text_pseudos.contains_key(&id) {
+            return None;
+        }
+        run.iter().rev().map(|&child| (child, None, None)).collect()
     } else {
         (parts[1].is_some().then_some(usize::MAX - 1).into_iter())
             .chain(doc.nodes[id].children.iter().rev().copied())
@@ -978,7 +1002,7 @@ pub(crate) fn inline_text(
             run.overline = None;
             run.color = renderer::Color::TRANSPARENT;
             run.nowrap = style.get(Prop::WHITE_SPACE) == Some("nowrap");
-            run.font_size = Some(renderer::px(0.01));
+            run.font_size = Some(renderer::px(0.));
             run.inset[0] = renderer::px(opening);
             for (inline, (mark, _)) in boxes[led..].iter_mut().zip(&marks[led..]) {
                 inline.lead = opening - mark;

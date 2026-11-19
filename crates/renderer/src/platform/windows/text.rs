@@ -914,6 +914,10 @@ impl TextSystem {
     }
 
     pub fn raster_bounds(&self, glyph: &GlyphRaster) -> Result<Rect<i32>> {
+        // Glyph run analysis has no strokes, so stroked text draws only its fill.
+        if glyph.stroke > 0. {
+            return Ok(Rect::default());
+        }
         let analysis = self.0.borrow().glyph_analysis(glyph, 0.)?;
         // SAFETY: a plain analysis query.
         let [x, y, width, height] = extent(unsafe { analysis.GetAlphaTextureBounds(COVERAGE)? });

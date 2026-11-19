@@ -5,7 +5,7 @@ mod selector;
 pub use document::{Document, Node, escape};
 pub(crate) use selector::{
     ACTIVE, Dependency, FOCUS, FOCUS_VISIBLE, FOCUS_WITHIN, HOVER, Named, Selector, SelectorCache,
-    SelectorList,
+    SelectorList, lowercase,
 };
 
 use crate::style;
@@ -66,8 +66,10 @@ pub(crate) struct LayoutNode {
     pub(crate) out: u64,
     pub revision: u64,
     pub geometry: u64,
-    pub flags: u16,
-    pub marks: u16,
+    // The last revision that changed the box itself, not only the boxes in it.
+    pub shell: u64,
+    pub flags: u32,
+    pub marks: u32,
 }
 
 // Match the JS buffer layout: 4 header floats (stale, capacity, layout count, moved), 8 floats per node, then
@@ -725,6 +727,8 @@ pub struct State {
     >,
     pub(crate) flexed_grids: rustc_hash::FxHashMap<usize, [Option<(f32, f32)>; 2]>,
     pub(crate) grid_widest: rustc_hash::FxHashMap<usize, f32>,
+    // The used columns and rows of the last layout of each grid, for `getComputedStyle()`.
+    pub(crate) tracks: rustc_hash::FxHashMap<usize, [Box<[f32]>; 2]>,
     pub(crate) baselines: crate::render::grid::Baselines,
     pub(crate) layout_nodes: Vec<Option<LayoutNode>>,
     pub(crate) measurements: crate::render::grid::Measurements,
@@ -788,6 +792,8 @@ pub struct State {
     pub(crate) linted: bool,
     pub(crate) warned: HashSet<String>,
     pub(crate) checked: rustc_hash::FxHashSet<(u8, style::Prop, Rc<str>)>,
+    // The values in `checked` by address. Each holds its value, so no other value takes the address.
+    pub(crate) checked_values: rustc_hash::FxHashMap<(usize, u8, style::Prop), Rc<str>>,
     pub(crate) motion: style::Motion,
     pub(crate) animated: HashMap<usize, style::Style>,
     pub(crate) animating: HashMap<usize, Rc<style::Style>>,
@@ -805,6 +811,12 @@ pub struct State {
     pub(crate) drawn: rustc_hash::FxHashMap<usize, Drawn>,
     drawn_order: u32,
     pub(crate) paint_requested: bool,
+    // The `content-visibility: auto` boxes, each with the boxes on its path, the boxes that clip it, and the view
+    // and its top and bottom at its last change.
+    #[allow(clippy::type_complexity)]
+    pub(crate) autos: rustc_hash::FxHashMap<usize, (Rc<[usize]>, Rc<[usize]>, (u64, [f32; 2]))>,
+    // `contentvisibilityautostatechange` events: the box and whether it skips its contents now.
+    pub(crate) skip_events: Vec<(usize, bool)>,
 }
 
 // Where a canvas drew a drawable element, which takes the pointer there.
@@ -871,6 +883,9 @@ impl State {
         }
         self.style_cache.forget(&gone);
         for id in gone {
+            self.measurements.shown.remove(&id);
+            self.autos.remove(&id);
+            self.measurements.remembered.remove(&id);
             self.measurements.texts.remove(&id);
             if let Some(node) = self.layout_nodes.get_mut(id) {
                 *node = None;
@@ -920,6 +935,11 @@ impl State {
         self.select_marks
             .get(id)
             .is_some_and(|marks| marks & INERT != 0)
+    }
+
+    // The styles of the last frame, also after a change that asks the next frame for new ones.
+    pub(crate) fn last_styles(&self) -> Option<&Rc<style::ComputedStyles>> {
+        self.computed.as_ref().or(self.previous.as_ref())
     }
 
     pub(crate) fn invalidate(&mut self) {
@@ -1223,7 +1243,18 @@ pub fn call(
         }
         changed.sort_unstable();
         state.sync_scroll();
-        return Ok(json!(changed));
+        let mut changed = json!(changed);
+        if !state.skip_events.is_empty()
+            && let Some(list) = changed.as_array_mut()
+        {
+            list.push(json!(
+                std::mem::take(&mut state.skip_events)
+                    .into_iter()
+                    .flat_map(|(id, skipped)| [id, usize::from(skipped)])
+                    .collect::<Vec<_>>()
+            ));
+        }
+        return Ok(changed);
     }
     if op == "dom.decoded" {
         let decoded =
@@ -1405,6 +1436,16 @@ pub fn call(
     if op == "dom.properties" {
         return Ok(json!(style::Prop::names()));
     }
+    if op == "dom.aliases" {
+        let aliases = style::Prop::names()
+            .iter()
+            .map(|name| format!("-webkit-{name}"));
+        return Ok(json!(
+            aliases
+                .filter(|alias| style::Prop::unprefixed(alias).is_some())
+                .collect::<Vec<_>>()
+        ));
+    }
     if op == "dom.path" {
         return Ok(json!(crate::render::canvas::svg_path(
             args[0].as_str().unwrap_or_default()
@@ -1482,9 +1523,13 @@ pub fn call(
                 let id = args[0].as_u64().context("Expected a sheet")? as u32;
                 match args[1].as_str().unwrap_or_default() {
                     "parse" => return Ok(style::Stylesheet::parse(text).cssom()),
-                    "replace" => {
+                    kind @ ("replace" | "load") => {
                         let sheet = style::Stylesheet::parse(text);
-                        let tree = sheet.cssom();
+                        let tree = if kind == "load" {
+                            Value::Null
+                        } else {
+                            sheet.cssom()
+                        };
                         state.style_cache.constructed.insert(id, Rc::new(sheet));
                         Ok(tree)
                     }
@@ -1771,20 +1816,36 @@ pub fn call(
         let repaint =
             focus == 0 && (ids.iter().any(control) || state.interaction[index].iter().any(control));
         if op == "dom.focus" {
-            if let Some(node) = state.focus.and_then(|id| doc.nodes.edit(id)) {
-                node.state &= !(FOCUS | FOCUS_VISIBLE);
+            for &id in state.focus.iter().chain(&state.interaction[0]) {
+                if let Some(node) = doc.nodes.edit(id) {
+                    node.state &= !(FOCUS | FOCUS_VISIBLE);
+                }
             }
             state.focus = ids.first().copied();
-            if let Some(node) = state
-                .focus
-                .filter(|_| shown)
-                .and_then(|id| doc.nodes.edit(id))
-            {
-                node.state |= if args[1].as_bool() == Some(false) {
-                    FOCUS
-                } else {
-                    FOCUS | FOCUS_VISIBLE
-                };
+            if let Some(focus) = state.focus.filter(|_| shown) {
+                if let Some(node) = doc.nodes.edit(focus) {
+                    node.state |= if args[1].as_bool() == Some(false) {
+                        FOCUS
+                    } else {
+                        FOCUS | FOCUS_VISIBLE
+                    };
+                }
+                // Like Chrome, the hosts of the shadow trees around the focused element match `:focus`. A host of a
+                // slotted element does not, so the walk follows tree parents, not the composed path.
+                let mut at = focus;
+                while let Some(host) = {
+                    while let Some(up) = doc.nodes[at].parent {
+                        at = up;
+                    }
+                    ids.iter()
+                        .copied()
+                        .find(|host| state.shadows.get(host) == Some(&at))
+                } {
+                    if let Some(node) = doc.nodes.edit(host) {
+                        node.state |= FOCUS;
+                    }
+                    at = host;
+                }
             }
         }
         for &id in &state.interaction[index] {
@@ -2037,6 +2098,27 @@ pub fn call(
                 "backdrop" => backdrop
                     .as_ref()
                     .or_else(|| styles.backdrops.get(&id).map(|style| &**style)),
+                "selection" => styles.selections.get(&id).map(|style| &**style),
+                // The button of a file input shares the slot of the scrollbar track.
+                "file-selector-button" | "-webkit-file-upload-button"
+                    if doc.nodes[id].tag == "input"
+                        && doc.nodes[id].input_type().eq_ignore_ascii_case("file") =>
+                {
+                    styles
+                        .scrollbars
+                        .get(&id)
+                        .and_then(|styles| styles[1].as_ref())
+                }
+                "marker" | "first-letter" | "first-line" | "placeholder" => {
+                    let index = ["marker", "first-letter", "first-line"]
+                        .iter()
+                        .position(|name| *name == pseudo)
+                        .unwrap_or(3);
+                    styles
+                        .text_pseudos
+                        .get(&id)
+                        .and_then(|styles| styles[index].as_ref())
+                }
                 _ => None,
             };
             let style = match (style, scripted) {
@@ -2073,7 +2155,28 @@ pub fn call(
                     json!([])
                 }));
             };
-            let units = styles.lengths[id];
+            let mut units = styles.lengths[id];
+            // Container units: the width of the nearest container, the height of the nearest size container.
+            let mut sizes = [None, None];
+            let queried =
+                !state.containers.is_empty() && style.own().any(|(_, value)| value.contains("cq"));
+            for node in std::iter::successors(doc.nodes[id].parent, |&node| doc.nodes[node].parent)
+                .take_while(|_| queried)
+            {
+                let kind = styles.values[node].get(Prop::CONTAINER_TYPE);
+                if let (Some(kind @ ("size" | "inline-size")), Some(size)) =
+                    (kind, state.containers.get(&node))
+                {
+                    sizes[0] = sizes[0].or(Some(size[0]));
+                    if kind == "size" {
+                        sizes[1] = Some(size[1]);
+                        break;
+                    }
+                }
+            }
+            if sizes[0].is_some() {
+                units.container = Some([0, 1].map(|axis| sizes[axis].unwrap_or(viewport[axis])));
+            }
             let shown = |node: usize| {
                 state.bounds.get(&node).is_some()
                     && unsafe { *state.bounds.flags(node) } & MIRROR_HIDDEN == 0
@@ -2197,6 +2300,51 @@ pub fn call(
                     {
                         "normal".to_owned()
                     }
+                    // Like Chrome, an element with no box, like `display: contents` or an element inside a
+                    // `display: none` box of the flat tree, has no transform.
+                    ("transform", transform)
+                        if transform != "none"
+                            && size.is_none()
+                            && (style.get(Prop::DISPLAY) == Some("contents")
+                                || std::iter::successors(
+                                    flat_parent(doc, state, &styles, id),
+                                    |&node| flat_parent(doc, state, &styles, node),
+                                )
+                                .any(|node| {
+                                    styles.values[node].get(Prop::DISPLAY) == Some("none")
+                                })) =>
+                    {
+                        "none".to_owned()
+                    }
+                    // As in Chrome, an SVG shape with no size has none, and a percentage is of its viewport: the
+                    // `viewBox` or the box of its `<svg>`.
+                    ("width" | "height", given)
+                        if matches!(doc.nodes[id].tag.as_str(), "rect" | "image")
+                            && (given == "auto" || given.contains('%')) =>
+                    {
+                        let axis = usize::from(&*name == "height");
+                        let svg = std::iter::successors(doc.nodes[id].parent, |&node| {
+                            doc.nodes[node].parent
+                        })
+                        .find(|&node| doc.nodes[node].tag == "svg");
+                        let viewport = svg.and_then(|svg| {
+                            let view_box: Vec<f32> = doc.nodes[svg]
+                                .attrs
+                                .get("viewBox")?
+                                .split([' ', ','])
+                                .filter_map(|part| part.parse().ok())
+                                .collect();
+                            view_box.get(2 + axis).copied()
+                        });
+                        let viewport = viewport.or_else(|| {
+                            svg.and_then(|svg| state.bounds.get(&svg))
+                                .map(|rect| rect[2 + axis])
+                        });
+                        match viewport.and_then(|base| units.resolve(given, base)) {
+                            Some(length) => format!("{}px", style::number(f64::from(length))),
+                            None => "0px".to_owned(),
+                        }
+                    }
                     ("min-width" | "min-height", "auto") if flow => "0px".to_owned(),
                     ("top" | "right" | "bottom" | "left", "auto")
                         if position != "static" && position != "sticky" =>
@@ -2271,10 +2419,112 @@ pub fn call(
                         format!("{}px", style::number(f64::from((used * 64.).round() / 64.)))
                     }
                     ("margin-top" | "margin-bottom", "auto") if size.is_some() => "0px".to_owned(),
+                    // The image layers set the number of layers of the other lists.
+                    (
+                        "background-position"
+                        | "background-size"
+                        | "background-repeat"
+                        | "background-attachment"
+                        | "background-origin"
+                        | "background-clip"
+                        | "background-blend-mode"
+                        | "mask-position"
+                        | "mask-size"
+                        | "mask-repeat"
+                        | "mask-origin"
+                        | "mask-clip"
+                        | "mask-composite"
+                        | "mask-mode",
+                        _,
+                    ) => {
+                        let image = if name.starts_with("mask") {
+                            "mask-image"
+                        } else {
+                            "background-image"
+                        };
+                        let count = style::components(&get(image), ',').len();
+                        let layers = style::components(&value, ',');
+                        if layers.len() == count {
+                            return value;
+                        }
+                        (0..count)
+                            .map(|index| layers[index % layers.len()].trim())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                    // Like Chrome, a rendered grid gives its used tracks, with the line names of explicit ones.
+                    ("grid-template-columns" | "grid-template-rows", _)
+                        if size.is_some()
+                            && value != "subgrid"
+                            && style
+                                .get(Prop::DISPLAY)
+                                .is_some_and(|display| display.ends_with("grid")) =>
+                    {
+                        let Some(tracks) = state.tracks.get(&id) else {
+                            return value;
+                        };
+                        let used = &tracks[usize::from(name == "grid-template-rows")];
+                        let mut used = used.iter().map(|&track| {
+                            format!(
+                                "{}px",
+                                style::number(f64::from((track * 64.).round() / 64.))
+                            )
+                        });
+                        // `repeat()` with a count gives its tracks and names that many times.
+                        let mut parts = Vec::new();
+                        for part in style::components(&value, ' ') {
+                            let repeat = part
+                                .strip_prefix("repeat(")
+                                .and_then(|inner| inner.strip_suffix(')')?.split_once(','))
+                                .and_then(|(count, body)| {
+                                    Some((count.trim().parse::<usize>().ok()?, body.trim()))
+                                });
+                            match repeat {
+                                Some((count, body)) => {
+                                    for _ in 0..count.min(1000) {
+                                        parts.extend(style::components(body, ' '));
+                                    }
+                                }
+                                None => parts.push(part),
+                            }
+                        }
+                        let mut out: Vec<String> = Vec::new();
+                        if value != "none" && !parts.iter().any(|part| part.starts_with("repeat("))
+                        {
+                            for part in parts {
+                                match (part.strip_prefix('['), out.last_mut()) {
+                                    // Names of one line join, like `[b a]`.
+                                    (Some(names), Some(last)) if last.ends_with(']') => {
+                                        last.pop();
+                                        last.push(' ');
+                                        last.push_str(names);
+                                    }
+                                    (Some(_), _) => out.push(part.to_owned()),
+                                    (None, _) => out.extend(used.next()),
+                                }
+                            }
+                        }
+                        out.extend(used);
+                        match out.is_empty() {
+                            true => value,
+                            false => out.join(" "),
+                        }
+                    }
+                    ("content", "normal") if matches!(pseudo, "before" | "after") => {
+                        "none".to_owned()
+                    }
                     // Chrome gives the strings and `attr()` values of generated content as one string.
                     ("content", _)
                         if !pseudo.is_empty() && value != "none" && value != "normal" =>
                     {
+                        // Counters keep their declared form, which `counting` holds.
+                        let value = match styles.counting.get(&id) {
+                            Some(sides) if matches!(pseudo, "before" | "after") => sides
+                                [usize::from(pseudo == "after")]
+                            .as_deref()
+                            .map_or(value, str::to_owned),
+                            _ => value,
+                        };
                         let (mut parts, mut text) = (Vec::new(), None::<String>);
                         let quote = |text: String| {
                             format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
@@ -2915,6 +3165,7 @@ pub fn call(
                 inset: Default::default(),
                 nowrap: false,
                 tab_size: 8.,
+                stroke: None,
             };
             let wrap = (!single
                 && !style
@@ -3150,6 +3401,63 @@ pub fn call(
             let computed = styles(doc, state, viewport);
             Ok(json!(rendered_text(doc, state, &computed, id, None)))
         }
+        "dom.caretText" => {
+            let computed = styles(doc, state, viewport);
+            let point = args[2]
+                .as_u64()
+                .map(|node| (node as usize, args[3].as_u64().unwrap_or(0) as usize));
+            let window = args[4]
+                .as_u64()
+                .map_or(usize::MAX, |window| window as usize);
+            Ok(caret_text(
+                doc,
+                &computed,
+                id,
+                args[1].as_bool().unwrap_or(false),
+                point,
+                window,
+            ))
+        }
+        // The boxes around the node that skip their contents: 2 if one has `content-visibility: hidden`, 1 if
+        // all have `auto`, 0 if none does, and -1 if the node or a box around it has `display: none`. With `true`,
+        // they show their contents until the next frame, so a layout gives the geometry of the node.
+        "dom.skipped" => {
+            let computed = styles(doc, state, viewport);
+            let (mut kind, mut roots) = (0, Vec::new());
+            // An `auto` box that shows its contents from the next frame on still skips them.
+            let hidden = state.cull.visible.get(id) == Some(&false);
+            let mut node = Some(id);
+            while let Some(at) = node {
+                let style = &computed.values[at];
+                if style.get(Prop::DISPLAY) == Some("none") {
+                    return Ok(json!(-1));
+                }
+                if at != id
+                    && (crate::render::skipping(doc, state, &computed, at, false)
+                        || hidden
+                            && style.get(Prop::CONTENT_VISIBILITY) == Some("auto")
+                            && state.measurements.shown.contains_key(&at))
+                {
+                    roots.push(at);
+                    kind = kind.max(if style.get(Prop::CONTENT_VISIBILITY) == Some("hidden") {
+                        2
+                    } else {
+                        1
+                    });
+                }
+                node = flat_parent(doc, state, &computed, at);
+            }
+            if args[1].as_bool() == Some(true) {
+                let measured = &mut state.measurements;
+                for root in roots {
+                    if measured.forced.insert(root) {
+                        measured.waking.push(root);
+                        state.cull.reskipped = true;
+                    }
+                }
+            }
+            Ok(json!(kind))
+        }
         _ => anyhow::bail!("Unknown DOM operation: {op}"),
     }
 }
@@ -3363,6 +3671,276 @@ fn display<'a>(computed: &style::ComputedStyles, id: usize, value: &'a str) -> &
     }
 }
 
+#[derive(Default)]
+struct Caret {
+    text: Vec<u16>,
+    runs: Vec<i64>,
+    found: i64,
+    waiting: bool,
+    edge: bool,
+    space: Option<(i64, i64)>,
+    // Editable content was skipped before the first character, or after the last.
+    hidden: [bool; 2],
+}
+
+impl Caret {
+    fn push(&mut self, units: &[u16], node: i64, offset: i64) {
+        let index = self.text.len() as i64;
+        if !matches!(self.runs[..], [.., start, last, from] if last == node && offset >= 0 && from + index - start == offset)
+        {
+            self.runs.extend([index, node, offset]);
+        }
+        self.text.extend_from_slice(units);
+    }
+
+    fn emit(&mut self, units: &[u16], node: i64, offset: i64) {
+        let after = self.text.last() == Some(&10);
+        if std::mem::take(&mut self.edge) {
+            if !self.text.is_empty() && !after {
+                self.push(&[10], -1, -1);
+            }
+        } else if let Some((at, from)) = self.space
+            && units != [10]
+            && !self.text.is_empty()
+            && !after
+        {
+            self.push(&[32], at, from);
+        }
+        self.space = None;
+        self.hidden[1] = false;
+        self.reach_all();
+        self.push(units, node, offset);
+    }
+
+    fn reach_all(&mut self) {
+        if std::mem::take(&mut self.waiting) {
+            self.found = self.text.len() as i64;
+        }
+    }
+
+    fn reach(&mut self) {
+        if self.edge || self.space.is_some() {
+            self.waiting = true;
+        } else {
+            self.found = self.text.len() as i64;
+        }
+    }
+
+    // A block edge drops a pending space, and the points after that space stay before the line break.
+    fn block_edge(&mut self) {
+        if !self.edge {
+            self.reach_all();
+        }
+        self.space = None;
+        self.edge = true;
+    }
+}
+
+// The text that `Selection.modify()` moves through: collapsed white space, one line break for each block edge
+// and `<br>`, and U+FFFC for each replaced element. Runs of `[index, node, offset]` map it back to the DOM: a
+// text node and the offset of the index, an element (offset -1) or a block edge (node -1). Only `window`
+// siblings on each side of the path to the point, and 512 times that many characters of each text node, are
+// read, so the cost does not grow with the document. Returns the text, the runs, the index of the point (-1
+// when it is not in the text), whether the text reaches the start and the end of the root, and whether
+// editable content comes before its first and after its last character.
+fn caret_text(
+    doc: &Document,
+    computed: &style::ComputedStyles,
+    root: usize,
+    editable: bool,
+    point: Option<(usize, usize)>,
+    window: usize,
+) -> Value {
+    enum Step {
+        Open(usize),
+        Close,
+        Point,
+    }
+    let mut limits = Vec::new();
+    if let Some((node, offset)) = point {
+        let (mut at, mut center) = (node, offset);
+        if doc.nodes[node].tag == "#text" {
+            center = usize::MAX;
+        }
+        loop {
+            let children = &doc.nodes[at].children;
+            if center != usize::MAX {
+                limits.push((
+                    at,
+                    center.saturating_sub(window),
+                    center.saturating_add(window).min(children.len()),
+                ));
+            }
+            let Some(parent) = doc.nodes[at].parent.filter(|_| at != root) else {
+                break;
+            };
+            center = doc.nodes[parent]
+                .children
+                .iter()
+                .position(|&child| child == at)
+                .unwrap_or(0);
+            at = parent;
+        }
+        if at != root {
+            limits.clear();
+        }
+    }
+    let mut caret = Caret {
+        found: -1,
+        ..Default::default()
+    };
+    let (mut start, mut end) = (true, true);
+    let mut steps = vec![Step::Open(root)];
+    while let Some(step) = steps.pop() {
+        let node = match step {
+            Step::Point => {
+                caret.reach();
+                continue;
+            }
+            Step::Close => {
+                caret.block_edge();
+                continue;
+            }
+            Step::Open(node) => node,
+        };
+        let current = &doc.nodes[node];
+        let style = current
+            .parent
+            .filter(|_| current.tag == "#text")
+            .map_or(&computed.values[node], |parent| &computed.values[parent]);
+        if current.tag == "#text" {
+            let white_space = style.get(Prop::WHITE_SPACE).unwrap_or("normal");
+            let keep = matches!(white_space, "pre" | "pre-wrap" | "break-spaces");
+            let hidden = style
+                .get(Prop::VISIBILITY)
+                .is_some_and(|value| matches!(value, "hidden" | "collapse"));
+            let budget = window.saturating_mul(512);
+            let ascii = current.text.is_ascii();
+            let (lo, hi, length) = if current.text.len() <= budget {
+                (0, usize::MAX, 0)
+            } else {
+                let length = if ascii {
+                    current.text.len()
+                } else {
+                    current.text.encode_utf16().count()
+                };
+                let (lo, hi) = match point {
+                    Some((at, offset)) if at == node => {
+                        (offset.saturating_sub(budget), offset.saturating_add(budget))
+                    }
+                    _ if caret.found >= 0 || caret.waiting => (0, budget),
+                    _ => (length.saturating_sub(budget), usize::MAX),
+                };
+                (lo, hi, length)
+            };
+            start &= lo == 0;
+            end &= hi >= length;
+            // ASCII text skips straight to the window.
+            let mut offset = if ascii { lo.min(current.text.len()) } else { 0 };
+            for character in current.text[offset..].chars().map(Some).chain([None]) {
+                if point == Some((node, offset)) {
+                    caret.reach();
+                }
+                let Some(character) = character.filter(|_| offset < hi) else {
+                    break;
+                };
+                let mut buffer = [0; 2];
+                let units = character.encode_utf16(&mut buffer);
+                if offset < lo || offset >= hi {
+                    offset += units.len();
+                    continue;
+                }
+                let collapses = !keep
+                    && !(white_space == "pre-line" && character == '\n')
+                    && matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c');
+                if collapses && !hidden {
+                    caret.space.get_or_insert((node as i64, offset as i64));
+                } else if !hidden {
+                    caret.emit(units, node as i64, offset as i64);
+                }
+                offset += units.len();
+            }
+            continue;
+        }
+        if current.tag.starts_with('#') && node != root {
+            continue;
+        }
+        let display = display(computed, node, style.get(Prop::DISPLAY).unwrap_or("inline"));
+        let host = current
+            .attrs
+            .get("contenteditable")
+            .map(|value| !value.eq_ignore_ascii_case("false"));
+        if node != root && !editable && host == Some(true) {
+            caret.hidden = [caret.text.is_empty() || caret.hidden[0], true];
+        }
+        if node != root && (display == "none" || !editable && host == Some(true)) {
+            continue;
+        }
+        let block = node != root && !display.starts_with("inline") && display != "contents";
+        let atom = node != root
+            && (editable && host == Some(false)
+                || matches!(
+                    current.tag.as_str(),
+                    "br" | "img"
+                        | "input"
+                        | "select"
+                        | "button"
+                        | "textarea"
+                        | "video"
+                        | "audio"
+                        | "canvas"
+                        | "iframe"
+                        | "svg"
+                        | "object"
+                        | "embed"
+                        | "meter"
+                        | "progress"
+                        | "terminal"
+                ));
+        if block {
+            caret.block_edge();
+        }
+        if atom {
+            caret.emit(
+                &[if current.tag == "br" { 10 } else { 0xfffc }],
+                node as i64,
+                -1,
+            );
+            if block {
+                caret.block_edge();
+            }
+            continue;
+        }
+        if block {
+            steps.push(Step::Close);
+        }
+        let children = &current.children;
+        let (lo, hi) = limits
+            .iter()
+            .find(|limit| limit.0 == node)
+            .map_or((0, children.len()), |limit| (limit.1, limit.2));
+        start &= lo == 0;
+        end &= hi == children.len();
+        for at in (lo..=hi).rev() {
+            if point == Some((node, at)) {
+                steps.push(Step::Point);
+            }
+            if at > lo {
+                steps.push(Step::Open(children[at - 1]));
+            }
+        }
+    }
+    caret.reach_all();
+    json!([
+        String::from_utf16_lossy(&caret.text),
+        caret.runs,
+        caret.found,
+        start,
+        end,
+        caret.hidden
+    ])
+}
+
 // The innerText algorithm of HTML in one pass over the flat tree. With `range`, only the selected parts of
 // the text nodes in it count.
 fn rendered_text(
@@ -3518,6 +4096,9 @@ fn rendered_text(
                 cells = true;
             }
             _ => {}
+        }
+        if crate::render::skipping(doc, state, computed, node, false) {
+            continue;
         }
         let blockify =
             display.ends_with("flex") || display.ends_with("grid") || display == "contents" && a;
@@ -3709,8 +4290,10 @@ pub(crate) fn hit_test(
                 }
             }
         }
-        // The fallback content of a canvas has no boxes.
-        if node.tag == "canvas" && !canvas {
+        // The fallback content of a canvas has no boxes, and skipped contents take no pointer.
+        if node.tag == "canvas" && !canvas
+            || crate::render::skipping(doc, state, computed, id, false)
+        {
             continue;
         }
         path.push((id, clip, 0));
@@ -4815,9 +5398,28 @@ mod tests {
                     h2::before{content:counter(sec) \". \"} h2::after{content:\"counter \" counters(sec, \"-\")}
                     .big{font-size:20px}</style></head><body><main id=main><h2 id=a>a</h2><p id=p>p</p><h2 id=b>b</h2>
                     <section id=s><h2 id=c>c</h2></section></main></body></html>");
-        let read = "[...document.querySelectorAll('h2')].map(h=>getComputedStyle(h,'::before').content+getComputedStyle(h,'::after').content).join('|')";
+        // `getComputedStyle()` gives the declared counters, so the text comes from the styles.
+        let read =
+            "[...document.querySelectorAll('h2')].map(h=>getComputedStyle(h).color&&h._id).join()";
+        let text = |ids: String| {
+            let host = host.borrow();
+            let computed = host.dom[&1].computed.as_ref().unwrap();
+            ids.split(',')
+                .map(|id| {
+                    let pseudos = &computed.pseudos[&id.parse::<usize>().unwrap()];
+                    pseudos
+                        .iter()
+                        .map(|style| style.get(Prop::CONTENT).unwrap_or_default())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        };
         let numbers = |list: &[&str]| -> String {
-            let text = |n: &&str| format!("\"{}. \"\"counter {n}\"", n.rsplit('-').next().unwrap());
+            let text = |n: &&str| {
+                let last = n.rsplit('-').next().unwrap();
+                format!("\"{last}\" \". \"\"counter \" \"{n}\"")
+            };
             list.iter().map(text).collect::<Vec<_>>().join("|")
         };
         engine
@@ -4836,7 +5438,7 @@ mod tests {
             ("a.className='big'", &["1", "2", "3"]),
         ] {
             let before = host.borrow().dom[&1].style_cache.incremental;
-            let result = engine.eval(&format!("{step};{read}"), "test").unwrap();
+            let result = text(engine.eval(&format!("{step};{read}"), "test").unwrap());
             assert_eq!(result, numbers(expected), "{step}");
             passes.push(host.borrow().dom[&1].style_cache.incremental > before);
         }

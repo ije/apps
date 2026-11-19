@@ -279,7 +279,7 @@ pub(crate) fn blocking(job: impl FnOnce() + Send + 'static) -> std::io::Result<(
 }
 
 pub(crate) struct State {
-    files: Arc<Files>,
+    pub(crate) files: Arc<Files>,
     next: u64,
     sender: mpsc::Sender<crate::jsc::payload::Payload>,
     receiver: mpsc::Receiver<crate::jsc::payload::Payload>,
@@ -452,6 +452,12 @@ impl State {
                     ));
                 }
                 Ok(Value::Null)
+            }
+            "zlib.crc32" => {
+                let mut hasher =
+                    crc32fast::Hasher::new_with_initial(args[1].as_u64().unwrap_or(0) as u32);
+                hasher.update(crate::jsc::payload::slice(&args[0]).context("Expected bytes")??);
+                Ok(json!(hasher.finalize()))
             }
             "zlib.free" => {
                 self.codecs

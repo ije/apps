@@ -297,6 +297,86 @@ pub(crate) struct State {
     foreign_thread: Arc<AtomicBool>,
 }
 impl State {
+    // The fast call of an FFI function: `values` are the call buffer and the keep list, whose items from index 2
+    // are pairs of an argument slot and the bytes whose address goes in it.
+    pub(crate) fn invoke(
+        &self,
+        api: &Rc<JavaScriptCore>,
+        ctx: Ptr,
+        role: Role,
+        id: u64,
+        values: &[Ptr],
+    ) -> Result<Ptr> {
+        ensure!(
+            !matches!(role, Role::Renderer(_)),
+            "FFI is unavailable in page scripts"
+        );
+        let function = self
+            .functions
+            .borrow()
+            .get(&id)
+            .cloned()
+            .context("FFI function is closed")?;
+        let (storage, length) = bytes(api, ctx, *values.first().context("Missing call buffer")?)?;
+        ensure!(
+            length == (function.count + 1) * 8,
+            "Invalid FFI call buffer"
+        );
+        let mut slots = vec![0u64; function.count];
+        unsafe {
+            ptr::copy_nonoverlapping(
+                storage.add(8),
+                slots.as_mut_ptr().cast(),
+                function.count * 8,
+            );
+        }
+        if let Some(&keep) = values.get(1) {
+            for index in (2..).step_by(2) {
+                let slot = unsafe { (api.get_index)(ctx, keep, index, ptr::null_mut()) };
+                if slot.is_null() || unsafe { (api.value_type)(ctx, slot) } != 3 {
+                    break;
+                }
+                let slot = unsafe { (api.to_number)(ctx, slot, ptr::null_mut()) } as usize;
+                let view = unsafe { (api.get_index)(ctx, keep, index + 1, ptr::null_mut()) };
+                ensure!(
+                    slot >= 1 && slot <= function.count,
+                    "Invalid FFI call buffer"
+                );
+                slots[slot - 1] = bytes(api, ctx, view)?.0 as u64;
+            }
+        }
+        let mut pointers: Vec<Ptr> = slots
+            .iter_mut()
+            .map(|slot| (slot as *mut u64).cast())
+            .collect();
+        let mut result = 0u64;
+        let _active = Active::new(&function.owner.active);
+        self.errors.borrow_mut().push(None);
+        // SAFETY: the script must give the right native signature and valid pointers; nothing here can check
+        // them.
+        unsafe {
+            low::call_return_into(
+                function.cif.as_raw_ptr(),
+                function.pointer,
+                pointers.as_mut_ptr(),
+                (&mut result as *mut u64).cast(),
+            );
+        }
+        let callback_error = self.errors.borrow_mut().pop().flatten();
+        ensure!(
+            !self.foreign_thread.swap(false, Ordering::Relaxed),
+            "FFI callbacks must run on their creating thread"
+        );
+        if let Some(error) = callback_error {
+            bail!(error);
+        }
+        // SAFETY: `bytes` pins the private call buffer, so `storage` stays valid across callbacks.
+        unsafe {
+            ptr::copy_nonoverlapping((&result as *const u64).cast::<u8>(), storage, 8);
+        }
+        Ok(unsafe { (api.undefined)(ctx) })
+    }
+
     pub(crate) fn call(
         &self,
         api: &Rc<JavaScriptCore>,
@@ -439,58 +519,6 @@ impl State {
                         );
                         json!({"id": id, "pointer": (pointer as usize).to_string()})
                     }
-                }
-            }
-            "invoke" => {
-                let function = self
-                    .functions
-                    .borrow()
-                    .get(&args[0].as_u64().context("Invalid function handle")?)
-                    .cloned()
-                    .context("FFI function is closed")?;
-                let (storage, length) =
-                    bytes(api, ctx, *values.first().context("Missing call buffer")?)?;
-                ensure!(
-                    length == (function.count + 1) * 8,
-                    "Invalid FFI call buffer"
-                );
-                let mut slots = vec![0u64; function.count];
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        storage.add(8),
-                        slots.as_mut_ptr().cast(),
-                        function.count * 8,
-                    );
-                }
-                let mut pointers: Vec<Ptr> = slots
-                    .iter_mut()
-                    .map(|slot| (slot as *mut u64).cast())
-                    .collect();
-                let mut result = 0u64;
-                let _active = Active::new(&function.owner.active);
-                self.errors.borrow_mut().push(None);
-                // SAFETY: the script must give the right native signature and valid pointers; nothing here can check
-                // them.
-                unsafe {
-                    low::call_return_into(
-                        function.cif.as_raw_ptr(),
-                        function.pointer,
-                        pointers.as_mut_ptr(),
-                        (&mut result as *mut u64).cast(),
-                    );
-                }
-                let callback_error = self.errors.borrow_mut().pop().flatten();
-                ensure!(
-                    !self.foreign_thread.swap(false, Ordering::Relaxed),
-                    "FFI callbacks must run on their creating thread"
-                );
-                if let Some(error) = callback_error {
-                    bail!(error);
-                }
-                // SAFETY: `bytes` pins the private call buffer, so `storage` stays valid across callbacks.
-                unsafe {
-                    ptr::copy_nonoverlapping((&result as *const u64).cast::<u8>(), storage, 8);
-                    return Ok(Output::Object((api.undefined)(ctx)));
                 }
             }
             "pointer" => {

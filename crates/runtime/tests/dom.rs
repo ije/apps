@@ -367,6 +367,44 @@ fn media_queries_follow_viewport_changes() {
 }
 
 #[test]
+fn visibility_observers_option_lists_and_canvas_current_color_follow_chrome() {
+    let (_, engine) = css_page(
+        "<html><body><div id=v>v</div><canvas id=k style='color: rgb(255, 0, 0)'></canvas><select id=s><option>A</option><option>B</option></select></body></html>",
+    );
+    engine.eval(r#"
+        const $ = id => document.getElementById(id), check = (got, want, what) => { if (JSON.stringify(got) !== JSON.stringify(want)) throw Error(what + ': ' + JSON.stringify(got)); };
+        check([typeof $('v').checkVisibility(null), typeof $('v').checkVisibility(undefined)], ['boolean', 'boolean'], 'null options');
+        for (const Type of [ResizeObserver, IntersectionObserver, MutationObserver]) { let threw = null; try { new Type(5); } catch (error) { threw = error.constructor.name; } check(threw, 'TypeError', Type.name); }
+        const ctx = $('k').getContext('2d');
+        ctx.fillStyle = '#00ff00'; ctx.fillStyle = 'currentcolor'; ctx.strokeStyle = 'CurrentColor';
+        check([ctx.fillStyle, ctx.strokeStyle], ['#ff0000', '#ff0000'], 'currentcolor');
+        ctx.fillRect(0, 0, 1, 1); check([...ctx.getImageData(0, 0, 1, 1).data], [255, 0, 0, 255], 'currentcolor pixel');
+        $('k').style.color = 'blue'; check(ctx.fillStyle, '#ff0000', 'currentcolor resolves when set');
+        ctx.fillStyle = 'currentcolor junk'; check(ctx.fillStyle, '#ff0000', 'invalid currentcolor');
+        check(ctx.shadowColor, 'rgba(0, 0, 0, 0)', 'default shadow');
+        ctx.shadowColor = 'red'; ctx.shadowColor = 'bogus'; check(ctx.shadowColor, '#ff0000', 'invalid shadow');
+        ctx.shadowColor = 'rgba(0, 0, 255, 0.5)'; check(ctx.shadowColor, 'rgba(0, 0, 255, 0.5)', 'shadow alpha');
+        ctx.shadowColor = 'currentcolor'; check(ctx.shadowColor, '#0000ff', 'shadow currentcolor');
+        $('k').style.color = 'rgb(255, 0, 0)'; ctx.fillStyle = 'currentcolor'; check(ctx.fillStyle, '#ff0000', 'currentcolor after the color changes back');
+        $('k').removeAttribute('style'); ctx.fillStyle = 'currentcolor'; check(ctx.fillStyle, '#000000', 'currentcolor without an inline style');
+        $('k').style.color = 'blue'; ctx.fillStyle = 'red';
+        const hidden = document.createElement('div'), inner = document.createElement('div'); hidden.style.display = 'none'; inner.style.transform = 'translateX(5px)'; hidden.append(inner); document.body.append(hidden);
+        check(getComputedStyle(inner).transform, 'none', 'transform inside display none'); let threw = ''; const fade = inner.animate([{ opacity: 0 }, { opacity: 1 }], 1000); fade.pause(); try { fade.commitStyles(); } catch (error) { threw = error.name; } fade.cancel(); check(threw, 'InvalidStateError', 'commit without a box'); hidden.style.display = 'block'; check(getComputedStyle(inner).transform, 'matrix(1, 0, 0, 1, 5, 0)', 'transform when shown'); hidden.remove();
+        ctx.fillStyle = 'color-mix(in srgb, currentcolor, blue)'; check(ctx.fillStyle, '#000080', 'currentcolor in a function is black');
+        const classed = document.createElement('canvas'); classed.className = 'c'; document.body.append(classed); document.head.append(Object.assign(document.createElement('style'), { textContent: '.c { color: red }' }));
+        const fromSheet = classed.getContext('2d'); fromSheet.fillStyle = 'currentcolor'; check(fromSheet.fillStyle, '#000000', 'only the inline color counts');
+        const loose = document.createElement('canvas').getContext('2d'), offscreen = new OffscreenCanvas(1, 1).getContext('2d');
+        for (const c of [loose, offscreen]) { c.fillStyle = '#00ff00'; c.fillStyle = 'currentcolor'; check(c.fillStyle, '#000000', 'currentcolor outside the document'); }
+        offscreen.fillStyle = 'color-mix(in srgb, currentcolor, blue)'; check(offscreen.fillStyle, '#000000', 'offscreen rejects currentcolor in a function');
+        const s = $('s'), first = s.options;
+        document.body.append(document.createElement('i'));
+        check(first === s.options, true, 'same options');
+        s.append(new Option('C'));
+        check([first === s.options, first.length, s.options.length, s.options === s.options], [false, 2, 3, true], 'options after a change');
+    "#, "test").unwrap();
+}
+
+#[test]
 fn canvas_pixels_survive_partial_updates_and_clipping() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(
@@ -1285,6 +1323,52 @@ fn canvas_paths_matrices_patterns_and_shadows() {
         same([at(9, 9), Math.abs(at(9, 6)[3] - 66) < 10, at(9, 3)[3] > 0, at(9, 0)[3]], [[255, 0, 0, 255], true, true, 0], 'shadow blur');
         ctx.shadowColor = 'transparent';
         same(await reply(worker(`postMessage([typeof Path2D, typeof DOMMatrix, typeof DOMPoint])`)), ['function', 'function', 'function'], 'worker globals');
+    "#,
+    );
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn canvas_sources_flush_their_readers_before_their_pixels_change() {
+    let (.., result) = offscreen_page(
+        r#"
+        const source = new OffscreenCanvas(2, 2), from = source.getContext('2d'), target = new OffscreenCanvas(10, 2), to = target.getContext('2d');
+        const at = x => [...to.getImageData(x, 0, 1, 1).data];
+        from.fillStyle = '#ff0000'; from.fillRect(0, 0, 2, 2); to.drawImage(source, 0, 0);
+        from.fillStyle = '#0000ff'; from.fillRect(0, 0, 2, 2); to.drawImage(source, 2, 0);
+        source.width = 2; to.drawImage(source, 4, 0);
+        from.fillStyle = '#00ff00'; from.fillRect(0, 0, 2, 2); to.fillStyle = to.createPattern(source, 'no-repeat'); to.fillRect(0, 0, 0, 0); to.drawImage(source, 6, 0);
+        const bitmap = source.transferToImageBitmap(); to.drawImage(source, 8, 0);
+        same([at(0), at(2), at(4)[3], at(6), at(8)[3]], [[255, 0, 0, 255], [0, 0, 255, 255], 0, [0, 255, 0, 255], 0], 'draws');
+        const check = new OffscreenCanvas(2, 2).getContext('2d'); check.drawImage(bitmap, 0, 0); same([...check.getImageData(0, 0, 1, 1).data], [0, 255, 0, 255], 'bitmap');
+        const element = document.createElement('canvas'); element.width = element.height = 2; const shown = element.getContext('2d');
+        shown.fillStyle = '#ff0000'; shown.fillRect(0, 0, 2, 2); to.clearRect(0, 0, 10, 2); to.drawImage(element, 0, 0);
+        element.width = 2; shown.fillStyle = '#0000ff'; shown.fillRect(0, 0, 1, 2); to.drawImage(element, 2, 0);
+        same([at(0), at(2), at(3)[3]], [[255, 0, 0, 255], [0, 0, 255, 255], 0], 'element source');
+        const a = new OffscreenCanvas(1, 1), b = new OffscreenCanvas(1, 1), ac = a.getContext('2d'), bc = b.getContext('2d');
+        ac.fillStyle = '#ff0000'; ac.fillRect(0, 0, 1, 1); bc.drawImage(a, 0, 0); ac.drawImage(b, 0, 0); ac.clearRect(0, 0, 1, 1); bc.fillStyle = '#0000ff'; bc.fillRect(0, 0, 1, 1); ac.drawImage(b, 0, 0);
+        same([[...ac.getImageData(0, 0, 1, 1).data], [...bc.getImageData(0, 0, 1, 1).data]], [[0, 0, 255, 255], [0, 0, 255, 255]], 'cycle');
+    "#,
+    );
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn dom_matrix_math_keeps_nan_infinity_negative_zero_and_2d() {
+    let (.., result) = offscreen_page(
+        r#"
+        const bits = m => (m._m ?? m).map(v => Object.is(v, -0) ? '-0' : String(v)).join();
+        const mul = (a, m) => a.map((_, i) => a[i & 3] * m[i & 12] + a[4 + (i & 3)] * m[(i & 12) + 1] + a[8 + (i & 3)] * m[(i & 12) + 2] + a[12 + (i & 3)] * m[(i & 12) + 3]);
+        const a = [1, -0, 0, 0, Infinity, 2, 0, 0, 0, 0, 1, 0, NaN, 3, 0, 1], b = [-0, 1, 0, 0, 2, Infinity, 0, 0, 0, 0, 1, 0, 0, -1, 0, 1];
+        same(bits(new DOMMatrix(a).multiply(new DOMMatrix(b))), bits(mul(a, b)), 'multiply');
+        same(bits(new DOMMatrix(a).multiply({ a: -0, b: 1, c: 2, d: Infinity, e: 0, f: -1 })), bits(mul(a, b)), 'multiply dictionary');
+        same(bits(new DOMMatrix(a).translate(Infinity, -0, 0)), bits(mul(a, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, Infinity, -0, 0, 1])), 'translate');
+        same(bits(new DOMMatrix(a).scale(-0, NaN, 1, 1, 2)), bits(mul(mul(mul(a, [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 2, 0, 1]), [-0, 0, 0, 0, 0, NaN, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]), [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -1, -2, -0, 1])), 'scale');
+        const m = new DOMMatrix(a); m.multiplySelf(m); same(bits(m), bits(mul(a, a)), 'self');
+        same([new DOMMatrix().translate(1, 2, -0).is2D, new DOMMatrix().translate(1, 2, '0').is2D, String(new DOMMatrix().translate('3', '4')), new DOMMatrix().scale(2, 3, 1).is2D, new DOMMatrix().scale(2, 3, '1').is2D, new DOMMatrix().scale(2, 3, 2).is2D],
+          [true, false, 'matrix(1, 0, 0, 1, 3, 4)', true, false, false], 'is2D');
+        same([new DOMMatrix().rotate(30).is2D, new DOMMatrix().rotateAxisAngle(1, 0, 0, 90).is2D, new DOMMatrix().skewX(10).is2D, new DOMMatrix([1, 0, 0, 1, 0, 0]).multiply({ m33: 2 }).is2D, new DOMMatrix([1, 0, 0, 1, 0, 0]).multiply({ m33: 2, is2D: true }).is2D, new DOMMatrix().translate(0, 0, 1).multiply(new DOMMatrix()).is2D],
+          [true, false, true, false, true, false], 'is2D products');
     "#,
     );
     assert_eq!(result, "ok");
@@ -2854,6 +2938,12 @@ fn child_lists_inline_shorthands_and_serialization_stay_current() {
         check('only HTML raw text stays raw', () => svg.innerHTML === '<svg><style>a&lt;b</style></svg><style>a<b</style>');
         const deep = document.createElement('div'); deep.innerHTML = '<div>'.repeat(20000);
         check('deep trees serialize and clone', () => deep.innerHTML.length === 220000 && deep.cloneNode(true).innerHTML.length === 220000);
+        const source = document.createElement('div'); source.innerHTML = '<p id="c1" class="a">x<b>y</b><!--n--></p><style>.c1{color:red}</style><svg><g><rect/></g></svg><input value="v"><details open>d</details>';
+        source.querySelector('input').value = 'typed'; source.querySelector('g').setAttribute('k', '1');
+        const copy = source.cloneNode(true), holder = document.createDocumentFragment(); holder.append(copy);
+        check('deep clones copy plain nodes, keep namespaces and wrapped controls', () => copy.innerHTML === source.innerHTML && holder.getElementById('c1')?.parentNode === copy && copy.querySelector('rect') instanceof SVGElement && copy.querySelector('input').value === 'typed' && copy.querySelector('details').open && copy.querySelector('style').textContent === '.c1{color:red}' && copy.matches('div') && copy.querySelector('p.a > b') === copy.querySelector('b'));
+        const styled = document.createElement('div'); styled.style.cssText = 'margin: 1px; color: red'; styled.style.opacity = '0.5'; styled.style.color = 'blue'; styled.style.marginTop = '2px'; styled.style.opacity = '1';
+        check('inline style writes keep the text of a full rebuild', () => styled.getAttribute('style').startsWith('margin: 2px 1px 1px;') && styled.getAttribute('style').endsWith(' opacity: 1;') && styled.style.cssText === styled.getAttribute('style'));
         const x = document.createElement('a'), y = document.createElement('a'); x.setAttribute('p', '1'); x.setAttribute('q', '2'); y.setAttribute('q', '2'); y.setAttribute('p', '1');
         check('isEqualNode ignores attribute order', () => x.isEqualNode(y) && !x.isEqualNode(document.createElement('a')));
         const [m, n] = [document.createElement('i'), document.createElement('i')], mn = m.compareDocumentPosition(n), nm = n.compareDocumentPosition(m);
@@ -3124,7 +3214,7 @@ fn invalid_selectors_throw_and_html_names_ignore_case() {
         check('closest throws', () => { try { document.querySelector('li').closest(':foo'); return false; } catch (e) { return e.name === 'SyntaxError'; } });
         check('type case', () => document.querySelectorAll('LI').length === 1 && document.getElementsByTagName('LI').length === 1 && document.getElementsByTagName('*').length > 5);
         check('attribute case', () => document.querySelector('[DATA-V]') !== null);
-        check('svg case', () => document.querySelector('linearGradient')?.id === 'g' && document.querySelector('lineargradient') === null && document.getElementsByTagName('linearGradient').length === 1);
+        check('svg case', () => document.querySelector('linearGradient')?.id === 'g' && document.querySelector('lineargradient')?.id === 'g' && document.getElementsByTagName('linearGradient').length === 1);
         check('namespaces', () => document.querySelector('*|rect')?.id === 'r' && document.querySelector('|rect') === null);
         "#,
     );
@@ -3280,6 +3370,25 @@ fn inline_style_declarations_validate_expand_and_serialize() {
         if (style.borderTopColor !== 'red' || style.border !== '1px solid red' || style.getPropertyValue('--x') !== '1') throw Error('border ' + style.cssText);
         a.style = 'padding: 4px';
         if (style.paddingRight !== '4px' || style.length !== 4) throw Error('assign');
+        // As in Chrome, a set name keeps its place, unless a later name of its logical group maps the other way.
+        const order = (text, change) => { a.setAttribute('style', text); change(style); return style.cssText + ' | ' + a.getAttribute('style'); };
+        for (const [text, change, want] of [
+          ['color: red; width: 1px; height: 2px', s => { s.width = '5px'; }, 'color: red; width: 5px; height: 2px;'],
+          ['color: red; width: 1px; height: 2px', s => { s.width = '5px'; s.color = 'green'; s.top = '1px'; s.height = '7px'; }, 'color: green; width: 5px; height: 7px; top: 1px;'],
+          ['color: red; width: 1px; height: 2px', s => s.setProperty('width', '9px', 'important'), 'color: red; width: 9px !important; height: 2px;'],
+          // As in Chrome, important declarations serialize after the others.
+          ['color: red; width: 1px !important; height: 2px', s => s.setProperty('width', '9px'), 'color: red; height: 2px; width: 9px;'],
+          ['--a: 1; color: red; --b: 2', s => s.setProperty('--a', '5'), '--a: 5; color: red; --b: 2;'],
+          ['color: red; margin: 1px; height: 2px', s => s.setProperty('margin', '4px'), 'color: red; margin: 4px; height: 2px;'],
+          ['margin-top: 1px; color: red; height: 2px', s => s.setProperty('margin', '4px'), 'margin: 4px; color: red; height: 2px;'],
+          ['color: red; margin: 1px; height: 2px', s => s.setProperty('margin-left', '4px', 'important'), 'color: red; margin-top: 1px; margin-right: 1px; margin-bottom: 1px; margin-left: 4px !important; height: 2px;'],
+          ['margin-inline-start: 2px; margin-left: 1px; color: red', s => s.setProperty('margin-left', '3px'), 'margin-inline-start: 2px; margin-left: 3px; color: red;'],
+          ['margin-left: 1px; margin-inline-start: 2px; color: red', s => s.setProperty('margin-left', '3px'), 'margin-inline-start: 2px; color: red; margin-left: 3px;'],
+          ['corner-top-left-shape: round; corner-start-start-shape: bevel', s => s.setProperty('corner-top-left-shape', 'scoop'), 'corner-start-start-shape: bevel; corner-top-left-shape: scoop;'],
+        ]) { const got = order(text, change); if (got !== want + ' | ' + want) throw Error(text + ' -> ' + got); }
+        a.setAttribute('style', 'border: 1px solid black; border-image: linear-gradient(red, red) 1');
+        style.borderImageSource = 'none';
+        if (getComputedStyle(a).borderImageSource !== 'none') throw Error('a name twice in the list ' + a.getAttribute('style'));
     "#, "test").unwrap();
 }
 
@@ -4042,6 +4151,51 @@ fn reflected_attributes_like_chrome() {
 }
 
 #[test]
+fn dom_api_edges_like_chrome() {
+    let (_, engine) = checked_page(
+        "<html><body><div id='h'></div><p id='p'>abc</p></body></html>",
+        r#"
+        const $ = id => document.getElementById(id), el = tag => document.createElement(tag);
+        check('classList.supports throws', () => { try { el('div').classList.supports('x'); } catch (e) { return e instanceof TypeError; } });
+        check('UIEvent view', () => new UIEvent('x').view === null && new MouseEvent('m', { view: window }).view === window);
+        const st = el('div'); st.style.color = 'red'; st.style.width = '1px'; st.style.color = 'blue';
+        check('style keeps order', () => st.style.cssText === 'color: blue; width: 1px;');
+        const dup = el('div'); dup.style.cssText = 'color:red;width:1px;color:blue'; dup.style.color = 'green';
+        check('style drops earlier duplicates', () => dup.style.cssText === 'width: 1px; color: green;');
+        const views = []; const field = el('input'); document.body.append(field); for (const type of ['focus', 'focusin', 'blur', 'focusout']) field.addEventListener(type, e => views.push(e.view === window)); field.focus(); field.blur();
+        check('focus events have a view', () => views.join() === 'true,true,true,true');
+        check('DOMException codes', () => new DOMException('', 'InUseAttributeError').code === 10 && new DOMException('', 'HierarchyRequestError').code === 3);
+        let records = 0; new MutationObserver(r => records += r.length).observe(st, { attributes: true }); st.style.color = 'blue';
+        globalThis.__records = () => records;
+        const r = document.createRange(), t = $('p').firstChild; r.setStart(t, 1); r.setEnd(t, 3); const c = r.cloneRange(); c.collapse(true);
+        check('Range constants', () => Range.START_TO_END === 1 && r.compareBoundaryPoints(Range.START_TO_END, c) === 1 && r.compareBoundaryPoints(Range.END_TO_START, c) === 0);
+        check('Range rejects doctype', () => { try { r.setStart(document.doctype ?? document.implementation.createDocumentType('html', '', ''), 0); } catch (e) { return e.name === 'InvalidNodeTypeError' && e.code === 24; } });
+        const box = el('input'); box.type = 'checkbox'; const num = el('input'); num.type = 'number';
+        check('no selection on checkbox', () => box.selectionStart === null && num.selectionStart === null && (() => { try { box.setSelectionRange(0, 1); } catch (e) { return e.name === 'InvalidStateError'; } })());
+        check('date sanitizing', () => (d => (d.type = 'date', d.value = '2020-13-01', d.value === '' && (d.value = '2020-02-03', d.value === '2020-02-03')))(el('input')));
+        check('tabIndex setter', () => (d => (d.tabIndex = '5x', d.getAttribute('tabindex') === '0'))(el('div')));
+        check('enumerated', () => el('img').referrerPolicy === '' && el('img').fetchPriority === 'auto' && el('video').preload === 'metadata' && el('track').kind === 'subtitles' && el('button').formMethod === '' && (a => (a.referrerPolicy = 'BOGUS', a.referrerPolicy === ''))(el('a')) && (l => (l.as = 'Script', l.as === 'script'))(el('link')));
+        check('text setters', () => (s => (s.text = 'x()', s.outerHTML === '<script>x()</script>'))(el('script')) && el('img').currentSrc === '');
+        check('svg className', () => (s => (s.setAttribute('class', 'a'), typeof s.className === 'object' && s.className.baseVal === 'a' && s.className === s.className))(document.createElementNS('http://www.w3.org/2000/svg', 'svg')));
+        const shadow = $('h').attachShadow({ mode: 'open' }); shadow.innerHTML = '<button>b</button>'; shadow.firstChild.focus();
+        check('host matches :focus', () => $('h').matches(':focus') && $('h').matches(':focus-within') && !$('p').matches(':focus'));
+        shadow.firstChild.blur();
+        check('host loses :focus', () => !$('h').matches(':focus'));
+        const order = []; globalThis.__order = order;
+        requestAnimationFrame(() => { order.push('raf1'); Promise.resolve().then(() => order.push('micro')); });
+        requestAnimationFrame(() => order.push('raf2'));
+    "#,
+    );
+    engine.eval("__appsAnimationFrame()", "test").unwrap();
+    assert_eq!(
+        engine
+            .eval("__order.join() + ' ' + __records()", "test")
+            .unwrap(),
+        "raf1,micro,raf2 0"
+    );
+}
+
+#[test]
 fn events_like_chrome() {
     checked_page(
         "<html><body><form id='f'><input name='q' value='1'></form><span id='s'></span></body></html>",
@@ -4295,6 +4449,90 @@ fn declared_values_serialize_like_chrome() {
 }
 
 #[test]
+fn named_style_queries_and_values_like_chrome() {
+    checked_page(
+        "<html><head><style>.box { background-color: rgb(200, 200, 200); } @container card style(--k: 1) { .named { background-color: rgb(0, 0, 255); } } @container card style(--k: 2) { .named { color: rgb(0, 128, 0); } } @container side style(--k: 1) { .named { outline-color: rgb(1, 2, 3); } } @container card (min-width: 10px) { .named { border-top-color: rgb(9, 9, 9); } } @container card style(--k) { .named::before { content: 'p'; color: rgb(0, 0, 255); } } .card { container-name: card; --k: 1; } .side { container: side / inline-size; --k: 1; } .mid { --k: 2; } .p { color: rgb(255, 0, 0); border: 2px solid; text-decoration: underline; } .c { color: rgb(0, 0, 255); border-color: inherit; text-decoration-color: inherit; background-color: inherit; } .p2 { color: rgb(255, 0, 0); border-color: rgb(255, 0, 0); } body { counter-reset: n; } .n::before { counter-increment: n; content: counter(n) '.'; } @media (200px <= width < 3000px) { .m { order: 1; } } @media (1/2 < aspect-ratio) { .m { order: 2; } }</style></head><body><div class=card id=c1><div><div class='box named' id=a></div></div></div><div class=card id=c2><div class=mid><div class='box named' id=b></div></div></div><div class=side id=s><div class=card id=c3 style='--k: 2'><div class='box named' id=c></div></div></div><div id=nc><div class='box named' id=d></div></div><div class=p><div class=c id=e></div></div><div class=p2><div class=c id=f></div></div><p class=n id=n>x</p><div id=x></div></body></html>",
+        r#"
+        const value = (id, name, pseudo) => getComputedStyle(document.getElementById(id), pseudo).getPropertyValue(name);
+        const node = id => document.getElementById(id);
+        const snap = () => ['a', 'b', 'c', 'd'].map(id => [value(id, 'background-color'), value(id, 'color'), value(id, 'outline-color'), value(id, 'border-top-color')].join(' ')).join('|');
+        const gray = 'rgb(200, 200, 200)', blue = 'rgb(0, 0, 255)', green = 'rgb(0, 128, 0)', black = 'rgb(0, 0, 0)';
+        check('named style queries read the nearest container of the name', () => snap() === [`${blue} ${black} ${black} ${black}`, `${blue} ${black} ${black} ${black}`, `${gray} ${green} rgb(1, 2, 3) ${green}`, `${gray} ${black} ${black} ${black}`].join('|') && value('b', 'content', '::before') === '"p"');
+        node('c1').style.setProperty('--k', '2'); node('c3').style.setProperty('--k', '1'); node('nc').className = 'card';
+        check('named style queries follow changes of the container', () => snap() === [`${gray} ${green} ${green} ${green}`, `${blue} ${black} ${black} ${black}`, `${blue} ${black} rgb(1, 2, 3) ${black}`, `${blue} ${black} ${black} ${black}`].join('|'));
+        node('c2').style.setProperty('container-name', 'other'); node('c3').style.setProperty('container-name', 'x'); node('s').style.setProperty('--k', '7');
+        check('named style queries follow container names', () => value('b', 'background-color') === gray && value('b', 'content', '::before') === 'none' && value('c', 'background-color') === gray && value('c', 'outline-color') === black);
+        check('inherit of a currentcolor value uses the own color', () => ['border-top-color', 'text-decoration-color', 'background-color'].map(name => value('e', name)).join() === `${blue},${blue},rgba(0, 0, 0, 0)` && value('f', 'border-top-color') === 'rgb(255, 0, 0)');
+        node('e').style.color = 'rgb(9, 9, 9)';
+        check('inherited currentcolor follows a new color', () => value('e', 'border-top-color') === 'rgb(9, 9, 9)');
+        node('f').parentNode.style.borderColor = 'currentcolor';
+        check('a parent that turns to currentcolor', () => value('f', 'border-top-color') === blue);
+        node('f').parentNode.style.borderColor = '';
+        check('a parent that turns back to its color', () => value('f', 'border-top-color') === 'rgb(255, 0, 0)');
+        check('counters keep their declared form', () => value('n', 'content', '::before') === 'counter(n) "."');
+        check('range media text', () => [...document.styleSheets[0].cssRules].filter(rule => rule.media).map(rule => rule.conditionText).join() === '(200px <= width < 3000px),(1 / 2 < aspect-ratio)');
+        const x = node('x');
+        const specified = (name, text) => { x.style.cssText = ''; x.style.setProperty(name, text); return x.style.getPropertyValue(name); };
+        const computed = (name, text) => { x.style.cssText = ''; x.style.setProperty(name, text); return getComputedStyle(x).getPropertyValue(name); };
+        check('calc sums', () => ['calc(10px + 2em)', 'calc(50% / 2)', 'calc(10px + 5% + 1em + 2px)', 'calc(2 * (3em + 1vw))', 'calc(-1 * 10px + 1em)', 'calc(1q + 1em)', 'calc(100% - (2em + 10px))', 'calc(1e-3px + 1em)'].map(text => specified('width', text)).join() === 'calc(2em + 10px),calc(25%),calc(5% + 1em + 12px),calc(6em + 2vw),calc(1em - 10px),calc(1em + 0.944882px),calc(100% - 2em - 10px),calc(1em + 0.001px)');
+        check('flex-flow', () => ['row wrap', 'column nowrap', 'row nowrap'].map(text => specified('flex-flow', text) + '/' + computed('flex-flow', text)).join() === 'wrap/row wrap,column/column nowrap,row/row nowrap');
+        check('list-style', () => ['square inside', 'url(a.png)', 'inside none'].map(text => specified('list-style', text)).join() === 'inside square,url("a.png"),inside none' && computed('list-style', 'inside none') === 'inside none none');
+        check('grid', () => specified('grid', 'auto-flow / 1fr 1fr') === 'none / 1fr 1fr' && specified('grid-auto-flow', 'row dense') === 'dense' && computed('grid-auto-flow', 'dense column') === 'column dense');
+        check('font stretch keywords', () => computed('font', 'condensed 12px Helvetica') === 'condensed 12px Helvetica' && (x.style.cssText = 'font: 10px serif; font-stretch: 80%', getComputedStyle(x).font === ''));
+        check('text-emphasis', () => computed('text-emphasis', 'filled red') === 'dot rgb(255, 0, 0)' && computed('text-emphasis', 'open') === 'open dot rgb(0, 0, 0)');
+        check('position values', () => computed('object-position', 'right 10px bottom') === '50% 50%' && specified('perspective-origin', 'left 10px top') === '');
+        check('background layers', () => (x.style.cssText = 'background-image: url(a.png); background-position: 1px 2px, 3px 4px; background-size: 1px, 2px', [getComputedStyle(x).backgroundPosition, getComputedStyle(x).backgroundSize].join() === '1px 2px,1px auto'));
+        check('offsets of static boxes', () => (x.style.cssText = 'left: calc(10% + 2px); top: 10%', [getComputedStyle(x).left, getComputedStyle(x).top].join() === 'calc(10% + 2px),10%'));
+        "#,
+    );
+}
+
+#[test]
+fn css_values_and_cascade_like_chrome() {
+    checked_page(
+        "<html><head><style>@scope (.card) { :scope { color: rgb(1, 0, 0); } } div { color: rgb(2, 0, 0); } @scope (.r5) { :where(:scope) { color: rgb(255, 0, 0); } & { color: rgb(0, 128, 0); } } @scope (.r3) { :not(:scope) { background-color: rgb(1, 1, 1); } :is(:scope) i { color: rgb(3, 3, 3); } } @container card style(--theme: dark) { .q { outline-color: rgb(9, 9, 9); } } .dark { --theme: dark; } @container style(--theme: dark) { .q { color: rgb(3, 0, 0); } } @container not style(--theme) { .q { background-color: rgb(4, 0, 0); } } .b { margin: 1px !important; margin-top: 5px; } .ctr { counter-reset: n m 3; counter-increment: n; } .nest { counter-reset: s; } p::before { content: normal; } p::first-letter { color: rgb(5, 6, 7); } input::placeholder { font-size: 12px; } li::marker { color: rgb(8, 9, 10); }</style></head><body><div class=card id=c></div><p class=r5 id=r5></p><div class=r3 id=r3><i id=r3i></i></div><div class=dark><div class=q id=q1></div></div><div><div class=q id=q2></div></div><div class=b id=b></div><div class=ctr id=ctr></div><p id=p>p</p><input id=in placeholder=x><ol class=nest><li id=l1><ol class=nest><li id=l2></li></ol></li></ol><div id=d></div></body></html>",
+        r#"
+        const value = (id, name, pseudo) => getComputedStyle(document.getElementById(id), pseudo).getPropertyValue(name);
+        const attempt = fn => { try { return fn(); } catch (error) { return error.name; } };
+        const d = document.getElementById('d'), set = text => { d.style.cssText = text; return getComputedStyle(d); };
+        check(':scope in @scope has the specificity of a class', () => value('c', 'color') === 'rgb(1, 0, 0)');
+        check(':not(:scope) stays in the scope', () => value('c', 'background-color') === 'rgba(0, 0, 0, 0)' && value('r3i', 'background-color') === 'rgb(1, 1, 1)' && value('r3i', 'color') === 'rgb(3, 3, 3)');
+        check(':scope in :where() adds nothing', () => value('r5', 'color') === 'rgb(0, 128, 0)');
+        check('named style queries never match', () => value('q1', 'outline-color') !== 'rgb(9, 9, 9)');
+        check('style() container queries', () => value('q1', 'color') === 'rgb(3, 0, 0)' && value('q2', 'color') === 'rgb(2, 0, 0)' && value('q2', 'background-color') === 'rgb(4, 0, 0)' && value('q1', 'background-color') === 'rgba(0, 0, 0, 0)');
+        check('important longhand of a rule wins', () => value('b', 'margin-top') === '1px' && document.styleSheets[0].cssRules[8].style.cssText === 'margin: 1px !important;');
+        check('important inline longhand wins', () => { d.style.cssText = 'margin: 1px !important; margin-top: 5px; color: red !important; color: blue'; return d.style.cssText === 'margin: 1px !important; color: red !important;' && d.style.getPropertyPriority('margin-top') === 'important'; });
+        check('important declarations go last', () => { d.style.cssText = 'color:red !important;width:1px'; return d.style.cssText === 'width: 1px; color: red !important;'; });
+        check('internal pseudo-classes are not for pages', () => !CSS.supports('selector(:-internal-scope)') && attempt(() => document.querySelector('div:-internal-scope')) === 'SyntaxError');
+        check('rotation axes', () => set('rotate: z 45deg').rotate === '45deg' && set('rotate: 0 0 -1 45deg').rotate === '-45deg');
+        check('a repeated declaration moves to its last place', () => { d.style.cssText = 'color:red;width:1px;color:blue'; return d.style.cssText === 'width: 1px; color: blue;'; });
+        check('declarations iterate', () => { d.style.cssText = 'color: red; width: 1px'; return [...d.style].join() === 'color,width' && [...getComputedStyle(d)].includes('color'); });
+        check('webkit aliases', () => { d.style.cssText = '-webkit-transform: scale(2); -webkit-box-shadow: 1px 1px red'; return d.style.transform === 'scale(2)' && d.style.webkitTransform === 'scale(2)' && getComputedStyle(d).boxShadow === 'rgb(255, 0, 0) 1px 1px 0px 0px'; });
+        check('opacity clamps', () => set('opacity: 2').opacity === '1' && set('opacity: -1').opacity === '0' && set('opacity: calc(50% + 10%)').opacity === '0.6');
+        check('aspect ratios', () => set('aspect-ratio: 16/9').aspectRatio === '16 / 9' && set('aspect-ratio: 2').aspectRatio === '2 / 1' && set('aspect-ratio: auto 1/2').aspectRatio === 'auto 1 / 2');
+        check('spacing', () => set('letter-spacing: 0').letterSpacing === 'normal' && set('word-spacing: normal').wordSpacing === '0px');
+        check('counters', () => value('ctr', 'counter-reset') === 'n 0 m 3' && value('ctr', 'counter-increment') === 'n 1');
+        check('scroll margins and column rules', () => { const s = set('scroll-margin: 5px 1em; scroll-padding: 2px; column-rule: 1px solid red; container: a / size'); return s.scrollMargin === '5px 16px' && s.scrollPaddingTop === '2px' && s.columnRule === '1px solid rgb(255, 0, 0)' && s.container === 'a / size'; });
+        check('logical border sides', () => set('border-inline-start: 2px dashed red').borderInlineStart === '2px dashed rgb(255, 0, 0)');
+        check('background positions with offsets', () => set('background-position: right 10px bottom').backgroundPosition === 'calc(100% - 10px) 100%' && set('background-position: left 5px top 20%').backgroundPosition === '5px 20%' && set('background-position: right 25% center').backgroundPosition === '75% 50%');
+        check('text fill color', () => set('color: red').webkitTextFillColor === 'rgb(255, 0, 0)');
+        check('content normal on ::before', () => value('p', 'content', '::before') === 'none');
+        check('individual transforms and zoom', () => { const s = set('rotate: calc(12deg * -1); translate: 0.25rem 0; scale: 150% -1; zoom: 50%'); return [s.rotate, s.translate, s.scale, s.zoom].join() === '-12deg,4px,1.5 -1,0.5'; });
+        check('grid tracks in pixels', () => { const s = set('grid-auto-columns: calc(0.25rem * 3); grid-template-columns: repeat(2, minmax(0, 1em)) 1fr 10%'); return s.gridAutoColumns === '12px' && s.gridTemplateColumns === 'repeat(2, minmax(0px, 16px)) 1fr 10%'; });
+        check('empty references leave no spaces', () => set('--x: ; filter: var(--x,) blur(2px) var(--x,)').filter === 'blur(2px)');
+        check('more computed values', () => { const s = set('letter-spacing: 1%; rotate: 1 0 0 90deg; scale: 1 1 1; translate: calc(10% + 1em); zoom: normal; background-position: right calc(10% + 2px) bottom; min-width: calc(10% + 1em); grid-area: -a / 1'); return [s.letterSpacing, s.rotate, s.scale, s.translate, s.zoom, s.backgroundPosition, s.minWidth, s.gridArea].join() === '1%,x 90deg,1,calc(10% + 16px),1,calc(90% - 2px) 100%,calc(10% + 16px),-a / 1'; });
+        check('webkit aliases in supports and masks', () => CSS.supports('-webkit-transform', 'none') && CSS.supports('(-webkit-columns: 2)') && (d.style.cssText = '-webkit-mask-image: none; -webkit-filter: blur(1px)', d.style.cssText === 'mask-image: none; filter: blur(1px);') && d.style.getPropertyValue('-webkit-mask-image') === 'none');
+        check('text pseudo-elements', () => value('p', 'color', '::first-letter') === 'rgb(5, 6, 7)' && value('in', 'font-size', '::placeholder') === '12px' && value('l1', 'color', '::marker') === 'rgb(8, 9, 10)');
+        for (const [text, expected] of [
+            ['width: round(23px, 10px)', 'width: calc(20px);'], ['transition-duration: calc(1s + 500ms)', 'transition-duration: calc(1.5s);'],
+            ['transform: rotate(calc(45deg + 0.25turn))', 'transform: rotate(calc(135deg));'], ['z-index: clamp(0, 2, 1)', 'z-index: calc(1);'],
+            ['width: calc(min(10px, 20px) + max(1em, 2px))', 'width: calc(10px + max(1em, 2px));'], ['width: calc(1rem + 2px)', 'width: calc(2px + 1rem);'], ['border-radius: calc(1px + 2%) / calc(3px + 1em)', 'border-radius: calc(2% + 1px) / calc(1em + 3px);'], ['--x: calc( 2px+1em )', '--x: calc( 2px+1em );'], ['height: -webkit-calc(1px + 2px)', 'height: calc(3px);'], ['width: calc(min(10px, 20px) + 5px)', 'width: calc(15px);'], ['width: calc(min(10px, 1em) * 1 + 2px)', 'width: calc(2px + min(10px, 1em));'],
+        ]) check(text, () => { d.style.cssText = text; return d.style.cssText === expected; });
+        "#,
+    );
+}
+
+#[test]
 fn computed_styles_report_used_values_like_chrome() {
     let (host, engine) = css_page(
         "<html><head><style>#w{position:relative;width:200px;height:100px;padding:5px;border:2px solid} #a{position:absolute;width:50%;left:10%;top:4px;padding:2px 3%} #r{position:relative;top:10px;left:5px} #m{width:100px;margin:0 auto} #h{display:none;width:50%;transform-origin:center} #p::before{content:'x' attr(data-v) \"y\"}</style></head><body><div id=w><div id=a></div><div id=r></div><div id=m></div></div><div id=h></div><p id=p data-v=t></p></body></html>",
@@ -4390,8 +4628,7 @@ fn border_images_parse_and_serialize_like_chrome() {
             ['border-image:#f00 1', ''], ['border-image:none', 'border-image: none;'], ['border-image:30', 'border-image: none 30 / 1 / 0 stretch;'],
             ['border-image:linear-gradient(#f00, #00f) 1 1 1 1 / 1 / 0 stretch stretch', 'border-image: linear-gradient(rgb(255, 0, 0), rgb(0, 0, 255)) 1 / 1 / 0 stretch;'],
             ['border-image-repeat:round round', 'border-image-repeat: round;'], ['border:1px solid red', 'border: 1px solid red;'],
-            // `border` resets only the source, where Chrome resets all of `border-image` and gives `border: 2px solid;`.
-            ['border-image:linear-gradient(red, blue) 1; border:2px solid', 'border: 2px solid; border-image-slice: 1; border-image-width: 1; border-image-outset: 0; border-image-repeat: stretch;'],
+            ['border-image:linear-gradient(red, blue) 1; border:2px solid', 'border: 2px solid;'],
             ['border:2px solid; border-image:linear-gradient(red, blue) 1', 'border-width: 2px; border-style: solid; border-color: currentcolor; border-image: linear-gradient(red, blue) 1 / 1 / 0 stretch;'],
         ]) check(text, () => { d.style.cssText = text; return d.style.cssText === expected; });
         const s = getComputedStyle(r);
@@ -4455,4 +4692,41 @@ fn same_text_writes_large_fragments_and_id_queries() {
         fails.join('\n') || 'ok'
     "#, "test").unwrap();
     assert_eq!(result, "ok");
+}
+
+#[test]
+fn data_and_blob_requests_fire_each_event_once_with_their_url() {
+    let (.., result) = offscreen_page(
+        r#"
+        const blob = URL.createObjectURL(new Blob(['b']));
+        for (const [url, text, final] of [['data:,abc#x', 'abc', 'data:,abc'], [blob + '#f', 'b', blob]]) {
+          const response = await fetch(url);
+          same([response.url, response.type, await response.text()], [final, 'basic', text], 'fetch ' + url);
+          const xhr = new XMLHttpRequest(), events = [];
+          for (const type of ['load', 'loadend', 'readystatechange']) xhr.addEventListener(type, () => events.push(type));
+          xhr.onload = () => events.push('onload');
+          await new Promise(resolve => { xhr.onloadend = resolve; xhr.open('GET', url); xhr.send(); });
+          same([xhr.responseURL, xhr.responseText, events.filter(type => type !== 'readystatechange')], [final, text, ['load', 'onload', 'loadend']], 'xhr ' + url);
+        }
+        "#,
+    );
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn text_stroke_values_like_chrome() {
+    let host = Rc::new(RefCell::new(Host::default()));
+    host.borrow_mut().pages.insert(1, Page {
+        doc: Document::parse("<html><head><style>body{font-size:16px}#a{-webkit-text-stroke:2px red}#b{-webkit-text-stroke:thin;color:blue}#c{-webkit-text-stroke:green 3px}#d{-webkit-text-stroke:-1px red}#e{-webkit-text-stroke-width:0.1em;font-size:20px}</style></head><body><div id=a><span id=a2>x</span></div><div id=b></div><div id=c></div><div id=d></div><div id=e></div></body></html>"),
+        dirty: false,
+    });
+    let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
+    engine.eval(r#"
+        const got = ['a', 'a2', 'b', 'c', 'd', 'e'].map(id => getComputedStyle(document.getElementById(id)).getPropertyValue('-webkit-text-stroke')).join('|');
+        if (got !== '2px rgb(255, 0, 0)|2px rgb(255, 0, 0)|0.666667px rgb(0, 0, 255)|3px rgb(0, 128, 0)|0px rgb(0, 0, 0)|2px rgb(0, 0, 0)') throw Error(got);
+        if (!CSS.supports('-webkit-text-stroke', '1px red') || CSS.supports('-webkit-text-stroke-width', '-1px')) throw Error('supports');
+        if (CSS.supports('color', '-webkit-focus-ring-color') || !CSS.supports('outline', 'auto -webkit-focus-ring-color')) throw Error('focus ring color');
+        document.body.style.outlineColor = '-webkit-focus-ring-color';
+        if (getComputedStyle(document.body).outlineColor !== 'rgb(0, 95, 204)') throw Error('focus ring color value');
+    "#, "test").unwrap();
 }

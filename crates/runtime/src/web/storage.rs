@@ -609,7 +609,16 @@ impl State {
                         let limit=args[7].as_u64().filter(|count|*count>0).map_or_else(||"-1".to_owned(),|count|count.to_string());
                         let columns=match kind {"keys"=>"key","values"=>"value",_=>"key,value"};
                         let rows=tx.database.query(&format!("SELECT {columns} FROM entries WHERE db=? AND store=? AND key>=? AND key<? ORDER BY key {} LIMIT ?",if args[6]==true{"DESC"}else{"ASC"}),&[&tx.name,store,&lower,&upper,&limit])?;
-                        return Ok(rows.into_iter().map(|mut row|match kind {"keys"=>wire_key(row[0].take()),"values"=>row[0].take().into(),_=>Value::Array(vec![wire_key(row[0].take()),row[1].take().into()])}).collect());
+                        if kind=="keys" {return Ok(rows.into_iter().map(|mut row|wire_key(row[0].take())).collect());}
+                        // Stored values are JSON text, so they join the result as they are and JavaScript parses them once.
+                        let mut text=String::from("[");
+                        for (index,mut row) in rows.into_iter().enumerate() {
+                            if index>0 {text.push(',');}
+                            if kind=="values" {text.push_str(row[0].as_deref().unwrap_or("null"));}
+                            else {use std::fmt::Write;let _=write!(text,"[{},{}]",wire_key(row[0].take()),row[1].as_deref().unwrap_or("null"));}
+                        }
+                        text.push(']');
+                        return Ok(crate::jsc::payload::raw(text,Value::Null));
                     }
                     "put"|"add"=>{let (key,value)=(hex_key(args[2].as_str().context("Expected record key")?)?,args[3].as_str().context("Expected record value")?);tx.database.query(if op=="put"{"INSERT INTO entries(db,store,key,value) VALUES(?,?,?,?) ON CONFLICT(db,store,key) DO UPDATE SET value=excluded.value"}else{"INSERT INTO entries(db,store,key,value) VALUES(?,?,?,?)"},&[&tx.name,store,&key,value])?;},
                     "clear"=>{tx.database.query("DELETE FROM entries WHERE db=? AND store=?",&[&tx.name,store])?;},

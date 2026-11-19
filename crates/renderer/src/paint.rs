@@ -50,19 +50,21 @@ impl Window {
         self.content_mask().radii == Default::default()
     }
 
-    pub(crate) fn begin_interest(&mut self, offset: Point<Pixels>) -> bool {
+    // `origin` is a point of the box in the window, so the area moves with the box when an outer scroll moves it.
+    pub(crate) fn begin_interest(&mut self, origin: Point<Pixels>, offset: Point<Pixels>) -> bool {
         let mask = self.content_mask();
         let open = self.opens_interest();
         self.viewports.push(open.then_some(mask.bounds));
         if open {
-            // `offset` moves the content, so a place in the content is a place in the window less `offset`.
-            let axis = |start: Pixels, length: Pixels, offset: Pixels| {
+            // `offset` moves the content, so a place in the content is a place in the window less `at`.
+            let axis = |start: Pixels, length: Pixels, at: Pixels| {
                 let step = (length.0 / 2.).max(256.).round();
-                let base = ((start - offset).0 / step).floor() * step;
-                (px(base - step) + offset, px(length.0 + step * 3.))
+                let base = ((start - at).0 / step).floor() * step;
+                (px(base - step) + at, px(length.0 + step * 3.))
             };
-            let (x, width) = axis(mask.bounds.origin.x, mask.bounds.size.width, offset.x);
-            let (y, height) = axis(mask.bounds.origin.y, mask.bounds.size.height, offset.y);
+            let at = origin + offset;
+            let (x, width) = axis(mask.bounds.origin.x, mask.bounds.size.width, at.x);
+            let (y, height) = axis(mask.bounds.origin.y, mask.bounds.size.height, at.y);
             self.push_content_mask(Clip::from(Rect::new(point(x, y), size(width, height))));
         }
         open
@@ -75,10 +77,10 @@ impl Window {
     }
 
     // The content of a scroll container, which `offset` moved, paints between these two calls.
-    pub(crate) fn begin_scroll(&mut self, id: u64, offset: Point<Pixels>) {
+    pub(crate) fn begin_scroll(&mut self, id: u64, origin: Point<Pixels>, offset: Point<Pixels>) {
         let viewport = self.snap_mask(self.content_mask());
         let scale = self.scale_factor;
-        let open = self.begin_interest(offset);
+        let open = self.begin_interest(origin, offset);
         self.scene.begin_scroll(
             id,
             viewport,
@@ -124,17 +126,22 @@ impl Window {
         instance.color = fill.fade(self.opacity).to_array();
         instance.border_color = border.color.fade(self.opacity).to_array();
         instance.aux = [widths.top, widths.right, widths.bottom, widths.left];
-        // Like in Chromium, dashes of square borders thinner than 3 CSS pixels are longer.
-        let thin = border.style == BorderStyle::Dashed
-            && instance.radii == [0.; 8]
-            && [
-                border.widths.top,
-                border.widths.right,
-                border.widths.bottom,
-                border.widths.left,
-            ]
-            .iter()
-            .all(|width| width.0 < 3.);
+        // Like in Chromium, dashes of square borders thinner than 3 CSS pixels are longer. On rounded borders, dashes
+        // thinner than 3 device pixels are longer, and dots up to 3 device pixels wide are square.
+        let sides = [
+            border.widths.top,
+            border.widths.right,
+            border.widths.bottom,
+            border.widths.left,
+        ];
+        let square = instance.radii == [0.; 8];
+        let below = |limit: f32, scale: f32| sides.iter().all(|width| width.0 * scale < limit);
+        let thin = match border.style {
+            BorderStyle::Dashed if square => below(3., 1.),
+            BorderStyle::Dashed => below(3., self.scale_factor),
+            BorderStyle::Dotted => !square && below(3.01, self.scale_factor),
+            _ => false,
+        };
         instance.info[1] =
             (border.style as u32 | u32::from(thin) << 4 | u32::from(border.sides) << 8) as f32;
         if instance.color[3] > 0. {
@@ -446,7 +453,8 @@ impl Window {
         }
     }
 
-    // An emoji draws in its own colors.
+    // An emoji draws in its own colors. A `stroke` above 0 draws a line of that width along the outline instead.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_glyph(
         &mut self,
         origin: Point<Pixels>,
@@ -455,6 +463,7 @@ impl Window {
         font_size: Pixels,
         color: Color,
         emoji: bool,
+        stroke: Pixels,
     ) {
         if self.opacity <= 0. {
             return;
@@ -479,11 +488,13 @@ impl Window {
             scale,
             subpixel,
             emoji,
-            dilation: if self.font_smoothing && !emoji {
+            // Like Skia, stroked glyphs are paths with no font smoothing.
+            dilation: if self.font_smoothing && !emoji && stroke.0 <= 0. {
                 self.text_system.dilation(color)
             } else {
                 0
             },
+            stroke: stroke.0,
         };
         let text = &self.text_system;
         let Some((tile, shown)) =

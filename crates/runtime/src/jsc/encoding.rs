@@ -256,6 +256,18 @@ fn number(api: &JavaScriptCore, ctx: Ptr, value: Ptr) -> f64 {
     unsafe { (api.to_number)(ctx, value, ptr::null_mut()) }
 }
 
+// Start and end that callers already checked. They are clamped here only to keep the slice in bounds.
+fn range(
+    api: &JavaScriptCore,
+    ctx: Ptr,
+    start: Ptr,
+    end: Ptr,
+    length: usize,
+) -> std::ops::Range<usize> {
+    let end = (number(api, ctx, end) as usize).min(length);
+    (number(api, ctx, start) as usize).min(end)..end
+}
+
 unsafe extern "C" fn encode(
     ctx: Ptr,
     _: Ptr,
@@ -315,7 +327,11 @@ unsafe extern "C" fn encode_into(
 ) -> Ptr {
     native(ctx, count, args, exception, |api, arg| {
         let chars = api.chars(ctx, arg(0)).context("Expected a string")?;
-        let out = api.bytes(ctx, arg(1)).context("Expected a Uint8Array")?;
+        let mut out = api.bytes(ctx, arg(1)).context("Expected a Uint8Array")?;
+        if count > 2 {
+            let range = range(api, ctx, arg(2), arg(3), out.len());
+            out = &mut out[range];
+        }
         let (read, written) = match chars {
             Chars::Latin1(text) => encode_latin1(text, out),
             Chars::Utf16(text) => encode_utf16(text, out),
@@ -339,9 +355,12 @@ unsafe extern "C" fn decode(
     exception: *mut Ptr,
 ) -> Ptr {
     native(ctx, count, args, exception, |api, arg| {
-        let bytes = api
+        let mut bytes = api
             .view(ctx, arg(0))
             .context("Expected an ArrayBuffer or a view")?;
+        if count > 4 {
+            bytes = &bytes[range(api, ctx, arg(4), arg(5), bytes.len())];
+        }
         let kind = number(api, ctx, arg(1)) as u32;
         let (fatal, stream) =
             unsafe { ((api.to_boolean)(ctx, arg(2)), (api.to_boolean)(ctx, arg(3))) };
@@ -444,6 +463,25 @@ unsafe extern "C" fn utf8_length(
             chars => api.simd_utf8(&chars, ptr::null_mut()),
         };
         Ok(unsafe { (api.number)(ctx, size as f64) })
+    })
+}
+
+unsafe extern "C" fn valid(
+    ctx: Ptr,
+    _: Ptr,
+    _: Ptr,
+    count: usize,
+    args: *const Ptr,
+    exception: *mut Ptr,
+) -> Ptr {
+    native(ctx, count, args, exception, |api, arg| {
+        let bytes = api.view(ctx, arg(0)).context("Expected bytes")?;
+        let valid = if unsafe { (api.to_boolean)(ctx, arg(1)) } {
+            bytes.is_ascii()
+        } else {
+            std::str::from_utf8(bytes).is_ok()
+        };
+        Ok(unsafe { (api.boolean)(ctx, valid) })
     })
 }
 
@@ -637,6 +675,7 @@ pub(crate) fn install(api: &JavaScriptCore, ctx: Ptr) {
             ("encodeInto", encode_into),
             ("decode", decode),
             ("utf8Length", utf8_length),
+            ("valid", valid),
             ("indexOf", index_of),
             ("compare", compare),
             ("random", random),

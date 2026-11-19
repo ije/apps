@@ -122,6 +122,51 @@ pub(super) fn canvas_source(
     }
 }
 
+enum ImageLayer {
+    // The file of a `url()`, or `None` when it names none.
+    File(Option<std::path::PathBuf>),
+    Text(String),
+}
+
+// The layers of `background-image`. A box that builds again on each frame keeps its style value, which can hold
+// large `data:` URLs, so its layers are parsed once per value.
+fn image_layers(
+    style: &style::Style,
+    base: Option<&url::Url>,
+    assets: &HashMap<String, std::path::PathBuf>,
+) -> Rc<[ImageLayer]> {
+    type Parsed = (Rc<str>, Option<url::Url>, Rc<[ImageLayer]>);
+    thread_local! {
+        static PARSED: std::cell::RefCell<rustc_hash::FxHashMap<usize, Parsed>> = Default::default();
+    }
+    let Some(value) = style.value(Prop::BACKGROUND_IMAGE) else {
+        return Rc::new([]);
+    };
+    let key = Rc::as_ptr(value).cast::<u8>() as usize;
+    PARSED.with_borrow_mut(|parsed| {
+        // The entry holds its value, so no other value takes its address.
+        if let Some((_, known, layers)) = parsed.get(&key)
+            && known.as_ref() == base
+        {
+            return layers.clone();
+        }
+        let layers: Rc<[ImageLayer]> = style::components(value, ',')
+            .into_iter()
+            .map(
+                |image| match image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
+                    Some(source) => ImageLayer::File(super::image::url_file(source, base, assets)),
+                    None => ImageLayer::Text(image.to_owned()),
+                },
+            )
+            .collect();
+        if parsed.len() >= 1024 {
+            parsed.clear();
+        }
+        parsed.insert(key, (value.clone(), base.cloned(), layers.clone()));
+        layers
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn css_background(
     style: &style::Style,
@@ -174,7 +219,7 @@ pub(super) fn css_background(
     }
     let mut layers = Vec::new();
     let mut indexes = Vec::new();
-    for (index, image) in list(Prop::BACKGROUND_IMAGE).into_iter().enumerate().rev() {
+    for (index, image) in image_layers(style, base, assets).iter().enumerate().rev() {
         let (size, position, repeat) = (
             pick(&sizes, index),
             pick(&positions, index),
@@ -187,9 +232,17 @@ pub(super) fn css_background(
             if canvas {
                 window.cull();
             }
+            // The content mask of a scroll is its interest area, larger than the viewport. A fixed layer moves
+            // in the content with each scroll, so its paint can't be copied.
+            if fixed {
+                window.paint_volatile();
+            }
             let mask = window.content_mask().bounds;
             (
-                if fixed { mask } else { bounds },
+                match fixed {
+                    true => renderer::Rect::new(Default::default(), window.viewport_size()),
+                    false => bounds,
+                },
                 if canvas { mask } else { bounds },
             )
         };
@@ -228,8 +281,8 @@ pub(super) fn css_background(
                 .bottom(px(clip[2]))
                 .left(px(clip[3]))
         };
-        if let Some(source) = image.strip_prefix("url(").and_then(|v| v.strip_suffix(')')) {
-            if let Some(path) = super::image::url_file(source, base, assets) {
+        if let ImageLayer::File(path) = image {
+            if let Some(path) = path.clone() {
                 let file = path.to_string_lossy().into_owned();
                 let view = view.clone();
                 let natural = std::cell::Cell::new(None::<[f32; 2]>);
@@ -589,6 +642,9 @@ pub(super) fn css_background(
             }
             continue;
         }
+        let ImageLayer::Text(image) = image else {
+            continue;
+        };
         let Some((kind, body)) = image
             .split_once('(')
             .filter(|(kind, _)| kind.ends_with("-gradient"))
@@ -695,10 +751,24 @@ pub(super) fn css_background(
                     })
                     .flatten();
                 let image = cached.or_else(|| {
-                    let image = super::effects::gradient_svg(
-                        &kind, &body, &size, position, &repeat, units, width, height, within,
-                    )
-                    .and_then(|source| super::canvas::svg_gradient(source, rw, rh))?;
+                    let image = match kind.ends_with("conic-gradient") {
+                        true => super::effects::conic_image(
+                            &kind,
+                            &body,
+                            &size,
+                            position,
+                            &repeat,
+                            units,
+                            [width, height],
+                            within,
+                            [rw, rh],
+                            entry.map(|(_, image)| image),
+                        ),
+                        false => super::effects::gradient_svg(
+                            &kind, &body, &size, position, &repeat, units, width, height, within,
+                        )
+                        .and_then(|source| super::canvas::svg_gradient(source, rw, rh)),
+                    }?;
                     const LIMIT: u32 = 8 << 20;
                     if new && rw * rh * 4 <= LIMIT / 4 {
                         dom.gradients.push((inputs.clone(), image.clone()));
@@ -722,9 +792,11 @@ pub(super) fn css_background(
                     None => dom.backgrounds.remove(&key),
                 };
                 if let Some((_, old)) = old
-                    && Arc::strong_count(&old) == 1
+                    && let Ok(mut old) = Arc::try_unwrap(old)
                 {
-                    window.release_image(old);
+                    // A gradient that changes on each frame draws into the pixels of its last image.
+                    super::effects::recycle(old.take_bytes());
+                    window.release_image(Arc::new(old));
                 }
             }
             if let Some((_, image)) = dom.backgrounds.get(&key)

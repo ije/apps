@@ -36,7 +36,7 @@ const SPACES: [(&str, Space); 15] = [
     ("hwb", Space::Hwb),
 ];
 
-const SYSTEM_COLORS: [(&str, u32, &str); 19] = [
+const SYSTEM_COLORS: [(&str, u32, &str); 20] = [
     ("canvas", 0xffffff, "#121212"),
     ("canvastext", 0x000000, "#ffffff"),
     ("linktext", 0x0000ee, "#9e9eff"),
@@ -56,6 +56,8 @@ const SYSTEM_COLORS: [(&str, u32, &str); 19] = [
     ("graytext", 0x808080, "#808080"),
     ("accentcolor", 0x0075ff, "#0075ff"),
     ("accentcolortext", 0xffffff, "#ffffff"),
+    // Chrome's, where outlines take it.
+    ("-webkit-focus-ring-color", 0x005fcc, "#99c8ff"),
 ];
 
 pub(crate) fn serialize(value: &str) -> Option<String> {

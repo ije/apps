@@ -187,6 +187,8 @@ style! {
     baseline: Baseline = Baseline::Auto,
     baseline_source: bool = false,
     inline: Inline = Inline::None,
+    /// A block container: the auto heights of its children are not definite, unlike the flexed sizes of flex items.
+    block: bool = false,
     background: Option<Color> = None,
     border_color: Option<Color> = None,
     border_style: BorderStyle = BorderStyle::Solid,

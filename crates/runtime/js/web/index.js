@@ -9,9 +9,10 @@ globalThis.__appsWeb = (call, codec) => {
   const decodeBytes = value => typeof value === 'string' ? Uint8Array.fromBase64(value) : value instanceof Uint8Array ? value : new Uint8Array(value);
   globalThis.__appsBytes = { decode: decodeBytes, memory: body => memoryBodies.get(body) };
   const retries = globalThis.__appsRetries = new Set();
+  const codes = { IndexSizeError: 1, InUseAttributeError: 10, HierarchyRequestError: 3, WrongDocumentError: 4, InvalidCharacterError: 5, NotFoundError: 8, TypeMismatchError: 17, NoModificationAllowedError: 7, InvalidModificationError: 13, AbortError: 20, QuotaExceededError: 22, NotSupportedError: 9, InvalidStateError: 11, SyntaxError: 12, TimeoutError: 23, DataCloneError: 25, InvalidNodeTypeError: 24, URLMismatchError: 21, SecurityError: 18, NetworkError: 19, InvalidAccessError: 15, NamespaceError: 14 };
   class DOMException extends Error {
     constructor(message = '', name = 'Error') { super(String(message)); this.name = String(name); }
-    get code() { return ({ InvalidCharacterError: 5, NotFoundError: 8, TypeMismatchError: 17, NoModificationAllowedError: 7, InvalidModificationError: 13, AbortError: 20, QuotaExceededError: 22, NotSupportedError: 9, InvalidStateError: 11, SyntaxError: 12, TimeoutError: 23, DataCloneError: 25 })[this.name] ?? 0; }
+    get code() { return codes[this.name] ?? 0; }
   }
   const eventStates = new WeakMap(), eventTargets = new WeakMap();
   class Event {
@@ -142,6 +143,7 @@ globalThis.__appsWeb = (call, codec) => {
       return { read, written };
     }
   }
+  const encoder = new TextEncoder();
   const decoderLabels = { 'utf-8': 'utf-8', utf8: 'utf-8', 'unicode-1-1-utf-8': 'utf-8', 'utf-16le': 'utf-16le', 'utf-16': 'utf-16le', 'ucs-2': 'utf-16le', 'unicode': 'utf-16le', 'utf-16be': 'utf-16be', 'unicodefffe': 'utf-16be', latin1: 'windows-1252', 'iso-8859-1': 'windows-1252', 'iso8859-1': 'windows-1252', ascii: 'windows-1252', 'us-ascii': 'windows-1252', 'windows-1252': 'windows-1252', cp1252: 'windows-1252', 'x-cp1252': 'windows-1252' };
   const decoderKinds = { 'utf-8': 0, 'utf-16le': 4, 'utf-16be': 5, 'windows-1252': 6 };
   class TextDecoder {
@@ -201,18 +203,24 @@ globalThis.__appsWeb = (call, codec) => {
   const params = new WeakMap(), urls = new WeakMap();
   const usv = value => { const text = String(value); return text.toWellFormed ? text.toWellFormed() : text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD'); };
   const updateParams = value => { const state = params.get(value); state.update?.(); };
+  const unplus = text => { if (text.includes('+')) text = text.replaceAll('+', ' '); return text.includes('%') ? decodeURIComponent(text) : text; };
   const query = text => {
     const list = [];
     try {
-      for (const part of text.split('&')) {
-        if (!part) continue;
-        const at = part.indexOf('='), name = at < 0 ? part : part.slice(0, at), value = at < 0 ? '' : part.slice(at + 1);
-        list.push([decodeURIComponent(name.replaceAll('+', ' ')), decodeURIComponent(value.replaceAll('+', ' '))]);
+      // `at` is the next `=` at or after `start`, or the text length, so each `=` is searched once.
+      for (let start = 0, at = -1; start <= text.length;) {
+        let end = text.indexOf('&', start); if (end < 0) end = text.length;
+        if (end > start) {
+          if (at < start) { at = text.indexOf('=', start); if (at < 0) at = text.length; }
+          const split = at < end; list.push([unplus(text.slice(start, split ? at : end)), split ? unplus(text.slice(at + 1, end)) : '']);
+        }
+        start = end + 1;
       }
     } catch { return call('web.params.parse', text); }
     return list;
   };
-  const form = text => encodeURIComponent(text).replace(/[!'()~]|%20/g, c => c === '%20' ? '+' : '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  const marks = /[!'()~]/g, markCodes = { '!': '%21', "'": '%27', '(': '%28', ')': '%29', '~': '%7E' };
+  const form = text => { let out = encodeURIComponent(text); if (out.includes('%20')) out = out.replaceAll('%20', '+'); marks.lastIndex = 0; return marks.test(out) ? out.replace(marks, c => markCodes[c]) : out; };
   class URLSearchParams {
     constructor(input = '') {
       let list;
@@ -299,7 +307,7 @@ globalThis.__appsWeb = (call, codec) => {
         const name = String(typeof algorithm === 'string' ? algorithm : algorithm?.name).toUpperCase();
         const data = bytes(input);
         if (!['SHA-1', 'SHA-256', 'SHA-384', 'SHA-512'].includes(name)) throw new DOMException('Unsupported digest algorithm', 'NotSupportedError');
-        return decodeBytes(call('web.digest', name, data)).buffer;
+        return codec.digest(name.replace('-', '').toLowerCase(), data).buffer;
       },
     }),
   });
@@ -336,11 +344,30 @@ globalThis.__appsWeb = (call, codec) => {
   const blobs = new WeakMap(), objectURLs = new Map();
   URL.createObjectURL = value => { if (!(value instanceof Blob)) throw new TypeError('Expected a Blob'); const url = 'blob:' + (globalThis.location?.origin ?? 'null') + '/' + crypto.randomUUID(); objectURLs.set(url, value); return url; };
   URL.revokeObjectURL = url => { objectURLs.delete(String(url)); };
+  // `adopt` gives a new Blob bytes that nothing else holds, without a copy.
+  let adopted = null;
+  const adopt = (data, type) => { adopted = data; return new Blob([], { type }); };
   class Blob {
     constructor(parts = [], options = {}) {
-      const chunks = Array.from(parts, part => part instanceof Blob ? blobs.get(part) : ArrayBuffer.isView(part) || part instanceof ArrayBuffer ? bytes(part) : new TextEncoder().encode(String(part)));
-      const output = new Uint8Array(chunks.reduce((size, chunk) => size + chunk.length, 0));
-      let offset = 0; for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.length; }
+      let output = adopted;
+      adopted = null;
+      if (!output) {
+        // Runs of strings encode once. Each part is made well formed first, so a pair split over two parts stays two U+FFFD.
+        const chunks = []; let text = '', owned = 0;
+        Array.from(parts, part => {
+          if (part instanceof Blob || ArrayBuffer.isView(part) || part instanceof ArrayBuffer) {
+            if (text) { chunks.push(encoder.encode(text)); text = ''; owned++; }
+            chunks.push(part instanceof Blob ? blobs.get(part) : bytes(part)); if (part instanceof Blob) owned++;
+          } else text += usv(part);
+        });
+        if (text) { chunks.push(encoder.encode(text)); owned++; }
+        // Encoded text and Blob bytes never change, so one such chunk is kept as it is.
+        if (chunks.length === 1 && owned === 1) output = chunks[0];
+        else {
+          output = new Uint8Array(chunks.reduce((size, chunk) => size + chunk.length, 0));
+          let offset = 0; for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.length; }
+        }
+      }
       blobs.set(this, output);
       const type = String(options.type ?? '');
       this._type = /[^\x20-\x7E]/.test(type) ? '' : type.toLowerCase();
@@ -350,7 +377,7 @@ globalThis.__appsWeb = (call, codec) => {
     async arrayBuffer() { return blobs.get(this).slice().buffer; }
     async bytes() { return blobs.get(this).slice(); }
     async text() { return new TextDecoder().decode(blobs.get(this)); }
-    slice(start = 0, end = this.size, type = '') { return new Blob([blobs.get(this).slice(start, end)], { type }); }
+    slice(start = 0, end = this.size, type = '') { return adopt(blobs.get(this).slice(start, end), type); }
     stream() {
       const data = blobs.get(this); let offset = 0;
       return new ReadableStream({ type: 'bytes', pull(controller) { if (offset < data.length) { const next = Math.min(offset + 65536, data.length); controller.enqueue(data.slice(offset, next)); offset = next; } if (offset === data.length) controller.close(); } });
@@ -400,10 +427,17 @@ globalThis.__appsWeb = (call, codec) => {
     if (type && !headers.has('content-type')) headers.set('content-type', type);
     const stream = blob.stream(); memoryBodies.set(stream, blobs.get(blob)); return stream;
   };
-  const consume = async (object, signal) => {
+  // Without `copy` the result can be the bytes of a Blob, which must not change.
+  const consume = async (object, signal, copy = true) => {
     const body = object.body;
     if (!body) return new Uint8Array();
     if (body.locked || disturbed(body)) throw new TypeError('Body is already used');
+    const data = memoryBodies.get(body);
+    // A body in memory ends like a full read: closed and disturbed, without its chunks, and locked until a later microtask.
+    if (data && !signal?.aborted) {
+      const reader = body.getReader();
+      try { reader.cancel().catch(() => {}); await null; return copy ? data.slice() : data; } finally { reader.releaseLock(); }
+    }
     const reader = body.getReader(), chunks = []; let size = 0;
     const onAbort = () => reader.cancel(signal.reason).catch(() => {});
     signal?.addEventListener('abort', onAbort, { once: true });
@@ -434,9 +468,9 @@ globalThis.__appsWeb = (call, codec) => {
     get bodyUsed() { return !!this.body && disturbed(this.body); }
     async arrayBuffer() { return (await consume(this)).buffer; }
     bytes() { return consume(this); }
-    async text() { return new TextDecoder().decode(await consume(this)); }
+    async text() { return new TextDecoder().decode(await consume(this, undefined, false)); }
     async json() { return JSON.parse(await this.text()); }
-    async blob() { return new Blob([await consume(this)], { type: this.headers.get('content-type') ?? '' }); }
+    async blob() { return adopt(await consume(this), this.headers.get('content-type') ?? ''); }
     async formData() {
       const type = this.headers.get('content-type') ?? '';
       if (!/^application\/x-www-form-urlencoded(?:;|$)/i.test(type)) throw new DOMException('Only URL-encoded form responses are supported', 'NotSupportedError');
@@ -563,29 +597,40 @@ globalThis.__appsWeb = (call, codec) => {
     let request;
     try {
       request = new Request(input, init); request.signal.throwIfAborted();
-      const url = new URL(request.url), protocol = url.protocol;
+      // The href is ASCII, with its scheme in lowercase.
+      const href = request.url, protocol = href.slice(0, href.indexOf(':') + 1), hash = href.indexOf('#'), url = hash < 0 ? href : href.slice(0, hash);
       if (protocol === 'apps:') {
         if (!['GET', 'HEAD'].includes(request.method)) throw new TypeError('Bundled assets require GET');
-        const data = call('web.asset', request.url);
+        const data = call('web.asset', url);
         if (data === null) throw new TypeError('Failed to fetch');
-        const type = { wasm: 'application/wasm', svg: 'image/svg+xml', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', woff2: 'font/woff2', woff: 'font/woff', ttf: 'font/ttf', otf: 'font/otf', mp3: 'audio/mpeg', wav: 'audio/wav', mp4: 'video/mp4', glb: 'model/gltf-binary' }[request.url.split('.').pop()] ?? 'application/octet-stream';
+        const type = { wasm: 'application/wasm', svg: 'image/svg+xml', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', woff2: 'font/woff2', woff: 'font/woff', ttf: 'font/ttf', otf: 'font/otf', mp3: 'audio/mpeg', wav: 'audio/wav', mp4: 'video/mp4', glb: 'model/gltf-binary' }[url.split('.').pop()] ?? 'application/octet-stream';
         resolve(new Response(request.method === 'HEAD' ? null : decodeBytes(data), { headers: { 'content-type': type } })); return;
       }
       if (protocol === 'data:') {
         if (request.method !== 'GET') throw new TypeError('Data URLs require GET');
-        const source=url.href.slice(5,url.hash?-url.hash.length:undefined), comma=source.indexOf(',');
-        if(comma<0)throw new TypeError('Invalid data URL');
-        let type=source.slice(0,comma), bytes=[];
-        const raw=source.slice(comma+1);
-        const encoder=new TextEncoder();
-        for(let i=0;i<raw.length;){const code=raw.charCodeAt(i);if(code===37&&/^[0-9a-f]{2}$/i.test(raw.slice(i+1,i+3))){bytes.push(parseInt(raw.slice(i+1,i+3),16));i+=3;}else if(code<128){bytes.push(code);i++;}else{let end=i+1;while(end<raw.length&&raw.charCodeAt(end)>=128)end++;for(const byte of encoder.encode(raw.slice(i,end)))bytes.push(byte);i=end;}}
-        if(/;base64$/i.test(type)){type=type.slice(0,-7);bytes=Uint8Array.fromBase64(codec.decode(new Uint8Array(bytes),1));}
-        if(!type)type='text/plain;charset=US-ASCII';else if(type.startsWith(';'))type='text/plain'+type;
-        resolve(new Response(new Uint8Array(bytes),{headers:{'content-type':type}}));return;
+        const source = url.slice(5), comma = source.indexOf(',');
+        if (comma < 0) throw new TypeError('Invalid data URL');
+        let type = source.slice(0, comma), raw = source.slice(comma + 1), data;
+        const base64 = /;base64$/i.test(type);
+        if (!raw.includes('%')) { if (!base64) data = codec.encode(raw, 1); }
+        else {
+          const hex = code => code >= 48 && code <= 57 || (code | 32) >= 97 && (code | 32) <= 102;
+          data = new Uint8Array(raw.length); let size = 0;
+          for (let i = 0; i < raw.length; i++) {
+            const code = raw.charCodeAt(i);
+            if (code === 37 && hex(raw.charCodeAt(i + 1)) && hex(raw.charCodeAt(i + 2))) { data[size++] = parseInt(raw.slice(i + 1, i + 3), 16); i += 2; } else data[size++] = code;
+          }
+          data = data.subarray(0, size); raw = null;
+        }
+        if (base64) { type = type.slice(0, -7); data = Uint8Array.fromBase64(raw ?? codec.decode(data, 1)); }
+        if (!type) type = 'text/plain;charset=US-ASCII'; else if (type.startsWith(';')) type = 'text/plain' + type;
+        const response = new Response(data, { headers: { 'content-type': type } }); Object.assign(responses.get(response), { url, type: 'basic' });
+        resolve(response); return;
       }
       if (protocol === 'blob:') {
-        const blob = objectURLs.get(request.url); if (!blob || request.method !== 'GET') throw new TypeError('Invalid Blob URL request');
-        resolve(new Response(blob, { headers: { 'content-type': blob.type, 'content-length': String(blob.size) } })); return;
+        const blob = objectURLs.get(url); if (!blob || request.method !== 'GET') throw new TypeError('Invalid Blob URL request');
+        const response = new Response(blob, { headers: { 'content-type': blob.type, 'content-length': String(blob.size) } }); Object.assign(responses.get(response), { url, type: 'basic' });
+        resolve(response); return;
       }
       if (!['http:', 'https:'].includes(protocol)) throw new TypeError('Fetch supports HTTP, HTTPS, Blob, and data URLs');
     }
@@ -608,7 +653,7 @@ globalThis.__appsWeb = (call, codec) => {
       } catch (error) { if (state.uploadReader) { const reader = state.uploadReader; reader.cancel(error).catch(() => {}).finally(() => reader.releaseLock()); } signal.removeEventListener('abort', state.onAbort); reject(signal.aborted ? signal.reason : new TypeError(error.message)); queued.shift()?.(); }
     };
     if (request.body && !memoryBodies.has(request.body)) { state.uploadReader = request.body.getReader(); start(new Uint8Array()); }
-    else if (request.body) consume(request, signal).then(start, error => { signal.removeEventListener('abort', state.onAbort); reject(error); });
+    else if (request.body) consume(request, signal, false).then(start, error => { signal.removeEventListener('abort', state.onAbort); reject(error); });
     else start(new Uint8Array());
   });
   let beaconBytes = 0;
@@ -631,7 +676,7 @@ globalThis.__appsWeb = (call, codec) => {
       const socket = sockets.get(event.id); if (!socket) continue;
       if (event.kind === 'open') { socket.readyState = 1; socket.protocol = event.protocol; socket.dispatchEvent(new Event('open')); }
       else if (event.kind === 'written') socket.bufferedAmount = Math.max(0, socket.bufferedAmount - event.bytes);
-      else if (event.kind === 'message') socket.dispatchEvent(new MessageEvent('message', { data: event.text ?? (socket.binaryType === 'arraybuffer' ? decodeBytes(event.bytes).buffer : new Blob([decodeBytes(event.bytes)])) }));
+      else if (event.kind === 'message') socket.dispatchEvent(new MessageEvent('message', { data: event.text ?? (socket.binaryType === 'arraybuffer' ? decodeBytes(event.bytes).buffer : adopt(decodeBytes(event.bytes), '')) }));
       else {
         socket.readyState = 3; sockets.delete(event.id);
         if (event.kind === 'error') socket.dispatchEvent(new Event('error'));
@@ -683,7 +728,7 @@ globalThis.__appsWeb = (call, codec) => {
   class ProgressEvent extends Event {
     constructor(type, init = {}) { super(type, init); this.lengthComputable = !!init.lengthComputable; this.loaded = Number(init.loaded) || 0; this.total = Number(init.total) || 0; }
   }
-  const fireXhr = (target, type, init = {}) => { const event = type === 'readystatechange' ? new Event(type) : new ProgressEvent(type, init); target.dispatchEvent(event); target['on' + type]?.call(target, event); };
+  const fireXhr = (target, type, init = {}) => { const event = type === 'readystatechange' ? new Event(type) : new ProgressEvent(type, init); target.dispatchEvent(event); };
   class XMLHttpRequestEventTarget extends EventTarget {
     onloadstart = null; onprogress = null; onabort = null; onerror = null; onload = null; ontimeout = null; onloadend = null;
   }
@@ -758,7 +803,7 @@ globalThis.__appsWeb = (call, codec) => {
       if (this.readyState !== 4 || !this.#response) return null;
       if (this.responseType === 'json') { try { return JSON.parse(new TextDecoder().decode(this.#bytes)); } catch { return null; } }
       if (this.responseType === 'arraybuffer') return this.#bytes.buffer;
-      if (this.responseType === 'blob') return new Blob([this.#bytes], { type: this.#mime ?? this.#response.headers.get('content-type') ?? '' });
+      if (this.responseType === 'blob') return adopt(this.#bytes, this.#mime ?? this.#response.headers.get('content-type') ?? '');
       return this.responseXML;
     }
   }

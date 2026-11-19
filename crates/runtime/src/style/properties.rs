@@ -71,9 +71,9 @@ props! {
     WEBKIT_MASK_SIZE "-webkit-mask-size" "*",
     WEBKIT_TAP_HIGHLIGHT_COLOR "-webkit-tap-highlight-color" inherited "<color>",
     WEBKIT_TEXT_FILL_COLOR "-webkit-text-fill-color" inherited "<color>",
-    WEBKIT_TEXT_STROKE "-webkit-text-stroke" inherited,
-    WEBKIT_TEXT_STROKE_COLOR "-webkit-text-stroke-color" inherited,
-    WEBKIT_TEXT_STROKE_WIDTH "-webkit-text-stroke-width" inherited,
+    WEBKIT_TEXT_STROKE "-webkit-text-stroke" inherited "[thin|medium|thick|<non-negative-length>|<color>]{1,2}",
+    WEBKIT_TEXT_STROKE_COLOR "-webkit-text-stroke-color" inherited "<color>",
+    WEBKIT_TEXT_STROKE_WIDTH "-webkit-text-stroke-width" inherited "thin|medium|thick|<non-negative-length>",
     WEBKIT_USER_SELECT "-webkit-user-select" "auto|none|text|all|contain",
     ACCENT_COLOR "accent-color" inherited "auto|<color>",
     ALIGN_CONTENT "align-content" "[normal|stretch|baseline|first|last|center|start|end|self-start|self-end|flex-start|flex-end|left|right|safe|unsafe|space-between|space-around|space-evenly|legacy|auto|anchor-center]+",
@@ -195,11 +195,16 @@ props! {
     COLUMN_WIDTH "column-width" "auto|<non-negative-length>",
     COLUMNS "columns" "*",
     CONTAIN "contain",
+    CONTAIN_INTRINSIC_BLOCK_SIZE "contain-intrinsic-block-size" "*",
+    CONTAIN_INTRINSIC_HEIGHT "contain-intrinsic-height" "*",
+    CONTAIN_INTRINSIC_INLINE_SIZE "contain-intrinsic-inline-size" "*",
+    CONTAIN_INTRINSIC_SIZE "contain-intrinsic-size" "*",
+    CONTAIN_INTRINSIC_WIDTH "contain-intrinsic-width" "*",
     CONTAINER "container" "*",
     CONTAINER_NAME "container-name" "none|[<custom-ident>]+",
     CONTAINER_TYPE "container-type" "normal|size|inline-size",
     CONTENT "content" "*",
-    CONTENT_VISIBILITY "content-visibility",
+    CONTENT_VISIBILITY "content-visibility" "visible|auto|hidden",
     CORNER_BOTTOM_LEFT_SHAPE "corner-bottom-left-shape" "<corner-shape>",
     CORNER_BOTTOM_RIGHT_SHAPE "corner-bottom-right-shape" "<corner-shape>",
     CORNER_BOTTOM_SHAPE "corner-bottom-shape" "[<corner-shape>]{1,2}",
@@ -552,6 +557,17 @@ impl Prop {
         self.is_known().then_some(self.0 as usize)
     }
 
+    // The standard property that Chrome also takes under this `-webkit-` name.
+    pub(crate) fn unprefixed(name: &str) -> Option<&str> {
+        const ALIASES: &str = "align-content align-items align-self background-origin background-size animation animation-delay animation-direction animation-duration animation-fill-mode animation-iteration-count animation-name animation-play-state animation-timing-function appearance backface-visibility border-bottom-left-radius border-bottom-right-radius border-radius border-top-left-radius border-top-right-radius box-shadow box-sizing clip-path column-count column-gap column-rule column-rule-color column-rule-style column-rule-width column-span column-width columns filter flex flex-basis flex-direction flex-flow flex-grow flex-shrink flex-wrap justify-content mask mask-clip mask-image mask-origin mask-position mask-repeat mask-size order perspective perspective-origin transform transform-origin transform-style transition transition-delay transition-duration transition-property transition-timing-function user-select";
+        let base = name.strip_prefix("-webkit-")?;
+        ALIASES
+            .split(' ')
+            .any(|alias| alias == base)
+            .then_some(base)
+            .filter(|base| Self::find(base).is_some_and(Self::is_known))
+    }
+
     pub(crate) fn names() -> &'static [&'static str] {
         &NAMES
     }
@@ -581,6 +597,30 @@ pub struct Style {
     vars: Vars,
     known: [u64; WORDS],
     before: [u16; WORDS],
+    // The properties of `CURRENT` whose value is `currentcolor`, stored as the color.
+    current: u16,
+}
+
+// Color properties that store `currentcolor` as the color, so `inherit` must know the keyword.
+const CURRENT: [Prop; 11] = [
+    Prop::BORDER_TOP_COLOR,
+    Prop::BORDER_RIGHT_COLOR,
+    Prop::BORDER_BOTTOM_COLOR,
+    Prop::BORDER_LEFT_COLOR,
+    Prop::OUTLINE_COLOR,
+    Prop::TEXT_DECORATION_COLOR,
+    Prop::COLUMN_RULE_COLOR,
+    Prop::BACKGROUND_COLOR,
+    Prop::FLOOD_COLOR,
+    Prop::LIGHTING_COLOR,
+    Prop::STOP_COLOR,
+];
+
+fn current_bit(prop: Prop) -> u16 {
+    CURRENT
+        .iter()
+        .position(|&known| known == prop)
+        .map_or(0, |index| 1 << index)
 }
 
 impl Style {
@@ -649,7 +689,20 @@ impl Style {
         self.position(prop).is_ok()
     }
 
+    pub(crate) fn current(&self, prop: Prop) -> bool {
+        self.current & current_bit(prop) != 0
+    }
+
+    // `currentcolor` that `value` stands for, or else another value.
+    pub(crate) fn insert_current(&mut self, prop: Prop, value: Rc<str>) {
+        self.insert(prop, value);
+        self.current |= current_bit(prop);
+    }
+
     pub(crate) fn insert(&mut self, prop: Prop, value: impl Into<Rc<str>>) {
+        if self.current != 0 {
+            self.current &= !current_bit(prop);
+        }
         let value = value.into();
         match (self.position(prop), prop.is_custom()) {
             (Ok(index), true) => Rc::make_mut(&mut self.vars)[index].1 = value,
@@ -663,12 +716,31 @@ impl Style {
     }
 
     pub(crate) fn remove(&mut self, prop: Prop) -> Option<Rc<str>> {
+        if self.current != 0 {
+            self.current &= !current_bit(prop);
+        }
         let index = self.position(prop).ok()?;
         if prop.is_custom() {
             return Some(Rc::make_mut(&mut self.vars).remove(index).1);
         }
         self.count(prop, -1);
         Some(self.entries.remove(index).1)
+    }
+
+    // `keep` returns whether the value stands for `currentcolor` among the properties of `CURRENT`.
+    pub(crate) fn retain_current(
+        &mut self,
+        mut keep: impl FnMut(Prop, &mut Rc<str>) -> (bool, bool),
+    ) {
+        let mut current = 0;
+        self.retain(|prop, value| {
+            let (kept, keyword) = keep(prop, value);
+            if keyword {
+                current |= current_bit(prop);
+            }
+            kept
+        });
+        self.current = current;
     }
 
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(Prop, &mut Rc<str>) -> bool) {

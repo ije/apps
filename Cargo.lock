@@ -189,6 +189,7 @@ dependencies = [
  "bytes",
  "cc",
  "cpal",
+ "crc32fast",
  "cssparser",
  "flate2",
  "futures-util",

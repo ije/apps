@@ -102,6 +102,28 @@ impl Cache {
             }
             None => {
                 let mut line = fonts.platform.shape(text, font_size, spans);
+                // Text with a font size of 0 takes no room, so its glyphs have no advance and no metrics.
+                if spans.iter().any(|span| span.size == px(0.)) {
+                    let (mut end, mut zero) = (0, Vec::new());
+                    for span in spans {
+                        if span.size == px(0.) {
+                            zero.push(end as u32..(end + span.len) as u32);
+                        }
+                        end += span.len;
+                    }
+                    let mut removed = px(0.);
+                    for at in 0..line.glyphs.len() {
+                        let next = line.glyphs.get(at + 1).map_or(line.width, |glyph| glyph.x);
+                        let glyph = &mut line.glyphs[at];
+                        let advance = next - glyph.x;
+                        glyph.x -= removed;
+                        if zero.iter().any(|range| range.contains(&glyph.index)) {
+                            removed += advance;
+                        }
+                    }
+                    line.width -= removed;
+                    (line.ascent, line.descent) = (px(0.), px(0.));
+                }
                 for span in spans {
                     let metrics = fonts.metrics(span.font);
                     line.ascent = line.ascent.max(span.size * metrics.ascent);

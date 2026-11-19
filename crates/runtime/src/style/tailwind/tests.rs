@@ -1711,3 +1711,114 @@ fn standalone_pages_get_their_theme_base_and_classes() {
     }
     assert!(!css.contains("const"));
 }
+
+#[test]
+fn arbitrary_and_bare_values_infer_like_tailwind() {
+    assert_generated(
+        "",
+        &[
+            ("bg-[auto]", ".bg-\\[auto\\]{background-size:auto;}"),
+            ("bg-[13px]", ".bg-\\[13px\\]{background-position:13px;}"),
+            ("bg-[cover]", ".bg-\\[cover\\]{background-size:cover;}"),
+            (
+                "bg-[cover,_contain]",
+                ".bg-\\[cover\\,_contain\\]{background-size:cover, contain;}",
+            ),
+            ("mask-[13px]", ".mask-\\[13px\\]{mask-position:13px;}"),
+            ("mask-[cover]", ".mask-\\[cover\\]{mask-size:cover;}"),
+            (
+                "mask-[url(/m.png)]",
+                ".mask-\\[url\\(\\/m\\.png\\)\\]{mask-image:url(/m.png);}",
+            ),
+            (
+                "font-[13px]",
+                ".font-\\[13px\\]{--tw-font-weight:13px;font-weight:13px;}",
+            ),
+            (
+                "font-[Georgia]",
+                ".font-\\[Georgia\\]{font-family:Georgia;}",
+            ),
+            (
+                "font-[-apple-system]",
+                ".font-\\[-apple-system\\]{font-family:-apple-system;}",
+            ),
+            (
+                "font-[var(--a),_Georgia]",
+                ".font-\\[var\\(--a\\)\\,_Georgia\\]{--tw-font-weight:var(--a), Georgia;font-weight:var(--a), Georgia;}",
+            ),
+            (
+                "font-(color:--x)",
+                ".font-\\(color\\:--x\\){--tw-font-weight:var(--x);font-weight:var(--x);}",
+            ),
+            (
+                "font-features-['smcp']",
+                ".font-features-\\[\\'smcp\\'\\]{font-feature-settings:'smcp';}",
+            ),
+            (
+                "auto-cols-3",
+                ".auto-cols-3{grid-auto-columns:calc(var(--spacing) * 3);}",
+            ),
+            (
+                "mask-radial-at-[13px]",
+                ".mask-radial-at-\\[13px\\]{--tw-mask-radial-position:13px;}",
+            ),
+            ("rotate-3.5", ""),
+            ("brightness-0.5", ""),
+            ("zoom-3.5", ""),
+            ("-z-auto", ""),
+            ("-order-none", ""),
+            (
+                "backdrop-opacity-2.5",
+                ".backdrop-opacity-2\\.5{--tw-backdrop-opacity:opacity(2.5%);-webkit-backdrop-filter:var(--tw-backdrop-blur,) var(--tw-backdrop-brightness,) var(--tw-backdrop-contrast,) var(--tw-backdrop-grayscale,) var(--tw-backdrop-hue-rotate,) var(--tw-backdrop-invert,) var(--tw-backdrop-opacity,) var(--tw-backdrop-saturate,) var(--tw-backdrop-sepia,);backdrop-filter:var(--tw-backdrop-blur,) var(--tw-backdrop-brightness,) var(--tw-backdrop-contrast,) var(--tw-backdrop-grayscale,) var(--tw-backdrop-hue-rotate,) var(--tw-backdrop-invert,) var(--tw-backdrop-opacity,) var(--tw-backdrop-saturate,) var(--tw-backdrop-sepia,);}",
+            ),
+        ],
+    );
+    let [divide, mask, negative] = generated(
+        "",
+        &["divide-x-(--w)", "mask-x-from-(--x)", "-mask-linear-[13px]"],
+    )
+    .try_into()
+    .unwrap();
+    assert!(
+        divide.contains("border-inline-start-width:calc(var(--w) * var(--tw-divide-x-reverse))")
+    );
+    assert!(mask.contains("--tw-mask-left-from-position:var(--x)"));
+    assert!(negative.contains("--tw-mask-linear-position:calc(13px * -1)"));
+}
+
+#[test]
+fn custom_utilities_extend_builtins_and_take_ratios_like_tailwind() {
+    assert_generated(
+        "@theme { --aspect-retro: 4 / 3; } @utility w-* { --tw-custom: --value([*]); } @utility flex { --x: 1; } @utility block { --x: 1; display: grid; } @utility tab-4 { tab-size: 4; } @utility rat-* { aspect-ratio: --value(ratio); } @utility fs-* { font-size: --value([length]); line-height: --modifier([length]); }",
+        &[
+            ("w-[13px]", ".w-\\[13px\\]{width:13px;--tw-custom:13px;}"),
+            ("w-4", ".w-4{width:calc(var(--spacing) * 4);}"),
+            ("flex", ".flex{display:flex;--x:1;}"),
+            ("block", ".block{--x:1;display:block;}"),
+            ("tab-4", ".tab-4{tab-size:4;}"),
+            (
+                "aspect-retro",
+                ".aspect-retro{aspect-ratio:var(--aspect-retro);}",
+            ),
+            ("rat-16/9", ".rat-16\\/9{aspect-ratio:16 / 9;}"),
+            ("rat-16/0", ".rat-16\\/0{aspect-ratio:16 / 0;}"),
+            ("rat-1.5/1", ""),
+            (
+                "fs-[13px]/[20px]",
+                ".fs-\\[13px\\]\\/\\[20px\\]{font-size:13px;line-height:20px;}",
+            ),
+            ("fs-[13px]/7", ""),
+        ],
+    );
+}
+
+#[test]
+fn apply_keeps_decimal_classes_like_tailwind() {
+    let (doc, styles) = computed(
+        "<style>@import 'tailwindcss';.b{@apply py-1.5 px-0.5}</style><div class=b></div>",
+        None,
+    );
+    let b = &styles.values[id(&doc, ".b")];
+    assert_eq!(length(&b["padding-top"], 0., 16., 800., 600.), 6.);
+    assert_eq!(length(&b["padding-left"], 0., 16., 800., 600.), 2.);
+}

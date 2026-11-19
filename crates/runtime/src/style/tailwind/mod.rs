@@ -1493,6 +1493,25 @@ impl Body {
         }
     }
 
+    // Tailwind's sort key of a rule: the order of its properties, then more declarations first.
+    fn order(&self) -> (Vec<u16>, Reverse<usize>) {
+        let mut properties = BTreeSet::new();
+        let mut count = 0;
+        for (key, _) in self
+            .declarations
+            .iter()
+            .chain(self.nested.iter().flat_map(|(.., values)| values))
+        {
+            count += 1;
+            if let Some(&index) = ORDER_INDEX.get(self.sort.unwrap_or(key)) {
+                properties.insert(index);
+            }
+        }
+        let mut properties: Vec<_> = properties.into_iter().collect();
+        properties.push(u16::MAX);
+        (properties, Reverse(count))
+    }
+
     fn nest(mut self, at: &[&str], selector: &str, source: &str) -> Self {
         let pairs = Self::parse(source).declarations;
         self.nested.push((
@@ -2195,24 +2214,11 @@ impl Config {
         }
         ranks.sort_unstable_by(|a, b| b.cmp(a));
         ranks.dedup();
-        let mut properties = BTreeSet::new();
-        let mut count = 0;
-        for (key, _) in body
-            .declarations
-            .iter()
-            .chain(body.nested.iter().flat_map(|(.., values)| values))
-        {
-            count += 1;
-            if let Some(&index) = ORDER_INDEX.get(body.sort.unwrap_or(key)) {
-                properties.insert(index);
-            }
-        }
-        let mut properties: Vec<_> = properties.into_iter().collect();
-        properties.push(u16::MAX);
+        let (properties, count) = body.order();
         let sort = Sort {
             variants: ranks,
             properties,
-            count: Reverse(count),
+            count,
             name: class.to_owned(),
         };
         let suffix = if important { " !important" } else { "" };
@@ -2565,6 +2571,16 @@ impl Config {
 
     fn custom(&self, class: &str) -> Option<Body> {
         let (candidate, modifier) = modifier(class);
+        self.custom_with(candidate, modifier).or_else(|| {
+            // A value like `16/9` can be one `--value(ratio)` instead of a value and a modifier.
+            modifier
+                .filter(|modifier| integer(modifier))
+                .and_then(|_| self.custom_with(class, None))
+        })
+    }
+
+    fn custom_with(&self, candidate: &str, modifier: Option<&str>) -> Option<Body> {
+        let class = candidate;
         self.utilities
             .iter()
             .enumerate()
@@ -2576,7 +2592,7 @@ impl Config {
                             .strip_prefix(prefix)
                             .filter(|value| !value.is_empty())?,
                     ),
-                    None if name == class => None,
+                    None if name == class && modifier.is_none() => None,
                     None => return None,
                 };
                 let key = (index, value.map(str::to_owned), modifier.map(str::to_owned));
@@ -2591,10 +2607,12 @@ impl Config {
                 }
                 let outer = self.cut.replace(false);
                 self.expanding.borrow_mut().push(index);
-                let mut resolved = false;
+                let mut resolved = [false; 2];
                 let body = self
                     .expand(body, value, modifier, &mut resolved, 0)
-                    .filter(|_| value.is_none() || resolved);
+                    .filter(|_| {
+                        (value.is_none() || resolved[0]) && (modifier.is_none() || resolved[1])
+                    });
                 self.expanding.borrow_mut().truncate(expanding);
                 if !self.cut.get() {
                     let mut expanded = self.expanded.borrow_mut();
@@ -2613,7 +2631,7 @@ impl Config {
         source: &str,
         value: Option<&str>,
         modifier: Option<&str>,
-        resolved: &mut bool,
+        resolved: &mut [bool; 2],
         depth: u8,
     ) -> Option<Body> {
         if depth > 8 {
@@ -2674,7 +2692,7 @@ impl Config {
                     };
                     raw.replace_range(start..=close, &result);
                     from = start + result.len();
-                    *resolved |= function == "--value";
+                    resolved[usize::from(function == "--modifier")] = true;
                 }
                 if valid {
                     body.declarations
@@ -2735,6 +2753,9 @@ impl Config {
                         || hint.as_deref() == Some(kind)
                         || hint.is_none() && is_type(kind, &raw))
                     .then_some(raw),
+                    (None, None) if argument == "ratio" => {
+                        is_type(argument, value).then(|| value.replacen('/', " / ", 1))
+                    }
                     (None, None) => {
                         (named_value(value) && is_type(argument, value)).then(|| value.to_owned())
                     }
@@ -2922,9 +2943,27 @@ impl Config {
     }
 
     fn utility(&self, class: &str) -> Option<Body> {
-        if let Some(body) = self.custom(class) {
-            return Some(body);
-        }
+        let custom = self.custom(class);
+        // Like Tailwind, a custom utility with the name of a built-in one adds to it, in sort order.
+        let Some(builtin) = self.builtin(class) else {
+            return custom;
+        };
+        let Some(custom) = custom else {
+            return Some(builtin);
+        };
+        let (mut body, last) = if custom.order() < builtin.order() {
+            (custom, builtin)
+        } else {
+            (builtin, custom)
+        };
+        body.declarations
+            .retain(|(key, _)| last.declarations.iter().all(|(other, _)| other != key));
+        body.declarations.extend(last.declarations);
+        body.nested.extend(last.nested);
+        Some(body)
+    }
+
+    fn builtin(&self, class: &str) -> Option<Body> {
         if let Some(raw) = class
             .strip_prefix('[')
             .and_then(|raw| raw.strip_suffix(']'))
@@ -3096,12 +3135,8 @@ impl Config {
             })
         };
         let number = |unit: &str| {
-            let value = bare?;
-            (integer(value)
-                || value
-                    .parse::<f64>()
-                    .is_ok_and(|n| n >= 0. && (n * 4.).fract() == 0.))
-            .then(|| format!("{value}{unit}"))
+            bare.filter(|value| integer(value))
+                .map(|value| format!("{value}{unit}"))
         };
         let width = |default: &str| match value {
             None => Some(default.to_owned()),
@@ -3120,6 +3155,7 @@ impl Config {
             let value = match (value, &raw) {
                 (None, _) => default?.to_owned(),
                 (_, Some(raw)) => raw.clone(),
+                _ if root == "backdrop-opacity" => self.opacity(bare?)?,
                 _ => number(unit)?,
             };
             let backdrop = root.starts_with("backdrop-");
@@ -3430,7 +3466,7 @@ impl Config {
                         &format!("border-color:{color}"),
                     ));
                 }
-                let width = width("1px")?;
+                let width = raw.clone().or_else(|| width("1px"))?;
                 let axis = &root[7..];
                 let reverse = format!("--tw-divide-{axis}-reverse");
                 let source = if axis == "x" {
@@ -3589,6 +3625,7 @@ impl Config {
                 let resolved = match (bare, &raw) {
                     (_, Some(raw)) if span => format!("span {raw} / span {raw}"),
                     (_, Some(raw)) => raw.clone(),
+                    (Some(value), _) if negative && !integer(value) => return None,
                     (None, _)
                         if matches!(root, "grow" | "shrink" | "flex-grow" | "flex-shrink") =>
                     {
@@ -3658,6 +3695,9 @@ impl Config {
                     (Some("min"), _) if root.starts_with("auto") => "min-content".into(),
                     (Some("max"), _) if root.starts_with("auto") => "max-content".into(),
                     (Some("fr"), _) if root.starts_with("auto") => "minmax(0, 1fr)".into(),
+                    (Some(value), _) if root.starts_with("auto") && value != "px" => {
+                        self.spacing(value)?
+                    }
                     _ => return None,
                 };
                 let property = match root {
@@ -3787,7 +3827,13 @@ impl Config {
                             Some("background-image")
                         }
                         None if is_color(raw) || raw.starts_with("var(") => None,
-                        None => Some("background-position"),
+                        None => layer(raw).map(|kind| {
+                            if kind == "size" {
+                                "background-size"
+                            } else {
+                                "background-position"
+                            }
+                        }),
                     };
                     if let Some(property) = property {
                         return Body::new(&[(property, raw.clone())]);
@@ -3906,11 +3952,27 @@ impl Config {
                     ("--tw-gradient-stops", STOPS.into()),
                 ])
             }
-            "mask" => Body::new(&[("mask-image", raw?)]),
+            "mask" => {
+                let raw = raw?;
+                let kind = match hint {
+                    Some("position" | "percentage") => Some("position"),
+                    Some("length" | "size" | "bg-size") => Some("size"),
+                    Some(_) => None,
+                    None => layer(&raw),
+                };
+                Body::new(&[(
+                    match kind {
+                        Some("position") => "mask-position",
+                        Some(_) => "mask-size",
+                        None => "mask-image",
+                    },
+                    raw,
+                )])
+            }
             "mask-linear" | "mask-conic" | "mask-radial" => {
                 let kind = &root[5..];
                 let position = match (bare, &raw) {
-                    (_, Some(raw)) => raw.clone(),
+                    (_, Some(raw)) => negate(raw.clone()),
                     (Some(angle @ ("0" | "1")), None) if kind != "radial" => {
                         format!(
                             "{}{angle}deg",
@@ -3940,8 +4002,9 @@ impl Config {
                 let (edge, end) = root[5..].rsplit_once('-')?;
                 let value = value?;
                 let position = match (bare, hint, &raw) {
-                    (_, Some("length" | "percentage"), Some(raw)) => Some(raw.clone()),
-                    (_, None, Some(raw)) if is_length(raw) => Some(raw.clone()),
+                    (_, Some("color"), _) => None,
+                    (_, Some(_), Some(raw)) => Some(raw.clone()),
+                    (_, None, Some(raw)) if !is_color(raw) => Some(raw.clone()),
                     (Some(value), ..) if value.ends_with('%') => {
                         integer(value.strip_suffix('%')?).then(|| value.to_owned())
                     }
@@ -4059,10 +4122,20 @@ impl Config {
             "font" => {
                 if let Some(raw) = &raw {
                     let weight = match hint {
-                        Some("number") => true,
                         Some("family-name" | "generic-name") => false,
-                        Some(_) => return None,
-                        None => raw.parse::<u16>().is_ok() || raw.starts_with("var("),
+                        Some(_) => true,
+                        // Tailwind's order: a var() or a number is a weight, then a family name has no
+                        // part that starts with a digit and one part that is not a var().
+                        None => {
+                            let parts = split(raw, ',');
+                            raw.starts_with("var(")
+                                || raw.parse::<f64>().is_ok()
+                                || MATH.iter().any(|name| raw.contains(&format!("{name}(")))
+                                || parts
+                                    .iter()
+                                    .any(|part| part.starts_with(|c: char| c.is_ascii_digit()))
+                                || parts.iter().all(|part| part.starts_with("var("))
+                        }
                     };
                     if weight {
                         return Body::new(&[
@@ -4125,9 +4198,12 @@ impl Config {
                     None => {
                         let value = bare?;
                         let number: f64 = value.parse().ok()?;
-                        ((number >= 0. && root == "zoom" || (0. ..=100.).contains(&number))
-                            && (number * 4.).fract() == 0.)
-                            .then(|| format!("{value}%"))?
+                        (if root == "zoom" {
+                            integer(value)
+                        } else {
+                            (0. ..=100.).contains(&number) && (number * 4.).fract() == 0.
+                        })
+                        .then(|| format!("{value}%"))?
                     }
                 };
                 Body::new(&[(root, resolved)])
@@ -4455,16 +4531,19 @@ impl Config {
                     (_, Some(raw)) => raw.clone(),
                     (Some("auto"), _) => "auto".into(),
                     (Some("square"), _) => "1 / 1".into(),
-                    (Some("video"), _) => self.theme("--aspect", "video")?,
                     (Some(value), _) if integer(value) && modifier.is_some_and(integer) => {
                         format!("{value} / {}", modifier?)
                     }
+                    (Some(value), _) if modifier.is_none() => self.theme("--aspect", value)?,
                     _ => return None,
                 };
                 Body::new(&[("aspect-ratio", resolved)])
             }
-            "cursor" | "will-change" | "contain" | "list" | "list-image" | "align" | "object" => {
+            "cursor" | "will-change" | "contain" | "list" | "list-image" | "align" | "object"
+            | "font-features" | "mask-radial-at" => {
                 let property = match root {
+                    "font-features" => "font-feature-settings",
+                    "mask-radial-at" => "--tw-mask-radial-position",
                     "list" => "list-style-type",
                     "list-image" => "list-style-image",
                     "align" => "vertical-align",
@@ -4829,11 +4908,12 @@ fn decode(raw: &str) -> String {
     math(&value)
 }
 
+const MATH: &[&str] = &[
+    "calc", "min", "max", "clamp", "mod", "rem", "sin", "cos", "tan", "asin", "acos", "atan",
+    "atan2", "pow", "sqrt", "hypot", "log", "exp", "round",
+];
+
 fn math(value: &str) -> String {
-    const MATH: &[&str] = &[
-        "calc", "min", "max", "clamp", "mod", "rem", "sin", "cos", "tan", "asin", "acos", "atan",
-        "atan2", "pow", "sqrt", "hypot", "log", "exp", "round",
-    ];
     if !MATH.iter().any(|name| value.contains(name)) {
         return value.to_owned();
     }
@@ -5017,8 +5097,30 @@ fn is_type(kind: &str, value: &str) -> bool {
                     .is_some_and(|number| number.parse::<f64>().is_ok())
         }
         "color" => is_color(value),
+        "ratio" => value
+            .split_once('/')
+            .is_some_and(|(a, b)| integer(a.trim()) && integer(b.trim())),
         _ => false,
     }
+}
+
+// Tailwind's inference of arbitrary background and mask values: "position" or "size".
+fn layer(raw: &str) -> Option<&'static str> {
+    let length = |part: &str| {
+        is_length(part) && (part == "0" || part.parse::<f64>().is_err() || part.ends_with('%'))
+    };
+    let parts = || {
+        raw.split(|c: char| c == ',' || c.is_ascii_whitespace())
+            .filter(|part| !part.is_empty())
+    };
+    if parts()
+        .all(|part| length(part) || matches!(part, "left" | "right" | "top" | "bottom" | "center"))
+    {
+        return Some("position");
+    }
+    parts()
+        .all(|part| length(part) || matches!(part, "auto" | "cover" | "contain"))
+        .then_some("size")
 }
 
 fn is_length(value: &str) -> bool {

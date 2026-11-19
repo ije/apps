@@ -77,6 +77,8 @@ pub(crate) struct PageState {
     shared: RefCell<rustc_hash::FxHashMap<u64, Vec<element::Shared>>>,
     focused: Cell<Option<usize>>,
     patches: RefCell<rustc_hash::FxHashMap<usize, element::Patch>>,
+    // How each absolutely positioned box was last built, to build it again in place.
+    outs: RefCell<rustc_hash::FxHashMap<usize, element::Patch>>,
     epoch: Cell<(u64, bool)>,
     reads: RefCell<Vec<element::Read>>,
     walked: RefCell<rustc_hash::FxHashMap<usize, element::Walked>>,
@@ -177,7 +179,10 @@ fn reflow(id: u64) {
     // Reflow after composite frames even if the page is clean: boxes moved without layout.
     if view.host.try_borrow_mut().map_or(true, |host| {
         !host.pages.get(&id).is_some_and(|page| page.dirty)
-            && !host.dom.get(&id).is_some_and(|dom| dom.bounds.moved())
+            && !host
+                .dom
+                .get(&id)
+                .is_some_and(|dom| dom.bounds.moved() || dom.cull.reskipped)
     }) {
         return;
     }
@@ -388,6 +393,7 @@ impl PageView {
             shared: RefCell::default(),
             focused: Cell::default(),
             patches: RefCell::default(),
+            outs: RefCell::default(),
             epoch: Cell::default(),
             reads: RefCell::default(),
             walked: RefCell::default(),
@@ -548,7 +554,9 @@ impl PageView {
                         "gestureScrollEnd"
                     };
                     link.event(
-                        format!("__appsEvent('input-event',{},{{type:'{kind}'}})", view.id),
+                        "input-event",
+                        view.id,
+                        Some(serde_json::json!({"type": kind})),
                         "apps:input",
                     );
                 }
@@ -625,6 +633,7 @@ impl PageView {
             window.forget_states();
             self.kept.take();
             self.patches.take();
+            self.outs.take();
             self.kept_frame.take();
             self.walked.take();
             self.adjoined.take();
@@ -668,6 +677,37 @@ impl PageView {
         {
             styles = crate::dom::styles(&mut doc, dom, [width, height]);
         }
+        // Boxes forced to show their contents for a script skip them again in the next frame.
+        let mut waking = std::mem::take(&mut dom.measurements.waking);
+        if !self.reflowing.get() {
+            waking.extend(dom.measurements.forced.drain());
+        }
+        if !waking.is_empty() {
+            let mut nodes = rustc_hash::FxHashSet::default();
+            for id in waking {
+                let path: Vec<_> = std::iter::successors(Some(id), |&node| {
+                    crate::dom::flat_parent(&doc, dom, &styles, node)
+                })
+                .collect();
+                for node in path {
+                    if let Some(info) = dom.cull.info.get_mut(node) {
+                        info.flags &= !cull::SHOWN;
+                    }
+                    nodes.insert(node);
+                }
+                // The boxes inside kept records of the other state, like the boxes of nested `auto` boxes.
+                let mut pending = doc
+                    .nodes
+                    .get(id)
+                    .map_or_else(Vec::new, |node| node.children.clone());
+                while let Some(node) = pending.pop() {
+                    nodes.insert(node);
+                    pending.extend(&doc.nodes[node].children);
+                    pending.extend(dom.shadows.get(&node));
+                }
+            }
+            cull::reskip(&self.0, dom, &nodes);
+        }
         let mut children: Vec<_> = styles
             .children
             .iter()
@@ -677,34 +717,46 @@ impl PageView {
         // Remove cull.seen's extra Rc during the frame so animated styles can swap values without copying.
         let last = dom.cull.seen.take();
         let (walked, serial) = (dom.cull.walk.nodes.clone(), dom.cull.walk.serial);
-        let same = last.as_ref().is_some_and(|(latest, focus, computed)| {
-            (*latest, *focus) == seen && Rc::ptr_eq(computed, &styles)
-        });
+        // Animated values that the last frame swapped in are gone from `styles`, so their nodes changed.
+        let same = dom.cull.swapped.is_empty()
+            && last.as_ref().is_some_and(|(latest, focus, computed)| {
+                (*latest, *focus) == seen && Rc::ptr_eq(computed, &styles)
+            });
         let mut visible = std::mem::take(&mut dom.cull.visible);
         let mut previous = None;
         let patched = !same && walk(&doc, dom, &styles);
         let none = |style: &Rc<style::Style>| style.get(Prop::DISPLAY) == Some("none");
+        let skips = |id: usize, style: &Rc<style::Style>| {
+            let value = style.get(Prop::CONTENT_VISIBILITY);
+            let tag = doc.nodes.get(id).map_or("", |node| node.tag.as_str());
+            (
+                cull::skippable(tag, style),
+                value == Some("hidden"),
+                value == Some("auto"),
+            )
+        };
         let rewalked = !Rc::ptr_eq(&dom.cull.walk.nodes, &walked);
         // A patched walk changes the visibility of the nodes it touched only. Table cells also show their rows,
         // so their lists must be the same.
         let touched = dom.cull.walk.since(serial).filter(|_| patched);
-        let steady = same
-            || dom.cull.cascaded
-                && (!rewalked || touched.is_some())
-                && last.as_ref().is_some_and(|(.., computed)| {
-                    styles
-                        .values
-                        .differing(&computed.values)
-                        .flatten()
-                        .all(|id| {
-                            computed.values.get(id).is_none_or(|old| {
-                                styles
-                                    .values
-                                    .get(id)
-                                    .is_some_and(|new| none(old) == none(new))
+        // A `content-visibility: auto` box that shows or skips its contents shows or hides all nodes in it.
+        let steady = !std::mem::take(&mut dom.cull.reskipped)
+            && (same
+                || dom.cull.cascaded
+                    && (!rewalked || touched.is_some())
+                    && last.as_ref().is_some_and(|(.., computed)| {
+                        styles
+                            .values
+                            .differing(&computed.values)
+                            .flatten()
+                            .all(|id| {
+                                computed.values.get(id).is_none_or(|old| {
+                                    styles.values.get(id).is_some_and(|new| {
+                                        none(old) == none(new) && skips(id, old) == skips(id, new)
+                                    })
+                                })
                             })
-                        })
-                });
+                    }));
         // The nodes that a patched walk showed or hid.
         let mut flips = Vec::new();
         if steady {
@@ -730,7 +782,9 @@ impl PageView {
             for (at, id) in placed {
                 let (id, parent) = (id as usize, walk.nodes[at as usize].1);
                 let style = &styles.values[id];
-                let shown = (parent == u32::MAX || visible[parent as usize])
+                let shown = (parent == u32::MAX
+                    || visible[parent as usize]
+                        && !skipping(&doc, dom, &styles, parent as usize, true))
                     && !match dom.layout_nodes.get(id).and_then(Option::as_ref) {
                         Some(old) if Rc::ptr_eq(&old.style, style) => old.flags & cull::HIDDEN != 0,
                         _ => none(style),
@@ -906,6 +960,8 @@ impl PageView {
         let mut restore = Vec::new();
         let mut restore_pseudos = Vec::new();
         let pseudos = std::mem::take(&mut dom.motion.pseudos);
+        // Paint and the next frame read the cascade values, so they go back to `computed` after the frame.
+        let taken = !pseudos.is_empty() || !animated.is_empty() || !lengths.is_empty();
         if !pseudos.is_empty() {
             dom.computed = None;
             let map = &mut Rc::make_mut(&mut styles).pseudos;
@@ -951,6 +1007,7 @@ impl PageView {
             self.svgs.borrow_mut().remove(&id);
             self.kept.borrow_mut().remove(&id);
             self.patches.borrow_mut().remove(&id);
+            self.outs.borrow_mut().remove(&id);
             self.walked.borrow_mut().remove(&id);
             self.adjoined.borrow_mut().remove(&id);
             self.fields.borrow_mut().remove(&id);
@@ -960,12 +1017,14 @@ impl PageView {
             dom.containers.remove(&id);
             dom.flexed_grids.remove(&id);
             dom.grid_widest.remove(&id);
+            dom.tracks.remove(&id);
             dom.anchors.remove(&id);
         }
         if flipped {
             self.svgs.borrow_mut().retain(|&id, _| shown(id));
             self.kept.borrow_mut().retain(|&id, _| shown(id));
             self.patches.borrow_mut().retain(|&id, _| shown(id));
+            self.outs.borrow_mut().retain(|&id, _| shown(id));
             self.walked.borrow_mut().retain(|&id, _| shown(id));
             self.adjoined.borrow_mut().retain(|&id, _| shown(id));
             self.fields.borrow_mut().retain(|&id, _| shown(id));
@@ -973,6 +1032,7 @@ impl PageView {
             dom.containers.retain(|&id, _| shown(id));
             dom.flexed_grids.retain(|&id, _| shown(id));
             dom.grid_widest.retain(|&id, _| shown(id));
+            dom.tracks.retain(|&id, _| shown(id));
             dom.anchors.retain(|&id, _| shown(id));
         }
         {
@@ -1171,7 +1231,7 @@ impl PageView {
                     .is_some_and(|info| info.flags & flags == flags)
             });
         let settled = unchanged && !dom.container_pass;
-        const PER_FRAME: u16 = cull::CHANGED
+        const PER_FRAME: u32 = cull::CHANGED
             | cull::CHILDREN_CHANGED
             | cull::GEOMETRY_CHANGED
             | cull::COMPOSITED
@@ -1280,6 +1340,7 @@ impl PageView {
                     .flatten()
                     .chain(dom.cull.painted.iter().copied())
                     .chain(paint.iter().map(|(id, _)| *id))
+                    .chain(std::mem::take(&mut dom.cull.swapped))
                 {
                     if id < doc.nodes.len() {
                         mark(id);
@@ -1371,19 +1432,35 @@ impl PageView {
                     !Rc::ptr_eq(&old.style, style) || repseudoed(old) || old.shape != shape
                 });
                 let own = restyled || old.is_some_and(|old| old.attrs != attrs);
-                // Pseudo-elements are boxes of the element, and grid items.
-                let reshaped = old.is_none_or(|old| {
-                    old.shape != shape
+                // Pseudo-elements are boxes of the element, and grid items. The ones that change other than in
+                // paint, and `true` when they can change the size of the box.
+                let repseudo = |old: &crate::dom::LayoutNode| {
+                    if !repseudoed(old) {
+                        return None;
+                    }
+                    let (Some(before), Some(now)) = (&old.pseudos, pseudos) else {
+                        return Some(true);
+                    };
+                    let positioned = |style: &style::Style| {
+                        style
+                            .get(Prop::POSITION)
+                            .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+                    };
+                    (before.iter().zip(now.iter()))
+                        .filter(|(old, new)| !cull::cosmetic(old, new))
+                        .map(|(old, new)| !positioned(old) || !positioned(new))
+                        .reduce(|a, b| a || b)
+                };
+                let shaped = old.map(|old| {
+                    let own = old.shape != shape
                         || !Rc::ptr_eq(&old.style, style)
                             && (old.units != units(&styles.lengths[id])
-                                || !cull::cosmetic(&old.style, style))
-                        || repseudoed(old)
-                            && !old.pseudos.as_ref().zip(pseudos).is_some_and(|(old, new)| {
-                                old.iter()
-                                    .zip(new.iter())
-                                    .all(|(old, new)| cull::cosmetic(old, new))
-                            })
+                                || !cull::cosmetic(&old.style, style));
+                    (own, repseudo(old))
                 });
+                let reshaped = shaped.is_none_or(|(own, pseudo)| own || pseudo.is_some());
+                // An absolutely positioned pseudo-element leaves the size of the box and its place as they were.
+                let resized = shaped.is_none_or(|(own, pseudo)| own || pseudo == Some(true));
                 let (flags, marks) = match old {
                     Some(old) if !restyled => (old.flags, old.marks),
                     _ => {
@@ -1416,8 +1493,8 @@ impl PageView {
                             pseudos.is_some_and(|pair| pair.iter().any(cull::reads_height));
                         (
                             flags,
-                            (u16::from(framed) * cull::READS_LAST_FRAME)
-                                | (u16::from(heighted) * cull::READS_HEIGHT),
+                            (u32::from(framed) * cull::READS_LAST_FRAME)
+                                | (u32::from(heighted) * cull::READS_HEIGHT),
                         )
                     }
                 };
@@ -1425,12 +1502,20 @@ impl PageView {
                     rustc_hash::FxHasher::default(),
                     rustc_hash::FxHasher::default(),
                 );
-                let (mut out, mut moved, mut below) = (0u64, 0u64, 0u16);
+                let (mut out, mut moved, mut below) = (0u64, 0u64, 0u32);
                 for &child in &node.children {
                     let child_info = &info[child];
                     below |= child_info.flags;
                     if child_info.flags & cull::OUT_OF_FLOW != 0 {
-                        out = out.wrapping_add(child_info.subtree);
+                        // A positioned box that builds in place leaves its parent as it was, when only the
+                        // boxes in it changed.
+                        let inside = child_info.flags & cull::HIDDEN == 0
+                            && self.outs.borrow().contains_key(&child)
+                            && self.kept.borrow().contains_key(&child);
+                        out = out.wrapping_add(match inside {
+                            true => child_info.shell,
+                            false => child_info.subtree,
+                        });
                     } else {
                         std::hash::Hasher::write_usize(&mut list, child);
                         std::hash::Hasher::write_usize(&mut kids, child);
@@ -1442,9 +1527,10 @@ impl PageView {
                     std::hash::Hasher::finish(&list),
                     std::hash::Hasher::finish(&kids),
                 );
+                // A box that only paints otherwise, or whose positioned pseudo-elements changed, builds in place.
                 let repainted = placing
                     && restyled
-                    && !reshaped
+                    && !resized
                     && old.is_some_and(|old| {
                         old.attrs == attrs
                             && old.out == out
@@ -1467,7 +1553,7 @@ impl PageView {
                 if own && !repainted || old.is_some_and(|old| old.out != out || old.kids != kids) {
                     relisted = old.is_none_or(|old| old.list != list);
                     let geometry = old
-                        .filter(|old| !reshaped && !relisted && moved <= old.geometry)
+                        .filter(|old| !resized && !relisted && moved <= old.geometry)
                         .map(|old| old.geometry);
                     dom.layout_revision =
                         LAYOUT_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1483,6 +1569,9 @@ impl PageView {
                         out,
                         revision: dom.layout_revision,
                         geometry: geometry.unwrap_or(dom.layout_revision),
+                        shell: old
+                            .filter(|_| !own)
+                            .map_or(dom.layout_revision, |old| old.shell),
                         flags,
                         marks,
                     });
@@ -1498,15 +1587,16 @@ impl PageView {
                 info[id] = cull::Info {
                     revision: layout.map_or(0, |node| node.geometry),
                     subtree: layout.map_or(0, |node| node.revision),
+                    shell: layout.map_or(0, |node| node.shell),
                     flags: if flags & cull::HIDDEN != 0 {
                         flags
                     } else {
                         info[id].flags
                             | flags
-                            | (u16::from(reshaped) * cull::CHANGED)
-                            | (u16::from(relisted) * cull::CHILDREN_CHANGED)
+                            | (u32::from(reshaped) * cull::CHANGED)
+                            | (u32::from(relisted) * cull::CHILDREN_CHANGED)
                             | marks
-                            | (u16::from(dom.focus == Some(id)) * cull::UNCULLABLE)
+                            | (u32::from(dom.focus == Some(id)) * cull::UNCULLABLE)
                             | below
                                 & (cull::UNCULLABLE
                                     | cull::READS_VIEWPORT
@@ -1545,7 +1635,7 @@ impl PageView {
             (!composited.is_empty()).then(|| (now + std::time::Duration::from_millis(300), false)),
         );
         for &(id, turns) in &composited {
-            info[id].flags |= cull::COMPOSITED | (u16::from(turns) * cull::TRANSFORMED);
+            info[id].flags |= cull::COMPOSITED | (u32::from(turns) * cull::TRANSFORMED);
             fresh.iter_mut().for_each(|fresh| fresh.push(id));
         }
         for &id in &pseudo_layers {
@@ -1683,6 +1773,7 @@ impl PageView {
         }
         let mut stale = false;
         let mut around = rustc_hash::FxHashSet::default();
+        let mut regridded = rustc_hash::FxHashSet::default();
         for &id in &changed {
             dom.measurements.texts.remove(&id);
             if dom.layout_nodes[id]
@@ -1691,10 +1782,17 @@ impl PageView {
             {
                 let mut node = Some(id);
                 while let Some(id) = node.filter(|&id| around.insert(id)) {
-                    dom.grids.remove(&id);
                     info[id].flags |= cull::GEOMETRY_CHANGED;
                     fresh.iter_mut().for_each(|fresh| fresh.push(id));
                     node = crate::dom::flat_parent(&doc, dom, &styles, id);
+                }
+                // Grid tracks leave out absolutely positioned items, so the grids above one keep their layout.
+                let mut node = Some(id);
+                while let Some(id) = node.filter(|&id| regridded.insert(id)) {
+                    dom.grids.remove(&id);
+                    node = (info[id].flags & cull::OUT_OF_FLOW == 0)
+                        .then(|| crate::dom::flat_parent(&doc, dom, &styles, id))
+                        .flatten();
                 }
                 stale = true;
             }
@@ -1711,6 +1809,7 @@ impl PageView {
             dom.linted = true;
             if dom.checked.len() > 65536 {
                 dom.checked.clear();
+                dom.checked_values.clear();
             }
             for name in style::DROPPED.take() {
                 if name.contains(':') {
@@ -1747,7 +1846,19 @@ impl PageView {
                 {
                     let Some(values) = values else { continue };
                     for (key, value) in values.own() {
-                        if !pseudo.is_empty() && style.value(key) == Some(value)
+                        // A custom property takes any value, and an animated one takes values between those of
+                        // its keyframes. Both can change each frame.
+                        if key.is_custom()
+                            || index == 0 && dom.motion.animates(id, &styles, key)
+                            || !pseudo.is_empty() && style.value(key) == Some(value)
+                            // Most values are the ones of the last style, so their address finds them first.
+                            || dom
+                                .checked_values
+                                .insert(
+                                    (Rc::as_ptr(value).cast::<u8>() as usize, index as u8, key),
+                                    value.clone(),
+                                )
+                                .is_some()
                             || !dom.checked.insert((index as u8, key, value.clone()))
                         {
                             continue;
@@ -1895,6 +2006,23 @@ impl PageView {
             })
             .collect();
         dom.measurements.pixel_ratio = window.scale_factor();
+        let measured = &dom.measurements;
+        for (&id, &shown) in &measured.shown {
+            if let Some(info) = info.get_mut(id) {
+                info.flags = info.flags & !cull::SHOWN | (u32::from(shown) * cull::SHOWN);
+            }
+        }
+        // A script reads geometry in a forced box, so neither it nor a box around it becomes a spacer.
+        for &id in &measured.forced {
+            let mut node = Some(id);
+            while let Some(id) = node {
+                if let Some(info) = info.get_mut(id) {
+                    info.flags |= cull::SHOWN;
+                }
+                node = crate::dom::flat_parent(&doc, dom, &styles, id);
+            }
+        }
+        let autos = !dom.autos.is_empty();
         let measured = RefCell::new(std::mem::take(&mut dom.measurements));
         let walk = dom.style_walk.nodes.clone();
         for text in warnings {
@@ -2114,6 +2242,91 @@ impl PageView {
                     window.patch(*node);
                 }
             }
+            // Positioned boxes whose parents stayed because only the boxes in them changed. Outside in, so a box
+            // that builds inside another one's build is skipped.
+            let mut stale: Vec<(usize, usize)> = {
+                let (outs, kept) = (self.outs.borrow(), self.kept.borrow());
+                (outs.iter())
+                    .filter(|&(&id, _)| {
+                        tree.contains(id)
+                            && info[id].flags & (cull::OUT_OF_FLOW | cull::HIDDEN)
+                                == cull::OUT_OF_FLOW
+                            && kept
+                                .get(&id)
+                                .is_some_and(|record| record.subtree() != info[id].subtree)
+                    })
+                    .map(|(&id, patch)| (patch.ancestors.len(), id))
+                    .collect()
+            };
+            stale.sort_unstable();
+            for (_, id) in stale {
+                // A positioned box around it built it already.
+                if self
+                    .kept
+                    .borrow()
+                    .get(&id)
+                    .is_none_or(|kept| kept.subtree() == info[id].subtree)
+                {
+                    continue;
+                }
+                let (Some(patch), Some(old)) = (
+                    self.outs.borrow_mut().remove(&id),
+                    self.kept.borrow_mut().remove(&id),
+                ) else {
+                    continue;
+                };
+                let mark = reads.borrow().len();
+                let inner = Build {
+                    ancestors: patch.ancestors.clone(),
+                    flex_parent: patch.flex_parent,
+                    columned: patch.columned,
+                    perspective: patch.perspective,
+                    zone: None,
+                    #[cfg(debug_assertions)]
+                    extra: Default::default(),
+                    #[cfg(debug_assertions)]
+                    plan: Default::default(),
+                    ..build
+                };
+                #[cfg(debug_assertions)]
+                let printed = inner.prints.borrow().len();
+                let bounds = patch.slot.as_ref().map(|(bounds, _)| *bounds);
+                let child = element(&inner, id, patch.containing, patch.container, patch.slot);
+                let child = match bounds {
+                    Some(bounds) => {
+                        let mut units = styles.lengths[id];
+                        units.container = Some(patch.container);
+                        let margin =
+                            units.edges(&styles.values[id], style::MARGIN, patch.containing[0]);
+                        element::place(child, margin, inner.pixel_ratio, bounds)
+                    }
+                    None => child,
+                };
+                #[cfg(debug_assertions)]
+                {
+                    inner.prints.borrow_mut().truncate(printed);
+                    if let Some(new) = self.kept.borrow().get(&id) {
+                        new.seen.set(old.seen.get());
+                    }
+                }
+                reads.borrow_mut().truncate(mark);
+                // The records of the boxes around hold the reads of the boxes in this one, so other reads build
+                // them again.
+                if self
+                    .kept
+                    .borrow()
+                    .get(&id)
+                    .is_none_or(|new| !new.same_reads(&old))
+                {
+                    let mut kept = self.kept.borrow_mut();
+                    for ancestor in patch.ancestors.iter() {
+                        kept.remove(ancestor);
+                    }
+                }
+                if let renderer::Child::Node(node) = child {
+                    window.patch(*node);
+                }
+            }
         }
         // Build in place from the outside in, so a box already built inside another one's build is skipped.
         let mut places: Vec<(usize, usize)> = {
@@ -2203,6 +2416,12 @@ impl PageView {
             dom.animating_pseudos.clear();
             let restored =
                 !restore.is_empty() || !restore_pseudos.is_empty() || !lengths.is_empty();
+            // Animated values go back to the cascade values here, and the next frame visits their nodes again.
+            // Animated units are not in the values, so a frame after them visits all nodes.
+            dom.cull.swapped = (restore.iter().map(|(id, _)| *id))
+                .chain(restore_pseudos.iter().map(|(id, _)| *id))
+                .collect();
+            let units = !lengths.is_empty();
             if restored {
                 let styles = Rc::make_mut(&mut styles);
                 for (id, old) in lengths {
@@ -2218,8 +2437,8 @@ impl PageView {
                     }
                 }
             }
-            dom.cull.seen = (!relaid).then(|| (seen.0, seen.1, styles.clone()));
-            if restored {
+            dom.cull.seen = (!units).then(|| (seen.0, seen.1, styles.clone()));
+            if taken {
                 dom.computed = Some(styles);
             }
             if !left.is_empty() {
@@ -2297,6 +2516,7 @@ impl PageView {
                 )
                 .absolute()
             })
+            .children(autos.then(|| cull::autos(self.0.clone())))
             .children(page_bar.map(|look| scrollbar::Scrollbar {
                 id: 0,
                 handle: page_scroll.clone(),
@@ -2933,6 +3153,23 @@ fn walk(
     patched
 }
 
+// The box skips its contents, so they are not rendered.
+// Without `forced`, also the boxes that show their contents only for the geometry that a script reads.
+pub(crate) fn skipping(
+    doc: &crate::dom::Document,
+    dom: &crate::dom::State,
+    styles: &style::ComputedStyles,
+    id: usize,
+    forced: bool,
+) -> bool {
+    let style = &styles.values[id];
+    let flags = match dom.layout_nodes.get(id).and_then(Option::as_ref) {
+        Some(old) if Rc::ptr_eq(&old.style, style) => old.flags,
+        _ => u32::from(cull::skippable(&doc.nodes[id].tag, style)) * cull::SKIPS,
+    };
+    cull::skips(flags, style, id, &dom.measurements, forced)
+}
+
 fn visibility(
     doc: &crate::dom::Document,
     dom: &crate::dom::State,
@@ -2941,7 +3178,9 @@ fn visibility(
     let mut visible = vec![false; doc.nodes.len()];
     for &(node, parent) in dom.cull.walk.nodes.iter() {
         let node = node as usize;
-        if parent != u32::MAX && !visible[parent as usize] {
+        if parent != u32::MAX
+            && (!visible[parent as usize] || skipping(doc, dom, styles, parent as usize, true))
+        {
             continue;
         }
         let style = &styles.values[node];

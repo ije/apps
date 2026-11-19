@@ -181,7 +181,7 @@ const ARGS: [usize; 45] = [
     12, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 4, 1,
 ];
 
-type GlyphKey = (u32, u16, u32, u32, u8, bool);
+type GlyphKey = (u32, u16, [u32; 3], u8, bool);
 
 type Glyph = (renderer::Point<i32>, renderer::Size<i32>, Vec<u8>);
 
@@ -300,6 +300,7 @@ pub fn line(
         inset: Default::default(),
         nowrap: false,
         tab_size: 8.,
+        stroke: None,
     };
     let font_size = size
         .split_whitespace()
@@ -1138,7 +1139,13 @@ impl Canvas {
                         } else {
                             (x * variants).round() / variants
                         };
-                        let reach = f32::from(glyph.size) * raster * 2.;
+                        // DirectWrite can't stroke glyphs, so text fills with the stroke style there.
+                        let stroke = if code == 24. || glyph.emoji || cfg!(windows) {
+                            0.
+                        } else {
+                            state.width
+                        };
+                        let reach = (f32::from(glyph.size) + stroke) * raster * 2.;
                         if x + reach < visible.left()
                             || x - reach > visible.right()
                             || fy + reach < visible.top()
@@ -1149,14 +1156,13 @@ impl Canvas {
                         let key = (
                             glyph.font,
                             glyph.id,
-                            f32::from(glyph.size).to_bits(),
-                            raster.to_bits(),
+                            [f32::from(glyph.size), raster, stroke].map(f32::to_bits),
                             ((x - x.floor()) * variants) as u8,
                             glyph.emoji,
                         );
                         if !self.glyphs.contains_key(&key) {
                             let pixels = system.glyph_pixels(
-                                glyph.font, glyph.id, glyph.size, raster, key.4, key.5,
+                                glyph.font, glyph.id, glyph.size, raster, key.3, key.4, stroke,
                             );
                             self.glyph_bytes +=
                                 pixels.as_ref().map_or(0, |pixels| pixels.2.len()) + 64;

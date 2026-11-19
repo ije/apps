@@ -415,7 +415,9 @@ impl TextSystem {
             ((left + width) * s).ceil() as i32,
             ((top + height) * s).ceil() as i32,
         );
-        Ok(Rect::new(min, size(max.x - min.x, max.y - min.y)).outset(1))
+        // A miter join reaches twice the stroke width past the outline at most.
+        let reach = (glyph.stroke * 2. * s).ceil() as i32;
+        Ok(Rect::new(min, size(max.x - min.x, max.y - min.y)).outset(1 + reach))
     }
 
     pub fn rasterize(
@@ -470,7 +472,15 @@ impl TextSystem {
         let oversize = if glyph.emoji { glyph.scale.max(2.) } else { 1. };
         let scale = (glyph.scale / oversize) as CGFloat;
         CGContext::scale_ctm(cx, scale, scale);
-        CGContext::set_text_drawing_mode(cx, CGTextDrawingMode::Fill);
+        if glyph.stroke > 0. {
+            // Like Skia, whose stroked text has miter joins up to 4 times the width.
+            CGContext::set_text_drawing_mode(cx, CGTextDrawingMode::Stroke);
+            CGContext::set_line_width(cx, glyph.stroke as CGFloat);
+            CGContext::set_miter_limit(cx, 4.);
+            CGContext::set_gray_stroke_color(cx, 0., 1.);
+        } else {
+            CGContext::set_text_drawing_mode(cx, CGTextDrawingMode::Fill);
+        }
         CGContext::set_allows_antialiasing(cx, true);
         CGContext::set_should_antialias(cx, true);
         CGContext::set_allows_font_subpixel_positioning(cx, true);
@@ -733,11 +743,14 @@ impl Book {
         let faces = &self.faces;
         self.sized
             .entry((font, size.to_bits()))
-            // SAFETY: a copy at another size.
+            // SAFETY: a copy at another size. CoreText keeps the size of the font for a size of 0, so text of size 0
+            // draws at a size too small to show.
             .or_insert_with(|| unsafe {
-                faces[font as usize]
-                    .font
-                    .copy_with_attributes(size as CGFloat, ptr::null(), None)
+                faces[font as usize].font.copy_with_attributes(
+                    size.max(1e-4) as CGFloat,
+                    ptr::null(),
+                    None,
+                )
             })
             .clone()
     }

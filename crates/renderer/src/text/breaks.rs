@@ -115,6 +115,13 @@ pub(crate) fn breaks_beside(
                     && !(wrapping.word_break == WordBreak::KeepAll
                         && ch.is_alphanumeric()
                         && previous.is_alphanumeric())
+                    // Like Chrome, an opening bracket stays with a letter, a number or a prefix before it.
+                    && !(matches!(ch, '(' | '[' | '{')
+                        && (previous.is_alphanumeric()
+                            || matches!(
+                                previous,
+                                '$' | '€' | '\'' | '(' | '[' | '{' | '«' | '<' | '\u{a0}'
+                            )))
                 || wrapping.word_break == WordBreak::BreakAll
                 || after_hyphen && ch.is_alphabetic())
         {
@@ -397,6 +404,14 @@ mod tests {
             breaks(&line(text), text, &wrapping(0., TextWrap::Wrap), &[]),
             [3, 6, 11]
         );
+    }
+
+    #[test]
+    fn opening_brackets_stay_with_the_word_before_them_like_chrome() {
+        let find = |text: &str| breaks(&line(text), text, &wrapping(0., TextWrap::Wrap), &[]);
+        assert_eq!(find("f(el).x a[0] (b)"), [8, 13]);
+        assert_eq!(find("$(x) a([{b}])"), [5]);
+        assert_eq!(find("a)(b x.(y) ?(a)"), [2, 5, 7, 11, 12]);
     }
 
     #[test]

@@ -37,7 +37,7 @@ fn feature(bloom: &mut Bloom, kind: u8, value: &str) {
     }
 }
 
-fn lowercase(value: &str) -> Cow<'_, str> {
+pub(crate) fn lowercase(value: &str) -> Cow<'_, str> {
     match value.bytes().any(|c| c.is_ascii_uppercase()) {
         true => value.to_ascii_lowercase().into(),
         false => value.into(),
@@ -57,6 +57,10 @@ enum SimpleSelector {
     Element(String, String),
     Parent(#[serde(skip)] SelectorList, usize),
     NoNamespace,
+}
+
+thread_local! {
+    static SCOPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 const PSEUDOS: [&str; 4] = [
@@ -1422,8 +1426,7 @@ impl Selector {
             .filter_map(|selector| match selector {
                 SimpleSelector::Id(id) => Some((0, Cow::Borrowed(id.as_str()))),
                 SimpleSelector::Class(class) => Some((1, Cow::Borrowed(class.as_str()))),
-                // Keys compare exactly, so mixed-case names, which also match lowercase HTML names, must get
-                // no key.
+                // Keys are lowercase, and nodes look up their names in lowercase, so mixed-case names get no key.
                 SimpleSelector::Tag(name) if !name.bytes().any(|c| c.is_ascii_uppercase()) => {
                     Some((2, Cow::Borrowed(name.as_str())))
                 }
@@ -1512,6 +1515,7 @@ impl Selector {
                         source.push(')');
                     }
                 }
+                SimpleSelector::Parent(_, 0) => source.push_str(":scope"),
                 SimpleSelector::Parent(_, count) => source.extend(std::iter::repeat_n('&', *count)),
                 SimpleSelector::NoNamespace => source.push('|'),
             }
@@ -1521,6 +1525,14 @@ impl Selector {
 
     pub(crate) fn parse(source: &str, parent: Option<&SelectorList>) -> Vec<Self> {
         Self::list(source, parent, true, true).unwrap_or_default()
+    }
+
+    // Rules of an `@scope` rule, where `:scope` is the root of the scope.
+    pub(crate) fn parse_scoped(source: &str, parent: Option<&SelectorList>) -> Vec<Self> {
+        SCOPED.set(true);
+        let selectors = Self::parse(source, parent);
+        SCOPED.set(false);
+        selectors
     }
 
     pub(crate) fn try_parse(source: &str) -> anyhow::Result<Vec<Self>> {
@@ -1555,7 +1567,8 @@ impl Selector {
                 return None;
             }
             let (mut quote, mut escaped) = (None, false);
-            let explicit = rest.chars().any(|c| {
+            let scoped = SCOPED.get();
+            let explicit = rest.char_indices().any(|(at, c)| {
                 let plain = !escaped && quote.is_none();
                 if escaped {
                     escaped = false;
@@ -1566,7 +1579,7 @@ impl Selector {
                 } else if plain && matches!(c, '"' | '\'') {
                     quote = Some(c);
                 }
-                plain && c == '&'
+                plain && (c == '&' || scoped && rest[at..].starts_with(":scope"))
             });
             let mut previous = parent
                 .filter(|_| nested && (!explicit || rest.starts_with(['>', '+', '~'])))
@@ -1741,7 +1754,7 @@ impl Selector {
                                 .split(' ')
                                 .any(|known| known == name)
                             && !(element && !functional && name.starts_with("-webkit-"))
-                            && !name.starts_with("-internal-")
+                            && name != "-internal-dialog-in-top-layer"
                         {
                             return None;
                         }
@@ -1753,6 +1766,18 @@ impl Selector {
                         if name == "root" {
                             specificity[1] = specificity[1].saturating_add(1);
                             simple.push(SimpleSelector::Root);
+                            continue;
+                        }
+                        // In an `@scope` rule, `:scope` is its root, with the specificity of a pseudo-class.
+                        if name == "scope"
+                            && !functional
+                            && let Some(parent) = parent.filter(|_| SCOPED.get())
+                        {
+                            if parent_index.is_none() {
+                                parent_index = Some(simple.len());
+                                simple.push(SimpleSelector::Parent(Rc::clone(parent), 0));
+                            }
+                            specificity[1] = specificity[1].saturating_add(1);
                             continue;
                         }
                         let (selectors, nth) = Self::argument(&name, argument, parent, strict)?;
@@ -1859,11 +1884,7 @@ impl Selector {
     // Whether the node has the tag, id and classes of the compound.
     fn plain(&self, node: &super::Node) -> bool {
         self.simple.iter().all(|simple| match simple {
-            SimpleSelector::Tag(tag) => {
-                node.tag == *tag
-                    || node.tag.eq_ignore_ascii_case(tag)
-                        && !node.tag.bytes().any(|c| c.is_ascii_uppercase())
-            }
+            SimpleSelector::Tag(tag) => node.tag == *tag || node.tag.eq_ignore_ascii_case(tag),
             SimpleSelector::Id(id) => node.attrs.get("id") == Some(id),
             SimpleSelector::Class(class) => node
                 .attrs
@@ -2099,11 +2120,7 @@ impl Selector {
                     SimpleSelector::Attribute(name, operator, value, flag) => node
                         .attrs
                         .iter()
-                        .find(|(key, _)| {
-                            *key == name
-                                || key.eq_ignore_ascii_case(name)
-                                    && !key.bytes().any(|c| c.is_ascii_uppercase())
-                        })
+                        .find(|(key, _)| *key == name || key.eq_ignore_ascii_case(name))
                         .is_some_and(|(_, actual)| {
                             let insensitive = *flag == 1
                                 || *flag == 2 && !node.tag.bytes().any(|c| c.is_ascii_uppercase());
@@ -3182,7 +3199,7 @@ mod tests {
     }
 
     #[test]
-    fn html_names_match_case_insensitively_and_svg_names_as_written() {
+    fn html_and_svg_names_match_case_insensitively_like_chrome() {
         let doc = Document::parse(
             "<ul><li id=a data-v=1></li></ul><svg id=s viewBox='0 0 1 1'><linearGradient id=g></linearGradient><rect id=r></rect></svg>",
         );
@@ -3201,11 +3218,11 @@ mod tests {
             ("[Data-V='1']", "a"),
             ("[data-v='1' i]", "a"),
             ("linearGradient", "g"),
-            ("lineargradient", ""),
-            ("LINEARGRADIENT", ""),
+            ("lineargradient", "g"),
+            ("LINEARGRADIENT", "g"),
             ("rect", "r"),
             ("[viewBox]", "s"),
-            ("[viewbox]", ""),
+            ("[viewbox]", "s"),
             ("*|rect", "r"),
             ("*|li", "a"),
             ("|rect, |li, |*", ""),
@@ -3215,12 +3232,32 @@ mod tests {
             assert_eq!(query(selector), expected, "{selector}");
         }
         assert_eq!(Selector::try_parse("|rect").unwrap()[0].source(), "|rect");
-        let doc =
-            Document::parse("<style>LI{color:red}[DATA-V]{margin-top:1px}</style><li data-v></li>");
+        let mut doc = Document::parse(
+            "<style>LI{color:red}[DATA-V]{margin-top:1px}lineargradient{color:red}[viewbox]{margin-top:1px}[viewbox='0 0 1 1']{color:blue}[foobar]{margin-top:2px}</style><li data-v></li><lineargradient></lineargradient><svg viewBox='0 0 1 1'><linearGradient/></svg>",
+        );
+        let gradient = doc
+            .nodes
+            .iter()
+            .position(|n| n.tag == "linearGradient")
+            .unwrap();
+        doc.nodes[gradient]
+            .attrs
+            .insert("fooBar".into(), String::new());
         let styles = crate::style::styles(&doc, 800., 600.);
-        let li = doc.nodes.iter().position(|n| n.tag == "li").unwrap();
-        assert_eq!(styles[li]["color"], "red");
-        assert_eq!(styles[li]["margin-top"], "1px");
+        let at = |tag: &str| doc.nodes.iter().position(|n| n.tag == tag).unwrap();
+        for (tag, color, margin) in [
+            ("li", "red", Some("1px")),
+            ("lineargradient", "red", None),
+            ("linearGradient", "red", Some("2px")),
+            ("svg", "blue", Some("1px")),
+        ] {
+            assert_eq!(styles[at(tag)]["color"], color, "{tag}");
+            assert_eq!(
+                styles[at(tag)].get("margin-top").map(String::as_str),
+                margin,
+                "{tag}"
+            );
+        }
     }
 
     #[test]

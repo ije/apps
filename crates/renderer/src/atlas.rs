@@ -603,6 +603,7 @@ mod tests {
             subpixel: 0,
             emoji: false,
             dilation: 0,
+            stroke: 0.,
         })
     }
 

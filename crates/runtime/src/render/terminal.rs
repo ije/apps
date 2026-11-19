@@ -544,6 +544,7 @@ impl Grid {
                     ink.size,
                     ink.color,
                     ink.emoji,
+                    px(0.),
                 );
             }
         }
@@ -617,6 +618,7 @@ impl Grid {
                             ink.size,
                             back,
                             ink.emoji,
+                            px(0.),
                         );
                     }
                 }

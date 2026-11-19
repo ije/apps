@@ -2,7 +2,7 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream, fail) => {
   const children = new Map();
   const key = {};
   let failureID = 0;
-  const view = data => Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  const view = data => Object.getPrototypeOf(data) === Uint8Array.prototype ? Object.setPrototypeOf(data, Buffer.prototype) : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
   const channel = (target, id, name) => {
     let parts = [];
     const disconnect = now => {
@@ -16,16 +16,17 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream, fail) => {
       ref() { ipc.unreferenced = false; }, unref() { ipc.unreferenced = true; },
       push(data) {
         if (data === null) { ipc.destroyed = true; disconnect(true); return true; }
-        let start = 0;
-        for (let end; (end = data.indexOf(10, start)) !== -1; start = end + 1) {
-          parts.push(data.subarray(start, end));
-          const message = JSON.parse(Buffer.concat(parts).toString());
-          parts = [];
+        // Byte 10 is never inside a UTF-8 sequence, so the lines decode at once.
+        const last = data.lastIndexOf(10);
+        if (last === -1) { parts.push(data); return true; }
+        const lines = (parts.length ? Buffer.concat([...parts, data.subarray(0, last)]) : data.subarray(0, last)).toString().split('\n');
+        parts = last + 1 < data.length ? [data.subarray(last + 1)] : [];
+        for (const line of lines) {
+          const message = JSON.parse(line);
           if (!target.connected || typeof message?.cmd === 'string' && message.cmd.startsWith('NODE_')) continue;
           // A listener that throws must not lose the other messages of this chunk.
           try { target.emit('message', message); target.parentPort?.emit('message', { data: message, ports: [] }); } catch (error) { fail(error); }
         }
-        if (start < data.length) parts.push(data.subarray(start));
         return true;
       },
       _childWritten() { ipc.sent.shift()?.(null); },
@@ -279,5 +280,5 @@ globalThis.__appsChildProcess = (call, EventEmitter, stream, fail) => {
     children.set(id, { child: { ipc, stdio: [], emit() {}, get _unreferenced() { return !ipc.sent.length && !(process.connected && !ipc.unreferenced && (live('message') || live('disconnect'))); } } });
     flush = () => { if (ipc.sent.length) call('child.flush', id, 'ipc'); };
   };
-  return { api: { spawn, fork, ChildProcess, spawnSync, execFileSync, execFile, exec, execSync }, utilityProcess, connect, flush: () => flush?.(), poll, pending: () => [...children.values()].some(({child})=>!child._unreferenced) };
+  return { api: { spawn, fork, ChildProcess, spawnSync, execFileSync, execFile, exec, execSync }, utilityProcess, connect, flush: () => flush?.(), poll, pending: () => { for (const { child } of children.values()) if (!child._unreferenced) return true; return false; } };
 };

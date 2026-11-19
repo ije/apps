@@ -212,8 +212,8 @@ float either_speed(float a, float b) {
 }
 
 float dash_coverage(float2 p, float4 rect, float4 rx, float4 ry, float4 widths, bool dotted, bool thin, float depth, float inner) {
-    float period_widths = thin ? 5.0 : dotted ? 2.0 : 3.0;
-    float dash = (thin ? 3.0 : dotted ? 1.0 : 2.0) / period_widths;
+    float period_widths = thin && !dotted ? 5.0 : dotted ? 2.0 : 3.0;
+    float dash = (thin && !dotted ? 3.0 : dotted ? 1.0 : 2.0) / period_widths;
     float2 local = p - rect.xy;
     float2 hs = rect.zw * 0.5;
     float2 from_center = local - hs;
@@ -224,12 +224,26 @@ float dash_coverage(float2 p, float4 rect, float4 rx, float4 ry, float4 widths, 
     float t = 0.0;
     float speed = 0.0;
     float total = 0.0;
+    bool closed = false;
     bool centered = false;
+    // A dot is as wide as its side and centered in it.
+    float dot_depth = depth;
+    float dot_width = depth + inner;
     if (all(rx == 0.0)) {
-        float width = across ? max(widths.x, widths.z) : max(widths.y, widths.w);
+        // Each side dashes by its own width. Like Chromium, the wider of two sides takes their corner, and sides of
+        // equal width split it on the diagonal.
+        float level = corner < 2u ? widths.x : widths.z;
+        float upright = corner == 0u || corner == 3u ? widths.w : widths.y;
+        bool in_level = local.y < widths.x || local.y > rect.w - widths.z;
+        bool in_upright = local.x < widths.w || local.x > rect.z - widths.y;
+        bool along = level == upright ? across : in_level && !(in_upright && upright > level);
+        float width = along ? level : upright;
+        float far = corner == 1u || corner == 2u ? rect.z - local.x : local.x;
+        dot_depth = along ? (corner < 2u ? local.y : rect.w - local.y) : far;
+        dot_width = width;
         speed = 1.0 / (period_widths * width);
-        t = (across ? local.x : local.y) * speed;
-        total = (across ? rect.z : rect.w) * speed - dash;
+        t = (along ? local.x : local.y) * speed;
+        total = (along ? rect.z : rect.w) * speed - dash;
     } else {
         float4 side_speed = widths > 0.0 ? 1.0 / (period_widths * widths) : (float4)0.0;
         float4 corner_speed = float4(
@@ -239,7 +253,10 @@ float dash_coverage(float2 p, float4 rect, float4 rx, float4 ry, float4 widths, 
             either_speed(side_speed.x, side_speed.w));
         // Corners measure along the middle of the border.
         float middle = 0.5;
-        float4 sweep = max((float4)0.0, (rx.yzwx + ry.yzwx) * 0.5 - middle * max(widths.xzzx, widths.yyww)) * (PI * 0.5) * corner_speed;
+        float4 round_sweep = max((float4)0.0, (rx.yzwx + ry.yzwx) * 0.5 - middle * max(widths.xzzx, widths.yyww)) * (PI * 0.5) * corner_speed;
+        // A square corner meets its sides at the middle of the border, half a width in from each edge.
+        float4 square_sweep = -(widths.yzwx * side_speed.xyzw + widths.xyzw * side_speed.yzwx) * 0.5;
+        float4 sweep = rx.yzwx * ry.yzwx == 0.0 ? square_sweep : round_sweep;
         float top_end = (rect.z - rx.x - rx.y) * side_speed.x;
         float right_start = top_end + sweep.x;
         float right_end = right_start + (rect.w - ry.y - ry.z) * side_speed.y;
@@ -280,25 +297,49 @@ float dash_coverage(float2 p, float4 rect, float4 rx, float4 ry, float4 widths, 
             speed = side_speed.y;
             t = right_start + (local.y - ry.y) * speed;
         }
-        float4 ends = float4(right_start - sweep.x * 0.5, right_end + sweep.y * 0.5, left_start - sweep.z * 0.5, left_end + sweep.w * 0.5);
-        if (t >= ends.w) {
-            t -= total;
+        closed = all(rx * ry > 0.0);
+        if (!closed) {
+            // With a square corner, each side runs from the middle of one corner to the middle of the next, with a
+            // dash centered in each corner, which keeps square corners solid.
+            float4 ends = float4(right_start - sweep.x * 0.5, right_end + sweep.y * 0.5, left_start - sweep.z * 0.5, left_end + sweep.w * 0.5);
+            if (t >= ends.w) {
+                t -= total;
+            }
+            float start = ends.z;
+            float end = ends.w;
+            if (t < ends.x) {
+                start = ends.w - total;
+                end = ends.x;
+            } else if (t < ends.y) {
+                start = ends.x;
+                end = ends.y;
+            } else if (t < ends.z) {
+                start = ends.y;
+                end = ends.z;
+            }
+            t -= start;
+            total = end - start;
+            centered = true;
         }
-        float start = ends.z;
-        float end = ends.w;
-        if (t < ends.x) {
-            start = ends.w - total;
-            end = ends.x;
-        } else if (t < ends.y) {
-            start = ends.x;
-            end = ends.y;
-        } else if (t < ends.z) {
-            start = ends.y;
-            end = ends.z;
+    }
+    if (closed) {
+        // Like Chromium, a rounded border dashes its middle line as one closed path from the end of the top left
+        // corner, clockwise. A whole number of dashes fits, with the gaps nearest to their length, and a short path
+        // is solid.
+        if (total <= dash * 2.0) {
+            return 1.0;
         }
-        t -= start;
-        total = end - start;
-        centered = true;
+        float fewer = max(floor(total), 1.0);
+        float more = fewer + 1.0;
+        float period = total / (total / more > dash && abs(total / more - 1.0) <= abs(total / fewer - 1.0) ? more : fewer);
+        // Dashes start at the start, and round dots are centered on it.
+        bool round_dot = dotted && !thin;
+        float from_start = t - (round_dot ? 0.0 : dash * 0.5);
+        float from_dash = from_start - floor(from_start / period + 0.5) * period;
+        if (round_dot) {
+            return saturate(0.5 - (length(float2(from_dash / speed, dot_depth - dot_width * 0.5)) - dot_width * 0.5));
+        }
+        return saturate(0.5 - (abs(from_dash) - dash * 0.5) / speed);
     }
     if (total >= 1.0 || (centered && total > 0.0)) {
         float fewer = max(floor(total), 1.0);
@@ -306,8 +347,7 @@ float dash_coverage(float2 p, float4 rect, float4 rx, float4 ry, float4 widths, 
         float period = total / count;
         float from_dash = fmod(t + (centered ? period * 0.5 : (period - dash) * 0.5), period) - period * 0.5;
         if (dotted) {
-            float width = depth + inner;
-            return saturate(0.5 - (length(float2(from_dash / speed, depth - width * 0.5)) - width * 0.5));
+            return saturate(0.5 - (length(float2(from_dash / speed, dot_depth - dot_width * 0.5)) - dot_width * 0.5));
         }
         return saturate(0.5 - (abs(from_dash) - dash * 0.5) / speed);
     }
@@ -410,34 +450,52 @@ float2 erf(float2 x) {
     return sign(x) * (1.0 - 1.0 / (q2 * q2));
 }
 
+// How far the box reaches out from its center on one side, at a row `row_y` below the center. The
+// corners of the side are `top` and `bottom`, and a row between their curves reaches the straight edge.
+float row_extent(uint top, uint bottom, float row_y, float2 hs, float4 rx, float4 ry, float2 shape) {
+    uint corner = top;
+    float edge = hs.y + row_y;
+    if (edge >= ry[top]) {
+        corner = bottom;
+        edge = hs.y - row_y;
+    }
+    float2 radius = radius_of(corner, rx, ry);
+    if (radius.y <= 0.0) {
+        return hs.x;
+    }
+    float into = min(edge - radius.y, 0.0);
+    uint code = shape_code(corner, shape);
+    float bulge = radius.x * sqrt(max(0.0, 1.0 - into * into / (radius.y * radius.y)));
+    if (code != 0u) {
+        float n = exponent(code);
+        float t = min(-into / radius.y, 1.0);
+        bool concave = code < 2048u;
+        float rest = 1.0 - pow(max(concave ? 1.0 - t : t, 1e-6), n);
+        float reach = 0.0;
+        if (rest > 0.0) {
+            reach = pow(rest, 1.0 / n);
+        }
+        bulge = radius.x * (concave ? 1.0 - reach : reach);
+    }
+    return hs.x - radius.x + bulge;
+}
+
 float blurred_box(float2 p, float4 box, float4 rx, float4 ry, float2 shape, float sigma) {
     float2 hs = box.zw * 0.5;
     float2 from_center = p - box.xy - hs;
-    uint corner = pick(from_center, hs, rx, ry);
-    float2 radius = radius_of(corner, rx, ry);
-    uint code = shape_code(corner, shape);
-    float n = exponent(code);
     float low = clamp(-3.0 * sigma, from_center.y - hs.y, from_center.y + hs.y);
     float high = clamp(3.0 * sigma, from_center.y - hs.y, from_center.y + hs.y);
-    uint rows = code != 0u ? 16u : 4u;
+    uint rows = any(shape != 0.0) ? 16u : 4u;
     float stride = (high - low) / float(rows);
+    uint4 codes = uint4(shape_code(0u, shape), shape_code(1u, shape), shape_code(2u, shape), shape_code(3u, shape));
+    bool mirrored = rx.x == rx.y && ry.x == ry.y && rx.w == rx.z && ry.w == ry.z && codes.x == codes.y && codes.w == codes.z;
     float sum = 0.0;
     [loop] for (uint row = 0u; row < rows; row++) {
         float y = low + (float(row) + 0.5) * stride;
-        float into = min(hs.y - radius.y - abs(from_center.y - y), 0.0);
-        float bulge = radius.y > 0.0 ? radius.x * sqrt(max(0.0, 1.0 - into * into / (radius.y * radius.y))) : 0.0;
-        if (code != 0u && radius.y > 0.0) {
-            float t = min(-into / radius.y, 1.0);
-            bool concave = code < 2048u;
-            float rest = 1.0 - pow(max(concave ? 1.0 - t : t, 1e-6), n);
-            float reach = 0.0;
-            if (rest > 0.0) {
-                reach = pow(rest, 1.0 / n);
-            }
-            bulge = radius.x * (concave ? 1.0 - reach : reach);
-        }
-        float extent = hs.x - radius.x + bulge;
-        float2 span = erf((from_center.x + float2(-extent, extent)) * (0.70710678 / sigma));
+        float row_y = from_center.y - y;
+        float west = row_extent(0u, 3u, row_y, hs, rx, ry, shape);
+        float east = mirrored ? west : row_extent(1u, 2u, row_y, hs, rx, ry, shape);
+        float2 span = erf((from_center.x + float2(-east, west)) * (0.70710678 / sigma));
         sum += (span.y - span.x) * exp(-0.5 * y * y / (sigma * sigma));
     }
     return 0.5 * sum * stride / (sqrt(2.0 * PI) * sigma);

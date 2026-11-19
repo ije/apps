@@ -1,7 +1,10 @@
 globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOptions, deepEqual }, info, codec) => {
   const windows = info.platform === 'win32';
-  const bytes = data => new Buffer(data.buffer, data.byteOffset, data.byteLength);
-  const view = (value, encoding) => typeof value === 'string' ? Buffer.from(value, encoding) : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : Buffer.from(value);
+  // Results are new arrays. Reading `.buffer` of a new array makes JSC allocate an ArrayBuffer and move the bytes.
+  const bytes = data => Object.getPrototypeOf(data) === Uint8Array.prototype ? Object.setPrototypeOf(data, Buffer.prototype) : new Buffer(data.buffer, data.byteOffset, data.byteLength);
+  // Own byte arrays skip `subarray()`: it allocates an ArrayBuffer, and subclasses run species code. Empty ones may be detached.
+  const plain = value => { if (!(value instanceof Uint8Array) || !value.length) return false; const proto = Object.getPrototypeOf(value); return proto === Buffer.prototype || proto === Uint8Array.prototype; };
+  const view = (value, encoding) => typeof value === 'string' ? Buffer.from(value, encoding) : plain(value) ? value : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : Buffer.from(value);
   const utf8 = /^utf-?8$/i, encodeKinds = { __proto__: null, utf8: 0, latin1: 1, ascii: 1, utf16le: 2 }, decodeKinds = { __proto__: null, utf8: 0, latin1: 1, ascii: 2, utf16le: 3 };
   const error = (Type, code, message) => Object.assign(new Type(message), { code });
   const received = value => { if (value == null) return String(value); if (typeof value === 'function') return `function ${value.name}`; if (typeof value === 'object') return value.constructor?.name ? `an instance of ${value.constructor.name}` : inspect(value, { depth: -1 }); if (typeof value !== 'string') return `type ${typeof value} (${inspect(value)})`; if (value.length > 28) value = value.slice(0, 25) + '...'; return `type string (${value.includes("'") ? JSON.stringify(value) : `'${value}'`})`; };
@@ -16,13 +19,15 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   const encode = (value, encoding = 'utf8') => {
     // Native decoders reject input Node accepts: stop at invalid hex pairs and skip non-base64 characters.
     if (encoding === 'hex') { try { return Uint8Array.fromHex(value.length & 1 ? value.slice(0, -1) : value); } catch { return Uint8Array.fromHex(value.match(/^(?:[\da-f]{2})*/i)[0]); } }
-    if (encoding === 'base64' || encoding === 'base64url') { try { return Uint8Array.fromBase64(value, { alphabet: encoding }); } catch {} const pad = value.indexOf('='); let text = (pad < 0 ? value : value.slice(0, pad)).replace(/[^\w+/-]|_/g, c => c === '_' ? '/' : '').replace(/-/g, '+'); if (text.length % 4 === 1) text = text.slice(0, -1); return Uint8Array.fromBase64(text); }
+    if (encoding === 'base64' || encoding === 'base64url') { try { return Uint8Array.fromBase64(value, { alphabet: encoding }); } catch {} try { return Uint8Array.fromBase64(value, { alphabet: encoding === 'base64' ? 'base64url' : 'base64' }); } catch {} const pad = value.indexOf('='); let text = (pad < 0 ? value : value.slice(0, pad)).replace(/[^\w+/-]|_/g, c => c === '_' ? '/' : '').replace(/-/g, '+'); if (text.length % 4 === 1) text = text.slice(0, -1); return Uint8Array.fromBase64(text); }
     return codec.encode(value, encodeKinds[encoding]);
   };
-  const decode = (data, encoding) => {
-    if (encoding === 'hex') return data.toHex();
-    if (encoding === 'base64' || encoding === 'base64url') return data.toBase64({ alphabet: encoding, omitPadding: encoding === 'base64url' });
-    return codec.decode(data, decodeKinds[encoding]);
+  const decode = (data, encoding, start, end) => {
+    if (encoding === 'hex' || encoding === 'base64' || encoding === 'base64url') {
+      if (start || end < data.length) data = data.subarray(start, end);
+      return encoding === 'hex' ? data.toHex() : data.toBase64({ alphabet: encoding, omitPadding: encoding === 'base64url' });
+    }
+    return start === undefined ? codec.decode(data, decodeKinds[encoding]) : codec.decode(data, decodeKinds[encoding], false, false, start, end);
   };
   const bounds = (value, length, type) => { if (Math.floor(value) !== value) { if (typeof value !== 'number') throw typeError(type || 'offset', 'of type number', value); throw rangeError(type || 'offset', 'an integer', value); } if (length < 0) throw error(RangeError, 'ERR_BUFFER_OUT_OF_BOUNDS', 'Attempt to access memory outside buffer bounds'); throw rangeError(type || 'offset', `>= ${type ? 1 : 0} and <= ${length}`, value); };
   const at = (buffer, offset, size) => { if (typeof offset !== 'number') throw typeError('offset', 'of type number', offset); if (buffer[offset] === undefined || buffer[offset + size - 1] === undefined) bounds(offset, buffer.length - size); return offset; };
@@ -50,13 +55,15 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     return a.length < b.length ? -1 : a.length > b.length ? 1 : 0;
   };
   // Copy short ASCII strings directly: a native call and view cost 3x more.
+  // Little-endian on all targets. Floats and 64-bit integers pass through these bytes: a DataView per call costs 15x more.
+  const scratch = new Uint8Array(32), f32 = new Float32Array(scratch.buffer, 0, 1), f64 = new Float64Array(scratch.buffer, 0, 1), i64 = new BigInt64Array(scratch.buffer, 0, 1), u64 = new BigUint64Array(scratch.buffer, 0, 1);
   const short = text => { if (text.length > 32) return false; for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 127) return false; return true; };
   class Buffer extends Uint8Array {
     static from(value, encoding, length) {
       if (typeof value === 'string') {
         encoding = typeof encoding === 'string' && encoding ? encodingOf(encoding) : 'utf8';
         if ((encoding === 'utf8' || encoding === 'latin1' || encoding === 'ascii') && short(value)) { const out = new Buffer(value.length); for (let i = 0; i < value.length; i++) out[i] = value.charCodeAt(i); return out; }
-        const data = encode(value, encoding); return new Buffer(data.buffer, data.byteOffset, data.length);
+        return Object.setPrototypeOf(encode(value, encoding), Buffer.prototype);
       }
       if (typeof value === 'object' && value !== null) {
         if (value instanceof ArrayBuffer || (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer)) {
@@ -111,7 +118,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
       const length = this.length;
       if (start <= 0) start = 0; else if (start >= length) return ''; else start = Math.trunc(start) || 0;
       if (end === undefined || end > length) end = length; else end = Math.trunc(end) || 0;
-      return end <= start ? '' : decode(start || end < length ? this.subarray(start, end) : this, encodingOf(encoding));
+      return end <= start ? '' : plain(this) ? decode(this, encodingOf(encoding), start, end) : decode(start || end < length ? this.subarray(start, end) : this, encodingOf(encoding));
     }
     toLocaleString(...args) { return this.toString(...args); }
     equals(other) { if (!(other instanceof Uint8Array)) throw typeError('otherBuffer', bufferTypes, other); return this === other || compare(this, other) === 0; }
@@ -132,10 +139,12 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     copy(target, targetStart, start, end) {
       if (!(target instanceof Uint8Array)) throw typeError('target', bufferTypes, target);
       targetStart = offsetOf(targetStart, 'targetStart', Infinity) ?? 0; start = offsetOf(start, 'sourceStart', this.length) ?? 0; end = offsetOf(end, 'sourceEnd', Infinity) ?? this.length;
-      if (targetStart >= target.length || start >= end) return 0;
-      const data = this.subarray(start, Math.min(end, start + target.length - targetStart));
-      target.set(data, targetStart);
-      return data.length;
+      const n = Math.min(end, this.length, start + target.length - targetStart) - start;
+      if (targetStart >= target.length || n <= 0) return 0;
+      if (n > 32 || !plain(this)) { target.set(this.subarray(start, start + n), targetStart); return n; }
+      for (let i = 0; i < n; i++) scratch[i] = this[start + i];
+      for (let i = 0; i < n; i++) target[targetStart + i] = scratch[i];
+      return n;
     }
     write(string, offset, length, encoding) {
       if (typeof string !== 'string') throw error(TypeError, 'ERR_INVALID_ARG_TYPE', 'argument must be a string');
@@ -144,10 +153,11 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
       else { integer(offset, 'offset', 0, this.length); const remaining = this.length - offset; if (length === undefined) length = remaining; else if (typeof length === 'string') { encoding = length; length = remaining; } else length = Math.min(integer(length, 'length', 0, this.length), remaining); }
       encoding = encoding ? encodingOf(encoding) : 'utf8';
       if ((encoding === 'utf8' || encoding === 'latin1' || encoding === 'ascii') && short(string)) { length = Math.min(length, string.length); for (let i = 0; i < length; i++) this[offset + i] = string.charCodeAt(i); return length; }
-      const target = this.subarray(offset, offset + length);
-      if (encoding === 'utf8') return codec.encodeInto(string, target)[1];
-      const data = encode(encoding === 'utf16le' ? string.slice(0, length >> 1) : string, encoding).subarray(0, length);
-      target.set(data);
+      const own = plain(this), target = own ? this : this.subarray(offset, offset + length);
+      if (encoding === 'utf8') return own ? codec.encodeInto(string, this, offset, offset + length)[1] : codec.encodeInto(string, target)[1];
+      let data = encode(encoding === 'utf16le' ? string.slice(0, length >> 1) : string, encoding);
+      if (data.length > length) data = data.subarray(0, length);
+      target.set(data, own ? offset : 0);
       return data.length;
     }
     fill(value, offset, end, encoding) {
@@ -198,9 +208,11 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     writeInt32LE(v, o = 0) { v = +v; limit(v, -2147483648, 2147483647, 4); check(this, o, 4); this[o] = v; this[o + 1] = v >>> 8; this[o + 2] = v >>> 16; this[o + 3] = v >>> 24; return o + 4; },
     writeInt32BE(v, o = 0) { v = +v; limit(v, -2147483648, 2147483647, 4); check(this, o, 4); this[o] = v >>> 24; this[o + 1] = v >>> 16; this[o + 2] = v >>> 8; this[o + 3] = v; return o + 4; },
   });
-  for (const [suffix, type, size, min, max] of [['Float', 'Float32', 4], ['Double', 'Float64', 8], ['BigInt64', 'BigInt64', 8, -(2n ** 63n), 2n ** 63n - 1n], ['BigUInt64', 'BigUint64', 8, 0n, 2n ** 64n - 1n]]) for (const endian of ['LE', 'BE']) {
-    Buffer.prototype['read' + suffix + endian] = function(offset = 0) { return new DataView(this.buffer, this.byteOffset, this.byteLength)['get' + type](at(this, offset, size), endian === 'LE'); };
-    Buffer.prototype['write' + suffix + endian] = function(value, offset = 0) { if (typeof min === 'number') value = +value; if (min !== undefined) limit(value, min, max, size); new DataView(this.buffer, this.byteOffset, this.byteLength)['set' + type](at(this, offset, size), value, endian === 'LE'); return offset + size; };
+  for (const [suffix, array, size, min, max] of [['Float', f32, 4], ['Double', f64, 8], ['BigInt64', i64, 8, -(2n ** 63n), 2n ** 63n - 1n], ['BigUInt64', u64, 8, 0n, 2n ** 64n - 1n]]) {
+    Buffer.prototype['read' + suffix + 'LE'] = function(offset = 0) { at(this, offset, size); for (let i = 0; i < size; i++) scratch[i] = this[offset + i]; return array[0]; };
+    Buffer.prototype['read' + suffix + 'BE'] = function(offset = 0) { at(this, offset, size); for (let i = 0; i < size; i++) scratch[size - 1 - i] = this[offset + i]; return array[0]; };
+    Buffer.prototype['write' + suffix + 'LE'] = function(value, offset = 0) { if (min !== undefined) limit(value, min, max, size); at(this, offset, size); array[0] = value; if (offset + size > this.length) throw new TypeError('Underlying ArrayBuffer has been detached from the view or out-of-bounds'); for (let i = 0; i < size; i++) this[offset + i] = scratch[i]; return offset + size; };
+    Buffer.prototype['write' + suffix + 'BE'] = function(value, offset = 0) { if (min !== undefined) limit(value, min, max, size); at(this, offset, size); array[0] = value; if (offset + size > this.length) throw new TypeError('Underlying ArrayBuffer has been detached from the view or out-of-bounds'); for (let i = 0; i < size; i++) this[offset + i] = scratch[size - 1 - i]; return offset + size; };
   }
   for (const endian of ['LE', 'BE']) {
     const index = (offset, length, i) => offset + (endian === 'LE' ? i : length - 1 - i);
@@ -209,14 +221,27 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     for (const signed of [false, true]) Buffer.prototype[(signed ? 'writeInt' : 'writeUInt') + endian] = function(value, offset, length) { const bits = width(length) * 8; value = +value; limit(value, signed ? -(2 ** (bits - 1)) : 0, signed ? 2 ** (bits - 1) - 1 : 2 ** bits - 1, length); at(this, offset, length); if (value < 0) value += 2 ** bits; for (let i = 0; i < length; i++) { this[index(offset, length, i)] = value % 256; value = Math.floor(value / 256); } return offset + length; };
   }
   for (const name of Object.getOwnPropertyNames(Buffer.prototype)) if (name.includes('UInt')) Buffer.prototype[name.replace('UInt', 'Uint')] = Buffer.prototype[name];
-  for (const size of [2, 4, 8]) Buffer.prototype['swap' + size * 8] = function() { if (this.length % size) throw Object.assign(new RangeError(`Buffer size must be a multiple of ${size * 8}-bits`), { code: 'ERR_INVALID_BUFFER_SIZE' }); for (let i = 0; i < this.length; i += size) for (let a = i, b = i + size - 1; a < b; a++, b--) { const t = this[a]; this[a] = this[b]; this[b] = t; } return this; };
+  // Swap whole 32-bit words of aligned buffers: 6x faster than a byte loop.
+  for (const size of [2, 4, 8]) Buffer.prototype['swap' + size * 8] = function() {
+    if (this.length % size) throw Object.assign(new RangeError(`Buffer size must be a multiple of ${size * 8}-bits`), { code: 'ERR_INVALID_BUFFER_SIZE' });
+    let i = 0;
+    if (this.length >= 128 && !(this.byteOffset & 3)) {
+      const words = new Uint32Array(this.buffer, this.byteOffset, this.length >> 2), n = size === 8 ? words.length & ~1 : words.length;
+      if (size === 2) for (let w = 0; w < n; w++) { const x = words[w]; words[w] = (x & 0xff00ff00) >>> 8 | (x & 0x00ff00ff) << 8; }
+      else if (size === 4) for (let w = 0; w < n; w++) { const x = words[w]; words[w] = x >>> 24 | (x >>> 8) & 0xff00 | (x & 0xff00) << 8 | x << 24; }
+      else for (let w = 0; w < n; w += 2) { const x = words[w], y = words[w + 1]; words[w] = y >>> 24 | (y >>> 8) & 0xff00 | (y & 0xff00) << 8 | y << 24; words[w + 1] = x >>> 24 | (x >>> 8) & 0xff00 | (x & 0xff00) << 8 | x << 24; }
+      i = n * 4;
+    }
+    for (; i < this.length; i += size) for (let a = i, b = i + size - 1; a < b; a++, b--) { const t = this[a]; this[a] = this[b]; this[b] = t; }
+    return this;
+  };
   Buffer.poolSize = 8192;
   for (const name of Object.getOwnPropertyNames(Buffer)) if (typeof Buffer[name] === 'function') Object.defineProperty(Buffer, name, { enumerable: true });
   globalThis.Buffer = Buffer;
   const transcodeError = code => Object.assign(new Error(`Unable to transcode Buffer [${code}]`), { code, errno: code === 'U_ILLEGAL_ARGUMENT_ERROR' ? 1 : 10 });
   const buffer = { Buffer, Blob, File, atob, btoa, kMaxLength, kStringMaxLength: 2 ** 30 - 25, constants: { MAX_LENGTH: kMaxLength, MAX_STRING_LENGTH: 2 ** 30 - 25 }, INSPECT_MAX_BYTES: 50,
-    isUtf8: value => { try { new TextDecoder('utf-8', { fatal: true }).decode(value); return true; } catch { return false; } },
-    isAscii: value => !/[^\x00-\x7f]/.test(codec.decode(view(value), 1)),
+    isUtf8: value => { if (ArrayBuffer.isView(value)) return codec.valid(value, false); try { new TextDecoder('utf-8', { fatal: true }).decode(value); return true; } catch { return false; } },
+    isAscii: value => codec.valid(view(value), true),
     transcode(source, from, to) {
       if (!(source instanceof Uint8Array)) throw typeError('source', bufferTypes, source);
       if (!source.length) return new Buffer(0);
@@ -483,7 +508,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     else if (offset > size) throw rangeError('offset', `<= ${size}`, offset);
     if (length < 0 || offset + length > size) throw rangeError('length', length < 0 ? '>= 0' : `<= ${size - offset}`, length);
   };
-  const chunk = (buffer, offset, length, position) => { if (typeof buffer === 'string') return [new Uint8Array(Buffer.from(buffer, length)), offset ?? null]; const bytes = view(buffer); if (offset !== null && typeof offset === 'object') ({ offset, length, position } = offset); offset = typeof offset === 'number' ? offset : 0; length = typeof length === 'number' ? length : bytes.length - offset; span(bytes.length, offset, length, true); return [bytes.subarray(offset, offset + length), position ?? null]; };
+  const chunk = (buffer, offset, length, position) => { if (typeof buffer === 'string') return [new Uint8Array(Buffer.from(buffer, length)), offset ?? null]; const bytes = view(buffer); if (offset !== null && typeof offset === 'object') ({ offset, length, position } = offset); offset = typeof offset === 'number' ? offset : 0; length = typeof length === 'number' ? length : bytes.length - offset; span(bytes.length, offset, length, true); return [offset || length !== bytes.length ? bytes.subarray(offset, offset + length) : bytes, position ?? null]; };
   const vectors = buffers => { if (!Array.isArray(buffers) || !buffers.every(buffer => ArrayBuffer.isView(buffer))) throw typeError('buffers', 'an instance of ArrayBufferView[]', buffers); return buffers.map(buffer => view(buffer)); };
   const scatter = (list, data) => { let at = 0; for (const buffer of list) { buffer.set(data.subarray(at, at + buffer.length)); at += buffer.length; } return data.length; };
   const offsetOrNull = position => typeof position === 'number' ? position : null;
@@ -493,8 +518,9 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     if (name === 'stat' || name === 'lstat' || name === 'fstat') return args[1]?.bigint ? new BigIntStats(result) : new Stats(result);
     if (name === 'statfs') return new StatFs(result, args[1]?.bigint);
     if (name === 'readdir') {
-      const opts = options(args[1]), raw = opts.encoding === 'buffer';
-      return result.map(([name, type]) => {
+      const opts = options(args[1]), raw = opts.encoding === 'buffer', types = result[1];
+      return (result[0] ? result[0].split('\0') : []).map((name, i) => {
+        const type = types.charCodeAt(i);
         if (!opts.withFileTypes) return raw ? Buffer.from(name) : name;
         const index = Math.max(name.lastIndexOf('/'), windows ? name.lastIndexOf('\\') : -1), base = name.slice(index + 1);
         return new Dirent(raw ? Buffer.from(base) : base, type, index < 0 ? args[0] : path.join(args[0], name.slice(0, index)));
@@ -508,11 +534,11 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     constructor(fd) { this.#fd = fd; handles.register(this, fd, this); }
     get fd() { return this.#fd; }
     async close() { const fd = this.#fd; if (fd < 0) return; this.#fd = -1; handles.unregister(this); await asyncCall('close', fd); }
-    async read(buffer = Buffer.alloc(16384), offset = 0, length, position = null) { if (!ArrayBuffer.isView(buffer)) ({ buffer = Buffer.alloc(16384), offset = 0, length, position = null } = buffer ?? {}); else if (offset !== null && typeof offset === 'object') ({ offset = 0, length, position = null } = offset); offset ??= 0; length ??= buffer.byteLength - offset; span(buffer.byteLength, offset, length); if (typeof position === 'bigint') position = Number(position); const data = bytes(await asyncCall('read', this.#fd, length, position)); view(buffer).set(data, offset); return { bytesRead: data.length, buffer }; }
+    async read(buffer = Buffer.alloc(16384), offset = 0, length, position = null) { if (!ArrayBuffer.isView(buffer)) ({ buffer = Buffer.alloc(16384), offset = 0, length, position = null } = buffer ?? {}); else if (offset !== null && typeof offset === 'object') ({ offset = 0, length, position = null } = offset); offset ??= 0; length ??= buffer.byteLength - offset; span(buffer.byteLength, offset, length); if (typeof position === 'bigint') position = Number(position); const data = await asyncCall('read', this.#fd, length, position); view(buffer).set(data, offset); return { bytesRead: data.length, buffer }; }
     async write(buffer, ...args) { return { bytesWritten: await asyncCall('write', this.#fd, ...chunk(buffer, ...args)), buffer }; }
     async readv(buffers, position) { const list = vectors(buffers); return { bytesRead: scatter(list, bytes(await asyncCall('read', this.#fd, list.reduce((n, b) => n + b.length, 0), offsetOrNull(position)))), buffers }; }
     async writev(buffers, position) { return { bytesWritten: await asyncCall('write', this.#fd, Buffer.concat(vectors(buffers)), offsetOrNull(position)), buffers }; }
-    async readFile(o) { const { encoding, signal } = options(o), chunks = []; for (;;) { aborted(signal); const chunk = await asyncCall('read', this.#fd, 1048576, null); if (!chunk.length) break; chunks.push(bytes(chunk)); } const b = Buffer.concat(chunks); return encoding && encoding !== 'buffer' ? b.toString(encoding) : b; }
+    async readFile(o) { const { encoding, signal } = options(o); aborted(signal); if (this.#fd < 0) await asyncCall('read', this.#fd, 0, null); const b = bytes(await asyncCall('readFile', this.#fd, {})); aborted(signal); return encoding && encoding !== 'buffer' ? b.toString(encoding) : b; }
     async writeFile(data, o) { const { encoding, signal } = options(o), bytes = view(data, encoding); let at = 0; do { aborted(signal); at += await asyncCall('write', this.#fd, bytes.subarray(at, at + 1048576), null); } while (at < bytes.length); }
     async appendFile(data, o) { await this.writeFile(data, o); }
     async stat(options) { const result = await asyncCall('fstat', this.#fd); return options?.bigint ? new BigIntStats(result) : new Stats(result); }
@@ -565,7 +591,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
   }
   files.realpathSync.native = files.realpathSync; files.realpath.native = files.realpath;
   files.existsSync = value => { try { return sync('exists', pathArg(value)); } catch { return false; } };
-  files.readSync = (fd, buffer, offset = 0, length, position = null) => { if (offset !== null && typeof offset === 'object') ({ offset = 0, length, position = null } = offset); offset ??= 0; length ??= buffer.byteLength - offset; span(buffer.byteLength, offset, length); if (typeof position === 'bigint') position = Number(position); let data; try { data = bytes(sync('read', fd, length, position)); } catch (error) { throw failure(error, 'read', [fd]); } view(buffer).set(data, offset); return data.length; };
+  files.readSync = (fd, buffer, offset = 0, length, position = null) => { if (offset !== null && typeof offset === 'object') ({ offset = 0, length, position = null } = offset); offset ??= 0; length ??= buffer.byteLength - offset; span(buffer.byteLength, offset, length); if (typeof position === 'bigint') position = Number(position); if (!ArrayBuffer.isView(buffer) || buffer instanceof DataView) { let data; try { data = sync('read', fd, length, position); } catch (error) { throw failure(error, 'read', [fd]); } view(buffer).set(data, offset); return data.length; } try { return call('node.readInto', fd, buffer, offset, length, position); } catch (error) { throw failure(error, 'read', [fd]); } };
   files.writeSync = (fd, ...args) => { try { return sync('write', fd, ...chunk(...args)); } catch (error) { throw failure(error, 'write', [fd]); } };
   files.read = (fd, buffer, offset, length, position, callback) => {
     callback = [buffer, offset, length, position, callback].findLast(value => typeof value === 'function');
@@ -573,7 +599,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     else if (typeof offset === 'object' && offset !== null) ({ offset = 0, length = buffer.byteLength - offset, position = null } = offset);
     offset = typeof offset === 'number' ? offset : 0; length = typeof length === 'number' ? length : buffer.byteLength - offset; position = typeof position === 'number' || typeof position === 'bigint' ? Number(position) : null;
     span(buffer.byteLength, offset, length);
-    asyncCall('read', fd, length, position).then(data => { data = bytes(data); view(buffer).set(data, offset); callback(null, data.length, buffer); }, error => callback(failure(error, 'read', [fd])));
+    asyncCall('read', fd, length, position).then(data => { view(buffer).set(data, offset); callback(null, data.length, buffer); }, error => callback(failure(error, 'read', [fd])));
   };
   files.write = (fd, buffer, ...args) => { const callback = args.pop(); asyncCall('write', fd, ...chunk(buffer, ...args)).then(written => callback(null, written, buffer), error => callback(failure(error, 'write', [fd]))); };
   files.readvSync = (fd, buffers, position) => { const list = vectors(buffers); try { return scatter(list, bytes(sync('read', fd, list.reduce((n, b) => n + b.length, 0), offsetOrNull(position)))); } catch (error) { throw failure(error, 'read', [fd]); } };
@@ -936,10 +962,11 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     pathToFileURL(value) {
       let resolved = path.resolve(value);
       if (/[\\/]$/.test(value) && !resolved.endsWith(path.sep)) resolved += '/';
-      const url = new URL('file://');
-      if (windows && resolved.startsWith('\\\\')) { const [host, ...rest] = resolved.slice(2).split('\\'); url.hostname = host; resolved = '/' + rest.join('/'); }
-      else if (windows) resolved = '/' + resolved.replaceAll('\\', '/');
-      url.pathname = resolved.replace(/[%\n\r\t#?\\]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'));
+      const escape = text => text.replace(/[\x00-\x20%#?\\]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'));
+      if (!windows || !resolved.startsWith('\\\\')) return new URL('file://' + escape(windows ? '/' + resolved.replaceAll('\\', '/') : resolved));
+      const url = new URL('file://'), [host, ...rest] = resolved.slice(2).split('\\');
+      url.hostname = host;
+      url.pathname = escape('/' + rest.join('/'));
       return url;
     },
     format(value, options) {
@@ -980,14 +1007,14 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
       if (typeof data === 'string') return data;
       if (!ArrayBuffer.isView(data)) throw typeError('buf', 'an instance of Buffer, TypedArray, or DataView', data);
       const encoding = this.encoding, char = this.#char, n = data.byteLength;
-      data = new Uint8Array(data.buffer, data.byteOffset, n);
+      if (!plain(data)) data = new Uint8Array(data.buffer, data.byteOffset, n);
       if (encoding === 'ascii' || encoding === 'hex' || encoding === 'latin1') return decode(data, encoding);
       let prefix = '', at = 0;
       if (this.#need) {
-        if (encoding === 'utf8') for (let i = 0; i < n && i < this.#need; i++) if ((data[i] & 0xC0) !== 0x80) { this.#need = 0; char.set(data.subarray(0, i), this.#have); this.#have += i; at = i; break; }
+        if (encoding === 'utf8') for (let i = 0; i < n && i < this.#need; i++) if ((data[i] & 0xC0) !== 0x80) { this.#need = 0; for (let j = 0; j < i; j++) char[this.#have + j] = data[j]; this.#have += i; at = i; break; }
         const found = Math.min(n - at, this.#need);
-        char.set(data.subarray(at, at + found), this.#have); at += found; this.#need -= found; this.#have += found;
-        if (!this.#need) { prefix = decode(char.subarray(0, this.#have), encoding); this.#have = 0; }
+        for (let j = 0; j < found; j++) char[this.#have + j] = data[at + j]; at += found; this.#need -= found; this.#have += found;
+        if (!this.#need) { prefix = decode(char, encoding, 0, this.#have); this.#have = 0; }
       }
       if (at === n) return prefix;
       if (encoding === 'utf8') {
@@ -1001,13 +1028,13 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
         }
       } else if (encoding === 'utf16le') { if ((n - at) % 2) this.#have = this.#need = 1; else if ((data[n - 1] & 0xFC) === 0xD8) this.#have = this.#need = 2; }
       else if ((this.#have = (n - at) % 3)) this.#need = 3 - this.#have;
-      if (this.#have) char.set(data.subarray(n - this.#have), 0);
-      return prefix + (n - this.#have > at ? decode(data.subarray(at, n - this.#have), encoding) : '');
+      for (let j = 0; j < this.#have; j++) char[j] = data[n - this.#have + j];
+      return prefix + (n - this.#have > at ? decode(data, encoding, at, n - this.#have) : '');
     }
     end(data) {
       let text = data === undefined ? '' : this.write(data);
       if (this.#have && this.encoding === 'utf16le' && this.#have % 2) { this.#need--; this.#have--; }
-      if (this.#have) { text += decode(this.#char.subarray(0, this.#have), this.encoding); this.#need = this.#have = 0; }
+      if (this.#have) { text += decode(this.#char, this.encoding, 0, this.#have); this.#need = this.#have = 0; }
       return text;
     }
   }
@@ -1057,7 +1084,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
     escape: value => { try { return encodeURIComponent(value); } catch { throw error(URIError, 'ERR_INVALID_URI', 'URI malformed'); } },
     unescape: (value, spaces) => { try { return decodeURIComponent(value); } catch { return querystring.unescapeBuffer(value, spaces).toString(); } },
     unescapeBuffer(text, spaces) {
-      const out = Buffer.allocUnsafe(text.length), hex = c => c >= 48 && c <= 57 ? c - 48 : (c | 32) >= 97 && (c | 32) <= 102 ? (c | 32) - 87 : -1;
+      const out = new Uint8Array(text.length), hex = c => c >= 48 && c <= 57 ? c - 48 : (c | 32) >= 97 && (c | 32) <= 102 ? (c | 32) - 87 : -1;
       let at = 0;
       for (let index = 0; index < text.length; index++) {
         let c = text.charCodeAt(index);
@@ -1065,7 +1092,7 @@ globalThis.__appsNode = (call, EventEmitter, { inspect, format, formatWithOption
         else if (c === 37 && index < text.length - 2) { const high = hex(text.charCodeAt(index + 1)), low = hex(text.charCodeAt(index + 2)); if (high >= 0 && low >= 0) { c = high * 16 + low; index += 2; } }
         out[at++] = c;
       }
-      return out.subarray(0, at);
+      return Object.setPrototypeOf(at === out.length ? out : out.slice(0, at), Buffer.prototype);
     },
     stringify(value, separator, equals, options) {
       if (value === null || typeof value !== 'object') return '';

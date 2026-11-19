@@ -243,7 +243,15 @@ impl TextLine {
                 } else if Rect::new(at + ink.lift, ink.size)
                     .intersects(window.content_mask().bounds)
                 {
-                    window.draw_glyph(at, glyph.font, glyph.id, glyph.size, color, glyph.emoji);
+                    window.draw_glyph(
+                        at,
+                        glyph.font,
+                        glyph.id,
+                        glyph.size,
+                        color,
+                        glyph.emoji,
+                        px(0.),
+                    );
                 } else {
                     // A copy of this paint can't move: it lacks the glyph.
                     window.cull();

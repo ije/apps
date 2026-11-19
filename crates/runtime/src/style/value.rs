@@ -652,6 +652,41 @@ pub(crate) fn number(value: f64) -> String {
     out
 }
 
+// Chrome's `%.6g` text of a number: 6 significant digits, an exponent below 1e-4 and from 1e6, within the f32
+// range.
+pub(crate) fn write_printed(value: f64, out: &mut String) {
+    use std::fmt::Write;
+    let value = value.clamp(-f64::from(f32::MAX), f64::from(f32::MAX));
+    if value == 0. || value.is_nan() {
+        out.push('0');
+        return;
+    }
+    // Here both print the same digits, and `write_number` needs no allocation.
+    if (1e-3..999_999.).contains(&value.abs()) {
+        return write_number(value, out);
+    }
+    let text = format!("{value:.5e}");
+    let (mantissa, exponent) = text.split_once('e').unwrap_or((&text, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let trim = |text: &str| match text.contains('.') {
+        true => text.trim_end_matches('0').trim_end_matches('.').len(),
+        false => text.len(),
+    };
+    if (-4..6).contains(&exponent) {
+        let start = out.len();
+        let _ = write!(out, "{value:.*}", (5 - exponent) as usize);
+        out.truncate(start + trim(&out[start..]));
+    } else {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        let _ = write!(
+            out,
+            "{}e{sign}{:02}",
+            &mantissa[..trim(mantissa)],
+            exponent.abs()
+        );
+    }
+}
+
 pub(crate) fn write_number(value: f64, out: &mut String) {
     use std::fmt::Write;
     let value = if value.abs() < 1e-9 { 0. } else { value };

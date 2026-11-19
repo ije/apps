@@ -398,6 +398,41 @@ impl State {
         Ok(self.keep(result))
     }
 
+    // Direct property access for keys that need no ToPropertyKey. `set` is a sloppy [[Set]], like the helpers.
+    unsafe fn access(
+        &self,
+        object: Ptr,
+        name: Option<*const c_char>,
+        index: u32,
+        value: Option<Ptr>,
+    ) -> std::result::Result<Ptr, i32> {
+        check(value.is_none_or(|value| !value.is_null()), 1)?;
+        let (api, ctx, mut exception) = (&self.api, self.ctx, ptr::null_mut());
+        let key = name.map(|name| api.string(&unsafe { CStr::from_ptr(name) }.to_string_lossy()));
+        let result = unsafe {
+            match (key, value) {
+                (Some(key), Some(value)) => {
+                    (api.set)(ctx, object, key, value, 0, &mut exception);
+                    ptr::null_mut()
+                }
+                (Some(key), None) => (api.get)(ctx, object, key, &mut exception),
+                (None, Some(value)) => {
+                    (api.set_index)(ctx, object, index, value, &mut exception);
+                    ptr::null_mut()
+                }
+                (None, None) => (api.get_index)(ctx, object, index, &mut exception),
+            }
+        };
+        if let Some(key) = key {
+            unsafe { (api.string_release)(key) };
+        }
+        if !exception.is_null() {
+            self.exception(exception);
+            return Err(10);
+        }
+        Ok(self.keep(result))
+    }
+
     fn truthy(&self, name: &str, args: &[Ptr]) -> std::result::Result<bool, i32> {
         let value = self.js(name, args)?;
         Ok(unsafe { (self.api.to_boolean)(self.ctx, value) })
@@ -1213,14 +1248,12 @@ api!(napi_get_named_property(
 ) {
     env.object(object)?;
     check(!name.is_null(), 1)?;
-    let key = env.c_text(name);
-    env.value(result, env.js("get", &[object, key])?)
+    env.value(result, env.access(object, Some(name), 0, None)?)
 });
 api!(napi_set_named_property(env, object: Ptr, name: *const c_char, value: Ptr) {
     env.object(object)?;
     check(!name.is_null(), 1)?;
-    let key = env.c_text(name);
-    env.js("set", &[object, key, value])?;
+    env.access(object, Some(name), 0, Some(value))?;
     Ok(())
 });
 api!(napi_has_named_property(
@@ -1238,13 +1271,11 @@ api!(napi_has_named_property(
 });
 api!(napi_get_element(env, object: Ptr, index: u32, result: *mut Ptr) {
     env.object(object)?;
-    let key = env.number(index as f64);
-    env.value(result, env.js("get", &[object, key])?)
+    env.value(result, env.access(object, None, index, None)?)
 });
 api!(napi_set_element(env, object: Ptr, index: u32, value: Ptr) {
     env.object(object)?;
-    let key = env.number(index as f64);
-    env.js("set", &[object, key, value])?;
+    env.access(object, None, index, Some(value))?;
     Ok(())
 });
 api!(napi_has_element(env, object: Ptr, index: u32, result: *mut bool) {
@@ -1356,7 +1387,19 @@ api!(napi_call_function(
     if argc > 0 {
         args.extend_from_slice(std::slice::from_raw_parts(argv, argc));
     }
-    let value = env.js("call", &args)?;
+    // JSC treats a primitive receiver as a missing one, so only object receivers skip the helper.
+    check(args.iter().all(|arg| !arg.is_null()), 1)?;
+    let value = if (env.api.value_type)(env.ctx, this) == 5 {
+        let mut exception = ptr::null_mut();
+        let value = (env.api.invoke)(env.ctx, function, this, argc, args.as_ptr().add(2), &mut exception);
+        if !exception.is_null() {
+            env.exception(exception);
+            return Err(10);
+        }
+        env.keep(value)
+    } else {
+        env.js("call", &args)?
+    };
     if !result.is_null() {
         env.value(result, value)?;
     }

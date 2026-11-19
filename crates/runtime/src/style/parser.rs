@@ -1,4 +1,6 @@
-use super::{Declaration, Declarations, MediaQuery, Rule, Selector, SelectorList, Stylesheet};
+use super::{
+    Declaration, Declarations, MediaQuery, Prop, Rule, Selector, SelectorList, Stylesheet,
+};
 use cssparser::{
     AtRuleParser, CowRcStr, DeclarationParser, Delimiter, ParseError, Parser, ParserState,
     QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, StyleSheetParser, Token,
@@ -20,7 +22,8 @@ struct Rules {
     declarations_only: bool,
     descriptors: bool,
     theme: bool,
-    scope: bool,
+    // In an `@scope` rule, the selector that keeps a rule in the scope.
+    scope: Option<String>,
     suffix: String,
 }
 
@@ -142,8 +145,16 @@ impl<'i> DeclarationParser<'i> for Rules {
         } else {
             Delimiter::Bang | Delimiter::CurlyBracketBlock
         };
+        let start = input.position();
         input.parse_until_before(delimiters, |input| source(input, &mut value, separator))?;
+        // Like Chrome, a custom property keeps its text as written.
+        if custom {
+            value = input.slice_from(start).to_owned();
+        }
         value.truncate(value.trim_end().len());
+        if value.contains("-webkit-calc(") {
+            value = value.replace("-webkit-calc(", "calc(");
+        }
         if value.contains("env(") {
             value = environment(&value);
         }
@@ -156,13 +167,30 @@ impl<'i> DeclarationParser<'i> for Rules {
         input.expect_exhausted()?;
         let name = if custom {
             name.to_string()
-        } else if name.eq_ignore_ascii_case("-webkit-user-select") {
-            "user-select".into()
         } else if name.eq_ignore_ascii_case("-webkit-app-region") {
             "app-region".into()
         } else {
-            name.to_ascii_lowercase()
+            let name = name.to_ascii_lowercase();
+            match Prop::unprefixed(&name) {
+                Some(base) => base.to_owned(),
+                None => name,
+            }
         };
+        // Like Chrome, a font weight is `normal`, `bold`, `auto`, or one or two numbers in [1, 1000].
+        if self.descriptors && name == "font-weight" {
+            let weights = super::components(&value, ' ');
+            if weights.len() > 2
+                || weights.iter().any(|weight| match weight.parse::<f64>() {
+                    Ok(weight) => !(1. ..=1000.).contains(&weight),
+                    Err(_) => {
+                        !(weight.starts_with("calc(")
+                            || weights.len() == 1 && matches!(*weight, "normal" | "bold" | "auto"))
+                    }
+                })
+            {
+                return Err(ParseError::unexpected_token());
+            }
+        }
         if !custom
             && !self.descriptors
             && !self.theme
@@ -186,7 +214,8 @@ pub(super) fn invalid(name: &str, plain: &str) -> bool {
         key.extend_from_slice(name.as_bytes());
         key.push(b':');
         // Validity never depends on which nonzero digits a number with a unit has, so `1px` and `27px` share an
-        // entry. Plain numbers can have a range, like `cubic-bezier(2, 0, 0, 1)`.
+        // entry. Plain numbers can have a range, like `cubic-bezier(2, 0, 0, 1)`, and with an exponent every digit
+        // counts, like `1.25e1`, so these stay as written.
         let (bytes, mut index, mut word) = (plain.as_bytes(), 0, false);
         while let Some(&byte) = bytes.get(index) {
             index += 1;
@@ -195,6 +224,17 @@ pub(super) fn invalid(name: &str, plain: &str) -> bool {
                 while let Some(&digit) = bytes.get(index).filter(|b| b.is_ascii_digit()) {
                     zero &= digit == b'0';
                     index += 1;
+                }
+                if matches!(bytes.get(index), Some(b'e' | b'E')) {
+                    let sign = usize::from(matches!(bytes.get(index + 1), Some(b'+' | b'-')));
+                    if bytes.get(index + 1 + sign).is_some_and(u8::is_ascii_digit) {
+                        index += 2 + sign;
+                        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+                            index += 1;
+                        }
+                        key.extend_from_slice(&bytes[start..index]);
+                        continue;
+                    }
                 }
                 match bytes.get(index) {
                     Some(unit) if unit.is_ascii_alphabetic() || *unit == b'%' => {
@@ -233,27 +273,42 @@ impl<'i> QualifiedRuleParser<'i> for Rules {
     fn parse_prelude(&mut self, input: &mut Parser<'i>) -> Result<SelectorList, ParseError<()>> {
         let mut value = String::new();
         source(input, &mut value, "/**/")?;
-        if self.scope {
-            value = value.replace(":scope", "&");
-        }
-        if !self.suffix.is_empty() {
+        if self.scope.is_some() || !self.suffix.is_empty() {
             let mut depth = 0;
-            let mut parts = vec![String::new()];
-            for c in value.chars() {
+            // Each selector, and whether it has `&` or `:scope` outside of functions.
+            let mut parts = vec![(String::new(), false)];
+            for (at, c) in value.char_indices() {
                 depth += i32::from(matches!(c, '(' | '[')) - i32::from(matches!(c, ')' | ']'));
                 match parts.last_mut() {
-                    Some(_) if c == ',' && depth == 0 => parts.push(String::new()),
-                    Some(part) => part.push(c),
+                    Some(_) if c == ',' && depth == 0 => parts.push((String::new(), false)),
+                    Some((part, top)) => {
+                        *top |= depth == 0 && (c == '&' || value[at..].starts_with(":scope"));
+                        part.push(c);
+                    }
                     None => {}
                 }
             }
             value = parts
                 .iter()
-                .map(|part| format!("{}{}", part.trim(), self.suffix))
+                .map(|(part, top)| {
+                    // `&` or `:scope` only inside a function, like `:not(:scope)`, doesn't keep the selector
+                    // in the scope.
+                    let bound = match &self.scope {
+                        Some(bound) if !top && (part.contains('&') || part.contains(":scope")) => {
+                            bound.as_str()
+                        }
+                        _ => "",
+                    };
+                    format!("{}{bound}{}", part.trim(), self.suffix)
+                })
                 .collect::<Vec<_>>()
                 .join(",");
         }
-        let selectors = Selector::parse(&value, self.parent.as_ref());
+        let selectors = if self.scope.is_some() {
+            Selector::parse_scoped(&value, self.parent.as_ref())
+        } else {
+            Selector::parse(&value, self.parent.as_ref())
+        };
         if selectors.is_empty() {
             return Err(ParseError::unexpected_token());
         }
@@ -376,13 +431,14 @@ impl<'i> AtRuleParser<'i> for Rules {
         }
         if name.eq_ignore_ascii_case("utility") && self.top_level {
             let mut name = String::new();
-            source(input, &mut name, "/**/")?;
+            source(input, &mut name, "")?;
             name.retain(|c| !c.is_whitespace());
             return Ok(Item::Rule(Rule::Utility(name, String::new())));
         }
         if name.eq_ignore_ascii_case("apply") && self.parse_declarations() {
             let mut value = String::new();
-            source(input, &mut value, "/**/")?;
+            // Class names keep adjacent tokens as written, like `py-1.5`.
+            source(input, &mut value, "")?;
             return Ok(Item::Declaration(Declaration::Apply(
                 super::components(&value, ' ')
                     .into_iter()
@@ -434,13 +490,24 @@ impl<'i> AtRuleParser<'i> for Rules {
             let mut pending = vec![&mut query];
             while let Some(query) = pending.pop() {
                 let replaced = match query {
-                    MediaQuery::Not(inner) => {
+                    MediaQuery::Not(inner) | MediaQuery::Range(_, inner) => {
                         pending.push(inner);
                         continue;
                     }
                     MediaQuery::And(items) | MediaQuery::Or(items) => {
                         pending.extend(items.iter_mut());
                         continue;
+                    }
+                    MediaQuery::Unknown(text)
+                        if text.to_ascii_lowercase().starts_with("style(") =>
+                    {
+                        let inner = text[6..].strip_suffix(')').unwrap_or_default();
+                        let (name, value) = inner.split_once(':').unwrap_or((inner, ""));
+                        let name = name.trim();
+                        if !name.starts_with("--") {
+                            continue;
+                        }
+                        MediaQuery::Feature("style".into(), name.into(), value.trim().into())
                     }
                     MediaQuery::Feature(name, op, value) => match name.as_str() {
                         "width" | "inline-size" => {
@@ -555,7 +622,7 @@ impl<'i> AtRuleParser<'i> for Rules {
         let nested = |input: &mut Parser<'i>| {
             Rules {
                 parent: self.parent.clone(),
-                scope: self.scope,
+                scope: self.scope.clone(),
                 suffix: self.suffix.clone(),
                 ..Rules::default()
             }
@@ -575,7 +642,7 @@ impl<'i> AtRuleParser<'i> for Rules {
                 });
                 let children = Rules {
                     parent: Some(root.clone()),
-                    scope: true,
+                    scope: Some(format!(":where(:where({start}), :where({start}) *)")),
                     suffix,
                     ..Rules::default()
                 }
@@ -747,7 +814,15 @@ fn condition(
                     && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
             };
             let feature = |name: &str, op: &str, value: &str| {
-                MediaQuery::Feature(name.into(), op.into(), value.into())
+                let value = match name.ends_with("aspect-ratio") {
+                    true => value
+                        .split('/')
+                        .map(str::trim)
+                        .collect::<Vec<_>>()
+                        .join(" / "),
+                    false => value.into(),
+                };
+                MediaQuery::Feature(name.into(), op.into(), value)
             };
             if let Some((name, value)) = text.split_once(':') {
                 let name = name
@@ -793,28 +868,53 @@ fn condition(
                 ">=" => "<=",
                 _ => "=",
             };
+            // Forms with the value first keep their text, like Chrome.
+            let text = || {
+                let ratio = |part: &str| {
+                    part.split('/')
+                        .map(str::trim)
+                        .collect::<Vec<_>>()
+                        .join(" / ")
+                };
+                match count {
+                    1 => format!("({} {} {})", ratio(parts[0]), ops[0], parts[1]),
+                    _ => format!(
+                        "({} {} {} {} {})",
+                        ratio(parts[0]),
+                        ops[0],
+                        parts[1],
+                        ops[1],
+                        ratio(parts[2])
+                    ),
+                }
+            };
             Ok(match count {
                 1 if ident(parts[0]) && !parts[1].is_empty() => {
                     Some(feature(parts[0], ops[0], parts[1]))
                 }
-                1 if ident(parts[1]) && !parts[0].is_empty() => {
-                    Some(feature(parts[1], flip(ops[0]), parts[0]))
-                }
+                1 if ident(parts[1]) && !parts[0].is_empty() => Some(MediaQuery::Range(
+                    text(),
+                    Box::new(feature(parts[1], flip(ops[0]), parts[0])),
+                )),
                 2 if ident(parts[1])
                     && ops[0] != "="
                     && ops[0].as_bytes().first() == ops[1].as_bytes().first()
                     && !parts[0].is_empty()
                     && !parts[2].is_empty() =>
                 {
-                    Some(MediaQuery::And(vec![
-                        feature(parts[1], flip(ops[0]), parts[0]),
-                        feature(parts[1], ops[1], parts[2]),
-                    ]))
+                    Some(MediaQuery::Range(
+                        text(),
+                        Box::new(MediaQuery::And(vec![
+                            feature(parts[1], flip(ops[0]), parts[0]),
+                            feature(parts[1], ops[1], parts[2]),
+                        ])),
+                    ))
                 }
                 _ => None,
             })
         })?;
-        let item = item.unwrap_or_else(|| MediaQuery::Unknown(input.slice_from(start).to_owned()));
+        let item =
+            item.unwrap_or_else(|| MediaQuery::Unknown(input.slice_from(start).trim().to_owned()));
         if not {
             return Ok(MediaQuery::Not(Box::new(item)));
         }
@@ -1078,6 +1178,16 @@ impl Lengths {
     }
 
     pub fn math(&self, source: &str, base: f32, vars: &[(&str, f64)]) -> Option<(f64, Kind)> {
+        self.math_unclamped(source, base, vars)
+            .map(|(value, kind)| (value.clamp(-33_554_428., 33_554_428.), kind))
+    }
+
+    pub fn math_unclamped(
+        &self,
+        source: &str,
+        base: f32,
+        vars: &[(&str, f64)],
+    ) -> Option<(f64, Kind)> {
         let mut parser = Math {
             rest: source.trim(),
             units: self,
@@ -1086,8 +1196,7 @@ impl Lengths {
             vars,
         };
         let value = parser.atom()?;
-        (parser.rest.trim().is_empty() && !value.0.is_nan())
-            .then_some((value.0.clamp(-33_554_428., 33_554_428.), value.1))
+        (parser.rest.trim().is_empty() && !value.0.is_nan()).then_some(value)
     }
 
     pub fn resolve(&self, source: &str, base: f32) -> Option<f32> {
@@ -1370,6 +1479,22 @@ impl Math<'_> {
                     "vh" | "svh" | "lvh" | "dvh" | "vb" | "svb" | "lvb" | "dvb" => vh / 100.,
                     "cqw" | "cqi" => self.units.container.unwrap_or(self.units.viewport)[0] / 100.,
                     "cqh" | "cqb" => self.units.container.unwrap_or(self.units.viewport)[1] / 100.,
+                    "cqmin" => {
+                        self.units
+                            .container
+                            .unwrap_or(self.units.viewport)
+                            .into_iter()
+                            .fold(f32::INFINITY, f32::min)
+                            / 100.
+                    }
+                    "cqmax" => {
+                        self.units
+                            .container
+                            .unwrap_or(self.units.viewport)
+                            .into_iter()
+                            .fold(0., f32::max)
+                            / 100.
+                    }
                     "vmin" | "svmin" | "lvmin" | "dvmin" => vw.min(vh) / 100.,
                     "vmax" | "svmax" | "lvmax" | "dvmax" => vw.max(vh) / 100.,
                     "in" => 96.,
@@ -1425,6 +1550,53 @@ impl<'i> QualifiedRuleParser<'i> for Keyframes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numbers_with_exponents_keep_their_own_validity() {
+        // As in Chrome: a number with `.` or an exponent is not an `<integer>`.
+        let cases = [
+            ("z-index", "1.5e1", true),
+            ("z-index", "1.25e1", true),
+            ("z-index", "1e1", true),
+            ("z-index", "2E+1", true),
+            ("z-index", "20e-1", true),
+            ("z-index", "05", false),
+            ("column-count", "2e0", true),
+            ("column-count", "2.5e0", true),
+            (
+                "animation-timing-function",
+                "cubic-bezier(1e0,0,0,1)",
+                false,
+            ),
+            ("animation-timing-function", "cubic-bezier(2e0,0,0,1)", true),
+            (
+                "animation-timing-function",
+                "cubic-bezier(5e-1,0,0,1)",
+                false,
+            ),
+            ("flex-grow", "2e0", false),
+            ("width", "1e1px", false),
+            ("grid-row", "1e0", true),
+            ("grid-row", "span 1.5 / 2", true),
+            ("grid-row", "1 / span 2", false),
+            ("counter-reset", "c 1e1", true),
+            ("counter-reset", "c -2", false),
+        ];
+        // Each thread starts with an empty cache.
+        for reverse in [false, true] {
+            std::thread::spawn(move || {
+                let mut cases = cases.to_vec();
+                if reverse {
+                    cases.reverse();
+                }
+                for (name, value, expected) in cases {
+                    assert_eq!(invalid(name, value), expected, "{name}: {value}");
+                }
+            })
+            .join()
+            .unwrap();
+        }
+    }
 
     #[test]
     fn viewport_font_and_absolute_units() {

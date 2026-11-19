@@ -128,13 +128,14 @@ globalThis.__appsPlatform = (call, node, codec) => {
     codecs?.register(state, state.id, state);
     const close = () => { if (state.id !== null) { call('web.platform.compression.close', state.id); state.id = null; codecs?.unregister(state); } };
     const write = (data, controller, finish) => {
-      const input = data instanceof ArrayBuffer ? new Uint8Array(data) : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
+      // The first `.buffer` read of a new array makes JSC allocate an ArrayBuffer. Empty ones may be detached.
+      const input = data instanceof ArrayBuffer ? new Uint8Array(data) : ArrayBuffer.isView(data) ? (data instanceof Uint8Array && data.length && Object.getPrototypeOf(data) === Uint8Array.prototype ? data : new Uint8Array(data.buffer, data.byteOffset, data.byteLength)) : null;
       if (!input) { close(); throw new TypeError('Expected an ArrayBuffer or view'); }
       let offset = 0;
       try {
         while (true) {
           const end = Math.min(offset + 65536, input.length);
-          const result = call('web.platform.compression.write', state.id, input.subarray(offset, end), finish && end === input.length);
+          const result = call('web.platform.compression.write', state.id, offset || end < input.length ? input.subarray(offset, end) : input, finish && end === input.length);
           offset += result.read;
           const output = codecBytes.decode(result.bytes);
           if (output.length) controller.enqueue(output);

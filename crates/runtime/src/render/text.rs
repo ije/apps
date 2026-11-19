@@ -8,6 +8,8 @@ pub(super) struct TextHighlight {
     pub(super) range: Range<usize>,
     pub(super) color: Option<renderer::Color>,
     pub(super) background: renderer::Color,
+    /// Like Chrome, a `::selection` style draws the text without its stroke.
+    pub(super) stroke: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -207,14 +209,17 @@ pub(super) fn paint_text(
             text_run += 1;
             run_end += runs[text_run].len;
         }
+        let highlight = highlights
+            .iter()
+            .find(|highlight| highlight.range.contains(&index));
         let color = ink.unwrap_or_else(|| {
-            highlights
-                .iter()
-                .find(|highlight| highlight.range.contains(&index))
-                .and_then(|highlight| highlight.color)
-                .unwrap_or(runs[text_run].color)
+            (highlight.and_then(|highlight| highlight.color)).unwrap_or(runs[text_run].color)
         });
-        if color.a == 0. && !window.clips_text() {
+        let stroke = runs[text_run]
+            .stroke
+            .filter(|_| !glyph.emoji && highlight.is_none_or(|highlight| highlight.stroke));
+        let fill = color.a > 0. || window.clips_text();
+        if !fill && stroke.is_none_or(|(_, color)| color.a == 0.) {
             continue;
         }
         let gap = rows
@@ -232,27 +237,42 @@ pub(super) fn paint_text(
             origin.x + shift(wrap) + glyph.x - left + gap,
             origin.y + line_height * wrap + baseline + drop(wrap),
         );
-        // The font box has y up from the baseline.
+        // The font box has y up from the baseline. A miter of the stroke reaches twice its width past the outline.
+        let reach = stroke.map_or(px(0.), |(width, _)| width * 2.);
         if !Rect::new(
             point(
-                position.x + glyph_box.left(),
-                position.y - glyph_box.bottom(),
+                position.x + glyph_box.left() - reach,
+                position.y - glyph_box.bottom() - reach,
             ),
-            glyph_box.size,
+            size(
+                glyph_box.size.width + reach * 2.,
+                glyph_box.size.height + reach * 2.,
+            ),
         )
         .intersects(window.content_mask().bounds)
         {
             window.cull();
             continue;
         }
-        window.draw_glyph(
-            position,
-            glyph.font,
-            glyph.id,
-            glyph.size,
-            color,
-            glyph.emoji,
-        );
+        if fill {
+            let id = glyph.id;
+            window.draw_glyph(
+                position,
+                glyph.font,
+                id,
+                glyph.size,
+                color,
+                glyph.emoji,
+                px(0.),
+            );
+        }
+        // Like Chrome, the stroke draws above the fill.
+        if let Some((width, stroke)) = stroke {
+            let color = ink.unwrap_or(stroke);
+            window.draw_glyph(
+                position, glyph.font, glyph.id, glyph.size, color, false, width,
+            );
+        }
     }
 }
 
@@ -722,7 +742,11 @@ impl From<InlineText> for renderer::Node {
                         cached.set(None);
                         *styled.borrow_mut() = Some(style.clone());
                     }
-                    let (font_size, line_height) = (style.font_size, style.line_height);
+                    // Like the renderer's paragraphs, a line is at most 2^25 device pixels tall.
+                    let font_size = style.font_size;
+                    let line_height = style
+                        .line_height
+                        .min(px(33_554_431. / window.scale_factor().max(1.)));
                     let wraps = style.white_space == renderer::WhiteSpace::Normal;
                     let min_content = wraps
                         && known.width.is_none()
@@ -732,7 +756,13 @@ impl From<InlineText> for renderer::Node {
                         _ => None,
                     });
                     let width = room.filter(|_| wraps);
-                    let key = (min_content, width);
+                    // A percentage of `text-indent` is of the width of the paragraph.
+                    let indent = style.text_indent
+                        + px(style.text_indent_percent * room.map_or(0., f32::from));
+                    let key = (
+                        min_content,
+                        room.filter(|_| style.text_indent_percent != 0.).or(width),
+                    );
                     let floats = window
                         .text_system()
                         .floats
@@ -764,7 +794,7 @@ impl From<InlineText> for renderer::Node {
                         &renderer::Wrapping {
                             width: wrap,
                             max_lines: style.line_clamp.filter(|_| !min_content),
-                            indent: style.text_indent,
+                            indent,
                             wrap: if min_content {
                                 renderer::TextWrap::Wrap
                             } else {
@@ -784,13 +814,13 @@ impl From<InlineText> for renderer::Node {
                     for (index, line) in lines.iter().enumerate() {
                         let mut line_size = line.extent(line_height);
                         if index == 0 && line.breaks.is_empty() {
-                            line_size.width = (line_size.width + style.text_indent).max(px(0.));
+                            line_size.width = (line_size.width + indent).max(px(0.));
                         }
                         size.height += line_size.height;
                         size.width = size.width.max(line_size.width);
                     }
                     if min_content {
-                        size.width = renderer::widest_piece(&lines, -style.text_indent);
+                        size.width = renderer::widest_piece(&lines, -indent);
                     }
                     // Rows that moved below floats make the text taller.
                     if let Some(&[.., top]) = lines.last().and_then(|line| line.shifts.last()) {
@@ -945,7 +975,29 @@ impl renderer::Hooks for InlineText {
             (None, None) => return,
         };
         let mut rows = Vec::new();
-        let indent = style.text_indent;
+        // Like Chrome, a percentage is of the content width of the block, which its paint hook records first.
+        let base = (style.text_indent_percent != 0.)
+            .then(|| {
+                let host = self.view.host.borrow();
+                let (page, dom) = (host.pages.get(&self.view.id)?, host.dom.get(&self.view.id)?);
+                let &(node, _) = self.data.ranges.first()?;
+                let (up, inner) = std::iter::successors(page.doc.nodes.get(node)?.parent, |&up| {
+                    page.doc.nodes[up].parent
+                })
+                .find_map(|up| Some((up, dom.cull.widths.get(&up)?)))?;
+                // The text of a flex or grid container is an anonymous item that fits its content.
+                let display = dom
+                    .last_styles()?
+                    .values
+                    .get(up)?
+                    .get(crate::style::Prop::DISPLAY);
+                (!display
+                    .is_some_and(|display| display.ends_with("flex") || display.ends_with("grid")))
+                .then(|| px(inner[0]))
+            })
+            .flatten()
+            .unwrap_or(bounds.size.width);
+        let indent = style.text_indent + px(style.text_indent_percent * f32::from(base));
         let strut = window.text_system().face(&style.font());
         let extents = row_extents(
             layout.lines().iter(),
@@ -1053,7 +1105,7 @@ impl renderer::Hooks for InlineText {
                         .borrow()
                         .dom
                         .get(&view.id)
-                        .and_then(|dom| dom.computed.clone())
+                        .and_then(|dom| dom.last_styles().cloned())
                 })
                 .as_ref()
                 .is_some_and(|styles| {
@@ -1119,7 +1171,7 @@ impl renderer::Hooks for InlineText {
         let shift = exact.origin - bounds.origin;
         let mut host = view.host.borrow_mut();
         let dom = host.dom.entry(view.id).or_default();
-        let computed = dom.computed.clone();
+        let computed = dom.last_styles().cloned();
         let mut spans: Option<Vec<(usize, Pixels)>> = None;
         let (mut layouts, mut rects) = {
             let mut prepainted = self.prepainted.borrow_mut();
@@ -1373,7 +1425,7 @@ impl renderer::Hooks for InlineText {
             let view = &*self.view;
             let host = view.host.borrow();
             let dom = &host.dom[&view.id];
-            if let Some(styles) = &dom.computed {
+            if let Some(styles) = dom.last_styles() {
                 let base = window.text_system().baseline(
                     strut,
                     text_style.font_size,
@@ -1521,6 +1573,7 @@ impl renderer::Hooks for InlineText {
                             range: start.min(end)..start.max(end),
                             color: color.map(Color::hex),
                             background: Color::hex(background),
+                            stroke: !styles.selections.contains_key(id),
                         });
                     }
                 }

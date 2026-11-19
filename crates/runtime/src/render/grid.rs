@@ -18,6 +18,15 @@ pub(crate) struct Measurements {
     // Use style-address keys only during grid layout, while styles outlive the map.
     #[allow(clippy::type_complexity)]
     pub(crate) edges: Option<rustc_hash::FxHashMap<(*const style::Style, u32), [[f32; 4]; 3]>>,
+    // The boxes with `content-visibility: auto`, true while they are near the view and show their contents.
+    pub(crate) shown: rustc_hash::FxHashMap<usize, bool>,
+    // For `contain-intrinsic-size: auto`: the last content size of a box that showed its contents, and whether it
+    // skipped them at its last build.
+    pub(crate) remembered: rustc_hash::FxHashMap<usize, (Option<[f32; 2]>, bool)>,
+    // Boxes that show their contents until the next frame, because a script reads the geometry of a node in them.
+    pub(crate) forced: rustc_hash::FxHashSet<usize>,
+    // Boxes that start or stop to skip their contents, which the next build builds again.
+    pub(crate) waking: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -29,6 +38,32 @@ pub(crate) struct Grid {
     pub baseline: bool,
     pub first_item: Option<usize>,
     pub first_baseline: Option<f32>,
+}
+
+// The content size of a box that skips its contents: its `contain-intrinsic-size`, or the size it remembers for
+// `auto`.
+pub(crate) fn intrinsic_size(
+    style: &style::Style,
+    units: &Lengths,
+    remembered: Option<[f32; 2]>,
+) -> [f32; 2] {
+    [0, 1].map(|axis| {
+        let value = style
+            .get(
+                [
+                    Prop::CONTAIN_INTRINSIC_WIDTH,
+                    Prop::CONTAIN_INTRINSIC_HEIGHT,
+                ][axis],
+            )
+            .unwrap_or("none");
+        match value.strip_prefix("auto") {
+            Some(length) => remembered
+                .map(|size| size[axis])
+                .or_else(|| units.resolve(length.trim(), 0.)),
+            None => units.resolve(value, 0.),
+        }
+        .unwrap_or(0.)
+    })
 }
 
 pub(crate) type Baselines = rustc_hash::FxHashMap<usize, [Option<f32>; 2]>;
@@ -176,7 +211,7 @@ fn tracks(
     (list, names, fit.then_some((index, inner.len() * count)))
 }
 
-fn placement(
+pub(super) fn placement(
     start: &str,
     end: &str,
     names: &[(String, usize)],
@@ -441,12 +476,18 @@ fn size(
     if let Some(space) = available
         && table
     {
-        let free = space - base.iter().sum::<f32>() - gaps(count);
-        let room: f32 = (0..count).map(|i| limit[i] - base[i]).sum();
-        if free > 0. && room > 0. {
-            let share = (free / room).min(1.);
-            for i in 0..count {
-                base[i] += (limit[i] - base[i]) * share;
+        let mut free = space - base.iter().sum::<f32>() - gaps(count);
+        // Like Chrome, columns with a width grow to it before the others grow past their min-content width.
+        for sized in [true, false] {
+            let grows = |i: &usize| matches!(max(*i), Fixed(_)) == sized;
+            let room: f32 = (0..count).filter(grows).map(|i| limit[i] - base[i]).sum();
+            if free > 0. && room > 0. {
+                let share = (free / room).min(1.);
+                for i in (0..count).filter(grows) {
+                    let add = (limit[i] - base[i]) * share;
+                    base[i] += add;
+                    free -= add;
+                }
             }
         }
     } else if let Some(space) = available {
@@ -614,7 +655,10 @@ pub(crate) fn intrinsic(
     let horizontal = [Prop::WIDTH, Prop::MIN_WIDTH, Prop::MAX_WIDTH];
     let fixed = sizes(horizontal, None);
     let used = sizes(horizontal, width);
+    // A table cell is as wide as its columns.
+    let cell = style::role(styles, id) == style::CELL;
     let available = used[0]
+        .filter(|_| !cell || width.is_none())
         .or(width.map(|width| width - outer[0]))
         .or(fixed[0])
         .map(|width| clamp(width, used).max(0.));
@@ -648,7 +692,19 @@ pub(crate) fn intrinsic(
     let natural = (node.tag != "svg")
         .then(|| super::element::natural_size(doc, id, measured.naturals.get(&id).copied(), style))
         .flatten();
-    if let Some((natural, ratio)) = natural {
+    let skipped = matches!(style.get(Prop::CONTENT_VISIBILITY), Some("hidden" | "auto"))
+        && super::cull::skips(
+            u32::from(super::cull::skippable(&node.tag, style)) * super::cull::SKIPS,
+            style,
+            id,
+            measured,
+            false,
+        );
+    if skipped {
+        let remembered = measured.remembered.get(&id).and_then(|entry| entry.0);
+        let [width, height] = intrinsic_size(style, units, remembered);
+        content = [width, width, height];
+    } else if let Some((natural, ratio)) = natural {
         let hint = [0, 1].map(|axis| {
             node.attrs
                 .get(["width", "height"][axis])
@@ -659,6 +715,9 @@ pub(crate) fn intrinsic(
                 .and_then(|v| super::element::dimension(v, false))
                 .map(|v| (v - if border_box { inner[axis] } else { 0. }).max(0.))
         });
+        // Like layout, a video without a frame and with a CSS ratio has no natural size: it adds no width, and
+        // the ratio gives its height from the width it gets.
+        let fills = fills(doc, styles, id, ratio);
         let height = vertical[0].or(hint[1]);
         let width = hint[0]
             .or_else(|| ratio.zip(height).map(|(ratio, height)| height * ratio))
@@ -668,7 +727,11 @@ pub(crate) fn intrinsic(
                 clamp(used[0].unwrap_or(width), used) / ratio
             })
         });
-        content = [width, width, height];
+        content = if fills {
+            [0.; 3]
+        } else {
+            [width, width, height]
+        };
     } else if node.tag == "svg" {
         let [width, height] = [0, 1].map(|axis| {
             [used[0], vertical[0]][axis].or_else(|| {
@@ -688,6 +751,12 @@ pub(crate) fn intrinsic(
         let [width, height] = match (width, height, ratio) {
             (None, Some(height), Some(ratio)) => [height * ratio, height],
             (Some(width), None, Some(ratio)) => [width, width / ratio],
+            // Like browsers, an SVG with a ratio and no size fills the available width, and adds nothing to the
+            // content sizes.
+            (None, None, Some(ratio)) => {
+                let width = available.unwrap_or(0.);
+                [width, width / ratio]
+            }
             _ => [width.unwrap_or(24.), height.unwrap_or(24.)],
         };
         content = [width, width, height];
@@ -753,7 +822,7 @@ pub(crate) fn intrinsic(
         None => measured
             .texts
             .entry(id)
-            .or_insert_with(|| style::inline_text(doc, styles, id).map(std::rc::Rc::new))
+            .or_insert_with(|| style::inline_text(doc, styles, id, &[]).map(std::rc::Rc::new))
             .clone()
             .map(|inline| {
                 (
@@ -1107,8 +1176,11 @@ pub(crate) fn intrinsic(
             })
         };
         let mut first = true;
+        // A collapsed space between inline boxes, which hangs at the end of a line.
+        let (mut spaced, mut space) = (false, None);
         for &child in &node.children {
             if skipped(child) {
+                spaced |= inline && doc.nodes[child].tag == "#text" && line[0] > 0.;
                 continue;
             }
             let gap = if first { [0.; 2] } else { gaps };
@@ -1126,7 +1198,7 @@ pub(crate) fn intrinsic(
                     content[2] += pending[0] + pending[1] + height;
                     (pending, placed) = ([0.; 2], true);
                 }
-                (line, run) = ([0.; 4], 0.);
+                (line, run, spaced) = ([0.; 4], 0., false);
                 let [min, max, _, height] =
                     intrinsic(doc, child, styles, available, None, text, measured);
                 content = [content[0].max(min), content[1].max(max), content[2]];
@@ -1159,7 +1231,22 @@ pub(crate) fn intrinsic(
                 Some(available)
                     if styles.values[child]
                         .get(Prop::WIDTH)
-                        .is_some_and(|v| v.contains('%')) =>
+                        .is_some_and(|v| v.contains('%'))
+                        || fills(
+                            doc,
+                            styles,
+                            child,
+                            super::element::natural_size(
+                                doc,
+                                child,
+                                measured.naturals.get(&child).copied(),
+                                &styles.values[child],
+                            )
+                            .and_then(|(_, ratio)| ratio),
+                        )
+                        || doc.nodes[child].tag == "svg"
+                            && styles.values[child].get(Prop::WIDTH).is_none()
+                            && !doc.nodes[child].attrs.contains_key("width") =>
                 {
                     intrinsic(doc, child, styles, Some(available), None, text, measured)[2]
                 }
@@ -1184,15 +1271,28 @@ pub(crate) fn intrinsic(
             } else {
                 content[0] + min + gap[0]
             };
-            run += max + gap[0];
+            let spacing = if std::mem::take(&mut spaced) && inline_level {
+                *space.get_or_insert_with(|| {
+                    let run = style::text_run(style, units, 1);
+                    f32::from(
+                        text.shape_line(" ", renderer::px(units.font.em), &run)
+                            .line
+                            .width,
+                    )
+                })
+            } else {
+                0.
+            };
+            run += max + gap[0] + spacing;
             if wrap
                 && line[0] > 0.
-                && available.is_some_and(|available| line[0] + gaps[0] + width > available)
+                && available
+                    .is_some_and(|available| line[0] + gaps[0] + spacing + width > available)
             {
                 content[2] += total(line) + gaps[1];
                 line = [0.; 4];
             }
-            line[0] += if line[0] > 0. { gaps[0] } else { 0. } + width;
+            line[0] += if line[0] > 0. { gaps[0] + spacing } else { 0. } + width;
             // Like a line box, a raised or lowered inline box grows the line by what it reaches past the strut.
             let (child_style, child_units) = (&styles.values[child], &styles.lengths[child]);
             let raise = match child_style.get(Prop::VERTICAL_ALIGN) {
@@ -1233,7 +1333,7 @@ pub(crate) fn intrinsic(
                         && child_style
                             .get(Prop::VERTICAL_ALIGN)
                             .is_none_or(|value| value == "baseline")
-                        && (doc.nodes[child].tag == "textarea"
+                        && (matches!(doc.nodes[child].tag.as_str(), "textarea" | "svg")
                             || doc.nodes[child].tag == "progress"
                                 && [Prop::APPEARANCE, Prop::WEBKIT_APPEARANCE]
                                     .into_iter()
@@ -1306,7 +1406,10 @@ pub(crate) fn intrinsic(
             || style
                 .get(Prop::POSITION)
                 .is_some_and(|v| matches!(v, "absolute" | "fixed"))
-            || style.get(Prop::CONTAIN).is_some_and(|v| v != "none");
+            || style.get(Prop::CONTAIN).is_some_and(|v| v != "none")
+            || style
+                .get(Prop::CONTENT_VISIBILITY)
+                .is_some_and(|v| v != "visible");
         let own = |value: f32| [value.max(0.), value.min(0.)];
         let mut sets = [own(margin[0]), own(margin[2])];
         if !placed {
@@ -1333,13 +1436,26 @@ pub(crate) fn intrinsic(
         }
         collapsed = Some(sets);
     }
-    // Like Chrome, floats side by side add up in the max-content width, and the box holds the tallest.
+    // Like Chrome, floats side by side add up in the max-content width, and the box holds the lowest. A float
+    // that clears the side of a float before it starts a new row below them.
     if natural.is_none() {
-        let (mut low, mut sum, mut tall) = (0f32, 0f32, 0f32);
+        let (mut low, mut sum, mut row, mut top, mut tall) = (0f32, 0f32, 0f32, 0f32, 0f32);
+        let mut sides = [false; 2];
         for &child in node.children.iter().filter(|&&child| floated(child)) {
             let [min, max, _, height] =
                 intrinsic(doc, child, styles, available, None, text, measured);
-            (low, sum, tall) = (low.max(min), sum + max.max(0.), tall.max(height));
+            let style = &styles.values[child];
+            let right = |value: &str| matches!(value, "right" | "inline-end");
+            if match style.get(Prop::CLEAR).unwrap_or("none") {
+                "none" => false,
+                "both" => sides[0] || sides[1],
+                value => sides[usize::from(right(value))],
+            } {
+                (row, top, sides) = (0., tall, [false; 2]);
+            }
+            sides[usize::from(style.get(Prop::FLOAT).is_some_and(right))] = true;
+            row += max.max(0.);
+            (low, sum, tall) = (low.max(min), sum.max(row), tall.max(top + height));
         }
         content = [content[0].max(low), content[1] + sum, content[2].max(tall)];
     }
@@ -1403,7 +1519,10 @@ pub(crate) fn intrinsic(
         content[2] = (ascent + descent) / measured.pixel_ratio + 2.;
     }
     let [min, max] = [content[0], content[1]].map(|value| clamp(fixed[0].unwrap_or(value), fixed));
-    let min = if matches!(
+    let min = if cell {
+        // Like Chrome, the width of a table cell raises its max-content width, not its min-content width.
+        content[0].max(fixed[1].unwrap_or(0.)).min(min.max(max))
+    } else if matches!(
         node.tag.as_str(),
         "img" | "video" | "canvas" | "iframe" | "svg" | "embed" | "object" | "input" | "textarea"
     ) && [Prop::WIDTH, Prop::MAX_WIDTH]
@@ -1463,6 +1582,21 @@ pub(crate) fn intrinsic(
     measured.sizes.insert(key, result);
     measured.margins.insert(key, sets);
     result
+}
+
+// A video without a frame, with a CSS ratio and an auto size, which fills the width that it gets.
+fn fills(doc: &Document, styles: &ComputedStyles, id: usize, natural_ratio: Option<f32>) -> bool {
+    let (node, style) = (&doc.nodes[id], &styles.values[id]);
+    node.tag == "video"
+        && natural_ratio.is_none()
+        && style.get(Prop::ASPECT_RATIO).is_some()
+        && [(Prop::WIDTH, "width"), (Prop::HEIGHT, "height")]
+            .iter()
+            .all(|&(prop, name)| {
+                style
+                    .get(prop)
+                    .map_or(!node.attrs.contains_key(name), |value| value == "auto")
+            })
 }
 
 /// The pseudo-element of an item key from `layout`: its element and its index, 0 for `::before`.
@@ -2212,7 +2346,7 @@ pub(crate) fn layout(
                         None => continue,
                     }
                 }
-                None => intrinsic(doc, child, styles, available[0], None, text, measured)[2],
+                None => intrinsic(doc, child, styles, None, None, text, measured)[1],
             };
             if let Some(slot) = columns.get_mut(cell[0]) {
                 *slot = match *slot {
@@ -2448,7 +2582,7 @@ pub(crate) fn layout(
             contributions.extend(
                 (columns.iter().enumerate())
                     .filter(|&(i, _)| percents.get(i).is_none_or(|&percent| percent == 0.))
-                    .filter_map(|(i, size)| size.map(|size| (i, 1, [size; 3]))),
+                    .filter_map(|(i, size)| size.map(|size| (i, 1, [0., 0., size]))),
             );
         } else if table {
             // The height of a row is the least height of its cells.
@@ -2466,15 +2600,48 @@ pub(crate) fn layout(
             }
         }
         let content = get([Prop::JUSTIFY_CONTENT, Prop::ALIGN_CONTENT][axis]).unwrap_or("normal");
-        let sizes = size(
+        let stretch = matches!(content, "normal" | "stretch");
+        let mut space = available[axis];
+        let mut sizes = size(
             &definitions[axis],
             &contributions,
             gap[axis],
-            available[axis],
-            matches!(content, "normal" | "stretch"),
+            space,
+            stretch,
             axis == 0 && table,
         );
-        if let Some(space) = available[axis]
+        // Like Chrome, rows of auto height grow to fill the min-height of the grid.
+        if axis == 1
+            && space.is_none()
+            && !table
+            && let Some(least) = get(Prop::MIN_HEIGHT)
+                .filter(|v| !v.contains('%'))
+                .and_then(|v| units.resolve(v, 0.))
+        {
+            let least = if get(Prop::BOX_SIZING) == Some("border-box") {
+                let base = available[0].unwrap_or(0.);
+                let [edges, margin] = [
+                    frame(style, units, base),
+                    units.edges(style, style::MARGIN, base),
+                ];
+                least - (edges[0] + edges[2] - margin[0] - margin[2])
+            } else {
+                least
+            };
+            let used = sizes.iter().sum::<f32>() + sizes.len().saturating_sub(1) as f32 * gap[1];
+            if used < least {
+                space = Some(least);
+                sizes = size(
+                    &definitions[1],
+                    &contributions,
+                    gap[1],
+                    space,
+                    stretch,
+                    false,
+                );
+            }
+        }
+        if let Some(space) = space
             && !sizes.is_empty()
         {
             let count = sizes.len() as f32;
@@ -2643,7 +2810,7 @@ mod tests {
         );
         assert_eq!(
             sized(Some(150.), true, true),
-            [19.184, 14.05, 19.075, 20.269, 33., 15.945, 16.478]
+            [18.398, 13.388, 18.082, 20.02, 33., 20., 15.112]
         );
         assert_eq!(
             sized(Some(400.), false, false),

@@ -115,9 +115,9 @@ globalThis.__appsBrowserEnvironment = (call, task) => {
       return [wire(range.lower), wire(range.upper), !!range.lowerOpen, !!range.upperOpen];
     }
     _scan(range, kind, count = 0, reverse = false) { return native('scan', this.transaction._id, this.name, ...range, reverse, count, kind); }
-    get(query) { if (query === undefined || query === null) throw fail('DataError'); const range = this._range(query); return this.transaction._request(this, () => { const value = this._scan(range, 'values', 1)[0]; return value === undefined ? undefined : codec.decode(JSON.parse(value)); }); }
+    get(query) { if (query === undefined || query === null) throw fail('DataError'); const range = this._range(query); return this.transaction._request(this, () => { const value = this._scan(range, 'values', 1)[0]; return value === undefined ? undefined : codec.decode(value); }); }
     getKey(query) { if (query === undefined || query === null) throw fail('DataError'); const range = this._range(query); return this.transaction._request(this, () => { const key = this._scan(range, 'keys', 1)[0]; return key === undefined ? undefined : keyValue(key); }); }
-    getAll(query, count) { const range = this._range(query); return this.transaction._request(this, () => this._scan(range, 'values', count).map(value => codec.decode(JSON.parse(value)))); }
+    getAll(query, count) { const range = this._range(query); return this.transaction._request(this, () => this._scan(range, 'values', count).map(value => codec.decode(value))); }
     getAllKeys(query, count) { const range = this._range(query); return this.transaction._request(this, () => this._scan(range, 'keys', count).map(key => keyValue(key))); }
     count(query) { const range = this._range(query); return this.transaction._request(this, () => this._scan(range, 'count')); }
     _write(op, value, key) {
@@ -138,7 +138,7 @@ globalThis.__appsBrowserEnvironment = (call, task) => {
       const from = (wire, open) => { range[reverse ? 1 : 0] = JSON.stringify(wire); range[reverse ? 3 : 2] = open; };
       const step = () => {
         const row = this._scan(range, keyOnly ? 'keys' : 'rows', 1, reverse)[0]; if (!row) return null;
-        const key = keyOnly ? row : row[0], cursor = new IDBCursor(this, request, direction, keyValue(key), keyOnly ? undefined : codec.decode(JSON.parse(row[1])));
+        const key = keyOnly ? row : row[0], cursor = new IDBCursor(this, request, direction, keyValue(key), keyOnly ? undefined : codec.decode(row[1]));
         from(key, true);
         cursor._continue = target => { if (target !== undefined) { const wire = keyWire(target), order = compare(wire, key); if (reverse ? order >= 0 : order <= 0) throw fail('DataError'); from(wire, false); } this.transaction._request(this, step, request); };
         return cursor;
@@ -215,6 +215,7 @@ globalThis.__appsBrowserEnvironment = (call, task) => {
       current = target; if (replace) entries[position] = { url: current.href, state: null }; else { entries.splice(++position); entries.push({ url: current.href, state: null }); }
       // As in browsers, the page scrolls to the element of the fragment, or to the top for an empty fragment or `#top`.
       const id = decodeURIComponent(current.hash.slice(1)), element = id && globalThis.document?.getElementById(id);
+      if (element) globalThis.document?._reveal?.(element);
       globalThis.document?._target?.(element);
       if (element) element.scrollIntoView(); else if (globalThis.document && (!id || id.toLowerCase() === 'top')) scrollTo(0, 0);
       dispatchEvent(Object.assign(new (globalThis.PopStateEvent ?? Event)('popstate'), { state: null })); changed(oldURL); entryChanged();

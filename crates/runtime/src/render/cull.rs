@@ -3,23 +3,79 @@ use crate::{dom::Document, style};
 use renderer::{Child, px};
 use std::{cell::Cell, rc::Rc};
 
-pub(crate) const UNCULLABLE: u16 = 1;
-pub(crate) const CHANGED: u16 = 2;
-pub(crate) const MOVES_CONTENT: u16 = 4;
-pub(crate) const OUT_OF_FLOW: u16 = 8;
-pub(crate) const HIDDEN: u16 = 16;
-pub(crate) const PLAIN_BLOCK: u16 = 32;
-pub(crate) const DEFINITE_SIZE: u16 = 64;
-pub(crate) const GEOMETRY_CHANGED: u16 = 128;
-pub(crate) const CHILDREN_CHANGED: u16 = 256;
-pub(crate) const READS_VIEWPORT: u16 = 512;
-pub(crate) const COMPOSITED: u16 = 1024;
-pub(crate) const TRANSFORMED: u16 = 2048;
+pub(crate) const UNCULLABLE: u32 = 1;
+pub(crate) const CHANGED: u32 = 2;
+pub(crate) const MOVES_CONTENT: u32 = 4;
+pub(crate) const OUT_OF_FLOW: u32 = 8;
+pub(crate) const HIDDEN: u32 = 16;
+pub(crate) const PLAIN_BLOCK: u32 = 32;
+pub(crate) const DEFINITE_SIZE: u32 = 64;
+pub(crate) const GEOMETRY_CHANGED: u32 = 128;
+pub(crate) const CHILDREN_CHANGED: u32 = 256;
+pub(crate) const READS_VIEWPORT: u32 = 512;
+pub(crate) const COMPOSITED: u32 = 1024;
+pub(crate) const TRANSFORMED: u32 = 2048;
 // A `::before` or `::after` of the node animates only its opacity, so frames patch its layer.
-pub(crate) const COMPOSITED_PSEUDO: u16 = 4096;
-pub(crate) const ANIMATED: u16 = 8192;
-pub(crate) const READS_LAST_FRAME: u16 = 16384;
-pub(crate) const READS_HEIGHT: u16 = 32768;
+pub(crate) const COMPOSITED_PSEUDO: u32 = 4096;
+pub(crate) const ANIMATED: u32 = 8192;
+pub(crate) const READS_LAST_FRAME: u32 = 16384;
+pub(crate) const READS_HEIGHT: u32 = 32768;
+// The box has `content-visibility: hidden` or `auto`, and can skip its contents.
+pub(crate) const SKIPS: u32 = 65536;
+// A `content-visibility: auto` box that shows its contents, or a box forced to show them, set each frame. Culling
+// would keep its skipped size.
+pub(crate) const SHOWN: u32 = 131072;
+
+// The box can skip its contents, or remember its size for `contain-intrinsic-size: auto`. Like in Chrome, tables
+// show their contents.
+pub(crate) fn skippable(tag: &str, style: &style::Style) -> bool {
+    (matches!(style.get(Prop::CONTENT_VISIBILITY), Some("hidden" | "auto"))
+        || [
+            Prop::CONTAIN_INTRINSIC_WIDTH,
+            Prop::CONTAIN_INTRINSIC_HEIGHT,
+        ]
+        .into_iter()
+        .any(|prop| {
+            style
+                .get(prop)
+                .is_some_and(|value| value.starts_with("auto"))
+        }))
+        && !tag.starts_with('#')
+        && tag != "table"
+        && !replaced(tag)
+        && matches!(
+            style.get(Prop::DISPLAY),
+            Some(
+                "block"
+                    | "inline-block"
+                    | "flex"
+                    | "inline-flex"
+                    | "grid"
+                    | "inline-grid"
+                    | "flow-root"
+                    | "list-item"
+                    | "-webkit-box"
+                    | "-webkit-inline-box"
+            )
+        )
+}
+
+// The box skips its contents: with `content-visibility: hidden`, or `auto` until it comes near the view.
+pub(crate) fn skips(
+    flags: u32,
+    style: &style::Style,
+    id: usize,
+    measured: &super::grid::Measurements,
+    forced: bool,
+) -> bool {
+    flags & SKIPS != 0
+        && !(forced && measured.forced.contains(&id))
+        && match style.get(Prop::CONTENT_VISIBILITY) {
+            Some("hidden") => true,
+            Some("auto") => measured.shown.get(&id) != Some(&true),
+            _ => false,
+        }
+}
 
 pub(crate) fn reads_height(style: &style::Style) -> bool {
     [
@@ -49,7 +105,9 @@ pub(crate) fn reads_height(style: &style::Style) -> bool {
 pub(crate) struct Info {
     pub(crate) revision: u64,
     pub(crate) subtree: u64,
-    pub(crate) flags: u16,
+    // The revision of the box itself, without the boxes in it.
+    pub(crate) shell: u64,
+    pub(crate) flags: u32,
 }
 
 #[derive(Default)]
@@ -76,8 +134,12 @@ pub(crate) struct Cull {
     pub(crate) canvases: Vec<usize>,
     pub(crate) iframes: Vec<usize>,
     pub(crate) seen: Option<(u64, Option<usize>, Rc<crate::style::ComputedStyles>)>,
+    // The nodes whose animated values the last frame swapped in. `seen` holds their cascade values, so the next
+    // frame visits them, also when their animation ended.
+    pub(crate) swapped: Vec<usize>,
     pub(crate) subtrees: Subtrees,
     pub(crate) scrolled: rustc_hash::FxHashMap<usize, f32>,
+    pub(crate) reskipped: bool,
 }
 
 pub(crate) type Subtrees = (u64, rustc_hash::FxHashMap<usize, Vec<usize>>);
@@ -256,7 +318,7 @@ pub(super) fn replaced(tag: &str) -> bool {
     )
 }
 
-pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, margin: f32) -> u16 {
+pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, margin: f32) -> u32 {
     let display = style.get(Prop::DISPLAY).unwrap_or("inline");
     let position = style.get(Prop::POSITION).unwrap_or("static");
     let auto = |prop| style.get(prop).is_none_or(|value| value == "auto");
@@ -355,6 +417,7 @@ pub(super) fn flags(tag: &str, style: &style::Style, units: &style::Lengths, mar
             DEFINITE_SIZE,
         ),
         (reads_height(style), READS_HEIGHT),
+        (skippable(tag, style), SKIPS),
         (
             style.iter().any(|(prop, value)| {
                 let bytes = value.as_bytes();
@@ -387,7 +450,7 @@ pub(super) fn member(
     margin: f32,
     flex: bool,
 ) -> Option<([f32; 4], [f32; 2])> {
-    let fits = info.flags & (UNCULLABLE | PLAIN_BLOCK) == PLAIN_BLOCK
+    let fits = info.flags & (UNCULLABLE | PLAIN_BLOCK | SHOWN) == PLAIN_BLOCK
         && (!flex || info.flags & DEFINITE_SIZE == 0)
         && (!zone.resized || info.flags & READS_VIEWPORT == 0);
     if !fits || info.revision == 0 || placed != info.revision {
@@ -666,6 +729,172 @@ pub(super) fn anchor(
     .top(px(0.))
     .size(px(0.))
     .into()
+}
+
+// After prepaint, shows the contents of each `content-visibility: auto` box near the view or with the focus,
+// and skips the contents of the others.
+pub(super) fn autos(view: Rc<super::PageState>) -> Child {
+    renderer::canvas_watching(
+        move |_, window| {
+            let view = &*view;
+            let mut guard = view.host.borrow_mut();
+            let host = &mut *guard;
+            let (Some(dom), Some(page)) = (host.dom.get_mut(&view.id), host.pages.get(&view.id))
+            else {
+                return;
+            };
+            // Like in Chrome, the view and each clip reach 150% of the view size further on each side.
+            let size = window.viewport_size();
+            let [x, y] = [f32::from(size.width), f32::from(size.height)].map(|side| side * 1.5);
+            let view_area = [
+                -x,
+                -y,
+                f32::from(size.width) + x,
+                f32::from(size.height) + y,
+            ];
+            // As in Chrome, a box with the focus or the selection in it shows its contents.
+            let mut relevant = rustc_hash::FxHashSet::default();
+            for start in dom.focus.into_iter().chain(dom.selection.keys().copied()) {
+                let mut node = Some(start);
+                while let Some(id) = node.filter(|&id| relevant.insert(id)) {
+                    node = page.doc.nodes.get(id).and_then(|node| node.parent);
+                }
+            }
+            // The boxes whose state changes, in document order, so boxes come after the boxes around them.
+            let mut changes = Vec::new();
+            let shown = &dom.measurements.shown;
+            let scroll = &dom.scroll;
+            dom.autos.retain(|&id, (path, clips, last)| {
+                let Some(node) = dom.layout_nodes.get(id).and_then(Option::as_ref) else {
+                    return false;
+                };
+                if node.flags & SKIPS == 0
+                    || node.style.get(Prop::CONTENT_VISIBILITY) != Some("auto")
+                {
+                    return false;
+                }
+                // A box in skipped contents keeps its state, as in Chrome.
+                let relevant = relevant.contains(&id);
+                if dom.cull.visible.get(id) != Some(&true) && !relevant {
+                    return true;
+                }
+                let area = clips.iter().filter_map(|clip| dom.bounds.get(clip)).fold(
+                    view_area,
+                    |area, rect| {
+                        [
+                            area[0].max(rect[0] - x),
+                            area[1].max(rect[1] - y),
+                            area[2].min(rect[0] + rect[2] + x),
+                            area[3].min(rect[1] + rect[3] + y),
+                        ]
+                    },
+                );
+                let near = relevant
+                    || dom.bounds.get(&id).is_some_and(|rect| {
+                        rect[0] <= area[2]
+                            && rect[0] + rect[2] >= area[0]
+                            && rect[1] <= area[3]
+                            && rect[1] + rect[3] >= area[1]
+                    });
+                if shown.get(&id) != Some(&near) {
+                    // Like in Chromium, a box that only resized since its last change, with one edge in place, changes
+                    // again only when the view moved: the change itself can take it out of the view again.
+                    let mut view = rustc_hash::FxHasher::default();
+                    for at in std::iter::once(&0).chain(clips.iter()) {
+                        if let Some(handle) = scroll.get(at) {
+                            let offset = handle.offset();
+                            std::hash::Hasher::write_u64(
+                                &mut view,
+                                u64::from(f32::from(offset.x).to_bits()) << 32
+                                    | u64::from(f32::from(offset.y).to_bits()),
+                            );
+                        }
+                    }
+                    std::hash::Hasher::write_u64(
+                        &mut view,
+                        u64::from(x.to_bits()) << 32 | u64::from(y.to_bits()),
+                    );
+                    let view = std::hash::Hasher::finish(&view) | 1;
+                    let edges = dom
+                        .bounds
+                        .get(&id)
+                        .map_or([f32::NAN; 2], |rect| [rect[1], rect[1] + rect[3]]);
+                    let resized =
+                        edges != last.1 && (edges[0] == last.1[0] || edges[1] == last.1[1]);
+                    if relevant || last.0 != view || !resized || shown.get(&id).is_none() {
+                        *last = (view, edges);
+                        changes.push((dom.cull.walk.place(id), id, near, path.clone()));
+                    }
+                }
+                true
+            });
+            let removed = dom.measurements.shown.len() > dom.autos.len();
+            if removed {
+                let autos = &dom.autos;
+                dom.measurements
+                    .shown
+                    .retain(|id, _| autos.contains_key(id));
+            }
+            changes.sort_unstable_by_key(|change| change.0);
+            let (mut flipped, mut seen) = (false, false);
+            let [width, height] = [f32::from(size.width), f32::from(size.height)];
+            for (_, id, near, path) in changes {
+                let shown = &mut dom.measurements.shown;
+                // A box in a box that skips its contents now keeps its state.
+                if path[..path.len() - 1]
+                    .iter()
+                    .any(|ancestor| shown.get(ancestor) == Some(&false))
+                {
+                    continue;
+                }
+                let old = shown.insert(id, near);
+                // As in Chrome, new boxes report that they skip their contents before any box reports a change.
+                if old.is_none() {
+                    let at = dom.skip_events.iter().take_while(|event| event.1).count();
+                    dom.skip_events.insert(at, (id, true));
+                }
+                if old.is_some() || near {
+                    dom.skip_events.push((id, !near));
+                    dom.measurements.waking.push(id);
+                    flipped = true;
+                    // A box that shows in the view needs its contents in this frame.
+                    seen |= near
+                        && dom.bounds.get(&id).is_some_and(|rect| {
+                            rect[0] < width
+                                && rect[0] + rect[2] > 0.
+                                && rect[1] < height
+                                && rect[1] + rect[3] > 0.
+                        });
+                }
+            }
+            drop(guard);
+            if seen {
+                window.restart();
+            } else if flipped {
+                window.request_animation_frame();
+            }
+        },
+        |_, _, _| {},
+    )
+    .absolute()
+    .into()
+}
+
+// Builds the boxes on the path again, and the visibility of all nodes, when a box starts or stops to skip its contents.
+pub(super) fn reskip(
+    view: &super::PageState,
+    dom: &mut crate::dom::State,
+    nodes: &rustc_hash::FxHashSet<usize>,
+) {
+    dom.cull.reskipped = true;
+    let measured = &mut dom.measurements;
+    measured.sizes.retain(|(node, ..), _| !nodes.contains(node));
+    let mut kept = view.kept.borrow_mut();
+    for node in nodes {
+        measured.texts.remove(node);
+        dom.grids.remove(node);
+        kept.remove(node);
+    }
 }
 
 fn wake(view: &super::PageState, path: &[usize], shown: bool, window: &mut renderer::Window) {

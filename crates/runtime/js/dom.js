@@ -1,6 +1,6 @@
 (() => {
-  const host = globalThis.__appsDOM, eventState = globalThis.__appsEventState, droppedFiles = globalThis.__appsFiles, microtask = queueMicrotask, json = JSON.parse;
-  delete globalThis.__appsDOM; delete globalThis.__appsEventState; delete globalThis.__appsFiles;
+  const host = globalThis.__appsDOM, eventState = globalThis.__appsEventState, droppedFiles = globalThis.__appsFiles, drainMicrotasks = globalThis.__appsDrain, microtask = queueMicrotask, json = JSON.parse;
+  delete globalThis.__appsDOM; delete globalThis.__appsEventState; delete globalThis.__appsFiles; delete globalThis.__appsDrain;
   // Flush dom.batch before any other host call that reads or changes the page. Replace shared noAttrs and noKids.
   // Never mutate them.
   class Attrs {
@@ -45,7 +45,7 @@
       for (let i = 0; i < list.length;) {
         const id = list[i], tag = list[i + 2], end = i + 5 + 2 * list[i + 4], up = i ? records[list[i + 1]] : null;
         let rec = records[id];
-        if (rec?.tag !== tag) rec = records[id] = new Record(id, tag, list[i + 3]); else rec.text = list[i + 3];
+        if (rec?.tag !== tag) { rec = records[id] = new Record(id, tag, list[i + 3]); if (tag.includes('-')) customTags.add(tag); } else rec.text = list[i + 3];
         if (rec.attrs) { rec.attrs = end > i + 5 ? new Attrs(list.slice(i + 5, end)) : noAttrs; const value = rec.attrs.get('id'); if (value) idAdd(value, rec); }
         if (up) { rec.up = up; rec.i = up.kids.push(rec) - 1; seen.add(rec); }
         i = end;
@@ -74,7 +74,8 @@
     if (geometry[0]) { const buffer = host('dom.layout', true), capacity = new F32(buffer, 0, 4)[1]; limit = 4 + capacity * 8; geometry = new F32(buffer, 0, limit); marks = new U8(buffer, limit * 4, capacity); }
     return geometry;
   };
-  const slot = node => { layout(); const i = 4 + node._id * 8; if (i >= limit || marks[node._id] & 16) return -1; if (node._placed !== version) { if (!node.isConnected) return -1; node._placed = version; } return i; };
+  // As in Chrome, the contents that a box skips get a layout when a script reads their geometry.
+  const slot = node => { layout(); const i = 4 + node._id * 8; if (i >= limit || marks[node._id] & 16 && !(!observing && node.isConnected && call('dom.skipped', node._id, true) > 0 && (stale = true, layout(), !(marks[node._id] & 16)))) return -1; if (node._placed !== version) { if (!node.isConnected) return -1; node._placed = version; } return i; };
   const metric = (node, k) => { const i = slot(node); return i < 0 ? 0 : geometry[i + k]; };
   // A box that was never scrolled reads 0 without a layout.
   const scrollOf = (node, k) => {
@@ -114,11 +115,11 @@
   const owned = (doc, node) => { if (doc !== document) node._owner = doc; return node; };
   const rootElement = node => node._m.tag === 'html' && node._m.up === records[0];
   const pageScroller = node => { layout(); return rootElement(node) && !(marks[node._id] & 2); };
-  const create = (tag, text = '') => {
+  const create = (tag, text = '', from = -1) => {
     if (!names.has(tag)) { if (!/^[a-z][a-z0-9-]*$/i.test(tag) && !types[tag]) throw new DOMException('Invalid tag', 'InvalidCharacterError'); names.set(tag, tag[0] === '#' ? tag === '#fragment' ? '#document-fragment' : tag : tag.toUpperCase()); }
     if (!pool.length) pool = host('dom.reserve', reserve = Math.min(reserve * 2, 1024)).reverse();
     const id = pool.pop();
-    records[id] = new Record(id, tag, text); op(0, id, tag, text); if (tag === 'base' || tag === 'title') rare[tag]++; return id;
+    records[id] = new Record(id, tag, text); if (tag.includes('-')) customTags.add(tag); if (from < 0) op(0, id, tag, text); else op(10, id, from); if (tag === 'base' || tag === 'title') rare[tag]++; return id;
   };
   let declarative = null;
   // Attach the declarative shadow roots of the last `load`. Only the page parser and `setHTMLUnsafe()` do this.
@@ -141,7 +142,7 @@
     for (let i = 0; i < list.length;) {
       const rec = records[list[i]] = new Record(list[i], list[i + 2], list[i + 3]), up = records[list[i + 1]], end = i + 5 + 2 * list[i + 4];
       if (end > i + 5) { rec.attrs = new Attrs(list.slice(i + 5, end)); const id = rec.attrs.get('id'); if (id) idAdd(id, rec); }
-      const tag = rec.tag;
+      const tag = rec.tag; if (tag.includes('-')) customTags.add(tag);
       if (tag === 'base' || tag === 'title') rare[tag]++;
       if (tag === 'template' && end > i + 5 && rec.attrs.has('shadowrootmode')) (declarative ??= []).push(rec);
       media ||= tag === 'img' || tag === 'video' || tag === 'audio';
@@ -278,7 +279,7 @@
     } finally { globalThis.event = outer; Object.assign(state, { target: shadow && target.getRootNode() instanceof ShadowRoot ? null : target, currentTarget: null, eventPhase: 0, dispatching: false, stopped: false, immediate: false, passive: false }); if (related) event.relatedTarget = related.getRootNode() instanceof ShadowRoot ? null : related; }
     return !event.defaultPrevented;
   };
-  const trusted = event => { eventState(event).trusted = true; return event; };
+  const trusted = event => { eventState(event).trusted = true; if (event.view === null) event.view = window; return event; };
   const labelable = rec => /^(button|meter|output|progress|select|textarea)$/.test(rec.tag) || rec.tag === 'input' && rec.attrs.get('type')?.toLowerCase() !== 'hidden';
   const labelControl = label => { const id = label.getAttribute('for'), control = id === null ? find(label._m, labelable) : id && label.getRootNode().getElementById?.(id); return control && labelable(control._m) ? control : null; };
   const disabled = node => {
@@ -287,11 +288,26 @@
     return false;
   };
   const activation = node => { const tag = node.localName; return tag === 'button' || tag === 'label' || tag === 'input' && /^(checkbox|radio|submit|reset|image|button|file)$/.test(node.type) || (tag === 'a' || tag === 'area') && node._m.attrs.has('href') || tag === 'summary' && node._m.up?.tag === 'details' && node._m.up.kids.find(kid => kid.tag === 'summary') === node._m; };
-  const group = radio => { const name = radio.name, form = radio.form, root = radio.getRootNode(); return name && root !== radio ? [...root.querySelectorAll('input[name=' + quote(name) + ']')].filter(other => other.type === 'radio' && other.form === form) : [radio]; };
+  // Keep the scope of `root.querySelectorAll('input[name=...]')`: no template contents, no shadow trees.
+  const group = radio => {
+    const name = radio.name, form = radio.form, root = radio.getRootNode();
+    if (!name || root === radio) return [radio];
+    const result = [], stack = [];
+    for (let i = root._m.kids.length; i--;) stack.push(root._m.kids[i]);
+    while (stack.length) {
+      const rec = stack.pop();
+      if (rec.tag === 'input' && rec.attrs.get('name') === name) { const other = of(rec); if (other.type === 'radio' && other.form === form) result.push(other); }
+      if (rec.tag !== 'template') for (let i = rec.kids.length; i--;) stack.push(rec.kids[i]);
+    }
+    return result;
+  };
   const focusable = node => {
     if (node?.nodeType !== 1 || !node.isConnected || disabled(node)) return false;
     laidOut();
-    if (marks[node._id] & 80) return false;
+    // As in Chrome, the contents that a `content-visibility: auto` box skips can take the focus, which shows them.
+    if (marks[node._id] & 64) return false;
+    const skipped = call('dom.skipped', node._id, false);
+    if (skipped === 2 || skipped < 0 || marks[node._id] & 16 && skipped !== 1) return false;
     const rec = node._m, tag = rec.tag;
     return /^\s*[+-]?\d/.test(rec.attrs.get('tabindex') ?? '') || node.isContentEditable || /^(select|textarea|button|iframe|dialog|terminal)$/.test(tag) || tag === 'input' && node.type !== 'hidden' || (tag === 'a' || tag === 'area') && rec.attrs.has('href') || tag === 'summary' && activation(node);
   };
@@ -316,7 +332,7 @@
     }
   };
   const fireClick = (target, init = {}, native = false) => {
-    const event = new PointerEvent('click', { bubbles: true, cancelable: true, composed: true, pointerId: native ? 1 : -1, pointerType: native ? 'mouse' : '', ...init });
+    const event = new PointerEvent('click', { bubbles: true, cancelable: true, composed: true, view: window, pointerId: native ? 1 : -1, pointerType: native ? 'mouse' : '', ...init });
     eventState(event).trusted = native;
     return activateClick(target, event, init, native);
   };
@@ -346,6 +362,9 @@
     return allowed;
   };
   const rawText = /^(style|script|xmp|iframe|noembed|noframes|plaintext|noscript)$/, voids = /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/, escapes = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\u00a0': '&nbsp;' };
+  const textEscape = /[&<>\u00a0]/, attrEscape = /[&"<>\u00a0]/;
+  // Tags whose copies need their wrapper: form state, media, frames, templates, slots and attribute side effects.
+  const copied = /^(input|select|textarea|option|optgroup|button|fieldset|output|form|label|details|dialog|slot|template|img|video|audio|canvas|iframe|webview|terminal)$/;
   const integration = /^(foreignObject|desc|title)$/, inSvg = rec => !!rec && rec.tag[0] !== '#' && of(rec) instanceof SVGElement && !integration.test(rec.tag);
   // Use a stack, not recursion: deep trees overflow the JavaScript stack.
   const serialize = (root, inner = false) => {
@@ -355,12 +374,12 @@
     while (stack.length) {
       const start = stack.pop(), svg = stack.pop(), rec = stack.pop(), tag = rec.tag;
       if (start >= 0) { if (out.length === start) out += own(rec); out += '</' + tag + '>'; continue; }
-      if (tag === '#text') { out += !svg && rec.up && rawText.test(rec.up.tag) ? own(rec) : own(rec).replace(/[&<>\u00a0]/g, c => escapes[c]); continue; }
+      if (tag === '#text') { const text = own(rec); out += !svg && rec.up && rawText.test(rec.up.tag) || !textEscape.test(text) ? text : text.replace(/[&<>\u00a0]/g, c => escapes[c]); continue; }
       if (tag === '#comment') { out += '<!--' + rec.text + '-->'; continue; }
       if (tag === '#doctype') { out += '<!DOCTYPE ' + own(rec).split('\0')[0] + '>'; continue; }
       if (tag[0] !== '#') {
         let attrs = '';
-        for (const [name, value] of rec.attrs) attrs += ' ' + name + '="' + value.replace(/[&"<>\u00a0]/g, c => escapes[c]) + '"';
+        for (let i = 0, list = rec.attrs.list; i < list.length; i += 2) { const value = list[i + 1]; attrs += ' ' + list[i] + '="' + (attrEscape.test(value) ? value.replace(/[&"<>\u00a0]/g, c => escapes[c]) : value) + '"'; }
         out += '<' + tag + attrs + '>';
         if (voids.test(tag)) continue;
         if (tag === 'template') { out += of(rec).innerHTML + '</template>'; continue; }
@@ -406,7 +425,7 @@
     try { new Type(); } catch (error) { node._failed = true; node._reactions.length = 0; throw error; } finally { constructing = null; }
     flag(node, 64, true);
     const observed = defined.get(Type)?.observed;
-    if (observed?.size) for (const [name, value] of node._m.attrs) if (observed.has(name)) node._reactions.push(['attributeChangedCallback', name, null, value]);
+    if (observed?.size) for (let i = 0, list = node._m.attrs.list; i < list.length; i += 2) if (observed.has(list[i])) node._reactions.push(['attributeChangedCallback', list[i], null, list[i + 1]]);
     if (node.isConnected) node._reactions.push(['connectedCallback']);
   };
   const slotChanges = new Set();
@@ -467,7 +486,7 @@
     if (gotten.size) for (const [id, node] of gotten) if (!node.isConnected) { gotten.delete(id); dispatch(document, trusted(new PointerEvent('lostpointercapture', { pointerId: id, pointerType: 'mouse', isPrimary: true, bubbles: true, composed: true }))); }
     if (!active || active.isConnected) return;
     finishComposition();
-    const previous = active, ancestors = () => parent?.isConnected ? [...path(previous), ...path(parent)] : undefined; active = null; call('dom.focus', []); if (windowFocused) { dispatch(previous, new FocusEvent('blur', { composed: true }), ancestors()); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true }), ancestors()); }
+    const previous = active, ancestors = () => parent?.isConnected ? [...path(previous), ...path(parent)] : undefined; active = null; call('dom.focus', []); if (windowFocused) { dispatch(previous, new FocusEvent('blur', { view: window, composed: true }), ancestors()); dispatch(previous, new FocusEvent('focusout', { view: window, bubbles: true, composed: true }), ancestors()); }
   };
   const watched = node => { if (observers.size && !quiet) for (const ref of observers) for (const [key, options] of ref.deref()?.targets ?? []) { const target = key.deref(); if (target && options.childList && (target === node || options.subtree && target.contains(node))) return true; } return false; };
   const ignore = () => {};
@@ -530,6 +549,8 @@
   const attrNode = (element, name) => { const nodes = element._attrs ??= new Map(); let attr = nodes.get(name); if (attr?.ownerElement !== element) nodes.set(name, attr = new Attr(element, name, element._m.attrs.get(name))); return attr; };
   const token = value => { value = String(value); if (!value) throw new DOMException('Token is empty', 'SyntaxError'); if (/[\t\n\f\r ]/.test(value)) throw new DOMException('Token contains whitespace', 'InvalidCharacterError'); return value; };
   const tokens = list => { const value = list.value; if (value !== list._source) { list._source = value; list._tokens = [...new Set(value.split(/[\t\n\f\r ]+/).filter(Boolean))]; } return list._tokens; };
+  // Keep the parsed tokens of an own write, so the next read does not split the value again.
+  const setTokens = (list, next) => { const value = next.join(' '); list.value = value; list._source = value; list._tokens = next; };
   const tokenIndex = key => { if (typeof key !== 'string') return -1; const i = +key; return i >>> 0 === i && String(i) === key ? i : -1; };
   const indexed = {
     get(list, key, receiver) { const i = tokenIndex(key); return i < 0 ? Reflect.get(list, key, receiver) : tokens(list)[i]; },
@@ -543,11 +564,11 @@
     get length() { return tokens(rawList(this)).length; }
     item(index) { return tokens(rawList(this))[index] ?? null; }
     contains(value) { return tokens(rawList(this)).includes(String(value)); }
-    add(...values) { const list = rawList(this), next = tokens(list).slice(); for (const value of values.map(token)) if (!next.includes(value)) next.push(value); if (next.length || list._element.hasAttribute(list._name)) list.value = next.join(' '); }
-    remove(...values) { const list = rawList(this); values = values.map(token); const next = tokens(list).filter(value => !values.includes(value)); if (next.length || list._element.hasAttribute(list._name)) list.value = next.join(' '); }
+    add(...values) { const list = rawList(this), next = tokens(list).slice(); for (const value of values.map(token)) if (!next.includes(value)) next.push(value); if (next.length || list._element.hasAttribute(list._name)) setTokens(list, next); }
+    remove(...values) { const list = rawList(this); values = values.map(token); const next = tokens(list).filter(value => !values.includes(value)); if (next.length || list._element.hasAttribute(list._name)) setTokens(list, next); }
     toggle(value, force) { const list = rawList(this); value = token(value); const add = force === undefined ? !list.contains(value) : !!force; if (add) list.add(value); else list.remove(value); return add; }
-    replace(old, value) { const list = rawList(this); old = token(old); value = token(value); const next = tokens(list).slice(), index = next.indexOf(old); if (index < 0) return false; next[index] = value; list.value = [...new Set(next)].join(' '); return true; }
-    supports() { return true; }
+    replace(old, value) { const list = rawList(this); old = token(old); value = token(value); const next = tokens(list).slice(), index = next.indexOf(old); if (index < 0) return false; next[index] = value; setTokens(list, [...new Set(next)]); return true; }
+    supports() { if (rawList(this)._name !== 'rel') throw new TypeError('DOMTokenList has no supported tokens'); return true; }
     forEach(fn, thisArg) { tokens(rawList(this)).forEach((value, index) => fn.call(thisArg, value, index, this)); }
     keys() { return tokens(rawList(this)).keys(); } values() { return tokens(rawList(this)).values(); } entries() { return tokens(rawList(this)).entries(); } [Symbol.iterator]() { return this.values(); }
     toString() { return rawList(this).value; }
@@ -679,13 +700,40 @@
     getRootNode(options) { const composed = options?.composed; let rec = this._m; while (rec.up ?? (composed ? rec.host : null)) rec = rec.up ?? rec.host; return of(rec); }
     cloneNode(deep = false) {
       const cloned = this.nodeType === 3 ? document.createTextNode(this.data) : this.nodeType === 8 ? document.createComment(this.data) : this.nodeType === 11 ? document.createDocumentFragment() : this.namespaceURI === XHTML ? wrap(create(this.localName)) : document.createElementNS(this.namespaceURI, this.localName);
-      if (this.nodeType === 1) { for (const [name, value] of this._m.attrs) cloned.setAttribute(name, value); if (this._value !== undefined) setValue(cloned, this._value); if (this._checked !== undefined) { setChecked(cloned, this._checked); cloned._dirty = this._dirty; } if (this._selected !== undefined) cloned._selected = this._selected; }
-      // Loop, not recursion: deep trees overflow the JavaScript stack. Fill each copy before it joins its parent, or
-      // the cycle check of every insert walks all ancestors. Templates clone their own content.
+      if (this.nodeType === 1) { for (let i = 0, list = this._m.attrs.list; i < list.length; i += 2) cloned.setAttribute(list[i], list[i + 1]); if (this._value !== undefined) setValue(cloned, this._value); if (this._checked !== undefined) { setChecked(cloned, this._checked); cloned._dirty = this._dirty; } if (this._selected !== undefined) cloned._selected = this._selected; }
+      // Loop, not recursion: deep trees overflow the JavaScript stack. Fill each copy before it joins its parent.
+      // Plain elements, texts and comments copy as records (op 10) and get wrappers only when read, so the namespace
+      // that `wrap` infers must match. Other nodes clone through their wrappers. Templates clone their own content.
+      // Entries: source record, its wrapper, copy record, copy wrapper, whether the copy is an SVG element.
       if (deep) {
-        const nodes = [this, cloned], starts = [];
-        for (let i = 0; i < nodes.length; i += 2) { starts.push(nodes.length); if (i && nodes[i] instanceof HTMLTemplateElement) continue; for (const kid of nodes[i]._m.kids) { const child = of(kid); nodes.push(child, child.cloneNode(child instanceof HTMLTemplateElement)); } }
-        for (let i = nodes.length - 2; i >= 0; i -= 2) for (let j = starts[i / 2], end = starts[i / 2 + 1] ?? nodes.length; j < end; j += 2) nodes[i + 1].appendChild(nodes[j + 1]);
+        const nodes = [this._m, this, cloned._m, cloned, cloned instanceof SVGElement], starts = [], fast = !this._svg;
+        for (let i = 0; i < nodes.length; i += 5) {
+          starts.push(nodes.length);
+          const rec = nodes[i], svg = nodes[i + 4];
+          if (i && nodes[i + 1] instanceof HTMLTemplateElement) continue;
+          for (const kid of rec.kids) {
+            const tag = kid.tag, source = kid.ref?.deref(), inferred = tag === 'svg' || svg && !integration.test(rec.tag);
+            if (fast && (tag === '#text' || tag === '#comment' || tag[0] !== '#' && !copied.test(tag) && !definitions.has(tag) && (!source || source.namespaceURI === (inferred ? SVG : XHTML)))) {
+              const copy = records[create(tag, tag[0] === '#' ? own(kid) : '', kid.id)];
+              if (kid.attrs?.size) { copy.attrs = new Attrs(kid.attrs.list.slice()); const id = copy.attrs.get('id'); if (id) idAdd(id, copy); }
+              nodes.push(kid, null, copy, null, inferred);
+            } else { const child = source ?? of(kid), clone = child.cloneNode(child instanceof HTMLTemplateElement); nodes.push(kid, child, clone._m, clone, clone instanceof SVGElement); }
+          }
+        }
+        // A wrapped copy under a record copy links as a record too. Its parent wraps after the whole copy is linked,
+        // so `wrap` infers the namespace from the right ancestors, and then holds it.
+        const held = [];
+        for (let i = nodes.length - 5; i >= 0; i -= 5) {
+          const parent = nodes[i + 2], start = starts[i / 5], end = starts[i / 5 + 1] ?? nodes.length;
+          if (start === end) continue;
+          touch(parent);
+          for (let j = start; j < end; j += 5) {
+            const kid = nodes[j + 2];
+            if (nodes[i + 3] && (nodes[j + 3] || parent.tag === 'select' || parent.tag === 'optgroup')) nodes[i + 3].appendChild(nodes[j + 3] ?? of(kid));
+            else { kid.up = parent; kid.i = parent.kids.push(kid) - 1; op(2, parent.id, kid.id, -1); if (nodes[j + 3]) held.push(parent, nodes[j + 3]); }
+          }
+        }
+        for (let i = 0; i < held.length; i += 2) hold(of(held[i]), held[i + 1]);
       }
       const Type = this.nodeType === 1 && definitions.get(cloned.localName); if (Type) enqueue(cloned, Type); return cloned;
     }
@@ -763,9 +811,10 @@
   };
   let cssProperties = null;
   const properties = () => cssProperties ??= new Set(call('dom.properties'));
+  let cssAliases = null;
   const cssProperty = name => properties().has(name) || name === 'float';
   const declared = new Map();
-  const declare = text => { let list = declared.get(text); if (!list) { if (declared.size > 1023) declared.clear(); const flat = /\S/.test(text) ? host('dom.declare', text) : []; list = []; for (let i = 0; i < flat.length; i += 3) list.push([flat[i], flat[i + 1], flat[i + 2]]); declared.set(text, list); } return list.map(entry => entry.slice()); };
+  const declare = text => { let list = declared.get(text); if (!list) { if (declared.size > 1023) declared.clear(); const flat = /\S/.test(text) ? host('dom.declare', text) : []; list = []; for (let i = 0; i < flat.length; i += 3) { const at = list.findIndex(entry => entry[0] === flat[i]); if (at >= 0) { if (list[at][2] && !flat[i + 2]) continue; list.splice(at, 1); } list.push([flat[i], flat[i + 1], flat[i + 2]]); } list = [...list.filter(entry => !entry[2]), ...list.filter(entry => entry[2])]; declared.set(text, list); } return list.map(entry => entry.slice()); };
   // Values keep the text as written and get Chrome's form only when read, so writes stay cheap.
   const specifiedText = new Map();
   const specified = (name, value) => { if (name.startsWith('--') || /^[a-z-]*$/.test(value) && !/position|origin|family|counter/.test(name)) return value; const key = name + ':' + value; let text = specifiedText.get(key); if (text === undefined) { if (specifiedText.size > 1023) specifiedText.clear(); specifiedText.set(key, text = host('dom.specified', name, value)); } return text; };
@@ -781,32 +830,36 @@
     for (const entry of folded) for (const part of entry[1]) { const list = shorthandsOf.get(part); if (list) list.push(entry); else shorthandsOf.set(part, [entry]); }
     return shorthands;
   };
-  const layers = value => { const out = []; let depth = 0, start = 0; for (let i = 0; i < value.length; i++) { const c = value[i]; if (c === '(') depth++; else if (c === ')') depth--; else if (c === ',' && !depth) { out.push(value.slice(start, i).trim()); start = i + 1; } } out.push(value.slice(start).trim()); return out; };
+  const layers = (value, separator = ',') => { const out = []; let depth = 0, start = 0; for (let i = 0; i < value.length; i++) { const c = value[i]; if (c === '(') depth++; else if (c === ')') depth--; else if (c === separator && !depth) { out.push(value.slice(start, i).trim()); start = i + 1; } } out.push(value.slice(start).trim()); return out; };
   const shorthandValue = (name, values, parts) => {
     if (name === 'border-image') return values.every(value => value === values[0]) && /^(inherit|initial|unset|revert|revert-layer)$/.test(values[0]) ? values[0] : values.join() === 'none,100%,1,0,stretch' ? 'none' : `${values[0]} ${values[1]} / ${values[2]} / ${values[3]} ${values[4]}`;
-    // `border` resets `border-image-source`, so it serializes only when that is `none`.
-    if (name === 'border' && parts.length === 13) { const source = values.splice(12)[0]; if (source !== 'none' && source !== values[0]) return ''; parts = parts.slice(0, 12); }
-    if (name === 'border-radius') { const axes = [0, 1].map(axis => shorthandValue('margin', values.map(value => { const both = value.split(' '); return both[axis] ?? both[0]; }), ['margin-top'])); return axes[0] === axes[1] ? axes[0] : axes.join(' / '); }
+    // `border` resets `border-image`, so it serializes only when that has its initial value.
+    if (name === 'border' && parts.length === 17) { const image = values.splice(12); if (image.join() !== 'none,100%,1,0,stretch' && image.some(value => value !== values[0])) return ''; parts = parts.slice(0, 12); }
+    if (name === 'border-radius') { const axes = [0, 1].map(axis => shorthandValue('margin', values.map(value => { const both = layers(value, ' '); return both[axis] ?? both[0]; }), ['margin-top'])); return axes[0] === axes[1] ? axes[0] : axes.join(' / '); }
     if (parts.length > 3 && parts.length % 3 === 0 && /-width$/.test(parts[0]) && /-style$/.test(parts[1])) { const first = values.slice(0, 3).join(); for (let i = 3; i < values.length; i += 3) if (values.slice(i, i + 3).join() !== first) return ''; return shorthandValue(name, values.slice(0, 3), parts.slice(0, 3)); }
     if (parts.length === 3 && /-width$/.test(parts[0]) && /-style$/.test(parts[1])) { const kept = values.filter((value, index) => value !== ['3px', 'none', 'currentcolor'][index]); return (name === 'outline' ? kept.reverse() : kept).join(' ') || 'none'; }
     if (values.length === 4 && /(^|-)top(-|$)/.test(parts[0])) { const [top, right, bottom, left] = values; return left !== right ? values.join(' ') : top !== bottom ? `${top} ${right} ${bottom}` : top !== right ? `${top} ${right}` : top; }
     if (name === 'font') { const [style, variant, weight, stretch, size, line, family] = values; return /^(normal|small-caps)$/.test(variant) && !/\d/.test(stretch) ? [style, variant, weight, stretch].filter(value => value !== 'normal').concat(size + (line === 'normal' ? '' : ' / ' + line), family).join(' ') : ''; }
     if (name === 'background') {
-      const lists = values.slice(1).map(layers), count = lists[0].length;
+      const lists = values.slice(1).map(value => layers(value)), count = lists[0].length;
       if (values.length !== 8 || lists.some(list => list.length !== count)) return '';
       return lists[0].map((_, i) => { const { image, position, size, repeat, clip, origin, attachment } = Object.fromEntries(parts.slice(1).map((part, j) => [part.slice(11), lists[j][i]])), out = image === 'none' ? [] : [image]; if (position !== '0% 0%' || size !== 'auto') out.push(size === 'auto' ? position : position + ' / ' + size); if (repeat !== 'repeat') out.push(repeat); if (attachment !== 'scroll') out.push(attachment); if (origin !== 'padding-box' || clip !== 'border-box') out.push(origin === clip ? origin : origin + ' ' + clip); if (i === count - 1 && values[0] !== 'transparent') out.push(values[0]); return out.join(' ') || 'none'; }).join(', ');
     }
     if (name === 'container') return values[1] === 'normal' ? values[0] : values.join(' / ');
-    if (name === 'flex' || name === 'flex-flow') return values.join(' ');
-    if (name === 'text-decoration' || name === 'list-style') { const defaults = name === 'list-style' ? ['outside', 'none'] : ['solid', 'currentcolor', 'auto'], kept = values.filter((value, index) => index === 0 && name !== 'list-style' || !defaults.includes(value)); return (kept.length ? kept : values.slice(0, 1)).join(' '); }
+    if (name === 'flex') return values.join(' ');
+    if (name === 'flex-flow') return values.filter((value, index) => value !== ['row', 'nowrap'][index]).join(' ') || 'row';
+    // Like Chrome: position, image, type, without their initial values.
+    if (name === 'list-style') { const [type, position, image] = values, kept = [position, image, type].filter((value, index) => value !== ['outside', 'none', 'disc'][index]); return kept.join(' ') || (image === 'none' && type === 'none' ? 'none' : type); }
+    if (name === 'text-decoration') { const kept = values.filter((value, index) => index === 0 || !['solid', 'currentcolor', 'auto'].includes(value)); return (kept.length ? kept : values.slice(0, 1)).join(' '); }
     const grid = parts.every(part => /^grid-.*-(start|end)$/.test(part));
     if (/^grid(-template)?$/.test(name)) return '';
     if (values.length === 2 && !grid) return values[0] === values[1] ? values[0] : values.join(' ');
-    const lists = values.map(layers), count = lists[0].length;
+    const lists = values.map(value => layers(value)), count = lists[0].length;
     if (lists.some(list => list.length !== count)) return '';
     return lists[0].map((_, i) => lists.map(list => list[i]).reduce((text, value, j) => text + (grid ? ' / ' : /-size$/.test(parts[j]) && /-position$/.test(parts[j - 1]) ? ' / ' : ' ') + value)).join(', ');
   };
-  const declarationText = list => {
+  // `keys` gets the name of each piece, or '' for a folded shorthand, then the piece.
+  const declarationText = (list, keys) => {
     const out = [], done = new Set();
     if (list.length > 1 && !shorthandsOf) loadShorthands();
     for (const [name, , priority] of list) {
@@ -822,10 +875,22 @@
         text = shorthand + ': ' + merged;
         break;
       }
+      const key = text ? '' : name;
       if (!text) { done.add(name); text = name + ': ' + list.findLast(entry => entry[0] === name)[1]; }
-      out.push(text + (priority ? ' !important' : '') + ';');
+      const piece = text + (priority ? ' !important' : '') + ';';
+      out.push(piece);
+      if (keys) keys.push(key, piece);
     }
     return out.join(' ');
+  };
+  // The logical property group of a name and whether the name is logical, or null, as Chromium's groups.
+  const logicalGroups = new Map();
+  const logicalGroup = name => {
+    let group = logicalGroups.get(name);
+    if (group !== undefined) return group;
+    group = /^(margin|padding|scroll-margin|scroll-padding|inset|border|overflow|overscroll-behavior|corner|min|max|contain-intrinsic)-|^(top|right|bottom|left|width|height|inline-size|block-size)$/.test(name) ? [name.replace(/^(min-|max-|contain-intrinsic-)?(width|height)$/, '$1inline-size').replace(/^(top|right|bottom|left)$/, 'inset-$1').replace(/(^|-)(top|right|bottom|left|inline|block|start|end|x|y)(?=-|$)/g, ''), /(^|-)(inline|block|start|end)(-|$)/.test(name)] : null;
+    if (logicalGroups.size < 4096) logicalGroups.set(name, group);
+    return group;
   };
   const readOnly = () => { throw new DOMException('Computed styles are read-only', 'NoModificationAllowedError'); };
   let keyboardFocus = true, windowFocused = true, ring = false;
@@ -837,6 +902,7 @@
     get parentRule() { return this._owner.rule ?? null; }
     getPropertyValue(name) {
       name = String(name); if (!name.startsWith('--')) name = name.toLowerCase();
+      if (name.startsWith('-webkit-') && (cssAliases ??= new Set(call('dom.aliases'))).has(name)) name = name.slice(8);
       if (this._owner.computed) return this._owner.computed(name);
       const list = this._list, found = list.findLast(entry => entry[0] === name);
       if (found) return specified(name, found[1]);
@@ -858,10 +924,21 @@
       if (priority && priority !== 'important') return;
       const added = owner.raw || name.startsWith('--') ? [[name, value, priority]] : declare(name + ':' + value + (priority ? ' !important' : ''));
       if (!added.length) return;
+      // As in Chrome, a set name keeps its place, unless a later name of its logical group maps the other way.
+      const next = owner.read().slice(), end = [];
+      for (const entry of added) {
+        const i = next.findLastIndex(old => old[0] === entry[0]), group = i < 0 || entry[0].startsWith('--') ? null : logicalGroup(entry[0]);
+        let moved = false;
+        if (group) for (let j = i + 1; j < next.length && !moved; j++) { const other = next[j][0].startsWith('--') ? null : logicalGroup(next[j][0]); moved = !!other && other[0] === group[0] && other[1] !== group[1]; }
+        if (i >= 0 && !moved) next[i] = entry;
+        else { if (i >= 0) next.splice(i, 1); end.push(entry); }
+        // A shorthand and its later longhands can leave one name twice. The last one is the declaration.
+        for (let j = i - 1; j >= 0; j--) if (next[j][0] === entry[0]) next.splice(j, 1);
+      }
+      // An unchanged value writes nothing, so it makes no mutation record.
       const list = owner.read();
-      if (added.length === 1) { owner.write([...list.filter(entry => entry[0] !== added[0][0]), added[0]]); return; }
-      const names = new Set(added.map(entry => entry[0]));
-      owner.write([...list.filter(entry => !names.has(entry[0])), ...added]);
+      if (!end.length && next.length === list.length && next.every((entry, i) => entry === list[i] || entry.every((part, j) => part === list[i][j]))) return;
+      owner.write(end.length ? next.concat(end) : next);
     }
     removeProperty(name) {
       if (this._owner.computed) readOnly();
@@ -870,6 +947,7 @@
       if (kept.length !== list.length) this._owner.write(kept);
       return old;
     }
+    *[Symbol.iterator]() { for (let i = 0, length = this.length; i < length; i++) yield this.item(i); }
     get cssText() { return this._owner.computed ? '' : declarationText(specifiedList(this._list)); }
     set cssText(value) { if (this._owner.computed) readOnly(); this._owner.write(this._owner.raw ? String(value).split(';').flatMap(part => { const colon = part.indexOf(':'); return colon > 0 ? [[part.slice(0, colon).trim(), part.slice(colon + 1).trim(), '']] : []; }) : declare(String(value))); }
   }
@@ -885,7 +963,7 @@
   const datasetOwner = Symbol(), datasetHandler = { get: (target, name) => target[datasetOwner].getAttribute('data-' + cssName(name)) ?? undefined, set: (target, name, value) => { if (/-[a-z]/.test(name)) throw new DOMException(`'${name}' is not a valid dataset name`, 'SyntaxError'); target[datasetOwner].setAttribute('data-' + cssName(name), value); return true; }, has: (target, name) => typeof name === 'string' && target[datasetOwner].hasAttribute('data-' + cssName(name)), deleteProperty: (target, name) => { target[datasetOwner].removeAttribute('data-' + cssName(name)); return true; }, ownKeys: target => target[datasetOwner].getAttributeNames().filter(name => name.startsWith('data-')).map(name => name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase())), getOwnPropertyDescriptor: () => ({ enumerable: true, configurable: true }) };
   class Element extends Node {
     constructor(id, tag) { const custom = id === undefined; if(custom){if(constructing?.node){const node=constructing.node;constructing=null;Object.setPrototypeOf(node,new.target.prototype);return node;}tag=constructing?.tag??defined.get(new.target)?.name;if(!tag)throw new TypeError('Illegal element constructor');id=create(tag);constructing=null;} super(id, tag);  this.tagName = this.nodeName; this.localName = tag; this.namespaceURI = XHTML; if (custom) flag(this, 64, true); }
-    get attributes() { const attrs = listOf(NamedNodeMap, Array.from(this._m.attrs, ([name]) => attrNode(this, name))); for (const attr of attrs) if (!(attr.name in attrs)) attrs[attr.name] = attr; return attrs; }
+    get attributes() { const attrs = listOf(NamedNodeMap, this._m.attrs.keys().map(name => attrNode(this, name))); for (const attr of attrs) if (!(attr.name in attrs)) attrs[attr.name] = attr; return attrs; }
     getAttributeNames() { return [...this._m.attrs.keys()]; }
     hasAttributes() { return this._m.attrs.size > 0; }
     get nextElementSibling() { let n = this.nextSibling; while (n && n.nodeType !== 1) n = n.nextSibling; return n; }
@@ -909,20 +987,35 @@
     get style() {
       if (this._style) return this._style;
       // The parsed list is shared, not copied, so declaration code must never change its entries.
-      let text = null, list = [];
-      return this._style = declaration({ read: () => { const now = this.getAttribute('style') ?? ''; if (now !== text) { text = now; list = declare(now); } return list; }, write: next => { text = declarationText(next); list = next; this.setAttribute('style', text); } });
+      // A write that only replaces or adds one name in no shorthand, as `setProperty` does, changes one piece of the last text.
+      let text = null, list = [], keys = null;
+      const write = next => {
+        let at = -1, same = !!keys && !!shorthandsOf && (next.length === list.length || next.length === list.length + 1);
+        for (let i = 0; same && i < list.length; i++) if (next[i] !== list[i]) { same = at < 0 && next.length === list.length && next[i][0] === list[i][0]; at = i; }
+        if (same && next.length > list.length) at = list.length;
+        if (same && at >= 0 && !shorthandsOf.has(next[at][0])) {
+          const [name, value, priority] = next[at], piece = name + ': ' + value + (priority ? ' !important' : '') + ';', j = at < list.length ? keys.indexOf(name) : -1;
+          if (j >= 0) keys[j + 1] = piece; else keys.push(name, piece);
+          text = '';
+          for (let k = 1; k < keys.length; k += 2) text += (k > 1 ? ' ' : '') + keys[k];
+        } else if (!same || at >= 0) text = declarationText(next, keys = []);
+        list = next; this.setAttribute('style', text);
+      };
+      return this._style = declaration({ read: () => { const now = this.getAttribute('style') ?? ''; if (now !== text) { text = now; list = declare(now); keys = null; } return list; }, write });
     }
     set style(value) { this.style.cssText = value; }
     get innerHTML() { return serialize(this._m, true) || own(this._m); }
     set innerHTML(value) { setHTML(this, value); }
     get outerHTML() { return serialize(this._m); }
     set outerHTML(value) { const parent = this.parentNode; if (!parent) return; if (parent.nodeType === 9) throw new DOMException('Cannot replace the document element', 'NoModificationAllowedError'); reactionDepth++; try { this.replaceWith(parseFragment(value, parent.nodeType === 1 ? parent : null)); } finally { leave(); } }
-    get innerText() { return slot(this) < 0 ? this.textContent : call('dom.innerText', this._id); }
+    get innerText() { return call('dom.skipped', this._id, false) > 0 ? '' : slot(this) < 0 ? this.textContent : call('dom.innerText', this._id); }
     set innerText(value) { const parts = String(value ?? '').split(/\r\n|\r|\n/); replaceAll(this, () => { release(this); detach(this._m); op(1, this._id, ''); }); quiet++; try { parts.forEach((part, index) => { if (index) this.append(document.createElement('br')); if (part) this.append(part); }); } finally { quiet--; } if (observers.size && this._m.kids.length) change({ type: 'childList', target: this, addedNodes: this.childNodes }); }
     matches(selector) { return selectors('dom.matches', this._id, selector); }
     closest(selector) { return wrap(selectors('dom.closest', this._id, selector)); }
     checkVisibility(options = {}) {
-      if (slot(this) < 0 || getComputedStyle(this).display === 'contents') return false;
+      // Like Chrome, the contents that a `content-visibility: auto` box skips count as visible unless the options ask.
+      const skipped = call('dom.skipped', this._id, false);
+      if (skipped > 0 ? skipped === 2 || options?.contentVisibilityAuto : slot(this) < 0) return false;
       if ((options?.checkVisibilityCSS || options?.visibilityProperty) && getComputedStyle(this).visibility !== 'visible') return false;
       if (options?.checkOpacity || options?.opacityProperty) for (let node = this; node; node = node.parentElement) if (getComputedStyle(node).opacity === '0') return false;
       return true;
@@ -974,24 +1067,24 @@
       // As in Chrome, no element has focus during `blur` and `focusout`, and a listener that moves the focus wins.
       if (previous && windowFocused) {
         active = null; call('dom.focus', []); commit(previous);
-        dispatch(previous, new FocusEvent('blur', { composed: true, relatedTarget: this })); dispatch(previous, new FocusEvent('focusout', { bubbles: true, composed: true, relatedTarget: this }));
+        dispatch(previous, new FocusEvent('blur', { view: window, composed: true, relatedTarget: this })); dispatch(previous, new FocusEvent('focusout', { view: window, bubbles: true, composed: true, relatedTarget: this }));
         if (active || !this.isConnected) return;
       }
-      active = this; call('dom.focus', path(this).map(node => node._id), ring = keyboardFocus || this.isContentEditable || this.localName === 'textarea' || this.localName === 'input' && !/^(button|submit|reset|checkbox|radio|range|color|file|image)$/i.test(this.getAttribute('type') ?? ''), !windowFocused);
+      active = this; call('dom.focus', path(this).map(node => node._id), ring = options?.focusVisible ?? (keyboardFocus || this.isContentEditable || this.localName === 'textarea' || this.localName === 'input' && !/^(button|submit|reset|checkbox|radio|range|color|file|image)$/i.test(this.getAttribute('type') ?? '')), !windowFocused);
       if (!options?.preventScroll) this.scrollIntoView({ block: 'if-needed', inline: 'if-needed' });
       // Like Chrome, an editing host that gets focus without the selection in it gets a caret at its start.
       if (this.isContentEditable && !this.contains(selection.anchorNode)) selection.collapse(document.createTreeWalker(this, 4).nextNode() ?? this, 0);
       else if (this.isContentEditable && selection.isCollapsed) selection._send();
       // Defer focus events while the window lacks focus. On window focus, emit them for the current element.
       if (!windowFocused) return;
-      if (active === this) { dispatch(this, new FocusEvent('focus', { composed: true, relatedTarget: previous })); dispatch(this, new FocusEvent('focusin', { bubbles: true, composed: true, relatedTarget: previous })); }
+      if (active === this) { dispatch(this, new FocusEvent('focus', { view: window, composed: true, relatedTarget: previous })); dispatch(this, new FocusEvent('focusin', { view: window, bubbles: true, composed: true, relatedTarget: previous })); }
     }
-    blur() { if (active !== this) return; finishComposition(); active = null; call('dom.focus', []); if (!windowFocused) return; commit(this); dispatch(this, new FocusEvent('blur', { composed: true })); dispatch(this, new FocusEvent('focusout', { bubbles: true, composed: true })); }
+    blur() { if (active !== this) return; finishComposition(); active = null; call('dom.focus', []); if (!windowFocused) return; commit(this); dispatch(this, new FocusEvent('blur', { view: window, composed: true })); dispatch(this, new FocusEvent('focusout', { view: window, bubbles: true, composed: true })); }
     click() { if (disabled(this) || this._clicking) return; this._clicking = true; try { fireClick(this); } finally { this._clicking = false; } }
     get contentEditable() { const value = this.getAttribute('contenteditable')?.toLowerCase(); return value === '' ? 'true' : value === 'true' || value === 'false' || value === 'plaintext-only' ? value : 'inherit'; }
     set contentEditable(value) { value = String(value).toLowerCase(); if (value === 'inherit') this.removeAttribute('contenteditable'); else if (value === 'true' || value === 'false' || value === 'plaintext-only') this.setAttribute('contenteditable', value); else throw new DOMException(`'${value}' is not a valid contentEditable value`, 'SyntaxError'); }
     get isContentEditable() { const value = this.contentEditable; return value === 'true' || value === 'plaintext-only' || value === 'inherit' && !!this.parentElement?.isContentEditable; }
-    get tabIndex() { const value = parseInt(this.getAttribute('tabindex'), 10), tag = this.localName; return Number.isNaN(value) ? /^(input|textarea|button|select|iframe|object|video|audio|terminal)$/.test(tag) || (tag === 'a' || tag === 'area') && (this.namespaceURI === XHTML || this.hasAttribute('href')) || tag === 'summary' && activation(this) ? 0 : -1 : value; } set tabIndex(value) { this.setAttribute('tabindex', value); }
+    get tabIndex() { const value = parseInt(this.getAttribute('tabindex'), 10), tag = this.localName; return Number.isNaN(value) ? /^(input|textarea|button|select|iframe|object|video|audio|terminal)$/.test(tag) || (tag === 'a' || tag === 'area') && (this.namespaceURI === XHTML || this.hasAttribute('href')) || tag === 'summary' && activation(this) ? 0 : -1 : value; } set tabIndex(value) { this.setAttribute('tabindex', Number(value) | 0); }
     attachShadow(options) { if (this._shadow) throw new DOMException('Shadow root already exists', 'NotSupportedError'); if(!['open','closed'].includes(options.mode))throw new TypeError('Invalid shadow mode');if(this.namespaceURI!==XHTML||!/^(article|aside|blockquote|body|div|footer|h[1-6]|header|main|nav|p|section|span|[a-z][a-z0-9._]*-[a-z0-9._-]*)$/.test(this.localName))throw new DOMException(`<${this.localName}> cannot have a shadow root`, 'NotSupportedError');const root = document.createDocumentFragment(); shadows++; Object.setPrototypeOf(root,ShadowRoot.prototype);root.host=this;root.mode=options.mode;root.delegatesFocus=!!options.delegatesFocus;root.slotAssignment=options.slotAssignment==='manual'?'manual':'named';root.clonable=!!options.clonable;root.serializable=!!options.serializable;this._shadow=root;root._m.host=this._m;this._m.shadow=root._m;op(6,this._id,root._id);return root; }
     get shadowRoot() { return this._shadow?.mode === 'open' ? this._shadow : null; }
     setPointerCapture(id) { if (!pointers.has(id)) throw new DOMException('Pointer is not active', 'NotFoundError'); captures.set(id, this); }
@@ -1004,12 +1097,6 @@
     getHTML() { return this.innerHTML; }
     setHTMLUnsafe(html) { this.innerHTML = html; attachDeclarative(); }
     get outerText() { return this.innerText; } set outerText(value) { if (!this.parentNode) throw new DOMException('The element has no parent', 'NoModificationAllowedError'); this.replaceWith(...String(value ?? '').split(/\r\n|\r|\n/).flatMap((part, index) => index ? [document.createElement('br'), part] : [part]).filter(part => part !== '')); }
-    checkVisibility(options = {}) {
-      if (slot(this) < 0) return false;
-      if ((options.checkVisibilityCSS || options.visibilityProperty) && getComputedStyle(this).visibility !== 'visible') return false;
-      if (options.checkOpacity || options.opacityProperty) for (let node = this; node; node = node.parentElement) if (getComputedStyle(node).opacity === '0') return false;
-      return true;
-    }
     insertAdjacentHTML(position, source) { const outside = /^(beforebegin|afterend)$/i.test(position), context = outside ? this.parentNode : this; if (outside && (!context || context.nodeType === 9)) throw new DOMException('The element has no parent', 'NoModificationAllowedError'); adjacent(this, position, parseFragment(source, context.nodeType === 1 && !(context.localName === 'html' && context.namespaceURI === XHTML) ? context : null)); }
   }
   for (const [Type, names] of [[Node, ['insertBefore', 'removeChild', 'replaceChild', 'cloneNode']], [Element, ['setAttribute', 'removeAttribute', 'insertAdjacentHTML']]]) for (const name of names) { const fn = Type.prototype[name]; Type.prototype[name] = { [name](a, b) { reactionDepth++; try { return fn.call(this, a, b); } finally { leave(); } } }[name]; }
@@ -1028,7 +1115,8 @@
     get offsetLeft() { return offset(this, 0); }
     get offsetTop() { return offset(this, 1); }
   }
-  class SVGElement extends Element {constructor(id,tag){super(id,tag);this.namespaceURI=SVG;this.nodeName=this.tagName=tag;}getBBox(){layout();const [x,y,width,height]=call('dom.svgBox',this._id);return new DOMRect(x,y,width,height);}get ownerSVGElement(){for(let node=this.parentElement;node;node=node.parentElement)if(node instanceof SVGSVGElement)return node;return null;}get viewportElement(){return this.ownerSVGElement;}}
+  class SVGAnimatedString { constructor(element) { this._element = element; } get baseVal() { return this._element.getAttribute('class') ?? ''; } set baseVal(value) { this._element.setAttribute('class', value); } get animVal() { return this.baseVal; } }
+  class SVGElement extends Element {constructor(id,tag){super(id,tag);this.namespaceURI=SVG;this.nodeName=this.tagName=tag;}get className(){return this._className??=new SVGAnimatedString(this);}getBBox(){layout();const [x,y,width,height]=call('dom.svgBox',this._id);return new DOMRect(x,y,width,height);}get ownerSVGElement(){for(let node=this.parentElement;node;node=node.parentElement)if(node instanceof SVGSVGElement)return node;return null;}get viewportElement(){return this.ownerSVGElement;}}
   class SVGSVGElement extends SVGElement {
     get viewBox() { const box = viewBoxOf(this) ?? [0, 0, 0, 0]; return { baseVal: new DOMRect(...box), animVal: new DOMRect(...box) }; }
     createSVGPoint() { return new DOMPoint(); } createSVGMatrix() { return new DOMMatrix(); } createSVGRect() { return new DOMRect(); }
@@ -1068,8 +1156,9 @@
     assignedElements(options = {}) { return this.assignedNodes(options).filter(node => node.nodeType === 1); }
   }
   const inputTypes = new Set(['hidden','text','search','tel','url','email','password','date','month','week','time','datetime-local','number','range','color','checkbox','radio','file','submit','image','reset','button']);
+  const selectable = node => node instanceof HTMLTextAreaElement || /^(text|search|tel|url|password)$/.test(node.type);
   const editable = node => node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement && /^(text|search|tel|url|email|password|number)$/.test(node.type);
-  const sanitize = (type, value) => type === 'number' ? /^-?(\d+(\.\d+)?|\.\d+)([eE][-+]?\d+)?$/.test(value) ? value : '' : type === 'color' ? /^#[\da-f]{6}$/i.test(value) ? value.toLowerCase() : '#000000' : /^(text|search|tel|password|url|email)$/.test(type) ? (value = value.replace(/[\r\n]/g, ''), type === 'url' || type === 'email' ? value.trim() : value) : value;
+  const sanitize = (type, value) => type === 'number' ? /^-?(\d+(\.\d+)?|\.\d+)([eE][-+]?\d+)?$/.test(value) ? value : '' : type === 'color' ? /^#[\da-f]{6}$/i.test(value) ? value.toLowerCase() : '#000000' : /^(text|search|tel|password|url|email)$/.test(type) ? (value = value.replace(/[\r\n]/g, ''), type === 'url' || type === 'email' ? value.trim() : value) : /^(date|time|datetime-local|month|week)$/.test(type) && Number.isNaN(stepKinds[type][3](value)) ? '' : value;
   const assign = (node, value) => { const old = node.value; setValue(node, value); if (value !== old) { node._start = node._end = value.length; node._direction = 'none'; if (active === node) call('dom.selection', node._id, value.length, value.length); } };
   const setValue = (node, value) => { node._value = value; op(7, node._id, value, 0); const length = value.length; node._start = Math.min(node._start ?? length, length); node._end = Math.min(node._end ?? length, length); revalidate(node); };
   const rangeBounds = node => { const number = name => { const value = parseFloat(node.getAttribute(name)); return Number.isFinite(value) ? value : null; }, min = number('min') ?? 0, step = number('step'); return [min, Math.max(min, number('max') ?? 100), node.getAttribute('step')?.trim().toLowerCase() === 'any' ? 0 : step > 0 ? step : 1]; };
@@ -1081,7 +1170,7 @@
   };
   // [scale of `step`, default step, default step base, parse, format, is a date]. Dates count ms since the epoch, months count months.
   const pad = (n, size = 2) => String(n).padStart(size, '0'), dayOf = text => /^(\d{4,})-(\d\d)-(\d\d)$/.exec(text), timeOf = text => /^(\d\d):(\d\d)(?::(\d\d)(?:\.(\d{1,3}))?)?$/.exec(text);
-  const day = text => { const m = dayOf(text); if (!m) return NaN; const value = Date.UTC(+m[1], m[2] - 1, +m[3]); return new Date(value).getUTCDate() === +m[3] && m[2] > 0 ? value : NaN; };
+  const day = text => { const m = dayOf(text); if (!m) return NaN; const value = Date.UTC(+m[1], m[2] - 1, +m[3]); return new Date(value).getUTCDate() === +m[3] && m[2] > 0 && m[2] <= 12 ? value : NaN; };
   const clock = text => { const m = timeOf(text); return m && m[1] < 24 && m[2] < 60 && (m[3] ?? 0) < 60 ? ((m[1] * 60 + +m[2]) * 60 + +(m[3] ?? 0)) * 1000 + +(m[4] ?? '0').padEnd(3, '0') : NaN; };
   const dayText = value => { const d = new Date(value); return pad(d.getUTCFullYear(), 4) + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()); };
   const clockText = value => { const d = new Date(value), s = d.getUTCSeconds(), ms = d.getUTCMilliseconds(); return pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + (s || ms ? ':' + pad(s) + (ms ? '.' + pad(ms, 3) : '') : ''); };
@@ -1107,26 +1196,26 @@
   const formState = (node, bits) => { if (node._bits !== bits) { node._bits = bits; op(8, node._id, bits); } };
   // User edits must change internal state, not value or checked properties: frameworks intercept those
   // properties to detect script writes.
-  const setChecked = (node, value) => { node._checked = value; formState(node, node._bits & ~3 | (value ? 3 : 2)); if (value && node.type === 'radio') for (const other of group(node)) if (other !== node && (other._checked ?? other.hasAttribute('checked'))) { other._checked = false; formState(other, other._bits & ~3 | 2); } revalidate(node); };
+  const setChecked = (node, value) => { node._checked = value; formState(node, node._bits & ~3 | (value ? 3 : 2)); const members = node.type === 'radio' ? group(node) : undefined; if (value && members) for (const other of members) if (other !== node && (other._checked ?? other.hasAttribute('checked'))) { other._checked = false; formState(other, other._bits & ~3 | 2); } revalidate(node, members); };
   const listed = /^(button|fieldset|input|object|output|select|textarea)$/;
   const candidate = node => !disabled(node) && !node.hasAttribute('readonly') && !node._m.up?.tag?.startsWith('datalist') && (node.localName === 'input' ? !/^(hidden|reset|button)$/.test(node.type) : node.localName === 'button' ? node.type === 'submit' : /^(select|textarea)$/.test(node.localName));
   const emailPattern = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
   // Rust matches `:valid` and `:invalid` with bit 128, so only controls that can fail a constraint are validated.
   const limited = (attrs, node) => node?._bits & 128 || node?._custom || attrs.list.some((name, i) => !(i & 1) && (/^(required|pattern|min|max|step|maxlength|minlength)$/.test(name) || name === 'type' && /^(email|url|number)$/i.test(attrs.list[i + 1])));
-  const revalidate = node => {
+  const revalidate = (node, members) => {
     if (!node || !/^(input|select|textarea|button)$/.test(node.localName)) return;
-    const members = node.type === 'radio' ? group(node) : [node];
-    if (members.some(other => limited(other._m.attrs, other))) for (const other of members) formState(other, validity(other).valid ? other._bits & ~128 : other._bits | 128);
+    const radio = node.type === 'radio'; members = radio ? members ?? group(node) : [node];
+    if (members.some(other => limited(other._m.attrs, other))) for (const other of members) formState(other, validity(other, radio ? members : undefined).valid ? other._bits & ~128 : other._bits | 128);
   };
   class ValidityState {}
   for (const name of ['valueMissing','typeMismatch','patternMismatch','tooLong','tooShort','rangeUnderflow','rangeOverflow','stepMismatch','badInput','customError','valid']) Object.defineProperty(ValidityState.prototype, name, { get() { return this['_' + name]; }, enumerable: true });
   const messages = { valueMissing: 'Please fill out this field.', typeMismatch: 'Please enter a valid value.', patternMismatch: 'Please match the requested format.', tooLong: 'Please shorten this text.', tooShort: 'Please lengthen this text.', rangeUnderflow: 'Value is too low.', rangeOverflow: 'Value is too high.', stepMismatch: 'Please enter a valid value.', badInput: 'Please enter a number.' };
-  const validity = node => {
+  const validity = (node, members) => {
     const flags = { valueMissing: false, typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false, rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false, customError: !!node._custom };
     const tag = node.localName, type = node.type, required = node.hasAttribute('required');
     if (tag === 'select') flags.valueMissing = required && !node.selectedOptions.some(option => option.value !== '' || option.index !== 0 || node.multiple || node.size > 1);
     else if (type === 'checkbox') flags.valueMissing = required && !node.checked;
-    else if (type === 'radio') flags.valueMissing = group(node).some(radio => radio.hasAttribute('required')) && !group(node).some(radio => radio.checked);
+    else if (type === 'radio') { members ??= group(node); flags.valueMissing = members.some(radio => radio.hasAttribute('required')) && !members.some(radio => radio.checked); }
     else if (tag === 'textarea' || tag === 'input' && !/^(hidden|submit|image|reset|button|file)$/.test(type)) {
       const value = node.value, length = value.length, attr = name => node.getAttribute(name);
       flags.valueMissing = required && !value;
@@ -1195,26 +1284,30 @@
     stepUp(n = 1) { stepBy(this, n); } stepDown(n = 1) { stepBy(this, -n); }
     get files() { return this.type === 'file' ? this._files ?? [] : null; }
     get list() { const id = this.getAttribute('list'); return id ? document.getElementById(id) : null; }
-    get selectionStart() { return this._start ?? 0; } set selectionStart(value) { this.setSelectionRange(value, Math.max(value, this.selectionEnd)); }
-    get selectionEnd() { return this._end ?? 0; } set selectionEnd(value) { this.setSelectionRange(Math.min(value, this.selectionStart), value); }
-    get selectionDirection() { return this._direction ?? 'none'; } set selectionDirection(value) { this.setSelectionRange(this.selectionStart, this.selectionEnd, value); }
+    // Like Chrome, the selection API works only on text fields. Editing code uses the fields, as number and email
+    // inputs keep a selection too.
+    get selectionStart() { return selectable(this) ? this._start ?? 0 : null; } set selectionStart(value) { this.setSelectionRange(value, Math.max(value, this.selectionEnd)); }
+    get selectionEnd() { return selectable(this) ? this._end ?? 0 : null; } set selectionEnd(value) { this.setSelectionRange(Math.min(value, this.selectionStart), value); }
+    get selectionDirection() { return selectable(this) ? this._direction ?? 'none' : null; } set selectionDirection(value) { this.setSelectionRange(this.selectionStart, this.selectionEnd, value); }
     setSelectionRange(start, end, direction = 'none', user = false) {
+      if (!user && !selectable(this)) throw new DOMException(`The input element's type ('${this.type}') does not support selection.`, 'InvalidStateError');
       const length = this.value.length;
       end = Math.min(Number(end) >>> 0, length); start = Math.min(Number(start) >>> 0, end);
       direction = ['forward','backward'].includes(direction) ? direction : 'none';
-      const changed = start !== this.selectionStart || end !== this.selectionEnd || direction !== this.selectionDirection;
+      const changed = start !== (this._start ?? 0) || end !== (this._end ?? 0) || direction !== (this._direction ?? 'none');
       this._start = start; this._end = end; this._direction = direction;
       if (active === this) call('dom.selection', this._id, start, end);
       // Selections by the user fire `select` only when they select text, as in Chrome.
       if (changed) { selectionChanged(this); if (!user || start !== end) setTimeout(() => dispatch(this, new Event('select', { bubbles: true })), 0); }
     }
     // Chromium and WebKit focus the field in `select()`; editors rely on it to move typing into the field.
-    select() { this.focus(); this.setSelectionRange(0, this.value.length); }
+    select() { this.focus(); if (editable(this)) this.setSelectionRange(0, this.value.length, 'none', !selectable(this)); }
     setRangeText(text, start = this.selectionStart, end = this.selectionEnd, mode = 'preserve') {
+      if (!selectable(this)) throw new DOMException(`The input element's type ('${this.type}') does not support selection.`, 'InvalidStateError');
       text = String(text); start = Number(start) >>> 0; end = Number(end) >>> 0;
       if (start > end) throw new DOMException('Invalid replacement range', 'IndexSizeError');
       if (!['select','start','end','preserve'].includes(mode)) throw new TypeError('Invalid selection mode');
-      const value = this.value, oldStart = this.selectionStart, oldEnd = this.selectionEnd;
+      const value = this.value, oldStart = this._start ?? 0, oldEnd = this._end ?? 0;
       start = Math.min(start, value.length); end = Math.min(end, value.length);
       this.value = value.slice(0, start) + text + value.slice(end);
       const after = start + text.length, delta = text.length - (end - start);
@@ -1230,9 +1323,12 @@
   }
   for (const name of ['selectionStart', 'selectionEnd', 'selectionDirection', 'setSelectionRange', 'select', 'setRangeText']) Object.defineProperty(HTMLTextAreaElement.prototype, name, Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, name));
   for (const attr of ['accept', 'alt', 'autocomplete', 'max', 'min', 'pattern', 'step']) Object.defineProperty(HTMLInputElement.prototype, attr, { get() { return this.getAttribute(attr) ?? ''; }, set(value) { this.setAttribute(attr, value); } });
-  const options = select => { const result = []; for (const kid of select._m.kids) { if (kid.tag === 'option') result.push(of(kid)); else if (kid.tag === 'optgroup') for (const sub of kid.kids) if (sub.tag === 'option') result.push(of(sub)); } return result; };
-  const selectedness = select => {
+  // Cached by `version`, which every tree and attribute change bumps. Never mutate the result.
+  const options = select => { if (select._optionsAt === version) return select._options; const result = []; for (const kid of select._m.kids) { if (kid.tag === 'option') result.push(of(kid)); else if (kid.tag === 'optgroup') for (const sub of kid.kids) if (sub.tag === 'option') result.push(of(sub)); } select._optionsAt = version; return select._options = result; };
+  // Getters pass `cached`: every write of `_selected` or `_none` runs a full pass after it.
+  const selectedness = (select, cached) => {
     const list = options(select);
+    if (cached && select._selectedAt === version) return list;
     if (select.multiple || select.size > 1) for (const option of list) option._current = option._selected ?? option.hasAttribute('selected');
     else {
       let chosen = null;
@@ -1242,6 +1338,7 @@
       for (const option of list) option._current = option === chosen;
     }
     for (const option of list) formState(option, option._current ? 3 : 2);
+    select._selectedAt = version;
     return list;
   };
   class HTMLOptionsCollection extends HTMLCollection {
@@ -1253,14 +1350,23 @@
   class HTMLSelectElement extends HTMLElement {
     get type() { return this.multiple ? 'select-multiple' : 'select-one'; }
     // A proxy, so `options.length = 0` and `options[i] = option` change the select, as in browsers.
-    get options() { const list = listOf(HTMLOptionsCollection, options(this)); list._select = this; return new Proxy(list, optionsHandler); }
+    // The same collection while the options stay the same, as in browsers. It stays a static list.
+    get options() {
+      const now = options(this);
+      if (this._optionsFrom !== now) {
+        const old = this._optionsList;
+        if (!old || old.length !== now.length || now.some((option, i) => old[i] !== option)) { const list = listOf(HTMLOptionsCollection, now.slice()); list._select = this; this._optionsList = new Proxy(list, optionsHandler); }
+        this._optionsFrom = now;
+      }
+      return this._optionsList;
+    }
     get length() { return options(this).length; }
     set length(value) { const list = options(this); value >>>= 0; for (let i = list.length; i < value; i++) this.append(document.createElement('option')); for (const option of list.slice(value)) option.remove(); }
     get size() { return Math.max(0, parseInt(this.getAttribute('size'), 10) || 0); } set size(value) { this.setAttribute('size', value >>> 0); }
-    get selectedOptions() { return listOf(HTMLCollection, selectedness(this).filter(option => option._current)); }
-    get selectedIndex() { return selectedness(this).findIndex(option => option._current); }
+    get selectedOptions() { return listOf(HTMLCollection, selectedness(this, true).filter(option => option._current)); }
+    get selectedIndex() { return selectedness(this, true).findIndex(option => option._current); }
     set selectedIndex(value) { value = Number(value); const list = options(this); this._none = list[value] ? null : list; for (const [index, option] of list.entries()) option._selected = index === value; selectedness(this); revalidate(this); }
-    get value() { return selectedness(this).find(option => option._current)?.value ?? ''; }
+    get value() { return selectedness(this, true).find(option => option._current)?.value ?? ''; }
     set value(value) { value = String(value); const list = options(this); let found = false; for (const option of list) option._selected = !found && option.value === value && (found = true); this._none = found ? null : list; selectedness(this); revalidate(this); }
     item(index) { return options(this)[index] ?? null; }
     showPicker() { if (!native) throw new DOMException('showPicker() needs a user gesture', 'NotAllowedError'); openSelect(this); }
@@ -1273,7 +1379,7 @@
     get value() { return this.getAttribute('value') ?? this.text; } set value(value) { this.setAttribute('value', value); }
     get text() { return this.textContent.replace(/[\t\n\f\r ]+/g, ' ').trim(); } set text(value) { this.textContent = value; }
     get label() { return this.getAttribute('label') ?? this.text; } set label(value) { this.setAttribute('label', value); }
-    get selected() { const select = this.select; if (select) selectedness(select); return this._current ?? this._selected ?? this.hasAttribute('selected'); }
+    get selected() { const select = this.select; if (select) selectedness(select, true); return this._current ?? this._selected ?? this.hasAttribute('selected'); }
     set selected(value) { const select = this.select; this._selected = !!value; if (select) { if (value && !select.multiple) for (const option of options(select)) if (option !== this) option._selected = false; select._none = null; selectedness(select); revalidate(select); } else this._current = !!value; }
     get defaultSelected() { return this.hasAttribute('selected'); } set defaultSelected(value) { this.toggleAttribute('selected', !!value); }
     get index() { const select = this.select; return select ? options(select).indexOf(this) : 0; }
@@ -1322,12 +1428,15 @@
     requestSubmit(submitter = null) { if (submitter !== null && (!(submitter instanceof HTMLElement) || submitter.form !== this || !(submitter.localName === 'button' ? submitter.type === 'submit' : /^(submit|image)$/.test(submitter.type)))) throw submitter?.form !== this ? new DOMException('The submitter is not owned by this form', 'NotFoundError') : new TypeError('The submitter is not a submit button'); submitForm(this, submitter); }
     reset() {
       if (!dispatch(this, new Event('reset', { bubbles: true, cancelable: true }))) return;
+      const radios = [];
       for (const control of this.elements) {
         if (control.localName === 'select') { for (const option of options(control)) option._selected = undefined; control._none = null; selectedness(control); }
         else if (control.localName === 'input' || control.localName === 'textarea') { control._value = control._checked = control._edited = control._dirty = undefined; op(7, control._id, '', 1); formState(control, control._bits & ~3); if (control.type === 'radio' && control.hasAttribute('checked')) setChecked(control, true); }
         else if (control.localName === 'output') control.textContent = control.defaultValue;
-        revalidate(control);
+        if (control.localName === 'input' && control.type === 'radio') radios.push(control); else revalidate(control);
       }
+      const done = new Set();
+      for (const radio of radios) if (!done.has(radio)) { const members = group(radio); for (const member of members) done.add(member); revalidate(radio, members); }
     }
     checkValidity() { return [...this.elements].map(control => (control._internals ?? control).checkValidity?.() ?? true).every(Boolean); }
     reportValidity() { const invalid = [...this.elements].filter(control => !((control._internals ?? control).checkValidity?.() ?? true)); invalid[0]?.focus(); return !invalid.length; }
@@ -1336,7 +1445,8 @@
       for (const control of this.elements) {
         const tag = control.localName, type = control.type, name = control.getAttribute('name'), value = control._internals?._value;
         if (!listed.test(tag)) { if (value instanceof FormData) for (const [key, item] of value) data.append(key, item); else if (name && value != null && !control.matches(':disabled')) data.append(name, value); continue; }
-        if (!name || disabled(control) || control.closest('datalist') || tag === 'button' && control !== submitter || tag === 'input' && /^(submit|image|reset|button)$/.test(type) && control !== submitter || /^(checkbox|radio)$/.test(type) && !control.checked || tag === 'object' || tag === 'output' || tag === 'fieldset') continue;
+        let inList = false; for (let rec = control._m.up; rec && !inList; rec = rec.up) inList = rec.tag === 'datalist';
+        if (!name || disabled(control) || inList || tag === 'button' && control !== submitter || tag === 'input' && /^(submit|image|reset|button)$/.test(type) && control !== submitter || /^(checkbox|radio)$/.test(type) && !control.checked || tag === 'object' || tag === 'output' || tag === 'fieldset') continue;
         if (tag === 'select') for (const option of control.selectedOptions) data.append(name, option.value);
         else if (type === 'file') for (const file of control.files.length ? control.files : [new File([], '', { type: 'application/octet-stream' })]) data.append(name, file);
         else data.append(name, control.value);
@@ -1517,6 +1627,7 @@
     get width() { return Number(this.getAttribute('width') ?? this.naturalWidth); } set width(value) { this.setAttribute('width',value); }
     get height() { return Number(this.getAttribute('height') ?? this.naturalHeight); } set height(value) { this.setAttribute('height',value); }
     get complete() { return !this.src || !!this._complete; }
+    get currentSrc() { return this.src; }
     setAttribute(name,value) { super.setAttribute(name,value); if (name === 'src') this._loadImage(); }
     _loadImage() {
       const raw = this.getAttribute('src'), source = this.src, load = this._load = {}, current = () => this._load === load && this.getAttribute('src') === raw; this._complete = false; if (this._bits & 32) flag(this, 32, false);
@@ -1576,7 +1687,7 @@
     set playbackRate(value) { value = +value; if (!(value >= 0.0625 && value <= 16)) throw new DOMException('The playback rate is not supported', 'NotSupportedError'); if (value === this.playbackRate) return; this._rate = value; control(this, SPEED, value); this._fire('ratechange'); }
     get defaultPlaybackRate() { return this._defaultRate ?? 1; } set defaultPlaybackRate(value) { this._defaultRate = +value; this._fire('ratechange'); }
     get preservesPitch() { return false; } set preservesPitch(value) {}
-    get preload() { const value = this.getAttribute('preload')?.toLowerCase(); return value === 'none' || value === 'metadata' ? value : 'auto'; } set preload(value) { this.setAttribute('preload', value); }
+    get preload() { const value = this.getAttribute('preload')?.toLowerCase(); return value === undefined ? 'metadata' : value === 'none' || value === 'metadata' ? value : 'auto'; } set preload(value) { this.setAttribute('preload', value); }
     get buffered() { return new TimeRanges(this._ready ? [[0, this.duration]] : []); } get seekable() { return this.buffered; } get played() { return new TimeRanges(); }
     get srcObject() { return null; } set srcObject(value) { if (value !== null) throw new DOMException('Media streams are not supported', 'NotSupportedError'); }
     canPlayType(type) {
@@ -1677,8 +1788,12 @@
   function Audio(src) { const audio = document.createElement('audio'); audio.preload = 'auto'; if (src !== undefined) audio.src = src; return audio; }
   Audio.prototype = HTMLAudioElement.prototype;
   class DOMRect { constructor(x = 0, y = 0, width = 0, height = 0) { this.x = x; this.y = y; this.width = width; this.height = height; } get left() { return Math.min(this.x, this.x + this.width); } get right() { return Math.max(this.x, this.x + this.width); } get top() { return Math.min(this.y, this.y + this.height); } get bottom() { return Math.max(this.y, this.y + this.height); } toJSON() { return { x: this.x, y: this.y, width: this.width, height: this.height, top: this.top, right: this.right, bottom: this.bottom, left: this.left }; } static fromRect(r = {}) { return new this(r.x, r.y, r.width, r.height); } }
-  class UIEvent extends Event { constructor(type, options = {}) { super(type, options); this.view = options.view ?? window; this.detail = options.detail ?? 0; } get which() { return 0; } }
+  class UIEvent extends Event { constructor(type, options = {}) { super(type, options); this.view = options.view ?? null; this.detail = options.detail ?? 0; } get which() { return 0; } }
   const mouseFields = { screenX: 0, screenY: 0, clientX: 0, clientY: 0, ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, button: 0, buttons: 0, relatedTarget: null, movementX: 0, movementY: 0 };
+  const layerOffset = (event, axis) => {
+    for (let node = event.target; node?.nodeType === 1; node = node.parentElement) if (getComputedStyle(node).position !== 'static') return Math.floor((axis ? event.clientY : event.clientX) - node.getBoundingClientRect()[axis ? 'top' : 'left']);
+    return axis ? event.pageY : event.pageX;
+  };
   class MouseEvent extends UIEvent {
     constructor(type, options = {}) {
       super(type, options); for (const key in mouseFields) this[key] = options[key] ?? mouseFields[key];
@@ -1690,12 +1805,15 @@
     get offsetX() { const target = this.target, x = eventState(this).x ?? this.clientX, offset = target?.getBoundingClientRect ? x - target.getBoundingClientRect().left - target.clientLeft : x; return this instanceof PointerEvent && !/^(click|auxclick|contextmenu)$/.test(this.type) ? offset : Math.round(offset); }
     get offsetY() { const target = this.target, y = eventState(this).y ?? this.clientY, offset = target?.getBoundingClientRect ? y - target.getBoundingClientRect().top - target.clientTop : y; return this instanceof PointerEvent && !/^(click|auxclick|contextmenu)$/.test(this.type) ? offset : Math.round(offset); }
     get which() { return eventState(this).which ?? this.button + 1; }
+    // Like Chrome, relative to the nearest positioned box, or to the page.
+    get layerX() { return layerOffset(this, 0); } get layerY() { return layerOffset(this, 1); }
     initMouseEvent(type, bubbles, cancelable, view, detail, screenX, screenY, clientX, clientY, ctrlKey, altKey, shiftKey, metaKey, button, relatedTarget) { this.initEvent(type, bubbles, cancelable); Object.assign(this, { view, detail, screenX, screenY, clientX, clientY, ctrlKey, altKey, shiftKey, metaKey, button, relatedTarget }); }
     getModifierState(key) { return !!this[({ Control: 'ctrlKey', Meta: 'metaKey', Alt: 'altKey', Shift: 'shiftKey' })[key]]; }
   }
   class WheelEvent extends MouseEvent { constructor(type, options = {}) { super(type, options); this.deltaX = options.deltaX ?? 0; this.deltaY = options.deltaY ?? 0; this.deltaZ = options.deltaZ ?? 0; this.deltaMode = options.deltaMode ?? 0; } }
   for (const [name, value] of Object.entries({ DOM_DELTA_PIXEL: 0, DOM_DELTA_LINE: 1, DOM_DELTA_PAGE: 2 })) { WheelEvent[name] = value; WheelEvent.prototype[name] = value; }
   class ToggleEvent extends Event { constructor(type, options = {}) { super(type, options); this.oldState = options.oldState ?? ''; this.newState = options.newState ?? ''; this.source = options.source ?? null; } }
+  class ContentVisibilityAutoStateChangeEvent extends Event { constructor(type, options = {}) { super(type, options); this.skipped = !!options.skipped; } }
   class SubmitEvent extends Event { constructor(type, options = {}) { super(type, options); this.submitter = options.submitter ?? null; } }
   class TransitionEvent extends Event { constructor(type, options = {}) { super(type, options); this.propertyName = String(options.propertyName ?? ''); this.elapsedTime = Number(options.elapsedTime ?? 0); this.pseudoElement = String(options.pseudoElement ?? ''); } }
   class AnimationEvent extends Event { constructor(type, options = {}) { super(type, options); this.animationName = String(options.animationName ?? ''); this.elapsedTime = Number(options.elapsedTime ?? 0); this.pseudoElement = String(options.pseudoElement ?? ''); } }
@@ -1804,16 +1922,19 @@
     set disabled(value) { value = !!value; if (value === this._disabled) return; this._disabled = value; if (this._node) call('dom.sheet', this._node._id, 'disabled', value); else for (const root of this._owners) adopt(root); }
   }
   class CSSStyleSheet extends StyleSheet {
-    constructor(options = {}, node = null) { super(); this._id = sheetIds++; this._node = node; this._text = null; this._data = []; this._rules = null; this._owners = new Set(); this._live = false; this._disabled = !!options.disabled; this._mediaText = typeof options.media === 'string' ? options.media : Array.from(options.media ?? []).join(', '); }
+    constructor(options = {}, node = null) { super(); this._id = sheetIds++; this._node = node; this._text = null; this._source = null; this._tree = []; this._rules = null; this._owners = new Set(); this._live = false; this._disabled = !!options.disabled; this._mediaText = typeof options.media === 'string' ? options.media : Array.from(options.media ?? []).join(', '); }
+    // Rules of a constructed sheet are parsed from `_source` when first read. `_source` is the text Rust has, until a rule edit.
+    get _data() { return this._tree ??= call('dom.constructed', 0, 'parse', this._source); }
     _sync() {
       if (!this._node) return;
       const value = text(this._node._m);
       if (value === this._text) return;
-      this._text = value; this._data = call('dom.css', this._node._id);
+      this._text = value; this._tree = call('dom.css', this._node._id);
       if (this._rules) this._rules.splice(0, this._rules.length, ...this._data.map(data => makeRule(this, this, data)));
     }
     _edit(kind, path, value = '') {
       let result = null;
+      this._source = null;
       if (path && this._node) result = call('dom.sheet', this._node._id, kind, value, path);
       else if (path && this._live) result = call('dom.constructed', this._id, kind, value, path);
       else if (kind === 'insert') { const parsed = call('dom.constructed', 0, 'parse', value); result = parsed.length === 1 && parsed[0][0] !== 'other' ? parsed[0] : { error: 'SyntaxError' }; }
@@ -1828,7 +1949,7 @@
     deleteRule(index) { const rules = this.cssRules; index = Number(index) >>> 0; if (index >= rules.length) throw new DOMException('Invalid rule index', 'IndexSizeError'); this._edit('delete', [index]); this._data.splice(index, 1); rules.splice(index, 1); }
     addRule(selector = 'undefined', style = 'undefined', index) { this.insertRule(`${selector}{${style}}`, index ?? this.cssRules.length); return -1; }
     removeRule(index = 0) { this.deleteRule(index); }
-    replaceSync(value) { if (this._node) throw new DOMException('Only constructed sheets can be replaced', 'NotAllowedError'); value = String(value).replace(/@import\s[^;]*;?/g, ''); this._data = call('dom.constructed', this._live ? this._id : 0, this._live ? 'replace' : 'parse', value); if (this._rules) this._rules.splice(0, this._rules.length, ...this._data.map(data => makeRule(this, this, data))); }
+    replaceSync(value) { if (this._node) throw new DOMException('Only constructed sheets can be replaced', 'NotAllowedError'); value = String(value).replace(/@import\s[^;]*;?/g, ''); this._source = value; this._tree = null; if (this._live) this._tree = call('dom.constructed', this._id, this._rules ? 'replace' : 'load', value); if (this._rules) this._rules.splice(0, this._rules.length, ...this._data.map(data => makeRule(this, this, data))); }
     replace(value) { try { this.replaceSync(value); return Promise.resolve(this); } catch (error) { return Promise.reject(error); } }
   }
   const adopt = root => call('dom.adopt', root === document ? 0 : root._id, (root._adopted ?? []).filter(sheet => {
@@ -1843,7 +1964,7 @@
       const previous = root._adopted ?? [];
       root._adopted = list;
       for (const sheet of previous) if (!list.includes(sheet)) sheet._owners.delete(root);
-      for (const sheet of list) { sheet._owners.add(root); if (!sheet._live) { sheet._live = true; call('dom.constructed', sheet._id, 'replace', sheet._data.map(ruleText).join('\n')); } }
+      for (const sheet of list) { sheet._owners.add(root); if (!sheet._live) { sheet._live = true; call('dom.constructed', sheet._id, 'load', sheet._source ?? sheet._data.map(ruleText).join('\n')); } }
       for (const sheet of previous) if (!sheet._owners.size && sheet._live) { sheet._live = false; call('dom.constructed', sheet._id, 'drop'); }
       adopt(root);
     };
@@ -1886,6 +2007,8 @@
     elementsFromPoint(x, y) { return Document.prototype.elementsFromPoint.call(this, x, y); }
   }
   // `define` resolves `whenDefined` before the upgrades it queued run, so a throwing upgrade can't leave it pending.
+  // Tags with a `-` that any record had, so `define` skips the document walk when no element can upgrade.
+  const customTags = new Set();
   const customElements = {
     define: scoped((name, Type) => {
       if (typeof Type !== 'function') throw new TypeError('Expected a constructor');
@@ -1893,7 +2016,7 @@
       if (definitions.has(name) || defined.has(Type)) throw new DOMException('Invalid custom element definition', 'NotSupportedError');
       const observed = new Set(typeof Type.prototype.attributeChangedCallback === 'function' ? Array.from(Type.observedAttributes ?? [], String) : []);
       definitions.set(name, Type); defined.set(Type, { name, observed });
-      reactions(document._m, undefined, name);
+      if (customTags.has(name)) reactions(document._m, undefined, name);
       for (const resolve of definitionsWaiting.get(name) ?? []) resolve(Type);
       definitionsWaiting.delete(name);
     }),
@@ -1999,6 +2122,8 @@
     constructor(id, tag) { super(tag ? id : create('#document'), '#document'); }
     get textContent() { return null; } set textContent(_) {}
     _target(element) { call('dom.target', element?._id ?? null); }
+    // As in browsers, a fragment shows its target: each `hidden=until-found` box around it gets `beforematch` and loses `hidden`, and closed details open.
+    _reveal(element) { for (let node = element; node; node = node.parentElement) { if (node.getAttribute('hidden')?.toLowerCase() === 'until-found') { node.dispatchEvent(new Event('beforematch', { bubbles: true })); node.removeAttribute('hidden'); } else if (node.localName === 'details' && !node.open && node !== element && !node.querySelector(':scope > summary')?.contains(element)) node.open = true; } }
     createElement(tag) {tag=String(tag).toLowerCase();if(tag[0]==='#')throw new DOMException('Invalid tag','InvalidCharacterError');const Type=definitions.get(tag);if(Type){constructing={tag};try{return new Type();}finally{constructing=null;}}return this===document?wrap(create(tag)):owned(this,wrap(create(tag)));}
     createAttribute(name) {return new Attr(null,badAttr(String(name).toLowerCase()),'');}
     createElementNS(namespace, tag) {namespace=namespace==null?null:String(namespace);tag=String(tag);if(tag[0]==='#')throw new DOMException('Invalid tag','InvalidCharacterError');if(namespace==='http://www.w3.org/1999/xhtml')return this.createElement(tag);const id=create(tag),Type=namespace==='http://www.w3.org/2000/svg'?(tag==='svg'?SVGSVGElement:SVGElement):Element;const node=new Type(id,tag);node.namespaceURI=namespace;return node;}
@@ -2125,6 +2250,7 @@
     get commonAncestorContainer() { const ends = new Set(); for (let rec = this._ec._m; rec; rec = rec.up) ends.add(rec); for (let rec = this._sc._m; rec; rec = rec.up) if (ends.has(rec)) return of(rec); return document; }
     setStart(node, offset) {
       offset = Number(offset) >>> 0;
+      if (node.nodeType === 10) throw new DOMException('Invalid node type', 'InvalidNodeTypeError');
       if (offset > (characterData(node) ? node.length : node._m.kids.length)) throw new DOMException('Invalid range offset', 'IndexSizeError');
       if (node.getRootNode() !== this._ec.getRootNode() || comparePoints(node, offset, this._ec, this._eo) > 0) place(this, false, node, offset);
       place(this, true, node, offset);
@@ -2132,6 +2258,7 @@
     }
     setEnd(node, offset) {
       offset = Number(offset) >>> 0;
+      if (node.nodeType === 10) throw new DOMException('Invalid node type', 'InvalidNodeTypeError');
       if (offset > (characterData(node) ? node.length : node._m.kids.length)) throw new DOMException('Invalid range offset', 'IndexSizeError');
       if (node.getRootNode() !== this._sc.getRootNode() || comparePoints(node, offset, this._sc, this._so) < 0) place(this, true, node, offset);
       place(this, false, node, offset);
@@ -2238,13 +2365,14 @@
     }
     createContextualFragment(html) { const node = this.startContainer.nodeType === 1 ? this.startContainer : this.startContainer.parentElement; return parseFragment(html, node && !(node.localName === 'html' && node.namespaceURI === XHTML) ? node : null); }
     getBoundingClientRect() {const rects=this.getClientRects();if(!rects.length)return new DOMRect();const left=Math.min(...rects.map(rect=>rect.left)),top=Math.min(...rects.map(rect=>rect.top));return new DOMRect(left,top,Math.max(...rects.map(rect=>rect.right))-left,Math.max(...rects.map(rect=>rect.bottom))-top);}
-    getClientRects() {return rangeNodes(this).flatMap(({node,start,end})=>call('dom.textRect',node._id,start,end).map(rect=>new DOMRect(...rect)));}
+    getClientRects() {layout();return rangeNodes(this).flatMap(({node,start,end})=>call('dom.textRect',node._id,start,end).map(rect=>new DOMRect(...rect)));}
     compareBoundaryPoints(how,range){return how===0?comparePoints(this.startContainer,this.startOffset,range.startContainer,range.startOffset):how===1?comparePoints(this.endContainer,this.endOffset,range.startContainer,range.startOffset):how===2?comparePoints(this.endContainer,this.endOffset,range.endContainer,range.endOffset):comparePoints(this.startContainer,this.startOffset,range.endContainer,range.endOffset);}
     isPointInRange(node,offset){if(node.getRootNode()!==this._sc.getRootNode())return false;return comparePoints(node,offset,this.startContainer,this.startOffset)>=0&&comparePoints(node,offset,this.endContainer,this.endOffset)<=0;}
     comparePoint(node,offset){if(node.getRootNode()!==this._sc.getRootNode())throw new DOMException('The node is in another tree','WrongDocumentError');return comparePoints(node,offset,this.startContainer,this.startOffset)<0?-1:comparePoints(node,offset,this.endContainer,this.endOffset)>0?1:0;}
     intersectsNode(node){if(!node.parentNode)return true;const parent=node.parentNode,at=index(node._m);return comparePoints(parent,at+1,this._sc,this._so)>0&&comparePoints(parent,at,this._ec,this._eo)<0;}
     detach() {}
   }
+  for (const [name, value] of Object.entries({ START_TO_START: 0, START_TO_END: 1, END_TO_END: 2, END_TO_START: 3 })) { Range[name] = value; Range.prototype[name] = value; }
   class StaticRange {
     constructor({startContainer, startOffset, endContainer, endOffset}) {
       for (const node of [startContainer, endContainer]) {
@@ -2263,10 +2391,10 @@
     get focusOffset() { return this.ranges[0]?.[this.direction === 'backward' ? 'startOffset' : 'endOffset'] ?? 0; }
     get rangeCount() { return this.ranges.length; } get isCollapsed() { return !this.rangeCount || this.ranges[0].collapsed; } get type() { return !this.rangeCount ? 'None' : this.isCollapsed ? 'Caret' : 'Range'; }
     _setRange(range, direction = 'none', changed = false) {
-      const previous = this.ranges[0];
-      changed ||= !previous || direction !== this.direction || ['startContainer','startOffset','endContainer','endOffset'].some(key => previous[key] !== range[key]);
-      this.ranges = [range]; this.direction = direction;
-      if (!changed) return;
+      const previous = this.ranges[0], moved = !previous || direction !== this.direction || ['startContainer','startOffset','endContainer','endOffset'].some(key => previous[key] !== range[key]);
+      this.ranges = [range]; this.direction = direction; this._x = undefined;
+      if (moved) typing = [];
+      if (!changed && !moved) return;
       this._send();
       selectionChanged();
     }
@@ -2316,6 +2444,70 @@
     extend(node, offset = 0) { if (!this.rangeCount) throw new DOMException('Selection is empty', 'InvalidStateError'); this.setBaseAndExtent(this.anchorNode, this.anchorOffset, node, offset); }
     containsNode(node, partial = false) { if (!this.rangeCount || node.getRootNode() !== this.anchorNode.getRootNode()) return false; const range = this.ranges[0], end = characterData(node) ? node.length : node._m.kids.length; return partial ? range.intersectsNode(node) : comparePoints(range.startContainer, range.startOffset, node, 0) <= 0 && comparePoints(range.endContainer, range.endOffset, node, end) >= 0; }
     deleteFromDocument() { for (const range of this.ranges) range.deleteContents(); }
+    modify(alter, direction, granularity) {
+      const to = this._point(alter, direction, granularity); if (!to) return;
+      if (String(alter).toLowerCase() === 'extend') this.setBaseAndExtent(this.anchorNode, this.anchorOffset, to[0], to[1]); else this.collapse(to[0], to[1]);
+      this._x = to[2];
+    }
+    // The new focus of modify(), and the x to keep for the next vertical move.
+    _point(alter, direction, granularity) {
+      [alter, direction, granularity] = [alter, direction, granularity].map(value => String(value).toLowerCase());
+      if (!this.rangeCount || !/^(move|extend)$/.test(alter) || !/^(forward|backward|left|right)$/.test(direction) || !/^(character|word|sentence|line|paragraph|lineboundary|sentenceboundary|paragraphboundary|documentboundary)$/.test(granularity)) return;
+      const forward = direction === 'forward' || direction === 'right', focus = this.focusNode, range = this.ranges[0];
+      if (granularity === 'character' && alter === 'move' && !range.collapsed) return forward ? [range.endContainer, range.endOffset] : [range.startContainer, range.startOffset];
+      let host = focus.nodeType === 1 ? focus : focus.parentElement;
+      if (host?.isContentEditable) while (host.parentElement?.isContentEditable) host = host.parentElement; else host = null;
+      const root = host ?? document.body; if (!root) return;
+      if (/line|paragraph$/.test(granularity)) layout();
+      // Read the text near the focus first, and more of it when a move reaches the edge of what was read.
+      for (let window = granularity === 'documentboundary' ? -1 : 8; ; window *= 16) {
+        const [text, runs, from, first, last, hidden] = call('dom.caretText', root._id, !!host, focus._id, this.focusOffset, window < 0 || window > 1e5 ? null : window);
+        if (from < 0) return;
+        const n = text.length;
+        const run = i => { let lo = 0, hi = runs.length / 3 - 1; while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (runs[mid * 3] <= i) lo = mid; else hi = mid - 1; } return lo * 3; };
+        // The DOM point before (side 0) or after (side 1) the character at i.
+        const point = (i, side) => { const r = run(i), node = runs[r + 1] < 0 ? null : wrap(runs[r + 1]); return !node ? null : runs[r + 2] < 0 ? [node.parentNode, index(node._m) + side] : [node, runs[r + 2] + i - runs[r] + side]; };
+        // Caret geometry takes the box of the character after the point, so a soft wrap belongs to the next line.
+        const rect = p => {
+          const after = p < n && (text[p] !== '\n' || p === 0 || text[p - 1] === '\n' && runs[run(p) + 1] >= 0), i = after ? p : p - 1, r = run(i), node = runs[r + 1];
+          if (i < 0 || node < 0) return null;
+          if (runs[r + 2] >= 0) { const at = runs[r + 2] + i - runs[r] + !after, box = after && call('dom.textRect', node, at, at + 1)[0] || call('dom.textRect', node, at, at)[0]; return box && { x: box[0], y: box[1], h: box[3] }; }
+          const box = wrap(node).getBoundingClientRect(); return { x: after ? box.left : box.right, y: box.top, h: box.height };
+        };
+        // The first index in [lo, hi) where test holds, for tests that hold from some index on.
+        const search = (lo, hi, test) => { while (lo < hi) { const mid = (lo + hi) >> 1; if (test(mid)) hi = mid; else lo = mid + 1; } return lo; };
+        // The first and last index on the line of p.
+        const lineStart = p => { const box = rect(p); return box ? search(0, p, i => !(rect(i)?.y < box.y - box.h / 2)) : p; };
+        const lineEnd = p => { const box = rect(p); return box ? search(p + 1, n + 1, i => !(rect(i)?.y < box.y + box.h / 2)) - 1 : p; };
+        const vertical = (p, x) => {
+          let start, end;
+          if (forward) { start = lineEnd(p) + 1; if (start > n) return n; end = lineEnd(start); }
+          else { end = lineStart(p) - 1; if (end < 0) return 0; start = lineStart(end); }
+          const at = search(start, end + 1, i => !(rect(i)?.x < x));
+          return at > start && (at > end || x - (rect(at - 1)?.x ?? -Infinity) <= rect(at).x - x) ? at - 1 : at;
+        };
+        const segment = (kind, i) => (kind === 'word' ? words ??= new Intl.Segmenter(undefined, { granularity: 'word' }) : kind === 'sentence' ? sentences ??= new Intl.Segmenter(undefined, { granularity: 'sentence' }) : graphemes ??= new Intl.Segmenter(undefined, { granularity: 'grapheme' })).segment(text).containing(i);
+        let p = from, x = this._x;
+        if (granularity === 'character') p = forward ? (p < n ? (s => s.index + s.segment.length)(segment('grapheme', p)) : p) : p > 0 ? segment('grapheme', p - 1).index : p;
+        else if (granularity === 'word') {
+          // Like Chrome on macOS: to the far edge of the next word or punctuation, and line breaks count as words.
+          const space = s => /^[^\S\n]+$/.test(s.segment);
+          if (forward) { for (let s = p < n && segment('word', p); s; s = s.index + s.segment.length < n && segment('word', s.index + s.segment.length)) if (!space(s)) { p = s.index + s.segment.length; break; } }
+          else for (let s = p > 0 && segment('word', p - 1); s; s = s.index > 0 && segment('word', s.index - 1)) if (!space(s)) { p = s.index; break; }
+        } else if (granularity === 'sentence' || granularity === 'sentenceboundary') {
+          if (forward) { for (let at = p; at < n;) { const s = segment('sentence', at), end = s.index + s.segment.length; at = end; if (end - (text[end - 1] === '\n') > p) { p = end - (text[end - 1] === '\n'); break; } if (granularity === 'sentenceboundary') break; } }
+          else if (p > 0) p = segment('sentence', granularity === 'sentence' || p === n ? p - 1 : p).index;
+        } else if (granularity === 'paragraphboundary') p = forward ? (text.indexOf('\n', p) + 1 || n + 1) - 1 : text.lastIndexOf('\n', p - 1) + 1;
+        // As in Chrome, the ends of a page that starts or ends in editable content are no places for the caret.
+        else if (granularity === 'documentboundary') { if (hidden[+forward]) return; p = forward ? n : 0; }
+        // As in Chrome, editable text ends a line after the space at a soft wrap.
+        else if (granularity === 'lineboundary') p = !forward ? lineStart(p) : (end => end >= n || text[end] === '\n' || !host && /[ \t]/.test(text[end]) ? end : end + 1)(lineEnd(p));
+        else { x ??= rect(p)?.x ?? 0; const start = text.lastIndexOf('\n', p - 1), end = text.indexOf('\n', p); do { const next = vertical(p, x); if (next === p) break; p = next; } while (granularity === 'paragraph' && p > start && (end < 0 || p <= end)); }
+        if (p === 0 && !first || p === n && !last) continue;
+        const place = i => (i > 0 && text[i - 1] !== '\n' && point(i - 1, 1)) || (i < n && point(i, 0)) || (i > 0 && point(i - 1, 1)) || [root, 0];
+        return [...place(p), /line|paragraph$/.test(granularity) ? x : undefined];
+      }
+    }
     toString() { return call('dom.selectionText', 0, this.ranges.flatMap(range => rangeNodes(range).map(({node,start,end}) => [node._id,start,end]))); }
   }
   class MutationObserver {
@@ -2335,7 +2527,7 @@
     observe(target){if(this.targets.has(target._m.ref))return;watch(this,target,null,intersectionObservers);host('dom.requestFrame');}unobserve(target){unwatch(this,target,intersectionObservers);}disconnect(){unwatchAll(this,intersectionObservers);this.records=[];}takeRecords(){return this.records.splice(0);}
   }
   const resizeObservers = new Set();
-  class ResizeObserver { constructor(callback) { this.callback = callback; this.targets = new Map(); this._ref = null; } observe(target, options) { const box = String(options?.box ?? 'content-box'); if (this.targets.has(target._m.ref) && (this._boxes ??= new WeakMap()).get(target) === box) return; (this._boxes ??= new WeakMap()).set(target, box); watch(this, target, null, resizeObservers); host('dom.requestFrame'); } unobserve(target) { unwatch(this, target, resizeObservers); } disconnect() { unwatchAll(this, resizeObservers); } }
+  class ResizeObserver { constructor(callback) { if (typeof callback !== 'function') throw new TypeError('Expected a callback'); this.callback = callback; this.targets = new Map(); this._ref = null; } observe(target, options) { const box = String(options?.box ?? 'content-box'); if (this.targets.has(target._m.ref) && (this._boxes ??= new WeakMap()).get(target) === box) return; (this._boxes ??= new WeakMap()).set(target, box); watch(this, target, null, resizeObservers); host('dom.requestFrame'); } unobserve(target) { unwatch(this, target, resizeObservers); } disconnect() { unwatchAll(this, resizeObservers); } }
   const breakout = /^(b|big|blockquote|body|br|center|code|dd|div|dl|dt|em|embed|h[1-6]|head|hr|i|img|li|listing|menu|meta|nobr|ol|p|pre|ruby|s|small|span|strong|strike|sub|sup|table|tt|u|ul|var)$/;
   const wrap = id => {
     let rec = records[id], node = rec?.ref?.deref();
@@ -2375,7 +2567,7 @@
   };
 
   const matrixFields = ['m11', 'm12', 'm13', 'm14', 'm21', 'm22', 'm23', 'm24', 'm31', 'm32', 'm33', 'm34', 'm41', 'm42', 'm43', 'm44'], plane = [0, 1, 4, 5, 12, 13];
-  const flat2D = m => m.every((v, i) => plane.includes(i) || v === +(i % 5 === 0)), flatMatrix = m => Object.assign(new DOMMatrix(m), { _2d: flat2D(m) });
+  const flat2D = m => m[2] === 0 && m[3] === 0 && m[6] === 0 && m[7] === 0 && m[8] === 0 && m[9] === 0 && m[10] === 1 && m[11] === 0 && m[14] === 0 && m[15] === 1;
   class DOMMatrixReadOnly {
     constructor(init) {
       if (init !== undefined && typeof init?.[Symbol.iterator] !== 'function' || typeof init === 'string') { init = String(init); const match = /^\s*matrix(?:3d)?\(([^)]*)\)\s*$/.exec(init); if (!match && !/^\s*(none)?\s*$/.test(init)) throw new DOMException(`Failed to parse '${init}'`, 'SyntaxError'); init = match?.[1].split(','); }
@@ -2397,15 +2589,17 @@
     toJSON() { const json = {}; for (const name of [...'abcdef', ...matrixFields, 'is2D', 'isIdentity']) json[name] = this[name]; return json; }
   }
   class DOMMatrix extends DOMMatrixReadOnly {
-    multiplySelf(other) { const a = this._m, b = DOMMatrix.fromMatrix(other), m = b._m; this._m = a.map((_, i) => a[i & 3] * m[i & 12] + a[4 + (i & 3)] * m[(i & 12) + 1] + a[8 + (i & 3)] * m[(i & 12) + 2] + a[12 + (i & 3)] * m[(i & 12) + 3]); this._2d &&= b._2d; return this; }
+    multiplySelf(other) { const b = other instanceof DOMMatrixReadOnly ? other : DOMMatrix.fromMatrix(other); return this._mul(b._m, b._2d); }
+    _mul(m, flat) { const a = this._m, out = new Array(16); for (let i = 0; i < 16; i++) { const r = i & 3, c = i & 12; out[i] = a[r] * m[c] + a[4 + r] * m[c + 1] + a[8 + r] * m[c + 2] + a[12 + r] * m[c + 3]; } this._m = out; this._2d &&= flat; return this; }
     preMultiplySelf(other) { const matrix = DOMMatrix.fromMatrix(other).multiplySelf(this); this._m = matrix._m; this._2d = matrix._2d; return this; }
-    translateSelf(x = 0, y = 0, z = 0) { return this.multiplySelf(flatMatrix([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1])); }
-    scaleSelf(x = 1, y = x, z = 1, ox = 0, oy = 0, oz = 0) { return this.translateSelf(ox, oy, oz).multiplySelf(flatMatrix([x, 0, 0, 0, 0, y, 0, 0, 0, 0, z, 0, 0, 0, 0, 1])).translateSelf(-ox, -oy, -oz); }
+    translateSelf(x = 0, y = 0, z = 0) { return this._mul([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, Number(x), Number(y), Number(z), 1], z === 0); }
+    scaleSelf(x = 1, y = x, z = 1, ox = 0, oy = 0, oz = 0) { return this.translateSelf(ox, oy, oz)._mul([Number(x), 0, 0, 0, 0, Number(y), 0, 0, 0, 0, Number(z), 0, 0, 0, 0, 1], z === 1).translateSelf(-ox, -oy, -oz); }
     scale3dSelf(scale = 1, ox = 0, oy = 0, oz = 0) { return this.scaleSelf(scale, scale, scale, ox, oy, oz); }
     rotateAxisAngleSelf(x = 0, y = 0, z = 0, angle = 0) {
       const length = Math.hypot(x, y, z); if (!length) return this; [x, y, z] = [x / length, y / length, z / length];
       const r = angle * Math.PI / 180, s = Math.sin(r), c = Math.cos(r), t = 1 - c;
-      return this.multiplySelf(flatMatrix([t * x * x + c, t * x * y + s * z, t * x * z - s * y, 0, t * x * y - s * z, t * y * y + c, t * y * z + s * x, 0, t * x * z + s * y, t * y * z - s * x, t * z * z + c, 0, 0, 0, 0, 1]));
+      const m = [t * x * x + c, t * x * y + s * z, t * x * z - s * y, 0, t * x * y - s * z, t * y * y + c, t * y * z + s * x, 0, t * x * z + s * y, t * y * z - s * x, t * z * z + c, 0, 0, 0, 0, 1];
+      return this._mul(m, flat2D(m));
     }
     rotateSelf(x = 0, y, z) { if (y === undefined && z === undefined) [x, y, z] = [0, 0, x]; return this.rotateAxisAngleSelf(0, 0, 1, z ?? 0).rotateAxisAngleSelf(0, 1, 0, y ?? 0).rotateAxisAngleSelf(1, 0, 0, x); }
     skewXSelf(angle = 0) { return this.multiplySelf(new DOMMatrix([1, 0, Math.tan(angle * Math.PI / 180), 1, 0, 0])); } skewYSelf(angle = 0) { return this.multiplySelf(new DOMMatrix([1, Math.tan(angle * Math.PI / 180), 0, 1, 0, 0])); }
@@ -2461,7 +2655,11 @@
       this._size = size + 1 + args.length;
       if (!size) queueMicrotask(() => this._flush()); else if (this._size > 1 << 18) this._flush();
     }
-    _flush() { if (!this._size) return; const ops = this._ops.subarray(0, this._size), text = this._texts.join(''), data = this._data; this._size = 0; this._texts.length = 0; this._data = []; bitmapDraws.delete(this); if (this.canvas.width && this.canvas.height) call('dom.canvas', this.canvas._id, ops, text, ...data); this.canvas._commit?.(); }
+    // A draw from another 2D canvas reads its pixels when it runs, so that canvas flushes its readers before its pixels change.
+    _read(source) { (source._readers ??= new Set()).add(this); (this._sources ??= new Set()).add(source); }
+    _release() { const readers = this._readers; if (!readers) return; for (const reader of readers) reader._flush(); this._readers = null; }
+    _forget() { if (!this._sources) return; for (const source of this._sources) source._readers?.delete(this); this._sources = null; }
+    _flush() { if (!this._size) return; this._release(); this._forget(); const ops = this._ops.subarray(0, this._size), text = this._texts.join(''), data = this._data; this._size = 0; this._texts.length = 0; this._data = []; bitmapDraws.delete(this); if (this.canvas.width && this.canvas.height) call('dom.canvas', this.canvas._id, ops, text, ...data); this.canvas._commit?.(); }
     // Canvas::draw keeps each Path2D it gets until the context resets or sends more than about 8 MB of paths.
     _path(path) {
       if (!(path instanceof Path2D)) throw new TypeError('Expected a Path2D');
@@ -2469,7 +2667,7 @@
       const reset = (this._pathSize += path._size) > 1 << 20; if (reset) { this._paths = new WeakMap(); this._pathSize = path._size; }
       this._paths.set(path, path._size); this._data.push(path._ops.subarray(0, path._size)); this._op(41, path._id, this._data.length - 1, +reset); return path._id;
     }
-    _resize() { this._size = 0; this._texts.length = 0; this._data = []; this._reset(); this._paths = new WeakMap(); this._pathSize = 0; call('dom.canvas', this.canvas._id, null); }
+    _resize() { this._release(); this._forget(); this._size = 0; this._texts.length = 0; this._data = []; this._reset(); this._paths = new WeakMap(); this._pathSize = 0; call('dom.canvas', this.canvas._id, null); }
     save() { this._stack.push({ ...this._state }); this._op(0); } restore() { if (this._stack.length) { this._state = this._stack.pop(); this._op(1); } }
     setTransform(a, b, c, d, e, f) { if (arguments.length < 2) ({ a, b, c, d, e, f } = DOMMatrix.fromMatrix(a)); this._op(3, a, b, c, d, e, f); }
     resetTransform() { this._op(3, 1, 0, 0, 1, 0, 0); } transform(a, b, c, d, e, f) { this._op(2, a, b, c, d, e, f); }
@@ -2504,7 +2702,7 @@
       if (right<=left||bottom<=top) return;
       dx+=(left-sx)*kx; dy+=(top-sy)*ky; dw=(right-left)*kx; dh=(bottom-top)*ky;
       this._op(25,image===this.canvas?-1:image._id,iw,ih,left,top,right-left,bottom-top,dx,dy,dw,dh);
-      if (image instanceof ImageBitmap) bitmapDraws.add(this); else if (image._context && image!==this.canvas) this._flush();
+      if (image instanceof ImageBitmap) bitmapDraws.add(this); else if (image._context instanceof CanvasRenderingContext2D && image !== this.canvas) this._read(image._context); else if (image._context && image!==this.canvas) this._flush();
     }
     // The source rectangle is in CSS pixels from the border box of the element. Without a size, the element draws as
     // large as the page would show it.
@@ -2529,10 +2727,31 @@
     stroke(path) { if (path === undefined) this._op(19); else this._op(42, this._path(path), 19, 0); }
     clip(path, rule) { if (path instanceof Path2D) this._op(42, this._path(path), 20, fillRule(rule)); else this._op(20, fillRule(path)); }
   }
+  // Both ops depend only on the text, so their answers are kept.
+  const canvasColors = new Map(), canvasFonts = new Map(), canvasCurrent = new Map();
+  const canvasParsed = (cache, op, value) => { let parsed = cache.get(value); if (parsed === undefined) { if (cache.size > 256) cache.clear(); cache.set(value, parsed = call(op, 0, value)); } return parsed; };
+  // As in Chromium, `currentcolor` alone is the `color` of the inline style of a connected canvas element, else black.
+  // Inside a color function it is black, and an OffscreenCanvas rejects such a function.
+  const canvasColor = (context, value) => {
+    if (/currentcolor/i.test(value)) {
+      if (/^[\t\n\f\r ]*currentcolor[\t\n\f\r ]*$/i.test(value)) {
+        // The inline color comes only from the style attribute, so its color is kept by the attribute text. As in Chromium, a `color-mix()` there is black.
+        const style = context.canvas?.isConnected && !(context instanceof OffscreenCanvasRenderingContext2D) && context.canvas.getAttribute('style');
+        if (!style) return '#000000';
+        let color = canvasCurrent.get(style);
+        if (color === undefined) { if (canvasCurrent.size > 256) canvasCurrent.clear(); const inline = context.canvas.style.getPropertyValue('color'); canvasCurrent.set(style, color = (!/^\s*color-mix\(/i.test(inline) && canvasParsed(canvasColors, 'dom.canvasColor', inline)) || '#000000'); }
+        return color;
+      }
+      if (context instanceof OffscreenCanvasRenderingContext2D) return null;
+      value = value.replace(/currentcolor/gi, '#000');
+    }
+    const color = canvasParsed(canvasColors, 'dom.canvasColor', value);
+    return color === null || /^\s*(oklch|oklab|lab|lch|color)\(/i.test(value) ? color && value : color;
+  };
   for (const [name, code] of [['fillStyle', 4], ['strokeStyle', 5], ['font', 6], ['textAlign', 7], ['textBaseline', 8], ['globalAlpha', 9], ['lineWidth', 10]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { get() { return this._state[name]; }, set(value) {
-    if (code < 6 && (value instanceof CanvasGradient || value instanceof CanvasPattern)) { this._state[name] = value; const image = value._image; image?._context?._flush?.(); const text = value._spec(image === this.canvas ? -1 : image?._id); this._texts.push(text); this._op(code, text.length); if (image instanceof ImageBitmap) bitmapDraws.add(this); else if (image?._context && image !== this.canvas) this._flush(); return; }
-    if (code === 6) { value = call('dom.canvasFont', 0, String(value)); if (value === null) return; } else if (code < 9) value = String(value); else if (value = Number(value), !(code === 9 ? value >= 0 && value <= 1 : value > 0 && value < Infinity)) return;
-    if (code < 6 && !/currentcolor/i.test(value)) { const color = call('dom.canvasColor', 0, value); if (color === null) return; if (!/^\s*(oklch|oklab|lab|lch|color)\(/i.test(value)) value = color; }
+    if (code < 6 && (value instanceof CanvasGradient || value instanceof CanvasPattern)) { this._state[name] = value; const image = value._image; image?._context?._flush?.(); const text = value._spec(image === this.canvas ? -1 : image?._id); this._texts.push(text); this._op(code, text.length); if (image instanceof ImageBitmap) bitmapDraws.add(this); else if (image?._context instanceof CanvasRenderingContext2D && image !== this.canvas) this._read(image._context); else if (image?._context && image !== this.canvas) this._flush(); return; }
+    if (code === 6) { value = canvasParsed(canvasFonts, 'dom.canvasFont', String(value)); if (value === null) return; } else if (code < 9) value = String(value); else if (value = Number(value), !(code === 9 ? value >= 0 && value <= 1 : value > 0 && value < Infinity)) return;
+    if (code < 6 && (value = canvasColor(this, value)) === null) return;
     if (this._state[name] === value) return;
     this._state[name] = value; if (code < 9) { this._texts.push(alone(value)); this._op(code, value.length); } else this._op(code, value);
   } });
@@ -2541,7 +2760,7 @@
   for (const [name, code] of [['letterSpacing', 38], ['wordSpacing', 39]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) { const px = /^(-?[\d.]+)px$/.exec(String(value).trim()); if (px) { this._state[name] = `${+px[1]}px`; this._op(code, +px[1]); } } });
   Object.defineProperty(CanvasRenderingContext2D.prototype, 'imageSmoothingEnabled', { configurable: true, enumerable: true, get() { return this._state.imageSmoothingEnabled; }, set(value) { this._state.imageSmoothingEnabled = !!value; this._op(40, value ? 1 : 0); } });
   for (const [name, valid] of [['shadowColor', () => true], ['shadowBlur', v => v >= 0 && v < Infinity], ['shadowOffsetX', Number.isFinite], ['shadowOffsetY', Number.isFinite]]) Object.defineProperty(CanvasRenderingContext2D.prototype, name, { configurable: true, enumerable: true, get() { return this._state[name]; }, set(value) {
-    value = name === 'shadowColor' ? String(value) : Number(value); if (!valid(value)) return;
+    value = name === 'shadowColor' ? canvasColor(this, String(value)) : Number(value); if (value === null || !valid(value)) return;
     const state = this._state; state[name] = value; this._texts.push(state.shadowColor); this._op(43, state.shadowColor.length, state.shadowBlur, state.shadowOffsetX, state.shadowOffsetY);
   } });
   // Of the filter functions, only `blur()` draws: other values keep their text and draw without a filter.
@@ -2561,9 +2780,11 @@
   // Web Audio: sources started in one task render to one PCM WAV, played by the <audio> player. Gain and biquad
   // nodes are linear, so each source renders along its own paths and the results add up.
   const audioCap = 10, audioTail = 0.1;
+  // The nominal ranges of the spec, as floats like Chromium: 1200 log2(FLT_MAX) cents and 40 log10(FLT_MAX) dB.
+  const detuneMax = Math.fround(1200 * Math.log2(3.4028234663852886e38)), gainMax = Math.fround(40 * Math.log10(3.4028234663852886e38));
   class AudioParam {
     constructor(context, value, min = -3.4028234663852886e38, max = 3.4028234663852886e38) { this._context = context; this.defaultValue = this._value = value; this.minValue = min; this.maxValue = max; this.automationRate = 'a-rate'; this._events = []; }
-    get value() { return this._events.length ? this._at(this._context.currentTime) : this._value; }
+    get value() { return this._events.length ? this._at(this._context.currentTime) : Math.min(this.maxValue, Math.max(this.minValue, this._value)); }
     set value(value) { value = +value; if (!Number.isFinite(value)) throw new TypeError('The value is not finite'); if (this._events.length) this.setValueAtTime(value, this._context.currentTime); else this._value = value; }
     _add(kind, value, time, extra) {
       value = +value; time = +time;
@@ -2578,22 +2799,41 @@
     setValueCurveAtTime(values, time, duration) { values = [...values]; this._add(0, values[0], time); values.forEach((value, i) => i && this._add(1, value, time + duration * i / (values.length - 1))); return this; }
     cancelScheduledValues(time) { this._events = this._events.filter(event => event[1] < time); return this; }
     cancelAndHoldAtTime(time) { const value = this._at(time); this.cancelScheduledValues(time); return this._add(0, value, time); }
-    // The value at a time, as the spec's automation timeline gives it.
+    // The value at a time, as the spec's automation timeline gives it, clamped to the nominal range.
     _at(time) {
-      let value = this._value, from = 0, target = null;
+      let value = this._value, from = 0, target = null, out = null;
       const settled = at => target ? target[2] + (value - target[2]) * (target[3] ? Math.exp(-(at - target[1]) / target[3]) : 0) : value;
       for (const event of this._events) {
         const [kind, at, to] = event;
         if (time < at) {
-          if (kind === 1 || kind === 2) { const start = settled(from), t = (time - from) / (at - from); return kind === 1 ? start + (to - start) * t : start * to > 0 ? start * (to / start) ** t : start; }
-          return settled(time);
+          if (kind === 1 || kind === 2) { const start = settled(from), t = (time - from) / (at - from); out = kind === 1 ? start + (to - start) * t : start * to > 0 ? start * (to / start) ** t : start; }
+          break;
         }
         value = kind === 3 ? settled(at) : to; target = kind === 3 ? event : null; from = at;
       }
-      return Math.min(this.maxValue, Math.max(this.minValue, settled(time)));
+      return Math.min(this.maxValue, Math.max(this.minValue, out ?? settled(time)));
     }
-    // The values of a run of frames.
-    _run(start, rate, length) { const out = new Float32Array(length); if (!this._events.length) return out.fill(this._value); for (let i = 0; i < length; i++) out[i] = this._at(start + i / rate); return out; }
+    // The values of a run of frames. Like `_at`, but it walks the events once, since the times only grow.
+    _run(start, rate, length) {
+      const out = new Float32Array(length), events = this._events, count = events.length;
+      const min = this.minValue, max = this.maxValue;
+      if (!count) return out.fill(Math.min(max, Math.max(min, this._value)));
+      let value = this._value, from = 0, target = null, next = 0;
+      const settled = at => target ? target[2] + (value - target[2]) * (target[3] ? Math.exp(-(at - target[1]) / target[3]) : 0) : value;
+      for (let i = 0; i < length; i++) {
+        const time = start + i / rate;
+        for (; next < count && !(time < events[next][1]); next++) { const event = events[next], kind = event[0], at = event[1]; value = kind === 3 ? settled(at) : event[2]; target = kind === 3 ? event : null; from = at; }
+        let v;
+        if (next === count) v = settled(time);
+        else {
+          const [kind, at, to] = events[next];
+          if (kind === 1 || kind === 2) { const begin = settled(from), t = (time - from) / (at - from); v = kind === 1 ? begin + (to - begin) * t : begin * to > 0 ? begin * (to / begin) ** t : begin; }
+          else v = settled(time);
+        }
+        out[i] = Math.min(max, Math.max(min, v));
+      }
+      return out;
+    }
   }
   class AudioNode extends EventTarget {
     constructor(context) { super(); this.context = context; this._outputs = new Set(); this.channelCount = 2; this.channelCountMode = 'max'; this.channelInterpretation = 'speakers'; }
@@ -2610,7 +2850,7 @@
   }
   const filterTypes = ['lowpass', 'highpass', 'bandpass', 'lowshelf', 'highshelf', 'peaking', 'notch', 'allpass'];
   class BiquadFilterNode extends AudioNode {
-    constructor(context, options) { super(context); this._type = 'lowpass'; Object.assign(this, { frequency: new AudioParam(context, 350, 0, context.sampleRate / 2), detune: new AudioParam(context, 0), Q: new AudioParam(context, 1), gain: new AudioParam(context, 0) }); audioOptions(this, options); }
+    constructor(context, options) { super(context); this._type = 'lowpass'; Object.assign(this, { frequency: new AudioParam(context, 350, 0, context.sampleRate / 2), detune: new AudioParam(context, 0, -detuneMax, detuneMax), Q: new AudioParam(context, 1), gain: new AudioParam(context, 0, undefined, gainMax) }); audioOptions(this, options); }
     get type() { return this._type; } set type(value) { if (filterTypes.includes(value)) this._type = value; }
     // The coefficients of the spec, from the Audio EQ Cookbook, b0 b1 b2 a1 a2 over a0.
     _coefficients(frequency, detune, q, gain, rate) {
@@ -2680,9 +2920,37 @@
     _ended() { const event = new Event('ended'); this.onended?.(event); this.dispatchEvent(event); }
   }
   const waveTypes = ['sine', 'square', 'sawtooth', 'triangle'];
-  class PeriodicWave { constructor(context, { real = [], imag = [], disableNormalization = false } = {}) { this._real = Float32Array.from(real); this._imag = Float32Array.from(imag); const peak = this._real.reduce((sum, _, i) => sum + Math.hypot(this._real[i] ?? 0, this._imag[i] ?? 0), 0) || 1; this._scale = disableNormalization ? 1 : 1 / peak; } }
+  class PeriodicWave {
+    constructor(context, { real, imag, disableNormalization = false } = {}) {
+      const r = real === undefined ? null : Float32Array.from(real), i = imag === undefined ? null : Float32Array.from(imag); this._real = r ?? (i ? new Float32Array(i.length) : Float32Array.of(0, 0)); this._imag = i ?? (r ? new Float32Array(r.length) : Float32Array.of(0, 1)); if (this._real.some(v => !Number.isFinite(v)) || this._imag.some(v => !Number.isFinite(v))) throw new TypeError('The provided float value is non-finite.'); if (this._real.length !== this._imag.length || this._real.length < 2) throw new DOMException(`The lengths of the real (${this._real.length}) and imaginary (${this._imag.length}) arrays must match and be at least 2`, 'IndexSizeError'); this._real[0] = this._imag[0] = 0; this._scale = 1;
+      if (disableNormalization) return;
+      // As in Chromium, the scale makes the peak of the table with all partials 1. A few partials are summed at each
+      // point of the table, more take an inverse FFT of the table size.
+      const rate = context.sampleRate, n = rate <= 24000 ? 2048 : rate <= 88200 ? 4096 : 16384, count = Math.min(this._real.length, n / 2), ar = this._real, ai = this._imag;
+      let peak = 0;
+      if (count - 1 <= Math.log2(n)) {
+        const c1 = Math.cos(2 * Math.PI / n), s1 = Math.sin(2 * Math.PI / n);
+        for (let i = 0, wr = 1, wi = 0; i < n; i++) {
+          let sum = 0, zr = wr, zi = wi;
+          for (let k = 1; k < count; k++) { sum += ar[k] * zr + ai[k] * zi; const t = zr * wr - zi * wi; zi = zr * wi + zi * wr; zr = t; }
+          peak = Math.max(peak, Math.abs(sum));
+          const t = wr * c1 - wi * s1; wi = wr * s1 + wi * c1; wr = t;
+        }
+      } else {
+        const re = new Float64Array(n), im = new Float64Array(n);
+        for (let k = 1; k < count; k++) { re[k] = ar[k]; im[k] = -ai[k]; }
+        for (let i = 1, j = 0; i < n; i++) { let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+        for (let size = 2; size <= n; size <<= 1) for (let k = 0, half = size / 2; k < half; k++) {
+          const c = Math.cos(2 * Math.PI * k / size), s = Math.sin(2 * Math.PI * k / size);
+          for (let a = k; a < n; a += size) { const b = a + half, tr = re[b] * c - im[b] * s, ti = re[b] * s + im[b] * c; re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti; }
+        }
+        for (let i = 0; i < n; i++) peak = Math.max(peak, Math.abs(re[i]));
+      }
+      if (peak) this._scale = 1 / peak;
+    }
+  }
   class OscillatorNode extends AudioScheduledSourceNode {
-    constructor(context, options) { super(context); this._type = 'sine'; this.frequency = new AudioParam(context, 440, -context.sampleRate / 2, context.sampleRate / 2); this.detune = new AudioParam(context, 0); audioOptions(this, options); }
+    constructor(context, options) { super(context); this._type = 'sine'; this.frequency = new AudioParam(context, 440, -context.sampleRate / 2, context.sampleRate / 2); this.detune = new AudioParam(context, 0, -detuneMax, detuneMax); audioOptions(this, options); }
     get type() { return this._type; }
     set type(value) { if (value === 'custom') throw new DOMException('Use setPeriodicWave()', 'InvalidStateError'); if (waveTypes.includes(value)) { this._type = value; this._wave = null; } }
     setPeriodicWave(wave) { this._wave = wave; this._type = 'custom'; }
@@ -2737,7 +3005,9 @@
     text(0, 'RIFF'); bytes.setUint32(4, 36 + frames * channels.length * 4, true); text(8, 'WAVEfmt '); bytes.setUint32(16, 16, true);
     bytes.setUint16(20, 3, true); bytes.setUint16(22, channels.length, true); bytes.setUint32(24, rate, true); bytes.setUint32(28, rate * channels.length * 4, true);
     bytes.setUint16(32, channels.length * 4, true); bytes.setUint16(34, 32, true); text(36, 'data'); bytes.setUint32(40, frames * channels.length * 4, true);
-    for (let i = 0, at = 44; i < frames; i++) for (const data of channels) { bytes.setFloat32(at, data[i], true); at += 4; }
+    // Every platform is little-endian, as WAV is.
+    const samples = new Float32Array(bytes.buffer, 44), count = channels.length;
+    for (let c = 0; c < count; c++) { const data = channels[c]; for (let i = 0, at = c; i < frames; i++, at += count) samples[at] = data[i]; }
     return bytes.buffer;
   };
   class AudioContext extends EventTarget {
@@ -2750,7 +3020,9 @@
     createGain() { return new GainNode(this); } createBufferSource() { return new AudioBufferSourceNode(this); }
     createOscillator() { return new OscillatorNode(this); } createBiquadFilter() { return new BiquadFilterNode(this); }
     createBuffer(numberOfChannels, length, sampleRate) { return new AudioBuffer({ numberOfChannels, length, sampleRate }); }
-    createPeriodicWave(real, imag, options) { return new PeriodicWave(this, { real, imag, ...options }); }
+    createPeriodicWave(real, imag, options) {
+      if (arguments.length < 2) throw new TypeError(`Failed to execute 'createPeriodicWave' on 'BaseAudioContext': 2 arguments required, but only ${arguments.length} present.`);
+      if (typeof real?.[Symbol.iterator] !== 'function' || typeof imag?.[Symbol.iterator] !== 'function') throw new TypeError("Failed to execute 'createPeriodicWave' on 'BaseAudioContext': The provided value cannot be converted to a sequence."); return new PeriodicWave(this, { real, imag, disableNormalization: options?.disableNormalization }); }
     decodeAudioData(data, done, failed) {
       const url = URL.createObjectURL(new Blob([data])), audio = new Audio(url);
       const result = new Promise((resolve, reject) => { audio.addEventListener('loadedmetadata', () => { audio._close(); resolve(new AudioBuffer(url, audio.duration)); }); audio.addEventListener('error', () => reject(new DOMException('The audio cannot be decoded', 'EncodingError'))); audio.load(); });
@@ -2946,7 +3218,7 @@
     transferToImageBitmap() {
       const { width, height } = this;
       if (!this._context || !width || !height) throw new DOMException('The canvas has no context or no pixels', 'InvalidStateError');
-      this._context._flush?.();
+      this._context._flush?.(); this._context._release?.();
       const node = canvasNode(width, height); call('dom.canvasTake', this._id, node._id);
       return bitmapOf(node);
     }
@@ -3020,7 +3292,7 @@
   for (const [tags, name] of [['a area link base', 'href'], ['img script iframe embed source track audio video input', 'src'], ['object', 'data'], ['blockquote q ins del', 'cite']]) for (const tag of tags.split(' ')) Object.defineProperty(htmlTypes.get(tag).prototype, name, { configurable: true, get() { const value = this.getAttribute(name); return value === null ? '' : resolved(value); }, set(value) { this.setAttribute(name, value); } });
   for (const key of ['protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin', 'username', 'password']) for (const tag of ['a', 'area']) Object.defineProperty(htmlTypes.get(tag).prototype, key, { configurable: true, get() { try { return new URL(this.href)[key]; } catch { return key === 'protocol' ? ':' : ''; } }, set(value) { try { const url = new URL(this.href); url[key] = value; this.href = url.href; } catch {} } });
   for (const tag of ['a', 'area']) Object.defineProperty(htmlTypes.get(tag).prototype, 'toString', { configurable: true, writable: true, value() { return this.href; } });
-  for (const [tags, names] of [['a area link', 'rel'], ['a area', 'target download'], ['a link script', 'type'], ['link', 'media as hreflang'], ['meta', 'name content']]) for (const tag of tags.split(' ')) for (const name of names.split(' ')) Object.defineProperty(htmlTypes.get(tag).prototype, name, { configurable: true, get() { return this.getAttribute(name) ?? ''; }, set(value) { this.setAttribute(name, value); } });
+  for (const [tags, names] of [['a area link', 'rel'], ['a area', 'target download'], ['a link script', 'type'], ['link', 'media hreflang'], ['meta', 'name content']]) for (const tag of tags.split(' ')) for (const name of names.split(' ')) Object.defineProperty(htmlTypes.get(tag).prototype, name, { configurable: true, get() { return this.getAttribute(name) ?? ''; }, set(value) { this.setAttribute(name, value); } });
   for (const tag of ['a', 'area', 'link']) Object.defineProperty(htmlTypes.get(tag).prototype, 'relList', { configurable: true, get() { return this._relList ??= new DOMTokenList(this, 'rel'); } });
   {
     // Reflected IDL attributes: `prop` or `prop=default` per kind; the attribute is the lowercase name.
@@ -3035,7 +3307,11 @@
     define('', 'enterKeyHint', keyword(['enter', 'done', 'go', 'next', 'previous', 'search', 'send']));
     define('', 'inputMode', keyword(['none', 'text', 'tel', 'url', 'email', 'numeric', 'decimal', 'search']));
     define('', 'dir', keyword(['ltr', 'rtl', 'auto']));
-    define('a area', 'hreflang referrerPolicy ping', string); define('a', 'text', () => ({ get() { return this.textContent; }, set(value) { this.textContent = value; } }));
+    define('a area', 'hreflang ping', string); define('a title script', 'text', () => ({ get() { return this.textContent; }, set(value) { this.textContent = value; } }));
+    define('a area img iframe link script', 'referrerPolicy', keyword(['no-referrer', 'no-referrer-when-downgrade', 'same-origin', 'origin', 'strict-origin', 'origin-when-cross-origin', 'strict-origin-when-cross-origin', 'unsafe-url']));
+    define('img link script', 'fetchPriority=auto', keyword(['high', 'low']));
+    define('button input', 'formMethod', keyword(['get', 'post', 'dialog'])); define('button input', 'formEnctype', keyword(['application/x-www-form-urlencoded', 'multipart/form-data', 'text/plain']));
+    define('track', 'kind=subtitles', keyword(['subtitles', 'captions', 'descriptions', 'chapters', 'metadata'])); define('area', 'shape', string);
     define('img', 'alt sizes srcset useMap', string); define('img', 'isMap', boolean);
     define('img', 'loading=auto', keyword(['lazy', 'eager'])); define('img', 'decoding=auto', keyword(['sync', 'async']));
     define('img script link video audio', 'crossOrigin', attr => ({ get() { const value = this.getAttribute(attr); return value === null ? null : value.toLowerCase() === 'use-credentials' ? 'use-credentials' : 'anonymous'; }, set(value) { if (value === null) this.removeAttribute(attr); else this.setAttribute(attr, value); } }));
@@ -3045,7 +3321,7 @@
     define('ol', 'start=1', long(-Infinity)); define('ol', 'reversed', boolean); define('li', 'value=0', long(-Infinity));
     define('progress', 'max=1 value=0', double); define('meter', 'value=0 min=0 max=1', double);
     define('script', 'async defer noModule', boolean); define('script', 'charset integrity', string); define('style', 'media', string);
-    define('link', 'integrity sizes', string); define('iframe', 'name allow referrerPolicy srcdoc', string); define('iframe', 'allowFullscreen', boolean);
+    define('link', 'integrity sizes', string); define('link', 'as', keyword(['fetch', 'audio', 'audioworklet', 'document', 'embed', 'font', 'image', 'manifest', 'object', 'paintworklet', 'report', 'script', 'serviceworker', 'sharedworker', 'style', 'track', 'video', 'worker', 'xslt', 'json'])); define('iframe', 'name allow srcdoc', string); define('iframe', 'allowFullscreen', boolean);
     // `draggable`, `spellcheck` and `translate` are true/false keywords with defaults that depend on the element.
     Object.defineProperties(HTMLElement.prototype, {
       draggable: { configurable: true, enumerable: true, get() { const value = this.getAttribute('draggable')?.toLowerCase(); return value === 'true' || value !== 'false' && (this.localName === 'img' || this.localName === 'a' && this.hasAttribute('href')); }, set(value) { this.setAttribute('draggable', !!value); } },
@@ -3096,7 +3372,7 @@
   globalThis.window = globalThis; globalThis.self = globalThis;
   selection = new Selection(); attachDeclarative();
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) globalThis[name] = Node.prototype[name].bind(globalThis);
-  Object.assign(globalThis, { ElementImage, CanvasPaintEvent, ElementGeometryUpdateEvent, ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, OfflineAudioContext, AudioNode, AudioParam, AudioScheduledSourceNode, GainNode, BiquadFilterNode, OscillatorNode, PeriodicWave, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent, StaticRange, customElements, ShadowRoot, CSSStyleSheet, DOMParser, CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration, AnimationEvent, BeforeUnloadEvent, ElementInternals, FormDataEvent, HashChangeEvent, PageTransitionEvent, PopStateEvent, RadioNodeList, StorageEvent, TransitionEvent });
+  Object.assign(globalThis, { ContentVisibilityAutoStateChangeEvent, ElementImage, CanvasPaintEvent, ElementGeometryUpdateEvent, ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, OfflineAudioContext, AudioNode, AudioParam, AudioScheduledSourceNode, GainNode, BiquadFilterNode, OscillatorNode, PeriodicWave, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, SVGAnimatedString, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent, StaticRange, customElements, ShadowRoot, CSSStyleSheet, DOMParser, CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration, AnimationEvent, BeforeUnloadEvent, ElementInternals, FormDataEvent, HashChangeEvent, PageTransitionEvent, PopStateEvent, RadioNodeList, StorageEvent, TransitionEvent });
   Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'styleSheets', { configurable: true, get() { return styleSheetsOf(this); } });
@@ -3122,7 +3398,7 @@
       } };
       this.addEventListener(name, created.listener);
     } });
-  const globalHandlers = 'abort auxclick beforeinput beforematch beforetoggle blur cancel canplay canplaythrough change click close command contextlost contextmenu contextrestored copy cuechange cut dblclick drag dragend dragenter dragleave dragover dragstart drop durationchange emptied ended error focus formdata input invalid keydown keypress keyup load loadeddata loadedmetadata loadstart mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup paste pause play playing progress ratechange reset resize scroll scrollend securitypolicyviolation seeked seeking select selectionchange selectstart slotchange stalled submit suspend timeupdate toggle volumechange waiting wheel animationstart animationiteration animationend animationcancel transitionrun transitionstart transitionend transitioncancel gotpointercapture lostpointercapture pointerdown pointermove pointerrawupdate pointerup pointercancel pointerover pointerout pointerenter pointerleave'.split(' ');
+  const globalHandlers = 'abort auxclick beforeinput beforematch beforetoggle blur cancel canplay canplaythrough change click close command contentvisibilityautostatechange contextlost contextmenu contextrestored copy cuechange cut dblclick drag dragend dragenter dragleave dragover dragstart drop durationchange emptied ended error focus formdata input invalid keydown keypress keyup load loadeddata loadedmetadata loadstart mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup paste pause play playing progress ratechange reset resize scroll scrollend securitypolicyviolation seeked seeking select selectionchange selectstart slotchange stalled submit suspend timeupdate toggle volumechange waiting wheel animationstart animationiteration animationend animationcancel transitionrun transitionstart transitionend transitioncancel gotpointercapture lostpointercapture pointerdown pointermove pointerrawupdate pointerup pointercancel pointerover pointerout pointerenter pointerleave'.split(' ');
   for (const name of globalHandlers) for (const target of [HTMLElement.prototype, SVGElement.prototype, Document.prototype]) handler(target, name);
   handler(Document.prototype, 'readystatechange'); handler(Document.prototype, 'visibilitychange');
   handler(Screen.prototype, 'change'); handler(ScreenOrientation.prototype, 'change');
@@ -3174,18 +3450,21 @@
     const id = node._id, kind = pseudo == null ? '' : String(pseudo);
     let names = null;
     // Container queries need sizes, so the first read of a page lays it out like Chrome does.
-    return declaration({ computed: name => { if (!laid || /^(width|height|min-|max-|margin|padding|inset|top|right|bottom|left|transform|perspective-origin)/.test(name)) layout(); return call('dom.computed', id, name, kind); }, names: () => names ??= call('dom.computed', id, null, kind) });
+    return declaration({ computed: name => { if (!laid || /^(width|height|min-|max-|margin|padding|inset|top|right|bottom|left|transform|perspective-origin|grid-template)/.test(name)) layout(); return call('dom.computed', id, name, kind); }, names: () => names ??= call('dom.computed', id, null, kind) });
   };
   const animationFrames = new Map(); let animationFrameId = 0, animationTimer, frameRequested = false;
   globalThis.__appsAnimationFrame = () => {
     animationTimer = undefined; frameRequested = false;
     const now = performance.now(), callbacks = [...animationFrames];
-    timelineTime = now; microtask(() => { timelineTime = null; });
+    timelineTime = now;
     if (pendingAnimations.size) { const ready = [...pendingAnimations]; pendingAnimations.clear(); for (const animation of ready) readyAnimation(animation); }
     for (const [id, callback] of callbacks) {
       if (!animationFrames.delete(id)) continue;
       try { callback(now); } catch (error) { report(error); }
+      // As in browsers, microtasks run after each callback.
+      drainMicrotasks?.();
     }
+    microtask(() => { timelineTime = null; });
   };
   // One request covers every callback until the next frame runs.
   const requestFrame = () => { if (!frameRequested) { frameRequested = true; if (!host('dom.requestFrame') && animationTimer === undefined) animationTimer = setTimeout(__appsAnimationFrame, 16); } };
@@ -3329,6 +3608,8 @@
   let animationIds = 0;
   const pendingAnimations = new Set();
   let readyAnimation;
+  // As in Chrome, an element with no box can't take committed styles: a disconnected one, one in a `display: none` or `content-visibility: hidden` box of the flat tree, or one with `display: contents`.
+  const boxless = target => { if (!target.isConnected) return true; for (let node = target; node; node = node.assignedSlot ?? node.parentElement ?? node.parentNode?.host) { const style = getComputedStyle(node); if (style.display === 'none' || node === target && style.display === 'contents' || node !== target && style.contentVisibility === 'hidden') return true; } return false; };
   class Animation extends EventTarget {
     #id = ++animationIds; #effect = null; #timeline; #start = null; #hold = null; #rate = 1; #pendingRate = null; #playing = false; #pausing = false; #previous = null;
     #finished; #settle; #fail; #done = false; #queued = false; #ready; #readyResolve = null; #readyReject = null; #timer; #replace = 'active'; #synced = null; #sent = null;
@@ -3489,7 +3770,8 @@
     commitStyles() {
       const effect = this.#effect && effects.get(this.#effect), target = effect?.target;
       if (!target) return;
-      if (effect.pseudo || !target.isConnected) throw new DOMException('The target is not rendered', 'NoModificationAllowedError');
+      if (effect.pseudo) throw new DOMException('The target is not rendered', 'NoModificationAllowedError');
+      if (boxless(target)) throw new DOMException('Target element is not rendered.', 'InvalidStateError');
       const synced = this.#synced !== null;
       if (!synced) this.#sync(true);
       const values = call('dom.animated', target._id, this.#id) ?? {};
@@ -3603,7 +3885,10 @@
     pause: { value() { cssControl(this, 'pause'); }, writable: true, configurable: true },
     finish: { value() { const { activeDuration } = cssData.get(this).effect.getComputedTiming(); if (activeDuration === Infinity) throw new DOMException('Cannot finish an endless animation', 'InvalidStateError'); cssControl(this, 'finish'); }, writable: true, configurable: true },
     cancel: { value() { if (cssState(this).state === 'idle') return; cssControl(this, 'cancel'); cssSettle(this, false); }, writable: true, configurable: true },
-    commitStyles: { value() { const target = cssData.get(this).effect.target, computed = getComputedStyle(target); for (const frame of effects.get(cssData.get(this).effect).frames) for (const [name] of frame.props) target.style.setProperty(name, computed.getPropertyValue(name)); }, writable: true, configurable: true },
+    commitStyles: { value() {
+      const target = cssData.get(this).effect.target;
+      if (boxless(target)) throw new DOMException('Target element is not rendered.', 'InvalidStateError');
+      const computed = getComputedStyle(target); for (const frame of effects.get(cssData.get(this).effect).frames) for (const [name] of frame.props) target.style.setProperty(name, computed.getPropertyValue(name)); }, writable: true, configurable: true },
   });
   const cssOf = (node, subtree) => {
     // Animations and transitions start when styles change, which the layout pass applies. Without a
@@ -3759,10 +4044,15 @@
       const visible = bounds.width > 0 && bounds.height > 0 && getComputedStyle(view).visibility !== 'hidden', key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height},${visible}`;
       if (key !== view._bounds) { view._bounds = key; call('dom.open', 'webview', 'bounds', view._guest, { bounds, visible }); }
     }
+    // Before the first frame there is no last layout, so observers would see empty boxes.
+    if ((resizeObservers.size || intersectionObservers.size) && !geometry[2]) laidOut();
     for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(), at = geometry[2]; if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === at) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) try { observer.callback(entries, observer); } catch (error) { report(error); } }
     // Resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
     // `scrollend` fires when a box has not scrolled for 100 ms, and only pages that listen for it pay for the timers.
-    for (const id of call('dom.scrollEvents')) { const node = wrap(id); if (!node) continue; hoverVersion = -1; node.dispatchEvent(new Event('scroll', { bubbles: !id })); if (ending) { clearTimeout(scrollEnds.get(node)); scrollEnds.set(node, setTimeout(() => { scrollEnds.delete(node); node.dispatchEvent(new Event('scrollend', { bubbles: !id })); }, 100)); } }
+    for (const id of call('dom.scrollEvents')) {
+      // The last item can list `content-visibility: auto` boxes, each with whether it skips its contents now.
+      if (typeof id !== 'number') { for (let i = 0; i < id.length; i += 2) wrap(id[i])?.dispatchEvent(new ContentVisibilityAutoStateChangeEvent('contentvisibilityautostatechange', { bubbles: true, skipped: !!id[i + 1] })); continue; }
+      const node = wrap(id); if (!node) continue; hoverVersion = -1; node.dispatchEvent(new Event('scroll', { bubbles: !id })); if (ending) { clearTimeout(scrollEnds.get(node)); scrollEnds.set(node, setTimeout(() => { scrollEnds.delete(node); node.dispatchEvent(new Event('scrollend', { bubbles: !id })); }, 100)); } }
     __appsMediaChanged();
     if(!intersectionObservers.size)return;
     call('dom.layout',false,true);
@@ -3792,17 +4082,144 @@
     }
   };
 
-  globalThis.__appsEditing = () => terminalOf(active) ? { id: active._id, text: active._preedit, start: active._preedit.length, end: active._preedit.length, marked: composing } : editable(active) ? { id: active._id, text: active.value, start: active.selectionDirection === 'backward' ? active.selectionEnd : active.selectionStart, end: active.selectionDirection === 'backward' ? active.selectionStart : active.selectionEnd, marked: composing } : active?.isContentEditable ? { id: active._id, text: active.textContent, start: textOffset(active,selection.anchorNode,selection.anchorOffset), end: textOffset(active,selection.focusNode,selection.focusOffset), node: selection.focusNode?._id, offset: selection.focusOffset, marked: composing } : null;
+  globalThis.__appsEditing = () => terminalOf(active) ? { id: active._id, text: active._preedit, start: active._preedit.length, end: active._preedit.length, marked: composing } : editable(active) ? { id: active._id, text: active.value, start: active._direction === 'backward' ? active._end ?? 0 : active._start ?? 0, end: active._direction === 'backward' ? active._start ?? 0 : active._end ?? 0, marked: composing } : active?.isContentEditable ? { id: active._id, text: active.textContent, start: textOffset(active,selection.anchorNode,selection.anchorOffset), end: textOffset(active,selection.focusNode,selection.focusOffset), node: selection.focusNode?._id, offset: selection.focusOffset, marked: composing } : null;
+  // The formatting that the next typed text gets, like Chrome's typing style: the inline elements around the
+  // last deleted text, which typing copies. A selection change clears it.
+  let typing = [];
+  const blockTag = /^(address|article|aside|blockquote|dd|details|dialog|div|dl|dt|fieldset|figcaption|figure|footer|form|h[1-6]|header|hr|li|main|nav|ol|p|pre|section|table|tbody|td|th|thead|tr|ul)$/;
+  // Warning: new nodes, even detached ones, make the next style read a full style pass, so the hot path of
+  // editing keeps references and HTML text instead of copies.
+  const formats = node => { const list = []; for (let up = node?.parentNode; up && up !== active && up.nodeType === 1 && !blockTag.test(up.localName); up = up.parentNode) list.unshift(up); return list; };
+  const emptyInline = node => node.nodeType === 1 && !blockTag.test(node.localName) && !/^(br|img|input|select|textarea|video|audio|canvas|iframe|svg|object|embed)$/.test(node.localName) && !node.textContent && !node.querySelector('br,img,input,select,textarea,video,audio,canvas,iframe,svg,object,embed');
+  // Whether nothing shows before (or after) the node on its line.
+  const lineEdge = (node, after) => {
+    for (let at = node; at !== active && at; at = at.parentNode) {
+      if (at.nodeType === 1 && blockTag.test(at.localName)) return true;
+      for (let next = after ? at.nextSibling : at.previousSibling; next; next = after ? next.nextSibling : next.previousSibling) {
+        if (next.localName === 'br' || next.nodeType === 1 && blockTag.test(next.localName)) return true;
+        if (/[^ \t\n\r]/.test(next.textContent) || next.nodeType === 1 && (/^(img|input|select|textarea|video|audio|canvas|iframe|svg|object|embed)$/.test(next.localName) || next.querySelector('img,input,select,textarea,video,audio,canvas,iframe,svg,object,embed'))) return false;
+      }
+    }
+    return true;
+  };
+  // Like Chrome, the run of spaces at an edit alternates no-break spaces and spaces, so that all of them show. A
+  // single space between other characters stays a space, and a run at the end of its text node ends with a
+  // no-break space. Spaces that did not show before the edit stay
+  // hidden: they go at the start of a line and stay as they are at its end. `typed` says that the edit wrote
+  // spaces of the run. Returns the new place of `at`.
+  const rebalance = (node, at, typed, deleted) => {
+    let start = at, end = at; const data = node.data, white = c => c === ' ' || c === ' ';
+    while (start > 0 && white(data[start - 1])) start--;
+    while (end < data.length && white(data[end])) end++;
+    if (start === end || /^(pre|pre-wrap|break-spaces)$/.test(getComputedStyle(node.parentNode).whiteSpace)) return at;
+    const hidden = !typed && !data.slice(start, end).includes(' ');
+    const first = start === 0 && lineEdge(node, false), last = end === data.length && lineEdge(node, true);
+    if (hidden && first && !(deleted && at === start)) { node.deleteData(0, end); return Math.max(0, at - end); }
+    if (hidden && last && !(deleted && at === end)) return at;
+    const edge = end === data.length;
+    let run = '';
+    for (let i = start; i < end; i++) run += end - start === 1 && start > 0 && !edge || (i - start) % 2 && !(edge && i === end - 1) ? ' ' : ' ';
+    if (run !== data.slice(start, end)) node.replaceData(start, end - start, run);
+    return at;
+  };
+  // Undo for editable content inverts the DOM changes of each edit, which an observer records while the edit
+  // runs. So the nodes stay the same objects, and page changes elsewhere in the host don't matter.
+  const recorder = new MutationObserver(() => {});
+  let step = null;
+  // The observer runs only while an edit runs, so page changes between the updates of a composition stay out.
+  const begin = (host, range, typed, backward, continuing) => {
+    if (step && !(continuing && step.host === host)) finish();
+    if (!step) {
+      const ends = [range.startContainer, range.startOffset, range.endContainer, range.endOffset];
+      // Like Chrome, undo selects what the edit replaced.
+      const sel = range.collapsed || selection.isCollapsed ? backward ? [ends[2], ends[3], ends[0], ends[1]] : ends : [selection.anchorNode, selection.anchorOffset, selection.focusNode, selection.focusOffset];
+      step = { host, sel, typed, records: [] };
+    }
+    recorder.observe(host, { subtree: true, childList: true, characterData: true, characterDataOldValue: true, attributes: true, attributeOldValue: true });
+  };
+  const pause = () => { const records = recorder.takeRecords(); recorder.disconnect(); step?.records.push(...records); };
+  // A text change keeps only the changed part: `[node, at, removed, inserted]`.
+  const diff = (node, before, after) => {
+    let at = 0, end = 0;
+    const most = Math.min(before.length, after.length);
+    // Long texts compare in slices first, which is much faster than one character at a time.
+    for (let step = 4096; step >= 1; step >>= 4) {
+      while (at + step <= most && before.slice(at, at + step) === after.slice(at, at + step)) at += step;
+      while (end + step <= most - at && before.slice(before.length - end - step, before.length - end) === after.slice(after.length - end - step, after.length - end)) end += step;
+    }
+    return { node, at, removed: before.slice(at, before.length - end), inserted: after.slice(at, after.length - end) };
+  };
+  const finish = () => {
+    pause();
+    if (!step) return;
+    const { host, sel, typed, records } = step, ops = [];
+    step = null;
+    for (const record of records) {
+      const last = ops.at(-1);
+      if (record.type === 'characterData') { if (!(last?.text && last.node === record.target)) ops.push({ text: true, node: record.target, old: record.oldValue }); }
+      else if (record.type === 'childList') ops.push({ parent: record.target, added: [...record.addedNodes], removed: [...record.removedNodes], next: record.nextSibling });
+      else ops.push({ element: record.target, name: record.attributeName, old: record.oldValue });
+    }
+    // Each text change runs to the next change of its node, or to its text now.
+    for (let i = ops.length; i--;) {
+      const op = ops[i];
+      if (op.text) { const later = ops.slice(i + 1).find(next => 'before' in next && next.node === op.node); ops[i] = diff(op.node, op.old, later ? later.before : op.node.data); ops[i].before = op.old; }
+      else if (op.element) { const later = ops.slice(i + 1).find(next => next.element === op.element && next.name === op.name); op.value = later ? later.old : op.element.getAttribute(op.name); }
+    }
+    for (const op of ops) delete op.before;
+    ops.splice(0, ops.length, ...ops.filter(op => !('at' in op) || op.removed || op.inserted));
+    if (!ops.length) return;
+    const history = histories.get(host) ?? histories.set(host, { undo: [], redo: [], size: 0 }).get(host), last = history.undo.at(-1), after = [selection.anchorNode, selection.anchorOffset, selection.focusNode, selection.focusOffset];
+    history.redo.length = 0;
+    // Typing in a row adds to one undo step.
+    if (typed && last?.typed && ops.length === 1 && last.ops.length === 1 && 'at' in ops[0] && last.ops[0].node === ops[0].node && last.after.every((value, i) => value === sel[i])) {
+      const [one, two] = [last.ops[0], ops[0]], data = one.node.data, middle = data.slice(0, two.at) + two.removed + data.slice(two.at + two.inserted.length);
+      last.ops[0] = diff(one.node, middle.slice(0, one.at) + one.removed + middle.slice(one.at + one.inserted.length), data);
+      last.after = after;
+      return;
+    }
+    // History is capped at 100 steps and about 8 MB of changed text.
+    const size = ops.reduce((sum, op) => sum + (op.removed?.length ?? 0) + (op.inserted?.length ?? 0) + (op.parent ? [...op.added, ...op.removed].reduce((count, node) => count + node.textContent.length, 0) : 0), 0);
+    history.undo.push({ ops, sel, after, typed, size }); history.size += size;
+    while (history.undo.length > 100 || history.size > 8e6 && history.undo.length > 1) history.size -= history.undo.shift().size;
+  };
+  // Redoes (or undoes) one change, after checking that the page left its nodes as the step left them.
+  const apply = (op, forward) => {
+    const check = value => { if (!value) throw new Error('The page changed the content'); };
+    if ('at' in op) {
+      const [from, to] = forward ? [op.removed, op.inserted] : [op.inserted, op.removed];
+      check(op.node.isConnected && op.node.data.substr(op.at, from.length) === from);
+      op.node.replaceData(op.at, from.length, to);
+    } else if (op.parent) {
+      const [gone, back] = forward ? [op.removed, op.added] : [op.added, op.removed];
+      check(gone.every(node => node.parentNode === op.parent) && (!op.next || op.next.parentNode === op.parent && !gone.includes(op.next)));
+      for (const node of gone) node.remove();
+      for (const node of back) op.parent.insertBefore(node, op.next);
+    } else {
+      const value = forward ? op.value : op.old;
+      if (value === null) op.element.removeAttribute(op.name); else op.element.setAttribute(op.name, value);
+    }
+  };
+  // Undoes (or redoes) the changes of a step, or none of them: a failed check puts back the ones it made.
+  const replay = (ops, forward) => {
+    const done = [];
+    try { for (const op of forward ? ops : [...ops].reverse()) { apply(op, forward); done.push(op); } }
+    catch (error) { for (const op of done.reverse()) apply(op, !forward); throw error; }
+  };
+
   const paragraph = (host, range) => {
     let block = range.startContainer.nodeType === 3 ? range.startContainer.parentNode : range.startContainer;
     while (block !== host && !/^(div|p|li|h[1-6]|blockquote|pre)$/.test(block.localName)) block = block.parentNode;
     const tail = document.createRange();
     tail.setStart(range.startContainer, range.startOffset);
-    // The split copies the inline ancestors of the caret. Like Chrome, the copies drop their id, and empty ones go.
+    if (range.startContainer.nodeType === 3 && range.startOffset === range.startContainer.length) tail.setStartAfter(range.startContainer);
+    // The split copies the inline ancestors of the caret. Like Chrome, the copies drop their id. A new empty line
+    // keeps them around its <br>, and otherwise empty copies go.
     const extract = () => {
       let depth = 0; for (let node = range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentNode; node !== block && node !== host; node = node.parentNode) depth++;
       const fragment = tail.extractContents(), clones = [];
       for (let node = fragment.firstChild; node?.nodeType === 1 && clones.length < depth; node = node.firstChild) clones.push(node);
+      if (clones.length && !fragment.textContent && !fragment.querySelector('br,img')) clones.at(-1).replaceChildren(document.createElement('br'));
       for (const node of clones.reverse()) { node.removeAttribute('id'); if (!node.textContent && !node.querySelector('br,img')) node.remove(); }
       return fragment;
     };
@@ -3810,16 +4227,17 @@
       let top = range.startContainer; while (top.parentNode !== host) top = top.parentNode;
       let next = top === host ? null : top.nextSibling; while (next && !/^(div|p|li|h[1-6]|blockquote|pre|ul|ol|table)$/.test(next.localName)) next = next.nextSibling;
       if (next) tail.setEndBefore(next); else tail.setEnd(host, host.childNodes.length);
-      const line = document.createElement('div'); line.append(extract());
-      if (!line.textContent) line.replaceChildren(document.createElement('br'));
+      // Warning: the new line goes into the page before its content, so that undo records where the content went.
+      const fragment = extract(), line = document.createElement('div'); host.insertBefore(line, next); line.append(fragment);
+      if (!line.textContent && !line.querySelector('br')) line.replaceChildren(document.createElement('br'));
       if (!host.textContent && !host.querySelector('br')) host.prepend(document.createElement('br'));
-      host.insertBefore(line, next); return line;
+      return line;
     }
     tail.setEndAfter(block.lastChild ?? block);
-    const line = document.createElement(/^(li|p)$/.test(block.localName) ? block.localName : 'div'); line.append(extract());
+    const fragment = extract(), line = document.createElement(/^(li|p)$/.test(block.localName) ? block.localName : 'div'); block.after(line); line.append(fragment);
     if (!line.textContent && !line.querySelector('br')) line.replaceChildren(document.createElement('br'));
     if (!block.textContent && !block.querySelector('br')) block.append(document.createElement('br'));
-    block.after(line); return line;
+    return line;
   };
   const insertText = (range, text) => {
     const node = range.startContainer, at = range.startOffset;
@@ -3845,15 +4263,18 @@
     const target = active, [at, removed, text] = composed;
     composing = null; call('dom.endComposition');
     if (terminalOf(target)) { target._preedit = ''; call('terminal.preedit', terminalOf(target), ''); return; }
+    finish();
     if (!text || !target?.isConnected) return;
-    remember(target, at, removed, text, !removed);
+    if (editable(target)) remember(target, at, removed, text, !removed);
     dispatch(target, trusted(new CompositionEvent('compositionend', { bubbles: true, composed: true, data: text })));
   };
   globalThis.__appsFinishComposition = finishComposition;
-  globalThis.__appsInput = (text, start, end, mark = false, selected = null, inputType, dataTransfer = null) => {
+  globalThis.__appsInput = (text, start, end, mark = false, selected = null, inputType, dataTransfer = null, explicit = null) => {
     const target = active;
     if (!target || disabled(target) || target.readOnly) return finishComposition();
-    const state = __appsEditing(); if (!state) return finishComposition();
+    // Plain edits of editable content take the selection, since the text of the host walks all of it.
+    const lazy = start == null && end == null && composing === null && !mark && target.isContentEditable && !editable(target) && !terminalOf(target) && selection.rangeCount > 0;
+    const state = lazy ? { text: '', start: 0, end: 0 } : __appsEditing(); if (!state) return finishComposition();
     text = String(text);
     // A terminal shows the text that an input method composes at its cursor, and sends the result to its program.
     const session = terminalOf(target);
@@ -3869,7 +4290,7 @@
     }
     start ??= composing?.[0] ?? Math.min(state.start,state.end); end ??= composing?.[1] ?? Math.max(state.start,state.end);
     start = Math.max(0, Math.min(start, state.text.length)); end = Math.max(start, Math.min(end, state.text.length));
-    const isComposing = mark || composing !== null, control = editable(target);
+    const isComposing = mark || composing !== null, continuing = composing !== null, control = editable(target);
     inputType ??= isComposing ? 'insertCompositionText' : text ? 'insertText' : 'deleteContentBackward';
     if (mark && !composing) {
       composing = [start,end]; composed = [start, state.text.slice(start,end), ''];
@@ -3879,6 +4300,8 @@
     // Offsets at block boundaries are ambiguous. Reuse a matching selection, or locate the first replaced
     // character.
     const replaced = () => {
+      if (explicit) return explicit.cloneRange();
+      if (lazy) return selection.getRangeAt(0).cloneRange();
       if (selection.rangeCount && start === Math.min(state.start,state.end) && end === Math.max(state.start,state.end) && target.contains(selection.getRangeAt(0).startContainer)) return selection.getRangeAt(0).cloneRange();
       const range = document.createRange(), [node,at] = textPoint(target,start + (start < end));
       range.setStart(node,at - (start < end)); range.setEnd(...textPoint(target,end));
@@ -3890,20 +4313,97 @@
     if (!dispatch(target, trusted(new InputEvent('beforeinput', { ...options, cancelable: !isComposing, targetRanges })))) return;
     if (active !== target || !target.isConnected) return finishComposition();
     // Like Chrome, a delete with nothing to delete fires no `input`.
-    if (start === end && inputType.startsWith('delete')) return true;
+    if ((explicit || lazy ? replaced().collapsed : start === end) && inputType.startsWith('delete')) return true;
     if (control) {
       target._edited = true;
       setValue(target, state.text.slice(0,start) + text + state.text.slice(end));
-      target.setSelectionRange(start + (selected?.[0] ?? text.length), start + (selected?.[1] ?? text.length), target.selectionDirection, true);
+      target.setSelectionRange(start + (selected?.[0] ?? text.length), start + (selected?.[1] ?? text.length), target._direction, true);
     } else {
-      const range = replaced();
-      if (!range.collapsed) range.deleteContents();
-      const plain = target.getAttribute('contenteditable')?.toLowerCase() === 'plaintext-only';
-      if (inputType === 'insertParagraph' && !plain) { const line = paragraph(target, range), first = line.firstChild; selection.collapse(first?.nodeType === 3 ? first : line, 0); }
-      else if (inputType === 'insertLineBreak' && !plain) { const br = document.createElement('br'); range.insertNode(br); if (!br.nextSibling || br.nextSibling.nodeType === 3 && !br.nextSibling.data && !br.nextSibling.nextSibling) br.after(document.createElement('br')); selection.collapse(br.parentNode, br.parentNode.childNodes.indexOf(br) + 1); }
-      else { const [node, at] = text ? insertText(range, text) : [range.startContainer, range.startOffset]; if (node.nodeType === 3) selection.setBaseAndExtent(node, at + (selected?.[0] ?? text.length), node, at + (selected?.[1] ?? text.length)); else selection.collapse(node, at); }
+      const range = replaced(), plain = target.getAttribute('contenteditable')?.toLowerCase() === 'plaintext-only';
+      begin(target, range, !isComposing && inputType === 'insertText' && !!text && range.collapsed, /Backward$/.test(inputType), continuing);
+      try {
+        let style = typing;
+        if (!range.collapsed) {
+          const block = node => { let up = node.nodeType === 3 ? node.parentNode : node; while (up !== target && getComputedStyle(up).display.startsWith('inline')) up = up.parentNode; return up; };
+          const first = block(range.startContainer), last = block(range.endContainer);
+          // Text that the range only touches at its edge stays as it is, so observers see no change of it.
+          const origin = [range.startContainer, range.startOffset], whole = range.startContainer;
+          if (whole === range.endContainer && whole.nodeType === 3 && !range.startOffset && range.endOffset === whole.length) range.selectNode(whole);
+          if (range.startContainer.nodeType === 3 && range.startOffset === range.startContainer.length) range.setStartAfter(range.startContainer);
+          if (range.endContainer.nodeType === 3 && !range.endOffset) range.setEndBefore(range.endContainer);
+          const { startContainer: start, startOffset: offset } = range;
+          style = formats(rangeNodes(range).find(part => part.end > part.start)?.node);
+          range.deleteContents();
+          // Like Chrome, a delete across blocks joins what is left of the last block to the first, after the inline
+          // boxes that end at the join.
+          if (last !== first && !last.contains(first) && last.isConnected && start.isConnected) {
+            // Like Chrome, the <br> that ends the last block stays behind.
+            if (last.lastChild?.localName === 'br') last.lastChild.remove();
+            const moved = last.childNodes; let gone = last;
+            while (gone.parentNode !== target && !gone.parentNode.contains(first) && gone.parentNode.childNodes.every(node => node === gone || node.nodeType === 3 && !/[^ \t\n\r]/.test(node.data))) gone = gone.parentNode;
+            let after = start.nodeType === 3 ? start : start.childNodes[offset - 1];
+            while (after && !after.nextSibling && after.parentNode !== first && after.parentNode !== target) after = after.parentNode;
+            // Warning: move the nodes before the block goes, so that undo records the move.
+            if (after) after.after(...moved); else start.prepend(...moved);
+            gone.remove();
+            const next = after?.nextSibling;
+            if (after?.nodeType === 3 && next?.nodeType === 3) { after.appendData(next.data); next.remove(); }
+            range.setStart(start, offset); range.collapse(true);
+          }
+          if (origin[0].isConnected && origin[1] <= origin[0].length) { range.setStart(...origin); range.collapse(true); }
+          // Text and inline elements that the delete emptied go, and the caret moves into the text beside them.
+          let node = range.startContainer, at = range.startOffset;
+          while (node !== target && (node.nodeType === 3 ? !node.length : emptyInline(node))) { at = index(node._m); const parent = node.parentNode; node.remove(); node = parent; }
+          for (let next = node.nodeType === 1 ? node.childNodes[at] : node.nextSibling; next && (emptyInline(next) || next.nodeType === 3 && !next.length);) { const gone = next; next = next.nextSibling; gone.remove(); }
+          // Like Chrome, a block that the delete emptied keeps a <br> for its line.
+          if (node !== target && node.nodeType === 1 && blockTag.test(node.localName) && !node.firstChild) node.append(document.createElement('br'));
+          let before = node.nodeType === 1 && node.childNodes[at - 1], after = node.nodeType === 1 && node.childNodes[at];
+          while (before?.nodeType === 1 && !blockTag.test(before.localName) && before.lastChild) before = before.lastChild;
+          while (after?.nodeType === 1 && !blockTag.test(after.localName) && after.firstChild) after = after.firstChild;
+          if (before?.nodeType === 3) [node, at] = [before, before.length]; else if (after?.nodeType === 3) [node, at] = [after, 0];
+          range.setStart(node, at); range.collapse(true);
+        }
+        if (inputType === 'insertParagraph' && !plain) {
+          const { startContainer: before, startOffset: at } = range, inside = before.nodeType === 3 && at > 0 && at < before.length;
+          const line = paragraph(target, range);
+          if (before.nodeType === 3 && before.isConnected) rebalance(before, at, false, true);
+          let first = line; while (first.firstChild && first.firstChild.localName !== 'br') first = first.firstChild;
+          // Like Chrome, spaces that a split moves to the start of the new line become one no-break space, but a
+          // text of only spaces keeps them after it. Spaces that a split leaves at the start of a text don't show,
+          // so the caret goes after them.
+          const lead = first.nodeType === 3 ? /^[ \t\n]*/.exec(first.data)[0].length : 0;
+          if (inside && lead) first.replaceData(0, lead === first.length ? 0 : lead, ' ');
+          selection.collapse(first, inside ? 0 : lead);
+        }
+        else if (inputType === 'insertLineBreak' && !plain) { const br = document.createElement('br'); range.insertNode(br); if (!br.nextSibling || br.nextSibling.nodeType === 3 && !br.nextSibling.data && !br.nextSibling.nextSibling) br.after(document.createElement('br')); selection.collapse(br.parentNode, br.parentNode.childNodes.indexOf(br) + 1); style = []; }
+        else {
+          let [node, at] = text ? insertText(range, text) : [range.startContainer, range.startOffset];
+          if (node.nodeType === 3 && !plain && !mark) {
+            const white = c => c === ' ' || c === ' ';
+            // Like Chrome, a delete at the end of a text node rebalances the spaces that start the next text on the line.
+            let next = node; while (next !== target && !next.nextSibling) next = next.parentNode;
+            for (next = next !== target && at === node.length && !text && next.nextSibling; next?.firstChild;) next = next.firstChild;
+            const inline = (from, to) => { for (let up = from.parentNode; !up.contains(to); up = up.parentNode) if (!getComputedStyle(up).display.startsWith('inline')) return false; return true; };
+            if (next?.nodeType === 3 && inline(next, node) && inline(node, next)) rebalance(next, 0, false, true);
+            else at = rebalance(node, at, white(text[0]), !text);
+            if (text) rebalance(node, at + text.length, white(text.at(-1)), false);
+          }
+          // The typing style wraps the new text in the formatting that is not around it yet.
+          const names = text && !isComposing && node.nodeType === 3 && new Set(formats(node).map(copy => copy.localName)), wrap = names ? style.filter(copy => !names.has(copy.localName)) : [];
+          if (wrap.length) {
+            const copy = element => { const node = element.cloneNode(false); node.removeAttribute('id'); return node; }, wrapper = copy(wrap[0]); let inner = wrapper;
+            for (const element of wrap.slice(1)) inner = inner.appendChild(copy(element));
+            const middle = at ? node.splitText(at) : node;
+            if (middle.length > text.length) middle.splitText(text.length);
+            middle.before(wrapper); inner.append(middle); node = middle; at = 0;
+          }
+          if (node.nodeType === 3) selection.setBaseAndExtent(node, at + (selected?.[0] ?? text.length), node, at + (selected?.[1] ?? text.length)); else selection.collapse(node, at);
+          if (text) style = [];
+        }
+        typing = style;
+      } finally { if (mark) pause(); else finish(); }
     }
-    if (!mark && !inputType.startsWith('history')) {
+    if (!mark && control && !inputType.startsWith('history')) {
       const [at, removed] = isComposing ? composed ?? [start, ''] : [start, state.text.slice(start,end)];
       remember(target, at, removed, control || !/^insert(Paragraph|LineBreak)$/.test(inputType) ? text : '', !removed && /^insert(Text|CompositionText)$/.test(inputType));
     }
@@ -3917,7 +4417,18 @@
   };
   // Entries hold offsets into the text, so a change that bypassed the history clears it.
   const undo = redo => {
-    const history = active && histories.get(active), state = __appsEditing(), entry = history?.[redo ? 'redo' : 'undo'].pop();
+    const host = active, history = host && histories.get(host), entry = history?.[redo ? 'redo' : 'undo'].pop(), inputType = redo ? 'historyRedo' : 'historyUndo';
+    if (entry?.ops) {
+      if (!dispatch(host, trusted(new InputEvent('beforeinput', { bubbles: true, cancelable: true, composed: true, inputType, data: null })))) { history[redo ? 'redo' : 'undo'].push(entry); return false; }
+      try { replay(entry.ops, redo); } catch { history.undo.length = history.redo.length = history.size = 0; return false; }
+      const [anchor, at, focus, to] = redo ? entry.after : entry.sel;
+      try { selection.setBaseAndExtent(anchor, at, focus, to); } catch { selection.collapse(host, 0); }
+      entry.typed = false;
+      history[redo ? 'undo' : 'redo'].push(entry);
+      dispatch(host, trusted(new InputEvent('input', { bubbles: true, composed: true, inputType, data: null })));
+      return true;
+    }
+    const state = __appsEditing();
     if (!entry || !state) return false;
     const [from, to] = redo ? [entry.removed, entry.inserted] : [entry.inserted, entry.removed];
     if (state.text.slice(entry.at, entry.at + from.length) !== from) { history.undo.length = history.redo.length = 0; return false; }
@@ -3926,26 +4437,48 @@
     history[done !== redo ? 'redo' : 'undo'].push(entry);
     return done;
   };
+  // The editing state without the text of editable content, which costs a walk of the whole host.
+  const editingState = () => active?.isContentEditable && !editable(active) && !terminalOf(active) ? { text: '', start: 0, end: selection.rangeCount && !selection.isCollapsed ? 1 : 0, rich: true } : __appsEditing();
   const edit = (command, text = '') => {
-    const target = active, state = __appsEditing();
+    const target = active, state = editingState();
     if (command === 'undo' || command === 'redo') return undo(command === 'redo');
     if (command === 'selectAll') {
       if (editable(target)) target.select();
+      else if (target?.isContentEditable) { selection.collapse(target, 0); selection.modify('move', 'backward', 'documentboundary'); selection.modify('extend', 'forward', 'documentboundary'); }
       else if (state) selection.selectAllChildren(target);
       else { const root = selection.anchorNode?.getRootNode(); selection.selectAllChildren(root?.host ? root : document.body); }
       return true;
     }
-    if (command === 'unselect') { if (editable(target)) target.setSelectionRange(target.selectionEnd, target.selectionEnd); else selection.removeAllRanges(); return true; }
+    if (command === 'unselect') { if (editable(target)) target.setSelectionRange(target._end ?? 0, target._end ?? 0, 'none', true); else selection.removeAllRanges(); return true; }
     if (!state) return false;
-    const start = Math.min(state.start,state.end), end = Math.max(state.start,state.end), forward = command === 'forwardDelete';
+    const forward = command === 'forwardDelete', [start, end] = state.rich ? [] : [Math.min(state.start,state.end), Math.max(state.start,state.end)];
     if (command === 'insertText' || command === 'replace') return !!__appsInput(text, start, end, false, null, command === 'replace' ? 'insertReplacementText' : 'insertText');
-    return !!__appsInput('', start === end && !forward ? textBoundary(state.text,start,false) : start, start === end && forward ? textBoundary(state.text,end,true) : end, false, null, forward ? 'deleteContentForward' : 'deleteContentBackward');
+    if (command === 'insertParagraph' || command === 'insertLineBreak') return active.localName !== 'input' && !!__appsInput('\n', start, end, false, null, command);
+    return remove(state, forward, 'character');
   };
+  // Deletes the selection, or else what the same move with Shift would select. In editable content that is a
+  // move by the layout, so it joins blocks like Chrome.
+  const remove = (state, forward, unit) => {
+    const text = state.text, start = Math.min(state.start, state.end), end = Math.max(state.start, state.end), line = unit === 'lineboundary';
+    const type = 'delete' + (line ? 'SoftLine' : unit === 'word' ? 'Word' : 'Content') + (forward ? 'Forward' : 'Backward');
+    if (state.rich) {
+      if (!selection.rangeCount) return false;
+      let range = selection.getRangeAt(0).cloneRange();
+      const point = range.collapsed && selection._point('extend', forward ? 'forward' : 'backward', unit), caret = [selection.focusNode, selection.focusOffset];
+      if (point) { range = document.createRange(); range.setStart(...forward ? caret : point.slice(0, 2)); range.setEnd(...forward ? point.slice(0, 2) : caret); }
+      return !!__appsInput('', null, null, false, null, type, null, range);
+    }
+    let from = start, to = end;
+    if (start === end && forward) to = line ? (text.indexOf('\n', end) + 1 || text.length + 1) - 1 : textBoundary(text, end, true, unit === 'word');
+    else if (start === end) from = line ? text.lastIndexOf('\n', start - 1) + 1 : textBoundary(text, start, false, unit === 'word');
+    return !!__appsInput('', from, to, false, null, type);
+  };
+
   globalThis.__appsEdit = (command, text = '') => command === 'copy' || command === 'cut' ? __appsClipboard(command) : void (command === 'paste' || command === 'pasteAndMatchStyle' ? __appsClipboard('paste', text) : edit(command, text));
-  const editCommands = new Map(['copy', 'cut', 'paste', 'selectAll', 'insertText', 'delete', 'forwardDelete', 'undo', 'redo'].map(name => [name.toLowerCase(), name]));
+  const editCommands = new Map(['copy', 'cut', 'paste', 'selectAll', 'insertText', 'insertParagraph', 'insertLineBreak', 'delete', 'forwardDelete', 'undo', 'redo'].map(name => [name.toLowerCase(), name]));
   // Like browsers, page scripts reach the clipboard only while they handle user input.
   const enabled = command => {
-    const state = __appsEditing(), ranged = state ? state.start !== state.end : !selection.isCollapsed, writable = !!state && !active.readOnly && !disabled(active);
+    const state = editingState(), ranged = state ? state.start !== state.end : !selection.isCollapsed, writable = !!state && !active.readOnly && !disabled(active);
     return (command === 'selectAll' || (command === 'undo' || command === 'redo' ? !!histories.get(active)?.[command].length : command === 'copy' ? ranged : writable && (command !== 'cut' || ranged))) && (!/^(copy|cut|paste)$/.test(command) || native > 0);
   };
   const openWindow = globalThis.open = (url = '', target = '', features = '') => {
@@ -4040,7 +4573,7 @@
   };
   const nativeKeys = { backspace:'Backspace', delete:'Delete', enter:'Enter', escape:'Escape', tab:'Tab', left:'ArrowLeft', right:'ArrowRight', up:'ArrowUp', down:'ArrowDown', home:'Home', end:'End', pageup:'PageUp', pagedown:'PageDown', insert:'Insert', space:' ', shift:'Shift', control:'Control', ctrl:'Control', alt:'Alt', command:'Meta', super:'Meta' };
   const keyCodes = { Backspace:8, Tab:9, Enter:13, Shift:16, Control:17, Alt:18, Escape:27, ' ':32, PageUp:33, PageDown:34, End:35, Home:36, ArrowLeft:37, ArrowUp:38, ArrowRight:39, ArrowDown:40, Insert:45, Delete:46, Meta:91, Process:229 };
-  let modifiers = {}, graphemes, words;
+  let modifiers = {}, graphemes, words, sentences;
   const space = /\s/;
   const textBoundary = (text, offset, forward, word = false) => {
     if (forward ? offset >= text.length : offset <= 0) return offset;
@@ -4125,9 +4658,9 @@
       if (!focused) finishComposition();
       if (target) call('dom.focus', path(target).map(node => node._id), ring, !focused);
       if (data.quiet) return true;
-      if (target && !focused) { commit(target); dispatch(target, trusted(new FocusEvent('blur', { composed: true }))); if (active === target) dispatch(target, trusted(new FocusEvent('focusout', { bubbles: true, composed: true }))); }
+      if (target && !focused) { commit(target); dispatch(target, trusted(new FocusEvent('blur', { view: window, composed: true }))); if (active === target) dispatch(target, trusted(new FocusEvent('focusout', { view: window, bubbles: true, composed: true }))); }
       dispatch(globalThis, new Event(name.slice(7)));
-      if (target && focused && active === target) { dispatch(target, trusted(new FocusEvent('focus', { composed: true }))); if (active === target) dispatch(target, trusted(new FocusEvent('focusin', { bubbles: true, composed: true }))); }
+      if (target && focused && active === target) { dispatch(target, trusted(new FocusEvent('focus', { view: window, composed: true }))); if (active === target) dispatch(target, trusted(new FocusEvent('focusin', { view: window, bubbles: true, composed: true }))); }
       return true;
     }
     if (name.startsWith('window:')) return dispatch(globalThis, new Event(name.slice(7)));
@@ -4172,7 +4705,7 @@
         if (event.key === ' ' && plain && (tag === 'button' || /^(button|submit|reset|image|checkbox)$/.test(type) || type === 'radio' && !target.checked || tag === 'summary') && !disabled(target)) fireClick(target, { detail: 0 }, true);
         return true;
       }
-      const state = __appsEditing(), mac = navigator.platform.includes('Mac'), primary = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey, lower = event.key.toLowerCase();
+      const state = editingState(), mac = navigator.platform.includes('Mac'), primary = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey, lower = event.key.toLowerCase();
       if (primary && !event.altKey && lower === 'a') { edit('selectAll'); return false; }
       if (state) {
         const start = Math.min(state.start,state.end), end = Math.max(state.start,state.end);
@@ -4183,24 +4716,24 @@
           const word = mac ? event.altKey && !event.metaKey && !event.ctrlKey : event.ctrlKey && !event.altKey && !event.metaKey;
           const line = mac && event.metaKey && !event.ctrlKey && !event.altKey;
           if (word || line || (!event.altKey && !event.metaKey && (!event.ctrlKey || mac))) {
-            const from = start !== end || forward ? start : line ? state.text.lastIndexOf('\n', start - 1) + 1 : textBoundary(state.text,start,false,word);
-            const to = start !== end || backward ? end : line ? (state.text.indexOf('\n',end) < 0 ? state.text.length : state.text.indexOf('\n',end)) : textBoundary(state.text,end,true,word);
-            __appsInput('', from, to, false, null, 'delete' + (line ? 'SoftLine' : word ? 'Word' : 'Content') + (forward ? 'Forward' : 'Backward'));
+            remove(state, forward, line ? 'lineboundary' : word ? 'word' : 'character');
             return false;
           }
         }
         if (event.key === 'Enter' && plain && (tag === 'textarea' || target.isContentEditable)) {
-          __appsInput('\n', start, end, false, null, tag === 'textarea' || event.shiftKey ? 'insertLineBreak' : 'insertParagraph');
+          __appsInput('\n', state.rich ? null : start, state.rich ? null : end, false, null, tag === 'textarea' || event.shiftKey ? 'insertLineBreak' : 'insertParagraph');
           return false;
         }
         if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(event.key)) {
           const word = mac ? event.altKey : event.ctrlKey, documentEdge = mac ? event.metaKey : event.ctrlKey;
-          const right = ['ArrowRight','ArrowDown','End'].includes(event.key), pos = state.end;
+          const right = ['ArrowRight','ArrowDown','End'].includes(event.key), pos = state.end, horizontal = ['ArrowLeft','ArrowRight'].includes(event.key);
+          const unit = documentEdge && !horizontal || mac && ['Home','End'].includes(event.key) ? 'documentboundary' : ['Home','End'].includes(event.key) || mac && event.metaKey && horizontal ? 'lineboundary' : horizontal ? (word ? 'word' : 'character') : 'line';
+          if (!editable(target)) { selection.modify(event.shiftKey ? 'extend' : 'move', right ? 'forward' : 'backward', unit); return false; }
           let next = pos;
-          if ((documentEdge && !['ArrowLeft','ArrowRight'].includes(event.key)) || (mac && ['Home','End'].includes(event.key))) next = right ? state.text.length : 0;
-          else if (['Home','End'].includes(event.key) || (mac && event.metaKey && ['ArrowLeft','ArrowRight'].includes(event.key))) next = right ? (state.text.indexOf('\n',pos) < 0 ? state.text.length : state.text.indexOf('\n',pos)) : pos === 0 ? 0 : state.text.lastIndexOf('\n',pos - 1) + 1;
-          else if (!event.shiftKey && start !== end && ['ArrowLeft','ArrowRight'].includes(event.key)) next = right ? end : start;
-          else if (['ArrowLeft','ArrowRight'].includes(event.key)) next = textBoundary(state.text,pos,right,word);
+          if (unit === 'documentboundary') next = right ? state.text.length : 0;
+          else if (unit === 'lineboundary') next = right ? (state.text.indexOf('\n',pos) < 0 ? state.text.length : state.text.indexOf('\n',pos)) : pos === 0 ? 0 : state.text.lastIndexOf('\n',pos - 1) + 1;
+          else if (!event.shiftKey && start !== end && horizontal) next = right ? end : start;
+          else if (horizontal) next = textBoundary(state.text,pos,right,word);
           else {
             const lineStart = state.text.lastIndexOf('\n',pos - 1) + 1, column = pos - lineStart;
             const lineEnd = state.text.indexOf('\n',pos);
@@ -4208,8 +4741,7 @@
             else { const previousStart = state.text.lastIndexOf('\n',lineStart - 2) + 1; next = lineStart === 0 ? 0 : Math.min(previousStart + column,lineStart - 1); }
           }
           const anchor = event.shiftKey ? state.start : next;
-          if (editable(target)) target.setSelectionRange(Math.min(anchor,next), Math.max(anchor,next), next < anchor ? 'backward' : next > anchor || !mac ? 'forward' : 'none', true);
-          else selection.setBaseAndExtent(...textPoint(target,anchor), ...textPoint(target,next));
+          target.setSelectionRange(Math.min(anchor,next), Math.max(anchor,next), next < anchor ? 'backward' : next > anchor || !mac ? 'forward' : 'none', true);
           return false;
         }
       }

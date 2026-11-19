@@ -31,6 +31,20 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer, { decode }) => {
         this._written = callback;
         try { call('web.tcp.write', this._socket, chunk); } catch (error) { this._written = null; callback(error); }
       };
+      // A backlog goes in writes of about 64 KB, joined just before each write, so it is never copied whole.
+      this._writev = (chunks, callback) => {
+        let at = 0;
+        const next = error => {
+          this._batch = null;
+          if (error || at === chunks.length) { callback(error); return; }
+          const group = [];
+          let size = 0;
+          while (at < chunks.length && (!group.length || size + chunks[at].chunk.length <= 65536)) { size += chunks[at].chunk.length; group.push(chunks[at++].chunk); }
+          this._batch = next;
+          this._write(group.length === 1 ? group[0] : Buffer.concat(group, size), null, next);
+        };
+        next();
+      };
       this._final = callback => { this._finished = callback; if (this._socket === undefined) callback(); else call('web.tcp.end', this._socket); };
       if (options.fd !== undefined) { this._socket = call('web.tcp.open', options.fd); sockets.set(this._socket, this); this.pending = false; }
     }
@@ -49,6 +63,9 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer, { decode }) => {
       return this;
     }
     _destroy(error, callback) {
+      // The callbacks of a batch in flight fail, like the queued writes that destroy() fails.
+      const batch = this._batch;
+      if (batch) { this._batch = null; this._written = null; queueMicrotask(() => batch(error ?? Object.assign(new Error('Cannot call write after a stream was destroyed'), { code: 'ERR_STREAM_DESTROYED' }))); }
       if (this._socket !== undefined) { call('web.tcp.destroy', this._socket); sockets.delete(this._socket); }
       clearTimeout(this._timer); this.connecting = false; this.pending = false;
       this._server?._connections.delete(this);
@@ -215,6 +232,6 @@ globalThis.__appsNet = (call, EventEmitter, streams, Buffer, { decode }) => {
         else if (event.kind === 'close') { if (socket._readableState.ended && !socket.readableEnded && socket.readableFlowing) socket.once('end', () => socket.destroy()); else socket.destroy(); }
       }
     },
-    pending: () => [...sockets.values(), ...servers.values()].some(value => value._referenced),
+    pending: () => { for (const value of sockets.values()) if (value._referenced) return true; for (const value of servers.values()) if (value._referenced) return true; return false; },
   };
 };

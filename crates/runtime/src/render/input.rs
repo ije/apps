@@ -190,6 +190,7 @@ impl renderer::Hooks for FieldText {
                 range: start..end,
                 color: self.selection.0.map(renderer::Color::hex),
                 background: renderer::Color::hex(self.selection.1),
+                stroke: true,
             })
             .into_iter()
             .collect();

@@ -110,6 +110,10 @@ impl Hooks for Transformed {
         true
     }
 
+    fn reach(&self, size: Size<Pixels>, far: Point<Pixels>) -> Point<Pixels> {
+        super::effects::reach(&self.local, &self.style, &self.units, size, far)
+    }
+
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         let matrix = super::effects::transform_at(&self.local, &self.style, &self.units, cx.bounds);
         self.matrix.set(matrix);
@@ -388,7 +392,7 @@ pub(super) struct DomBox {
     pub(super) text: Option<([u32; 2], [f32; 2])>,
     pub(super) placed: Cell<(Rect<Pixels>, Option<super::effects::Matrix>)>,
     // The window bounds and cull flags of the last prepaint, which a skip gives to `merge`.
-    pub(super) reached_at: Cell<(Rect<Pixels>, u16)>,
+    pub(super) reached_at: Cell<(Rect<Pixels>, u32)>,
     pub(super) offset: Cell<Point<Pixels>>,
     pub(super) frame: bool,
     pub(super) text_clip: bool,
@@ -527,7 +531,7 @@ impl DomBox {
         }
     }
 
-    fn reached(&self, window_bounds: Rect<Pixels>, flags: u16) {
+    fn reached(&self, window_bounds: Rect<Pixels>, flags: u32) {
         self.reached_at.set((window_bounds, flags));
         let view = &*self.view;
         let none = [f32::INFINITY, f32::NEG_INFINITY];
@@ -547,7 +551,7 @@ impl DomBox {
     }
 
     // Adds the reach of the box to the box around it.
-    fn merge(&self, reach: [f32; 2], window_bounds: Rect<Pixels>, flags: u16) {
+    fn merge(&self, reach: [f32; 2], window_bounds: Rect<Pixels>, flags: u32) {
         let mut reaching = self.view.reaching.borrow_mut();
         if let Some(([bottom, top], plans)) = reaching.last_mut() {
             *bottom = bottom.min(reach[0]);
@@ -573,6 +577,17 @@ impl Hooks for DomBox {
                 || [Prop::FILTER, Prop::WEBKIT_FILTER]
                     .into_iter()
                     .all(|prop| self.style.get(prop).is_none_or(|value| value == "none")))
+    }
+
+    fn reach(&self, size: Size<Pixels>, far: Point<Pixels>) -> Point<Pixels> {
+        if self.drawn
+            || super::TRANSFORM_PROPS
+                .iter()
+                .all(|&prop| self.style.get(prop).is_none_or(|value| value == "none"))
+        {
+            return far;
+        }
+        super::effects::reach(&self.local, &self.style, &self.units, size, far)
     }
 
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
@@ -1247,7 +1262,7 @@ impl DomBox {
             && host
                 .dom
                 .get(&view.id)
-                .and_then(|dom| dom.computed.as_ref())
+                .and_then(|dom| dom.last_styles())
                 .is_none_or(|styles| styles.blended());
         let needed = outer.transform.is_some()
             || outer.opacity < 1.
@@ -1465,10 +1480,11 @@ pub(super) fn mask_svg<'a>(
                 "contain" => "xMidYMid meet",
                 _ => "none",
             };
-            let [[tw, th], at] = super::effects::tile(size, position, &units, width, height, None);
+            let ([[tw, th], at], steps) =
+                super::effects::tile_repeat(size, position, repeat, &units, width, height, None);
             files.push(path);
             super::effects::tiled(
-                repeat,
+                steps,
                 [tw, th],
                 at,
                 &format!(

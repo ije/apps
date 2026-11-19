@@ -144,7 +144,10 @@ impl TextState {
         } = self;
         let (runs, style) = (self.runs.borrow(), self.style.borrow());
         let (runs, style) = (&*runs, &*style);
-        let line_height = style.line_height;
+        // Like Chrome's layout units, which count device pixels, a line is at most 2^25 device pixels tall.
+        let line_height = style
+            .line_height
+            .min(px(33_554_431. / window.scale_factor().max(1.)));
         let definite = |space: AvailableSpace| match space {
             AvailableSpace::Definite(width) => Some(width),
             _ => None,
@@ -152,6 +155,10 @@ impl TextState {
         let width = known.width.or(definite(available.width));
         let wraps = style.white_space == WhiteSpace::Normal;
         let wrap_width = width.filter(|_| wraps);
+        let indent = match style.text_indent_percent {
+            0. => style.text_indent,
+            percent => style.text_indent + px(width.map_or(0., |width| width.0) * percent),
+        };
         let truncate = style.text_overflow.clone().zip(width);
         let probe = ((wraps || style.float > px(0.)) && width.is_none())
             .then(|| (available.width != AvailableSpace::MinContent) as usize);
@@ -165,6 +172,7 @@ impl TextState {
             }
         } else if let Some(inner) = layout.0.borrow().as_ref()
             && wrap_width == inner.wrap_width
+            && (wraps || style.text_indent_percent == 0.)
             && inner.floats == floats
             && inner.shaped_width != Some(px(0.))
             && truncate.is_none()
@@ -214,7 +222,7 @@ impl TextState {
             float == px(0.)
                 && wrap_width.is_none()
                 && style.line_clamp.is_none()
-                && style.text_indent == px(0.)
+                && indent == px(0.)
                 && {
                     let mut kept = self.base.borrow_mut();
                     let (lines, _) = kept.get_or_insert_with(base);
@@ -231,7 +239,7 @@ impl TextState {
             let lines = match wrap {
                 Some((width, ..))
                     if banded.is_none()
-                        && *first <= width.min(width - style.text_indent)
+                        && *first <= width.min(width - indent)
                         && *rest <= width =>
                 {
                     lines.clone()
@@ -259,11 +267,7 @@ impl TextState {
                             let wrapping = Wrapping {
                                 width: Some(width),
                                 max_lines: clamp.map(|max: usize| max.saturating_sub(wrapped)),
-                                indent: if index == 0 {
-                                    style.text_indent
-                                } else {
-                                    px(0.)
-                                },
+                                indent: if index == 0 { indent } else { px(0.) },
                                 wrap,
                                 word_break,
                             };
@@ -304,7 +308,7 @@ impl TextState {
                     wrap_width
                 },
                 max_lines: style.line_clamp.filter(|_| !min_content),
-                indent: style.text_indent,
+                indent,
                 wrap: if min_content {
                     TextWrap::Wrap
                 } else {
@@ -347,18 +351,16 @@ impl TextState {
         for (index, line) in lines.iter().enumerate() {
             let mut line_size = line.extent(line_height);
             if index == 0 && line.breaks.is_empty() {
-                line_size.width = (line_size.width + style.text_indent).max(px(0.));
+                line_size.width = (line_size.width + indent).max(px(0.));
             }
             size.height += line_size.height;
             size.width = size.width.max(line_size.width);
         }
         if min_content {
-            size.width = widest_piece(&lines, float - top - style.text_indent);
+            size.width = widest_piece(&lines, float - top - indent);
         } else if wrap_width.is_some() && !truncated {
             // Like CSS, a box that fits its content in the available width is never narrower than its widest word.
-            size.width = size
-                .width
-                .max(widest_piece(&lines, float - top - style.text_indent));
+            size.width = size.width.max(widest_piece(&lines, float - top - indent));
         }
         if let Some(banded) = &banded {
             size.height = px(banded.y);
@@ -605,7 +607,7 @@ impl Paragraph {
 
 pub(crate) fn same_shaping(a: &TextStyle, b: &TextStyle) -> bool {
     same!(a, b; font_family, font_features, font_size, line_height, font_weight, font_style,
-        white_space, text_overflow, line_clamp, letter_spacing, word_spacing, text_indent, float, text_wrap, word_break)
+        white_space, text_overflow, line_clamp, letter_spacing, word_spacing, text_indent, text_indent_percent, float, text_wrap, word_break)
 }
 
 fn truncate_text(

@@ -1923,7 +1923,13 @@ impl Walk<'_> {
             shadow: effect.shadow.map(|(offset, sigma, _)| (offset, sigma)),
             transform: effect.transform,
         };
-        if effect.backdrop.is_some() || effect.blend_mode != BlendMode::Normal {
+        // A blend mode or a backdrop color change reads only the pixel below, which the region draws too. A
+        // backdrop blur reads around it.
+        if effect
+            .backdrop
+            .as_ref()
+            .is_some_and(|backdrop| backdrop.blur > 0.25)
+        {
             let reach = window_reach(&self.maps, parent as u32, nested.reach());
             self.reads.push(reach);
         }
