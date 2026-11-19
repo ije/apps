@@ -244,18 +244,28 @@ pub fn library_path(executable: &Path, platform: &str) -> Result<PathBuf> {
     )
 }
 
+// JSC threads outlive every handle, so the library must never unmap. On Linux the runtime also links
+// WebKitGTK, which loads the system JavaScriptCore with the same C++ symbols. Deep binding makes Bun's
+// library resolve its own symbols first, not the system copy's.
+#[cfg(unix)]
+unsafe fn open_library(path: &Path) -> std::result::Result<Library, libloading::Error> {
+    use libloading::os::unix::{Library, RTLD_LOCAL, RTLD_NOW};
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let flags = RTLD_NOW | RTLD_LOCAL | libc::RTLD_NODELETE | libc::RTLD_DEEPBIND;
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let flags = RTLD_NOW | RTLD_LOCAL | libc::RTLD_NODELETE;
+    unsafe { Library::open(Some(path), flags) }.map(Into::into)
+}
+
+#[cfg(not(unix))]
+unsafe fn open_library(path: &Path) -> std::result::Result<Library, libloading::Error> {
+    unsafe { Library::new(path) }
+}
+
 impl JavaScriptCore {
     pub fn load() -> Result<Rc<Self>> {
         let path = library_path(&std::env::current_exe()?, std::env::consts::OS)?;
-        // WebKitGTK also loads JSC. Its symbols must not replace this library's functions or globals.
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        let library = unsafe {
-            libloading::os::unix::Library::open(Some(&path), libc::RTLD_NOW | libc::RTLD_DEEPBIND)
-                .map(Library::from)
-        };
-        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-        let library = unsafe { Library::new(&path) };
-        let library = library
+        let library = unsafe { open_library(&path) }
             .with_context(|| format!("Cannot load Bun JavaScriptCore from {}", path.display()))?;
         let image = path.with_file_name("../Resources/app.dylib");
         unsafe {

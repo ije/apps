@@ -393,7 +393,7 @@ impl State {
         let args = &request["args"];
         let value = match op {
             "info" => {
-                json!({"suffix": if cfg!(windows) { "dll" } else if cfg!(target_os = "macos") { "dylib" } else { "so" }, "littleEndian": cfg!(target_endian = "little"), "pointerSize": size_of::<usize>(), "signedChar": c_char::MIN < 0})
+                json!({"suffix": if cfg!(windows) { "dll" } else if cfg!(target_os = "macos") { "dylib" } else { "so" }, "littleEndian": cfg!(target_endian = "little"), "pointerSize": size_of::<usize>(), "signedChar": i64::from(c_char::MIN) < 0})
             }
             "open" => {
                 let handle = if args[0].is_null() {

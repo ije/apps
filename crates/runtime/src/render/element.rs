@@ -8800,7 +8800,7 @@ pub(super) fn file_size(
     ]
 }
 
-fn layout_ceil(size: f32, pixel_ratio: f32) -> f32 {
+pub(super) fn layout_ceil(size: f32, pixel_ratio: f32) -> f32 {
     (size * pixel_ratio * 64.).ceil() / 64. / pixel_ratio
 }
 

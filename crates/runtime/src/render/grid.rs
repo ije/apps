@@ -566,6 +566,14 @@ fn size(
     base
 }
 
+// The renderer ceils each measured leaf to layout units, so sums of leaves must use the same widths.
+fn leaf_ceil(width: f32, pixel_ratio: f32) -> f32 {
+    match pixel_ratio > 0. {
+        true => super::element::layout_ceil(width, pixel_ratio),
+        false => width,
+    }
+}
+
 pub(crate) fn intrinsic(
     doc: &Document,
     id: usize,
@@ -805,10 +813,12 @@ pub(crate) fn intrinsic(
                 .line
                 .width,
         );
-        content = [width, width, units.font.lh];
+        let ceiled = leaf_ceil(width, measured.pixel_ratio);
+        content = [ceiled, ceiled, units.font.lh];
         if node.native_control(style).is_some() {
             let [padding, height] = super::native::size(renderer::ControlKind::Button);
-            content = [width + padding, width + padding, height];
+            let ceiled = leaf_ceil(width + padding, measured.pixel_ratio);
+            content = [ceiled, ceiled, height];
         }
     } else if let Some((source, mut runs, atoms, heights, mixed, pseudos)) = match alt {
         Some(alt) => Some((
@@ -993,9 +1003,10 @@ pub(crate) fn intrinsic(
         if !wrap {
             content[0] = content[1] - float;
         }
+        let ceil = |width: f32| leaf_ceil(width, measured.pixel_ratio);
         content = [
-            content[0].max(float),
-            content[1] + top,
+            ceil(content[0].max(float)),
+            ceil(content[1] + top),
             (content[2] + top).max(float),
         ];
     } else if matches!(display, "grid" | "inline-grid")

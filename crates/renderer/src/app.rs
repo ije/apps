@@ -34,12 +34,27 @@ struct Home {
     backlog: RefCell<VecDeque<Job>>,
 }
 
+struct Slot(RefCell<Option<Rc<Home>>>);
+
+// Runs only when the process exits inside the loop, like `process::exit()`. GPU objects can't drop then,
+// because their destructors use thread locals that are already gone, so the app is leaked.
+impl Drop for Slot {
+    fn drop(&mut self) {
+        std::mem::forget(self.0.get_mut().take());
+    }
+}
+
 thread_local! {
-    static HOME: RefCell<Option<Rc<Home>>> = const { RefCell::new(None) };
+    static HOME: Slot = const { Slot(RefCell::new(None)) };
+}
+
+fn set_home(home: Option<Rc<Home>>) {
+    let old = HOME.with(|slot| slot.0.replace(home));
+    drop(old);
 }
 
 fn home() -> Option<Rc<Home>> {
-    HOME.with_borrow(Option::clone)
+    HOME.with(|slot| slot.0.borrow().clone())
 }
 
 impl Home {
@@ -92,7 +107,7 @@ fn install(platform: Rc<platform::Platform>) {
         app: RefCell::new(app),
         backlog: RefCell::default(),
     };
-    HOME.with_borrow_mut(|slot| *slot = Some(Rc::new(home)));
+    set_home(Some(Rc::new(home)));
 }
 
 pub const THREAD_PER_APP: bool = cfg!(target_os = "macos");
@@ -106,7 +121,7 @@ pub fn spawn(init: impl FnOnce(&mut App) + Send + 'static) {
             update(init);
         },
         // Drop windows before thread-local teardown: their destructors need other thread locals.
-        || HOME.with_borrow_mut(|slot| *slot = None),
+        || set_home(None),
     );
 }
 
@@ -119,7 +134,7 @@ pub fn run(native: impl FnOnce() + 'static) {
     // Close native views before the app: their callbacks can still access it.
     let windows = home().map(|home| std::mem::take(&mut home.app.borrow_mut().windows));
     drop(windows);
-    HOME.with_borrow_mut(|slot| *slot = None);
+    set_home(None);
 }
 
 /// Wakes that arrive before the app runs merge into one.

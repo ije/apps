@@ -625,6 +625,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn classic_mac_faces_get_taller_line_boxes() {
         let text = TextSystem::new();
         for (family, tall) in [

@@ -240,6 +240,8 @@ impl Shelf {
         );
         if let Some(laid) = lines.first() {
             let pen = line.width;
+            let first = line.glyphs.len();
+            let mut places = Vec::new();
             for glyph in &laid.glyphs {
                 // A variation selector that no font joined to its base can't be drawn.
                 if piece[glyph.start..glyph.end]
@@ -262,6 +264,7 @@ impl Shelf {
                 }) else {
                     continue;
                 };
+                places.push(glyph.x);
                 line.glyphs.push(Glyph {
                     x: pen + px(glyph.x + glyph.font_size * glyph.x_offset),
                     y: px(glyph.y - glyph.font_size * glyph.y_offset),
@@ -271,6 +274,14 @@ impl Shelf {
                     id: glyph.glyph_id,
                     emoji: self.faces[font as usize].color,
                 });
+            }
+            // cosmic-text gives right-to-left runs in text order. Lines keep glyphs in visual order, as CoreText
+            // does, because wrapping and hit testing walk them by x.
+            if !places.is_sorted() {
+                let mut order: Vec<usize> = (0..places.len()).collect();
+                order.sort_by(|&a, &b| places[a].total_cmp(&places[b]));
+                let shaped = line.glyphs.split_off(first);
+                line.glyphs.extend(order.into_iter().map(|at| shaped[at]));
             }
             line.width += px(laid.w);
         }
