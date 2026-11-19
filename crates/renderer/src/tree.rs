@@ -301,6 +301,9 @@ pub struct Tree {
     floated: bool,
     // Floats wait to paint after the blocks of their formatting context, like in CSS.
     deferred: Vec<u32>,
+    // The masks of the boxes that paint now. An outline takes the mask of its box in this paint: the mask of
+    // prepaint has no effect layers, whose content paints unclipped.
+    masks: Vec<Clip<Pixels>>,
     // Whether the boxes that `keep` visits stay where they were, and allow a skip.
     still: bool,
     skips: bool,
@@ -875,11 +878,14 @@ impl Tree {
         if !window.redraws() {
             // The boxes inside a box that a scroll moved keep their old places.
             let mut stale = vec![false; self.slots.len()];
+            // The z-index lists of a moved box, and of the boxes inside it, are old too. Paint copies such a box.
+            let mut lagged = vec![false; self.slots.len()];
             let mut pending = vec![(index_of(root), false)];
             while let Some((index, inside)) = pending.pop() {
                 let slot = &self.slots[index as usize];
                 stale[index as usize] = inside;
                 let inside = inside || slot.lag != Point::default();
+                lagged[index as usize] = inside;
                 pending.extend(slot.children.iter().map(|&child| (index_of(child), inside)));
             }
             let boxes = |tree: &Tree| {
@@ -947,12 +953,22 @@ impl Tree {
                     full.2[at].1.bounds
                 ))
             );
-            assert!(
-                kept.3 == full.3,
-                "kept layers differ: {:?} {:?}",
-                kept.3,
-                full.3
-            );
+            let lists = (kept.3.iter())
+                .filter(|(at, list)| {
+                    !lagged.get(**at as usize).copied().unwrap_or(false)
+                        && full.3.get(at) != Some(list)
+                })
+                .map(|(at, list)| (at, Some(list), full.3.get(at)))
+                .chain(
+                    (full.3.iter())
+                        .filter(|(at, _)| {
+                            !lagged.get(**at as usize).copied().unwrap_or(false)
+                                && !kept.3.contains_key(at)
+                        })
+                        .map(|(at, list)| (at, None, Some(list))),
+                )
+                .collect::<Vec<_>>();
+            assert!(lists.is_empty(), "kept layers differ: {lists:?}");
         }
     }
 
@@ -1495,7 +1511,8 @@ impl Tree {
                 }
                 self.calm(index);
                 let slot = &mut self.slots[index as usize];
-                slot.painted = slot.bounds;
+                // Paint places the box where its hooks moved it, like a translate, so the scroll moves that place.
+                slot.painted.origin += by;
                 slot.reach = (slot.reach).map(|reach| Rect::new(reach.origin + by, reach.size));
                 if let Some(region) = &mut slot.region {
                     region.bounds.origin += by;
@@ -1802,7 +1819,10 @@ impl Tree {
 
     fn paint_box_node(&mut self, index: u32, listed: bool, window: &mut Window) {
         let slot = &self.slots[index as usize];
-        let escaped = slot.escaped;
+        let escaped = match slot.style.escape == Escape::OUTLINE {
+            true => self.masks.last().copied().or(slot.escaped),
+            false => slot.escaped,
+        };
         // A layers node paints the z-indexed boxes of its stacking context, whose reach holds them.
         if slot.listed != listed
             || self.unbounded == 0
@@ -1843,8 +1863,11 @@ impl Tree {
                 {
                     Some((chunk, Some((at - chunk.at, chunk.mask, mask))))
                 }
+                // A span that drew nothing can't show that the box draws nothing in its new place.
                 Some(area)
-                    if chunk.key.same_paint(&key) && window.movable(area, at - chunk.at, mask) =>
+                    if !area.is_empty()
+                        && chunk.key.same_paint(&key)
+                        && window.movable(area, at - chunk.at, mask) =>
                 {
                     Some((chunk, Some((at - chunk.at, chunk.mask, mask))))
                 }
@@ -1899,12 +1922,14 @@ impl Tree {
         let unbounded = slot.hooks.as_ref().is_some_and(|hooks| !hooks.bounded());
         self.unbounded += u32::from(unbounded);
         let smoothing = mem::replace(&mut window.font_smoothing, slot.text.font_smoothing);
+        self.masks.push(mask);
         self.visit(
             index,
             window,
             |hooks, cx, inner| hooks.paint(cx, inner),
             |tree, style, window| tree.paint_box(index, style, window),
         );
+        self.masks.pop();
         self.unbounded -= u32::from(unbounded);
         window.font_smoothing = smoothing;
         if escaped.is_some() {
@@ -1921,7 +1946,8 @@ impl Tree {
             let last = window.span_records(&chunk.span, true, moved);
             assert!(
                 now.as_ref().is_some_and(|now| same_records(now, &last)),
-                "box {index} would draw a copy that differs from its paint: {:?}",
+                "box {index} would draw a copy moved by {:?} that differs from its paint: {:?}",
+                moved.map(|(by, ..)| by),
                 now.map(|now| (now.iter().zip(&last))
                     .find(|(now, last)| now != last)
                     .map_or_else(

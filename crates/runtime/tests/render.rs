@@ -935,6 +935,32 @@ fn nested_scrolls_copy_their_content_when_an_outer_scroll_moves_them() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn scrolled_copies_follow_offsets_outlines_and_moving_interest_areas() {
+    // Debug builds check each copied paint and kept prepaint against a fresh one.
+    run_hidden(
+        r#"
+        await load('copies.html');
+        for (let index = 0; index < 120; index++) {
+            await run('scrollBy(0, 7)');
+            await win.webContents.capturePage();
+        }
+        "#,
+        &[(
+            "copies.html",
+            "<body style='margin:0;height:4000px'><style>\
+             .b{width:180px;height:40px;margin:8px;background:#9cf;box-shadow:0 2px 6px #0006}\
+             </style><div style='filter:drop-shadow(0 0 1px red);position:relative;z-index:1'>\
+             <div class=b style='outline:2px solid #333'></div>\
+             <div class=b style='position:absolute;left:200px;top:0;transform:translate(30px,5px)'></div>\
+             <div class=b style='position:relative;z-index:2'></div></div>\
+             <div style='height:900px'></div><input style='width:180px;height:30px;border:2px solid #333'>\
+             <div style='filter:opacity(.9)'><div class=b style='outline:2px solid #333'></div></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn text_draws_its_selection_in_the_frame_a_popover_leaves() {
     run_hidden(
         r#"
