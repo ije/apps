@@ -1135,6 +1135,7 @@ impl Renderer {
             false => Vec::new(),
         };
         frame.fresh = srgb.is_some();
+        frame.keeps_under = true;
         self.pool.spare(&mut frame.spare);
         frame.record(scene, window, MAX_TEXTURE_SIZE, true);
         let device = &self.device;
@@ -2251,16 +2252,22 @@ mod tests {
         };
         use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
         let (send, receive) = std::sync::mpsc::channel();
-        // Scroll offsets in device pixels. A part of a pixel can't be copied, and a change inside the content draws it.
-        let steps: [(f32, bool); 8] = [
-            (0., false),
-            (6., false),
-            (12., false),
-            (30., false),
-            (30.5, false),
-            (40., false),
-            (52., true),
-            (46., false),
+        // Scroll offsets in device pixels, and a change: 1 and 2 recolor a row (2 one under the bar), 3 the bar. A
+        // part of a pixel can't be copied, and a change inside the content draws it.
+        let steps: [(f32, u8); 13] = [
+            (0., 0),
+            (6., 0),
+            (12., 0),
+            (30., 0),
+            (30.5, 0),
+            (40., 0),
+            (52., 1),
+            (46., 0),
+            (20., 0),
+            (20., 2),
+            (14., 0),
+            (14., 3),
+            (8., 0),
         ];
         let job = move || {
             let size = objc2_core_foundation::CGSize::new(200., 120.);
@@ -2304,7 +2311,7 @@ mod tests {
                     let y = 14. + 22. * row as f32 - offset;
                     let shade = row as f32 / 12.;
                     let color = match (changed, row) {
-                        (true, 4) => [0.9, 0.1, 0.1, 1.],
+                        (1, 4) | (2, 1) => [0.9, 0.1, 0.1, 1.],
                         _ => [shade, 0.4, 1. - shade, 1.],
                     };
                     scene.push(quad([20., y, 120., 16.], viewport, color));
@@ -2314,13 +2321,26 @@ mod tests {
                         [0.2, 0.2, 0.2, 0.5],
                     ));
                 }
+                // A bar that stays over the top of the viewport, painted inside it as a fixed box is.
+                let bar = match changed {
+                    3 => [0.6, 0.2, 0.5, 0.7],
+                    _ => [0.1, 0.5, 0.3, 0.8],
+                };
+                scene.pause_cuts(0);
+                scene.push(quad([0., 0., 200., 24.], window, bar));
+                scene.resume_cuts(0);
+                // Content after the bar, as a scroll bar is.
+                scene.push(quad(
+                    [184., 60. - offset, 6., 40.],
+                    viewport,
+                    [0.3, 0.3, 0.3, 0.6],
+                ));
                 scene.end_scroll();
-                // A bar that stays over the top of the viewport.
-                scene.push(quad([0., 0., 200., 24.], window, [0.1, 0.5, 0.3, 0.8]));
                 scene.diff(Some(&[]));
                 let shifted = scene.shift;
                 renderer.draw(&scene, false);
                 scene.drawn();
+                let kept = renderer.frame.keeps_under_now();
                 let area: i32 = renderer
                     .frame
                     .damage
@@ -2329,16 +2349,22 @@ mod tests {
                     .sum();
                 let pixels = read(&renderer);
                 let (_, full) = reference.draw(&scene, true).unwrap().unwrap();
-                send.send((offset, shifted, area, pixels == full)).unwrap();
+                send.send((offset, shifted, area, pixels == full, kept))
+                    .unwrap();
             }
             super::super::threads::end_thread();
         };
         super::super::threads::spawn_render(job, || {});
         let mut last = 0.;
-        for (offset, changed) in steps {
-            let (got, shifted, area, same) = receive.recv().unwrap();
+        for (at, (offset, changed)) in steps.into_iter().enumerate() {
+            let (got, shifted, area, same, kept) = receive.recv().unwrap();
             assert_eq!(got, offset);
-            assert!(same, "offset {offset}: the frame matches a full frame");
+            assert!(
+                same,
+                "offset {offset}, change {changed}: the frame matches a full frame"
+            );
+            // The first scroll keeps the window below the bar, and later frames keep it up to date.
+            assert_eq!(kept, at > 0, "offset {offset}, change {changed}");
             let by = offset - last;
             let copies = by != 0. && by.fract() == 0. && last.fract() == 0.;
             assert_eq!(
@@ -2346,7 +2372,7 @@ mod tests {
                 copies.then_some([0, by as i32]),
                 "offset {offset}"
             );
-            if copies && !changed {
+            if copies && changed == 0 {
                 // The edge, and the bar where it is and where the copy put it.
                 assert!(
                     area <= 200 * (24 + 2) * 2 + 182 * (by.abs() as i32 + 2),

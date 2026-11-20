@@ -29,7 +29,7 @@ pub struct Scene {
     // Digests whose cached pixels are wrong, since an atlas tile that they read has new pixels.
     pub(crate) stale: Vec<u64>,
     // Layers that read the pixels below them, in window pixels.
-    pub(crate) reads: Vec<Rect<f32>>,
+    pub(crate) reads: Vec<(Rect<f32>, u32)>,
     // Atlas tiles removed since the last paint: (color page, page, texels). A span of `last` that reads one
     // can't be copied, but its box can paint again while other boxes copy theirs.
     pub(crate) removed: Vec<(bool, u32, Rect<i32>)>,
@@ -50,8 +50,10 @@ pub struct Scene {
     scrolls: Vec<Scroll>,
     last_scrolls: Vec<Scroll>,
     prior_scrolls: Vec<Scroll>,
-    // Open scrolls of the paint, or `usize::MAX` for one outside the window layer.
+    // Open scrolls of the paint, or `usize::MAX` for one outside the window layer or paused.
     open: Vec<usize>,
+    // For each `pause_cuts`, the open scrolls that it ended: (depth, scroll).
+    held: Vec<Vec<(usize, usize)>>,
     cuts: Vec<Cut>,
     last_cuts: Vec<Cut>,
     // Open cuts of the paint, or `usize::MAX` for a scroll without one.
@@ -63,6 +65,32 @@ pub struct Scene {
     // The window region that shows a scroll container, and how far its content moved since the drawn frame, in
     // device pixels: the backend copies the last frame moved by it there and draws only `damage`.
     pub(crate) shift: Option<Shift>,
+    // The window below what paints after the content of a scroll, when something there covers its viewport.
+    pub(crate) under: Option<Under>,
+    // The scroll of `under`, kept while frames don't move it, and the split of the last diff.
+    under_scroll: Option<u64>,
+    under_split: Option<[u32; 2]>,
+}
+
+// The items of the window layer up to the end of a scroll's content, which a backend can keep drawn across frames, so
+// a scroll draws again only what changed in them, and the items after them over it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Under {
+    pub scroll: u64,
+    // Where the items after the content start: an instance index and a nested layer index.
+    pub split: [u32; 2],
+    // What changed below the items after the content, within `damage`.
+    pub damage: Damage,
+}
+
+impl Under {
+    // Whether a top item of the window layer (an instance, or NESTED with a nested index) paints after the split.
+    pub fn after(split: [u32; 2], top: u32) -> bool {
+        match top & NESTED {
+            0 => top >= split[0],
+            _ => top & !NESTED >= split[1],
+        }
+    }
 }
 
 // A viewport region in device pixels, and how far its content moved.
@@ -154,9 +182,11 @@ struct Entry {
     item: u32,
     // The innermost scroll that holds the entry, plus one, or 0.
     scroll: u32,
+    // The item of the window layer that holds the entry, as `item`.
+    top: u32,
 }
 
-const NESTED: u32 = 1 << 31;
+pub(crate) const NESTED: u32 = 1 << 31;
 
 // How a nested layer shows its pixels in its parent.
 #[derive(Clone, Copy, Default)]
@@ -439,6 +469,7 @@ impl Default for Scene {
             last_scrolls: Vec::new(),
             prior_scrolls: Vec::new(),
             open: Vec::new(),
+            held: Vec::new(),
             cuts: Vec::new(),
             last_cuts: Vec::new(),
             cutting: Vec::new(),
@@ -446,6 +477,9 @@ impl Default for Scene {
             baked: false,
             owners: Default::default(),
             shift: None,
+            under: None,
+            under_scroll: None,
+            under_split: None,
         }
     }
 }
@@ -472,8 +506,10 @@ impl Scene {
         self.damage.clear();
         self.damage.whole = true;
         self.shift = None;
+        self.under = None;
         self.diffed = Some(false);
         self.open.clear();
+        self.held.clear();
         self.cutting.clear();
         // A painted scene stays as the source of the next paint's spans.
         if let Some(pass) = self.pass.take() {
@@ -541,8 +577,19 @@ impl Scene {
         });
     }
 
-    // Ends the open cuts after the first `depth` scrolls, for content that escapes their viewports.
+    // Ends the open cuts after the first `depth` scrolls, for content that escapes their viewports. Their scrolls end
+    // too, so the content doesn't move with them.
     pub(crate) fn pause_cuts(&mut self, depth: usize) {
+        let (window, mut held) = (&self.layers[0], Vec::new());
+        for at in depth..self.open.len() {
+            let scroll = mem::replace(&mut self.open[at], usize::MAX);
+            if scroll != usize::MAX {
+                self.scrolls[scroll].instances[1] = window.instances.len() as u32;
+                self.scrolls[scroll].nested[1] = window.nested.len() as u32;
+                held.push((at, scroll));
+            }
+        }
+        self.held.push(held);
         for at in depth..self.cutting.len() {
             if let Some(cut) = self.cuts.get_mut(self.cutting[at]) {
                 let layer = &self.layers[cut.layer as usize];
@@ -552,8 +599,21 @@ impl Scene {
         }
     }
 
-    // Starts the cuts that `pause_cuts` ended again.
+    // Starts the cuts that `pause_cuts` ended again, and the scrolls in a new part with the same id.
     pub(crate) fn resume_cuts(&mut self, depth: usize) {
+        let window = &self.layers[0];
+        for (at, scroll) in self.held.pop().unwrap_or_default() {
+            let parent = (self.open[..at].iter().rev())
+                .find(|&&outer| outer != usize::MAX)
+                .map_or(u32::MAX, |&outer| outer as u32);
+            self.open[at] = self.scrolls.len();
+            self.scrolls.push(Scroll {
+                instances: [window.instances.len() as u32, u32::MAX],
+                nested: [window.nested.len() as u32, u32::MAX],
+                parent,
+                ..self.scrolls[scroll]
+            });
+        }
         for at in depth..self.cutting.len() {
             if let Some(&cut) = self.cuts.get(self.cutting[at]) {
                 let layer = &self.layers[cut.layer as usize];
@@ -1390,7 +1450,7 @@ impl Scene {
         walk.maps.resize(self.layers.len(), Map::default());
         walk.digests.clear();
         walk.digests.resize(self.layers.len(), 0);
-        walk.layer(0, 0, None);
+        walk.layer(0, 0, None, 0);
         (
             self.entries,
             self.maps,
@@ -1426,10 +1486,11 @@ impl Scene {
         }
         // The backend can copy the last frame moved when one scroll and the scrolls inside it moved together, by whole
         // device pixels, in a viewport that stayed and has square corners.
+        // A scroll can have several parts, around content that escapes it.
         let within = |scrolls: &[Scroll], inner: usize, outer: usize| {
             let mut at = inner as u32;
             while at != u32::MAX {
-                if at as usize == outer {
+                if scrolls[at as usize].id == scrolls[outer].id {
                     return true;
                 }
                 at = scrolls[at as usize].parent;
@@ -1458,10 +1519,52 @@ impl Scene {
                 && by.x.abs() < bounds.size.width
                 && by.y.abs() < bounds.size.height
         });
+        // The scroll whose content the backend can keep below what paints after it, and where the items after it
+        // start in this scene and in the drawn one.
+        let kept = copy.map(|(at, prior, _)| (at, prior)).or_else(|| {
+            let id = self.under_scroll?;
+            let at = self.scrolls.iter().position(|scroll| scroll.id == id)?;
+            let prior = (self.prior_scrolls.iter()).position(|scroll| scroll.id == id)?;
+            Some((at, prior))
+        });
+        // Where the items over the viewport start: the first item of the window layer after the start of the scroll
+        // that isn't its content and reaches into the viewport. The items after it draw over the kept window, also
+        // content of the scroll, like its scroll bar.
+        let split = kept.and_then(|(at, _)| {
+            let scroll = &self.scrolls[at];
+            let window = &self.layers[0];
+            let top = (self.entries.iter())
+                .filter(|entry| {
+                    !(entry.scroll != 0 && within(&self.scrolls, entry.scroll as usize - 1, at))
+                        && Under::after([scroll.instances[0], scroll.nested[0]], entry.top)
+                        && (window_reach(&self.maps, entry.layer, entry.reach))
+                            .intersects(scroll.viewport.bounds)
+                })
+                .map(|entry| entry.top)
+                .min_by_key(|&top| match top & NESTED {
+                    0 => (top, 1),
+                    _ => (window.nested[(top & !NESTED) as usize].at, 0),
+                })?;
+            Some(match top & NESTED {
+                0 => [
+                    top,
+                    window.nested.partition_point(|nested| nested.at <= top) as u32,
+                ],
+                _ => [window.nested[(top & !NESTED) as usize].at, top & !NESTED],
+            })
+        });
+        let splits = split.map(|split| (split, self.under_split));
+        let after_new = |top| splits.is_some_and(|(new, _)| Under::after(new, top));
+        // Without the split of the drawn scene, all of the kept window draws again.
+        let after_old =
+            |top| splits.is_some_and(|(_, old)| old.is_some_and(|old| Under::after(old, top)));
+        let mut under = damage.clone();
         if copy.is_none() {
             for &(at, prior, _) in &moved {
-                damage.add(self.scrolls[at].viewport.bounds);
-                damage.add(self.prior_scrolls[prior].viewport.bounds);
+                for damage in [&mut damage, &mut under] {
+                    damage.add(self.scrolls[at].viewport.bounds);
+                    damage.add(self.prior_scrolls[prior].viewport.bounds);
+                }
             }
         }
         // Content of the copied scroll moved by `-by` in the window. Everything else that the viewport shows moved with
@@ -1482,6 +1585,7 @@ impl Scene {
             let patched = damage.rects.clone();
             for rect in patched {
                 copied(&mut damage, rect);
+                copied(&mut under, rect);
             }
             // The edges that the copy has no pixels for.
             let [x, y, width, height] = [
@@ -1490,36 +1594,48 @@ impl Scene {
                 viewport.size.width,
                 viewport.size.height,
             ];
-            if by.y > 0. {
-                damage.add(Rect::new(
-                    point(x, y + height - by.y),
-                    Size::new(width, by.y),
-                ));
-            } else if by.y < 0. {
-                damage.add(Rect::new(point(x, y), Size::new(width, -by.y)));
-            }
-            if by.x > 0. {
-                damage.add(Rect::new(
-                    point(x + width - by.x, y),
-                    Size::new(by.x, height),
-                ));
-            } else if by.x < 0. {
-                damage.add(Rect::new(point(x, y), Size::new(-by.x, height)));
+            let edges = [
+                (by.y > 0.).then(|| Rect::new(point(x, y + height - by.y), Size::new(width, by.y))),
+                (by.y < 0.).then(|| Rect::new(point(x, y), Size::new(width, -by.y))),
+                (by.x > 0.).then(|| Rect::new(point(x + width - by.x, y), Size::new(by.x, height))),
+                (by.x < 0.).then(|| Rect::new(point(x, y), Size::new(-by.x, height))),
+            ];
+            for edge in edges.into_iter().flatten() {
+                damage.add(edge);
+                under.add(edge);
             }
         }
-        let added = |damage: &mut Damage, entries: &[Entry], maps: &[Map], at: usize| {
+        let added = |damage: &mut Damage,
+                     under: &mut Damage,
+                     entries: &[Entry],
+                     maps: &[Map],
+                     at: usize| {
             let entry = &entries[at];
-            damage.add(window_reach(maps, entry.layer, entry.reach));
+            let reach = window_reach(maps, entry.layer, entry.reach);
+            damage.add(reach);
+            if !after_new(entry.top) {
+                under.add(reach);
+            }
         };
-        let removed = |damage: &mut Damage, entries: &[Entry], maps: &[Map], at: usize| {
+        let removed = |damage: &mut Damage,
+                       under: &mut Damage,
+                       entries: &[Entry],
+                       maps: &[Map],
+                       at: usize| {
             let entry = &entries[at];
             let reach = window_reach(maps, entry.layer, entry.reach);
             let inside = entry.scroll != 0 && inside_old[entry.scroll as usize - 1];
-            if !inside {
-                damage.add(reach);
-            }
-            if copy.is_some() {
-                copied(damage, reach);
+            let after = after_old(entry.top);
+            for damage in [Some(&mut *damage), (!after).then_some(&mut *under)]
+                .into_iter()
+                .flatten()
+            {
+                if !inside {
+                    damage.add(reach);
+                }
+                if copy.is_some() {
+                    copied(damage, reach);
+                }
             }
         };
         let (old, new) = (&self.prior, &self.entries);
@@ -1558,11 +1674,11 @@ impl Scene {
                 .zip(old.get(next))
                 .is_some_and(|(new, old)| new.hash == old.hash);
             if found == u32::MAX || (found as usize) < next || inserted {
-                added(&mut damage, new, &self.maps, at);
+                added(&mut damage, &mut under, new, &self.maps, at);
                 continue;
             }
             for skipped in next..found as usize {
-                removed(&mut damage, old, &self.prior_maps, skipped);
+                removed(&mut damage, &mut under, old, &self.prior_maps, skipped);
             }
             next = found as usize + 1;
         }
@@ -1570,7 +1686,7 @@ impl Scene {
             if damage.whole {
                 break;
             }
-            removed(&mut damage, old, &self.prior_maps, skipped);
+            removed(&mut damage, &mut under, old, &self.prior_maps, skipped);
         }
         // What the viewport shows outside the copied scroll moved with the copy, unless it is one color all over.
         if copy.is_some() {
@@ -1597,8 +1713,16 @@ impl Scene {
                 }
                 damage.add(reach.intersect(viewport));
                 copied(&mut damage, reach);
+                if !after_new(entry.top) {
+                    under.add(reach.intersect(viewport));
+                    copied(&mut under, reach);
+                }
             }
         }
+        // A scroll without anything over its viewport needs no kept window below.
+        self.under_scroll = kept
+            .filter(|_| split.is_some())
+            .map(|(at, _)| self.scrolls[at].id);
         self.shift = (copy.is_some() && !damage.whole).then(|| {
             let region = [
                 viewport.origin.x,
@@ -1618,6 +1742,7 @@ impl Scene {
             self.stale.extend_from_slice(&self.digests);
             self.damage = damage;
             self.shift = None;
+            self.under = None;
             return;
         };
         if !fresh.is_empty() {
@@ -1641,7 +1766,11 @@ impl Scene {
                 }) {
                     continue;
                 }
-                damage.add(window_reach(&self.maps, entry.layer, entry.reach));
+                let reach = window_reach(&self.maps, entry.layer, entry.reach);
+                damage.add(reach);
+                if !after_new(entry.top) {
+                    under.add(reach);
+                }
                 let mut layer = entry.layer;
                 while layer != 0 {
                     self.stale.push(self.digests[layer as usize]);
@@ -1652,6 +1781,13 @@ impl Scene {
         if damage.whole {
             self.shift = None;
         }
+        under.whole |= damage.whole || splits.is_some_and(|(_, old)| old.is_none());
+        self.under_split = split;
+        self.under = (self.under_scroll.zip(split)).map(|(scroll, split)| Under {
+            scroll,
+            split,
+            damage: under,
+        });
         self.damage = damage;
     }
 
@@ -1719,13 +1855,13 @@ struct Walk<'a> {
     entries: Vec<Entry>,
     maps: Vec<Map>,
     digests: Vec<u64>,
-    reads: Vec<Rect<f32>>,
+    reads: Vec<(Rect<f32>, u32)>,
 }
 
 impl Walk<'_> {
     // Lists the entries of a layer and returns its digest. `context` stands for the layers around it, and `scroll`
     // holds a nested layer in a scroll.
-    fn layer(&mut self, layer: usize, context: u64, scroll: Option<usize>) -> u64 {
+    fn layer(&mut self, layer: usize, context: u64, scroll: Option<usize>, top: u32) -> u64 {
         let content = &self.layers[layer];
         let origin = match layer {
             0 => Point::default(),
@@ -1738,7 +1874,15 @@ impl Walk<'_> {
         for (at, instance) in content.instances.iter().enumerate() {
             while let Some((index, inner)) = nested.next_if(|(_, inner)| inner.at as usize <= at) {
                 let scroll = self.find(layer, index, true).or(scroll);
-                digest = mix(digest, self.nested(layer, origin, inner, context, scroll));
+                let top = if layer == 0 {
+                    index as u32 | NESTED
+                } else {
+                    top
+                };
+                digest = mix(
+                    digest,
+                    self.nested(layer, origin, inner, context, scroll, top),
+                );
             }
             // A scroll viewport cut it away, so it draws nothing.
             if instance.reach().is_empty() {
@@ -1772,11 +1916,20 @@ impl Walk<'_> {
                 layer: layer as u32,
                 item: at as u32,
                 scroll: scroll.map_or(0, |at| at as u32 + 1),
+                top: if layer == 0 { at as u32 } else { top },
             });
         }
         for (index, inner) in nested {
             let scroll = self.find(layer, index, true).or(scroll);
-            digest = mix(digest, self.nested(layer, origin, inner, context, scroll));
+            let top = if layer == 0 {
+                index as u32 | NESTED
+            } else {
+                top
+            };
+            digest = mix(
+                digest,
+                self.nested(layer, origin, inner, context, scroll, top),
+            );
         }
         self.digests[layer] = digest;
         digest
@@ -1799,6 +1952,7 @@ impl Walk<'_> {
         nested: &Nested,
         context: u64,
         scroll: Option<usize>,
+        top: u32,
     ) -> u64 {
         let layers = self.layers;
         let Some(effect) = &layers[nested.layer].effect else {
@@ -1953,6 +2107,7 @@ impl Walk<'_> {
             layer: parent as u32,
             item: nested.layer as u32 | NESTED,
             scroll: scroll.map_or(0, |at| at as u32 + 1),
+            top,
         });
         self.maps[nested.layer] = Map {
             parent: parent as u32,
@@ -1969,13 +2124,13 @@ impl Walk<'_> {
             .is_some_and(|backdrop| backdrop.blur > 0.25)
         {
             let reach = window_reach(&self.maps, parent as u32, nested.reach());
-            self.reads.push(reach);
+            self.reads.push((reach, top));
         }
         let inner = origin(&layers[nested.layer]);
         let offset = place(point(inner.x - base.x, inner.y - base.y));
         mix(
             mix(own, offset),
-            self.layer(nested.layer, mix(inner_context, context), scroll),
+            self.layer(nested.layer, mix(inner_context, context), scroll, top),
         )
     }
 }

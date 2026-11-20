@@ -4,7 +4,7 @@ use crate::{
         BOX, Blur, COMPOSITE_BACKDROP, COMPOSITE_BLEND, COMPOSITE_CLIP, COMPOSITE_MASK,
         COMPOSITE_MATRIX, COMPOSITE_SHADOW, Composite, Globals, Instance,
     },
-    scene::{Nested, Scene},
+    scene::{NESTED, Nested, Scene, Under},
 };
 use std::ops::Range;
 
@@ -109,6 +109,21 @@ pub struct RenderFrame {
     pub shots: Vec<(u64, Target, [i32; 4])>,
     // The commands of the snapshot layers start here.
     pub shot_commands: usize,
+    // Set by a backend that draws damage regions over the last frame: it then keeps the window below what paints
+    // after a scrolled content, so a scroll draws again only what changed there and what paints after it.
+    pub keeps_under: bool,
+    under: Option<KeptUnder>,
+    // Draws only the items of the window layer before the split of `Under`, or only those after it.
+    half: Option<([u32; 2], bool)>,
+}
+
+// Two textures that take turns, since a scroll copies one into the other moved.
+struct KeptUnder {
+    scroll: u64,
+    ids: [u64; 2],
+    turn: usize,
+    count: u32,
+    window: [u32; 2],
 }
 
 // The pixels of a layer from an earlier frame, which draw again while its digest and place stay.
@@ -156,7 +171,10 @@ impl<T> Pool<T> {
     ) -> anyhow::Result<()> {
         // The textures of dropped layers go back to the others.
         for (.., idle, id) in &mut self.textures {
-            if *id != 0 && !frame.cache.iter().any(|cached| cached.id == *id) {
+            if *id != 0
+                && !frame.cache.iter().any(|cached| cached.id == *id)
+                && !(frame.under.as_ref()).is_some_and(|under| under.ids.contains(id))
+            {
                 (*idle, *id) = (0, 0);
             }
         }
@@ -230,6 +248,7 @@ impl<T> Pool<T> {
         self.textures.clear();
         self.slots.clear();
         frame.cache.clear();
+        frame.under = None;
     }
 }
 
@@ -250,7 +269,21 @@ pub fn damage_regions(
     window: [u32; 2],
     extra: &[[i32; 4]],
 ) -> Option<Vec<[i32; 4]>> {
-    if scene.damage.whole {
+    regions_of(
+        &scene.damage,
+        scene.reads.iter().map(|read| read.0),
+        window,
+        extra,
+    )
+}
+
+fn regions_of(
+    damage: &crate::scene::Damage,
+    reads: impl Iterator<Item = Rect<f32>>,
+    window: [u32; 2],
+    extra: &[[i32; 4]],
+) -> Option<Vec<[i32; 4]>> {
+    if damage.whole {
         return None;
     }
     let bounds = Rect::new(
@@ -276,7 +309,7 @@ pub fn damage_regions(
         regions.push(region);
     };
     // Edges blend into the pixel next to them.
-    for rect in &scene.damage.rects {
+    for rect in &damage.rects {
         let rect = rect.outset(1.).intersect(bounds);
         if !rect.is_empty() {
             add(&mut regions, region(rect));
@@ -285,7 +318,7 @@ pub fn damage_regions(
     for &region in extra {
         add(&mut regions, region);
     }
-    let reads: Vec<[i32; 4]> = (scene.reads.iter())
+    let reads: Vec<[i32; 4]> = reads
         .map(|read| read.intersect(bounds))
         .filter(|read| !read.is_empty())
         .map(region)
@@ -328,22 +361,38 @@ impl RenderFrame {
         for cached in &mut self.cache {
             cached.used = false;
         }
+        let under = self.record_under(scene);
+        let whole = [0, 0, window[0] as i32, window[1] as i32];
         if self.damage.is_empty() {
             self.bases.push(Target::Frame);
-            self.record_layer(scene, 0, Target::Frame, true, 0);
+            match under {
+                Some((kept, split)) => {
+                    self.commands.push(Command::Copy {
+                        src: kept,
+                        dst: Target::Frame,
+                        region: whole,
+                    });
+                    self.half = Some((split, true));
+                    self.record_layer(scene, 0, Target::Frame, false, 0);
+                    self.half = None;
+                }
+                None => self.record_layer(scene, 0, Target::Frame, true, 0),
+            }
         }
         for at in 0..self.damage.len() {
             let region = self.damage[at];
-            let base = self.acquire(region, 1);
-            // Layers take the same place as in a whole frame.
-            if let Target::Layer(index) = base {
-                self.layers[index].bounds = [0., 0., window[0] as f32, window[1] as f32];
+            let base = self.region_base(region);
+            match under {
+                Some((kept, split)) => {
+                    self.commands.push(Command::Copy {
+                        src: kept,
+                        dst: base,
+                        region,
+                    });
+                    self.record_region(scene, base, region, Some((split, true)), false);
+                }
+                None => self.record_region(scene, base, region, None, true),
             }
-            self.bases.push(base);
-            let [x, y, width, height] = region.map(|value| value as f32);
-            self.cull = Some(Rect::new(Point::new(x, y), Size::new(width, height)));
-            self.record_layer(scene, 0, base, true, 0);
-            self.cull = None;
             self.commands.push(Command::Copy {
                 src: base,
                 dst: Target::Frame,
@@ -401,6 +450,162 @@ impl RenderFrame {
                 }
             }
         }
+    }
+
+    // Brings the kept window below the items after a scrolled content up to this scene, and returns it with the
+    // split, or forgets it when the scene has none.
+    fn record_under(&mut self, scene: &Scene) -> Option<(Target, [u32; 2])> {
+        let Some(info) = scene.under.as_ref().filter(|_| self.keeps_under) else {
+            self.under = None;
+            return None;
+        };
+        let (count, window) = (self.count, self.window);
+        let valid = self.under.as_ref().is_some_and(|kept| {
+            kept.scroll == info.scroll
+                && kept.count == count.wrapping_sub(1)
+                && kept.window == window
+        });
+        // Only a scroll starts one.
+        if !valid && scene.shift.is_none() {
+            self.under = None;
+            return None;
+        }
+        if !valid {
+            self.ids += 2;
+            self.under = Some(KeptUnder {
+                scroll: info.scroll,
+                ids: [self.ids - 1, self.ids],
+                turn: 0,
+                count,
+                window,
+            });
+        }
+        let split = info.split;
+        let regions = valid
+            .then(|| {
+                let reads = (scene.reads.iter())
+                    .filter(|read| !Under::after(split, read.1))
+                    .map(|read| read.0);
+                regions_of(&info.damage, reads, window, &[])
+            })
+            .flatten();
+        let kept = self.under.as_mut()?;
+        kept.count = count;
+        let Some(regions) = regions else {
+            let target = {
+                let kept = self.under.as_ref()?;
+                let id = kept.ids[kept.turn];
+                self.kept_layer(id, [0, 0])
+            };
+            self.bases.push(target);
+            self.half = Some((split, false));
+            self.record_layer(scene, 0, target, true, 0);
+            self.half = None;
+            return Some((target, split));
+        };
+        let target = match scene.shift {
+            Some(([x, y, width, height], by)) => {
+                let kept = self.under.as_mut()?;
+                let (old, new) = (kept.ids[kept.turn], kept.ids[kept.turn ^ 1]);
+                kept.turn ^= 1;
+                let target = self.kept_layer(new, [0, 0]);
+                let (source, moved) = (
+                    self.kept_layer(old, [0, 0]),
+                    self.kept_layer(old, [-by[0], -by[1]]),
+                );
+                // The viewport copies the pixels that were `by` further, and the rest of the window stays.
+                let area = [
+                    x + (-by[0]).max(0),
+                    y + (-by[1]).max(0),
+                    width - by[0].abs(),
+                    height - by[1].abs(),
+                ];
+                let [right, bottom] = [window[0] as i32, window[1] as i32];
+                let [x, y, width, height] = area;
+                for (src, region) in [
+                    (source, [0, 0, right, y]),
+                    (source, [0, y + height, right, bottom - y - height]),
+                    (source, [0, y, x, height]),
+                    (source, [x + width, y, right - x - width, height]),
+                    (moved, area),
+                ] {
+                    if region[2] > 0 && region[3] > 0 {
+                        self.commands.push(Command::Copy {
+                            src,
+                            dst: target,
+                            region,
+                        });
+                    }
+                }
+                target
+            }
+            None => {
+                let kept = self.under.as_ref()?;
+                let id = kept.ids[kept.turn];
+                self.kept_layer(id, [0, 0])
+            }
+        };
+        for region in regions {
+            let base = self.region_base(region);
+            self.record_region(scene, base, region, Some((split, false)), true);
+            self.commands.push(Command::Copy {
+                src: base,
+                dst: target,
+                region,
+            });
+            self.release(base);
+        }
+        Some((target, split))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keeps_under_now(&self) -> bool {
+        self.under.is_some()
+    }
+
+    // A window-size texture that stays across frames, with the window at `origin`.
+    fn kept_layer(&mut self, id: u64, origin: [i32; 2]) -> Target {
+        let size = self.window;
+        self.textures.push(size);
+        self.kept.push(id);
+        self.layers.push(Layer {
+            texture: self.textures.len() - 1,
+            origin,
+            scale: 1.,
+            bounds: [
+                origin[0] as f32,
+                origin[1] as f32,
+                size[0] as f32,
+                size[1] as f32,
+            ],
+            scissor: [0, 0, size[0], size[1]],
+        });
+        Target::Layer(self.layers.len() - 1)
+    }
+
+    fn region_base(&mut self, region: [i32; 4]) -> Target {
+        let base = self.acquire(region, 1);
+        // Layers take the same place as in a whole frame.
+        if let Target::Layer(index) = base {
+            self.layers[index].bounds = [0., 0., self.window[0] as f32, self.window[1] as f32];
+        }
+        self.bases.push(base);
+        base
+    }
+
+    fn record_region(
+        &mut self,
+        scene: &Scene,
+        base: Target,
+        region: [i32; 4],
+        half: Option<([u32; 2], bool)>,
+        clear: bool,
+    ) {
+        let [x, y, width, height] = region.map(|value| value as f32);
+        self.cull = Some(Rect::new(Point::new(x, y), Size::new(width, height)));
+        self.half = half;
+        self.record_layer(scene, 0, base, clear, 0);
+        (self.cull, self.half) = (None, None);
     }
 
     pub fn texture(&self, target: Target) -> Option<usize> {
@@ -659,6 +864,9 @@ impl RenderFrame {
     ) {
         self.commands.push(Command::Pass(target, clear));
         let content = &scene.layers[layer];
+        // The items of the other half of the window layer don't draw, and don't hide others.
+        let half = self.half.filter(|_| layer == 0);
+        let skip = |top: u32| half.is_some_and(|(split, after)| Under::after(split, top) != after);
         // Skip what a later opaque box hides, since stacked page backgrounds can fill the window many
         // times. An effect that reads the target sees the pixels drawn before it, so a box after the effect
         // hides only the boxes after the effect too.
@@ -673,8 +881,9 @@ impl RenderFrame {
         let min = self.window[0] as f32 * self.window[1] as f32 / 64.;
         let mut occluders: Vec<(usize, Rect<f32>, f32, usize)> = (content.instances.iter())
             .enumerate()
-            .filter(|(_, instance)| {
-                instance.kind() == BOX
+            .filter(|(at, instance)| {
+                !skip(*at as u32)
+                    && instance.kind() == BOX
                     && instance.color[3] >= 1.
                     && instance.aux == [0.; 4]
                     && instance.radii == [0.; 8]
@@ -729,7 +938,10 @@ impl RenderFrame {
                 return true;
             }
         };
-        let mut nested = content.nested.iter().peekable();
+        let mut nested = (content.nested.iter().enumerate())
+            .filter(|(index, _)| !skip(*index as u32 | NESTED))
+            .map(|(_, nested)| nested)
+            .peekable();
         let mut start = self.instances.len() as u32;
         let mut pages = [None; 2];
         for (at, instance) in content.instances.iter().enumerate() {
@@ -740,6 +952,9 @@ impl RenderFrame {
                 }
                 self.flush(target, depth);
                 start = self.instances.len() as u32;
+            }
+            if skip(at as u32) {
+                continue;
             }
             let mut instance = *instance;
             let mut bounds = instance.reach();
