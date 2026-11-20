@@ -134,7 +134,7 @@ pub(crate) struct Damage {
     pub whole: bool,
 }
 
-const DAMAGE_RECTS: usize = 8;
+const DAMAGE_RECTS: usize = 16;
 // A rectangle joins another when their union adds at most this many pixels.
 const DAMAGE_SLACK: f32 = 64. * 64.;
 
