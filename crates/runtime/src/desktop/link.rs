@@ -530,8 +530,14 @@ impl Main {
                     }
                 }
                 (ToMain::Native(command), _) => self.native(command),
-                (ToMain::OpenTools, Some(_)) => {
-                    match super::devtools::DevTools::new("Main", crate::host::Role::Main, None) {
+                (ToMain::OpenTools, Some(engine)) => {
+                    let tools =
+                        super::devtools::DevTools::new("Main", crate::host::Role::Main, None);
+                    // The agent keeps the logged values from now on, so their rows can expand.
+                    match tools.and_then(|tools| {
+                        super::devtools::agent(engine, "poll", &Value::Null)?;
+                        Ok(tools)
+                    }) {
                         Ok(tools) => *self.tools.borrow_mut() = Some(tools),
                         Err(error) => {
                             eprintln!("apps: {error:#}");

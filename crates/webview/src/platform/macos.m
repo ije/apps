@@ -160,6 +160,8 @@ double apps_browser_dock(void *handle, double width) {
     NSView *page = owner.page, *content = page.superview;
     if (!content) return 0;
     NSSize size = content.bounds.size;
+    // The page keeps 240 points, or half of a small window.
+    if (width > 0) width = MIN(width, MAX(size.width / 2, size.width - 240));
     if (width > 0) {
         if (view.superview != content) [content addSubview:view];
         view.autoresizingMask = NSViewHeightSizable | NSViewMaxXMargin;

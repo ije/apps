@@ -115,7 +115,8 @@ pub unsafe extern "C" fn apps_devtools_hud_tick(hud: *mut Hud) -> bool {
 }
 
 /// Records a frame that took `draw` nanoseconds from render to paint, then paints the HUD at the top right
-/// of a window of `width` by `height` pixels. `redrawing` is a second pass of the same frame.
+/// of a window of `width` by `height` pixels. `redrawing` is a second paint of the same frame. `display` is the
+/// CoreGraphics display of the window, or 0.
 ///
 /// # Safety
 /// `hud` comes from `apps_devtools_hud_new`. `paint` gets `cx` and an item that lives during the call.
@@ -125,6 +126,7 @@ pub unsafe extern "C" fn apps_devtools_hud_paint(
     hud: *mut Hud,
     draw: u64,
     redrawing: bool,
+    display: u32,
     width: f32,
     height: f32,
     scale: f32,
@@ -157,7 +159,7 @@ pub unsafe extern "C" fn apps_devtools_hud_paint(
             .is_none_or(|at| now.duration_since(at) >= READOUT)
     {
         hud.readout_at = Some(now);
-        let refresh = probe::refresh_period();
+        let refresh = probe::refresh_period(display);
         hud.budget = refresh.unwrap_or(1. / 60.);
         while hud
             .times

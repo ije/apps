@@ -13,7 +13,8 @@ use std::{
     time::Instant,
 };
 
-type Done = extern "C" fn(*mut c_void, bool, *const u8, usize);
+// The reply, ok, JSON value or error text, and an optional PNG.
+type Done = extern "C" fn(*mut c_void, bool, *const u8, usize, *const u8, usize);
 
 #[repr(C)]
 struct Host {
@@ -173,7 +174,14 @@ unsafe impl Send for Slot {}
 impl Drop for Slot {
     fn drop(&mut self) {
         let text = "The window closed";
-        (self.1)(self.0, false, text.as_ptr(), text.len());
+        (self.1)(
+            self.0,
+            false,
+            text.as_ptr(),
+            text.len(),
+            std::ptr::null(),
+            0,
+        );
     }
 }
 
@@ -182,12 +190,28 @@ struct Reply(Arc<Mutex<Option<Slot>>>);
 
 impl Reply {
     fn send(&self, result: Result<Value>) {
+        self.send_image(result.map(|value| (value, Vec::new())));
+    }
+
+    fn send_image(&self, result: Result<(Value, Vec<u8>)>) {
         if let Some(slot) = self.0.lock().unwrap_or_else(PoisonError::into_inner).take() {
-            let (ok, data) = match result {
-                Ok(value) => (true, value.to_string()),
-                Err(error) => (false, format!("{error:#}")),
+            let (ok, data, image) = match result {
+                Ok((value, image)) => (true, value.to_string(), image),
+                Err(error) => (false, format!("{error:#}"), Vec::new()),
             };
-            (slot.1)(slot.0, ok, data.as_ptr(), data.len());
+            let image_ptr = if image.is_empty() {
+                std::ptr::null()
+            } else {
+                image.as_ptr()
+            };
+            (slot.1)(
+                slot.0,
+                ok,
+                data.as_ptr(),
+                data.len(),
+                image_ptr,
+                image.len(),
+            );
             std::mem::forget(slot);
         }
     }
@@ -279,8 +303,11 @@ fn screenshot(
         let scale = view.scale_factor();
         view.capture(move |frame, _| {
             let result = frame.and_then(|frame| png(frame, scale, &crop, css));
-            reply.send(result.map(|([width, height], bytes)| {
-                json!({"image": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes), "text": format!("Window {window}, {width}x{height} pixels")})
+            reply.send_image(result.map(|([width, height], bytes)| {
+                (
+                    format!("Window {window}, {width}x{height} pixels").into(),
+                    bytes,
+                )
             }));
         });
     })

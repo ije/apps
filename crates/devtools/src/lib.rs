@@ -2,7 +2,7 @@ mod hud;
 mod mcp;
 
 // Update this ABI version with `mcp::Host`, `hud::Item` or function signatures, and match the runtime.
-const ABI: u32 = 3;
+const ABI: u32 = 4;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn apps_devtools_abi() -> u32 {

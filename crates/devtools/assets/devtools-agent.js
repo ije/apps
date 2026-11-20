@@ -1,7 +1,8 @@
 (() => {
   // Runs in the page for the developer tools. Nodes go to the panel by their id, and stay known by it.
   const known = new Map();
-  const id = node => { known.set(node._id, new WeakRef(node)); return node._id; };
+  let limit = 2000;
+  const id = node => { if (known.get(node._id)?.deref() !== node) known.set(node._id, new WeakRef(node)); return node._id; };
   const get = id => known.get(id)?.deref() ?? null;
   // The layers of a node: its elements and texts, without the ones that draw nothing.
   const kids = node => [...(node.shadowRoot?.childNodes ?? []), ...node.childNodes].filter(kid => kid.nodeType === 1 ? !/^(head|script|style|link|meta|title|template|noscript)$/.test(kid.localName) : kid.nodeType === 3 && kid.data.trim());
@@ -19,6 +20,8 @@
   const held = new Map(), logged = new Map();
   let handles = 0, logs = 0;
   const trim = (map, size) => { for (const key of map.keys()) { if (map.size <= size) break; map.delete(key); } };
+  const indexed = value => Array.isArray(value) || ArrayBuffer.isView(value) && !(value instanceof DataView);
+  const first = (iterable, count) => { const list = []; for (const item of iterable) { if (list.length === count) break; list.push(item); } return list; };
   const short = (value, inner) => {
     try {
       const type = typeof value;
@@ -29,12 +32,14 @@
       if (value instanceof Error || value instanceof RegExp) return String(value);
       if (value instanceof Date) return Number.isNaN(+value) ? 'Invalid Date' : value.toISOString();
       if (value.nodeType === 1) return `<${value.localName}${value.id ? '#' + value.id : ''}>`;
-      const name = value.constructor?.name ?? 'Object', size = Array.isArray(value) ? value.length : value instanceof Map || value instanceof Set ? value.size : null;
+      const list = indexed(value), name = value.constructor?.name ?? 'Object', size = list ? value.length : value instanceof Map || value instanceof Set ? value.size : null;
       if (inner) return size != null ? `${name}(${size})` : name === 'Object' ? '{…}' : name;
-      if (size != null && !Array.isArray(value)) return `${name}(${size})`;
-      const keys = Object.keys(value), parts = keys.slice(0, 5).map(key => (Array.isArray(value) ? '' : key + ': ') + (Object.getOwnPropertyDescriptor(value, key).get ? '(…)' : short(value[key], true)));
+      if (size != null && !list) return `${name}(${size})`;
+      // Only the first keys of a big array or object are read.
+      const keys = list ? Array.from({ length: Math.min(size, 6) }, (_, at) => String(at)) : Object.keys(value);
+      const parts = keys.slice(0, 5).map(key => (list ? '' : key + ': ') + (Object.getOwnPropertyDescriptor(value, key)?.get ? '(…)' : short(value[key], true)));
       if (keys.length > 5) parts.push('…');
-      return Array.isArray(value) ? `(${size}) [${parts.join(', ')}]` : `${name === 'Object' ? '' : name + ' '}{${parts.join(', ')}}`;
+      return list ? `${Array.isArray(value) ? '' : name}(${size}) [${parts.join(', ')}]` : `${name === 'Object' ? '' : name + ' '}{${parts.join(', ')}}`;
     } catch { return Object.prototype.toString.call(value); }
   };
   const inspect = value => {
@@ -58,9 +63,10 @@
       const object = held.get(id), list = [];
       if (object == null) return list;
       const add = (name, read) => { let item; try { item = inspect(read()); } catch (error) { item = { type: 'error', text: String(error) }; } list.push({ name: String(name), ...item }); };
-      if (object instanceof Map) [...object].slice(0, 200).forEach(([key, value], at) => add(at, () => ({ key, value })));
-      if (object instanceof Set) [...object].slice(0, 200).forEach((value, at) => add(at, () => value));
-      for (const key of Reflect.ownKeys(object).slice(0, 500)) { const slot = Object.getOwnPropertyDescriptor(object, key); add(typeof key === 'symbol' ? key.toString() : key, () => slot.get ?? slot.set ?? slot.value); }
+      if (object instanceof Map) first(object, 200).forEach(([key, value], at) => add(at, () => ({ key, value })));
+      if (object instanceof Set) first(object, 200).forEach((value, at) => add(at, () => value));
+      const keys = indexed(object) ? Array.from({ length: Math.min(object.length, 500) }, (_, at) => String(at)).concat(Array.isArray(object) ? ['length'] : []) : Reflect.ownKeys(object).slice(0, 500);
+      for (const key of keys) { const slot = Object.getOwnPropertyDescriptor(object, key); if (slot) add(typeof key === 'symbol' ? key.toString() : key, () => slot.get ?? slot.set ?? slot.value); }
       const parent = Object.getPrototypeOf(object);
       if (parent) add('[[Prototype]]', () => parent);
       return list;
@@ -68,7 +74,10 @@
     clear() { held.clear(); logged.clear(); },
     // The tools closed: the page stops paying for them.
     close() { observer?.disconnect(); api.clear(); delete globalThis.__appsLogged; },
-    poll() { const value = state; state = 0; return value; },
+    poll() {
+      if (known.size > limit) { for (const [key, ref] of known) if (!ref.deref()) known.delete(key); limit = Math.max(2000, known.size * 2); }
+      const value = state; state = 0; return value;
+    },
     // The children of each node. A null id gives the root element.
     tree: ({ ids }) => Object.fromEntries(ids.map(id => [id ?? 'root', id == null ? [entry(document.documentElement)] : get(id)?.isConnected ? kids(get(id)).map(entry) : []])),
     path({ id: from }) { const path = []; for (let node = get(from); node && node !== document; node = up(node)) path.unshift(id(node)); return path; },

@@ -72,7 +72,7 @@ body { -webkit-user-select: none; }
   const caret = (shown, open, more = '') => h('i', { class: 'caret grid size-3 flex-none place-items-center text-dim transition-transform' + more + (shown ? '' : ' invisible') + (open ? ' rotate-90' : ''), innerHTML: '<svg viewBox="0 0 12 12" class="size-3"><path d="M4.5 2.5l4 3.5-4 3.5z" fill="currentColor"/></svg>' });
 
   const messages = [], history = [];
-  let historyAt = 0, drawing = false;
+  let historyAt = 0, drawing = false, drawn = 0;
   const marks = {
     error: '<svg viewBox="0 0 12 12" class="size-3"><circle cx="6" cy="6" r="5.5" fill="#e5665e"/><path d="M4 4l4 4M8 4l-4 4" stroke="#3a1d1d" stroke-width="1.4" stroke-linecap="round"/></svg>',
     warn: '<svg viewBox="0 0 12 12" class="size-3"><path d="M6 .8l5.6 10.4H.4z" fill="#f0a23b" stroke="#f0a23b" stroke-linejoin="round"/><path d="M6 4.6v3M6 9.3v.4" stroke="#352c18" stroke-width="1.4" stroke-linecap="round"/></svg>',
@@ -111,21 +111,26 @@ body { -webkit-user-select: none; }
     };
     return row(message.level, h('div', { class: 'min-w-0 flex-1' }, head, kids));
   };
-  const drawConsole = () => {
+  // Adds the rows of new messages and removes the old ones. Only a new filter draws all rows again.
+  const drawConsole = full => {
     drawing = false;
     const filter = $('#filter').value.toLowerCase(), output = $('#output'), end = output.scrollTop + output.clientHeight >= output.scrollHeight - 24;
-    output.replaceChildren(...messages.filter(message => !filter || message.text.toLowerCase().includes(filter)).map(message => message.row ??= entry(message)));
+    const old = messages.splice(0, Math.max(0, messages.length - 2000));
+    drawn = Math.max(0, drawn - old.length);
+    const rows = list => list.filter(message => !filter || message.text.toLowerCase().includes(filter)).map(message => message.row ??= entry(message));
+    if (full === true) output.replaceChildren(...rows(messages));
+    else { for (const message of old) message.row?.remove(); output.append(...rows(messages.slice(drawn))); }
+    drawn = messages.length;
     if (end) output.scrollTop = output.scrollHeight;
   };
   const log = (level, text, more) => {
     messages.push({ level, text, ...more });
-    if (messages.length > 2000) messages.shift();
     if (level === 'error' && $('#console').hidden) $('#alert').hidden = false;
     if (!drawing) { drawing = true; requestAnimationFrame(drawConsole); }
   };
   const expression = $('#expression');
-  $('#clear').onclick = () => { messages.length = 0; drawConsole(); request('Console.clear').catch(() => {}); };
-  $('#filter').oninput = drawConsole;
+  $('#clear').onclick = () => { messages.length = 0; drawConsole(true); request('Console.clear').catch(() => {}); };
+  $('#filter').oninput = () => drawConsole(true);
   $('#prompt').onsubmit = async event => {
     event.preventDefault();
     const source = expression.value.trim();
@@ -247,10 +252,13 @@ body { -webkit-user-select: none; }
   // Without tabs the console is always there.
   const showConsole = () => docked ? show('console') : expression.focus();
   $('#close').onclick = () => request('Panel.close');
+  // The height of the title bar changes with full screen, so each dock reads it again.
+  const dock = width => request('Panel.resize', { width }).then(titlebar => { document.body.style.paddingTop = titlebar + 'px'; }, () => {});
+  addEventListener('resize', () => { if (docked) dock(innerWidth); });
   $('#grip').onpointerdown = event => {
     const grip = event.currentTarget, from = event.screenX, start = innerWidth;
     grip.setPointerCapture(event.pointerId);
-    grip.onpointermove = move => request('Panel.resize', { width: start + move.screenX - from });
+    grip.onpointermove = move => dock(start + move.screenX - from);
     grip.onpointerup = grip.onpointercancel = () => { grip.onpointermove = null; };
   };
   addEventListener('keydown', event => {

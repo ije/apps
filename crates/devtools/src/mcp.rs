@@ -4,18 +4,19 @@ use std::{
     cell::{OnceCell, RefCell},
     collections::{BTreeMap, HashMap, VecDeque},
     ffi::{CString, c_char, c_void},
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, IoSlice, Read, Write},
     net::{TcpListener, TcpStream},
     rc::Rc,
     sync::{
-        Mutex, OnceLock, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        Mutex, MutexGuard, OnceLock, PoisonError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
 };
 
-type Done = extern "C" fn(*mut c_void, bool, *const u8, usize);
+// The reply, ok, JSON value or error text, and an optional PNG.
+type Done = extern "C" fn(*mut c_void, bool, *const u8, usize, *const u8, usize);
 
 #[repr(C)]
 pub struct Host {
@@ -34,7 +35,18 @@ enum Role {
     Renderer(u64),
 }
 
-type Reply = mpsc::Sender<Result<Value>>;
+struct Answer {
+    value: Value,
+    image: Option<Vec<u8>>,
+}
+
+impl From<Value> for Answer {
+    fn from(value: Value) -> Self {
+        Self { value, image: None }
+    }
+}
+
+type Reply = mpsc::Sender<Result<Answer>>;
 type Waiter = Box<dyn FnOnce(Result<Value>)>;
 
 struct Call {
@@ -43,15 +55,23 @@ struct Call {
     reply: Reply,
 }
 
-struct Shared {
-    paused: Mutex<Option<String>>,
-    pauses: AtomicU64,
-    page_paused: AtomicU64,
+struct Pause {
+    seq: u64,
+    thread: Option<u64>,
+    role: Role,
+    at: String,
+}
+
+struct Posted {
+    result: mpsc::Receiver<Result<Answer>>,
+    thread: Option<u64>,
+    seq: u64,
 }
 
 struct Script {
     url: String,
-    map_url: String,
+    // A source map URL, or for a big inline map only its sources and mappings as JSON. Parsing takes it.
+    raw: RefCell<String>,
     map: OnceCell<Option<Rc<SourceMap>>>,
 }
 
@@ -59,34 +79,37 @@ struct Script {
 struct Session {
     scripts: HashMap<String, Script>,
     breakpoints: Vec<(String, String)>,
+    debugging: bool,
 }
 
 struct Profile {
-    ctx: usize,
-    started: Instant,
-    cpu: f64,
+    tracked: Vec<(usize, String)>,
+    attached: Vec<usize>,
 }
 
 #[derive(Default)]
 struct State {
     next: u64,
-    responses: HashMap<u64, Result<Value, String>>,
-    waiting: HashMap<u64, Waiter>,
+    // Only ids that `request` waits for. Other answers are dropped.
+    responses: HashMap<u64, Option<Result<Value, String>>>,
+    waiting: HashMap<u64, (Instant, Waiter)>,
     sessions: HashMap<usize, Session>,
     paused: Option<(usize, Value)>,
     stepping: Option<Reply>,
     profile: Option<Profile>,
-    samples: Option<Value>,
+    samples: Vec<(usize, Value)>,
 }
 
 static HOST: OnceLock<&'static Host> = OnceLock::new();
 static MAIN: OnceLock<mpsc::Sender<Call>> = OnceLock::new();
 static PAGES: Mutex<BTreeMap<u64, mpsc::Sender<Call>>> = Mutex::new(BTreeMap::new());
-static SHARED: Shared = Shared {
-    paused: Mutex::new(None),
-    pauses: AtomicU64::new(0),
-    page_paused: AtomicU64::new(0),
-};
+static PAUSES: Mutex<Vec<Pause>> = Mutex::new(Vec::new());
+static PAUSE_SEQ: AtomicU64 = AtomicU64::new(0);
+// Main code and all pages share one thread, whose page key is 0.
+static ONE_THREAD: AtomicBool = AtomicBool::new(false);
+// The start, the process CPU time then, and the threads that profile.
+type Running = (Instant, f64, Vec<Option<u64>>);
+static PROFILE: Mutex<Option<Running>> = Mutex::new(None);
 static LOGS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 
 thread_local! {
@@ -94,6 +117,10 @@ thread_local! {
     static MAIN_CHANNEL: OnceCell<mpsc::Receiver<Call>> = const { OnceCell::new() };
     static STATE: RefCell<State> = RefCell::default();
     static FRAMES: RefCell<Option<Vec<(u64, Duration)>>> = const { RefCell::new(None) };
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 const PAUSED: &str = "The app is paused in the debugger. Resume it with the debugger tool first";
@@ -133,24 +160,52 @@ pub extern "C" fn apps_devtools_mcp_start(port: u16, host: &'static Host) -> *mu
 #[unsafe(no_mangle)]
 pub extern "C" fn apps_devtools_mcp_install(key: u64) {
     let (sender, calls) = mpsc::channel();
-    PAGES
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(key, sender);
+    lock(&PAGES).insert(key, sender);
     CHANNEL.with(|channel| channel.set((calls, key))).ok();
+    if MAIN_CHANNEL.with(|channel| channel.get().is_some()) {
+        ONE_THREAD.store(true, Ordering::Release);
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn apps_devtools_mcp_uninstall() {
     if let Some(key) = CHANNEL.with(|channel| channel.get().map(|(_, key)| *key)) {
-        PAGES
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&key);
+        lock(&PAGES).remove(&key);
     }
 }
 
+fn respond(
+    stream: &mut TcpStream,
+    status: &str,
+    kind: &str,
+    body: &[u8],
+    close: bool,
+    // `/mcp` takes only POST, the other paths GET and POST.
+    mcp: bool,
+) -> Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n{}{}\r\n",
+        body.len(),
+        match (status.starts_with("405"), mcp) {
+            (true, true) => "Allow: POST\r\n",
+            (true, false) => "Allow: GET, POST\r\n",
+            _ => "",
+        },
+        if close { "Connection: close\r\n" } else { "" }
+    );
+    let mut parts = [IoSlice::new(head.as_bytes()), IoSlice::new(body)];
+    let mut parts = &mut parts[..];
+    while !parts.is_empty() {
+        let written = stream.write_vectored(parts)?;
+        ensure!(written > 0, "The client closed the connection");
+        IoSlice::advance_slices(&mut parts, written);
+    }
+    Ok(())
+}
+
 fn serve(mut stream: TcpStream) -> Result<()> {
+    const LIMIT: usize = 64 << 20;
+    stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let local = |host: &str| {
         let host = host
@@ -166,21 +221,35 @@ fn serve(mut stream: TcpStream) -> Result<()> {
         if reader.read_line(&mut line)? == 0 {
             return Ok(());
         }
+        if line.trim().is_empty() {
+            continue;
+        }
         let mut parts = line.split_whitespace();
-        let (method, path) = (
-            parts.next().unwrap_or("").to_owned(),
-            parts.next().unwrap_or("").to_owned(),
-        );
-        let (mut length, mut allowed, mut close, mut expect) = (0usize, true, false, false);
+        let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        let (mut length, mut chunked, mut bad) = (0usize, false, false);
+        let (mut allowed, mut close, mut expect) = (true, false, false);
         loop {
             let mut header = String::new();
-            reader.read_line(&mut header)?;
-            let Some((name, value)) = header.trim_end().split_once(':') else {
+            if reader.read_line(&mut header)? == 0 {
+                return Ok(());
+            }
+            let header = header.trim_end();
+            if header.is_empty() {
                 break;
+            }
+            let Some((name, value)) = header.split_once(':') else {
+                continue;
             };
             let value = value.trim();
-            match name.to_ascii_lowercase().as_str() {
-                "content-length" => length = value.parse()?,
+            match name.trim().to_ascii_lowercase().as_str() {
+                "content-length" => match value.parse() {
+                    Ok(value) => length = value,
+                    Err(_) => bad = true,
+                },
+                "transfer-encoding" => match value.eq_ignore_ascii_case("chunked") {
+                    true => chunked = true,
+                    false => bad = true,
+                },
                 // Web pages can reach localhost, so the host must be local. A browser names the page's origin
                 // with every POST, and tool clients send none, so a request with an origin is from a page:
                 // also a page of another local server, which must not call tools either.
@@ -191,12 +260,66 @@ fn serve(mut stream: TcpStream) -> Result<()> {
                 _ => {}
             }
         }
-        ensure!(length <= 64 << 20, "Request is too large");
+        if bad || length > LIMIT {
+            let (status, text) = match bad {
+                true => (
+                    "400 Bad Request",
+                    "Invalid Content-Length or Transfer-Encoding",
+                ),
+                false => ("413 Content Too Large", "Request is too large"),
+            };
+            return respond(
+                &mut stream,
+                status,
+                "text/plain",
+                text.as_bytes(),
+                true,
+                false,
+            );
+        }
         if expect {
             stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
         }
-        let mut body = vec![0; length];
-        reader.read_exact(&mut body)?;
+        let mut body = Vec::new();
+        let read = if chunked {
+            (|| -> Result<()> {
+                loop {
+                    let mut size = String::new();
+                    ensure!(reader.read_line(&mut size)? > 0, "Unexpected end of body");
+                    let size =
+                        usize::from_str_radix(size.split(';').next().unwrap_or("").trim(), 16)?;
+                    if size == 0 {
+                        break;
+                    }
+                    ensure!(body.len() + size <= LIMIT, "Request is too large");
+                    let start = body.len();
+                    body.resize(start + size, 0);
+                    reader.read_exact(&mut body[start..])?;
+                    let mut end = String::new();
+                    reader.read_line(&mut end)?;
+                    ensure!(end.trim().is_empty(), "Invalid chunk");
+                }
+                loop {
+                    let mut trailer = String::new();
+                    if reader.read_line(&mut trailer)? == 0 || trailer.trim().is_empty() {
+                        return Ok(());
+                    }
+                }
+            })()
+        } else {
+            body.resize(length, 0);
+            reader.read_exact(&mut body).map_err(Into::into)
+        };
+        if let Err(error) = read {
+            return respond(
+                &mut stream,
+                "400 Bad Request",
+                "text/plain",
+                format!("{error:#}").as_bytes(),
+                true,
+                false,
+            );
+        }
         let path = path.split('?').next().unwrap_or("");
         let tool = path.strip_prefix('/').filter(|tool| {
             tools()
@@ -205,52 +328,47 @@ fn serve(mut stream: TcpStream) -> Result<()> {
                 .iter()
                 .any(|item| item["name"] == *tool)
         });
-        let body = if body.iter().all(u8::is_ascii_whitespace) {
-            b"{}".to_vec()
-        } else {
-            body
-        };
-        let (status, kind, response) = match (allowed, method.as_str(), path, tool) {
+        if body.iter().all(u8::is_ascii_whitespace) {
+            body = b"{}".to_vec();
+        }
+        let (status, kind, response) = match (allowed, method, path, tool) {
             (false, ..) => ("403 Forbidden", "text/plain", b"Only local clients may connect".to_vec()),
             (_, "GET", "/", _) => ("200 OK", "text/plain; charset=utf-8", help().into_bytes()),
             (_, "POST", "/mcp", _) => match serde_json::from_slice::<Value>(&body) {
                 Ok(request) => match rpc(&request) {
                     Some(response) => ("200 OK", "application/json", response.to_string().into_bytes()),
-                    None => ("202 Accepted", "application/json", Vec::new()),
+                    None => ("202 Accepted", "text/plain", Vec::new()),
                 },
                 Err(error) => ("400 Bad Request", "application/json", json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":error.to_string()}}).to_string().into_bytes()),
             },
+            // No server-sent event stream: MCP clients expect 405 for GET.
+            (_, _, "/mcp", _) => ("405 Method Not Allowed", "text/plain", Vec::new()),
             (_, "POST", _, Some(tool)) => match serde_json::from_slice::<Value>(&body).map_err(anyhow::Error::from).and_then(|args| call(tool, args)) {
-                Ok(Value::Object(image)) if image.contains_key("image") => (
-                    "200 OK",
-                    "image/png",
-                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, image["image"].as_str().unwrap_or(""))?,
-                ),
-                Ok(Value::String(text)) => ("200 OK", "text/plain; charset=utf-8", text.into_bytes()),
-                Ok(value) => ("200 OK", "application/json", value.to_string().into_bytes()),
+                Ok(Answer { image: Some(image), .. }) => ("200 OK", "image/png", image),
+                Ok(Answer { value: Value::String(text), .. }) => ("200 OK", "text/plain; charset=utf-8", text.into_bytes()),
+                Ok(Answer { value, .. }) => ("200 OK", "application/json", value.to_string().into_bytes()),
                 Err(error) => ("400 Bad Request", "text/plain; charset=utf-8", format!("{error:#}").into_bytes()),
             },
             (_, "GET" | "POST", ..) => ("404 Not Found", "text/plain", b"Not found. GET / lists the tools".to_vec()),
             _ => ("405 Method Not Allowed", "text/plain", Vec::new()),
         };
-        write!(
-            stream,
-            "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nAllow: GET, POST\r\n\r\n",
-            response.len()
-        )?;
-        stream.write_all(&response)?;
+        respond(&mut stream, status, kind, &response, close, path == "/mcp")?;
         if close {
             return Ok(());
         }
     }
 }
 
+const VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
 fn rpc(request: &Value) -> Option<Value> {
+    // Responses and notifications from the client get no answer.
+    let method = request.get("method")?.as_str()?;
     let id = request.get("id")?.clone();
     let params = &request["params"];
-    let result = match request["method"].as_str().unwrap_or("") {
+    let result = match method {
         "initialize" => json!({
-            "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
+            "protocolVersion": VERSIONS.iter().find(|version| params["protocolVersion"] == **version).unwrap_or(&VERSIONS[0]),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "apps-devtools", "version": env!("CARGO_PKG_VERSION")},
             "instructions": "Debug the running app. Tools without `window` target the main process; pass a window id from `windows` for a page. Lines and columns are 1-based and refer to source files.",
@@ -261,12 +379,20 @@ fn rpc(request: &Value) -> Option<Value> {
             params["name"].as_str().unwrap_or(""),
             params["arguments"].clone(),
         ) {
-            Ok(Value::String(text)) => json!({"content": [{"type": "text", "text": text}]}),
-            Ok(Value::Object(image)) if image.contains_key("image") => json!({"content": [
-                {"type": "image", "data": image["image"], "mimeType": "image/png"},
-                {"type": "text", "text": image["text"]},
+            Ok(Answer {
+                value,
+                image: Some(image),
+            }) => json!({"content": [
+                {"type": "image", "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, image), "mimeType": "image/png"},
+                {"type": "text", "text": value},
             ]}),
-            Ok(value) => json!({"content": [{"type": "text", "text": value.to_string()}]}),
+            Ok(Answer {
+                value: Value::String(text),
+                ..
+            }) => json!({"content": [{"type": "text", "text": text}]}),
+            Ok(Answer { value, .. }) => {
+                json!({"content": [{"type": "text", "text": value.to_string()}]})
+            }
             Err(error) => {
                 json!({"content": [{"type": "text", "text": format!("{error:#}")}], "isError": true})
             }
@@ -280,61 +406,93 @@ fn rpc(request: &Value) -> Option<Value> {
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
-fn call(tool: &str, args: Value) -> Result<Value> {
-    let pages = PAGES.lock().unwrap_or_else(PoisonError::into_inner);
-    if tool == "windows" {
-        let keys: Vec<_> = pages.keys().copied().collect();
-        drop(pages);
-        let mut list = Vec::new();
-        for key in keys {
-            if let Ok(Value::Array(windows)) = dispatch(tool, args.clone(), Some(key)) {
-                list.extend(windows);
-            }
-        }
-        list.sort_by_key(|window| window["id"].as_u64());
-        return Ok(list.into());
+fn call(tool: &str, mut args: Value) -> Result<Answer> {
+    match tool {
+        "console" => return Ok(console(&args).into()),
+        "windows" => return windows(&args),
+        "profile" => return profile(&args),
+        _ => {}
     }
-    let paused = SHARED.page_paused.load(Ordering::Acquire);
-    let key = if args["window"].is_null()
-        && (tool == "evaluate" || tool == "debugger" || tool == "console" && pages.is_empty())
-        && paused == 0
-    {
-        None
-    } else {
-        let wanted = match args["window"].as_u64() {
-            Some(window) if pages.contains_key(&window) => Some(window),
-            Some(window) => bail!("No window {window}"),
-            None if !args["window"].is_null() => bail!("No window {}", args["window"]),
-            None => (paused > 0).then(|| paused - 1),
+    if (tool == "evaluate" || tool == "debugger") && args["window"].is_null() {
+        // While only pages are paused, evaluate and the stepping actions follow the paused context.
+        let follow = tool == "evaluate"
+            || matches!(
+                args["action"].as_str(),
+                Some("state" | "resume" | "step_over" | "step_into" | "step_out")
+            );
+        let pauses = lock(&PAUSES);
+        let page = pauses
+            .iter()
+            .all(|pause| pause.role != Role::Main)
+            .then(|| {
+                pauses.iter().find_map(|pause| match pause.role {
+                    Role::Preload(id) => Some((id, true)),
+                    Role::Renderer(id) => Some((id, false)),
+                    Role::Main => None,
+                })
+            })
+            .flatten()
+            .filter(|_| follow);
+        drop(pauses);
+        let Some((window, preload)) = page else {
+            return dispatch(tool, args, None);
         };
-        Some(
-            wanted
-                .or_else(|| pages.keys().next().copied())
-                .context("The app has no windows")?,
-        )
+        args["window"] = window.into();
+        args["preload"] = preload.into();
+    }
+    let pages = lock(&PAGES);
+    let key = match args["window"].as_u64() {
+        // Key 0 is a page thread that serves every window.
+        Some(_) if pages.contains_key(&0) => 0,
+        Some(window) if pages.contains_key(&window) => window,
+        Some(window) => bail!("No window {window}"),
+        None if !args["window"].is_null() => bail!("No window {}", args["window"]),
+        None => *pages.keys().next().context("The app has no windows")?,
     };
     drop(pages);
-    if tool == "profile"
-        && args["action"].is_null()
-        && let Some(duration) = args["duration"].as_u64()
-    {
-        dispatch(tool, json!({"action": "start"}), key)?;
-        std::thread::sleep(Duration::from_millis(duration.min(60_000)));
-        return dispatch(tool, json!({"action": "stop"}), key);
-    }
-    dispatch(tool, args, key)
+    dispatch(tool, args, Some(key))
 }
 
-fn dispatch(tool: &str, args: Value, key: Option<u64>) -> Result<Value> {
+fn windows(args: &Value) -> Result<Answer> {
+    let keys: Vec<u64> = lock(&PAGES).keys().copied().collect();
+    let posted: Vec<_> = keys
+        .into_iter()
+        .map(|key| (key, post("windows", args.clone(), Some(key))))
+        .collect();
+    let started = Instant::now();
+    let (mut list, mut failed) = (Vec::new(), None);
+    for (key, posted) in posted {
+        let timeout = Duration::from_secs(2).saturating_sub(started.elapsed());
+        match posted.and_then(|posted| wait(posted, timeout)) {
+            Ok(Answer {
+                value: Value::Array(windows),
+                ..
+            }) => list.extend(windows),
+            Ok(_) => {}
+            // A busy or paused page still shows up, without its details.
+            Err(error) if key != 0 => list.push(json!({"id": key, "error": format!("{error:#}")})),
+            Err(error) => failed = Some(error),
+        }
+    }
+    if let Some(error) = failed.filter(|_| list.is_empty()) {
+        return Err(error);
+    }
+    list.sort_by_key(|window| window["id"].as_u64());
+    Ok(Value::from(list).into())
+}
+
+fn dispatch(tool: &str, args: Value, key: Option<u64>) -> Result<Answer> {
     let timeout =
         Duration::from_millis(30_000 + args["duration"].as_u64().unwrap_or(0).min(60_000));
+    wait(post(tool, args, key)?, timeout)
+}
+
+fn post(tool: &str, args: Value, key: Option<u64>) -> Result<Posted> {
     let (reply, result) = mpsc::channel();
-    let pauses = SHARED.pauses.load(Ordering::Acquire);
+    let seq = PAUSE_SEQ.load(Ordering::Acquire);
     let sender = match key {
         None => MAIN.get().context("The app has quit")?.clone(),
-        Some(key) => PAGES
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        Some(key) => lock(&PAGES)
             .get(&key)
             .cloned()
             .context("The window is closed")?,
@@ -347,24 +505,35 @@ fn dispatch(tool: &str, args: Value, key: Option<u64>) -> Result<Value> {
         })
         .map_err(|_| anyhow!("The app has quit"))?;
     (host().wake)(key.unwrap_or(u64::MAX));
+    let thread = key.or_else(|| ONE_THREAD.load(Ordering::Acquire).then_some(0));
+    Ok(Posted {
+        result,
+        thread,
+        seq,
+    })
+}
+
+fn wait(posted: Posted, timeout: Duration) -> Result<Answer> {
     let started = Instant::now();
-    let value = loop {
-        match result.recv_timeout(Duration::from_millis(100)) {
-            Ok(value) => break value?,
+    loop {
+        match posted.result.recv_timeout(Duration::from_millis(100)) {
+            Ok(value) => return value,
             Err(mpsc::RecvTimeoutError::Disconnected) => bail!("The app has quit"),
             Err(_) if started.elapsed() > timeout => {
                 bail!(
                     "No answer after {} seconds. The app may be busy, or its window hidden",
-                    timeout.as_secs()
+                    timeout.as_secs_f32().round()
                 )
             }
             Err(_) => {
-                let paused = SHARED.paused.lock().unwrap().clone();
                 // This call itself may have hit a breakpoint, and then only the debugger tool can answer.
-                if let Some(at) = paused.filter(|_| SHARED.pauses.load(Ordering::Acquire) != pauses)
-                {
-                    if let Ok(value) = result.try_recv() {
-                        break value?;
+                let at = lock(&PAUSES)
+                    .iter()
+                    .find(|pause| pause.seq > posted.seq && pause.thread == posted.thread)
+                    .map(|pause| pause.at.clone());
+                if let Some(at) = at {
+                    if let Ok(value) = posted.result.try_recv() {
+                        return value;
                     }
                     bail!(
                         "The app paused in the debugger at {at}. Use the debugger tool to inspect or resume it"
@@ -372,8 +541,7 @@ fn dispatch(tool: &str, args: Value, key: Option<u64>) -> Result<Value> {
                 }
             }
         }
-    };
-    Ok(value)
+    }
 }
 
 const TOOLS: &str = r#"[
@@ -494,9 +662,10 @@ fn settle_step() {
     if STATE.with_borrow(|state| state.paused.is_none())
         && let Some(reply) = STATE.with_borrow_mut(|state| state.stepping.take())
     {
-        let _ = reply.send(Ok(
-            "Resumed. The code finished without pausing again.".into()
-        ));
+        let _ = reply.send(Ok(Value::from(
+            "Resumed. The code finished without pausing again.",
+        )
+        .into()));
     }
 }
 
@@ -573,13 +742,13 @@ pub extern "C" fn apps_devtools_mcp_frame(window: u64, nanos: u64) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_devtools_mcp_paused(ctx: usize, done: *mut bool) {
     pump();
-    let page = CHANNEL.with(|channel| channel.get().map(|(_, key)| *key));
-    if page.is_none() && !MAIN_CHANNEL.with(|channel| channel.get().is_some()) {
+    let thread = CHANNEL.with(|channel| channel.get().map(|(_, key)| *key));
+    if thread.is_none() && !MAIN_CHANNEL.with(|channel| channel.get().is_some()) {
         let _ = send(ctx, "Debugger.resume", json!({}));
         return;
     }
     if let Some(reply) = STATE.with_borrow_mut(|state| state.stepping.take()) {
-        let _ = reply.send(state(&json!({})));
+        let _ = reply.send(state(&json!({})).map(Answer::from));
     }
     let at = STATE.with_borrow(|state| {
         let (_, paused) = state.paused.as_ref()?;
@@ -591,11 +760,17 @@ pub unsafe extern "C" fn apps_devtools_mcp_paused(ctx: usize, done: *mut bool) {
             paused["reason"].as_str().unwrap_or("pause")
         ))
     });
-    *SHARED.paused.lock().unwrap() = Some(at.unwrap_or_else(|| "a statement".into()));
-    SHARED.pauses.fetch_add(1, Ordering::AcqRel);
-    SHARED
-        .page_paused
-        .store(page.map_or(0, |key| key + 1), Ordering::Release);
+    let role = contexts()
+        .into_iter()
+        .find_map(|(found, role)| (found == ctx).then_some(role))
+        .unwrap_or(Role::Main);
+    let seq = PAUSE_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+    lock(&PAUSES).push(Pause {
+        seq,
+        thread,
+        role,
+        at: at.unwrap_or_else(|| "a statement".into()),
+    });
     // JSC sets `done` while a dispatched message runs, so read it again each time.
     while !unsafe { std::ptr::read_volatile(done) } {
         if let Some(call) = next(true) {
@@ -603,8 +778,7 @@ pub unsafe extern "C" fn apps_devtools_mcp_paused(ctx: usize, done: *mut bool) {
         }
         pump();
     }
-    *SHARED.paused.lock().unwrap() = None;
-    SHARED.page_paused.store(0, Ordering::Release);
+    lock(&PAUSES).retain(|pause| pause.seq != seq);
     STATE.with_borrow_mut(|state| state.paused = None);
 }
 
@@ -619,14 +793,13 @@ fn run(Call { tool, args, reply }: Call, app: *mut c_void) {
         "screenshot" => screenshot(&args, app, &reply),
         "dom" => dom(&args).map(Some),
         "input" => input(&args, app, &reply),
-        "console" => Ok(Some(console(&args))),
-        "memory" => memory(&args, app).map(Some),
-        "profile" => profile(&args).map(Some),
+        "memory" => memory(&args, app, &reply),
+        "profile" => profile_thread(&args).map(Some),
         "debugger" => debugger(&args, &reply),
         _ => Err(anyhow!("Unknown tool: {tool}")),
     };
     match result {
-        Ok(Some(value)) => drop(reply.send(Ok(value))),
+        Ok(Some(value)) => drop(reply.send(Ok(value.into()))),
         Ok(None) => {}
         Err(error) => drop(reply.send(Err(error))),
     }
@@ -637,11 +810,24 @@ fn host() -> &'static Host {
 }
 
 fn desktop(app: *mut c_void, op: &str, args: &Value, reply: Reply) {
-    extern "C" fn done(reply: *mut c_void, ok: bool, data: *const u8, len: usize) {
+    extern "C" fn done(
+        reply: *mut c_void,
+        ok: bool,
+        data: *const u8,
+        len: usize,
+        image: *const u8,
+        image_len: usize,
+    ) {
         let reply = unsafe { Box::from_raw(reply.cast::<Reply>()) };
         let data = unsafe { std::slice::from_raw_parts(data, len) };
         let _ = reply.send(if ok {
-            serde_json::from_slice(data).map_err(Into::into)
+            serde_json::from_slice(data)
+                .map(|value| Answer {
+                    value,
+                    image: (!image.is_null())
+                        .then(|| unsafe { std::slice::from_raw_parts(image, image_len) }.to_vec()),
+                })
+                .map_err(Into::into)
         } else {
             Err(anyhow!("{}", String::from_utf8_lossy(data)))
         });
@@ -665,6 +851,7 @@ fn desktop_now(app: *mut c_void, op: &str, args: &Value) -> Result<Value> {
     result
         .try_recv()
         .with_context(|| format!("{op} did not answer"))?
+        .map(|answer| answer.value)
 }
 
 fn contexts() -> Vec<(usize, Role)> {
@@ -690,11 +877,13 @@ fn context(role: Role) -> Option<usize> {
         .find_map(|(ctx, found)| (found == role).then_some(ctx))
 }
 
-fn inspector_messages() -> Vec<(usize, String)> {
+fn inspector_messages() -> Vec<(usize, Value)> {
     extern "C" fn push(list: *mut c_void, ctx: usize, message: *const u8, len: usize) {
-        let list = unsafe { &mut *list.cast::<Vec<(usize, String)>>() };
+        let list = unsafe { &mut *list.cast::<Vec<(usize, Value)>>() };
         let message = unsafe { std::slice::from_raw_parts(message, len) };
-        list.push((ctx, String::from_utf8_lossy(message).into_owned()));
+        if let Ok(message) = serde_json::from_slice(message) {
+            list.push((ctx, message));
+        }
     }
     let mut list = Vec::new();
     (host().messages)((&raw mut list).cast(), push);
@@ -720,45 +909,78 @@ fn inspect(ctx: usize, message: &str) -> Result<()> {
 }
 
 fn pump() {
-    for (ctx, message) in inspector_messages() {
-        let Ok(message) = serde_json::from_str::<Value>(&message) else {
-            continue;
-        };
+    for (ctx, mut message) in inspector_messages() {
         if let Some(id) = message["id"].as_u64() {
             let result = match message.get("error") {
                 Some(error) => Err(error["message"]
                     .as_str()
                     .unwrap_or("Inspector error")
                     .to_owned()),
-                None => Ok(message["result"].clone()),
+                None => Ok(message["result"].take()),
             };
             match STATE.with_borrow_mut(|state| state.waiting.remove(&id)) {
-                Some(done) => done(result.map_err(anyhow::Error::msg)),
-                None => drop(STATE.with_borrow_mut(|state| state.responses.insert(id, result))),
+                Some((_, done)) => done(result.map_err(anyhow::Error::msg)),
+                None => STATE.with_borrow_mut(|state| {
+                    if let Some(slot) = state.responses.get_mut(&id) {
+                        *slot = Some(result);
+                    }
+                }),
             }
             continue;
         }
-        let params = &message["params"];
-        STATE.with_borrow_mut(|state| match message["method"].as_str().unwrap_or("") {
+        let method = match message["method"].take() {
+            Value::String(method) => method,
+            _ => continue,
+        };
+        let params = &mut message["params"];
+        STATE.with_borrow_mut(|state| match method.as_str() {
             "Debugger.scriptParsed" => {
+                let raw = params["sourceMapURL"].take();
                 if let (Some(session), Some(id)) =
                     (state.sessions.get_mut(&ctx), params["scriptId"].as_str())
                 {
+                    let mut raw = match raw {
+                        Value::String(url) => url,
+                        _ => String::new(),
+                    };
+                    if raw.len() > 64 << 10 {
+                        raw = compact(&raw).unwrap_or_default();
+                    }
                     session.scripts.insert(
                         id.into(),
                         Script {
                             url: params["url"].as_str().unwrap_or("").into(),
-                            map_url: params["sourceMapURL"].as_str().unwrap_or("").into(),
+                            raw: RefCell::new(raw),
                             map: OnceCell::new(),
                         },
                     );
                 }
             }
-            "Debugger.paused" => state.paused = Some((ctx, params.clone())),
+            "Debugger.paused" => state.paused = Some((ctx, params.take())),
             "Debugger.resumed" => state.paused = None,
-            "ScriptProfiler.trackingComplete" => state.samples = Some(params["samples"].clone()),
+            "ScriptProfiler.trackingComplete" => {
+                state.samples.push((ctx, params["samples"].take()))
+            }
             _ => {}
         });
+    }
+    // Waiters for promises that never settle would stay forever.
+    let expired: Vec<Waiter> = STATE.with_borrow_mut(|state| {
+        if state.waiting.is_empty() {
+            return Vec::new();
+        }
+        let old: Vec<u64> = state
+            .waiting
+            .iter()
+            .filter(|(_, (since, _))| since.elapsed() > Duration::from_secs(120))
+            .map(|(id, _)| *id)
+            .collect();
+        old.iter()
+            .filter_map(|id| state.waiting.remove(id).map(|(_, done)| done))
+            .collect()
+    });
+    for done in expired {
+        done(Err(anyhow!("The promise did not settle")));
     }
 }
 
@@ -779,16 +1001,17 @@ fn send(ctx: usize, method: &str, params: Value) -> Result<u64> {
 
 fn request(ctx: usize, method: &str, params: Value) -> Result<Value> {
     let id = send(ctx, method, params)?;
+    STATE.with_borrow_mut(|state| state.responses.insert(id, None));
     pump();
     STATE
-        .with_borrow_mut(|state| state.responses.remove(&id))
+        .with_borrow_mut(|state| state.responses.remove(&id).flatten())
         .with_context(|| format!("{method} did not answer"))?
         .map_err(anyhow::Error::msg)
 }
 
 fn request_later(ctx: usize, method: &str, params: Value, done: Waiter) -> Result<()> {
     let id = send(ctx, method, params)?;
-    STATE.with_borrow_mut(|state| state.waiting.insert(id, done));
+    STATE.with_borrow_mut(|state| state.waiting.insert(id, (Instant::now(), done)));
     pump();
     Ok(())
 }
@@ -809,6 +1032,11 @@ fn attach(ctx: usize) -> Result<()> {
 
 fn debug(ctx: usize) -> Result<()> {
     attach(ctx)?;
+    STATE.with_borrow_mut(|state| {
+        if let Some(session) = state.sessions.get_mut(&ctx) {
+            session.debugging = true;
+        }
+    });
     request(
         ctx,
         "Debugger.setPauseOnDebuggerStatements",
@@ -915,7 +1143,7 @@ fn evaluate(args: &Value, reply: &Reply) -> Result<Option<Value>> {
                     .unwrap_or("undefined")
                     .to_owned();
                 ensure!(!thrown && response["wasThrown"] != true, "Uncaught {text}");
-                Ok(text.into())
+                Ok(Value::from(text).into())
             }));
         }),
     )?;
@@ -1015,7 +1243,7 @@ fn console(args: &Value) -> Value {
     }
 }
 
-fn memory(args: &Value, app: *mut c_void) -> Result<Value> {
+fn memory(args: &Value, app: *mut c_void, reply: &Reply) -> Result<Option<Value>> {
     let mut report = desktop_now(app, "memory", args)?;
     if let Some(types) = report["heap"]
         .as_object_mut()
@@ -1033,47 +1261,61 @@ fn memory(args: &Value, app: *mut c_void) -> Result<Value> {
             .map(|(count, name)| json!([name, count]))
             .collect();
     }
-    if args["snapshot"] == true {
-        let ctx = context(Role::Renderer(window(args)?)).context("No JavaScript context")?;
-        let snapshot = request(ctx, "Heap.snapshot", json!({}))?;
-        let data = snapshot["snapshotData"]
-            .as_str()
-            .context("Empty heap snapshot")?;
-        let path = std::env::temp_dir().join(format!(
-            "apps-heap-{}-{}.json",
-            std::process::id(),
-            snapshot["timestamp"].as_f64().unwrap_or(0.) as u64
-        ));
-        std::fs::write(&path, data)?;
-        let parsed: Value = serde_json::from_str(data)?;
-        let stride = if parsed["type"] == "GCDebugging" {
-            7
-        } else {
-            4
-        };
-        let names = parsed["nodeClassNames"]
-            .as_array()
-            .context("Invalid heap snapshot")?;
-        let mut classes: HashMap<usize, (u64, u64)> = HashMap::new();
-        for node in parsed["nodes"]
-            .as_array()
-            .context("Invalid heap snapshot")?
-            .chunks(stride)
-        {
-            let entry = classes
-                .entry(node[2].as_u64().unwrap_or(0) as usize)
-                .or_default();
-            entry.0 += 1;
-            entry.1 += node[1].as_u64().unwrap_or(0);
-        }
-        let mut classes: Vec<_> = classes.into_iter().collect();
-        classes.sort_unstable_by_key(|(_, (_, size))| std::cmp::Reverse(*size));
-        report["snapshot"] = json!({
-            "path": path,
-            "largestClasses": classes.into_iter().take(25).map(|(name, (count, size))| json!({"class": names.get(name), "count": count, "bytes": size})).collect::<Vec<_>>(),
-        });
+    if args["snapshot"] != true {
+        return Ok(Some(report));
     }
-    Ok(report)
+    let ctx = context(Role::Renderer(window(args)?)).context("No JavaScript context")?;
+    let mut snapshot = request(ctx, "Heap.snapshot", json!({}))?;
+    let Value::String(data) = snapshot["snapshotData"].take() else {
+        bail!("Empty heap snapshot");
+    };
+    let path = std::env::temp_dir().join(format!(
+        "apps-heap-{}-{}.json",
+        std::process::id(),
+        snapshot["timestamp"].as_f64().unwrap_or(0.) as u64
+    ));
+    // Writing and reading a big snapshot would stop the page, so another thread does it.
+    let reply = reply.clone();
+    std::thread::Builder::new()
+        .name("apps-mcp-heap".into())
+        .spawn(move || {
+            let summary = (|| -> Result<Value> {
+                std::fs::write(&path, &data)?;
+                let invalid = || anyhow!("Invalid heap snapshot");
+                let at = data.find("\"nodes\":").ok_or_else(invalid)? + 8;
+                let stride = if data[..at].contains("\"GCDebugging\"") {
+                    7
+                } else {
+                    4
+                };
+                let mut nodes =
+                    serde_json::Deserializer::from_str(&data[at..]).into_iter::<Vec<u64>>();
+                let list = nodes.next().ok_or_else(invalid)??;
+                let rest = &data[at + nodes.byte_offset()..];
+                let at = rest.find("\"nodeClassNames\":").ok_or_else(invalid)? + 17;
+                let names = serde_json::Deserializer::from_str(&rest[at..])
+                    .into_iter::<Vec<String>>()
+                    .next()
+                    .ok_or_else(invalid)??;
+                let mut classes: HashMap<usize, (u64, u64)> = HashMap::new();
+                for node in list.chunks_exact(stride) {
+                    let entry = classes.entry(node[2] as usize).or_default();
+                    entry.0 += 1;
+                    entry.1 += node[1];
+                }
+                let mut classes: Vec<_> = classes.into_iter().collect();
+                classes.sort_unstable_by_key(|(_, (_, size))| std::cmp::Reverse(*size));
+                Ok(json!({
+                    "path": path,
+                    "largestClasses": classes.into_iter().take(25).map(|(name, (count, size))| json!({"class": names.get(name), "count": count, "bytes": size})).collect::<Vec<_>>(),
+                }))
+            })();
+            let _ = reply.send(summary.map(|summary| {
+                report["snapshot"] = summary;
+                report.into()
+            }));
+        })?;
+    Ok(None)
 }
 
 fn cpu_time() -> f64 {
@@ -1081,139 +1323,220 @@ fn cpu_time() -> f64 {
     (usage["user"].as_f64().unwrap_or(0.) + usage["system"].as_f64().unwrap_or(0.)) / 1000.
 }
 
-fn profile(args: &Value) -> Result<Value> {
-    match args["action"].as_str() {
-        Some("start") => {
-            profile_start()?;
-            Ok("Profiling. Call profile with action stop to get the report.".into())
-        }
-        Some("stop") => profile_stop(),
-        _ => bail!("Pass action start or stop, or a duration"),
+fn profile(args: &Value) -> Result<Answer> {
+    if args["action"].is_null()
+        && let Some(duration) = args["duration"].as_u64()
+    {
+        profile(&json!({"action": "start"}))?;
+        std::thread::sleep(Duration::from_millis(duration.min(60_000)));
+        return profile(&json!({"action": "stop"}));
     }
-}
-
-fn profile_start() -> Result<()> {
+    let action = args["action"].as_str();
     ensure!(
-        STATE.with_borrow(|state| state.profile.is_none()),
-        "A profile is already running"
+        matches!(action, Some("start" | "stop")),
+        "Pass action start or stop, or a duration"
     );
-    let ctx = context(Role::Main)
-        .or_else(|| {
-            contexts()
-                .into_iter()
-                .find_map(|(ctx, role)| matches!(role, Role::Renderer(_)).then_some(ctx))
-        })
-        .context("No JavaScript context")?;
-    for (ctx, _) in contexts() {
-        attach(ctx)?;
+    let mut running = lock(&PROFILE);
+    if action == Some("start") {
+        ensure!(running.is_none(), "A profile is already running");
+        let mut keys: Vec<_> = lock(&PAGES).keys().map(|key| Some(*key)).collect();
+        if !ONE_THREAD.load(Ordering::Acquire) {
+            keys.insert(0, None);
+        }
+        let (cpu, mut threads) = (cpu_time(), Vec::new());
+        for key in keys {
+            if dispatch("profile", json!({"action": "start"}), key).is_ok() {
+                threads.push(key);
+            }
+        }
+        *running = Some((Instant::now(), cpu, threads));
+        return Ok(
+            Value::from("Profiling. Call profile with action stop to get the report.").into(),
+        );
     }
-    request(
-        ctx,
-        "ScriptProfiler.startTracking",
-        json!({"includeSamples": true}),
-    )?;
-    STATE.with_borrow_mut(|state| {
-        state.samples = None;
-        state.profile = Some(Profile {
-            ctx,
-            started: Instant::now(),
-            cpu: cpu_time(),
-        });
-    });
-    FRAMES.set(Some(Vec::new()));
-    Ok(())
-}
-
-fn profile_stop() -> Result<Value> {
-    let profile = STATE
-        .with_borrow_mut(|state| state.profile.take())
-        .context("No profile is running")?;
-    let frames = FRAMES.take().unwrap_or_default();
-    let elapsed = profile.started.elapsed().as_secs_f64() * 1000.;
-    request(profile.ctx, "ScriptProfiler.stopTracking", json!({}))?;
-    let cpu = cpu_time() - profile.cpu;
-    let mut text = format!(
-        "Profiled {elapsed:.0} ms. Process CPU {cpu:.0} ms ({:.1}% of one core).\n",
-        cpu / elapsed * 100.
+    let (started, cpu, threads) = running.take().context("No profile is running")?;
+    drop(running);
+    let elapsed = started.elapsed().as_secs_f64() * 1000.;
+    let (mut frames, mut functions, mut samples) = (Vec::new(), HashMap::new(), 0);
+    let mut text = String::new();
+    for key in threads {
+        let report = match dispatch("profile", json!({"action": "stop"}), key) {
+            Ok(report) => report.value,
+            Err(error) => {
+                if let Some(key) = key.filter(|key| *key != 0) {
+                    text += &format!("Window {key}: {error:#}\n");
+                }
+                continue;
+            }
+        };
+        samples += report["samples"].as_u64().unwrap_or(0);
+        for frame in report["frames"].as_array().into_iter().flatten() {
+            frames.push((
+                frame[0].as_u64().unwrap_or(0),
+                frame[1].as_f64().unwrap_or(0.),
+            ));
+        }
+        for function in report["functions"].as_array().into_iter().flatten() {
+            let entry: &mut (u64, u64) = functions
+                .entry(function[0].as_str().unwrap_or("").to_owned())
+                .or_default();
+            entry.0 += function[1].as_u64().unwrap_or(0);
+            entry.1 += function[2].as_u64().unwrap_or(0);
+        }
+    }
+    let cpu = cpu_time() - cpu;
+    text.insert_str(
+        0,
+        &format!(
+            "Profiled {elapsed:.0} ms. Process CPU {cpu:.0} ms ({:.1}% of one core).\n",
+            cpu / elapsed * 100.
+        ),
     );
     if frames.is_empty() {
         text += "No window drew a frame.\n";
     }
-    let mut windows: Vec<u64> = frames.iter().map(|(window, _)| *window).collect();
-    windows.sort_unstable();
-    windows.dedup();
-    for window in windows {
-        let mut times: Vec<f64> = frames
-            .iter()
-            .filter(|(id, _)| *id == window)
-            .map(|(_, time)| time.as_secs_f64() * 1000.)
-            .collect();
-        times.sort_unstable_by(f64::total_cmp);
+    frames.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    for times in frames.chunk_by(|a, b| a.0 == b.0) {
         text += &format!(
-            "Window {window}: {} frames ({:.1} fps). Frame CPU time from render to paint: avg {:.2} ms, p95 {:.2} ms, max {:.2} ms.\n",
+            "Window {}: {} frames ({:.1} fps). Frame CPU time from render to paint: avg {:.2} ms, p95 {:.2} ms, max {:.2} ms.\n",
+            times[0].0,
             times.len(),
             times.len() as f64 / elapsed * 1000.,
-            times.iter().sum::<f64>() / times.len() as f64,
-            times[(times.len() * 95 / 100).min(times.len() - 1)],
-            times[times.len() - 1],
+            times.iter().map(|(_, time)| time).sum::<f64>() / times.len() as f64,
+            times[(times.len() * 95 / 100).min(times.len() - 1)].1,
+            times[times.len() - 1].1,
         );
     }
-    let traces = STATE
-        .with_borrow_mut(|state| state.samples.take())
-        .unwrap_or_default();
-    let traces = traces["stackTraces"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let mut functions: HashMap<String, (u64, u64)> = HashMap::new();
-    STATE.with_borrow(|state| {
-        for trace in &traces {
-            let mut seen = Vec::new();
-            for (index, frame) in trace["stackFrames"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .enumerate()
-            {
-                let key = format!(
-                    "{}  {}",
-                    frame["name"]
-                        .as_str()
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or("(anonymous)"),
-                    location(
-                        state,
-                        &json!({
-                            "scriptId": frame["sourceID"],
-                            "lineNumber": frame["line"].as_i64().unwrap_or(0) - 1,
-                            "columnNumber": frame["column"].as_i64().unwrap_or(0) - 1,
-                        })
-                    )
-                );
-                if seen.contains(&key) {
-                    continue;
-                }
-                let entry = functions.entry(key.clone()).or_default();
-                entry.0 += u64::from(index == 0);
-                entry.1 += 1;
-                seen.push(key);
-            }
-        }
-    });
-    if traces.is_empty() {
+    if samples == 0 {
         text += "No JavaScript ran.";
-        return Ok(text.into());
+        return Ok(Value::from(text).into());
     }
     let mut functions: Vec<_> = functions.into_iter().collect();
     functions.sort_unstable_by_key(|(_, counts)| std::cmp::Reverse(*counts));
     text += &format!(
-        "JavaScript: {} samples, about 1 ms each.\n   self   total  function  location\n",
-        traces.len()
+        "JavaScript: {samples} samples, about 1 ms each.\n   self   total  context  function  location\n"
     );
     for (name, (own, total)) in functions.into_iter().take(30) {
         text += &format!("{own:7} {total:7}  {name}\n");
     }
-    Ok(text.into())
+    Ok(Value::from(text).into())
+}
+
+fn profile_thread(args: &Value) -> Result<Value> {
+    if args["action"] == "start" {
+        if STATE.with_borrow(|state| state.profile.is_some()) {
+            return Ok(Value::Null);
+        }
+        let contexts = contexts();
+        let one = ONE_THREAD.load(Ordering::Acquire);
+        // Sampling covers a whole VM: main has one, and the pages of a thread share one.
+        let mut tracked: Vec<(usize, String)> = Vec::new();
+        for (ctx, role) in &contexts {
+            let label = match role {
+                Role::Main => "main".into(),
+                _ if one => "pages".into(),
+                Role::Preload(id) | Role::Renderer(id) => format!("window {id}"),
+            };
+            if !tracked.iter().any(|(_, found)| *found == label) {
+                tracked.push((*ctx, label));
+            }
+        }
+        let attached = contexts
+            .iter()
+            .map(|(ctx, _)| *ctx)
+            .filter(|ctx| STATE.with_borrow(|state| !state.sessions.contains_key(ctx)))
+            .collect();
+        for (ctx, _) in &contexts {
+            attach(*ctx)?;
+        }
+        for (ctx, _) in &tracked {
+            request(
+                *ctx,
+                "ScriptProfiler.startTracking",
+                json!({"includeSamples": true}),
+            )?;
+        }
+        STATE.with_borrow_mut(|state| {
+            state.samples.clear();
+            state.profile = Some(Profile { tracked, attached });
+        });
+        FRAMES.set(Some(Vec::new()));
+        return Ok(Value::Null);
+    }
+    let profile = STATE
+        .with_borrow_mut(|state| state.profile.take())
+        .context("No profile is running")?;
+    let frames: Vec<_> = FRAMES
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(window, time)| json!([window, time.as_secs_f64() * 1000.]))
+        .collect();
+    for (ctx, _) in &profile.tracked {
+        let _ = request(*ctx, "ScriptProfiler.stopTracking", json!({}));
+    }
+    let traces = STATE.with_borrow_mut(|state| std::mem::take(&mut state.samples));
+    let mut functions: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut samples = 0;
+    STATE.with_borrow(|state| {
+        for (ctx, data) in &traces {
+            let label = profile
+                .tracked
+                .iter()
+                .find_map(|(found, label)| (found == ctx).then_some(label.as_str()))
+                .unwrap_or("");
+            for trace in data["stackTraces"].as_array().into_iter().flatten() {
+                samples += 1;
+                let mut seen = Vec::new();
+                for (index, frame) in trace["stackFrames"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    let key = format!(
+                        "{label}  {}  {}",
+                        frame["name"]
+                            .as_str()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or("(anonymous)"),
+                        location(
+                            state,
+                            &json!({
+                                "scriptId": frame["sourceID"],
+                                "lineNumber": frame["line"].as_i64().unwrap_or(0) - 1,
+                                "columnNumber": frame["column"].as_i64().unwrap_or(0) - 1,
+                            })
+                        )
+                    );
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    let entry = functions.entry(key.clone()).or_default();
+                    entry.0 += u64::from(index == 0);
+                    entry.1 += 1;
+                    seen.push(key);
+                }
+            }
+        }
+    });
+    // Only the debugger tool keeps the debugger on.
+    for ctx in profile.attached {
+        if STATE.with_borrow(|state| {
+            state
+                .sessions
+                .get(&ctx)
+                .is_some_and(|session| !session.debugging)
+        }) {
+            let _ = request(ctx, "Debugger.disable", json!({}));
+            STATE.with_borrow_mut(|state| state.sessions.remove(&ctx));
+        }
+    }
+    Ok(json!({
+        "frames": frames,
+        "samples": samples,
+        "functions": functions.into_iter().map(|(name, (own, total))| json!([name, own, total])).collect::<Vec<_>>(),
+    }))
 }
 
 fn debugger(args: &Value, reply: &Reply) -> Result<Option<Value>> {
@@ -1258,7 +1581,7 @@ fn debugger(args: &Value, reply: &Reply) -> Result<Option<Value>> {
         }
         "clear" => {
             let ctx = target(args)?;
-            attach(ctx)?;
+            debug(ctx)?;
             let id = args["id"].as_str();
             let ids: Vec<String> = STATE
                 .with_borrow_mut(|state| {
@@ -1543,8 +1866,32 @@ fn location(state: &State, location: &Value) -> String {
 fn source_map(script: &Script) -> Option<Rc<SourceMap>> {
     script
         .map
-        .get_or_init(|| SourceMap::parse(&script.map_url).map(Rc::new))
+        .get_or_init(|| SourceMap::parse(&script.raw.take()).map(Rc::new))
         .clone()
+}
+
+// Keeps only the sources and mappings of an inline source map, without its source texts.
+fn compact(url: &str) -> Option<String> {
+    let mut map: Value = serde_json::from_slice(&decode(url)?).ok()?;
+    Some(json!({"sources": map["sources"].take(), "mappings": map["mappings"].take()}).to_string())
+}
+
+fn decode(url: &str) -> Option<Vec<u8>> {
+    let (head, data) = url.strip_prefix("data:")?.split_once(',')?;
+    if head.ends_with(";base64") {
+        return base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).ok();
+    }
+    let mut bytes = Vec::with_capacity(data.len());
+    let mut input = data.bytes();
+    while let Some(byte) = input.next() {
+        if byte != b'%' {
+            bytes.push(byte);
+            continue;
+        }
+        let hex = [input.next()?, input.next()?];
+        bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+    }
+    Some(bytes)
 }
 
 struct SourceMap {
@@ -1553,24 +1900,11 @@ struct SourceMap {
 }
 
 impl SourceMap {
-    fn parse(url: &str) -> Option<Self> {
-        let (head, data) = url.strip_prefix("data:")?.split_once(',')?;
-        let json = if head.ends_with(";base64") {
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).ok()?
-        } else {
-            let mut bytes = Vec::with_capacity(data.len());
-            let mut input = data.bytes();
-            while let Some(byte) = input.next() {
-                if byte != b'%' {
-                    bytes.push(byte);
-                    continue;
-                }
-                let hex = [input.next()?, input.next()?];
-                bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
-            }
-            bytes
+    fn parse(raw: &str) -> Option<Self> {
+        let map: Value = match raw.starts_with('{') {
+            true => serde_json::from_str(raw).ok()?,
+            false => serde_json::from_slice(&decode(raw)?).ok()?,
         };
-        let map: Value = serde_json::from_slice(&json).ok()?;
         let sources: Vec<String> = map["sources"]
             .as_array()?
             .iter()
@@ -1668,5 +2002,12 @@ mod tests {
         assert_eq!(map.generated(0, 1, 0), Some((2, 0)));
         assert_eq!(map.generated(0, 2, 0), None);
         assert!(SourceMap::parse(r#"data:,{"sources":["a"],"mappings":"ACAA"}"#).is_none());
+        let compacted =
+            compact(r#"data:,{"sources":["a"],"sourcesContent":["x"],"mappings":"AAAA"}"#).unwrap();
+        assert_eq!(compacted, r#"{"sources":["a"],"mappings":"AAAA"}"#);
+        assert_eq!(
+            SourceMap::parse(&compacted).unwrap().mappings,
+            [[0, 0, 0, 0, 0]]
+        );
     }
 }

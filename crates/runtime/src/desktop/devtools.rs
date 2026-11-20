@@ -24,7 +24,7 @@ pub(crate) fn pages_open() -> bool {
     PAGE_TOOLS.load(Ordering::Relaxed) > 0
 }
 
-const ABI: u32 = 3;
+const ABI: u32 = 4;
 
 // The developer tools library, with the panel page, the MCP server and the FPS HUD. Built apps ship without
 // it. It is never unloaded: its threads run and the panel uses its texts until the app quits.
@@ -181,15 +181,21 @@ impl DevTools {
     }
 
     pub(crate) fn events(&self, values: &[Value]) -> Result<()> {
-        let batch: Vec<_> = values.iter().map(|event| if event["method"] == "Runtime.consoleAPICalled" {
+        let window = |context: &Value| context["renderer"].as_u64().or(context["preload"].as_u64());
+        let batch: Vec<_> = values.iter().filter_map(|event| if event["method"] == "Runtime.consoleAPICalled" {
             let params = &event["params"];
+            // Windows that share a thread share their logs: keep the ones of this window.
+            let other = window(&params["context"])
+                .is_some_and(|id| id != crate::host::WORKER_PAGE && window(&self.context).is_some_and(|own| own != id));
             let values = (params["context"] == self.context).then(|| &params["ref"]);
-            json!({"type":"console","level":params["type"],"text":params["text"],"ref":values})
-        } else { event.clone() }).collect();
+            (!other).then(|| json!({"type":"console","level":params["type"],"text":params["text"],"ref":values}))
+        } else { Some(event.clone()) }).collect();
         if !self.ready.get() {
+            // Keep the newest events: the errors just before the panel opened matter most.
             let mut events = self.events.borrow_mut();
-            let count = 500usize.saturating_sub(events.len());
-            events.extend(batch.into_iter().take(count));
+            events.extend(batch);
+            let extra = events.len().saturating_sub(500);
+            events.drain(..extra);
             return Ok(());
         }
         if !batch.is_empty() {
@@ -431,6 +437,23 @@ mod tests {
         assert_eq!(props[0], json!({"name":"a","type":"number","text":"1"}));
         assert_eq!(props[1]["text"], "(2) [1, \"x\"]");
         assert_eq!(props[3]["name"], "[[Prototype]]");
+        // Big values read only what the console shows.
+        let typed = call(
+            "Runtime.evaluate",
+            json!({"expression":"new Float32Array(1e7)"}),
+        );
+        assert_eq!(
+            typed["value"]["text"],
+            "Float32Array(10000000) [0, 0, 0, 0, 0, …]"
+        );
+        let props = call("Console.props", json!({"id":typed["value"]["id"]}));
+        assert_eq!(props.as_array().unwrap().len(), 501);
+        let map = call(
+            "Runtime.evaluate",
+            json!({"expression":"new Map(Array.from({length: 1e5}, (_, at) => [at, at]))"}),
+        );
+        let props = call("Console.props", json!({"id":map["value"]["id"]}));
+        assert_eq!(props.as_array().unwrap().len(), 201);
         // A logged object stays for the console to expand.
         engine
             .eval_page(

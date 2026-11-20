@@ -327,6 +327,10 @@ impl Window {
         pacer.sync();
     }
 
+    pub fn display(&self) -> Option<u32> {
+        lock(&self.pacer).display
+    }
+
     pub fn force_frame(&self) {
         let callbacks = self.callbacks;
         post(callbacks.thread, Box::new(move || step(callbacks)));

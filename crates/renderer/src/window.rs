@@ -753,6 +753,14 @@ impl Window {
         self.settling
     }
 
+    // The CoreGraphics id of the display that shows the window, on macOS.
+    pub fn display(&self) -> Option<u32> {
+        #[cfg(target_os = "macos")]
+        return self.platform.display();
+        #[cfg(not(target_os = "macos"))]
+        None
+    }
+
     pub fn will_draw(&self) -> bool {
         self.drawing || self.dirty || !self.captures.is_empty()
     }

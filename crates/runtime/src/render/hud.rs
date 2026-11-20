@@ -34,13 +34,15 @@ struct Library {
     new: extern "C" fn() -> *mut c_void,
     free: unsafe extern "C" fn(*mut c_void),
     tick: unsafe extern "C" fn(*mut c_void) -> bool,
-    paint: unsafe extern "C" fn(*mut c_void, u64, bool, f32, f32, f32, *mut c_void, Paint),
+    paint: unsafe extern "C" fn(*mut c_void, u64, bool, u32, f32, f32, f32, *mut c_void, Paint),
 }
 
 pub(crate) struct Hud {
     raw: NonNull<c_void>,
     library: &'static Library,
     pub(crate) started: Cell<Instant>,
+    // The start of the frame that painted last. A frame can paint in its first pass, its settle pass, or both.
+    painted: Cell<Option<Instant>>,
     timer: RefCell<Timer>,
 }
 
@@ -54,6 +56,7 @@ impl Hud {
                         raw,
                         library,
                         started: Cell::new(Instant::now()),
+                        painted: Cell::new(None),
                         timer: RefCell::new(tick(Rc::downgrade(view), window)),
                     });
                     view.hud.replace(hud);
@@ -66,11 +69,14 @@ impl Hud {
 
     pub(super) fn paint(&self, window: &mut Window) {
         let size = window.viewport_size();
+        let started = self.started.get();
+        let again = self.painted.replace(Some(started)) == Some(started);
         unsafe {
             (self.library.paint)(
                 self.raw.as_ptr(),
-                self.started.get().elapsed().as_nanos() as u64,
-                window.redrawing(),
+                started.elapsed().as_nanos() as u64,
+                again,
+                window.display().unwrap_or(0),
                 size.width.into(),
                 size.height.into(),
                 window.scale_factor(),

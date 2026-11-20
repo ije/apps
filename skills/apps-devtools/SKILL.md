@@ -31,7 +31,7 @@ curl -s $D/evaluate -d '{"expression":"document.title","window":1}'
 curl -s $D/screenshot -d '{"window":1}' -o /tmp/shot.png    # then read the PNG
 ```
 
-Window ids come from `windows`. Without `window`, `evaluate` and `debugger` use the main process, and the other tools use the first window. Lines and columns are 1-based and refer to your source files. Like Playwright, pages count as focused while this server runs, so hidden windows get focus events and `:focus` styles, and pages get no `focus` or `blur` on `window`.
+Window ids come from `windows`. Without `window`, `evaluate` and `debugger` use the main process, and the other tools use the first window. While only a page is paused, `evaluate` and the debugger actions `state`, `resume` and the steps use that page. `windows` lists a busy or paused window with an `error` instead of its details. Lines and columns are 1-based and refer to your source files. Like Playwright, pages count as focused while this server runs, so hidden windows get focus events and `:focus` styles, and pages get no `focus` or `blur` on `window`.
 
 | Tool | Use |
 |---|---|
@@ -42,7 +42,7 @@ Window ids come from `windows`. Without `window`, `evaluate` and `debugger` use 
 | `input` | Real input: `click`, `move`, `press`, `pressed_move` and `release` for a paced drag, `drag` (from `x`, `y` to `to_x`, `to_y`), `drop` (`paths` dragged in from another app, with `hold` or `leave`), `scroll` (trackpad pixels, or mouse wheel lines with `"lines":true`, and a gesture `"phase"`: `began`, `changed`, `ended`, `momentum`, `momentum_ended`, which spreads the scroll over the next frames), `key` (`enter`, `cmd-a`), `type` |
 | `console` | Console messages and uncaught errors since the last call |
 | `memory` | Process memory, JavaScript heap, DOM nodes. `gc`, `snapshot` |
-| `profile` | JavaScript samples, frame times, CPU. `{"duration":3000}`, or `action` `start` and `stop` |
+| `profile` | JavaScript samples of the main process and all windows, frame times, CPU. `{"duration":3000}`, or `action` `start` and `stop` |
 | `debugger` | Breakpoints, pause, step, call stack and variables |
 
 ## Debug with breakpoints
