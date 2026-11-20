@@ -190,7 +190,7 @@ With `background-clip: text`, a box paints its background in its own layer. The 
 
 The backend implementations live in [renderer/src/platform](crates/renderer/src/platform). On macOS, display links deliver frame requests directly to render threads. Ordinary page frames do not require main JavaScript to return.
 
-A display link stays on for 30 ticks after the last frame, because a start takes several milliseconds. A trackpad scroll delta reaches the scroll offset spread over the time between two events, so a 60 Hz scroll moves on each frame of a 120 Hz display. Draws that wait for a drawable twice in a row skip one tick, which drains the queue of frames and its delay.
+A display link stays on for 30 ticks after the last frame, because a start takes several milliseconds. A trackpad scroll delta reaches the scroll offset spread over the time between two events, so a 60 Hz scroll moves on each frame of a 120 Hz display. Draws that wait more than 3 ms for a drawable twice in a row skip one tick, which drains the queue of frames and its delay. A skipped tick shows as a dropped frame, so one queued frame, whose waits are shorter, stays.
 
 ### Native content
 

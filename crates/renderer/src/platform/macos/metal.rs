@@ -639,8 +639,9 @@ impl Renderer {
 
     // Frames queue when they are drawn faster than the display shows them: after a late frame, or
     // while a ProMotion display still speeds up. Each queued frame delays all later ones by a
-    // refresh. Draws that wait for a drawable in a row tell that the queue is full, a single one
-    // does not.
+    // refresh. Long draws that wait for a drawable in a row tell that the queue is full, a single one
+    // does not. A skipped tick shows as a dropped frame, so one frame in the queue stays: its waits
+    // are short.
     pub fn take_congested(&mut self) -> bool {
         let congested = self.waits >= 2;
         self.waits = self.waits.min(1);
@@ -871,7 +872,7 @@ impl Renderer {
         self.layer.setPresentsWithTransaction(transact);
         let asked = Instant::now();
         let next = self.layer.nextDrawable();
-        self.waits = match asked.elapsed() > Duration::from_millis(1) {
+        self.waits = match asked.elapsed() > Duration::from_millis(3) {
             true => self.waits.saturating_add(1),
             false => 0,
         };
