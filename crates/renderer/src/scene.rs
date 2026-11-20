@@ -1650,6 +1650,17 @@ impl Scene {
                 next += 1;
                 continue;
             }
+            // A replaced entry, like a canvas with a new tile, keeps the old ones after it, so it needs no index.
+            if index.is_none()
+                && next < old.len()
+                && (new.get(at + 1).map(|entry| entry.hash))
+                    == old.get(next + 1).map(|entry| entry.hash)
+            {
+                added(&mut damage, &mut under, new, &self.maps, at);
+                removed(&mut damage, &mut under, old, &self.prior_maps, next);
+                next += 1;
+                continue;
+            }
             // Later old entries by hash, each with the next one of the same hash.
             let (first, chain) = index.get_or_insert_with(|| {
                 let mut first = FxHashMap::default();
