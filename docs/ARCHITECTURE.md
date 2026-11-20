@@ -71,9 +71,11 @@ The runtime loads its own JavaScriptCore library from Bun's WebKit fork. [build-
 |---|---|
 | Default | JavaScriptCore compiles source at runtime. Runtime scripts share a bytecode cache across VMs. |
 | `--bytecode` | The build stores bytecode for runtime scripts, main code, and eligible chunks in `app.bundle`. |
-| `--aot` | The build compiles app code and runtime scripts into `app.dylib`, paired with `libJavaScriptCoreAOT.dylib`. |
+| `--aot` | The build compiles app code and runtime scripts into `app.dylib` on macOS or `app.so` on Linux, paired with `libJavaScriptCoreAOT`. |
 
-AOT currently requires a native macOS arm64 build and a JavaScript or TypeScript main entry. The CLI rejects `--aot` and `--bytecode` together. If `jsExecute` or `httpImport` is enabled, the CLI warns and uses the default build mode.
+AOT requires a native build: macOS arm64, Linux x64, or Linux arm64. It needs a JavaScript or TypeScript main entry. The CLI rejects `--aot` and `--bytecode` together. If `jsExecute` or `httpImport` is enabled, the CLI warns and uses the default build mode.
+
+On Linux the image is an ELF shared library. Its header, machine code, and constants are three page-aligned `PT_LOAD` segments, read-only, then executable, then read-only. That is the layout Bun writes into an ELF executable. JavaScriptCore checks those protections with `dl_iterate_phdr`.
 
 The [AOT path](crates/cli/src/aot.rs) uses Bun's Rust frontend and the JavaScriptCore compiler library. The CLI checks that both come from the same Bun revision. Build identifiers and a hash of runtime scripts connect the compiled image to the correct runtime.
 

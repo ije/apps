@@ -51,15 +51,20 @@ fn read(jsc: &Library, path: &Path) -> Result<Option<Image>> {
         ensure!(manifest.version == 1, "Unsupported AOT manifest version");
         ensure!(
             manifest.runtime == super::RUNTIME_SCRIPTS,
-            "app.dylib was built for another runtime"
+            "{} was built for another runtime",
+            super::aot_image_name(std::env::consts::OS)
         );
         ensure!(
             manifest.scripts.values().all(|&module| module != 0),
             "Invalid AOT module ID"
         );
-        let register: unsafe extern "C" fn(*const u8, usize, *mut c_char, usize) -> bool = *jsc
-            .get(b"JSLoadAOT\0")
-            .context("app.dylib needs the JavaScriptCore of its build")?;
+        let register: unsafe extern "C" fn(*const u8, usize, *mut c_char, usize) -> bool =
+            *jsc.get(b"JSLoadAOT\0").with_context(|| {
+                format!(
+                    "{} needs the JavaScriptCore of its build",
+                    super::aot_image_name(std::env::consts::OS)
+                )
+            })?;
         let mut error = [0; 1024];
         ensure!(
             register(
@@ -103,7 +108,11 @@ impl Image {
             .ok()
             .and_then(|reference| reference.split_once(':'))
             .context("Invalid AOT reference")?;
-        ensure!(build == self.build, "app.dylib does not match app.bundle");
+        ensure!(
+            build == self.build,
+            "{} does not match app.bundle",
+            super::aot_image_name(std::env::consts::OS)
+        );
         self.modules
             .get(name)
             .copied()

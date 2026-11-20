@@ -49,11 +49,13 @@ bin=packages/apps-$os-$cpu/bin
 files=("apps$exe" "apps-runtime$exe" "${lib}apps_media$ext" "${lib}ffmpeg$ext" FFmpeg.LICENSE "${lib}apps_devtools$ext")
 jsc=target/bun-jsc/$system-$arch
 jscs=("${lib}JavaScriptCore$ext" JavaScriptCore.LICENSE)
-# Linux links WebGPU into the runtime, and apps build --aot works only on macOS arm64.
+# Linux links WebGPU into the runtime.
 [[ $os != linux ]] && files+=("${lib}apps_webgpu$ext")
 # The terminal library has no Windows build yet.
 [[ $os != win32 ]] && files+=("${lib}Ghostty$ext" Ghostty.LICENSE)
+# build-jsc.sh --aot writes these. Linux packages include them when that build has been run.
 [[ $os-$cpu == darwin-arm64 ]] && jscs+=(libJavaScriptCoreAOT.dylib libJavaScriptCoreCompiler.dylib libapps_aot.dylib)
+[[ $os == linux && -f $jsc/libJavaScriptCoreAOT.so ]] && jscs+=(libJavaScriptCoreAOT.so libJavaScriptCoreCompiler.so libapps_aot.so)
 rm -rf "$bin"
 mkdir -p "$bin"
 for file in "${files[@]}"; do cp "target/release/$file" "$bin/"; done

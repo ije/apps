@@ -66,7 +66,7 @@ pub fn package_app(
         !files.contains_key(&executable_name)
             && !matches!(
                 executable_name.to_ascii_lowercase().as_str(),
-                "app.bundle" | "app.dylib" | ".apps-build" | "node_modules"
+                "app.bundle" | "app.dylib" | "app.so" | ".apps-build" | "node_modules"
             ),
         "Executable name conflicts with a bundle file: {executable_name}"
     );
@@ -161,10 +161,11 @@ pub fn package_app(
     };
     let mut bytes = apps_runtime::bundle::write(&assets.join("app.bundle"), files, &bytecode)?;
     if let Some(aot) = aot {
+        let image_name = apps_runtime::jsc::aot_image_name(target.platform);
         target
             .validate_binary(aot)
-            .context("app.dylib does not match the build target")?;
-        bytes += fs::copy(aot, assets.join("app.dylib"))? as usize;
+            .with_context(|| format!("{image_name} does not match the build target"))?;
+        bytes += fs::copy(aot, assets.join(image_name))? as usize;
     }
     fs::write(stage.path().join(".apps-build"), b"1")?;
     let executable = if target.platform == "macos" {
@@ -198,7 +199,7 @@ pub fn package_app(
     }
     // AOT code runs only in the JSC that its compiler was built with.
     let jsc = if aot.is_some() {
-        jsc.with_file_name("libJavaScriptCoreAOT.dylib")
+        jsc.with_file_name(apps_runtime::jsc::aot_engine_library(target.platform))
     } else {
         jsc
     };
@@ -267,6 +268,7 @@ pub fn package_app(
                         Some(
                             "app.bundle"
                                 | "app.dylib"
+                                | "app.so"
                                 | "native.json"
                                 | "assets.json"
                                 | "package.json"

@@ -84,23 +84,34 @@ case "$(uname -m)" in
     ;;
 esac
 
-if ((aot)) && [[ $system != macos || $arch != aarch64 ]]; then
-  printf '%s\n' '--aot currently requires macOS arm64' >&2
-  exit 1
+if ((aot)); then
+  supported=0
+  [[ $system == macos && $arch == aarch64 ]] && supported=1
+  [[ $system == linux ]] && supported=1
+  if ((!supported)); then
+    printf '%s\n' '--aot currently requires macOS arm64 or Linux' >&2
+    exit 1
+  fi
 fi
 
 source_dir=$root/target/bun-jsc/source
 output=$root/target/bun-jsc/$system-$arch
 build=$output/build
 
-if [[ ! -d $source_dir ]]; then
-  git clone --config core.autocrlf=false --depth 1 --filter=blob:none --sparse \
-    --branch "autobuild-$revision" https://github.com/oven-sh/WebKit.git "$source_dir"
+# A restored build cache can hold an older checkout. Fetch the pinned commit; its autobuild branch is not kept.
+if [[ -d $source_dir ]] && [[ $(git -C "$source_dir" rev-parse HEAD 2>/dev/null || true) != "$revision" ]]; then
+  rm -rf "$source_dir"
 fi
-
-if [[ $(git -C "$source_dir" rev-parse HEAD) != "$revision" ]]; then
-  printf '%s must be at %s; move it aside before rebuilding\n' "$source_dir" "$revision" >&2
-  exit 1
+if [[ ! -d $source_dir ]]; then
+  git init -q "$source_dir"
+  git -C "$source_dir" remote add origin https://github.com/oven-sh/WebKit.git
+  git -C "$source_dir" config core.autocrlf false
+  git -C "$source_dir" sparse-checkout set --cone \
+    Source/JavaScriptCore Source/WTF Source/bmalloc Source/cmake \
+    Source/ThirdParty/gtest Source/ThirdParty/gmock Source/ThirdParty/unifdef \
+    Source/ThirdParty/capstone Source/WebGPU Tools/Scripts Tools/jsc
+  git -C "$source_dir" fetch --depth 1 --filter=blob:none origin "$revision"
+  git -C "$source_dir" checkout --detach FETCH_HEAD
 fi
 
 git -C "$source_dir" sparse-checkout set \
@@ -244,31 +255,77 @@ if ((aot)); then
     exit 1
   fi
   # Both builds need identical sources, options and Bun built-in tables: AOT code embeds field offsets and
-  # built-in IDs.
+  # built-in IDs. These builds are separate from the runtime library above.
+  size_launcher=$root/scripts/jsc-cc.sh
+  if [[ $system == linux ]]; then
+    cxx=c++
+    for arg in "$@"; do
+      [[ $arg == -DCMAKE_CXX_COMPILER=* ]] && cxx=${arg#-DCMAKE_CXX_COMPILER=}
+    done
+    if ! printf 'void f() {}\n' | "$cxx" -x c++ -Oz -c -o /dev/null - >/dev/null 2>&1; then
+      size_launcher="$root/scripts/jsc-cc.sh;-Os"
+    fi
+  fi
   for runtime in 0 1; do
     build=$output/build-compiler
     flags="-DENABLE_AOT=1 -DAPPS_JSC_AOT_RUNTIME=$runtime"
+    [[ $system == linux ]] && flags+=" -ffunction-sections -fdata-sections"
     aot_options=("${options[@]}" "-DAPPS_JSC_AOT_SOURCE=$root/scripts/jsc-aot.cpp" "-DCMAKE_C_FLAGS=$flags" "-DCMAKE_CXX_FLAGS=$flags")
+    [[ $system == linux ]] && aot_options+=("-DCMAKE_C_COMPILER_LAUNCHER=$size_launcher" "-DCMAKE_CXX_COMPILER_LAUNCHER=$size_launcher")
     if ((runtime)); then
       build=$output/build-aot
-      aot_options+=(-DENABLE_STATIC_JSC=ON -DENABLE_REMOTE_INSPECTOR=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DAPPS_JSC_AOT_RUNTIME=ON)
+      # The runtime drops the inspector and keeps the compiler's field offsets with the padding in jsc.patch.
+      # macOS links the static archives by hand. Linux uses the shared library CMake already links.
+      if [[ $system == macos ]]; then
+        aot_options+=(-DENABLE_STATIC_JSC=ON -DENABLE_REMOTE_INSPECTOR=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DAPPS_JSC_AOT_RUNTIME=ON)
+      else
+        aot_options+=(-DENABLE_REMOTE_INSPECTOR=OFF -DAPPS_JSC_AOT_RUNTIME=ON)
+      fi
     fi
-    cmake -S "$source_dir" -B "$build" -G Ninja "${aot_options[@]}" "$@"
+    # AOT sources are written for Clang 21. The runtime library above keeps the compiler this script was given.
+    aot_compiler=()
+    if [[ $system == linux ]] && command -v clang-21 >/dev/null && command -v clang++-21 >/dev/null; then
+      aot_compiler=(-DCMAKE_C_COMPILER=clang-21 -DCMAKE_CXX_COMPILER=clang++-21)
+    fi
+    cmake -S "$source_dir" -B "$build" -G Ninja "${aot_options[@]}" "$@" "${aot_compiler[@]}"
     "${APPS_BUN:-bun}" "$root/scripts/jsc-aot-table.ts" "$bun_source" \
       "$source_dir/Source/JavaScriptCore" "$build/JavaScriptCore/DerivedSources/aot"
     cmake --build "$build" --target JavaScriptCore --parallel "$jobs"
   done
-  name=libJavaScriptCoreCompiler.dylib
-  cp -p "$output/build-compiler/lib/JavaScriptCore.framework/JavaScriptCore" "$output/.$name"
-  install_name_tool -id "@rpath/$name" "$output/.$name"
-  xcrun strip -x "$output/.$name"
-  codesign --force --sign - "$output/.$name"
-  mv -f "$output/.$name" "$output/$name"
-  name=libJavaScriptCoreAOT.dylib
-  xcrun clang++ -dynamiclib -arch arm64 -mmacosx-version-min=13.0 -o "$output/.$name" -Wl,-install_name,"@rpath/$name" \
-    -Wl,-dead_strip -Wl,-x -Wl,-exported_symbols_list,"$root/scripts/jsc.exports" -Wl,-all_load \
-    "$build/lib/libJavaScriptCore.a" "$build/lib/libWTF.a" "$build/lib/libbmalloc.a" -licucore -lobjc
-  mv -f "$output/.$name" "$output/$name"
+  if [[ $system == macos ]]; then
+    name=libJavaScriptCoreCompiler.dylib
+    cp -p "$output/build-compiler/lib/JavaScriptCore.framework/JavaScriptCore" "$output/.$name"
+    install_name_tool -id "@rpath/$name" "$output/.$name"
+    xcrun strip -x "$output/.$name"
+    codesign --force --sign - "$output/.$name"
+    mv -f "$output/.$name" "$output/$name"
+    name=libJavaScriptCoreAOT.dylib
+    xcrun clang++ -dynamiclib -arch arm64 -mmacosx-version-min=13.0 -o "$output/.$name" -Wl,-install_name,"@rpath/$name" \
+      -Wl,-dead_strip -Wl,-x -Wl,-exported_symbols_list,"$root/scripts/jsc.exports" -Wl,-all_load \
+      "$build/lib/libJavaScriptCore.a" "$build/lib/libWTF.a" "$build/lib/libbmalloc.a" -licucore -lobjc
+    mv -f "$output/.$name" "$output/$name"
+  else
+    name=libJavaScriptCoreCompiler.so
+    cp -p "$output/build-compiler/lib/libJavaScriptCore.so" "$output/.$name"
+    strip --strip-unneeded "$output/.$name"
+    mv -f "$output/.$name" "$output/$name"
+    name=libJavaScriptCoreAOT.so
+    cp -p "$output/build-aot/lib/libJavaScriptCore.so" "$output/.$name"
+    strip --strip-unneeded "$output/.$name"
+    mv -f "$output/.$name" "$output/$name"
+    for symbol in JSCompileAOT JSGetAOTCompilerRevision; do
+      nm -D --defined-only "$output/libJavaScriptCoreCompiler.so" | awk '{ print $NF }' | grep -qx "$symbol" || {
+        printf '%s\n' "libJavaScriptCoreCompiler.so does not export $symbol" >&2
+        exit 1
+      }
+    done
+    for symbol in JSLoadAOT JSAttachAOT JSGetAOTFunction; do
+      nm -D --defined-only "$output/libJavaScriptCoreAOT.so" | awk '{ print $NF }' | grep -qx "$symbol" || {
+        printf '%s\n' "libJavaScriptCoreAOT.so does not export $symbol" >&2
+        exit 1
+      }
+    done
+  fi
 
   # Build the AOT front end with Bun's nightly toolchain.
   bun=$(command -v "${APPS_BUN:-bun}")
@@ -277,16 +334,29 @@ if ((aot)); then
   # MB of debug maps.
   (cd "$bun_source" && BUN_CODEGEN_DIR=$codegen APPS_BUN_REVISION=$bun_revision cargo build --release -p apps_aot \
     --config 'profile.release.opt-level="s"' --config 'profile.release.lto="fat"')
-  name=libapps_aot.dylib
-  xcrun clang -dynamiclib -arch arm64 -mmacosx-version-min=13.0 -o "$output/.$name" -Wl,-install_name,"@rpath/$name" \
-    -Wl,-dead_strip -Wl,-x -Wl,-S -Wl,-exported_symbol,_apps_aot_front_end -Wl,-exported_symbol,_apps_aot_free \
-    -Wl,-exported_symbol,_apps_aot_revision \
-    "$bun_source/target/release/libapps_aot.a" -liconv -lc -lm
+  if [[ $system == macos ]]; then
+    name=libapps_aot.dylib
+    xcrun clang -dynamiclib -arch arm64 -mmacosx-version-min=13.0 -o "$output/.$name" -Wl,-install_name,"@rpath/$name" \
+      -Wl,-dead_strip -Wl,-x -Wl,-S -Wl,-exported_symbol,_apps_aot_front_end -Wl,-exported_symbol,_apps_aot_free \
+      -Wl,-exported_symbol,_apps_aot_revision \
+      "$bun_source/target/release/libapps_aot.a" -liconv -lc -lm
+  else
+    name=libapps_aot.so
+    # -u pulls the archive members that define the exports. --gc-sections then drops the rest.
+    cc -c -fPIC -fvisibility=hidden -o "$output/apps-aot-stubs.o" "$root/scripts/apps-aot-stubs.c"
+    c++ -shared -fPIC -o "$output/.$name" -Wl,--gc-sections -Wl,-z,defs \
+      -Wl,-u,apps_aot_front_end -Wl,-u,apps_aot_free -Wl,-u,apps_aot_revision \
+      -Wl,--export-dynamic-symbol,apps_aot_front_end -Wl,--export-dynamic-symbol,apps_aot_free \
+      -Wl,--export-dynamic-symbol,apps_aot_revision \
+      "$bun_source/target/release/libapps_aot.a" "$output/apps-aot-stubs.o" -pthread -ldl -lm
+    strip --strip-unneeded "$output/.$name"
+    rm -f "$output/apps-aot-stubs.o"
+  fi
   mv -f "$output/.$name" "$output/$name"
 fi
 
 {
-  if [[ -f $output/libJavaScriptCoreAOT.dylib ]]; then
+  if [[ -f $output/libJavaScriptCoreAOT.dylib || -f $output/libJavaScriptCoreAOT.so ]]; then
     cat "$root/target/bun-aot/source/LICENSE.md"
     printf '\n'
   fi
