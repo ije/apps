@@ -1,6 +1,7 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use bbtree::unsync::BBTreeMap;
+use object::{Object, ObjectSegment, ObjectSymbol};
 use oxc_ast::{
     AstKind,
     ast::{Argument, Statement},
@@ -19,14 +20,15 @@ use std::{
 const NO_SOURCE: &str = "/*apps:no-source*/";
 
 pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<tempfile::TempDir> {
-    let library = apps_runtime::jsc::library_path(runtime, "macos")?;
+    let platform = std::env::consts::OS;
+    let library = apps_runtime::jsc::library_path(runtime, platform)?;
+    let engine = apps_runtime::jsc::aot_engine_library(platform);
     ensure!(
-        library
-            .with_file_name("libJavaScriptCoreAOT.dylib")
-            .is_file(),
-        "--aot needs libJavaScriptCoreAOT.dylib; run bash scripts/build-jsc.sh --aot"
+        library.with_file_name(engine).is_file(),
+        "--aot needs {engine}; run bash scripts/build-jsc.sh --aot"
     );
-    let compiler = library.with_file_name("libJavaScriptCoreCompiler.dylib");
+    let compiler_name = apps_runtime::jsc::aot_compiler_library(platform);
+    let compiler = library.with_file_name(compiler_name);
     let compiler = unsafe { libloading::Library::new(&compiler) }.with_context(|| {
         format!(
             "Cannot load {}; run bash scripts/build-jsc.sh --aot",
@@ -44,7 +46,8 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         usize,
     ) -> bool;
     let compile = unsafe { *compiler.get::<Compile>(b"JSCompileAOT\0")? };
-    let front = library.with_file_name("libapps_aot.dylib");
+    let front_name = apps_runtime::jsc::aot_front_end_library(platform);
+    let front = library.with_file_name(front_name);
     let front = unsafe { libloading::Library::new(&front) }.with_context(|| {
         format!(
             "Cannot load {}; run bash scripts/build-jsc.sh --aot",
@@ -76,7 +79,7 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
     };
     ensure!(
         matches!(&revisions, [Ok(compiler), Ok(front)] if compiler == front),
-        "libapps_aot.dylib and libJavaScriptCoreCompiler.dylib are from different Bun revisions; run bash scripts/build-jsc.sh --aot"
+        "{front_name} and {compiler_name} are from different Bun revisions; run bash scripts/build-jsc.sh --aot"
     );
     let directory = tempfile::Builder::new().prefix("apps-aot-").tempdir()?;
     fs::write(
@@ -390,8 +393,39 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
         }
     }
     fs::write(directory.path().join("manifest.json"), &manifest)?;
+    link_image(
+        directory.path(),
+        layout[0] as usize,
+        layout[1] as usize,
+        fs::metadata(&image)?.len() as usize,
+        manifest.len(),
+    )?;
+    Ok(directory)
+}
+
+fn link_image(
+    directory: &Path,
+    header: usize,
+    executable: usize,
+    image_size: usize,
+    manifest_size: usize,
+) -> Result<()> {
+    if cfg!(target_os = "linux") {
+        link_elf(directory, header, executable, image_size, manifest_size)
+    } else {
+        link_macho(directory, header, executable, image_size, manifest_size)
+    }
+}
+
+fn link_macho(
+    directory: &Path,
+    header: usize,
+    executable: usize,
+    image_size: usize,
+    manifest_size: usize,
+) -> Result<()> {
     fs::write(
-        directory.path().join("image.s"),
+        directory.join("image.s"),
         format!(
             r#".section __AOT_HEADER,__header,regular,no_dead_strip
 .p2align 14
@@ -399,30 +433,26 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
 _apps_aot_image:
 .incbin "image.bin", 0, {header}
 .section __AOT_CODE,__code,regular,pure_instructions+no_dead_strip
-.incbin "image.bin", {header}, {code}
+.incbin "image.bin", {header}, {executable}
 .section __AOT_CONST,__const,regular,no_dead_strip
 .incbin "image.bin", {data}
 .section __DATA_CONST,__const
 .p2align 3
 .globl _apps_aot_image_size
 _apps_aot_image_size:
-.quad {}
+.quad {image_size}
 .globl _apps_aot_manifest_size
 _apps_aot_manifest_size:
-.quad {}
+.quad {manifest_size}
 .globl _apps_aot_manifest
 _apps_aot_manifest:
 .incbin "manifest.json"
 "#,
-            fs::metadata(image)?.len(),
-            manifest.len(),
-            header = layout[0],
-            code = layout[1],
-            data = layout[0] + layout[1],
+            data = header + executable,
         ),
     )?;
     let output = Command::new("xcrun")
-        .current_dir(directory.path())
+        .current_dir(directory)
         .args([
             "clang",
             "-dynamiclib",
@@ -444,5 +474,183 @@ _apps_aot_manifest:
         "Cannot link app.dylib: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    Ok(directory)
+    Ok(())
+}
+
+// Bun splits an ELF payload at the image's code into three PT_LOAD segments: read-only, executable,
+// then read-only. The parts stay contiguous and page-aligned, which is what JavaScriptCore checks.
+fn link_elf(
+    directory: &Path,
+    header: usize,
+    executable: usize,
+    image_size: usize,
+    manifest_size: usize,
+) -> Result<()> {
+    let align = if cfg!(target_arch = "aarch64") {
+        65536
+    } else {
+        16384
+    };
+    ensure!(
+        header.is_multiple_of(align)
+            && executable.is_multiple_of(align)
+            && image_size.is_multiple_of(align)
+            && header + executable <= image_size
+            && executable > 0,
+        "AOT image layout is not aligned to {align} bytes"
+    );
+    let data = header + executable;
+    let constants = image_size - data;
+    fs::write(
+        directory.join("image.s"),
+        format!(
+            r#".section .aot_header, "a", @progbits
+.balign {align}
+.globl apps_aot_image
+apps_aot_image:
+.incbin "image.bin", 0, {header}
+.section .aot_code, "ax", @progbits
+.balign {align}
+.incbin "image.bin", {header}, {executable}
+.section .aot_const, "a", @progbits
+.balign {align}
+.incbin "image.bin", {data}, {constants}
+.section .rodata
+.balign 8
+.globl apps_aot_image_size
+apps_aot_image_size:
+.quad {image_size}
+.globl apps_aot_manifest_size
+apps_aot_manifest_size:
+.quad {manifest_size}
+.globl apps_aot_manifest
+apps_aot_manifest:
+.incbin "manifest.json"
+"#
+        ),
+    )?;
+    fs::write(
+        directory.join("aot.lds"),
+        format!(
+            r#"SECTIONS
+{{
+  .aot_header ALIGN({align}) : {{ KEEP(*(.aot_header)) }}
+  .aot_code ALIGN({align}) : {{ KEEP(*(.aot_code)) }}
+  .aot_const ALIGN({align}) : {{ KEEP(*(.aot_const)) }}
+}}
+INSERT AFTER .text;
+"#
+        ),
+    )?;
+    let args = [
+        "-shared".to_string(),
+        "-fPIC".to_string(),
+        format!("-Wl,-z,max-page-size={align}"),
+        format!("-Wl,-z,common-page-size={align}"),
+        "-Wl,-z,noexecstack".to_string(),
+        "-Wl,-T,aot.lds".to_string(),
+        "image.s".to_string(),
+        "-o".to_string(),
+        "app.so".to_string(),
+    ];
+    let output = Command::new("cc")
+        .current_dir(directory)
+        .args(&args)
+        .output()
+        .context("--aot needs a C compiler")?;
+    ensure!(
+        output.status.success(),
+        "Cannot link app.so: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure_elf_layout(&directory.join("app.so"), header, executable, image_size)
+}
+
+fn ensure_elf_layout(
+    path: &Path,
+    header: usize,
+    executable: usize,
+    image_size: usize,
+) -> Result<()> {
+    let bytes = fs::read(path)?;
+    let file = object::File::parse(bytes.as_slice())
+        .with_context(|| format!("Invalid ELF image {}", path.display()))?;
+    let start = file
+        .dynamic_symbols()
+        .find(|symbol| symbol.name() == Ok("apps_aot_image"))
+        .context("app.so does not export apps_aot_image")?
+        .address();
+    check_elf_range(&file, start, header as u64, false)?;
+    check_elf_range(&file, start + header as u64, executable as u64, true)?;
+    check_elf_range(
+        &file,
+        start + (header + executable) as u64,
+        (image_size - header - executable) as u64,
+        false,
+    )?;
+    for name in [
+        "apps_aot_image_size",
+        "apps_aot_manifest",
+        "apps_aot_manifest_size",
+    ] {
+        ensure!(
+            file.dynamic_symbols()
+                .any(|symbol| symbol.name() == Ok(name)),
+            "app.so does not export {name}"
+        );
+    }
+    Ok(())
+}
+
+fn check_elf_range(file: &object::File, address: u64, size: u64, executable: bool) -> Result<()> {
+    if size == 0 {
+        ensure!(!executable, "AOT image has no executable bytes");
+        return Ok(());
+    }
+    let segment = file
+        .segments()
+        .find(|segment| {
+            let object::SegmentFlags::Elf { p_type, .. } = segment.flags() else {
+                return false;
+            };
+            if p_type != object::elf::PT_LOAD {
+                return false;
+            }
+            let begin = segment.address();
+            let (_, filesz) = segment.file_range();
+            address >= begin && filesz.saturating_sub(address - begin) >= size
+        })
+        .context("AOT image crosses an ELF segment boundary")?;
+    let object::SegmentFlags::Elf { p_flags, .. } = segment.flags() else {
+        bail!("app.so is not an ELF image");
+    };
+    let writable = p_flags.0 & object::elf::PF_W.0 != 0;
+    let execute = p_flags.0 & object::elf::PF_X.0 != 0;
+    ensure!(!writable, "AOT image segment is writable");
+    ensure!(
+        execute == executable,
+        "AOT image segment protections do not match the image"
+    );
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elf_image_uses_bun_segment_protections() {
+        let directory = tempfile::tempdir().unwrap();
+        let align = if cfg!(target_arch = "aarch64") {
+            65536
+        } else {
+            16384
+        };
+        let header = align;
+        let executable = align * 2;
+        let image_size = align * 4;
+        fs::write(directory.path().join("image.bin"), vec![0; image_size]).unwrap();
+        fs::write(directory.path().join("manifest.json"), b"{}").unwrap();
+        link_elf(directory.path(), header, executable, image_size, 2).unwrap();
+    }
 }

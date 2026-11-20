@@ -82,7 +82,11 @@ pub fn run(
         bytecode,
         compiled
             .as_ref()
-            .map(|directory| directory.path().join("app.dylib"))
+            .map(|directory| {
+                directory
+                    .path()
+                    .join(apps_runtime::jsc::aot_image_name(target.platform))
+            })
             .as_deref(),
     )?;
     println!(

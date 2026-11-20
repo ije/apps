@@ -1083,6 +1083,29 @@ index b493f6763b4..d1990400485 100644
      list(APPEND JavaScriptCore_SOURCES ${JavaScriptCore_AOT_BUILTIN_TABLE_DATA_SOURCES})
  endif ()
  
+diff --git a/Source/JavaScriptCore/aot/image/AOTFaultTable.cpp b/Source/JavaScriptCore/aot/image/AOTFaultTable.cpp
+index 144c5f77..df0426e0 100644
+--- a/Source/JavaScriptCore/aot/image/AOTFaultTable.cpp
++++ b/Source/JavaScriptCore/aot/image/AOTFaultTable.cpp
+@@ -51,7 +51,7 @@
+ #include <sys/mman.h>
+ #endif
+ 
+-#if OS(DARWIN)
++#if OS(DARWIN) || OS(LINUX)
+ #include <dlfcn.h>
+ #elif OS(UNIX)
+ extern "C" char __executable_start;
+@@ -741,7 +741,8 @@ struct SignalStackOfThread {
+ 
+ static bool isCodeOfThisProgram(const void* address)
+ {
+-#if OS(DARWIN)
++#if OS(DARWIN) || OS(LINUX)
++    // A shared engine has no __executable_start. The handler belongs to this library, as on Darwin.
+     Dl_info theirs { };
+     Dl_info ours { };
+     return dladdr(address, &theirs) && dladdr(reinterpret_cast<const void*>(&takeFaultsOfThisThreadOnAnotherStack), &ours) && theirs.dli_fbase == ours.dli_fbase;
 diff --git a/Source/JavaScriptCore/aot/image/AOTFunctionSources.cpp b/Source/JavaScriptCore/aot/image/AOTFunctionSources.cpp
 index 9d629a7b3ac..2a363fc2965 100644
 --- a/Source/JavaScriptCore/aot/image/AOTFunctionSources.cpp
@@ -1121,7 +1144,29 @@ index f949a45aaec..36257d785fe 100644
  #include <mach-o/loader.h>
  #include <mach/mach.h>
  #include <mach/mach_vm.h>
-@@ -320,7 +320,10 @@ static constexpr bool dataHasSegmentsOfItsOwn = false;
+@@ -307,9 +307,17 @@ const LoadedObject& loadedExecutable()
+ static std::optional<SegmentOfExecutable> findSegmentOfExecutable(const uint8_t* address)
+ {
+-    const LoadedObject& executable = loadedExecutable();
+-    const ProgramHeader* segment = executable.findSegment(reinterpret_cast<uintptr_t>(address));
++    // apps keeps the image in its own shared object. Bun finds it in the engine because both are one ELF.
++    LoadedObjectSearch search(reinterpret_cast<uintptr_t>(address));
++    dl_iterate_phdr([](struct dl_phdr_info* object, size_t, void* data) {
++        size_t numberOfHeaders = object->dlpi_phdr ? object->dlpi_phnum : 0;
++        return static_cast<LoadedObjectSearch*>(data)->visit({ object->dlpi_addr, { object->dlpi_phdr, numberOfHeaders } });
++    }, &search);
++    const std::optional<LoadedObject> executable = search.found();
++    if (!executable)
++        return std::nullopt;
++    const ProgramHeader* segment = executable->findSegment(reinterpret_cast<uintptr_t>(address));
+     if (!segment)
+         return std::nullopt;
+-    uint64_t offsetInSegment = reinterpret_cast<uintptr_t>(address) - (executable.loadBias + segment->p_vaddr);
+-    return SegmentOfExecutable { segment->p_filesz - offsetInSegment, !!(segment->p_flags & PF_W), !!(segment->p_flags & PF_X), static_cast<int64_t>(segment->p_offset + offsetInSegment), !executable.loadBias };
++    uint64_t offsetInSegment = reinterpret_cast<uintptr_t>(address) - (executable->loadBias + segment->p_vaddr);
++    return SegmentOfExecutable { segment->p_filesz - offsetInSegment, !!(segment->p_flags & PF_W), !!(segment->p_flags & PF_X), static_cast<int64_t>(segment->p_offset + offsetInSegment), !executable->loadBias };
+ }
+@@ -320,7 +355,10 @@ static constexpr bool dataHasSegmentsOfItsOwn = false;
  
  static std::optional<SegmentOfExecutable> findSegmentOfExecutable(const uint8_t* address)
  {
@@ -1133,6 +1178,58 @@ index f949a45aaec..36257d785fe 100644
      if (!executable || executable->magic != MH_MAGIC_64)
          return std::nullopt;
      auto findSegment = [&](auto&& isWanted) -> const segment_command_64* {
+@@ -394,5 +402,39 @@ static int openExecutableAt(std::span<const uint8_t> bytes, int64_t offsetInFile)
+         return pread(descriptor, header.data(), header.size(), offsetInFile) == static_cast<ssize_t>(header.size()) && !memcmp(header.data(), bytes.data(), header.size());
+     });
+ }
+ 
++#if OS(LINUX)
++// app.so is not the main executable. Open the object that holds the image so its code can be mapped.
++static int openSharedObjectContaining(const uint8_t* address, int64_t offsetInFile, std::span<const uint8_t> bytes)
++{
++    struct Query {
++        uintptr_t address;
++        char path[4096];
++    } query { reinterpret_cast<uintptr_t>(address), { } };
++    dl_iterate_phdr([](struct dl_phdr_info* object, size_t, void* data) {
++        auto* query = static_cast<Query*>(data);
++        size_t numberOfHeaders = object->dlpi_phdr ? object->dlpi_phnum : 0;
++        if (!LoadedObject { object->dlpi_addr, { object->dlpi_phdr, numberOfHeaders } }.findSegment(query->address))
++            return 0;
++        if (object->dlpi_name && object->dlpi_name[0]) {
++            size_t length = strlen(object->dlpi_name);
++            if (length < sizeof(query->path))
++                memcpy(query->path, object->dlpi_name, length + 1);
++        }
++        return 1;
++    }, &query);
++    if (!query.path[0])
++        return -1;
++    int descriptor = open(query.path, O_RDONLY | O_CLOEXEC);
++    if (descriptor < 0)
++        return -1;
++    std::array<uint8_t, offsetof(ImageHeader, codeSize) + sizeof(ImageHeader::codeSize)> header;
++    if (pread(descriptor, header.data(), header.size(), offsetInFile) != static_cast<ssize_t>(header.size()) || memcmp(header.data(), bytes.data(), header.size())) {
++        close(descriptor);
++        return -1;
++    }
++    return descriptor;
++}
++#endif
++
+ int openExecutableContaining(const Image& image)
+@@ -639,5 +674,10 @@ Wire::ImageVerdict useImage(std::span<const uint8_t> bytes, std::optional<ImageFile> file, const std::array<uint8_t, 16>& identity)
+ #if OS(LINUX) || OS(FREEBSD)
+     if (std::optional<SegmentOfExecutable> segment = file ? std::nullopt : findSegmentOfExecutable(bytes.data())) {
+-        if (int descriptor = openExecutableAt(bytes, segment->offsetInFile); descriptor >= 0)
++        int descriptor = openExecutableAt(bytes, segment->offsetInFile);
++#if OS(LINUX)
++        if (descriptor < 0)
++            descriptor = openSharedObjectContaining(bytes.data(), segment->offsetInFile, bytes);
++#endif
++        if (descriptor >= 0)
+             positionInFile = Image::PositionInFile { descriptor, segment->offsetInFile };
+     }
 diff --git a/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp b/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp
 index 6b72f859352..b74c3bb6f46 100644
 --- a/Source/JavaScriptCore/aot/runtime/AOTBuiltinCells.cpp

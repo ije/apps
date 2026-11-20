@@ -191,6 +191,38 @@ pub fn library_name(platform: &str) -> Result<&'static str> {
     }
 }
 
+pub fn aot_image_name(platform: &str) -> &'static str {
+    if platform == "linux" {
+        "app.so"
+    } else {
+        "app.dylib"
+    }
+}
+
+pub fn aot_engine_library(platform: &str) -> &'static str {
+    if platform == "linux" {
+        "libJavaScriptCoreAOT.so"
+    } else {
+        "libJavaScriptCoreAOT.dylib"
+    }
+}
+
+pub fn aot_compiler_library(platform: &str) -> &'static str {
+    if platform == "linux" {
+        "libJavaScriptCoreCompiler.so"
+    } else {
+        "libJavaScriptCoreCompiler.dylib"
+    }
+}
+
+pub fn aot_front_end_library(platform: &str) -> &'static str {
+    if platform == "linux" {
+        "libapps_aot.so"
+    } else {
+        "libapps_aot.dylib"
+    }
+}
+
 pub fn library_path(executable: &Path, platform: &str) -> Result<PathBuf> {
     let executable = executable.canonicalize()?;
     let directory = executable
@@ -267,7 +299,11 @@ impl JavaScriptCore {
         let path = library_path(&std::env::current_exe()?, std::env::consts::OS)?;
         let library = unsafe { open_library(&path) }
             .with_context(|| format!("Cannot load Bun JavaScriptCore from {}", path.display()))?;
-        let image = path.with_file_name("../Resources/app.dylib");
+        let image = if cfg!(target_os = "macos") {
+            path.with_file_name("../Resources/app.dylib")
+        } else {
+            path.with_file_name(aot_image_name(std::env::consts::OS))
+        };
         unsafe {
             let group_create: unsafe extern "C" fn() -> Ptr =
                 *library.get(b"JSContextGroupCreate\0")?;

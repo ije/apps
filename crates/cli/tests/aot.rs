@@ -37,10 +37,9 @@ fn rejects_unsupported_aot_targets() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("--aot currently requires a native macOS arm64 build")
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains(
+        "--aot currently requires a native macOS arm64, Linux x64, or Linux arm64 build"
+    ));
 }
 
 #[test]

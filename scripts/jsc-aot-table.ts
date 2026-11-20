@@ -11,7 +11,7 @@ const { table } = await generate({
   bunRoot: root,
   javaScriptCore: engine,
   prebuiltGenerated: null,
-  target: "Darwin",
+  target: process.platform === "linux" ? "Linux" : "Darwin",
   bindgenSources: sources.map((source: string) => `${crateOf(source)}=${source}`),
   typesOnly: sources.filter((source: string) => source.endsWith("_test.bind.ts")).map((source: string) => basename(source)),
 });

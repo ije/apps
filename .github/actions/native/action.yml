@@ -2,7 +2,7 @@ name: Native libraries
 description: Restores JavaScriptCore, FFmpeg and libghostty-vt from the cache, or builds them.
 inputs:
   aot:
-    description: Set to true to also build the AOT libraries. macOS arm64 only.
+    description: Set to true to also build the AOT libraries. macOS arm64 and Linux.
 runs:
   using: composite
   steps:
@@ -25,7 +25,14 @@ runs:
       shell: bash
       run: |
         case $RUNNER_OS in
-          Linux) options='-DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19' ;;
+          Linux)
+            # The runtime library stays on Clang 19. build-jsc.sh uses Clang 21 for --aot when it is installed.
+            if [[ '${{ inputs.aot }}' == true ]] && ! command -v clang-21 >/dev/null; then
+              curl -fsSL https://apt.llvm.org/llvm.sh -o "$RUNNER_TEMP/llvm.sh"
+              sudo bash "$RUNNER_TEMP/llvm.sh" 21
+            fi
+            options='-DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19'
+            ;;
           Windows)
             # msvc-dev-cmd makes rustc take link.exe from PATH, where bash steps find the one of Git first.
             rm -f /usr/bin/link.exe
@@ -37,8 +44,15 @@ runs:
         if [[ '${{ inputs.aot }}' == true ]]; then
           # Use the Bun release that Bun's CI builds build-jsc.sh's Bun revision with: `bun.version` in Bun's
           # scripts/build/ci-images/spec.ts.
-          npm install --prefix "$RUNNER_TEMP/bun" @oven/bun-darwin-aarch64@1.4.4
-          export APPS_BUN=$RUNNER_TEMP/bun/node_modules/@oven/bun-darwin-aarch64/bin/bun
+          case $RUNNER_OS-$RUNNER_ARCH in
+            macOS-ARM64) bun_pkg=@oven/bun-darwin-aarch64 ;;
+            macOS-X64) bun_pkg=@oven/bun-darwin-x64 ;;
+            Linux-X64) bun_pkg=@oven/bun-linux-x64 ;;
+            Linux-ARM64) bun_pkg=@oven/bun-linux-aarch64 ;;
+            *) printf 'No Bun package for %s-%s\n' "$RUNNER_OS" "$RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          npm install --prefix "$RUNNER_TEMP/bun" "$bun_pkg@1.4.4"
+          export APPS_BUN=$RUNNER_TEMP/bun/node_modules/$bun_pkg/bin/bun
           aot=--aot
         fi
         bash scripts/build-jsc.sh ${aot-} -- ${options-}

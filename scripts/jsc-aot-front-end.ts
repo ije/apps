@@ -25,7 +25,7 @@ const generated = await generate({
   bunRoot: root,
   javaScriptCore: engine,
   prebuiltGenerated: null,
-  target: "Darwin",
+  target: process.platform === "linux" ? "Linux" : "Darwin",
   bindgenSources: sources.map(source => `${crateOf(source)}=${source}`),
   typesOnly: sources.filter(source => source.endsWith("_test.bind.ts")).map(source => basename(source)),
 });
