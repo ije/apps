@@ -208,6 +208,9 @@ const FAILED: u8 = 3;
 struct Done {
     list: Mutex<Vec<(u64, bool)>>,
     pending: AtomicUsize,
+    // Held while the poll thread polls. A map that completes there leaves its buffer unmapped for a moment, so
+    // an unmap of a pending map in that moment fails: it takes this lock first.
+    polls: Mutex<()>,
 }
 
 impl Done {
@@ -432,7 +435,11 @@ impl Gpu {
                                 submission_index: None,
                                 timeout: Some(std::time::Duration::from_millis(1)),
                             };
-                            if let Ok(PollStatus::QueueEmpty) = poller.poll(wait) {
+                            let status = {
+                                let _poll = done.polls.lock().unwrap();
+                                poller.poll(wait)
+                            };
+                            if let Ok(PollStatus::QueueEmpty) = status {
                                 break;
                             }
                         }
@@ -979,6 +986,7 @@ impl Gpu {
                 let before = self.maps.len();
                 self.maps.retain(|_, (k, _)| *k != key);
                 if self.maps.len() < before {
+                    let _poll = self.done.polls.lock().unwrap();
                     buffer.unmap();
                     return Ok(Value::Null);
                 }
