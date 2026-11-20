@@ -70,6 +70,11 @@ struct Display {
 
 static DISPLAY: Mutex<Option<Display>> = Mutex::new(None);
 
+// The work area of the primary screen as of the launch or the last window that opened.
+pub(crate) fn work_area() -> Option<Rect> {
+    lock(&DISPLAY).map(|display| display.work_area)
+}
+
 pub(crate) fn measure_screens() {
     let mtm = MainThreadMarker::new().unwrap();
     let Some(screen) = NSScreen::screens(mtm)

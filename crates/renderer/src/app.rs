@@ -634,6 +634,12 @@ pub mod native {
         platform::native_after(delay, f);
     }
 
+    /// Builds the GPU device and pipelines on this thread, so the first window doesn't wait for them.
+    pub fn prewarm() {
+        #[cfg(target_os = "macos")]
+        platform::prewarm();
+    }
+
     pub fn sync<R: Send>(f: impl FnOnce() -> R + Send) -> R {
         platform::native_sync(f)
     }

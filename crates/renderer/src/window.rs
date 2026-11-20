@@ -1482,7 +1482,9 @@ impl Window {
     pub(crate) fn begin_paint(&mut self) -> (u32, Option<u32>) {
         self.paints = self.paints.wrapping_add(1);
         let generation = self.text_system.generation();
-        let evicted = self.platform.atlas().take_evicted();
+        let atlas = self.platform.atlas();
+        atlas.take_removed(&mut self.scene.removed);
+        let evicted = atlas.take_evicted();
         let fresh = mem::take(&mut self.repaint) || evicted || generation != self.generation;
         self.generation = generation;
         self.scene.begin_paint(self.paints);

@@ -340,26 +340,39 @@ impl Pipelines {
 // A copy that starts a frame: the source, its offset and the area.
 type Prelude<'a> = (&'a ProtocolObject<dyn MTLTexture>, [i32; 2], [i32; 4]);
 
+// All windows share the device and the pipelines. Metal objects are thread-safe. A window that opens while
+// another thread builds them waits for that build.
+fn shared() -> Result<&'static (Device, Pipelines)> {
+    static SHARED: OnceLock<(Device, Pipelines)> = OnceLock::new();
+    static BUILD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if let Some(shared) = SHARED.get() {
+        return Ok(shared);
+    }
+    let _build = BUILD.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(shared) = SHARED.get() {
+        return Ok(shared);
+    }
+    // Built-in GPUs first, and among those the integrated one, which saves power.
+    let rank = |device: &ProtocolObject<dyn MTLDevice>| {
+        2 * u8::from(device.isRemovable()) + u8::from(!device.isLowPower())
+    };
+    let device = MTLCopyAllDevices()
+        .iter()
+        .min_by_key(|device| rank(device))
+        .or_else(|| MTLCreateSystemDefaultDevice())
+        .context("no Metal device")?;
+    let pipelines = Pipelines::new(&device)?;
+    Ok(SHARED.get_or_init(|| (device, pipelines)))
+}
+
+// Builds the device and the pipelines before the first window needs them.
+pub(crate) fn prewarm() {
+    let _ = shared();
+}
+
 impl Renderer {
     pub fn new(transparent: bool) -> Result<Self> {
-        // All windows share the device and the pipelines. Metal objects are thread-safe.
-        static SHARED: OnceLock<(Device, Pipelines)> = OnceLock::new();
-        let (device, pipelines) = match SHARED.get() {
-            Some(shared) => shared,
-            None => {
-                // Built-in GPUs first, and among those the integrated one, which saves power.
-                let rank = |device: &ProtocolObject<dyn MTLDevice>| {
-                    2 * u8::from(device.isRemovable()) + u8::from(!device.isLowPower())
-                };
-                let device = MTLCopyAllDevices()
-                    .iter()
-                    .min_by_key(|device| rank(device))
-                    .or_else(|| MTLCreateSystemDefaultDevice())
-                    .context("no Metal device")?;
-                let pipelines = Pipelines::new(&device)?;
-                SHARED.get_or_init(|| (device, pipelines))
-            }
-        };
+        let (device, pipelines) = shared()?;
         let device = device.clone();
         let wide = forced_p3() == Some(true);
         let layer = metal_layer(&device, !transparent, wide);

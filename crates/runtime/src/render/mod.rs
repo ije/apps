@@ -249,7 +249,16 @@ fn animation_frame(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     {
         eprintln!("apps: {error}");
     }
-    window.refresh();
+    // A frame whose callbacks changed nothing draws nothing.
+    if view.host.try_borrow().map_or(true, |host| {
+        host.pages.get(&view.id).is_some_and(|page| page.dirty)
+            || host
+                .graphics
+                .get(&view.id)
+                .is_some_and(|gpu| gpu.presented())
+    }) {
+        window.refresh();
+    }
     if view
         .host
         .try_borrow_mut()

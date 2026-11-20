@@ -30,6 +30,9 @@ pub struct Scene {
     pub(crate) stale: Vec<u64>,
     // Layers that read the pixels below them, in window pixels.
     pub(crate) reads: Vec<Rect<f32>>,
+    // Atlas tiles removed since the last paint: (color page, page, texels). A span of `last` that reads one
+    // can't be copied, but its box can paint again while other boxes copy theirs.
+    pub(crate) removed: Vec<(bool, u32, Rect<i32>)>,
     entries: Vec<Entry>,
     maps: Vec<Map>,
     prior: Vec<Entry>,
@@ -422,6 +425,7 @@ impl Default for Scene {
             digests: Vec::new(),
             stale: Vec::new(),
             reads: Vec::new(),
+            removed: Vec::new(),
             entries: Vec::new(),
             maps: Vec::new(),
             prior: Vec::new(),
@@ -826,11 +830,44 @@ impl Scene {
     // Copies a span of the last paint into the current layer, and returns where it is now.
     // Debug builds paint instead, to check the copy.
     #[cfg_attr(debug_assertions, allow(dead_code))]
+    // Whether the span of `last` reads an atlas tile that was removed since that paint.
+    fn reads_removed(&self, span: &Span) -> bool {
+        if self.removed.is_empty() {
+            return false;
+        }
+        let removed = |(color, page, texels): (bool, u32, Rect<f32>)| {
+            let texels = texels.map(|value| value as i32);
+            (self.removed.iter()).any(|&(at_color, at, rect)| {
+                at_color == color && at == page && rect.intersects(texels)
+            })
+        };
+        let read = |instance: &Instance| {
+            instance
+                .page()
+                .is_some_and(|(color, page)| removed((color, page, rect(instance.aux))))
+        };
+        let [start, end] = span.instances.map(|at| at as usize);
+        self.last[span.layer as usize].instances[start..end]
+            .iter()
+            .any(read)
+            || self.last[span.layers[0] as usize..span.layers[1] as usize]
+                .iter()
+                .any(|layer| {
+                    layer.instances.iter().any(read)
+                        || (layer.effect.as_ref())
+                            .and_then(|effect| effect.mask.as_ref())
+                            .is_some_and(|(tile, _)| {
+                                removed((true, tile.page, tile.rect.map(|value| value as f32)))
+                            })
+                })
+    }
+
     pub(crate) fn replay(&mut self, span: &Span) -> Option<Span> {
         let source = self.last.get(span.layer as usize)?;
         if source.instances.len() < span.instances[1] as usize
             || source.nested.len() < span.nested[1] as usize
             || self.last.len() < span.layers[1] as usize
+            || self.reads_removed(span)
         {
             return None;
         }
@@ -945,6 +982,7 @@ impl Scene {
         if source.instances.len() < span.instances[1] as usize
             || source.nested.len() < span.nested[1] as usize
             || self.last.len() < span.layers[1] as usize
+            || self.reads_removed(span)
         {
             return None;
         }

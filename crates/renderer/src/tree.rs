@@ -72,6 +72,8 @@ struct Slot {
     floats: bool,
     // The last layout broke the lines of the box beside floats.
     banded: bool,
+    // A layout beside floats emptied the cache, so the caches of the parents can still be full.
+    uncached: bool,
     // The floats that the box placed in the context of its parent when no other float reached it, from its origin.
     spill: Option<Box<Spill>>,
     // The prepaint pass that kept the box and all boxes in it where they were, and the first pass of the run
@@ -173,6 +175,7 @@ impl Slot {
             split: None,
             floats: false,
             banded: false,
+            uncached: false,
             spill: None,
             calm: 0,
             since: 0,
@@ -220,6 +223,7 @@ impl Slot {
         self.far = [None; 2];
         self.floats = false;
         self.banded = false;
+        self.uncached = false;
         self.spill = None;
         self.region = None;
         self.listed = false;
@@ -297,8 +301,6 @@ pub struct Tree {
     copies: bool,
     graveyard: Vec<Remains>,
     refined: FxHashMap<usize, Refined>,
-    // A float was in the tree: layout skips the caches of boxes beside floats, so `dirty` goes up to the root.
-    floated: bool,
     // Floats wait to paint after the blocks of their formatting context, like in CSS.
     deferred: Vec<u32>,
     // The masks of the boxes that paint now. An outline takes the mask of its box in this paint: the mask of
@@ -687,7 +689,6 @@ impl Tree {
             child.style.flow & Flow::FLOAT != 0
                 || child.floats && child.style.flow & Flow::BLOCK != 0
         });
-        self.floated |= floats;
         let slot = &mut self.slots[index as usize];
         (slot.free, slot.below, slot.lively) = (free, below, lively);
         let relaid = mem::replace(&mut slot.floats, floats) != floats || relaid;
@@ -731,8 +732,8 @@ impl Tree {
             let parent = slot.parent;
             // An empty cache means its parents were cleared too, unless it was just made or laid out beside floats.
             if matches!(slot.cache.clear(), ClearState::AlreadyEmpty)
-                && !self.floated
                 && parent != NONE
+                && !self.slots[parent as usize].uncached
                 && self.slots[parent as usize].cache.is_empty()
             {
                 break;
@@ -2746,6 +2747,7 @@ impl LayoutTree<'_> {
             // Beside floats, the result depends on them, so the cache is neither read nor stored, and a later
             // layout without floats must not find a result from before them.
             self.slots[index].cache.clear();
+            self.slots[index].uncached = true;
             layout(self, node, inputs)
         } else {
             taffy::compute_cached_layout(self, node, inputs, layout)
@@ -3901,6 +3903,7 @@ impl LayoutTree<'_> {
                             // The line box gets the place and the baselines of its lines.
                             let row = &mut self.slots[usize::from(child)];
                             row.cache.clear();
+                            row.uncached = true;
                             let shift = outer.top + own_margin.top;
                             row.baselines = Baselines {
                                 first: output.baselines.first.map(|base| base + shift),
@@ -4938,6 +4941,7 @@ impl CacheTree for LayoutTree<'_> {
     fn cache_store(&mut self, node: NodeId, input: &LayoutInput, output: LayoutOutput) {
         let slot = &mut self.slots[usize::from(node)];
         let relative = self.exact || slot.style.relative;
+        slot.uncached = false;
         slot.cache
             .store(&cache_input(slot.free, relative, input), output);
     }

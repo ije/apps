@@ -1413,9 +1413,9 @@ pub fn call(
         );
         return Ok(Value::Null);
     }
+    // A request only needs a tick: the page draws when the callbacks change it.
     if op == "dom.requestFrame" {
         state.frame_requested = true;
-        state.dirty = true;
         return Ok(json!(state.text_system.is_some()));
     }
     if op == "dom.requestPaint" {

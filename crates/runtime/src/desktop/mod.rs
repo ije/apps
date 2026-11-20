@@ -215,9 +215,9 @@ impl Desktop {
             main,
         } = bundle;
         let files = &files;
-        let api = JavaScriptCore::load()?;
         let windows = !pages.is_empty() || files.keys().any(|name| name.ends_with(".html"));
-        // Preload the window server, Metal and CoreText here to avoid delays at launch and the first frame.
+        // Preload Metal, the window server and CoreText here, while JavaScriptCore loads, to avoid delays at
+        // launch and the first frame.
         #[cfg(target_os = "macos")]
         if windows {
             let _ = std::thread::Builder::new()
@@ -228,14 +228,7 @@ impl Desktop {
                     unsafe extern "C" {
                         fn CGMainDisplayID() -> u32;
                     }
-                    #[link(name = "Metal", kind = "framework")]
-                    unsafe extern "C" {
-                        fn MTLCopyAllDevices() -> *const std::ffi::c_void;
-                    }
-                    #[link(name = "CoreFoundation", kind = "framework")]
-                    unsafe extern "C" {
-                        fn CFRelease(value: *const std::ffi::c_void);
-                    }
+                    renderer::native::prewarm();
                     unsafe { CGMainDisplayID() };
                     let text = TextSystem::new();
                     let run = TextRun {
@@ -253,12 +246,9 @@ impl Desktop {
                     });
                     text.face(&Font::new("Menlo"));
                     text.face(&Font::new("Helvetica"));
-                    let devices = unsafe { MTLCopyAllDevices() };
-                    if !devices.is_null() {
-                        unsafe { CFRelease(devices) };
-                    }
                 });
         }
+        let api = JavaScriptCore::load()?;
         let link = Link::new();
         // Install the waker before the app runs, because native producers of this thread capture it then.
         crate::host::Waker::install({

@@ -32,6 +32,7 @@ use std::{
 
 pub(crate) use controls::control_size;
 pub(crate) use glass::available as supports_glass;
+pub(crate) use metal::prewarm;
 pub(crate) use text::TextSystem;
 pub(crate) use threads::{
     AppThread, app_thread, ask, end_thread, native_after, native_post, native_sync, park_render,
@@ -173,13 +174,16 @@ impl Platform {
         native_post(Box::new(move || nsview::set_cursor(cursor)));
     }
 
+    // The cached screen saves a wait for main, which is busy while the app launches.
     pub fn primary_display_bounds(&self) -> Option<Rect> {
-        native_sync(|| {
-            let primary = NSScreen::screens(MainThreadMarker::new().unwrap()).firstObject()?;
-            Some(window::flip(
-                primary.visibleFrame(),
-                primary.frame().size.height,
-            ))
+        window::work_area().or_else(|| {
+            native_sync(|| {
+                let primary = NSScreen::screens(MainThreadMarker::new().unwrap()).firstObject()?;
+                Some(window::flip(
+                    primary.visibleFrame(),
+                    primary.frame().size.height,
+                ))
+            })
         })
     }
 
