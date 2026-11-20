@@ -347,7 +347,9 @@ impl Window {
         self.scene.push_effect(state, effect.key);
         // Ancestor clips apply after the effect, in window space, so the layer starts unclipped.
         self.push_content_mask(unbounded_mask());
+        let groups = mem::take(&mut self.group_clips);
         let result = f(self);
+        self.group_clips = groups;
         self.content_masks.pop();
         self.scene.pop_effect();
         result
@@ -488,8 +490,7 @@ impl Window {
             scale,
             subpixel,
             emoji,
-            // Like Skia, stroked glyphs are paths with no font smoothing.
-            dilation: if self.font_smoothing && !emoji && stroke.0 <= 0. {
+            dilation: if self.font_smoothing && !emoji {
                 self.text_system.dilation(color)
             } else {
                 0

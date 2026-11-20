@@ -653,18 +653,30 @@ pub(super) fn css_background(
             continue;
         };
         let strip = super::effects::gradient_axis(&kind, &body, &units);
+        let modes = match repeat.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["repeat-x"] => ["repeat", "no-repeat"],
+            ["repeat-y"] => ["no-repeat", "repeat"],
+            [one] => [*one; 2],
+            [a, b, ..] => [*a, *b],
+            [] => ["repeat"; 2],
+        };
+        let repeats = modes.map(|mode| mode == "repeat");
+        let plain = modes
+            .iter()
+            .all(|mode| matches!(*mode, "repeat" | "no-repeat"));
         let view = view.clone();
         layers.push(layer(paint(canvas, move |bounds, _, window| {
             let (bounds, clip) = areas(bounds, window);
             let area = if fixed { [0.; 4] } else { area };
             let [width, height] = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
-            if width <= 0. || height <= 0. {
+            // A canvas layer tiles the whole canvas, also around an empty root box.
+            if !canvas && (width <= 0. || height <= 0.) {
                 return;
             }
             // Keep the gradient strip's outer pixels outside the box so filtering cannot sample
             // neighboring atlas tiles.
             let scale = window.scale_factor();
-            let repeated = matches!(repeat.trim(), "" | "repeat" | "repeat repeat");
+            let repeated = repeats == [true; 2];
             let axis = strip.filter(|_| {
                 !canvas
                     && matches!(size.as_str(), "" | "auto" | "auto auto")
@@ -677,20 +689,43 @@ pub(super) fn css_background(
             let whole = |value: f32| (value * scale - (value * scale).round()).abs() < 0.01;
             let radii = corners(bounds);
             let [aw, ah] = [width + area[2], height + area[3]];
-            let [[tw, th], [x, y]] = super::effects::tile(&size, &position, &units, aw, ah, None);
-            let [x, y] = [x + area[0], y + area[1]];
+            let [[tw, th], at] = super::effects::tile(&size, &position, &units, aw, ah, None);
+            let [x, y] = [at[0] + area[0], at[1] + area[1]];
             let [cw, ch] = [tw, th].map(|side| side * (256. / (side * scale)).ceil().max(1.));
-            let grouped = super::effects::tile(&size, "0 0", &units, cw, ch, None)[0] == [tw, th];
-            // Repeated canvas layers always tile, since they cover more than the root box.
+            // A layer that repeats on one axis rasters one row or column of tiles. On the other axis the raster
+            // starts at a device pixel, with the tile at its offset in it.
+            let lone = !repeated && repeats.contains(&true);
+            let start = [f32::from(bounds.left()) + x, f32::from(bounds.top()) + y];
+            let snapped = start.map(|at| (at * scale).floor() / scale);
+            let offset = [0, 1].map(|axis| match repeats[axis] {
+                true => 0.,
+                false => start[axis] - snapped[axis],
+            });
+            let grouped =
+                lone || super::effects::tile(&size, "0 0", &units, cw, ch, None)[0] == [tw, th];
             let [cw, ch] = if grouped { [cw, ch] } else { [tw, th] };
+            let [cw, ch] =
+                [(0, cw, tw), (1, ch, th)].map(|(axis, cell, side)| match repeats[axis] {
+                    true => cell,
+                    false => ((offset[axis] + side) * scale).ceil() / scale,
+                });
+            // Repeated canvas layers always tile, since they cover more than the root box.
             let tiled = (axis.is_none()
-                && repeated
+                && plain
+                && repeats.contains(&true)
                 && radii.is_zero()
-                && (canvas
-                    || [tw, th, x, y].into_iter().all(whole)
-                        && cw * ch < width * height
+                && (canvas && repeated
+                    || [[tw, x], [th, y]]
+                        .into_iter()
+                        .zip(repeats)
+                        .all(|(pair, repeats)| !repeats || pair.into_iter().all(whole))
+                        && (canvas || cw * ch < width * height)
                         && grouped))
                 .then_some([x.rem_euclid(tw), y.rem_euclid(th)]);
+            if tiled.is_none() && (width <= 0. || height <= 0.) {
+                return;
+            }
+            let explicit = lone && tiled.is_some();
             let ((width, height), within) = match axis {
                 Some(1) => ((3., height), [0., area[1], 3., ah]),
                 Some(_) => ((width, 3.), [area[0], 0., aw, 3.]),
@@ -711,7 +746,7 @@ pub(super) fn css_background(
                 position.as_str()
             };
             let mut inputs = String::with_capacity(
-                kind.len() + body.len() + size.len() + position.len() + repeat.len() + 168,
+                kind.len() + body.len() + size.len() + position.len() + repeat.len() + 200,
             );
             for part in [
                 kind.as_str(),
@@ -724,7 +759,8 @@ pub(super) fn css_background(
                 inputs.push('\0');
             }
             super::effects::push_bits(&mut inputs, [width, height], &units);
-            for value in within {
+            let exact = [tw, th, offset[0], offset[1]];
+            for value in within.iter().chain(if explicit { &exact[..] } else { &[] }) {
                 inputs.push_str(&value.to_bits().to_string());
                 inputs.push('\0');
             }
@@ -737,6 +773,16 @@ pub(super) fn css_background(
             };
             let entry = dom.backgrounds.get(&key);
             if entry.is_none_or(|(old, image)| old != &inputs || !fits(image)) {
+                let texts = explicit.then(|| {
+                    (
+                        format!("{tw}px {th}px"),
+                        format!("{}px {}px", offset[0], offset[1]),
+                    )
+                });
+                let (size, position) = match &texts {
+                    Some((size, position)) => (size.as_str(), position.as_str()),
+                    None => (size.as_str(), position),
+                };
                 // Cache only on new boxes, or animated gradients retain old frames.
                 let new = entry.is_none();
                 let cached = new
@@ -755,7 +801,7 @@ pub(super) fn css_background(
                         true => super::effects::conic_image(
                             &kind,
                             &body,
-                            &size,
+                            size,
                             position,
                             &repeat,
                             units,
@@ -765,7 +811,7 @@ pub(super) fn css_background(
                             entry.map(|(_, image)| image),
                         ),
                         false => super::effects::gradient_svg(
-                            &kind, &body, &size, position, &repeat, units, width, height, within,
+                            &kind, &body, size, position, &repeat, units, width, height, within,
                         )
                         .and_then(|source| super::canvas::svg_gradient(source, rw, rh)),
                     }?;
@@ -812,16 +858,28 @@ pub(super) fn css_background(
                     let at = (at * scale).round() / scale;
                     px(at + cell * ((f32::from(low) - at) / cell).floor())
                 };
-                let mut top = start(bounds.top(), y, th, ch, visible.top());
+                let mut top = match repeats[1] {
+                    true => start(bounds.top(), y, th, ch, visible.top()),
+                    false => px(snapped[1]),
+                };
                 while top < visible.bottom() {
-                    let mut left = start(bounds.left(), x, tw, cw, visible.left());
+                    let mut left = match repeats[0] {
+                        true => start(bounds.left(), x, tw, cw, visible.left()),
+                        false => px(snapped[0]),
+                    };
                     while left < visible.right() {
                         let target = renderer::Rect::new(
                             renderer::point(left, top),
                             renderer::size(px(cw), px(ch)),
                         );
                         window.draw_image(clip, target, radii, image.clone(), false, false);
+                        if !repeats[0] {
+                            break;
+                        }
                         left += px(cw);
+                    }
+                    if !repeats[1] {
+                        break;
                     }
                     top += px(ch);
                 }

@@ -44,6 +44,7 @@ pub type Variations = Rc<[([u8; 4], f32)]>;
 
 #[derive(Clone, PartialEq)]
 pub struct Font {
+    /// The family, then the families for glyphs it lacks, one per line. Only macOS uses the others yet.
     pub family: Rc<str>,
     pub features: Features,
     pub variations: Variations,
@@ -51,6 +52,8 @@ pub struct Font {
     pub optical_size: Option<f32>,
     pub weight: FontWeight,
     pub style: FontStyle,
+    /// `font-synthesis`: whether a face may get a synthetic bold, and a synthetic slant.
+    pub synthesis: [bool; 2],
 }
 
 thread_local! {
@@ -67,6 +70,7 @@ impl Font {
             optical_size: None,
             weight: 400.,
             style: FontStyle::Normal,
+            synthesis: [true; 2],
         }
     }
 }
@@ -88,6 +92,7 @@ impl Hash for Font {
             self.weight.to_bits(),
             self.style,
             self.optical_size.map(f32::to_bits),
+            self.synthesis,
         )
             .hash(state);
         for (tag, value) in self.variations.iter() {
@@ -118,6 +123,8 @@ const STAND_INS: [&str; 6] = [
     "Arial",
 ];
 
+type Coverage = (u128, FxHashMap<char, bool>);
+
 #[derive(Default)]
 pub struct Fonts {
     // Backends are called from one thread at a time.
@@ -126,6 +133,8 @@ pub struct Fonts {
     // Hashing a whole `Font` costs more than a shaping cache lookup, so recent fonts match by pointer first.
     recent: RefCell<Vec<(Font, FontId)>>,
     metrics: RefCell<Vec<Option<FaceMetrics>>>,
+    // The ASCII glyphs of each face as bits (all set until known), and the other chars asked so far.
+    coverage: RefCell<FxHashMap<FontId, Coverage>>,
     generation: Cell<usize>,
 }
 
@@ -145,6 +154,7 @@ impl Fonts {
                 && kept.optical_size == font.optical_size
                 && kept.weight == font.weight
                 && kept.style == font.style
+                && kept.synthesis == font.synthesis
         };
         if let Some(&(_, id)) = self.recent.borrow().iter().find(|(kept, _)| same(kept)) {
             return id;
@@ -193,6 +203,34 @@ impl Fonts {
         }
         all[at] = Some(metrics);
         metrics
+    }
+
+    /// Whether `font` has a glyph for `ch`, kept per face. Callers that test many chars test ASCII with
+    /// `ascii_glyphs`.
+    pub fn covers(&self, font: FontId, ch: char) -> bool {
+        if ch.is_ascii() {
+            return self.ascii_glyphs(font) >> (ch as u32) & 1 == 1;
+        }
+        *(self.coverage.borrow_mut())
+            .entry(font)
+            .or_insert((u128::MAX, FxHashMap::default()))
+            .1
+            .entry(ch)
+            .or_insert_with(|| self.platform.glyph(font, ch).is_some())
+    }
+
+    /// A bit for each ASCII char that `font` has a glyph for.
+    pub fn ascii_glyphs(&self, font: FontId) -> u128 {
+        let mut coverage = self.coverage.borrow_mut();
+        let (ascii, _) = coverage
+            .entry(font)
+            .or_insert((u128::MAX, FxHashMap::default()));
+        if *ascii == u128::MAX {
+            *ascii = (0..127u8).fold(0, |bits, byte| {
+                bits | u128::from(self.platform.glyph(font, char::from(byte)).is_some()) << byte
+            });
+        }
+        *ascii
     }
 
     pub fn glyph_box(&self, font: FontId, size: Pixels) -> Rect<Pixels> {

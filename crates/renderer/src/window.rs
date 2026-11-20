@@ -335,6 +335,8 @@ struct Placed {
     clip: Clip<Pixels>,
     view: Rect,
     transform: Option<Rc<HitTransform>>,
+    // The rounded corners of the region's own box.
+    corners: Radii,
 }
 
 impl Placed {
@@ -352,6 +354,8 @@ impl Placed {
                 .intersect(self.clip.bounds)
                 .intersect(self.view)
                 .contains(local)
+                && (self.clip.radii.is_zero() || self.clip.radii.contains(self.clip.rounded, local))
+                && (self.corners.is_zero() || self.corners.contains(self.region.bounds, local))
         })
     }
 }
@@ -568,6 +572,8 @@ pub struct Window {
     hovered: usize,
     next_region: u64,
     content_masks: Vec<(Clip<Pixels>, Clip<f32>)>,
+    // The clips of `with_group_clip` in the space of the content masks.
+    pub(crate) group_clips: Vec<Clip<Pixels>>,
     // The viewports of the scrolls whose content paints in a larger interest area, or `None` for other scrolls.
     viewports: Vec<Option<Rect<Pixels>>>,
     offsets: Vec<Point<Pixels>>,
@@ -643,6 +649,7 @@ impl Window {
             hovered: 0,
             next_region: 0,
             content_masks: Vec::new(),
+            group_clips: Vec::new(),
             viewports: Vec::new(),
             unsettled: 0,
             transforms: 0,
@@ -1402,8 +1409,16 @@ impl Window {
                 None => self.visible_mask().bounds,
             },
             transform: self.hit_transform.clone(),
+            corners: Radii::default(),
         });
         region
+    }
+
+    /// Gives the last placed region the rounded corners of its box.
+    pub fn round_region(&mut self, corners: Radii) {
+        if let Some(placed) = self.pending.regions.last_mut() {
+            placed.corners = corners;
+        }
     }
 
     pub fn add_region(&mut self, bounds: Rect, hit: Hit) -> Region {
@@ -1830,18 +1845,28 @@ impl Window {
     // Stops the cuts of the scroll viewports inside the first `depth` until `resume_cuts`.
     pub(crate) fn pause_cuts(&mut self, depth: usize) -> Vec<Option<Rect<Pixels>>> {
         self.scene.pause_cuts(depth);
+        self.hide_viewports(depth)
+    }
+
+    pub(crate) fn resume_cuts(&mut self, paused: Vec<Option<Rect<Pixels>>>) {
+        self.show_viewports(paused);
+        self.scene.resume_cuts();
+    }
+
+    // Takes the scroll viewports inside the first `depth` out of the clips until `show_viewports`.
+    pub(crate) fn hide_viewports(&mut self, depth: usize) -> Vec<Option<Rect<Pixels>>> {
+        let depth = depth.min(self.viewports.len());
         self.viewports[depth..]
             .iter_mut()
             .map(Option::take)
             .collect()
     }
 
-    pub(crate) fn resume_cuts(&mut self, paused: Vec<Option<Rect<Pixels>>>) {
-        let depth = self.viewports.len() - paused.len();
-        for (viewport, old) in self.viewports[depth..].iter_mut().zip(paused) {
+    pub(crate) fn show_viewports(&mut self, hidden: Vec<Option<Rect<Pixels>>>) {
+        let depth = self.viewports.len() - hidden.len();
+        for (viewport, old) in self.viewports[depth..].iter_mut().zip(hidden) {
             *viewport = old;
         }
-        self.scene.resume_cuts(depth);
     }
 
     // Pair with pop_content_mask.
@@ -1852,6 +1877,19 @@ impl Window {
 
     pub(crate) fn pop_content_mask(&mut self) {
         self.content_masks.pop();
+    }
+
+    /// Clips what `f` paints, also the out-of-flow boxes that escape the clips around them, as `clip-path`.
+    pub fn with_group_clip<R>(&mut self, clip: Clip<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.group_clips.push(clip);
+        let result = self.scope(Scope::Clip(Some(clip)), f);
+        self.group_clips.pop();
+        result
+    }
+
+    // The mask of an out-of-flow box inside the group clips.
+    pub(crate) fn group_clipped(&self, mask: Clip<Pixels>) -> Clip<Pixels> {
+        (self.group_clips.iter()).fold(mask, |mask, clip| clip.intersect(&mask))
     }
 
     pub fn scope<R>(&mut self, scope: Scope, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -1889,8 +1927,9 @@ impl Window {
         // The layer is no part of the page, so the clips and the opacity around it don't apply.
         self.push_content_mask(unbounded_mask());
         let (opacity, text_clip) = (mem::replace(&mut self.opacity, 1.), self.text_clip.take());
+        let groups = mem::take(&mut self.group_clips);
         let result = f(self);
-        (self.opacity, self.text_clip) = (opacity, text_clip);
+        (self.opacity, self.text_clip, self.group_clips) = (opacity, text_clip, groups);
         self.content_masks.pop();
         let shot = key.map(|key| (key, self.snap_bounds(bounds)));
         self.scene.pop_offscreen(shot);
@@ -2069,6 +2108,7 @@ mod tests {
             clip: Clip::from(clip),
             view: clip,
             transform,
+            corners: Radii::default(),
         }
     }
 

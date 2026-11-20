@@ -283,8 +283,13 @@ pub fn line(
             .into(),
         ),
     ]));
-    if let Some(family) = aliases.get(face.family.as_ref()) {
-        face.family = family.clone().into();
+    let (first, rest) = face.family.split_once('\n').unwrap_or((&face.family, ""));
+    if let Some(family) = aliases.get(first) {
+        face.family = if rest.is_empty() {
+            family.clone().into()
+        } else {
+            format!("{family}\n{rest}").into()
+        };
     }
     let run = renderer::TextRun {
         len: text.len(),
@@ -1648,7 +1653,13 @@ pub fn svg_pixels(
     Ok(pixels)
 }
 
-pub type SvgGeometry = ([f32; 2], [f32; 4], Vec<(String, [f32; 4], [f32; 4])>);
+/// The size, the content box, the element boxes and the painted area of an SVG tree.
+pub type SvgGeometry = (
+    [f32; 2],
+    [f32; 4],
+    Vec<(String, [f32; 4], [f32; 4])>,
+    [f32; 4],
+);
 
 pub fn svg_boxes(tree: &usvg::Tree) -> SvgGeometry {
     let rect = |rect: usvg::Rect| [rect.x(), rect.y(), rect.width(), rect.height()];
@@ -1686,10 +1697,12 @@ pub fn svg_boxes(tree: &usvg::Tree) -> SvgGeometry {
         [usvg::Node::Group(group)] if group.id().is_empty() => group.bounding_box(),
         _ => tree.root().bounding_box(),
     };
+    let painted = tree.root().abs_layer_bounding_box();
     (
         [tree.size().width(), tree.size().height()],
         rect(content),
         boxes,
+        [painted.x(), painted.y(), painted.width(), painted.height()],
     )
 }
 
@@ -2023,7 +2036,7 @@ mod tests {
 
     #[test]
     fn svg_boxes_map_elements_to_canvas_and_own_coordinates() {
-        let (size, content, boxes) = svg_boxes(&svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 100 50"><rect id="r" x="10" y="5" width="30" height="20"/><g transform="translate(5 30)"><rect id="apps-7" width="10" height="10"/></g></svg>"##, false).unwrap());
+        let (size, content, boxes, _) = svg_boxes(&svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 100 50"><rect id="r" x="10" y="5" width="30" height="20"/><g transform="translate(5 30)"><rect id="apps-7" width="10" height="10"/></g></svg>"##, false).unwrap());
         assert_eq!(size, [200., 100.]);
         assert_eq!(content, [5., 5., 35., 35.]);
         let find = |name: &str| {
@@ -2037,7 +2050,7 @@ mod tests {
             find("apps-7"),
             Some(([10., 60., 20., 20.], [0., 0., 10., 10.]))
         );
-        let (_, _, boxes) = svg_boxes(&svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><rect id="s" width="10" height="10"/></defs><use id="u" href="#s" x="20" y="10" transform="scale(2)"/></svg>"##, false).unwrap());
+        let (_, _, boxes, _) = svg_boxes(&svg_tree(r##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><rect id="s" width="10" height="10"/></defs><use id="u" href="#s" x="20" y="10" transform="scale(2)"/></svg>"##, false).unwrap());
         assert_eq!(
             boxes
                 .iter()

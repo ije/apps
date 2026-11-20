@@ -47,6 +47,8 @@ pub(crate) type SvgBoxes = (
     [f32; 2],
     Vec<(usize, [f32; 4], [f32; 4])>,
     [f32; 4],
+    [f32; 4],
+    [f32; 4],
 );
 
 // The mask of a box, 0, or of its `::before` or `::after`, 1 and 2: its inputs and its image.
@@ -72,8 +74,8 @@ pub(crate) struct LayoutNode {
     pub marks: u32,
 }
 
-// Match the JS buffer layout: 4 header floats (stale, capacity, layout count, moved), 8 floats per node, then
-// MIRROR_* bytes.
+// Match the JS buffer layout: 4 header floats (stale, capacity, layout count, moved), 8 floats per node,
+// MIRROR_* bytes, then a count of bounds changes.
 #[derive(Default)]
 pub struct LayoutMirror {
     memory: Option<Arc<MirrorMemory>>,
@@ -462,7 +464,25 @@ pub(crate) const INVALID: u16 = 32768;
 pub(crate) const TOP_LAYER: u16 = MODAL | POPOVER | FULLSCREEN;
 pub(crate) const LEAVING: u16 = TOP_LAYER << 5;
 
+// A `contenteditable` value makes the element editable or not, or inherits when `None`.
+pub(crate) fn editable_value(value: &str) -> Option<bool> {
+    if value.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        (value.is_empty()
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("plaintext-only"))
+        .then_some(true)
+    }
+}
+
 impl Node {
+    pub(crate) fn content_editable(&self) -> Option<bool> {
+        self.attrs
+            .get("contenteditable")
+            .and_then(|value| editable_value(value))
+    }
+
     pub(crate) fn checked(&self) -> bool {
         if self.state & DIRTY != 0 {
             self.state & CHECKED != 0
@@ -526,6 +546,10 @@ impl LayoutMirror {
         self.slot(self.capacity).cast::<u8>().wrapping_add(id)
     }
 
+    fn changes(&self) -> *mut f32 {
+        self.slot(self.capacity).wrapping_add(self.capacity / 4)
+    }
+
     fn reserve(&mut self, id: usize) {
         if id >= self.capacity {
             self.resize((id + 1).next_power_of_two().max(1024));
@@ -540,7 +564,7 @@ impl LayoutMirror {
     }
 
     fn resize(&mut self, capacity: usize) {
-        let words = 4 + capacity * 8 + capacity / 4;
+        let words = 4 + capacity * 8 + capacity / 4 + 1;
         let memory = std::ptr::NonNull::new(Box::into_raw(vec![0f32; words].into_boxed_slice()))
             .expect("Layout memory")
             .cast::<f32>();
@@ -555,6 +579,7 @@ impl LayoutMirror {
                     kept,
                 );
                 *memory.as_ptr().add(2) = *old.0.as_ptr().add(2);
+                *memory.as_ptr().add(words - 1) = *self.changes();
                 // Pages keep reading the old buffer until they see this flag and fetch the new one.
                 *old.0.as_ptr() = 1.;
             }
@@ -576,8 +601,14 @@ impl LayoutMirror {
     pub fn insert(&mut self, id: usize, rect: [f32; 4]) {
         self.reserve(id);
         unsafe {
-            *self.slot(id).cast::<[f32; 4]>() = rect;
-            *self.flags(id) |= MIRROR_BOUNDS;
+            let (slot, flags) = (self.slot(id).cast::<[f32; 4]>(), self.flags(id));
+            // Pages compare the count only for equality, so it wraps before an f32 stops counting.
+            if *flags & MIRROR_BOUNDS == 0 || *slot != rect {
+                let changes = self.changes();
+                *changes = (*changes + 1.) % 16_777_216.;
+            }
+            *slot = rect;
+            *flags |= MIRROR_BOUNDS;
         }
     }
 
@@ -601,6 +632,12 @@ impl LayoutMirror {
         self.memory
             .as_ref()
             .is_some_and(|memory| unsafe { *memory.0.as_ptr().add(3) } != 0.)
+    }
+
+    pub(crate) fn settle(&mut self) {
+        if let Some(memory) = &self.memory {
+            unsafe { *memory.0.as_ptr().add(3) = 0. };
+        }
     }
 
     pub(crate) fn set_moved(&mut self) {
@@ -672,7 +709,7 @@ impl LayoutMirror {
         let memory = self.memory.clone().expect("Layout memory");
         (
             memory.0.as_ptr().cast(),
-            (4 + self.capacity * 8) * 4 + self.capacity,
+            (4 + self.capacity * 8) * 4 + self.capacity + 4,
             Arc::into_raw(memory).cast_mut().cast(),
         )
     }
@@ -693,6 +730,9 @@ impl Extend<(usize, [f32; 4])> for LayoutMirror {
     }
 }
 
+// A move of the mirror for a scroll: by how much, and the nodes of the walk it moved.
+type ScrollShift = ([f32; 2], Rc<Vec<(u32, u32)>>, std::ops::Range<usize>);
+
 #[derive(Default)]
 pub struct State {
     pub base: Option<url::Url>,
@@ -707,6 +747,14 @@ pub struct State {
     pub(crate) text_layouts: rustc_hash::FxHashMap<usize, TextLayout>,
     pub scroll: rustc_hash::FxHashMap<usize, renderer::ScrollRef>,
     scroll_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
+    // The scroll offsets that the mirror shows, as of the last prepaint, the moves of the mirror for user scrolls
+    // since then, and whether the boxes in each scroll move as a whole, by style epoch and walk.
+    mirror_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
+    scroll_shifts: Vec<ScrollShift>,
+    // Scrolls that moved since the mirror did, and whether they alone left it stale.
+    unshifted: Vec<usize>,
+    only_scrolled: bool,
+    shiftable: rustc_hash::FxHashMap<usize, (u64, u64, bool)>,
     pub(crate) computed: Option<Rc<style::ComputedStyles>>,
     previous: Option<Rc<style::ComputedStyles>>,
     pub(crate) style_walk: Walk,
@@ -729,6 +777,8 @@ pub struct State {
     pub(crate) grid_widest: rustc_hash::FxHashMap<usize, f32>,
     // The used columns and rows of the last layout of each grid, for `getComputedStyle()`.
     pub(crate) tracks: rustc_hash::FxHashMap<usize, [Box<[f32]>; 2]>,
+    // The grid area of each grid item at its last build, for `getComputedStyle()`.
+    pub(crate) areas: rustc_hash::FxHashMap<usize, [f32; 2]>,
     pub(crate) baselines: crate::render::grid::Baselines,
     pub(crate) layout_nodes: Vec<Option<LayoutNode>>,
     pub(crate) measurements: crate::render::grid::Measurements,
@@ -801,6 +851,9 @@ pub struct State {
     pub(crate) recolored: Vec<usize>,
     pub(crate) containers: rustc_hash::FxHashMap<usize, [f32; 2]>,
     pub(crate) atoms: rustc_hash::FxHashMap<usize, [f32; 3]>,
+    // The rendered `::before` and `::after` boxes that scripts can read, by their atom key: the place of the border
+    // box from the border box of the element in layout, its size, then the padding plus border of each side.
+    pub pseudo_boxes: rustc_hash::FxHashMap<usize, [f32; 8]>,
     pub(crate) container_pass: bool,
     pub(crate) anchors: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
     pub(crate) blocks: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
@@ -848,6 +901,141 @@ impl State {
             | ((self.pixel_ratio.clamp(0., 600.) * 100.).round() as u32) << 16
     }
 
+    // After prepaint, the mirror shows the scroll offsets now.
+    pub(crate) fn prepainted(&mut self) {
+        self.mirror_offsets.clear();
+        for (&id, handle) in &self.scroll {
+            self.mirror_offsets
+                .insert(id, painted_offset(handle, self.pixel_ratio));
+        }
+    }
+
+    // Prepaint moves the mirror from where it put it, so the moves for user scrolls go back first.
+    pub(crate) fn unshift(&mut self) {
+        self.unshifted.clear();
+        self.only_scrolled = false;
+        for (by, nodes, range) in std::mem::take(&mut self.scroll_shifts).into_iter().rev() {
+            self.shift_mirror(&nodes[range], [-by[0], -by[1]]);
+        }
+    }
+
+    fn shift_mirror(&mut self, nodes: &[(u32, u32)], [x, y]: [f32; 2]) {
+        for &(id, _) in nodes {
+            let id = id as usize;
+            if let Some(rect) = self.bounds.get_mut(&id)
+                && *rect != [0.; 4]
+            {
+                (rect[0], rect[1]) = (rect[0] + x, rect[1] + y);
+            }
+            if !self.fragments.is_empty()
+                && let Some(parts) = self.fragments.get_mut(&id)
+            {
+                parts
+                    .iter_mut()
+                    .for_each(|part| (part[0], part[1]) = (part[0] + x, part[1] + y));
+            }
+        }
+    }
+
+    // How far the user scrolls since the last prepaint moved a node of the mirror. Text layouts keep their places.
+    pub(crate) fn scroll_shift(&self, id: usize) -> [f32; 2] {
+        let Some(place) = self.style_walk.place(id).map(|place| place as usize) else {
+            return [0.; 2];
+        };
+        self.scroll_shifts
+            .iter()
+            .filter(|(_, nodes, range)| {
+                range.contains(&place) && nodes.get(place).is_some_and(|node| node.0 as usize == id)
+            })
+            .fold([0.; 2], |[x, y], (by, ..)| [x + by[0], y + by[1]])
+    }
+
+    // Moves the mirror for the user scrolls since the last prepaint, when a script reads geometry. True when the
+    // mirror is then current without a layout.
+    pub(crate) fn shift_scrolls(&mut self) -> bool {
+        let unshifted = std::mem::take(&mut self.unshifted);
+        if !std::mem::take(&mut self.only_scrolled) {
+            return false;
+        }
+        let mut shifted = true;
+        for id in unshifted {
+            let to = self
+                .scroll
+                .get(&id)
+                .map(|handle| painted_offset(handle, self.pixel_ratio));
+            shifted &= to.is_some_and(|to| self.shift_scrolled(id, to));
+        }
+        if shifted {
+            self.bounds.settle();
+        }
+        shifted
+    }
+
+    // Moves the mirror of the boxes in a scroll that the user moved, so geometry reads before the next prepaint
+    // see the new offset. False when its boxes don't move as a whole, like fixed, sticky or transformed boxes.
+    fn shift_scrolled(&mut self, id: usize, to: renderer::Point<renderer::Pixels>) -> bool {
+        let Some(&from) = self.mirror_offsets.get(&id).filter(|_| id != 0) else {
+            return false;
+        };
+        let by = [f32::from(to.x - from.x), f32::from(to.y - from.y)];
+        let walk = &self.style_walk;
+        let (Some(start), Some(computed)) = (walk.place(id), self.computed.as_ref()) else {
+            return false;
+        };
+        let range = start as usize + 1..start as usize + walk.span(id);
+        let key = (self.style_epoch, walk.serial);
+        let shiftable = match self.shiftable.get(&id) {
+            Some(&(epoch, serial, shiftable)) if (epoch, serial) == key => shiftable,
+            _ => {
+                // A transform, zoom or perspective on the scroll, around it or in it doesn't move boxes by the offset.
+                let flat = |node: usize| {
+                    computed.values.get(node).is_some_and(|style| {
+                        [
+                            Prop::TRANSFORM,
+                            Prop::TRANSLATE,
+                            Prop::ROTATE,
+                            Prop::SCALE,
+                            Prop::PERSPECTIVE,
+                        ]
+                        .into_iter()
+                        .all(|prop| style.get(prop).is_none_or(|value| value == "none"))
+                            && style.get(Prop::ZOOM).is_none_or(|value| {
+                                matches!(value, "normal" | "reset" | "1" | "100%")
+                            })
+                    })
+                };
+                let contains = crate::render::effects::establishes(&computed.values[id]).absolute;
+                let shiftable = self.top_layer.is_empty()
+                    && std::iter::successors(Some(id as u32), |&node| {
+                        walk.parent(node as usize)
+                            .filter(|&parent| parent != ABSENT)
+                    })
+                    .all(|node| flat(node as usize))
+                    && walk.nodes[range.clone()].iter().all(|&(node, _)| {
+                        let position = computed
+                            .values
+                            .get(node as usize)
+                            .map_or("static", |style| {
+                                style.get(Prop::POSITION).unwrap_or("static")
+                            });
+                        !matches!(position, "fixed" | "sticky")
+                            && (contains || position != "absolute")
+                            && flat(node as usize)
+                    });
+                self.shiftable.insert(id, (key.0, key.1, shiftable));
+                shiftable
+            }
+        };
+        if !shiftable {
+            return false;
+        }
+        let nodes = walk.nodes.clone();
+        self.shift_mirror(&nodes[range.clone()], by);
+        self.scroll_shifts.push((by, nodes, range));
+        self.mirror_offsets.insert(id, to);
+        true
+    }
+
     pub(crate) fn sync_scroll(&mut self) {
         for (&id, handle) in &self.scroll {
             let (offset, max) = (scroll_offset(handle, handle.offset()), handle.max_offset());
@@ -887,6 +1075,12 @@ impl State {
             self.autos.remove(&id);
             self.measurements.remembered.remove(&id);
             self.measurements.texts.remove(&id);
+            if !self.pseudo_boxes.is_empty() {
+                for pseudo in 1..3 {
+                    self.pseudo_boxes
+                        .remove(&crate::style::atom_key(id, pseudo));
+                }
+            }
             if let Some(node) = self.layout_nodes.get_mut(id) {
                 *node = None;
             }
@@ -1242,6 +1436,19 @@ pub fn call(
             }
         }
         changed.sort_unstable();
+        // Prepaint moves the mirror for a scroll, so a geometry read before it moves the mirror, or lays out again.
+        if !changed.is_empty() {
+            state.only_scrolled = (state.only_scrolled || !state.bounds.moved())
+                && changed
+                    .iter()
+                    .all(|id| state.mirror_offsets.contains_key(id));
+            for &id in &changed {
+                if !state.unshifted.contains(&id) {
+                    state.unshifted.push(id);
+                }
+            }
+            state.bounds.set_moved();
+        }
         state.sync_scroll();
         let mut changed = json!(changed);
         if !state.skip_events.is_empty()
@@ -1646,6 +1853,7 @@ pub fn call(
                 }
                 state.svg_sources.remove(&id);
                 state.svg_boxes.remove(&id);
+                state.cull.spills.remove(&id);
                 state.svg_trees.remove(&id);
                 state.svg_images.remove(&id);
                 state.measurements.naturals.remove(&id);
@@ -2069,15 +2277,16 @@ pub fn call(
                 _ => None,
             };
             let scripted = slot.and_then(|slot| state.motion.scripted(id, slot, &styles, u32::MAX));
-            // The compositor can play animations between frames, so they are sampled now.
-            let current = state
-                .animating
-                .contains_key(&id)
-                .then(|| {
-                    let now = std::time::Instant::now();
-                    state.motion.timeline(id, 0, &styles, &[now], &[]).pop()
-                })
-                .flatten();
+            // The compositor can play animations between frames, so they are sampled now. As in Chrome, values that
+            // move boxes stay those of the last frame, which match its layout.
+            let current = state.animating.get(&id).and_then(|last| {
+                let now = std::time::Instant::now();
+                let current = state.motion.timeline(id, 0, &styles, &[now], &[]).pop()?;
+                let paints = current.iter().all(|(prop, value)| {
+                    crate::render::composited(prop) || last.get(prop) == Some(&**value)
+                });
+                paints.then_some(current)
+            });
             let mut sampled = None;
             let backdrop = (pseudo == "backdrop")
                 .then(|| state.motion.backdrop(id, styles.backdrops.get(&id)?))
@@ -2202,10 +2411,17 @@ pub fn call(
             let position = style.get(Prop::POSITION).unwrap_or("static");
             // The containing block: the parent's content box, or for positioned boxes the padding box of the
             // nearest positioned or transformed ancestor. `None` is the viewport.
-            let block = match position {
-                "fixed" => None,
-                "absolute" => {
-                    std::iter::successors(doc.nodes[id].parent, |&node| doc.nodes[node].parent)
+            // `::before` and `::after` are children of their element.
+            let generated = matches!(pseudo, "before" | "after");
+            let start = if generated {
+                Some(id)
+            } else {
+                doc.nodes[id].parent
+            };
+            let block =
+                match position {
+                    "fixed" => None,
+                    "absolute" => std::iter::successors(start, |&node| doc.nodes[node].parent)
                         .find(|&node| {
                             styles.values[node]
                                 .get(Prop::POSITION)
@@ -2213,33 +2429,46 @@ pub fn call(
                                 || styles.values[node]
                                     .get(Prop::TRANSFORM)
                                     .is_some_and(|value| value != "none")
-                        })
+                        }),
+                    _ => start,
                 }
-                _ => doc.nodes[id].parent,
-            }
-            .and_then(|node| {
-                let rect = *state.bounds.get(&node)?;
-                let (style, units) = (&styles.values[node], &styles.lengths[node]);
-                let outer = edges(style, units, rect[2], true);
-                let inner = state
-                    .cull
-                    .widths
-                    .get(&node)
-                    .copied()
-                    .unwrap_or([rect[2] - outer[1] - outer[3], rect[3] - outer[0] - outer[2]]);
-                let padding = if position == "absolute" {
-                    edges(style, units, inner[0], false)
-                } else {
-                    [0.; 4]
-                };
-                Some([
-                    rect[0] + outer[3] - padding[3],
-                    rect[1] + outer[0] - padding[0],
-                    inner[0] + padding[1] + padding[3],
-                    inner[1] + padding[0] + padding[2],
-                ])
+                .and_then(|node| {
+                    let rect = *state.bounds.get(&node)?;
+                    let (style, units) = (&styles.values[node], &styles.lengths[node]);
+                    let outer = edges(style, units, rect[2], true);
+                    let inner =
+                        state.cull.widths.get(&node).copied().unwrap_or([
+                            rect[2] - outer[1] - outer[3],
+                            rect[3] - outer[0] - outer[2],
+                        ]);
+                    let padding = if position == "absolute" {
+                        edges(style, units, inner[0], false)
+                    } else {
+                        [0.; 4]
+                    };
+                    Some([
+                        rect[0] + outer[3] - padding[3],
+                        rect[1] + outer[0] - padding[0],
+                        inner[0] + padding[1] + padding[3],
+                        inner[1] + padding[0] + padding[2],
+                    ])
+                })
+                .unwrap_or([0., 0., viewport[0], viewport[1]]);
+            // A grid item takes percentages from its grid area.
+            let area = (!generated
+                && !matches!(position, "absolute" | "fixed")
+                && !style::table_part(doc, &styles, id))
+            .then(|| {
+                // The box parent, past `display: contents` boxes.
+                std::iter::successors(flat_parent(doc, state, &styles, id), |&parent| {
+                    flat_parent(doc, state, &styles, parent)
+                })
+                .find(|&parent| styles.values[parent].get(Prop::DISPLAY) != Some("contents"))
             })
-            .unwrap_or([0., 0., viewport[0], viewport[1]]);
+            .flatten()
+            .filter(|parent| state.tracks.contains_key(parent))
+            .and_then(|_| state.areas.get(&id).copied());
+            let block = area.map_or(block, |[width, height]| [block[0], block[1], width, height]);
             let container = || [block[2], block[3]];
             let inline = !doc.nodes[id].tag.starts_with('#')
                 && style
@@ -2262,6 +2491,19 @@ pub fn call(
                 );
             // The untransformed border box. Inline boxes and boxes that are not rendered have none, so their
             // percentages stay as they are.
+            // The box of a rendered `::before` or `::after`: its place, size and padding plus border.
+            let pseudo_box = (generated
+                && !inline
+                && shown(id)
+                && !matches!(style.get(Prop::DISPLAY), Some("none" | "contents"))
+                && style
+                    .get(Prop::CONTENT)
+                    .is_some_and(|content| !matches!(content, "none" | "normal")))
+            .then(|| {
+                let key = crate::style::atom_key(id, if pseudo == "after" { 2 } else { 1 });
+                state.pseudo_boxes.get(&key).copied()
+            })
+            .flatten();
             let size = (pseudo.is_empty() && !inline && shown(id))
                 .then(|| {
                     let inner = state.cull.widths.get(&id)?;
@@ -2276,12 +2518,11 @@ pub fn call(
                     (pseudo.is_empty() && !inline && shown(id))
                         .then(|| state.bounds.get(&id).map(|rect| [rect[2], rect[3]]))
                         .flatten()
-                });
+                })
+                .or_else(|| pseudo_box.map(|rect| [rect[2], rect[3]]));
             let registry = state.style_cache.registry();
-            let parent = doc.nodes[id].parent.map(|parent| &*styles.values[parent]);
-            let flow = doc.nodes[id]
-                .parent
-                .is_some_and(|parent| style::table_box(style::role(&styles, parent)))
+            let parent = start.map(|parent| &*styles.values[parent]);
+            let flow = start.is_some_and(|parent| style::table_box(style::role(&styles, parent)))
                 || parent.is_none_or(|parent| {
                     parent.get(Prop::DISPLAY).is_none_or(|display| {
                         !display.ends_with("flex") && !display.ends_with("grid")
@@ -2367,25 +2608,39 @@ pub fn call(
                                 _ => "0px".to_owned(),
                             };
                         }
-                        let (Some(&[x, y, width, height]), Some(size)) =
-                            (state.bounds.get(&id), size)
-                        else {
-                            return value;
-                        };
-                        // The bounds hold the transformed box, whose center is the transformed center of the box.
-                        let bounds = renderer::Rect::new(
-                            renderer::point(renderer::px(0.), renderer::px(0.)),
-                            renderer::size(renderer::px(size[0]), renderer::px(size[1])),
-                        );
-                        let center =
-                            match crate::render::effects::transform(style, &units, bounds, None) {
+                        let corner = if generated {
+                            // The layout place of the pseudo-element is from the border box of its element.
+                            let (Some([x, y, ..]), Some(&[left, top, ..])) =
+                                (pseudo_box, state.bounds.get(&id))
+                            else {
+                                return value;
+                            };
+                            [left + x, top + y]
+                        } else {
+                            let (Some(&[x, y, width, height]), Some(size)) =
+                                (state.bounds.get(&id), size)
+                            else {
+                                return value;
+                            };
+                            // The bounds hold the transformed box, whose center is the transformed center of the box.
+                            let bounds = renderer::Rect::new(
+                                renderer::point(renderer::px(0.), renderer::px(0.)),
+                                renderer::size(renderer::px(size[0]), renderer::px(size[1])),
+                            );
+                            let center = match crate::render::effects::transform(
+                                style, &units, bounds, None,
+                            ) {
                                 Some(m) if m[3] == 0. && m[7] == 0. && m[15] == 1. => {
                                     let [cx, cy] = [size[0] / 2., size[1] / 2.];
                                     [m[0] * cx + m[4] * cy + m[12], m[1] * cx + m[5] * cy + m[13]]
                                 }
                                 _ => [size[0] / 2., size[1] / 2.],
                             };
-                        let corner = [x + width / 2. - center[0], y + height / 2. - center[1]];
+                            [x + width / 2. - center[0], y + height / 2. - center[1]]
+                        };
+                        let Some(size) = size else {
+                            return value;
+                        };
                         let margin = units.edges(style, style::MARGIN, block[2]);
                         let start = corner[axis] - margin[3 - 3 * axis] - block[axis];
                         let used = if name == "top" || name == "left" {
@@ -2403,22 +2658,74 @@ pub fn call(
                         if !flow || position == "absolute" || position == "fixed" {
                             return "0px".to_owned();
                         }
-                        let other = get(if name == "margin-left" {
-                            "margin-right"
-                        } else {
-                            "margin-left"
-                        });
-                        let free = block[2] - size.unwrap_or_default()[0];
-                        let used = match other
+                        let left = name == "margin-left";
+                        let other = get(if left { "margin-right" } else { "margin-left" });
+                        let other = other
                             .strip_suffix("px")
-                            .and_then(|px| px.parse::<f32>().ok())
-                        {
-                            Some(px) => free - px,
+                            .and_then(|px| px.parse::<f32>().ok());
+                        let free = block[2] - size.unwrap_or_default()[0] - other.unwrap_or(0.);
+                        // CSS 2 §10.3.3: auto margins of a box wider than its containing block are 0, and the end
+                        // margin takes the rest.
+                        let rtl =
+                            parent.and_then(|parent| parent.get(Prop::DIRECTION)) == Some("rtl");
+                        let used = match other {
+                            _ if free < 0. => {
+                                if left == rtl {
+                                    free
+                                } else {
+                                    0.
+                                }
+                            }
+                            Some(_) => free,
                             None => free / 2.,
                         };
                         format!("{}px", style::number(f64::from((used * 64.).round() / 64.)))
                     }
                     ("margin-top" | "margin-bottom", "auto") if size.is_some() => "0px".to_owned(),
+                    // Layout gives a pseudo-element box its padding, so its sizes are not resolved again.
+                    (
+                        "width" | "height" | "padding-top" | "padding-right" | "padding-bottom"
+                        | "padding-left",
+                        _,
+                    ) if let Some(rect) = pseudo_box => {
+                        let borders = [
+                            Prop::BORDER_TOP_WIDTH,
+                            Prop::BORDER_RIGHT_WIDTH,
+                            Prop::BORDER_BOTTOM_WIDTH,
+                            Prop::BORDER_LEFT_WIDTH,
+                        ]
+                        .map(|prop| {
+                            get(prop.name())
+                                .strip_suffix("px")
+                                .and_then(|px| px.parse::<f32>().ok())
+                                .unwrap_or(0.)
+                        });
+                        let used = match &*name {
+                            "width" | "height" => {
+                                let axis = usize::from(&*name == "height");
+                                match style.get(Prop::BOX_SIZING) == Some("border-box") {
+                                    true => rect[2 + axis],
+                                    false => rect[2 + axis] - rect[5 - axis] - rect[7 - axis],
+                                }
+                            }
+                            side => {
+                                let side = [
+                                    "padding-top",
+                                    "padding-right",
+                                    "padding-bottom",
+                                    "padding-left",
+                                ]
+                                .iter()
+                                .position(|name| *name == side)
+                                .unwrap_or(0);
+                                rect[4 + side] - borders[side]
+                            }
+                        };
+                        format!(
+                            "{}px",
+                            style::number(f64::from((used.max(0.) * 64.).round() / 64.))
+                        )
+                    }
                     // The image layers set the number of layers of the other lists.
                     (
                         "background-position"
@@ -3063,7 +3370,7 @@ pub fn call(
                 .find_map(|node| state.svg_boxes.get(&node).map(|boxes| (node, boxes)));
             Ok(json!(
                 boxes
-                    .and_then(|(root, (.., boxes, content))| if root == id {
+                    .and_then(|(root, (_, _, _, boxes, content, ..))| if root == id {
                         Some(*content)
                     } else {
                         boxes
@@ -3075,13 +3382,6 @@ pub fn call(
             ))
         }
         "dom.textRect" | "dom.textIndex" => {
-            let Some(bounds) = state.bounds.get(&id) else {
-                return Ok(if op == "dom.textRect" {
-                    json!([])
-                } else {
-                    json!(0)
-                });
-            };
             let password = doc.nodes[id]
                 .password()
                 .then(|| doc.nodes[id].current_value().unwrap_or("").to_owned());
@@ -3100,137 +3400,42 @@ pub fn call(
             if let Some((layout, text, range, rows, font)) = state.text_layouts.get(&id) {
                 let content = &text[range.clone()];
                 let source = doc.nodes[id].text.as_str();
+                let [dx, dy] = state.scroll_shift(id);
                 if op == "dom.textIndex" {
                     let position = renderer::point(
-                        renderer::px(args[1].as_f64().unwrap_or(0.) as f32),
-                        renderer::px(args[2].as_f64().unwrap_or(0.) as f32),
+                        renderer::px(args[1].as_f64().unwrap_or(0.) as f32 - dx),
+                        renderer::px(args[2].as_f64().unwrap_or(0.) as f32 - dy),
                     );
                     let index = crate::render::text::text_index(layout, text, rows, position, true)
                         .unwrap_or_else(|index| index)
                         .clamp(range.start, range.end);
-                    return Ok(json!(real(source_offset(
-                        source,
-                        content,
-                        index - range.start
-                    ))));
+                    let offset = source_offset(source, content, index - range.start);
+                    return Ok(json!(real(offset)));
                 }
-                return Ok(json!(crate::render::text::text_rects(
+                let mut rects = crate::render::text::text_rects(
                     layout,
                     text,
                     rows,
                     [start, end].map(|index| range.start + shown_index(source, content, index)),
                     *font,
-                )));
+                );
+                rects
+                    .iter_mut()
+                    .for_each(|rect| (rect[0], rect[1]) = (rect[0] + dx, rect[1] + dy));
+                return Ok(json!(rects));
             }
-            let system = state
-                .text_system
-                .clone()
-                .context("Text geometry requires a displayed window")?;
-            let [x, y, width, full] = *bounds;
-            // A focus change just before a click can drop the cached styles, so they are computed again here.
-            let computed = styles(doc, state, viewport);
-            let (style, units) = (&computed.values[id], &computed.lengths[id]);
-            let node = &doc.nodes[id];
-            let text = node.shown_text(
-                node.current_value()
-                    .map_or_else(|| doc.text(id), str::to_owned),
-            );
-            let (font_size, height) = (units.font.em, units.font.lh.max(1.));
-            let padding = units.edges(style, style::PADDING, width);
-            let borders = units.borders(style, width);
-            let [top, right, bottom, left] =
-                [0, 1, 2, 3].map(|side| padding[side].max(0.) + borders[side]);
-            let single = node.tag == "input";
-            let bounds = [
-                x + left,
-                y + top
-                    + if single {
-                        (full - top - bottom - height) / 2.
-                    } else {
-                        0.
-                    },
-                width - left - right,
-            ];
-            let run = renderer::TextRun {
-                len: text.len(),
-                font: style::font(style),
-                color: renderer::Color::BLACK,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-                overline: None,
-                letter_spacing: style::spacing(style, units, Prop::LETTER_SPACING),
-                word_spacing: style::spacing(style, units, Prop::WORD_SPACING),
-                font_size: None,
-                inset: Default::default(),
-                nowrap: false,
-                tab_size: 8.,
-                stroke: None,
-            };
-            let wrap = (!single
-                && !style
-                    .get(Prop::WHITE_SPACE)
-                    .is_some_and(|s| matches!(s, "pre" | "nowrap")))
-            .then_some(renderer::px(bounds[2]));
-            let lines = system.shape_text(
-                &text,
-                renderer::px(font_size),
-                &[run],
-                &renderer::Wrapping {
-                    width: wrap,
-                    word_break: crate::style::word_break(style),
-                    ..Default::default()
-                },
-            );
-            let mut top = 0.;
-            let mut offset = 0;
-            let mut rects: Vec<[f32; 4]> = Vec::new();
-            for line in lines {
-                let rows = line.rows();
-                if op == "dom.textIndex" {
-                    let y = args[2].as_f64().unwrap_or(0.) as f32 - bounds[1];
-                    if y < top + rows as f32 * height {
-                        let index = line.hit(
-                            ((y - top) / height) as usize,
-                            renderer::px(args[1].as_f64().unwrap_or(0.) as f32 - bounds[0]),
-                            true,
-                        );
-                        let index = index.unwrap_or_else(|index| index);
-                        return Ok(json!(real(
-                            offset + line.text[..index].encode_utf16().count()
-                        )));
-                    }
-                } else {
-                    let length = line.text.encode_utf16().count();
-                    if end >= offset && start <= offset + length {
-                        let a = utf16_index(&line.text, start.saturating_sub(offset));
-                        let b = utf16_index(&line.text, end.saturating_sub(offset));
-                        for byte in line
-                            .text
-                            .char_indices()
-                            .map(|(i, _)| i)
-                            .chain(std::iter::once(line.text.len()))
-                            .filter(|i| *i >= a && *i <= b)
-                        {
-                            if let Some((row, x)) = line.caret(byte) {
-                                let x = bounds[0] + f32::from(x);
-                                let y = bounds[1] + top + f32::from(renderer::px(height) * row);
-                                if let Some(rect) = rects.last_mut().filter(|rect| rect[1] == y) {
-                                    rect[2] = x - rect[0];
-                                } else {
-                                    rects.push([x, y, 0., height]);
-                                }
-                            }
-                        }
-                    }
-                }
-                offset += line.text.encode_utf16().count() + 1;
-                top += rows as f32 * height;
+            // Text that this frame did not lay out, like the text of a block far from the view, lays out with its
+            // block on the next reflow: `null` asks the script for one, as `dom.skipped` does.
+            let forced = &mut state.measurements.forced;
+            if doc.nodes[id].parent.is_some() && forced.insert(id) {
+                state.measurements.waking.push(id);
+                state.cull.reskipped = true;
+                return Ok(Value::Null);
             }
             Ok(if op == "dom.textRect" {
-                json!(rects)
+                json!([])
             } else {
-                json!(real(text.encode_utf16().count()))
+                json!(0)
             })
         }
         "dom.measureText" => {
@@ -3510,6 +3715,13 @@ fn scroll_offset(
         offset.y = offset.y.clamp(-max.y, renderer::px(0.));
     }
     offset
+}
+
+pub(crate) fn painted_offset(
+    handle: &renderer::ScrollRef,
+    scale: f32,
+) -> renderer::Point<renderer::Pixels> {
+    handle.painted_at(scroll_offset(handle, handle.offset()), scale)
 }
 
 pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Result<String> {
@@ -3866,10 +4078,7 @@ fn caret_text(
             continue;
         }
         let display = display(computed, node, style.get(Prop::DISPLAY).unwrap_or("inline"));
-        let host = current
-            .attrs
-            .get("contenteditable")
-            .map(|value| !value.eq_ignore_ascii_case("false"));
+        let host = current.content_editable();
         if node != root && !editable && host == Some(true) {
             caret.hidden = [caret.text.is_empty() || caret.hidden[0], true];
         }
@@ -4127,6 +4336,27 @@ pub(crate) fn hit_test(
     caret: bool,
 ) -> Value {
     let mut nearest = Vec::new();
+    // Like Chrome, a box at the height of the point comes first, then the boxes below it, then the boxes above it.
+    // Then the vertical and the horizontal distance of the point to the box.
+    let gap = |[left, top, width, height]: [f32; 4]| {
+        let rank = if y < top {
+            1.
+        } else if y > top + height {
+            2.
+        } else {
+            0.
+        };
+        [
+            rank,
+            (top - y).max(y - top - height).max(0.),
+            (left - x).max(x - left - width).max(0.),
+        ]
+    };
+    let order = |a: &[f32; 3], b: &[f32; 3]| {
+        (a[0].total_cmp(&b[0]))
+            .then(a[1].total_cmp(&b[1]))
+            .then(a[2].total_cmp(&b[2]))
+    };
     let screen = [0., 0., viewport[0], viewport[1]];
     let up = |id: usize| {
         doc.nodes[id]
@@ -4151,14 +4381,23 @@ pub(crate) fn hit_test(
         .collect();
     // The last field is 1 in the drawable content of a canvas, which takes no pointer, and 2 in an element
     // that the canvas drew.
-    let mut pending = vec![(0, screen, false, 0, 0u8)];
-    pending.extend(top.iter().map(|&id| (id, screen, false, 0, 0)));
+    // The rounded corners of the nearest clipping box, as in the renderer.
+    type Round = Option<(renderer::Rect<renderer::Pixels>, renderer::Radii)>;
+    let mut pending = vec![(
+        0,
+        screen,
+        false,
+        0,
+        0u8,
+        None::<(renderer::Rect<renderer::Pixels>, renderer::Radii)>,
+    )];
+    pending.extend(top.iter().map(|&id| (id, screen, false, 0, 0, None)));
     let mut hits = Vec::new();
     // The ancestors of the current node with the clips inside them and, once read, the containing blocks they
     // make: 1 when read, 2 for absolute and 4 for fixed boxes.
-    let mut path: Vec<(usize, [f32; 4], u8)> = Vec::new();
+    let mut path: Vec<(usize, [f32; 4], u8, Round)> = Vec::new();
     let inside = |clip: [f32; 4]| x >= clip[0] && x < clip[2] && y >= clip[1] && y < clip[3];
-    while let Some((id, mut clip, hit, depth, mut drawn)) = pending.pop() {
+    while let Some((id, mut clip, hit, depth, mut drawn, mut round)) = pending.pop() {
         if hit {
             hits.push(id);
             continue;
@@ -4224,22 +4463,33 @@ pub(crate) fn hit_test(
                 .filter(|&value| matches!(value, "absolute" | "fixed"))
         {
             let bit = if escape == "fixed" { 4 } else { 2 };
-            clip = path
+            (clip, round) = path
                 .iter_mut()
                 .rev()
-                .find_map(|(id, clip, made)| {
+                .find_map(|(id, clip, made, round)| {
                     if *made == 0 {
                         let block = crate::render::effects::establishes(&computed.values[*id]);
                         *made = 1 | (u8::from(block.absolute) * 2) | (u8::from(block.fixed) * 4);
                     }
-                    (*made & bit != 0).then_some(*clip)
+                    (*made & bit != 0).then_some((*clip, *round))
                 })
-                .unwrap_or(screen);
+                .unwrap_or((screen, None));
         }
         let canvas = style::drawable_canvas(node, style);
         if inside(clip)
             && let Some(&[left, top, width, height]) = state.bounds.get(&id)
         {
+            let size = renderer::size(renderer::px(width), renderer::px(height));
+            let rect =
+                renderer::Rect::new(renderer::point(renderer::px(left), renderer::px(top)), size);
+            let at = renderer::point(renderer::px(x), renderer::px(y));
+            let corners = match node.tag.starts_with('#') {
+                true => renderer::Radii::default(),
+                false => {
+                    crate::render::effects::radii(style, &computed.lengths[id], || [width, height])
+                        .resolve(size)
+                }
+            };
             let selectable = !style
                 .get(Prop::POINTER_EVENTS)
                 .is_some_and(|value| value == "none")
@@ -4247,9 +4497,7 @@ pub(crate) fn hit_test(
                     .get(Prop::VISIBILITY)
                     .is_some_and(|value| matches!(value, "hidden" | "collapse"));
             if caret && node.tag == "#text" && selectable && height > 0. {
-                let distance = (left - x).max(0.).max(x - left - width).powi(2)
-                    + (top - y).max(0.).max(y - top - height).powi(2);
-                nearest.push((id, distance));
+                nearest.push((id, gap([left, top, width, height])));
             }
             let within = |[left, top, width, height]: [f32; 4]| {
                 width > 0.
@@ -4269,10 +4517,13 @@ pub(crate) fn hit_test(
                             parts.iter().copied().any(within)
                         }),
                 }
+                // Like Chrome, a point outside the rounded corners misses the box and what it clips.
+                && (node.tag.starts_with('#') || corners.contains(rect, at))
+                && round.is_none_or(|(rect, corners)| corners.contains(rect, at))
                 && selectable
                 && drawn != 1
             {
-                pending.push((id, clip, true, depth, drawn));
+                pending.push((id, clip, true, depth, drawn, None));
             }
             // A canvas shows its drawable content only inside its box.
             if canvas {
@@ -4287,6 +4538,9 @@ pub(crate) fn hit_test(
                 {
                     clip[axis] = clip[axis].max([left, top][axis]);
                     clip[axis + 2] = clip[axis + 2].min([left + width, top + height][axis]);
+                    if !corners.is_zero() {
+                        round = Some((rect, corners));
+                    }
                 }
             }
         }
@@ -4296,7 +4550,7 @@ pub(crate) fn hit_test(
         {
             continue;
         }
-        path.push((id, clip, 0));
+        path.push((id, clip, 0, round));
         pending.extend(
             computed
                 .children
@@ -4304,12 +4558,12 @@ pub(crate) fn hit_test(
                 .unwrap_or(&doc.nodes[id].children)
                 .iter()
                 .filter(|child| !top.contains(child))
-                .map(|&child| (child, clip, false, depth + 1, drawn)),
+                .map(|&child| (child, clip, false, depth + 1, drawn, round)),
         );
     }
     hits.sort_by_cached_key(|&id| {
         let painted = |id: usize| {
-            std::iter::successors(Some(id), |&id| doc.nodes[id].parent)
+            std::iter::successors(Some(id), |&id| up(id))
                 .find_map(|id| state.painted.get(id).copied().filter(|&order| order > 0))
                 .unwrap_or(0)
         };
@@ -4357,13 +4611,45 @@ pub(crate) fn hit_test(
             return json!(id);
         }
         let target = hits.first().copied();
+        let editable = |id: usize| {
+            std::iter::successors(Some(id), |&id| doc.nodes[id].parent)
+                .find_map(|id| doc.nodes[id].content_editable())
+                .unwrap_or(false)
+        };
+        let editing = target.is_some_and(editable);
+        // Like Chrome: the line nearest to the point, then the nearest text on it. An editable target takes
+        // only its editable text.
         let text = nearest
             .into_iter()
-            .filter(|(id, _)| {
-                std::iter::successors(doc.nodes[*id].parent, |&id| doc.nodes[id].parent)
+            .filter(|&(id, _)| {
+                std::iter::successors(doc.nodes[id].parent, |&id| doc.nodes[id].parent)
                     .any(|id| Some(id) == target)
+                    && (!editing || editable(id))
             })
-            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(id, key)| {
+                // A text box that spans the point's height can hold more lines: measure each.
+                let lines = (state.text_layouts.get(&id)).filter(|_| key[0] == 0.).map(
+                    |(layout, text, range, rows, font)| {
+                        crate::render::text::text_rects(
+                            layout,
+                            text,
+                            rows,
+                            [range.start, range.end],
+                            *font,
+                        )
+                    },
+                );
+                (
+                    id,
+                    lines
+                        .into_iter()
+                        .flatten()
+                        .map(gap)
+                        .min_by(order)
+                        .unwrap_or(key),
+                )
+            })
+            .min_by(|a, b| order(&a.1, &b.1))
             .map(|(id, _)| id);
         return json!(text.or(target));
     }
@@ -4510,12 +4796,7 @@ pub(crate) fn styles(
         let editable = |id: usize| {
             let node = &doc.nodes[id];
             matches!(node.tag.as_str(), "input" | "textarea")
-                || node.attrs.get("contenteditable").is_some_and(|value| {
-                    matches!(
-                        value.to_ascii_lowercase().as_str(),
-                        "" | "true" | "plaintext-only"
-                    )
-                })
+                || node.content_editable() == Some(true)
         };
         // The marks of the last pass tell which nodes the lists hold.
         let kept = state.style_walk.since(serial).is_some_and(|touched| {
@@ -4796,21 +5077,15 @@ pub(crate) fn shown_index(source: &str, shown: &str, offset: usize) -> usize {
     if source.is_empty() || source == shown {
         return utf16_index(shown, offset);
     }
-    let mut rest = shown.char_indices().peekable();
-    let mut units = 0;
+    let (mut at, mut units) = (0, 0);
     for c in source.chars() {
         if units >= offset {
             break;
         }
         units += c.len_utf16();
-        if rest
-            .peek()
-            .is_some_and(|&(_, next)| !c.is_ascii_whitespace() || next == ' ' || next == c)
-        {
-            rest.next();
-        }
+        at += shown_len(c, &shown[at..]);
     }
-    rest.peek().map_or(shown.len(), |&(byte, _)| byte)
+    at
 }
 
 pub(crate) fn source_offset(source: &str, shown: &str, byte: usize) -> usize {
@@ -4822,14 +5097,44 @@ pub(crate) fn source_offset(source: &str, shown: &str, byte: usize) -> usize {
         if at >= byte {
             break;
         }
-        units += c.len_utf16();
-        if let Some(next) = shown[at..].chars().next()
-            && (!c.is_ascii_whitespace() || next == ' ' || next == c)
-        {
-            at += next.len_utf8();
+        at += shown_len(c, &shown[at..]);
+        // Like Chrome, a place inside the letters of one case mapping, like the `SS` of `ß`, is before them.
+        if at > byte {
+            break;
         }
+        units += c.len_utf16();
     }
     units
+}
+
+/// The bytes at the start of `shown` that the source char `c` became: none for collapsed white space, one char, or
+/// the chars of a case mapping like `ß` to `SS`.
+fn shown_len(c: char, shown: &str) -> usize {
+    let Some(next) = shown.chars().next() else {
+        return 0;
+    };
+    if c.is_ascii_whitespace() && next != ' ' && next != c {
+        return 0;
+    }
+    let full = |mapped: &mut dyn ExactSizeIterator<Item = char>| {
+        if mapped.len() < 2 {
+            return None;
+        }
+        let (mut rest, mut len) = (shown.chars(), 0);
+        for m in mapped {
+            if rest.next() != Some(m) {
+                return None;
+            }
+            len += m.len_utf8();
+        }
+        Some(len)
+    };
+    if next != c
+        && let Some(len) = full(&mut c.to_uppercase()).or_else(|| full(&mut c.to_lowercase()))
+    {
+        return len;
+    }
+    next.len_utf8()
 }
 
 pub(crate) fn utf16_index(text: &str, index: usize) -> usize {
@@ -4984,6 +5289,13 @@ mod tests {
         assert_eq!(super::source_offset(source, shown, 3), 6);
         assert_eq!(super::shown_index("héllo", "héllo", 2), 3);
         assert_eq!(super::shown_index("", "abc", 2), 2);
+        // `text-transform: uppercase` makes one `ß` two letters.
+        let (source, shown) = ("groß ist", "GROSS IST");
+        assert_eq!(super::shown_index(source, shown, 4), 5);
+        assert_eq!(super::shown_index(source, shown, 5), 6);
+        assert_eq!(super::source_offset(source, shown, 5), 4);
+        assert_eq!(super::source_offset(source, shown, 4), 3);
+        assert_eq!(super::source_offset(source, shown, 7), 6);
     }
 
     #[test]

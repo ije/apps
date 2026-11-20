@@ -176,13 +176,17 @@ fn reflow(id: u64) {
     else {
         return;
     };
-    // Reflow after composite frames even if the page is clean: boxes moved without layout.
-    if view.host.try_borrow_mut().map_or(true, |host| {
-        !host.pages.get(&id).is_some_and(|page| page.dirty)
-            && !host
-                .dom
-                .get(&id)
-                .is_some_and(|dom| dom.bounds.moved() || dom.cull.reskipped)
+    // Reflow after composite frames even if the page is clean: boxes moved without layout. User scrolls move the
+    // mirror without one.
+    if view.host.try_borrow_mut().map_or(true, |mut host| {
+        let shifted = !host.pages.get(&id).is_some_and(|page| page.dirty)
+            && host.dom.get_mut(&id).is_some_and(|dom| dom.shift_scrolls());
+        shifted
+            || !host.pages.get(&id).is_some_and(|page| page.dirty)
+                && !host
+                    .dom
+                    .get(&id)
+                    .is_some_and(|dom| dom.bounds.moved() || dom.cull.reskipped)
     }) {
         return;
     }
@@ -436,6 +440,7 @@ impl PageView {
             state.text_system = Some(window.text_system().clone());
             state.pixel_ratio = window.scale_factor();
             state.window = window.window_state();
+            state.unshift();
             state.sync_scroll();
             state.bounds.touch();
             let hash = |value: &dyn Fn(&mut rustc_hash::FxHasher)| {
@@ -1027,6 +1032,7 @@ impl PageView {
             dom.flexed_grids.remove(&id);
             dom.grid_widest.remove(&id);
             dom.tracks.remove(&id);
+            dom.areas.remove(&id);
             dom.anchors.remove(&id);
         }
         if flipped {
@@ -1042,6 +1048,7 @@ impl PageView {
             dom.flexed_grids.retain(|&id, _| shown(id));
             dom.grid_widest.retain(|&id, _| shown(id));
             dom.tracks.retain(|&id, _| shown(id));
+            dom.areas.retain(|&id, _| shown(id));
             dom.anchors.retain(|&id, _| shown(id));
         }
         {
@@ -1049,6 +1056,15 @@ impl PageView {
             if reach.len() > doc.nodes.len() {
                 reach.truncate(doc.nodes.len());
                 reach.shrink_to_fit();
+            }
+        }
+        // The boxes around an `<svg>` whose spill changed build again, so spacers follow its flags.
+        for id in std::mem::take(&mut dom.cull.respilled) {
+            let mut kept = self.kept.borrow_mut();
+            let mut node = Some(id).filter(|&id| id < doc.nodes.len());
+            while let Some(id) = node {
+                kept.remove(&id);
+                node = crate::dom::flat_parent(&doc, dom, &styles, id);
             }
         }
         if self.focused.replace(dom.focus) != dom.focus
@@ -1512,10 +1528,13 @@ impl PageView {
                     rustc_hash::FxHasher::default(),
                 );
                 let (mut out, mut moved, mut below) = (0u64, 0u64, 0u32);
+                let (mut positioned, mut any) = (rustc_hash::FxHasher::default(), false);
                 for &child in &node.children {
                     let child_info = &info[child];
                     below |= child_info.flags;
                     if child_info.flags & cull::OUT_OF_FLOW != 0 {
+                        std::hash::Hasher::write_usize(&mut positioned, child);
+                        any = true;
                         // A positioned box that builds in place leaves its parent as it was, when only the
                         // boxes in it changed.
                         let inside = child_info.flags & cull::HIDDEN == 0
@@ -1531,6 +1550,23 @@ impl PageView {
                         std::hash::Hasher::write_u64(&mut kids, child_info.subtree);
                         moved = moved.max(child_info.revision);
                     }
+                }
+                // A positioned box in a paragraph splits its lines, so it changes the layout when it comes or goes.
+                if any
+                    && node.children.iter().any(|&child| {
+                        let kid = &doc.nodes[child];
+                        if kid.tag == "#text" {
+                            !kid.text.trim_ascii().is_empty()
+                        } else {
+                            !kid.tag.starts_with('#')
+                                && info[child].flags & cull::OUT_OF_FLOW == 0
+                                && styles.values[child]
+                                    .get(Prop::DISPLAY)
+                                    .is_none_or(|v| v.starts_with("inline"))
+                        }
+                    })
+                {
+                    std::hash::Hasher::write_u64(&mut list, std::hash::Hasher::finish(&positioned));
                 }
                 let (list, kids) = (
                     std::hash::Hasher::finish(&list),
@@ -1605,7 +1641,8 @@ impl PageView {
                             | (u32::from(reshaped) * cull::CHANGED)
                             | (u32::from(relisted) * cull::CHILDREN_CHANGED)
                             | marks
-                            | (u32::from(dom.focus == Some(id)) * cull::UNCULLABLE)
+                            | (u32::from(dom.focus == Some(id) || dom.cull.spills.contains(&id))
+                                * cull::UNCULLABLE)
                             | below
                                 & (cull::UNCULLABLE
                                     | cull::READS_VIEWPORT
@@ -1772,8 +1809,9 @@ impl PageView {
                 });
             }
         }
+        dom.measurements.noted.clear();
         if dom.cull.frame != frame {
-            dom.measurements.sizes.clear();
+            dom.measurements.retain(|_| false);
             // Text keeps the fonts that it resolved, so a font load must build it again.
             dom.measurements.texts.clear();
             dom.grids.clear();
@@ -1796,7 +1834,7 @@ impl PageView {
                 }
             }
             let measured = &mut dom.measurements;
-            measured.sizes.retain(|(id, ..), _| !nodes.contains(id));
+            measured.retain(|id| !nodes.contains(&id));
             let (mut walked, mut adjoined) = (self.walked.borrow_mut(), self.adjoined.borrow_mut());
             for id in &nodes {
                 measured.texts.remove(id);
@@ -1832,7 +1870,7 @@ impl PageView {
             }
         }
         if stale {
-            dom.measurements.sizes.retain(|&(id, ..), _| {
+            dom.measurements.retain(|id| {
                 info.get(id)
                     .is_none_or(|info| info.flags & cull::GEOMETRY_CHANGED == 0)
             });
@@ -2544,6 +2582,7 @@ impl PageView {
                             && let Some(dom) = host.dom.get_mut(&data.id)
                         {
                             dom.sync_scroll();
+                            dom.prepainted();
                         }
                     },
                     |_, _, _| (),
@@ -2626,6 +2665,11 @@ const BLURS: [[Prop; 2]; 2] = [
     [Prop::FILTER, Prop::WEBKIT_FILTER],
     [Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER],
 ];
+
+/// Whether the compositor can play an animation of the property between page frames.
+pub(crate) fn composited(prop: Prop) -> bool {
+    COMPOSITED_PROPS.contains(&prop) || BLURS.as_flattened().contains(&prop)
+}
 
 /// The filter (0) or backdrop filter (1) of a style.
 fn filter(style: &style::Style, which: usize) -> Option<&str> {

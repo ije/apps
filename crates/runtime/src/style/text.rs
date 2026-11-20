@@ -34,6 +34,8 @@ pub(crate) struct InlineText {
     pub runs: Vec<renderer::TextRun>,
     pub ranges: Vec<(usize, std::ops::Range<usize>)>,
     pub boxes: Vec<InlineBox>,
+    /// The ranges of inline boxes with an outline.
+    pub outlines: Vec<usize>,
     pub atoms: Vec<Atom>,
     pub cursors: Vec<(usize, renderer::Cursor)>,
     pub shadows: Vec<(f32, f32, f32, renderer::Color)>,
@@ -43,6 +45,36 @@ pub(crate) struct InlineText {
     pub pseudos: [bool; 2],
     /// A run has another font, size or line height than the block, so rows can grow around it.
     pub mixed: bool,
+    /// Like Chromium, `break-spaces` and a `::first-line` style turn balance and pretty off.
+    pub greedy: bool,
+    fallback: std::cell::OnceCell<bool>,
+}
+
+impl InlineText {
+    /// Like `mixed`, or a glyph from a fallback font grows a row with a normal line height, as in Chrome.
+    pub fn mixed(&self, system: &renderer::TextSystem) -> bool {
+        self.mixed
+            || *self.fallback.get_or_init(|| {
+                let normal = self
+                    .line_heights
+                    .iter()
+                    .any(|(_, kind)| *kind == LineHeight::Normal);
+                let mut start = 0;
+                normal
+                    && self.runs.iter().any(|run| {
+                        let part = self.text.get(start..start + run.len).unwrap_or("");
+                        start += run.len;
+                        let face = system.face(&run.font);
+                        let ascii = system.ascii_glyphs(face);
+                        part.chars().any(|c| match c.is_ascii() {
+                            true => ascii >> (c as u32) & 1 == 0 && !c.is_ascii_whitespace(),
+                            false => {
+                                c != '\u{fffc}' && !c.is_whitespace() && !system.covers(face, c)
+                            }
+                        })
+                    })
+            })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -186,6 +218,27 @@ fn starts_word(before: char, prev: char, c: char) -> bool {
         || matches!(prev, '\'' | '\u{2019}' | '.' | ',' | ';')
             && before.is_numeric()
             && c.is_numeric())
+}
+
+// Apostrophes, periods, colons and combining marks, which a final sigma looks past.
+fn case_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\'' | '\u{2019}' | '.' | ':' | '\u{b7}' | '\u{300}'..='\u{36f}'
+    )
+}
+
+/// Pushes the mapping of `c` when it is not one char of the same UTF-8 length, and returns its last char.
+fn push_full(
+    text: &mut String,
+    c: char,
+    mapped: impl ExactSizeIterator<Item = char> + Clone,
+) -> Option<char> {
+    let first = mapped.clone().next()?;
+    if mapped.len() == 1 && first.len_utf8() == c.len_utf8() {
+        return None;
+    }
+    mapped.inspect(|&m| text.push(m)).last()
 }
 
 // Only mappings to one char of the same UTF-8 length apply, so text ranges stay valid.
@@ -363,6 +416,62 @@ pub(crate) fn spacing(style: &Style, units: &Lengths, prop: Prop) -> renderer::P
             .filter(|value| value.is_finite())
             .unwrap_or(0.),
     )
+}
+
+/// An absolute or fixed box with an inset on both axes, which needs no static place in a line.
+pub(crate) fn placed_out_of_flow(style: &Style) -> bool {
+    style
+        .get(Prop::POSITION)
+        .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+        && [[Prop::LEFT, Prop::RIGHT], [Prop::TOP, Prop::BOTTOM]]
+            .iter()
+            .all(|axis| {
+                axis.iter()
+                    .any(|&prop| style.get(prop).is_some_and(|value| value != "auto"))
+            })
+}
+
+// Whether a box after `child` in the paragraph paints in a layer of its own, like a positioned box. It must paint
+// above `child`, which the paragraph builds after its text.
+fn layered_after(doc: &Document, styles: &ComputedStyles, id: usize, child: usize) -> bool {
+    let children = &doc.nodes[id].children;
+    let at = children
+        .iter()
+        .position(|&node| node == child)
+        .unwrap_or(children.len());
+    let mut pending: Vec<usize> = children[at + 1..].to_vec();
+    while let Some(node) = pending.pop() {
+        let style = &styles.values[node];
+        if doc.nodes[node].tag.starts_with('#')
+            || style.get(Prop::DISPLAY) == Some("none")
+            || doc.nodes[node].parent == Some(id) && placed_out_of_flow(style)
+        {
+            continue;
+        }
+        if style
+            .get(Prop::POSITION)
+            .is_some_and(|value| value != "static")
+            || style.get(Prop::OPACITY).is_some_and(|value| value != "1")
+            || style.get(Prop::ISOLATION) == Some("isolate")
+            || style
+                .get(Prop::MIX_BLEND_MODE)
+                .is_some_and(|value| value != "normal")
+            || [
+                Prop::TRANSFORM,
+                Prop::TRANSLATE,
+                Prop::ROTATE,
+                Prop::SCALE,
+                Prop::FILTER,
+                Prop::BACKDROP_FILTER,
+            ]
+            .into_iter()
+            .any(|prop| style.get(prop).is_some_and(|value| value != "none"))
+        {
+            return true;
+        }
+        pending.extend(&doc.nodes[node].children);
+    }
+    false
 }
 
 pub(crate) fn makes_no_line(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
@@ -600,6 +709,11 @@ fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
                         | Prop::TRANSITION_BEHAVIOR
                         | Prop::WILL_CHANGE
                         | Prop::FONT_FEATURE_SETTINGS
+                        | Prop::FONT_VARIANT_NUMERIC
+                        | Prop::FONT_VARIANT_LIGATURES
+                        | Prop::FONT_KERNING
+                        | Prop::FONT_SYNTHESIS
+                        | Prop::FONT_OPTICAL_SIZING
                         | Prop::FONT_VARIATION_SETTINGS
                         | Prop::WEBKIT_FONT_SMOOTHING
                         | Prop::MOZ_OSX_FONT_SMOOTHING
@@ -650,7 +764,100 @@ fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
     split
 }
 
-/// The text of the inline content of `id`, or of `run`, a part of its children between its blocks.
+/// The siblings before or after `id`, nearest first, and its parent.
+fn around(
+    doc: &Document,
+    id: usize,
+    after: bool,
+) -> (Box<dyn Iterator<Item = usize> + '_>, Option<usize>) {
+    let parent = doc.nodes[id].parent;
+    let siblings = parent.map_or(&[][..], |parent| &doc.nodes[parent].children[..]);
+    let at = siblings.iter().position(|&sibling| sibling == id);
+    let nodes: Box<dyn Iterator<Item = usize>> = match (at, after) {
+        (None, _) => Box::new(std::iter::empty()),
+        (Some(at), true) => Box::new(siblings[at + 1..].iter().copied()),
+        (Some(at), false) => Box::new(siblings[..at].iter().rev().copied()),
+    };
+    (nodes, parent)
+}
+
+/// A parent that keeps its children in the line of its siblings.
+fn inline_parent(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
+    !doc.nodes[id].tag.starts_with('#')
+        && styles.values[id]
+            .get(Prop::DISPLAY)
+            .is_none_or(|value| matches!(value, "inline" | "contents"))
+        && !holds_block_box(doc, styles, id)
+}
+
+/// Whether the inline content of `id` ends with a collapsible space, or with a line break. `None` when it has none.
+fn ends_with_space(doc: &Document, styles: &ComputedStyles, id: usize) -> Option<bool> {
+    let node = &doc.nodes[id];
+    let style = &styles.values[id];
+    match node.tag.as_str() {
+        "#text" => return node.text.chars().last().map(|c| c.is_ascii_whitespace()),
+        "#comment" => return None,
+        "br" => return Some(true),
+        "img" | "svg" | "canvas" | "video" | "audio" | "iframe" | "embed" | "object" | "input"
+        | "button" | "select" | "textarea" | "progress" | "meter" | "terminal" => {
+            return Some(false);
+        }
+        _ => {}
+    }
+    if style.get(Prop::DISPLAY) == Some("none")
+        || style
+            .get(Prop::POSITION)
+            .is_some_and(|value| matches!(value, "absolute" | "fixed"))
+    {
+        return None;
+    }
+    if !inline_parent(doc, styles, id) {
+        return Some(
+            style
+                .get(Prop::DISPLAY)
+                .is_some_and(|value| !value.starts_with("inline")),
+        );
+    }
+    (node.children.iter().rev()).find_map(|&child| ends_with_space(doc, styles, child))
+}
+
+/// Whether the inline content before `id` in its line ends with a collapsible space, or there is none.
+fn space_before(doc: &Document, styles: &ComputedStyles, mut id: usize) -> bool {
+    loop {
+        let (mut before, parent) = around(doc, id, false);
+        if let Some(space) = before.find_map(|sibling| ends_with_space(doc, styles, sibling)) {
+            return space;
+        }
+        match parent.filter(|&parent| inline_parent(doc, styles, parent)) {
+            Some(parent) => id = parent,
+            None => return true,
+        }
+    }
+}
+
+/// Whether inline content follows `id` in its line.
+fn inline_after(doc: &Document, styles: &ComputedStyles, mut id: usize) -> bool {
+    loop {
+        let (mut after, parent) = around(doc, id, true);
+        if let Some(next) = after.find(|&sibling| !makes_no_line(doc, styles, sibling)) {
+            let node = &doc.nodes[next];
+            return node.tag == "#text"
+                || !node.tag.starts_with('#')
+                    && node.tag != "br"
+                    && styles.values[next]
+                        .get(Prop::DISPLAY)
+                        .is_none_or(|value| value.starts_with("inline"))
+                    && !holds_block_box(doc, styles, next);
+        }
+        match parent.filter(|&parent| inline_parent(doc, styles, parent)) {
+            Some(parent) => id = parent,
+            None => return false,
+        }
+    }
+}
+
+/// The text of the inline content of `id`, or of `run`, a part of its children between its blocks. For a text node,
+/// `run` holds the text nodes after it that make one flex or grid item with it.
 pub(crate) fn inline_text(
     doc: &Document,
     styles: &ComputedStyles,
@@ -687,40 +894,27 @@ pub(crate) fn inline_text(
     {
         return None;
     }
-    let siblings = doc.nodes[id]
-        .parent
-        .map_or(&[][..], |parent| &doc.nodes[parent].children[..]);
-    let position = siblings
-        .iter()
-        .position(|&sibling| sibling == id)
-        .unwrap_or(0);
-    let item = doc.nodes[id].parent.is_some_and(|parent| {
-        styles.values[parent]
+    // The parent box, past `display: contents` elements.
+    let item = std::iter::successors(doc.nodes[id].parent, |&up| doc.nodes[up].parent)
+        .map(|up| styles.values[up].get(Prop::DISPLAY).unwrap_or("inline"))
+        .find(|value| *value != "contents")
+        .is_some_and(|value| value.ends_with("flex") || value.ends_with("grid"));
+    // A text node or an inline box built alone shares its line with the inline siblings around it.
+    let shares = own
+        || parent
             .get(Prop::DISPLAY)
-            .is_some_and(|value| value.ends_with("flex") || value.ends_with("grid"))
-    });
-    let inline_sibling = |sibling: Option<&usize>| {
-        own && !item
-            && sibling.is_some_and(|&sibling| {
-                doc.nodes[sibling].tag == "#text"
-                    || !doc.nodes[sibling].tag.starts_with('#')
-                        && doc.nodes[sibling].tag != "br"
-                        && styles.values[sibling]
-                            .get(Prop::DISPLAY)
-                            .is_none_or(|value| value.starts_with("inline"))
-                        && !holds_block_box(doc, styles, sibling)
-            })
-    };
-    let trailing = inline_sibling(siblings.get(position + 1..).and_then(|rest| {
-        rest.iter()
-            .find(|&&sibling| !makes_no_line(doc, styles, sibling))
-    }));
+            .is_none_or(|value| value == "inline");
+    let alone = shares && !item;
+    // Like CSS, a space at the end stays when inline content follows in the line, and the next part drops its own.
+    let trailing = alone && inline_after(doc, styles, id);
     let mut text = String::new();
     // Two runs fit a small block of the runtime's allocator, four don't.
     let mut runs: Vec<renderer::TextRun> = Vec::with_capacity(2);
+    let mut break_spaces = false;
     let mut line_heights = Vec::new();
     let mut ranges = Vec::new();
     let mut boxes: Vec<InlineBox> = Vec::new();
+    let mut outlines = Vec::new();
     let mut atoms: Vec<Atom> = Vec::new();
     let atomic_allowed = !own
         && !parent
@@ -783,14 +977,12 @@ pub(crate) fn inline_text(
                 .is_some_and(|value| value != "normal");
         Some((pseudo_content(doc, id, pseudo, content), boxed))
     });
-    let mut space = !inline_sibling(siblings.get(..position).and_then(|rest| {
-        rest.iter()
-            .rev()
-            .find(|&&sibling| !makes_no_line(doc, styles, sibling))
-    }));
+    let mut space = !alone || space_before(doc, styles, id);
     // A pseudo-element is the node `usize::MAX - index` here.
     let mut pending: Vec<_> = if own {
-        vec![(id, None, None)]
+        (run.iter().rev().chain([&id]))
+            .map(|&node| (node, None, None))
+            .collect()
     } else if !run.is_empty() {
         // The pseudo-elements and first line of the box belong to its first and last lines, not to a run.
         if parts.iter().any(Option::is_some) || styles.text_pseudos.contains_key(&id) {
@@ -866,6 +1058,15 @@ pub(crate) fn inline_text(
                     continue 'nodes;
                 }
                 return None;
+            }
+            // Like a float, an out-of-flow child placed on both axes is a box beside the paragraph. Others keep
+            // the pieces, which give them their static place in the line and their paint order.
+            if atomic_allowed
+                && node.parent == Some(id)
+                && placed_out_of_flow(style)
+                && !layered_after(doc, styles, id, child)
+            {
+                continue 'nodes;
             }
             if node.tag == "br" {
                 if text.ends_with(' ')
@@ -947,6 +1148,13 @@ pub(crate) fn inline_text(
             {
                 cursors.push((index, style));
             }
+            if node.tag != "#text"
+                && style
+                    .get(Prop::OUTLINE_STYLE)
+                    .is_some_and(|kind| !matches!(kind, "none" | "hidden"))
+            {
+                outlines.push(index);
+            }
             let inherited_background = background;
             let background = style
                 .get(Prop::BACKGROUND_COLOR)
@@ -1023,6 +1231,7 @@ pub(crate) fn inline_text(
         if !node_text.is_empty() {
             let start = text.len();
             let mode = style.get(Prop::WHITE_SPACE).unwrap_or("normal");
+            break_spaces |= mode == "break-spaces";
             let preserve = matches!(mode, "pre" | "pre-wrap" | "break-spaces");
             let transform = style.get(Prop::TEXT_TRANSFORM).unwrap_or("");
             // Like Chromium, small caps are capitals at 70% of the size, where the letter was lowercase.
@@ -1031,7 +1240,14 @@ pub(crate) fn inline_text(
             let mut last = text.chars().rev();
             let (mut prev, mut before) = (last.next().unwrap_or(' '), last.next().unwrap_or(' '));
             text.reserve(node_text.len());
-            for c in node_text.chars() {
+            // A cased letter before, in this text node, for a final sigma.
+            let mut cased = false;
+            let mut chars = node_text.chars();
+            while let Some(c) = chars.next() {
+                let after_cased = cased;
+                if !case_ignorable(c) {
+                    cased = c.is_alphabetic();
+                }
                 if c.is_ascii_whitespace() && !preserve && !(c == '\n' && mode == "pre-line") {
                     if !space {
                         text.push(' ');
@@ -1040,7 +1256,30 @@ pub(crate) fn inline_text(
                     space = true;
                     continue;
                 }
-                let c = case(c, transform, starts_word(before, prev, c));
+                // Like Chrome, uppercase and lowercase take the full case mappings, like `ß` to `SS`.
+                let full = match transform {
+                    "uppercase" => push_full(&mut text, c, c.to_uppercase()),
+                    "lowercase" => push_full(&mut text, c, c.to_lowercase()),
+                    _ => None,
+                };
+                if let Some(last) = full {
+                    (before, prev) = (prev, last);
+                    space = false;
+                    continue;
+                }
+                // Like Chrome, a lowercase sigma at the end of a word takes its final form.
+                let c = if c == 'Σ'
+                    && transform == "lowercase"
+                    && after_cased
+                    && !chars
+                        .clone()
+                        .find(|&next| !case_ignorable(next))
+                        .is_some_and(char::is_alphabetic)
+                {
+                    'ς'
+                } else {
+                    case(c, transform, starts_word(before, prev, c))
+                };
                 (before, prev) = (prev, c);
                 let c = match c.to_uppercase().next() {
                     Some(upper) if caps && c.is_lowercase() && upper.len_utf8() == c.len_utf8() => {
@@ -1203,12 +1442,16 @@ pub(crate) fn inline_text(
         .iter()
         .any(|run| run.font_size.is_some() || run.font != root)
         || line_heights.iter().any(|(_, kind)| *kind != height);
+    let greedy = break_spaces || pseudos.is_some_and(|pseudos| pseudos[2].is_some());
     Some(InlineText {
         mixed,
+        greedy,
+        fallback: Default::default(),
         text: text.into(),
         runs,
         ranges,
         boxes,
+        outlines,
         atoms,
         cursors,
         shadows,
@@ -1314,55 +1557,69 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
             return family.clone();
         }
         let families = value.map_or("system-ui", |value| &**value);
-        let family: renderer::SharedString = components(families, ',')
-            .into_iter()
-            .find_map(|family| {
-                let family = family.trim().trim_matches(['\'', '"']);
-                let lower = family.to_ascii_lowercase();
-                let generic: &[&str] = match lower.as_str() {
-                    "ui-monospace" | "ui-serif" | "ui-sans-serif" | "ui-rounded" => return None,
-                    "system-ui" | "-apple-system" | "blinkmacsystemfont" => &[".SystemUIFont"],
-                    "sans-serif" => &[
-                        "Helvetica",
-                        "Arial",
-                        "DejaVu Sans",
-                        "Liberation Sans",
-                        ".SystemUIFont",
-                    ],
-                    "monospace" => &[
-                        "Menlo",
-                        "SF Mono",
-                        "Consolas",
-                        "DejaVu Sans Mono",
-                        "Liberation Mono",
-                        "Courier New",
-                    ],
-                    "serif" => &[
-                        "Times",
-                        "Times New Roman",
-                        "DejaVu Serif",
-                        "Liberation Serif",
-                    ],
-                    "cursive" => &["Apple Chancery", "Comic Sans MS"],
-                    "fantasy" => &["Papyrus", "Impact"],
-                    _ => {
-                        return if names.0.is_empty() {
-                            Some(family.to_owned())
-                        } else {
-                            names.0.get(&lower).cloned()
-                        };
-                    }
-                };
-                generic
-                    .iter()
-                    .find(|name| {
-                        name.starts_with('.') || names.0.contains_key(&name.to_ascii_lowercase())
-                    })
-                    .or(generic.first().filter(|_| names.0.is_empty()))
-                    .map(|name| name.to_string())
-            })
-            .unwrap_or_else(|| ".SystemUIFont".into())
-            .into();
+        // The used family, then the other installed families of the list for missing glyphs, one per line.
+        let mut list = String::new();
+        for family in components(families, ',').into_iter().filter_map(|family| {
+            let family = family.trim().trim_matches(['\'', '"']);
+            let lower = family.to_ascii_lowercase();
+            let generic: &[&str] = match lower.as_str() {
+                "ui-monospace" | "ui-serif" | "ui-sans-serif" | "ui-rounded" => return None,
+                "system-ui" | "-apple-system" | "blinkmacsystemfont" => &[".SystemUIFont"],
+                "sans-serif" => &[
+                    "Helvetica",
+                    "Arial",
+                    "DejaVu Sans",
+                    "Liberation Sans",
+                    ".SystemUIFont",
+                ],
+                "monospace" => &[
+                    "Menlo",
+                    "SF Mono",
+                    "Consolas",
+                    "DejaVu Sans Mono",
+                    "Liberation Mono",
+                    "Courier New",
+                ],
+                "serif" => &[
+                    "Times",
+                    "Times New Roman",
+                    "DejaVu Serif",
+                    "Liberation Serif",
+                ],
+                "cursive" => &["Apple Chancery", "Comic Sans MS"],
+                "fantasy" => &["Papyrus", "Impact"],
+                _ => {
+                    return if names.0.is_empty() {
+                        Some(family.to_owned())
+                    } else {
+                        names.0.get(&lower).cloned()
+                    };
+                }
+            };
+            generic
+                .iter()
+                .find(|name| {
+                    name.starts_with('.') || names.0.contains_key(&name.to_ascii_lowercase())
+                })
+                .or(generic.first().filter(|_| names.0.is_empty()))
+                .map(|name| name.to_string())
+        }) {
+            if list.split('\n').any(|kept| kept == family) {
+                continue;
+            }
+            if !list.is_empty() {
+                list.push('\n');
+            }
+            list += &family;
+            // The system font falls back through the whole system cascade.
+            if family == ".SystemUIFont" {
+                break;
+            }
+        }
+        if list.is_empty() {
+            list += ".SystemUIFont";
+        }
+        let family: renderer::SharedString = list.into();
         if !names.0.is_empty() {
             if names.1.len() > 4096 {
                 names.1.clear();
@@ -1382,6 +1639,10 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
         None => 400.,
     };
     font.weight = weight.clamp(1., 1000.);
+    if let Some(value) = style.get(Prop::FONT_SYNTHESIS) {
+        let has = |name| value.split_ascii_whitespace().any(|word| word == name);
+        font.synthesis = [has("weight"), has("style")];
+    }
     font.style = match style.get(Prop::FONT_STYLE) {
         Some("italic") => renderer::FontStyle::Italic,
         Some(value) if value.starts_with("oblique") => renderer::FontStyle::Oblique,
@@ -1465,4 +1726,21 @@ pub(crate) fn font(style: &Style) -> renderer::Font {
             .and_then(|size| size.strip_suffix("px")?.parse().ok());
     }
     font
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn font_synthesis_turns_off_synthetic_bold_and_slant() {
+        let synthesis = |value: Option<&str>| {
+            let style = Style::from_iter(value.map(|value| (Prop::FONT_SYNTHESIS, value.into())));
+            font(&style).synthesis
+        };
+        assert_eq!(synthesis(None), [true, true]);
+        assert_eq!(synthesis(Some("none")), [false, false]);
+        assert_eq!(synthesis(Some("style")), [false, true]);
+        assert_eq!(synthesis(Some("weight small-caps")), [true, false]);
+    }
 }

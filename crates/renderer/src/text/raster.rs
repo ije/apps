@@ -90,6 +90,7 @@ impl Fonts {
         Ok(Some((shown, size, bytes)))
     }
 
+    /// Font smoothing for glyphs in `color`, part of the raster key: 0 for none.
     pub(crate) fn dilation(&self, color: Color) -> u8 {
         self.platform.dilation(color)
     }

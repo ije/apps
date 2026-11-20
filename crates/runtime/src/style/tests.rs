@@ -698,6 +698,66 @@ fn inline_boxes_ignore_properties_that_do_not_apply_to_them() {
 }
 
 #[test]
+fn inline_boxes_built_alone_keep_the_spaces_between_their_siblings() {
+    let doc = Document::parse(
+        "<div><mark>San</mark><span id=a> Juan </span><b>PR</b><span id=b> Rico </span><div>block</div></div>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let text = |selector| {
+        inline_text(&doc, &computed, element(&doc, selector), &[])
+            .unwrap()
+            .text
+    };
+    assert_eq!(&*text("#a"), " Juan ");
+    assert_eq!(&*text("#b"), " Rico");
+}
+
+#[test]
+fn inline_boxes_built_alone_collapse_the_spaces_between_them() {
+    let doc = Document::parse(
+        "<p><span id=a1>a </span><span id=a2> b</span></p>\
+         <p>a <span id=f> b </span><br></p>\
+         <p><span id=l1>a </span>\n<span id=l2>b</span></p>\
+         <p><span style=display:inline-block>ib</span> <span id=i> x </span> <span style=display:inline-block>ib</span></p>\
+         <p>Hello <em><span id=c>world </span></em>again</p>\
+         <p>one<em id=d> <span>two</span></em> three</p>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let text = |id: usize| inline_text(&doc, &computed, id, &[]).map(|inline| inline.text);
+    let of = |selector| text(element(&doc, selector)).unwrap();
+    let pairs = [
+        ("#a1", "a "),
+        ("#a2", "b"),
+        ("#f", "b"),
+        ("#l1", "a "),
+        ("#l2", "b"),
+        ("#i", "x "),
+        ("#c", "world "),
+    ];
+    for (selector, expected) in pairs {
+        assert_eq!(&*of(selector), expected, "{selector}");
+    }
+    let space = doc.nodes[element(&doc, "#d")].children[0];
+    assert_eq!(text(space).as_deref(), Some(" "));
+}
+
+#[test]
 fn rounded_inline_highlights_keep_one_text_layout_when_tokens_split() {
     let mut expected = None;
     for content in [
@@ -5576,6 +5636,57 @@ fn capitalize_follows_words_across_inline_text() {
     let mut text = "ab cd".to_owned();
     text_transform(&mut text, 1..5, "capitalize");
     assert_eq!(text, "ab Cd");
+}
+
+#[test]
+fn fallback_glyphs_measure_rows_with_a_normal_line_height() {
+    let doc = Document::parse(
+        "<p id=a style='font:16px Helvetica'>Hello 日本</p><p id=b style='font:16px Helvetica'>Héllo</p>\
+         <p id=c style='font:16px/20px Helvetica'>Hello 日本</p>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let system = renderer::TextSystem::new();
+    let mixed = |id| {
+        let node = doc
+            .nodes
+            .iter()
+            .position(|node| node.attrs.get("id").map(String::as_str) == Some(id));
+        inline_text(&doc, &computed, node.unwrap(), &[])
+            .unwrap()
+            .mixed(&system)
+    };
+    // Like Chrome, the font of `日本` grows the row, but not a fixed line height.
+    assert_eq!([mixed("a"), mixed("b"), mixed("c")], [true, false, false]);
+}
+
+#[test]
+fn uppercase_and_lowercase_take_full_case_mappings_like_chrome() {
+    let doc = Document::parse(
+        "<p style='text-transform:uppercase'>straße <b>ŉ ﬁx</b></p><div style='text-transform:lowercase'>İX ΟΔΟΣ ΣΑ ΟΔΟΣ'S ΟΔΟ<b>Σ</b></div>",
+    );
+    let computed = compute_styles(
+        &doc,
+        800.,
+        600.,
+        None,
+        &mut HashMap::new(),
+        &mut StyleCache::default(),
+        None,
+    );
+    let inline = inline_text(&doc, &computed, element(&doc, "p"), &[]).unwrap();
+    assert_eq!(&*inline.text, "STRASSE ʼN FIX");
+    assert_eq!(inline.ranges.last().map(|(_, range)| range.len()), Some(7));
+    let inline = inline_text(&doc, &computed, element(&doc, "div"), &[]).unwrap();
+    // A sigma at the end of a word takes its final form.
+    assert_eq!(&*inline.text, "i\u{307}x οδος σα οδοσ's οδοσ");
 }
 
 #[test]

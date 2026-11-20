@@ -2270,6 +2270,9 @@ fn range_inputs_sanitize_slide_and_step() {
         r.min = '-1'; r.step = '0.3'; r.value = '0.95'; values.push(r.value);
         r.value = 'abc'; values.push(r.value);
         check('min, max and step reflect and sanitize ' + values, () => values.join() === '1,1,0.5,1,0.8,-0.1');
+        r.step = 'any'; r.min = '1'; r.max = '1e30';
+        const any = ['1.6494845360824741', '3.999999999999999', '1.2e2', '0.0000001234', '1152921504606846976', '12345678901234567.5', ' 5', '-0'].map(v => (r.value = v, r.value));
+        check('step any keeps 15 digits like Chrome ' + any, () => any.join() === '1.64948453608247,4,1.2e+2,1,1.15292150460684697e+18,1.23456789012346e+16,5e+29,1');
         "#,
     );
     let id: usize = engine
@@ -2297,6 +2300,43 @@ fn range_inputs_sanitize_slide_and_step() {
         for (const key of ['ArrowRight', 'PageDown', 'Home', 'Home', 'End']) __appsDispatch('keydown', [], { key });
         if (seen.join() !== 'input:76,change:76,input:66,change:66,input:0,change:0,input:100,change:100') throw Error('Keys ' + seen);
     "#, "test").unwrap();
+}
+
+#[test]
+fn file_lists_and_input_type_changes_like_chrome() {
+    checked_page(
+        "<html><body><form id=fm><input id=f name=f type=file></form><input id=t value=12345></body></html>",
+        r#"
+        const f = document.getElementById('f'), t = document.getElementById('t'), dt = new DataTransfer();
+        dt.items.add(new File(['abc'], 'a.txt')); dt.items.add(new File(['d'], 'b.txt'));
+        const list = dt.files;
+        check('FileList', () => list instanceof FileList && list === dt.files && !Array.isArray(list) && String(list) === '[object FileList]' && list.length === 2 && list.item(1).name === 'b.txt' && list.item(2) === null && [...list].length === 2);
+        let illegal; try { new FileList(); } catch (e) { illegal = e.name; }
+        check('no FileList constructor', () => illegal === 'TypeError');
+        check('empty files', () => f.files instanceof FileList && f.files.length === 0 && f.files === f.files);
+        f.files = list;
+        check('files setter', () => f.files === list && f.value === 'C:\\fakepath\\a.txt');
+        dt.items.add(new File([''], 'c.txt'));
+        check('live list', () => f.files.length === 3);
+        let typed; try { f.files = []; } catch (e) { typed = e.name; }
+        f.files = null;
+        check('setter types', () => typed === 'TypeError' && f.files === list);
+        const clone = f.cloneNode();
+        check('a clone has a new list of the files', () => clone.files !== list && clone.files.length === 3 && clone.value === 'C:\\fakepath\\a.txt');
+        document.getElementById('fm').reset();
+        check('reset empties the list', () => list.length === 0 && f.value === '' && !new FormData(document.getElementById('fm')).get('f').name);
+        f.files = clone.files; f.type = 'text';
+        check('a text type has no files and no fake path', () => f.files === null && f.value === '');
+        f.type = 'file';
+        check('files go with the file type', () => f.files.length === 0);
+        f.files = clone.files; f.value = '';
+        check('clearing the value empties the list', () => clone.files.length === 0 && f.value === '');
+        t.setSelectionRange(1, 3, 'backward'); t.type = 'password';
+        check('selection stays between text types', () => t.selectionStart === 1 && t.selectionEnd === 3);
+        t.type = 'number'; t.type = 'text';
+        check('a type that gains the selection API starts at 0', () => t.selectionStart === 0 && t.selectionEnd === 0 && t.selectionDirection === 'none');
+        "#,
+    );
 }
 
 #[test]
@@ -3027,6 +3067,42 @@ fn form_controls_keep_radio_groups_values_and_clones() {
 }
 
 #[test]
+fn text_field_selection_follows_chrome_on_value_writes_and_tab_focus() {
+    checked_page(
+        "<html><body><button id=s>s</button><input id=a value=hello><textarea id=t>abc def</textarea><input id=n type=number value=12><div contenteditable id=ce>x</div><input id=d value=xyz></body></html>",
+        r#"
+        const $ = id => document.getElementById(id), sel = el => [el.selectionStart, el.selectionEnd].join();
+        const a = $('a'), t = $('t');
+        check('a fresh field has its caret at the start', () => sel(a) === '0,0' && sel(t) === '0,0');
+        a.value = a.value; t.value = t.value;
+        check('the same value keeps the caret', () => sel(a) === '0,0' && sel(t) === '0,0');
+        $('d').defaultValue = 'longer'; check('a new default value keeps the caret', () => $('d').value === 'longer' && sel($('d')) === '0,0');
+        a.value = 'other'; check('a new value puts the caret at the end', () => sel(a) === '5,5');
+        a.setSelectionRange(1, 2); t.setSelectionRange(1, 2); $('s').focus(); a.focus();
+        check('script focus keeps the selection', () => sel(a) === '1,2');
+        $('s').focus();
+        const seen = []; a.addEventListener('focus', () => seen.push(sel(a)));
+        __appsDispatch('keydown', [], { key: 'Tab' });
+        check('tab into an input selects all', () => document.activeElement === a && sel(a) === '0,5' && seen.join() === '0,5');
+        __appsDispatch('keydown', [], { key: 'Tab' });
+        check('tab into a textarea keeps its selection', () => document.activeElement === t && sel(t) === '1,2');
+        __appsDispatch('keydown', [], { key: 'Tab' });
+        check('tab into a number input selects all', () => document.activeElement === $('n') && $('n')._start === 0 && $('n')._end === 2);
+        __appsDispatch('keydown', [], { key: 'Tab', shiftKey: true }); __appsDispatch('keydown', [], { key: 'Tab', shiftKey: true });
+        check('shift tab back selects all again', () => document.activeElement === a && sel(a) === '0,5');
+        const form = document.createElement('form'); form.innerHTML = '<input value=start>'; document.body.append(form);
+        const reset = form.firstChild; reset.value = 'typed text'; reset.setSelectionRange(1, 2); form.reset();
+        check('reset puts the caret at the end', () => reset.value === 'start' && sel(reset) === '5,5');
+        form.innerHTML = '<input value=abc><input value=abc><textarea>abc</textarea><input>';
+        const [same, dirty, area, fresh] = form.children; dirty.value = 'abc';
+        for (const field of [same, dirty, area]) field.setSelectionRange(1, 2);
+        fresh.defaultValue = 'abc'; form.reset();
+        check('reset keeps the selection when the value stays', () => [same, dirty, area].every(field => sel(field) === '1,2') && fresh.value === 'abc' && sel(fresh) === '0,0');
+        "#,
+    );
+}
+
+#[test]
 fn child_node_methods_reactions_and_observers_follow_the_standard() {
     let (_, engine) = checked_page(
         "<html><body><div id='box'></div></body></html>",
@@ -3471,6 +3547,104 @@ fn focus_visible_follows_the_input_modality() {
         if (!c.matches(':focus-visible')) throw Error('A key shows the focus');
         b.focus();
         if (!b.matches(':focus-visible') || c.matches(':focus-visible')) throw Error('Script focus after a key');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn script_focus_in_a_press_keeps_the_last_focus_modality() {
+    let (_, engine) = css_page(
+        "<html><body><div id=d tabindex=-1>d</div><button id=c>c</button><p id=p>p</p><input id=r type=range></body></html>",
+    );
+    engine.eval(r#"
+        const $ = id => document.getElementById(id);
+        const press = node => { __appsDispatch('pointerdown', [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 }); __appsDispatch('pointerup', [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 }); };
+        $('d').addEventListener('pointerdown', () => $('d').focus());
+        $('p').addEventListener('pointerdown', event => { event.preventDefault(); $('r').focus(); });
+        press($('d'));
+        if (document.activeElement !== $('d') || !$('d').matches(':focus-visible')) throw Error('Focus in a press before any mouse focus');
+        press($('c'));
+        press($('d'));
+        if (document.activeElement !== $('d') || $('d').matches(':focus-visible')) throw Error('Focus in a press after a mouse focus');
+        __appsDispatch('keydown', [], { key: 'a', code: 'KeyA' });
+        press($('p'));
+        if (document.activeElement !== $('r') || !$('r').matches(':focus-visible')) throw Error('Focus in a press after a key');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn presses_and_labels_set_the_focus_modality_like_chrome() {
+    let (_, engine) = css_page(
+        "<html><body><button id=a>a</button><button id=b>b</button><p id=p>p</p><p id=x>x</p><label id=l>label <input id=c type=checkbox></label></body></html>",
+    );
+    engine.eval(r#"
+        const $ = id => document.getElementById(id), shown = id => document.activeElement === $(id) && $(id).matches(':focus-visible');
+        const send = (name, node) => __appsDispatch(name, [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 });
+        const click = node => { send('pointerdown', node); send('pointerup', node); __appsDispatch('click', [node._id], { clientX: 1, clientY: 1, button: 0, detail: 1 }); };
+        const key = key => __appsDispatch('keydown', [], { key, code: key });
+        $('x').addEventListener('pointerdown', event => event.preventDefault());
+        click($('a')); key('ArrowDown'); click($('l'));
+        if (document.activeElement !== $('c') || $('c').matches(':focus-visible')) throw Error('A label click after a key');
+        click($('a')); key('x'); click($('p')); $('b').focus();
+        if ($('b').matches(':focus-visible')) throw Error('Script focus after a press on text');
+        click($('a')); key('x'); click($('x')); $('b').focus();
+        if (!shown('b')) throw Error('Script focus after a canceled press keeps the key');
+        $('a').focus(); key('Tab'); click($('b'));
+        if (!shown('b')) throw Error('A press on the element of a Tab keeps its ring');
+        $('a').focus(); $('a').blur(); click($('x')); key('Tab');
+        if (document.activeElement !== $('c')) throw Error('Tab after a canceled press starts after it');
+        click($('a')); key('a'); click($('a'));
+        if (!shown('a')) throw Error('A press on the focused element keeps the key');
+        $('b').focus();
+        if (!shown('b')) throw Error('Script focus after a press on the focused element');
+        $('l').focus();
+        if (document.activeElement !== $('c')) throw Error('A label gives the focus to its control');
+    "#, "test").unwrap();
+}
+
+#[test]
+fn shift_arrows_do_not_scroll_like_chrome() {
+    let (_, engine) = css_page("<html><body><p>p</p></body></html>");
+    engine.eval(r#"
+        const calls = [];
+        document.scrollingElement.scrollBy = options => calls.push(Object.keys(options)[0]);
+        for (const [key, shiftKey] of [['ArrowRight', true], ['ArrowDown', true], ['PageDown', true], ['ArrowRight', false], [' ', true]]) __appsDispatch('keydown', [], { key, code: key, shiftKey });
+        if (calls.join() !== 'left,top') throw Error('scrolls: ' + calls.join());
+    "#, "test").unwrap();
+}
+
+#[test]
+fn tab_goes_on_from_the_last_press_or_removed_focus() {
+    let (_, engine) = css_page(
+        "<html><body><button id=a>a</button><div><button id=b>b</button><button id=c>c</button></div><p id=p>p</p><button id=d>d</button><div id=e><button id=f>f</button></div><button id=g>g</button><div id=host></div><p id=q>q</p><button id=h>h</button></body></html>",
+    );
+    engine.eval(r#"
+        const $ = id => document.getElementById(id);
+        const tab = (shiftKey = false) => { __appsDispatch('keydown', [], { key: 'Tab', code: 'Tab', shiftKey }); return document.activeElement.id; };
+        const press = node => { __appsDispatch('pointerdown', [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 }); __appsDispatch('pointerup', [node._id], { pointerId: 1, pointerType: 'mouse', clientX: 1, clientY: 1, button: 0 }); };
+        $('b').focus(); $('b').remove();
+        if (tab() !== 'c') throw Error('Tab after removing the focused element');
+        $('c').focus(); $('c').remove();
+        if (tab(true) !== 'a') throw Error('Shift+Tab after removing the last child');
+        press($('p'));
+        if (document.activeElement !== document.body || tab() !== 'd') throw Error('Tab after a press');
+        press($('p'));
+        if (tab(true) !== 'a') throw Error('Shift+Tab after a press');
+        $('f').focus(); $('e').textContent = '';
+        if (tab() !== 'g') throw Error('Tab after emptying the parent of the focused element');
+        const root = $('host').attachShadow({ mode: 'open' }); root.innerHTML = '<button id=s1>s1</button><span id=st>t</span><button id=s2>s2</button>';
+        const deep = () => root.activeElement?.id ?? document.activeElement.id;
+        press($('q'));
+        if (tab() !== 'h') throw Error('Tab after a press past a shadow tree');
+        press($('q'));
+        if ((tab(true), deep()) !== 's2') throw Error('Shift+Tab after a press past a shadow tree');
+        press(root.getElementById('st'));
+        if ((tab(), deep()) !== 's2') throw Error('Tab after a press in a shadow tree');
+        press(root.getElementById('st'));
+        if ((tab(true), deep()) !== 's1') throw Error('Shift+Tab after a press in a shadow tree');
+        press($('q')); $('q').remove();
+        if (tab() !== 'h') throw Error('Tab after removing the pressed element');
+        $('g').focus(); $('g').blur();
+        if ((tab(), deep()) !== 's1') throw Error('Tab after a blur');
     "#, "test").unwrap();
 }
 
@@ -4505,6 +4679,7 @@ fn css_values_and_cascade_like_chrome() {
         check('important declarations go last', () => { d.style.cssText = 'color:red !important;width:1px'; return d.style.cssText === 'width: 1px; color: red !important;'; });
         check('internal pseudo-classes are not for pages', () => !CSS.supports('selector(:-internal-scope)') && attempt(() => document.querySelector('div:-internal-scope')) === 'SyntaxError');
         check('rotation axes', () => set('rotate: z 45deg').rotate === '45deg' && set('rotate: 0 0 -1 45deg').rotate === '-45deg');
+        check('translate and inset sides', () => { d.style.cssText = 'translate: 0 251px'; const one = d.style.translate; d.style.translate = '0px 0px'; return one === '0px 251px' && d.style.translate === '0px' && set('clip-path: inset(0 calc(100% - 30%) 0 0)').clipPath === 'inset(0px 70% 0px 0px)' && set('clip-path: inset(0 calc(100% - 60px) 0 0)').clipPath === 'inset(0px calc(100% - 60px) 0px 0px)' && set('clip-path: inset(0 round 10% 2em)').clipPath === 'inset(0px round 10% 32px)' && set('clip-path: inset(1px 2px round 1em / 5px)').clipPath === 'inset(1px 2px round 16px / 5px)'; });
         check('a repeated declaration moves to its last place', () => { d.style.cssText = 'color:red;width:1px;color:blue'; return d.style.cssText === 'width: 1px; color: blue;'; });
         check('declarations iterate', () => { d.style.cssText = 'color: red; width: 1px'; return [...d.style].join() === 'color,width' && [...getComputedStyle(d)].includes('color'); });
         check('webkit aliases', () => { d.style.cssText = '-webkit-transform: scale(2); -webkit-box-shadow: 1px 1px red'; return d.style.transform === 'scale(2)' && d.style.webkitTransform === 'scale(2)' && getComputedStyle(d).boxShadow === 'rgb(255, 0, 0) 1px 1px 0px 0px'; });
@@ -4535,7 +4710,7 @@ fn css_values_and_cascade_like_chrome() {
 #[test]
 fn computed_styles_report_used_values_like_chrome() {
     let (host, engine) = css_page(
-        "<html><head><style>#w{position:relative;width:200px;height:100px;padding:5px;border:2px solid} #a{position:absolute;width:50%;left:10%;top:4px;padding:2px 3%} #r{position:relative;top:10px;left:5px} #m{width:100px;margin:0 auto} #h{display:none;width:50%;transform-origin:center} #p::before{content:'x' attr(data-v) \"y\"}</style></head><body><div id=w><div id=a></div><div id=r></div><div id=m></div></div><div id=h></div><p id=p data-v=t></p></body></html>",
+        "<html><head><style>#w{position:relative;width:200px;height:100px;padding:5px;border:2px solid} #a{position:absolute;width:50%;left:10%;top:4px;padding:2px 3%} #r{position:relative;top:10px;left:5px} #m{width:100px;margin:0 auto} #h{display:none;width:50%;transform-origin:center} #p::before{content:'x' attr(data-v) \"y\"} .o{width:100%;padding:28px;margin:0 auto} #v{direction:rtl;width:200px} #w::before{content:'';display:block;width:max(10%,3px);height:4px;margin-left:5%} #w::after{content:'';display:block;width:calc(10% + 1px);min-width:20%} #m::before{content:'';display:block;padding-left:5%} #r::before{content:'x';display:none;width:50%} #r::after{content:'';position:absolute;width:10px;height:10px}</style></head><body><div id=w><div id=a></div><div id=r></div><div id=m></div><div id=o class=o></div></div><div id=h></div><p id=p data-v=t></p><div id=v><div id=q class=o></div></div></body></html>",
     );
     let id = |name: &str| -> usize {
         engine
@@ -4544,7 +4719,7 @@ fn computed_styles_report_used_values_like_chrome() {
             .parse()
             .unwrap()
     };
-    let ids = ["w", "a", "r", "m", "p"].map(id);
+    let ids = ["w", "a", "r", "m", "p", "o", "v", "q"].map(id);
     {
         let mut host = host.borrow_mut();
         let state = host.dom.entry(1).or_default();
@@ -4554,7 +4729,19 @@ fn computed_styles_report_used_values_like_chrome() {
             [20., 25., 200., 0.],
             [65., 15., 100., 0.],
             [8., 130., 784., 16.],
+            [15., 15., 256., 56.],
+            [8., 150., 200., 56.],
+            [8., 150., 256., 56.],
         ]));
+        // The boxes that layout gave the pseudo-elements, by node | pseudo << 30: the place from the border box of
+        // the element, the size, then the padding plus border of each side.
+        state.pseudo_boxes.extend([
+            (ids[0] | 1 << 30, [17., 7., 20., 4., 0., 0., 0., 0.]),
+            (ids[0] | 2 << 30, [7., 11., 40., 0., 0., 0., 0., 0.]),
+            (ids[3] | 1 << 30, [0., 0., 100., 0., 0., 0., 0., 10.]),
+            (ids[2] | 1 << 30, [0., 0., 200., 18., 0., 0., 0., 0.]),
+            (ids[2] | 2 << 30, [0., 0., 10., 10., 0., 0., 0., 0.]),
+        ]);
     }
     engine.eval(r#"
         const value = (id, name, pseudo) => getComputedStyle(document.getElementById(id), pseudo).getPropertyValue(name);
@@ -4563,6 +4750,11 @@ fn computed_styles_report_used_values_like_chrome() {
             ['r', 'right', '-5px'], ['r', 'bottom', '-10px'], ['m', 'margin', '0px 50px'], ['m', 'margin-left', '50px'],
             ['h', 'width', '50%'], ['h', 'transform-origin', '50% 50%'],
             ['p', 'content', '"xty"', '::before'], ['p', 'content', 'none', '::after'],
+            ['o', 'margin', '0px -56px 0px 0px'], ['q', 'margin', '0px 0px 0px -56px'],
+            ['w', 'width', '20px', '::before'], ['w', 'margin-left', '10px', '::before'], ['w', 'height', '4px', '::before'],
+            ['w', 'width', '40px', '::after'], ['w', 'height', '0px', '::after'], ['m', 'width', '90px', '::before'], ['m', 'padding-left', '10px', '::before'],
+            ['r', 'inset', '0px 190px -10px 0px', '::after'],
+            ['r', 'width', '50%', '::before'],
         ]) if (value(id, name, pseudo) !== expected) throw Error(`${id} ${name}: ${value(id, name, pseudo)} != ${expected}`);
     "#, "test").unwrap();
 }

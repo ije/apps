@@ -2523,9 +2523,7 @@ impl Selector {
                                         "dir" => ["ltr", "rtl", "auto"]
                                             .iter()
                                             .any(|v| value.eq_ignore_ascii_case(v)),
-                                        _ => ["", "true", "false", "plaintext-only"]
-                                            .iter()
-                                            .any(|v| value.eq_ignore_ascii_case(v)),
+                                        _ => super::editable_value(value).is_some(),
                                     }
                                 });
                                 current = doc.nodes[ancestor].parent;
@@ -2555,7 +2553,8 @@ impl Selector {
                                         || wanted.eq_ignore_ascii_case("ltr") && !rtl
                                 }
                                 _ => {
-                                    value.is_some_and(|value| !value.eq_ignore_ascii_case("false"))
+                                    (value.and_then(|value| super::editable_value(value))
+                                        == Some(true))
                                         == (name == "read-write")
                                 }
                             }

@@ -52,8 +52,8 @@ pub struct Scene {
     prior_scrolls: Vec<Scroll>,
     // Open scrolls of the paint, or `usize::MAX` for one outside the window layer or paused.
     open: Vec<usize>,
-    // For each `pause_cuts`, the open scrolls that it ended: (depth, scroll).
-    held: Vec<Vec<(usize, usize)>>,
+    // For each `pause_cuts`, the open scrolls and cuts that it ended: (depth, scroll, cut), `usize::MAX` for none.
+    held: Vec<Vec<(usize, usize, usize)>>,
     cuts: Vec<Cut>,
     last_cuts: Vec<Cut>,
     // Open cuts of the paint, or `usize::MAX` for a scroll without one.
@@ -578,44 +578,48 @@ impl Scene {
     }
 
     // Ends the open cuts after the first `depth` scrolls, for content that escapes their viewports. Their scrolls end
-    // too, so the content doesn't move with them.
+    // too, so the content doesn't move with them. A cut that an outer pause ended stays ended.
     pub(crate) fn pause_cuts(&mut self, depth: usize) {
-        let (window, mut held) = (&self.layers[0], Vec::new());
+        let mut held = Vec::new();
         for at in depth..self.open.len() {
             let scroll = mem::replace(&mut self.open[at], usize::MAX);
+            let cut = mem::replace(&mut self.cutting[at], usize::MAX);
             if scroll != usize::MAX {
+                let window = &self.layers[0];
                 self.scrolls[scroll].instances[1] = window.instances.len() as u32;
                 self.scrolls[scroll].nested[1] = window.nested.len() as u32;
-                held.push((at, scroll));
             }
-        }
-        self.held.push(held);
-        for at in depth..self.cutting.len() {
-            if let Some(cut) = self.cuts.get_mut(self.cutting[at]) {
+            if cut != usize::MAX {
+                let cut = &mut self.cuts[cut];
                 let layer = &self.layers[cut.layer as usize];
                 cut.instances[1] = layer.instances.len() as u32;
                 cut.nested[1] = layer.nested.len() as u32;
             }
+            if scroll != usize::MAX || cut != usize::MAX {
+                held.push((at, scroll, cut));
+            }
         }
+        self.held.push(held);
     }
 
     // Starts the cuts that `pause_cuts` ended again, and the scrolls in a new part with the same id.
-    pub(crate) fn resume_cuts(&mut self, depth: usize) {
-        let window = &self.layers[0];
-        for (at, scroll) in self.held.pop().unwrap_or_default() {
-            let parent = (self.open[..at].iter().rev())
-                .find(|&&outer| outer != usize::MAX)
-                .map_or(u32::MAX, |&outer| outer as u32);
-            self.open[at] = self.scrolls.len();
-            self.scrolls.push(Scroll {
-                instances: [window.instances.len() as u32, u32::MAX],
-                nested: [window.nested.len() as u32, u32::MAX],
-                parent,
-                ..self.scrolls[scroll]
-            });
-        }
-        for at in depth..self.cutting.len() {
-            if let Some(&cut) = self.cuts.get(self.cutting[at]) {
+    pub(crate) fn resume_cuts(&mut self) {
+        for (at, scroll, cut) in self.held.pop().unwrap_or_default() {
+            if scroll != usize::MAX {
+                let parent = (self.open[..at].iter().rev())
+                    .find(|&&outer| outer != usize::MAX)
+                    .map_or(u32::MAX, |&outer| outer as u32);
+                let window = &self.layers[0];
+                self.open[at] = self.scrolls.len();
+                self.scrolls.push(Scroll {
+                    instances: [window.instances.len() as u32, u32::MAX],
+                    nested: [window.nested.len() as u32, u32::MAX],
+                    parent,
+                    ..self.scrolls[scroll]
+                });
+            }
+            if cut != usize::MAX {
+                let cut = self.cuts[cut];
                 let layer = &self.layers[cut.layer as usize];
                 self.cutting[at] = self.cuts.len();
                 self.cuts.push(Cut {
@@ -2475,6 +2479,33 @@ mod tests {
             scene.drawn();
             scene.clear();
         }
+    }
+
+    #[test]
+    fn nested_escapes_close_their_cuts() {
+        // A fixed box in an absolute box: both escape the scroll, one inside the other.
+        let viewport = Clip::from(bounds([0., 0., 100., 100.]));
+        let open = Clip::from(bounds([0., -100., 100., 300.]));
+        let at = |y: f32| Instance::new(BOX, bounds([0., y, 10., 10.]), open);
+        let mut scene = Scene::default();
+        scene.begin_paint(1);
+        scene.begin_scroll(1, viewport, point(0., 0.), true);
+        scene.push(at(150.));
+        scene.pause_cuts(0);
+        scene.push(at(160.));
+        scene.pause_cuts(0);
+        scene.push(at(170.));
+        scene.resume_cuts();
+        scene.push(at(180.));
+        scene.resume_cuts();
+        scene.push(at(190.));
+        scene.end_scroll();
+        assert!(scene.cuts.iter().all(|cut| cut.instances[1] != u32::MAX));
+        scene.bake();
+        let heights: Vec<f32> = (scene.layers[0].instances.iter())
+            .map(|instance| instance.clip[3])
+            .collect();
+        assert_eq!(heights, [100., 300., 300., 300., 100.]);
     }
 
     #[test]

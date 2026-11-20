@@ -93,6 +93,7 @@ text_style! {
     line_height set_line_height: Pixels = px(20.),
     font_weight set_font_weight: FontWeight = 400.,
     font_style set_font_style: FontStyle = FontStyle::Normal,
+    font_synthesis set_font_synthesis: [bool; 2] = [true; 2],
     background_color set_background_color: Option<Color> = None,
     underline set_underline: Option<Decoration> = None,
     strikethrough set_strikethrough: Option<Decoration> = None,
@@ -122,6 +123,7 @@ impl TextStyle {
             features,
             weight,
             style,
+            synthesis: self.font_synthesis,
             ..Font::default()
         }
     }

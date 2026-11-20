@@ -588,6 +588,8 @@ fn first_line(
 
 pub(super) struct InlineText {
     pub(super) data: Rc<style::InlineText>,
+    /// Rows can grow around runs or fallback glyphs, see `style::InlineText::mixed`.
+    pub(super) mixed: bool,
     pub(super) view: Rc<super::PageState>,
     pub(super) atoms: Rc<[AtomSlot]>,
     pub(super) justify: Option<bool>,
@@ -602,6 +604,8 @@ pub(super) struct Prepainted {
     layouts: Vec<(usize, crate::dom::TextLayout)>,
     rects: Vec<(usize, [f32; 4])>,
     origin: Point<Pixels>,
+    // Where the text that prepaint shaped is placed. The renderer moves only the text of its own nodes.
+    shaped_at: Point<Pixels>,
     // Some rows moved to later columns, so rows don't go down in order.
     split: bool,
 }
@@ -710,7 +714,7 @@ impl PartialEq for Measured {
 impl From<InlineText> for renderer::Node {
     fn from(text: InlineText) -> Self {
         let data = &text.data;
-        if data.first_line.is_none() && !data.mixed {
+        if data.first_line.is_none() && !text.mixed {
             return renderer::text(data.text.clone(), Some(data.runs.to_vec())).hooks(text);
         }
         renderer::node()
@@ -913,7 +917,11 @@ impl renderer::Hooks for InlineText {
     }
 
     // The renderer moved the text layouts.
-    fn shift(&self, _: Point<Pixels>, exact: Rect<Pixels>, window: &mut Window) -> bool {
+    fn shift(&self, by: Point<Pixels>, exact: Rect<Pixels>, window: &mut Window) -> bool {
+        if let Some((layout, _)) = &*self.shaped.borrow() {
+            layout.shift(by);
+            self.prepainted.borrow_mut().shaped_at += by;
+        }
         self.skip(exact, window)
     }
 
@@ -1021,6 +1029,7 @@ impl renderer::Hooks for InlineText {
         if style.text_align != renderer::TextAlign::Left
             || banded
             || !self.data.boxes.is_empty()
+            || !self.data.outlines.is_empty()
             || indent != px(0.)
             || self.justify.is_some()
             || extents.iter().flatten().any(|extra| *extra > px(0.))
@@ -1335,6 +1344,7 @@ impl renderer::Hooks for InlineText {
             layouts,
             rects,
             origin: exact.origin,
+            shaped_at: exact.origin,
             split: !moves.is_empty(),
         };
     }
@@ -1364,9 +1374,16 @@ impl renderer::Hooks for InlineText {
             layouts,
             rects,
             origin: at,
+            shaped_at,
             ..
         } = &mut *prepainted;
         let moved = origin != *at;
+        if let Some((shaped, _)) = &*self.shaped.borrow()
+            && *shaped_at != origin
+        {
+            shaped.shift(origin - *shaped_at);
+            *shaped_at = origin;
+        }
         let window = &mut *cx.window;
         let places: Vec<_> = match &layout {
             Some(layout) if moved => self
@@ -1421,6 +1438,7 @@ impl renderer::Hooks for InlineText {
         }
         let strut = window.text_system().face(&text_style.font());
         let mut highlights = Vec::new();
+        let mut outlines = Vec::new();
         {
             let view = &*self.view;
             let host = view.host.borrow();
@@ -1432,16 +1450,13 @@ impl renderer::Hooks for InlineText {
                     layout.line_height(),
                     window.scale_factor(),
                 );
-                for inline in &self.data.boxes {
-                    if inline.fill.is_transparent()
-                        && (inline.border.is_transparent() || inline.borders == [0.; 4])
-                    {
-                        continue;
-                    }
-                    let (id, range) = &self.data.ranges[inline.index];
-                    let style = &styles.values[*id];
-                    let units = styles.lengths[*id];
-                    if let Some((a, b, offset, height)) = inline_box(
+                // The border box of an inline box on each of its rows, with its left and right sides.
+                let fragments = |index: usize,
+                                 inline: Option<&style::InlineBox>,
+                                 window: &Window| {
+                    let (id, range) = &self.data.ranges[index];
+                    let (style, units) = (&styles.values[*id], styles.lengths[*id]);
+                    let (a, b, offset, height) = inline_box(
                         layout,
                         &self.data.text,
                         rows,
@@ -1449,88 +1464,194 @@ impl renderer::Hooks for InlineText {
                         Some((style, units)),
                         base,
                         window,
-                    ) {
-                        let radii = [
-                            Prop::BORDER_TOP_LEFT_RADIUS,
-                            Prop::BORDER_TOP_RIGHT_RADIUS,
-                            Prop::BORDER_BOTTOM_RIGHT_RADIUS,
-                            Prop::BORDER_BOTTOM_LEFT_RADIUS,
-                        ]
-                        .map(|corner| {
-                            px(style
-                                .get(corner)
-                                .and_then(|v| units.resolve(v, (b.x - a.x).into()))
-                                .unwrap_or(0.))
-                        });
-                        let (top, line_height) = (layout.bounds().top(), layout.line_height());
-                        let drop = |row: usize| rows.get(row).map_or(px(0.), |row| row.drop);
-                        let row_at = |y: Pixels| {
-                            (0..rows.len().max(1))
-                                .rev()
-                                .find(|&row| {
-                                    top + line_height * row as f32 + drop(row) <= y + px(0.5)
-                                })
-                                .unwrap_or(0)
+                    )?;
+                    let (top, line_height) = (layout.bounds().top(), layout.line_height());
+                    let drop = |row: usize| rows.get(row).map_or(px(0.), |row| row.drop);
+                    let row_at = |y: Pixels| {
+                        (0..rows.len().max(1))
+                            .rev()
+                            .find(|&row| top + line_height * row as f32 + drop(row) <= y + px(0.5))
+                            .unwrap_or(0)
+                    };
+                    let [first, last] = [a.y, b.y].map(row_at);
+                    let clone = style
+                        .get(Prop::BOX_DECORATION_BREAK)
+                        .is_some_and(|value| value == "clone");
+                    let [above, right_edge, below, left_edge] =
+                        inline.map_or([0.; 4], |inline| inline.edges).map(px);
+                    let (lead, trail) =
+                        inline.map_or((0., 0.), |inline| (inline.lead, inline.trail));
+                    let parts = (first..=last).map(move |row| {
+                        let (start, end) = (row == first, row == last);
+                        let extent = rows
+                            .get(row)
+                            .map_or((px(0.), layout.bounds().size.width), |row| {
+                                (row.shift, row.right)
+                            });
+                        let x = if start {
+                            a.x - px(lead)
+                        } else {
+                            layout.bounds().left() + extent.0
+                                - if clone { left_edge } else { px(0.) }
                         };
-                        let [first, last] = [a.y, b.y].map(row_at);
-                        let clone = style
-                            .get(Prop::BOX_DECORATION_BREAK)
-                            .is_some_and(|value| value == "clone");
-                        let [width_above, width_right, width_below, width_left] =
-                            inline.borders.map(px);
-                        let [above, right_edge, below, left_edge] = inline.edges.map(px);
-                        for row in first..=last {
-                            let (start, end) = (row == first, row == last);
-                            let extent = rows
-                                .get(row)
-                                .map_or((px(0.), layout.bounds().size.width), |row| {
-                                    (row.shift, row.right)
-                                });
-                            let [left_side, right_side] = [start || clone, end || clone];
-                            let x = if start {
-                                a.x - px(inline.lead)
-                            } else {
-                                layout.bounds().left() + extent.0
-                                    - if clone { left_edge } else { px(0.) }
-                            };
-                            let right = if end {
-                                if inline.trail.is_nan() {
-                                    x + left_edge + right_edge
-                                } else {
-                                    b.x - px(inline.trail)
-                                }
-                            } else {
-                                layout.bounds().left()
-                                    + extent.1
-                                    + if clone { right_edge } else { px(0.) }
-                            };
-                            window.draw_box(
-                                Rect::new(
-                                    point(
-                                        x,
-                                        top + line_height * row as f32 + drop(row) + offset - above,
-                                    ),
-                                    size(right - x, height + above + below),
-                                ),
-                                renderer::Corners {
-                                    top_left: if left_side { radii[0] } else { px(0.) },
-                                    top_right: if right_side { radii[1] } else { px(0.) },
-                                    bottom_right: if right_side { radii[2] } else { px(0.) },
-                                    bottom_left: if left_side { radii[3] } else { px(0.) },
+                        let right = if !end {
+                            layout.bounds().left()
+                                + extent.1
+                                + if clone { right_edge } else { px(0.) }
+                        } else if trail.is_nan() {
+                            x + left_edge + right_edge
+                        } else {
+                            b.x - px(trail)
+                        };
+                        let rect = Rect::new(
+                            point(
+                                x,
+                                top + line_height * row as f32 + drop(row) + offset - above,
+                            ),
+                            size(right - x, height + above + below),
+                        );
+                        (rect, [start || clone, end || clone])
+                    });
+                    Some((style, units, b.x - a.x, parts))
+                };
+                let radii = |style: &style::Style, units: style::Lengths, width: Pixels| {
+                    [
+                        Prop::BORDER_TOP_LEFT_RADIUS,
+                        Prop::BORDER_TOP_RIGHT_RADIUS,
+                        Prop::BORDER_BOTTOM_RIGHT_RADIUS,
+                        Prop::BORDER_BOTTOM_LEFT_RADIUS,
+                    ]
+                    .map(|corner| {
+                        px(style
+                            .get(corner)
+                            .and_then(|v| units.resolve(v, width.into()))
+                            .unwrap_or(0.))
+                    })
+                };
+                for inline in &self.data.boxes {
+                    if inline.fill.is_transparent()
+                        && (inline.border.is_transparent() || inline.borders == [0.; 4])
+                    {
+                        continue;
+                    }
+                    let Some((style, units, width, parts)) =
+                        fragments(inline.index, Some(inline), window)
+                    else {
+                        continue;
+                    };
+                    let radii = radii(style, units, width);
+                    let [width_above, width_right, width_below, width_left] =
+                        inline.borders.map(px);
+                    for (rect, [left_side, right_side]) in parts {
+                        window.draw_box(
+                            rect,
+                            renderer::Corners {
+                                top_left: if left_side { radii[0] } else { px(0.) },
+                                top_right: if right_side { radii[1] } else { px(0.) },
+                                bottom_right: if right_side { radii[2] } else { px(0.) },
+                                bottom_left: if left_side { radii[3] } else { px(0.) },
+                            },
+                            inline.fill,
+                            renderer::Border {
+                                widths: renderer::Edges {
+                                    top: width_above,
+                                    right: if right_side { width_right } else { px(0.) },
+                                    bottom: width_below,
+                                    left: if left_side { width_left } else { px(0.) },
                                 },
-                                inline.fill,
+                                color: inline.border,
+                                style: renderer::BorderStyle::Solid,
+                                sides: 0,
+                            },
+                        );
+                    }
+                }
+                // Like Chrome, each row of an outlined inline box draws its own outline, above the text.
+                for &index in &self.data.outlines {
+                    let inline = (self.data.boxes)
+                        .binary_search_by_key(&index, |inline| inline.index)
+                        .ok()
+                        .map(|at| &self.data.boxes[at]);
+                    let Some((style, units, width, parts)) = fragments(index, inline, window)
+                    else {
+                        continue;
+                    };
+                    let Some(kind) = style
+                        .get(Prop::OUTLINE_STYLE)
+                        .filter(|kind| !matches!(*kind, "none" | "hidden"))
+                    else {
+                        continue;
+                    };
+                    let color = [Prop::OUTLINE_COLOR, Prop::COLOR]
+                        .into_iter()
+                        .find_map(|prop| style.get(prop).and_then(style::paint))
+                        .unwrap_or(Color::BLACK);
+                    let offset = style
+                        .get(Prop::OUTLINE_OFFSET)
+                        .and_then(|v| units.resolve(v, 0.))
+                        .unwrap_or(0.);
+                    let radii = radii(style, units, width);
+                    // A focus ring is 2px of the outline color over a 1px ring of white, or of #101010 in a dark
+                    // scheme, and has a radius of 3px without a border radius.
+                    // Rings as (grow, width, color, style), and how radii grow: (by, then, without a radius).
+                    let (rings, (by, then, square)) = if kind == "auto" {
+                        let at = offset.trunc()
+                            - if inline
+                                .is_some_and(|inline| inline.borders.iter().all(|w| *w >= 1.))
+                            {
+                                1.
+                            } else {
+                                0.
+                            };
+                        let under = Color::hex(if style::dark(style) {
+                            0x101010ff
+                        } else {
+                            0xffffffff
+                        });
+                        let rings =
+                            vec![(at + 2., 2., under, "solid"), (at + 1., 2., color, "solid")];
+                        (rings, (at, 1., 4.))
+                    } else {
+                        let Some(line) = units
+                            .resolve(style.get(Prop::OUTLINE_WIDTH).unwrap_or("3px"), 0.)
+                            .filter(|line| *line > 0.)
+                        else {
+                            continue;
+                        };
+                        (
+                            vec![(offset + line, line, color, kind)],
+                            (offset + line, 0., 0.),
+                        )
+                    };
+                    for (rect, [left_side, right_side]) in parts {
+                        for &(grow, line, color, kind) in &rings {
+                            let rect = Rect::new(
+                                rect.origin - point(px(grow), px(grow)),
+                                rect.size + size(px(grow * 2.), px(grow * 2.)),
+                            );
+                            if rect.size.width <= px(0.) || rect.size.height <= px(0.) {
+                                continue;
+                            }
+                            let corner = |side: bool, radius: Pixels| match side && radius > px(0.)
+                            {
+                                true => (radius + px(by)).max(px(0.)) + px(then),
+                                false => px(square),
+                            };
+                            outlines.push((
+                                rect,
+                                renderer::Corners {
+                                    top_left: corner(left_side, radii[0]),
+                                    top_right: corner(right_side, radii[1]),
+                                    bottom_right: corner(right_side, radii[2]),
+                                    bottom_left: corner(left_side, radii[3]),
+                                },
                                 renderer::Border {
-                                    widths: renderer::Edges {
-                                        top: width_above,
-                                        right: if right_side { width_right } else { px(0.) },
-                                        bottom: width_below,
-                                        left: if left_side { width_left } else { px(0.) },
-                                    },
-                                    color: inline.border,
-                                    style: renderer::BorderStyle::Solid,
+                                    widths: renderer::Edges::all(px(line)),
+                                    color,
+                                    style: super::element::border_style(kind),
                                     sides: 0,
                                 },
-                            );
+                            ));
                         }
                     }
                 }
@@ -1640,6 +1761,9 @@ impl renderer::Hooks for InlineText {
             } else {
                 paint(window);
             }
+        }
+        for (rect, corners, border) in outlines {
+            window.draw_box(rect, corners, Color::TRANSPARENT, border);
         }
         true
     }

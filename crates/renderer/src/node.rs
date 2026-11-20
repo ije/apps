@@ -1053,6 +1053,11 @@ impl ScrollState {
     }
 }
 
+// Where layout places scrolled content: the offset with its stretch, snapped to device pixels.
+fn snap_offset(at: Point<Pixels>, scale: f32) -> Point<Pixels> {
+    at.map(|value| px((value.0 * scale).round() / scale))
+}
+
 #[derive(Clone, Default)]
 pub struct ScrollRef(Rc<RefCell<ScrollState>>);
 
@@ -1071,7 +1076,12 @@ impl ScrollRef {
         self.0.borrow().stretch
     }
 
-    pub(crate) fn painted(&self) -> Point<Pixels> {
+    // The place that layout gives the content for `offset`, before a layout with it.
+    pub fn painted_at(&self, offset: Point<Pixels>, scale: f32) -> Point<Pixels> {
+        snap_offset(offset + self.stretch(), scale)
+    }
+
+    pub fn painted(&self) -> Point<Pixels> {
         self.0.borrow().painted
     }
 
@@ -1178,6 +1188,7 @@ impl ScrollRef {
         &self,
         style: &Style,
         bounds: Rect,
+        client: Size<Pixels>,
         content: Size<Pixels>,
         scale: f32,
     ) -> Point<Pixels> {
@@ -1187,17 +1198,18 @@ impl ScrollRef {
             Length::Px(value) => unit(value),
             Length::Fraction(fraction) => bounds.size.width * fraction,
             Length::Calc(fraction, offset) => bounds.size.width * fraction + unit(offset),
-            Length::Auto => Pixels::ZERO,
+            Length::Bound(_) | Length::Auto => Pixels::ZERO,
         };
         let padding = Size::new(
             side(style.padding.left) + side(style.padding.right),
             side(style.padding.top) + side(style.padding.bottom),
         );
-        // Taffy and these sums differ after a few decimals, so the range rounds to two places.
-        let round = |value: Pixels| (value * 100.).round() / 100.;
-        let max = Point::from(content + padding - bounds.size)
-            .map(round)
-            .max(Point::default());
+        // Like Chrome, the range is the scroll size less the client size, both from the layout before it snaps to
+        // device pixels, and each rounded to them. Taffy and these sums differ after a few decimals, so they first
+        // round to two places.
+        let round = |value: Pixels| ((value * scale * 100.).round() / 100.).round() / scale;
+        let max =
+            Point::from((content + padding).map(round) - client.map(round)).max(Point::default());
         let scroll = &mut *self.0.borrow_mut();
         let within =
             |at: Point<Pixels>| point(at.x.clamp(-max.x, px(0.)), at.y.clamp(-max.y, px(0.)));
@@ -1207,8 +1219,7 @@ impl ScrollRef {
         }
         scroll.max_offset = max;
         scroll.bounds = bounds;
-        let snap = |value: Pixels| px((value.0 * scale).round() / scale);
-        scroll.painted = (scroll.offset + scroll.stretch).map(snap);
+        scroll.painted = snap_offset(scroll.offset + scroll.stretch, scale);
         scroll.painted
     }
 }

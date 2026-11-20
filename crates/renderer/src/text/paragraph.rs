@@ -421,6 +421,11 @@ pub fn widest_piece(lines: &[TextLine], mut start: Pixels) -> Pixels {
 }
 
 impl TextState {
+    pub(crate) fn unplaced(&self) -> bool {
+        self.repaint.get()
+            || (self.layout.0.borrow().as_ref()).is_some_and(|inner| inner.bounds.is_none())
+    }
+
     /// taffy can answer the final width from its cache across frames, while the text was last shaped for another width.
     pub(crate) fn fit(&self, width: Pixels, window: &mut Window) {
         let style = self.style.borrow();
@@ -580,7 +585,7 @@ impl Paragraph {
         state.layout
     }
 
-    pub(crate) fn shift(&self, by: Point<Pixels>) {
+    pub fn shift(&self, by: Point<Pixels>) {
         if let Some(bounds) = self
             .0
             .borrow_mut()
@@ -606,7 +611,7 @@ impl Paragraph {
 }
 
 pub(crate) fn same_shaping(a: &TextStyle, b: &TextStyle) -> bool {
-    same!(a, b; font_family, font_features, font_size, line_height, font_weight, font_style,
+    same!(a, b; font_family, font_features, font_size, line_height, font_weight, font_style, font_synthesis,
         white_space, text_overflow, line_clamp, letter_spacing, word_spacing, text_indent, text_indent_percent, float, text_wrap, word_break)
 }
 

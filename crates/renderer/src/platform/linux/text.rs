@@ -326,7 +326,7 @@ impl TextSystem {
     pub fn font(&self, font: &Font) -> Option<FontId> {
         let shelf = &mut *self.0.borrow_mut();
         let db = shelf.library.get().db();
-        let family = match &*font.family {
+        let family = match font.family.split('\n').next().unwrap_or_default() {
             ".SystemUIFont" => db.family_name(&Family::SansSerif).to_owned(),
             name => name.to_owned(),
         };

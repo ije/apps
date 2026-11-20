@@ -173,8 +173,14 @@ fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
     };
     let accent = if solid {
         0x757575
-    } else if look.hover && !look.disabled {
-        darken(look.accent)
+    } else if (look.hover || look.active) && !look.disabled {
+        // Like Chrome, hover moves the HSL lightness away from the field and a press toward it.
+        let by = if look.dark == look.active {
+            -0.11
+        } else {
+            0.11
+        };
+        lighten(look.accent, by)
     } else {
         look.accent
     };
@@ -240,13 +246,38 @@ fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
             let y = ((h - bar) / 2. * 2.).floor() / 2.;
             let length = w - 2. * x;
             let meter = look.control == Control::Meter;
-            let [track, edge, value_edge] = if look.dark {
-                ["#3b3b3b", "#858585", "#858585"]
-            } else if meter {
-                ["#efefef", "#cbcbcb", "#3b75ba"]
+            // Like Chrome, a range and a progress bar change their edges and light track on hover and press.
+            let stateful =
+                matches!(look.control, Control::Range | Control::Progress) && !look.disabled;
+            let state_edge = (box_colors(look).0.filter(|_| stateful)).unwrap_or(if look.dark {
+                0x858585
             } else {
-                ["#efefef", "#b2b2b2", "#3b75ba"]
+                0x767676
+            });
+            // A light edge is half-transparent: `up` rounds the mix up.
+            let mix = |a: u32, b: u32, up: u32| {
+                let channel =
+                    |shift: u32| (((a >> shift & 0xff) + (b >> shift & 0xff) + up) / 2) << shift;
+                channel(16) | channel(8) | channel(0)
             };
+            let value_edge = if look.dark {
+                state_edge
+            } else {
+                mix(accent, state_edge, 1)
+            };
+            let track = match (look.dark, stateful && look.active, stateful && look.hover) {
+                (true, ..) => 0x3b3b3b,
+                _ if meter => 0xefefef,
+                (_, true, _) => 0xf5f5f5,
+                (_, _, true) => 0xe5e5e5,
+                _ => 0xefefef,
+            };
+            let edge = match look.dark {
+                true => state_edge,
+                _ if meter => 0xcbcbcb,
+                _ => mix(state_edge, track, 0),
+            };
+            let [track, edge] = [track, edge].map(hex);
             write!(
                 body,
                 r#"<rect x="{}" y="{}" width="{}" height="{}" rx="{}" fill="{track}" stroke="{edge}"/>"#,
@@ -272,8 +303,9 @@ fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
                 if !meter {
                     write!(
                         body,
-                        r#"<rect x="{x}" y="{y}" width="{length}" height="{bar}" rx="{}" fill="{value_edge}"/>"#,
+                        r#"<rect x="{x}" y="{y}" width="{length}" height="{bar}" rx="{}" fill="{}"/>"#,
                         bar / 2.,
+                        hex(value_edge),
                     )
                     .ok()?;
                 }
@@ -294,7 +326,8 @@ fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
                         r#"<circle cx="{end}" cy="{}" r="{}" fill="{}"/>"#,
                         h / 2.,
                         thumb / 2.,
-                        hex(accent),
+                        // Chrome hovers the thumb only under the pointer, which the look doesn't know.
+                        hex(if look.active { accent } else { look.accent }),
                     )
                     .ok()?;
                 }
@@ -363,9 +396,50 @@ fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
     ))
 }
 
-fn darken(color: u32) -> u32 {
-    let channel = |shift: u32| ((color >> shift & 0xff) as f32 * 0.8) as u32;
-    channel(16) << 16 | channel(8) << 8 | channel(0)
+/// Like Chrome, a checked box, a range or a progress bar flips its color scheme when its `accent-color` is hard
+/// to see on it.
+pub(super) fn accent_dark(control: Control, checked: bool, accent: u32, dark: bool) -> bool {
+    let light = match control {
+        Control::Range | Control::Progress => 0xefefef,
+        Control::Check | Control::Radio if checked => 0xffffff,
+        _ => return dark,
+    };
+    let luminance = |color: u32| {
+        let [r, g, b] = [16, 8, 0].map(|shift| {
+            let c = (color >> shift & 0xff) as f32 / 255.;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        });
+        0.2126 * r + 0.7152 * g + 0.0722 * b + 0.05
+    };
+    let [accent, light, dark_field] = [accent, light, 0x3b3b3b].map(luminance);
+    let contrast = |other: f32| accent.max(other) / accent.min(other);
+    let [with_light, with_dark] = [contrast(light), contrast(dark_field)];
+    if dark {
+        !(with_dark < 3. && with_dark < with_light)
+    } else {
+        with_light < 3. && with_light < with_dark
+    }
+}
+
+fn lighten(color: u32, by: f32) -> u32 {
+    let [r, g, b] = [16, 8, 0].map(|shift| (color >> shift & 0xff) as f32 / 255.);
+    let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+    let light = (max + min) / 2.;
+    let to = (light + by).clamp(0., 1.);
+    // Keep hue and saturation: each channel keeps its place between the gray of the lightness and the extreme.
+    let [r, g, b] = [r, g, b].map(|c| {
+        let span = |l: f32| if l <= 0.5 { l } else { 1. - l };
+        let value = match span(light) {
+            s if s > 0. => to + (c - light) * span(to) / s,
+            _ => to,
+        };
+        (value * 255.).round().clamp(0., 255.) as u32
+    });
+    r << 16 | g << 8 | b
 }
 
 pub(super) fn box_colors(look: &Look) -> (Option<u32>, Option<u32>) {
@@ -390,4 +464,47 @@ pub(super) fn box_colors(look: &Look) -> (Option<u32>, Option<u32>) {
         _ => None,
     };
     (edge, fill)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hover_and_press_shift_the_accent_like_chrome() {
+        // Chrome's colors for these accents: (accent, light hover, light press).
+        for (accent, hover, press) in [
+            (0x2060d0, 0x194a9f, 0x467fe2),
+            (0xffd000, 0xc7a200, 0xffda38),
+            (0xff8a3d, 0xff6805, 0xffac75),
+            (0x99c8ff, 0x61aaff, 0xd1e6ff),
+        ] {
+            assert_eq!(super::lighten(accent, -0.11), hover, "{accent:06x}");
+            assert_eq!(super::lighten(accent, 0.11), press, "{accent:06x}");
+        }
+    }
+
+    #[test]
+    fn progress_tracks_follow_hover_and_press_like_chrome() {
+        for (hover, active, dark, track, edge) in [
+            (false, false, false, "#efefef", "#b2b2b2"),
+            (true, false, false, "#e5e5e5", "#9a9a9a"),
+            (true, true, false, "#f5f5f5", "#c1c1c1"),
+            (true, false, true, "#3b3b3b", "#acacac"),
+            (true, true, true, "#3b3b3b", "#6e6e6e"),
+        ] {
+            let look = super::Look {
+                control: super::Control::Progress,
+                hover,
+                active,
+                dark,
+                accent: 0x2060d0,
+                value: 0.5,
+                ..Default::default()
+            };
+            let svg = super::svg(&look, 200., 16.).unwrap();
+            assert!(
+                svg.contains(&format!(r#"fill="{track}" stroke="{edge}""#)),
+                "{svg}"
+            );
+        }
+    }
 }

@@ -21,9 +21,9 @@ pub use color::{color, p3, paint, rgba, wide, wide_rgb};
 pub(crate) use parser::{DROPPED, FontUnits, Lengths, NodeLengths};
 use shorthand::{BORDER_IMAGE, BORDER_IMAGE_INITIAL, expand};
 pub(crate) use text::{
-    Atom, InlineText, LineHeight, atom_key, cursor, font, holds_block_box, inline_text,
-    line_height, makes_no_line, pseudo_content, restyle, selection_colors, spacing, text_run,
-    text_transform, word_break,
+    Atom, InlineBox, InlineText, LineHeight, atom_key, cursor, font, holds_block_box, inline_text,
+    line_height, makes_no_line, placed_out_of_flow, pseudo_content, restyle, selection_colors,
+    spacing, text_run, text_transform, word_break,
 };
 pub use value::length;
 pub(crate) use value::{
@@ -75,6 +75,16 @@ pub(crate) fn role(styles: &ComputedStyles, id: usize) -> u16 {
 
 pub(crate) fn table_box(role: u16) -> bool {
     matches!(role, 1..=3 | 10..)
+}
+
+/// A table cell or caption that a grid doesn't blockify: it takes percentages from its table, not from a grid area.
+pub(crate) fn table_part(doc: &crate::dom::Document, styles: &ComputedStyles, id: usize) -> bool {
+    matches!(role(styles, id), CELL | CAPTION)
+        && doc.nodes[id].parent.is_none_or(|parent| {
+            styles.values[parent]
+                .get(Prop::DISPLAY)
+                .is_none_or(|display| !display.ends_with("grid"))
+        })
 }
 
 const UA: &str = "
@@ -3191,10 +3201,31 @@ pub(crate) fn resolved(
                 [a, b, c, d] => [a, b, c, d],
                 _ => return value,
             };
-            let mut result = format!("inset({}", shortest(sides));
+            // Like Chrome, each side and radius is a computed length-percentage.
+            let computed = |part: &str| match part.contains('%') {
+                true => percents(part),
+                false => units
+                    .resolve(part, f32::NAN)
+                    .map_or_else(|| part.to_owned(), px),
+            };
+            let sides = sides.map(computed);
+            let round = round.map(|round| {
+                components(round, ' ')
+                    .into_iter()
+                    .map(|part| {
+                        if part == "/" {
+                            part.to_owned()
+                        } else {
+                            computed(part)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+            let mut result = format!("inset({}", shortest(sides.each_ref().map(String::as_str)));
             if let Some(round) = round {
                 result.push_str(" round ");
-                result.push_str(round);
+                result.push_str(&round);
             }
             result.push(')');
             result
@@ -3645,6 +3676,7 @@ pub(crate) fn specified(name: &str, value: &str) -> String {
     let grammar = grammar(name).unwrap_or("*");
     let length =
         grammar.contains("length") && !grammar.contains("number>") && !grammar.contains("integer>")
+            || name == "translate"
             || name.ends_with("-shadow")
             || name.ends_with("-origin")
             || name.ends_with("-position");

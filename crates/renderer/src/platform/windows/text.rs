@@ -252,7 +252,7 @@ impl Library {
     }
 
     fn font(&mut self, font: &Font) -> Option<FontId> {
-        let family = HSTRING::from(match &*font.family {
+        let family = HSTRING::from(match font.family.split('\n').next().unwrap_or_default() {
             ".SystemUIFont" => self.ui_family.as_str(),
             family => family,
         });

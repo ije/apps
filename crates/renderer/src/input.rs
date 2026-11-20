@@ -72,6 +72,7 @@ impl Key {
         let name = match last {
             "" if !source.is_empty() => "-".to_owned(),
             _ if modifier(&last.to_ascii_lowercase()).is_some() => return None,
+            _ if last.eq_ignore_ascii_case("esc") => "escape".to_owned(),
             _ => {
                 if last.len() == 1 && last.as_bytes()[0].is_ascii_uppercase() {
                     held = held.plus(Modifiers::SHIFT);
@@ -268,6 +269,8 @@ mod tests {
         assert_eq!(parse("alt-"), key("-", Some("-"), Modifiers::ALT));
         assert_eq!(parse("fn-f12"), key("f12", None, Modifiers::FN));
         assert_eq!(parse("enter"), key("enter", None, Modifiers::NONE));
+        assert_eq!(parse("esc"), key("escape", None, Modifiers::NONE));
+        assert_eq!(parse("shift-Esc"), key("escape", None, Modifiers::SHIFT));
         let secondary = if cfg!(target_os = "macos") {
             Modifiers::COMMAND
         } else {

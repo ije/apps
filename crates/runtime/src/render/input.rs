@@ -715,7 +715,11 @@ impl renderer::View for PageView {
             let to = super::text::text_position(layout, text, rows, end)
                 .filter(|to| to.y == at.y && to.x >= at.x)
                 .unwrap_or(at);
-            return Some(Rect::new(at, size(to.x - at.x, layout.line_height())));
+            let [dx, dy] = dom.scroll_shift(node);
+            return Some(Rect::new(
+                at + point(px(dx), px(dy)),
+                size(to.x - at.x, layout.line_height()),
+            ));
         }
         // A terminal composes text at its cursor.
         let caret = dom
@@ -741,6 +745,8 @@ impl renderer::View for PageView {
         let host = self.host.borrow();
         let dom = host.dom.get(&self.id)?;
         if let Some((layout, text, span, rows, _)) = dom.text_layouts.get(&id) {
+            let [dx, dy] = dom.scroll_shift(id);
+            let point = point - renderer::point(px(dx), px(dy));
             let index = super::text::text_index(layout, text, rows, point, false)
                 .unwrap_or_else(|index| index)
                 .clamp(span.start, span.end);

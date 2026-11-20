@@ -296,7 +296,8 @@ mod tests {
             crate::style::Prop::FONT_FAMILY,
             "Missing, Brand, sans-serif".into(),
         )]));
-        assert_eq!(&*font.family, "Brand");
+        // The later installed families stay for the glyphs that the first lacks.
+        assert!(font.family.starts_with("Brand\n"), "{}", font.family);
         assert!(!load(&mut doc, &mut state).0);
         assert_eq!(state.font_text.1.len(), 0x110000 / 64);
         let text = doc

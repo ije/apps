@@ -2329,7 +2329,7 @@ mod tests {
                 };
                 scene.pause_cuts(0);
                 scene.push(quad([0., 0., 200., 24.], window, bar));
-                scene.resume_cuts(0);
+                scene.resume_cuts();
                 // Content after the bar, as a scroll bar is.
                 scene.push(quad(
                     [184., 60. - offset, 6., 40.],

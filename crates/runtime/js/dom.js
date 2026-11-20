@@ -67,13 +67,15 @@
   // Keep mirror arrays private. Retain constructors and avoid prototype getters. A nonzero first float means
   // Rust moved the buffer.
   const F32 = Float32Array, U8 = Uint8Array;
-  let geometry = new F32(1), marks, limit = 0, flagged = -1; geometry[0] = 1;
+  let geometry = new F32(1), marks, moves = new F32(1), limit = 0, flagged = -1; geometry[0] = 1;
   let observing = false;
   const layout = () => {
     if ((stale || geometry[3]) && !observing) { stale = false; laid = true; call('dom.reflow'); }
-    if (geometry[0]) { const buffer = host('dom.layout', true), capacity = new F32(buffer, 0, 4)[1]; limit = 4 + capacity * 8; geometry = new F32(buffer, 0, limit); marks = new U8(buffer, limit * 4, capacity); }
+    if (geometry[0]) { const buffer = host('dom.layout', true), capacity = new F32(buffer, 0, 4)[1]; limit = 4 + capacity * 8; geometry = new F32(buffer, 0, limit); marks = new U8(buffer, limit * 4, capacity); moves = new F32(buffer, limit * 4 + capacity, 1); }
     return geometry;
   };
+  // Text that the last layout did not place, like text far from the view, gets a layout when a script reads it.
+  const textCall = (op, ...args) => { let result = call(op, ...args); if (result === null) { stale = true; layout(); result = call(op, ...args) ?? (op === 'dom.textRect' ? [] : 0); } return result; };
   // As in Chrome, the contents that a box skips get a layout when a script reads their geometry.
   const slot = node => { layout(); const i = 4 + node._id * 8; if (i >= limit || marks[node._id] & 16 && !(!observing && node.isConnected && call('dom.skipped', node._id, true) > 0 && (stale = true, layout(), !(marks[node._id] & 16)))) return -1; if (node._placed !== version) { if (!node.isConnected) return -1; node._placed = version; } return i; };
   const metric = (node, k) => { const i = slot(node); return i < 0 ? 0 : geometry[i + k]; };
@@ -181,7 +183,7 @@
   const definitions = new Map(), defined = new WeakMap(), definitionsWaiting = new Map();
   let constructing = null;
   const wrapped = [], names = new Map(), types = { __proto__: null, '#document': 9, '#text': 3, '#comment': 8, '#fragment': 11, '#doctype': 10 }, events = new WeakMap(), registered = [], pointers = new Set(), captures = new Map(), gotten = new Map(), observers = new Set();
-  let readyState = 'loading', currentScript = null, active = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null, quiet = 0, shadows = 0, moving = false, wheeling = false, iterating = false, native = 0, ending = false, hoverVersion = 0;
+  let readyState = 'loading', currentScript = null, active = null, navStart = null, hovered = null, selection = null, composing = null, mutationQueued = false, selectionDrag = null, quiet = 0, shadows = 0, moving = false, wheeling = false, iterating = false, native = 0, ending = false, hoverVersion = 0;
   const scrollEnds = new Map();
   const selectionPending = new Set();
   const topLayer = [], dialogs = [], autos = [], hints = [], fullscreens = [], watchers = [];
@@ -301,7 +303,15 @@
     }
     return result;
   };
-  const focusable = node => {
+  // Like Chrome, a box that the user can scroll takes the focus from scripts and the keyboard, not from a press.
+  const overflows = id => marks[id] & 2 && 4 + id * 8 < limit && (geometry[10 + id * 8] > 0 || geometry[11 + id * 8] > 0);
+  const scroller = node => {
+    const id = node._id, tag = node._m.tag;
+    if (!overflows(id) || tag === 'html' || tag === 'body') return false;
+    const style = getComputedStyle(node);
+    return geometry[10 + id * 8] > 0 && /auto|scroll/.test(style.overflowX) || geometry[11 + id * 8] > 0 && /auto|scroll/.test(style.overflowY);
+  };
+  const focusable = (node, press) => {
     if (node?.nodeType !== 1 || !node.isConnected || disabled(node)) return false;
     laidOut();
     // As in Chrome, the contents that a `content-visibility: auto` box skips can take the focus, which shows them.
@@ -309,13 +319,16 @@
     const skipped = call('dom.skipped', node._id, false);
     if (skipped === 2 || skipped < 0 || marks[node._id] & 16 && skipped !== 1) return false;
     const rec = node._m, tag = rec.tag;
-    return /^\s*[+-]?\d/.test(rec.attrs.get('tabindex') ?? '') || node.isContentEditable || /^(select|textarea|button|iframe|dialog|terminal)$/.test(tag) || tag === 'input' && node.type !== 'hidden' || (tag === 'a' || tag === 'area') && rec.attrs.has('href') || tag === 'summary' && activation(node);
+    return /^\s*[+-]?\d/.test(rec.attrs.get('tabindex') ?? '') || node.isContentEditable || /^(select|textarea|button|iframe|dialog|terminal)$/.test(tag) || tag === 'input' && node.type !== 'hidden' || (tag === 'a' || tag === 'area') && rec.attrs.has('href') || tag === 'summary' && activation(node) || !press && scroller(node);
   };
   const commit = node => { if (node._edited) { node._edited = false; dispatch(node, trusted(new Event('change', { bubbles: true }))); } };
   const selectors = (name, id, selector, first) => { try { return call(name, id, String(selector), first); } catch (error) { if (/^SyntaxError/.test(error?.message)) throw new DOMException(error.message.replace(/^SyntaxError: /, ''), 'SyntaxError'); throw error; } };
   const toggles = new Map();
   const validated = /^(required|pattern|min|max|step|maxlength|minlength|type|multiple|size|value|name|selected|form)$/;
   const attributeChanged = (element, name, oldValue, value) => {
+    // As in Chrome, a type that gains the selection API starts with the caret at the start.
+    if (name === 'type' && element.localName === 'input' && element._files && element.type !== 'file') element._files = null;
+    if (name === 'type' && element.localName === 'input' && selectable(element)) { const old = (oldValue ?? '').toLowerCase(); if (!/^(text|search|tel|url|password)$/.test(inputTypes.has(old) ? old : 'text')) { element._start = element._end = 0; element._direction = 'none'; if (active === element) call('dom.selection', element._id, 0, 0); } }
     if (shadows && name === 'slot') { signal(element.parentNode, element, oldValue ?? ''); signal(element.parentNode, element); }
     else if (shadows && name === 'name' && element.localName === 'slot') { const root = element.getRootNode(); if (root instanceof ShadowRoot && (slotted(root.host, oldValue ?? '') || slotted(root.host, value ?? ''))) queueSlot(element); }
     else if (name === 'popover' && element._popover && popoverState(oldValue) !== popoverState(value)) hidePopover(element, true, true);
@@ -350,7 +363,7 @@
       else if (kind === 'checkbox' || previous !== activator) { dispatch(activator, new Event('input', { bubbles: true, composed: true })); dispatch(activator, new Event('change', { bubbles: true })); }
     } else if (allowed && activator) {
       const tag = activator.localName, type = tag === 'button' ? activator.type : kind;
-      if (tag === 'label') { const control = labelControl(activator), list = path(target); let inner = false; for (let i = 0; list[i] !== activator && !inner; i++) { const node = list[i], name = node.localName; inner = /^(button|details|embed|iframe|label|select|textarea)$/.test(name) || name === 'input' && node.type !== 'hidden' || (name === 'audio' || name === 'video') && node.hasAttribute('controls') || name === 'img' && node.hasAttribute('usemap'); } if (control && !inner && !control.contains(target) && !disabled(control)) { if (focusable(control)) control.focus(); fireClick(control, init, native); } }
+      if (tag === 'label') { const control = labelControl(activator), list = path(target); let inner = false; for (let i = 0; list[i] !== activator && !inner; i++) { const node = list[i], name = node.localName; inner = /^(button|details|embed|iframe|label|select|textarea)$/.test(name) || name === 'input' && node.type !== 'hidden' || (name === 'audio' || name === 'video') && node.hasAttribute('controls') || name === 'img' && node.hasAttribute('usemap'); } if (control && !inner && !control.contains(target) && !disabled(control)) { if (focusable(control)) { if (native && control !== active) { mouseFocus = true; hadKey = false; } control.focus(); } fireClick(control, init, native); } }
       else if (tag === 'summary') activator.parentElement.open = !activator.parentElement.open;
       else if ((type === 'submit' || type === 'image') && activator.form) activator.form.requestSubmit(activator);
       else if (type === 'file') pickFiles(activator);
@@ -477,16 +490,18 @@
   const always = () => true;
   const rangesRemove = (parent, child, index) => { if (iterators.size) iteratorsRemove(child); if (!anchors.size) return; inside(child._m, (range, rec) => shift(range, rec, always, parent, () => index)); each(parent._m, range => shift(range, parent._m, at => at > index, parent, at => at - 1)); };
   // `parent` held the removed tree, so the blur of a removed focused element still reaches the document, as in browsers.
-  const forgetRemoved = parent => {
+  const forgetRemoved = (parent, next) => {
     if (topLayer.length || dialogs.length) {
       if (fullscreens.some(node => !node.isConnected)) exitFullscreen(true);
       for (const node of [...topLayer, ...dialogs]) if (!node.isConnected) { if (node._popover) hidePopover(node, false, false); if (dialogs.includes(node)) closeDialog(node); }
     }
     if (captures.size) for (const [id, node] of captures) if (!node.isConnected) captures.delete(id);
     if (gotten.size) for (const [id, node] of gotten) if (!node.isConnected) { gotten.delete(id); dispatch(document, trusted(new PointerEvent('lostpointercapture', { pointerId: id, pointerType: 'mouse', isPrimary: true, bubbles: true, composed: true }))); }
+    if (parent && navStart && (!navStart[0].isConnected || navStart[1] && !navStart[1].isConnected)) navStart = [parent, next && of(next)];
     if (!active || active.isConnected) return;
     finishComposition();
-    const previous = active, ancestors = () => parent?.isConnected ? [...path(previous), ...path(parent)] : undefined; active = null; call('dom.focus', []); if (windowFocused) { dispatch(previous, new FocusEvent('blur', { view: window, composed: true }), ancestors()); dispatch(previous, new FocusEvent('focusout', { view: window, bubbles: true, composed: true }), ancestors()); }
+    // As in Chrome, Tab goes on from the place of the removed element.
+    const previous = active, ancestors = () => parent?.isConnected ? [...path(previous), ...path(parent)] : undefined; active = null; navStart = parent ? [parent, next && of(next)] : null; call('dom.focus', []); if (windowFocused) { dispatch(previous, new FocusEvent('blur', { view: window, composed: true }), ancestors()); dispatch(previous, new FocusEvent('focusout', { view: window, bubbles: true, composed: true }), ancestors()); }
   };
   const watched = node => { if (observers.size && !quiet) for (const ref of observers) for (const [key, options] of ref.deref()?.targets ?? []) { const target = key.deref(); if (target && options.childList && (target === node || options.subtree && target.contains(node))) return true; } return false; };
   const ignore = () => {};
@@ -678,7 +693,7 @@
       op(3, this._id, child._id); this._nodes = this._elements = null; this._m.kids.splice(i, 1); kid.up = null; unhold(child); child._parent = null;
       if (this._m.tag === 'select' || this._m.tag === 'optgroup') revalidate(this._m.tag === 'select' ? this : this.parentElement);
       if (connected) reactions(kid, 'disconnectedCallback');
-      forgetRemoved(this);
+      forgetRemoved(this, this._m.kids[i] ?? null);
       if (record) change(record);
       return child;
     }
@@ -700,7 +715,7 @@
     getRootNode(options) { const composed = options?.composed; let rec = this._m; while (rec.up ?? (composed ? rec.host : null)) rec = rec.up ?? rec.host; return of(rec); }
     cloneNode(deep = false) {
       const cloned = this.nodeType === 3 ? document.createTextNode(this.data) : this.nodeType === 8 ? document.createComment(this.data) : this.nodeType === 11 ? document.createDocumentFragment() : this.namespaceURI === XHTML ? wrap(create(this.localName)) : document.createElementNS(this.namespaceURI, this.localName);
-      if (this.nodeType === 1) { for (let i = 0, list = this._m.attrs.list; i < list.length; i += 2) cloned.setAttribute(list[i], list[i + 1]); if (this._value !== undefined) setValue(cloned, this._value); if (this._checked !== undefined) { setChecked(cloned, this._checked); cloned._dirty = this._dirty; } if (this._selected !== undefined) cloned._selected = this._selected; }
+      if (this.nodeType === 1) { for (let i = 0, list = this._m.attrs.list; i < list.length; i += 2) cloned.setAttribute(list[i], list[i + 1]); if (this._value !== undefined) setValue(cloned, this._value); if (this._files) { cloned._files = fileList([...this._files]); showFiles(cloned); } if (this._checked !== undefined) { setChecked(cloned, this._checked); cloned._dirty = this._dirty; } if (this._selected !== undefined) cloned._selected = this._selected; }
       // Loop, not recursion: deep trees overflow the JavaScript stack. Fill each copy before it joins its parent.
       // Plain elements, texts and comments copy as records (op 10) and get wrappers only when read, so the namespace
       // that `wrap` infers must match. Other nodes clone through their wrappers. Templates clone their own content.
@@ -893,7 +908,10 @@
     return group;
   };
   const readOnly = () => { throw new DOMException('Computed styles are read-only', 'NoModificationAllowedError'); };
-  let keyboardFocus = true, windowFocused = true, ring = false;
+  // As in Chrome, script focus shows the ring unless the last focus came from a press and no key went down since a press
+  // moved the focus.
+  let mouseFocus = false, hadKey = false, windowFocused = true, ring = false;
+  const showsRing = node => !mouseFocus || hadKey || node.isContentEditable || node.localName === 'textarea' || node.localName === 'input' && !/^(button|submit|reset|checkbox|radio|range|color|file|image)$/i.test(node.getAttribute('type') ?? '');
   class CSSStyleDeclaration {
     constructor(owner) { this._owner = owner; }
     get _list() { return this._owner.read(); }
@@ -1061,6 +1079,8 @@
       }
     }
     focus(options) {
+      // Like Chrome, a label that can't take the focus gives it to its control.
+      if (this.localName === 'label' && !focusable(this)) return labelControl(this)?.focus(options);
       if (active === this || !focusable(this)) return;
       finishComposition();
       const previous = active;
@@ -1070,7 +1090,7 @@
         dispatch(previous, new FocusEvent('blur', { view: window, composed: true, relatedTarget: this })); dispatch(previous, new FocusEvent('focusout', { view: window, bubbles: true, composed: true, relatedTarget: this }));
         if (active || !this.isConnected) return;
       }
-      active = this; call('dom.focus', path(this).map(node => node._id), ring = options?.focusVisible ?? (keyboardFocus || this.isContentEditable || this.localName === 'textarea' || this.localName === 'input' && !/^(button|submit|reset|checkbox|radio|range|color|file|image)$/i.test(this.getAttribute('type') ?? '')), !windowFocused);
+      active = this; navStart = [this]; call('dom.focus', path(this).map(node => node._id), ring = options?.focusVisible ?? showsRing(this), !windowFocused);
       if (!options?.preventScroll) this.scrollIntoView({ block: 'if-needed', inline: 'if-needed' });
       // Like Chrome, an editing host that gets focus without the selection in it gets a caret at its start.
       if (this.isContentEditable && !this.contains(selection.anchorNode)) selection.collapse(document.createTreeWalker(this, 4).nextNode() ?? this, 0);
@@ -1160,13 +1180,34 @@
   const editable = node => node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement && /^(text|search|tel|url|email|password|number)$/.test(node.type);
   const sanitize = (type, value) => type === 'number' ? /^-?(\d+(\.\d+)?|\.\d+)([eE][-+]?\d+)?$/.test(value) ? value : '' : type === 'color' ? /^#[\da-f]{6}$/i.test(value) ? value.toLowerCase() : '#000000' : /^(text|search|tel|password|url|email)$/.test(type) ? (value = value.replace(/[\r\n]/g, ''), type === 'url' || type === 'email' ? value.trim() : value) : /^(date|time|datetime-local|month|week)$/.test(type) && Number.isNaN(stepKinds[type][3](value)) ? '' : value;
   const assign = (node, value) => { const old = node.value; setValue(node, value); if (value !== old) { node._start = node._end = value.length; node._direction = 'none'; if (active === node) call('dom.selection', node._id, value.length, value.length); } };
-  const setValue = (node, value) => { node._value = value; op(7, node._id, value, 0); const length = value.length; node._start = Math.min(node._start ?? length, length); node._end = Math.min(node._end ?? length, length); revalidate(node); };
+  // The field shows the first file, which the value names, but the value is not stored.
+  const showFiles = node => { op(7, node._id, node.value, 0); revalidate(node); };
+  const setValue = (node, value) => { node._value = value; op(7, node._id, value, 0); const length = value.length; node._start = Math.min(node._start ?? 0, length); node._end = Math.min(node._end ?? 0, length); revalidate(node); };
   const rangeBounds = node => { const number = name => { const value = parseFloat(node.getAttribute(name)); return Number.isFinite(value) ? value : null; }, min = number('min') ?? 0, step = number('step'); return [min, Math.max(min, number('max') ?? 100), node.getAttribute('step')?.trim().toLowerCase() === 'any' ? 0 : step > 0 ? step : 1]; };
   const rangeValue = (node, raw) => {
-    const [min, max, step] = rangeBounds(node); let value = String(raw ?? '').trim() ? Number(raw) : NaN;
-    value = Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : (min + max) / 2;
+    const [min, max, step] = rangeBounds(node), text = String(raw ?? ''); let value = floatText.test(text) ? Number(text) : NaN;
+    if (!Number.isFinite(value)) value = (min + max) / 2;
+    else if (!step && value >= min && value <= max) return decimalText(text);
+    value = Math.min(max, Math.max(min, value));
     if (step) { let n = Math.round((value - min) / step); if (min + n * step > max) n--; value = +(min + n * step).toPrecision(15); }
-    return String(value);
+    return decimalText(String(value));
+  };
+  // Like Chrome's Decimal: keeps 18 digits of a valid float, and writes fractions with 15 digits at most.
+  const floatText = /^-?(\d+(\.\d+)?|\.\d+)([eE][-+]?\d+)?$/;
+  const decimalText = text => {
+    const [, sign, whole, fraction = '', e = 0] = /^(-?)(\d*)(?:\.(\d*))?(?:e([-+]?\d+))?$/i.exec(text), int = whole.replace(/^0+/, '');
+    let exp = +e, digits = int.length >= 18 ? int.slice(0, 18) : int + fraction.slice(0, 18 - int.length);
+    exp += int.length >= 18 ? int.length - 18 : int.length - digits.length;
+    digits = digits.replace(/^0+/, '');
+    if (exp < 0) {
+      if (digits.length > 15) { const up = digits[15] >= '5'; exp += digits.length - 15; digits = digits.slice(0, 15); if (up) digits = String(BigInt(digits) + 1n); }
+      while (exp < 0 && digits.length > 1 && digits.endsWith('0')) { digits = digits.slice(0, -1); exp++; }
+    }
+    if (!digits) return '0';
+    const adjusted = exp + digits.length - 1;
+    if (exp <= 0 && adjusted >= -6) return sign + (!exp ? digits : adjusted >= 0 ? digits.slice(0, adjusted + 1) + '.' + digits.slice(adjusted + 1) : '0.' + '0'.repeat(-adjusted - 1) + digits);
+    const mantissa = digits.replace(/0+$/, '');
+    return sign + digits[0] + (mantissa.length > 1 ? '.' + mantissa.slice(1) : '') + (adjusted ? (adjusted < 0 ? 'e' : 'e+') + adjusted : '');
   };
   // [scale of `step`, default step, default step base, parse, format, is a date]. Dates count ms since the epoch, months count months.
   const pad = (n, size = 2) => String(n).padStart(size, '0'), dayOf = text => /^(\d{4,})-(\d\d)-(\d\d)$/.exec(text), timeOf = text => /^(\d\d):(\d\d)(?::(\d\d)(?:\.(\d{1,3}))?)?$/.exec(text);
@@ -1270,8 +1311,8 @@
   };
   class HTMLInputElement extends HTMLElement {
     get type() { const type = (this.getAttribute('type') ?? '').toLowerCase(); return inputTypes.has(type) ? type : 'text'; } set type(value) { this.setAttribute('type', value); }
-    get value() { const type = this.type; return /^(hidden|submit|image|reset|button)$/.test(type) ? this.getAttribute('value') ?? '' : type === 'checkbox' || type === 'radio' ? this.getAttribute('value') ?? 'on' : type === 'file' ? '' : type === 'range' ? rangeValue(this, this._value ?? this.getAttribute('value')) : this._value ?? sanitize(type, this.getAttribute('value') ?? ''); }
-    set value(value) { value = String(value ?? ''); if (/^(hidden|submit|image|reset|button|checkbox|radio)$/.test(this.type)) this.setAttribute('value', value); else if (this.type !== 'file' || !value) { if (!value) this._files = null; assign(this, sanitize(this.type, value)); } }
+    get value() { const type = this.type; return /^(hidden|submit|image|reset|button)$/.test(type) ? this.getAttribute('value') ?? '' : type === 'checkbox' || type === 'radio' ? this.getAttribute('value') ?? 'on' : type === 'file' ? (this._files?.length ? 'C:\\fakepath\\' + this._files[0].name : '') : type === 'range' ? rangeValue(this, this._value ?? this.getAttribute('value')) : this._value ?? sanitize(type, this.getAttribute('value') ?? ''); }
+    set value(value) { value = String(value ?? ''); if (/^(hidden|submit|image|reset|button|checkbox|radio)$/.test(this.type)) this.setAttribute('value', value); else if (this.type !== 'file' || !value) { if (!value && this._files) setFiles(this._files, []); assign(this, sanitize(this.type, value)); } }
     get defaultValue() { return this.getAttribute('value') ?? ''; } set defaultValue(value) { this.setAttribute('value', value); }
     get checked() { return this._checked ?? this.hasAttribute('checked'); }
     set checked(value) { setChecked(this, !!value); this._dirty = true; }
@@ -1282,7 +1323,8 @@
     get valueAsDate() { const kind = stepKinds[this.type], value = kind?.[5] ? this.valueAsNumber : NaN; return Number.isNaN(value) ? null : new Date(this.type === 'month' ? Date.UTC(1970 + Math.floor(value / 12), value % 12) : value); }
     set valueAsDate(date) { if (!stepKinds[this.type]?.[5]) throw new DOMException('This input has no date value', 'InvalidStateError'); if (date !== null && !(date instanceof Date)) throw new TypeError('Expected a Date'); const time = date?.getTime() ?? NaN; this.valueAsNumber = this.type === 'month' && !Number.isNaN(time) ? (date.getUTCFullYear() - 1970) * 12 + date.getUTCMonth() : time; }
     stepUp(n = 1) { stepBy(this, n); } stepDown(n = 1) { stepBy(this, -n); }
-    get files() { return this.type === 'file' ? this._files ?? [] : null; }
+    get files() { return this.type === 'file' ? this._files ??= fileList() : null; }
+    set files(value) { if (value == null) return; if (!(value instanceof FileList)) throw new TypeError("Failed to set the 'files' property on 'HTMLInputElement': The provided value is not of type 'FileList'."); if (this.type === 'file') { this._files = value; showFiles(this); } }
     get list() { const id = this.getAttribute('list'); return id ? document.getElementById(id) : null; }
     // Like Chrome, the selection API works only on text fields. Editing code uses the fields, as number and email
     // inputs keep a selection too.
@@ -1431,7 +1473,7 @@
       const radios = [];
       for (const control of this.elements) {
         if (control.localName === 'select') { for (const option of options(control)) option._selected = undefined; control._none = null; selectedness(control); }
-        else if (control.localName === 'input' || control.localName === 'textarea') { control._value = control._checked = control._edited = control._dirty = undefined; op(7, control._id, '', 1); formState(control, control._bits & ~3); if (control.type === 'radio' && control.hasAttribute('checked')) setChecked(control, true); }
+        else if (control.localName === 'input' || control.localName === 'textarea') { const old = control.value; control._value = control._checked = control._edited = control._dirty = undefined; if (control._files) setFiles(control._files, []); op(7, control._id, '', 1); formState(control, control._bits & ~3); if (control.value !== old) { const end = control._start = control._end = control.value.length; control._direction = 'none'; if (active === control) call('dom.selection', control._id, end, end); } if (control.type === 'radio' && control.hasAttribute('checked')) setChecked(control, true); }
         else if (control.localName === 'output') control.textContent = control.defaultValue;
         if (control.localName === 'input' && control.type === 'radio') radios.push(control); else revalidate(control);
       }
@@ -1832,8 +1874,23 @@
     getTargetRanges() { return this._targetRanges.slice(); }
   }
   const droppedDirectories = new WeakSet();
+  let setFiles, addFile;
+  class FileList {
+    #files = [];
+    static {
+      const define = (list, value, i) => Object.defineProperty(list, i, { value, enumerable: true, configurable: true });
+      setFiles = (list, files) => { const old = list.#files; for (let i = files.length; i < old.length; i++) delete list[i]; list.#files = files; files.forEach((value, i) => old[i] !== value && define(list, value, i)); return list; };
+      addFile = (list, file) => define(list, file, list.#files.push(file) - 1);
+    }
+    constructor(key) { if (key !== setFiles) throw new TypeError("Failed to construct 'FileList': Illegal constructor"); }
+    get length() { return this.#files.length; }
+    item(index) { return this.#files[index >>> 0] ?? null; }
+  }
+  Object.defineProperty(FileList.prototype, Symbol.iterator, { configurable: true, writable: true, value: Array.prototype.values });
+  const fileList = (files = []) => setFiles(new FileList(setFiles), files);
   class DataTransfer {
-    constructor(){this.dropEffect='none';this.effectAllowed='all';this._data=new Map();this.files=[];this.items=[];this.items.add=(value,type)=>{if(value instanceof File){this.files.push(value);const directory=droppedDirectories.has(value),item={kind:'file',type:value.type,getAsFile:()=>value,getAsString:()=>{},webkitGetAsEntry:()=>({isFile:!directory,isDirectory:directory,name:value.name,fullPath:'/'+value.name})};this.items.push(item);return item;}this.setData(type,String(value));return this.items.at(-1);};this.items.remove=index=>{const item=this.items[index];if(item?.kind==='file')this.files.splice(this.files.indexOf(item.getAsFile()),1);this.items.splice(index,1);};this.items.clear=()=>{this.items.length=0;this.files.length=0;this._data.clear();};}
+    get files(){return this._files;}
+    constructor(){this.dropEffect='none';this.effectAllowed='all';this._data=new Map();this._files=fileList();this.items=[];this.items.add=(value,type)=>{if(value instanceof File){addFile(this._files,value);const directory=droppedDirectories.has(value),item={kind:'file',type:value.type,getAsFile:()=>value,getAsString:()=>{},webkitGetAsEntry:()=>({isFile:!directory,isDirectory:directory,name:value.name,fullPath:'/'+value.name})};this.items.push(item);return item;}this.setData(type,String(value));return this.items.at(-1);};this.items.remove=index=>{const item=this.items[index];if(item?.kind==='file'){const files=[...this._files];files.splice(files.indexOf(item.getAsFile()),1);setFiles(this._files,files);}this.items.splice(index,1);};this.items.clear=()=>{this.items.length=0;setFiles(this._files,[]);this._data.clear();};}
     get types(){return [...this._data.keys(),...(this.items.some(item=>item.kind==='file')?['Files']:[])];}getData(type){return this._data.get(type==='text'?'text/plain':type)??'';}setData(type,data){type=type==='text'?'text/plain':type;this._data.set(type,String(data));const item={kind:'string',type,getAsFile:()=>null,getAsString:callback=>queueMicrotask(()=>callback(this.getData(type)))};const index=this.items.findIndex(item=>item.type===type&&item.kind==='string');if(index<0)this.items.push(item);else this.items[index]=item;}clearData(type){if(type===undefined){this._data.clear();this.items.splice(0,this.items.length,...this.items.filter(item=>item.kind==='file'));}else{this._data.delete(type);const index=this.items.findIndex(item=>item.type===type&&item.kind==='string');if(index>=0)this.items.splice(index,1);}}
   }
   class ClipboardEvent extends Event {constructor(type,options={}){super(type,options);this.clipboardData=options.clipboardData??null;}}
@@ -2173,7 +2230,7 @@
     createNodeIterator(root, whatToShow, filter) { return new NodeIterator(root, whatToShow, filter); }
     caretRangeFromPoint(x,y) {
       const node = wrap(call('dom.hitTest',x,y,true,true)); if (!node) return null;
-      const range = this.createRange(); range.setStart(node,node.nodeType === 3 ? call('dom.textIndex',node._id,x,y) : 0); range.collapse(true); return range;
+      const range = this.createRange(); range.setStart(node,node.nodeType === 3 ? textCall('dom.textIndex',node._id,x,y) : 0); range.collapse(true); return range;
     }
     caretPositionFromPoint(x,y){const range=this.caretRangeFromPoint(x,y);return range?{offsetNode:range.startContainer,offset:range.startOffset}:null;}
     elementFromPoint(x, y) { const node = hitAt(x, y); return node && retarget(node, this); }
@@ -2365,7 +2422,7 @@
     }
     createContextualFragment(html) { const node = this.startContainer.nodeType === 1 ? this.startContainer : this.startContainer.parentElement; return parseFragment(html, node && !(node.localName === 'html' && node.namespaceURI === XHTML) ? node : null); }
     getBoundingClientRect() {const rects=this.getClientRects();if(!rects.length)return new DOMRect();const left=Math.min(...rects.map(rect=>rect.left)),top=Math.min(...rects.map(rect=>rect.top));return new DOMRect(left,top,Math.max(...rects.map(rect=>rect.right))-left,Math.max(...rects.map(rect=>rect.bottom))-top);}
-    getClientRects() {layout();return rangeNodes(this).flatMap(({node,start,end})=>call('dom.textRect',node._id,start,end).map(rect=>new DOMRect(...rect)));}
+    getClientRects() {layout();return rangeNodes(this).flatMap(({node,start,end})=>textCall('dom.textRect',node._id,start,end).map(rect=>new DOMRect(...rect)));}
     compareBoundaryPoints(how,range){return how===0?comparePoints(this.startContainer,this.startOffset,range.startContainer,range.startOffset):how===1?comparePoints(this.endContainer,this.endOffset,range.startContainer,range.startOffset):how===2?comparePoints(this.endContainer,this.endOffset,range.endContainer,range.endOffset):comparePoints(this.startContainer,this.startOffset,range.endContainer,range.endOffset);}
     isPointInRange(node,offset){if(node.getRootNode()!==this._sc.getRootNode())return false;return comparePoints(node,offset,this.startContainer,this.startOffset)>=0&&comparePoints(node,offset,this.endContainer,this.endOffset)<=0;}
     comparePoint(node,offset){if(node.getRootNode()!==this._sc.getRootNode())throw new DOMException('The node is in another tree','WrongDocumentError');return comparePoints(node,offset,this.startContainer,this.startOffset)<0?-1:comparePoints(node,offset,this.endContainer,this.endOffset)>0?1:0;}
@@ -2471,7 +2528,7 @@
         const rect = p => {
           const after = p < n && (text[p] !== '\n' || p === 0 || text[p - 1] === '\n' && runs[run(p) + 1] >= 0), i = after ? p : p - 1, r = run(i), node = runs[r + 1];
           if (i < 0 || node < 0) return null;
-          if (runs[r + 2] >= 0) { const at = runs[r + 2] + i - runs[r] + !after, box = after && call('dom.textRect', node, at, at + 1)[0] || call('dom.textRect', node, at, at)[0]; return box && { x: box[0], y: box[1], h: box[3] }; }
+          if (runs[r + 2] >= 0) { const at = runs[r + 2] + i - runs[r] + !after, box = after && textCall('dom.textRect', node, at, at + 1)[0] || textCall('dom.textRect', node, at, at)[0]; return box && { x: box[0], y: box[1], h: box[3] }; }
           const box = wrap(node).getBoundingClientRect(); return { x: after ? box.left : box.right, y: box.top, h: box.height };
         };
         // The first index in [lo, hi) where test holds, for tests that hold from some index on.
@@ -2527,6 +2584,7 @@
     observe(target){if(this.targets.has(target._m.ref))return;watch(this,target,null,intersectionObservers);host('dom.requestFrame');}unobserve(target){unwatch(this,target,intersectionObservers);}disconnect(){unwatchAll(this,intersectionObservers);this.records=[];}takeRecords(){return this.records.splice(0);}
   }
   const resizeObservers = new Set();
+  const atomicTags = /^(img|svg|canvas|video|audio|iframe|embed|object|input|select|textarea|button|math)$/;
   class ResizeObserver { constructor(callback) { if (typeof callback !== 'function') throw new TypeError('Expected a callback'); this.callback = callback; this.targets = new Map(); this._ref = null; } observe(target, options) { const box = String(options?.box ?? 'content-box'); if (this.targets.has(target._m.ref) && (this._boxes ??= new WeakMap()).get(target) === box) return; (this._boxes ??= new WeakMap()).set(target, box); watch(this, target, null, resizeObservers); host('dom.requestFrame'); } unobserve(target) { unwatch(this, target, resizeObservers); } disconnect() { unwatchAll(this, resizeObservers); } }
   const breakout = /^(b|big|blockquote|body|br|center|code|dd|div|dl|dt|em|embed|h[1-6]|head|hr|i|img|li|listing|menu|meta|nobr|ol|p|pre|ruby|s|small|span|strong|strike|sub|sup|table|tt|u|ul|var)$/;
   const wrap = id => {
@@ -3372,7 +3430,7 @@
   globalThis.window = globalThis; globalThis.self = globalThis;
   selection = new Selection(); attachDeclarative();
   for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) globalThis[name] = Node.prototype[name].bind(globalThis);
-  Object.assign(globalThis, { ContentVisibilityAutoStateChangeEvent, ElementImage, CanvasPaintEvent, ElementGeometryUpdateEvent, ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, OfflineAudioContext, AudioNode, AudioParam, AudioScheduledSourceNode, GainNode, BiquadFilterNode, OscillatorNode, PeriodicWave, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, SVGAnimatedString, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, ClipboardEvent, DragEvent, StaticRange, customElements, ShadowRoot, CSSStyleSheet, DOMParser, CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration, AnimationEvent, BeforeUnloadEvent, ElementInternals, FormDataEvent, HashChangeEvent, PageTransitionEvent, PopStateEvent, RadioNodeList, StorageEvent, TransitionEvent });
+  Object.assign(globalThis, { ContentVisibilityAutoStateChangeEvent, ElementImage, CanvasPaintEvent, ElementGeometryUpdateEvent, ImageBitmap, ImageBitmapRenderingContext, OffscreenCanvas, OffscreenCanvasRenderingContext2D, Screen, ScreenOrientation, CanvasGradient, Path2D, CanvasPattern, DOMMatrix, DOMMatrixReadOnly, DOMPoint, DOMPointReadOnly, TextMetrics, AudioContext, OfflineAudioContext, AudioNode, AudioParam, AudioScheduledSourceNode, GainNode, BiquadFilterNode, OscillatorNode, PeriodicWave, AudioBuffer, AudioBufferSourceNode, AudioDestinationNode, Node, CharacterData, Text, Comment, DocumentType, Attr, NamedNodeMap, NodeList, HTMLCollection, DOMTokenList, Element, HTMLElement, SVGElement, SVGSVGElement, SVGAnimatedString, HTMLSlotElement, HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLOptGroupElement, HTMLOptionsCollection, HTMLButtonElement, HTMLFieldSetElement, HTMLOutputElement, HTMLFormElement, HTMLFormControlsCollection, HTMLDialogElement, HTMLDetailsElement, HTMLLabelElement, ValidityState, DOMRectList, WheelEvent, ToggleEvent, CommandEvent, SubmitEvent, HTMLDocument: Document, HTMLImageElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, Audio, MediaError, TimeRanges, HTMLTemplateElement, Document, DocumentFragment, TreeWalker, NodeIterator, XMLSerializer, Range, Selection, DOMRect, DOMRectReadOnly: DOMRect, MutationObserver, ResizeObserver, IntersectionObserver, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, FocusEvent, InputEvent, CompositionEvent, CanvasRenderingContext2D, ImageData, DataTransfer, FileList, ClipboardEvent, DragEvent, StaticRange, customElements, ShadowRoot, CSSStyleSheet, DOMParser, CSS, StyleSheet, StyleSheetList, MediaList, CSSRule, CSSRuleList, CSSGroupingRule, CSSStyleRule, CSSMediaRule, CSSSupportsRule, CSSContainerRule, CSSLayerBlockRule, CSSLayerStatementRule, CSSKeyframesRule, CSSKeyframeRule, CSSFontFaceRule, CSSPropertyRule, CSSImportRule, CSSStyleDeclaration, AnimationEvent, BeforeUnloadEvent, ElementInternals, FormDataEvent, HashChangeEvent, PageTransitionEvent, PopStateEvent, RadioNodeList, StorageEvent, TransitionEvent });
   Object.defineProperty(ShadowRoot.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'adoptedStyleSheets', adoptedProperty);
   Object.defineProperty(Document.prototype, 'styleSheets', { configurable: true, get() { return styleSheetsOf(this); } });
@@ -3405,7 +3463,7 @@
   handler(HTMLCanvasElement.prototype, 'paint'); handler(HTMLCanvasElement.prototype, 'elementgeometryupdate');
   for (const name of ['fullscreenchange', 'fullscreenerror']) for (const target of [Element.prototype, Document.prototype]) handler(target, name);
   for (const name of [...globalHandlers, ...'afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pagehide pageshow popstate rejectionhandled storage unhandledrejection unload'.split(' ')]) if (!Object.hasOwn(globalThis, 'on' + name)) handler(globalThis, name);
-  for (const [name, Type] of Object.entries(globalThis)) if (typeof Type === 'function' && Type.prototype && (Type.prototype instanceof Node || Type === Event || Type.prototype instanceof Event || /^(HTML|SVG|DOM|Node|Text|Comment|Attr|Range|Selection|Tree|Mutation|Resize|Intersection|Validity|Static|XML|CSS|ShadowRoot|Custom|Image|Canvas|Font|Media|Data|Clipboard|Drag|Composition|Input|Focus|Keyboard|Mouse|Pointer|Wheel|UI|Toggle|Command|Submit|Offscreen|Screen|ElementImage)/.test(name)) && !Object.hasOwn(Type.prototype, Symbol.toStringTag)) Object.defineProperty(Type.prototype, Symbol.toStringTag, { configurable: true, value: name === 'HTMLDocument' ? 'Document' : name });
+  for (const [name, Type] of Object.entries(globalThis)) if (typeof Type === 'function' && Type.prototype && (Type.prototype instanceof Node || Type === Event || Type.prototype instanceof Event || /^(HTML|SVG|DOM|Node|Text|Comment|Attr|Range|Selection|Tree|Mutation|Resize|Intersection|Validity|Static|XML|CSS|ShadowRoot|Custom|Image|Canvas|Font|Media|Data|Clipboard|Drag|Composition|Input|Focus|Keyboard|Mouse|Pointer|Wheel|UI|Toggle|Command|Submit|Offscreen|Screen|ElementImage|FileList)/.test(name)) && !Object.hasOwn(Type.prototype, Symbol.toStringTag)) Object.defineProperty(Type.prototype, Symbol.toStringTag, { configurable: true, value: name === 'HTMLDocument' ? 'Document' : name });
   Object.defineProperty(globalThis, Symbol.toStringTag, { configurable: true, value: 'Window' });
   globalThis.__appsScript = node => { currentScript = node ?? null; };
   globalThis.__appsLoaded = () => {
@@ -4046,7 +4104,12 @@
     }
     // Before the first frame there is no last layout, so observers would see empty boxes.
     if ((resizeObservers.size || intersectionObservers.size) && !geometry[2]) laidOut();
-    for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(), at = geometry[2]; if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === at) continue; const [, , clientWidth, clientHeight, top, right, bottom, left] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom), value = rect.width + ':' + rect.height + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: rect.width, blockSize: rect.height }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) try { observer.callback(entries, observer); } catch (error) { report(error); } }
+    for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(), at = geometry[2]; if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === at) continue; let [, , clientWidth, clientHeight, top, right, bottom, left, borderWidth, borderHeight] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom);
+      // As in Chrome, an SVG element other than `<svg>` reports its bounding box, and a non-replaced inline box nothing.
+      if (target instanceof SVGElement && !(target instanceof SVGSVGElement)) { const box = target.getBBox(); top = left = 0; borderWidth = width = box.width; borderHeight = height = box.height; } else if (!atomicTags.test(target.localName)) { if (getComputedStyle(target).display === 'inline') top = left = borderWidth = borderHeight = width = height = 0; }
+      // An atomic inline box like `<math>` has no client box, so its content box comes from its border box.
+      else if (!clientWidth && !clientHeight && (borderWidth || borderHeight)) { const s = getComputedStyle(target), side = name => parseFloat(s['padding' + name]) + parseFloat(s['border' + name + 'Width']); left = parseFloat(s.paddingLeft); top = parseFloat(s.paddingTop); width = Math.max(0, borderWidth - side('Left') - side('Right')); height = Math.max(0, borderHeight - side('Top') - side('Bottom')); }
+      const value = borderWidth + ':' + borderHeight + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: borderWidth, blockSize: borderHeight }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) try { observer.callback(entries, observer); } catch (error) { report(error); } }
     // Resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
     // `scrollend` fires when a box has not scrolled for 100 ms, and only pages that listen for it pay for the timers.
     for (const id of call('dom.scrollEvents')) {
@@ -4527,7 +4590,7 @@
   const fileType=name=>({'png':'image/png','jpg':'image/jpeg','jpeg':'image/jpeg','webp':'image/webp','gif':'image/gif','svg':'image/svg+xml','txt':'text/plain','md':'text/markdown','json':'application/json','pdf':'application/pdf','html':'text/html','htm':'text/html','css':'text/css','js':'text/javascript','csv':'text/csv','xml':'text/xml','zip':'application/zip','mp3':'audio/mpeg','wav':'audio/wav','mp4':'video/mp4','webm':'video/webm'})[name.split('.').at(-1).toLowerCase()]??'application/octet-stream';
   const picks=new Map();let nextPick=0;
   pickFiles=input=>{if(!native)return;const id=++nextPick;picks.set(id,input);call('dom.filePicker',{id,multiple:input.multiple,directory:input.hasAttribute('webkitdirectory'),accept:input.getAttribute('accept')??''});};
-  globalThis.__appsFilesPicked=(id,files)=>{const input=picks.get(id);picks.delete(id);if(!input)return;if(!files){dispatch(input,new Event('cancel',{bubbles:true}));return;}input._files=files.map(({name,lastModified,data})=>new File([Uint8Array.fromBase64(data)],name,{lastModified,type:fileType(name)}));setValue(input,files.length?'C:\\fakepath\\'+files[0].name:'');dispatch(input,new Event('input',{bubbles:true,composed:true}));dispatch(input,new Event('change',{bubbles:true}));};
+  globalThis.__appsFilesPicked=(id,files)=>{const input=picks.get(id);picks.delete(id);if(!input)return;if(!files){dispatch(input,new Event('cancel',{bubbles:true}));return;}input._files=fileList(files.map(({name,lastModified,data})=>new File([Uint8Array.fromBase64(data)],name,{lastModified,type:fileType(name)})));showFiles(input);dispatch(input,new Event('input',{bubbles:true,composed:true}));dispatch(input,new Event('change',{bubbles:true}));};
   const pickOption=(select,option)=>{if(option._current)return;for(const other of options(select))other._selected=other===option;select._none=false;selectedness(select);revalidate(select);dispatch(select,trusted(new Event('input',{bubbles:true,composed:true})));dispatch(select,trusted(new Event('change',{bubbles:true})));};
   openSelect=select=>{
     if(!native||!navigator.platform.includes('Mac')||select.multiple||select.size>1||disabled(select))return;
@@ -4610,7 +4673,8 @@
   };
   // As in Chrome, a label shares its hover and press with its control.
   const labeled = list => { const label = list.find(node => node.localName === 'label'), control = label && labelControl(label); return control && !list.includes(control) ? [...list, control] : list; };
-  const hover = (target, data) => {
+  // `between` runs after the pointer events, before the mouse events.
+  const hover = (target, data, between) => {
     if (target === hovered) return;
     const previous = hovered, from = previous ? path(previous) : [], to = target ? path(target) : [];
     hovered = target;
@@ -4621,6 +4685,7 @@
       from.forEach((node, index) => { if (node.nodeType !== 11 && !to.includes(node)) fire(node, 'leave', from.slice(index), target, false); });
       if (target) fire(target, 'over', to.slice(), previous, true);
       for (let index = to.length; index--;) if (to[index].nodeType !== 11 && !from.includes(to[index])) fire(to[index], 'enter', to.slice(index), previous, false);
+      if (kind === 'pointer') between?.();
     }
   };
   let press = null, last = null, sliding = null, hoverCheck = null, scrollStart = null;
@@ -4631,18 +4696,22 @@
     if (current) { gotten.delete(1); dispatch(current, trusted(new PointerEvent('lostpointercapture', mouseInit(data, { cancelable: false })))); }
     if (pending) { gotten.set(1, pending); dispatch(pending, trusted(new PointerEvent('gotpointercapture', mouseInit(data, { cancelable: false })))); }
   };
-  // As in Chrome, the hovered element follows layout and scroll changes under a still pointer, at most every 100 ms.
+  // As in Chrome, the hovered element follows DOM, layout and scroll changes under a still pointer, at most every 100 ms.
+  // A layout without DOM changes, like a transition, checks again until the layouts stop. During a press, a DOM change
+  // lets a pending pointer capture take effect.
+  let hoverLayout = 0;
+  const checkHover = () => {
+    hoverCheck = null;
+    if (!last || !hovered || pointers.size && !captures.has(1)) return;
+    const data = { clientX: last[0], clientY: last[1], buttons: pointers.size }, capture = captures.get(1), hit = capture ?? hitAt(last[0], last[1]);
+    native++; try { if (!capture) settleCapture(data); hover(hit?.nodeType === 3 ? hit.parentElement : hit, mouseInit(data), () => settleCapture(data)); settleCapture(data); } finally { native--; }
+    hoverVersion = version; hoverLayout = moves[0];
+  };
   const pointerLayout = globalThis.__appsLayout;
   globalThis.__appsLayout = () => {
     pointerLayout();
-    if (hoverCheck || !last || !hovered || pointers.size || hoverVersion === version) return;
-    hoverCheck = setTimeout(() => {
-      hoverCheck = null;
-      if (!last || !hovered || pointers.size) return;
-      const hit = hitAt(last[0], last[1]), element = hit?.nodeType === 3 ? hit.parentElement : hit;
-      native++; try { hover(element, mouseInit({ clientX: last[0], clientY: last[1] })); } finally { native--; }
-      hoverVersion = version;
-    }, 100);
+    if (hoverCheck || !last || !hovered || hoverVersion === version && (pointers.size || hoverLayout === moves[0] && !geometry[0]) || pointers.size && !captures.has(1)) return;
+    hoverCheck = setTimeout(checkHover, 100);
   };
   const slide = (node, x) => { const rect = node.getBoundingClientRect(), thumb = Math.min(rect.height, 16), [min, max] = rangeBounds(node); setRange(node, min + Math.min(1, Math.max(0, (x - rect.left - thumb / 2) / (rect.width - thumb || 1))) * (max - min)); };
   const mouseInit = (data, extra) => ({ bubbles: true, cancelable: true, composed: true, view: window, clientX: data.clientX, clientY: data.clientY, screenX: data.screenX ?? data.clientX, screenY: data.screenY ?? data.clientY, ctrlKey: !!data.ctrlKey, metaKey: !!data.metaKey, altKey: !!data.altKey, shiftKey: !!data.shiftKey, button: data.button ?? 0, buttons: data.buttons ?? 0, detail: data.detail ?? 0, movementX: last ? data.clientX - last[0] : 0, movementY: last ? data.clientY - last[1] : 0, pointerId: 1, pointerType: 'mouse', isPrimary: true, ...extra });
@@ -4673,7 +4742,7 @@
       return true;
     }
     if (name === 'keydown' || name === 'keyup') {
-      if (name === 'keydown' && !keyboardFocus && !data.metaKey && !data.ctrlKey && !data.altKey) { keyboardFocus = true; if (active) call('dom.focus', path(active).map(node => node._id), ring = true, !windowFocused); }
+      if (name === 'keydown' && !hadKey && !data.metaKey && !data.ctrlKey && !data.altKey) { hadKey = true; if (active && !ring) call('dom.focus', path(active).map(node => node._id), ring = true, !windowFocused); }
       const target = active ?? document.body; if (!target) return false;
       if (data.nativeKey !== undefined) {
         const raw = data.nativeKey, upper = raw.toUpperCase(), named = nativeKeys[raw] ?? (/^f\d{1,2}$/.test(raw) ? upper : null);
@@ -4778,7 +4847,7 @@
         if (next !== target) { next.focus(); fireClick(next, { detail: 0 }, true); }
         return false;
       }
-      const sign = plain && !editable(target) && !target.isContentEditable && tag !== 'select' && !(event.key === ' ' && activation(target)) ? { ' ': event.shiftKey ? -1 : 1, PageDown: 1, PageUp: -1, ArrowDown: 1, ArrowUp: -1, ArrowRight: 1, ArrowLeft: -1, Home: -1, End: 1 }[event.key] : 0;
+      const sign = plain && (!event.shiftKey || event.key === ' ') && !editable(target) && !target.isContentEditable && tag !== 'select' && !(event.key === ' ' && activation(target)) ? { ' ': event.shiftKey ? -1 : 1, PageDown: 1, PageUp: -1, ArrowDown: 1, ArrowUp: -1, ArrowRight: 1, ArrowLeft: -1, Home: -1, End: 1 }[event.key] : 0;
       if (sign) {
         // Like Chrome: the focused box, or else the box of the last press, or the nearest ancestor that can scroll that way. Then the page.
         const x = /Left|Right/.test(event.key), root = document.scrollingElement;
@@ -4791,15 +4860,35 @@
       }
       if (event.key === 'Tab' && !event.metaKey && !event.ctrlKey && !event.altKey) {
         // Wrap only records whose tabIndex can be 0 or more: wrappers live until their nodes leave the page.
-        const found = [], stack = [records[0]];
+        // Without a focused element, Tab starts at the last press or the place of the removed focused element: the
+        // count of candidates before that place in the composed tree.
+        const [at, before] = active ? [] : navStart ?? [], end = {};
+        laidOut();
+        const found = [], stack = [records[0]], scrollers = new Set();
+        let boundary = -1;
         while (stack.length) {
           const rec = stack.pop(), tag = rec.tag;
+          if (rec === end) { boundary = found.length; continue; }
+          if (rec === before?._m) boundary = found.length;
           if (tag[0] !== '#' && (rec.attrs.has('tabindex') || rec.attrs.has('contenteditable') || tag.includes('-') || /^(input|textarea|button|select|iframe|summary|terminal)$/.test(tag) || (tag === 'a' || tag === 'area') && rec.attrs.has('href'))) { const node = of(rec); if ((/^\s*[+-]?\d/.test(rec.attrs.get('tabindex') ?? '') ? node.tabIndex >= 0 : tag !== 'dialog') && focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable)) found.push(node); }
+          else if (tag[0] !== '#' && overflows(rec.id)) { const node = of(rec); if (focusable(node)) { scrollers.add(node); found.push(node); } }
           const assigned = tag === 'slot' && of(rec) instanceof HTMLSlotElement ? call('dom.assignedNodes', rec.id, false) : null, kids = assigned?.length ? assigned.map(id => records[id]) : (rec.shadow ?? rec).kids;
+          if (rec === at?._m) { if (before === undefined) boundary = found.length; else if (before === null) stack.push(end); }
           for (let index = kids.length; index--;) stack.push(kids[index]);
         }
-        const list = found.map((node, order) => [node.tabIndex > 0 ? node.tabIndex : Infinity, order, node]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(entry => entry[2]), index = list.indexOf(active), next = index < 0 ? (event.shiftKey ? list.length - 1 : 0) : (index + (event.shiftKey ? -1 : 1) + list.length) % list.length;
-        list[next]?.focus();
+        // Like Chrome, a scroller is a Tab stop only when nothing in it is one.
+        const sorted = found.map((node, order) => [node.tabIndex > 0 ? node.tabIndex : Infinity, order, node]).filter(entry => !scrollers.has(entry[2]) || !entry[2].contains(found[entry[1] + 1] ?? null)).sort((a, b) => a[0] - b[0] || a[1] - b[1]), list = sorted.map(entry => entry[2]), index = list.indexOf(active);
+        let next = index < 0 ? (event.shiftKey ? list.length - 1 : 0) : (index + (event.shiftKey ? -1 : 1) + list.length) % list.length;
+        if (index < 0 && boundary >= 0) {
+          const from = event.shiftKey ? sorted.findLastIndex(entry => entry[1] < boundary) : sorted.findIndex(entry => entry[1] >= boundary);
+          if (from >= 0) next = from;
+        }
+        // Like Chrome, keyboard focus selects all the text of an input. A textarea keeps its selection.
+        const node = list[next], all = node instanceof HTMLInputElement && editable(node) && node !== active;
+        if (all) node.setSelectionRange(0, node.value.length, 'none', true);
+        if (node && node !== active) mouseFocus = false;
+        node?.focus();
+        if (all && active === node) call('dom.selection', node._id, node._start, node._end);
         return false;
       }
       return true;
@@ -4815,8 +4904,10 @@
     }
     if (name !== 'pointermove' && name !== 'pointerdown' && name !== 'pointerup') return false;
     if (name === 'pointerdown') finishComposition();
+    // Like Chrome, a new capture target gets the pointer boundary events, then `gotpointercapture`, then the mouse ones.
+    if (!captures.has(1)) settleCapture(data);
+    hover(element, mouseInit(data), () => settleCapture(data)); hoverVersion = version; hoverLayout = moves[0];
     settleCapture(data);
-    if (!captures.has(1)) hover(element, mouseInit(data));
     // A terminal gets the pointer while a button is down, also outside its box, and every move above it.
     if (terminalDrag && name !== 'pointerdown') { if (terminalOf(terminalDrag)) terminalMouse(terminalOf(terminalDrag), name === 'pointerup' ? 1 : 2, name === 'pointerup' ? [1, 3, 2][data.button ?? 0] ?? 0 : 0, data); if (name === 'pointerup' && !data.buttons) terminalDrag = null; }
     else if (name === 'pointermove' && terminalOf(element)) terminalMouse(terminalOf(element), 2, 0, data);
@@ -4827,7 +4918,6 @@
     if (!target) return false;
     const first = name === 'pointerdown' && (!press || press.button === button), ended = name === 'pointerup' && !data.buttons;
     if (first) { pointers.add(1); press = { target, button, detail: data.detail ?? 1, mouse: true }; }
-    if (name === 'pointerdown') keyboardFocus = false;
     if (first || ended) {
       if (autos.length || hints.length) {
         const clicked = nearestPopover(target, [...autos, ...hints]), invoker = path(target).map(node => node.nodeType === 1 && invoked(node)).find(popover => popover?._popover && popover._popover !== 'manual') ?? null;
@@ -4848,10 +4938,14 @@
     if (moved) eventState(down).which = 0;
     // Disabled controls get no mouse events, but a press on them still moves the focus.
     const mouse = (press?.mouse ?? true) && (blocked || dispatch(target, down));
+    // Like Chrome, every press sets the place where Tab starts.
+    if (name === 'pointerdown') navStart = [target.nodeType === 1 ? target : target.parentElement];
     if (name === 'pointerdown' && mouse) {
       if (button === 0) selectionDrag = null;
-      const focus = path(target).find(node => focusable(node) && !(node.isContentEditable && node.parentElement?.isContentEditable));
-      const offset = editable(focus) && button === 0 ? call('dom.textIndex', focus._id, data.clientX, data.clientY) : 0;
+      const focus = path(target).find(node => focusable(node, true) && !(node.isContentEditable && node.parentElement?.isContentEditable));
+      const offset = editable(focus) && button === 0 ? textCall('dom.textIndex', focus._id, data.clientX, data.clientY) : 0;
+      // Like Chrome, a press that moves the focus forgets the last key, and one that focuses an element makes it a mouse focus.
+      if (focus ? focus !== active : button === 0 && active) { hadKey = false; if (focus) mouseFocus = true; }
       if (focus) focus.focus({ preventScroll: true }); else if (button === 0) active?.blur();
       scrollStart = target.nodeType === 1 ? target : target.parentElement;
       if (button === 0 && focus?.localName === 'select') openSelect(focus);
@@ -4887,7 +4981,7 @@
       const { host, node, offset, endNode, endOffset, granularity } = selectionDrag;
       selectionDrag.x = data.clientX; selectionDrag.y = data.clientY;
       if (editable(host)) {
-        let end = call('dom.textIndex',host._id,data.clientX,data.clientY), start = offset;
+        let end = textCall('dom.textIndex',host._id,data.clientX,data.clientY), start = offset;
         if (granularity > 1) {
           const extent = selectionExtent(host.value,end,granularity);
           [start,end] = end < offset ? [endOffset,extent[0]] : [offset,Math.max(endOffset,extent[1])];
@@ -4911,6 +5005,8 @@
       if (!blocked && common?.isConnected) { if (button === 0) { fireClick(common, { ...init, detail }, true); if (detail === 2) dispatch(common, trusted(new MouseEvent('dblclick', { ...init, detail }))); } else dispatch(common, trusted(new PointerEvent('auxclick', { ...init, detail }))); }
     }
     if (ended) { selectionDrag = null; press = null; pointers.delete(1); }
+    // The press changes its own state, so only later changes check the hover.
+    if (name === 'pointerdown') hoverVersion = version;
     return result;
   };
 })();

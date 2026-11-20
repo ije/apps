@@ -362,6 +362,94 @@ pub(super) struct Sticky {
     pub(super) block: Option<(usize, [f32; 4])>,
 }
 
+// The layout place of an element's border box, which its `::before` and `::after` boxes measure from.
+pub(super) struct ElementOrigin(pub(super) Rc<Cell<Point<Pixels>>>);
+
+impl Hooks for ElementOrigin {
+    fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        self.0.set(cx.exact.origin);
+        inner(cx.window)
+    }
+    fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        self.0.set(cx.exact.origin);
+        inner(cx.window)
+    }
+    fn volatile(&self) -> bool {
+        false
+    }
+    fn bounded(&self) -> bool {
+        true
+    }
+    fn cached(&self) -> bool {
+        true
+    }
+    fn skippable(&self) -> bool {
+        true
+    }
+    fn skip(&self, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+    fn shifts(&self) -> bool {
+        true
+    }
+    fn shift(&self, _: Point<Pixels>, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+}
+
+// Keeps the box of a `::before` or `::after` for `getComputedStyle()`: its layout place from the border box of
+// its element without the scroll of the element, its size, and its padding plus border. Moves of the element
+// don't change them, so only prepaint writes them.
+pub(super) struct PseudoBox {
+    pub(super) view: Rc<super::PageState>,
+    pub(super) element: usize,
+    pub(super) origin: Rc<Cell<Point<Pixels>>>,
+    pub(super) key: usize,
+}
+
+impl Hooks for PseudoBox {
+    fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let view = &*self.view;
+        let scale = cx.window.scale_factor();
+        let mut host = view.host.borrow_mut();
+        let dom = host.dom.entry(view.id).or_default();
+        let scroll = dom
+            .scroll
+            .get(&self.element)
+            .map_or(Point::default(), |handle| {
+                crate::dom::painted_offset(handle, scale)
+            });
+        let at = cx.exact.origin - self.origin.get() - scroll;
+        let [x, y] = [at.x, at.y].map(f32::from);
+        let [w, h] = [cx.exact.size.width, cx.exact.size.height].map(f32::from);
+        let [a, b, c, d] = cx.inset.map(f32::from);
+        dom.pseudo_boxes.insert(self.key, [x, y, w, h, a, b, c, d]);
+        drop(host);
+        inner(cx.window)
+    }
+    fn volatile(&self) -> bool {
+        false
+    }
+    fn bounded(&self) -> bool {
+        true
+    }
+    fn cached(&self) -> bool {
+        true
+    }
+    fn skippable(&self) -> bool {
+        true
+    }
+    fn skip(&self, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+    fn shifts(&self) -> bool {
+        true
+    }
+    fn shift(&self, _: Point<Pixels>, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+}
+
 pub(super) struct DomBox {
     pub(super) anchor: Option<([bool; 2], bool, [f32; 2])>,
     pub(super) id: usize,
@@ -372,6 +460,8 @@ pub(super) struct DomBox {
     pub(super) fixed: bool,
     pub(super) block: Option<[f32; 4]>,
     pub(super) container: Option<usize>,
+    // The containing block is right-to-left, so `right` wins over `left`.
+    pub(super) rtl: bool,
     pub(super) sized: Option<[f32; 2]>,
     pub(super) inset: [Option<f32>; 4],
     pub(super) style: Rc<style::Style>,
@@ -671,11 +761,15 @@ impl Hooks for DomBox {
                     0 => dom.scroll.get(&0).map(|scroll| {
                         let [width, height] = self.units.viewport;
                         Rect::new(
-                            scroll.bounds().origin + scroll.offset() + scroll.stretch(),
+                            scroll.bounds().origin + scroll.painted(),
                             renderer::size(px(width), px(height)),
                         )
                     }),
-                    _ => dom.blocks.get(&container).copied(),
+                    // The boxes that a scroll container contains move with its scroll.
+                    _ => dom.blocks.get(&container).map(|block| {
+                        let scroll = dom.scroll.get(&container);
+                        *block + scroll.map_or(Point::default(), |s| s.painted())
+                    }),
                 })
             }
         {
@@ -702,10 +796,10 @@ impl Hooks for DomBox {
             let [top, right, bottom, left] = self.inset;
             let [margin_top, margin_right, margin_bottom, margin_left] = self.margin.map(px);
             let mut shift = point(px(0.), px(0.));
-            if let Some(left) = left {
-                shift.x = block.left() + px(left) + margin_left - bounds.left();
-            } else if let Some(right) = right {
+            if let Some(right) = right.filter(|_| self.rtl || left.is_none()) {
                 shift.x = block.right() - px(right) - margin_right - bounds.right();
+            } else if let Some(left) = left {
+                shift.x = block.left() + px(left) + margin_left - bounds.left();
             }
             if let Some(top) = top {
                 shift.y = block.top() + px(top) + margin_top - bounds.top();
@@ -1130,7 +1224,7 @@ impl DomBox {
         }
         let (clip, mut layers) = self.effects(bounds, matrix, window);
         let mut paint = |window: &mut Window| match &clip {
-            Some(clip) => window.scope(renderer::Scope::Clip(Some(*clip)), |window| inner(window)),
+            Some(clip) => window.with_group_clip(*clip, |window| inner(window)),
             None => inner(window),
         };
         nest_effects(&mut layers, window, &mut paint);

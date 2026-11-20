@@ -181,17 +181,25 @@ impl TextLine {
                 None => return Err(0),
             },
         };
-        let (end, right) = match self.row_start(row + 1) {
-            Some(glyph) => (glyph.index as usize, glyph.x),
-            None => (self.line.len, self.line.width),
+        let (end, right, kept) = match self.row_start(row + 1) {
+            // Like Chrome, the caret goes before the spaces that hang at the end of a wrapped row.
+            Some(glyph) => {
+                let end = glyph.index as usize;
+                let kept = self
+                    .text
+                    .get(start..end)
+                    .map_or(end, |text| start + text.trim_end_matches(' ').len());
+                (end, glyph.x, kept)
+            }
+            None => (self.line.len, self.line.width, self.line.len),
         };
         let x = x + left;
         if x < left {
             Err(start)
         } else if x >= right {
-            Err(end)
+            Err(kept)
         } else if nearest {
-            Ok(self.line.nearest_index(x))
+            Ok(self.line.nearest_index(x).min(kept))
         } else {
             // A trailing zero-width glyph can reach past the line width, where no glyph starts.
             self.line.index_at(x).ok_or(end)

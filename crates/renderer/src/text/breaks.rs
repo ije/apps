@@ -76,7 +76,11 @@ pub(crate) fn breaks_beside(
 ) -> Vec<u32> {
     let width = wrapping.width.unwrap_or_default();
     let held = |index: usize| nowrap.iter().any(|range| range.contains(&index));
-    let even = wrapping.wrap != TextWrap::Wrap && wrapping.max_lines.is_none() && banded.is_none();
+    // Like Chromium, preserved tabs turn balance and pretty off.
+    let even = wrapping.wrap != TextWrap::Wrap
+        && wrapping.max_lines.is_none()
+        && banded.is_none()
+        && !text.contains('\t');
     let mut edges = [0.; 2];
     if let Some(banded) = banded.as_deref_mut() {
         edges = banded.edges(banded.y).0;
@@ -95,7 +99,7 @@ pub(crate) fn breaks_beside(
     let mut chance: Option<(u32, Pixels)> = None;
     let (mut row_glyph, mut row_x) = (0, px(0.));
     let (mut started, mut words_end, mut previous_index) = (false, 0., 0);
-    let (mut previous, mut after_hyphen) = ('\0', false);
+    let (mut previous, mut before_previous) = ('\0', '\0');
     for (at, glyph) in glyphs.iter().enumerate() {
         let index = glyph.index as usize;
         let Some(ch) = text[index..].chars().next() else {
@@ -107,23 +111,25 @@ pub(crate) fn breaks_beside(
         let joined = !nowrap.is_empty() && held(index) && held(previous_index);
         previous_index = index;
         let at = at as u32;
+        let class = line_class(ch);
         if started
             && ch != ' '
             && !joined
-            && (matches!(previous, ' ' | '\u{fffc}')
-                || !is_word_char(ch)
-                    && !(wrapping.word_break == WordBreak::KeepAll
-                        && ch.is_alphanumeric()
-                        && previous.is_alphanumeric())
-                    // Like Chrome, an opening bracket stays with a letter, a number or a prefix before it.
-                    && !(matches!(ch, '(' | '[' | '{')
-                        && (previous.is_alphanumeric()
-                            || matches!(
-                                previous,
-                                '$' | '€' | '\'' | '(' | '[' | '{' | '«' | '<' | '\u{a0}'
-                            )))
+            // A zero width joiner holds the characters on both sides together.
+            && !text[..index].ends_with('\u{200d}')
+            && (previous == ' '
                 || wrapping.word_break == WordBreak::BreakAll
-                || after_hyphen && ch.is_alphabetic())
+                || class != CM
+                    && can_break(
+                        before_previous,
+                        previous,
+                        ch,
+                        class,
+                        &text[index + ch.len_utf8()..],
+                    )
+                    && !(wrapping.word_break == WordBreak::KeepAll
+                        && LETTERS & 1 << line_class(previous) != 0
+                        && LETTERS & 1 << class != 0))
         {
             chance = Some((at, glyph.x));
             if even {
@@ -181,8 +187,9 @@ pub(crate) fn breaks_beside(
                 banded.rows.push([edges[0], edges[1], banded.y]);
             }
         }
-        after_hyphen = ch == '-' && previous.is_alphanumeric();
-        previous = ch;
+        if class != CM {
+            (before_previous, previous) = (previous, ch);
+        }
     }
     if let Some(banded) = banded {
         banded.y += banded.line;
@@ -195,10 +202,16 @@ pub(crate) fn breaks_beside(
         x: line.width.0,
         words_end,
     });
-    even_out(rows, &chances, width.0, wrapping)
+    even_out(rows, &chances, width.0, line.font_size.0, wrapping)
 }
 
-fn even_out(rows: Vec<u32>, chances: &[Chance], max: f32, wrapping: &Wrapping) -> Vec<u32> {
+fn even_out(
+    rows: Vec<u32>,
+    chances: &[Chance],
+    max: f32,
+    font_size: f32,
+    wrapping: &Wrapping,
+) -> Vec<u32> {
     let (wrap, indent) = (wrapping.wrap, wrapping.indent.0);
     let last = chances.len() - 1;
     let span = |from: usize, to: usize| {
@@ -213,26 +226,30 @@ fn even_out(rows: Vec<u32>, chances: &[Chance], max: f32, wrapping: &Wrapping) -
     }
     greedy.push(last);
     let count = greedy.len() - 1;
-    let ideal = match wrap {
-        TextWrap::Balance => {
-            greedy
-                .windows(2)
-                .map(|pair| span(pair[0], pair[1]))
-                .sum::<f32>()
-                / count as f32
-        }
-        _ => max - 45.,
+    let ideal = if wrap == TextWrap::Balance {
+        greedy
+            .windows(2)
+            .map(|pair| span(pair[0], pair[1]))
+            .sum::<f32>()
+            / count as f32
+    } else {
+        0.
     };
     let pretty = wrap == TextWrap::Pretty;
-    if pretty && (1..=last).any(|at| span(at - 1, at) > max) {
-        return rows;
-    }
-    // Like Chromium, pretty acts only on a last row of one word, and moves only the breaks of the last 4 rows.
-    if pretty && (count < 2 || greedy[count - 1] + 1 != last) {
-        return rows;
-    }
+    // Like Chromium's ScoreLineBreaker: pretty acts only when no word overflows and the greedy last row
+    // is one word shorter than a third of the row. It moves only the breaks of the last 4 rows, and
+    // needs 3 break chances there.
     let kept = if pretty { count.saturating_sub(4) } else { 0 };
     let start = greedy[kept];
+    if pretty
+        && (count < 2
+            || greedy[count - 1] + 1 != last
+            || span(greedy[count - 1], last) >= max / 3.
+            || last - start < 4
+            || (1..=last).any(|at| span(at - 1, at) > max))
+    {
+        return rows;
+    }
     // Balance keeps the row count of the greedy result: a layer per row count. Pretty needs only "reached".
     let exact = wrap == TextWrap::Balance && count <= 12;
     let layers = if exact { count + 1 } else { 2 };
@@ -240,28 +257,19 @@ fn even_out(rows: Vec<u32>, chances: &[Chance], max: f32, wrapping: &Wrapping) -
     let mut cost = vec![f32::INFINITY; chances.len() * layers];
     let mut came = vec![0; chances.len() * layers];
     cost[cell(start, 0)] = 0.;
-    let (mut first, mut reached) = (start, start);
+    let mut first = start;
+    // Chromium's penalties: a cost per row, and an orphan cost for a last row of one word.
+    let line_penalty = 4. * max * font_size;
     for to in start + 1..=last {
         while first < to && span(first, to) > max {
             first += 1;
         }
-        if pretty && first > reached {
-            // Nothing fits from the last reached chance, so take its longest overfull row.
-            let end = (reached + 2..=last)
-                .take_while(|&end| span(reached, end) <= max)
-                .last()
-                .unwrap_or(reached + 1);
-            cost[cell(end, 1)] = cost[cell(reached, 1)].min(cost[cell(reached, 0)]);
-            came[cell(end, 1)] = reached;
-            reached = end;
-        }
         for from in first..to {
             let width = span(from, to);
-            // Pretty scores the slack of each row but the last, which only needs two words.
             let row = match (pretty, to == last) {
-                (true, true) if from + 1 == to => f32::INFINITY,
-                (true, true) => 0.,
-                (true, false) => (max - width).powi(2),
+                (true, true) if from + 1 == to => 50000. + line_penalty,
+                (true, true) => line_penalty,
+                (true, false) => (max - width).powi(2) + line_penalty,
                 _ => 100. * ((width - ideal) / 15.).abs().powi(3),
             };
             for layer in 0..if exact { layers - 1 } else { layers } {
@@ -275,7 +283,6 @@ fn even_out(rows: Vec<u32>, chances: &[Chance], max: f32, wrapping: &Wrapping) -
                 {
                     cost[cell(to, next)] = total;
                     came[cell(to, next)] = from;
-                    reached = to;
                 }
             }
         }
@@ -291,18 +298,225 @@ fn even_out(rows: Vec<u32>, chances: &[Chance], max: f32, wrapping: &Wrapping) -
         layer = if exact { layer - 1 } else { 1 };
         at = came[cell(at, layer)];
     }
+    // Like Chromium, pretty falls back to the greedy rows when it would change their count.
+    if pretty && picked.len() != count - 1 - kept {
+        return rows;
+    }
     picked.extend(rows[..kept].iter().rev());
     picked.reverse();
     picked
 }
 
-pub(crate) fn is_word_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || matches!(c,
-            '\u{c0}'..='\u{24f}' | '\u{300}'..='\u{36f}' | '\u{400}'..='\u{4ff}' | '\u{980}'..='\u{9ff}'
-            | '\u{1e00}'..='\u{1eff}' | '\u{a0}' | '\u{2011}' | '\u{202f}'
-            | '-' | '_' | '.' | ',' | ':' | ';' | '\'' | '"' | '!' | '$' | '%' | '@' | '#' | '^' | '~' | '='
-            | ')' | ']' | '}' | '‘' | '’' | '”' | '»' | '…' | '⋯')
+// UAX #14 line break classes, merged where Chrome breaks the same. OPW is an East Asian wide OP.
+// SA (Thai, Lao, Myanmar, Khmer) needs a dictionary, so it breaks between its letters as a fallback.
+const AL: u8 = 0;
+const NU: u8 = 1;
+const OP: u8 = 2;
+const OPW: u8 = 3;
+const CL: u8 = 4;
+const CP: u8 = 5;
+const QU: u8 = 6;
+const GL: u8 = 7;
+const NS: u8 = 8;
+const EX: u8 = 9;
+const SY: u8 = 10;
+const IS: u8 = 11;
+const PR: u8 = 12;
+const PO: u8 = 13;
+const ID: u8 = 14;
+const IN: u8 = 15;
+const HY: u8 = 16;
+const BA: u8 = 17;
+const B2: u8 = 18;
+const ZW: u8 = 19;
+const CM: u8 = 20;
+const CB: u8 = 21;
+const SA: u8 = 22;
+
+const fn set(classes: &[u8]) -> u32 {
+    let (mut set, mut at) = (0, 0);
+    while at < classes.len() {
+        set |= 1 << classes[at];
+        at += 1;
+    }
+    set
+}
+
+const LETTERS: u32 = set(&[AL, NU, ID]);
+/// Classes with no break before them, and with no break after them.
+const NO_BREAK_BEFORE: u32 = set(&[CL, CP, EX, IS, SY, QU, GL, NS, IN, HY, BA, CM, ZW]);
+const NO_BREAK_AFTER: u32 = set(&[OP, OPW, QU, GL]);
+
+fn line_class(c: char) -> u8 {
+    match c {
+        'a'..='z' | 'A'..='Z' => AL,
+        '0'..='9' => NU,
+        '(' | '[' | '{' => OP,
+        ')' | ']' => CP,
+        '}' => CL,
+        '-' => HY,
+        '!' | '?' => EX,
+        '.' | ',' | ':' | ';' => IS,
+        '/' => SY,
+        '$' | '+' | '\\' => PR,
+        '%' => PO,
+        '"' | '\'' => QU,
+        '|' => BA,
+        '\0'..='\u{7f}' => AL,
+        '\u{a0}' | '\u{ad}' | '\u{2007}' | '\u{2011}' | '\u{202f}' | '\u{2060}' | '\u{feff}' => GL,
+        '\u{200b}' => ZW,
+        '\u{fffc}' => CB,
+        '\u{300}'..='\u{36f}'
+        | '\u{e31}'
+        | '\u{e34}'..='\u{e3a}'
+        | '\u{e47}'..='\u{e4e}'
+        | '\u{1ab0}'..='\u{1aff}'
+        | '\u{1dc0}'..='\u{1dff}'
+        | '\u{200c}'
+        | '\u{200d}'
+        | '\u{20d0}'..='\u{20ff}'
+        | '\u{fe00}'..='\u{fe0f}'
+        | '\u{fe20}'..='\u{fe2f}'
+        | '\u{1f3fb}'..='\u{1f3ff}'
+        | '\u{e0020}'..='\u{e01ef}' => CM,
+        '\u{a1}' | '\u{bf}' | '\u{201a}' | '\u{201e}' | '\u{2045}' | '\u{207d}' | '\u{208d}' => OP,
+        '\u{2046}' | '\u{207e}' | '\u{208e}' => CL,
+        '\u{ab}'
+        | '\u{bb}'
+        | '\u{2018}'
+        | '\u{2019}'
+        | '\u{201b}'..='\u{201d}'
+        | '\u{201f}'
+        | '\u{2039}'
+        | '\u{203a}' => QU,
+        '\u{2014}' | '\u{2e3a}' | '\u{2e3b}' => B2,
+        '\u{5be}'
+        | '\u{2000}'..='\u{2006}'
+        | '\u{2008}'..='\u{200a}'
+        | '\u{2010}'
+        | '\u{2012}'
+        | '\u{2013}'
+        | '\u{2027}'
+        | '\u{205f}'
+        | '\u{3000}' => BA,
+        '\u{2024}'..='\u{2026}' | '\u{22ef}' | '\u{fe19}' => IN,
+        '\u{61b}' | '\u{61f}' | '\u{6d4}' | '\u{fe56}' | '\u{fe57}' | '\u{ff01}' | '\u{ff1f}' => EX,
+        '\u{37e}' | '\u{60c}' | '\u{60d}' | '\u{2044}' | '\u{fe10}' | '\u{fe13}' | '\u{fe14}' => IS,
+        '\u{a3}'..='\u{a5}'
+        | '\u{b1}'
+        | '\u{2116}'
+        | '\u{2212}'
+        | '\u{2213}'
+        | '\u{20a0}'..='\u{20a6}'
+        | '\u{20a8}'..='\u{20cf}' => PR,
+        '\u{a2}'
+        | '\u{b0}'
+        | '\u{2030}'..='\u{2037}'
+        | '\u{20a7}'
+        | '\u{2103}'
+        | '\u{2109}'
+        | '\u{ff05}'
+        | '\u{ffe0}' => PO,
+        '\u{3001}' | '\u{3002}' | '\u{ff09}' | '\u{ff0c}' | '\u{ff0e}' | '\u{ff3d}'
+        | '\u{ff5d}' | '\u{ff60}' | '\u{ff61}' | '\u{ff63}' | '\u{ff64}' | '\u{301e}'
+        | '\u{301f}' => CL,
+        '\u{ff08}' | '\u{ff3b}' | '\u{ff5b}' | '\u{ff5f}' | '\u{ff62}' | '\u{301d}' => OPW,
+        '\u{3008}'..='\u{3011}' | '\u{3014}'..='\u{301b}' => {
+            if c as u32 & 1 == 0 {
+                OPW
+            } else {
+                CL
+            }
+        }
+        '\u{3005}'
+        | '\u{301c}'
+        | '\u{303b}'
+        | '\u{309b}'..='\u{309e}'
+        | '\u{30a0}'
+        | '\u{30fb}'..='\u{30fe}'
+        | '\u{31f0}'..='\u{31ff}'
+        | '\u{203c}'
+        | '\u{203d}'
+        | '\u{2047}'..='\u{2049}'
+        | '\u{ff1a}'
+        | '\u{ff1b}'
+        | '\u{ff65}'
+        | '\u{ff67}'..='\u{ff70}' => NS,
+        // Small kana.
+        '\u{3041}' | '\u{3043}' | '\u{3045}' | '\u{3047}' | '\u{3049}' | '\u{3063}'
+        | '\u{3083}' | '\u{3085}' | '\u{3087}' | '\u{308e}' | '\u{3095}' | '\u{3096}'
+        | '\u{30a1}' | '\u{30a3}' | '\u{30a5}' | '\u{30a7}' | '\u{30a9}' | '\u{30c3}'
+        | '\u{30e3}' | '\u{30e5}' | '\u{30e7}' | '\u{30ee}' | '\u{30f5}' | '\u{30f6}' => NS,
+        '\u{660}'..='\u{669}' | '\u{6f0}'..='\u{6f9}' => NU,
+        '\u{e00}'..='\u{eff}' | '\u{1000}'..='\u{109f}' | '\u{1780}'..='\u{17ff}' => SA,
+        '\u{1100}'..='\u{115f}'
+        | '\u{2e80}'..='\u{2fff}'
+        | '\u{3003}'..='\u{33ff}'
+        | '\u{3400}'..='\u{4dbf}'
+        | '\u{4e00}'..='\u{9fff}'
+        | '\u{a000}'..='\u{a4cf}'
+        | '\u{ac00}'..='\u{d7af}'
+        | '\u{f900}'..='\u{faff}'
+        | '\u{fe30}'..='\u{fe4f}'
+        | '\u{ff00}'..='\u{ffef}'
+        | '\u{1f000}'..='\u{1faff}'
+        | '\u{20000}'..='\u{3fffd}' => ID,
+        _ => AL,
+    }
+}
+
+/// East Asian wide and fullwidth characters, roughly.
+fn wide(c: char) -> bool {
+    matches!(c,
+        '\u{1100}'..='\u{115f}' | '\u{2e80}'..='\u{a4cf}' | '\u{ac00}'..='\u{d7a3}' | '\u{f900}'..='\u{faff}'
+        | '\u{fe30}'..='\u{fe4f}' | '\u{ff00}'..='\u{ff60}' | '\u{ffe0}'..='\u{ffe6}' | '\u{1f300}'..='\u{1faff}'
+        | '\u{20000}'..='\u{3fffd}')
+}
+
+/// Whether a line can break between `previous` and `ch` (of `class`), with no spaces between them.
+fn can_break(before_previous: char, previous: char, ch: char, class: u8, after: &str) -> bool {
+    // Like Chrome, pairs of ASCII characters break only after `-` and `?`, and before an opening bracket after some symbols.
+    if previous.is_ascii() && ch.is_ascii() {
+        let ch = ch as u8;
+        return match previous {
+            // A `-` before a digit is a minus sign unless a letter or a digit comes before it.
+            '-' if ch.is_ascii_digit() => before_previous.is_ascii_alphanumeric(),
+            '-' => !b"!$),./:;?]}".contains(&ch),
+            '?' => !b"!\"'),./:;?]}".contains(&ch),
+            _ => b"([{<".contains(&ch) && b"!\"#%&)*+,-.:;=>?\\]|}~".contains(&(previous as u8)),
+        };
+    }
+    let before = line_class(previous);
+    if matches!(before, ZW | CB) || class == CB {
+        return true;
+    }
+    const NOT_QU: u32 = !(1 << QU);
+    if NO_BREAK_BEFORE & NOT_QU & 1 << class != 0 || NO_BREAK_AFTER & NOT_QU & 1 << before != 0 {
+        return class == GL && matches!(before, HY | BA);
+    }
+    // Like Chrome (UAX #14 LB19a), an opening quote can start a line and a closing quote can end one only
+    // between East Asian characters.
+    if class == QU || before == QU {
+        let opening = matches!(
+            ch,
+            '\u{2018}' | '\u{201c}' | '\u{ab}' | '\u{2039}' | '\u{201b}' | '\u{201f}'
+        );
+        let closing = matches!(previous, '\u{2019}' | '\u{201d}' | '\u{bb}' | '\u{203a}');
+        return opening && wide(previous) && after.chars().next().is_some_and(wide)
+            || closing && wide(ch) && wide(before_previous);
+    }
+    let kept = match class {
+        AL => const { set(&[AL, NU, PR, PO, IS, CP, SA]) },
+        SA => const { set(&[AL, NU, PR, PO, IS, CP]) },
+        NU => const { set(&[AL, NU, PR, PO, IS, SY, HY, CP, SA]) },
+        OP => const { set(&[AL, NU, SA]) },
+        PR => const { set(&[AL, NU, SA]) },
+        PO => const { set(&[AL, NU, ID, SA]) },
+        ID => const { set(&[PR]) },
+        B2 => const { set(&[B2]) },
+        _ => 0,
+    };
+    kept & 1 << before == 0
 }
 
 #[cfg(test)]
@@ -402,8 +616,40 @@ mod tests {
         let text = "ab-cd x-12 -ef";
         assert_eq!(
             breaks(&line(text), text, &wrapping(0., TextWrap::Wrap), &[]),
-            [3, 6, 11]
+            [3, 6, 8, 11, 12]
         );
+    }
+
+    #[test]
+    fn breaks_follow_line_break_classes_like_chrome() {
+        // Each text with the breaks that Chrome finds in a box of zero width.
+        for (text, starts) in [
+            ("pr-312", &[3][..]),
+            ("a--2", &[2]),
+            (".-2", &[]),
+            ("x(-1)", &[]),
+            ("é-1", &[]),
+            ("a?1", &[2]),
+            ("a/b+c<d>e&f|g*h", &[]),
+            ("kj@nasa.gov>,", &[]),
+            ("1,000.5 $12.50 50%", &[8, 15]),
+            ("a中b", &[1, 2]),
+            ("中文。中", &[1, 3]),
+            ("「中」a", &[3]),
+            ("a—b a…b a–1", &[1, 2, 4, 6, 8, 10]),
+            ("“a” «b» ‘c’", &[4, 8]),
+            ("a\u{200b}b", &[2]),
+            ("€(a", &[1]),
+            ("中“文”中 中«文»中", &[1, 4, 6, 7, 10]),
+            ("中\"文\"中 中“a”中 「“文”」", &[6, 12]),
+            ("a\u{200d}中 中\u{200d}中", &[4]),
+        ] {
+            assert_eq!(
+                breaks(&line(text), text, &wrapping(0., TextWrap::Wrap), &[]),
+                starts,
+                "{text}"
+            );
+        }
     }
 
     #[test]
@@ -442,6 +688,30 @@ mod tests {
                 "{wrap:?}"
             );
         }
+    }
+
+    #[test]
+    fn pretty_acts_only_where_chromium_does() {
+        let at = |text: &str, width: f32| {
+            let pretty = breaks(&line(text), text, &wrapping(width, TextWrap::Pretty), &[]);
+            (
+                breaks(&line(text), text, &wrapping(width, TextWrap::Wrap), &[]),
+                pretty,
+            )
+        };
+        // The last row of 70px is not shorter than a third of 200px, but is of 220px.
+        let text = format!("{} aaaaaaa", ["aaaa"; 8].join(" "));
+        assert_eq!(at(&text, 200.), (vec![20, 40], vec![20, 40]));
+        assert_eq!(at(&text, 220.), (vec![20, 40], vec![20, 35]));
+        // Preserved tabs turn pretty off.
+        let tabbed = text.replacen(' ', "\t", 1);
+        let (wrap, pretty) = at(&tabbed, 220.);
+        assert_eq!(pretty, wrap);
+        // A one-word last row costs less than the 250px gap that moving a word down leaves.
+        let text = format!("{} {} {} a", "a".repeat(39), "a".repeat(15), "a".repeat(24));
+        assert_eq!(at(&text, 400.), (vec![40, 81], vec![40, 81]));
+        // Fewer than 3 break chances in the last rows.
+        assert_eq!(at("aaaaaaaa aaaaaaaaaa b", 200.), (vec![20], vec![20]));
     }
 
     #[test]

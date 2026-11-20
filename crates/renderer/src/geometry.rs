@@ -572,6 +572,26 @@ impl Radii {
         }
     }
 
+    /// Whether `at` is inside `bounds` with these corners. Every corner shape counts as round.
+    pub fn contains(&self, bounds: Rect, at: Point<Pixels>) -> bool {
+        let (x, y) = (self.x.to_array(), self.y.to_array());
+        let [left, top] = [bounds.origin.x.0, bounds.origin.y.0];
+        let [right, bottom] = [left + bounds.size.width.0, top + bounds.size.height.0];
+        let [px, py] = [at.x.0, at.y.0];
+        (0..4).all(|corner| {
+            let [rx, ry] = [x[corner].0, y[corner].0];
+            let cx = if corner == 0 || corner == 3 {
+                left + rx
+            } else {
+                right - rx
+            };
+            let cy = if corner < 2 { top + ry } else { bottom - ry };
+            let [dx, dy] = [(px - cx) / rx, (py - cy) / ry];
+            let outward = (corner == 0 || corner == 3) == (dx < 0.) && (corner < 2) == (dy < 0.);
+            rx <= 0. || ry <= 0. || !outward || dx * dx + dy * dy <= 1.
+        })
+    }
+
     pub fn fit(self, size: Size) -> Self {
         let (mut x, mut y) = (self.x.to_array(), self.y.to_array());
         for corner in 0..4 {

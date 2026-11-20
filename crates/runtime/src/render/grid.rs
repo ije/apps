@@ -14,9 +14,17 @@ pub(crate) struct Measurements {
     // margins of children that they adjoin.
     #[allow(clippy::type_complexity)]
     pub(crate) margins: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), [[f32; 2]; 2]>,
+    // How far the first line of a text box reaches above its strut, by the keys of `sizes`.
+    #[allow(clippy::type_complexity)]
+    pub(crate) leads: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), f32>,
     pub(crate) pixel_ratio: f32,
     pub(crate) naturals: rustc_hash::FxHashMap<usize, [f32; 2]>,
     pub(crate) texts: rustc_hash::FxHashMap<usize, Option<std::rc::Rc<style::InlineText>>>,
+    // The text nodes in runs of more than one in flex and grid containers: `None` for a later node, which the
+    // first builds, and for the first, whether the run has text other than white space.
+    pub(crate) joined: rustc_hash::FxHashMap<usize, Option<bool>>,
+    // The containers whose runs this build noted.
+    pub(crate) noted: rustc_hash::FxHashSet<usize>,
     // Use style-address keys only during grid layout, while styles outlive the map.
     #[allow(clippy::type_complexity)]
     pub(crate) edges: Option<rustc_hash::FxHashMap<(*const style::Style, u32), [[f32; 4]; 3]>>,
@@ -31,6 +39,76 @@ pub(crate) struct Measurements {
     pub(crate) waking: Vec<usize>,
 }
 
+impl Measurements {
+    /// Keeps the measured sizes, margins and leads of the boxes that `keep` takes.
+    pub(crate) fn retain(&mut self, keep: impl Fn(usize) -> bool) {
+        self.sizes.retain(|&(id, ..), _| keep(id));
+        self.margins.retain(|&(id, ..), _| keep(id));
+        self.leads.retain(|&(id, ..), _| keep(id));
+    }
+
+    /// Like CSS, each run of text nodes in a flex or grid container is one anonymous item. Its first node builds it
+    /// with the text of all. `again` notes the runs of `children` also when this build noted them.
+    pub(crate) fn note_runs(
+        &mut self,
+        doc: &Document,
+        styles: &ComputedStyles,
+        container: usize,
+        children: &[usize],
+        again: bool,
+    ) {
+        if !self.noted.insert(container) && !again {
+            return;
+        }
+        let mut at = 0;
+        while at < children.len() {
+            if doc.nodes[children[at]].tag != "#text" {
+                at += 1;
+                continue;
+            }
+            let end = at
+                + children[at..]
+                    .iter()
+                    .take_while(|&&node| {
+                        matches!(doc.nodes[node].tag.as_str(), "#text" | "#comment")
+                    })
+                    .count();
+            let run: Vec<usize> = children[at..end]
+                .iter()
+                .copied()
+                .filter(|&node| doc.nodes[node].tag == "#text")
+                .collect();
+            if let [first, rest @ ..] = &run[..]
+                && !rest.is_empty()
+            {
+                let text = run
+                    .iter()
+                    .any(|&node| !doc.nodes[node].text.trim_ascii().is_empty());
+                self.joined.insert(*first, Some(text));
+                self.joined.extend(rest.iter().map(|&node| (node, None)));
+                self.texts.insert(
+                    *first,
+                    style::inline_text(doc, styles, *first, rest).map(std::rc::Rc::new),
+                );
+            } else {
+                self.joined.remove(&children[at]);
+            }
+            at = end;
+        }
+    }
+
+    /// Whether a text child of a flex or grid container makes an item: not for a later node of a run, and for
+    /// white space only with `preserve` or other text in its run.
+    pub(crate) fn text_item(&self, doc: &Document, child: usize, preserve: bool) -> bool {
+        let blank = doc.nodes[child].text.trim_ascii().is_empty();
+        match self.joined.get(&child) {
+            Some(None) => false,
+            Some(&Some(text)) => text || preserve || !blank,
+            None => preserve || !blank,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Grid {
     pub columns: Vec<f32>,
@@ -40,6 +118,30 @@ pub(crate) struct Grid {
     pub baseline: bool,
     pub first_item: Option<usize>,
     pub first_baseline: Option<f32>,
+    // The height of the content when it is not the sum of the rows: flexible rows that sum to less than `1fr`
+    // size again in the height that they first gave the grid.
+    pub height: Option<f32>,
+}
+
+impl Grid {
+    /// The size of the tracks with their gaps in an axis, or the height of the content.
+    pub(crate) fn extent(&self, axis: usize) -> f32 {
+        let tracks = [&self.columns, &self.rows][axis];
+        self.height.filter(|_| axis == 1).unwrap_or_else(|| {
+            tracks.iter().sum::<f32>() + tracks.len().saturating_sub(1) as f32 * self.gap[axis]
+        })
+    }
+
+    /// The width and height of the grid area of a cell placement: column, row, columns, rows.
+    pub(crate) fn area(&self, place: [usize; 4]) -> [f32; 2] {
+        [0, 1].map(|axis| {
+            let span = place[axis + 2];
+            [&self.columns, &self.rows][axis]
+                .get(place[axis]..place[axis] + span)
+                .map_or(0., |tracks| tracks.iter().sum())
+                + self.gap[axis] * span.saturating_sub(1) as f32
+        })
+    }
 }
 
 // The content size of a box that skips its contents: its `contain-intrinsic-size`, or the size it remembers for
@@ -297,6 +399,9 @@ fn size(
     available: Option<f32>,
     stretch: bool,
     table: bool,
+    // Like Chrome, rows of an auto height are laid out, not sized under a content constraint, so their auto
+    // minimums take the minimum contributions of the items.
+    rows: bool,
 ) -> Vec<f32> {
     use Sizing::*;
     let count = tracks.len();
@@ -374,7 +479,10 @@ fn size(
                         && match step {
                             0 => matches!(min(i), MinContent | MaxContent | Auto),
                             1 => matches!(min(i), MinContent | MaxContent),
-                            2 => min(i) == MaxContent || available.is_none() && min(i) == Auto,
+                            2 => {
+                                min(i) == MaxContent
+                                    || available.is_none() && !rows && min(i) == Auto
+                            }
                             4 => {
                                 matches!(max(i), MinContent | MaxContent | Auto | FitContent(_))
                             }
@@ -385,7 +493,7 @@ fn size(
                     continue;
                 }
                 let value = match step {
-                    0 if available.is_none() => contribution[2]
+                    0 if available.is_none() && !rows => contribution[2]
                         .min(
                             (start..start + span)
                                 .map(|i| match max(i) {
@@ -601,6 +709,10 @@ pub(crate) fn intrinsic(
     let key = (id, width.map(f32::to_bits), height.map(f32::to_bits));
     if let Some(value) = measured.sizes.get(&(key.0, key.1, key.2, false)) {
         return *value;
+    }
+    // Clear before this measure, so the lead that it records stays with its size.
+    if measured.sizes.len() > 65536 {
+        measured.retain(|_| false);
     }
     let node = &doc.nodes[id];
     let style = &styles.values[id];
@@ -842,7 +954,7 @@ pub(crate) fn intrinsic(
                     inline.runs.to_vec(),
                     inline.atoms.clone(),
                     inline.line_heights.clone(),
-                    inline.mixed,
+                    inline.mixed(text),
                     inline.pseudos,
                 )
             }),
@@ -884,6 +996,17 @@ pub(crate) fn intrinsic(
             .is_some()
             {
                 height
+            } else if styles.values[atom.node]
+                .get(Prop::DISPLAY)
+                .is_some_and(|value| matches!(value, "inline-flex" | "inline-grid"))
+            {
+                // A flex or grid box sits on the baseline of its first item, or else on its bottom border edge.
+                let (own, lengths) = (&styles.values[atom.node], &styles.lengths[atom.node]);
+                let [above, _, below, _] =
+                    lengths.edges(own, style::MARGIN, available.unwrap_or(0.));
+                above
+                    + first_baseline(doc, atom.node, styles, available, text, measured)
+                        .unwrap_or(height - above - below)
             } else {
                 let (own, lengths) = (&styles.values[atom.node], &styles.lengths[atom.node]);
                 let [ascent, descent, _] = text
@@ -947,13 +1070,14 @@ pub(crate) fn intrinsic(
             at += run.len;
         }
         // Runs of other sizes or line heights make some rows taller than the strut.
+        let mut lead = 0.;
         if mixed || !boxes.is_empty() {
             let strut = (
                 text.face(&style::font(style)),
                 renderer::px(units.font.em),
                 renderer::px(units.font.lh),
             );
-            for [above, below] in super::text::row_extents(
+            for (row, [above, below]) in super::text::row_extents(
                 &lines,
                 &runs,
                 &heights,
@@ -961,7 +1085,13 @@ pub(crate) fn intrinsic(
                 strut,
                 text,
                 measured.pixel_ratio,
-            ) {
+            )
+            .into_iter()
+            .enumerate()
+            {
+                if row == 0 {
+                    lead = f32::from(above);
+                }
                 content[2] += f32::from(above + below);
             }
         }
@@ -1005,6 +1135,7 @@ pub(crate) fn intrinsic(
         if !wrap {
             content[0] = content[1] - float;
         }
+        measured.leads.insert(key, lead + top);
         let ceil = |width: f32| leaf_ceil(width, measured.pixel_ratio);
         content = [
             ceil(content[0].max(float)),
@@ -1022,10 +1153,7 @@ pub(crate) fn intrinsic(
                 return [columns, rows];
             }
             let grid = layout(doc, id, styles, width, height, None, None, text, measured);
-            let [columns, rows] =
-                [(&grid.columns, grid.gap[0]), (&grid.rows, grid.gap[1])].map(|(sizes, gap)| {
-                    sizes.iter().sum::<f32>() + sizes.len().saturating_sub(1) as f32 * gap
-                });
+            let [columns, rows] = [0, 1].map(|axis| grid.extent(axis));
             measured.sizes.insert(key, [columns, rows, 0., 0.]);
             [columns, rows]
         };
@@ -1064,36 +1192,60 @@ pub(crate) fn intrinsic(
         let preserve = style
             .get(Prop::WHITE_SPACE)
             .is_some_and(|v| matches!(v, "pre" | "pre-wrap" | "break-spaces"));
-        let skipped = |child: usize| {
+        if flex {
+            measured.note_runs(doc, styles, id, &node.children, false);
+        }
+        let made: Vec<bool> = match flex {
+            true => (node.children.iter())
+                .map(|&child| {
+                    doc.nodes[child].tag != "#text" || measured.text_item(doc, child, preserve)
+                })
+                .collect(),
+            false => Vec::new(),
+        };
+        let skipped = |at: usize, child: usize| {
             styles.values[child]
                 .get(Prop::POSITION)
                 .is_some_and(|v| matches!(v, "absolute" | "fixed"))
                 || styles.values[child].get(Prop::DISPLAY) == Some("none")
-                || !preserve
-                    && doc.nodes[child].tag == "#text"
-                    && doc.nodes[child].text.trim_ascii().is_empty()
+                || doc.nodes[child].tag == "#text"
+                    && !match flex {
+                        true => made[at],
+                        false => preserve || !doc.nodes[child].text.trim_ascii().is_empty(),
+                    }
                 || doc.nodes[child].tag == "#text"
                     && node.tag == "details"
                     && !node.attrs.contains_key("open")
                 || floated(child)
         };
         // Flex base sizes decide where lines break, and the widths of a single line where text wraps.
-        let mut resolved = Vec::new();
+        // The flexed widths, and whether each item starts a line after the first.
+        let (mut resolved, mut starts) = (Vec::new(), Vec::new());
         if let Some(space) = available.filter(|_| flex && row) {
             let mut items: Vec<[f32; 4]> = Vec::new();
-            for &child in &node.children {
-                if skipped(child) {
+            for (at, &child) in node.children.iter().enumerate() {
+                if skipped(at, child) {
                     continue;
                 }
                 let own = &styles.values[child];
                 let lengths = &styles.lengths[child];
                 let [min, _, auto, _] = intrinsic(doc, child, styles, None, None, text, measured);
                 let frame = frame(own, lengths, space);
+                let sides = frame[1] + frame[3];
+                // A length sizes the border box with `box-sizing: border-box`, which keeps only the margins outside.
+                let outer = |v: f32| {
+                    if own.get(Prop::BOX_SIZING) == Some("border-box") {
+                        let margin = lengths.edges(own, style::MARGIN, space);
+                        (v + margin[1] + margin[3]).max(sides)
+                    } else {
+                        v + sides
+                    }
+                };
                 let basis = own
                     .get(Prop::FLEX_BASIS)
                     .filter(|v| !matches!(*v, "auto" | "content"))
                     .and_then(|v| lengths.resolve(v, space))
-                    .map_or(auto, |v| v + frame[1] + frame[3]);
+                    .map_or(auto, outer);
                 let lower = if own
                     .get(Prop::OVERFLOW_X)
                     .is_some_and(|v| !matches!(v, "visible" | "clip"))
@@ -1101,7 +1253,7 @@ pub(crate) fn intrinsic(
                 {
                     own.get(Prop::MIN_WIDTH)
                         .and_then(|v| lengths.resolve(v, space))
-                        .map_or(0., |v| v + frame[1] + frame[3])
+                        .map_or(0., outer)
                 } else {
                     min
                 };
@@ -1118,52 +1270,75 @@ pub(crate) fn intrinsic(
                     factor(Prop::FLEX_SHRINK, 1.) * basis,
                 ]);
             }
-            resolved = items
+            let hypothetical = items
                 .iter()
                 .map(|item| if wrap { item[0].min(space) } else { item[0] })
                 .collect::<Vec<_>>();
-            let space = space - gaps[0] * items.len().saturating_sub(1) as f32;
-            let mut frozen = vec![false; items.len()];
-            for _ in 0..if wrap { 0 } else { items.len() } {
-                let free = space - resolved.iter().sum::<f32>();
-                let index = 2 + usize::from(free < 0.);
-                let total: f32 = (0..items.len())
-                    .filter(|&i| !frozen[i])
-                    .map(|i| items[i][index])
-                    .sum();
-                if total <= 0. || free.abs() < 0.01 {
-                    break;
+            resolved.clone_from(&hypothetical);
+            starts = vec![false; items.len()];
+            // Each line resolves the flexible lengths of its items.
+            let mut start = 0;
+            while start < items.len() {
+                let mut end = start + 1;
+                let mut used = hypothetical[start];
+                while wrap && end < items.len() && used + gaps[0] + hypothetical[end] <= space {
+                    used += gaps[0] + hypothetical[end];
+                    end += 1;
                 }
-                let free = if index == 2 {
-                    free * total.min(1.)
-                } else {
-                    free
-                };
-                let mut clamped = false;
-                for (i, item) in items.iter().enumerate() {
-                    if !frozen[i] {
-                        resolved[i] += free * item[index] / total;
-                        if resolved[i] < item[1] {
-                            resolved[i] = item[1];
-                            frozen[i] = true;
-                            clamped = true;
+                if !wrap {
+                    end = items.len();
+                }
+                let line = start..end;
+                if let Some(next) = starts.get_mut(end) {
+                    *next = true;
+                }
+                start = end;
+                let space = space - gaps[0] * line.len().saturating_sub(1) as f32;
+                let mut frozen = vec![false; line.len()];
+                for _ in 0..line.len() {
+                    let free = space - resolved[line.clone()].iter().sum::<f32>();
+                    let index = 2 + usize::from(free < 0.);
+                    let total: f32 = line
+                        .clone()
+                        .filter(|&i| !frozen[i - line.start])
+                        .map(|i| items[i][index])
+                        .sum();
+                    if total <= 0. || free.abs() < 0.01 {
+                        break;
+                    }
+                    let free = if index == 2 {
+                        free * total.min(1.)
+                    } else {
+                        free
+                    };
+                    let mut clamped = false;
+                    for i in line.clone() {
+                        if !frozen[i - line.start] {
+                            resolved[i] += free * items[i][index] / total;
+                            if resolved[i] < items[i][1] {
+                                resolved[i] = items[i][1];
+                                frozen[i - line.start] = true;
+                                clamped = true;
+                            }
                         }
                     }
-                }
-                if !clamped {
-                    break;
-                }
-                // Restart the distribution from the bases of the items that are not frozen.
-                for (i, item) in items.iter().enumerate() {
-                    if !frozen[i] {
-                        resolved[i] = item[0];
+                    if !clamped {
+                        break;
+                    }
+                    // Restart the distribution from the bases of the items that are not frozen.
+                    for i in line.clone() {
+                        if !frozen[i - line.start] {
+                            resolved[i] = items[i][0];
+                        }
                     }
                 }
             }
         }
-        let mut resolved = resolved.into_iter();
+        let (mut resolved, mut starts) = (resolved.into_iter(), starts.into_iter());
         // `line` is the width, the tallest piece, and how far raised pieces reach above and below the strut.
         let (mut line, mut run) = ([0f32; 4], 0f32);
+        // How far the baseline-aligned items of a flex line reach above and below their shared baseline.
+        let mut aligned = [0f32; 2];
         // Margins that adjoin the top edge, those after the last box placed, and whether a box was placed.
         let (mut top, mut pending, mut placed) = ([0f32; 2], [0f32; 2], false);
         let join = |a: [f32; 2], b: [f32; 2]| [a[0].max(b[0]), a[1].min(b[1])];
@@ -1177,8 +1352,8 @@ pub(crate) fn intrinsic(
         let mut first = true;
         // A collapsed space between inline boxes, which hangs at the end of a line.
         let (mut spaced, mut space) = (false, None);
-        for &child in &node.children {
-            if skipped(child) {
+        for (at, &child) in node.children.iter().enumerate() {
+            if skipped(at, child) {
                 spaced |= inline && doc.nodes[child].tag == "#text" && line[0] > 0.;
                 continue;
             }
@@ -1252,17 +1427,21 @@ pub(crate) fn intrinsic(
                 Some(available) => max.min(available),
                 None => max,
             });
+            // Flex lines break where their items were collected, before they grow or shrink.
+            let starts = starts.next();
             // A box with its own width takes percentages from the container.
             let sized = flex
                 && styles.values[child]
                     .get(Prop::WIDTH)
                     .is_some_and(|v| v != "auto");
-            let height = if sized && available.is_some() {
-                intrinsic(doc, child, styles, available, None, text, measured)[3]
-            } else if width != max {
-                intrinsic(doc, child, styles, Some(width), None, text, measured)[3]
+            let at = if sized && available.is_some() {
+                available
             } else {
-                height
+                (width != max).then_some(width)
+            };
+            let height = match at {
+                Some(_) => intrinsic(doc, child, styles, at, None, text, measured)[3],
+                None => height,
             };
             let wrap = wrap || inline_level;
             content[0] = if wrap {
@@ -1283,13 +1462,13 @@ pub(crate) fn intrinsic(
                 0.
             };
             run += max + gap[0] + spacing;
-            if wrap
-                && line[0] > 0.
-                && available
-                    .is_some_and(|available| line[0] + gaps[0] + spacing + width > available)
-            {
+            if starts.unwrap_or_else(|| {
+                wrap && line[0] > 0.
+                    && available
+                        .is_some_and(|available| line[0] + gaps[0] + spacing + width > available)
+            }) {
                 content[2] += total(line) + gaps[1];
-                line = [0.; 4];
+                (line, aligned) = ([0.; 4], [0.; 2]);
             }
             line[0] += if line[0] > 0. { gaps[0] + spacing } else { 0. } + width;
             // Like a line box, a raised or lowered inline box grows the line by what it reaches past the strut.
@@ -1326,6 +1505,26 @@ pub(crate) fn intrinsic(
                 }
                 None => {
                     line[1] = line[1].max(height);
+                    // Like layout, items aligned on their baselines can make the line taller than each item.
+                    if flex
+                        && row
+                        && styles.values[child]
+                            .get(Prop::ALIGN_SELF)
+                            .filter(|value| *value != "auto")
+                            .or(style.get(Prop::ALIGN_ITEMS))
+                            .is_some_and(|value| {
+                                value.ends_with("baseline") && !value.starts_with("last")
+                            })
+                    {
+                        let [above, _, below, _] =
+                            child_units.edges(child_style, style::MARGIN, available.unwrap_or(0.));
+                        // An item without a baseline sits on its bottom border edge.
+                        let above = above
+                            + first_baseline(doc, child, styles, at, text, measured)
+                                .unwrap_or(height - above - below);
+                        aligned = [aligned[0].max(above), aligned[1].max(height - above)];
+                        line[1] = line[1].max(aligned[0] + aligned[1]);
+                    }
                     // A replaced box on the baseline of the strut keeps the strut below it in the line.
                     if inline_level
                         && !flex
@@ -1574,13 +1773,173 @@ pub(crate) fn intrinsic(
                 .map(|[positive, negative]| positive + negative)
                 .sum::<f32>(),
     ];
-    if measured.sizes.len() > 65536 {
-        measured.sizes.clear();
-        measured.margins.clear();
-    }
     measured.sizes.insert((key.0, key.1, key.2, false), result);
     measured.margins.insert(key, sets);
     result
+}
+
+/// The first baseline of a box from the top of its border box, as layout places it: the first line of its text, or
+/// the baseline of its first item. `None` for a box without one, which then sits on its bottom border edge.
+fn first_baseline(
+    doc: &Document,
+    id: usize,
+    styles: &ComputedStyles,
+    width: Option<f32>,
+    text: &renderer::TextSystem,
+    measured: &mut Measurements,
+) -> Option<f32> {
+    let [.., used, height] = intrinsic(doc, id, styles, width, None, text, measured);
+    let (node, style, units) = (&doc.nodes[id], &styles.values[id], &styles.lengths[id]);
+    let base = width.unwrap_or(0.);
+    let [margin, padding] =
+        [style::MARGIN, style::PADDING].map(|sides| units.edges(style, sides, base));
+    let border = units.borders(style, base);
+    let top = padding[0] + border[0];
+    let strut = |measured: &Measurements| {
+        f32::from(text.baseline(
+            text.face(&style::font(style)),
+            renderer::px(units.font.em),
+            renderer::px(units.font.lh),
+            measured.pixel_ratio,
+        ))
+    };
+    // Like Chrome, a replaced box sits on its bottom edge.
+    if node.tag == "svg"
+        || super::element::natural_size(doc, id, measured.naturals.get(&id).copied(), style)
+            .is_some()
+    {
+        return None;
+    }
+    // A control centers its line of text.
+    if matches!(node.tag.as_str(), "input" | "select" | "textarea") {
+        let inner = height - margin[0] - margin[2] - top - padding[2] - border[2];
+        return Some(top + (inner - units.font.lh) / 2. + strut(measured));
+    }
+    if matches!(node.tag.as_str(), "progress" | "meter") {
+        return None;
+    }
+    if node.tag.starts_with('#') || measured.texts.get(&id).is_some_and(Option::is_some) {
+        let lead = measured.leads.get(&(id, width.map(f32::to_bits), None));
+        return Some(top + lead.copied().unwrap_or(0.) + strut(measured));
+    }
+    let display = style.get(Prop::DISPLAY).unwrap_or("");
+    let flex = matches!(display, "flex" | "inline-flex");
+    let grid = display.ends_with("grid");
+    let preserve = style
+        .get(Prop::WHITE_SPACE)
+        .is_some_and(|v| matches!(v, "pre" | "pre-wrap" | "break-spaces"));
+    let inner = used
+        - [margin, padding, border]
+            .iter()
+            .map(|edges| edges[1] + edges[3])
+            .sum::<f32>();
+    let in_flow = |child: usize, measured: &Measurements| {
+        let own = &styles.values[child];
+        match doc.nodes[child].tag.as_str() {
+            "#comment" => false,
+            "#text" if flex || grid => measured.text_item(doc, child, preserve),
+            "#text" => preserve || !doc.nodes[child].text.trim_ascii().is_empty(),
+            _ => {
+                own.get(Prop::DISPLAY) != Some("none")
+                    && own
+                        .get(Prop::POSITION)
+                        .is_none_or(|v| !matches!(v, "absolute" | "fixed"))
+                    && (flex || grid || own.get(Prop::FLOAT).is_none_or(|v| v == "none"))
+            }
+        }
+    };
+    // The baseline of an item from the top of its margin box, or its bottom border edge without one.
+    let item = |child: usize, width: Option<f32>, measured: &mut Measurements| {
+        let (own, lengths) = (&styles.values[child], &styles.lengths[child]);
+        let [above, _, below, _] = lengths.edges(own, style::MARGIN, width.unwrap_or(inner));
+        let outer = intrinsic(doc, child, styles, width, None, text, measured)[3];
+        let baseline = first_baseline(doc, child, styles, width, text, measured);
+        (above + baseline.unwrap_or(outer - above - below), outer)
+    };
+    let align = |child: usize| {
+        (styles.values[child].get(Prop::ALIGN_SELF))
+            .filter(|v| *v != "auto")
+            .or(style.get(Prop::ALIGN_ITEMS))
+            .unwrap_or("normal")
+    };
+    let shared = |align: &str| align.ends_with("baseline") && !align.starts_with("last");
+    let shift = |align: &str, free: f32| match align {
+        "center" | "safe center" => free / 2.,
+        "end" | "flex-end" | "self-end" => free,
+        _ => 0.,
+    };
+    // Like CSS, the items aligned on their baselines give the baseline of the first row, or else its first item.
+    if grid {
+        let layout = layout(
+            doc,
+            id,
+            styles,
+            Some(inner),
+            None,
+            None,
+            None,
+            text,
+            measured,
+        );
+        let first = layout.cells.iter().map(|cell| cell.1[1]).min()?;
+        // (aligned, column, baseline)
+        let mut found: Option<(bool, usize, f32)> = None;
+        for &(child, cell, [_, y, width, _], _) in &layout.cells {
+            let aligned = shared(align(child));
+            match found {
+                _ if cell[1] != first => continue,
+                Some((true, ..)) if !aligned => continue,
+                Some((false, column, _)) if !aligned && column <= cell[0] => continue,
+                _ => {}
+            }
+            let at = y + item(child, Some(width), measured).0;
+            found = Some(match found {
+                Some((true, column, max)) => (true, column, max.max(at)),
+                _ => (aligned, cell[0], at),
+            });
+        }
+        return found.map(|(.., baseline)| top + baseline);
+    }
+    if flex
+        && style
+            .get(Prop::FLEX_DIRECTION)
+            .is_none_or(|v| !v.starts_with("column"))
+    {
+        let cross = height - margin[0] - margin[2] - top - padding[2] - border[2];
+        let (mut aligned, mut first) = (None::<f32>, None);
+        for &child in &node.children {
+            if !in_flow(child, measured) {
+                continue;
+            }
+            let align = align(child);
+            if shared(align) {
+                let (baseline, _) = item(child, None, measured);
+                aligned = Some(aligned.unwrap_or(0f32).max(baseline));
+            } else if first.is_none() {
+                let (baseline, outer) = item(child, None, measured);
+                first = Some(shift(align, cross - outer) + baseline);
+            }
+        }
+        return aligned.or(first).map(|baseline| top + baseline);
+    }
+    // Columns and blocks take the baseline of their first item that has one.
+    let gap = (style.get(Prop::ROW_GAP))
+        .filter(|_| flex)
+        .and_then(|v| units.resolve(v, 0.))
+        .unwrap_or(0.)
+        .max(0.);
+    let mut y = top;
+    for &child in &node.children {
+        if !in_flow(child, measured) {
+            continue;
+        }
+        if let Some(baseline) = first_baseline(doc, child, styles, Some(inner), text, measured) {
+            let (own, lengths) = (&styles.values[child], &styles.lengths[child]);
+            return Some(y + lengths.edges(own, style::MARGIN, inner)[0] + baseline);
+        }
+        y += intrinsic(doc, child, styles, Some(inner), None, text, measured)[3] + gap;
+    }
+    None
 }
 
 // A video without a frame, with a CSS ratio and an auto size, which fills the width that it gets.
@@ -1799,6 +2158,12 @@ pub(crate) fn layout(
     use Sizing::*;
     let style = &styles.values[id];
     let units = &styles.lengths[id];
+    if style
+        .get(Prop::DISPLAY)
+        .is_some_and(|value| value.ends_with("grid"))
+    {
+        measured.note_runs(doc, styles, id, &doc.nodes[id].children, false);
+    }
     // An anonymous table is as wide as its content, inside its block.
     let block = width;
     let width = match width {
@@ -1917,13 +2282,39 @@ pub(crate) fn layout(
         fit[axis] = collapse;
     }
     let automatic = [0, 1].map(|axis| tracks(implicit[axis], units, available[axis], 0.).0);
-    let shrinks = |style: &style::Style, axis: usize| {
-        style
-            .get([Prop::OVERFLOW_X, Prop::OVERFLOW_Y][axis])
-            .is_some_and(|v| !matches!(v, "visible" | "clip"))
-            || style
-                .get([Prop::MIN_WIDTH, Prop::MIN_HEIGHT][axis])
-                .is_some_and(|v| v == "0" || v == "0px")
+    // The minimum contribution of an item without a preferred size: the outer size of its min size, or of 0 for a
+    // scroll container. Other items contribute their min-content size.
+    let least = |style: &style::Style, units: &Lengths, axis: usize| -> Option<f32> {
+        // A percentage depends on the track, so it counts as `auto` here.
+        if style
+            .get([Prop::WIDTH, Prop::HEIGHT][axis])
+            .is_some_and(|v| v != "auto" && !v.contains('%'))
+        {
+            return None;
+        }
+        let base = available[0].unwrap_or(0.);
+        let size = match style.get([Prop::MIN_WIDTH, Prop::MIN_HEIGHT][axis]) {
+            Some(value) if value.contains('%') => 0.,
+            Some(value) if let Some(size) = units.resolve(value, 0.) => size,
+            // Like Chrome, content keywords act as `auto` in columns and as 0 in rows.
+            Some(value) if axis == 1 && value.contains("content") => 0.,
+            _ if style
+                .get([Prop::OVERFLOW_X, Prop::OVERFLOW_Y][axis])
+                .is_some_and(|v| !matches!(v, "visible" | "clip")) =>
+            {
+                0.
+            }
+            _ => return None,
+        };
+        let frame = frame(style, units, base);
+        let margin = units.edges(style, style::MARGIN, base);
+        let [start, end] = if axis == 0 { [3, 1] } else { [0, 2] };
+        let (sides, margins) = (frame[start] + frame[end], margin[start] + margin[end]);
+        Some(if style.get(Prop::BOX_SIZING) == Some("border-box") {
+            (size + margins).max(sides)
+        } else {
+            size + sides
+        })
     };
     let alignment = |own: &style::Style, axis: usize, replaced: bool| {
         let margins = [
@@ -1947,6 +2338,14 @@ pub(crate) fn layout(
             ([true, false], _) => (Some(1.), None),
             ([false, true], _) => (Some(0.), None),
             (_, "normal") if replaced => (Some(0.), None),
+            // Like Chrome, a box with a ratio and an auto height keeps the height of its ratio.
+            (_, "normal")
+                if axis == 1
+                    && own.get(Prop::ASPECT_RATIO).is_some_and(|v| v != "auto")
+                    && own.get(Prop::HEIGHT).is_none_or(|v| v == "auto") =>
+            {
+                (Some(0.), None)
+            }
             (_, "normal" | "stretch") => (None, None),
             (_, "center") => (Some(0.5), None),
             (_, "end" | "flex-end" | "self-end" | "right") => (Some(1.), None),
@@ -1961,7 +2360,6 @@ pub(crate) fn layout(
         placed: ([Option<usize>; 2], [usize; 2]),
         alignment: [Option<f32>; 2],
         baseline: Option<bool>,
-        shrink: [bool; 2],
         auto_width: bool,
         height: Option<&'a str>,
         subgrid: [bool; 2],
@@ -2021,7 +2419,6 @@ pub(crate) fn layout(
                     }
                     (position, span)
                 };
-                let shrink = [0, 1].map(|axis| shrinks(style, axis));
                 let subgrid = [0, 1].map(|axis| {
                     pseudo_item(child).is_none()
                         && style
@@ -2036,7 +2433,6 @@ pub(crate) fn layout(
                     placed,
                     alignment: [column, row],
                     baseline,
-                    shrink,
                     auto_width: style.get(Prop::WIDTH).is_none_or(|v| v == "auto"),
                     height: style.get(Prop::HEIGHT),
                     subgrid,
@@ -2060,7 +2456,7 @@ pub(crate) fn layout(
     };
     let mut children: Vec<(usize, Item)> = (shown(0).then_some(!(id * 2)).into_iter())
         .chain(doc.nodes[id].children.iter().copied().filter(|&child| {
-            !(doc.nodes[child].tag == "#text" && doc.nodes[child].text.trim_ascii().is_empty())
+            doc.nodes[child].tag != "#text" || measured.text_item(doc, child, false)
         }))
         .chain(shown(1).then_some(!(id * 2 + 1)))
         .map(|child| (child, read(child)))
@@ -2455,10 +2851,7 @@ pub(crate) fn layout(
                         text,
                         measured,
                     );
-                    height = inner.rows.iter().sum::<f32>()
-                        + inner.rows.len().saturating_sub(1) as f32 * inner.gap[1]
-                        + frame[0]
-                        + frame[2];
+                    height = inner.extent(1) + frame[0] + frame[2];
                 }
                 boxes[index] = [x + (area - size) * fraction.unwrap_or(0.), 0., size, height];
                 if let (Some(last), Some(&[first, end])) = (
@@ -2526,7 +2919,16 @@ pub(crate) fn layout(
                 contributions.push((
                     cell[axis],
                     cell[axis + 2],
-                    [if derived[index].shrink[axis] { 0. } else { min }, min, max],
+                    [
+                        least(
+                            item_style(child),
+                            &styles.lengths[pseudo_item(child).map_or(child, |(parent, _)| parent)],
+                            axis,
+                        )
+                        .map_or(min, |least| least.min(min)),
+                        min,
+                        max,
+                    ],
                 ));
                 continue;
             }
@@ -2570,7 +2972,8 @@ pub(crate) fn layout(
                 } else {
                     [value[3]; 2]
                 };
-                let least = if shrinks(style, axis) { 0. } else { min };
+                let least = least(style, &styles.lengths[grandchild], axis)
+                    .map_or(min, |least| least.min(min));
                 contributions.push((start, span, [least, min, max]));
                 offset += span;
             }
@@ -2608,28 +3011,45 @@ pub(crate) fn layout(
             space,
             stretch,
             axis == 0 && table,
+            axis == 1,
         );
-        // Like Chrome, rows of auto height grow to fill the min-height of the grid.
-        if axis == 1
-            && space.is_none()
-            && !table
-            && let Some(least) = get(Prop::MIN_HEIGHT)
-                .filter(|v| !v.contains('%'))
-                .and_then(|v| units.resolve(v, 0.))
-        {
-            let least = if get(Prop::BOX_SIZING) == Some("border-box") {
+        // Like Chrome, the rows size again in a definite height: the min-height or max-height of the grid when they
+        // leave it, or the height that flexible rows below `1fr` first gave the grid, so `0.5fr` takes half of it.
+        if axis == 1 && space.is_none() && !table {
+            let sides = if get(Prop::BOX_SIZING) == Some("border-box") {
                 let base = available[0].unwrap_or(0.);
                 let [edges, margin] = [
                     frame(style, units, base),
                     units.edges(style, style::MARGIN, base),
                 ];
-                least - (edges[0] + edges[2] - margin[0] - margin[2])
+                edges[0] + edges[2] - margin[0] - margin[2]
             } else {
-                least
+                0.
             };
+            let [least, most] = [Prop::MIN_HEIGHT, Prop::MAX_HEIGHT].map(|prop| {
+                get(prop)
+                    .filter(|v| !v.contains('%'))
+                    .and_then(|v| units.resolve(v, 0.))
+                    .map(|v| v - sides)
+            });
+            let factors: f32 = (definitions[1].iter())
+                .filter_map(|track| match track.1 {
+                    Flex(factor) => Some(factor),
+                    _ => None,
+                })
+                .sum();
             let used = sizes.iter().sum::<f32>() + sizes.len().saturating_sub(1) as f32 * gap[1];
-            if used < least {
-                space = Some(least);
+            let height = match (least, most) {
+                (Some(least), _) if used < least => Some(least),
+                (_, Some(most)) if factors > 0. && used > most => {
+                    Some(most.max(least.unwrap_or(0.)))
+                }
+                _ if factors > 0. && factors < 1. => Some(used),
+                _ => None,
+            };
+            if let Some(height) = height {
+                grid.height = Some(height);
+                space = Some(height);
                 sizes = size(
                     &definitions[1],
                     &contributions,
@@ -2637,6 +3057,7 @@ pub(crate) fn layout(
                     space,
                     stretch,
                     false,
+                    true,
                 );
             }
         }
@@ -2718,7 +3139,11 @@ pub(crate) fn layout(
         } else {
             fraction.is_none() && value.is_none_or(|v| v == "auto")
         } {
-            height = area;
+            // A min-height of a content keyword keeps the content height in a smaller row.
+            let least = item_style(child)
+                .get(Prop::MIN_HEIGHT)
+                .is_some_and(|v| v.contains("content"));
+            height = if least { area.max(height) } else { area };
         }
         let y = if caption && styles.values[child].get(Prop::CAPTION_SIDE) != Some("bottom") {
             y - gap[1]
@@ -2794,7 +3219,7 @@ mod tests {
             (2, 2, [30., 30., 90.]),
         ];
         let sized = |available, stretch, table| -> Vec<f32> {
-            size(&tracks, &items, 2., available, stretch, table)
+            size(&tracks, &items, 2., available, stretch, table, false)
                 .into_iter()
                 .map(|v| (v * 1000.).round() / 1000.)
                 .collect()
@@ -2828,7 +3253,7 @@ mod tests {
         available: Option<f32>,
     ) -> Vec<f32> {
         let (list, ..) = tracks(template, &Lengths::new(16., 800., 600.), available, gap);
-        size(&list, items, gap, available, true, false)
+        size(&list, items, gap, available, true, false, false)
             .into_iter()
             .map(|v| (v * 100.).round() / 100.)
             .collect()

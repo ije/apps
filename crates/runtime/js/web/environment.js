@@ -208,10 +208,12 @@ globalThis.__appsBrowserEnvironment = (call, task) => {
   }
   Object.assign(globalThis, { Storage, IDBFactory, IDBDatabase, IDBTransaction, IDBRequest, IDBOpenDBRequest, IDBObjectStore, IDBCursor, IDBCursorWithValue: IDBCursor, IDBKeyRange, indexedDB: new IDBFactory() });
   let current = new URL('apps://app/'), entries = [{ url: current.href, state: null }], position = 0;
-  const changed = oldURL => { if (new URL(oldURL).hash !== current.hash) setTimeout(() => dispatchEvent(Object.assign(new (globalThis.HashChangeEvent ?? Event)('hashchange'), { oldURL, newURL: current.href })), 0); };
+  const fragment = href => href.includes('#') ? href.slice(href.indexOf('#')) : null;
+  const changed = oldURL => { if (fragment(oldURL) !== fragment(current.href)) setTimeout(() => dispatchEvent(Object.assign(new (globalThis.HashChangeEvent ?? Event)('hashchange'), { oldURL, newURL: current.href })), 0); };
   const navigate = (url, replace = false, reload = false) => {
     const target = new URL(String(url), current), oldURL = current.href;
-    if (!reload && target.href.split('#')[0] === current.href.split('#')[0]) {
+    // As in browsers, only a URL with a fragment navigates within the page, and the same URL loads the page again.
+    if (!reload && target.href.includes('#') && target.href.split('#')[0] === current.href.split('#')[0]) {
       current = target; if (replace) entries[position] = { url: current.href, state: null }; else { entries.splice(++position); entries.push({ url: current.href, state: null }); }
       // As in browsers, the page scrolls to the element of the fragment, or to the top for an empty fragment or `#top`.
       const id = decodeURIComponent(current.hash.slice(1)), element = id && globalThis.document?.getElementById(id);
@@ -230,7 +232,7 @@ globalThis.__appsBrowserEnvironment = (call, task) => {
     toString() { return current.href; }
     valueOf() { return this.toString(); }
   }
-  for (const name of ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) Object.defineProperty(Location.prototype, name, { enumerable: true, get: () => name === 'origin' ? originOf(current) : current[name], ...(name === 'origin' ? {} : { set: value => { const url = new URL(current); url[name] = value; if (name !== 'hash' || url.hash !== current.hash) navigate(url); } }) });
+  for (const name of ['href', 'origin', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash']) Object.defineProperty(Location.prototype, name, { enumerable: true, get: () => name === 'origin' ? originOf(current) : current[name], ...(name === 'origin' ? {} : { set: value => { if (name === 'hash') { const href = new URL(current.href.split('#')[0] + '#' + String(value).replace(/^#/, '')).href; if (fragment(href) !== fragment(current.href)) navigate(href); return; } const url = new URL(current); url[name] = value; navigate(url); } }) });
   class History {
     get length() { return entries.length; }
     get state() { return clone(entries[position].state); }

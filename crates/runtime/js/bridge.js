@@ -49,6 +49,7 @@ globalThis.__appsBridge = (call,role,EventEmitter,hooks={}) => {
     if(value instanceof Promise){if(strict)uncloneable();return{type:'promise',id,then:capability(settle=>{value.then(v=>settle(true,v),e=>settle(false,e));},target,!persistent)};}
     if(value instanceof Map)return{type:'map',id,items:[...value].map(([k,v])=>[next(k),next(v)])};
     if(value instanceof Set)return{type:'set',id,items:[...value].map(next)};
+    if(globalThis.FileList&&value instanceof FileList)value=[...value];
     if(Array.isArray(value)){const items=[];for(let i=0;i<value.length;i++)items.push(i in value?next(value[i]):null);return{type:'array',id,items};}
     return{type:'object',id,items:Object.fromEntries(Object.entries(value).map(([k,v])=>[k,next(v)]))};
   };

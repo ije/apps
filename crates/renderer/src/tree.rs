@@ -247,6 +247,8 @@ impl Slot {
 pub(crate) struct Styled {
     style: Style,
     taffy: taffy::Style,
+    // The scaled bounds that calc handles of `taffy` point to.
+    _bounds: Box<[crate::Bound]>,
     relative: bool,
 }
 
@@ -312,6 +314,9 @@ pub struct Tree {
     // The outermost containing block that an out-of-flow box in the current box reads: its place in `blocks` plus
     // one, or 0 for the viewport. A box can skip only if no such block is outside it.
     escapes: Option<usize>,
+    // For each out-of-flow box that prepaint visits, the scroll viewports inside its containing block, which don't
+    // clip the boxes in it.
+    hidden: Vec<Vec<Option<Rect<Pixels>>>>,
     // The move of the box that `keep` visits when its layout stayed and only the scroll offset moved it.
     delta: Option<Point<Pixels>>,
     // The boxes whose hooks skip also inside a skipped box, in this pass and the last one.
@@ -431,7 +436,10 @@ impl Tree {
         {
             let mut style = style.clone();
             (style.inset.left, style.inset.top, style.size) = placed;
-            self.slots[index as usize].style = self.styles.styled(style, scale);
+            let slot = &mut self.slots[index as usize];
+            slot.style = self.styles.styled(style, scale);
+            // The stretched copy holds calc handles into the old style.
+            slot.stretched = None;
             changed(&mut self.slots, index as usize);
             self.dirty(index);
         }
@@ -870,6 +878,7 @@ impl Tree {
         self.stacks.clear();
         self.depths.clear();
         self.blocks.clear();
+        self.hidden.clear();
         #[cfg(debug_assertions)]
         let start = window.region_places().len();
         self.copies = window.copies();
@@ -1042,7 +1051,7 @@ impl Tree {
         self.flatten(index, transforms, shifting, window);
         self.reach(index, window.scale_factor());
         if self.slots[index as usize].escaped.is_some() {
-            window.pop_content_mask();
+            self.unescape(window);
         }
         self.recorded(index, [regions, touched], listed, outer, window);
     }
@@ -1084,10 +1093,19 @@ impl Tree {
         };
         if let Some(mask) = escaped {
             window.push_content_mask(mask);
+            self.hidden.push(window.hide_viewports(cut as usize));
         }
         let slot = &mut self.slots[index as usize];
         (slot.escaped, slot.cut) = (escaped, cut);
         depth
+    }
+
+    // Ends `escape`.
+    fn unescape(&mut self, window: &mut Window) {
+        window.pop_content_mask();
+        if let Some(hidden) = self.hidden.pop() {
+            window.show_viewports(hidden);
+        }
     }
 
     // A box is flat when no hit transform is in it and all hooks in it can shift.
@@ -1157,20 +1175,21 @@ impl Tree {
             .as_ref()
             .and_then(|events| events.scroll.clone());
         let needs_hitbox = Events::needs_region(slot.events.as_deref(), style);
+        let client = unsnapped(&slot.layout, scale);
         let content = match &scroll {
             Some(_) if !slot.children.is_empty() => self.content(index, origin, scale),
-            _ => bounds.size,
+            _ => client,
         };
         // A box that spans columns takes pointer events in its first part.
         let first = parts(&self.slots[index as usize], bounds.origin, scale)
             .next()
             .unwrap_or(bounds);
         window.scope(Scope::Clip(style.overflow_mask(bounds)), |window| {
-            let region = needs_hitbox.then(|| window.add_region(first, Hit::Pass));
+            let region = needs_hitbox.then(|| place_region(window, style, first, None));
             let offset = match &scroll {
                 Some(handle) => {
                     handle.drive(window);
-                    handle.clamp(style, bounds, content, scale)
+                    handle.clamp(style, bounds, client, content, scale)
                 }
                 None => Point::default(),
             };
@@ -1341,11 +1360,11 @@ impl Tree {
     // padding follows the margin boxes of its children and its lines, but not the overflow of boxes inside them.
     fn content(&mut self, index: u32, origin: Point<f32>, scale: f32) -> Size<Pixels> {
         let layout = self.slots[index as usize].layout;
+        // The extent before it snaps to device pixels, which `clamp` rounds like Chrome.
         let mut min = point(
             origin.x + layout.border.left + layout.padding.left,
             origin.y + layout.border.top + layout.padding.top,
-        )
-        .map(round_half_up);
+        );
         let mut max = min;
         let border = point(
             layout.border.left + layout.border.right,
@@ -1376,8 +1395,8 @@ impl Tree {
             }
             let nested = self.far(id, scale, true);
             far = far.max(point(nested.x - end.x, nested.y - end.y));
-            min = min.min(at.map(round_half_up));
-            max = max.max(point(origin.x + far.x, origin.y + far.y).map(round_half_up));
+            min = min.min(at);
+            max = max.max(point(origin.x + far.x, origin.y + far.y));
         }
         // `clamp` takes the scroll range from the border box.
         Size::from(max - min + border).map(|value| Pixels(value / scale))
@@ -1524,7 +1543,7 @@ impl Tree {
                 slot.lag += by;
                 self.shifting &= slot.flat;
                 if slot.escaped.is_some() {
-                    window.pop_content_mask();
+                    self.unescape(window);
                 }
                 let min = |a: Option<usize>, b: Option<usize>| {
                     a.zip(b).map(|(a, b)| a.min(b)).or(a).or(b)
@@ -1566,7 +1585,7 @@ impl Tree {
                 slot.skipped = self.prepaints;
                 self.shifting &= slot.flat;
                 if slot.escaped.is_some() {
-                    window.pop_content_mask();
+                    self.unescape(window);
                 }
                 let min = |a: Option<usize>, b: Option<usize>| {
                     a.zip(b).map(|(a, b)| a.min(b)).or(a).or(b)
@@ -1608,7 +1627,7 @@ impl Tree {
             self.reach(index, window.scale_factor());
         }
         if self.slots[index as usize].escaped.is_some() {
-            window.pop_content_mask();
+            self.unescape(window);
         }
         self.delta = parent;
         // A calm box and all boxes in it stayed, or moved together with the scroll offset. An out-of-flow box
@@ -1640,7 +1659,7 @@ impl Tree {
         window.scope(Scope::Clip(style.overflow_mask(bounds)), |window| {
             let slot = &mut self.slots[index as usize];
             if let Some(region) = &slot.region {
-                slot.region = Some(window.move_region(region, first));
+                slot.region = Some(place_region(window, style, first, Some(region)));
             }
             if style.display != Display::None {
                 if style.stacking {
@@ -1665,11 +1684,12 @@ impl Tree {
                     .and_then(|events| events.scroll.clone());
                 let offset = scroll.as_ref().map(|handle| {
                     handle.drive(window);
+                    let client = unsnapped(&self.slots[index as usize].layout, scale);
                     let content = match self.slots[index as usize].children.is_empty() {
-                        true => bounds.size,
+                        true => client,
                         false => self.content(index, origin, scale),
                     };
-                    handle.clamp(style, bounds, content, scale)
+                    handle.clamp(style, bounds, client, content, scale)
                 });
                 window.scope(Scope::Offset(offset.unwrap_or_default()), |window| {
                     if let Some(offset) = offset {
@@ -1823,7 +1843,8 @@ impl Tree {
         let escaped = match slot.style.escape == Escape::OUTLINE {
             true => self.masks.last().copied().or(slot.escaped),
             false => slot.escaped,
-        };
+        }
+        .map(|mask| window.group_clipped(mask));
         // A layers node paints the z-indexed boxes of its stacking context, whose reach holds them.
         if slot.listed != listed
             || self.unbounded == 0
@@ -2383,6 +2404,7 @@ impl Fingerprint for Style {
             crate::Length::Calc(value, offset) => {
                 (value.to_bits(), offset.0.to_bits()).hash(hasher)
             }
+            crate::Length::Bound(index) => (2, index).hash(hasher),
         };
         (
             self.display as u8,
@@ -2440,6 +2462,7 @@ impl Fingerprint for Style {
             }),
         )
             .hash(hasher);
+        self.bounds.iter().for_each(|bound| bound.hash(hasher));
     }
 }
 
@@ -2486,7 +2509,7 @@ impl Interned<Styled> {
             style,
             |kept, style| kept.style == *style,
             |style| {
-                let taffy = style.to_taffy(scale);
+                let (taffy, bounds) = style.to_taffy(scale);
                 let fixed = |raw: taffy::CompactLength| {
                     matches!(
                         raw.tag(),
@@ -2512,6 +2535,7 @@ impl Interned<Styled> {
                     .all(fixed);
                 Styled {
                     taffy,
+                    _bounds: bounds,
                     style,
                     relative,
                 }
@@ -2700,7 +2724,31 @@ impl LayoutTree<'_> {
                 output = tree.columns(node, inputs, output);
             }
             if inputs.run_mode == RunMode::PerformLayout {
-                taffy::compute_oof_layout(tree, node, &mut output);
+                // Taffy reads `direction` in all layout, which handles right-to-left itself, so a right-to-left
+                // box gives it only to the pass of its absolute boxes.
+                let index = usize::from(node);
+                if tree.slots[index].style.flow & Flow::RTL_BLOCK != 0 {
+                    if let Some(area) = output.oof_positioning_area
+                        && !output.oof_candidates.is_empty()
+                    {
+                        let claims =
+                            taffy::CoreStyle::is_containing_block(&tree.slots[index].taffy());
+                        let candidates = output.oof_candidates.take();
+                        let result = taffy::compute_oof_layout_for_area(
+                            tree,
+                            node,
+                            candidates.as_slice(),
+                            area,
+                            taffy::Direction::Rtl,
+                            claims,
+                        );
+                        output.oof_candidates = result.unclaimed;
+                        // Warning: with Taffy's `content_size` feature, merge `result.scrollable_overflow_rect`
+                        // into the output here, as `compute_oof_layout` does.
+                    }
+                } else {
+                    taffy::compute_oof_layout(tree, node, &mut output);
+                }
                 output.baselines = tree.baselines(usize::from(node), &output);
             }
             output
@@ -4107,6 +4155,39 @@ impl LayoutTree<'_> {
             width: width.max(cross),
             height: outer,
         };
+        // Floats take this path whatever the alignment, so it aligns the content after placing it.
+        let lift = match justify {
+            AlignContentKeyword::Center
+            | AlignContentKeyword::SpaceAround
+            | AlignContentKeyword::SpaceEvenly => 0.5,
+            AlignContentKeyword::End | AlignContentKeyword::FlexEnd => 1.,
+            _ => 0.,
+        };
+        if lift > 0. {
+            let (mut above, mut below) = (f32::INFINITY, f32::NEG_INFINITY);
+            for &child in &self.slots[index].children {
+                let slot = &self.slots[usize::from(child)];
+                if flow(slot.taffy()) {
+                    let layout = &slot.layout;
+                    above = above.min(layout.location.y - layout.margin.top);
+                    below =
+                        below.max(layout.location.y + layout.size.height + layout.margin.bottom);
+                }
+            }
+            let mut free = size.height - inset.top - inset.bottom - (below - above);
+            if self.slots[index].style.safe {
+                free = free.max(0.);
+            }
+            let shift = inset.top - above + free * lift;
+            if above.is_finite() && shift != 0. {
+                for at in 0..self.slots[index].children.len() {
+                    let child = usize::from(self.slots[index].children[at]);
+                    if flow(self.slots[child].taffy()) {
+                        self.slots[child].layout.location.y += shift;
+                    }
+                }
+            }
+        }
         let mut candidates = taffy::OofCandidates::new();
         for order in 0..self.slots[index].children.len() {
             let child = self.slots[index].children[order];
@@ -4362,6 +4443,47 @@ impl LayoutTree<'_> {
                 }
             }
             top = false;
+        }
+        // Taffy ignores align-content on a single line, which a button or a block still aligns in its height.
+        let lift = match style.align_content {
+            Some(AlignContent::Center) => 0.5,
+            Some(AlignContent::End | AlignContent::FlexEnd) => 1.,
+            _ => 0.,
+        };
+        let own = self.slots[index].taffy();
+        if lift > 0. && own.flex_wrap == taffy::FlexWrap::NoWrap {
+            use taffy::ResolveOrZero;
+            let calc = |value, basis| crate::style::resolve_calc(value, basis);
+            let width = inputs.parent_size.width;
+            let edges =
+                own.padding.resolve_or_zero(width, calc) + own.border.resolve_or_zero(width, calc);
+            let (mut above, mut below) = (f32::INFINITY, f32::NEG_INFINITY);
+            for &child in &children {
+                let slot = &self.slots[usize::from(child)];
+                if flows(slot) {
+                    let layout = &slot.layout;
+                    above = above.min(layout.location.y - layout.margin.top);
+                    below =
+                        below.max(layout.location.y + layout.size.height + layout.margin.bottom);
+                }
+            }
+            let mut free = output.size.height - edges.top - edges.bottom - (below - above);
+            if style.safe {
+                free = free.max(0.);
+            }
+            let shift = edges.top - above + free * lift;
+            if above.is_finite() && shift != 0. {
+                for &child in &children {
+                    let slot = &mut self.slots[usize::from(child)];
+                    if flows(slot) {
+                        slot.layout.location.y += shift;
+                    }
+                }
+                let baselines = &mut output.baselines;
+                for base in [&mut baselines.first, &mut baselines.last] {
+                    *base = base.map(|base| base + shift);
+                }
+            }
         }
         self.slots[index].children = children;
         self.hung.truncate(start);
@@ -4663,7 +4785,13 @@ impl LayoutTree<'_> {
                 last: Some(last.0 * scale + top),
             };
         }
-        if rebanded {
+        // A measure that shaped the text again drops the place of its lines, also when layout takes the final size
+        // from its cache, so prepaint must place the box again.
+        let unplaced = content.is_some()
+            && (self.slots[index].state.as_ref())
+                .and_then(|state| state.downcast_ref::<TextState>())
+                .is_some_and(TextState::unplaced);
+        if rebanded || unplaced {
             changed(self.slots, index);
         } else if remeasured {
             unfar(self.slots, index);
@@ -4805,11 +4933,36 @@ impl LayoutPartialTree for LayoutTree<'_> {
     // A box that only moved is not marked changed, since its kept prepaint follows it.
     fn set_unrounded_layout(&mut self, node: NodeId, layout: &Layout) {
         let index = usize::from(node);
-        let old = mem::replace(&mut self.slots[index].layout, *layout);
+        let mut layout = *layout;
+        // Taffy gives negative free space to cross-axis auto margins. In CSS the start margin is then 0, and the
+        // end margin takes the rest.
+        let margin = layout.margin;
+        if margin.left.min(margin.right).min(margin.top) < 0. {
+            let slot = &self.slots[index];
+            let style = slot.taffy();
+            if style.position != taffy::Position::Absolute {
+                if margin.top < 0. && style.margin.top.is_auto() {
+                    layout.location.y -= margin.top;
+                    layout.margin.bottom += margin.top;
+                    layout.margin.top = 0.;
+                }
+                let rtl = slot.style.flow & Flow::RTL != 0;
+                if !rtl && margin.left < 0. && style.margin.left.is_auto() {
+                    layout.location.x -= margin.left;
+                    layout.margin.right += margin.left;
+                    layout.margin.left = 0.;
+                } else if rtl && margin.right < 0. && style.margin.right.is_auto() {
+                    layout.location.x += margin.right;
+                    layout.margin.left += margin.right;
+                    layout.margin.right = 0.;
+                }
+            }
+        }
+        let old = mem::replace(&mut self.slots[index].layout, layout);
         if !self.exact
             && (Layout {
                 location: old.location,
-                ..*layout
+                ..layout
             }) != old
         {
             changed(self.slots, index);
@@ -4835,6 +4988,14 @@ impl LayoutContainingBlock for LayoutTree<'_> {
     fn clear_hoisted_children(&mut self, _: NodeId) {}
 
     fn add_hoisted_children(&mut self, _: NodeId, _: &[NodeId]) {}
+}
+
+// The border box size of a layout in CSS pixels, before it snaps to device pixels.
+fn unsnapped(layout: &Layout, scale: f32) -> Size<Pixels> {
+    Size::new(
+        px(layout.size.width / scale),
+        px(layout.size.height / scale),
+    )
 }
 
 // A height, min-height or max-height that depends on the height of the parent.
@@ -5046,6 +5207,19 @@ fn same_records(now: &[String], last: &[String]) -> bool {
                         .zip(&y)
                         .all(|(x, y)| (x - y).abs() <= 1e-3 * (1. + x.abs()))
         })
+}
+
+// Like Chrome, a press outside the rounded corners misses the box.
+fn place_region(window: &mut Window, style: &Style, first: Rect, old: Option<&Region>) -> Region {
+    let region = match old {
+        Some(region) => window.move_region(region, first),
+        None => window.add_region(first, Hit::Pass),
+    };
+    let corners = style.corner_radii.resolve(first.size);
+    if !corners.is_zero() {
+        window.round_region(corners);
+    }
+    region
 }
 
 #[cfg(test)]

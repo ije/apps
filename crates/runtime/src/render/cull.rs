@@ -137,6 +137,10 @@ pub(crate) struct Cull {
     // The nodes whose animated values the last frame swapped in. `seen` holds their cascade values, so the next
     // frame visits them, also when their animation ended.
     pub(crate) swapped: Vec<usize>,
+    // The `<svg>` boxes that paint farther than the cull margin outside their box, so no box around them becomes a
+    // spacer, and the ones that changed since the last frame.
+    pub(crate) spills: rustc_hash::FxHashSet<usize>,
+    pub(crate) respilled: Vec<usize>,
     pub(crate) subtrees: Subtrees,
     pub(crate) scrolled: rustc_hash::FxHashMap<usize, f32>,
     pub(crate) reskipped: bool,
@@ -888,7 +892,7 @@ pub(super) fn reskip(
 ) {
     dom.cull.reskipped = true;
     let measured = &mut dom.measurements;
-    measured.sizes.retain(|(node, ..), _| !nodes.contains(node));
+    measured.retain(|node| !nodes.contains(&node));
     let mut kept = view.kept.borrow_mut();
     for node in nodes {
         measured.texts.remove(node);

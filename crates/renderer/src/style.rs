@@ -12,6 +12,56 @@ pub enum Length {
     Px(Pixels),
     Fraction(f32),
     Calc(f32, Pixels),
+    /// The bound at this index in [`Style::bounds`].
+    Bound(u8),
+}
+
+/// `min()`, `max()` and `clamp()` of percentages, which resolve at layout: terms `share * basis + offset`, and the
+/// least or largest of other bounds.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Bound {
+    Term(f32, f32),
+    Min(Vec<Bound>),
+    Max(Vec<Bound>),
+}
+
+// A calc handle with these top bits holds the address of a bound. Other handles hold a share there, which is never
+// this NaN.
+const BOUND_TAG: u64 = 0x7fc1 << 48;
+const ADDRESS: u64 = (1 << 48) - 1;
+
+impl Bound {
+    fn resolve(&self, basis: f32) -> f32 {
+        match self {
+            Self::Term(share, offset) => share * basis + offset,
+            Self::Min(bounds) => bounds.iter().fold(f32::INFINITY, |least, bound| {
+                least.min(bound.resolve(basis))
+            }),
+            Self::Max(bounds) => bounds.iter().fold(f32::NEG_INFINITY, |most, bound| {
+                most.max(bound.resolve(basis))
+            }),
+        }
+    }
+
+    fn scaled(&self, scale: f32) -> Self {
+        let all = |bounds: &[Bound]| bounds.iter().map(|bound| bound.scaled(scale)).collect();
+        match self {
+            Self::Term(share, offset) => Self::Term(*share, to_layout_unit(*offset, scale)),
+            Self::Min(bounds) => Self::Min(all(bounds)),
+            Self::Max(bounds) => Self::Max(all(bounds)),
+        }
+    }
+
+    pub(crate) fn hash(&self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        match self {
+            Self::Term(share, offset) => (0u8, share.to_bits(), offset.to_bits()).hash(hasher),
+            Self::Min(bounds) | Self::Max(bounds) => {
+                (matches!(self, Self::Min(_)), bounds.len()).hash(hasher);
+                bounds.iter().for_each(|bound| bound.hash(hasher));
+            }
+        }
+    }
 }
 
 impl From<Pixels> for Length {
@@ -25,18 +75,19 @@ pub fn relative(fraction: f32) -> Length {
 }
 
 impl Length {
-    /// Auto counts as zero.
+    /// Auto and bounds count as zero.
     pub fn of(self, basis: Pixels) -> Pixels {
         match self {
             Self::Auto => Pixels::ZERO,
             Self::Px(value) => value,
             Self::Fraction(share) => basis * share,
             Self::Calc(share, value) => basis * share + value,
+            Self::Bound(_) => Pixels::ZERO,
         }
     }
 
-    // Taffy keeps lengths in device pixels. Auto is `None`.
-    fn to_taffy(self, scale: f32) -> Option<taffy::LengthPercentage> {
+    // Taffy keeps lengths in device pixels. Auto is `None`. `bounds` are the scaled bounds of the style.
+    fn to_taffy(self, scale: f32, bounds: &[Bound]) -> Option<taffy::LengthPercentage> {
         use taffy::LengthPercentage as Taffy;
         Some(match self {
             Self::Auto => return None,
@@ -44,6 +95,13 @@ impl Length {
             Self::Fraction(share) => Taffy::percent(share),
             Self::Calc(share, value) => {
                 calc(share, value, scale).map_or(Taffy::percent(share), Taffy::calc)
+            }
+            Self::Bound(index) => {
+                let bound = bounds.get(usize::from(index))?;
+                let address = (bound as *const Bound).expose_provenance() as u64;
+                Taffy::calc(std::ptr::without_provenance(
+                    (address & ADDRESS | BOUND_TAG) as usize,
+                ))
             }
         })
     }
@@ -60,6 +118,12 @@ fn calc(share: f32, offset: Pixels, scale: f32) -> Option<*const ()> {
 
 pub(crate) fn resolve_calc(handle: *const (), basis: f32) -> f32 {
     let bits = handle.addr() as u64;
+    if bits & !ADDRESS == BOUND_TAG {
+        let bound = std::ptr::with_exposed_provenance::<Bound>((bits & ADDRESS) as usize);
+        // SAFETY: the handle comes from the scaled bounds of a `Styled`, which outlives each Taffy style made from
+        // it.
+        return unsafe { &*bound }.resolve(basis);
+    }
     let share = f32::from_bits((bits >> 32) as u32);
     let units = (bits as u32 as i32) >> 3;
     share * basis + units as f32 / 64.
@@ -176,8 +240,12 @@ style! {
     border_widths: Edges<Pixels> = Edges::default(),
     align_items: Option<AlignItems> = None,
     align_self: Option<AlignItems> = None,
+    /// The horizontal self-alignment of an absolute box, as Taffy reads it.
+    justify_self: Option<AlignItems> = None,
     align_content: Option<AlignContent> = None,
     justify_content: Option<AlignContent> = None,
+    /// Content alignment falls back to the start when the content overflows, like `safe`.
+    safe: bool = false,
     gap: Size<Length> = Size::new(ZERO, ZERO),
     flex_direction: FlexDirection = FlexDirection::Row,
     flex_wrap: FlexWrap = FlexWrap::NoWrap,
@@ -208,6 +276,8 @@ style! {
     breaks: u8 = 0,
     /// [`Flow`] bits of a box in a block formatting context with floats.
     flow: u8 = 0,
+    /// The bounds that [`Length::Bound`] lengths of this style index.
+    bounds: Vec<Bound> = Vec::new(),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -241,6 +311,10 @@ impl Flow {
     /// A block column or line box in the formatting context of its parent: floats reach its lines and the boxes
     /// in it, and floats in it reach the boxes after it.
     pub const BLOCK: u8 = 16;
+    /// A box in a right-to-left parent: auto margins that overflow keep its right edge.
+    pub const RTL: u8 = 32;
+    /// A right-to-left box: its absolute boxes resolve their insets and auto margins from the right.
+    pub const RTL_BLOCK: u8 = 64;
     pub const FLOAT: u8 = Self::LEFT | Self::RIGHT;
 }
 
@@ -254,19 +328,29 @@ impl Escape {
 }
 
 impl Style {
-    pub(crate) fn to_taffy(&self, scale: f32) -> taffy::Style {
+    /// The Taffy style, and the scaled bounds that its calc handles point to, which must outlive it.
+    pub(crate) fn to_taffy(&self, scale: f32) -> (taffy::Style, Box<[Bound]>) {
         use taffy::{Dimension, LengthPercentage, LengthPercentageAuto, style as t};
+        let bounds: Box<[Bound]> = self
+            .bounds
+            .iter()
+            .map(|bound| bound.scaled(scale))
+            .collect();
         let length = |value: Length| {
             value
-                .to_taffy(scale)
+                .to_taffy(scale, &bounds)
                 .unwrap_or(LengthPercentage::length(0.))
         };
         let auto = |value: Length| {
             value
-                .to_taffy(scale)
+                .to_taffy(scale, &bounds)
                 .map_or(LengthPercentageAuto::auto(), Into::into)
         };
-        let dimension = |value: Length| value.to_taffy(scale).map_or(Dimension::auto(), Into::into);
+        let dimension = |value: Length| {
+            value
+                .to_taffy(scale, &bounds)
+                .map_or(Dimension::auto(), Into::into)
+        };
         let edges =
             |edges: &Edges<Length>, side: &dyn Fn(Length) -> LengthPercentageAuto| taffy::Rect {
                 top: side(edges.top),
@@ -291,6 +375,14 @@ impl Style {
             AlignContent::SpaceBetween => t::AlignContent::SPACE_BETWEEN,
             AlignContent::SpaceEvenly => t::AlignContent::SPACE_EVENLY,
             AlignContent::SpaceAround => t::AlignContent::SPACE_AROUND,
+        };
+        let safety = match self.safe {
+            true => t::AlignmentSafety::Safe,
+            false => t::AlignmentSafety::Default,
+        };
+        let content = |value: AlignContent| t::AlignContent {
+            safety,
+            ..content(value)
         };
         let overflow = |value: Overflow| match value {
             Overflow::Visible => t::Overflow::Visible,
@@ -349,6 +441,7 @@ impl Style {
             },
             align_items: self.align_items.map_or_else(Default::default, items),
             align_self: self.align_self.map(items),
+            justify_self: self.justify_self.map(items),
             align_content: self.align_content.map_or_else(Default::default, content),
             justify_content: self.justify_content.map_or_else(Default::default, content),
             flex_direction: match self.flex_direction {
@@ -372,7 +465,7 @@ impl Style {
         };
         (layout.flex_grow, layout.flex_shrink) = (self.flex_grow, self.flex_shrink);
         layout.aspect_ratio = self.aspect_ratio;
-        layout
+        (layout, bounds)
     }
 
     /// A visible axis stays open, and a visible border is outside the clip.
@@ -539,7 +632,7 @@ mod tests {
             baseline: Baseline::None,
             ..Style::default()
         };
-        let taffy = style.to_taffy(2.);
+        let (taffy, _) = style.to_taffy(2.);
         assert_eq!(taffy.display, taffy::Display::Flex);
         assert_eq!(taffy.size.width, taffy::Dimension::length(20.));
         assert_eq!(taffy.size.height, taffy::Dimension::percent(0.5));
@@ -551,7 +644,7 @@ mod tests {
             taffy::Dimension::calc(calc(0.5, px(4.), 2.).unwrap())
         );
         assert_eq!(taffy.contain, taffy::style::Contain::LAYOUT);
-        assert_eq!(Style::default().to_taffy(1.).flex_shrink, 1.);
+        assert_eq!(Style::default().to_taffy(1.).0.flex_shrink, 1.);
     }
 
     #[test]

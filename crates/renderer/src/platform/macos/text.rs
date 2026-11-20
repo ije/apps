@@ -9,14 +9,16 @@ use crate::{
 use anyhow::{Context as _, Result, bail};
 use objc2_core_foundation::{
     CFArray, CFData, CFDictionary, CFIndex, CFMutableAttributedString, CFNumber, CFRange,
-    CFRetained, CFString, CFType, CGFloat, CGPoint, CGRect, CGSize,
+    CFRetained, CFString, CFType, CGAffineTransform, CGFloat, CGPoint, CGRect, CGSize,
 };
-use objc2_core_graphics::{CGBitmapContextCreate, CGColorSpace, CGContext, CGTextDrawingMode};
+use objc2_core_graphics::{
+    CGBitmapContextCreate, CGColorSpace, CGContext, CGPathDrawingMode, CGTextDrawingMode,
+};
 use objc2_core_text::{
     CTFont, CTFontCollection, CTFontDescriptor, CTFontManagerCopyAvailableFontFamilyNames,
     CTFontManagerCreateFontDescriptorsFromData, CTFontOrientation, CTFontSymbolicTraits, CTLine,
-    CTRun, kCTFontAttributeName, kCTFontFamilyNameAttribute, kCTFontSlantTrait,
-    kCTFontSymbolicTrait, kCTFontWeightTrait, kCTFontWidthTrait,
+    CTRun, kCTFontAttributeName, kCTFontCascadeListAttribute, kCTFontFamilyNameAttribute,
+    kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait, kCTFontWidthTrait,
 };
 use rustc_hash::FxHashMap;
 use std::{
@@ -84,6 +86,9 @@ struct Face {
     local: bool,
     emoji: bool,
     mono: bool,
+    /// Like Chrome, a face without the asked bold or slant draws its glyphs emboldened or skewed.
+    bold: bool,
+    oblique: bool,
     units: OnceCell<Units>,
     matching: OnceCell<(f32, FontStyle, f32)>,
     axes: OnceCell<Axes>,
@@ -111,6 +116,8 @@ impl Face {
         Self {
             emoji: name == "AppleColorEmoji" || name == ".AppleColorEmojiUI",
             mono: traits.contains(CTFontSymbolicTraits::TraitMonoSpace),
+            bold: false,
+            oblique: false,
             font,
             local,
             units: OnceCell::new(),
@@ -179,6 +186,23 @@ impl Face {
         .map(|value| value * per_point)
     }
 
+    /// `[min x, min y, max x, max y]` of the drawn glyph at `size`, with the synthetic bold and slant.
+    fn drawn(&self, glyph: GlyphId, size: f32) -> [f32; 4] {
+        let k = size / self.units().per_em as f32;
+        let [x0, y0, x1, y1] = self.outline(glyph).map(|value| value * k);
+        let (x0, x1) = if self.oblique {
+            (x0 + SKEW * y0.min(0.), x1 + SKEW * y1.max(0.))
+        } else {
+            (x0, x1)
+        };
+        let out = if self.bold {
+            embolden(size, 1.) / 2.
+        } else {
+            0.
+        };
+        [x0 - out, y0 - out, x1 + out, y1 + out]
+    }
+
     fn matching(&self) -> (f32, FontStyle, f32) {
         *self.matching.get_or_init(|| {
             // SAFETY: plain CoreText queries.
@@ -209,6 +233,53 @@ impl Face {
             (weight, style, css_stretch(width as f32))
         })
     }
+}
+
+/// Skia's A8 mask gamma tables (`SkTMaskGamma<3, 3, 3>`) for Chromium on macOS: sRGB, no contrast. Each of the
+/// 8 luminance levels maps linear coverage so that blending in sRGB values looks like blending in linear light.
+fn mask_gamma() -> &'static [[u8; 256]; 8] {
+    static TABLES: OnceLock<[[u8; 256]; 8]> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        let to_linear = |v: f32| {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let from_linear = |v: f32| {
+            if v <= 0.003_130_8 {
+                v * 12.92
+            } else {
+                1.055 * v.powf(1. / 2.4) - 0.055
+            }
+        };
+        std::array::from_fn(|level| {
+            let lum = (level as u32) << 5 | (level as u32) << 2 | (level as u32) >> 1;
+            let src = lum as f32 / 255.;
+            let dst = 1. - src;
+            let (src_linear, dst_linear) = (to_linear(src), to_linear(dst));
+            std::array::from_fn(|i| {
+                let a = i as f32 / 255.;
+                if (src - dst).abs() < 1. / 256. {
+                    return i as u8;
+                }
+                let out = from_linear(src_linear * a + (1. - a) * dst_linear);
+                (255. * (out - dst) / (src - dst)).round().clamp(0., 255.) as u8
+            })
+        })
+    })
+}
+
+/// Skia's skew for a synthetic slant.
+const SKEW: f32 = 0.25;
+
+/// The width of the line that Skia strokes around outlines for a synthetic bold, in CSS pixels: 1/24 of the size
+/// up to 9px, 1/32 from 36px. Like Chromium, the size is in device pixels, so the line is thinner at 2x.
+fn embolden(size: f32, scale: f32) -> f32 {
+    let device = size * scale;
+    let t = ((device - 9.) / 27.).clamp(0., 1.);
+    size * (1. / 24. + t * (1. / 32. - 1. / 24.))
 }
 
 /// CoreText weights of the CSS weights 100 to 900 for Apple's faces. A plain linear scale maps Medium to 530,
@@ -391,10 +462,8 @@ impl TextSystem {
 
     pub fn ink(&self, font: FontId, glyph: GlyphId, size: f32) -> Option<[f32; 4]> {
         let book = self.0.borrow();
-        let face = book.face(font);
-        let [x0, y0, x1, y1] = face.outline(glyph);
-        let scale = size / face.units().per_em as f32;
-        Some([x0 * scale, x1 * scale, y1 * scale, y0 * scale])
+        let [x0, y0, x1, y1] = book.face(font).drawn(glyph, size);
+        Some([x0, x1, y1, y0])
     }
 
     pub fn shape(&self, text: &str, font_size: Pixels, spans: &[Span]) -> Line {
@@ -404,8 +473,7 @@ impl TextSystem {
     pub fn raster_bounds(&self, glyph: &GlyphRaster) -> Result<Rect<i32>> {
         let book = self.0.borrow();
         let face = book.face(glyph.font);
-        let k = glyph.size.0 / face.units().per_em as f32;
-        let [x0, y0, x1, y1] = face.outline(glyph.glyph).map(|value| value * k);
+        let [x0, y0, x1, y1] = face.drawn(glyph.glyph, glyph.size.0);
         // To y down, measured from the top.
         let (width, height) = (x1 - x0, y1 - y0);
         let (left, top) = (x0, -y0 - height);
@@ -415,8 +483,14 @@ impl TextSystem {
             ((left + width) * s).ceil() as i32,
             ((top + height) * s).ceil() as i32,
         );
-        // A miter join reaches twice the stroke width past the outline at most.
-        let reach = (glyph.stroke * 2. * s).ceil() as i32;
+        // A miter join reaches twice the stroke width past the outline at most. `drawn` holds half the synthetic
+        // bold, and sharp corners can reach half more.
+        let bold = if face.bold {
+            embolden(glyph.size.0, s) / 2.
+        } else {
+            0.
+        };
+        let reach = ((glyph.stroke * 2. + bold) * s).ceil() as i32;
         Ok(Rect::new(min, size(max.x - min.x, max.y - min.y)).outset(1 + reach))
     }
 
@@ -454,14 +528,22 @@ impl TextSystem {
         }
         .context("Could not make a glyph canvas")?;
         let cx = Some(&*context);
+        let (bold, oblique) = {
+            let book = self.0.borrow();
+            let face = book.face(glyph.font);
+            (face.bold, face.oblique)
+        };
+        // Like Skia, which draws emboldened and stroked glyphs from their outlines, without the font smoothing of
+        // CoreText.
+        let smooth = glyph.dilation > 0 && !bold && glyph.stroke == 0.;
         if opaque {
             CGContext::set_gray_fill_color(cx, 1., 1.);
             CGContext::fill_rect(
                 cx,
                 CGRect::new(CGPoint::ZERO, CGSize::new(width as _, height as _)),
             );
-            CGContext::set_allows_font_smoothing(cx, glyph.dilation > 0);
-            CGContext::set_should_smooth_fonts(cx, glyph.dilation > 0);
+            CGContext::set_allows_font_smoothing(cx, smooth);
+            CGContext::set_should_smooth_fonts(cx, smooth);
         }
         CGContext::translate_ctm(
             cx,
@@ -472,12 +554,28 @@ impl TextSystem {
         let oversize = if glyph.emoji { glyph.scale.max(2.) } else { 1. };
         let scale = (glyph.scale / oversize) as CGFloat;
         CGContext::scale_ctm(cx, scale, scale);
+        if oblique {
+            let skew = CGAffineTransform {
+                a: 1.,
+                b: 0.,
+                c: SKEW as CGFloat,
+                d: 1.,
+                tx: 0.,
+                ty: 0.,
+            };
+            CGContext::concat_ctm(cx, skew);
+        }
+        let bold = if bold {
+            embolden(glyph.size.0, glyph.scale)
+        } else {
+            0.
+        };
+        // Like Skia, whose stroked text has miter joins up to 4 times the width.
+        CGContext::set_line_width(cx, (glyph.stroke + bold) as CGFloat);
+        CGContext::set_miter_limit(cx, 4.);
+        CGContext::set_gray_stroke_color(cx, 0., 1.);
         if glyph.stroke > 0. {
-            // Like Skia, whose stroked text has miter joins up to 4 times the width.
             CGContext::set_text_drawing_mode(cx, CGTextDrawingMode::Stroke);
-            CGContext::set_line_width(cx, glyph.stroke as CGFloat);
-            CGContext::set_miter_limit(cx, 4.);
-            CGContext::set_gray_stroke_color(cx, 0., 1.);
         } else {
             CGContext::set_text_drawing_mode(cx, CGTextDrawingMode::Fill);
         }
@@ -497,14 +595,49 @@ impl TextSystem {
             glyph.glyph,
             CGPoint::new((shift / glyph.scale) as CGFloat, 0.),
         );
-        // SAFETY: one glyph at one position, drawn into a live context.
-        unsafe { font.draw_glyphs(NonNull::from(&mut id), NonNull::from(&mut at), 1, &context) };
+        // Like Skia, a synthetic bold fills the outline grown by half the width: a fill and a stroke of the path.
+        let path = if glyph.stroke == 0. && bold > 0. {
+            let moved = CGAffineTransform {
+                a: 1.,
+                b: 0.,
+                c: 0.,
+                d: 1.,
+                tx: at.x,
+                ty: 0.,
+            };
+            // SAFETY: a path of one glyph of a live font.
+            unsafe { font.path_for_glyph(id, &moved) }
+        } else {
+            None
+        };
+        if let Some(path) = &path {
+            CGContext::add_path(cx, Some(path));
+            CGContext::draw_path(cx, CGPathDrawingMode::FillStroke);
+        } else {
+            // SAFETY: one glyph at one position, drawn into a live context.
+            unsafe {
+                font.draw_glyphs(NonNull::from(&mut id), NonNull::from(&mut at), 1, &context)
+            };
+        }
         if opaque {
+            // Like Skia: smoothed CoreGraphics values are squared back to linear coverage, and all masks go
+            // through the mask gamma of their text luminance.
+            let gamma =
+                (glyph.dilation > 0).then(|| &mask_gamma()[usize::from(glyph.dilation - 1)]);
             bytes = bytes
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .map(|pixel| 255 - pixel[1])
+                .map(|pixel| {
+                    let value = u32::from(pixel[1]);
+                    let value = if smooth {
+                        (value * value + 128) / 255
+                    } else {
+                        value
+                    };
+                    255 - value as u8
+                })
+                .map(|coverage| gamma.map_or(coverage, |table| table[usize::from(coverage)]))
                 .collect();
         } else if glyph.emoji {
             for pixel in bytes.as_chunks_mut::<4>().0 {
@@ -544,7 +677,8 @@ impl TextSystem {
             .spawn(load);
     }
 
-    pub fn dilation(&self, _: Color) -> u8 {
+    /// 0 without font smoothing, else 1 + the luminance level of `color` for `mask_gamma`.
+    pub fn dilation(&self, color: Color) -> u8 {
         static SMOOTHING: OnceLock<bool> = OnceLock::new();
         let smoothing = *SMOOTHING.get_or_init(|| {
             use objc2_core_foundation::{
@@ -558,7 +692,18 @@ impl TextSystem {
                 .and_then(|value| value.downcast::<CFNumber>().ok())
                 .is_none_or(|value| value.as_i64() != Some(0))
         });
-        smoothing.into()
+        if !smoothing {
+            return 0;
+        }
+        // Like Skia's mask gamma: 3 bits per channel, halved for CoreGraphics smoothing and cut to 3 bits again,
+        // then 3 bits of luminance.
+        let canonical = |bits: u32| bits << 5 | bits << 2 | bits >> 1;
+        let [r, g, b] = [color.r, color.g, color.b].map(|value| {
+            let bits = (value.clamp(0., 1.) * 255.).round() as u32 >> 5;
+            canonical((canonical(bits) / 2) >> 5)
+        });
+        let level = (r * 54 + g * 183 + b * 19) >> 8 >> 5;
+        1 + level as u8
     }
 }
 
@@ -575,6 +720,40 @@ impl Book {
     }
 
     fn font(&mut self, font: &Font) -> Option<FontId> {
+        if let Some((first, rest)) = font.family.split_once('\n') {
+            let id = self.font(&Font {
+                family: first.into(),
+                ..font.clone()
+            })?;
+            return Some(self.cascade(id, rest, font));
+        }
+        let id = self.matched(font)?;
+        let face = self.face(id);
+        let weight = face.matching().0;
+        let bold = font.synthesis[0]
+            && font.weight >= 600.
+            && weight < 600.
+            && !face.axes().iter().any(|&(tag, _)| tag == open_type::WGHT);
+        // Like Chrome, faces that only lean, without the italic trait, slant more.
+        // SAFETY: plain CoreText query.
+        let italic =
+            unsafe { face.font.symbolic_traits() }.contains(CTFontSymbolicTraits::TraitItalic);
+        let oblique = font.synthesis[1] && font.style != FontStyle::Normal && !italic;
+        if face.emoji || !bold && !oblique {
+            return Some(id);
+        }
+        let name = format!("{id}#synthetic{}{}", u8::from(bold), u8::from(oblique));
+        if let Some(&known) = self.names.get(&name) {
+            return Some(known);
+        }
+        let (copy, local) = (face.font.clone(), face.local);
+        let synthetic = self.register(copy, name, local);
+        let face = &mut self.faces[synthetic as usize];
+        (face.bold, face.oblique) = (bold, oblique);
+        Some(synthetic)
+    }
+
+    fn matched(&mut self, font: &Font) -> Option<FontId> {
         let key = (font.family.clone(), font.features.clone());
         let candidates = match self.families.get(&key) {
             Some(found) => found.clone(),
@@ -637,6 +816,48 @@ impl Book {
             return Some(id);
         }
         Some(self.instance(id, wanted))
+    }
+
+    /// A copy of `id` that falls back to the faces of `families`, one per line, before the system fonts.
+    fn cascade(&mut self, id: FontId, families: &str, font: &Font) -> FontId {
+        let name = format!("{id}#cascade\n{families}");
+        if let Some(&known) = self.names.get(&name) {
+            return known;
+        }
+        let descriptors: Vec<_> = families
+            .split('\n')
+            .filter_map(|family| {
+                let id = self.font(&Font {
+                    family: family.into(),
+                    ..font.clone()
+                })?;
+                // SAFETY: plain CoreText query.
+                Some(unsafe { self.face(id).font.font_descriptor() })
+            })
+            .collect();
+        if descriptors.is_empty() {
+            return id;
+        }
+        let list = CFArray::from_retained_objects(&descriptors);
+        // SAFETY: a descriptor with a cascade list of descriptors, and a copy of a live font with it.
+        let copy = unsafe {
+            let attributes = CFDictionary::<CFString, CFType>::from_slices(
+                &[kCTFontCascadeListAttribute],
+                &[list.as_ref()],
+            );
+            let descriptor = CTFontDescriptor::with_attributes(attributes.as_opaque());
+            self.face(id)
+                .font
+                .copy_with_attributes(0., ptr::null(), Some(&descriptor))
+        };
+        let (local, bold, oblique) = {
+            let face = self.face(id);
+            (face.local, face.bold, face.oblique)
+        };
+        let cascade = self.register(copy, name, local);
+        let face = &mut self.faces[cascade as usize];
+        (face.bold, face.oblique) = (bold, oblique);
+        cascade
     }
 
     fn load(&mut self, family: &str, features: &[(String, u32)]) -> Option<Vec<FontId>> {
@@ -1706,6 +1927,165 @@ mod tests {
             .iter()
             .any(|kept| CFRetained::as_ptr(&kept.font) == CFRetained::as_ptr(face));
         assert!(shared, "the second text system uses the process's faces");
+    }
+
+    #[test]
+    fn later_families_fill_in_missing_glyphs_before_the_system_fonts() {
+        let text = TextSystem::default();
+        let fonts = |family: &str| {
+            let id = text.font(&Font::new(family)).unwrap();
+            let line = text.shape(
+                "aא",
+                px(16.),
+                &[Span {
+                    len: "aא".len(),
+                    font: id,
+                    size: px(16.),
+                    letter_spacing: px(0.),
+                    word_spacing: px(0.),
+                    inset: [px(0.); 2],
+                    nowrap: false,
+                }],
+            );
+            line.glyphs
+                .iter()
+                .map(|glyph| name(&text, glyph.font))
+                .collect::<Vec<_>>()
+        };
+        let alone = fonts("Helvetica");
+        let listed = fonts("Helvetica\nTimes New Roman");
+        assert!(
+            alone[0].starts_with("Helvetica") && !alone[1].starts_with("TimesNewRoman"),
+            "{alone:?}"
+        );
+        assert!(
+            listed[0].contains("#cascade") && listed[1].starts_with("TimesNewRoman"),
+            "{listed:?}"
+        );
+    }
+
+    #[test]
+    fn faces_without_bold_or_italic_get_synthetic_ones_like_chrome() {
+        let text = TextSystem::default();
+        let face = |weight, style, synthesis| {
+            let id = text
+                .font(&Font {
+                    weight,
+                    style,
+                    synthesis,
+                    ..Font::new("Herculanum")
+                })
+                .unwrap();
+            let book = text.0.borrow();
+            (id, book.face(id).bold, book.face(id).oblique)
+        };
+        let on = [true; 2];
+        let (regular, ..) = face(400., FontStyle::Normal, on);
+        assert_eq!(face(500., FontStyle::Normal, on).0, regular);
+        let (bold, true, false) = face(600., FontStyle::Normal, on) else {
+            panic!("600 is bold")
+        };
+        let (slanted, false, true) = face(400., FontStyle::Italic, on) else {
+            panic!("italic slants")
+        };
+        assert!(matches!(
+            face(700., FontStyle::Oblique, on),
+            (_, true, true)
+        ));
+        // `font-synthesis` turns each off.
+        assert_eq!(face(700., FontStyle::Italic, [false; 2]).0, regular);
+        assert!(matches!(
+            face(700., FontStyle::Italic, [false, true]),
+            (_, false, true)
+        ));
+        // Helvetica has its own bold and italic faces.
+        let helvetica = text.font(&Font {
+            weight: 700.,
+            style: FontStyle::Oblique,
+            ..Font::new("Helvetica")
+        });
+        let book = text.0.borrow();
+        let face = book.face(helvetica.unwrap());
+        assert!(!face.bold && !face.oblique);
+        drop(book);
+        let glyph = text.glyph(regular, 'H').unwrap();
+        let raster = |font, size, scale| GlyphRaster {
+            font,
+            glyph,
+            size: px(size),
+            scale,
+            subpixel: 0,
+            emoji: false,
+            dilation: 0,
+            stroke: 0.,
+        };
+        let bounds = |font| text.raster_bounds(&raster(font, 48., 2.)).unwrap();
+        let [plain, bold_box, slanted_box] = [regular, bold, slanted].map(bounds);
+        assert!(bold_box.size.width > plain.size.width && bold_box.size.height > plain.size.height);
+        assert!(
+            slanted_box.size.width > plain.size.width
+                && slanted_box.size.height == plain.size.height
+        );
+        // Like Chrome, the advances stay those of the face.
+        assert_eq!(text.advance(bold, glyph), text.advance(regular, glyph));
+        // Small text at 1x gets bolder too.
+        for (size, scale) in [(48., 2.), (12., 1.)] {
+            let ink = |font| {
+                let glyph = raster(font, size, scale);
+                let (_, pixels) = text
+                    .rasterize(&glyph, text.raster_bounds(&glyph).unwrap())
+                    .unwrap();
+                pixels.iter().map(|&value| u32::from(value)).sum::<u32>()
+            };
+            assert!(ink(bold) > ink(regular) * 11 / 10, "{size}px at {scale}x");
+        }
+    }
+
+    #[test]
+    fn glyphs_take_skias_mask_gamma_of_their_color() {
+        let tables = mask_gamma();
+        // Dark text: edge coverage lightens, as sRGB blending of linear light does. Light text stays near linear.
+        assert_eq!((tables[0][0], tables[0][255]), (0, 255));
+        assert!((66..=70).contains(&tables[0][128]), "{}", tables[0][128]);
+        assert!((110..=128).contains(&tables[3][128]), "{}", tables[3][128]);
+        // Like Chromium, the synthetic bold line is thinner at 2x: its fraction of the size follows device pixels.
+        assert!(embolden(16., 2.) < embolden(16., 1.));
+        assert_eq!(embolden(48., 2.), 48. / 32.);
+        let text = TextSystem::default();
+        let font = |weight| {
+            text.font(&Font {
+                weight,
+                ..Font::new("Helvetica")
+            })
+            .unwrap()
+        };
+        let regular = font(400.);
+        if text.dilation(Color::WHITE) == 0 {
+            return;
+        }
+        // Halved for CoreGraphics smoothing, white is luminance level 3.
+        assert_eq!(text.dilation(Color::BLACK), 1);
+        assert_eq!(text.dilation(Color::WHITE), 4);
+        let glyph = text.glyph(regular, 'e').unwrap();
+        let ink = |dilation, stroke| {
+            let raster = GlyphRaster {
+                font: regular,
+                glyph,
+                size: px(13.),
+                scale: 2.,
+                subpixel: 0,
+                emoji: false,
+                dilation,
+                stroke,
+            };
+            let (_, pixels) = text
+                .rasterize(&raster, text.raster_bounds(&raster).unwrap())
+                .unwrap();
+            pixels.iter().map(|&value| u32::from(value)).sum::<u32>()
+        };
+        // Like Chrome, light text on a dark background draws heavier than dark text, and so do stroked glyphs.
+        assert!(ink(4, 0.) > ink(1, 0.) * 21 / 20);
+        assert!(ink(1, 1.) < ink(0, 1.));
     }
 
     #[test]
