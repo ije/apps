@@ -173,7 +173,21 @@ fn selector_boundary(source: &str, separator: impl Fn(char) -> bool) -> usize {
     source.len()
 }
 
-type Matches = rustc_hash::FxHashMap<(usize, usize, Option<usize>, bool), (bool, Rc<[Dependency]>)>;
+// Match results by selector, node, and scope with a flag: the place of their dependencies in `found`, and the
+// result in the top bit of the length.
+type Matches = rustc_hash::FxHashMap<(usize, u32, u32), (u32, u32)>;
+
+const MATCHED: u32 = 1 << 31;
+
+fn match_key(
+    selector: usize,
+    id: usize,
+    scope: Option<usize>,
+    ancestor: bool,
+) -> (usize, u32, u32) {
+    let scope = scope.map_or(0, |scope| scope as u32 + 1);
+    (selector, id as u32, scope << 1 | u32::from(ancestor))
+}
 
 // The place of each element child, and the element children in order.
 type Positions = Rc<(rustc_hash::FxHashMap<usize, [usize; 4]>, Vec<usize>)>;
@@ -225,7 +239,8 @@ pub(crate) struct SelectorCache {
     latest: u64,
     forgotten: Vec<usize>,
     values: Matches,
-    size: usize,
+    // The dependencies of `values`. Replaced results leave theirs here until both are cleared.
+    found: Vec<Dependency>,
     positions: rustc_hash::FxHashMap<usize, (u32, Positions)>,
     nth: rustc_hash::FxHashMap<(usize, usize, Option<usize>), NthPositions>,
     pub(crate) dependencies: Vec<Dependency>,
@@ -270,7 +285,7 @@ impl SelectorCache {
     // Clear selector results when scopes change: selector addresses key the cache.
     pub(crate) fn forget_selectors(&mut self) {
         self.values.clear();
-        self.size = 0;
+        self.found.clear();
         self.within.retain(|_, results| {
             results.retain(|result| Rc::strong_count(&result.0) > 1);
             !results.is_empty()
@@ -372,7 +387,7 @@ impl SelectorCache {
 
     pub fn trim(&mut self, len: usize) {
         self.values = Default::default();
-        self.size = 0;
+        self.found = Vec::new();
         self.positions = Default::default();
         self.dependencies = Vec::new();
         self.nodes.truncate(len);
@@ -398,7 +413,7 @@ impl SelectorCache {
         self.pass = self.pass.wrapping_add(1).max(1);
         if self.values.len() > 131072 {
             self.values.clear();
-            self.size = 0;
+            self.found.clear();
         }
         if self.positions.len() > 65536 {
             self.positions.clear();
@@ -926,12 +941,25 @@ impl SelectorCache {
         })
     }
 
-    fn reserve(&mut self, count: usize) {
-        self.size += count;
-        if self.size > 2_000_000 {
+    // Keeps a result with the dependencies recorded since `from`.
+    fn store(&mut self, key: (usize, u32, u32), result: bool, from: usize) {
+        if self.found.len() + self.dependencies.len() - from > 2_000_000 {
             self.values.clear();
-            self.size = count;
+            self.found.clear();
         }
+        let start = self.found.len();
+        self.found.extend_from_slice(&self.dependencies[from..]);
+        self.found[start..].sort_unstable();
+        let mut end = start;
+        for at in start..self.found.len() {
+            if end == start || self.found[at] != self.found[end - 1] {
+                self.found[end] = self.found[at];
+                end += 1;
+            }
+        }
+        self.found.truncate(end);
+        let len = (end - start) as u32 | if result { MATCHED } else { 0 };
+        self.values.insert(key, (start as u32, len));
     }
 
     pub(crate) fn valid_since(
@@ -2032,7 +2060,7 @@ impl Selector {
         store: bool,
         subject: bool,
     ) -> bool {
-        let key = (self as *const Self as usize, id, scope, false);
+        let key = match_key(self as *const Self as usize, id, scope, false);
         let compound = !store
             || self.previous.is_none()
                 && self.simple.iter().all(|simple| match simple {
@@ -2066,12 +2094,13 @@ impl Selector {
             return false;
         }
         if !compound
-            && let Some((result, dependencies)) = memo.values.get(&key)
-            && memo.valid(dependencies)
+            && let Some(&(at, len)) = memo.values.get(&key)
+            && let found = &memo.found[at as usize..][..(len & !MATCHED) as usize]
+            && memo.valid(found)
         {
             memo.dependencies.truncate(start);
-            memo.dependencies.extend(dependencies.iter().copied());
-            return *result;
+            memo.dependencies.extend_from_slice(found);
+            return len & MATCHED != 0;
         }
         let result = (|| {
             let host = node
@@ -2685,12 +2714,13 @@ impl Selector {
                         // other's branch dependencies.
                         let from = memo.dependencies.len();
                         memo.depend(id, 1);
-                        let key = (&**previous as *const Self as usize, id, scope, true);
-                        if let Some((result, dependencies)) = memo.values.get(&key)
-                            && memo.valid(dependencies)
+                        let key = match_key(&**previous as *const Self as usize, id, scope, true);
+                        if let Some(&(at, len)) = memo.values.get(&key)
+                            && let found = &memo.found[at as usize..][..(len & !MATCHED) as usize]
+                            && memo.valid(found)
                         {
-                            matched = *result;
-                            memo.dependencies.extend(dependencies.iter().copied());
+                            matched = len & MATCHED != 0;
+                            memo.dependencies.extend_from_slice(found);
                             break;
                         }
                         visited.push((key, from));
@@ -2701,12 +2731,7 @@ impl Selector {
                         ancestor = doc.nodes[id].parent;
                     }
                     for (key, from) in visited.into_iter().rev() {
-                        let mut dependencies = memo.dependencies[from..].to_vec();
-                        dependencies.sort_unstable();
-                        dependencies.dedup();
-                        let dependencies: Rc<[_]> = dependencies.into();
-                        memo.reserve(dependencies.len());
-                        memo.values.insert(key, (matched, dependencies));
+                        memo.store(key, matched, from);
                     }
                     matched
                 }
@@ -2715,11 +2740,7 @@ impl Selector {
         if compound {
             return result;
         }
-        let mut dependencies = memo.dependencies[start..].to_vec();
-        dependencies.sort_unstable();
-        dependencies.dedup();
-        memo.reserve(dependencies.len());
-        memo.values.insert(key, (result, dependencies.into()));
+        memo.store(key, result, start);
         result
     }
 }
