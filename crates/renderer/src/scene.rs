@@ -35,6 +35,8 @@ pub struct Scene {
     pub(crate) removed: Vec<(bool, u32, Rect<i32>)>,
     entries: Vec<Entry>,
     maps: Vec<Map>,
+    // Layers that patches changed since the last diff, so `maps` doesn't place what they hold.
+    moved: Vec<usize>,
     prior: Vec<Entry>,
     prior_maps: Vec<Map>,
     // `prior` holds what the window shows, and `entries` this scene since `diff`.
@@ -458,6 +460,7 @@ impl Default for Scene {
             removed: Vec::new(),
             entries: Vec::new(),
             maps: Vec::new(),
+            moved: Vec::new(),
             prior: Vec::new(),
             prior_maps: Vec::new(),
             drawn: false,
@@ -1336,31 +1339,28 @@ impl Scene {
         let Some(index) = self.keyed(key) else {
             return false;
         };
-        // The reach in window pixels, while no layer around it moves or spreads its pixels.
+        // The reach in window pixels. Layers around it map it to the window as the last diff found them,
+        // unless a patch moved them since.
         let reach = |scene: &Self| {
-            let mut child = index;
-            let mut reach = None;
-            loop {
-                let (parent, nested) =
-                    scene.layers.iter().enumerate().find_map(|(at, layer)| {
-                        let nested = layer.nested.iter().find(|nested| nested.layer == child)?;
-                        Some((at, nested))
-                    })?;
-                let reach = *reach.get_or_insert(nested.reach());
-                if parent == 0 {
-                    return Some(reach);
-                }
-                let effect = scene.layers[parent].effect.as_ref()?;
-                if effect.transform.is_some()
-                    || effect.blur > 0.
-                    || effect.shadow.is_some()
+            let (parent, nested) = scene.layers.iter().enumerate().find_map(|(at, layer)| {
+                let nested = layer.nested.iter().find(|nested| nested.layer == index)?;
+                Some((at, nested))
+            })?;
+            let reach = nested.reach();
+            let mut layer = parent;
+            while layer != 0 {
+                let effect = scene.layers[layer].effect.as_ref()?;
+                if scene.diffed == Some(false)
+                    || layer >= scene.maps.len()
+                    || scene.moved.contains(&layer)
                     || effect.backdrop.is_some()
                     || effect.blend_mode != crate::BlendMode::Normal
                 {
                     return None;
                 }
-                child = parent;
+                layer = scene.maps[layer].parent as usize;
             }
+            Some(window_reach(&scene.maps, parent as u32, reach))
         };
         let before = reach(self);
         let Some(effect) = self.layers[index].effect.as_mut() else {
@@ -1396,7 +1396,11 @@ impl Scene {
                 }),
                 None => true,
             };
-        match (before, reach(self)) {
+        let after = reach(self);
+        if !self.moved.contains(&index) {
+            self.moved.push(index);
+        }
+        match (before, after) {
             (Some(before), Some(after)) => {
                 let changed = before.union(after);
                 self.damage.add(changed);
@@ -1477,6 +1481,7 @@ impl Scene {
             walk.owners,
         );
         self.diffed = Some(true);
+        self.moved.clear();
         let mut damage = mem::take(&mut self.patched);
         damage.whole |= !self.drawn;
         // Scrolls whose content moved since the drawn frame: (scroll, its prior one, how far).
@@ -2750,6 +2755,79 @@ mod tests {
         assert!(scene.layers[0].instances.is_empty());
         assert!(scene.layers[0].nested.is_empty());
         assert_eq!(scene.layers[0].bounds, None);
+    }
+
+    #[test]
+    fn patches_in_moved_layers_damage_only_their_place() {
+        let mask = Clip::from(bounds([0., 0., 800., 600.]));
+        let fill = |scene: &mut Scene, opacity: f32, shadow: bool| {
+            scene.clear();
+            scene.push(Instance::new(BOX, bounds([0., 0., 800., 600.]), mask));
+            let mut matrix = crate::frame::IDENTITY;
+            [matrix[12], matrix[13]] = [300., 200.];
+            scene.push_effect(
+                EffectState {
+                    transform: Some(matrix),
+                    shadow: shadow.then(|| {
+                        let color = crate::Color {
+                            r: 0.,
+                            g: 0.,
+                            b: 0.,
+                            a: 0.5,
+                        };
+                        (point(0., 4.), 6., color)
+                    }),
+                    ..effect(mask)
+                },
+                None,
+            );
+            scene.push_effect(
+                EffectState {
+                    opacity,
+                    ..effect(mask)
+                },
+                Some(7),
+            );
+            scene.push(Instance::new(BOX, bounds([20., 20., 40., 40.]), mask));
+            scene.pop_effect();
+            scene.pop_effect();
+        };
+        for shadow in [false, true] {
+            // What a new scene damages.
+            let mut fresh = Scene::default();
+            fill(&mut fresh, 0.9, shadow);
+            fresh.diff(Some(&[]));
+            fresh.drawn();
+            fill(&mut fresh, 0.5, shadow);
+            fresh.diff(Some(&[]));
+            let wanted = fresh.damage.clone();
+            assert!(!wanted.whole && !wanted.rects.is_empty());
+
+            let mut patched = Scene::default();
+            fill(&mut patched, 0.9, shadow);
+            patched.diff(Some(&[]));
+            patched.drawn();
+            assert!(patched.patch(7, 0.5, None, [None; 2]));
+            assert!(!patched.damage.whole, "shadow {shadow}");
+            for rect in &wanted.rects {
+                assert!(
+                    patched
+                        .damage
+                        .rects
+                        .iter()
+                        .any(|got| got.intersect(*rect) == *rect),
+                    "shadow {shadow}: {rect:?} in {:?}",
+                    patched.damage.rects
+                );
+            }
+            let area: f32 = (patched.damage.rects.iter())
+                .map(|rect| rect.size.width * rect.size.height)
+                .sum();
+            assert!(area < 100. * 100., "shadow {shadow}: {area}");
+            // A second patch of a layer whose place a patch changed can't use the maps of the diff.
+            assert!(patched.patch(7, 0.4, None, [None; 2]));
+            assert!(!patched.damage.whole);
+        }
     }
 
     #[test]
