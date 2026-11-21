@@ -230,6 +230,10 @@ impl Surface {
 
     fn tick(&self) {
         let pace = &self.pace;
+        // A tick queued before the last frame drew waits for that frame's callback, or it draws twice per refresh.
+        if pace.waiting.get() {
+            return;
+        }
         if self.calls.frame() == Some(false) {
             pace.wants.set(false);
             return;

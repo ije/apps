@@ -86,6 +86,8 @@ pub(crate) struct PageState {
     kept_frame: RefCell<([f32; 4], Vec<usize>)>,
     mismatched: RefCell<[Mismatches; 2]>,
     layout_queued: Cell<bool>,
+    // The queued animation frame: true when it can composite, false when it must draw the page again.
+    motion_frame: Cell<Option<bool>>,
     #[cfg(target_os = "macos")]
     canvas: Cell<(u32, u8)>,
     canvas_layers: Cell<Option<u64>>,
@@ -423,6 +425,7 @@ impl PageView {
             kept_frame: RefCell::default(),
             mismatched: RefCell::default(),
             layout_queued: Cell::default(),
+            motion_frame: Cell::default(),
         });
         VIEWS.with_borrow_mut(|views| {
             views.retain(|_, view| view.strong_count() > 0);
@@ -1773,6 +1776,8 @@ impl PageView {
         }
         placed.extend(self.animated.borrow().iter());
         let mut recolored = std::mem::take(&mut dom.recolored);
+        // The values that move boxes. `self.animated` builds the boxes of painted values in place next frame.
+        let relayouts = restore.len();
         if !paint.is_empty() {
             let values = &mut Rc::make_mut(&mut styles).values;
             for (id, style) in paint {
@@ -2510,7 +2515,7 @@ impl PageView {
                 !restore.is_empty() || !restore_pseudos.is_empty() || !lengths.is_empty();
             // Animated values go back to the cascade values here, and the next frame visits their nodes again.
             // Animated units are not in the values, so a frame after them visits all nodes.
-            dom.cull.swapped = (restore.iter().map(|(id, _)| *id))
+            dom.cull.swapped = (restore[..relayouts].iter().map(|(id, _)| *id))
                 .chain(restore_pseudos.iter().map(|(id, _)| *id))
                 .collect();
             let units = !lengths.is_empty();
@@ -2752,10 +2757,16 @@ fn animate(
     match next {
         Some(at) if at <= now + std::time::Duration::from_millis(8) => {
             dom.motion.wake = None;
+            // Paint and composite both ask for the next frame, and two callbacks would each ask again.
+            let queued = view.motion_frame.replace(Some(composite));
+            if let Some(queued) = queued {
+                view.motion_frame.set(Some(queued && composite));
+                return;
+            }
             let view = view.clone();
-            window.next_frame(move |window, cx| match composite {
-                true => self::composite(view, window, cx),
-                false => window.refresh(),
+            window.next_frame(move |window, cx| match view.motion_frame.take() {
+                Some(true) => self::composite(view, window, cx),
+                _ => window.refresh(),
             });
         }
         Some(at) => {
