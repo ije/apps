@@ -95,11 +95,13 @@
     if (marks[node._id] & 128 && (box[8] !== geometry[i + 2] || box[9] !== geometry[i + 3])) return Math.round(box[2 + axis]);
     if (!box[2] && !box[3] && !box[4] && !box[5] && !box[6] && !box[7] && /^(inline|contents)$/.test(getComputedStyle(node).display)) return 0;
     const start = geometry[i + axis] + box[axis], pending = [...(node._m.shadow ?? node._m).kids];
+    // A right-to-left box overflows to its left, so its width counts from its right side.
+    const right = !axis && getComputedStyle(node).direction === 'rtl' ? start + box[2] : null;
     let end = 0;
     while (pending.length) {
       const kid = pending.pop(), j = 4 + kid.id * 8;
       if (j >= limit || (marks[kid.id] & 49) !== 1) continue;
-      if (geometry[j + 2] || geometry[j + 3]) end = Math.max(end, geometry[j + axis] + geometry[j + 2 + axis] - start);
+      if (geometry[j + 2] || geometry[j + 3]) end = Math.max(end, right === null ? geometry[j + axis] + geometry[j + 2 + axis] - start : right - geometry[j]);
       else if (kid.tag[0] !== '#') pending.push(...(kid.shadow ?? kid).kids);
     }
     return Math.round(Math.max(box[2 + axis], end && end + box[5 + axis]));
@@ -1058,7 +1060,8 @@
         const padding = (side, extent) => { const value = style['scrollPadding' + side]; return value.endsWith('%') ? parseFloat(value) / 100 * extent : parseFloat(value) || 0; };
         for (const [axis, align, start, size, edge, client, near, far] of [
           ['Y', options.block ?? 'start', top, height, root ? 0 : bounds.top + p.clientTop, root ? innerHeight : p.clientHeight, 'Top', 'Bottom'],
-          ['X', options.inline ?? 'nearest', left, width, root ? 0 : bounds.left + p.clientLeft, root ? innerWidth : p.clientWidth, 'Left', 'Right'],
+          // `start` and `end` are logical, so in a right-to-left box `end` is its left side.
+          ['X', style.direction === 'rtl' ? { start: 'end', end: 'start' }[options.inline] ?? options.inline ?? 'nearest' : options.inline ?? 'nearest', left, width, root ? 0 : bounds.left + p.clientLeft, root ? innerWidth : p.clientWidth, 'Left', 'Right'],
         ]) {
           // The root always scrolls the page, as the viewport.
           if (!root && !['auto','scroll','hidden'].includes(style['overflow' + axis] || style.overflow)) continue;

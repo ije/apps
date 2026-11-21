@@ -195,6 +195,32 @@ fn pseudo_elements_report_the_sizes_of_their_boxes() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn pages_scroll_sideways_from_their_start() {
+    run_hidden(
+        r#"
+        await load('wide.html');
+        const read = () => run(`[scrollX, document.scrollingElement.scrollWidth - innerWidth, document.body.scrollWidth].join()`);
+        const step = async code => { await run(code); await win.webContents.capturePage(); return read(); };
+        const ltr = [await read(), await step('scrollTo(9999, 0)'), await step('scrollTo(-9999, 0)')].join(' ');
+        const m = 1500 - (await run('innerWidth'));
+        if (ltr !== `0,${m},1500 ${m},${m},1500 0,${m},1500`) fail('ltr: ' + ltr);
+        const rtl = [
+            await step("document.documentElement.dir = 'rtl'"),
+            await step('scrollTo(-9999, 0)'),
+            await step('scrollTo(9999, 0)'),
+            await step("document.getElementById('w').scrollIntoView({ inline: 'end' })"),
+        ].join(' ');
+        if (rtl !== `0,${m},1500 -${m},${m},1500 0,${m},1500 -${m},${m},1500`) fail('rtl: ' + rtl);
+        "#,
+        &[(
+            "wide.html",
+            "<body style='margin:0'><div id=w style='width:1500px;height:40px'></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn right_to_left_and_reversed_boxes_scroll_from_their_end() {
     run_hidden(
         r#"

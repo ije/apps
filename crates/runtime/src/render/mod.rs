@@ -2015,29 +2015,40 @@ impl PageView {
                     })
             })
             .or(body);
-        let overflow = source
-            .and_then(|id| styles.values[id].get(Prop::OVERFLOW_Y))
-            .unwrap_or("visible");
-        let page_scrolls = !matches!(overflow, "hidden" | "clip");
+        let [overflow_x, overflow] = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y].map(|prop| {
+            source
+                .and_then(|id| styles.values[id].get(prop))
+                .unwrap_or("visible")
+        });
+        let [page_scrolls_x, page_scrolls] =
+            [overflow_x, overflow].map(|value| !matches!(value, "hidden" | "clip"));
+        // Like Chrome, the viewport takes the direction of the root element, so an RTL page scrolls from its right.
+        let page_rtl =
+            html.is_some_and(|html| styles.values[html].get(Prop::DIRECTION) == Some("rtl"));
         let page_overscroll = html.map_or_else(Default::default, |html| {
             element::overscroll(&styles.values[html])
         });
-        let page_bar = html.filter(|_| page_scrolls).and_then(|html| {
-            let parts = body
-                .and_then(|body| styles.scrollbars.get(&body))
-                .filter(|parts| parts[0].is_some())
-                .or_else(|| styles.scrollbars.get(&html));
-            let mut look = scrollbar::Look::new(
-                &styles.values[html],
-                parts.map(|parts| &**parts),
-                &styles.lengths[html],
-                (background.1 >= 128).then_some(background.0),
-            )?;
-            look.forced = [false, overflow == "scroll" || look.forced[1]];
-            Some(look)
-        });
+        let page_bar = html
+            .filter(|_| page_scrolls || page_scrolls_x)
+            .and_then(|html| {
+                let parts = body
+                    .and_then(|body| styles.scrollbars.get(&body))
+                    .filter(|parts| parts[0].is_some())
+                    .or_else(|| styles.scrollbars.get(&html));
+                let mut look = scrollbar::Look::new(
+                    &styles.values[html],
+                    parts.map(|parts| &**parts),
+                    &styles.lengths[html],
+                    (background.1 >= 128).then_some(background.0),
+                )?;
+                look.forced = [
+                    overflow_x == "scroll" || look.forced[0],
+                    overflow == "scroll" || look.forced[1],
+                ];
+                Some(look)
+            });
         let page_space = page_bar.as_ref().map_or([0.; 2], |look| {
-            look.space(look.shown([false, true], page_scroll.extent()))
+            look.space(look.shown([page_scrolls_x, page_scrolls], page_scroll.extent()))
         });
         if !dom.container_pass {
             let mut moved = 0.;
@@ -2180,8 +2191,8 @@ impl PageView {
         let root = element(
             &build,
             0,
-            [width - page_space[1], height],
-            [width - page_space[1], height],
+            [width - page_space[1], height - page_space[0]],
+            [width - page_space[1], height - page_space[0]],
             None,
         );
         build.zone = None;
@@ -2452,8 +2463,8 @@ impl PageView {
             let fresh = element(
                 &full,
                 0,
-                [width - page_space[1], height],
-                [width - page_space[1], height],
+                [width - page_space[1], height - page_space[0]],
+                [width - page_space[1], height - page_space[0]],
                 None,
             );
             build.prints.borrow_mut().truncate(printed);
@@ -2559,9 +2570,17 @@ impl PageView {
         } else {
             page.overflow_y_hidden()
         };
+        page.style().overflow.x = match page_scrolls_x {
+            true => renderer::Overflow::Scroll,
+            false => renderer::Overflow::Hidden,
+        };
+        if page_rtl {
+            page.style().flow |= renderer::Flow::RTL_BLOCK;
+        }
         page.style().overscroll = page_overscroll;
         let page = page
             .pr(renderer::px(page_space[1]))
+            .pb(renderer::px(page_space[0]))
             .restrict_scroll_to_axis()
             .track_scroll(&page_scroll)
             .bg(Color::hex((background.0 << 8) | background.1 as u32))
@@ -2600,7 +2619,7 @@ impl PageView {
                 id: 0,
                 handle: page_scroll.clone(),
                 look: Some(look),
-                axes: [false, true],
+                axes: [page_scrolls_x, page_scrolls],
                 reserved: page_space,
                 borders: [0.; 4],
                 origin: [0.; 2],
