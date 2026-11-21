@@ -589,6 +589,8 @@ pub struct Window {
     states: FxHashMap<(NodeKey, TypeId), Box<dyn Any>>,
     next_states: FxHashMap<(NodeKey, TypeId), Box<dyn Any>>,
     frame_callbacks: Vec<FrameCallback>,
+    // A patch frame waits for the end of the frame, where a full draw can take its place.
+    pub(crate) patch: bool,
     pub(crate) captures: Vec<CaptureCallback>,
     pub(crate) ime_key: Option<(Event, bool)>,
     #[cfg(target_os = "macos")]
@@ -666,6 +668,7 @@ impl Window {
             states: FxHashMap::default(),
             next_states: FxHashMap::default(),
             frame_callbacks: Vec::new(),
+            patch: false,
             captures: Vec::new(),
             ime_key: None,
             #[cfg(target_os = "macos")]
@@ -917,10 +920,19 @@ impl Window {
         if self.will_draw() {
             return false;
         }
-        // The atlas and text caches keep their frame, so the tiles this scene reads stay.
-        let _ = self.platform.draw(&self.scene, false);
-        self.scene.drawn();
+        // WARNING: two presents in one tick fill the drawable queue, and each later frame then waits a
+        // refresh for a drawable, with the input it handles.
+        self.patch = true;
+        self.platform.request_frame();
         true
+    }
+
+    pub(crate) fn draw_patch(&mut self) {
+        if mem::take(&mut self.patch) {
+            // The atlas and text caches keep their frame, so the tiles this scene reads stay.
+            let _ = self.platform.draw(&self.scene, false);
+            self.scene.drawn();
+        }
     }
 
     pub fn next_frame(&mut self, job: impl FnOnce(&mut Window, &mut App) + 'static) {
@@ -986,7 +998,7 @@ impl Window {
     }
 
     pub(crate) fn wants_frame(&self) -> bool {
-        self.dirty || !self.frame_callbacks.is_empty()
+        self.dirty || self.patch || !self.frame_callbacks.is_empty()
     }
 
     // Core Animation avoids about 126 MB of Metal memory for caret blinking. Use it only without effects,

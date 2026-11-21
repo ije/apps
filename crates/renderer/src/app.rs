@@ -380,8 +380,11 @@ impl Callbacks {
                 callback(window, app);
             }
             if window.dirty || !window.captures.is_empty() {
+                // The diff damage holds the regions of a patch that was not drawn.
+                window.patch = false;
                 window.draw(app);
             }
+            window.draw_patch();
             window.frame_at = None;
         })?;
         let home = home()?;

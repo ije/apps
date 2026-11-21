@@ -159,12 +159,6 @@ pub(crate) struct Renderer {
     glass_update: bool,
     glass_stale: bool,
     waits: u8,
-    // Drawables handed to the display, and those that it showed. While two wait to show, all three are
-    // taken, so the next one would block the thread and the input it handles.
-    queued: u64,
-    queued_at: Instant,
-    shown: Arc<AtomicU64>,
-    skipped: u8,
     caret: Option<(Retained<CALayer>, Rect<f32>, Color, std::time::Instant)>,
     restacked: bool,
     committed: u64,
@@ -430,10 +424,6 @@ impl Renderer {
             glass_update: false,
             glass_stale: false,
             waits: 0,
-            queued: 0,
-            queued_at: Instant::now(),
-            shown: Arc::new(AtomicU64::new(0)),
-            skipped: 0,
             caret: None,
             restacked: false,
             committed: 0,
@@ -655,15 +645,7 @@ impl Renderer {
     pub fn take_congested(&mut self) -> bool {
         let congested = self.waits >= 2;
         self.waits = self.waits.min(1);
-        // A display that shows no frames, like one of a covered window, calls no handlers, and a dropped
-        // present calls none: draw anyway then.
-        let shown = self.shown.load(Ordering::Acquire);
-        if self.queued_at.elapsed() > Duration::from_millis(100) {
-            self.queued = self.queued.min(shown);
-        }
-        let full = self.queued.saturating_sub(shown) >= 2 && self.skipped < 4;
-        self.skipped = if full { self.skipped + 1 } else { 0 };
-        congested || full
+        congested
     }
 
     pub fn take_present(&mut self) -> Option<Present> {
@@ -1008,14 +990,6 @@ impl Renderer {
                 }
             })
             .collect();
-        self.queued += 1;
-        self.queued_at = Instant::now();
-        let shown = self.shown.clone();
-        let handler = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLDrawable>>| {
-            shown.fetch_add(1, Ordering::Release);
-        });
-        // SAFETY: Metal copies the block and calls it once, when the drawable shows or is skipped.
-        unsafe { drawable.addPresentedHandler(RcBlock::as_ptr(&handler)) };
         if transact {
             commands.commit();
             commands.waitUntilScheduled();
