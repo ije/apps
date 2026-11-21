@@ -550,6 +550,18 @@ impl LayoutMirror {
         self.slot(self.capacity).wrapping_add(self.capacity / 4)
     }
 
+    // Counts the style changes, which can change a content box without a new border box.
+    fn restyles(&self) -> *mut f32 {
+        self.changes().wrapping_add(1)
+    }
+
+    pub(crate) fn restyled(&mut self) {
+        if self.memory.is_some() {
+            // Pages compare the count only for equality, so it wraps before an f32 stops counting.
+            unsafe { *self.restyles() = (*self.restyles() + 1.) % 16_777_216. };
+        }
+    }
+
     fn reserve(&mut self, id: usize) {
         if id >= self.capacity {
             self.resize((id + 1).next_power_of_two().max(1024));
@@ -564,7 +576,7 @@ impl LayoutMirror {
     }
 
     fn resize(&mut self, capacity: usize) {
-        let words = 4 + capacity * 8 + capacity / 4 + 1;
+        let words = 4 + capacity * 8 + capacity / 4 + 2;
         let memory = std::ptr::NonNull::new(Box::into_raw(vec![0f32; words].into_boxed_slice()))
             .expect("Layout memory")
             .cast::<f32>();
@@ -579,7 +591,8 @@ impl LayoutMirror {
                     kept,
                 );
                 *memory.as_ptr().add(2) = *old.0.as_ptr().add(2);
-                *memory.as_ptr().add(words - 1) = *self.changes();
+                *memory.as_ptr().add(words - 2) = *self.changes();
+                *memory.as_ptr().add(words - 1) = *self.restyles();
                 // Pages keep reading the old buffer until they see this flag and fetch the new one.
                 *old.0.as_ptr() = 1.;
             }
@@ -709,7 +722,7 @@ impl LayoutMirror {
         let memory = self.memory.clone().expect("Layout memory");
         (
             memory.0.as_ptr().cast(),
-            (4 + self.capacity * 8) * 4 + self.capacity + 4,
+            (4 + self.capacity * 8) * 4 + self.capacity + 8,
             Arc::into_raw(memory).cast_mut().cast(),
         )
     }
@@ -3536,7 +3549,7 @@ pub fn call(
             let tag = doc.nodes[id].tag.as_str();
             if (style::ROW..=style::FOOTER).contains(&style::role(&computed, id)) {
                 return Ok(json!([
-                    0., 0., rect[2], rect[3], 0., 0., 0., 0., rect[2], rect[3], 0., 0.
+                    0., 0., rect[2], rect[3], 0., 0., 0., 0., rect[2], rect[3], 0., 0., 0.
                 ]));
             }
             if tag.starts_with('#')
@@ -3544,8 +3557,9 @@ pub fn call(
                     .get(Prop::DISPLAY)
                     .is_none_or(|value| matches!(value, "inline" | "contents"))
             {
+                // The last value says that the box is inline, so it has no client box.
                 return Ok(json!([
-                    0., 0., 0., 0., 0., 0., 0., 0., rect[2], rect[3], 0., 0.
+                    0., 0., 0., 0., 0., 0., 0., 0., rect[2], rect[3], 0., 0., 1.
                 ]));
             }
             let shared = style::role(&computed, id) == style::CELL
@@ -3637,7 +3651,8 @@ pub fn call(
                 size[0],
                 size[1],
                 shift[0],
-                shift[1]
+                shift[1],
+                0.
             ]))
         }
         "dom.innerText" => {
@@ -4718,6 +4733,19 @@ pub(crate) fn styles(
     let key = (viewport, scale, reduced_motion, theme);
     let animated = std::mem::take(&mut state.animated);
     let animating = !animated.is_empty();
+    // Resize observers read content boxes, which these values change without a new border box.
+    if animated.values().any(|style| {
+        !style.vars().is_empty()
+            || style.own().any(|(prop, _)| {
+                let name = prop.name();
+                ["padding", "border", "overflow", "scrollbar"]
+                    .iter()
+                    .any(|start| name.starts_with(start))
+                    || matches!(name, "display" | "font-size" | "zoom" | "box-sizing")
+            })
+    }) {
+        state.bounds.restyled();
+    }
     if !animating
         && state.style_key == key
         && let Some(computed) = &state.computed
@@ -5078,6 +5106,7 @@ pub(crate) fn styles(
     state.animating.clear();
     state.animating_pseudos.clear();
     state.style_epoch += 1;
+    state.bounds.restyled();
     state.style_key = key;
     let result = Rc::new(result);
     state.select_base = (Rc::as_ptr(&result) as usize, subject, serial, flatten);
