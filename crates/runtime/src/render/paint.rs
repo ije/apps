@@ -110,8 +110,8 @@ impl Hooks for Transformed {
         true
     }
 
-    fn reach(&self, size: Size<Pixels>, far: Point<Pixels>) -> Point<Pixels> {
-        super::effects::reach(&self.local, &self.style, &self.units, size, far)
+    fn reach(&self, size: Size<Pixels>, corners: [Point<Pixels>; 2]) -> [Point<Pixels>; 2] {
+        super::effects::reach(&self.local, &self.style, &self.units, size, corners)
     }
 
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
@@ -669,15 +669,15 @@ impl Hooks for DomBox {
                     .all(|prop| self.style.get(prop).is_none_or(|value| value == "none")))
     }
 
-    fn reach(&self, size: Size<Pixels>, far: Point<Pixels>) -> Point<Pixels> {
+    fn reach(&self, size: Size<Pixels>, corners: [Point<Pixels>; 2]) -> [Point<Pixels>; 2] {
         if self.drawn
             || super::TRANSFORM_PROPS
                 .iter()
                 .all(|&prop| self.style.get(prop).is_none_or(|value| value == "none"))
         {
-            return far;
+            return corners;
         }
-        super::effects::reach(&self.local, &self.style, &self.units, size, far)
+        super::effects::reach(&self.local, &self.style, &self.units, size, corners)
     }
 
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {

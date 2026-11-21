@@ -503,6 +503,11 @@ pub(crate) fn text_index(
 ) -> Result<usize, usize> {
     let (top, line_height) = (layout.bounds().top(), layout.line_height());
     let split = rows.windows(2).any(|pair| pair[1].drop < pair[0].drop);
+    // Above the text is its start and below it its end, as for text without rows.
+    let bounds = layout.bounds();
+    if !split && (position.y < bounds.top() || position.y >= bounds.bottom()) {
+        return layout.index_at(position, nearest);
+    }
     let row = if split {
         // Rows in columns: the nearest row box to the point.
         let left = layout.bounds().left();
@@ -593,6 +598,8 @@ pub(super) struct InlineText {
     pub(super) view: Rc<super::PageState>,
     pub(super) atoms: Rc<[AtomSlot]>,
     pub(super) justify: Option<bool>,
+    /// Right-to-left text: indents and rows that overflow start at the right.
+    pub(super) rtl: bool,
     pub(super) shaped: std::cell::RefCell<Option<(renderer::Paragraph, Vec<renderer::TextRun>)>>,
     pub(super) prepainted: std::cell::RefCell<Prepainted>,
 }
@@ -895,6 +902,10 @@ impl InlineText {
 }
 
 impl renderer::Hooks for InlineText {
+    fn overflows_left(&self) -> bool {
+        self.rtl
+    }
+
     fn bounded(&self) -> bool {
         true
     }
@@ -1027,6 +1038,7 @@ impl renderer::Hooks for InlineText {
         let mut drop = px(0.);
         let banded = layout.lines().iter().any(|line| !line.shifts.is_empty());
         if style.text_align != renderer::TextAlign::Left
+            || self.rtl
             || banded
             || !self.data.boxes.is_empty()
             || !self.data.outlines.is_empty()
@@ -1064,8 +1076,7 @@ impl renderer::Hooks for InlineText {
                             ]
                         })
                         .map(px);
-                    let free =
-                        (bounds.size.width - inset - outset - indent - (end - left)).max(px(0.));
+                    let free = bounds.size.width - inset - outset - indent - (end - left);
                     let next = boundary.map_or(offset + line.len(), |&at| {
                         offset + glyphs[at as usize].index as usize
                     });
@@ -1074,15 +1085,19 @@ impl renderer::Hooks for InlineText {
                         Some(last) => (boundary.is_some() || last) && gaps > 0.,
                         None => false,
                     };
-                    let (shift, gap) = if justified {
-                        (inset + indent, free / gaps)
+                    // The indent and a row that overflows are at the start edge, the right one in right-to-left text.
+                    let first = inset + if self.rtl { px(0.) } else { indent };
+                    let (shift, gap) = if free < px(0.) {
+                        (first + if self.rtl { free } else { px(0.) }, px(0.))
+                    } else if justified {
+                        (first, free / gaps)
                     } else {
                         let shift = match style.text_align {
                             renderer::TextAlign::Left => px(0.),
                             renderer::TextAlign::Center => free / 2.,
                             renderer::TextAlign::Right => free,
                         };
-                        (inset + indent + shift, px(0.))
+                        (first + shift, px(0.))
                     };
                     let [above, below] = extents.get(rows.len()).copied().unwrap_or_default();
                     rows.push(crate::dom::Row {

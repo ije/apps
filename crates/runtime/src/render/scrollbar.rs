@@ -236,7 +236,8 @@ pub(super) struct Bar {
     track: [f32; 2],
     thumb: [f32; 2],
     view: f32,
-    max: f32,
+    // The scroll range of the axis: the lowest and the highest offset.
+    range: [f32; 2],
 }
 
 fn along(position: Point<Pixels>, axis: usize) -> f32 {
@@ -316,9 +317,9 @@ impl Scrollbar {
         let state = window
             .keyed::<Rc<RefCell<State>>>(("scrollbar", self.id).into())
             .clone();
-        let (bounds, max, offset, stretch) = (
+        let (bounds, [low, high], offset, stretch) = (
             self.handle.bounds(),
-            self.handle.max_offset(),
+            self.handle.range(),
             self.handle.offset(),
             self.handle.stretch(),
         );
@@ -330,6 +331,7 @@ impl Scrollbar {
             }
             state.offset = Some(drawn);
         }
+        let max = high - low;
         let shown = look.shown(self.axes, max);
         let space = look.space(shown);
         if space != self.reserved {
@@ -349,8 +351,9 @@ impl Scrollbar {
             Some((size, _)) => size[axis],
             None => OVERLAY[usize::from(look.thin)][0],
         });
-        let (max, offset, stretch) = (
+        let (max, high, offset, stretch) = (
             [max.x, max.y].map(f32::from),
+            [high.x, high.y].map(f32::from),
             [offset.x, offset.y].map(f32::from),
             [stretch.x, stretch.y].map(f32::from),
         );
@@ -383,7 +386,8 @@ impl Scrollbar {
                 thumb[1] = (track[1] * view / (view + max[axis]))
                     .max(shortest)
                     .min(track[1]);
-                thumb[0] += (track[1] - thumb[1]) * (-offset[axis] / max[axis]).clamp(0., 1.);
+                thumb[0] +=
+                    (track[1] - thumb[1]) * ((high[axis] - offset[axis]) / max[axis]).clamp(0., 1.);
                 if look.custom.is_none() && stretch[axis] != 0. {
                     let end = thumb[0] + thumb[1];
                     thumb[1] = (thumb[1] - stretch[axis].abs()).max(shortest.min(thumb[1]));
@@ -398,7 +402,7 @@ impl Scrollbar {
                 track,
                 thumb,
                 view,
-                max: max[axis],
+                range: [high[axis] - max[axis], high[axis]],
             })
         });
         Some((state, Rc::new(bars)))
@@ -540,10 +544,11 @@ impl Scrollbar {
                                     0.
                                 };
                                 let mut offset = handle.offset();
+                                let to = px(bar.range[1] - ratio * (bar.range[1] - bar.range[0]));
                                 if axis == 0 {
-                                    offset.x = px(-ratio * bar.max);
+                                    offset.x = to;
                                 } else {
-                                    offset.y = px(-ratio * bar.max);
+                                    offset.y = to;
                                 }
                                 handle.set_offset(offset);
                                 window.refresh();
@@ -599,7 +604,7 @@ impl Scrollbar {
             state.active = Some(Instant::now());
             if on_thumb {
                 state.pointer = Pointer::Drag(axis, position - bar.thumb[0]);
-            } else if bar.max > 0. {
+            } else if bar.range[1] > bar.range[0] {
                 let step = (bar.view * 0.875).max(bar.view - 40.).max(1.);
                 let step = if position < bar.thumb[0] { step } else { -step };
                 let mut offset = handle.target();
@@ -608,7 +613,7 @@ impl Scrollbar {
                 } else {
                     &mut offset.y
                 };
-                *value = (*value + px(step)).clamp(px(-bar.max), px(0.));
+                *value = (*value + px(step)).clamp(px(bar.range[0]), px(bar.range[1]));
                 handle.animate_to(offset, false);
             }
             window.refresh();

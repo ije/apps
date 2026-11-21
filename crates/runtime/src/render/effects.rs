@@ -339,25 +339,27 @@ pub(crate) fn transform_at(
     local.map(|local| placed(&local, [bounds.origin.x, bounds.origin.y].map(f32::from)))
 }
 
-// The far corner of the rectangle from the origin to `far` after the transform of a box of `size`.
+// The near and far corners of the rectangle between `corners` after the transform of a box of `size`.
 pub(super) fn reach(
     cache: &Local,
     style: &Style,
     units: &Lengths,
     size: renderer::Size<Pixels>,
-    far: renderer::Point<Pixels>,
-) -> renderer::Point<Pixels> {
+    corners: [renderer::Point<Pixels>; 2],
+) -> [renderer::Point<Pixels>; 2] {
     let Some(matrix) = transform_at(cache, style, units, Rect::new(Default::default(), size))
     else {
-        return far;
+        return corners;
     };
-    let [x, y] = [far.x, far.y].map(f32::from);
-    [[0., 0.], [x, 0.], [0., y], [x, y]]
+    let [[left, top], [right, bottom]] = corners.map(|at| [at.x, at.y].map(f32::from));
+    let mut mapped = [[left, top], [right, top], [left, bottom], [right, bottom]]
         .into_iter()
         .filter_map(|corner| map(&matrix, corner))
-        .map(|[x, y]| point(px(x), px(y)))
-        .reduce(|a, b| a.max(b))
-        .unwrap_or(far)
+        .map(|[x, y]| point(px(x), px(y)));
+    let Some(first) = mapped.next() else {
+        return corners;
+    };
+    mapped.fold([first; 2], |[near, far], at| [near.min(at), far.max(at)])
 }
 
 pub(crate) fn translation(matrix: &Matrix) -> Option<[f32; 2]> {

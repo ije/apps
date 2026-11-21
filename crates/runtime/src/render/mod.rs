@@ -2031,7 +2031,7 @@ impl PageView {
             Some(look)
         });
         let page_space = page_bar.as_ref().map_or([0.; 2], |look| {
-            look.space(look.shown([false, true], page_scroll.max_offset()))
+            look.space(look.shown([false, true], page_scroll.extent()))
         });
         if !dom.container_pass {
             let mut moved = 0.;

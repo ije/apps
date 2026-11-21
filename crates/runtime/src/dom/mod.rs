@@ -1038,7 +1038,7 @@ impl State {
 
     pub(crate) fn sync_scroll(&mut self) {
         for (&id, handle) in &self.scroll {
-            let (offset, max) = (scroll_offset(handle, handle.offset()), handle.max_offset());
+            let (offset, max) = (scroll_offset(handle, handle.offset()), handle.overflow());
             self.bounds.scroll(
                 id,
                 [
@@ -1959,10 +1959,25 @@ pub fn call(
                 .copied()
                 .or_else(|| following(end))
         };
+        // With `elements`, elements that the range holds whole come too, for their boxes.
+        let elements = args.get(4).and_then(Value::as_bool) == Some(true);
         let mut ranges = Vec::new();
+        // Like CSSOM, an element whose parent is selected too gives no box of its own.
+        let mut whole = None;
         while let Some(id) = current.filter(|id| Some(*id) != stop) {
             let node = &doc.nodes[id];
-            if node.tag == "#text" {
+            if elements
+                && !node.tag.starts_with('#')
+                && std::iter::successors(Some(end), |&at| doc.nodes[at].parent).all(|at| at != id)
+            {
+                if whole.is_none_or(|whole| {
+                    std::iter::successors(node.parent, |&at| doc.nodes[at].parent)
+                        .all(|at| at != whole)
+                }) {
+                    ranges.push([id, 0, 0]);
+                    whole = Some(id);
+                }
+            } else if node.tag == "#text" {
                 ranges.push([
                     id,
                     if id == start { from } else { 0 },
@@ -3000,7 +3015,7 @@ pub fn call(
                 renderer::point(axis(&args[1], previous.x), axis(&args[2], previous.y)),
             );
             if target != handle.target() {
-                let smooth = handle.max_offset() != renderer::Point::default()
+                let smooth = handle.extent() != renderer::Point::default()
                     && match args[3].as_str() {
                         Some("smooth") => true,
                         Some("instant") => false,
@@ -3547,7 +3562,7 @@ pub fn call(
                             .get(prop)
                             .is_some_and(|value| matches!(value, "auto" | "scroll"))
                     });
-                    Some(look.space(look.shown(scrolls, handle.max_offset())))
+                    Some(look.space(look.shown(scrolls, handle.extent())))
                 })
                 .unwrap_or_default();
             let gutters = if style
@@ -3706,15 +3721,13 @@ fn tree(doc: &Document, root: usize, inclusive: bool) -> Value {
 
 fn scroll_offset(
     handle: &renderer::ScrollRef,
-    mut offset: renderer::Point<renderer::Pixels>,
+    offset: renderer::Point<renderer::Pixels>,
 ) -> renderer::Point<renderer::Pixels> {
     let bounds = handle.bounds();
-    if bounds.size.width > renderer::px(0.) || bounds.size.height > renderer::px(0.) {
-        let max = handle.max_offset();
-        offset.x = offset.x.clamp(-max.x, renderer::px(0.));
-        offset.y = offset.y.clamp(-max.y, renderer::px(0.));
+    match bounds.size.width > renderer::px(0.) || bounds.size.height > renderer::px(0.) {
+        true => handle.clamped(offset),
+        false => offset,
     }
-    offset
 }
 
 pub(crate) fn painted_offset(

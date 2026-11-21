@@ -235,10 +235,14 @@ pub trait Hooks: 'static {
     fn shifts(&self) -> bool {
         false
     }
-    // The far corner of the rectangle from the origin of a box of `size` to `far` where paint moves it, like a
+    // The near and far corners of the rectangle between `corners` in a box of `size` where paint moves it, like a
     // transform. Scroll containers count it in their scrollable overflow.
-    fn reach(&self, _size: Size<Pixels>, far: Point<Pixels>) -> Point<Pixels> {
-        far
+    fn reach(&self, _size: Size<Pixels>, corners: [Point<Pixels>; 2]) -> [Point<Pixels>; 2] {
+        corners
+    }
+    // Return true if the lines that a measured box draws overflow it to the left, like right-to-left text.
+    fn overflows_left(&self) -> bool {
+        false
     }
 }
 
@@ -327,8 +331,12 @@ impl Hooks for Chain {
         self.0.skips_inside() || self.1.skips_inside()
     }
 
-    fn reach(&self, size: Size<Pixels>, far: Point<Pixels>) -> Point<Pixels> {
-        self.0.reach(size, self.1.reach(size, far))
+    fn reach(&self, size: Size<Pixels>, corners: [Point<Pixels>; 2]) -> [Point<Pixels>; 2] {
+        self.0.reach(size, self.1.reach(size, corners))
+    }
+
+    fn overflows_left(&self) -> bool {
+        self.0.overflows_left() || self.1.overflows_left()
     }
 }
 
@@ -769,16 +777,13 @@ impl Wheel {
                 false => moved.x = Pixels::ZERO,
             }
         }
-        let max = handle.max_offset();
+        let extent = handle.extent();
         let stops = [(overscroll.x, delta.x), (overscroll.y, delta.y)]
             .iter()
             .any(|(own, delta)| !delta.is_zero() && *own != Overscroll::Auto);
         if lines {
             let from = handle.target();
-            let to = point(
-                (from.x + moved.x).clamp(-max.x, px(0.)),
-                (from.y + moved.y).clamp(-max.y, px(0.)),
-            );
+            let to = handle.clamped(from + moved);
             if to != from {
                 app.stop_event();
                 handle.animate_to(to, true);
@@ -806,8 +811,8 @@ impl Wheel {
             _ => px(0.),
         };
         let rest = point(
-            bounce(overscroll.x, max.x, over.x),
-            bounce(overscroll.y, max.y, over.y),
+            bounce(overscroll.x, extent.x, over.x),
+            bounce(overscroll.y, extent.y, over.y),
         );
         if rest != Point::default() {
             // An outer scroller may take the rest first. It comes back here if none does.
@@ -837,7 +842,10 @@ struct ScrollState {
     offset: Point<Pixels>,
     // The offset of the last prepaint, in whole device pixels like Chrome, so a scroll moves content by whole pixels.
     painted: Point<Pixels>,
-    max_offset: Point<Pixels>,
+    // The lowest and the highest offset. Content that scrolls from its end has positive offsets.
+    range: [Point<Pixels>; 2],
+    // The scroll size less the client size before they round to device pixels, which `scrollWidth` rounds.
+    overflow: Point<Pixels>,
     bounds: Rect,
     animation: Option<Animation>,
     driven: bool,
@@ -910,7 +918,10 @@ impl Animation {
 
 impl ScrollState {
     fn pan(&mut self, delta: Point<Pixels>, sent: Option<Instant>) -> (bool, Point<Pixels>) {
-        let axis = |offset: &mut Pixels, stretch: &mut Pixels, max: Pixels, mut delta: Pixels| {
+        let axis = |offset: &mut Pixels,
+                    stretch: &mut Pixels,
+                    [low, high]: [Pixels; 2],
+                    mut delta: Pixels| {
             let mut moved = false;
             if !stretch.is_zero() && !delta.is_zero() {
                 moved = true;
@@ -922,17 +933,17 @@ impl ScrollState {
                 *stretch = px(0.);
                 delta = next * STIFFNESS;
             }
-            let to = (*offset + delta).clamp(-max, px(0.));
+            let to = (*offset + delta).clamp(low, high);
             let rest = *offset + delta - to;
             moved |= to != *offset;
             *offset = to;
             (moved, rest)
         };
-        let max = self.max_offset;
+        let [low, high] = self.range;
         let mut aim = self.glide.as_ref().map_or(self.offset, |glide| glide.to);
         let resting = aim == self.offset;
-        let (moved_x, x) = axis(&mut aim.x, &mut self.stretch.x, max.x, delta.x);
-        let (moved_y, y) = axis(&mut aim.y, &mut self.stretch.y, max.y, delta.y);
+        let (moved_x, x) = axis(&mut aim.x, &mut self.stretch.x, [low.x, high.x], delta.x);
+        let (moved_y, y) = axis(&mut aim.y, &mut self.stretch.y, [low.y, high.y], delta.y);
         let moved = moved_x || moved_y;
         if moved {
             self.animation = None;
@@ -1053,6 +1064,10 @@ impl ScrollState {
     }
 }
 
+fn within([low, high]: [Point<Pixels>; 2], at: Point<Pixels>) -> Point<Pixels> {
+    point(at.x.clamp(low.x, high.x), at.y.clamp(low.y, high.y))
+}
+
 // Where layout places scrolled content: the offset with its stretch, snapped to device pixels.
 fn snap_offset(at: Point<Pixels>, scale: f32) -> Point<Pixels> {
     at.map(|value| px((value.0 * scale).round() / scale))
@@ -1085,8 +1100,23 @@ impl ScrollRef {
         self.0.borrow().painted
     }
 
-    pub fn max_offset(&self) -> Point<Pixels> {
-        self.0.borrow().max_offset
+    /// The lowest and the highest offset.
+    pub fn range(&self) -> [Point<Pixels>; 2] {
+        self.0.borrow().range
+    }
+
+    /// How far the content can scroll on each axis.
+    pub fn extent(&self) -> Point<Pixels> {
+        let [low, high] = self.range();
+        high - low
+    }
+
+    pub fn overflow(&self) -> Point<Pixels> {
+        self.0.borrow().overflow
+    }
+
+    pub fn clamped(&self, at: Point<Pixels>) -> Point<Pixels> {
+        within(self.range(), at)
     }
 
     pub fn bounds(&self) -> Rect {
@@ -1115,7 +1145,8 @@ impl ScrollRef {
     /// Sets the range of a handle that no box tracks, like the scrollback of a terminal.
     pub fn set_range(&self, bounds: Rect, max_offset: Point<Pixels>) {
         let scroll = &mut *self.0.borrow_mut();
-        (scroll.bounds, scroll.max_offset) = (bounds, max_offset);
+        (scroll.bounds, scroll.range) = (bounds, [-max_offset, Point::default()]);
+        scroll.overflow = max_offset;
     }
 
     fn pan(&self, delta: Point<Pixels>, sent: Option<Instant>) -> (bool, Point<Pixels>) {
@@ -1207,17 +1238,34 @@ impl ScrollRef {
         // Like Chrome, the range is the scroll size less the client size, both from the layout before it snaps to
         // device pixels, and each rounded to them. Taffy and these sums differ after a few decimals, so they first
         // round to two places.
-        let round = |value: Pixels| ((value * scale * 100.).round() / 100.).round() / scale;
+        let exact = |value: Pixels| (value.0 * scale * 100.).round() / 100.;
+        let round = |value: Pixels| px(exact(value).round() / scale);
         let max =
             Point::from((content + padding).map(round) - client.map(round)).max(Point::default());
+        // A box that scrolls from its end starts at the overflow on that side, which Chrome floors to device pixels.
+        let start = |reverse: bool, content: Pixels, client: Pixels, max: Pixels| match reverse {
+            true => px((exact(content) - exact(client)).floor() / scale).clamp(px(0.), max),
+            false => px(0.),
+        };
+        let over = |content: Pixels, client: Pixels| {
+            px(((exact(content) - exact(client)) / scale).max(0.))
+        };
+        let overflow = point(
+            over(content.width + padding.width, client.width),
+            over(content.height + padding.height, client.height),
+        );
+        let [x, y] = style.scrolls_from_end();
+        let high = point(
+            start(x, content.width + padding.width, client.width, max.x),
+            start(y, content.height + padding.height, client.height, max.y),
+        );
+        let range = [high - max, high];
         let scroll = &mut *self.0.borrow_mut();
-        let within =
-            |at: Point<Pixels>| point(at.x.clamp(-max.x, px(0.)), at.y.clamp(-max.y, px(0.)));
-        scroll.offset = within(scroll.offset);
+        scroll.offset = within(range, scroll.offset);
         if let Some(glide) = &mut scroll.glide {
-            glide.to = within(glide.to);
+            glide.to = within(range, glide.to);
         }
-        scroll.max_offset = max;
+        (scroll.range, scroll.overflow) = (range, overflow);
         scroll.bounds = bounds;
         scroll.painted = snap_offset(scroll.offset + scroll.stretch, scale);
         scroll.painted
@@ -1234,7 +1282,7 @@ mod tests {
     fn stretch_follows_the_pan_and_gives_way_to_scrolling() {
         let delta = |y: f32| point(px(0.), px(y));
         let handle = ScrollRef::default();
-        handle.0.borrow_mut().max_offset = delta(100.);
+        handle.0.borrow_mut().range = [delta(-100.), delta(0.)];
 
         let pan = |by: Point<Pixels>| handle.pan(by, None);
         assert_eq!(pan(delta(-30.)), (true, delta(0.)));
@@ -1261,7 +1309,7 @@ mod tests {
     fn pans_move_evenly_between_events() {
         let delta = |y: f32| point(px(0.), px(y));
         let handle = ScrollRef::default();
-        handle.0.borrow_mut().max_offset = delta(1000.);
+        handle.0.borrow_mut().range = [delta(-1000.), delta(0.)];
         let (start, frame) = (Instant::now(), Duration::from_micros(8_333));
         let mut last = 0.;
         let mut steps = Vec::new();

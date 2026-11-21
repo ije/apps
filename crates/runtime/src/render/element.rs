@@ -486,7 +486,7 @@ fn href(node: &crate::dom::Node) -> Option<&str> {
 
 fn scrolled(handle: Option<&renderer::ScrollRef>) -> Option<[bool; 2]> {
     handle.map(|handle| {
-        let max = handle.max_offset();
+        let max = handle.extent();
         [max.x > px(0.5), max.y > px(0.5)]
     })
 }
@@ -2066,7 +2066,7 @@ fn create(
     let line_justify = match (style.get(Prop::TEXT_ALIGN), rtl) {
         (Some("right" | "-webkit-right"), _)
         | (Some("end"), false)
-        | (None | Some("start"), true) => Some(renderer::AlignContent::End),
+        | (None | Some("start" | "justify"), true) => Some(renderer::AlignContent::End),
         (Some("center" | "-webkit-center"), _) => Some(renderer::AlignContent::Center),
         _ => None,
     };
@@ -3049,6 +3049,8 @@ fn create(
             text: shown,
             run,
             single_line,
+            rtl: rtl && line_justify == Some(renderer::AlignContent::End),
+            rows: Default::default(),
             caret: caret_color,
             selection: selection_colors,
             handle: handle.clone(),
@@ -3064,7 +3066,15 @@ fn create(
         // Added after the background layers, which are absolute too and would paint over the text.
         field_layer = Some(if single_line {
             let line = renderer::node().flex_shrink_0().child(field);
-            clip.top(px(padding[0]))
+            // A right-to-left row starts at the right, so text that overflows goes to the left and scrolls from there.
+            let line = match (line_justify, rtl) {
+                (Some(renderer::AlignContent::Center), _) => line.ml_auto().mr_auto(),
+                (Some(renderer::AlignContent::End), false) => line.ml_auto(),
+                (None, true) => line.mr_auto(),
+                _ => line,
+            };
+            let mut clip = clip
+                .top(px(padding[0]))
                 .right(px(padding[1]))
                 .bottom(px(padding[2]))
                 .left(px(padding[3]))
@@ -3072,26 +3082,32 @@ fn create(
                 .flex()
                 .flex_row()
                 .items_center()
-                .whitespace_nowrap()
-                .child(match line_justify {
-                    Some(renderer::AlignContent::End) => line.ml_auto(),
-                    Some(renderer::AlignContent::Center) => line.ml_auto().mr_auto(),
-                    _ => line,
-                })
+                .whitespace_nowrap();
+            if rtl {
+                clip.style().flex_direction = renderer::FlexDirection::RowReverse;
+            }
+            clip.child(line)
         } else {
+            if rtl && line_justify == Some(renderer::AlignContent::End) {
+                clip.style().flow |= renderer::Flow::RTL_BLOCK;
+            }
             clip.style().overflow.x = renderer::Overflow::Scroll;
             clip.top_0()
                 .right(px(0.))
                 .bottom(px(0.))
                 .left_0()
                 .pt(px(padding[0]))
-                .pr(px(padding[1]))
                 .pb(px(padding[2]))
-                .pl(px(padding[3]))
                 .overflow_y_scroll()
                 .flex()
                 .flex_col()
-                .child(field)
+                // The text takes the side padding, so like the inner editor of Chrome, the end padding doesn't
+                // follow text that overflows.
+                .child(
+                    renderer::Node::from(field)
+                        .pl(px(padding[3]))
+                        .pr(px(padding[1])),
+                )
         });
     }
     if hit.is_none()
@@ -3245,7 +3261,7 @@ fn create(
         let dom = host.dom.entry(view.id).or_default();
         let handle = dom.scroll.entry(id).or_default();
         reader.log(Query::Scroll(id as u32), 0, hashed(scrolled(Some(handle))));
-        look.space(look.shown(scrolls, handle.max_offset()))
+        look.space(look.shown(scrolls, handle.extent()))
     });
     let mut padding = parsed.padding.unwrap_or_else(|| {
         units
@@ -3907,6 +3923,13 @@ fn create(
         && node.tag != "summary"
         && !matches!(position, "absolute" | "fixed")
         && parent.is_some_and(|parent| doc.nodes[parent].tag == "details");
+    // The initial `start` follows the direction of the box.
+    if hit.is_none()
+        && style.get(Prop::TEXT_ALIGN).is_none()
+        && rtl != (reader.parent(id, Prop::DIRECTION) == Some("rtl"))
+    {
+        el = if rtl { el.text_right() } else { el.text_left() };
+    }
     for (prop, value) in style.iter().filter(|_| hit.is_none()) {
         let value: &str = value;
         let vertical = matches!(
@@ -4070,6 +4093,9 @@ fn create(
                 }
             }
             Prop::FLEX_DIRECTION if flexbox => {
+                if rtl && value.starts_with("column") {
+                    el.style().flow |= renderer::Flow::RTL_ITEMS;
+                }
                 el.style().flex_direction = match (value, rtl) {
                     ("row-reverse", false) | ("row", true) => renderer::FlexDirection::RowReverse,
                     ("column", _) => renderer::FlexDirection::Column,
@@ -4165,9 +4191,9 @@ fn create(
             Prop::TEXT_ALIGN => {
                 el = match (value, rtl) {
                     ("center" | "-webkit-center", _) => el.text_center(),
-                    ("right" | "-webkit-right", _) | ("end", false) | ("start", true) => {
-                        el.text_right()
-                    }
+                    ("right" | "-webkit-right", _)
+                    | ("end", false)
+                    | ("start" | "justify", true) => el.text_right(),
                     _ => el.text_left(),
                 }
             }
@@ -5946,9 +5972,9 @@ fn create(
                     Prop::TEXT_ALIGN => {
                         decoration = match (value, rtl) {
                             ("center" | "-webkit-center", _) => decoration.text_center(),
-                            ("right" | "-webkit-right", _) | ("end", false) | ("start", true) => {
-                                decoration.text_right()
-                            }
+                            ("right" | "-webkit-right", _)
+                            | ("end", false)
+                            | ("start" | "justify", true) => decoration.text_right(),
                             _ => decoration.text_left(),
                         }
                     }
@@ -6518,6 +6544,7 @@ fn create(
             view: view.clone(),
             shaped: Default::default(),
             prepainted: Default::default(),
+            rtl,
             justify: style
                 .get(Prop::TEXT_ALIGN)
                 .is_some_and(|value| value == "justify")
@@ -7467,6 +7494,7 @@ fn create(
                         view: view.clone(),
                         shaped: Default::default(),
                         prepainted: Default::default(),
+                        rtl,
                         justify: style
                             .get(Prop::TEXT_ALIGN)
                             .is_some_and(|value| value == "justify")

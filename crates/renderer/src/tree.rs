@@ -65,8 +65,8 @@ struct Slot {
     escaped: Option<Clip<Pixels>>,
     // The size that the measure function gave in the last layout, which can overflow the box.
     measured: taffy::Size<f32>,
-    // The far corners that `far` found, from the origin of the box. Cleared up the tree when a box changes.
-    far: [Option<Point<f32>>; 2],
+    // The near and far corners that `far` found, from the origin of the box. Cleared up the tree when a box changes.
+    far: [Option<[Point<f32>; 2]>; 2],
     split: Option<Rc<Split>>,
     // Floats are in the box, or below it in blocks of its formatting context.
     floats: bool,
@@ -1258,9 +1258,9 @@ impl Tree {
         (slot.below, slot.lively) = (below, lively);
     }
 
-    // The far corner of a box and of the overflow that it doesn't clip, in the layout units of its parent. Without
-    // `nested`, only the content of its lines counts, not of boxes inside it.
-    fn far(&mut self, index: u32, scale: f32, nested: bool) -> Point<f32> {
+    // The near and far corners of a box and of the overflow that it doesn't clip, in the layout units of its
+    // parent. Without `nested`, only the content of its lines counts, not of boxes inside it.
+    fn far(&mut self, index: u32, scale: f32, nested: bool) -> [Point<f32>; 2] {
         let slot = &self.slots[index as usize];
         let Layout {
             mut location, size, ..
@@ -1268,8 +1268,14 @@ impl Tree {
         if let Some(split) = &slot.split {
             (location.x, location.y) = (location.x + split.shift.x, location.y + split.shift.y);
         }
-        if let Some(far) = slot.far[nested as usize].filter(|_| !self.full) {
-            return point(location.x + far.x, location.y + far.y);
+        let placed = |[near, far]: [Point<f32>; 2]| {
+            [
+                point(location.x + near.x, location.y + near.y),
+                point(location.x + far.x, location.y + far.y),
+            ]
+        };
+        if let Some(corners) = slot.far[nested as usize].filter(|_| !self.full) {
+            return placed(corners);
         }
         let visible = slot
             .style
@@ -1285,13 +1291,15 @@ impl Tree {
             true => point(size.width, 0.),
             false => point(size.width, size.height),
         };
+        let mut near = point(0., 0.);
         for part in slot.split.iter().flat_map(|split| &split.rects) {
             far = far.max(point(part.right(), part.bottom()));
+            near = near.min(point(part.left(), part.top()));
         }
         if !visible.x && !visible.y {
-            let far = self.painted_far(index, nested, scale, far);
-            self.slots[index as usize].far[nested as usize] = Some(far);
-            return point(location.x + far.x, location.y + far.y);
+            let corners = self.painted(index, nested, scale, [near, far]);
+            self.slots[index as usize].far[nested as usize] = Some(corners);
+            return placed(corners);
         }
         // Without `nested`, only anonymous line boxes, which have no hooks, hold content of the scroll container.
         let descend = nested || slot.hooks.is_none() && slot.style.inline != Inline::None;
@@ -1303,31 +1311,48 @@ impl Tree {
                 .and_then(|state| state.downcast_ref::<TextState>())
                 .and_then(|state| state.layout.overflow())
                 .map_or(0., |width| width.0 * scale);
-            far = far.max(point(
-                sides.left + slot.measured.width.max(text),
-                sides.top + slot.measured.height,
-            ));
+            let width = slot.measured.width.max(text);
+            far = far.max(point(sides.left + width, sides.top + slot.measured.height));
+            // Lines that overflow start at their start edge, so right-to-left ones overflow to the left.
+            if slot
+                .hooks
+                .as_ref()
+                .is_some_and(|hooks| hooks.overflows_left())
+            {
+                near.x = near.x.min(size.width - sides.right - width);
+            }
         }
         if descend {
             for child in 0..self.slots[index as usize].children.len() {
                 let child = index_of(self.slots[index as usize].children[child]);
                 if self.slots[child as usize].style.escape & (Escape::FIXED | Escape::OUTLINE) == 0
                 {
-                    far = far.max(self.far(child, scale, nested));
+                    let [child_near, child_far] = self.far(child, scale, nested);
+                    (near, far) = (near.min(child_near), far.max(child_far));
                 }
             }
         }
+        let near = point(
+            if visible.x { near.x } else { 0. },
+            if visible.y { near.y } else { 0. },
+        );
         let far = point(
             if visible.x { far.x } else { size.width },
             if visible.y { far.y } else { size.height },
         );
-        let far = self.painted_far(index, nested, scale, far);
-        self.slots[index as usize].far[nested as usize] = Some(far);
-        point(location.x + far.x, location.y + far.y)
+        let corners = self.painted(index, nested, scale, [near, far]);
+        self.slots[index as usize].far[nested as usize] = Some(corners);
+        placed(corners)
     }
 
     // Like Chrome, lines take the boxes where layout placed them, and the overflow takes them where they paint.
-    fn painted_far(&self, index: u32, nested: bool, scale: f32, far: Point<f32>) -> Point<f32> {
+    fn painted(
+        &self,
+        index: u32,
+        nested: bool,
+        scale: f32,
+        corners: [Point<f32>; 2],
+    ) -> [Point<f32>; 2] {
         let slot = &self.slots[index as usize];
         // An absolute box whose containing block is outside the scroll container counts where layout placed it.
         let escapes = slot.style.escape & Escape::ABSOLUTE != 0
@@ -1349,28 +1374,30 @@ impl Tree {
                         width: Pixels(slot.layout.size.width / scale),
                         height: Pixels(slot.layout.size.height / scale),
                     },
-                    point(Pixels(far.x / scale), Pixels(far.y / scale)),
+                    corners.map(|at| point(Pixels(at.x / scale), Pixels(at.y / scale))),
                 )
-                .map(|value| value.0 * scale),
-            None => far,
+                .map(|at| at.map(|value| value.0 * scale)),
+            None => corners,
         }
     }
 
-    // The scrollable content of a scroll container from the start of its content box. Like Chrome, its end
-    // padding follows the margin boxes of its children and its lines, but not the overflow of boxes inside them.
+    // The scrollable content of a scroll container. Like Chrome, it starts at the start of its content box, or at
+    // the end on an axis where the box scrolls from its end, and overflow on the other side can't be reached. Its
+    // end padding follows the margin boxes of its children and its lines, but not the overflow of boxes inside them.
     fn content(&mut self, index: u32, origin: Point<f32>, scale: f32) -> Size<Pixels> {
-        let layout = self.slots[index as usize].layout;
+        let slot = &self.slots[index as usize];
+        let (layout, reverse) = (slot.layout, slot.style.scrolls_from_end());
+        let (padding, border) = (layout.padding, layout.border);
         // The extent before it snaps to device pixels, which `clamp` rounds like Chrome.
-        let mut min = point(
-            origin.x + layout.border.left + layout.padding.left,
-            origin.y + layout.border.top + layout.padding.top,
+        let start = point(
+            origin.x + border.left + padding.left,
+            origin.y + border.top + padding.top,
         );
-        let mut max = min;
-        let border = point(
-            layout.border.left + layout.border.right,
-            layout.border.top + layout.border.bottom,
+        let end = point(
+            origin.x + layout.size.width - border.right - padding.right,
+            origin.y + layout.size.height - border.bottom - padding.bottom,
         );
-        let end = point(layout.padding.right, layout.padding.bottom);
+        let (mut min, mut max) = (end, start);
         for child in 0..self.slots[index as usize].children.len() {
             let id = index_of(self.slots[index as usize].children[child]);
             let child = &self.slots[id as usize];
@@ -1380,26 +1407,35 @@ impl Tree {
             {
                 continue;
             }
-            let shift = child
-                .split
-                .as_ref()
-                .map_or(Point::default(), |split| split.shift);
-            let at = point(
-                origin.x + layout.location.x + shift.x,
-                origin.y + layout.location.y + shift.y,
-            );
-            let mut far = self.far(id, scale, false);
+            let [mut near, mut far] = self.far(id, scale, false);
             if !absolute {
                 far.x += layout.margin.right.max(0.);
                 far.y += layout.margin.bottom.max(0.);
+                near.x -= layout.margin.left.max(0.);
+                near.y -= layout.margin.top.max(0.);
             }
-            let nested = self.far(id, scale, true);
-            far = far.max(point(nested.x - end.x, nested.y - end.y));
-            min = min.min(at);
+            let [inner_near, inner_far] = self.far(id, scale, true);
+            far = far.max(point(
+                inner_far.x - padding.right,
+                inner_far.y - padding.bottom,
+            ));
+            near = near.min(point(
+                inner_near.x + padding.left,
+                inner_near.y + padding.top,
+            ));
+            min = min.min(point(origin.x + near.x, origin.y + near.y));
             max = max.max(point(origin.x + far.x, origin.y + far.y));
         }
+        let axis = |reverse: bool, start: f32, end: f32, min: f32, max: f32| match reverse {
+            true => end - min.min(end),
+            false => max.max(start) - start,
+        };
         // `clamp` takes the scroll range from the border box.
-        Size::from(max - min + border).map(|value| Pixels(value / scale))
+        size(
+            axis(reverse[0], start.x, end.x, min.x, max.x) + border.left + border.right,
+            axis(reverse[1], start.y, end.y, min.y, max.y) + border.top + border.bottom,
+        )
+        .map(|value| Pixels(value / scale))
     }
 
     fn place(&mut self, index: u32, origin: Point<f32>, window: &mut Window) -> [Rect<Pixels>; 2] {

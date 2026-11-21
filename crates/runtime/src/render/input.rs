@@ -52,6 +52,9 @@ pub(super) fn paint_caret(
     }
 }
 
+// The rows of `aligned_rows` with the lines, width and alignment they are for.
+type KeptRows = (Rc<[renderer::TextLine]>, u32, u8, crate::dom::Rows);
+
 pub(super) struct FieldText {
     pub(super) id: usize,
     pub(super) view: Rc<PageState>,
@@ -60,17 +63,25 @@ pub(super) struct FieldText {
     pub(super) run: renderer::TextRun,
     pub(super) placeholder: bool,
     pub(super) single_line: bool,
+    /// A right-to-left field whose rows start at the right. The caret is on the left of its place.
+    pub(super) rtl: bool,
+    /// The place of each row for `text-align`, for the lines, width and alignment of the last prepaint.
+    pub(super) rows: std::cell::RefCell<Option<KeptRows>>,
     pub(super) caret: renderer::Color,
     pub(super) selection: (Option<u32>, u32),
     pub(super) handle: renderer::ScrollRef,
     pub(super) selected: std::cell::Cell<Option<[usize; 2]>>,
 }
 
+impl From<FieldText> for renderer::Node {
+    fn from(field: FieldText) -> Self {
+        renderer::text(field.text.clone(), Some(vec![field.run.clone()])).hooks(field)
+    }
+}
+
 impl From<FieldText> for renderer::Child {
     fn from(field: FieldText) -> Self {
-        renderer::text(field.text.clone(), Some(vec![field.run.clone()]))
-            .hooks(field)
-            .into()
+        renderer::Node::from(field).into()
     }
 }
 
@@ -85,11 +96,85 @@ pub(super) fn natural_width(natural: Pixels) -> renderer::Node {
     })
 }
 
+// Where each row starts for `text-align`, as the renderer places them. Left-aligned text needs none.
+fn aligned_rows(
+    layout: &renderer::Paragraph,
+    align: renderer::TextAlign,
+    rtl: bool,
+) -> crate::dom::Rows {
+    if align == renderer::TextAlign::Left {
+        return Rc::default();
+    }
+    let width = layout.bounds().size.width;
+    let mut rows = Vec::new();
+    let mut offset = 0;
+    for line in layout.lines().iter() {
+        let glyphs = &line.line.glyphs;
+        let (mut left, mut start) = (px(0.), offset);
+        for boundary in line.breaks.iter().map(Some).chain([None]) {
+            let next = boundary.map_or(line.line.width, |&at| glyphs[at as usize].x);
+            // A space at the end of a wrapped row hangs past its edge.
+            let end = boundary
+                .and_then(|&at| (at as usize).checked_sub(1))
+                .map(|at| &glyphs[at])
+                .filter(|glyph| line.text.as_bytes().get(glyph.index as usize) == Some(&b' '))
+                .map_or(next, |glyph| glyph.x);
+            let free = width - (end - left);
+            // A row that overflows starts at its start edge, the right one in right-to-left text.
+            let shift = match align {
+                _ if free < px(0.) => {
+                    if rtl {
+                        free
+                    } else {
+                        px(0.)
+                    }
+                }
+                renderer::TextAlign::Center => free / 2.,
+                _ => free,
+            };
+            rows.push(crate::dom::Row {
+                shift,
+                right: shift + end - left,
+                gap: px(0.),
+                start,
+                drop: px(0.),
+                above: px(0.),
+            });
+            if let Some(&at) = boundary {
+                (left, start) = (next, offset + glyphs[at as usize].index as usize);
+            }
+        }
+        offset += line.len() + 1;
+    }
+    rows.into()
+}
+
 impl renderer::Hooks for FieldText {
+    fn overflows_left(&self) -> bool {
+        self.rtl
+    }
+
     fn prepaint(&self, cx: &mut renderer::NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window);
         let Some(layout) = cx.text_layout().cloned() else {
             return;
+        };
+        let rows = {
+            let (lines, align) = (layout.lines(), cx.text.text_align);
+            let width = f32::from(layout.bounds().size.width).to_bits();
+            let mut kept = self.rows.borrow_mut();
+            match &*kept {
+                Some((old, at, by, rows))
+                    if Rc::ptr_eq(old, &lines) && *at == width && *by == align as u8 =>
+                {
+                    rows.clone()
+                }
+                _ => {
+                    let rows = aligned_rows(&layout, align, self.rtl);
+                    *kept = Some((lines, width, align as u8, rows.clone()));
+                    rows
+                }
+            }
         };
         let window = &mut *cx.window;
         let view = &*self.view;
@@ -111,7 +196,7 @@ impl renderer::Hooks for FieldText {
                     layout.clone(),
                     self.text.clone(),
                     0..self.text.len(),
-                    Rc::default(),
+                    rows.clone(),
                     [px(0.), layout.line_height()],
                 ),
             );
@@ -123,12 +208,16 @@ impl renderer::Hooks for FieldText {
             let mut offset = old;
             match selected {
                 Some([_, end]) => {
-                    if let Some(caret) = layout.point_at(crate::dom::utf16_index(&self.text, end)) {
+                    let index = crate::dom::utf16_index(&self.text, end);
+                    if let Some(caret) =
+                        super::text::text_position(&layout, &self.text, &rows, index)
+                    {
                         let line = layout.line_height();
-                        if caret.x < shown.left() {
-                            offset.x += shown.left() - caret.x;
-                        } else if caret.x + px(1.) > shown.right() {
-                            offset.x -= caret.x + px(1.) - shown.right();
+                        let left = if self.rtl { caret.x - px(1.) } else { caret.x };
+                        if left < shown.left() {
+                            offset.x += shown.left() - left;
+                        } else if left + px(1.) > shown.right() {
+                            offset.x -= left + px(1.) - shown.right();
                         }
                         if caret.y < shown.top() {
                             offset.y += shown.top() - caret.y;
@@ -140,9 +229,10 @@ impl renderer::Hooks for FieldText {
                 None if self.single_line => offset = Point::default(),
                 None => {}
             }
-            let max = self.handle.max_offset();
-            offset.x = offset.x.clamp(-max.x, px(0.));
-            offset.y = offset.y.clamp(-max.y, px(0.));
+            // Layout sums leave a few thousandths of a pixel, so the offset snaps to device pixels.
+            let scale = window.scale_factor();
+            let offset =
+                (self.handle.clamped(offset)).map(|value| px((value.0 * scale).round() / scale));
             if offset != old {
                 self.handle.set_offset(offset);
                 window.redraw();
@@ -196,9 +286,12 @@ impl renderer::Hooks for FieldText {
             .collect();
         let strut = window.text_system().face(&self.run.font);
         let mask = window.content_mask().bounds;
+        let rows = (self.rows.borrow().as_ref()).map_or_else(Rc::default, |kept| kept.3.clone());
         let mut origin = layout.bounds().origin;
-        let mut offset = 0;
+        let (mut offset, mut row) = (0, 0);
         for line in layout.lines().iter() {
+            let first = row.min(rows.len());
+            row += line.rows();
             let height = line_height * line.rows();
             if origin.y >= mask.bottom() {
                 window.cull();
@@ -214,7 +307,7 @@ impl renderer::Hooks for FieldText {
                     std::slice::from_ref(&self.run),
                     offset,
                     &highlights,
-                    &[],
+                    &rows[first..row.min(rows.len())],
                     text,
                     None,
                     strut,
@@ -226,7 +319,7 @@ impl renderer::Hooks for FieldText {
         }
         if let Some([start, end, caret]) = selected
             && start == end
-            && let Some(at) = layout.point_at(caret)
+            && let Some(at) = super::text::text_position(&layout, text, &rows, caret)
         {
             paint_caret(
                 &self.view,

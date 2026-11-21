@@ -2296,7 +2296,7 @@
     for (let child = ra; child.up; child = child.up) if (child.up === rb) return index(child) < end ? -1 : 1;
     return a.compareDocumentPosition(b) & 4 ? -1 : 1;
   };
-  const rangeNodes=range=>call('dom.rangeNodes',range.startContainer._id,range.startOffset,range.endContainer._id,range.endOffset).map(([id,start,end])=>({node:wrap(id),start,end}));
+  const rangeNodes=(range,elements)=>call('dom.rangeNodes',range.startContainer._id,range.startOffset,range.endContainer._id,range.endOffset,elements).map(([id,start,end])=>({node:wrap(id),start,end}));
   const textPoint=(root,offset)=>{const [id,index]=call('dom.textPoint',root._id,offset);return [wrap(id),index];};
   const textOffset=(root,node,offset)=>call('dom.textOffset',root._id,node?._id,offset);
   const characterData = node => node.nodeType === 3 || node.nodeType === 8;
@@ -2422,7 +2422,8 @@
     }
     createContextualFragment(html) { const node = this.startContainer.nodeType === 1 ? this.startContainer : this.startContainer.parentElement; return parseFragment(html, node && !(node.localName === 'html' && node.namespaceURI === XHTML) ? node : null); }
     getBoundingClientRect() {const rects=this.getClientRects();if(!rects.length)return new DOMRect();const left=Math.min(...rects.map(rect=>rect.left)),top=Math.min(...rects.map(rect=>rect.top));return new DOMRect(left,top,Math.max(...rects.map(rect=>rect.right))-left,Math.max(...rects.map(rect=>rect.bottom))-top);}
-    getClientRects() {layout();return rangeNodes(this).flatMap(({node,start,end})=>textCall('dom.textRect',node._id,start,end).map(rect=>new DOMRect(...rect)));}
+    // Like the CSSOM spec: the boxes of the elements that the range holds whole, and of its text.
+    getClientRects() {layout();return rangeNodes(this,true).flatMap(({node,start,end})=>node.nodeType===1?[...node.getClientRects()]:textCall('dom.textRect',node._id,start,end).map(rect=>new DOMRect(...rect)));}
     compareBoundaryPoints(how,range){return how===0?comparePoints(this.startContainer,this.startOffset,range.startContainer,range.startOffset):how===1?comparePoints(this.endContainer,this.endOffset,range.startContainer,range.startOffset):how===2?comparePoints(this.endContainer,this.endOffset,range.endContainer,range.endOffset):comparePoints(this.startContainer,this.startOffset,range.endContainer,range.endOffset);}
     isPointInRange(node,offset){if(node.getRootNode()!==this._sc.getRootNode())return false;return comparePoints(node,offset,this.startContainer,this.startOffset)>=0&&comparePoints(node,offset,this.endContainer,this.endOffset)<=0;}
     comparePoint(node,offset){if(node.getRootNode()!==this._sc.getRootNode())throw new DOMException('The node is in another tree','WrongDocumentError');return comparePoints(node,offset,this.startContainer,this.startOffset)<0?-1:comparePoints(node,offset,this.endContainer,this.endOffset)>0?1:0;}
@@ -4852,7 +4853,12 @@
         // Like Chrome: the focused box, or else the box of the last press, or the nearest ancestor that can scroll that way. Then the page.
         const x = /Left|Right/.test(event.key), root = document.scrollingElement;
         let box = active ?? scrollStart;
-        for (; box && box !== root && box.nodeType === 1; box = box.parentElement) { const style = getComputedStyle(box), at = x ? box.scrollLeft : box.scrollTop; if (/auto|scroll/.test(x ? style.overflowX : style.overflowY) && (sign > 0 ? at < (x ? box.scrollWidth - box.clientWidth : box.scrollHeight - box.clientHeight) : at > 0)) break; }
+        for (; box && box !== root && box.nodeType === 1; box = box.parentElement) {
+          const style = getComputedStyle(box), at = x ? box.scrollLeft : box.scrollTop, range = x ? box.scrollWidth - box.clientWidth : box.scrollHeight - box.clientHeight;
+          // A box that scrolls from its end has offsets from -range to 0.
+          const flex = style.display.endsWith('flex'), low = (x ? (style.direction === 'rtl') !== (flex && style.flexDirection === 'row-reverse') : flex && style.flexDirection === 'column-reverse') ? -range : 0;
+          if (/auto|scroll/.test(x ? style.overflowX : style.overflowY) && (sign > 0 ? at < low + range : at > low)) break;
+        }
         if (!box?.isConnected || box.nodeType !== 1 || box === document.body) box = root;
         const size = x ? box.clientWidth : box.clientHeight, step = /Arrow/.test(event.key) ? 40 : /Home|End/.test(event.key) ? (x ? box.scrollWidth : box.scrollHeight) : Math.max(size * 0.875, size - 20);
         box.scrollBy({ [x ? 'left' : 'top']: sign * step, behavior: 'smooth' });

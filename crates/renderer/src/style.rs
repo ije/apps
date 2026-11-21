@@ -315,6 +315,8 @@ impl Flow {
     pub const RTL: u8 = 32;
     /// A right-to-left box: its absolute boxes resolve their insets and auto margins from the right.
     pub const RTL_BLOCK: u8 = 64;
+    /// A right-to-left flex column: its items start at the right.
+    pub const RTL_ITEMS: u8 = 128;
     pub const FLOAT: u8 = Self::LEFT | Self::RIGHT;
 }
 
@@ -450,6 +452,10 @@ impl Style {
                 FlexDirection::Column => t::FlexDirection::Column,
                 FlexDirection::ColumnReverse => t::FlexDirection::ColumnReverse,
             },
+            direction: match self.flow & Flow::RTL_ITEMS {
+                0 => t::Direction::Ltr,
+                _ => t::Direction::Rtl,
+            },
             flex_wrap: match self.flex_wrap {
                 FlexWrap::NoWrap => t::FlexWrap::NoWrap,
                 FlexWrap::Wrap => t::FlexWrap::Wrap,
@@ -466,6 +472,22 @@ impl Style {
         (layout.flex_grow, layout.flex_shrink) = (self.flex_grow, self.flex_shrink);
         layout.aspect_ratio = self.aspect_ratio;
         (layout, bounds)
+    }
+
+    /// The axes where a scroll container starts at the end, like Chrome: right-to-left boxes and reversed flex
+    /// boxes. Their content overflows to the left or the top, and their offsets are positive. The flex direction
+    /// is physical, so a right-to-left row is a reversed row here. Rows of lines are blocks.
+    pub(crate) fn scrolls_from_end(&self) -> [bool; 2] {
+        let rtl = self.flow & Flow::RTL_BLOCK != 0;
+        if self.display != Display::Flex || self.inline == Inline::Lines {
+            return [rtl, false];
+        }
+        match self.flex_direction {
+            FlexDirection::Row => [false, false],
+            FlexDirection::RowReverse => [true, false],
+            FlexDirection::Column => [rtl, false],
+            FlexDirection::ColumnReverse => [rtl, true],
+        }
     }
 
     /// A visible axis stays open, and a visible border is outside the clip.

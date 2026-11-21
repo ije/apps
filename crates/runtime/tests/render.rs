@@ -195,6 +195,48 @@ fn pseudo_elements_report_the_sizes_of_their_boxes() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn right_to_left_and_reversed_boxes_scroll_from_their_end() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const read = id => run(`(s => (r => [s.scrollWidth, s.scrollLeft, s.scrollTop, Math.round(r.x), Math.round(r.y)].join())(s.firstElementChild.getBoundingClientRect()))(document.getElementById('${id}'))`);
+        const set = (id, key, value) => run(`document.getElementById('${id}').${key} = ${value}`);
+        for (const [id, key, ...want] of [
+            ['r', 'scrollLeft', '500,0,0,-300,0', '500,-300,0,0,0', '500,-50,0,-250,0', '500,0,0,-300,0'],
+            ['f', 'scrollLeft', '500,0,0,-300,40', '500,-300,0,0,40', '500,-50,0,-250,40', '500,0,0,-300,40'],
+            ['c', 'scrollTop', '200,0,0,0,0', '200,0,-80,0,80', '200,0,-50,0,50', '200,0,0,0,0'],
+            ['l', 'scrollLeft', '400,0,0,-100,200', '400,0,0,-100,200', '400,0,0,-100,200', '400,200,0,-300,200'],
+            ['k', 'scrollLeft', '500,0,0,-300,280', '500,-300,0,0,280', '500,-50,0,-250,280', '500,0,0,-300,280'],
+        ]) {
+            const got = [await read(id)];
+            for (const value of [-9999, -50, 9999]) {
+                await set(id, key, value);
+                await win.webContents.capturePage();
+                got.push(await read(id));
+            }
+            if (got.join(' ') !== want.join(' ')) fail(id + ': ' + got.join(' '));
+        }
+        const text = (await read('t')).split(',').map(Number);
+        await set('t', 'scrollLeft', -9999);
+        await win.webContents.capturePage();
+        const end = (await read('t')).split(',').map(Number);
+        if (!(text[0] > 300 && Math.abs(end[1] + text[0] - 200) <= 0.5 && Math.abs(end[3] + end[1]) <= 0.5)) fail('text that overflows to the left: ' + text + ' ' + end);
+        "#,
+        &[(
+            "page.html",
+            "<head><style>body{margin:0} div>div{flex:none;width:500px;height:20px} .s{width:200px;height:40px;overflow:auto}</style></head>\
+             <body><div id=r class=s dir=rtl><div></div></div>\
+             <div id=f class=s style='display:flex;flex-direction:row-reverse'><div></div></div>\
+             <div id=c class=s style='display:flex;flex-direction:column-reverse;height:120px'><div style='width:100px;height:200px'></div></div>\
+             <div id=l class=s><div style='margin-left:-100px'></div></div>\
+             <div id=t class=s dir=rtl><div style='width:auto;white-space:nowrap'>A line of text that is much wider than its box</div></div>\
+             <div id=k class=s dir=rtl style='display:flex;flex-direction:column'><div></div></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn reloads_never_show_boxes_of_the_old_page() {
     run_hidden(
         r#"
