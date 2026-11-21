@@ -4630,6 +4630,14 @@ fn create(
                 {
                     f32::INFINITY
                 }
+                // A top or bottom box sits on a line edge, so the strut below the baseline does not reach it.
+                _ if matches!(
+                    el.style().align_self,
+                    Some(renderer::AlignItems::FlexStart | renderer::AlignItems::FlexEnd)
+                ) =>
+                {
+                    f32::INFINITY
+                }
                 _ if edge => 0.,
                 _ if display == "inline" => below(style, units.font),
                 _ => padding[2] + borders[2] + below(style, units.font),

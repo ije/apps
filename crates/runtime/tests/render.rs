@@ -3316,6 +3316,21 @@ fn paragraphs_with_inline_boxes_shrink_to_fit_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn top_aligned_spans_keep_fixed_line_heights_like_chrome() {
+    let (text, rects) = picture_rects(
+        "top.html",
+        "<body style='margin:0;font:14px/20px Helvetica'><style>.w{width:300px}</style>\
+         <div class=w><p id=p0 style='margin:0'>Ab <span style='font-size:17px;vertical-align:top'>Hxg</span> z</p></div>\
+         <div class=w><p id=p1 style='margin:0'>Ab <span style='font-size:22px;vertical-align:top'>Hxg</span> z</p></div>\
+         <div class=w><p id=p2 style='margin:0'>Ab <span style='font-size:22px;font-family:Menlo;vertical-align:top'>Hxg</span> z</p></div></body>",
+    );
+    for id in ["p0", "p1", "p2"] {
+        assert_eq!(rects[id], "0,0,300,20", "{id}, as in Chrome: {text}");
+    }
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn wide_first_items_and_spaces_break_lines_like_chrome() {
     let (text, rects) = picture_rects(
         "breaks.html",
