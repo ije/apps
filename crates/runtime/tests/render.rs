@@ -1356,6 +1356,38 @@ fn nested_scrolls_copy_their_content_when_an_outer_scroll_moves_them() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn borders_that_the_interest_area_cut_draw_after_a_scroll_jump() {
+    // Debug builds check each copied paint against a fresh one. Rows below a short window are not painted.
+    run_hidden(
+        r#"
+        win.setContentSize(800, 600);
+        await load('rows.html');
+        await win.webContents.capturePage();
+        for (const top of [510, 37, 1500, 1499]) {
+            await run(`document.getElementById('s').scrollTop = ${top}`);
+            await win.webContents.capturePage();
+            await win.webContents.capturePage();
+        }
+        "#,
+        &[(
+            "rows.html",
+            "<body style='margin:8px;font:12px/16px Helvetica'><style>\
+             #s{width:150px;height:200px;overflow:auto;border:1px solid}\
+             #s div{height:40px;border-bottom:1px solid #ccc;box-sizing:border-box}\
+             #s div:nth-child(3n){border-top:2px solid #c66}</style><div id=s>\
+             <div>0</div><div>1</div><div>2</div><div>3</div><div>4</div><div>5</div><div>6</div><div>7</div>\
+             <div>8</div><div>9</div><div>10</div><div>11</div><div>12</div><div>13</div><div>14</div><div>15</div>\
+             <div>16</div><div>17</div><div>18</div><div>19</div><div>20</div><div>21</div><div>22</div><div>23</div>\
+             <div>24</div><div>25</div><div>26</div><div>27</div><div>28</div><div>29</div><div>30</div><div>31</div>\
+             <div>32</div><div>33</div><div>34</div><div>35</div><div>36</div><div>37</div><div>38</div><div>39</div>\
+             <div>40</div><div>41</div><div>42</div><div>43</div><div>44</div><div>45</div><div>46</div><div>47</div>\
+             </div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn scrolled_copies_follow_offsets_outlines_and_moving_interest_areas() {
     // Debug builds check each copied paint and kept prepaint against a fresh one.
     run_hidden(

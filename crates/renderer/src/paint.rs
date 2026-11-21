@@ -184,6 +184,10 @@ impl Window {
                 _ => Rect::between(rect.origin, point(rect.left() + depth, rect.bottom())),
             };
             let part = clip.bounds.intersect(band);
+            // A band that the mask cut draws differently in another mask, so a copy of it can't move.
+            if part != band {
+                self.scene.culled += 1;
+            }
             if !part.is_empty() {
                 instance.clip = part.to_array();
                 self.scene.push(instance);
@@ -227,6 +231,9 @@ impl Window {
             Rect::between(hole.top_right(), point(rect.right(), hole.bottom())),
         ] {
             let part = clip.bounds.intersect(strip);
+            if part != strip {
+                self.scene.culled += 1;
+            }
             if !part.is_empty() {
                 instance.clip = part.to_array();
                 self.scene.push(instance);
