@@ -2143,8 +2143,9 @@ fn create(
                 .then(|| style::inline_text(doc, styles, id, run, &parts, ends))
                 .flatten()
                 .map(|mut data| {
+                    // Far above node ids, and unique per parent, so these lines keep their keys.
                     if run.is_empty() {
-                        data.key = !index;
+                        data.key = !(id << 20 | index);
                     }
                     Rc::new(data)
                 })
@@ -2329,6 +2330,9 @@ fn create(
                 "fixed" => renderer::Escape::FIXED,
                 _ => 0,
             };
+            el.style().scroll_anchor = (u8::from(style.get(Prop::OVERFLOW_ANCHOR) == Some("none"))
+                * renderer::ScrollAnchor::NONE)
+                | (u8::from(position == "sticky") * renderer::ScrollAnchor::STICKY);
             // Only boxes in columns break, so others skip these reads.
             if columned {
                 use renderer::Break;
@@ -6703,6 +6707,9 @@ fn create(
             && style
                 .get(Prop::WRITING_MODE)
                 .is_none_or(|mode| mode.starts_with("horizontal"));
+        if !alone {
+            paragraph = paragraph.id(("text", data.key));
+        }
         paragraph.style().flow = renderer::Flow::BLOCK;
         // Text straight in a multi-column box breaks between its rows.
         let multicol = (flow && data.atoms.is_empty())
@@ -7694,6 +7701,8 @@ fn create(
                                     .is_some_and(|value| value == "justify")
                             }),
                     });
+                    // Text keeps its box when runs come before it, so it can stay a scroll anchor.
+                    paragraph = paragraph.id(("text", data.key));
                     paragraph.style().flow = renderer::Flow::BLOCK;
                     if data.greedy {
                         paragraph

@@ -276,6 +276,8 @@ style! {
     breaks: u8 = 0,
     /// [`Flow`] bits of a box in a block formatting context with floats.
     flow: u8 = 0,
+    /// [`ScrollAnchor`] bits.
+    scroll_anchor: u8 = 0,
     /// The bounds that [`Length::Bound`] lengths of this style index.
     bounds: Vec<Bound> = Vec::new(),
 }
@@ -318,6 +320,16 @@ impl Flow {
     /// A right-to-left flex column: its items start at the right.
     pub const RTL_ITEMS: u8 = 128;
     pub const FLOAT: u8 = Self::LEFT | Self::RIGHT;
+}
+
+pub struct ScrollAnchor;
+
+impl ScrollAnchor {
+    /// `overflow-anchor: none`: the box is no scroll anchor, nor any box in it, and a scroll container keeps no
+    /// anchor.
+    pub const NONE: u8 = 1;
+    /// A sticky box, which moves with the scroll: like in Chrome, it is no anchor, nor any box in it.
+    pub const STICKY: u8 = 2;
 }
 
 pub struct Escape;

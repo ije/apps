@@ -606,6 +606,9 @@ pub struct Window {
     restarts: u8,
     rebuild: bool,
     patches: Vec<crate::Node>,
+    // The boxes whose style moved or sized them since the last layout, which keeps the offset for scroll anchors in
+    // or below them.
+    pub(crate) unanchored: rustc_hash::FxHashSet<u64>,
     pub(crate) pointer: Point<Pixels>,
     pub(crate) closed: bool,
     cursor: Option<Cursor>,
@@ -679,6 +682,7 @@ impl Window {
             restarts: 0,
             rebuild: false,
             patches: Vec::new(),
+            unanchored: Default::default(),
             pointer: Point::default(),
             closed: false,
             cursor: None,
@@ -749,6 +753,13 @@ impl Window {
 
     pub fn rebuild(&mut self) {
         self.rebuild = true;
+    }
+
+    /// A change of the style of the box moves it or sizes it, so the next layout doesn't move scroll offsets for
+    /// the scroll anchors in it.
+    pub fn suppress_anchoring(&mut self, id: impl Into<crate::NodeKey>) {
+        self.unanchored
+            .insert(crate::tree::identity(Some(id.into()), 0));
     }
 
     // The node needs its key, or the patch is ignored.

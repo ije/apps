@@ -1,9 +1,11 @@
 use crate::{
     AlignContent, AlignItems, AvailableSpace, Baseline, Clip, Display, Escape, Flow, Hit, Hooks,
-    Inline, Overflow, Pixels, Point, Position, Rect, Region, Scope, Size, Style, TextStyle,
-    Visibility, Window,
+    Inline, Overflow, Pixels, Point, Position, Rect, Region, Scope, ScrollAnchor, ScrollRef, Size,
+    Style, TextStyle, Visibility, Window,
     geometry::round_half_up,
-    node::{Child, Content, Events, MeasureFn, Measurement, Node, NodeCx, NodeKey, NodeStyle},
+    node::{
+        Anchor, Child, Content, Events, MeasureFn, Measurement, Node, NodeCx, NodeKey, NodeStyle,
+    },
     point, px, size,
     text::{TextState, same_shaping},
     window::{PaintKey, PaintSpan, Placement},
@@ -33,6 +35,10 @@ enum Kind {
 
 struct Slot {
     key: (u64, u32),
+    // The node has its own id, like the box of an element. Other boxes are anonymous.
+    keyed: bool,
+    // The prepaint pass that listed the box in `Tree.anchoring`.
+    anchoring: u32,
     live: bool,
     seen: u32,
     parent: u32,
@@ -141,6 +147,8 @@ impl Slot {
     fn new(key: (u64, u32), inherited: Rc<TextStyle>, style: Rc<Styled>) -> Self {
         Self {
             key,
+            keyed: false,
+            anchoring: 0,
             live: true,
             seen: 0,
             parent: NONE,
@@ -212,6 +220,7 @@ impl Slot {
 
     fn reuse(&mut self, key: (u64, u32), inherited: &Rc<TextStyle>) {
         self.key = key;
+        self.anchoring = 0;
         self.live = true;
         self.parent = NONE;
         self.inherited = inherited.clone();
@@ -324,9 +333,11 @@ pub struct Tree {
     last_touched: (u32, Vec<u32>),
     // The paint pass, and the last one whose chunks this pass can copy.
     paints: (u32, Option<u32>),
+    // The scroll containers of the last prepaint, which can choose a scroll anchor.
+    anchoring: Vec<(u64, u32)>,
 }
 
-fn identity(id: Option<NodeKey>, scope: u64) -> u64 {
+pub(crate) fn identity(id: Option<NodeKey>, scope: u64) -> u64 {
     let mut hasher = FxHasher::default();
     (id.map(|id| id.0), scope).hash(&mut hasher);
     hasher.finish()
@@ -606,6 +617,7 @@ impl Tree {
         };
         let slot = &mut self.slots[index as usize];
         slot.seen = self.pass;
+        slot.keyed = id.is_some();
         let same_measure = match &measurement {
             Some(measurement) => {
                 measurement.same(slot.state.as_ref())
@@ -808,6 +820,7 @@ impl Tree {
             width: taffy::AvailableSpace::Definite(viewport.width.0 * scale),
             height: taffy::AvailableSpace::Definite(viewport.height.0 * scale),
         };
+        self.choose_anchors(window);
         let mut tree = LayoutTree {
             slots: &mut self.slots,
             window,
@@ -853,6 +866,169 @@ impl Tree {
         }
     }
 
+    // Before a layout, the boxes are where the last one put them. A scroll container that a scroll moved since it
+    // chose its scroll anchor chooses again there when the content inside lays out again, as in Chrome.
+    fn choose_anchors(&mut self, window: &mut Window) {
+        let unanchored = mem::take(&mut window.unanchored);
+        let scale = window.scale_factor();
+        for at in 0..self.anchoring.len() {
+            let Some(&index) = self.keys.get(&self.anchoring[at]) else {
+                continue;
+            };
+            let Some(handle) = scroll_of(&self.slots[index as usize]) else {
+                continue;
+            };
+            let offset = handle.offset();
+            let mut anchor = handle
+                .anchor()
+                .filter(|anchor| anchor.offset == offset && self.keys.contains_key(&anchor.key));
+            if anchor.is_none()
+                && offset.y != Pixels::ZERO
+                && self.slots[index as usize].cache.is_empty()
+            {
+                let slot = &self.slots[index as usize];
+                let taffy::Layout { size, border, .. } = slot.layout;
+                let view = [
+                    border.left,
+                    border.top,
+                    size.width - border.right,
+                    size.height - border.bottom,
+                ];
+                let shift = point(offset.x.0 * scale, offset.y.0 * scale);
+                anchor = self
+                    .find_anchor(index, shift, view, slot.style.contains)
+                    .map(|(found, at)| Anchor {
+                        key: self.slots[found as usize].key,
+                        at,
+                        offset,
+                        suppressed: false,
+                    });
+            }
+            // A change of the style of a box between the anchor and the scroll container suppresses the adjustment.
+            if let Some(anchor) = &mut anchor
+                && !unanchored.is_empty()
+                && let Some(mut node) = self.keys.get(&anchor.key).copied()
+            {
+                loop {
+                    let slot = &self.slots[node as usize];
+                    if slot.keyed && slot.key.1 == 0 && unanchored.contains(&slot.key.0) {
+                        anchor.suppressed = true;
+                    }
+                    if node == index || slot.parent == NONE {
+                        break;
+                    }
+                    node = slot.parent;
+                }
+            }
+            handle.set_anchor(anchor);
+        }
+    }
+
+    // The first box in tree order that the viewport shows, as Chrome finds it: one that it shows whole, or else the
+    // last box on the path to the first one that it shows in part. `at` places the box in the viewport, and the
+    // result has the top of the anchor there.
+    fn find_anchor(
+        &self,
+        index: u32,
+        at: Point<f32>,
+        view @ [left, top, right, bottom]: [f32; 4],
+        contains: u8,
+    ) -> Option<(u32, f32)> {
+        for &child in &self.slots[index as usize].children {
+            let child = index_of(child);
+            let slot = &self.slots[child as usize];
+            let style = &slot.style;
+            if style.display == Display::None
+                || style.scroll_anchor != 0
+                || matches!(slot.kind, Kind::Layers(_))
+                || style.escape & (Escape::FIXED | Escape::OUTLINE) != 0
+                || style.escape & Escape::ABSOLUTE != 0 && contains & Escape::ABSOLUTE == 0
+            {
+                continue;
+            }
+            let location = slot.layout.location;
+            let mut origin = point(at.x + location.x, at.y + location.y);
+            if let Some(split) = &slot.split {
+                origin += split.shift;
+            }
+            let size = slot.layout.size;
+            let contains = contains | style.contains;
+            // A scroll container is an anchor itself, since its boxes move with its own offset.
+            let scrolls = (slot.events.as_ref()).is_some_and(|events| events.scroll.is_some());
+            if !slot.keyed && !matches!(slot.kind, Kind::Text(_))
+                || size.width <= 0.
+                || size.height <= 0.
+            {
+                // Anonymous boxes are no anchors, but the boxes in them can be.
+                if !scrolls && let Some(found) = self.find_anchor(child, origin, view, contains) {
+                    return Some(found);
+                }
+                continue;
+            }
+            let far = point(origin.x + size.width, origin.y + size.height);
+            if origin.x >= right || far.x <= left || origin.y >= bottom || far.y <= top {
+                continue;
+            }
+            let whole = origin.x >= left && origin.y >= top && far.x <= right && far.y <= bottom;
+            if whole || scrolls {
+                return Some((child, origin.y));
+            }
+            return self
+                .find_anchor(child, origin, view, contains)
+                .or(Some((child, origin.y)));
+        }
+        None
+    }
+
+    // Moves the scroll offset by the move of the scroll anchor since the last layout, so the anchor stays where the
+    // viewport showed it. Lists the container for the next layout to choose an anchor.
+    fn anchor(&mut self, index: u32, handle: &ScrollRef, scale: f32) {
+        let slot = &mut self.slots[index as usize];
+        if slot.style.scroll_anchor & ScrollAnchor::NONE != 0 {
+            handle.set_anchor(None);
+            return;
+        }
+        // A scroll from the top and a change in the same task choose an anchor at the next layout too.
+        if mem::replace(&mut slot.anchoring, self.prepaints) != self.prepaints {
+            self.anchoring.push(slot.key);
+        }
+        let offset = handle.offset();
+        let Some(anchor) = handle.anchor() else {
+            return;
+        };
+        let Some(mut node) = self
+            .keys
+            .get(&anchor.key)
+            .copied()
+            .filter(|_| anchor.offset == offset)
+        else {
+            return handle.set_anchor(None);
+        };
+        let mut top = 0.;
+        while node != index {
+            let slot = &self.slots[node as usize];
+            top += slot.layout.location.y + slot.split.as_ref().map_or(0., |split| split.shift.y);
+            node = slot.parent;
+            if node == NONE {
+                return handle.set_anchor(None);
+            }
+        }
+        // Like Chrome, the anchor moves the offset by whole device pixels.
+        let delta = (top + offset.y.0 * scale).round() - anchor.at.round();
+        if delta != 0. && anchor.suppressed {
+            return handle.set_anchor(None);
+        }
+        if anchor.suppressed {
+            handle.set_anchor(Some(Anchor {
+                suppressed: false,
+                ..anchor
+            }));
+        }
+        if delta != 0. {
+            handle.anchor_by(px(-delta / scale));
+        }
+    }
+
     fn bounds(&self, index: u32, origin: Point<f32>, window: &Window) -> [Rect<Pixels>; 2] {
         let scale = window.scale_factor();
         let layout = &self.slots[index as usize].layout;
@@ -879,6 +1055,7 @@ impl Tree {
         self.depths.clear();
         self.blocks.clear();
         self.hidden.clear();
+        self.anchoring.clear();
         #[cfg(debug_assertions)]
         let start = window.region_places().len();
         self.copies = window.copies();
@@ -1189,6 +1366,7 @@ impl Tree {
             let offset = match &scroll {
                 Some(handle) => {
                     handle.drive(window);
+                    self.anchor(index, handle, scale);
                     handle.clamp(style, bounds, client, content, scale)
                 }
                 None => Point::default(),
@@ -1720,6 +1898,7 @@ impl Tree {
                     .and_then(|events| events.scroll.clone());
                 let offset = scroll.as_ref().map(|handle| {
                     handle.drive(window);
+                    self.anchor(index, handle, scale);
                     let client = unsnapped(&self.slots[index as usize].layout, scale);
                     let content = match self.slots[index as usize].children.is_empty() {
                         true => client,
@@ -2404,6 +2583,10 @@ fn changed(slots: &mut [Slot], index: usize) {
 fn inset(layout: &Layout, scale: f32) -> [Pixels; 4] {
     let sides = layout.padding + layout.border;
     [sides.top, sides.right, sides.bottom, sides.left].map(|side| Pixels(side / scale))
+}
+
+fn scroll_of(slot: &Slot) -> Option<ScrollRef> {
+    slot.events.as_ref()?.scroll.clone()
 }
 
 fn index_of(node: NodeId) -> u32 {

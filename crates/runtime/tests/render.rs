@@ -195,6 +195,49 @@ fn pseudo_elements_report_the_sizes_of_their_boxes() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn scroll_anchors_keep_the_content_in_view() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const step = async code => { const out = await run(code); await win.webContents.capturePage(); return out; };
+        const read = () => run(`[...'abcde'].map(id => document.getElementById(id).scrollTop).join()`);
+        await step(`for (const id of 'abcd') document.getElementById(id).scrollTop = 60`);
+        const sync = await step(`for (const id of 'abcde') document.getElementById(id + '1').style.height = '30px';
+            document.getElementById('c3').style.position = 'relative'; document.getElementById('a').offsetTop;
+            document.getElementById('a').scrollTop`);
+        if (sync !== 70) fail('a layout for a script: ' + sync);
+        const grown = await read();
+        if (grown !== '70,60,60,70,0') fail('grown: ' + grown);
+        await step(`for (const id of 'abcd') document.getElementById(id + '2').style.height = '0'`);
+        const shrunk = await read();
+        if (shrunk !== '50,60,60,50,0') fail('shrunk: ' + shrunk);
+        await step(`document.getElementById('a').scrollTop = 0; document.getElementById('a3').style.height = '50px'`);
+        const top = await read();
+        if (top !== '0,60,60,50,0') fail('at the top: ' + top);
+        await step('scrollTo(0, 300)');
+        const page = await step(`document.getElementById('p1').style.height = '30px'; scrollY`);
+        if (page !== 310) fail('the page: ' + page);
+        // As in Chrome, a move for an anchor fires a scroll event.
+        const events = await run(`events.join()`);
+        if (!events.startsWith('a60,a70,') || !events.endsWith(',p300,p310')) fail('scroll events: ' + events);
+        "#,
+        &[(
+            "page.html",
+            "<head><style>.s{display:inline-block;width:60px;height:100px;overflow:auto}\
+             .s>div,#p>div{height:20px}</style></head><body style='margin:0'>\
+             <div id=a class=s></div><div id=b class=s style='overflow-anchor:none'></div><div id=c class=s></div>\
+             <div id=d class=s></div><div id=e class=s></div><div id=p></div>\
+             <script>for (const id of 'abcdep') { const box = document.getElementById(id);\
+             for (let i = 0; i < 40; i++) box.append(Object.assign(document.createElement('div'), { id: id + i, textContent: i })); }\
+             document.getElementById('d3').style.overflowAnchor = 'none';\
+             globalThis.events = []; document.getElementById('a').addEventListener('scroll', e => events.push('a' + e.target.scrollTop));\
+             addEventListener('scroll', () => events.push('p' + scrollY));</script></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn pages_scroll_sideways_from_their_start() {
     run_hidden(
         r#"

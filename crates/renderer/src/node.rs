@@ -853,6 +853,20 @@ struct ScrollState {
     spring: Option<Spring>,
     loose: bool,
     glide: Option<Glide>,
+    anchor: Option<Anchor>,
+}
+
+// The scroll anchor: a box that keeps its place in the scroll viewport when the content above it changes size.
+#[derive(Clone, Copy)]
+pub(crate) struct Anchor {
+    pub(crate) key: (u64, u32),
+    // The top of the box in the viewport, in device pixels.
+    pub(crate) at: f32,
+    // The offset that the anchor holds for. Any other move of the offset drops it.
+    pub(crate) offset: Point<Pixels>,
+    // A box from the anchor to the scroll container changed its place or size by style, so the next layout keeps
+    // the offset and drops the anchor.
+    pub(crate) suppressed: bool,
 }
 
 const STIFFNESS: f32 = 20.;
@@ -1142,6 +1156,27 @@ impl ScrollRef {
         self.0.borrow_mut().animate_to(offset, wheel);
     }
 
+    pub(crate) fn anchor(&self) -> Option<Anchor> {
+        self.0.borrow().anchor
+    }
+
+    pub(crate) fn set_anchor(&self, anchor: Option<Anchor>) {
+        self.0.borrow_mut().anchor = anchor;
+    }
+
+    // Moves the offset for the anchor. A smooth scroll keeps its target, as in Chrome, and a trackpad scroll moves
+    // on from the new offset.
+    pub(crate) fn anchor_by(&self, by: Pixels) {
+        let scroll = &mut *self.0.borrow_mut();
+        scroll.offset.y += by;
+        if let Some(glide) = &mut scroll.glide {
+            glide.to.y += by;
+        }
+        if let Some(anchor) = &mut scroll.anchor {
+            anchor.offset = scroll.offset;
+        }
+    }
+
     /// Sets the range of a handle that no box tracks, like the scrollback of a terminal.
     pub fn set_range(&self, bounds: Rect, max_offset: Point<Pixels>) {
         let scroll = &mut *self.0.borrow_mut();
@@ -1261,7 +1296,13 @@ impl ScrollRef {
         );
         let range = [high - max, high];
         let scroll = &mut *self.0.borrow_mut();
-        scroll.offset = within(range, scroll.offset);
+        let offset = within(range, scroll.offset);
+        if let Some(anchor) = &mut scroll.anchor
+            && anchor.offset == scroll.offset
+        {
+            anchor.offset = offset;
+        }
+        scroll.offset = offset;
         if let Some(glide) = &mut scroll.glide {
             glide.to = within(range, glide.to);
         }

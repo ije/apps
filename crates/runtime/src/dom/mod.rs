@@ -872,6 +872,8 @@ pub struct State {
     pub(crate) autos: rustc_hash::FxHashMap<usize, (Rc<[usize]>, Rc<[usize]>, (u64, [f32; 2]))>,
     // `contentvisibilityautostatechange` events: the box and whether it skips its contents now.
     pub(crate) skip_events: Vec<(usize, bool)>,
+    // The nodes whose style moved or sized them since the last frame, which suppress scroll anchoring.
+    pub(crate) unanchored: Vec<usize>,
 }
 
 // Where a canvas drew a drawable element, which takes the pointer there.
@@ -5048,6 +5050,19 @@ pub(crate) fn styles(
             }
         }
     }
+    if let Some(previous) = &context.previous {
+        for range in result.values.differing(&previous.values) {
+            for id in range {
+                let new = &result.values[id];
+                if previous.values.get(id).is_some_and(|old| {
+                    !Rc::ptr_eq(old, new) && old.differs_in(new, &ANCHORING_PROPS)
+                }) && state.unanchored.len() < 4096
+                {
+                    state.unanchored.push(id);
+                }
+            }
+        }
+    }
     if animating {
         let result = Rc::new(result);
         state.select_base = (Rc::as_ptr(&result) as usize, subject, serial, flatten);
@@ -5064,6 +5079,51 @@ pub(crate) fn styles(
     state.previous = None;
     result
 }
+
+// Like Chrome, a change of these properties of the scroll anchor or a box around it keeps the scroll offset.
+const ANCHORING_PROPS: style::PropSet = style::PropSet::new(&[
+    Prop::POSITION,
+    Prop::TOP,
+    Prop::RIGHT,
+    Prop::BOTTOM,
+    Prop::LEFT,
+    Prop::INSET_BLOCK_START,
+    Prop::INSET_BLOCK_END,
+    Prop::INSET_INLINE_START,
+    Prop::INSET_INLINE_END,
+    Prop::WIDTH,
+    Prop::HEIGHT,
+    Prop::MIN_WIDTH,
+    Prop::MIN_HEIGHT,
+    Prop::MAX_WIDTH,
+    Prop::MAX_HEIGHT,
+    Prop::INLINE_SIZE,
+    Prop::BLOCK_SIZE,
+    Prop::MIN_INLINE_SIZE,
+    Prop::MIN_BLOCK_SIZE,
+    Prop::MAX_INLINE_SIZE,
+    Prop::MAX_BLOCK_SIZE,
+    Prop::MARGIN_TOP,
+    Prop::MARGIN_RIGHT,
+    Prop::MARGIN_BOTTOM,
+    Prop::MARGIN_LEFT,
+    Prop::PADDING_TOP,
+    Prop::PADDING_RIGHT,
+    Prop::PADDING_BOTTOM,
+    Prop::PADDING_LEFT,
+    Prop::TRANSFORM,
+    Prop::TRANSLATE,
+    Prop::ROTATE,
+    Prop::SCALE,
+    Prop::MARGIN_BLOCK_START,
+    Prop::MARGIN_BLOCK_END,
+    Prop::MARGIN_INLINE_START,
+    Prop::MARGIN_INLINE_END,
+    Prop::PADDING_BLOCK_START,
+    Prop::PADDING_BLOCK_END,
+    Prop::PADDING_INLINE_START,
+    Prop::PADDING_INLINE_END,
+]);
 
 // A path with a bad item is empty, so the edit fails with IndexSizeError instead of reaching another rule.
 fn path(kind: &str, value: &Value) -> (Vec<usize>, Option<(usize, bool)>) {

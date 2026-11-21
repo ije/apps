@@ -33,7 +33,7 @@ pub(crate) use value::{
 };
 
 pub use properties::Style;
-pub(crate) use properties::{Prop, Vars};
+pub(crate) use properties::{Prop, PropSet, Vars};
 
 pub(crate) const DISPLAY_NONE: u16 = 1;
 pub(crate) const DISPLAY_CONTENTS: u16 = 2;

@@ -346,7 +346,7 @@ props! {
     OUTLINE_STYLE "outline-style" "auto|none|hidden|dotted|dashed|solid|double|groove|ridge|inset|outset",
     OUTLINE_WIDTH "outline-width" "thin|medium|thick|<non-negative-length>",
     OVERFLOW "overflow" "[visible|hidden|clip|scroll|auto|overlay]{1,2}",
-    OVERFLOW_ANCHOR "overflow-anchor",
+    OVERFLOW_ANCHOR "overflow-anchor" "auto|none",
     OVERFLOW_CLIP_MARGIN "overflow-clip-margin",
     OVERFLOW_WRAP "overflow-wrap" inherited "normal|break-word|anywhere",
     OVERFLOW_X "overflow-x" "visible|hidden|clip|scroll|auto|overlay",
@@ -591,6 +591,22 @@ pub(crate) type Vars = Rc<Vec<(Prop, Rc<str>)>>;
 
 const WORDS: usize = (Known::Count as usize).div_ceil(64);
 
+// A set of known properties, as bits.
+pub(crate) struct PropSet([u64; WORDS]);
+
+impl PropSet {
+    pub(crate) const fn new(props: &[Prop]) -> Self {
+        let mut bits = [0; WORDS];
+        let mut at = 0;
+        while at < props.len() {
+            let id = props[at].0 as usize;
+            bits[id / 64] |= 1 << (id % 64);
+            at += 1;
+        }
+        Self(bits)
+    }
+}
+
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct Style {
     entries: Vec<(Prop, Rc<str>)>,
@@ -683,6 +699,28 @@ impl Style {
         } else {
             &self.entries[index].1
         })
+    }
+
+    // Whether a property of `set` has another value, or is set in one style only.
+    pub(crate) fn differs_in(&self, other: &Self, set: &PropSet) -> bool {
+        for word in 0..WORDS {
+            let mine = self.known[word] & set.0[word];
+            if mine != other.known[word] & set.0[word] {
+                return true;
+            }
+            let mut bits = mine;
+            while bits != 0 {
+                let below = (1u64 << bits.trailing_zeros()) - 1;
+                bits &= bits - 1;
+                let at = |style: &Self| {
+                    style.before[word] as usize + (style.known[word] & below).count_ones() as usize
+                };
+                if self.entries[at(self)].1 != other.entries[at(other)].1 {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub(crate) fn contains(&self, prop: Prop) -> bool {
@@ -854,4 +892,28 @@ impl std::ops::Index<&str> for Style {
 #[test]
 fn names_are_sorted() {
     assert!(NAMES.is_sorted());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Prop, PropSet, Style};
+
+    #[test]
+    fn styles_differ_only_in_the_properties_of_a_set() {
+        let set = PropSet::new(&[Prop::TOP, Prop::WIDTH, Prop::TRANSFORM]);
+        let mut a = Style::default();
+        a.insert(Prop::COLOR, "red");
+        a.insert(Prop::WIDTH, "10px");
+        let mut b = a.clone();
+        b.insert(Prop::COLOR, "blue");
+        assert!(!a.differs_in(&b, &set));
+        b.insert(Prop::WIDTH, "11px");
+        assert!(a.differs_in(&b, &set));
+        b.insert(Prop::WIDTH, "10px");
+        b.insert(Prop::TOP, "0px");
+        assert!(a.differs_in(&b, &set) && b.differs_in(&a, &set));
+        a.insert(Prop::TOP, "0px");
+        a.insert(Prop::ZOOM, "1");
+        assert!(!a.differs_in(&b, &set));
+    }
 }

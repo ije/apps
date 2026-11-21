@@ -2487,6 +2487,9 @@ impl PageView {
         let repass = {
             let mut host = self.host.borrow_mut();
             let dom = host.dom.entry(self.id).or_default();
+            for id in dom.unanchored.drain(..) {
+                window.suppress_anchoring(id);
+            }
             #[cfg(debug_assertions)]
             if let Some(fresh) = &fresh {
                 let fresh: rustc_hash::FxHashSet<usize> = fresh.iter().copied().collect();
