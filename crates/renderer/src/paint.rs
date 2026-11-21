@@ -439,7 +439,11 @@ impl Window {
         for row in &[0., 2.][..1 + usize::from(style == DecorationStyle::Double)] {
             let mut line = instance;
             line.rect[1] += thickness * row;
-            let shown = crate::gpu::rect(line.rect).intersect(clip.bounds);
+            let full = crate::gpu::rect(line.rect);
+            let shown = full.intersect(clip.bounds);
+            if shown != full {
+                self.scene.culled += 1;
+            }
             if shown.is_empty() {
                 continue;
             }
