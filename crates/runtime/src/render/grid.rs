@@ -88,7 +88,8 @@ impl Measurements {
                 self.joined.extend(rest.iter().map(|&node| (node, None)));
                 self.texts.insert(
                     *first,
-                    style::inline_text(doc, styles, *first, rest).map(std::rc::Rc::new),
+                    style::inline_text(doc, styles, *first, rest, &[], [true; 2])
+                        .map(std::rc::Rc::new),
                 );
             } else {
                 self.joined.remove(&children[at]);
@@ -946,7 +947,9 @@ pub(crate) fn intrinsic(
         None => measured
             .texts
             .entry(id)
-            .or_insert_with(|| style::inline_text(doc, styles, id, &[]).map(std::rc::Rc::new))
+            .or_insert_with(|| {
+                style::inline_text(doc, styles, id, &[], &[], [true; 2]).map(std::rc::Rc::new)
+            })
             .clone()
             .map(|inline| {
                 (
@@ -1166,8 +1169,26 @@ pub(crate) fn intrinsic(
             content[2] = extent(width, vertical[0])[1];
         }
     } else {
-        let inline = !node.children.is_empty()
-            && node.children.iter().all(|&child| {
+        // The content of spliced inline boxes is in the flow of the box.
+        let mut kids = std::borrow::Cow::Borrowed(&node.children[..]);
+        if !matches!(display, "flex" | "inline-flex")
+            && node
+                .children
+                .iter()
+                .any(|&child| style::spliced(doc, styles, child))
+        {
+            let (mut flat, mut pending) = (Vec::new(), node.children.clone());
+            pending.reverse();
+            while let Some(child) = pending.pop() {
+                match style::spliced(doc, styles, child) {
+                    true => pending.extend(doc.nodes[child].children.iter().rev()),
+                    false => flat.push(child),
+                }
+            }
+            kids = std::borrow::Cow::Owned(flat);
+        }
+        let inline = !kids.is_empty()
+            && kids.iter().all(|&child| {
                 doc.nodes[child].tag.starts_with('#')
                     || doc.nodes[child].tag == "br"
                     || styles.values[child]
@@ -1352,7 +1373,7 @@ pub(crate) fn intrinsic(
         let mut first = true;
         // A collapsed space between inline boxes, which hangs at the end of a line.
         let (mut spaced, mut space) = (false, None);
-        for (at, &child) in node.children.iter().enumerate() {
+        for (at, &child) in kids.iter().enumerate() {
             if skipped(at, child) {
                 spaced |= inline && doc.nodes[child].tag == "#text" && line[0] > 0.;
                 continue;

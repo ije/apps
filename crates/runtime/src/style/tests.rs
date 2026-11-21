@@ -648,7 +648,7 @@ fn inline_runs_keep_node_ranges_and_reject_independent_boxes() {
         &mut StyleCache::default(),
         None,
     );
-    let inline = inline_text(&doc, &computed, id, &[]).unwrap();
+    let inline = inline_text(&doc, &computed, id, &[], &[], [true; 2]).unwrap();
     assert_eq!(&*inline.text, "A😀BC");
     assert_eq!(inline.boxes.len(), 1);
     assert_eq!(inline.boxes[0].fill, renderer::Color::hex(0xffee00ff));
@@ -676,7 +676,7 @@ fn inline_runs_keep_node_ranges_and_reject_independent_boxes() {
         &mut StyleCache::default(),
         None,
     );
-    assert!(inline_text(&doc, &computed, id, &[]).is_none());
+    assert!(inline_text(&doc, &computed, id, &[], &[], [true; 2]).is_none());
 }
 
 #[test]
@@ -693,7 +693,7 @@ fn inline_boxes_ignore_properties_that_do_not_apply_to_them() {
         &mut StyleCache::default(),
         None,
     );
-    let inline = inline_text(&doc, &computed, element(&doc, "p"), &[]).unwrap();
+    let inline = inline_text(&doc, &computed, element(&doc, "p"), &[], &[], [true; 2]).unwrap();
     assert_eq!(&*inline.text, "the /hairline-create skill");
 }
 
@@ -712,9 +712,16 @@ fn inline_boxes_built_alone_keep_the_spaces_between_their_siblings() {
         None,
     );
     let text = |selector| {
-        inline_text(&doc, &computed, element(&doc, selector), &[])
-            .unwrap()
-            .text
+        inline_text(
+            &doc,
+            &computed,
+            element(&doc, selector),
+            &[],
+            &[],
+            [true; 2],
+        )
+        .unwrap()
+        .text
     };
     assert_eq!(&*text("#a"), " Juan ");
     assert_eq!(&*text("#b"), " Rico");
@@ -739,7 +746,8 @@ fn inline_boxes_built_alone_collapse_the_spaces_between_them() {
         &mut StyleCache::default(),
         None,
     );
-    let text = |id: usize| inline_text(&doc, &computed, id, &[]).map(|inline| inline.text);
+    let text =
+        |id: usize| inline_text(&doc, &computed, id, &[], &[], [true; 2]).map(|inline| inline.text);
     let of = |selector| text(element(&doc, selector)).unwrap();
     let pairs = [
         ("#a1", "a "),
@@ -775,7 +783,7 @@ fn rounded_inline_highlights_keep_one_text_layout_when_tokens_split() {
             &mut StyleCache::default(),
             None,
         );
-        let inline = inline_text(&doc, &computed, id, &[]).unwrap();
+        let inline = inline_text(&doc, &computed, id, &[], &[], [true; 2]).unwrap();
         let actual = (
             inline.text.clone(),
             inline
@@ -839,7 +847,7 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
     assert_eq!(&marker["color"], "blue");
     assert!(marker.contains(Prop::CONTENT) && marker.contains(Prop::FONT_SIZE));
     assert!(computed.text_pseudos[&p][0].is_none());
-    let inline = inline_text(&doc, &computed, p, &[]).unwrap();
+    let inline = inline_text(&doc, &computed, p, &[], &[], [true; 2]).unwrap();
     assert_eq!(&*inline.text, "\"Hi there x");
     assert_eq!(
         inline.runs.iter().map(|run| run.len).sum::<usize>(),
@@ -879,7 +887,7 @@ fn text_pseudo_elements_restyle_runs_and_parse_shadows() {
         &mut StyleCache::default(),
         None,
     );
-    assert!(inline_text(&doc, &computed, element(&doc, "p"), &[]).is_none());
+    assert!(inline_text(&doc, &computed, element(&doc, "p"), &[], &[], [true; 2]).is_none());
     assert_eq!(
         &computed.values[element(&doc, "td")]["vertical-align"],
         "middle"
@@ -1126,7 +1134,7 @@ fn inline_boxes_and_atoms_stay_in_one_text_layout() {
         &mut StyleCache::default(),
         None,
     );
-    let inline = inline_text(&doc, &computed, element(&doc, "#p"), &[]).unwrap();
+    let inline = inline_text(&doc, &computed, element(&doc, "#p"), &[], &[], [true; 2]).unwrap();
     assert_eq!(&*inline.text, "a b \u{fffc} \u{fffc}d e");
     assert_eq!(inline.atoms.len(), 2);
     assert_eq!(inline.boxes.len(), 1);
@@ -1149,8 +1157,18 @@ fn inline_boxes_and_atoms_stay_in_one_text_layout() {
     assert_eq!(run_of("b").inset[1], renderer::px(5.));
     assert!(run_of("d").nowrap);
     assert!(!run_of("e").nowrap);
-    assert!(inline_text(&doc, &computed, element(&doc, "#alone"), &[]).is_none());
-    assert!(inline_text(&doc, &computed, element(&doc, "#flex"), &[]).is_none());
+    assert!(
+        inline_text(
+            &doc,
+            &computed,
+            element(&doc, "#alone"),
+            &[],
+            &[],
+            [true; 2]
+        )
+        .is_none()
+    );
+    assert!(inline_text(&doc, &computed, element(&doc, "#flex"), &[], &[], [true; 2]).is_none());
 }
 
 #[test]
@@ -3784,7 +3802,7 @@ fn block_in_inline_splits_and_empty_inlines_make_no_line() {
     assert!(makes_no_line(&doc, &computed, id("s")));
     assert!(!makes_no_line(&doc, &computed, id("t")));
     assert!(!makes_no_line(&doc, &computed, id("u")));
-    let inline = inline_text(&doc, &computed, id("q"), &[]).unwrap();
+    let inline = inline_text(&doc, &computed, id("q"), &[], &[], [true; 2]).unwrap();
     assert_eq!(&*inline.text, "a b\nc");
     assert_eq!(
         inline.runs.iter().map(|run| run.len).sum::<usize>(),
@@ -5369,7 +5387,7 @@ fn small_caps_are_smaller_capitals_like_chrome() {
         None,
     );
     let p = doc.nodes.iter().position(|node| node.tag == "p").unwrap();
-    let inline = inline_text(&doc, &computed, p, &[]).unwrap();
+    let inline = inline_text(&doc, &computed, p, &[], &[], [true; 2]).unwrap();
     assert_eq!(&*inline.text, "AB CD 1");
     let runs: Vec<_> = inline
         .runs
@@ -5631,7 +5649,7 @@ fn capitalize_follows_words_across_inline_text() {
         &mut StyleCache::default(),
         None,
     );
-    let inline = inline_text(&doc, &computed, element(&doc, "p"), &[]).unwrap();
+    let inline = inline_text(&doc, &computed, element(&doc, "p"), &[], &[], [true; 2]).unwrap();
     assert_eq!(&*inline.text, "Foobar Don't 3d X.y A-B _c Ef");
     let mut text = "ab cd".to_owned();
     text_transform(&mut text, 1..5, "capitalize");
@@ -5659,7 +5677,7 @@ fn fallback_glyphs_measure_rows_with_a_normal_line_height() {
             .nodes
             .iter()
             .position(|node| node.attrs.get("id").map(String::as_str) == Some(id));
-        inline_text(&doc, &computed, node.unwrap(), &[])
+        inline_text(&doc, &computed, node.unwrap(), &[], &[], [true; 2])
             .unwrap()
             .mixed(&system)
     };
@@ -5681,10 +5699,10 @@ fn uppercase_and_lowercase_take_full_case_mappings_like_chrome() {
         &mut StyleCache::default(),
         None,
     );
-    let inline = inline_text(&doc, &computed, element(&doc, "p"), &[]).unwrap();
+    let inline = inline_text(&doc, &computed, element(&doc, "p"), &[], &[], [true; 2]).unwrap();
     assert_eq!(&*inline.text, "STRASSE ʼN FIX");
     assert_eq!(inline.ranges.last().map(|(_, range)| range.len()), Some(7));
-    let inline = inline_text(&doc, &computed, element(&doc, "div"), &[]).unwrap();
+    let inline = inline_text(&doc, &computed, element(&doc, "div"), &[], &[], [true; 2]).unwrap();
     // A sigma at the end of a word takes its final form.
     assert_eq!(&*inline.text, "i\u{307}x οδος σα οδοσ's οδοσ");
 }

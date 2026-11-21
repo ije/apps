@@ -6720,3 +6720,45 @@ fn pretty_rows_rects_and_carets_of_case_mappings_like_chrome() {
              </body>")],
     );
 }
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn inline_boxes_split_around_their_blocks_like_chrome() {
+    let text = run_hidden(
+        &format!(
+            r#"{RECTS}
+            const parts = () => run(`['a', 'c', 'd'].map(id => [...document.getElementById(id).getClientRects()]
+                .map(rect => Math.round(rect.width)).join()).join('|')`);
+            await load('split.html');
+            console.log('PARTS ' + await parts());
+            await run("document.getElementById('a').style.opacity = '0.5'");
+            await win.webContents.capturePage();
+            await run("document.getElementById('a').style.opacity = ''");
+            await win.webContents.capturePage();
+            console.log('RECTS ' + await rects());
+            "#
+        ),
+        &[(
+            "split.html",
+            "<body style='margin:0;font:14px/20px Helvetica'><style>.w{width:300px}\
+             .p::before{content:'B';display:block}.d{border:2px solid;padding:0 6px}</style>\
+             <div class=w>One <span id=a>inline <div id=b>block</div> tail</span> two</div>\
+             <div class=w>One <span id=c class=p>inline with block before</span> two</div>\
+             <div class=w><span id=d class=d><div id=e>first</div>after</span></div></body>",
+        )],
+    );
+    let rects = rects(&text);
+    for (id, rect) in [
+        ("a", "0,2,300,56"),
+        ("b", "0,20,300,20"),
+        ("c", "0,20,300,38"),
+        ("d", "0,0,300,60"),
+        ("e", "0,20,300,20"),
+    ] {
+        assert_eq!(rects[id], rect, "{id}, as in Chrome: {text}");
+    }
+    assert!(
+        text.contains("PARTS 33,300,18|0,300,142|8,300,36"),
+        "{text}"
+    );
+}

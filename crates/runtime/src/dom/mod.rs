@@ -744,6 +744,8 @@ pub struct State {
     pub bounds: LayoutMirror,
     // The parts of boxes that columns split, which take pointer events.
     pub(crate) fragments: rustc_hash::FxHashMap<usize, Box<[[f32; 4]]>>,
+    // The parts of spliced inline boxes in each line of text that holds them, by the key of that text.
+    pub(crate) pieces: rustc_hash::FxHashMap<usize, Vec<(usize, [f32; 4])>>,
     pub(crate) text_layouts: rustc_hash::FxHashMap<usize, TextLayout>,
     pub scroll: rustc_hash::FxHashMap<usize, renderer::ScrollRef>,
     scroll_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
@@ -933,6 +935,13 @@ impl State {
                 parts
                     .iter_mut()
                     .for_each(|part| (part[0], part[1]) = (part[0] + x, part[1] + y));
+            }
+            if !self.pieces.is_empty()
+                && let Some(pieces) = self.pieces.get_mut(&id)
+            {
+                pieces
+                    .iter_mut()
+                    .for_each(|(_, part)| (part[0], part[1]) = (part[0] + x, part[1] + y));
             }
         }
     }
@@ -1817,6 +1826,7 @@ pub fn call(
                 doc.nodes[id] = Node::default();
                 state.bounds.remove(&id);
                 state.fragments.remove(&id);
+                state.pieces.remove(&id);
                 state.cull.widths.remove(&id);
                 state.text_layouts.remove(&id);
                 state.scroll.remove(&id);
@@ -3396,6 +3406,10 @@ pub fn call(
                     .unwrap_or_default()
             ))
         }
+        "dom.fragments" => Ok(state
+            .fragments
+            .get(&id)
+            .map_or(Value::Null, |parts| json!(parts))),
         "dom.textRect" | "dom.textIndex" => {
             let password = doc.nodes[id]
                 .password()

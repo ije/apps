@@ -1039,7 +1039,7 @@
       return true;
     }
     getBoundingClientRect() { const i = slot(this), m = geometry; return i < 0 ? new DOMRect() : new DOMRect(m[i], m[i + 1], m[i + 2], m[i + 3]); }
-    getClientRects() { return slot(this) < 0 ? listOf(DOMRectList, []) : listOf(DOMRectList, [this.getBoundingClientRect()]); }
+    getClientRects() { if (slot(this) < 0) return listOf(DOMRectList, []); const parts = call('dom.fragments', this._id); return listOf(DOMRectList, parts ? parts.map(part => new DOMRect(...part)) : [this.getBoundingClientRect()]); }
     get clientWidth() { return rootElement(this) ? innerWidth : Math.round(client(this)[2]); } get clientHeight() { return rootElement(this) ? innerHeight : Math.round(client(this)[3]); }
     get clientLeft() { return Math.round(client(this)[0]); } get clientTop() { return Math.round(client(this)[1]); }
     get scrollTop() { return scrollOf(this, 5); } set scrollTop(value) { call('dom.scroll', this._id, null, Number(value)); }

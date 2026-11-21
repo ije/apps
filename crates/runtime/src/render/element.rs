@@ -88,6 +88,7 @@ pub(super) enum Query {
     Theme,
     LineBase(u32),
     Shrinks(u32),
+    Spliced(u32),
 }
 
 impl Query {
@@ -108,6 +109,7 @@ impl Query {
             Query::Value(node) => Query::Value(at(node)?),
             Query::LineBase(node) => Query::LineBase(at(node)?),
             Query::Shrinks(node) => Query::Shrinks(at(node)?),
+            Query::Spliced(node) => Query::Spliced(at(node)?),
             query => query,
         })
     }
@@ -667,6 +669,7 @@ impl<'a> Build<'a> {
             }
             Query::Look(node) => hashed(doc.nodes[node as usize].state & LOOK),
             Query::Boxless(node) => hashed(boxless(doc, node as usize).map(|select| select.1)),
+            Query::Spliced(node) => hashed(style::spliced(doc, styles, node as usize)),
             Query::RowFill => {
                 hashed(row_fill(doc, styles, id).map(|fill| fill.to_array().map(f32::to_bits)))
             }
@@ -1235,7 +1238,7 @@ pub(super) fn element(
         value: hashed(&build.doc.nodes[id].value),
     });
     let cell = slot.clone().filter(|_| storable);
-    let child = create(build, id, containing, container, slot);
+    let child = create(build, id, containing, container, slot, None);
     #[cfg(debug_assertions)]
     let plan = build.plan.take();
     #[cfg(debug_assertions)]
@@ -1441,7 +1444,7 @@ fn check(
         ..*build
     };
     let start = build.reads.borrow().len();
-    let fresh = create(&shadow, id, containing, container, slot);
+    let fresh = create(&shadow, id, containing, container, slot, None);
     let depth = build.ancestors.len();
     let set = |reads: &[Read]| {
         let mut set: Vec<_> = reads
@@ -1506,12 +1509,14 @@ fn print(build: &Build<'_>, from: usize, child: &Child) -> u64 {
     print
 }
 
+/// Builds the box of `id`, or with `pseudo` only that block pseudo-element of a spliced inline box.
 fn create(
     build: &Build<'_>,
     id: usize,
     containing: [f32; 2],
     container: [f32; 2],
     slot: Option<([f32; 4], super::grid::Grid)>,
+    pseudo: Option<usize>,
 ) -> Child {
     let reader = build;
     let Build {
@@ -1993,15 +1998,40 @@ fn create(
     } else {
         node.children.iter().rev().copied().collect()
     };
+    // Spliced inline boxes, with the range of their content in `flat`. The end of a box is `!index` in `pending`.
+    let mut cuts: Vec<(usize, usize, usize)> = Vec::new();
+    // The parts of the spliced boxes: their place in `flat`, and the key of their text or their first and last block.
+    let mut cut_parts: Vec<(usize, usize, super::paint::Piece)> = Vec::new();
+    // The block `::before` and `::after` of spliced boxes: their place in `flat` and their index.
+    let mut cut_pseudos: Vec<(usize, usize)> = Vec::new();
     while let Some(child) = pending.pop() {
+        if child > usize::MAX / 2 {
+            let cut = cuts[!child].0;
+            if style::pseudo_blocks(styles, cut).is_some_and(|[_, after]| after) {
+                cut_pseudos.push((flat.len(), 1));
+                flat.push(cut);
+            }
+            cuts[!child].2 = flat.len();
         // A plain block is an element with a box, and its flags are closer than its node.
-        if info[child].flags & cull::PLAIN_BLOCK != 0 {
+        } else if info[child].flags & cull::PLAIN_BLOCK != 0 {
             flat.push(child);
         } else if styles.values[child]
             .get(Prop::DISPLAY)
             .is_some_and(|value| value == "contents")
         {
             pending.extend(doc.nodes[child].children.iter().rev());
+        } else if flow && !drawable && style::holds_block_box(doc, styles, child) && {
+            let spliced = style::spliced(doc, styles, child);
+            reader.log(Query::Spliced(child as u32), depth, hashed(spliced));
+            spliced
+        } {
+            pending.push(!cuts.len());
+            cuts.push((child, flat.len(), flat.len()));
+            pending.extend(doc.nodes[child].children.iter().rev());
+            if style::pseudo_blocks(styles, child).is_some_and(|[before, _]| before) {
+                cut_pseudos.push((flat.len(), 0));
+                flat.push(child);
+            }
         } else if !matches!(doc.nodes[child].tag.as_str(), "#comment" | "#doctype")
             && !(doc.nodes[child].tag == "br"
                 && styles.values[child].get(Prop::DISPLAY) == Some("none"))
@@ -2018,6 +2048,7 @@ fn create(
             .borrow_mut()
             .note_runs(doc, styles, id, &flat, true);
     }
+    let cut_ids: rustc_hash::FxHashSet<usize> = cuts.iter().map(|&(cut, ..)| cut).collect();
     let floated = |child: usize| {
         flow && float_side(&styles.values[child]).is_some()
             && styles.values[child]
@@ -2041,7 +2072,9 @@ fn create(
             .borrow_mut()
             .texts
             .entry(id)
-            .or_insert_with(|| style::inline_text(doc, styles, id, &[]).map(Rc::new))
+            .or_insert_with(|| {
+                style::inline_text(doc, styles, id, &[], &[], [true; 2]).map(Rc::new)
+            })
             .clone()
     };
     let breaks = display != "inline"
@@ -2055,6 +2088,85 @@ fn create(
         && flat.iter().all(|&child| {
             inline_level(child) || styles.values[child].get(Prop::DISPLAY) == Some("none")
         });
+    // Inline content between the blocks of a box, which lays out as one paragraph.
+    let in_run = |child: usize| {
+        let node = &doc.nodes[child];
+        match node.tag.as_str() {
+            "#text" | "#comment" => true,
+            _ => {
+                let own = &styles.values[child];
+                own.get(Prop::DISPLAY) == Some("none")
+                    || inline_level(child)
+                        && !floated(child)
+                        && own
+                            .get(Prop::POSITION)
+                            .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
+                    // A float in a spliced box goes beside the line that holds its place.
+                    || floated(child)
+                        && !cuts.is_empty()
+                        && std::iter::successors(node.parent, |&up| doc.nodes[up].parent)
+                            .take_while(|&up| up != id)
+                            .any(|up| cut_ids.contains(&up))
+            }
+        }
+    };
+    // The text of the run of `flat` from `index` to `end`, which the first and last runs share with the
+    // pseudo-elements of the box. Only boxes with spliced boxes in them hold those in their runs.
+    let content = |child: usize| {
+        in_run(child) || !floated(child) && info[child].flags & cull::OUT_OF_FLOW == 0
+    };
+    let first_content = flat.iter().position(|&child| content(child));
+    let last_content = flat.iter().rposition(|&child| content(child));
+    let run_texts: RefCell<rustc_hash::FxHashMap<usize, Option<Rc<style::InlineText>>>> =
+        RefCell::default();
+    let run_text = |index: usize, end: usize| {
+        let run = &flat[index..end];
+        let parts = run_cuts(build, &cuts, &flat, [index, end], in_run);
+        let found = run_texts
+            .borrow_mut()
+            .entry(index)
+            .or_insert_with(|| {
+                let ends = [
+                    !run.is_empty() && first_content == Some(index),
+                    !run.is_empty() && last_content == Some(end.saturating_sub(1)),
+                ];
+                (run.is_empty()
+                    || run.iter().any(|&kid| {
+                        doc.nodes[kid].tag == "#text"
+                            && !doc.nodes[kid].text.trim_ascii().is_empty()
+                    })
+                    // The edges of a spliced box make a line also with only white space.
+                    || parts.iter().any(|&(cut, flags)| {
+                        flags & style::CUT_FIRST != 0 && edge(build, cut, 3)
+                            || flags & style::CUT_LAST != 0 && edge(build, cut, 1)
+                    }))
+                .then(|| style::inline_text(doc, styles, id, run, &parts, ends))
+                .flatten()
+                .map(|mut data| {
+                    if run.is_empty() {
+                        data.key = !index;
+                    }
+                    Rc::new(data)
+                })
+            })
+            .clone();
+        (found, parts)
+    };
+    // The runs that start and end the content of a box with spliced boxes.
+    let edge_text = |index: usize| {
+        let at = [first_content, last_content][index]?;
+        if cuts.is_empty() || !in_run(flat[at]) {
+            return None;
+        }
+        let [mut start, mut end] = [at, at + 1];
+        while start > 0 && in_run(flat[start - 1]) {
+            start -= 1;
+        }
+        while end < flat.len() && in_run(flat[end]) {
+            end += 1;
+        }
+        run_text(start, end).0
+    };
     // An inline box with only blank text or comments, which can make a line of its own.
     let empty_inline = || {
         display == "inline"
@@ -5634,7 +5746,12 @@ fn create(
         let mut units = units;
         units.container = own.or(units.container);
         let keyed = info[id].flags & cull::COMPOSITED_PSEUDO != 0;
-        for (index, pseudo) in pseudos.iter().enumerate() {
+        for (index, style_of) in pseudos.iter().enumerate() {
+            if pseudo.is_some_and(|only| only != index) {
+                continue;
+            }
+            let pseudo_only = pseudo.is_some();
+            let pseudo = style_of;
             let Some(content) = pseudo
                 .get(Prop::CONTENT)
                 .filter(|v| !matches!(*v, "none" | "normal"))
@@ -5648,11 +5765,12 @@ fn create(
                 continue;
             }
             // The text holds an inline pseudo-element: plain text as runs, a box as an atom.
+            let held = inline_text().or_else(|| edge_text(index));
             let merged = !editable
                 && !matches!(node.tag.as_str(), "svg" | "canvas" | "iframe" | "terminal")
-                && inline_text().is_some_and(|data| data.pseudos[index]);
+                && held.as_ref().is_some_and(|data| data.pseudos[index]);
             let atom = merged
-                && inline_text().is_some_and(|data| {
+                && held.is_some_and(|data| {
                     data.atoms
                         .iter()
                         .any(|atom| usize::from(atom.pseudo) == index + 1)
@@ -6244,6 +6362,16 @@ fn create(
                     key: style::atom_key(id, index as u8 + 1),
                 })
             };
+            // The part of a spliced box gives the box its bounds.
+            if pseudo_only {
+                return decoration
+                    .hooks(super::paint::PseudoPart {
+                        view: view.clone(),
+                        node: id,
+                        key: style::atom_key(id, index as u8 + 1),
+                    })
+                    .into();
+            }
             // A block pseudo-element in a line of text takes a line of its own.
             let decoration = if own_line {
                 renderer::node()
@@ -7425,37 +7553,96 @@ fn create(
         let mut item_margins =
             rustc_hash::FxHashMap::<(*const style::Style, u32), [f32; 4]>::default();
         let (mut scanned, mut last_flow, mut seen, mut flowed) = (0, None, 0, false);
-        // Inline content between the blocks of a box, which lays out as one paragraph.
-        let in_run = |child: usize| {
-            let node = &doc.nodes[child];
-            match node.tag.as_str() {
-                "#text" | "#comment" => true,
-                _ => {
-                    let own = &styles.values[child];
-                    own.get(Prop::DISPLAY) == Some("none")
-                        || inline_level(child)
+        if children.len() == flat.len() {
+            for &(cut, from, to) in &cuts {
+                let mut at = from;
+                while at < to {
+                    let blocky = |child: usize| {
+                        !in_run(child)
                             && !floated(child)
-                            && own
-                                .get(Prop::POSITION)
-                                .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
+                            && info[child].flags & cull::OUT_OF_FLOW == 0
+                    };
+                    if !blocky(children[at]) {
+                        at += 1;
+                        continue;
+                    }
+                    let mut last = at;
+                    while last + 1 < to
+                        && (blocky(children[last + 1]) || !in_run(children[last + 1]))
+                    {
+                        last += 1;
+                    }
+                    while !blocky(children[last]) {
+                        last -= 1;
+                    }
+                    let key = |at: usize| match cut_pseudos.binary_search_by_key(&at, |part| part.0)
+                    {
+                        Ok(found) => style::atom_key(children[at], cut_pseudos[found].1 as u8 + 1),
+                        Err(_) => children[at],
+                    };
+                    cut_parts.push((
+                        cut,
+                        2 * at + 1,
+                        super::paint::Piece::Blocks(key(at), key(last), {
+                            let last = children[last];
+                            styles.lengths[last].edges(&styles.values[last], style::MARGIN, 0.)[2]
+                        }),
+                    ));
+                    at = last + 1;
                 }
+            }
+        }
+        // A spliced box has no box of its own, so its blocks and atoms take its opacity.
+        let fade = |child: usize| {
+            let start = (!cuts.is_empty()).then_some(child);
+            std::iter::successors(start, |&up| doc.nodes[up].parent)
+                .take_while(|&up| up != id)
+                .filter(|&up| up != child && cut_ids.contains(&up))
+                .map(|up| super::effects::opacity(&styles.values[up]))
+                .product::<f32>()
+        };
+        let faded = |child: usize, element: Child| {
+            let fade = fade(child);
+            match fade < 1. {
+                true => renderer::node()
+                    .flex()
+                    .flex_col()
+                    .child(element)
+                    .hooks(super::paint::Effected {
+                        effect: renderer::PaintEffect {
+                            opacity: fade,
+                            ..Default::default()
+                        },
+                        backdrop: None,
+                    })
+                    .into(),
+                false => element,
             }
         };
         let (mut run_end, mut tried) = (0, 0);
-        for (index, &child) in children.iter().enumerate() {
+        for index in 0..=children.len() {
             if index < run_end {
                 continue;
             }
-            if index >= tried
+            let child = children.get(index).copied();
+            let paragraphs = index >= tried
                 && flow
                 && !all_inline
                 && !flexbox
                 && grid.is_none()
                 && line.is_none()
-                && plan.is_none()
-                && culled.is_empty()
-                && in_run(child)
+                && culled.is_empty();
+            // The edges of spliced boxes next to a block and no other line take a line of their own.
+            let edges = if paragraphs
+                && !cuts.is_empty()
+                && child.is_none_or(|child| !in_run(child))
+                && (index == 0 || !in_run(children[index - 1]))
             {
+                run_cuts(build, &cuts, &children, [index, index], in_run)
+            } else {
+                Vec::new()
+            };
+            if paragraphs && (child.is_some_and(in_run) || !edges.is_empty()) {
                 let end = index
                     + children[index..]
                         .iter()
@@ -7463,23 +7650,26 @@ fn create(
                         .count();
                 tried = end;
                 let run = &children[index..end];
-                if let Some(data) = run
-                    .iter()
-                    .any(|&kid| {
-                        doc.nodes[kid].tag == "#text"
-                            && !doc.nodes[kid].text.trim_ascii().is_empty()
-                    })
-                    .then(|| style::inline_text(doc, styles, id, run))
-                    .flatten()
-                {
+                let (found, parts) = run_text(index, end);
+                if let Some(data) = found {
                     #[cfg(debug_assertions)]
                     reader.extra.set(hashed((reader.extra.get(), &*data.text)));
-                    let data = Rc::new(data);
+                    cut_parts
+                        .extend((parts.iter()).map(|&(cut, _)| {
+                            (cut, 2 * index, super::paint::Piece::Text(data.key))
+                        }));
+
                     let content = content_box();
                     let mut atom_elements: Vec<Child> = data
                         .atoms
                         .iter()
-                        .map(|atom| element(build, atom.node, content, container, None))
+                        .map(|atom| match atom.pseudo {
+                            0 => element(build, atom.node, content, container, None),
+                            pseudo => pseudo_atoms[usize::from(pseudo - 1)]
+                                .take()
+                                .unwrap_or_default()
+                                .into(),
+                        })
                         .collect();
                     let atom_slots: Rc<[super::text::AtomSlot]> = data
                         .atoms
@@ -7515,17 +7705,75 @@ fn create(
                         .flex_col()
                         .child(paragraph.min_w(px(0.)).max_w(relative(1.)).flex_shrink(1.));
                     for (at, (atom, child)) in data.atoms.iter().zip(atom_elements).enumerate() {
-                        block = block.child(atom_box(at, atom, child, &atom_slots, [0.; 4]));
+                        let atom_box = atom_box(at, atom, child, &atom_slots, [0.; 4]);
+                        block = block.child(match fade(atom.node) {
+                            fade if fade < 1. => atom_box.hooks(super::paint::Effected {
+                                effect: renderer::PaintEffect {
+                                    opacity: fade,
+                                    ..Default::default()
+                                },
+                                backdrop: None,
+                            }),
+                            _ => atom_box,
+                        });
                     }
                     let struts = (
                         std::mem::take(&mut strut_due),
                         std::mem::take(&mut strut_next),
                     );
+                    // Floats of the line come first, so layout places them before it.
+                    for &kid in run.iter().filter(|&&kid| floated(kid)) {
+                        place!(
+                            element(build, kid, content_box(), container, None),
+                            Some(kid)
+                        );
+                    }
                     place!(block, None);
                     (strut_due, strut_next) = struts;
-                    run_end = end;
-                    continue;
+                    if !run.is_empty() {
+                        run_end = end;
+                        continue;
+                    }
+                } else {
+                    // A run that lays out as boxes gives the spliced boxes in it the bounds of their boxes.
+                    for &(cut, from, to) in &cuts {
+                        let nodes: Vec<usize> = (from.max(index)..to.min(end))
+                            .map(|at| children[at])
+                            .collect();
+                        if !nodes.is_empty() {
+                            cut_parts.push((cut, 2 * index, super::paint::Piece::Nodes(nodes)));
+                        }
+                    }
                 }
+            }
+            let Some(child) = child else {
+                break;
+            };
+            if let Ok(found) = cut_pseudos.binary_search_by_key(&index, |part| part.0) {
+                if let Some(open) = line.take() {
+                    place!(open, None);
+                }
+                let part = cut_pseudos[found].1;
+                let decoration = create(build, child, content_box(), container, None, Some(part));
+                // The pseudo-element is in its box, which `faded` leaves out.
+                let fade = super::effects::opacity(&styles.values[child]);
+                let decoration = match fade < 1. {
+                    true => renderer::node()
+                        .flex()
+                        .flex_col()
+                        .child(decoration)
+                        .hooks(super::paint::Effected {
+                            effect: renderer::PaintEffect {
+                                opacity: fade,
+                                ..Default::default()
+                            },
+                            backdrop: None,
+                        })
+                        .into(),
+                    false => decoration,
+                };
+                place!(faded(child, decoration), None);
+                continue;
             }
             // Flex places a pseudo-element before the children of a higher order, and `::before` also before
             // those of its own.
@@ -7669,6 +7917,13 @@ fn create(
                     content
                 };
                 let child_element = element(build, child, containing, container, placement);
+                let child_element = match inline_level(child)
+                    || floated(child)
+                    || info[child].flags & cull::OUT_OF_FLOW != 0
+                {
+                    true => child_element,
+                    false => faded(child, child_element),
+                };
                 if bounds.is_some()
                     && let Child::Kept(_) = child_element
                     && let Some(patch) = view.patches.borrow_mut().get_mut(&child)
@@ -8653,10 +8908,26 @@ fn create(
                 }
             }
             let rows = rows.into_iter().map(|(row, cells)| (row, true, cells));
-            rows.chain(groups.into_iter().map(|(group, rows)| (group, false, rows)))
-                .collect()
+            let rows = rows.chain(groups.into_iter().map(|(group, rows)| (group, false, rows)));
+            Some(Rc::new(super::paint::Parts::Rows(rows.collect())))
         } else {
-            Rc::from([])
+            (!cuts.is_empty()).then(|| {
+                cut_parts.sort_by_key(|&(_, at, _)| at);
+                let at: rustc_hash::FxHashMap<usize, usize> = cuts
+                    .iter()
+                    .enumerate()
+                    .map(|(at, &(cut, ..))| (cut, at))
+                    .collect();
+                let mut boxes: Vec<_> = cuts.iter().map(|&(cut, ..)| (cut, Vec::new())).collect();
+                for (cut, _, piece) in cut_parts {
+                    boxes[at[&cut]].1.push(piece);
+                }
+                Rc::new(super::paint::Parts::Cuts {
+                    sides: (!multicol)
+                        .then_some([padding[3] + borders[3], padding[1] + borders[1]]),
+                    boxes,
+                })
+            })
         },
         id,
         plans,
@@ -8820,7 +9091,7 @@ fn create(
                 plan: Default::default(),
                 ..*reader
             };
-            let fresh = create(&shadow, id, containing, container, None);
+            let fresh = create(&shadow, id, containing, container, None, None);
             reader.prints.borrow_mut().truncate(printed);
             let own = |reads: &[Read]| {
                 let mut own: Vec<_> = reads
@@ -9305,6 +9576,58 @@ pub(super) fn place(
     }
 }
 
+/// Whether an inline box has padding, a border or a margin on a side.
+fn edge(build: &Build<'_>, id: usize, side: usize) -> bool {
+    let (style, units) = (&build.styles.values[id], &build.styles.lengths[id]);
+    units.edges(style, style::PADDING, 0.)[side]
+        + units.edges(style, style::MARGIN, 0.)[side]
+        + units.borders(style, 0.)[side]
+        != 0.
+}
+
+/// The spliced inline boxes with a part in the run `[start, end)` of `children`, with their `CUT_*` flags.
+fn run_cuts(
+    build: &Build<'_>,
+    cuts: &[(usize, usize, usize)],
+    children: &[usize],
+    [start, end]: [usize; 2],
+    in_run: impl Fn(usize) -> bool,
+) -> Vec<(usize, u8)> {
+    let blocky = |child: usize| {
+        !in_run(child)
+            && float_side(&build.styles.values[child]).is_none()
+            && build.styles.values[child]
+                .get(Prop::POSITION)
+                .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
+    };
+    // An empty run is a line of its own, only for the edges of the boxes next to it.
+    let edge = |cut: usize, side: usize| start < end || edge(build, cut, side);
+    let mut parts = Vec::new();
+    let near = cuts.partition_point(|&(_, from, _)| from <= end);
+    for &(cut, from, to) in cuts[..near].iter().filter(|&&(_, _, to)| to >= start) {
+        let (Some(before), Some(after)) = (
+            children.get(from..start.max(from)),
+            children.get(end.min(to)..to),
+        ) else {
+            continue;
+        };
+        let content = |child: &usize| in_run(*child) || blocky(*child);
+        let flags = if from < end && to > start && start < end {
+            (u8::from(!before.iter().any(content)) * style::CUT_FIRST)
+                | (u8::from(!after.iter().any(content)) * style::CUT_LAST)
+        // Like Chrome, a box that starts or ends with a block has an empty part in the line next to it.
+        } else if to == start && to > from && blocky(children[to - 1]) && edge(cut, 1) {
+            style::CUT_LAST | style::CUT_BEFORE
+        } else if from == end && from < to && blocky(children[from]) && edge(cut, 3) {
+            style::CUT_FIRST | style::CUT_AFTER
+        } else {
+            continue;
+        };
+        parts.push((cut, flags));
+    }
+    parts
+}
+
 fn in_flow(doc: &Document, info: &[cull::Info], id: usize) -> bool {
     let node = &doc.nodes[id];
     !matches!(node.tag.as_str(), "#comment" | "#doctype")
@@ -9322,7 +9645,14 @@ fn margins(
     slot: bool,
 ) -> [f32; 4] {
     let mut margin = units.edges(&build.styles.values[id], style::MARGIN, width);
-    let Some(parent) = build.doc.nodes[id].parent.filter(|_| !flex_parent && !slot) else {
+    // The blocks of a spliced inline box are in the flow of its block.
+    let parent = std::iter::successors(build.doc.nodes[id].parent, |&up| {
+        style::spliced(build.doc, build.styles, up)
+            .then(|| build.doc.nodes[up].parent)
+            .flatten()
+    })
+    .find(|&up| !style::spliced(build.doc, build.styles, up));
+    let Some(parent) = parent.filter(|_| !flex_parent && !slot) else {
         return margin;
     };
     let walked = build.walks.borrow().get(&parent).cloned();
@@ -9430,20 +9760,34 @@ fn margins(
 }
 
 fn flow(build: &Build<'_>, id: usize) -> Vec<usize> {
-    build.doc.nodes[id]
-        .children
-        .iter()
-        .copied()
-        .filter(|&child| {
-            // A plain block is an element in the flow that doesn't float.
-            // Preserved white space makes a line.
-            build.info[child].flags & cull::PLAIN_BLOCK != 0
-                || (in_flow(build.doc, build.info, child)
-                    || build.doc.nodes[child].tag == "#text"
-                        && !style::makes_no_line(build.doc, build.styles, child))
-                    && float_side(&build.styles.values[child]).is_none()
-        })
-        .collect()
+    let mut flow = Vec::new();
+    let mut pending: Vec<usize> = build.doc.nodes[id].children.iter().rev().copied().collect();
+    while let Some(child) = pending.pop() {
+        if child > usize::MAX / 2 {
+            flow.push(!child);
+        // A plain block is an element in the flow that doesn't float.
+        } else if build.info[child].flags & cull::PLAIN_BLOCK != 0 {
+            flow.push(child);
+        } else if style::spliced(build.doc, build.styles, child) {
+            // The edges of the box make lines, which keep margins apart.
+            let edges = [3, 1].map(|side| edge(build, child, side));
+            if edges[1] {
+                pending.push(!child);
+            }
+            pending.extend(build.doc.nodes[child].children.iter().rev());
+            if edges[0] {
+                flow.push(child);
+            }
+        // Preserved white space makes a line.
+        } else if (in_flow(build.doc, build.info, child)
+            || build.doc.nodes[child].tag == "#text"
+                && !style::makes_no_line(build.doc, build.styles, child))
+            && float_side(&build.styles.values[child]).is_none()
+        {
+            flow.push(child);
+        }
+    }
+    flow
 }
 
 fn block(build: &Build<'_>, id: usize) -> bool {
@@ -9453,6 +9797,7 @@ fn block(build: &Build<'_>, id: usize) -> bool {
             .get(Prop::DISPLAY)
             .is_some_and(|value| !value.starts_with("inline") && value != "contents")
         || style::holds_block_box(build.doc, build.styles, id)
+            && !style::spliced(build.doc, build.styles, id)
 }
 
 fn container(build: &Build<'_>, id: usize) -> bool {

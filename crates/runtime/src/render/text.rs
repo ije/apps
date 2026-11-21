@@ -874,6 +874,24 @@ impl From<InlineText> for renderer::Node {
     }
 }
 
+// The mirror of a node of the text. A spliced inline box has a part in each line of text, which its block joins.
+fn place(dom: &mut crate::dom::State, data: &style::InlineText, id: usize, rect: [f32; 4]) {
+    if !data.cuts.contains(&id) {
+        dom.bounds.insert(id, rect);
+        return;
+    }
+    dom.pieces.entry(id).or_default().push((data.key, rect));
+}
+
+// Drops the parts that the text gave its spliced boxes before it gives them again.
+fn unplace(dom: &mut crate::dom::State, data: &style::InlineText) {
+    for cut in &data.cuts {
+        if let Some(pieces) = dom.pieces.get_mut(cut) {
+            pieces.retain(|(key, _)| *key != data.key);
+        }
+    }
+}
+
 impl InlineText {
     fn cursors<'a>(
         &'a self,
@@ -1197,6 +1215,7 @@ impl renderer::Hooks for InlineText {
         let dom = host.dom.entry(view.id).or_default();
         let computed = dom.last_styles().cloned();
         let mut spans: Option<Vec<(usize, Pixels)>> = None;
+        unplace(dom, &self.data);
         let (mut layouts, mut rects) = {
             let mut prepainted = self.prepainted.borrow_mut();
             (
@@ -1335,10 +1354,18 @@ impl renderer::Hooks for InlineText {
                         rect = union;
                     }
                     dom.fragments.insert(*id, parts);
-                } else if !dom.fragments.is_empty() {
+                } else if !dom.fragments.is_empty() && !self.data.cuts.contains(id) {
                     dom.fragments.remove(id);
                 }
-                dom.bounds.insert(*id, rect);
+                // Like Chrome, a part that starts with a line break also has an empty part on the line before.
+                if self.data.cuts.contains(id) && self.data.text[range.clone()].starts_with('\n') {
+                    let line = f32::from(layout.line_height());
+                    let left = f32::from(layout.bounds().left() + shift.x);
+                    let empty = [left, rect[1] - line, 0., rect[3]];
+                    place(dom, &self.data, *id, empty);
+                    rects.push((*id, empty));
+                }
+                place(dom, &self.data, *id, rect);
                 rects.push((*id, rect));
                 let entry = (
                     layout.clone(),
@@ -1416,10 +1443,11 @@ impl renderer::Hooks for InlineText {
         if moved {
             let [x, y] = [origin.x - at.x, origin.y - at.y].map(f32::from);
             *at = origin;
+            unplace(dom, &self.data);
             for (id, rect) in rects.iter_mut() {
                 rect[0] += x;
                 rect[1] += y;
-                dom.bounds.insert(*id, *rect);
+                place(dom, &self.data, *id, *rect);
                 for part in dom.fragments.get_mut(id).into_iter().flatten() {
                     part[0] += x;
                     part[1] += y;
@@ -1544,8 +1572,10 @@ impl renderer::Hooks for InlineText {
                     })
                 };
                 for inline in &self.data.boxes {
+                    let shadowed = self.data.cuts.contains(&self.data.ranges[inline.index].0);
                     if inline.fill.is_transparent()
                         && (inline.border.is_transparent() || inline.borders == [0.; 4])
+                        && !shadowed
                     {
                         continue;
                     }
@@ -1554,7 +1584,53 @@ impl renderer::Hooks for InlineText {
                     else {
                         continue;
                     };
+                    let parts: Vec<_> = parts
+                        .map(|(rect, [left, right])| {
+                            (rect, [left && !inline.open[0], right && !inline.open[1]])
+                        })
+                        .collect();
                     let radii = radii(style, units, width);
+                    // A spliced box has no box of its own, so each part draws its shadow.
+                    let mut shadows = match shadowed {
+                        true => units.shadows(style.get(Prop::BOX_SHADOW).unwrap_or("none"), false),
+                        false => Vec::new(),
+                    };
+                    for shadow in &mut shadows {
+                        shadow.color = shadow.color.fade(inline.fade);
+                    }
+                    // A part has no shadow at its open sides: it goes on past them, cut at the side.
+                    for (rect, [left_side, right_side]) in
+                        parts.iter().filter(|_| !shadows.is_empty())
+                    {
+                        let corner =
+                            |round: bool, radius: Pixels| if round { radius } else { px(0.) };
+                        let corners = renderer::Corners {
+                            top_left: corner(*left_side, radii[0]),
+                            top_right: corner(*right_side, radii[1]),
+                            bottom_right: corner(*right_side, radii[2]),
+                            bottom_left: corner(*left_side, radii[3]),
+                        };
+                        let far = px(1e4);
+                        let [left, right] = [*left_side, *right_side]
+                            .map(|closed| if closed { far } else { px(0.) });
+                        let clip = Rect::new(
+                            point(rect.left() - left, rect.top() - far),
+                            size(rect.size.width + left + right, rect.size.height + far + far),
+                        );
+                        let [left, right] = [*left_side, *right_side]
+                            .map(|closed| if closed { px(0.) } else { far });
+                        let wide = Rect::new(
+                            point(rect.left() - left, rect.top()),
+                            size(rect.size.width + left + right, rect.size.height),
+                        );
+                        window.scope(
+                            renderer::Scope::Clip(Some(renderer::Clip::rounded(
+                                clip,
+                                renderer::Corners::default(),
+                            ))),
+                            |window| window.draw_shadows(wide, corners.into(), &shadows, false),
+                        );
+                    }
                     let [width_above, width_right, width_below, width_left] =
                         inline.borders.map(px);
                     for (rect, [left_side, right_side]) in parts {

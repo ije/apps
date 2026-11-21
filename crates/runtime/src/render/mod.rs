@@ -295,7 +295,11 @@ impl PageState {
         let kept = self.kept.borrow();
         let mut node = id;
         let place = loop {
-            if let Some(record) = kept.get(&node) {
+            // An inline box that holds a block splits around it or not by its style, which its block decides.
+            if let Some(record) = kept
+                .get(&node)
+                .filter(|_| !style::holds_block_box(doc, styles, node))
+            {
                 break record
                     .in_place()
                     .filter(|_| {
@@ -935,6 +939,8 @@ impl PageView {
                     && (styles.values[*id].get(Prop::CANVAS_CONTENT) != Some("drawable")
                         || doc.nodes[*id].tag == "canvas")
                     && composites(style, &styles.values[*id])
+                    // A spliced box has no layer: its parts draw its opacity.
+                    && !style::spliced(&doc, &styles, *id)
                     // A step that draws like the base style builds in place, like other paint changes.
                     && !style.iter().eq(styles.values[*id].iter())
                     && filter(style, 1).is_none_or(|value| {

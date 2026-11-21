@@ -397,6 +397,68 @@ impl Hooks for ElementOrigin {
     }
 }
 
+/// A block pseudo-element of a spliced inline box, which gives the box a part. The box of an ancestor that a
+/// scroll moves moves the part with the box's other pieces.
+pub(super) struct PseudoPart {
+    pub(super) view: Rc<super::PageState>,
+    pub(super) node: usize,
+    pub(super) key: usize,
+}
+
+impl PseudoPart {
+    fn place(&self, exact: Rect<Pixels>, window: &Window) {
+        let bounds = window.transformed_bounds(exact);
+        let rect = [
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.width,
+            bounds.size.height,
+        ]
+        .map(f32::from);
+        let view = &*self.view;
+        let mut host = view.host.borrow_mut();
+        let dom = host.dom.entry(view.id).or_default();
+        let pieces = dom.pieces.entry(self.node).or_default();
+        match pieces.iter_mut().find(|(key, _)| *key == self.key) {
+            Some((_, old)) => *old = rect,
+            None => pieces.push((self.key, rect)),
+        }
+    }
+}
+
+impl Hooks for PseudoPart {
+    fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        self.place(cx.exact, cx.window);
+        inner(cx.window)
+    }
+    fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        self.place(cx.exact, cx.window);
+        inner(cx.window)
+    }
+    fn volatile(&self) -> bool {
+        false
+    }
+    fn bounded(&self) -> bool {
+        true
+    }
+    fn cached(&self) -> bool {
+        true
+    }
+    fn skippable(&self) -> bool {
+        true
+    }
+    fn skip(&self, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+    fn shifts(&self) -> bool {
+        true
+    }
+    fn shift(&self, _: Point<Pixels>, exact: Rect<Pixels>, window: &mut Window) -> bool {
+        self.place(exact, window);
+        true
+    }
+}
+
 // Keeps the box of a `::before` or `::after` for `getComputedStyle()`: its layout place from the border box of
 // its element without the scroll of the element, its size, and its padding plus border. Moves of the element
 // don't change them, so only prepaint writes them.
@@ -475,7 +537,7 @@ pub(super) struct DomBox {
     pub(super) margin: [f32; 4],
     pub(super) cell: Option<usize>,
     pub(super) grid: Option<(usize, bool)>,
-    pub(super) parts: Rc<[(usize, bool, Vec<usize>)]>,
+    pub(super) parts: Option<Rc<Parts>>,
     pub(super) shared: Option<[f32; 4]>,
     pub(super) leading: Option<[f32; 3]>,
     pub(super) boxless: bool,
@@ -494,6 +556,31 @@ pub(super) struct DomBox {
 
 // With its counts, a box's `Rc` must stay within the small blocks of the runtime's allocator.
 const _: () = assert!(size_of::<DomBox>() + 16 <= 512);
+
+/// Boxes whose bounds join the bounds of others after a prepaint.
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) enum Parts {
+    /// The rows and row groups of a table, with their cells or rows.
+    Rows(Vec<(usize, bool, Vec<usize>)>),
+    /// The spliced inline boxes of a block, with their parts, and the left and right sides of its content box,
+    /// which a run of blocks spans. In columns, a run of blocks spans its blocks.
+    Cuts {
+        sides: Option<[f32; 2]>,
+        boxes: Vec<(usize, Vec<Piece>)>,
+    },
+}
+
+/// A part of a spliced inline box.
+#[cfg_attr(debug_assertions, derive(Debug))]
+pub(super) enum Piece {
+    /// The part in a line of text, by the key of the text.
+    Text(usize),
+    /// A run of blocks, from the first to the last, and the bottom margin of the last. A block pseudo-element is
+    /// its key.
+    Blocks(usize, usize, f32),
+    /// Boxes that a line of boxes holds.
+    Nodes(Vec<usize>),
+}
 
 impl DomBox {
     fn block(&self, bounds: Rect<Pixels>, translation: Point<Pixels>) {
@@ -589,13 +676,105 @@ impl DomBox {
                 );
             }
         }
-        if !self.parts.is_empty() {
+        if let Some(Parts::Cuts { sides, boxes }) = self.parts.as_deref() {
+            let mut host = view.host.borrow_mut();
+            let dom = host.dom.entry(view.id).or_default();
+            if let Some(&[x, _, width, _]) = dom.bounds.get(&self.id) {
+                let union = |rects: &mut dyn Iterator<Item = [f32; 4]>| {
+                    rects.reduce(|[x, y, w, h], [a, b, c, d]| {
+                        let [left, top] = [x.min(a), y.min(b)];
+                        [
+                            left,
+                            top,
+                            (x + w).max(a + c) - left,
+                            (y + h).max(b + d) - top,
+                        ]
+                    })
+                };
+                // A block pseudo-element is a piece of its box, by its key.
+                let rect = |key: usize| match key >> 30 {
+                    0 => dom.bounds.get(&key).copied(),
+                    _ => dom
+                        .pieces
+                        .get(&(key & ((1 << 30) - 1)))?
+                        .iter()
+                        .find_map(|&(other, rect)| (other == key).then_some(rect)),
+                };
+                let start = x + sides.map_or(0., |[left, _]| left);
+                let mut found = Vec::with_capacity(boxes.len());
+                for (node, pieces) in boxes {
+                    let mut parts: Vec<[f32; 4]> = Vec::new();
+                    for piece in pieces {
+                        match piece {
+                            Piece::Text(key) => parts.extend(
+                                (dom.pieces.get(node).into_iter().flatten())
+                                    .filter(|(other, _)| other == key)
+                                    .map(|(_, rect)| *rect),
+                            ),
+                            // Like Chrome, a run of blocks is one part as wide as the content box.
+                            &Piece::Blocks(first, last, _) => {
+                                let Some([left, top, across, height]) =
+                                    rect(first).zip(rect(last)).and_then(|(first, last)| {
+                                        union(&mut [first, last].into_iter())
+                                    })
+                                else {
+                                    continue;
+                                };
+                                parts.push(match sides {
+                                    Some([left, right]) => {
+                                        [x + left, top, width - left - right, height]
+                                    }
+                                    None => [left, top, across, height],
+                                });
+                            }
+                            Piece::Nodes(nodes) => parts.extend(union(
+                                &mut nodes
+                                    .iter()
+                                    .filter_map(|node| dom.bounds.get(node).copied())
+                                    .filter(|rect| rect[2] > 0. || rect[3] > 0.),
+                            )),
+                        }
+                    }
+                    // Like Chrome, a box that starts or ends with a block has an empty part there.
+                    let blocks = |piece: Option<&Piece>| matches!(piece, Some(Piece::Blocks(..)));
+                    if let (true, Some(&[_, top, ..])) = (blocks(pieces.first()), parts.first()) {
+                        parts.insert(0, [start, top, 0., 0.]);
+                    }
+                    // It comes after the bottom margin of the last block.
+                    if let (Some(&Piece::Blocks(.., margin)), Some(&[_, top, _, height])) =
+                        (pieces.last(), parts.last())
+                    {
+                        parts.push([start, top + height + margin.max(0.), 0., 0.]);
+                    }
+                    // Like Chrome, an empty part is not in the union.
+                    let all = union(&mut parts.iter().copied().filter(|part| part[2] > 0.));
+                    found.push((*node, all, parts));
+                }
+                for ((node, all, parts), (_, pieces)) in found.into_iter().zip(boxes) {
+                    if let Some(all) = all {
+                        dom.bounds.insert(node, all);
+                    }
+                    dom.fragments.insert(node, parts.into());
+                    // Lines of text that the box left keep no part.
+                    if let Some(kept) = dom.pieces.get_mut(&node) {
+                        kept.retain(|&(key, _)| {
+                            key == node | 1 << 30
+                                || key == node | 2 << 30
+                                || pieces.iter().any(
+                                    |piece| matches!(piece, Piece::Text(other) if *other == key),
+                                )
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(Parts::Rows(rows)) = self.parts.as_deref() {
             let mut host = view.host.borrow_mut();
             let bounds = &mut host.dom.entry(view.id).or_default().bounds;
             // Rows and row groups span all columns of the table. A row ends where its first cell that
             // spans no rows below ends.
             let mut across = [f32::INFINITY, f32::NEG_INFINITY];
-            for (part, row, members) in self.parts.iter() {
+            for (part, row, members) in rows {
                 let union = members
                     .iter()
                     .filter_map(|member| bounds.get(member).copied())
@@ -613,7 +792,7 @@ impl DomBox {
                     bounds.insert(*part, union);
                 }
             }
-            for (part, ..) in self.parts.iter() {
+            for (part, ..) in rows {
                 if let Some(rect) = bounds.get_mut(part) {
                     [rect[0], rect[2]] = [across[0], across[1] - across[0]];
                 }
@@ -1094,6 +1273,11 @@ impl Hooks for DomBox {
                 parts
                     .iter_mut()
                     .for_each(|part| (part[0], part[1]) = (part[0] + x, part[1] + y));
+            }
+            if let Some(pieces) = dom.pieces.get_mut(&id) {
+                pieces
+                    .iter_mut()
+                    .for_each(|(_, part)| (part[0], part[1]) = (part[0] + x, part[1] + y));
             }
             if let Some(block) = dom.blocks.get_mut(&id) {
                 block.origin += by;
