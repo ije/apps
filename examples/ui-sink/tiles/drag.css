@@ -1,0 +1,2041 @@
+/* Drag tiles. Every rule is scoped under .dg- and reads the tile's tone. */
+
+.dg-fill {
+  align-self: stretch;
+  justify-self: stretch;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+}
+
+.dg-tabs-hint kbd,
+.dg-tl-free kbd {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  margin-right: 2px;
+  border-radius: 5px;
+  background: var(--tile-surface);
+  box-shadow:
+    inset 0 -1px 0 color-mix(in oklab, var(--tile-ink) 14%, transparent),
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 10%, transparent);
+  color: var(--tile-ink-2);
+  font: 500 11px/1 var(--sans);
+}
+
+/* 1. The dragging sidebar */
+
+/* Registered, so a keyboard or released change of width glides while a drag follows the pointer exactly. */
+@property --dg-side {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 0px;
+}
+
+.dg-side {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 16px;
+  background: var(--tile-surface);
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 9%, transparent),
+    var(--tile-shadow);
+  user-select: none;
+  -webkit-user-select: none;
+  transition: --dg-side 260ms var(--ease-out);
+}
+
+.dg-side[data-dragging] {
+  transition: none;
+}
+
+.dg-side-nav {
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+  width: var(--dg-side);
+  overflow: hidden;
+  background: var(--tile-surface-2);
+  transition: filter 180ms var(--ease-out);
+}
+
+.dg-side[data-landing="collapsed"] .dg-side-nav {
+  filter: brightness(0.8) saturate(0.55);
+}
+
+/* Right-aligned and never narrower than the minimum, so the content leaves with the edge. */
+.dg-side-inner {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: max(var(--dg-side), var(--dg-side-min));
+  padding: 14px 10px;
+  transition:
+    filter 180ms var(--ease-out),
+    opacity 180ms var(--ease-out);
+}
+
+.dg-side[data-landing="collapsed"] .dg-side-inner {
+  filter: blur(2px);
+  opacity: 0.72;
+}
+
+.dg-side-space {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  padding: 2px 6px;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.dg-side-mark {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: linear-gradient(
+    160deg,
+    oklch(0.64 0.11 205),
+    oklch(0.5 0.11 225)
+  );
+  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.25);
+  color: white;
+}
+
+.dg-side-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.dg-side-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 32px;
+  padding: 0 8px;
+  border-radius: 8px;
+  color: var(--tile-ink-2);
+  font-size: 13.5px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.dg-side-item svg {
+  flex: none;
+  color: var(--tile-ink-3);
+}
+
+.dg-side-item[data-active] {
+  background: var(--tile-surface);
+  color: var(--tile-ink);
+  box-shadow:
+    0 1px 2px oklch(0.2 0.02 60 / 0.08),
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 5%, transparent);
+}
+
+.dg-side-item[data-active] svg {
+  color: oklch(0.55 0.11 215);
+}
+
+.dg-side-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dg-side-count {
+  font: 500 11.5px/1 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+/* The edge: a hairline with a wide hit area and a grip that shows where to hold. */
+.dg-side-handle {
+  position: relative;
+  z-index: 2;
+  flex: none;
+  width: 1px;
+  background: var(--tile-rule);
+  cursor: col-resize;
+  outline: none;
+}
+
+.dg-side-handle::before {
+  content: "";
+  position: absolute;
+  inset: 0 -7px;
+}
+
+.dg-side-handle[data-edge="closed"] {
+  cursor: e-resize;
+}
+
+.dg-side-handle[data-edge="max"] {
+  cursor: w-resize;
+}
+
+.dg-side[data-collapsed] .dg-side-handle::before {
+  inset: 0 -14px 0 0;
+}
+
+.dg-side-grip {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 32px;
+  border-radius: 999px;
+  background: var(--tile-ink-3);
+  opacity: 0;
+  translate: -50% -50%;
+  transition:
+    opacity 140ms var(--ease-out),
+    background 140ms var(--ease-out),
+    height 200ms var(--ease-out);
+}
+
+.dg-side-handle:hover .dg-side-grip,
+.dg-side-handle:focus-visible .dg-side-grip,
+.dg-side[data-dragging] .dg-side-grip {
+  opacity: 1;
+}
+
+.dg-side[data-dragging] .dg-side-grip {
+  height: 44px;
+  background: var(--tile-ink);
+}
+
+.dg-side[data-collapsed] .dg-side-grip {
+  left: 7px;
+  opacity: 0.55;
+}
+
+.dg-side-handle:focus-visible .dg-side-grip {
+  background: var(--tile-accent);
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+}
+
+.dg-side-main {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  container-type: inline-size;
+}
+
+.dg-side-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  height: 48px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--tile-rule);
+}
+
+.dg-side-toggle {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--tile-ink-2);
+  cursor: pointer;
+  transition: background 120ms;
+}
+
+.dg-side-toggle:hover {
+  background: color-mix(in oklab, var(--tile-ink) 7%, transparent);
+}
+
+.dg-side-toggle[aria-expanded="false"] {
+  color: var(--tile-ink);
+}
+
+.dg-side-toggle:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 1px;
+}
+
+.dg-side-crumb {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--tile-ink-2);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.dg-side-width {
+  flex: none;
+  margin-left: auto;
+  padding: 5px 9px;
+  border-radius: 999px;
+  background: var(--tile-surface-2);
+  color: var(--tile-ink-2);
+  font: 500 11.5px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.dg-side-doc {
+  max-width: 460px;
+  padding: 24px 26px;
+}
+
+.dg-side-meta {
+  margin: 0 0 10px;
+  font: 500 11.5px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.dg-side-title {
+  margin: 0;
+  font: 400 32px/1.06 var(--serif);
+  letter-spacing: -0.012em;
+  text-wrap: balance;
+}
+
+.dg-side-text {
+  margin: 14px 0 0;
+  color: var(--tile-ink-2);
+  font-size: 14px;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.dg-side-chart {
+  margin: 22px 0 0;
+}
+
+.dg-side-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  height: 72px;
+  padding-bottom: 1px;
+  border-bottom: 1px solid var(--tile-rule);
+}
+
+.dg-side-bars span {
+  flex: 1;
+  max-width: 22px;
+  border-radius: 4px 4px 1px 1px;
+  background: oklch(0.86 0.045 212);
+}
+
+.dg-side-bars span:last-child {
+  background: oklch(0.56 0.11 215);
+}
+
+.dg-side-chart figcaption {
+  margin-top: 8px;
+  color: var(--tile-ink-3);
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+@container (max-width: 260px) {
+  .dg-side-doc {
+    padding: 16px 14px;
+  }
+  .dg-side-title {
+    font-size: 21px;
+  }
+  .dg-side-text {
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  .dg-side-crumb {
+    display: none;
+  }
+}
+
+.dg-side-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  max-width: calc(100% - 28px);
+  margin: 0;
+  padding: 7px 12px;
+  border-radius: 999px;
+  background: var(--tile-surface-2);
+  color: var(--tile-ink-2);
+  font-size: 12px;
+  line-height: 1.3;
+  text-align: center;
+  translate: -50% 0;
+  width: max-content;
+  transition:
+    background 160ms var(--ease-out),
+    color 160ms var(--ease-out);
+}
+
+.dg-side-hint[data-tone="size"] {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.dg-side-hint[data-tone="fold"] {
+  background: var(--tile-ink);
+  color: var(--tile-surface);
+}
+
+.dg-side-hint[data-tone="open"] {
+  background: var(--tile-accent);
+  color: var(--tile-accent-ink);
+}
+
+/* 2. Swipe to dismiss */
+
+.dg-toasts {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: 100%;
+  max-width: 300px;
+}
+
+.dg-toasts-head {
+  margin-bottom: 6px;
+  text-align: center;
+}
+
+.dg-toasts-head p {
+  margin: 0;
+}
+
+.dg-toasts-time {
+  font: 400 60px/1 var(--serif);
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.dg-toasts-date {
+  margin-top: 8px !important;
+  color: var(--tile-ink-2);
+  font-size: 13.5px;
+  font-weight: 500;
+}
+
+/* Rows carry their gap as a bottom margin, so a leaving row folds its gap away with it. */
+.dg-toasts-list {
+  display: flex;
+  flex-direction: column;
+  margin: 0 0 -8px;
+  padding: 0;
+  list-style: none;
+}
+
+.dg-toast-row {
+  display: grid;
+  grid-template-rows: 1fr;
+  margin-bottom: 8px;
+  transition:
+    grid-template-rows 240ms var(--ease-out) 180ms,
+    margin-bottom 240ms var(--ease-out) 180ms,
+    opacity 160ms var(--ease-out) 180ms,
+    translate 220ms var(--ease-out);
+}
+
+.dg-toast-row[data-leaving] {
+  grid-template-rows: 0fr;
+  margin-bottom: 0;
+  opacity: 0;
+}
+
+@starting-style {
+  .dg-toasts[data-round] .dg-toast-row {
+    opacity: 0;
+    translate: 0 -8px;
+  }
+}
+
+.dg-toast-slot {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 16px;
+  box-shadow:
+    0 1px 2px oklch(0.25 0.05 250 / 0.08),
+    0 12px 26px -16px oklch(0.25 0.06 250 / 0.45);
+}
+
+.dg-toast-behind {
+  position: absolute;
+  inset-block: 0;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  background: color-mix(in oklch, var(--tile-ink) 9%, var(--tile-surface));
+  color: var(--tile-ink-2);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+  white-space: nowrap;
+  transition:
+    width 340ms cubic-bezier(0.3, 1.3, 0.5, 1),
+    background 140ms var(--ease-out),
+    color 140ms var(--ease-out);
+}
+
+.dg-toast-behind[data-side="start"] {
+  left: 0;
+  justify-content: flex-end;
+  padding-right: 32px;
+}
+
+.dg-toast-behind[data-side="end"] {
+  right: 0;
+  justify-content: flex-start;
+  padding-left: 32px;
+}
+
+.dg-toast-behind[data-dismissing] {
+  background: oklch(0.6 0.21 25);
+  color: white;
+}
+
+.dg-toast-slot:has(.dg-toast[data-dragging]) .dg-toast-behind {
+  transition:
+    background 140ms var(--ease-out),
+    color 140ms var(--ease-out);
+}
+
+.dg-toast {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 10px 12px 12px;
+  border-radius: 16px;
+  background: var(--tile-surface);
+  cursor: grab;
+  touch-action: pan-y;
+  user-select: none;
+  -webkit-user-select: none;
+  transition:
+    translate 340ms cubic-bezier(0.3, 1.3, 0.5, 1),
+    box-shadow 160ms var(--ease-out);
+}
+
+.dg-toast[data-dragging] {
+  cursor: grabbing;
+  box-shadow: 0 6px 18px -4px oklch(0.25 0.06 250 / 0.35);
+  transition: box-shadow 160ms var(--ease-out);
+}
+
+.dg-toast-row[data-leaving] .dg-toast,
+.dg-toast-row[data-leaving] .dg-toast-behind {
+  transition:
+    translate 200ms var(--ease-out),
+    width 200ms var(--ease-out);
+}
+
+.dg-toast-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: linear-gradient(
+    160deg,
+    oklch(0.68 0.15 var(--dg-hue)),
+    oklch(0.56 0.16 var(--dg-hue))
+  );
+  box-shadow: inset 0 1px 0 oklch(1 0 0 / 0.25);
+  color: white;
+}
+
+.dg-toast-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.dg-toast-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.dg-toast-title {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.dg-toast-time {
+  flex: none;
+  font: 500 11px/1 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.dg-toast-body {
+  color: var(--tile-ink-2);
+  font-size: 13px;
+  text-wrap: pretty;
+}
+
+.dg-toast-close {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--tile-ink-3);
+  cursor: pointer;
+  transition:
+    background 120ms,
+    color 120ms;
+}
+
+.dg-toast-close:hover {
+  background: color-mix(in oklab, var(--tile-ink) 8%, transparent);
+  color: var(--tile-ink);
+}
+
+.dg-toast-close:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 1px;
+}
+
+.dg-toasts-empty {
+  padding: 28px 0;
+  color: var(--tile-ink-3);
+  font-size: 13px;
+  line-height: 1.3;
+  text-align: center;
+}
+
+.b-btn.dg-toasts-again {
+  align-self: center;
+  height: 32px;
+  border-color: transparent;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--tile-surface) 70%, transparent);
+  box-shadow: 0 1px 2px oklch(0.25 0.05 250 / 0.1);
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 160ms var(--ease-out),
+    visibility 0s 160ms,
+    transform 120ms var(--ease-out);
+}
+
+.b-btn.dg-toasts-again[data-shown] {
+  opacity: 1;
+  visibility: visible;
+  transition:
+    opacity 160ms var(--ease-out),
+    transform 120ms var(--ease-out);
+}
+
+.b-btn.dg-toasts-again:focus-visible {
+  outline: 2px solid var(--tile-accent);
+}
+
+/* 3. Reorder tabs */
+
+.dg-tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+}
+
+.dg-tabs-scroll {
+  margin: -6px;
+  padding: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.dg-tabs-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.dg-tablist {
+  position: relative;
+  display: inline-flex;
+  gap: 2px;
+  height: 38px;
+  padding: 3px;
+  border-radius: 12px;
+  background: var(--tile-surface-2);
+  box-shadow: inset 0 0 0 1px
+    color-mix(in oklab, var(--tile-ink) 6%, transparent);
+  vertical-align: top;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.dg-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  height: 32px;
+  padding: 0 11px 0 9px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--tile-ink-2);
+  font: 500 13px/1 var(--sans);
+  white-space: nowrap;
+  cursor: grab;
+  touch-action: none;
+  transition:
+    left 180ms var(--ease-out),
+    background 120ms,
+    color 120ms,
+    box-shadow 160ms var(--ease-out),
+    scale 160ms var(--ease-out);
+}
+
+.dg-tab svg {
+  flex: none;
+  color: var(--tile-ink-3);
+}
+
+.dg-tab:hover {
+  color: var(--tile-ink);
+}
+
+.dg-tab[aria-selected="true"] {
+  background: var(--tile-surface);
+  color: var(--tile-ink);
+  box-shadow:
+    0 1px 2px oklch(0.2 0.02 60 / 0.1),
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 6%, transparent);
+}
+
+.dg-tab[aria-selected="true"] svg {
+  color: var(--tile-accent);
+}
+
+.dg-tab:focus-visible {
+  z-index: 3;
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 1px;
+}
+
+.dg-tablist[data-dragging] .dg-tab {
+  position: absolute;
+  top: 3px;
+}
+
+.dg-tab[data-moving] {
+  z-index: 2;
+  background: var(--tile-surface);
+  color: var(--tile-ink);
+  cursor: grabbing;
+  box-shadow:
+    0 10px 24px -8px oklch(0.2 0.02 60 / 0.35),
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 8%, transparent);
+  scale: 1.04;
+  transition:
+    box-shadow 160ms var(--ease-out),
+    scale 160ms var(--ease-out);
+}
+
+.dg-tabs-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+}
+
+.dg-tabs-path {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  color: var(--tile-ink-3);
+  font: 500 12px/1.3 var(--mono);
+}
+
+.dg-tabs-path svg {
+  flex: none;
+  color: var(--tile-accent);
+}
+
+.dg-tabs-path > span:first-of-type {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.dg-tabs-path strong {
+  color: var(--tile-ink);
+  font-weight: 500;
+}
+
+.dg-tabs-pos {
+  flex: none;
+  margin-left: auto;
+  font-family: var(--sans);
+}
+
+.dg-tabs-line {
+  display: flex;
+  gap: 14px;
+  min-width: 0;
+  margin: 0;
+  font: 400 12.5px/1.5 var(--mono);
+  white-space: nowrap;
+}
+
+.dg-tabs-num {
+  flex: none;
+  color: var(--tile-ink-3);
+}
+
+.dg-code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--tile-ink);
+  font: inherit;
+  text-overflow: ellipsis;
+}
+
+.dg-code-string {
+  color: oklch(0.52 0.13 150);
+}
+
+.dg-code-key {
+  color: oklch(0.55 0.17 30);
+}
+
+.dg-tabs-hint {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin: 0;
+  color: var(--tile-ink-3);
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.dg-tabs-hint > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.dg-tabs-hint kbd + :not(kbd) {
+  margin-left: 4px;
+}
+
+@container (max-width: 420px) {
+  .dg-tabs-hint > span:last-child {
+    display: none;
+  }
+}
+
+.dg-tabs {
+  container-type: inline-size;
+}
+
+/* 4. Song timeline */
+
+.dg-tl {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  container-type: inline-size;
+}
+
+.dg-tl p {
+  margin: 0;
+}
+
+.dg-tl-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.dg-tl-lcd {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex: none;
+  padding: 7px 10px 6px;
+  border-radius: 8px;
+  background: oklch(0.13 0.012 70);
+  box-shadow:
+    inset 0 1px 3px oklch(0 0 0 / 0.7),
+    0 0 0 1px oklch(0.32 0.012 65),
+    0 1px 0 oklch(1 0 0 / 0.04);
+}
+
+.dg-tl-clock {
+  min-width: 6ch;
+  color: oklch(0.86 0.16 78);
+  font: 500 22px/1 var(--pixel);
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 0 10px oklch(0.8 0.16 78 / 0.45);
+}
+
+.dg-tl-total {
+  color: oklch(0.56 0.07 78);
+  font: 500 12px/1 var(--pixel);
+}
+
+.dg-tl-section {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--tile-ink-2);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.dg-tl-section[data-on] {
+  color: var(--tile-ink);
+}
+
+.dg-tl-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: oklch(0.78 0.12 var(--dg-hue));
+  box-shadow: 0 0 0 3px oklch(0.78 0.12 var(--dg-hue) / 0.18);
+}
+
+.dg-tl-meta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  min-width: 0;
+  margin-left: auto !important;
+  color: var(--tile-ink-3);
+  font-size: 12px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.dg-tl-track {
+  color: var(--tile-ink-2);
+  font-weight: 500;
+}
+
+.dg-tl-free {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.dg-tl-free kbd {
+  background: var(--tile-surface-2);
+  color: var(--tile-ink);
+}
+
+@container (max-width: 440px) {
+  .dg-tl-meta {
+    display: none;
+  }
+}
+
+.dg-tl-control {
+  position: relative;
+  display: grid;
+  height: 94px;
+  border-radius: 10px;
+  background: oklch(0.235 0.012 62);
+  box-shadow:
+    inset 0 0 0 1px var(--tile-rule),
+    inset 0 1px 6px oklch(0 0 0 / 0.35);
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.dg-tl-control > * {
+  grid-area: 1 / 1;
+}
+
+.dg-tl-art {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 7px 0 8px;
+  overflow: hidden;
+  border-radius: 10px;
+  pointer-events: none;
+}
+
+.dg-tl-lanes {
+  position: relative;
+  flex: none;
+  height: 20px;
+}
+
+.dg-tl-lane {
+  position: absolute;
+  top: 0;
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding: 0 7px;
+  overflow: hidden;
+  border-left: 2px solid oklch(0.76 0.12 var(--dg-hue));
+  background: oklch(0.45 0.07 var(--dg-hue) / 0.32);
+  box-shadow: inset -2px 0 0 oklch(0.235 0.012 62);
+  color: oklch(0.86 0.07 var(--dg-hue));
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+  white-space: nowrap;
+  transition:
+    background 160ms var(--ease-out),
+    color 160ms var(--ease-out);
+}
+
+.dg-tl-lane[data-active] {
+  background: oklch(0.58 0.11 var(--dg-hue) / 0.6);
+  color: oklch(0.99 0.01 90);
+}
+
+.dg-tl-waves {
+  position: relative;
+  flex: 1;
+}
+
+.dg-wave {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0.3;
+}
+
+.dg-tl-played {
+  position: absolute;
+  inset: 0;
+  clip-path: inset(0 calc(100% - var(--dg-played)) 0 0);
+}
+
+.dg-tl-played .dg-wave {
+  opacity: 1;
+}
+
+.dg-tl-track-rail {
+  height: 100%;
+}
+
+.dg-tl-fill {
+  background: linear-gradient(to right, transparent 40%, oklch(1 0 0 / 0.05));
+  border-radius: 10px 0 0 10px;
+  pointer-events: none;
+}
+
+.dg-tl-head-thumb {
+  display: flex;
+  justify-content: center;
+  width: 18px;
+  height: 100%;
+  cursor: grab;
+}
+
+.dg-tl[data-dragging] .dg-tl-head-thumb {
+  cursor: grabbing;
+}
+
+.dg-tl-head-thumb::before {
+  content: "";
+  width: 2px;
+  height: 100%;
+  background: oklch(0.97 0.01 85);
+  box-shadow: 0 0 10px oklch(0.97 0.01 85 / 0.35);
+}
+
+.dg-tl-cap {
+  position: absolute;
+  top: -6px;
+  left: 50%;
+  width: 14px;
+  height: 12px;
+  border-radius: 3px 3px 7px 7px;
+  background: oklch(0.97 0.01 85);
+  box-shadow: 0 2px 5px oklch(0 0 0 / 0.45);
+  translate: -50% 0;
+  transition: scale 140ms var(--ease-out);
+}
+
+.dg-tl[data-dragging] .dg-tl-cap {
+  scale: 1.18;
+}
+
+.dg-tl-head-thumb:has(:focus-visible) .dg-tl-cap {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+}
+
+.dg-tl-ruler {
+  display: flex;
+  justify-content: space-between;
+  color: var(--tile-ink-3);
+  font: 500 11px/1.3 var(--mono);
+}
+
+/* 5. Rubber band pager */
+
+.dg-band {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+}
+
+.dg-band-view {
+  margin: 0 -22px;
+  padding: 4px 0 14px;
+  overflow: hidden;
+  cursor: grab;
+  outline: none;
+  touch-action: pan-y;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.dg-band-view[data-dragging] {
+  cursor: grabbing;
+}
+
+.dg-band-track {
+  display: flex;
+  gap: 10px;
+  translate: var(--dg-x, 28px) 0;
+}
+
+.dg-band-card {
+  display: flex;
+  flex-direction: column;
+  flex: none;
+  width: var(--dg-card);
+  padding: 7px 7px 11px;
+  border-radius: 16px;
+  background: var(--tile-surface);
+  box-shadow:
+    0 1px 2px oklch(0.3 0.1 40 / 0.15),
+    0 14px 26px -16px oklch(0.3 0.12 40 / 0.7);
+  color: oklch(0.25 0.03 40);
+}
+
+.dg-band-view:focus-visible .dg-band-card[aria-hidden="false"] {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 3px;
+}
+
+.dg-band-art {
+  height: 46px;
+  margin-bottom: 9px;
+  border-radius: 10px;
+  box-shadow: inset 0 0 0 1px oklch(0 0 0 / 0.06);
+}
+
+.dg-band-art[data-art="a"] {
+  background:
+    radial-gradient(
+      circle at 78% 38%,
+      oklch(0.95 0.08 90) 0 9px,
+      transparent 10px
+    ),
+    linear-gradient(150deg, oklch(0.82 0.13 70), oklch(0.66 0.18 32));
+}
+
+.dg-band-art[data-art="b"] {
+  background:
+    linear-gradient(
+      180deg,
+      transparent 0 58%,
+      oklch(0.96 0.015 90) 58% 72%,
+      oklch(0.9 0.03 85) 72%
+    ),
+    linear-gradient(180deg, oklch(0.82 0.07 230), oklch(0.68 0.11 205));
+}
+
+.dg-band-art[data-art="c"] {
+  background:
+    radial-gradient(
+      circle at 26% 70%,
+      oklch(0.88 0.14 75) 0 7px,
+      transparent 8px
+    ),
+    linear-gradient(
+      180deg,
+      oklch(0.42 0.09 15),
+      oklch(0.66 0.16 42) 75%,
+      oklch(0.75 0.14 60)
+    );
+}
+
+.dg-band-day {
+  padding: 0 6px;
+  color: oklch(0.55 0.06 40);
+  font: 500 11px/1.3 var(--mono);
+}
+
+.dg-band-title {
+  padding: 2px 6px 0;
+  font: 400 19px/1.2 var(--serif);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dg-band-detail {
+  padding: 2px 6px 0;
+  color: oklch(0.47 0.04 40);
+  font-size: 12.5px;
+  line-height: 1.3;
+}
+
+.dg-band-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--tile-ink-2);
+  font: 500 11.5px/1.3 var(--mono);
+}
+
+.dg-band-dots {
+  display: flex;
+  gap: 5px;
+}
+
+.dg-band-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--tile-ink) 40%, transparent);
+  transition:
+    width 220ms var(--ease-out),
+    background 220ms var(--ease-out);
+}
+
+.dg-band-dots span[data-on] {
+  width: 16px;
+  background: var(--tile-ink);
+}
+
+/* 6. Patch bay */
+
+.dg-bay {
+  --dg-metal: oklch(0.27 0.008 260);
+  position: relative;
+  flex: none;
+  width: 236px;
+  height: 156px;
+  border-radius: 10px;
+  background:
+    repeating-linear-gradient(
+      90deg,
+      oklch(1 0 0 / 0.018) 0 1px,
+      transparent 1px 3px
+    ),
+    linear-gradient(180deg, oklch(0.31 0.008 260), oklch(0.235 0.008 260));
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0 / 0.14),
+    inset 0 -1px 0 oklch(0 0 0 / 0.45),
+    0 1px 1px oklch(0 0 0 / 0.25),
+    0 10px 22px -12px oklch(0.2 0.02 60 / 0.5);
+  color: oklch(0.9 0.01 90);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.dg-bay [data-source="mic"] {
+  --dg-cable: oklch(0.64 0.2 27);
+}
+
+.dg-bay [data-source="gtr"] {
+  --dg-cable: oklch(0.83 0.15 86);
+}
+
+.dg-bay [data-source="bass"] {
+  --dg-cable: oklch(0.67 0.14 236);
+}
+
+.dg-bay-screw {
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 35% 30%,
+    oklch(0.84 0.005 260),
+    oklch(0.46 0.005 260)
+  );
+  box-shadow: 0 1px 1px oklch(0 0 0 / 0.55);
+}
+
+.dg-bay-screw::after {
+  content: "";
+  position: absolute;
+  inset: 3.5px 1.5px;
+  border-radius: 1px;
+  background: oklch(0.32 0.005 260);
+  rotate: 35deg;
+}
+
+.dg-bay-screw[data-at="tl"] {
+  top: 7px;
+  left: 7px;
+}
+
+.dg-bay-screw[data-at="tr"] {
+  top: 7px;
+  right: 7px;
+}
+
+.dg-bay-screw[data-at="bl"] {
+  bottom: 7px;
+  left: 7px;
+}
+
+.dg-bay-screw[data-at="br"] {
+  right: 7px;
+  bottom: 7px;
+}
+
+.dg-bay-rail {
+  position: absolute;
+  top: 12px;
+  right: 24px;
+  left: 24px;
+  display: flex;
+  justify-content: space-between;
+  margin: 0;
+  color: oklch(0.66 0.01 90);
+  font: 500 11px/1 var(--pixel);
+  letter-spacing: 0.08em;
+}
+
+.dg-bay-source {
+  position: absolute;
+  left: 14px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 62px;
+  height: 24px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 5px;
+  background: oklch(0.19 0.008 260);
+  box-shadow:
+    inset 0 1px 2px oklch(0 0 0 / 0.65),
+    0 1px 0 oklch(1 0 0 / 0.07);
+  color: oklch(0.93 0.01 90);
+  font: 500 11px/1 var(--pixel);
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+
+.dg-bay-source:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+}
+
+.dg-bay-swatch {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dg-cable);
+  box-shadow: 0 0 6px var(--dg-cable);
+}
+
+.dg-bay-channel {
+  position: absolute;
+  left: 166px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 24px;
+  color: oklch(0.7 0.01 90);
+  font: 500 11px/1 var(--pixel);
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+  transition: color 160ms;
+}
+
+.dg-bay-channel[data-on] {
+  color: oklch(0.95 0.01 90);
+}
+
+.dg-bay-led {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: oklch(0.34 0.03 150);
+  box-shadow: inset 0 1px 1px oklch(0 0 0 / 0.5);
+  transition:
+    background 160ms,
+    box-shadow 160ms;
+}
+
+.dg-bay-channel[data-on] .dg-bay-led {
+  background: oklch(0.84 0.2 145);
+  box-shadow: 0 0 7px oklch(0.84 0.2 145 / 0.85);
+}
+
+.dg-bay-jack {
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  margin: -10px 0 0 -10px;
+  border-radius: 50%;
+  background:
+    radial-gradient(
+      circle,
+      oklch(0.07 0 0) 0 4px,
+      oklch(0.24 0 0) 4.5px 5.5px,
+      transparent 6px
+    ),
+    radial-gradient(
+      circle at 35% 30%,
+      oklch(0.9 0.005 260),
+      oklch(0.52 0.005 260) 68%,
+      oklch(0.36 0.005 260)
+    );
+  box-shadow:
+    0 1px 2px oklch(0 0 0 / 0.6),
+    0 0 0 2px oklch(0.17 0.006 260);
+  cursor: crosshair;
+  touch-action: none;
+  transition: box-shadow 140ms var(--ease-out);
+}
+
+.dg-bay-jack[data-connect="candidate"] {
+  box-shadow:
+    0 1px 2px oklch(0 0 0 / 0.6),
+    0 0 0 2px oklch(0.17 0.006 260),
+    0 0 0 5px oklch(0.84 0.2 145 / 0.3);
+}
+
+.dg-bay-jack[data-connect="target"] {
+  box-shadow:
+    0 1px 2px oklch(0 0 0 / 0.6),
+    0 0 0 2px oklch(0.17 0.006 260),
+    0 0 0 5px oklch(0.84 0.2 145 / 0.85),
+    0 0 12px oklch(0.84 0.2 145 / 0.6);
+}
+
+.dg-bay-cables {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.dg-cable {
+  filter: drop-shadow(0 3px 2px oklch(0 0 0 / 0.45));
+}
+
+.dg-cable path,
+path.dg-cable-draft {
+  fill: none;
+  stroke: var(--dg-cable);
+  stroke-width: 5;
+  stroke-linecap: round;
+}
+
+.dg-cable path.dg-cable-shine {
+  stroke: oklch(1 0 0 / 0.38);
+  stroke-width: 1.4;
+  translate: 0 -1.2px;
+}
+
+path.dg-cable-draft {
+  opacity: 0.92;
+}
+
+.dg-plug circle:first-child {
+  fill: oklch(0.2 0.005 260);
+  stroke: var(--dg-cable);
+  stroke-width: 2.5;
+}
+
+.dg-plug .dg-plug-core {
+  fill: oklch(0.78 0.005 260);
+}
+
+.dg-plug {
+  filter: drop-shadow(0 2px 2px oklch(0 0 0 / 0.5));
+}
+
+.dg-plug-tip:not([data-source]) {
+  display: none;
+}
+
+/* 7. Lasso photos */
+
+.dg-photos {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  width: 100%;
+  max-width: 280px;
+  padding: 10px;
+  border-radius: 16px;
+  background: var(--tile-surface-2);
+  cursor: crosshair;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.dg-photos-head {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 24px;
+  margin: 0;
+  padding: 0 2px;
+  color: var(--tile-ink-2);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.3;
+  pointer-events: none;
+}
+
+.dg-photos-clear {
+  height: 24px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--tile-surface);
+  box-shadow: 0 0 0 1px var(--tile-rule);
+  color: var(--tile-ink);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: auto;
+  visibility: hidden;
+  transition:
+    opacity 140ms var(--ease-out),
+    visibility 0s 140ms;
+}
+
+.dg-photos-clear[data-shown] {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 140ms var(--ease-out);
+}
+
+.dg-photos-clear:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+}
+
+.dg-photo {
+  position: relative;
+  aspect-ratio: 4 / 3;
+  border-radius: 10px;
+  box-shadow: inset 0 0 0 1px oklch(0 0 0 / 0.06);
+  pointer-events: none;
+  transition:
+    box-shadow 120ms var(--ease-out),
+    scale 180ms var(--ease-out),
+    filter 160ms;
+}
+
+.dg-photo[data-photo="dunes"] {
+  background:
+    radial-gradient(
+      circle at 74% 30%,
+      oklch(0.97 0.06 95) 0 7px,
+      transparent 8px
+    ),
+    linear-gradient(180deg, transparent 0 55%, oklch(0.74 0.12 58) 55%),
+    linear-gradient(170deg, oklch(0.9 0.07 80), oklch(0.82 0.1 66));
+}
+
+.dg-photo[data-photo="fjord"] {
+  background:
+    linear-gradient(
+      200deg,
+      transparent 0 48%,
+      oklch(0.35 0.06 220) 48% 66%,
+      transparent 66%
+    ),
+    linear-gradient(
+      180deg,
+      oklch(0.78 0.06 230),
+      oklch(0.5 0.08 235) 70%,
+      oklch(0.36 0.06 205)
+    );
+}
+
+.dg-photo[data-photo="lagoon"] {
+  background:
+    radial-gradient(
+      120% 70% at 50% 110%,
+      oklch(0.68 0.12 195) 0 50%,
+      transparent 51%
+    ),
+    linear-gradient(170deg, oklch(0.92 0.06 180), oklch(0.78 0.1 190));
+}
+
+.dg-photo[data-photo="glacier"] {
+  background:
+    linear-gradient(
+      160deg,
+      transparent 0 52%,
+      oklch(0.86 0.05 225) 52% 70%,
+      transparent 70%
+    ),
+    linear-gradient(180deg, oklch(0.98 0.012 220), oklch(0.82 0.05 228));
+}
+
+.dg-photo[data-photo="mesa"] {
+  background: linear-gradient(
+    180deg,
+    oklch(0.86 0.07 70) 0 44%,
+    oklch(0.62 0.13 40) 44% 72%,
+    oklch(0.5 0.12 35) 72%
+  );
+}
+
+.dg-photo[data-photo="aurora"] {
+  background:
+    radial-gradient(
+      90% 50% at 30% 40%,
+      oklch(0.7 0.15 158 / 0.85),
+      transparent 70%
+    ),
+    linear-gradient(
+      180deg,
+      oklch(0.27 0.05 250),
+      oklch(0.34 0.06 220) 70%,
+      oklch(0.22 0.03 250)
+    );
+}
+
+.dg-photo-name {
+  position: absolute;
+  bottom: 5px;
+  left: 7px;
+  color: white;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-shadow: 0 1px 2px oklch(0 0 0 / 0.4);
+}
+
+.dg-photo[data-photo="glacier"] .dg-photo-name,
+.dg-photo[data-photo="lagoon"] .dg-photo-name {
+  color: oklch(0.3 0.05 225);
+  text-shadow: none;
+}
+
+.dg-photo-badge {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--tile-accent);
+  box-shadow: 0 0 0 2px white;
+  color: var(--tile-accent-ink);
+  opacity: 0;
+  scale: 0.6;
+  transition:
+    opacity 140ms var(--ease-out),
+    scale 180ms var(--ease-out);
+}
+
+.dg-photo[data-lassoed] {
+  box-shadow:
+    0 0 0 2px var(--tile-surface-2),
+    0 0 0 4px color-mix(in oklab, var(--tile-accent) 50%, transparent);
+}
+
+.dg-photo[data-selected] {
+  box-shadow:
+    0 0 0 2px var(--tile-surface-2),
+    0 0 0 4px var(--tile-accent);
+  scale: 0.94;
+}
+
+.dg-photo[data-selected] .dg-photo-badge {
+  opacity: 1;
+  scale: 1;
+}
+
+.dg-photo[data-locked] {
+  filter: saturate(0.55);
+}
+
+.dg-photo[data-locked] .dg-photo-badge {
+  background: oklch(0.2 0.01 60 / 0.55);
+  box-shadow: none;
+  color: white;
+  opacity: 1;
+  scale: 1;
+}
+
+.dg-lasso {
+  z-index: 2;
+  border: 1.5px solid var(--tile-accent);
+  border-radius: 4px;
+  background: color-mix(in oklab, var(--tile-accent) 12%, transparent);
+  pointer-events: none;
+}
+
+/* 8. Desktop windows */
+
+.dg-desk {
+  display: flex;
+  flex-direction: column;
+  align-self: stretch;
+  justify-self: stretch;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 14px;
+  background:
+    radial-gradient(
+      120% 90% at 15% 0%,
+      oklch(0.8 0.08 150 / 0.9),
+      transparent 60%
+    ),
+    linear-gradient(160deg, oklch(0.62 0.08 168), oklch(0.42 0.07 200));
+  box-shadow:
+    0 0 0 1px oklch(0.2 0.04 160 / 0.12),
+    0 10px 24px -14px oklch(0.25 0.05 155 / 0.5);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.dg-desk-menu {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex: none;
+  height: 24px;
+  margin: 0;
+  padding: 0 12px;
+  background: oklch(1 0 0 / 0.55);
+  backdrop-filter: blur(10px);
+  color: oklch(0.25 0.03 160);
+  font-size: 11.5px;
+  line-height: 1.3;
+}
+
+.dg-desk-menu span {
+  font: 500 11px/1 var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.dg-desk-area {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.dg-win {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 9px;
+  background: oklch(0.99 0.004 160);
+  box-shadow:
+    0 0 0 1px oklch(0 0 0 / 0.1),
+    0 6px 14px -8px oklch(0.2 0.05 170 / 0.5);
+  transition: box-shadow 160ms var(--ease-out);
+}
+
+.dg-win[data-front] {
+  box-shadow:
+    0 0 0 1px oklch(0 0 0 / 0.12),
+    0 14px 26px -10px oklch(0.2 0.05 170 / 0.6);
+}
+
+.dg-win[data-resizing] {
+  box-shadow:
+    0 0 0 1px oklch(0 0 0 / 0.14),
+    0 20px 34px -10px oklch(0.2 0.05 170 / 0.7);
+}
+
+.dg-win-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  height: 22px;
+  padding: 0 8px;
+  border-bottom: 1px solid oklch(0 0 0 / 0.07);
+  background: oklch(0.955 0.008 160);
+  color: oklch(0.3 0.02 160);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+  cursor: grab;
+  outline: none;
+}
+
+.dg-win[data-resizing="move"] .dg-win-title {
+  cursor: grabbing;
+}
+
+.dg-win[aria-disabled="true"] .dg-win-title {
+  cursor: default;
+}
+
+.dg-win-title:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: -2px;
+  border-radius: 9px 9px 0 0;
+}
+
+.dg-win-lights {
+  display: flex;
+  gap: 4px;
+}
+
+.dg-win[aria-disabled="true"] .dg-win-lights {
+  display: none;
+}
+
+.dg-win-lights span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: oklch(0.82 0.01 160);
+}
+
+.dg-win[data-front] .dg-win-lights span:nth-child(1) {
+  background: oklch(0.7 0.17 25);
+}
+
+.dg-win[data-front] .dg-win-lights span:nth-child(2) {
+  background: oklch(0.83 0.15 85);
+}
+
+.dg-win[data-front] .dg-win-lights span:nth-child(3) {
+  background: oklch(0.73 0.16 145);
+}
+
+.dg-win-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.dg-win-title svg {
+  flex: none;
+  color: oklch(0.5 0.02 160);
+}
+
+.dg-win-todo {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: hidden;
+  color: oklch(0.3 0.02 160);
+  font-size: 11.5px;
+  line-height: 1.3;
+  list-style: none;
+}
+
+.dg-win-todo li {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+
+.dg-win-todo li::before {
+  content: "";
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1.5px oklch(0.62 0.03 160);
+}
+
+.dg-win-todo li[data-done] {
+  color: oklch(0.58 0.02 160);
+  text-decoration: line-through;
+}
+
+.dg-win-todo li[data-done]::before {
+  background: oklch(0.6 0.12 160);
+  box-shadow: none;
+}
+
+.dg-win-shell {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  gap: 2px;
+  margin: 0;
+  padding: 7px 9px;
+  overflow: hidden;
+  background: oklch(0.22 0.012 170);
+  color: oklch(0.88 0.02 160);
+  font: 500 11px/1.4 var(--mono);
+  white-space: nowrap;
+}
+
+.dg-win-ok {
+  color: oklch(0.8 0.15 150);
+}
+
+.dg-win-timer {
+  display: grid;
+  place-items: center;
+  flex: 1;
+  margin: 0;
+  color: oklch(0.34 0.03 160);
+  font: 500 18px/1 var(--pixel);
+  font-variant-numeric: tabular-nums;
+}
+
+.dg-win-edge {
+  position: absolute;
+  z-index: 2;
+}
+
+.dg-win-edge[data-at="n"] {
+  top: 0;
+  right: 10px;
+  left: 10px;
+  height: 5px;
+}
+
+.dg-win-edge[data-at="s"] {
+  right: 10px;
+  bottom: 0;
+  left: 10px;
+  height: 6px;
+}
+
+.dg-win-edge[data-at="e"] {
+  top: 10px;
+  right: 0;
+  bottom: 10px;
+  width: 6px;
+}
+
+.dg-win-edge[data-at="w"] {
+  top: 10px;
+  bottom: 10px;
+  left: 0;
+  width: 6px;
+}
+
+.dg-win-edge[data-at="ne"],
+.dg-win-edge[data-at="nw"],
+.dg-win-edge[data-at="sw"] {
+  width: 10px;
+  height: 10px;
+}
+
+.dg-win-edge[data-at="ne"] {
+  top: 0;
+  right: 0;
+}
+
+.dg-win-edge[data-at="nw"] {
+  top: 0;
+  left: 0;
+}
+
+.dg-win-edge[data-at="sw"] {
+  bottom: 0;
+  left: 0;
+}
+
+.dg-win-grip {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  z-index: 3;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 0;
+  border-radius: 0 0 9px 0;
+  background: linear-gradient(
+    135deg,
+    transparent 0 52%,
+    oklch(0.62 0.02 160) 52% 59%,
+    transparent 59% 70%,
+    oklch(0.62 0.02 160) 70% 77%,
+    transparent 77%
+  );
+  outline: none;
+}
+
+.dg-win-grip:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: -2px;
+}

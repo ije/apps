@@ -1,0 +1,18 @@
+{
+  "name": "ui_sink",
+  "productName": "UI Sink",
+  "private": true,
+  "main": "main.ts",
+  "scripts": {
+    "dev": "apps run --watch",
+    "build": "apps build"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "2.1.10",
+    "@ui-sdk/core": "0.1.0-beta.13",
+    "@ui-sdk/react": "0.1.0-beta.13",
+    "geist": "1.9.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  }
+}

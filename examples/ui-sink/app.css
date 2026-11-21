@@ -1,0 +1,22 @@
+@font-face { font-family: 'Geist'; font-weight: 400; src: url('./node_modules/geist/dist/fonts/geist-sans/Geist-Regular.woff2') format('woff2'); }
+@font-face { font-family: 'Geist'; font-weight: 500; src: url('./node_modules/geist/dist/fonts/geist-sans/Geist-Medium.woff2') format('woff2'); }
+@font-face { font-family: 'Geist'; font-weight: 600; src: url('./node_modules/geist/dist/fonts/geist-sans/Geist-SemiBold.woff2') format('woff2'); }
+@font-face { font-family: 'Geist'; font-weight: 700; src: url('./node_modules/geist/dist/fonts/geist-sans/Geist-Bold.woff2') format('woff2'); }
+@font-face { font-family: 'Geist Mono'; font-weight: 400; src: url('./node_modules/geist/dist/fonts/geist-mono/GeistMono-Regular.woff2') format('woff2'); }
+@font-face { font-family: 'Geist Mono'; font-weight: 500; src: url('./node_modules/geist/dist/fonts/geist-mono/GeistMono-Medium.woff2') format('woff2'); }
+@font-face { font-family: 'Geist Mono'; font-weight: 600; src: url('./node_modules/geist/dist/fonts/geist-mono/GeistMono-SemiBold.woff2') format('woff2'); }
+@font-face { font-family: 'Geist Serif'; src: url('./node_modules/geist/dist/fonts/geist-serif/GeistSerif-Regular.woff2') format('woff2'); }
+@font-face { font-family: 'Geist Pixel Square'; src: url('./node_modules/geist/dist/fonts/geist-pixel/GeistPixel-Square.woff2') format('woff2'); }
+
+/* next/font sets these on ui-sdk.dev. */
+:root {
+  --font-geist: 'Geist';
+  --font-geist-mono: 'Geist Mono';
+  --font-geist-serif-regular: 'Geist Serif';
+  --font-geist-pixel-square: 'Geist Pixel Square';
+  background: oklch(0.968 0.008 85);
+}
+
+body {
+  margin: 0;
+}

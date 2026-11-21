@@ -1,0 +1,610 @@
+/* Scoped to the page, since it shares the docs' document and stylesheets. */
+
+.sink {
+  --paper: oklch(0.968 0.008 85);
+  --paper-2: oklch(0.944 0.011 83);
+  --raised: oklch(0.995 0.003 85);
+  --ink: oklch(0.22 0.015 60);
+  --ink-2: oklch(0.45 0.018 62);
+  --ink-3: oklch(0.62 0.016 70);
+  --rule: oklch(0.89 0.012 80);
+  --signal: oklch(0.64 0.19 38);
+
+  --serif: var(--font-geist-serif-regular), "Times New Roman", Georgia, serif;
+  --sans: var(--font-geist), ui-sans-serif, system-ui, sans-serif;
+  --mono: var(--font-geist-mono), ui-monospace, "SF Mono", monospace;
+  --pixel: var(--font-geist-pixel-square), var(--font-geist-mono), monospace;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+
+  --gap: 14px;
+  --radius: 22px;
+  --cell: 288px;
+
+  color: var(--ink);
+  font: 14px/1.45 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* The tiles are drawn for a light page, so the header and footer around them go light too. */
+:root:has(.sink) {
+  color-scheme: light;
+  --canvas: oklch(0.968 0.008 85);
+}
+
+/* Zero specificity, so each tile's own rules still win, as they did on a page of their own. */
+:where(.sink) {
+  &,
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+    color: inherit;
+  }
+
+  /* The page */
+
+  & {
+    width: 100%;
+    max-width: 1480px;
+    margin: 0 auto;
+    padding: 28px 28px 120px;
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  /* The filters: a tile's tags pick them, and this bar clears them. Square, like the docs' buttons. */
+  .filter {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: calc(100vw - 32px);
+    padding: 6px 6px 6px 14px;
+    background: var(--ink);
+    color: var(--paper);
+    box-shadow:
+      0 0 0 1px color-mix(in oklab, var(--paper) 14%, transparent),
+      0 12px 32px -12px oklch(0.2 0.02 60 / 0.5);
+    translate: -50% calc(100% + 28px);
+    opacity: 0;
+    transition:
+      translate 320ms var(--ease-out),
+      opacity 200ms var(--ease-out);
+  }
+
+  .filter[data-open] {
+    translate: -50% 0;
+    opacity: 1;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .filter {
+      transition: opacity 160ms;
+    }
+  }
+
+  .filter-count {
+    flex: none;
+    margin: 0;
+    font: 500 12px/1 var(--mono);
+    color: color-mix(in oklab, var(--paper) 70%, transparent);
+    white-space: nowrap;
+  }
+
+  .filter-names {
+    display: flex;
+    gap: 4px;
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+    list-style: none;
+  }
+
+  .filter-name {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 8px;
+    border: 1px solid color-mix(in oklab, var(--paper) 22%, transparent);
+    background: transparent;
+    font: 12px/1 var(--mono);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .filter-name:hover {
+    border-color: color-mix(in oklab, var(--paper) 55%, transparent);
+  }
+
+  .filter-mode {
+    position: relative;
+    isolation: isolate;
+    flex: none;
+    display: inline-flex;
+    padding: 2px;
+    border: 1px solid color-mix(in oklab, var(--paper) 22%, transparent);
+  }
+
+  .filter-mode-indicator {
+    position: absolute;
+    z-index: -1;
+    top: var(--segmented-control-indicator-top);
+    left: var(--segmented-control-indicator-left);
+    width: var(--segmented-control-indicator-width);
+    height: var(--segmented-control-indicator-height);
+    background: var(--paper);
+    transition-property: left, width;
+    transition-duration: 200ms;
+    transition-timing-function: var(--ease-out);
+  }
+
+  .filter-mode button {
+    height: 22px;
+    padding: 0 8px;
+    border: 0;
+    background: transparent;
+    font: 500 12px/1 var(--sans);
+    cursor: pointer;
+  }
+
+  .filter-mode button[data-checked] {
+    color: var(--ink);
+  }
+
+  .filter-mode:not(:has(> .filter-mode-indicator[style])) button[data-checked] {
+    background: var(--paper);
+  }
+
+  .filter-clear {
+    flex: none;
+    height: 28px;
+    padding: 0 12px;
+    border: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 500 13px/1 var(--sans);
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .filter-clear:hover {
+    background: var(--raised);
+  }
+
+  .tile-use {
+    display: inline-flex;
+    align-items: center;
+    height: 24px;
+    padding: 0 9px;
+    border: 1px solid var(--rule);
+    background: var(--raised);
+    font: 500 11.5px/1 var(--mono);
+    color: var(--ink-2);
+    cursor: pointer;
+    transition:
+      background 120ms,
+      border-color 120ms,
+      color 120ms;
+  }
+
+  .tile-use:hover {
+    border-color: var(--ink-3);
+    color: var(--ink);
+  }
+
+  .tile-use[data-pressed] {
+    background: var(--ink);
+    border-color: var(--ink);
+    color: var(--paper);
+  }
+
+  .filter-name:focus-visible,
+  .filter-clear:focus-visible,
+  .tile-use:focus-visible,
+  .filter-mode button:focus-visible,
+  .b-btn:focus-visible {
+    outline: 2px solid var(--signal);
+    outline-offset: 2px;
+  }
+
+  /* The grid */
+
+  .bento {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, var(--cell)), 1fr));
+    grid-auto-rows: 320px;
+    grid-auto-flow: dense;
+    gap: var(--gap);
+  }
+
+  .bento-empty {
+    grid-column: 1 / -1;
+    padding: 80px 0;
+    text-align: center;
+    font: 400 28px var(--serif);
+    color: var(--ink-3);
+  }
+
+  /* The tile. Every tile shares this frame; the variety lives inside. */
+
+  .tile {
+    --tile-bg: var(--raised);
+    --tile-ink: var(--ink);
+    --tile-ink-2: var(--ink-2);
+    --tile-ink-3: var(--ink-3);
+    --tile-rule: var(--rule);
+    --tile-surface: oklch(1 0 0);
+    --tile-surface-2: var(--paper);
+    --tile-accent: var(--signal);
+    --tile-accent-ink: oklch(1 0 0);
+    --tile-shadow:
+      0 1px 2px oklch(0.2 0.02 60 / 0.06),
+      0 8px 24px -12px oklch(0.2 0.02 60 / 0.18);
+
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+    border-radius: var(--radius);
+    background: var(--tile-bg);
+    color: var(--tile-ink);
+    box-shadow: inset 0 0 0 1px
+      color-mix(in oklab, var(--tile-ink) 6%, transparent);
+    scroll-margin-top: 110px;
+  }
+
+  .tile[hidden] {
+    display: none;
+  }
+
+  .tile[data-size="wide"] {
+    grid-column: span 2;
+  }
+
+  .tile[data-size="tall"] {
+    grid-row: span 2;
+  }
+
+  .tile[data-size="large"] {
+    grid-column: span 2;
+    grid-row: span 2;
+  }
+
+  @media (max-width: 640px) {
+    & {
+      padding: 16px 16px 96px;
+    }
+    .tile[data-size="wide"],
+    .tile[data-size="large"] {
+      grid-column: auto;
+    }
+  }
+
+  .tile[data-tone="paper"] {
+    --tile-bg: var(--paper-2);
+    --tile-surface: var(--raised);
+    --tile-surface-2: oklch(0.925 0.012 82);
+  }
+
+  .tile[data-tone="ink"] {
+    --tile-bg: oklch(0.2 0.012 60);
+    --tile-ink: oklch(0.96 0.006 85);
+    --tile-ink-2: oklch(0.76 0.01 80);
+    --tile-ink-3: oklch(0.58 0.012 75);
+    --tile-rule: oklch(0.32 0.012 65);
+    --tile-surface: oklch(0.26 0.012 62);
+    --tile-surface-2: oklch(0.3 0.012 62);
+    --tile-accent: oklch(0.74 0.16 50);
+    --tile-accent-ink: oklch(0.18 0.02 60);
+    --tile-shadow: 0 10px 30px -10px oklch(0 0 0 / 0.6);
+  }
+
+  .tile[data-tone="blueprint"] {
+    --tile-bg: oklch(0.32 0.075 255);
+    --tile-ink: oklch(0.95 0.025 240);
+    --tile-ink-2: oklch(0.8 0.05 245);
+    --tile-ink-3: oklch(0.66 0.06 250);
+    --tile-rule: oklch(0.45 0.08 252);
+    --tile-surface: oklch(0.37 0.08 254);
+    --tile-surface-2: oklch(0.42 0.08 254);
+    --tile-accent: oklch(0.86 0.12 200);
+    --tile-accent-ink: oklch(0.25 0.06 255);
+    --tile-shadow: 0 10px 30px -12px oklch(0.15 0.08 260 / 0.7);
+    background-image:
+      linear-gradient(oklch(1 0 0 / 0.05) 1px, transparent 1px),
+      linear-gradient(90deg, oklch(1 0 0 / 0.05) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+
+  .tile[data-tone="signal"] {
+    --tile-bg: oklch(0.66 0.18 40);
+    --tile-ink: oklch(0.99 0.01 70);
+    --tile-ink-2: oklch(0.94 0.04 60);
+    --tile-ink-3: oklch(0.88 0.06 55);
+    --tile-rule: oklch(0.74 0.15 45);
+    --tile-surface: oklch(0.99 0.01 70);
+    --tile-surface-2: oklch(0.93 0.05 55);
+    --tile-accent: oklch(0.22 0.04 40);
+    --tile-accent-ink: oklch(0.99 0.01 70);
+  }
+
+  .tile[data-tone="sage"] {
+    --tile-bg: oklch(0.9 0.035 150);
+    --tile-ink: oklch(0.25 0.04 155);
+    --tile-ink-2: oklch(0.42 0.045 155);
+    --tile-ink-3: oklch(0.56 0.04 155);
+    --tile-rule: oklch(0.8 0.045 150);
+    --tile-surface: oklch(0.98 0.012 140);
+    --tile-surface-2: oklch(0.86 0.04 150);
+    --tile-accent: oklch(0.48 0.11 155);
+    --tile-accent-ink: oklch(0.98 0.012 140);
+  }
+
+  .tile[data-tone="sky"] {
+    --tile-bg: oklch(0.91 0.04 235);
+    --tile-ink: oklch(0.26 0.05 250);
+    --tile-ink-2: oklch(0.43 0.06 248);
+    --tile-ink-3: oklch(0.57 0.05 245);
+    --tile-rule: oklch(0.82 0.05 238);
+    --tile-surface: oklch(0.99 0.01 235);
+    --tile-surface-2: oklch(0.87 0.045 236);
+    --tile-accent: oklch(0.52 0.15 255);
+    --tile-accent-ink: oklch(0.99 0.01 235);
+  }
+
+  .tile[data-tone="butter"] {
+    --tile-bg: oklch(0.93 0.07 92);
+    --tile-ink: oklch(0.28 0.04 70);
+    --tile-ink-2: oklch(0.45 0.05 72);
+    --tile-ink-3: oklch(0.58 0.05 75);
+    --tile-rule: oklch(0.85 0.07 88);
+    --tile-surface: oklch(0.99 0.02 95);
+    --tile-surface-2: oklch(0.89 0.08 90);
+    --tile-accent: oklch(0.3 0.04 70);
+    --tile-accent-ink: oklch(0.97 0.04 95);
+  }
+
+  /* The picture: centered by default, a demo can lay out its own. */
+  .tile-stage {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    place-items: center;
+    padding: 22px 22px 16px;
+    /* Nothing runs under the copy. Popups and dialogs sit in the top layer, past this clip. */
+    overflow: hidden;
+  }
+
+  .tile-copy {
+    padding: 0 20px 18px;
+  }
+
+  .tile-title {
+    margin: 0;
+    font-size: 15px;
+    line-height: 1.35;
+    color: var(--tile-ink-2);
+    text-wrap: pretty;
+  }
+
+  .tile-title strong {
+    font-weight: 600;
+    color: var(--tile-ink);
+  }
+
+  /* One line, so a tile's demo keeps its room. It scrolls sideways, and Tab reaches every tag. */
+  .tile-uses {
+    display: flex;
+    gap: 4px;
+    margin: 7px -4px 0;
+    padding: 3px 4px;
+    overflow-x: auto;
+    scrollbar-width: none;
+    mask-image: linear-gradient(to right, black calc(100% - 28px), transparent);
+  }
+
+  .tile-uses::-webkit-scrollbar {
+    display: none;
+  }
+
+  .tile-uses .tile-use {
+    flex: none;
+  }
+
+  .tile .tile-use {
+    height: 22px;
+    padding: 0 8px;
+    font-size: 11px;
+    background: transparent;
+    border-color: color-mix(in oklab, var(--tile-ink) 16%, transparent);
+    color: var(--tile-ink-2);
+  }
+
+  .tile .tile-use:hover {
+    border-color: color-mix(in oklab, var(--tile-ink) 40%, transparent);
+    color: var(--tile-ink);
+  }
+
+  .tile .tile-use[data-pressed] {
+    background: var(--tile-ink);
+    border-color: var(--tile-ink);
+    color: var(--tile-bg);
+  }
+
+  .tile-error {
+    margin: 0;
+    font: 12px var(--mono);
+    color: oklch(0.55 0.2 25);
+  }
+
+  /*
+  Shared base classes for demos. They read the tile's tone, so a demo built
+  from them works on every ground. Restyle freely inside a demo's own class.
+*/
+
+  .b-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 32px;
+    padding: 0 12px;
+    border: 1px solid var(--tile-rule, var(--rule));
+    border-radius: 10px;
+    background: var(--tile-surface, var(--raised));
+    color: var(--tile-ink, var(--ink));
+    font-weight: 500;
+    white-space: nowrap;
+    cursor: pointer;
+    transition:
+      background 120ms,
+      border-color 120ms,
+      transform 120ms var(--ease-out);
+  }
+
+  .b-btn:hover {
+    border-color: var(--tile-ink-3, var(--ink-3));
+  }
+
+  .b-btn:active {
+    transform: scale(0.97);
+  }
+
+  .b-btn[data-variant="primary"] {
+    background: var(--tile-accent);
+    border-color: var(--tile-accent);
+    color: var(--tile-accent-ink);
+  }
+
+  .b-btn[data-variant="primary"]:hover {
+    background: color-mix(in oklch, var(--tile-accent) 88%, var(--tile-ink));
+  }
+
+  .b-btn[data-variant="ghost"] {
+    background: transparent;
+    border-color: transparent;
+  }
+
+  .b-btn[data-variant="ghost"]:hover {
+    background: color-mix(in oklab, var(--tile-ink) 7%, transparent);
+  }
+
+  .b-btn:disabled,
+  .b-btn[data-disabled] {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .b-input {
+    height: 36px;
+    width: 100%;
+    padding: 0 12px;
+    border: 1px solid var(--tile-rule);
+    border-radius: 10px;
+    background: var(--tile-surface);
+    color: var(--tile-ink);
+    font-size: 14px;
+    outline: none;
+    transition:
+      border-color 120ms,
+      box-shadow 120ms;
+  }
+
+  .b-input::placeholder {
+    color: var(--tile-ink-3);
+  }
+
+  .b-input:focus-visible,
+  .b-input[data-focused] {
+    border-color: var(--tile-accent);
+    box-shadow: 0 0 0 3px
+      color-mix(in oklab, var(--tile-accent) 22%, transparent);
+  }
+
+  .b-input[data-invalid] {
+    border-color: oklch(0.6 0.2 25);
+  }
+
+  /* A popup surface: menus, listboxes, popovers. Popups stay in the tile's DOM, so they keep its tone. */
+  .b-pop {
+    min-width: 180px;
+    margin: 0;
+    padding: 5px;
+    border: 1px solid var(--tile-rule);
+    border-radius: 14px;
+    background: var(--tile-surface);
+    color: var(--tile-ink);
+    box-shadow:
+      var(--tile-shadow),
+      0 18px 40px -16px oklch(0.2 0.02 60 / 0.28);
+    outline: none;
+    transform-origin: var(--transform-origin, top);
+    transition:
+      opacity 140ms var(--ease-out),
+      transform 140ms var(--ease-out);
+  }
+
+  .b-pop[data-starting-style],
+  .b-pop[data-ending-style] {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+
+  .b-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 32px;
+    padding: 6px 10px;
+    border-radius: 9px;
+    cursor: default;
+    outline: none;
+    user-select: none;
+  }
+
+  .b-item[data-highlighted] {
+    background: color-mix(in oklab, var(--tile-ink) 8%, transparent);
+  }
+
+  .b-item[data-disabled] {
+    opacity: 0.45;
+  }
+
+  .b-label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--tile-ink-2);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      transition-duration: 0ms !important;
+      animation-duration: 0ms !important;
+    }
+  }
+}

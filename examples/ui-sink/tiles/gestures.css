@@ -1,0 +1,745 @@
+/* Hold to delete */
+
+.gs-hold {
+  --gs-danger: oklch(0.58 0.2 27);
+  display: grid;
+  gap: 10px;
+  width: 100%;
+  max-width: 240px;
+}
+
+.gs-hold-project {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 10px;
+  align-items: center;
+  padding: 12px;
+  border-radius: 14px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+  transition:
+    opacity 240ms var(--ease-out),
+    transform 240ms var(--ease-out);
+}
+
+.gs-hold[data-deleted] .gs-hold-project {
+  opacity: 0.45;
+  transform: scale(0.97);
+}
+
+.gs-hold-icon {
+  grid-row: span 2;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  background: color-mix(in oklab, var(--gs-danger) 12%, transparent);
+  color: var(--gs-danger);
+}
+
+.gs-hold-name {
+  font-weight: 600;
+  font-size: 13.5px;
+}
+
+.gs-hold-meta {
+  font-size: 12px;
+  color: var(--tile-ink-3);
+}
+
+.gs-hold-button {
+  position: relative;
+  overflow: hidden;
+  height: 40px;
+  padding: 0 14px;
+  border: 1px solid color-mix(in oklab, var(--gs-danger) 45%, transparent);
+  border-radius: 12px;
+  background: var(--tile-surface);
+  color: var(--gs-danger);
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+  transition: transform 160ms var(--ease-out);
+}
+
+.gs-hold-button:focus-visible {
+  outline: 2px solid var(--gs-danger);
+  outline-offset: 2px;
+}
+
+.gs-hold-button[data-holding] {
+  transform: scale(0.98);
+}
+
+.gs-hold-fill {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in oklab, var(--gs-danger) 20%, transparent);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 260ms var(--ease-out);
+}
+
+.gs-hold-button:dir(rtl) .gs-hold-fill {
+  transform-origin: right;
+}
+
+.gs-hold-button[data-holding] .gs-hold-fill {
+  transform: scaleX(1);
+  transition: transform var(--hold-delay) linear;
+}
+
+.gs-hold-label {
+  position: relative;
+}
+
+.gs-hold-hint {
+  font-size: 12px;
+  text-align: center;
+  color: var(--tile-ink-3);
+}
+
+.gs-hold-hint[data-early] {
+  color: var(--gs-danger);
+  animation: gs-nudge 320ms var(--ease-out);
+}
+
+@keyframes gs-nudge {
+  30% {
+    transform: translateX(-3px);
+  }
+  60% {
+    transform: translateX(3px);
+  }
+}
+
+.gs-hold-done {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  height: 40px;
+  padding-inline-start: 4px;
+  font-size: 13px;
+  font-weight: 500;
+  animation: gs-rise 240ms var(--ease-out);
+}
+
+@keyframes gs-rise {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The fill shows how long is left, so it keeps its duration. */
+  .gs-hold-button[data-holding] .gs-hold-fill {
+    transition-duration: var(--hold-delay) !important;
+  }
+}
+
+/* Guest stepper */
+
+.gs-guests {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  width: 100%;
+  max-width: 230px;
+  padding: 14px 14px 12px;
+  border-radius: 18px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+}
+
+.gs-guests-event {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  width: 100%;
+  font-size: 12px;
+}
+
+.gs-guests-name {
+  font-weight: 600;
+}
+
+.gs-guests-when {
+  color: var(--tile-ink-3);
+}
+
+.gs-guests-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+
+.gs-step {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--tile-surface-2);
+  color: var(--tile-ink);
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+  transition:
+    transform 140ms var(--ease-out),
+    opacity 140ms;
+}
+
+.gs-step[data-holding] {
+  transform: scale(0.9);
+}
+
+.gs-step[aria-disabled] {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.gs-step:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+}
+
+.gs-guests-count {
+  display: grid;
+  justify-items: center;
+}
+
+.gs-guests-number {
+  font: 600 38px/1 var(--sans);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+
+.gs-guests-unit {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--tile-ink-3);
+}
+
+.gs-guests-capacity {
+  width: 100%;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--tile-surface-2);
+}
+
+.gs-guests-bar {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--tile-accent);
+  transform: scaleX(var(--fill));
+  transform-origin: left;
+  transition: transform 120ms var(--ease-out);
+}
+
+.gs-guests-bar:dir(rtl) {
+  transform-origin: right;
+}
+
+.gs-guests-left {
+  font: 500 11px var(--mono);
+  color: var(--tile-ink-3);
+}
+
+/* Alarm wheels */
+
+.gs-alarm {
+  display: grid;
+  gap: 10px;
+  justify-items: center;
+}
+
+.gs-alarm-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--tile-ink-2);
+}
+
+.gs-alarm-head strong {
+  color: var(--tile-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.gs-wheels {
+  position: relative;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  border-radius: 18px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+}
+
+.gs-wheels::before {
+  content: "";
+  position: absolute;
+  inset: 50% 8px auto;
+  height: 30px;
+  translate: 0 -50%;
+  border-radius: 9px;
+  background: color-mix(in oklab, var(--tile-ink) 9%, transparent);
+  pointer-events: none;
+}
+
+.gs-wheels-colon {
+  position: relative;
+  font-size: 20px;
+  font-weight: 600;
+  translate: 0 -1px;
+}
+
+.gs-wheel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 56px;
+  height: 150px;
+  padding-block: 60px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+  scroll-snap-type: y mandatory;
+  perspective: 360px;
+  mask-image: linear-gradient(transparent, #000 32%, #000 68%, transparent);
+  outline: none;
+  cursor: grab;
+}
+
+.gs-wheel::-webkit-scrollbar {
+  display: none;
+}
+
+.gs-wheel:focus-visible {
+  border-radius: 10px;
+  box-shadow: inset 0 0 0 2px var(--tile-accent);
+}
+
+.gs-wheel-item {
+  flex: none;
+  display: grid;
+  place-items: center;
+  height: 30px;
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+  color: var(--tile-ink-2);
+  scroll-snap-align: center;
+  cursor: default;
+  outline: none;
+  transform: rotateX(calc(var(--picker-offset, 0) * -22deg));
+  opacity: calc(1 - abs(var(--picker-offset, 0)) * 0.22);
+}
+
+.gs-wheel-item[data-selected] {
+  color: var(--tile-ink);
+  font-weight: 600;
+}
+
+/* Bottom sheet */
+
+.gs-map {
+  --gs-sheet-bleed: 40px;
+  position: relative;
+  align-self: stretch;
+  justify-self: stretch;
+  overflow: hidden;
+  border-radius: 18px;
+  background: oklch(0.95 0.02 120);
+  box-shadow: inset 0 0 0 1px var(--tile-rule);
+  isolation: isolate;
+}
+
+.gs-map-ground {
+  position: absolute;
+  inset: 0;
+}
+
+.gs-map-road {
+  position: absolute;
+  background: oklch(1 0 0);
+  box-shadow: 0 0 0 1px oklch(0.88 0.02 110);
+}
+
+.gs-map-road[data-road="a"] {
+  inset: 30% -10% auto;
+  height: 12px;
+  rotate: -12deg;
+}
+
+.gs-map-road[data-road="b"] {
+  inset: -10% auto -10% 58%;
+  width: 10px;
+  rotate: 8deg;
+}
+
+.gs-map-road[data-road="c"] {
+  inset: 62% -10% auto;
+  height: 8px;
+  rotate: 18deg;
+}
+
+.gs-map-park {
+  position: absolute;
+  top: 8%;
+  left: 8%;
+  width: 34%;
+  height: 16%;
+  border-radius: 14px;
+  background: oklch(0.88 0.07 145);
+}
+
+.gs-map-pin {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 2px solid oklch(1 0 0);
+  border-radius: 50%;
+  background: oklch(0.5 0.12 50);
+  color: oklch(1 0 0);
+  box-shadow: 0 2px 4px oklch(0 0 0 / 0.2);
+}
+
+.gs-map-pin[data-pin="0"] {
+  top: 22%;
+  left: 52%;
+}
+
+.gs-map-pin[data-pin="1"] {
+  top: 38%;
+  left: 22%;
+}
+
+.gs-map-pin[data-pin="2"] {
+  top: 46%;
+  left: 70%;
+}
+
+.gs-map-pin[data-pin="3"] {
+  top: 12%;
+  left: 76%;
+}
+
+.gs-map-pin[data-pin="4"] {
+  top: 56%;
+  left: 40%;
+}
+
+.gs-map-scrim {
+  position: absolute;
+  inset: 0;
+  background: oklch(0.15 0.02 250);
+  opacity: calc(max(var(--sheet-progress, 0) - 0.5, 0) * 0.5);
+  pointer-events: none;
+}
+
+.gs-sheet {
+  position: absolute;
+  inset: auto 0 calc(-1 * var(--gs-sheet-bleed));
+  height: calc(100% - 10px + var(--gs-sheet-bleed));
+  border-radius: 18px 18px 0 0;
+  background: var(--tile-surface);
+  color: var(--tile-ink);
+  box-shadow:
+    0 -1px 0 var(--tile-rule),
+    0 -6px 16px -10px oklch(0 0 0 / 0.3);
+  translate: 0 calc(100% - 64px - var(--gs-sheet-bleed));
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grab;
+  will-change: translate;
+}
+
+.gs-sheet[data-dragging] {
+  cursor: grabbing;
+}
+
+.gs-sheet-handle {
+  display: block;
+  width: 100%;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: inherit;
+}
+
+.gs-sheet-handle::before {
+  content: "";
+  display: block;
+  width: 36px;
+  height: 5px;
+  margin: 0 auto;
+  border-radius: 5px;
+  background: color-mix(in oklab, var(--tile-ink) 20%, transparent);
+}
+
+.gs-sheet-handle:focus-visible {
+  outline: none;
+}
+
+.gs-sheet-handle:focus-visible::before {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 3px;
+}
+
+.gs-sheet-head {
+  display: grid;
+  padding: 0 16px 10px;
+}
+
+.gs-sheet-title {
+  font-weight: 600;
+  font-size: 15px;
+}
+
+.gs-sheet-sub {
+  font-size: 12px;
+  color: var(--tile-ink-3);
+}
+
+.gs-sheet-filters {
+  display: flex;
+  gap: 6px;
+  padding: 0 16px 10px;
+  overflow: hidden;
+}
+
+.gs-sheet-filters span {
+  flex: none;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--tile-surface-2);
+  color: var(--tile-ink-2);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.gs-sheet-list {
+  margin: 0;
+  padding: 0 8px;
+  list-style: none;
+}
+
+.gs-sheet-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 46px;
+  padding: 0 8px;
+  border-top: 1px solid var(--tile-rule);
+  font-size: 13px;
+}
+
+.gs-sheet-cup {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: color-mix(in oklab, oklch(0.5 0.12 50) 14%, transparent);
+  color: oklch(0.5 0.12 50);
+}
+
+.gs-sheet-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.gs-sheet-rating {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--tile-ink-2);
+  font-size: 12px;
+}
+
+.gs-sheet-rating svg {
+  color: oklch(0.75 0.15 80);
+}
+
+.gs-sheet-far {
+  width: 44px;
+  text-align: end;
+  font: 500 11px var(--mono);
+  color: var(--tile-ink-3);
+}
+
+/* Mention previews */
+
+.gs-thread {
+  position: relative;
+  display: grid;
+  align-content: center;
+  gap: 14px;
+  width: 100%;
+  max-width: 460px;
+}
+
+.gs-message {
+  display: flex;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 16px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+}
+
+.gs-message-avatar,
+.gs-card-avatar {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--tile-accent);
+  color: var(--tile-accent-ink);
+  font: 600 11px var(--sans);
+}
+
+.gs-message-body {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.gs-message-meta {
+  font-size: 12px;
+  color: var(--tile-ink-3);
+}
+
+.gs-message-meta strong {
+  margin-inline-end: 4px;
+  color: var(--tile-ink);
+  font-weight: 600;
+}
+
+.gs-message-text {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.gs-mention {
+  padding: 0 3px;
+  border: 0;
+  border-radius: 5px;
+  background: color-mix(in oklab, var(--tile-accent) 14%, transparent);
+  color: color-mix(in oklch, var(--tile-accent) 80%, var(--tile-ink));
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 120ms;
+}
+
+.gs-mention:hover,
+.gs-mention[aria-expanded="true"] {
+  background: color-mix(in oklab, var(--tile-accent) 24%, transparent);
+}
+
+.gs-mention:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 1px;
+}
+
+.gs-card {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 10px;
+  align-items: center;
+  width: min(232px, 100%);
+  padding: 12px;
+  border: 1px solid var(--tile-rule);
+  border-radius: 14px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+  opacity: 0;
+  scale: 0.96;
+  transform-origin: top left;
+  pointer-events: none;
+  transition:
+    opacity 140ms var(--ease-out),
+    scale 140ms var(--ease-out);
+}
+
+.gs-card[data-open] {
+  opacity: 1;
+  scale: 1;
+  pointer-events: auto;
+  transition:
+    opacity 160ms var(--ease-out),
+    scale 160ms var(--ease-out),
+    translate 220ms var(--ease-out);
+}
+
+.gs-card[data-open][data-fresh] {
+  transition:
+    opacity 160ms var(--ease-out),
+    scale 160ms var(--ease-out);
+}
+
+.gs-card-avatar {
+  grid-row: span 3;
+  width: 40px;
+  height: 40px;
+  font-size: 13px;
+}
+
+.gs-card-name {
+  font-weight: 600;
+}
+
+.gs-card-role {
+  font-size: 12.5px;
+  color: var(--tile-ink-2);
+}
+
+.gs-card-time {
+  font: 500 11px var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.gs-thread-hint {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 12px;
+  margin: 0;
+  padding: 0 4px;
+  font-size: 12px;
+  color: var(--tile-ink-3);
+}
+
+.gs-thread-source {
+  font: 500 11px var(--mono);
+  color: var(--tile-ink-2);
+}

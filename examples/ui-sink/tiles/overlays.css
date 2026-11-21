@@ -1,0 +1,2723 @@
+/* Overlays, popups and menus. Every selector is scoped under .ov-. */
+
+/* Shared bits */
+
+.ov-avatar {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--tile-surface-2);
+  color: var(--tile-ink-2);
+  font: 600 11px/1 var(--sans);
+  letter-spacing: 0.02em;
+}
+
+.ov-avatar[data-size="sm"] {
+  width: 24px;
+  height: 24px;
+}
+
+.ov-avatar[data-size="lg"] {
+  width: 38px;
+  height: 38px;
+  font-size: 12.5px;
+}
+
+.ov-avatar-empty {
+  background: transparent;
+  border: 1.5px dashed var(--tile-ink-3);
+}
+
+.ov-keys {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.ov-kbd {
+  display: inline-grid;
+  place-items: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border: 1px solid var(--tile-rule);
+  border-bottom-width: 2px;
+  border-radius: 6px;
+  background: var(--tile-surface);
+  color: var(--tile-ink-2);
+  font: 500 11px/1 var(--mono);
+}
+
+.ov-dot {
+  display: inline-block;
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ov-status, currentColor);
+}
+
+.ov-trigger[data-open] {
+  border-color: var(--tile-ink-3);
+  background: color-mix(in oklch, var(--tile-ink) 8%, var(--tile-surface));
+}
+
+.ov-trigger[data-variant="primary"][data-open] {
+  background: color-mix(in oklch, var(--tile-accent) 82%, var(--tile-ink));
+}
+
+:is(
+  .ov-trigger,
+  .ov-wide-btn,
+  .ov-tool,
+  .ov-dots,
+  .ov-quick,
+  .ov-mention,
+  .ov-line,
+  .ov-assignee,
+  .ov-mb-trigger,
+  .ov-side-link,
+  .ov-inbox-archive,
+  .ov-token-revoke,
+  .ov-tree-reset
+):focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+}
+
+:is(
+    .ov-dialog,
+    .ov-drawer,
+    .ov-pop,
+    .ov-bubble,
+    .ov-toast,
+    .ov-tokens-empty,
+    .ov-inbox-zero,
+    .ov-presence-pop
+  )
+  button:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+}
+
+/* Closed popups keep [hidden]; don't let a display rule undo it. */
+:is(
+  .ov-tip,
+  .ov-dialog,
+  .ov-drawer,
+  .ov-pop,
+  .ov-card,
+  .ov-menu,
+  .ov-side-panel,
+  .ov-side-viewport,
+  .ov-presence-pop,
+  .ov-assign-pop
+)[hidden] {
+  display: none;
+}
+
+/* Popups render inside centered tile layouts; reset the inherited alignment. */
+:is(
+  .ov-dialog,
+  .ov-drawer,
+  .ov-pop,
+  .ov-card,
+  .ov-menu,
+  .ov-side-viewport,
+  .ov-presence-pop,
+  .ov-assign-pop,
+  .ov-bubble,
+  .ov-toasts,
+  .ov-tip
+) {
+  text-align: start;
+}
+
+/* Dialogs and alert dialogs, over the whole page */
+
+.ov-backdrop {
+  position: fixed;
+  inset: 0;
+  background: oklch(0.24 0.02 60 / 0.3);
+  backdrop-filter: blur(3px);
+  transition: opacity 200ms var(--ease-out);
+}
+
+.ov-backdrop:is([data-starting-style], [data-ending-style]) {
+  opacity: 0;
+}
+
+.ov-dialog {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  width: min(400px, calc(100vw - 32px));
+  height: fit-content;
+  max-width: none;
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: 24px;
+  overflow: auto;
+  border: 0;
+  border-radius: 20px;
+  background: var(--tile-surface);
+  color: var(--tile-ink);
+  font: 14px/1.45 var(--sans);
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 8%, transparent),
+    0 28px 70px -24px oklch(0.2 0.02 60 / 0.5);
+  outline: none;
+  transform-origin: center;
+  transition:
+    opacity 200ms var(--ease-out),
+    scale 200ms var(--ease-out);
+}
+
+.ov-dialog::backdrop {
+  background: transparent;
+}
+
+.ov-dialog:is([data-starting-style], [data-ending-style]) {
+  opacity: 0;
+  scale: 0.96;
+}
+
+.ov-dialog-title {
+  margin: 0;
+  font: 600 17px/1.3 var(--sans);
+}
+
+.ov-dialog-desc {
+  margin: 4px 0 0;
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--tile-ink-2);
+}
+
+.ov-dialog-x {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--tile-ink-3);
+  cursor: pointer;
+}
+
+.ov-dialog-x:hover {
+  background: color-mix(in oklab, var(--tile-ink) 7%, transparent);
+  color: var(--tile-ink);
+}
+
+.ov-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 18px;
+}
+
+.ov-field-error {
+  font-size: 12.5px;
+  color: oklch(0.55 0.19 27);
+}
+
+.b-input.ov-mono-input {
+  font-family: var(--mono);
+  font-size: 13.5px;
+}
+
+.ov-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 22px;
+}
+
+.ov-actions .b-btn {
+  height: 36px;
+  padding: 0 14px;
+}
+
+.ov-actions .b-btn[data-pending] {
+  cursor: progress;
+  opacity: 0.75;
+}
+
+.ov-alert-icon {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  margin-bottom: 14px;
+  border-radius: 12px;
+  background: oklch(0.6 0.2 27 / 0.12);
+  color: oklch(0.55 0.2 27);
+}
+
+.ov-actions .ov-destroy {
+  border-color: oklch(0.55 0.2 27);
+  background: oklch(0.55 0.2 27);
+  color: oklch(0.99 0 0);
+}
+
+.ov-actions .ov-destroy:hover {
+  background: oklch(0.49 0.19 27);
+}
+
+/* Popup surfaces built on .b-pop */
+
+.b-pop.ov-menu {
+  min-width: 200px;
+  max-height: var(--available-height);
+  overflow-y: auto;
+  font: 14px/1.45 var(--sans);
+}
+
+.b-item.ov-menu-item {
+  gap: 10px;
+  font-size: 13.5px;
+}
+
+.ov-menu-item[data-open] {
+  background: color-mix(in oklab, var(--tile-ink) 8%, transparent);
+}
+
+.ov-menu-icon {
+  display: flex;
+  color: var(--tile-ink-3);
+}
+
+.ov-menu-item[data-highlighted] .ov-menu-icon {
+  color: var(--tile-ink);
+}
+
+.ov-menu-caret {
+  margin-left: auto;
+  color: var(--tile-ink-3);
+}
+
+.ov-menu [data-slot="menu-shortcut"] {
+  margin-left: auto;
+  padding-left: 16px;
+  font: 500 11.5px/1 var(--mono);
+  letter-spacing: 0.04em;
+  color: var(--tile-ink-3);
+}
+
+.ov-menu-sep {
+  height: 1px;
+  margin: 5px -5px;
+  background: var(--tile-rule);
+}
+
+.ov-menu-label {
+  padding: 6px 10px 4px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--tile-ink-3);
+}
+
+.ov-mono-item {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+.ov-check {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+
+.ov-check[data-unchecked] {
+  visibility: hidden;
+}
+
+.ov-radio-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* [popover] defaults to overflow: auto, which would clip arrows. */
+.b-pop.ov-pop,
+.b-pop.ov-card,
+.ov-tip {
+  overflow: visible;
+}
+
+.ov-arrow {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border: 1px solid var(--tile-rule);
+  background: var(--tile-surface);
+  rotate: 45deg;
+}
+
+.ov-arrow[data-side="bottom"] {
+  top: -7px;
+  border-right: 0;
+  border-bottom: 0;
+}
+
+.ov-arrow[data-side="top"] {
+  bottom: -7px;
+  border-top: 0;
+  border-left: 0;
+}
+
+.ov-arrow[data-side="left"] {
+  right: -7px;
+  border-bottom: 0;
+  border-left: 0;
+}
+
+.ov-arrow[data-side="right"] {
+  left: -7px;
+  border-top: 0;
+  border-right: 0;
+}
+
+.ov-dots {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--tile-ink-2);
+  cursor: pointer;
+  transition: background 120ms;
+}
+
+.ov-dots:hover {
+  background: color-mix(in oklab, var(--tile-ink) 7%, transparent);
+}
+
+.ov-dots[data-open] {
+  background: color-mix(in oklab, var(--tile-ink) 12%, transparent);
+  color: var(--tile-ink);
+}
+
+/* Tooltips */
+
+.ov-tip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--tile-ink);
+  color: var(--tile-bg);
+  font: 500 12px/1.3 var(--sans);
+  box-shadow: 0 8px 20px -8px oklch(0 0 0 / 0.4);
+  transform-origin: var(--transform-origin);
+  transition:
+    opacity 120ms var(--ease-out),
+    scale 120ms var(--ease-out);
+}
+
+.ov-tip:is([data-starting-style], [data-ending-style]) {
+  opacity: 0;
+  scale: 0.96;
+}
+
+.ov-tip[data-instant] {
+  transition: none;
+}
+
+.ov-tip-key {
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: color-mix(in oklab, var(--tile-bg) 20%, transparent);
+  font: 500 11px/1 var(--mono);
+  text-transform: uppercase;
+}
+
+.ov-tip-arrow {
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  background: var(--tile-ink);
+  rotate: 45deg;
+}
+
+.ov-tip-arrow[data-side="top"] {
+  bottom: -4px;
+}
+
+.ov-tip-arrow[data-side="bottom"] {
+  top: -4px;
+}
+
+.ov-tip-arrow[data-side="left"] {
+  right: -4px;
+}
+
+.ov-tip-arrow[data-side="right"] {
+  left: -4px;
+}
+
+/* 1. Command palette */
+
+.ov-cmd {
+  display: flex;
+  flex-direction: column;
+  width: min(100%, 500px);
+  height: min(100%, 468px);
+  overflow: hidden;
+  border-radius: 18px;
+  background: var(--tile-surface);
+  font: 14px/1.45 var(--sans);
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 8%, transparent),
+    var(--tile-shadow);
+}
+
+.ov-cmd-search {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 10px;
+  height: 56px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--tile-rule);
+  color: var(--tile-ink-3);
+}
+
+.ov-cmd-crumb {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 7px;
+  background: color-mix(in oklab, var(--tile-accent) 12%, transparent);
+  color: var(--tile-ink);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.ov-cmd-input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--tile-ink);
+  font: 400 16px var(--sans);
+  outline: none;
+}
+
+.ov-cmd-input::placeholder {
+  color: var(--tile-ink-3);
+}
+
+.ov-cmd-empty {
+  margin: 0;
+  padding: 32px 16px;
+  text-align: center;
+  font-size: 14px;
+  color: var(--tile-ink-3);
+}
+
+.ov-cmd-empty:not([data-empty]),
+.ov-cmd-empty:empty {
+  display: none;
+}
+
+.ov-cmd-list {
+  flex: 1;
+  min-height: 0;
+  padding: 6px 8px;
+  overflow-y: auto;
+  scroll-padding: 8px;
+  outline: none;
+}
+
+.ov-cmd-group + .ov-cmd-group {
+  margin-top: 6px;
+}
+
+.ov-cmd-label {
+  padding: 8px 10px 4px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--tile-ink-3);
+}
+
+.ov-cmd-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 40px;
+  padding: 0 10px;
+  border-radius: 10px;
+  color: var(--tile-ink);
+  cursor: default;
+  user-select: none;
+}
+
+.ov-cmd-item[data-highlighted] {
+  background: color-mix(in oklab, var(--tile-accent) 10%, transparent);
+}
+
+.ov-cmd-item[data-pending] {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.ov-cmd-icon {
+  display: flex;
+  color: var(--tile-ink-3);
+}
+
+.ov-cmd-item[data-highlighted] .ov-cmd-icon {
+  color: var(--tile-accent);
+}
+
+.ov-cmd-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.ov-cmd-text[data-matched] {
+  color: var(--tile-ink-2);
+}
+
+.ov-cmd-text mark {
+  background: transparent;
+  color: var(--tile-ink);
+  font-weight: 600;
+}
+
+.ov-cmd-mono {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.ov-cmd-hint {
+  flex: none;
+  font-size: 12.5px;
+  color: var(--tile-ink-3);
+}
+
+.ov-cmd-shortcut {
+  flex: none;
+  padding: 3px 6px;
+  border: 1px solid var(--tile-rule);
+  border-radius: 6px;
+  font: 500 11.5px/1 var(--mono);
+  letter-spacing: 0.04em;
+  color: var(--tile-ink-3);
+}
+
+.ov-cmd-caret {
+  flex: none;
+  color: var(--tile-ink-3);
+}
+
+.ov-cmd-foot {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 44px;
+  padding: 0 16px;
+  border-top: 1px solid var(--tile-rule);
+  background: color-mix(
+    in oklch,
+    var(--tile-surface-2) 45%,
+    var(--tile-surface)
+  );
+  font-size: 12.5px;
+  color: var(--tile-ink-3);
+}
+
+.ov-cmd-result {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.ov-cmd-done {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-weight: 500;
+  color: var(--tile-ink);
+  animation: ov-cmd-done 280ms var(--ease-out);
+}
+
+.ov-cmd-done svg {
+  flex: none;
+  color: oklch(0.6 0.15 150);
+}
+
+.ov-cmd-done[data-busy] {
+  color: var(--tile-ink-2);
+}
+
+.ov-cmd-done[data-busy] svg {
+  display: none;
+}
+
+@keyframes ov-cmd-done {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+.ov-cmd-keys {
+  display: flex;
+  flex: none;
+  gap: 14px;
+}
+
+.ov-cmd-keys > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 2. Invite */
+
+.ov-team {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.ov-team p {
+  margin: 0;
+}
+
+.ov-team-avatars {
+  display: flex;
+  margin-bottom: 14px;
+}
+
+.ov-team-avatars .ov-avatar {
+  box-shadow: 0 0 0 3px var(--tile-bg);
+}
+
+.ov-team-avatars .ov-avatar + .ov-avatar {
+  margin-left: -8px;
+}
+
+.ov-avatar-more {
+  color: var(--tile-ink-3);
+}
+
+.ov-team-name {
+  font: 400 28px/1.1 var(--serif);
+}
+
+.ov-team-meta {
+  margin: 4px 0 16px !important;
+  font-size: 13px;
+  color: var(--tile-ink-3);
+}
+
+.ov-team .ov-trigger {
+  height: 36px;
+  padding: 0 16px;
+}
+
+/* 3. Delete project */
+
+.ov-project {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: 100%;
+  max-width: 250px;
+  padding: 16px;
+  border-radius: 16px;
+  background: var(--tile-surface);
+  box-shadow:
+    var(--tile-shadow),
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 6%, transparent);
+}
+
+.ov-project p {
+  margin: 0;
+}
+
+.ov-project-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ov-project-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  background: var(--tile-surface-2);
+  color: var(--tile-ink-2);
+}
+
+.ov-project-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  line-height: 1.3;
+}
+
+.ov-project-name {
+  font: 500 15px/1.3 var(--mono);
+}
+
+.ov-project-meta {
+  font-size: 12.5px;
+  color: var(--tile-ink-3);
+}
+
+.ov-project[data-deleted] .ov-project-name {
+  color: var(--tile-ink-3);
+  text-decoration: line-through;
+}
+
+.b-btn.ov-wide-btn {
+  width: 100%;
+  height: 36px;
+}
+
+/* 4. Tokens */
+
+.ov-tokens {
+  width: 100%;
+  max-width: 260px;
+}
+
+.ov-tokens-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--tile-ink-2);
+}
+
+.ov-tokens-list {
+  margin: 0;
+  padding: 2px 4px;
+  list-style: none;
+  border-radius: 14px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+}
+
+.ov-token {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 4px 7px 10px;
+}
+
+.ov-token + .ov-token {
+  border-top: 1px solid var(--tile-rule);
+}
+
+.ov-token-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  line-height: 1.3;
+}
+
+.ov-token-name {
+  font: 500 13px/1.3 var(--mono);
+}
+
+.ov-token-id {
+  font: 11.5px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.b-btn.ov-token-revoke {
+  height: 28px;
+  margin-left: auto;
+  padding: 0 10px;
+  font-size: 12.5px;
+}
+
+.ov-tokens-empty {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 26px 16px;
+  border-radius: 14px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+}
+
+.ov-tokens-empty p {
+  margin: 0;
+  font: 400 22px/1.1 var(--serif);
+}
+
+/* 5. Region */
+
+.ov-region {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  max-width: 240px;
+}
+
+.ov-region p {
+  margin: 0;
+}
+
+.ov-region-lead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font: 500 12.5px/1.3 var(--mono);
+  color: var(--tile-ink-2);
+}
+
+.ov-region-city {
+  margin-top: 8px !important;
+  font: 400 32px/1.05 var(--serif);
+  letter-spacing: -0.01em;
+}
+
+.ov-region-meta {
+  margin: 6px 0 16px !important;
+  font-size: 13px;
+  line-height: 1.35;
+  color: var(--tile-ink-3);
+}
+
+.ov-region-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 18px;
+}
+
+.ov-region-option {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) auto 16px;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--tile-rule);
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 120ms,
+    border-color 120ms;
+}
+
+.ov-region-option:hover {
+  background: color-mix(in oklab, var(--tile-ink) 4%, transparent);
+}
+
+.ov-region-option[data-current] {
+  border-color: var(--tile-accent);
+  box-shadow: inset 0 0 0 1px var(--tile-accent);
+}
+
+.ov-region-id {
+  font: 500 12px var(--mono);
+  color: var(--tile-ink-2);
+}
+
+.ov-region-name {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.ov-region-ms {
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--tile-ink-3);
+}
+
+.ov-region-check {
+  visibility: hidden;
+  color: var(--tile-accent);
+}
+
+.ov-region-option[data-current] .ov-region-check {
+  visibility: visible;
+}
+
+/* 6. Build log drawer */
+
+.ov-build {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  max-width: 240px;
+}
+
+.ov-build p {
+  margin: 0;
+}
+
+.ov-build-status {
+  --ov-status: oklch(0.68 0.19 27);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--ov-status) 18%, transparent);
+  color: color-mix(in oklch, var(--ov-status) 55%, var(--tile-ink));
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.ov-build-status[data-status="queued"] {
+  --ov-status: oklch(0.8 0.14 80);
+}
+
+.ov-build-status[data-status="ready"] {
+  --ov-status: oklch(0.74 0.16 150);
+}
+
+.ov-build-name {
+  margin-top: 12px !important;
+  font: 400 30px/1.05 var(--serif);
+  letter-spacing: -0.01em;
+}
+
+.ov-build-meta {
+  margin: 6px 0 16px !important;
+  font-size: 13px;
+  color: var(--tile-ink-3);
+}
+
+.ov-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: oklch(0.16 0.01 60 / 0.45);
+}
+
+.ov-drawer {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 620px;
+  height: calc(100dvh - 48px);
+  margin-inline: auto;
+  border-radius: 22px 22px 0 0;
+  background: var(--tile-surface);
+  color: var(--tile-ink);
+  font: 14px/1.45 var(--sans);
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 8%, transparent),
+    0 -16px 50px -16px oklch(0 0 0 / 0.5);
+  outline: none;
+}
+
+.ov-drawer::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  top: 100%;
+  height: 96px;
+  background: inherit;
+}
+
+.ov-handle {
+  position: relative;
+  flex: none;
+  width: 72px;
+  height: 6px;
+  margin: 10px auto 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--tile-ink) 28%, transparent);
+  cursor: grab;
+}
+
+.ov-handle::after {
+  content: "";
+  position: absolute;
+  inset: -12px -10px;
+}
+
+.ov-handle:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 4px;
+}
+
+.ov-drawer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 24px 16px;
+  border-bottom: 1px solid var(--tile-rule);
+}
+
+.ov-drawer-head .b-btn {
+  height: 36px;
+  padding: 0 14px;
+}
+
+.ov-log {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 16px 24px 32px;
+  overflow: auto;
+  list-style: none;
+  font: 12.5px/1.75 var(--mono);
+  color: var(--tile-ink-2);
+}
+
+.ov-log li {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 12px;
+  white-space: pre-wrap;
+}
+
+.ov-log li[data-error] {
+  color: oklch(0.76 0.14 27);
+}
+
+.ov-log-time {
+  color: var(--tile-ink-3);
+}
+
+/* 7. Schedule popover */
+
+.ov-release {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  max-width: 240px;
+}
+
+.ov-release p {
+  margin: 0;
+}
+
+.ov-release-tag {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--tile-ink-2);
+}
+
+.ov-release-tag svg {
+  color: var(--tile-accent);
+}
+
+.ov-release-version {
+  margin-top: 6px !important;
+  font: 400 50px/1 var(--serif);
+  letter-spacing: -0.02em;
+}
+
+.ov-release-meta {
+  margin: 6px 0 16px !important;
+  font-size: 13px;
+  color: var(--tile-ink-3);
+}
+
+.b-pop.ov-pop {
+  width: 250px;
+  padding: 16px;
+  font: 14px/1.45 var(--sans);
+}
+
+.ov-pop-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.ov-pop-desc {
+  margin: 2px 0 12px;
+  font-size: 13px;
+  color: var(--tile-ink-3);
+}
+
+.ov-slots {
+  display: grid;
+  gap: 6px;
+}
+
+.ov-slot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--tile-rule);
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  font-size: 13.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    border-color 120ms,
+    background 120ms;
+}
+
+.ov-slot:hover {
+  background: color-mix(in oklab, var(--tile-ink) 4%, transparent);
+}
+
+.ov-slot[aria-checked="true"] {
+  border-color: var(--tile-accent);
+  background: color-mix(in oklab, var(--tile-accent) 8%, transparent);
+  box-shadow: inset 0 0 0 1px var(--tile-accent);
+}
+
+.ov-slot:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 1px;
+}
+
+.ov-slot-time {
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  color: var(--tile-ink-3);
+}
+
+.b-btn.ov-pop-submit {
+  width: 100%;
+  height: 36px;
+  margin-top: 12px;
+}
+
+/* 8. Review toolbar */
+
+.ov-diff {
+  width: 100%;
+  max-width: 250px;
+}
+
+.ov-diff p {
+  margin: 0;
+}
+
+.ov-diff-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 12px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+}
+
+.ov-tool {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--tile-ink-2);
+  cursor: pointer;
+  transition: background 120ms;
+}
+
+.ov-tool:hover {
+  background: color-mix(in oklab, var(--tile-ink) 9%, transparent);
+  color: var(--tile-ink);
+}
+
+.ov-tool[aria-pressed="true"] {
+  background: var(--tile-accent);
+  color: var(--tile-accent-ink);
+}
+
+.ov-diff-sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: var(--tile-rule);
+}
+
+.ov-diff-count {
+  margin-left: auto;
+  padding-right: 10px;
+  font: 500 12px var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.ov-diff-path {
+  margin-top: 18px !important;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font: 500 15px/1.3 var(--mono);
+}
+
+.ov-diff-stats {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px !important;
+  font: 12.5px/1.3 var(--mono);
+}
+
+.ov-diff-add {
+  color: color-mix(in oklch, oklch(0.78 0.16 150) 80%, var(--tile-ink));
+}
+
+.ov-diff-del {
+  color: color-mix(in oklch, oklch(0.74 0.16 25) 80%, var(--tile-ink));
+}
+
+.ov-diff-viewed {
+  margin-left: auto;
+  font-family: var(--sans);
+  color: var(--tile-ink-2);
+}
+
+.ov-diff-progress {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  margin-top: 12px;
+}
+
+.ov-diff-progress span {
+  height: 4px;
+  border-radius: 2px;
+  background: color-mix(in oklab, var(--tile-ink) 18%, transparent);
+  transition: background 160ms var(--ease-out);
+}
+
+.ov-diff-progress span[data-current] {
+  background: color-mix(in oklab, var(--tile-ink) 45%, transparent);
+}
+
+.ov-diff-progress span[data-viewed] {
+  background: var(--tile-accent);
+}
+
+/* 9. Quick keys */
+
+.ov-quickkeys {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  max-width: 256px;
+}
+
+.ov-quick {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 42px;
+  white-space: nowrap;
+  padding: 0 10px 0 14px;
+  border: 0;
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--tile-ink) 13%, transparent);
+  color: var(--tile-ink);
+  font: 500 14px var(--sans);
+  cursor: pointer;
+  transition:
+    background 160ms var(--ease-out),
+    color 160ms var(--ease-out),
+    scale 160ms var(--ease-out);
+}
+
+.ov-quick:hover {
+  background: color-mix(in oklab, var(--tile-ink) 20%, transparent);
+}
+
+.ov-quick[data-hit] {
+  background: var(--tile-surface);
+  color: var(--tile-accent);
+  scale: 1.02;
+}
+
+.ov-quick .ov-kbd {
+  border-color: color-mix(in oklab, var(--tile-ink) 32%, transparent);
+  background: color-mix(in oklab, var(--tile-ink) 14%, transparent);
+  color: var(--tile-ink);
+}
+
+.ov-quick[data-hit] .ov-kbd {
+  border-color: color-mix(in oklab, var(--tile-accent) 25%, transparent);
+  background: transparent;
+  color: var(--tile-accent);
+}
+
+.ov-quick-out {
+  display: block;
+  margin-top: 6px;
+  padding-left: 2px;
+  font-size: 13px;
+  line-height: 1.35;
+  color: var(--tile-ink-2);
+}
+
+/* 10. Mention */
+
+.ov-comment {
+  width: 100%;
+  max-width: 252px;
+  padding: 14px 16px 16px;
+  border-radius: 16px;
+  background: var(--tile-surface);
+  box-shadow:
+    var(--tile-shadow),
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 6%, transparent);
+}
+
+.ov-comment-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ov-comment-who {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.ov-comment-when {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--tile-ink-3);
+}
+
+.ov-comment-body {
+  margin: 10px 0 0;
+  font-size: 14.5px;
+  line-height: 1.5;
+  color: var(--tile-ink-2);
+}
+
+.ov-mention {
+  padding: 1px 3px;
+  border-radius: 5px;
+  background: color-mix(in oklab, var(--tile-accent) 11%, transparent);
+  color: var(--tile-accent);
+  font-weight: 600;
+  text-decoration: none;
+  transition: background 120ms;
+}
+
+.ov-mention:hover,
+.ov-mention[data-open] {
+  background: color-mix(in oklab, var(--tile-accent) 20%, transparent);
+}
+
+.b-pop.ov-card {
+  width: 244px;
+  padding: 14px 16px;
+  font: 14px/1.45 var(--sans);
+}
+
+.ov-card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.ov-card-name {
+  font-size: 14.5px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.ov-card-role {
+  font-size: 12.5px;
+  color: var(--tile-ink-3);
+}
+
+.ov-card-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--tile-ink-2);
+}
+
+.ov-card-row svg {
+  color: var(--tile-ink-3);
+}
+
+.ov-card-oncall .ov-dot {
+  margin: 0 3px;
+  background: oklch(0.68 0.17 150);
+}
+
+/* 11. Deploys */
+
+.ov-deploys {
+  width: 100%;
+  max-width: 560px;
+}
+
+.ov-deploys-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 8px;
+  padding: 0 4px;
+}
+
+.ov-deploys-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.ov-deploys-note {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 12.5px;
+  color: var(--tile-ink-3);
+}
+
+.ov-deploys-list {
+  margin: 0;
+  padding: 2px 4px;
+  list-style: none;
+  border-radius: 16px;
+  background: var(--tile-surface);
+  box-shadow:
+    var(--tile-shadow),
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 6%, transparent);
+}
+
+.ov-deploy {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr) 148px 28px 30px;
+  align-items: center;
+  gap: 12px;
+  height: 46px;
+  padding: 0 6px 0 12px;
+}
+
+.ov-deploy + .ov-deploy {
+  border-top: 1px solid var(--tile-rule);
+}
+
+.ov-deploy-status {
+  --ov-status: oklch(0.66 0.17 150);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.ov-deploy-status[data-status="building"] {
+  --ov-status: oklch(0.76 0.15 75);
+}
+
+.ov-deploy-status[data-status="error"] {
+  --ov-status: oklch(0.6 0.21 27);
+}
+
+.ov-deploy-msg {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.3;
+}
+
+.ov-deploy-text {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 13.5px;
+  font-weight: 500;
+}
+
+.ov-deploy-sha {
+  font: 11.5px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.ov-deploy-branch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font: 12px var(--mono);
+  color: var(--tile-ink-2);
+}
+
+.ov-deploy-branch svg {
+  flex: none;
+  color: var(--tile-ink-3);
+}
+
+.ov-deploy-age {
+  text-align: right;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--tile-ink-3);
+}
+
+@media (max-width: 640px) {
+  .ov-deploy {
+    grid-template-columns: 82px minmax(0, 1fr) 30px;
+  }
+
+  .ov-deploy-branch,
+  .ov-deploy-age {
+    display: none;
+  }
+}
+
+/* 12. File tree with a context menu */
+
+.ov-tree {
+  width: 100%;
+  max-width: 250px;
+}
+
+.ov-tree-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 8px;
+  padding: 0 4px;
+  font: 500 12.5px/1.3 var(--mono);
+  color: var(--tile-ink-2);
+}
+
+.ov-tree-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font: 12px var(--sans);
+  color: var(--tile-ink-3);
+}
+
+.ov-tree-list {
+  max-height: 128px;
+  margin: 0;
+  padding: 4px;
+  overflow-y: auto;
+  list-style: none;
+  border-radius: 14px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+}
+
+.ov-tree-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 9px;
+  font: 13px var(--mono);
+  color: var(--tile-ink);
+  cursor: context-menu;
+  user-select: none;
+  outline: none;
+}
+
+.ov-tree-row svg {
+  color: var(--tile-ink-3);
+}
+
+.ov-tree-row:hover {
+  background: color-mix(in oklab, var(--tile-ink) 5%, transparent);
+}
+
+.ov-tree-row:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: -2px;
+}
+
+.ov-tree-row:not([data-closed]) {
+  background: color-mix(in oklab, var(--tile-accent) 12%, transparent);
+}
+
+.ov-tree-row:not([data-closed]) svg {
+  color: var(--tile-accent);
+}
+
+.b-btn.ov-tree-reset {
+  width: 100%;
+}
+
+.ov-tree-note {
+  display: block;
+  margin-top: 8px;
+  padding: 0 4px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 12.5px;
+  color: var(--tile-ink-3);
+}
+
+/* 13. Branch rename */
+
+.ov-branch {
+  width: 100%;
+  max-width: 260px;
+}
+
+.ov-branch-card {
+  position: relative;
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) 30px;
+  align-items: center;
+  column-gap: 12px;
+  padding: 16px 16px 14px;
+  border-radius: 18px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+}
+
+.ov-branch-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: var(--tile-accent);
+  color: var(--tile-accent-ink);
+}
+
+.ov-branch-text {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  margin-top: 12px;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  line-height: 1.3;
+}
+
+.ov-branch-name {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font: 500 15px/1.3 var(--mono);
+}
+
+.ov-branch-pr {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--tile-rule);
+  font-size: 12.5px;
+  color: var(--tile-ink-2);
+}
+
+.ov-branch-pr svg {
+  color: var(--tile-ink-3);
+}
+
+.ov-branch-card .ov-dots {
+  grid-column: 3;
+  grid-row: 1;
+  align-self: start;
+}
+
+.ov-branch-meta {
+  font-size: 12.5px;
+  color: var(--tile-ink-3);
+}
+
+/* 14. Menubar editor */
+
+.ov-ide {
+  width: 100%;
+  max-width: 560px;
+  overflow: hidden;
+  border-radius: 16px;
+  background: var(--tile-surface);
+  box-shadow:
+    var(--tile-shadow),
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 6%, transparent);
+}
+
+.ov-ide-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 46px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--tile-rule);
+}
+
+.ov-wordmark {
+  margin-right: 6px;
+  font: 600 15px var(--sans);
+  letter-spacing: -0.02em;
+}
+
+.ov-menubar {
+  display: flex;
+  gap: 2px;
+}
+
+.ov-mb-trigger {
+  height: 30px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--tile-ink-2);
+  font: 500 13.5px var(--sans);
+  cursor: default;
+  transition: background 120ms;
+}
+
+.ov-mb-trigger:hover,
+.ov-mb-trigger[data-open] {
+  background: color-mix(in oklab, var(--tile-ink) 8%, transparent);
+  color: var(--tile-ink);
+}
+
+.ov-ide-status {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 12.5px;
+  color: var(--tile-ink-3);
+}
+
+.ov-code {
+  display: flex;
+  padding: 10px 0;
+}
+
+.ov-code-lines {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 0 14px;
+  list-style: none;
+  counter-reset: ov-line;
+  font: 12px/1.7 var(--mono);
+  color: var(--tile-ink-2);
+  transition: line-height 160ms var(--ease-out);
+}
+
+.ov-code[data-density="compact"] .ov-code-lines {
+  line-height: 1.4;
+}
+
+.ov-code-lines li {
+  display: flex;
+  gap: 14px;
+  white-space: pre;
+}
+
+.ov-code-lines code {
+  min-width: 0;
+  overflow: hidden;
+  font: inherit;
+  text-overflow: ellipsis;
+}
+
+.ov-code[data-wrap] .ov-code-lines li {
+  white-space: pre-wrap;
+}
+
+.ov-code-lines[data-numbers] li::before {
+  content: counter(ov-line);
+  counter-increment: ov-line;
+  flex: none;
+  width: 12px;
+  text-align: right;
+  color: var(--tile-ink-3);
+}
+
+.ov-minimap {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 5px;
+  width: 56px;
+  margin-right: 12px;
+  padding: 4px 0 4px 10px;
+  border-left: 1px solid var(--tile-rule);
+}
+
+.ov-minimap span {
+  height: 3px;
+  border-radius: 2px;
+  background: color-mix(in oklab, var(--tile-ink) 16%, transparent);
+}
+
+/* 15. Sidebar navigation */
+
+.ov-side {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 236px;
+  height: 100%;
+  max-height: 480px;
+  padding: 10px;
+  border-radius: 18px;
+  background: var(--tile-surface);
+  box-shadow:
+    var(--tile-shadow),
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 6%, transparent);
+}
+
+.ov-side-ws {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  padding: 8px 10px 16px;
+  border-bottom: 1px solid var(--tile-rule);
+}
+
+.ov-side-ws-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.3;
+}
+
+.ov-side-ws-name {
+  font: 400 24px/1.1 var(--serif);
+}
+
+.ov-side-ws-plan,
+.ov-side-user-role {
+  font-size: 12px;
+  color: var(--tile-ink-3);
+}
+
+.ov-side-nav {
+  flex: 1;
+}
+
+.ov-side-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ov-side-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: 40px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--tile-ink-2);
+  font: 500 14px var(--sans);
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+  transition:
+    background 120ms,
+    color 120ms;
+}
+
+.ov-side-link:hover {
+  background: color-mix(in oklab, var(--tile-ink) 5%, transparent);
+  color: var(--tile-ink);
+}
+
+.ov-side-link[data-current],
+.ov-side-trigger[data-current] {
+  background: color-mix(in oklab, var(--tile-ink) 7%, transparent);
+  color: var(--tile-ink);
+}
+
+.ov-side-trigger[data-open] {
+  background: color-mix(in oklab, var(--tile-accent) 11%, transparent);
+  color: var(--tile-ink);
+}
+
+.ov-side-icon {
+  display: flex;
+  color: var(--tile-ink-3);
+}
+
+.ov-side-link[data-current] .ov-side-icon,
+.ov-side-trigger:is([data-open], [data-current]) .ov-side-icon {
+  color: var(--tile-accent);
+}
+
+.ov-side-caret {
+  margin-left: auto;
+  color: var(--tile-ink-3);
+  transition: translate 160ms var(--ease-out);
+}
+
+.ov-side-trigger[data-open] .ov-side-caret {
+  translate: 2px 0;
+}
+
+.ov-side-user {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: auto;
+  padding: 12px 8px 4px;
+  border-top: 1px solid var(--tile-rule);
+}
+
+.ov-side-user-name {
+  font-size: 13.5px;
+  font-weight: 500;
+}
+
+.ov-side-viewport {
+  --panel-height: var(--available-height);
+  width: var(--viewport-width);
+  height: var(--viewport-height);
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--tile-rule);
+  border-radius: 16px;
+  background: var(--tile-surface);
+  color: var(--tile-ink);
+  box-shadow:
+    var(--tile-shadow),
+    0 18px 40px -16px oklch(0.2 0.02 60 / 0.28);
+  transform-origin: var(--transform-origin);
+  transition:
+    opacity 180ms var(--ease-out),
+    scale 180ms var(--ease-out),
+    width 200ms var(--ease-out),
+    height 200ms var(--ease-out),
+    top 200ms var(--ease-out);
+}
+
+.ov-side-viewport:is([data-starting-style], [data-ending-style]) {
+  opacity: 0;
+  scale: 0.97;
+}
+
+.ov-side-panel {
+  position: absolute;
+  top: 0;
+  inset-inline-start: 0;
+  width: 248px;
+  max-height: var(--available-height, var(--panel-height));
+  padding: 8px;
+  overflow-y: auto;
+  font: 14px/1.45 var(--sans);
+  transition:
+    opacity 160ms var(--ease-out),
+    translate 160ms var(--ease-out);
+}
+
+.ov-side-panel:is([data-starting-style], [data-ending-style]) {
+  opacity: 0;
+}
+
+.ov-side-panel[data-motion="from-end"][data-starting-style],
+.ov-side-panel[data-motion="to-end"][data-ending-style] {
+  translate: 0 12px;
+}
+
+.ov-side-panel[data-motion="from-start"][data-starting-style],
+.ov-side-panel[data-motion="to-start"][data-ending-style] {
+  translate: 0 -12px;
+}
+
+.ov-side-panel-title {
+  margin: 0;
+  padding: 6px 10px 4px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--tile-ink-3);
+}
+
+.ov-side-panel ul {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ov-side-panel .ov-side-link {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  height: auto;
+  padding: 8px 10px;
+  line-height: 1.3;
+}
+
+.ov-side-panel-name {
+  font-size: 13.5px;
+  color: var(--tile-ink);
+}
+
+.ov-side-panel-detail {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--tile-ink-3);
+}
+
+/* 16. Inbox and toasts */
+
+.ov-inbox {
+  width: 100%;
+  max-width: 256px;
+}
+
+.ov-inbox-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 8px;
+  padding: 0 4px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--tile-ink-2);
+}
+
+.ov-inbox-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--tile-ink);
+  color: var(--tile-bg);
+  font: 600 11px/1 var(--sans);
+}
+
+.ov-inbox-list {
+  margin: 0;
+  padding: 2px 4px;
+  list-style: none;
+  border-radius: 14px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+}
+
+.ov-inbox-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 4px 2px 4px 8px;
+}
+
+.ov-inbox-row + .ov-inbox-row {
+  border-top: 1px solid var(--tile-rule);
+}
+
+.ov-inbox-icon {
+  flex: none;
+  color: var(--tile-ink-3);
+}
+
+.ov-inbox-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.ov-inbox-archive {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--tile-ink-3);
+  cursor: pointer;
+}
+
+.ov-inbox-archive:hover {
+  background: color-mix(in oklab, var(--tile-ink) 8%, transparent);
+  color: var(--tile-ink);
+}
+
+.ov-inbox-zero {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 28px 16px;
+  border-radius: 14px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+}
+
+.ov-inbox-zero p {
+  margin: 0;
+  font: 400 24px/1.1 var(--serif);
+}
+
+.ov-toasts {
+  --dir: -1;
+  width: 360px;
+  max-width: calc(100vw - 32px);
+  height: var(--toast-front-height);
+  margin: 16px;
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  background: transparent;
+  outline: none;
+  font: 14px/1.45 var(--sans);
+}
+
+.ov-toasts[data-side="top"] {
+  --dir: 1;
+}
+
+.ov-toasts[data-expanded] {
+  height: calc(var(--toast-stack-height) + (var(--toast-count) - 1) * 10px);
+}
+
+.ov-toast {
+  --y: calc(var(--dir) * var(--toast-index) * 10px);
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  z-index: calc(100 - var(--toast-index));
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 10px 12px 16px;
+  overflow: hidden;
+  border-radius: 14px;
+  background: var(--tile-surface);
+  color: var(--tile-ink);
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--tile-ink) 9%, transparent),
+    0 14px 36px -14px oklch(0.2 0.02 60 / 0.4);
+  translate: var(--toast-swipe-x, 0px)
+    calc(var(--y) + var(--toast-swipe-y, 0px));
+  scale: calc(1 - var(--toast-index) * 0.05);
+  transition:
+    translate 280ms var(--ease-out),
+    scale 280ms var(--ease-out),
+    opacity 280ms var(--ease-out),
+    height 280ms var(--ease-out);
+}
+
+.ov-toasts[data-side="top"] .ov-toast {
+  top: 0;
+  bottom: auto;
+}
+
+.ov-toast:not([data-front]):not([data-expanded]) {
+  height: var(--toast-front-height);
+}
+
+.ov-toast[data-expanded] {
+  --y: calc(var(--dir) * (var(--toast-offset) + var(--toast-index) * 10px));
+  scale: 1;
+}
+
+.ov-toast[data-starting-style] {
+  --y: calc(var(--dir) * -100%);
+  opacity: 0;
+}
+
+.ov-toast[data-ending-style] {
+  opacity: 0;
+}
+
+.ov-toast[data-swiping] {
+  transition: none;
+}
+
+.ov-toast-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.35;
+}
+
+.ov-toast-title {
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.ov-toast-desc {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 12.5px;
+  color: var(--tile-ink-2);
+}
+
+.b-btn.ov-toast-undo {
+  height: 30px;
+  padding: 0 12px;
+  font-size: 13px;
+}
+
+.ov-toast-x {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--tile-ink-3);
+  cursor: pointer;
+}
+
+.ov-toast-x:hover {
+  background: color-mix(in oklab, var(--tile-ink) 8%, transparent);
+  color: var(--tile-ink);
+}
+
+/* 17. Presence, a custom popup */
+
+.ov-presence {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 14px;
+  width: 100%;
+  max-width: 240px;
+}
+
+.ov-presence-who {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ov-presence-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1.3;
+}
+
+.ov-presence-role {
+  font-size: 12.5px;
+  color: var(--tile-ink-3);
+}
+
+.ov-presence-avatar {
+  position: relative;
+}
+
+.ov-presence-avatar .ov-avatar {
+  width: 46px;
+  height: 46px;
+  font-size: 14px;
+}
+
+.ov-presence-dot {
+  --ov-presence: oklch(0.7 0.16 70);
+  display: inline-block;
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ov-presence);
+}
+
+.ov-presence-dot[data-status="available"] {
+  --ov-presence: oklch(0.68 0.17 150);
+}
+
+.ov-presence-dot[data-status="meeting"] {
+  --ov-presence: oklch(0.62 0.19 27);
+}
+
+.ov-presence-dot[data-status="away"] {
+  --ov-presence: oklch(0.72 0.01 70);
+}
+
+.ov-presence-avatar > .ov-presence-dot {
+  position: absolute;
+  right: 0;
+  bottom: 1px;
+  width: 15px;
+  height: 15px;
+  box-shadow: 0 0 0 3px var(--tile-bg);
+}
+
+.ov-presence-name {
+  font: 400 24px/1.1 var(--serif);
+}
+
+.b-btn.ov-presence-trigger {
+  justify-content: flex-start;
+  gap: 8px;
+  height: 38px;
+  padding: 0 12px;
+}
+
+.ov-presence-trigger svg {
+  margin-left: auto;
+  color: var(--tile-ink-3);
+}
+
+.ov-presence-until {
+  font-weight: 400;
+  color: var(--tile-ink-3);
+}
+
+.b-pop.ov-presence-pop {
+  width: 240px;
+  font: 14px/1.45 var(--sans);
+}
+
+.b-item.ov-presence-option {
+  width: 100%;
+  gap: 10px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 13.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ov-presence-option:hover {
+  background: color-mix(in oklab, var(--tile-ink) 7%, transparent);
+}
+
+.ov-presence-option[aria-pressed="true"] {
+  background: color-mix(in oklab, var(--tile-accent) 10%, transparent);
+}
+
+.ov-presence-label {
+  flex: 1;
+}
+
+.ov-presence-option .ov-presence-until {
+  font-size: 12px;
+}
+
+/* 18. Line comments */
+
+.ov-lines {
+  width: 100%;
+  max-width: 256px;
+}
+
+.ov-lines-file {
+  margin: 0 0 8px;
+  padding: 0 2px;
+  font: 500 12.5px/1.3 var(--mono);
+  color: var(--tile-ink-2);
+}
+
+.ov-lines-code {
+  margin: 0;
+  padding: 6px 0;
+  overflow: hidden;
+  list-style: none;
+  border-radius: 12px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+}
+
+.ov-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: 26px;
+  padding: 0 10px 0 0;
+  border: 0;
+  background: transparent;
+  color: var(--tile-ink-2);
+  font: 12px/1 var(--mono);
+  text-align: left;
+  cursor: pointer;
+}
+
+.ov-lines-code li[data-kind="add"] .ov-line {
+  background: oklch(0.72 0.17 150 / 0.13);
+  color: var(--tile-ink);
+}
+
+.ov-lines-code li[data-kind="del"] .ov-line {
+  background: oklch(0.65 0.2 27 / 0.1);
+}
+
+.ov-line:hover {
+  box-shadow: inset 0 0 0 999px
+    color-mix(in oklab, var(--tile-ink) 4%, transparent);
+}
+
+.ov-line[data-open] {
+  box-shadow:
+    inset 3px 0 0 var(--tile-accent),
+    inset 0 0 0 999px color-mix(in oklab, var(--tile-accent) 10%, transparent);
+}
+
+.ov-line:focus-visible {
+  outline-offset: -2px;
+}
+
+.ov-line-n {
+  flex: none;
+  width: 30px;
+  text-align: right;
+  color: var(--tile-ink-3);
+}
+
+.ov-line-code {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: pre;
+  text-overflow: ellipsis;
+  font: inherit;
+}
+
+.ov-line-note {
+  flex: none;
+  color: var(--tile-accent);
+}
+
+.ov-bubble {
+  position: fixed;
+  inset: auto;
+  width: 248px;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--tile-rule);
+  border-radius: 14px;
+  background: var(--tile-surface);
+  color: var(--tile-ink);
+  font: 14px/1.45 var(--sans);
+  box-shadow:
+    var(--tile-shadow),
+    0 18px 40px -16px oklch(0.2 0.02 60 / 0.3);
+  transform-origin: var(--transform-origin, top);
+  animation: ov-pop-in 160ms var(--ease-out);
+}
+
+@keyframes ov-pop-in {
+  from {
+    opacity: 0;
+    scale: 0.96;
+  }
+}
+
+.b-input.ov-bubble-input {
+  display: block;
+  height: auto;
+  padding: 8px 10px;
+  resize: none;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.ov-bubble-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.ov-bubble-actions .b-btn {
+  height: 30px;
+  font-size: 13px;
+}
+
+/* 19. Assignee picker */
+
+.ov-issue {
+  width: 100%;
+  max-width: 252px;
+  padding: 16px;
+  border-radius: 16px;
+  background: var(--tile-surface);
+  box-shadow: var(--tile-shadow);
+}
+
+.ov-issue-id {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font: 500 12px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.ov-issue-prio {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: oklch(0.66 0.2 27);
+}
+
+.ov-issue-title {
+  margin: 8px 0 16px;
+  font-size: 16.5px;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.ov-assignee {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 12px 0 5px;
+  border: 1px solid var(--tile-rule);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--tile-ink);
+  font: 500 13.5px var(--sans);
+  cursor: pointer;
+  transition:
+    background 120ms,
+    border-color 120ms;
+}
+
+.ov-assignee svg {
+  color: var(--tile-ink-3);
+}
+
+.ov-assignee:hover {
+  border-color: var(--tile-ink-3);
+}
+
+.ov-assignee[data-open] {
+  border-color: var(--tile-ink-3);
+  background: color-mix(in oklab, var(--tile-ink) 8%, transparent);
+}
+
+.b-pop.ov-assign-pop {
+  width: 240px;
+  padding: 0;
+  overflow: hidden;
+  font: 14px/1.45 var(--sans);
+}
+
+.ov-assign-input {
+  width: 100%;
+  height: 42px;
+  padding: 0 14px;
+  border: 0;
+  border-bottom: 1px solid var(--tile-rule);
+  background: transparent;
+  color: var(--tile-ink);
+  font: 14px var(--sans);
+  outline: none;
+}
+
+.ov-assign-input::placeholder {
+  color: var(--tile-ink-3);
+}
+
+.ov-assign-list {
+  max-height: 232px;
+  padding: 4px;
+  overflow-y: auto;
+  outline: none;
+}
+
+.b-item.ov-assign-item {
+  font-size: 13.5px;
+}
+
+.ov-assign-check {
+  margin-left: auto;
+  color: var(--tile-accent);
+}
+
+.ov-assign .ov-cmd-empty {
+  padding: 20px 12px;
+  font-size: 13px;
+}
+
+.ov-cmd-vercel {
+  font-size: 13px;
+  line-height: 1;
+}
+
+.ov-inbox-zero .ov-inbox-zero-note {
+  margin: -6px 0 0;
+  font: 500 11px var(--mono);
+  color: var(--tile-ink-3);
+}

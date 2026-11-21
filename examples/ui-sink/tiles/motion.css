@@ -1,0 +1,2206 @@
+/* Shared */
+
+.mo-fill {
+  align-self: stretch;
+  justify-self: stretch;
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  margin: -10px -10px 0;
+}
+
+.mo-grip {
+  flex: none;
+  color: var(--tile-ink-3);
+}
+
+.mo-hint {
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+  margin: 0;
+  font: 500 11px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+  pointer-events: none;
+}
+
+/* 1. Sortable layers */
+
+.mo-layers-wrap {
+  width: 100%;
+  max-width: 250px;
+}
+
+.mo-layers {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  border-radius: 14px;
+  background: var(--tile-surface-2);
+}
+
+.mo-layer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 38px;
+  padding: 0 12px 0 8px;
+  border-radius: 10px;
+  background: var(--tile-surface);
+  box-shadow: 0 0 0 1px var(--tile-rule);
+  font-weight: 500;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+  transition:
+    transform 200ms var(--ease-out),
+    box-shadow 160ms var(--ease-out),
+    scale 160ms var(--ease-out);
+}
+
+.mo-layer:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 1px;
+}
+
+.mo-layer[data-moving] {
+  position: relative;
+  z-index: 1;
+  scale: 1.02;
+  box-shadow:
+    0 0 0 1px var(--tile-rule),
+    0 12px 24px -10px oklch(0.2 0.02 60 / 0.35);
+}
+
+.mo-layer[data-grabbed] {
+  transform: translate(var(--drag-x, 0), var(--drag-y, 0));
+  cursor: grabbing;
+  transition:
+    box-shadow 160ms var(--ease-out),
+    scale 160ms var(--ease-out);
+}
+
+.mo-layer-icon {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  background: color-mix(in oklab, var(--tile-accent) 14%, transparent);
+  color: var(--tile-accent);
+}
+
+.mo-layer-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 2. Swatch grid */
+
+.mo-palette {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mo-palette-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mo-palette-count {
+  font: 500 11px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.mo-swatches {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(4, 52px);
+  gap: 10px;
+}
+
+.mo-swatch {
+  position: relative;
+  width: 52px;
+  height: 52px;
+  border-radius: 14px;
+  box-shadow: inset 0 0 0 1px oklch(0 0 0 / 0.08);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+  transition:
+    box-shadow 140ms var(--ease-out),
+    opacity 140ms var(--ease-out);
+}
+
+.mo-swatch[data-selected] {
+  box-shadow:
+    0 0 0 2px var(--tile-bg),
+    0 0 0 4px var(--tile-ink);
+}
+
+.mo-swatch:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 6px;
+}
+
+.mo-swatch[data-moving]:not([data-drag-preview]) {
+  opacity: 0.35;
+}
+
+.mo-swatch[data-drag-preview] {
+  scale: 1.08;
+  box-shadow: 0 16px 28px -10px oklch(0.15 0.02 60 / 0.45);
+  cursor: grabbing;
+}
+
+.mo-swatch[data-drag-preview][data-drag-count]::after {
+  content: counter(mo-count);
+  counter-reset: mo-count var(--drag-count);
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  display: grid;
+  place-items: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: oklch(0.22 0.015 60);
+  color: white;
+  font: 600 11px/1 var(--sans);
+}
+
+/* 3. Board */
+
+.mo-board {
+  container-type: inline-size;
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  width: 100%;
+  align-self: stretch;
+}
+
+.mo-col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border-radius: 14px;
+  background: var(--tile-surface-2);
+}
+
+.mo-col-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--tile-ink-2);
+}
+
+.mo-col-count {
+  font: 500 11px/1 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.mo-col-list {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 40px;
+}
+
+.mo-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 10px 0 6px;
+  border-radius: 9px;
+  background: var(--tile-surface);
+  box-shadow: 0 0 0 1px var(--tile-rule);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+  transition:
+    opacity 140ms var(--ease-out),
+    box-shadow 140ms var(--ease-out);
+}
+
+.mo-card:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 1px;
+}
+
+.mo-card-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mo-card-tag {
+  flex: none;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: color-mix(in oklab, var(--tile-accent) 12%, transparent);
+  color: color-mix(in oklch, var(--tile-accent) 80%, var(--tile-ink));
+  font: 500 11px/1.3 var(--mono);
+}
+
+@container (max-width: 460px) {
+  .mo-card-tag {
+    display: none;
+  }
+}
+
+.mo-card[data-moving]:not([data-drag-preview]) {
+  box-shadow:
+    0 0 0 2px var(--tile-accent),
+    0 10px 20px -12px oklch(0.2 0.02 60 / 0.4);
+}
+
+.mo-card[data-dragging]:not([data-drag-preview]) {
+  opacity: 0.4;
+  box-shadow: inset 0 0 0 1px var(--tile-ink-3);
+}
+
+.mo-card[data-drag-preview] {
+  rotate: -2deg;
+  box-shadow: 0 16px 28px -10px oklch(0.15 0.02 60 / 0.4);
+  cursor: grabbing;
+}
+
+/* 4. Outline */
+
+.mo-outline {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  max-width: 240px;
+  padding: 6px;
+  border-radius: 14px;
+  background: var(--tile-surface);
+  box-shadow:
+    var(--tile-shadow),
+    0 0 0 1px var(--tile-rule);
+}
+
+.mo-node-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 10px 0 calc(4px + var(--depth, 0) * 18px);
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+  transition:
+    padding 180ms var(--ease-out),
+    background 120ms;
+}
+
+.mo-node-row:hover {
+  background: color-mix(in oklab, var(--tile-ink) 5%, transparent);
+}
+
+.mo-node-row[data-parent] {
+  font-weight: 600;
+}
+
+.mo-node-row:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: -2px;
+}
+
+.mo-node-icon {
+  flex: none;
+  color: var(--tile-ink-3);
+}
+
+.mo-node-row[data-parent] .mo-node-icon {
+  color: var(--tile-accent);
+}
+
+.mo-node-row[data-moving]:not([data-drag-preview]) {
+  background: color-mix(in oklab, var(--tile-accent) 12%, transparent);
+  box-shadow: inset 0 0 0 1px
+    color-mix(in oklab, var(--tile-accent) 50%, transparent);
+}
+
+.mo-node-row[data-drag-preview] {
+  box-shadow: 0 12px 24px -10px oklch(0.15 0.02 60 / 0.4);
+  background: white;
+  cursor: grabbing;
+}
+
+/* 5. Tags */
+
+.mo-tags {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: 100%;
+  max-width: 250px;
+}
+
+.mo-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mo-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 28px;
+  padding: 0 10px 0 6px;
+  border: 1px solid var(--tile-rule);
+  border-radius: 999px;
+  background: var(--tile-surface);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  transition: opacity 140ms var(--ease-out);
+}
+
+.mo-chip svg {
+  color: var(--tile-ink-3);
+}
+
+.mo-chip:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+}
+
+.mo-chip[data-dragging] {
+  opacity: 0.4;
+}
+
+.mo-chip[data-used] {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.mo-chip[data-drag-preview] {
+  scale: 1.06;
+  box-shadow: 0 12px 24px -10px oklch(0.15 0.02 60 / 0.45);
+  cursor: grabbing;
+  transition: scale 140ms var(--ease-out);
+}
+
+.mo-chip[data-drag-preview][data-over] {
+  scale: 0.96;
+}
+
+.mo-task {
+  padding: 14px;
+  border-radius: 14px;
+  background: var(--tile-surface);
+  box-shadow:
+    var(--tile-shadow),
+    0 0 0 1px var(--tile-rule);
+  transition:
+    box-shadow 140ms var(--ease-out),
+    scale 160ms var(--ease-out);
+}
+
+.mo-task[data-over] {
+  scale: 1.02;
+  box-shadow:
+    var(--tile-shadow),
+    0 0 0 2px var(--tile-accent);
+}
+
+.mo-task-title {
+  margin: 0 0 10px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.mo-task-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 24px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mo-task-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 24px;
+  padding: 0 4px 0 8px;
+  border-radius: 7px;
+  background: color-mix(in oklab, var(--tile-accent) 14%, transparent);
+  color: color-mix(in oklch, var(--tile-accent) 75%, var(--tile-ink));
+  font-size: 12px;
+  font-weight: 500;
+  animation: mo-pop 240ms var(--ease-out);
+}
+
+.mo-task-tag button {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.mo-task-tag button:hover {
+  background: color-mix(in oklab, var(--tile-accent) 18%, transparent);
+}
+
+.mo-task-tag button:focus-visible {
+  outline: 2px solid var(--tile-accent);
+}
+
+@keyframes mo-pop {
+  from {
+    opacity: 0;
+    scale: 0.85;
+  }
+}
+
+/* 6. Drop on a date */
+
+.mo-dates {
+  display: grid;
+  grid-template-columns: 1fr 112px;
+  gap: 14px;
+  width: 100%;
+  max-width: 262px;
+  height: 172px;
+}
+
+.mo-dates-side {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mo-event-chip {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 10px 10px 10px 6px;
+  border: 0;
+  border-left: 3px solid var(--tile-accent);
+  border-radius: 10px;
+  background: var(--tile-surface);
+  box-shadow:
+    var(--tile-shadow),
+    0 0 0 1px var(--tile-rule);
+  text-align: left;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.mo-event-chip svg {
+  flex: none;
+  margin-top: 1px;
+  color: var(--tile-ink-3);
+}
+
+.mo-event-chip small {
+  display: block;
+  margin-top: 2px;
+  font: 500 11px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.mo-event-chip:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+}
+
+.mo-event-chip[data-dragging] {
+  opacity: 0.45;
+}
+
+.mo-event-chip[data-drag-preview] {
+  rotate: 2deg;
+  box-shadow: 0 16px 28px -10px oklch(0.15 0.02 60 / 0.45);
+}
+
+.mo-days {
+  overflow-y: auto;
+  padding: 4px;
+  border-radius: 12px;
+  background: var(--tile-surface);
+  box-shadow: 0 0 0 1px var(--tile-rule);
+  scrollbar-width: thin;
+  overscroll-behavior: contain;
+}
+
+.mo-day {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 8px;
+  border-radius: 7px;
+  transition: background 120ms;
+}
+
+.mo-day + .mo-day {
+  margin-top: 2px;
+}
+
+.mo-day[data-over] {
+  background: color-mix(in oklab, var(--tile-accent) 16%, transparent);
+}
+
+.mo-day-hit {
+  padding: 0;
+  border: 0;
+  background: none;
+  text-align: left;
+  font: 500 12px/1.4 var(--mono);
+  color: var(--tile-ink-2);
+  cursor: pointer;
+}
+
+.mo-day-hit:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.mo-day-event {
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--tile-accent);
+  color: var(--tile-accent-ink);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+  animation: mo-pop 240ms var(--ease-out);
+}
+
+/* 7. Stickies */
+
+.mo-board-surface {
+  position: relative;
+  overflow: hidden;
+  border-radius: 14px;
+  background-color: color-mix(in oklab, var(--tile-surface) 55%, transparent);
+  background-image: radial-gradient(
+    color-mix(in oklab, var(--tile-ink) 18%, transparent) 1px,
+    transparent 1px
+  );
+  background-size: 16px 16px;
+}
+
+.mo-sticky {
+  position: absolute;
+  display: flex;
+  align-items: flex-start;
+  width: 108px;
+  height: 62px;
+  padding: 12px;
+  border-radius: 4px 4px 12px 4px;
+  background: oklch(0.95 0.09 98);
+  color: oklch(0.3 0.04 80);
+  box-shadow:
+    0 1px 2px oklch(0.3 0.05 80 / 0.15),
+    0 6px 14px -8px oklch(0.3 0.05 80 / 0.35);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.3;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+  transition:
+    box-shadow 160ms var(--ease-out),
+    scale 160ms var(--ease-out),
+    rotate 200ms var(--ease-out);
+}
+
+.mo-sticky[data-note="lena"] {
+  background: oklch(0.9 0.07 150);
+  color: oklch(0.3 0.05 155);
+}
+
+.mo-sticky[data-note="friday"] {
+  background: oklch(0.89 0.07 25);
+  color: oklch(0.32 0.06 25);
+}
+
+.mo-sticky:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+}
+
+.mo-sticky[data-dragging] {
+  z-index: 2;
+  scale: 1.05;
+  rotate: -2deg;
+  cursor: grabbing;
+  box-shadow:
+    0 2px 4px oklch(0.3 0.05 80 / 0.12),
+    0 18px 30px -12px oklch(0.3 0.05 80 / 0.5);
+}
+
+/* 8. Artboard */
+
+.mo-artboard-surface {
+  position: relative;
+  border-radius: 14px;
+  box-shadow: inset 0 0 0 1px var(--tile-rule);
+}
+
+.mo-frame {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border: 1.5px solid var(--tile-accent);
+  background: color-mix(in oklab, var(--tile-accent) 10%, transparent);
+  cursor: move;
+  touch-action: none;
+  user-select: none;
+}
+
+.mo-frame-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.mo-frame-size {
+  align-self: center;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--tile-accent);
+  color: var(--tile-accent-ink);
+  font: 600 11px/1.3 var(--mono);
+  white-space: nowrap;
+}
+
+.mo-handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  padding: 0;
+  border: 1.5px solid var(--tile-accent);
+  border-radius: 3px;
+  background: var(--tile-bg);
+  transform: translate(-50%, -50%);
+  transition: scale 120ms var(--ease-out);
+}
+
+.mo-handle:hover,
+.mo-frame[data-dragging] .mo-handle {
+  scale: 1.2;
+}
+
+.mo-handle:focus-visible {
+  outline: 2px solid var(--tile-ink);
+  outline-offset: 2px;
+}
+
+.mo-handle[data-at="nw"] {
+  left: 0;
+  top: 0;
+}
+.mo-handle[data-at="n"] {
+  left: 50%;
+  top: 0;
+}
+.mo-handle[data-at="ne"] {
+  left: 100%;
+  top: 0;
+}
+.mo-handle[data-at="e"] {
+  left: 100%;
+  top: 50%;
+}
+.mo-handle[data-at="se"] {
+  left: 100%;
+  top: 100%;
+}
+.mo-handle[data-at="s"] {
+  left: 50%;
+  top: 100%;
+}
+.mo-handle[data-at="sw"] {
+  left: 0;
+  top: 100%;
+}
+.mo-handle[data-at="w"] {
+  left: 0;
+  top: 50%;
+}
+
+/* 9. Swipe rows */
+
+.mo-inbox {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 262px;
+  overflow: hidden;
+  border-radius: 14px;
+  background: var(--tile-surface);
+  box-shadow:
+    var(--tile-shadow),
+    0 0 0 1px var(--tile-rule);
+}
+
+.mo-swipe-row {
+  position: relative;
+  overflow: hidden;
+  touch-action: pan-y;
+  user-select: none;
+  outline: none;
+}
+
+.mo-swipe-row + .mo-swipe-row {
+  border-top: 1px solid var(--tile-rule);
+}
+
+.mo-swipe-row:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: -2px;
+}
+
+.mo-swipe-actions {
+  position: absolute;
+  inset: 0 0 0 auto;
+  display: flex;
+}
+
+.mo-swipe-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  width: 64px;
+  border: 0;
+  color: white;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mo-swipe-btn[data-kind="archive"] {
+  background: oklch(0.6 0.12 245);
+}
+
+.mo-swipe-btn[data-kind="delete"] {
+  background: oklch(0.58 0.2 27);
+}
+
+.mo-swipe-btn:focus-visible {
+  outline: 2px solid white;
+  outline-offset: -4px;
+}
+
+.mo-swipe-content {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  background: var(--tile-surface);
+  cursor: grab;
+  transition: transform 260ms var(--ease-out);
+}
+
+.mo-swipe-content[data-swiping] {
+  cursor: grabbing;
+  transition: none;
+}
+
+.mo-swipe-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.mo-swipe-cue {
+  flex: none;
+  color: var(--tile-ink-3);
+  transition: opacity 160ms var(--ease-out);
+}
+
+.mo-swipe-content[data-swipe] .mo-swipe-cue {
+  opacity: 0;
+}
+
+.mo-swipe-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mo-swipe-meta {
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--tile-ink-3);
+}
+
+.mo-inbox-empty {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px;
+  font-weight: 500;
+  color: var(--tile-ink-2);
+}
+
+/* 10. Color pad */
+
+.mo-color {
+  display: flex;
+  align-items: stretch;
+  gap: 16px;
+  width: 100%;
+  max-width: 256px;
+}
+
+.mo-pad {
+  position: relative;
+  flex: 1;
+  height: 150px;
+  border-radius: 12px;
+  background:
+    linear-gradient(to top, black, transparent),
+    linear-gradient(to right, white, hsl(calc(var(--hue) * 1deg) 100% 50%));
+  box-shadow: inset 0 0 0 1px oklch(1 0 0 / 0.08);
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+}
+
+.mo-pad-thumb {
+  width: 20px;
+  height: 20px;
+  border: 3px solid white;
+  border-radius: 50%;
+  box-shadow:
+    0 0 0 1px oklch(0 0 0 / 0.3),
+    0 4px 10px oklch(0 0 0 / 0.35);
+  transform: translate(-50%, -50%);
+  outline: none;
+  cursor: grab;
+  transition: scale 120ms var(--ease-out);
+}
+
+.mo-pad:active .mo-pad-thumb {
+  scale: 1.15;
+}
+
+.mo-pad-thumb:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 3px;
+}
+
+.mo-color-side {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 4px;
+  width: 76px;
+}
+
+.mo-color-swatch {
+  width: 100%;
+  height: 54px;
+  margin-bottom: auto;
+  border-radius: 12px;
+  box-shadow: inset 0 0 0 1px oklch(1 0 0 / 0.1);
+}
+
+.mo-color-hex {
+  font: 600 14px/1.3 var(--mono);
+}
+
+.mo-color-sv {
+  font: 500 11px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+/* 11. Timeline */
+
+.mo-timeline {
+  --room: 84px;
+  container-type: inline-size;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.mo-tl-hours {
+  position: relative;
+  height: 14px;
+  margin-left: var(--room);
+  margin-right: 8px;
+}
+
+.mo-tl-hours span {
+  position: absolute;
+  top: 0;
+  translate: -50% 0;
+  font: 500 11px/1.2 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.mo-tl-row {
+  display: flex;
+  align-items: center;
+}
+
+.mo-tl-room {
+  flex: none;
+  width: var(--room);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--tile-ink-2);
+}
+
+.mo-tl-track {
+  position: relative;
+  flex: 1;
+  height: 40px;
+  margin-right: 8px;
+  border-radius: 8px;
+  background-color: var(--tile-surface-2);
+  background-image: linear-gradient(
+    90deg,
+    var(--tile-rule) 1px,
+    transparent 1px
+  );
+  background-size: calc(100% / 8) 100%;
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+}
+
+.mo-booking {
+  top: 4px;
+  bottom: 4px;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--tile-ink);
+  color: var(--tile-bg);
+  cursor: grab;
+  outline: none;
+  transition: box-shadow 140ms var(--ease-out);
+}
+
+.mo-booking[data-hold] {
+  background: var(--tile-accent);
+  color: var(--tile-accent-ink);
+}
+
+.mo-booking[data-dragging],
+.mo-booking[data-resizing],
+.mo-booking[data-drawing] {
+  z-index: 1;
+  cursor: grabbing;
+  box-shadow: 0 8px 16px -6px oklch(0.2 0.02 60 / 0.45);
+}
+
+.mo-booking[data-drawing] {
+  background: color-mix(in oklab, var(--tile-accent) 70%, transparent);
+}
+
+.mo-booking:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+}
+
+.mo-booking-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mo-edge {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: ew-resize;
+}
+
+.mo-edge[data-span-edge="start"] {
+  left: 0;
+}
+
+.mo-edge[data-span-edge="end"] {
+  right: 0;
+}
+
+.mo-edge::after {
+  content: "";
+  display: block;
+  width: 2px;
+  height: 12px;
+  margin: 12px auto 0;
+  border-radius: 2px;
+  background: currentColor;
+  opacity: 0.4;
+}
+
+@container (max-width: 460px) {
+  .mo-tl-row,
+  .mo-tl-hours,
+  .mo-tl-foot {
+    --room: 72px;
+  }
+  .mo-booking-title {
+    padding: 0 6px;
+  }
+  .mo-edge::after {
+    display: none;
+  }
+}
+
+.mo-tl-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 4px;
+  padding-left: var(--room);
+  padding-right: 8px;
+}
+
+.mo-tl-free {
+  font: 500 11px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.mo-timeline .b-btn {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+/* 12. Day calendar */
+
+.mo-day-cal {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-self: stretch;
+  justify-self: stretch;
+  min-height: 0;
+}
+
+.mo-day-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.mo-day-head svg {
+  align-self: center;
+  color: var(--tile-accent);
+}
+
+.mo-day-name {
+  font: 400 24px/1.1 var(--serif);
+}
+
+.mo-day-date {
+  font: 500 12px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.mo-day-body {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  padding: 6px 0;
+}
+
+.mo-day-hours {
+  position: relative;
+  flex: none;
+  width: 44px;
+}
+
+.mo-day-hours span {
+  position: absolute;
+  left: 0;
+  translate: 0 -50%;
+  font: 500 11px/1 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.mo-day-track {
+  position: relative;
+  flex: 1;
+  border-radius: 10px;
+  background-color: var(--tile-surface);
+  background-image: linear-gradient(var(--tile-rule) 1px, transparent 1px);
+  background-size: 100% calc(100% / 11);
+  box-shadow: 0 0 0 1px var(--tile-rule);
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+}
+
+.mo-plan {
+  padding: 1px 2px;
+  min-height: 0;
+  cursor: grab;
+  outline: none;
+}
+
+.mo-plan-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  height: 100%;
+  overflow: hidden;
+  padding: 4px 8px;
+  border-left: 3px solid var(--tile-accent);
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--tile-accent) 16%, var(--tile-surface));
+  color: var(--tile-ink);
+  transition: box-shadow 140ms var(--ease-out);
+}
+
+.mo-plan[data-new] .mo-plan-body {
+  background: var(--tile-accent);
+  color: var(--tile-accent-ink);
+}
+
+.mo-plan[data-short] .mo-plan-body {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  padding-block: 0;
+}
+
+.mo-plan[data-dragging],
+.mo-plan[data-resizing],
+.mo-plan[data-drawing] {
+  z-index: 2;
+  cursor: grabbing;
+}
+
+.mo-plan[data-dragging] .mo-plan-body,
+.mo-plan[data-resizing] .mo-plan-body {
+  box-shadow: 0 10px 20px -8px oklch(0.2 0.05 250 / 0.45);
+}
+
+.mo-plan:focus-visible .mo-plan-body {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 1px;
+}
+
+.mo-plan-title {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mo-plan-time {
+  overflow: hidden;
+  font: 500 11px/1.3 var(--mono);
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+.mo-plan-edge {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 0;
+  height: 8px;
+  cursor: ns-resize;
+}
+
+/* 13. Theme preview */
+
+.mo-theme {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  max-width: 250px;
+}
+
+.mo-theme-card {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  width: 100%;
+  padding: 12px;
+  border-radius: 14px;
+  background: color-mix(in oklch, var(--swatch) 14%, var(--tile-surface));
+  box-shadow:
+    var(--tile-shadow),
+    0 0 0 1px var(--tile-rule);
+  transition: background 220ms var(--ease-out);
+}
+
+.mo-theme-bar {
+  flex: none;
+  width: 4px;
+  border-radius: 4px;
+  background: var(--swatch);
+  transition: background 220ms var(--ease-out);
+}
+
+.mo-theme-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mo-theme-title {
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.mo-theme-meta {
+  font-size: 12px;
+  color: var(--tile-ink-2);
+}
+
+.mo-theme-swatches {
+  display: flex;
+  gap: 10px;
+}
+
+.mo-theme-swatch {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--swatch);
+  cursor: pointer;
+  transition:
+    scale 140ms var(--ease-out),
+    box-shadow 140ms var(--ease-out);
+}
+
+.mo-theme-swatch:hover,
+.mo-theme-swatch[data-previewing] {
+  scale: 1.12;
+}
+
+.mo-theme-swatch[aria-checked="true"] {
+  box-shadow:
+    0 0 0 2px var(--tile-bg),
+    0 0 0 4px var(--swatch);
+}
+
+.mo-theme-swatch:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 5px;
+}
+
+.mo-theme-status {
+  margin: 0;
+  font: 500 11px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+/* 14. Lasso map */
+
+.mo-map {
+  position: relative;
+  overflow: hidden;
+  border-radius: 14px;
+  background: oklch(0.95 0.015 120);
+  box-shadow: inset 0 0 0 1px var(--tile-rule);
+  cursor: crosshair;
+  touch-action: none;
+  user-select: none;
+}
+
+.mo-map-road,
+.mo-map-river {
+  position: absolute;
+  pointer-events: none;
+}
+
+.mo-map-road {
+  background: white;
+  box-shadow: 0 0 0 1px oklch(0.88 0.01 90);
+}
+
+.mo-map-road[data-road="a"] {
+  left: -10%;
+  right: -10%;
+  top: 46%;
+  height: 8px;
+  rotate: -8deg;
+}
+
+.mo-map-road[data-road="b"] {
+  top: -10%;
+  bottom: -10%;
+  left: 48%;
+  width: 8px;
+  rotate: 14deg;
+}
+
+.mo-map-river {
+  right: -20%;
+  bottom: -30%;
+  width: 70%;
+  height: 50%;
+  border-radius: 50%;
+  background: oklch(0.86 0.05 225);
+}
+
+.mo-pin {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 2px solid white;
+  border-radius: 50% 50% 50% 4px;
+  background: oklch(0.4 0.02 260);
+  color: white;
+  box-shadow: 0 4px 10px -4px oklch(0 0 0 / 0.4);
+  transform: translate(-50%, -100%) rotate(-45deg);
+  cursor: pointer;
+  transition:
+    background 140ms,
+    scale 160ms var(--ease-out);
+}
+
+.mo-pin svg {
+  rotate: 45deg;
+}
+
+.mo-pin[data-selected],
+.mo-pin[data-lassoed] {
+  background: var(--tile-accent);
+  scale: 1.12;
+}
+
+.mo-pin:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+}
+
+.mo-lasso {
+  border: 1.5px solid var(--tile-accent);
+  border-radius: 4px;
+  background: color-mix(in oklab, var(--tile-accent) 14%, transparent);
+}
+
+.mo-map-status {
+  position: absolute;
+  left: 12px;
+  bottom: 10px;
+  margin: 0;
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: oklch(1 0 0 / 0.9);
+  color: oklch(0.3 0.02 60);
+  font: 500 11px/1.3 var(--mono);
+  pointer-events: none;
+}
+
+/* 15. Flow canvas */
+
+.mo-flow-frame {
+  position: relative;
+  min-height: 0;
+  container-type: inline-size;
+}
+
+@container (max-width: 520px) {
+  .mo-flow-hint {
+    display: none;
+  }
+}
+
+.mo-flow {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  border-radius: 16px;
+  box-shadow: inset 0 0 0 1px var(--tile-rule);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+}
+
+.mo-flow:active {
+  cursor: grabbing;
+}
+
+.mo-flow:focus-visible {
+  box-shadow:
+    inset 0 0 0 1px var(--tile-rule),
+    inset 0 0 0 3px var(--tile-accent);
+}
+
+.mo-flow-edges {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.mo-flow-edges path {
+  fill: none;
+  stroke: var(--tile-ink-2);
+  stroke-width: 2;
+}
+
+.mo-flow-edges path[data-draft] {
+  stroke: var(--tile-accent);
+  stroke-dasharray: 6 5;
+}
+
+.mo-flow-node {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px 0 10px;
+  border-radius: 12px;
+  background: var(--tile-surface);
+  box-shadow:
+    var(--tile-shadow),
+    inset 0 0 0 1px var(--tile-rule);
+  cursor: grab;
+  outline: none;
+  transition:
+    box-shadow 160ms var(--ease-out),
+    scale 160ms var(--ease-out);
+}
+
+.mo-flow-node:focus-visible {
+  box-shadow:
+    var(--tile-shadow),
+    0 0 0 2px var(--tile-accent);
+}
+
+.mo-flow-node[data-dragging] {
+  z-index: 2;
+  scale: 1.04;
+  cursor: grabbing;
+  box-shadow:
+    0 18px 36px -12px oklch(0.1 0.08 260 / 0.8),
+    inset 0 0 0 1px var(--tile-accent);
+}
+
+.mo-flow-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: var(--tile-accent);
+  color: var(--tile-accent-ink);
+}
+
+.mo-flow-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.mo-flow-title {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mo-flow-kind {
+  font: 500 11px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.mo-port {
+  position: absolute;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--tile-ink-2);
+  border-radius: 50%;
+  background: var(--tile-bg);
+  translate: -50% -50%;
+  cursor: crosshair;
+  transition:
+    scale 140ms var(--ease-out),
+    background 140ms,
+    border-color 140ms;
+}
+
+.mo-port::before {
+  content: "";
+  position: absolute;
+  inset: -8px;
+  border-radius: 50%;
+}
+
+.mo-port[data-port="in"] {
+  left: 0;
+}
+
+.mo-port[data-port="out"] {
+  left: 100%;
+}
+
+.mo-port:hover,
+.mo-port[data-connect="candidate"] {
+  border-color: var(--tile-accent);
+  scale: 1.2;
+}
+
+.mo-port[data-connect="source"],
+.mo-port[data-connect="target"] {
+  border-color: var(--tile-accent);
+  background: var(--tile-accent);
+  scale: 1.3;
+}
+
+.mo-flow-hint {
+  position: absolute;
+  left: 14px;
+  bottom: 12px;
+  margin: 0;
+  font: 500 11px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+  pointer-events: none;
+}
+
+.mo-flow-tools {
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 11px;
+  background: var(--tile-surface);
+  box-shadow:
+    var(--tile-shadow),
+    inset 0 0 0 1px var(--tile-rule);
+}
+
+.mo-tool {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--tile-ink-2);
+  cursor: pointer;
+}
+
+.mo-tool:hover {
+  background: color-mix(in oklab, var(--tile-ink) 10%, transparent);
+  color: var(--tile-ink);
+}
+
+.mo-tool:focus-visible {
+  outline: 2px solid var(--tile-accent);
+}
+
+.mo-zoom-readout {
+  min-width: 42px;
+  text-align: center;
+  font: 500 11px/1 var(--mono);
+  color: var(--tile-ink-2);
+}
+
+/* 16. Throw */
+
+.mo-deck {
+  position: relative;
+  width: 196px;
+  height: 140px;
+}
+
+.mo-place {
+  --depth: 0;
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 2px;
+  padding: 14px;
+  border-radius: 18px;
+  background: var(--tile-surface);
+  color: oklch(0.25 0.03 40);
+  box-shadow: 0 12px 30px -14px oklch(0.25 0.1 40 / 0.6);
+  transform: translateY(calc(var(--depth) * -10px))
+    scale(calc(1 - var(--depth) * 0.06));
+  transform-origin: 50% 0;
+  transition:
+    transform 260ms var(--ease-out),
+    opacity 200ms var(--ease-out);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+}
+
+.mo-place[data-depth="0"] {
+  z-index: 3;
+}
+
+.mo-place[data-depth="1"] {
+  z-index: 2;
+}
+
+.mo-place[data-depth="2"] {
+  z-index: 1;
+}
+
+.mo-place > * {
+  transition: opacity 200ms var(--ease-out);
+}
+
+.mo-place:not([data-depth="0"]) > * {
+  opacity: 0;
+}
+
+.mo-place[data-dragging] {
+  cursor: grabbing;
+  box-shadow: 0 24px 40px -14px oklch(0.25 0.1 40 / 0.7);
+}
+
+.mo-place:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 3px;
+}
+
+.mo-place-map {
+  position: absolute;
+  inset: 8px 8px auto;
+  display: grid;
+  place-items: center;
+  height: 64px;
+  border-radius: 12px;
+  background:
+    linear-gradient(
+      115deg,
+      transparent 46%,
+      white 46%,
+      white 52%,
+      transparent 52%
+    ),
+    linear-gradient(20deg, transparent 60%, oklch(0.86 0.05 225) 60%),
+    oklch(0.93 0.03 110);
+  color: oklch(0.6 0.19 38);
+}
+
+.mo-place-name {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.mo-place-kind {
+  font-size: 12px;
+  line-height: 1.3;
+  color: oklch(0.5 0.03 40);
+}
+
+/* 17. Pull to refresh */
+
+.mo-pull {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 250px;
+  height: 176px;
+  overflow: hidden;
+  border-radius: 16px;
+  background: var(--tile-surface-2);
+  box-shadow: inset 0 0 0 1px var(--tile-rule);
+}
+
+.mo-pull-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 8px 6px 14px;
+}
+
+.mo-pull-title {
+  font-weight: 600;
+}
+
+.mo-pull-refresh {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--tile-ink-2);
+  cursor: pointer;
+}
+
+.mo-pull-refresh:hover {
+  background: color-mix(in oklab, var(--tile-ink) 7%, transparent);
+}
+
+.mo-pull-refresh:focus-visible {
+  outline: 2px solid var(--tile-accent);
+}
+
+.mo-pull-viewport {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.mo-pull-indicator {
+  position: absolute;
+  inset: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 44px;
+  font: 500 11px/1.3 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.mo-pull-indicator svg {
+  rotate: calc(var(--pull-progress, 0) * 270deg);
+}
+
+.mo-pull-indicator[data-phase="ready"] {
+  color: var(--tile-accent);
+}
+
+.mo-pull-indicator[data-phase="refreshing"] svg {
+  animation: mo-spin 700ms linear infinite;
+}
+
+@keyframes mo-spin {
+  to {
+    rotate: 360deg;
+  }
+}
+
+.mo-pull-sheet {
+  position: relative;
+  height: 100%;
+  padding: 6px 6px 0;
+  border-radius: 14px 14px 0 0;
+  background: var(--tile-surface);
+  box-shadow: 0 -1px 0 var(--tile-rule);
+  translate: 0 var(--pull, 0px);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.mo-pull-sheet:active {
+  cursor: grabbing;
+}
+
+.mo-pull-grabber {
+  display: block;
+  width: 32px;
+  height: 4px;
+  margin: 0 auto 4px;
+  border-radius: 4px;
+  background: var(--tile-rule);
+}
+
+.mo-pull-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mo-pull-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  padding: 0 8px;
+  font-size: 13px;
+  animation: mo-pop 260ms var(--ease-out);
+}
+
+.mo-pull-list li + li {
+  border-top: 1px solid var(--tile-rule);
+}
+
+.mo-pull-list svg {
+  flex: none;
+  color: var(--tile-accent);
+}
+
+.mo-pull-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mo-pull-far {
+  font: 500 11px/1 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+/* 18. Radial menu */
+
+.mo-radial {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.mo-radial-ring {
+  position: relative;
+  width: 148px;
+  height: 148px;
+  border-radius: 50%;
+  background: color-mix(in oklab, var(--tile-surface) 40%, transparent);
+  transition: background 160ms var(--ease-out);
+}
+
+.mo-radial[data-open] .mo-radial-ring {
+  background: color-mix(in oklab, var(--tile-surface) 85%, transparent);
+  box-shadow: var(--tile-shadow);
+}
+
+.mo-radial-pin {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 3px solid var(--tile-surface);
+  border-radius: 50%;
+  background: var(--tile-accent);
+  color: var(--tile-accent-ink);
+  box-shadow: 0 6px 14px -6px oklch(0.2 0.05 155 / 0.6);
+  translate: -50% -50%;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  transition: scale 160ms var(--ease-out);
+}
+
+.mo-radial[data-open] .mo-radial-pin {
+  scale: 0.9;
+}
+
+.mo-radial-pin:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 3px;
+}
+
+.mo-radial-item {
+  --x: 0px;
+  --y: 0px;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--tile-surface);
+  color: var(--tile-ink-2);
+  box-shadow: 0 0 0 1px var(--tile-rule);
+  translate: calc(-50% + var(--x) * 0.4) calc(-50% + var(--y) * 0.4);
+  scale: 0.6;
+  opacity: 0;
+  pointer-events: none;
+  cursor: pointer;
+  transition:
+    translate 220ms var(--ease-out),
+    scale 220ms var(--ease-out),
+    opacity 160ms var(--ease-out),
+    background 120ms,
+    color 120ms;
+}
+
+.mo-radial-item[data-index="0"] {
+  --y: -52px;
+}
+.mo-radial-item[data-index="1"] {
+  --x: 52px;
+}
+.mo-radial-item[data-index="2"] {
+  --y: 52px;
+}
+.mo-radial-item[data-index="3"] {
+  --x: -52px;
+}
+
+.mo-radial[data-open] .mo-radial-item {
+  translate: calc(-50% + var(--x)) calc(-50% + var(--y));
+  scale: 1;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.mo-radial[data-open] .mo-radial-item[data-active] {
+  background: var(--tile-accent);
+  color: var(--tile-accent-ink);
+  scale: 1.15;
+}
+
+.mo-radial-item:focus-visible {
+  outline: 2px solid var(--tile-accent);
+  outline-offset: 2px;
+}
+
+.mo-radial-caption {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.3;
+  color: var(--tile-ink-2);
+}
+
+/* 19. Split panes */
+
+.mo-split {
+  width: 100%;
+  height: 172px;
+  overflow: hidden;
+  border-radius: 14px;
+  background: var(--tile-surface);
+  box-shadow:
+    var(--tile-shadow),
+    0 0 0 1px var(--tile-rule);
+}
+
+.mo-split-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  padding: 12px 10px;
+}
+
+.mo-split-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--tile-ink-3);
+  white-space: nowrap;
+}
+
+.mo-split-layers {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mo-split-layers li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.mo-split-layers span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mo-split-layers li:first-child {
+  background: color-mix(in oklab, var(--tile-accent) 12%, transparent);
+}
+
+.mo-split-layers svg {
+  flex: none;
+  color: var(--tile-ink-3);
+}
+
+.mo-split-canvas {
+  align-items: center;
+  justify-content: center;
+  background-color: var(--tile-surface-2);
+  background-image: radial-gradient(
+    color-mix(in oklab, var(--tile-ink) 14%, transparent) 1px,
+    transparent 1px
+  );
+  background-size: 12px 12px;
+}
+
+.mo-split-board {
+  width: min(80%, 120px);
+  aspect-ratio: 16 / 10;
+  border-radius: 4px;
+  background: var(--tile-surface);
+  box-shadow:
+    0 0 0 1.5px var(--tile-accent),
+    var(--tile-shadow);
+}
+
+.mo-split-props {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+}
+
+.mo-split-props div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 7px;
+  background: var(--tile-surface-2);
+}
+
+.mo-split-props dt {
+  font: 600 11px/1 var(--mono);
+  color: var(--tile-ink-3);
+}
+
+.mo-split-props dd {
+  margin: 0;
+  font: 500 12px/1 var(--mono);
+}
+
+.mo-split-handle {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1px;
+  background: var(--tile-rule);
+  outline: none;
+  transition: background 120ms;
+}
+
+.mo-split-handle[data-hovered],
+.mo-split-handle[data-dragging] {
+  background: var(--tile-accent);
+}
+
+.mo-split-handle:focus-visible {
+  background: var(--tile-accent);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--tile-accent) 30%, transparent);
+}
+
+.mo-split-grip {
+  z-index: 1;
+  flex: none;
+  width: 6px;
+  height: 28px;
+  border: 1px solid var(--tile-rule);
+  border-radius: 4px;
+  background: var(--tile-surface);
+}
+
+.mo-split-handle[data-dragging] .mo-split-grip,
+.mo-split-handle[data-hovered] .mo-split-grip {
+  border-color: var(--tile-accent);
+}
