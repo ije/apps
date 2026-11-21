@@ -1401,8 +1401,16 @@ impl Scene {
                 let changed = before.union(after);
                 self.damage.add(changed);
                 self.patched.add(changed);
+                if let Some(under) = &mut self.under {
+                    under.damage.add(changed);
+                }
             }
-            _ => (self.damage.whole, self.patched.whole) = (true, true),
+            _ => {
+                (self.damage.whole, self.patched.whole) = (true, true);
+                if let Some(under) = &mut self.under {
+                    under.damage.whole = true;
+                }
+            }
         }
         // The layers around it draw otherwise, so their cached pixels can't be used.
         self.salt += 1;
@@ -1809,6 +1817,11 @@ impl Scene {
     // The backend drew the scene as it is.
     pub(crate) fn drawn(&mut self) {
         self.damage.clear();
+        // Frames drawn without a new diff, like patch frames, must not copy the scroll again.
+        self.shift = None;
+        if let Some(under) = &mut self.under {
+            under.damage.clear();
+        }
         // A new scene without a diff leaves the prior entries behind.
         self.drawn = self.diffed != Some(false);
         if self.diffed.take() == Some(true) {

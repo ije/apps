@@ -2249,7 +2249,7 @@ mod tests {
             Clip,
             gpu::{BOX, Instance, rect},
             point,
-            scene::Scene,
+            scene::{EffectState, Scene, effect},
         };
         use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
         let (send, receive) = std::sync::mpsc::channel();
@@ -2315,7 +2315,18 @@ mod tests {
                         (1, 4) | (2, 1) => [0.9, 0.1, 0.1, 1.],
                         _ => [shade, 0.4, 1. - shade, 1.],
                     };
+                    // A composited opacity animation, which patch frames draw without a new diff.
+                    if row == 3 {
+                        let state = EffectState {
+                            opacity: 0.8,
+                            ..effect(viewport)
+                        };
+                        scene.push_effect(state, Some(9));
+                    }
                     scene.push(quad([20., y, 120., 16.], viewport, color));
+                    if row == 3 {
+                        scene.pop_effect();
+                    }
                     scene.push(quad(
                         [150., y + 4., 30., 8.],
                         viewport,
@@ -2350,19 +2361,36 @@ mod tests {
                     .sum();
                 let pixels = read(&renderer);
                 let (_, full) = reference.draw(&scene, true).unwrap().unwrap();
-                send.send((offset, shifted, area, pixels == full, kept))
-                    .unwrap();
+                // A patch frame after the scroll must not copy the scroll again.
+                assert!(scene.patch(9, 0.4, None, [None; 2]));
+                renderer.draw(&scene, false);
+                scene.drawn();
+                let patched = read(&renderer);
+                let (_, patched_full) = reference.draw(&scene, true).unwrap().unwrap();
+                send.send((
+                    offset,
+                    shifted,
+                    area,
+                    pixels == full,
+                    kept,
+                    patched == patched_full,
+                ))
+                .unwrap();
             }
             super::super::threads::end_thread();
         };
         super::super::threads::spawn_render(job, || {});
         let mut last = 0.;
         for (at, (offset, changed)) in steps.into_iter().enumerate() {
-            let (got, shifted, area, same, kept) = receive.recv().unwrap();
+            let (got, shifted, area, same, kept, patched) = receive.recv().unwrap();
             assert_eq!(got, offset);
             assert!(
                 same,
                 "offset {offset}, change {changed}: the frame matches a full frame"
+            );
+            assert!(
+                patched,
+                "offset {offset}, change {changed}: the patch frame matches a full frame"
             );
             // The first scroll keeps the window below the bar, and later frames keep it up to date.
             assert_eq!(kept, at > 0, "offset {offset}, change {changed}");
