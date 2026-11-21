@@ -5581,6 +5581,35 @@ fn offsets_leave_out_transforms_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn offsets_leave_out_animated_transforms_like_chrome() {
+    let text = run_hidden(
+        r#"
+        await load('t.html');
+        await run("window.runs = [document.getElementById('a').animate([{ translate: '0 50px' }, { translate: '0 0' }], { duration: 4000 }), document.getElementById('b').animate([{ transform: 'translate(30px, 40px) rotate(10deg)' }, { transform: 'none' }], { duration: 4000 })]; 1");
+        const out = [];
+        for (let i = 0; i < 4; i++) {
+            await win.webContents.capturePage({ x: 0, y: 0, width: 8, height: 8 });
+            await new Promise(done => setTimeout(done, 40));
+            out.push(await run("[...'ab'].map(id => { const e = document.getElementById(id); return [e.offsetLeft, e.offsetTop, Math.round(e.getBoundingClientRect().top) > e.offsetTop] }).join(' ')"));
+        }
+        console.log('OFFSETS ' + [...new Set(out)].join(' | '));
+        "#,
+        &[(
+            "t.html",
+            "<body style='margin:0;font:10px/12px Helvetica'><div style='position:relative;padding:3px'>\
+             <b id=a style='display:block;height:20px'>x</b><b id=b style='display:block;height:20px'>x</b></div></body>",
+        )],
+    );
+    let offsets = text
+        .lines()
+        .find_map(|line| line.strip_prefix("OFFSETS "))
+        .unwrap_or_else(|| panic!("{text}"));
+    // Chrome's values: the boxes are drawn lower while they animate, and their offsets stay their layout places.
+    assert_eq!(offsets, "3,3,true 3,23,true");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn positioned_boxes_fill_aspect_ratio_and_padding_boxes_like_chrome() {
     let text = run_hidden(
         r#"

@@ -3605,8 +3605,10 @@ pub fn call(
                 renderer::point(renderer::px(0.), renderer::px(0.)),
                 renderer::size(renderer::px(size[0]), renderer::px(size[1])),
             );
+            // The bounds are those of the last frame, so its animated transform moved them.
+            let moved = state.animating.get(&id).unwrap_or(style);
             let shift = match transformed
-                .then(|| crate::render::effects::transform(style, units, local, None))
+                .then(|| crate::render::effects::transform(moved, units, local, None))
                 .flatten()
             {
                 Some(m) if m[3] == 0. && m[7] == 0. && m[15] == 1. => {

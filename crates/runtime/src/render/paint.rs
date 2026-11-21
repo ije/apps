@@ -636,9 +636,10 @@ impl DomBox {
             scaled(window_bounds.size.width, size.width)
                 || scaled(window_bounds.size.height, size.height)
                 || !self.drawn
-                    && [Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE, Prop::TRANSFORM]
-                        .into_iter()
-                        .any(|prop| self.style.get(prop).is_some_and(|value| value != "none")),
+                    && (self.transformed
+                        || [Prop::TRANSLATE, Prop::ROTATE, Prop::SCALE, Prop::TRANSFORM]
+                            .into_iter()
+                            .any(|prop| self.style.get(prop).is_some_and(|value| value != "none"))),
         );
         // Like Chrome, a box that columns split reports the union of its parts.
         if let Some(union) = parts.iter().copied().reduce(|all, part| all.union(part)) {
