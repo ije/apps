@@ -694,6 +694,47 @@ pub(crate) fn line_block(doc: &Document, styles: &ComputedStyles, id: usize) -> 
     Some(up)
 }
 
+/// Whether the lines of its block give `id` a box of its own. A plain inline box whose style they can draw is a
+/// part of their text instead.
+pub(crate) fn own_box(doc: &Document, styles: &ComputedStyles, id: usize) -> bool {
+    let node = &doc.nodes[id];
+    let style = &styles.values[id];
+    if node.tag.starts_with('#')
+        || style
+            .get(Prop::DISPLAY)
+            .is_some_and(|value| value != "inline")
+        || matches!(
+            node.tag.as_str(),
+            "img"
+                | "svg"
+                | "canvas"
+                | "video"
+                | "audio"
+                | "iframe"
+                | "object"
+                | "embed"
+                | "input"
+                | "button"
+                | "select"
+                | "textarea"
+                | "progress"
+                | "meter"
+        )
+        || styles.pseudos.contains_key(&id)
+        || styles.animations.contains_key(&id)
+    {
+        return true;
+    }
+    std::iter::successors(node.parent, |&up| doc.nodes[up].parent)
+        .find(|&up| {
+            styles.values[up]
+                .get(Prop::DISPLAY)
+                .is_some_and(|value| !matches!(value, "inline" | "contents"))
+                && !spliced(doc, styles, up)
+        })
+        .is_none_or(|block| splits(style, &styles.values[block]))
+}
+
 // Retain both styles used as pointer keys to prevent address reuse.
 fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
     type Pairs = rustc_hash::FxHashMap<(*const Style, *const Style), (Rc<Style>, Rc<Style>, bool)>;

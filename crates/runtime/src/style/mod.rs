@@ -22,9 +22,9 @@ pub(crate) use parser::{DROPPED, FontUnits, Lengths, NodeLengths};
 use shorthand::{BORDER_IMAGE, BORDER_IMAGE_INITIAL, expand};
 pub(crate) use text::{
     Atom, CUT_AFTER, CUT_BEFORE, CUT_FIRST, CUT_LAST, InlineBox, InlineText, LineHeight, atom_key,
-    cursor, font, holds_block_box, inline_text, line_height, makes_no_line, placed_out_of_flow,
-    pseudo_blocks, pseudo_content, restyle, selection_colors, spacing, spliced, text_run,
-    text_transform, word_break,
+    cursor, font, holds_block_box, inline_text, line_height, makes_no_line, own_box,
+    placed_out_of_flow, pseudo_blocks, pseudo_content, restyle, selection_colors, spacing, spliced,
+    text_run, text_transform, word_break,
 };
 pub use value::length;
 pub(crate) use value::{

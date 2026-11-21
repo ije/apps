@@ -295,11 +295,11 @@ impl PageState {
         let kept = self.kept.borrow();
         let mut node = id;
         let place = loop {
-            // An inline box that holds a block splits around it or not by its style, which its block decides.
-            if let Some(record) = kept
-                .get(&node)
-                .filter(|_| !style::holds_block_box(doc, styles, node))
-            {
+            // An inline box that holds a block splits around it or not by its style, which its block decides. An
+            // inline box that lost what gave it a box of its own goes back into the text of its block.
+            if let Some(record) = kept.get(&node).filter(|_| {
+                !style::holds_block_box(doc, styles, node) && style::own_box(doc, styles, node)
+            }) {
                 break record
                     .in_place()
                     .filter(|_| {

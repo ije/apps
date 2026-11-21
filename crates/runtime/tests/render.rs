@@ -6723,6 +6723,37 @@ fn pretty_rows_rects_and_carets_of_case_mappings_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn inline_boxes_go_back_into_their_lines_without_opacity() {
+    let text = run_hidden(
+        &format!(
+            r#"{RECTS}
+            await load('back.html');
+            for (const value of ['0.5', '']) {{
+              await run(`for (const id of ['a', 'c']) document.getElementById(id).style.opacity = '${{value}}'`);
+              await win.webContents.capturePage();
+            }}
+            console.log('RECTS ' + await rects());
+            "#
+        ),
+        &[(
+            "back.html",
+            "<body style='margin:0;font:14px/20px Helvetica'><style>.w{width:220px}</style>\
+             <div class=w>aa lead <span id=a>plain child text with <i>italic</i> part in text</span> zz</div>\
+             <div class=w>aa lead <span id=b>plain child text with <i>italic</i> part in text</span> zz</div>\
+             <div class=w>aa <span style='border:1px solid'>lead <span id=c>plain child text with \
+             <i>italic</i> part</span><div>blk</div> tail</span> zz</div>\
+             <div class=w>aa <span style='border:1px solid'>lead <span id=d>plain child text with \
+             <i>italic</i> part</span><div>blk</div> tail</span> zz</div></body>",
+        )],
+    );
+    let rects = rects(&text);
+    for (toggled, fresh) in [("a", "b"), ("c", "d")] {
+        assert_eq!(rects[toggled], rects[fresh], "{toggled}: {text}");
+    }
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn inline_boxes_split_around_their_blocks_like_chrome() {
     let text = run_hidden(
         &format!(
