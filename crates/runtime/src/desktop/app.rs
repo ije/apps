@@ -16,6 +16,8 @@ static DEV_LIBRARIES: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceL
 
 // The executable whose folder holds the library `name`.
 #[doc(hidden)]
+// Only debug builds read `name`.
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
 pub fn library_exe(name: &str) -> std::io::Result<std::path::PathBuf> {
     if let Some(exe) = DEV_LIBRARIES.get() {
         return Ok(exe.clone());
