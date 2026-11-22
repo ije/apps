@@ -284,7 +284,8 @@ impl Window {
                 let grown = radii.moved_out(shadow.spread_radius, grown);
                 ((bounds + shadow.offset).outset(shadow.spread_radius), grown)
             };
-            let mut instance = Instance::new(SHADOW, self.cover_bounds(shape), clip);
+            let quad = self.cover_bounds(shape);
+            let mut instance = Instance::new(SHADOW, quad, clip);
             instance.radii = shape_radii.scale(scale).to_array();
             instance.color = shadow.color.fade(self.opacity).to_array();
             instance.aux = caster;
@@ -292,7 +293,50 @@ impl Window {
             [instance.shape[0], instance.shape[1]] = [top, bottom];
             instance.info[1] = f32::from(u8::from(inset));
             instance.info[2] = shadow.blur_radius.scale(scale);
-            self.scene.push(instance);
+            // The shader draws nothing under the box of an outer shadow, or inside the shape of an inset
+            // one, so the quad leaves that hole out.
+            let blur = instance.info[2] * 3.;
+            let rect =
+                |[x, y, width, height]: [f32; 4]| Rect::new(point(x, y), size(width, height));
+            let area = match inset {
+                true => rect(caster),
+                false => rect([
+                    quad.left() - blur,
+                    quad.top() - blur,
+                    quad.size.width + blur * 2.,
+                    quad.size.height + blur * 2.,
+                ]),
+            };
+            let (solid, radii, margin) = match inset {
+                true => (quad, instance.radii, blur + 1.),
+                false => (rect(caster), caster_radii, 1.),
+            };
+            let [x, y] = [&radii[..4], &radii[4..]]
+                .map(|radii| radii.iter().copied().fold(0., f32::max) + margin);
+            let hole = rect([
+                solid.left() + x,
+                solid.top() + y,
+                solid.size.width - x * 2.,
+                solid.size.height - y * 2.,
+            ])
+            .intersect(area);
+            // A strip that the mask cut would draw differently in another mask, so such a shadow stays whole.
+            let cut = clip.bounds.intersect(area) != area;
+            if cut || hole.size.width < 64. || hole.size.height < 64. {
+                self.scene.push(instance);
+                continue;
+            }
+            for strip in [
+                Rect::between(area.origin, point(area.right(), hole.top())),
+                Rect::between(point(area.left(), hole.bottom()), area.bottom_right()),
+                Rect::between(point(area.left(), hole.top()), hole.bottom_left()),
+                Rect::between(hole.top_right(), point(area.right(), hole.bottom())),
+            ] {
+                if !strip.is_empty() {
+                    instance.clip = strip.to_array();
+                    self.scene.push(instance);
+                }
+            }
         }
     }
 
