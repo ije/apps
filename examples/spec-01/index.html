@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SPEC-01/HARDWARE</title>
+  <link rel="stylesheet" href="./styles/app.css">
+</head>
+<body>
+  <spec-hardware data-site data-key="orange" key-color="0.64 0.31 48">
+    <spec-navbar>
+      <ui-radio-group slot="leading" data-kit="key-picker" aria-label="Key color" default-value="orange">
+        <ui-radio value="orange" data-kit="key-swatch" title="Orange-red" style="--swatch: oklch(0.64 0.31 48)"></ui-radio>
+        <ui-radio value="yellow" data-kit="key-swatch" title="Yellow" style="--swatch: oklch(0.94 0.23 105.21)"></ui-radio>
+        <ui-radio value="green" data-kit="key-swatch" title="Green" style="--swatch: oklch(0.7 0.29 147.6)"></ui-radio>
+        <ui-radio value="blue" data-kit="key-swatch" title="Blue" style="--swatch: oklch(0.56 0.37 260)"></ui-radio>
+        <ui-radio value="violet" data-kit="key-swatch" title="Violet" style="--swatch: oklch(0.56 0.3 296.49)"></ui-radio>
+        <ui-radio value="black" data-kit="key-swatch" title="Black" style="--swatch: oklch(0.24 0 0)"></ui-radio>
+      </ui-radio-group>
+      <button slot="leading" type="button" data-kit="sound-toggle" aria-label="Interaction sounds">
+        <spec-icon name="volume"></spec-icon>
+      </button>
+      <a href="#/">Components</a>
+      <a href="#/music">Player</a>
+      <a href="#/paint">Paint</a>
+      <a href="#/midi">MIDI</a>
+      <a href="#/timer">Timer</a>
+      <a href="#/color">Color</a>
+      <a href="#/image">Photo</a>
+      <a href="#/dashboard">Dashboard</a>
+    </spec-navbar>
+    <main data-kit="sheet"></main>
+    <footer data-site-footer>by <a href="https://x.com/shuding" target="_blank">@shuding</a></footer>
+    <spec-toasts></spec-toasts>
+  </spec-hardware>
+  <script type="module" src="./page.ts"></script>
+</body>
+</html>

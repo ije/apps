@@ -1,0 +1,206 @@
+/* The site around the panels, with its navbar floating over the top. Pages
+   are centered under it; --site-edge is the navbar's margin from the sides. */
+[data-site] {
+  --site-edge: 16px;
+  min-height: 100dvh;
+  color: var(--ink);
+  background: var(--tex-grain) #eeeeec;
+}
+
+[data-site] > main[data-kit="sheet"] {
+  min-height: auto;
+  padding-top: 40px;
+}
+
+[data-site] > main[data-kit="app"] [data-kit="sidebar"] {
+  top: 76px;
+  height: calc(100dvh - 76px);
+}
+
+/* The deployments console fills the page below the strip. */
+[data-site] > main[data-kit="app"] [data-kit="shell"] {
+  min-height: calc(100dvh - 76px);
+}
+
+[data-site] > main[data-kit="app"] [data-kit="topbar"] {
+  top: 76px;
+}
+
+/* The introduction under the title: a short measure, in a gray dark enough
+   to read (the dim print color is 2.8:1 here; this is 5.4:1). */
+/* On narrow screens the title steps down to 40px, and further if even that
+   won't fit: it runs 9 times its size wide, with no space to wrap at. */
+@media (max-width: 760px) {
+  [data-skin="hardware"][data-site] [data-kit="masthead"] h1 {
+    font-size: min(40px, (100vw - 32px) / 9);
+  }
+}
+
+/* The link to the prompt for a coding agent, under the subtitle. It opens
+   a popover, so it's a button, drawn as the link. */
+[data-site] [data-kit="masthead"] [data-install-prompt] {
+  margin-top: 14px;
+  font-size: 15px;
+
+  & button[data-kit="link"] {
+    padding: 0;
+    border: 0;
+    background: none;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+  }
+}
+
+/* The prompt in its popover, printed on the LCD in its own case, keeping
+   its breaks, with a block cursor blinking after the last line. */
+[data-skin="hardware"] [data-install-prompt-surface]:not(#_):not(#_) {
+  width: min(580px, calc(100vw - 32px));
+
+  & [data-install-prompt-text] {
+    max-width: none;
+    margin: 0;
+    padding: 4px 2px 0;
+    font: 400 13px/1.65 var(--sans);
+    color: var(--gray-ink);
+    text-transform: none;
+    white-space: pre-wrap;
+    /* Rows fill to the edge and break at any character, as on a character LCD. */
+    word-break: break-all;
+  }
+
+  & [data-install-caret] {
+    display: inline-block;
+    width: 0.6em;
+    height: 1.15em;
+    margin-inline-start: 2px;
+    vertical-align: -0.22em;
+    background: var(--gray-ink);
+    animation: screen-cursor 1.1s steps(1) infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-skin="hardware"] [data-install-caret] {
+    animation: none;
+  }
+}
+
+[data-site] [data-kit="masthead"] p {
+  max-width: 54ch;
+  margin-top: 14px;
+  font-size: 15px;
+  line-height: 1.5;
+  color: #5f5e59;
+  text-wrap: pretty;
+
+  & a {
+    color: var(--ink);
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+  }
+}
+
+/* The catalog packs densely, so smaller panels fill holes left by wide ones. */
+[data-site] [data-kit="grid"] {
+  grid-auto-flow: row dense;
+}
+
+/* Narrow screens: even margins of 16px, and the navbar nearly to the edges. */
+@media (max-width: 760px) {
+  [data-site] {
+    --site-edge: 10px;
+  }
+
+  [data-site] > main[data-kit="sheet"] {
+    padding-inline: 16px;
+  }
+}
+
+/* Phones: the page fades out at the top and bottom of the screen instead of
+   being cut off there. Two fixed strips blur what scrolls under them, the
+   blur and a wash of the page's gray fading out toward the middle. The top
+   one sits under the navbar and covers the status bar's area too; the
+   bottom one covers the home indicator's. They take no taps. */
+@media (max-width: 760px) {
+  [data-skin="hardware"][data-site]::before,
+  [data-skin="hardware"][data-site]::after {
+    content: "";
+    position: fixed;
+    z-index: 50;
+    left: 0;
+    right: 0;
+    pointer-events: none;
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+  }
+
+  [data-skin="hardware"][data-site]::before {
+    top: 0;
+    height: calc(env(safe-area-inset-top, 0px) + 28px);
+    background: linear-gradient(to bottom, rgb(238 238 236 / 1), rgb(238 238 236 / 0));
+    -webkit-mask-image: linear-gradient(to bottom, #000 18%, transparent);
+    mask-image: linear-gradient(to bottom, #000 18%, transparent);
+  }
+
+  [data-skin="hardware"][data-site]::after {
+    bottom: 0;
+    height: calc(env(safe-area-inset-bottom, 0px) + 32px);
+    background: linear-gradient(to top, rgb(238 238 236 / 1), rgb(238 238 236 / 0));
+    -webkit-mask-image: linear-gradient(to top, #000 18%, transparent);
+    mask-image: linear-gradient(to top, #000 18%, transparent);
+  }
+}
+
+/* The site is a column filling the window, the page taking what's left, so
+   on a short page the footer still sits at the window's foot. */
+[data-skin="hardware"][data-site] {
+  display: flex;
+  flex-direction: column;
+  /* Its top padding counts toward the window's height, not past it. */
+  box-sizing: border-box;
+
+  /* The footer takes the last 52px of the sheet's usual 120px foot. The
+     sheet is a grid, so its content packs to the top: otherwise its row
+     stretched with it and pulled every device page's device tall. */
+  & > [data-kit="sheet"] {
+    flex: 1 0 auto;
+    width: 100%;
+    padding-bottom: 68px;
+    align-content: start;
+  }
+}
+
+/* The footer: the author, printed small under the page. */
+[data-site-footer] {
+  padding: 0 24px 40px;
+  text-align: center;
+  font: var(--label);
+  letter-spacing: 0.08em;
+
+  & a {
+    color: #5f5e59;
+    text-decoration: none;
+
+    &:hover {
+      color: var(--ink);
+    }
+  }
+}
+
+
+/* The navbar is the title bar of the window: it spans the window and drags
+   it, and on macOS it leaves room for the window buttons. */
+[data-skin="hardware"][data-site] > [data-kit="navbar"] {
+  width: calc(100% - var(--site-edge) * 2);
+  app-region: drag;
+
+  & :is(a, button, [data-kit="key-picker"]) {
+    app-region: no-drag;
+  }
+}
+
+[data-skin="hardware"][data-site][data-titlebar] > [data-kit="navbar"] {
+  padding-left: 92px;
+}

@@ -1,0 +1,32 @@
+/* The skin's rules with a child selector that the wrapper elements of
+   @ui-sdk/web (ui-popover-close around its button, and the like) keep from
+   matching. They are the same rules, with a descendant selector. */
+[data-skin="hardware"] [data-kit="stepper"] [data-kit="button"]:not(#_):not(#_):not(#_) {
+  justify-content: center;
+  align-items: center;
+}
+
+[data-row] [data-kit="button"]:has([data-kit="icon"]):not(#_) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+[data-skin="hardware"] [data-kit="actions"] [data-kit="button"]:has(> [data-icon]):not(#_):not(#_) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+
+  & [data-icon] svg {
+    width: 14px;
+    height: 14px;
+  }
+}
+
+[data-skin="hardware"] [data-kit="popover"] [data-kit="popover-surface"]:not([data-size]):not(#_):not(#_):not(#_):not(#_):not(#_) [data-kit="actions"] [data-kit="button"] {
+  height: 34px;
+  min-width: 0;
+  padding: 0 14px;
+}
