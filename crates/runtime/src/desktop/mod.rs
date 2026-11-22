@@ -2444,6 +2444,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "only macOS moves windows")]
     fn window_state_events_and_close_follow_electron() {
         let code = r#"
             const {app, BrowserWindow} = __apps;
@@ -2551,6 +2552,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "uses window methods that only macOS has"
+    )]
     fn window_extras_follow_electron() {
         let code = r#"
             const {app, BrowserWindow} = __apps;

@@ -1268,10 +1268,14 @@ mod tests {
             r#"5{"type":"keyDown","key":"Process","code":"p","isAutoRepeat":false,"isComposing":true,"shift":false,"control":false,"alt":false,"meta":false,"location":0,"modifiers":[]}|5{"type":"keyDown","key":"P","code":"p","isAutoRepeat":false,"isComposing":false,"shift":false,"control":false,"alt":false,"meta":false,"location":0,"modifiers":[]}"#
         );
         let tools = Modifiers::COMMAND.plus(Modifiers::ALT);
+        let primary = match cfg!(target_os = "macos") {
+            true => Modifiers::COMMAND,
+            false => Modifiers::CTRL,
+        };
         for tool in [
             key("f12", Modifiers::NONE),
             key("i", tools),
-            key("f", tools),
+            key("f", primary.plus(Modifiers::ALT)),
         ] {
             assert!(!main.before_input(5, &down(tool), &|| false));
         }

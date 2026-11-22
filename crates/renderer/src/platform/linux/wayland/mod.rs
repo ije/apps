@@ -145,6 +145,8 @@ struct Screen {
     at: Option<Point<i32>>,
     pixels: Option<crate::Size<i32>>,
     scale: i32,
+    // In mHz, 0 when unknown.
+    refresh: i32,
 }
 
 struct Keys {
@@ -655,6 +657,20 @@ fn scroll(delta: &mut Option<Point<f32>>, axis: WEnum<wl_pointer::Axis>, amount:
 }
 
 impl Client {
+    // The time of one refresh of the fastest screen.
+    pub(super) fn period(&self) -> Duration {
+        let live = self.live.borrow();
+        let fastest = live
+            .screens
+            .values()
+            .map(|(_, screen)| screen.refresh)
+            .max();
+        match fastest {
+            Some(rate @ 1_000..) => Duration::from_secs(1000) / rate as u32,
+            _ => Duration::from_micros(16_667),
+        }
+    }
+
     fn on_registry(
         &self,
         registry: &wl_registry::WlRegistry,
@@ -701,9 +717,10 @@ impl Client {
                 flags: WEnum::Value(flags),
                 width,
                 height,
-                ..
+                refresh,
             } if flags.contains(wl_output::Mode::Current) => {
                 screen.pixels = Some(size(width, height));
+                screen.refresh = refresh;
             }
             _ => {}
         }

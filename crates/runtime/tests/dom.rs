@@ -9,7 +9,7 @@ use std::{cell::RefCell, rc::Rc};
 fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><main><div id='left'></div><div id='right'></div></main></body></html>"),
+        doc: Document::parse("<html><body><main><div id='left' style='overflow:auto'></div><div id='right' style='overflow:auto'></div></main></body></html>"),
         dirty: false,
     });
     let engine = JsContext::new(
@@ -47,6 +47,7 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
         if(JSON.stringify(received)!=='[["capture","left"],["left",60,25],["capture","right"],["right",60,25]]') throw Error(JSON.stringify(received));
         received.length=0;
         const root=document.body.attachShadow({mode:'open'}), inner=document.createElement('div');
+        inner.style.overflow='auto';
         root.append(inner);
         document.addEventListener('scroll',()=>received.push('outside'),true);
         root.addEventListener('scroll',()=>received.push('shadow'),true);
@@ -1453,8 +1454,10 @@ fn offscreen_canvas_draws_reads_and_resizes() {
         const element = document.createElement('canvas'); element.width = element.height = 4; const other = element.getContext('2d'); other.drawImage(canvas, 2, 2);
         same([...other.getImageData(3, 3, 1, 1).data], [255, 0, 0, 255], 'drawn on a canvas');
         const blob = await canvas.convertToBlob({ type: 'image/webp' }), jpeg = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.5 });
-        same([blob.type, jpeg.type, element.toDataURL('image/JPEG').slice(0, 26), element.toDataURL('text/plain').slice(0, 22)], ['image/png', 'image/jpeg', 'data:image/jpeg;base64,/9j', 'data:image/png;base64,'], 'blob type');
-        same([...new Uint8Array(await blob.arrayBuffer()).subarray(0, 4), ...new Uint8Array(await jpeg.arrayBuffer()).subarray(0, 2)], [137, 80, 78, 71, 255, 216], 'png');
+        // Only macOS makes JPEG, and other platforms give PNG for it.
+        const mac = navigator.platform.includes('Mac');
+        same([blob.type, jpeg.type, element.toDataURL('image/JPEG').slice(0, 26), element.toDataURL('text/plain').slice(0, 22)], mac ? ['image/png', 'image/jpeg', 'data:image/jpeg;base64,/9j', 'data:image/png;base64,'] : ['image/png', 'image/png', 'data:image/png;base64,iVBO', 'data:image/png;base64,'], 'blob type');
+        same([...new Uint8Array(await blob.arrayBuffer()).subarray(0, 4), ...new Uint8Array(await jpeg.arrayBuffer()).subarray(0, 2)], [137, 80, 78, 71, ...(mac ? [255, 216] : [137, 80])], 'png');
         context.fillStyle = '#00ff00'; canvas.width = 6;
         same([canvas.width, [...context.getImageData(0, 0, 1, 1).data]], [6, [0, 0, 0, 0]], 'resize clears');
         same(context.fillStyle, '#000000', 'resize resets the state');
@@ -1703,7 +1706,8 @@ fn bitmaps_free_their_pixels() {
         .unwrap();
     let (mut most, mut made) = (0, 0);
     let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_secs(3) {
+    // A loaded machine makes few bitmaps in a debug build, so it makes at least 40.
+    while started.elapsed() < std::time::Duration::from_secs(3) || made < 40 {
         engine.eval("drop()", "test").unwrap();
         made += 1;
         engine.tick().unwrap();
@@ -2429,8 +2433,9 @@ fn focus_editing_fonts_and_xml_follow_the_standard() {
         t.focus();
         for (const value of ['ab👨‍👩‍👧', 'xé', 'a🇫🇷🇩🇪', '🇫🇷'.repeat(40), 'q🏳️‍🌈']) { t.value = value; t.setSelectionRange(value.length, value.length); key('Backspace'); edits.push(t.value); }
         t.value = '🇫🇷🇩🇪x'; t.setSelectionRange(0, 0); key('Delete'); edits.push(t.value);
-        t.value = 'foo  bar  '; t.setSelectionRange(10, 10); key('Backspace', { altKey: true, ctrlKey: !navigator.platform.includes('Mac') }); edits.push(t.value);
-        t.value = '  foo bar'; t.setSelectionRange(0, 0); key('Delete', { altKey: true, ctrlKey: !navigator.platform.includes('Mac') }); edits.push(t.value);
+        const mac = navigator.platform.includes('Mac');
+        t.value = 'foo  bar  '; t.setSelectionRange(10, 10); key('Backspace', { altKey: mac, ctrlKey: !mac }); edits.push(t.value);
+        t.value = '  foo bar'; t.setSelectionRange(0, 0); key('Delete', { altKey: mac, ctrlKey: !mac }); edits.push(t.value);
         check('graphemes and words', () => JSON.stringify(edits) === JSON.stringify(['ab', 'x', 'a🇫🇷', '🇫🇷'.repeat(39), 'q', '🇩🇪x', 'foo  ', ' bar']));
         const data = new FontFace('X', new Uint8Array([0, 1, 2, 3]).buffer), url = new FontFace('Y', 'url(y.woff2)');
         check('font data loads', () => data.status === 'error' && url.status === 'unloaded');
@@ -4250,7 +4255,9 @@ fn throwing_resize_observer_does_not_stop_layout_callbacks() {
     host.borrow_mut().pages.insert(
         1,
         Page {
-            doc: Document::parse("<html><body><main><div id='box'></div></main></body></html>"),
+            doc: Document::parse(
+                "<html><body><main><div id='box' style='overflow:auto'></div></main></body></html>",
+            ),
             dirty: false,
         },
     );

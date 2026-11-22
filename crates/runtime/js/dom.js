@@ -19,7 +19,9 @@
   let detached = false;
   let scheduled = false, changed = false, pool = [], reserve = 32, codes = new Int32Array(1024), size = 0;
   // The parsed page has no layout yet, so the first geometry read must lay it out.
-  let stale = true, laid = false, version = 0;
+  // The layout count when the page last changed, or a script scrolled, since a layout. A layout after it, like the
+  // one of a frame, has the change.
+  let stale = true, staleAt, scrolled = false, scrolledAt, laid = false, version = 0;
   const rare = { base: 0, title: 0 };
   let retrying = false;
   const flush = () => {
@@ -59,33 +61,50 @@
   const alone = value => { const last = value.charCodeAt(value.length - 1); return last >= 0xd800 && last < 0xdc00 ? value.slice(0, -1) + '\u{fffd}' : value; };
   const op = (code, a, b = 0, c = 0) => {
     if (size === codes.length) { const grown = new Int32Array(size * 2); grown.set(codes); codes = grown; }
-    changed = stale = true; version++; codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(alone(b)), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(alone(c)), c.length) : c; size += 4;
+    changed = stale = true; staleAt = geometry[2]; version++; codes[size] = code; codes[size + 1] = a; codes[size + 2] = typeof b === 'string' ? (texts.push(alone(b)), b.length) : b; codes[size + 3] = typeof c === 'string' ? (texts.push(alone(c)), c.length) : c; size += 4;
     if (!scheduled) { scheduled = true; microtask(drain); } else if (size > 1 << 18) flush();
   };
   let webviewScan = true, pickFiles, openSelect;
-  const call = (name, ...args) => { flush(); if (name === 'dom.html') { changed = true; webviewScan ||= /<webview/i.test(args[1]); } if (name === 'dom.html' || name === 'dom.scroll' || name === 'dom.focus' || name === 'dom.target' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font' || name === 'dom.animation') { stale = true; version++; } return host(name, ...args); };
+  const call = (name, ...args) => { flush(); if (name === 'dom.html') { changed = true; webviewScan ||= /<webview/i.test(args[1]); } if (name === 'dom.scroll') { scrolled = true; scrolledAt = geometry[2]; version++; } else if (name === 'dom.html' || name === 'dom.focus' || name === 'dom.target' || name === 'dom.hover' || name === 'dom.active' || name === 'dom.font' || name === 'dom.animation') { stale = true; staleAt = geometry[2]; version++; } return host(name, ...args); };
   // Keep mirror arrays private. Retain constructors and avoid prototype getters. A nonzero first float means
   // Rust moved the buffer.
   const F32 = Float32Array, U8 = Uint8Array;
   let geometry = new F32(1), marks, moves = new F32(1), limit = 0, flagged = -1; geometry[0] = 1;
   let observing = false;
+  const changes = () => (stale &&= geometry[2] === staleAt);
+  const pending = () => { scrolled &&= geometry[2] === scrolledAt; return changes() || scrolled; };
   const layout = () => {
-    if ((stale || geometry[3]) && !observing) { stale = false; laid = true; call('dom.reflow'); }
-    if (geometry[0]) { const buffer = host('dom.layout', true), capacity = new F32(buffer, 0, 4)[1]; limit = 4 + capacity * 8; geometry = new F32(buffer, 0, limit); marks = new U8(buffer, limit * 4, capacity); moves = new F32(buffer, limit * 4 + capacity, 1); }
+    if ((pending() || geometry[3]) && !observing) { stale = scrolled = false; laid = true; call('dom.reflow'); }
+    if (geometry[0]) { const buffer = host('dom.layout', true), capacity = new F32(buffer, 0, 4)[1]; limit = 4 + capacity * 8; geometry = new F32(buffer, 0, limit); marks = new U8(buffer, limit * 4, capacity); moves = new F32(buffer, limit * 4 + capacity, 2); }
     return geometry;
   };
   // Text that the last layout did not place, like text far from the view, gets a layout when a script reads it.
-  const textCall = (op, ...args) => { let result = call(op, ...args); if (result === null) { stale = true; layout(); result = call(op, ...args) ?? (op === 'dom.textRect' ? [] : 0); } return result; };
+  const textCall = (op, ...args) => { let result = call(op, ...args); if (result === null) { stale = true; staleAt = geometry[2]; layout(); result = call(op, ...args) ?? (op === 'dom.textRect' ? [] : 0); } return result; };
   // As in Chrome, the contents that a box skips get a layout when a script reads their geometry.
-  const slot = node => { layout(); const i = 4 + node._id * 8; if (i >= limit || marks[node._id] & 16 && !(!observing && node.isConnected && call('dom.skipped', node._id, true) > 0 && (stale = true, layout(), !(marks[node._id] & 16)))) return -1; if (node._placed !== version) { if (!node.isConnected) return -1; node._placed = version; } return i; };
+  const slot = node => { layout(); const i = 4 + node._id * 8; if (i >= limit || marks[node._id] & 16 && !(!observing && node.isConnected && call('dom.skipped', node._id, true) > 0 && (stale = true, staleAt = geometry[2], layout(), !(marks[node._id] & 16)))) return -1; if (node._placed !== version) { if (!node.isConnected) return -1; node._placed = version; } return i; };
   const metric = (node, k) => { const i = slot(node); return i < 0 ? 0 : geometry[i + k]; };
-  // A box that was never scrolled reads 0 without a layout.
+  // A box that was never scrolled reads 0 without a layout. A scroll offset doesn't need a layout of the boxes that
+  // it or a transform moved, so while the page has no other change it comes from the mirror.
   const scrollOf = (node, k) => {
-    if (rootElement(node)) { if (pageScroller(node)) node = document; } else if ((stale || geometry[3]) && !observing && !call('dom.scrolled', node._id)) return 0;
+    if (!observing && !geometry[0] && !changes()) {
+      host('dom.layout', false);
+      const id = rootElement(node) && !(marks[node._id] & 2) ? 0 : node._id, i = 4 + id * 8;
+      if (i < limit && !(marks[id] & 16)) return marks[id] & 2 ? geometry[i + k] : 0;
+    }
+    if (rootElement(node)) { if (pageScroller(node)) node = document; } else if ((pending() || geometry[3]) && !observing && !call('dom.scrolled', node._id)) return 0;
     return metric(node, k);
   };
+  // As in Chrome, a scroll lays out a box that was no scroll box in the last layout, so it scrolls only if it can,
+  // and its offset stays in its range.
+  const scrollTo = (node, left, top, behavior = null) => {
+    const fresh = !rootElement(node) && !(marks?.[node._id] & 2);
+    if (fresh) layout();
+    const offset = call('dom.scroll', node._id, left, top, behavior);
+    if (fresh) layout();
+    return offset;
+  };
   // Do not cache client boxes from observer reads: they use the previous frame's styles.
-  const client = node => { if (slot(node) < 0) return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; if (observing) return call('dom.client', node._id, true); const cached = node._client; if (cached?.[12] === geometry[2] && cached[13] === version) return cached; return node._client = [...call('dom.client', node._id), geometry[2], version]; };
+  const client = node => { if (slot(node) < 0) return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; if (observing) return call('dom.client', node._id, true); const cached = node._client; if (cached?.[13] === geometry[2] && cached[14] === version) return cached; return node._client = [...call('dom.client', node._id), geometry[2], version]; };
   // Only scroll boxes have a scroll range, so other boxes take the border boxes of their children as their
   // scrollable overflow, then their end padding.
   const extent = (node, axis) => {
@@ -1044,10 +1063,10 @@
     getClientRects() { if (slot(this) < 0) return listOf(DOMRectList, []); const parts = call('dom.fragments', this._id); return listOf(DOMRectList, parts ? parts.map(part => new DOMRect(...part)) : [this.getBoundingClientRect()]); }
     get clientWidth() { return rootElement(this) ? innerWidth : Math.round(client(this)[2]); } get clientHeight() { return rootElement(this) ? innerHeight : Math.round(client(this)[3]); }
     get clientLeft() { return Math.round(client(this)[0]); } get clientTop() { return Math.round(client(this)[1]); }
-    get scrollTop() { return scrollOf(this, 5); } set scrollTop(value) { call('dom.scroll', this._id, null, Number(value)); }
-    get scrollLeft() { return scrollOf(this, 4); } set scrollLeft(value) { call('dom.scroll', this._id, Number(value), null); }
+    get scrollTop() { return scrollOf(this, 5); } set scrollTop(value) { scrollTo(this, null, Number(value)); }
+    get scrollLeft() { return scrollOf(this, 4); } set scrollLeft(value) { scrollTo(this, Number(value), null); }
     get scrollWidth() { return pageScroller(this) ? Math.round(innerWidth + metric(document, 6)) : extent(this, 0); } get scrollHeight() { return pageScroller(this) ? Math.round(innerHeight + metric(document, 7)) : extent(this, 1); }
-    scrollTo(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); call('dom.scroll', this._id, left ?? null, top ?? null, behavior); }
+    scrollTo(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); scrollTo(this, left ?? null, top ?? null, behavior); }
     scroll(left, top) { this.scrollTo(left, top); }
     scrollBy(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); this.scrollTo({ left: this.scrollLeft + (left ?? 0), top: this.scrollTop + (top ?? 0), behavior }); }
     scrollIntoView(options = {}) {
@@ -3489,7 +3508,7 @@
   }
   class FontFaceSet extends EventTarget {
     constructor() {super();this._faces=new Set();this._css=[];}
-    _all() {const [added,css]=call('dom.fonts',0);if(added){stale=true;version++;}this._css=css.map(([family,source,range,status],i)=>{let face=this._css[i];if(face?.family!==family||face._source!==source||face.status!==status&&face.status!=='loading'){face=new FontFace(family,source,range?{unicodeRange:range}:{});face._done(status,new DOMException('Font load failed','NetworkError'));}return face;});return [...this._css,...this._faces];}
+    _all() {const [added,css]=call('dom.fonts',0);if(added){stale=true;staleAt=geometry[2];version++;}this._css=css.map(([family,source,range,status],i)=>{let face=this._css[i];if(face?.family!==family||face._source!==source||face.status!==status&&face.status!=='loading'){face=new FontFace(family,source,range?{unicodeRange:range}:{});face._done(status,new DOMException('Font load failed','NetworkError'));}return face;});return [...this._css,...this._faces];}
     add(face) {if(!(face instanceof FontFace))throw new TypeError('Expected FontFace');this._faces.add(face);return this;} delete(face){return this._faces.delete(face);} clear(){this._faces.clear();} has(face){return this._all().includes(face);} get size(){return this._all().length;} values(){return this._all().values();} keys(){return this.values();} entries(){return this._all().map(face=>[face,face]).values();} forEach(fn,thisArg){for(const face of this._all())fn.call(thisArg,face,face,this);} [Symbol.iterator](){return this.values();}
     get status() {return this._all().some(face=>face.status==='loading')?'loading':'loaded';}
     get ready() {return Promise.all(this._all().map(face=>face.status==='loading'&&face.loaded.catch(()=>{}))).then(()=>this);}
@@ -4083,6 +4102,13 @@
       query.dispatchEvent(new MediaQueryListEvent('change', { media: query.media, matches }));
     }
   };
+  // Besides the border box, a content box reads the styles, the width of the parent for percentages and the scroll
+  // range for scroll bars. A transformed box measures its layout box anew after each layout.
+  const inputs = node => {
+    const id = node._id, i = 4 + id * 8, up = node._m.up?.id, j = 4 + up * 8;
+    if (i >= limit || marks[id] & 128) return 'l' + geometry[2];
+    return moves[1] + ':' + (j < limit ? geometry[j + 2] : '') + (marks[id] & 2 ? ':' + geometry[i + 6] + ':' + geometry[i + 7] : '');
+  };
   // Use the last frame's observer flags. A forced layout here adds work every frame.
   globalThis.__appsLayout = () => {
     if (active) { observing = true; const lost = !focusable(active); observing = false; if (lost) active.blur(); }
@@ -4108,12 +4134,14 @@
     }
     // Before the first frame there is no last layout, so observers would see empty boxes.
     if ((resizeObservers.size || intersectionObservers.size) && !geometry[2]) laidOut();
-    for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(), at = geometry[2]; if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === at) continue; let [, , clientWidth, clientHeight, top, right, bottom, left, borderWidth, borderHeight] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom);
+    for (const ref of resizeObservers) { const observer = ref.deref(); if (!observer) { resizeObservers.delete(ref); continue; } const entries = []; observing = true; try { for (const [key, previous] of observer.targets) { const target = key.deref(); if (!target) { observer.targets.delete(key); continue; } const rect = target.getBoundingClientRect(), at = inputs(target); if (previous?.[0] === rect.width && previous[1] === rect.height && previous[2] === at) continue; let [, , clientWidth, clientHeight, top, right, bottom, left, borderWidth, borderHeight, , , inline] = client(target), width = Math.max(0, clientWidth - left - right), height = Math.max(0, clientHeight - top - bottom);
       // As in Chrome, an SVG element other than `<svg>` reports its bounding box, and a non-replaced inline box nothing.
-      if (target instanceof SVGElement && !(target instanceof SVGSVGElement)) { const box = target.getBBox(); top = left = 0; borderWidth = width = box.width; borderHeight = height = box.height; } else if (!atomicTags.test(target.localName)) { if (getComputedStyle(target).display === 'inline') top = left = borderWidth = borderHeight = width = height = 0; }
+      if (target instanceof SVGElement && !(target instanceof SVGSVGElement)) { const box = target.getBBox(); top = left = 0; borderWidth = width = box.width; borderHeight = height = box.height; } else if (!atomicTags.test(target.localName)) { if (inline) top = left = borderWidth = borderHeight = width = height = 0; }
       // An atomic inline box like `<math>` has no client box, so its content box comes from its border box.
       else if (!clientWidth && !clientHeight && (borderWidth || borderHeight)) { const s = getComputedStyle(target), side = name => parseFloat(s['padding' + name]) + parseFloat(s['border' + name + 'Width']); left = parseFloat(s.paddingLeft); top = parseFloat(s.paddingTop); width = Math.max(0, borderWidth - side('Left') - side('Right')); height = Math.max(0, borderHeight - side('Top') - side('Bottom')); }
-      const value = borderWidth + ':' + borderHeight + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: borderWidth, blockSize: borderHeight }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) try { observer.callback(entries, observer); } catch (error) { report(error); } }
+      // Sizes are in 1/64 pixels, like Chrome's layout units, so float noise reports no change.
+      const unit = value => Math.round(value * 64) / 64; [borderWidth, borderHeight, width, height] = [borderWidth, borderHeight, width, height].map(unit);
+      const value = observer._boxes?.get(target) === 'border-box' ? borderWidth + ':' + borderHeight : width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: borderWidth, blockSize: borderHeight }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) try { observer.callback(entries, observer); } catch (error) { report(error); } }
     // Resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
     // `scrollend` fires when a box has not scrolled for 100 ms, and only pages that listen for it pay for the timers.
     for (const id of call('dom.scrollEvents')) {

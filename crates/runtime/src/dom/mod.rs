@@ -550,6 +550,18 @@ impl LayoutMirror {
         self.slot(self.capacity).wrapping_add(self.capacity / 4)
     }
 
+    // Counts the style changes, which can change a content box without a new border box.
+    fn restyles(&self) -> *mut f32 {
+        self.changes().wrapping_add(1)
+    }
+
+    pub(crate) fn restyled(&mut self) {
+        if self.memory.is_some() {
+            // Pages compare the count only for equality, so it wraps before an f32 stops counting.
+            unsafe { *self.restyles() = (*self.restyles() + 1.) % 16_777_216. };
+        }
+    }
+
     fn reserve(&mut self, id: usize) {
         if id >= self.capacity {
             self.resize((id + 1).next_power_of_two().max(1024));
@@ -564,7 +576,7 @@ impl LayoutMirror {
     }
 
     fn resize(&mut self, capacity: usize) {
-        let words = 4 + capacity * 8 + capacity / 4 + 1;
+        let words = 4 + capacity * 8 + capacity / 4 + 2;
         let memory = std::ptr::NonNull::new(Box::into_raw(vec![0f32; words].into_boxed_slice()))
             .expect("Layout memory")
             .cast::<f32>();
@@ -579,7 +591,8 @@ impl LayoutMirror {
                     kept,
                 );
                 *memory.as_ptr().add(2) = *old.0.as_ptr().add(2);
-                *memory.as_ptr().add(words - 1) = *self.changes();
+                *memory.as_ptr().add(words - 2) = *self.changes();
+                *memory.as_ptr().add(words - 1) = *self.restyles();
                 // Pages keep reading the old buffer until they see this flag and fetch the new one.
                 *old.0.as_ptr() = 1.;
             }
@@ -709,7 +722,7 @@ impl LayoutMirror {
         let memory = self.memory.clone().expect("Layout memory");
         (
             memory.0.as_ptr().cast(),
-            (4 + self.capacity * 8) * 4 + self.capacity + 4,
+            (4 + self.capacity * 8) * 4 + self.capacity + 8,
             Arc::into_raw(memory).cast_mut().cast(),
         )
     }
@@ -3013,6 +3026,24 @@ pub fn call(
             let page = doc.nodes[id].parent == Some(0)
                 && doc.nodes[id].tag == "html"
                 && !state.scroll.contains_key(&id);
+            // As in Chrome, a box that can't scroll keeps its offset at 0.
+            if !page && !state.scroll.contains_key(&id) {
+                let computed = styles(doc, state, viewport);
+                let style = computed.values.get(id);
+                let scrolls = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                    .into_iter()
+                    .any(|prop| {
+                        style
+                            .and_then(|style| style.get(prop))
+                            .is_some_and(|value| !matches!(value, "visible" | "clip"))
+                    });
+                let boxed = style
+                    .and_then(|style| style.get(Prop::DISPLAY))
+                    .is_some_and(|value| !matches!(value, "inline" | "contents" | "none"));
+                if doc.nodes[id].tag.starts_with('#') || !scrolls || !boxed {
+                    return Ok(json!([0., 0.]));
+                }
+            }
             let handle = state
                 .scroll
                 .entry(if page { 0 } else { id })
@@ -3536,7 +3567,7 @@ pub fn call(
             let tag = doc.nodes[id].tag.as_str();
             if (style::ROW..=style::FOOTER).contains(&style::role(&computed, id)) {
                 return Ok(json!([
-                    0., 0., rect[2], rect[3], 0., 0., 0., 0., rect[2], rect[3], 0., 0.
+                    0., 0., rect[2], rect[3], 0., 0., 0., 0., rect[2], rect[3], 0., 0., 0.
                 ]));
             }
             if tag.starts_with('#')
@@ -3544,8 +3575,9 @@ pub fn call(
                     .get(Prop::DISPLAY)
                     .is_none_or(|value| matches!(value, "inline" | "contents"))
             {
+                // The last value says that the box is inline, so it has no client box.
                 return Ok(json!([
-                    0., 0., 0., 0., 0., 0., 0., 0., rect[2], rect[3], 0., 0.
+                    0., 0., 0., 0., 0., 0., 0., 0., rect[2], rect[3], 0., 0., 1.
                 ]));
             }
             let shared = style::role(&computed, id) == style::CELL
@@ -3562,11 +3594,13 @@ pub fn call(
                 .parent
                 .and_then(|parent| state.bounds.get(&parent))
                 .map_or(viewport[0], |rect| rect[2]);
+            // The bounds are those of the last frame, which laid out the animated padding and borders.
+            let now = state.animating.get(&id).unwrap_or(style);
             let borders = units
-                .borders(style, base)
+                .borders(now, base)
                 .map(|width| width / if shared { 2. } else { 1. });
             let padding = units
-                .edges(style, style::PADDING, base)
+                .edges(now, style::PADDING, base)
                 .map(|value| value.max(0.));
             let bars = state
                 .scroll
@@ -3611,9 +3645,8 @@ pub fn call(
                 renderer::size(renderer::px(size[0]), renderer::px(size[1])),
             );
             // The bounds are those of the last frame, so its animated transform moved them.
-            let moved = state.animating.get(&id).unwrap_or(style);
             let shift = match transformed
-                .then(|| crate::render::effects::transform(moved, units, local, None))
+                .then(|| crate::render::effects::transform(now, units, local, None))
                 .flatten()
             {
                 Some(m) if m[3] == 0. && m[7] == 0. && m[15] == 1. => {
@@ -3637,7 +3670,8 @@ pub fn call(
                 size[0],
                 size[1],
                 shift[0],
-                shift[1]
+                shift[1],
+                0.
             ]))
         }
         "dom.innerText" => {
@@ -4718,6 +4752,19 @@ pub(crate) fn styles(
     let key = (viewport, scale, reduced_motion, theme);
     let animated = std::mem::take(&mut state.animated);
     let animating = !animated.is_empty();
+    // Resize observers read content boxes, which these values change without a new border box.
+    if animated.values().any(|style| {
+        !style.vars().is_empty()
+            || style.own().any(|(prop, _)| {
+                let name = prop.name();
+                ["padding", "border", "overflow", "scrollbar"]
+                    .iter()
+                    .any(|start| name.starts_with(start))
+                    || matches!(name, "display" | "font-size" | "zoom" | "box-sizing")
+            })
+    }) {
+        state.bounds.restyled();
+    }
     if !animating
         && state.style_key == key
         && let Some(computed) = &state.computed
@@ -5078,6 +5125,7 @@ pub(crate) fn styles(
     state.animating.clear();
     state.animating_pseudos.clear();
     state.style_epoch += 1;
+    state.bounds.restyled();
     state.style_key = key;
     let result = Rc::new(result);
     state.select_base = (Rc::as_ptr(&result) as usize, subject, serial, flatten);
