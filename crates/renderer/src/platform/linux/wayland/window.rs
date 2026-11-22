@@ -4,7 +4,8 @@ use crate::platform::linux::{Action, Display as _, Native, run_after, soon};
 use crate::{Pixels, Rect, Scene, Size, WindowOptions, WindowState, app::Callbacks, point, px};
 use anyhow::Result;
 use raw_window_handle::{RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
-use std::{cell::Cell, cell::RefCell, ptr::NonNull, rc::Rc, rc::Weak, time::Duration};
+use std::time::{Duration, Instant};
+use std::{cell::Cell, cell::RefCell, ptr::NonNull, rc::Rc, rc::Weak};
 use wayland_backend::client::ObjectId;
 use wayland_client::protocol::{wl_callback, wl_surface, wl_surface::WlSurface};
 use wayland_client::{Proxy as _, WEnum};
@@ -59,6 +60,10 @@ struct Pace {
     configured: Cell<bool>,
     shown: Cell<bool>,
     presented: Cell<bool>,
+    // A frame drew before the frame callback of the one before it.
+    ahead: Cell<bool>,
+    timed: Cell<bool>,
+    started: Cell<Option<Instant>>,
 }
 
 // Dropping them destroys the roles before their surface.
@@ -230,21 +235,44 @@ impl Surface {
 
     fn tick(&self) {
         let pace = &self.pace;
-        // A tick queued before the last frame drew waits for that frame's callback, or it draws twice per refresh.
+        let now = Instant::now();
+        let period = self
+            .client
+            .upgrade()
+            .map_or(RETRY, |client| client.period());
+        // The compositor sends the frame callback only after the GPU drew the frame, so one frame
+        // draws ahead of it after a refresh, and the CPU works while the GPU draws.
+        let due = pace
+            .started
+            .get()
+            .map(|at| at + period - Duration::from_millis(1));
         if pace.waiting.get() {
-            return;
+            match due {
+                _ if pace.ahead.get() => return,
+                Some(due) if due > now => return self.later(due - now),
+                _ => pace.ahead.set(true),
+            }
         }
+        pace.started.set(Some(now));
         if self.calls.frame() == Some(false) {
             pace.wants.set(false);
             return;
         }
-        if pace.waiting.get() || pace.queued.replace(true) {
+        match pace.waiting.get() {
+            true if pace.ahead.get() => {}
+            true => self.later((now + period).saturating_duration_since(Instant::now())),
+            false => self.later(RETRY),
+        }
+    }
+
+    fn later(&self, delay: Duration) {
+        if self.pace.timed.replace(true) {
             return;
         }
         let me = self.me.clone();
-        run_after(RETRY, move || {
+        run_after(delay, move || {
             if let Some(window) = me.upgrade() {
-                window.pace.queued.set(false);
+                window.pace.timed.set(false);
                 if window.pace.wants.get() {
                     window.tick();
                 }
@@ -525,6 +553,7 @@ impl Client {
             && let Some(window) = self.window_of(surface)
         {
             window.pace.waiting.set(false);
+            window.pace.ahead.set(false);
             window.kick();
         }
     }
