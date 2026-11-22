@@ -3089,6 +3089,42 @@ fn boxes_that_never_cull_keep_the_boxes_around_them() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn cleared_blocks_far_below_floats_stay_spacers() {
+    let mut page =
+        String::from("<body id=body style='margin:0'><p id=o style='margin:0'>x</p><div>");
+    for _ in 0..300 {
+        page.push_str("<div style='float:left;width:90px;height:40px'></div>");
+    }
+    page.push_str("</div><div id=g style='clear:both'>");
+    for index in 0..50 {
+        page.push_str(&format!("<div id=c{index}>row {index}</div>"));
+    }
+    page.push_str("</div></body>");
+    let text = run_hidden(
+        &format!(
+            r#"{STEPS}
+            await load('cleared.html');
+            await win.webContents.capturePage();
+            await win.webContents.capturePage();
+            await step('edit', () => run("document.getElementById('o').textContent = 'y'"));
+            console.log('TOP ' + await run("Math.round(document.getElementById('g').getBoundingClientRect().top)"));
+            "#
+        ),
+        &[("cleared.html", &page)],
+    );
+    let built = built(&text, "edit");
+    assert!(
+        !built.iter().any(|id| *id == "g" || id.starts_with('c')),
+        "a cleared block far below floats is a spacer, which stays: {built:?}"
+    );
+    assert!(
+        text.contains("TOP 3019"),
+        "the spacer keeps the clearance: {text}"
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn first_builds_log_reads_that_replay_the_same() {
     // Debug builds build the second wrapper again when it takes the style of the first.
     let wrapper = "<div class=w><div style='height:50px;overflow:auto'>short</div>\

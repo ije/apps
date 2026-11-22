@@ -7432,6 +7432,9 @@ fn create(
                                 units.viewport[1],
                                 flexbox,
                             )
+                            .map(|(bounds, margins)| {
+                                (bounds, margins, clear_bits(&styles.values[child]))
+                            })
                         },
                         gap,
                     )

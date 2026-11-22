@@ -191,6 +191,8 @@ pub(super) struct Run {
     pub(super) width: f32,
     pub(super) margins: [f32; 2],
     pub(super) watch: Vec<(usize, f32)>,
+    // The clear flow bits of the first block, which the spacer keeps, as clearance places it below floats.
+    pub(super) clear: u8,
 }
 
 pub(super) fn cosmetic(old: &style::Style, new: &style::Style) -> bool {
@@ -468,7 +470,7 @@ pub(super) fn member(
 pub(super) fn plan(
     children: &[usize],
     shown: impl Fn(usize) -> bool,
-    mut member: impl FnMut(usize) -> Option<([f32; 4], [f32; 2])>,
+    mut member: impl FnMut(usize) -> Option<([f32; 4], [f32; 2], u8)>,
     gap: f32,
 ) -> (Vec<usize>, Vec<Option<Run>>) {
     let mut slots = vec![0; children.len()];
@@ -478,12 +480,14 @@ pub(super) fn plan(
         if !shown(index) {
             continue;
         }
-        let Some(([_, y, width, height], margins)) = member(child) else {
+        let Some(([_, y, width, height], margins, clear)) = member(child) else {
             open = false;
             continue;
         };
+        // A cleared block starts a run, so the spacer of the run can place it below floats.
         match runs.last_mut().and_then(Option::as_mut).filter(|run| {
-            open && (y - run.top - run.height - run.margins[1] - gap - margins[0]).abs() <= 0.5
+            open && clear == 0
+                && (y - run.top - run.height - run.margins[1] - gap - margins[0]).abs() <= 0.5
         }) {
             Some(run) => {
                 run.members.push(child);
@@ -498,6 +502,7 @@ pub(super) fn plan(
                 width,
                 margins,
                 watch: Vec::new(),
+                clear,
             })),
         }
         open = true;
@@ -560,6 +565,7 @@ pub(super) fn lines(
                 width: 0.,
                 margins: [0.; 2],
                 watch: Vec::new(),
+                clear: 0,
             })),
         }
         open = true;
@@ -620,6 +626,7 @@ pub(super) fn spacer(
         width: size,
         margins,
         watch,
+        clear,
     } = run;
     let parent = path.last().copied().unwrap_or_default();
     let (first, last) = (Cell::new(None), Cell::new([left, top]));
@@ -683,8 +690,8 @@ pub(super) fn spacer(
     .mt(px(margins[0]))
     .mb(px(margins[1]))
     .flex_shrink_0();
-    // Like the blocks it stands for, floats don't move it.
-    spacer.style().flow = renderer::Flow::BLOCK;
+    // Like the blocks it stands for, floats don't move it, and only clearance does.
+    spacer.style().flow = renderer::Flow::BLOCK | clear;
     spacer.into()
 }
 
@@ -1283,7 +1290,7 @@ mod tests {
                     .get(&child)
                     .copied()
                     .filter(|_| child != 7)
-                    .map(|bounds| (bounds, [0.; 2]))
+                    .map(|bounds| (bounds, [0.; 2], 0))
             },
             4.,
         );
@@ -1296,6 +1303,7 @@ mod tests {
                 width,
                 margins,
                 watch: Vec::new(),
+                clear: 0,
             })
         };
         assert_eq!(
@@ -1316,7 +1324,11 @@ mod tests {
         let (slots, runs) = plan(
             &[1, 2, 4, 5],
             |_| true,
-            |child| spaced.get(&child).copied(),
+            |child| {
+                spaced
+                    .get(&child)
+                    .map(|&(bounds, margins)| (bounds, margins, 0))
+            },
             4.,
         );
         assert_eq!(slots, [1, 1, 1, 2]);
