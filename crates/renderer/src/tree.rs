@@ -241,6 +241,7 @@ impl Slot {
         self.uncached = false;
         self.inputs = None;
         self.held = false;
+        self.skipped = 0;
         self.spill = None;
         self.region = None;
         self.listed = false;
@@ -1243,10 +1244,9 @@ impl Tree {
             return;
         }
         let slot = &mut self.slots[index as usize];
-        // The boxes inside a box that a skip kept in the last pass are as they were.
-        let covered = !self.full
-            && slot.placed.is_some()
-            && (covered || slot.skipped == prepaints.wrapping_sub(1));
+        // The boxes inside a box that a skip kept in the last pass are as they were, also when the box itself
+        // was built again since.
+        let covered = !self.full && (covered || slot.skipped == prepaints.wrapping_sub(1));
         let outer = (
             mem::replace(&mut self.skips, true),
             self.escapes.take(),
