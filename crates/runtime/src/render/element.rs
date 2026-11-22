@@ -688,6 +688,36 @@ impl<'a> Build<'a> {
     }
 }
 
+// The axes, 1 for x and 2 for y, that the insets of an out-of-flow box set.
+fn inset_axes(style: &style::Style) -> u8 {
+    [[Prop::LEFT, Prop::RIGHT], [Prop::TOP, Prop::BOTTOM]]
+        .iter()
+        .enumerate()
+        .filter(|(_, axis)| {
+            axis.iter()
+                .any(|&prop| style.get(prop).is_some_and(|value| value != "auto"))
+        })
+        .fold(0, |axes, (axis, _)| axes | 1 << axis)
+}
+
+// An empty box at the static place of an absolute box, which puts its place in `anchors` for the box to follow.
+fn static_mark(view: &Rc<super::PageState>, key: usize) -> renderer::Node {
+    let view = view.clone();
+    renderer::canvas_watching(
+        move |bounds, _| {
+            let mut host = view.host.borrow_mut();
+            host.dom
+                .entry(view.id)
+                .or_default()
+                .anchors
+                .insert(key, bounds);
+        },
+        |_, _, _| {},
+    )
+    .w(px(0.))
+    .h(px(0.))
+}
+
 fn positioner(
     position: &str,
     mut ancestors: impl Iterator<Item = usize>,
@@ -2330,6 +2360,9 @@ fn create(
                 "fixed" => renderer::Escape::FIXED,
                 _ => 0,
             };
+            if position == "absolute" {
+                el.style().placed = inset_axes(style);
+            }
             el.style().scroll_anchor = (u8::from(style.get(Prop::OVERFLOW_ANCHOR) == Some("none"))
                 * renderer::ScrollAnchor::NONE)
                 | (u8::from(position == "sticky") * renderer::ScrollAnchor::STICKY);
@@ -5746,6 +5779,8 @@ fn create(
     let mut after = Vec::new();
     // Inline pseudo-elements of a block that also holds blocks, which join the first and last lines.
     let mut lines: [Option<renderer::Node>; 2] = [None, None];
+    // The placeholder of an out-of-flow `::after` at its static place, at the end of the last line.
+    let mut static_anchor: Option<renderer::Node> = None;
     // In-flow pseudo-elements of a grid or flex box are its first and last items, which the grid places and
     // flex orders among the children.
     let mut items = [None, None];
@@ -6420,9 +6455,11 @@ fn create(
                     } else {
                         renderer::Escape::ABSOLUTE
                     };
+                    decoration.style().placed = inset_axes(pseudo);
                     contained = Some(super::paint::PseudoBlock {
                         view: view.clone(),
-                        place: super::paint::Contained {
+                        anchor: None,
+                        place: Some(super::paint::Contained {
                             key: super::pseudo_key(id, index as u8 + 1) as usize,
                             container,
                             viewport: units.viewport,
@@ -6436,13 +6473,54 @@ fn create(
                             }]
                             .get(Prop::DIRECTION)
                                 == Some("rtl"),
-                        },
+                        }),
                         offset: Default::default(),
                     });
                     decoration
                 }
                 None => decoration,
             };
+            // Like an out-of-flow child, an `::after` at its static place in the last line follows a placeholder there.
+            if index == 1 && style::static_after(styles, id) {
+                let key = style::atom_key(id, 2);
+                if flow
+                    && !flexbox
+                    && !matches!(display, "grid" | "inline-grid")
+                    && !node.children.is_empty()
+                    && inline_text().is_none()
+                {
+                    let mut placeholder = static_mark(view, key).flex_shrink_0();
+                    placeholder.style().align_self = Some(renderer::AlignItems::FlexStart);
+                    static_anchor = Some(placeholder);
+                }
+                let axes = [[Prop::LEFT, Prop::RIGHT], [Prop::TOP, Prop::BOTTOM]].map(|axis| {
+                    axis.iter()
+                        .all(|&prop| pseudo.get(prop).is_none_or(|value| value == "auto"))
+                });
+                // The direction of the containing block: the element's, or the one of the block it escapes to.
+                let rtl = match escaped {
+                    Some((usize::MAX, ..)) => styles.values[0].get(Prop::DIRECTION) == Some("rtl"),
+                    Some((block, ..)) => styles.values[block].get(Prop::DIRECTION) == Some("rtl"),
+                    None => rtl,
+                };
+                let anchor = Some((
+                    axes,
+                    key,
+                    [pseudo_margin[3], pseudo_margin[0], pseudo_margin[1]],
+                    rtl,
+                ));
+                match &mut contained {
+                    Some(contained) => contained.anchor = anchor,
+                    None => {
+                        contained = Some(super::paint::PseudoBlock {
+                            view: view.clone(),
+                            place: None,
+                            anchor,
+                            offset: Default::default(),
+                        })
+                    }
+                }
+            }
             let order = pseudo
                 .get(Prop::Z_INDEX)
                 .and_then(|value| value.parse::<i32>().ok())
@@ -6506,7 +6584,7 @@ fn create(
             } else {
                 flex_order
             };
-            if atom {
+            if atom && !absolute {
                 pseudo_atoms[index] = Some(decoration);
             } else if grid_item || flexbox && !absolute {
                 items[index] = Some((flex_order, decoration, pseudo_margin));
@@ -6695,10 +6773,18 @@ fn create(
         #[cfg(debug_assertions)]
         reader.extra.set(hashed(&*data.text));
         let atom_containing = content_box();
+        // An absolute box at its static place in a line has an empty atom there, which gives it its place.
+        let marker = |atom: &style::Atom| {
+            style::static_inline(match atom.pseudo {
+                0 => &styles.values[atom.node],
+                pseudo => &styles.pseudos[&id][usize::from(pseudo - 1)],
+            })
+        };
         let mut atom_elements: Vec<renderer::Child> = data
             .atoms
             .iter()
             .map(|atom| match atom.pseudo {
+                _ if marker(atom) => static_mark(view, atom.key()).into(),
                 0 => element(build, atom.node, atom_containing, container, None),
                 pseudo => pseudo_atoms[usize::from(pseudo - 1)]
                     .take()
@@ -6711,6 +6797,14 @@ fn create(
             .iter()
             .zip(&mut atom_elements)
             .map(|(atom, child)| {
+                if marker(atom) {
+                    // At the top of its line, as Chrome places the box.
+                    return super::text::AtomSlot {
+                        size: [0.; 3],
+                        align: Some(renderer::AlignItems::FlexStart),
+                        at: Default::default(),
+                    };
+                }
                 atom_slot(atom, child, containing[0], &|| {
                     super::grid::pseudo_atom(
                         doc,
@@ -6769,7 +6863,12 @@ fn create(
                 el = el.child(float);
             } else if doc.nodes[child].parent == Some(id)
                 && styles.values[child].get(Prop::DISPLAY) != Some("none")
-                && style::placed_out_of_flow(&styles.values[child])
+                && (style::placed_out_of_flow(&styles.values[child])
+                    || data
+                        .atoms
+                        .iter()
+                        .any(|atom| atom.pseudo == 0 && atom.node == child)
+                        && style::static_inline(&styles.values[child]))
                 && !top_layer.contains(&child)
             {
                 placed.push(child);
@@ -8175,8 +8274,10 @@ fn create(
                     // The placeholder must come before the box, which reads its bounds in prepaint.
                     let block = child_style
                         .get(Prop::DISPLAY)
-                        .is_some_and(|value| !value.starts_with("inline"));
-                    let pending = if block && line.is_none() && !all_inline {
+                        .is_some_and(|value| !value.starts_with("inline"))
+                        && !child_style.contains(Prop::INTERNAL_STATIC_INLINE);
+                    // Outside a line, a box that was inline starts where a new line would.
+                    let pending = if line.is_none() && !all_inline {
                         for &other in &children[scanned..index] {
                             if in_flow(doc, info, other) && !floated(other) {
                                 last_flow = Some(other);
@@ -8237,14 +8338,7 @@ fn create(
                     placeholder.style().align_self = Some(renderer::AlignItems::FlexStart);
                     match line.take() {
                         Some(open) => line = Some(open.child(placeholder)),
-                        None if all_inline || block => place!(placeholder, None),
-                        None => {
-                            let mut next = renderer::node().flex().flex_row().flex_wrap();
-                            next.style().justify_content = line_justify;
-                            next.style().inline = renderer::Inline::Lines;
-                            line = Some(next.child(placeholder));
-                            line_strut = false;
-                        }
+                        None => place!(placeholder, None),
                     }
                 }
                 if flow
@@ -8544,6 +8638,13 @@ fn create(
                 }
             }
         }
+        if let Some(anchor) = static_anchor.take() {
+            match line.take() {
+                Some(open) => line = Some(open.child(anchor)),
+                None if all_inline => place!(anchor, None),
+                None => line = Some(open_line(anchor, &mut line_strut)),
+            }
+        }
         match (line.take(), tail) {
             (Some(open), Some(tail)) if grid.is_none() => {
                 let (first, rest, _) = with_strut(tail.into(), line_justify);
@@ -8761,7 +8862,8 @@ fn create(
                 }
             }
         } else if !matches!(parent_display, "flex" | "inline-flex") {
-            let block = !display.starts_with("inline");
+            let block =
+                !display.starts_with("inline") && !style.contains(Prop::INTERNAL_STATIC_INLINE);
             if block
                 && axes[0]
                 && let Some(parent) = parent

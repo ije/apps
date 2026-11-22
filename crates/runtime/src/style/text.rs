@@ -448,6 +448,26 @@ pub(crate) fn placed_out_of_flow(style: &Style) -> bool {
             })
 }
 
+/// Whether an absolute box keeps its static place in a line, as a box that was inline. The text holds an empty
+/// atom there, which the box follows.
+pub(crate) fn static_inline(style: &Style) -> bool {
+    style.get(Prop::POSITION) == Some("absolute")
+        && style.contains(Prop::INTERNAL_STATIC_INLINE)
+        && !placed_out_of_flow(style)
+}
+
+/// Whether the `::after` of `id` is absolute at its static place in the last line.
+pub(crate) fn static_after(styles: &ComputedStyles, id: usize) -> bool {
+    styles.pseudos.get(&id).is_some_and(|pseudos| {
+        let after = &pseudos[1];
+        static_inline(after)
+            && after
+                .get(Prop::CONTENT)
+                .is_some_and(|value| !matches!(value, "none" | "normal"))
+            && after.get(Prop::DISPLAY) != Some("none")
+    })
+}
+
 // Whether a box after `child` in the paragraph paints in a layer of its own, like a positioned box. It must paint
 // above `child`, which the paragraph builds after its text.
 fn layered_after(doc: &Document, styles: &ComputedStyles, id: usize, child: usize) -> bool {
@@ -1106,7 +1126,13 @@ pub(crate) fn inline_text(
     let mut led = 0;
     let mut cursors = Vec::new();
     // In-flow inline `::before` and `::after` are a part of the text: plain text as runs, and boxes as atoms.
+    // Absolute boxes at their static place in a line are empty atoms of the paragraph of a block. An inline box is
+    // too narrow to lay them out in.
+    let markers = run.is_empty() && atomic_allowed && !shares;
     let parts: [Option<(String, bool)>; 2] = [0, 1].map(|index| {
+        if index == 1 && markers && static_after(styles, id) {
+            return Some((String::new(), true));
+        }
         let pseudo = &styles.pseudos.get(&id).filter(|_| atomic_allowed)?[index];
         let content = pseudo
             .get(Prop::CONTENT)
@@ -1355,6 +1381,13 @@ pub(crate) fn inline_text(
             {
                 continue 'nodes;
             }
+            if markers
+                && node.parent == Some(id)
+                && static_inline(style)
+                && !layered_after(doc, styles, id, child)
+            {
+                break 'source ("", &**style, None, units, Some(child));
+            }
             if node.tag == "br" {
                 if text.ends_with(' ')
                     && !style
@@ -1551,7 +1584,8 @@ pub(crate) fn inline_text(
             });
             runs.push(run);
             line_heights.push((text.len(), LineHeight::Fixed(0.)));
-            space = false;
+            // Spaces collapse across an absolute box, as if it were not there.
+            space &= static_inline(style);
             continue;
         }
         if !node_text.is_empty() {

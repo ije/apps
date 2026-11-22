@@ -1047,6 +1047,7 @@ impl PageView {
             dom.tracks.remove(&id);
             dom.areas.remove(&id);
             dom.anchors.remove(&id);
+            dom.anchors.remove(&style::atom_key(id, 2));
         }
         if flipped {
             self.svgs.borrow_mut().retain(|&id, _| shown(id));
@@ -1062,7 +1063,8 @@ impl PageView {
             dom.grid_widest.retain(|&id, _| shown(id));
             dom.tracks.retain(|&id, _| shown(id));
             dom.areas.retain(|&id, _| shown(id));
-            dom.anchors.retain(|&id, _| shown(id));
+            // Pseudo-elements keep their anchors by `atom_key`.
+            dom.anchors.retain(|&id, _| shown(id & ((1 << 30) - 1)));
         }
         {
             let mut reach = self.reach.borrow_mut();

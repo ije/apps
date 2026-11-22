@@ -601,16 +601,44 @@ impl Contained {
     }
 }
 
-// Moves an absolute or fixed `::before` or `::after` into its containing block, when that is not its element.
+// Moves an absolute or fixed `::before` or `::after` into its containing block, when that is not its element, and
+// to its static place in the last line on the axes without insets.
 pub(super) struct PseudoBlock {
     pub(super) view: Rc<super::PageState>,
-    pub(super) place: Contained,
+    pub(super) place: Option<Contained>,
+    // The axes without insets, the key of the placeholder in `anchors`, the left, top and right margins, and
+    // whether the containing block is right-to-left.
+    pub(super) anchor: Option<([bool; 2], usize, [f32; 3], bool)>,
     pub(super) offset: Rc<Cell<Point<Pixels>>>,
 }
 
 impl Hooks for PseudoBlock {
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
-        let offset = self.place.shift(&self.view, cx.exact, cx.window);
+        let mut bounds = cx.exact;
+        let mut offset = Point::default();
+        if let Some((axes, key, margin, rtl)) = self.anchor
+            && let Some(anchor) = {
+                let view = &*self.view;
+                let host = view.host.borrow();
+                host.dom
+                    .get(&view.id)
+                    .and_then(|dom| dom.anchors.get(&key).copied())
+            }
+        {
+            if axes[0] {
+                offset.x = match rtl {
+                    true => anchor.left() - px(margin[2]) - bounds.right(),
+                    false => anchor.left() + px(margin[0]) - bounds.left(),
+                };
+            }
+            if axes[1] {
+                offset.y = anchor.top() + px(margin[1]) - bounds.top();
+            }
+            bounds.origin += offset;
+        }
+        if let Some(place) = &self.place {
+            offset += place.shift(&self.view, bounds, cx.window);
+        }
         self.offset.set(offset);
         cx.window
             .scope(renderer::Scope::Offset(offset), |window| inner(window));
@@ -994,8 +1022,12 @@ impl Hooks for DomBox {
                     .and_then(|dom| dom.anchors.get(&self.id).copied())
             }
         {
+            // In a right-to-left containing block, the right margin edge is at the static place.
             if axes[0] && !block {
-                offset.x = anchor.left() + px(margin[0]) - bounds.left();
+                offset.x = match self.rtl {
+                    true => anchor.left() - px(self.margin[1]) - bounds.right(),
+                    false => anchor.left() + px(margin[0]) - bounds.left(),
+                };
             }
             if axes[1] {
                 offset.y = if block { anchor.bottom() } else { anchor.top() } + px(margin[1])

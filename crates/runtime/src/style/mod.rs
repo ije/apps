@@ -24,7 +24,7 @@ pub(crate) use text::{
     Atom, CUT_AFTER, CUT_BEFORE, CUT_FIRST, CUT_LAST, InlineBox, InlineText, LineHeight, atom_key,
     cursor, font, holds_block_box, inline_text, line_height, makes_no_line, own_box,
     placed_out_of_flow, pseudo_blocks, pseudo_content, restyle, selection_colors, spacing, spliced,
-    text_run, text_transform, word_break,
+    static_after, static_inline, text_run, text_transform, word_break,
 };
 pub use value::length;
 pub(crate) use value::{
@@ -10204,6 +10204,13 @@ fn blockify(style: &mut Style, item: bool, table_item: bool) {
     }
     if !(item || positioned || style.get(Prop::FLOAT).is_some_and(|value| value != "none")) {
         return;
+    }
+    if positioned
+        && style
+            .get(Prop::DISPLAY)
+            .is_none_or(|display| display.starts_with("inline"))
+    {
+        style.insert(Prop::INTERNAL_STATIC_INLINE, "1");
     }
     let display = match style.get(Prop::DISPLAY).unwrap_or("inline") {
         "inline" | "inline-block" => "block",

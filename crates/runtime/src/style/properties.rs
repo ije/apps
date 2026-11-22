@@ -35,6 +35,8 @@ fn known(name: &str) -> Option<Prop> {
 // parser check values against.
 props! {
     CANVAS_CONTENT "-canvas-content" inherited "fallback|drawable",
+    // Set by blockification on an out-of-flow box that was inline-level, whose static place is then in its line.
+    INTERNAL_STATIC_INLINE "-internal-static-inline",
     MACOS_GLASS "-macos-glass" "none|regular|clear",
     MACOS_GLASS_INTERACTIVE "-macos-glass-interactive" "false|true",
     MACOS_GLASS_TINT_COLOR "-macos-glass-tint-color" "<color>",

@@ -10,7 +10,7 @@ use crate::{
     text::{TextState, same_shaping},
     window::{PaintKey, PaintSpan, Placement},
 };
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::{
     any::Any,
     hash::{Hash, Hasher},
@@ -315,6 +315,8 @@ pub struct Tree {
     orphans: Vec<u32>,
     // Layout boundaries whose content changed, which lay out again alone when their parents keep their layout.
     bounded: Vec<u32>,
+    // Absolute boxes that escape their parent, which layout places again in their containing blocks.
+    escaping: FxHashSet<u32>,
     root: Option<u32>,
     measured_with: (f32, usize),
     stretch: Option<Size<Pixels>>,
@@ -384,6 +386,7 @@ impl Tree {
             self.slots.clear();
             self.free.clear();
             self.keys.clear();
+            self.escaping.clear();
             self.orphans.clear();
             self.root = None;
             self.styles = Interned::default();
@@ -688,6 +691,9 @@ impl Tree {
             }
         }
         slot.kind = kind;
+        if styled.escape & Escape::ABSOLUTE != 0 && styled.placed != 0 {
+            self.escaping.insert(index);
+        }
         slot.style = styled;
         slot.stretched = stretched;
         slot.volatile = hooks.as_ref().is_some_and(|hooks| hooks.volatile());
@@ -856,6 +862,10 @@ impl Tree {
             *index = moved[*index as usize];
         }
         self.root = self.root.map(|root| moved[root as usize]);
+        self.escaping = (self.escaping.iter())
+            .map(|&index| moved[index as usize])
+            .filter(|&index| index != NONE)
+            .collect();
         self.slots = slots;
         self.free.clear();
         self.layers.clear();
@@ -905,7 +915,12 @@ impl Tree {
             while let Some(index) = pending.pop() {
                 let slot = &tree.slots[index as usize];
                 let (_, layout, baselines) = &kept[index as usize];
-                let exact = (slot.layout.location, slot.layout.size, slot.baselines);
+                // `contain` moves escaped boxes after layout.
+                let location = match self.escaping.contains(&index) {
+                    true => layout.location,
+                    false => slot.layout.location,
+                };
+                let exact = (location, slot.layout.size, slot.baselines);
                 assert!(
                     (layout.location, layout.size, *baselines) == exact,
                     "box {index} was laid out at {:?} {:?} {baselines:?}, taffy places it at {:?} {:?} {:?}",
@@ -919,6 +934,97 @@ impl Tree {
             }
             for (slot, (cache, layout, baselines)) in tree.slots.iter_mut().zip(kept) {
                 (slot.cache, slot.layout, slot.baselines) = (cache, layout, baselines);
+            }
+        }
+        self.contain(viewport, scale);
+    }
+
+    // Taffy places an absolute box in its parent, so a box whose containing block is further out moves to its
+    // insets there, before the scroll range and paint read its place. An axis without insets keeps its static
+    // place. The result doesn't depend on the place it had, so cached layouts that keep it stay right.
+    fn contain(&mut self, viewport: Size<Pixels>, scale: f32) {
+        let slots = &mut self.slots;
+        // A new page can have fewer slots.
+        self.escaping.retain(|&index| {
+            slots.get(index as usize).is_some_and(|slot| {
+                slot.live && slot.style.escape & Escape::ABSOLUTE != 0 && slot.style.placed != 0
+            })
+        });
+        for &index in &self.escaping {
+            let slot = &slots[index as usize];
+            let parent = slot.parent;
+            if parent == NONE || slots[parent as usize].style.contains & Escape::ABSOLUTE != 0 {
+                continue;
+            }
+            // The parent's place in the containing block, which is the outermost box when no box contains it.
+            let (mut at, mut block) = ([0f32; 2], parent);
+            loop {
+                let outer = &slots[block as usize];
+                if outer.style.contains & Escape::ABSOLUTE != 0 || outer.parent == NONE {
+                    break;
+                }
+                at = [
+                    at[0] + outer.layout.location.x,
+                    at[1] + outer.layout.location.y,
+                ];
+                block = outer.parent;
+            }
+            let outer = &slots[block as usize];
+            let [origin, size] = match outer.style.contains & Escape::ABSOLUTE != 0 {
+                true => {
+                    let (border, size) = (outer.layout.border, outer.layout.size);
+                    [
+                        [border.left, border.top],
+                        [
+                            size.width - border.left - border.right,
+                            size.height - border.top - border.bottom,
+                        ],
+                    ]
+                }
+                false => [
+                    [0., 0.],
+                    [viewport.width.0 * scale, viewport.height.0 * scale],
+                ],
+            };
+            let rtl = outer.style.flow & Flow::RTL_BLOCK != 0;
+            let resolve = |length: crate::Length, basis: f32| match length {
+                crate::Length::Px(value) => Some(value.0 * scale),
+                crate::Length::Fraction(share) => Some(share * basis),
+                crate::Length::Calc(share, offset) => Some(share * basis + offset.0 * scale),
+                _ => None,
+            };
+            let (inset, layout) = (&slot.style.inset, slot.layout);
+            let mut location = layout.location;
+            let place = |start: Option<f32>, end: Option<f32>, end_wins: bool, axis: usize| {
+                let [margin_start, margin_end, extent] = match axis {
+                    0 => [layout.margin.left, layout.margin.right, layout.size.width],
+                    _ => [layout.margin.top, layout.margin.bottom, layout.size.height],
+                };
+                match (start, end) {
+                    (Some(start), end) if !end_wins || end.is_none() => {
+                        Some(origin[axis] + start + margin_start)
+                    }
+                    (_, Some(end)) => Some(origin[axis] + size[axis] - end - margin_end - extent),
+                    _ => None,
+                }
+            };
+            let [left, right] = [inset.left, inset.right].map(|v| resolve(v, size[0]));
+            let [top, bottom] = [inset.top, inset.bottom].map(|v| resolve(v, size[1]));
+            let placed = slot.style.placed;
+            if placed & 1 != 0
+                && let Some(x) = place(left, right, rtl, 0)
+            {
+                location.x = x - at[0];
+            }
+            if placed & 2 != 0
+                && let Some(y) = place(top, bottom, false, 1)
+            {
+                location.y = y - at[1];
+            }
+            if location != layout.location {
+                slots[index as usize].layout.location = location;
+                changed(slots, index as usize);
+                unfar(slots, parent as usize);
             }
         }
     }

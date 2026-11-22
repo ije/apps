@@ -270,6 +270,8 @@ style! {
     contains: u8 = 0,
     /// An [`Escape`] bit when the box is out of flow: only the clips of its containing block apply.
     escape: u8 = 0,
+    /// The axes, 1 for x and 2 for y, whose insets place an absolute box in a containing block outside its parent.
+    placed: u8 = 0,
     /// A column set: its first child is the flow of content, as wide as one column.
     columns: Option<Box<Columns>> = None,
     /// [`Break`] bits of a box in a column flow.

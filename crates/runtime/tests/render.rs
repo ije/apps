@@ -220,6 +220,32 @@ fn absolute_pseudo_elements_of_static_boxes_take_the_containing_block_of_an_ance
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn absolute_boxes_keep_their_static_place_in_the_line_and_out_of_the_scroll_range() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const box = await run(`(r => [r.left, r.top].map(Math.round).join())(document.getElementById('i').getBoundingClientRect())`);
+        const end = await run(`Math.round((g => (g.selectNodeContents(document.getElementById('p').firstChild), g.getClientRects()[1].right))(document.createRange()))`);
+        if (box !== end + ',20') fail('the box at the top of the second line, after its text: ' + box + ' text end ' + end);
+        const height = await run(`document.getElementById('p').getBoundingClientRect().height`);
+        if (height !== 40) fail('the paragraph stays two lines: ' + height);
+        const left = await run(`parseFloat(getComputedStyle(document.getElementById('q'), '::after').left)`);
+        if (!(left > 15 && left < 40)) fail('an ::after after its text: ' + left);
+        const width = await run(`document.documentElement.scrollWidth`);
+        if (width !== 400) fail('a box placed in another block scrolls from where it is: ' + width);
+        "#,
+        &[(
+            "page.html",
+            "<head><style>body{margin:0;font:16px Helvetica} #p{width:120px;line-height:20px} #p i{position:absolute;width:10px;height:10px}\
+             #q{position:relative;width:200px} #q::after{content:'';position:absolute;top:0;width:10px;height:10px}\
+             #w{margin-left:100px} #w>u{position:absolute;left:300px;width:30px;height:30px}</style></head>\
+             <body><div id=p>one two three four<i id=i></i> five</div><div id=q>abc</div><div id=w><u></u>x</div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn scroll_anchors_keep_the_content_in_view() {
     run_hidden(
         r#"
