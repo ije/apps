@@ -666,7 +666,7 @@ fn inline_runs_keep_node_ranges_and_reject_independent_boxes() {
     doc.nodes[span].inline = None;
     doc.nodes[span]
         .attrs
-        .insert("style".into(), "opacity:0.5;background:red".into());
+        .insert("style".into(), "opacity:0.5;box-shadow:0 0 2px red".into());
     let computed = compute_styles(
         &doc,
         800.,

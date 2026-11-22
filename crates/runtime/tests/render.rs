@@ -3687,6 +3687,27 @@ fn faded_inline_text_stays_in_its_lines() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn faded_inline_boxes_with_backgrounds_draw_as_groups_in_their_lines() {
+    run_hidden(
+        r#"
+        await load('group.html');
+        await win.webContents.capturePage();
+        const rect = await run("(r => [r.x, r.y].map(Math.round).join())(document.getElementById('g').getBoundingClientRect())");
+        if (rect !== '18,4') fail('the box left its line: ' + rect);
+        const pixel = async (x, y) => [...(await win.webContents.capturePage({ x, y, width: 1, height: 1 })).toBitmap()].slice(0, 3).reverse().join();
+        const back = await pixel(21, 26);
+        if (!/^12[78],12[78],255$/.test(back)) fail('the background is not half faded: ' + back);
+        "#,
+        &[(
+            "group.html",
+            "<body style='margin:0;font:20px/30px Helvetica'><p style='margin:0'>A <span id=g \
+             style='opacity:.5;background:rgb(0,0,255);color:#000'>faded</span> end</p></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn wide_first_items_and_spaces_break_lines_like_chrome() {
     let (text, rects) = picture_rects(
         "breaks.html",

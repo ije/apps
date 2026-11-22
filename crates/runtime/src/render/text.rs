@@ -12,6 +12,15 @@ pub(super) struct TextHighlight {
     pub(super) stroke: bool,
 }
 
+// A background or border of an inline box in a group of the text: the group, rect, corners, fill and border.
+type Grouped = (
+    usize,
+    Rect<Pixels>,
+    renderer::Corners<Pixels>,
+    Color,
+    renderer::Border,
+);
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn paint_text(
     text_line: &renderer::TextLine,
@@ -1482,6 +1491,25 @@ impl renderer::Hooks for InlineText {
         let strut = window.text_system().face(&text_style.font());
         let mut highlights = Vec::new();
         let mut outlines = Vec::new();
+        // Inline boxes with opacity whose text, background and borders draw as a group, in a layer after the rest of
+        // the text, like the stacking context of such a box in Chrome. The outermost ones, with their text ranges.
+        let mut groups: Vec<(f32, std::ops::Range<usize>)> = Vec::new();
+        for inline in self.data.boxes.iter().filter(|inline| inline.group < 1.) {
+            let range = self.data.ranges[inline.index].1.clone();
+            if !groups
+                .iter()
+                .any(|(_, outer)| outer.start <= range.start && range.end <= outer.end)
+            {
+                groups.push((inline.group, range));
+            }
+        }
+        let group_of = |range: &std::ops::Range<usize>| {
+            groups
+                .iter()
+                .position(|(_, outer)| outer.start <= range.start && range.end <= outer.end)
+        };
+        // The backgrounds and borders of the boxes in each group.
+        let mut grouped: Vec<Grouped> = Vec::new();
         {
             let view = &*self.view;
             let host = view.host.borrow();
@@ -1633,28 +1661,31 @@ impl renderer::Hooks for InlineText {
                     }
                     let [width_above, width_right, width_below, width_left] =
                         inline.borders.map(px);
+                    let group = group_of(&self.data.ranges[inline.index].1);
                     for (rect, [left_side, right_side]) in parts {
-                        window.draw_box(
-                            rect,
-                            renderer::Corners {
-                                top_left: if left_side { radii[0] } else { px(0.) },
-                                top_right: if right_side { radii[1] } else { px(0.) },
-                                bottom_right: if right_side { radii[2] } else { px(0.) },
-                                bottom_left: if left_side { radii[3] } else { px(0.) },
+                        let corners = renderer::Corners {
+                            top_left: if left_side { radii[0] } else { px(0.) },
+                            top_right: if right_side { radii[1] } else { px(0.) },
+                            bottom_right: if right_side { radii[2] } else { px(0.) },
+                            bottom_left: if left_side { radii[3] } else { px(0.) },
+                        };
+                        let border = renderer::Border {
+                            widths: renderer::Edges {
+                                top: width_above,
+                                right: if right_side { width_right } else { px(0.) },
+                                bottom: width_below,
+                                left: if left_side { width_left } else { px(0.) },
                             },
-                            inline.fill,
-                            renderer::Border {
-                                widths: renderer::Edges {
-                                    top: width_above,
-                                    right: if right_side { width_right } else { px(0.) },
-                                    bottom: width_below,
-                                    left: if left_side { width_left } else { px(0.) },
-                                },
-                                color: inline.border,
-                                style: renderer::BorderStyle::Solid,
-                                sides: 0,
-                            },
-                        );
+                            color: inline.border,
+                            style: renderer::BorderStyle::Solid,
+                            sides: 0,
+                        };
+                        match group {
+                            Some(group) => {
+                                grouped.push((group, rect, corners, inline.fill, border))
+                            }
+                            None => window.draw_box(rect, corners, inline.fill, border),
+                        }
                     }
                 }
                 // Like Chrome, each row of an outlined inline box draws its own outline, above the text.
@@ -1791,6 +1822,85 @@ impl renderer::Hooks for InlineText {
                 }
             }
         }
+        // Runs whose text is in a group, or out of it, draw clear.
+        let clear = |runs: &[renderer::TextRun], keep: &dyn Fn(usize) -> bool| {
+            let mut at = 0;
+            runs.iter()
+                .map(|run| {
+                    let mut run = run.clone();
+                    if !keep(at) {
+                        run.color = Color::TRANSPARENT;
+                        run.background_color = None;
+                        run.stroke = None;
+                        for line in [
+                            &mut run.underline,
+                            &mut run.strikethrough,
+                            &mut run.overline,
+                        ] {
+                            if let Some(line) = line.as_mut() {
+                                line.color = Some(Color::TRANSPARENT);
+                            }
+                        }
+                    }
+                    at += run.len;
+                    run
+                })
+                .collect::<Vec<_>>()
+        };
+        let inside = |at: usize| {
+            groups
+                .iter()
+                .any(|(_, range)| range.start <= at && at < range.end)
+        };
+        let main = (!groups.is_empty()).then(|| clear(runs, &|at| !inside(at)));
+        let main = main.as_deref().unwrap_or(runs);
+        let lines = |window: &mut Window,
+                     runs: &[renderer::TextRun],
+                     shift: Point<Pixels>,
+                     ink: Option<Color>,
+                     highlights: &[TextHighlight]| {
+            let mut offset = 0;
+            let mut row = 0;
+            let mut origin = layout.bounds().origin + shift;
+            let mask = window.content_mask().bounds;
+            for line in layout.lines().iter() {
+                let count = line.rows();
+                let height = line.extent(layout.line_height()).height;
+                if origin.y > mask.bottom() && !split {
+                    window.cull();
+                    break;
+                }
+                // Taller rows above push this line down: the next row's drop says how far.
+                let dropped = match rows.get(row + count) {
+                    Some(next) => next.drop - next.above,
+                    None if rows.is_empty() => px(0.),
+                    None => px(f32::INFINITY),
+                };
+                if *split || origin.y + height + dropped + layout.line_height() > mask.top() {
+                    paint_text(
+                        line,
+                        origin,
+                        layout.line_height(),
+                        runs,
+                        offset,
+                        highlights,
+                        rows.get(row..row + count).unwrap_or_default(),
+                        &self.data.text,
+                        ink,
+                        strut,
+                        window,
+                    );
+                } else {
+                    window.cull();
+                }
+                row += count;
+                offset += line.len() + 1;
+                origin.y += height;
+                if offset > self.data.text.len() {
+                    break;
+                }
+            }
+        };
         let passes = self
             .data
             .shadows
@@ -1798,49 +1908,12 @@ impl renderer::Hooks for InlineText {
             .map(|&(x, y, blur, color)| (point(px(x), px(y)), Some(color), blur))
             .chain([(point(px(0.), px(0.)), None, 0.)]);
         for (shift, ink, blur) in passes {
-            let paint = |window: &mut Window| {
-                let mut offset = 0;
-                let mut row = 0;
-                let mut origin = layout.bounds().origin + shift;
-                let mask = window.content_mask().bounds;
-                for line in layout.lines().iter() {
-                    let count = line.rows();
-                    let height = line.extent(layout.line_height()).height;
-                    if origin.y > mask.bottom() && !split {
-                        window.cull();
-                        break;
-                    }
-                    // Taller rows above push this line down: the next row's drop says how far.
-                    let dropped = match rows.get(row + count) {
-                        Some(next) => next.drop - next.above,
-                        None if rows.is_empty() => px(0.),
-                        None => px(f32::INFINITY),
-                    };
-                    if *split || origin.y + height + dropped + layout.line_height() > mask.top() {
-                        paint_text(
-                            line,
-                            origin,
-                            layout.line_height(),
-                            runs,
-                            offset,
-                            if ink.is_some() { &[] } else { &highlights },
-                            rows.get(row..row + count).unwrap_or_default(),
-                            &self.data.text,
-                            ink,
-                            strut,
-                            window,
-                        );
-                    } else {
-                        window.cull();
-                    }
-                    row += count;
-                    offset += line.len() + 1;
-                    origin.y += height;
-                    if offset > self.data.text.len() {
-                        break;
-                    }
-                }
+            let highlights = if ink.is_some() {
+                &[][..]
+            } else {
+                &highlights[..]
             };
+            let paint = |window: &mut Window| lines(window, main, shift, ink, highlights);
             if blur > 0. {
                 let effect = renderer::PaintEffect {
                     blur: px(blur / 2.),
@@ -1852,6 +1925,21 @@ impl renderer::Hooks for InlineText {
             } else {
                 paint(window);
             }
+        }
+        for (group, (opacity, range)) in groups.iter().enumerate() {
+            let runs = clear(runs, &|at| range.start <= at && at < range.end);
+            let effect = renderer::PaintEffect {
+                opacity: *opacity,
+                ..Default::default()
+            };
+            window.with_effect(effect, |window| {
+                for (_, rect, corners, fill, border) in
+                    grouped.iter().filter(|draw| draw.0 == group)
+                {
+                    window.draw_box(*rect, *corners, *fill, *border);
+                }
+                lines(window, &runs, point(px(0.), px(0.)), None, &highlights);
+            });
         }
         for (rect, corners, border) in outlines {
             window.draw_box(rect, corners, Color::TRANSPARENT, border);

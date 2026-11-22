@@ -112,6 +112,8 @@ pub(crate) struct InlineBox {
     pub trail: f32,
     /// The opacity of the spliced boxes around the box and of the box, which its colors take.
     pub fade: f32,
+    /// The opacity of a box whose text draws as a group with its background and borders, or 1.
+    pub group: f32,
     /// The part of a spliced box goes on past its left or right side.
     pub open: [bool; 2],
 }
@@ -667,6 +669,13 @@ pub(crate) fn fades(style: &Style) -> bool {
         .all(|prop| none(prop, &["none", "hidden"]))
 }
 
+/// Whether the lines of a box can draw its opacity: its text takes it, or a layer with its background and borders.
+/// Shadows and outlines draw in other passes, so they need a box of its own.
+pub(crate) fn groups(style: &Style) -> bool {
+    let none = |prop: Prop| style.get(prop).is_none_or(|value| value == "none");
+    none(Prop::BOX_SHADOW) && none(Prop::TEXT_SHADOW) && none(Prop::OUTLINE_STYLE)
+}
+
 /// Whether `id` has a `::first-letter` or `::first-line` style.
 fn first_text(styles: &ComputedStyles, id: usize) -> bool {
     styles
@@ -774,7 +783,7 @@ fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
         || style.iter().any(|(key, value)| {
             key.is_known()
                 && parent.value(key) != Some(value)
-                && !(key == Prop::OPACITY && fades(style))
+                && !(key == Prop::OPACITY && groups(style))
                 && !(key == Prop::POSITION
                     && &**value == "relative"
                     && [
@@ -1251,6 +1260,7 @@ pub(crate) fn inline_text(
             up != node
                 && !doc.nodes[up].tag.starts_with('#')
                 && styles.values[up].get(Prop::DISPLAY) != Some("contents")
+                && fades(&styles.values[up])
                 || cuts.iter().any(|(cut, _)| *cut == up)
         })
         .map(|up| opacity(&styles.values[up]))
@@ -1495,6 +1505,10 @@ pub(crate) fn inline_text(
                         lead: f32::NAN,
                         trail: f32::NAN,
                         fade: faded,
+                        group: match part.is_none() && !fades(style) {
+                            true => opacity(style),
+                            false => 1.,
+                        },
                         open: [CUT_FIRST, CUT_LAST]
                             .map(|flag| part.is_some_and(|flags| flags & flag == 0)),
                     });
