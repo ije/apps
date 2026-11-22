@@ -3125,6 +3125,38 @@ fn cleared_blocks_far_below_floats_stay_spacers() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn fixed_floats_lay_out_their_content_alone() {
+    run_hidden(
+        r#"
+        const expect = async (step, code, value) => {
+            const got = await run(code);
+            if (got !== value) fail(step + ': ' + got + ' instead of ' + value);
+        };
+        const rect = id => `(r => [r.x, r.y, r.width, r.height].map(Math.round).join())(document.getElementById('${id}').getBoundingClientRect())`;
+        await load('floats.html');
+        await win.webContents.capturePage();
+        await expect('first', rect('i') + " + ' ' + " + rect('x'), '0,0,20,10 135,0,20,20');
+        await run("document.getElementById('i').style.width = '60px'");
+        await win.webContents.capturePage();
+        await expect('inside', rect('i') + " + ' ' + " + rect('x'), '0,0,60,10 135,0,20,20');
+        await run("document.getElementById('t').textContent = 'a much longer text'");
+        await win.webContents.capturePage();
+        await expect('text', rect('x'), '135,0,20,20');
+        await run("document.getElementById('f').style.width = '200px'");
+        await win.webContents.capturePage();
+        await expect('outside', rect('x'), '235,0,20,20');
+        "#,
+        &[(
+            "floats.html",
+            "<body style='margin:0;font:16px/20px Helvetica;width:300px'>\
+             <div id=f style='float:left;width:100px;height:40px;overflow:hidden'><div id=i style='width:20px;height:10px'></div>\
+             <span id=t>text</span></div><div id=n>next <span id=x style='display:inline-block;width:20px;height:20px'></span></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn first_builds_log_reads_that_replay_the_same() {
     // Debug builds build the second wrapper again when it takes the style of the first.
     let wrapper = "<div class=w><div style='height:50px;overflow:auto'>short</div>\

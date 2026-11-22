@@ -80,6 +80,10 @@ struct Slot {
     banded: bool,
     // A layout beside floats emptied the cache, so the caches of the parents can still be full.
     uncached: bool,
+    // The inputs of the last full layout of the box, which a layout boundary uses to lay out again alone, and
+    // whether it waits for that layout.
+    inputs: Option<LayoutInput>,
+    held: bool,
     // The floats that the box placed in the context of its parent when no other float reached it, from its origin.
     spill: Option<Box<Spill>>,
     // The prepaint pass that kept the box and all boxes in it where they were, and the first pass of the run
@@ -184,6 +188,8 @@ impl Slot {
             floats: false,
             banded: false,
             uncached: false,
+            inputs: None,
+            held: false,
             spill: None,
             calm: 0,
             since: 0,
@@ -233,6 +239,8 @@ impl Slot {
         self.floats = false;
         self.banded = false;
         self.uncached = false;
+        self.inputs = None;
+        self.held = false;
         self.spill = None;
         self.region = None;
         self.listed = false;
@@ -249,6 +257,30 @@ impl Slot {
 
     fn taffy(&self) -> &taffy::Style {
         self.stretched.as_deref().unwrap_or(&self.style.taffy)
+    }
+
+    // A float with a fixed size is a layout boundary: what changes in it can't move or size the boxes around it,
+    // which take no baseline from it. Absolute boxes are not, since the inline-blocks of a line are absolute boxes.
+    fn boundary(&self) -> bool {
+        use taffy::CompactLength;
+        let style = self.taffy();
+        let fixed = |raw: CompactLength| raw.tag() == CompactLength::LENGTH_TAG;
+        let bound = |raw: CompactLength| {
+            matches!(
+                raw.tag(),
+                CompactLength::LENGTH_TAG | CompactLength::AUTO_TAG
+            )
+        };
+        self.style.flow & Flow::FLOAT != 0
+            && style.position != taffy::Position::Absolute
+            && style.display != taffy::Display::None
+            && self.split.is_none()
+            && fixed(style.size.width.into_raw())
+            && fixed(style.size.height.into_raw())
+            && [style.min_size.width, style.min_size.height]
+                .into_iter()
+                .chain([style.max_size.width, style.max_size.height])
+                .all(|value| bound(value.into_raw()))
     }
 }
 
@@ -280,6 +312,8 @@ pub struct Tree {
     scopes: Vec<u64>,
     pass: u32,
     orphans: Vec<u32>,
+    // Layout boundaries whose content changed, which lay out again alone when their parents keep their layout.
+    bounded: Vec<u32>,
     root: Option<u32>,
     measured_with: (f32, usize),
     stretch: Option<Size<Pixels>>,
@@ -402,7 +436,7 @@ impl Tree {
         self.commit_node(node, &inherited, scale);
         changed(&mut self.slots, index as usize);
         // The boxes around keep their layout caches unless the patch clears them.
-        self.dirty(index);
+        self.dirty(index, true);
         // The layers nodes of the stacking contexts around paint the positioned boxes in the patch.
         let mut at = self.slots[index as usize].parent;
         while at != NONE {
@@ -452,7 +486,7 @@ impl Tree {
             // The stretched copy holds calc handles into the old style.
             slot.stretched = None;
             changed(&mut self.slots, index as usize);
-            self.dirty(index);
+            self.dirty(index, true);
         }
         Some(NodeId::from(index as usize))
     }
@@ -491,7 +525,7 @@ impl Tree {
                 }
             }
             if slot.measure.is_some() && !kept {
-                self.dirty(index);
+                self.dirty(index, false);
             }
             changed(&mut self.slots, index as usize);
         }
@@ -628,9 +662,8 @@ impl Tree {
         };
         let kids = &self.kids[start..];
         let relisted = slot.children != kids;
-        let relaid = kept.is_none()
-            || !same_measure
-            || relisted
+        // The box itself changed, not only what is in it.
+        let mut outer = kept.is_none()
             || (restyled || stretched.is_some())
                 && *slot.taffy() != *stretched.as_deref().unwrap_or(&styled.taffy)
             || restyled
@@ -639,6 +672,7 @@ impl Tree {
                     || slot.style.inline != styled.inline
                     || slot.style.block != styled.block
                     || slot.style.flow != styled.flow);
+        let relaid = outer || !same_measure || relisted;
         if !same_measure {
             match measurement {
                 Some(measurement) => {
@@ -711,9 +745,11 @@ impl Tree {
         });
         let slot = &mut self.slots[index as usize];
         (slot.free, slot.below, slot.lively) = (free, below, lively);
-        let relaid = mem::replace(&mut slot.floats, floats) != floats || relaid;
-        if relaid {
-            self.dirty(index);
+        if mem::replace(&mut slot.floats, floats) != floats {
+            outer = true;
+        }
+        if relaid || outer {
+            self.dirty(index, outer);
         }
         NodeId::from(index as usize)
     }
@@ -746,10 +782,20 @@ impl Tree {
         self.scopes.last().copied().unwrap_or_default()
     }
 
-    fn dirty(&mut self, mut index: u32) {
+    /// Clears the layout caches of the box and the boxes around it, up to a layout boundary. `outer`: the box itself
+    /// changed, so a boundary there can't hold the change.
+    fn dirty(&mut self, mut index: u32, mut outer: bool) {
         while index != NONE {
             let slot = &mut self.slots[index as usize];
             let parent = slot.parent;
+            if !outer && slot.inputs.is_some() && slot.boundary() {
+                slot.cache.clear();
+                if !mem::replace(&mut slot.held, true) {
+                    self.bounded.push(index);
+                }
+                break;
+            }
+            outer = false;
             // An empty cache means its parents were cleared too, unless it was just made or laid out beside floats.
             if matches!(slot.cache.clear(), ClearState::AlreadyEmpty)
                 && parent != NONE
@@ -835,6 +881,16 @@ impl Tree {
             hung: Vec::new(),
         };
         taffy::compute_root_layout(&mut tree, root, space);
+        // A layout boundary that the layout of its parents didn't reach lays out alone, as its parents placed it.
+        for index in mem::take(&mut self.bounded) {
+            let slot = &tree.slots[index as usize];
+            if slot.live
+                && slot.held
+                && let Some(inputs) = slot.inputs
+            {
+                tree.compute(NodeId::from(index as usize), inputs, None);
+            }
+        }
         #[cfg(debug_assertions)]
         {
             let kept: Vec<_> = tree
@@ -2846,6 +2902,11 @@ impl LayoutTree<'_> {
         let joined = mem::take(&mut self.active);
         if inputs.run_mode == RunMode::PerformHiddenLayout {
             return taffy::compute_hidden_layout(self, node);
+        }
+        if inputs.run_mode == RunMode::PerformLayout {
+            let slot = &mut self.slots[usize::from(node)];
+            slot.held = false;
+            slot.inputs = slot.boundary().then_some(inputs);
         }
         let slot = &self.slots[usize::from(node)];
         let style = slot.taffy();
