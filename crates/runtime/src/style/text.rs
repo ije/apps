@@ -31,6 +31,9 @@ pub(crate) fn selection_colors(style: &Style, selection: Option<&Rc<Style>>) -> 
 #[derive(Clone)]
 pub(crate) struct InlineText {
     pub text: Rc<str>,
+    /// Out-of-flow boxes in the paragraph that its element builds beside it: nodes inside its inline boxes and
+    /// nodes at their static place, or `::before` (1) and `::after` (2) of its inline boxes.
+    pub lifted: Vec<(usize, u8)>,
     pub runs: Vec<renderer::TextRun>,
     pub ranges: Vec<(usize, std::ops::Range<usize>)>,
     pub boxes: Vec<InlineBox>,
@@ -456,6 +459,32 @@ pub(crate) fn static_inline(style: &Style) -> bool {
         && !placed_out_of_flow(style)
 }
 
+/// Whether the `::before` and `::after` of the inline box `id` that draw are all out of flow and placed on both axes,
+/// so the box stays a part of the text. Adds them to `lifted`.
+fn lifts_pseudos(styles: &ComputedStyles, id: usize, lifted: &mut Vec<(usize, u8)>) -> bool {
+    let Some(pseudos) = styles.pseudos.get(&id) else {
+        return true;
+    };
+    let drawn = |pseudo: &Style| {
+        pseudo
+            .get(Prop::CONTENT)
+            .is_some_and(|value| !matches!(value, "none" | "normal"))
+            && pseudo.get(Prop::DISPLAY) != Some("none")
+    };
+    if !pseudos
+        .iter()
+        .all(|pseudo| !drawn(pseudo) || placed_out_of_flow(pseudo))
+    {
+        return false;
+    }
+    lifted.extend(
+        (0..2)
+            .filter(|&at| drawn(&pseudos[at]))
+            .map(|at| (id, at as u8 + 1)),
+    );
+    true
+}
+
 /// Whether the `::after` of `id` is absolute at its static place in the last line.
 pub(crate) fn static_after(styles: &ComputedStyles, id: usize) -> bool {
     styles.pseudos.get(&id).is_some_and(|pseudos| {
@@ -468,20 +497,28 @@ pub(crate) fn static_after(styles: &ComputedStyles, id: usize) -> bool {
     })
 }
 
-// Whether a box after `child` in the paragraph paints in a layer of its own, like a positioned box. It must paint
-// above `child`, which the paragraph builds after its text.
+// Whether a box after `child` in the paragraph of `id` paints in a layer of its own, like a positioned box. It must
+// paint above `child`, which the paragraph builds after its text. `child` can be inside inline boxes of the paragraph.
 fn layered_after(doc: &Document, styles: &ComputedStyles, id: usize, child: usize) -> bool {
-    let children = &doc.nodes[id].children;
-    let at = children
-        .iter()
-        .position(|&node| node == child)
-        .unwrap_or(children.len());
-    let mut pending: Vec<usize> = children[at + 1..].to_vec();
+    let mut pending: Vec<usize> = Vec::new();
+    let mut at = child;
+    while let Some(parent) = doc.nodes[at].parent {
+        let children = &doc.nodes[parent].children;
+        let index = children
+            .iter()
+            .position(|&node| node == at)
+            .unwrap_or(children.len());
+        pending.extend_from_slice(&children[index + 1..]);
+        if parent == id {
+            break;
+        }
+        at = parent;
+    }
     while let Some(node) = pending.pop() {
         let style = &styles.values[node];
         if doc.nodes[node].tag.starts_with('#')
             || style.get(Prop::DISPLAY) == Some("none")
-            || doc.nodes[node].parent == Some(id) && placed_out_of_flow(style)
+            || placed_out_of_flow(style)
         {
             continue;
         }
@@ -1129,6 +1166,9 @@ pub(crate) fn inline_text(
     // Absolute boxes at their static place in a line are empty atoms of the paragraph of a block. An inline box is
     // too narrow to lay them out in.
     let markers = run.is_empty() && atomic_allowed && !shares;
+    // Out-of-flow boxes in the paragraph that its element builds beside it: nodes, or `::before` (1) and `::after`
+    // (2) of inline boxes.
+    let mut lifted: Vec<(usize, u8)> = Vec::new();
     let parts: [Option<(String, bool)>; 2] = [0, 1].map(|index| {
         if index == 1 && markers && static_after(styles, id) {
             return Some((String::new(), true));
@@ -1373,19 +1413,20 @@ pub(crate) fn inline_text(
                 return None;
             }
             // Like a float, an out-of-flow child placed on both axes is a box beside the paragraph. Others keep
-            // the pieces, which give them their static place in the line and their paint order.
+            // the pieces, which give them their static place in the line and their paint order. In the paragraph of
+            // a block, such boxes inside its inline boxes are boxes beside it too.
             if atomic_allowed
-                && node.parent == Some(id)
+                && (node.parent == Some(id) || markers)
                 && placed_out_of_flow(style)
                 && !layered_after(doc, styles, id, child)
             {
+                if node.parent != Some(id) {
+                    lifted.push((child, 0));
+                }
                 continue 'nodes;
             }
-            if markers
-                && node.parent == Some(id)
-                && static_inline(style)
-                && !layered_after(doc, styles, id, child)
-            {
+            if markers && static_inline(style) && !layered_after(doc, styles, id, child) {
+                lifted.push((child, 0));
                 break 'source ("", &**style, None, units, Some(child));
             }
             if node.tag == "br" {
@@ -1465,6 +1506,7 @@ pub(crate) fn inline_text(
                 // its style.
                 || part.is_none()
                     && (styles.pseudos.contains_key(&child)
+                        && !(markers && lifts_pseudos(styles, child, &mut lifted))
                         || styles.animations.contains_key(&child)
                         || splits(style, parent))
             {
@@ -1854,6 +1896,7 @@ pub(crate) fn inline_text(
         shadows,
         line_heights,
         pseudos: [parts[0].is_some(), parts[1].is_some()],
+        lifted,
         first_line: pseudos.and_then(|pseudos| pseudos[2].as_ref()).map(|line| {
             Box::new((
                 text_run(parent, &styles.lengths[id], 0),

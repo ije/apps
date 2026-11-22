@@ -1259,6 +1259,25 @@ impl renderer::Hooks for InlineText {
                     top -= px(inline.edges[0]);
                     height += px(inline.edges[0] + inline.edges[2]);
                 }
+                // A positioned inline box contains the out-of-flow boxes in it: the padding box from the start of its
+                // first part to the end of its last, as in Chrome.
+                if let Some(styles) = computed.as_deref()
+                    && super::effects::establishes(&styles.values[*id]).absolute
+                {
+                    let borders = boxed.map_or([0.; 4], |inline| inline.borders);
+                    let start = point(a.x + px(borders[3]), a.y + top + px(borders[0]));
+                    let end = point(b.x - px(borders[1]), b.y + top + height - px(borders[2]));
+                    dom.blocks.insert(
+                        *id,
+                        Rect::new(
+                            start + shift,
+                            renderer::size(
+                                (end.x - start.x).max(px(0.)),
+                                (end.y - start.y).max(px(0.)),
+                            ),
+                        ),
+                    );
+                }
                 let (left, width) = if a.y == b.y {
                     (a.x, b.x - a.x)
                 } else {

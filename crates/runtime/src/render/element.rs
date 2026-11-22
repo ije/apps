@@ -1702,6 +1702,13 @@ fn create(
         );
     }
     let positioner = positioner.filter(|_| id != 0);
+    // An inline box can be a part of the text of its block, so its out-of-flow boxes follow the containing block it
+    // gives them even when it is their parent. When it has a box of its own, that is the same place.
+    let parent_box = parent.filter(|&parent| {
+        !matches!(position, "absolute" | "fixed")
+            || doc.nodes[parent].tag.starts_with('#')
+            || styles.values[parent].get(Prop::DISPLAY).unwrap_or("inline") != "inline"
+    });
     let viewport = || {
         reader.log(Query::Viewport, 0, hashed(units.viewport.map(f32::to_bits)));
         Some(units.viewport)
@@ -1710,7 +1717,7 @@ fn create(
         viewport()
     } else {
         positioner
-            .filter(|&block| Some(block) != parent)
+            .filter(|&block| Some(block) != parent_box)
             .and_then(|block| {
                 if block == 0 {
                     return viewport();
@@ -6007,35 +6014,42 @@ fn create(
             // An out-of-flow pseudo-element whose element makes no containing block for it goes to the one of an
             // ancestor: the viewport (`usize::MAX`), the initial block (0) or a box, with its padding box size.
             let fixed = pseudo.get(Prop::POSITION) == Some("fixed");
-            let escaped = (absolute && id != 0 && !if fixed { made.fixed } else { made.absolute })
-                .then(|| {
-                    let block = self::positioner(
+            let gives = if fixed { made.fixed } else { made.absolute };
+            // Built alone, an out-of-flow pseudo-element is beside the text that holds its inline box, so it
+            // follows its containing block from there, also when its element gives it.
+            let lifted = pseudo_only && absolute;
+            let escaped = (absolute && id != 0 && (!gives || lifted)).then(|| {
+                let block = match gives {
+                    true => Some(id),
+                    false => self::positioner(
                         if fixed { "fixed" } else { "absolute" },
                         ancestors.iter().rev().copied(),
                         |ancestor| super::effects::establishes(&styles.values[ancestor]),
-                    );
-                    let scope = block
-                        .and_then(|block| ancestors.iter().rposition(|&a| a == block))
-                        .map_or(1, |index| index + 1);
+                    ),
+                };
+                let scope = block
+                    .and_then(|block| ancestors.iter().rposition(|&a| a == block))
+                    .map_or(1, |index| index + 1);
+                if !gives {
                     reader.log(Query::Positioner(fixed), scope, hashed(block));
-                    match block {
-                        None | Some(0) => (
-                            block.unwrap_or(usize::MAX),
-                            viewport().unwrap_or(units.viewport),
-                            false,
-                        ),
-                        Some(block) => {
-                            let size =
-                                reader.block_size(view.host.borrow().dom.get(&view.id), block);
-                            reader.log(
-                                Query::Block(block as u32),
-                                0,
-                                hashed(size.map(|size| size.map(f32::to_bits))),
-                            );
-                            (block, size.unwrap_or(containing), true)
-                        }
+                }
+                match block {
+                    None | Some(0) => (
+                        block.unwrap_or(usize::MAX),
+                        viewport().unwrap_or(units.viewport),
+                        false,
+                    ),
+                    Some(block) => {
+                        let size = reader.block_size(view.host.borrow().dom.get(&view.id), block);
+                        reader.log(
+                            Query::Block(block as u32),
+                            0,
+                            hashed(size.map(|size| size.map(f32::to_bits))),
+                        );
+                        (block, size.unwrap_or(containing), true)
                     }
-                });
+                }
+            });
             let own_flex = matches!(own, "flex" | "inline-flex");
             for (prop, value) in pseudo.iter() {
                 let value: &str = value;
@@ -6545,6 +6559,7 @@ fn create(
                     element: id,
                     origin: pseudo_origin.get_or_insert_default().clone(),
                     shift: contained.as_ref().map(|contained| contained.offset.clone()),
+                    mirrored: lifted,
                     key: style::atom_key(id, index as u8 + 1),
                 })
             };
@@ -6553,6 +6568,9 @@ fn create(
                 Some(contained) => decoration.hooks(contained),
                 None => decoration,
             };
+            if lifted {
+                return decoration.into();
+            }
             // The part of a spliced box gives the box its bounds.
             if pseudo_only {
                 return decoration
@@ -6863,12 +6881,7 @@ fn create(
                 el = el.child(float);
             } else if doc.nodes[child].parent == Some(id)
                 && styles.values[child].get(Prop::DISPLAY) != Some("none")
-                && (style::placed_out_of_flow(&styles.values[child])
-                    || data
-                        .atoms
-                        .iter()
-                        .any(|atom| atom.pseudo == 0 && atom.node == child)
-                        && style::static_inline(&styles.values[child]))
+                && style::placed_out_of_flow(&styles.values[child])
                 && !top_layer.contains(&child)
             {
                 placed.push(child);
@@ -6896,6 +6909,7 @@ fn create(
         });
         let alone = el.kids().is_empty()
             && placed.is_empty()
+            && data.lifted.is_empty()
             && data.atoms.is_empty()
             && trim_top == 0.
             && trim_bottom == 0.
@@ -6976,6 +6990,50 @@ fn create(
                 ],
             };
             el = el.child(element(build, child, containing, container, None));
+        }
+        // Out-of-flow boxes inside the inline boxes of the text, and at their static place: they lay out beside it,
+        // with the inline boxes around them as ancestors.
+        for &(node, pseudo) in &data.lifted {
+            if top_layer.contains(&node) {
+                continue;
+            }
+            let path: Vec<usize> =
+                std::iter::successors(doc.nodes[node].parent, |&up| doc.nodes[up].parent)
+                    .take_while(|&up| up != id)
+                    .collect();
+            let lifted = Build {
+                ancestors: build
+                    .ancestors
+                    .iter()
+                    .copied()
+                    .chain(path.into_iter().rev())
+                    .collect(),
+                flex_parent: false,
+                perspective: None,
+                zone: None,
+                #[cfg(debug_assertions)]
+                extra: Default::default(),
+                #[cfg(debug_assertions)]
+                plan: Default::default(),
+                ..*build
+            };
+            let content = content_box();
+            let padded = [
+                content[0] + padding[1] + padding[3],
+                content[1] + padding[0] + padding[2],
+            ];
+            let containing = if made.absolute { padded } else { content };
+            el = el.child(match pseudo {
+                0 => element(&lifted, node, containing, container, None),
+                pseudo => create(
+                    &lifted,
+                    node,
+                    containing,
+                    container,
+                    None,
+                    Some(usize::from(pseudo - 1)),
+                ),
+            });
         }
     } else if drawable {
         // The children of a canvas with drawable content lay out as blocks at its content box, and take no room
@@ -9039,10 +9097,10 @@ fn create(
         frame: node.tag == "iframe",
         anchor,
         block: made.absolute.then_some(borders),
-        container: positioner.filter(|&block| position == "fixed" || Some(block) != parent),
+        container: positioner.filter(|&block| position == "fixed" || Some(block) != parent_box),
         rtl: rtl_block,
         sized: positioner
-            .filter(|&block| block != 0 && Some(block) != parent)
+            .filter(|&block| block != 0 && Some(block) != parent_box)
             .map(|_| containing),
         style: style.clone(),
         effects: effect_layer,

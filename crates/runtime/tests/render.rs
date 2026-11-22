@@ -246,6 +246,31 @@ fn absolute_boxes_keep_their_static_place_in_the_line_and_out_of_the_scroll_rang
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn positioned_inline_boxes_contain_the_boxes_in_them_from_their_first_to_their_last_line() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const start = await run(`Math.round((g => (g.selectNodeContents(document.getElementById('s').firstChild), g.getClientRects()[0].left))(document.createRange()))`);
+        const span = await run(`Math.round(document.getElementById('s').getBoundingClientRect().bottom)`);
+        const box = await run(`(r => [r.left, r.bottom].map(Math.round).join())(document.getElementById('i').getBoundingClientRect())`);
+        if (box !== start + ',' + span) fail('the box at the start of the first line and the bottom of the last: ' + box + ' start ' + start + ' bottom ' + span);
+        const height = await run(`document.getElementById('p').getBoundingClientRect().height`);
+        if (height !== 36) fail('the text stays two lines: ' + height);
+        const before = await run(`parseFloat(getComputedStyle(document.getElementById('s'), '::before').top)`);
+        if (before !== -4) fail('the ::before of the inline box: ' + before);
+        "#,
+        &[(
+            "page.html",
+            "<head><style>body{margin:0;font:14px/18px Helvetica} #p{width:180px}\
+             #s{position:relative} #s::before{content:'';position:absolute;top:-4px;left:0;width:4px;height:4px}\
+             i{position:absolute;left:0;bottom:0;width:8px;height:8px}</style></head>\
+             <body><div id=p>aaa bbb ccc <span id=s>ddd eee fff ggg hhh<i id=i></i></span> iii</div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn scroll_anchors_keep_the_content_in_view() {
     run_hidden(
         r#"

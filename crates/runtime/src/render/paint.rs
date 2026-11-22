@@ -468,6 +468,8 @@ pub(super) struct PseudoBox {
     pub(super) origin: Rc<Cell<Point<Pixels>>>,
     // The move of a `PseudoBlock` around it.
     pub(super) shift: Option<Rc<Cell<Point<Pixels>>>>,
+    // The element is a part of the text of its block, so its place is in the layout mirror, not in `origin`.
+    pub(super) mirrored: bool,
     pub(super) key: usize,
 }
 
@@ -487,7 +489,12 @@ impl Hooks for PseudoBox {
             .shift
             .as_ref()
             .map_or(Point::default(), |shift| shift.get());
-        let at = cx.exact.origin + shift - self.origin.get() - scroll;
+        let origin = match self.mirrored {
+            true => (dom.bounds.get(&self.element))
+                .map_or(Point::default(), |&[x, y, ..]| point(px(x), px(y))),
+            false => self.origin.get(),
+        };
+        let at = cx.exact.origin + shift - origin - scroll;
         let [x, y] = [at.x, at.y].map(f32::from);
         let [w, h] = [cx.exact.size.width, cx.exact.size.height].map(f32::from);
         let [a, b, c, d] = cx.inset.map(f32::from);
