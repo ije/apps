@@ -195,6 +195,31 @@ fn pseudo_elements_report_the_sizes_of_their_boxes() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn absolute_pseudo_elements_of_static_boxes_take_the_containing_block_of_an_ancestor() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const read = (id, pseudo) => run(`(s => [s.top, s.right, s.bottom, s.left, s.width, s.height].join())(getComputedStyle(document.getElementById('${id}'), '${pseudo}'))`);
+        const corner = await read('e', '::before');
+        if (corner !== '110px,0px,0px,200px,20px,10px') fail('a corner of the ancestor block: ' + corner);
+        const stretched = await read('e', '::after');
+        if (stretched !== '114px,0px,0px,0px,220px,6px') fail('stretched across the ancestor block: ' + stretched);
+        const percent = await read('a', '::before');
+        if (percent !== '12px,55px,84px,110px,55px,24px') fail('percentages of the ancestor block: ' + percent);
+        "#,
+        &[(
+            "page.html",
+            "<head><style>#p{position:relative;width:200px;height:100px;padding:10px} #p>div{margin:20px;height:30px;overflow:hidden}\
+             #e::before{content:'';position:absolute;right:0;bottom:0;width:20px;height:10px;background:red}\
+             #e::after{content:'';position:absolute;left:0;right:0;bottom:0;height:6px;background:blue}\
+             #a::before{content:'';position:absolute;left:50%;top:10%;width:25%;height:20%;background:green}</style></head>\
+             <body style='margin:0'><div id=p><div id=e></div><div id=a></div></div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn scroll_anchors_keep_the_content_in_view() {
     run_hidden(
         r#"

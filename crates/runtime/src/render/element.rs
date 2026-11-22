@@ -5969,6 +5969,38 @@ fn create(
             }
             let mut pseudo_shadows = Vec::new();
             let placed = absolute || pseudo.get(Prop::POSITION) == Some("relative");
+            // An out-of-flow pseudo-element whose element makes no containing block for it goes to the one of an
+            // ancestor: the viewport (`usize::MAX`), the initial block (0) or a box, with its padding box size.
+            let fixed = pseudo.get(Prop::POSITION) == Some("fixed");
+            let escaped = (absolute && id != 0 && !if fixed { made.fixed } else { made.absolute })
+                .then(|| {
+                    let block = self::positioner(
+                        if fixed { "fixed" } else { "absolute" },
+                        ancestors.iter().rev().copied(),
+                        |ancestor| super::effects::establishes(&styles.values[ancestor]),
+                    );
+                    let scope = block
+                        .and_then(|block| ancestors.iter().rposition(|&a| a == block))
+                        .map_or(1, |index| index + 1);
+                    reader.log(Query::Positioner(fixed), scope, hashed(block));
+                    match block {
+                        None | Some(0) => (
+                            block.unwrap_or(usize::MAX),
+                            viewport().unwrap_or(units.viewport),
+                            false,
+                        ),
+                        Some(block) => {
+                            let size =
+                                reader.block_size(view.host.borrow().dom.get(&view.id), block);
+                            reader.log(
+                                Query::Block(block as u32),
+                                0,
+                                hashed(size.map(|size| size.map(f32::to_bits))),
+                            );
+                            (block, size.unwrap_or(containing), true)
+                        }
+                    }
+                });
             let own_flex = matches!(own, "flex" | "inline-flex");
             for (prop, value) in pseudo.iter() {
                 let value: &str = value;
@@ -5976,8 +6008,14 @@ fn create(
                     prop,
                     Prop::HEIGHT | Prop::MIN_HEIGHT | Prop::MAX_HEIGHT | Prop::TOP | Prop::BOTTOM
                 );
-                let base = containing[usize::from(vertical)];
+                let base = escaped.map_or(containing, |(_, size, _)| size)[usize::from(vertical)];
+                // Layout takes percentages from the element, so those of another block resolve here.
                 let length = |extra: f32, own: &mut renderer::Style| -> Option<renderer::Length> {
+                    if escaped.is_some() {
+                        return pseudo_units
+                            .resolve(value, base)
+                            .map(|value| px(value + extra).into());
+                    }
                     match percentage(value) {
                         Some(percent) if extra == 0. => Some(relative(percent / 100.)),
                         Some(percent) => Some(renderer::Length::Calc(percent / 100., px(extra))),
@@ -6348,15 +6386,73 @@ fn create(
             } else {
                 decoration
             };
+            let mut contained = None;
+            let decoration = match escaped {
+                Some((container, size, sized)) => {
+                    let inset = [Prop::TOP, Prop::RIGHT, Prop::BOTTOM, Prop::LEFT].map(|prop| {
+                        let axis = usize::from(matches!(prop, Prop::TOP | Prop::BOTTOM));
+                        pseudo
+                            .get(prop)
+                            .and_then(|v| pseudo_units.resolve(v, size[axis]))
+                    });
+                    // Both insets of an axis stretch an auto size across the containing block.
+                    let mut decoration = decoration;
+                    for (axis, [start, end]) in [(0, [3, 1]), (1, [0, 2])] {
+                        let prop = if axis == 0 { Prop::WIDTH } else { Prop::HEIGHT };
+                        if let (Some(first), Some(last)) = (inset[start], inset[end])
+                            && pseudo.get(prop).is_none_or(|value| value == "auto")
+                        {
+                            let length = px((size[axis]
+                                - first
+                                - last
+                                - pseudo_margin[start]
+                                - pseudo_margin[end])
+                                .max(0.));
+                            decoration = if axis == 0 {
+                                decoration.w(length)
+                            } else {
+                                decoration.h(length)
+                            };
+                        }
+                    }
+                    decoration.style().escape = if fixed {
+                        renderer::Escape::FIXED
+                    } else {
+                        renderer::Escape::ABSOLUTE
+                    };
+                    contained = Some(super::paint::PseudoBlock {
+                        view: view.clone(),
+                        place: super::paint::Contained {
+                            key: super::pseudo_key(id, index as u8 + 1) as usize,
+                            container,
+                            viewport: units.viewport,
+                            sized: sized.then_some(size),
+                            inset,
+                            margin: pseudo_margin,
+                            rtl: styles.values[if container == usize::MAX {
+                                0
+                            } else {
+                                container
+                            }]
+                            .get(Prop::DIRECTION)
+                                == Some("rtl"),
+                        },
+                        offset: Default::default(),
+                    });
+                    decoration
+                }
+                None => decoration,
+            };
             let order = pseudo
                 .get(Prop::Z_INDEX)
                 .and_then(|value| value.parse::<i32>().ok())
                 .unwrap_or(0);
-            let decoration = if order != 0
-                && (grid_item
-                    || pseudo
-                        .get(Prop::POSITION)
-                        .is_some_and(|value| value != "static"))
+            // Like positioned elements, positioned pseudo-elements with `z-index: auto` or 0 paint after the in-flow
+            // boxes of their stacking context.
+            let decoration = if pseudo
+                .get(Prop::POSITION)
+                .is_some_and(|value| value != "static")
+                || order != 0 && grid_item
             {
                 decoration.z_index(order)
             } else {
@@ -6370,8 +6466,14 @@ fn create(
                     view: view.clone(),
                     element: id,
                     origin: pseudo_origin.get_or_insert_default().clone(),
+                    shift: contained.as_ref().map(|contained| contained.offset.clone()),
                     key: style::atom_key(id, index as u8 + 1),
                 })
+            };
+            // Outside `PseudoBox`, which reads its move.
+            let decoration = match contained {
+                Some(contained) => decoration.hooks(contained),
+                None => decoration,
             };
             // The part of a spliced box gives the box its bounds.
             if pseudo_only {

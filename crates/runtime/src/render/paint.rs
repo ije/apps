@@ -466,6 +466,8 @@ pub(super) struct PseudoBox {
     pub(super) view: Rc<super::PageState>,
     pub(super) element: usize,
     pub(super) origin: Rc<Cell<Point<Pixels>>>,
+    // The move of a `PseudoBlock` around it.
+    pub(super) shift: Option<Rc<Cell<Point<Pixels>>>>,
     pub(super) key: usize,
 }
 
@@ -481,7 +483,11 @@ impl Hooks for PseudoBox {
             .map_or(Point::default(), |handle| {
                 crate::dom::painted_offset(handle, scale)
             });
-        let at = cx.exact.origin - self.origin.get() - scroll;
+        let shift = self
+            .shift
+            .as_ref()
+            .map_or(Point::default(), |shift| shift.get());
+        let at = cx.exact.origin + shift - self.origin.get() - scroll;
         let [x, y] = [at.x, at.y].map(f32::from);
         let [w, h] = [cx.exact.size.width, cx.exact.size.height].map(f32::from);
         let [a, b, c, d] = cx.inset.map(f32::from);
@@ -508,6 +514,119 @@ impl Hooks for PseudoBox {
         true
     }
     fn shift(&self, _: Point<Pixels>, _: Rect<Pixels>, _: &mut Window) -> bool {
+        true
+    }
+}
+
+// The insets of an out-of-flow box whose containing block is an ancestor of its layout parent.
+pub(super) struct Contained {
+    // Tells mismatches of this box from those of others.
+    pub(super) key: usize,
+    pub(super) container: usize,
+    pub(super) viewport: [f32; 2],
+    // The containing block size that the build used, when it came from another box.
+    pub(super) sized: Option<[f32; 2]>,
+    pub(super) inset: [Option<f32>; 4],
+    pub(super) margin: [f32; 4],
+    // The containing block is right-to-left, so `right` wins over `left`.
+    pub(super) rtl: bool,
+}
+
+impl Contained {
+    // The move that places `bounds` by the insets in the padding box of the containing block.
+    fn shift(
+        &self,
+        view: &super::PageState,
+        bounds: Rect<Pixels>,
+        window: &mut Window,
+    ) -> Point<Pixels> {
+        let block = {
+            let host = view.host.borrow();
+            host.dom.get(&view.id).and_then(|dom| match self.container {
+                usize::MAX => Some(Rect::new(
+                    Point::default(),
+                    renderer::size(px(self.viewport[0]), px(self.viewport[1])),
+                )),
+                0 => dom.scroll.get(&0).map(|scroll| {
+                    let [width, height] = self.viewport;
+                    Rect::new(
+                        scroll.bounds().origin + scroll.painted(),
+                        renderer::size(px(width), px(height)),
+                    )
+                }),
+                // The boxes that a scroll container contains move with its scroll.
+                container => dom.blocks.get(&container).map(|block| {
+                    let scroll = dom.scroll.get(&container);
+                    *block + scroll.map_or(Point::default(), |s| s.painted())
+                }),
+            })
+        };
+        let Some(block) = block else {
+            return Point::default();
+        };
+        // Redraw only once per mismatch to avoid endless frames when layout repeats the same size.
+        if let Some([width, height]) = self.sized
+            && ((f32::from(block.size.width) - width).abs() > 0.5
+                || (f32::from(block.size.height) - height).abs() > 0.5)
+        {
+            let key = (
+                self.key,
+                [
+                    width,
+                    height,
+                    block.size.width.into(),
+                    block.size.height.into(),
+                ]
+                .map(f32::to_bits),
+            );
+            let [current, seen] = &mut *view.mismatched.borrow_mut();
+            if current.insert(key) && !seen.contains(&key) {
+                window.redraw();
+            }
+        }
+        let [top, right, bottom, left] = self.inset;
+        let [margin_top, margin_right, margin_bottom, margin_left] = self.margin.map(px);
+        let mut shift = point(px(0.), px(0.));
+        if let Some(right) = right.filter(|_| self.rtl || left.is_none()) {
+            shift.x = block.right() - px(right) - margin_right - bounds.right();
+        } else if let Some(left) = left {
+            shift.x = block.left() + px(left) + margin_left - bounds.left();
+        }
+        if let Some(top) = top {
+            shift.y = block.top() + px(top) + margin_top - bounds.top();
+        } else if let Some(bottom) = bottom {
+            shift.y = block.bottom() - px(bottom) - margin_bottom - bounds.bottom();
+        }
+        shift
+    }
+}
+
+// Moves an absolute or fixed `::before` or `::after` into its containing block, when that is not its element.
+pub(super) struct PseudoBlock {
+    pub(super) view: Rc<super::PageState>,
+    pub(super) place: Contained,
+    pub(super) offset: Rc<Cell<Point<Pixels>>>,
+}
+
+impl Hooks for PseudoBlock {
+    fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let offset = self.place.shift(&self.view, cx.exact, cx.window);
+        self.offset.set(offset);
+        cx.window
+            .scope(renderer::Scope::Offset(offset), |window| inner(window));
+    }
+    fn kept(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
+        let offset = self.offset.get();
+        cx.window
+            .scope(renderer::Scope::Offset(offset), |window| inner(window));
+    }
+    fn volatile(&self) -> bool {
+        true
+    }
+    fn bounded(&self) -> bool {
+        true
+    }
+    fn cached(&self) -> bool {
         true
     }
 }
@@ -933,59 +1052,17 @@ impl Hooks for DomBox {
             }
             bounds.origin += offset;
         }
-        if let Some(container) = self.container
-            && let Some(block) = {
-                let view = &*self.view;
-                let host = view.host.borrow();
-                host.dom.get(&view.id).and_then(|dom| match container {
-                    0 => dom.scroll.get(&0).map(|scroll| {
-                        let [width, height] = self.units.viewport;
-                        Rect::new(
-                            scroll.bounds().origin + scroll.painted(),
-                            renderer::size(px(width), px(height)),
-                        )
-                    }),
-                    // The boxes that a scroll container contains move with its scroll.
-                    _ => dom.blocks.get(&container).map(|block| {
-                        let scroll = dom.scroll.get(&container);
-                        *block + scroll.map_or(Point::default(), |s| s.painted())
-                    }),
-                })
+        if let Some(container) = self.container {
+            let shift = Contained {
+                key: self.id,
+                container,
+                viewport: self.units.viewport,
+                sized: self.sized,
+                inset: self.inset,
+                margin: self.margin,
+                rtl: self.rtl,
             }
-        {
-            // Redraw only once per mismatch to avoid endless frames when layout repeats the same size.
-            if let Some([width, height]) = self.sized
-                && ((f32::from(block.size.width) - width).abs() > 0.5
-                    || (f32::from(block.size.height) - height).abs() > 0.5)
-            {
-                let key = (
-                    self.id,
-                    [
-                        width,
-                        height,
-                        block.size.width.into(),
-                        block.size.height.into(),
-                    ]
-                    .map(f32::to_bits),
-                );
-                let [current, seen] = &mut *self.view.mismatched.borrow_mut();
-                if current.insert(key) && !seen.contains(&key) {
-                    window.redraw();
-                }
-            }
-            let [top, right, bottom, left] = self.inset;
-            let [margin_top, margin_right, margin_bottom, margin_left] = self.margin.map(px);
-            let mut shift = point(px(0.), px(0.));
-            if let Some(right) = right.filter(|_| self.rtl || left.is_none()) {
-                shift.x = block.right() - px(right) - margin_right - bounds.right();
-            } else if let Some(left) = left {
-                shift.x = block.left() + px(left) + margin_left - bounds.left();
-            }
-            if let Some(top) = top {
-                shift.y = block.top() + px(top) + margin_top - bounds.top();
-            } else if let Some(bottom) = bottom {
-                shift.y = block.bottom() - px(bottom) - margin_bottom - bounds.bottom();
-            }
+            .shift(&self.view, bounds, window);
             offset += shift;
             bounds.origin += shift;
         }
