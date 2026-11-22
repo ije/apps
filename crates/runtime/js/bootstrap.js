@@ -1018,7 +1018,7 @@
       BrowserWindow.prototype[method] = () => { throw Error(`BrowserWindow.${method}() is not supported on ${info.platform}`); };
     Object.assign(BrowserWindow.prototype, { setVibrancy() { state(this); } }, win32
       ? { setVisibleOnAllWorkspaces() { state(this); }, isVisibleOnAllWorkspaces() { state(this); return false; } }
-      : { setOpacity() { state(this); }, getOpacity() { state(this); return 1; }, setContentProtection() { state(this); }, isContentProtected() { state(this); return false; } });
+      : { setOpacity(opacity) { state(this); num(opacity, 'opacity'); }, getOpacity() { state(this); return 1; }, setContentProtection() { state(this); }, isContentProtected() { state(this); return false; } });
   }
   const app = new events.EventEmitter();
   const event = () => ({ defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } });
