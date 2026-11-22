@@ -6753,7 +6753,17 @@ fn create(
             )
         };
         for (index, (atom, child)) in data.atoms.iter().zip(atom_elements).enumerate() {
-            el = el.child(atom_box(index, atom, child, &atom_slots, padding));
+            let atom_box = atom_box(index, atom, child, &atom_slots, padding);
+            el = el.child(match inline_fade(doc, styles, atom.node, id) {
+                fade if fade < 1. => atom_box.hooks(super::paint::Effected {
+                    effect: renderer::PaintEffect {
+                        opacity: fade,
+                        ..Default::default()
+                    },
+                    backdrop: None,
+                }),
+                _ => atom_box,
+            });
         }
         for child in placed {
             // The containing block of a positioned child is the padding box.
@@ -7613,15 +7623,9 @@ fn create(
                 }
             }
         }
-        // A spliced box has no box of its own, so its blocks and atoms take its opacity.
-        let fade = |child: usize| {
-            let start = (!cuts.is_empty()).then_some(child);
-            std::iter::successors(start, |&up| doc.nodes[up].parent)
-                .take_while(|&up| up != id)
-                .filter(|&up| up != child && cut_ids.contains(&up))
-                .map(|up| super::effects::opacity(&styles.values[up]))
-                .product::<f32>()
-        };
+        // A spliced box, and an inline box in the text, has no box of its own, so its blocks and atoms take its
+        // opacity.
+        let fade = |child: usize| inline_fade(doc, styles, child, id);
         let faded = |child: usize, element: Child| {
             let fade = fade(child);
             match fade < 1. {
@@ -9779,6 +9783,20 @@ fn margins(
         margin[2] = bottom;
     }
     margin
+}
+
+/// The opacity of the inline boxes between `child` and its block `id`, which are parts of the text of the block.
+fn inline_fade(doc: &Document, styles: &style::ComputedStyles, child: usize, id: usize) -> f32 {
+    std::iter::successors(doc.nodes.get(child).and_then(|node| node.parent), |&up| {
+        doc.nodes[up].parent
+    })
+    .take_while(|&up| up != id)
+    .filter(|&up| {
+        !doc.nodes[up].tag.starts_with('#')
+            && styles.values[up].get(Prop::DISPLAY) != Some("contents")
+    })
+    .map(|up| super::effects::opacity(&styles.values[up]))
+    .product()
 }
 
 fn flow(build: &Build<'_>, id: usize) -> Vec<usize> {

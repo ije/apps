@@ -647,6 +647,26 @@ fn opacity(style: &Style) -> f32 {
     })
 }
 
+/// Whether the text of a box can draw its opacity: with nothing drawn below or around the text, fading its colors
+/// gives the same pixels as a group, so the box stays a part of the lines of its block.
+pub(crate) fn fades(style: &Style) -> bool {
+    let none =
+        |prop: Prop, values: &[&str]| style.get(prop).is_none_or(|value| values.contains(&value));
+    none(Prop::BACKGROUND_COLOR, &["transparent", "rgba(0, 0, 0, 0)"])
+        && none(Prop::BACKGROUND_IMAGE, &["none"])
+        && none(Prop::BOX_SHADOW, &["none"])
+        && none(Prop::TEXT_SHADOW, &["none"])
+        && none(Prop::OUTLINE_STYLE, &["none"])
+        && [
+            Prop::BORDER_TOP_STYLE,
+            Prop::BORDER_RIGHT_STYLE,
+            Prop::BORDER_BOTTOM_STYLE,
+            Prop::BORDER_LEFT_STYLE,
+        ]
+        .into_iter()
+        .all(|prop| none(prop, &["none", "hidden"]))
+}
+
 /// Whether `id` has a `::first-letter` or `::first-line` style.
 fn first_text(styles: &ComputedStyles, id: usize) -> bool {
     styles
@@ -754,6 +774,7 @@ fn splits(style: &Rc<Style>, parent: &Rc<Style>) -> bool {
         || style.iter().any(|(key, value)| {
             key.is_known()
                 && parent.value(key) != Some(value)
+                && !(key == Prop::OPACITY && fades(style))
                 && !(key == Prop::POSITION
                     && &**value == "relative"
                     && [
@@ -1220,14 +1241,18 @@ pub(crate) fn inline_text(
             .map(|child| (child, None, None))
             .collect()
     };
-    // The opacity of the spliced boxes around a node and of the node itself.
+    // The opacity of the inline boxes around a node, and of the node itself when it is a spliced box.
     let fade = |node: usize| {
-        std::iter::successors(
-            Some(node).filter(|&node| !cuts.is_empty() && node < doc.nodes.len()),
-            |&up| doc.nodes[up].parent,
-        )
+        std::iter::successors(Some(node).filter(|&node| node < doc.nodes.len()), |&up| {
+            doc.nodes[up].parent
+        })
         .take_while(|&up| up != id)
-        .filter(|up| cuts.iter().any(|(cut, _)| cut == up))
+        .filter(|&up| {
+            up != node
+                && !doc.nodes[up].tag.starts_with('#')
+                && styles.values[up].get(Prop::DISPLAY) != Some("contents")
+                || cuts.iter().any(|(cut, _)| *cut == up)
+        })
         .map(|up| opacity(&styles.values[up]))
         .product::<f32>()
     };

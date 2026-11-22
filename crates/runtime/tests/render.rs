@@ -3662,6 +3662,31 @@ fn the_only_box_of_a_run_paints_its_new_color() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn faded_inline_text_stays_in_its_lines() {
+    let (text, rects) = picture_rects(
+        "faded.html",
+        "<body style='margin:0;font:20px/30px Helvetica'><style>.w{width:300px}</style>\
+         <div class=w><p id=p style='margin:0'>C <span id=c style='opacity:.5;padding:0 20px'>wraps across many \
+         lines of text here to show line pieces</span> end</p></div>\
+         <div class=w><p style='margin:0'>E <span style='opacity:.4'>box <b id=b style='display:inline-block;\
+         width:40px;height:20px'></b> after</span></p></div></body>",
+    );
+    for (id, expected) in [
+        ("p", "0,0,300,90"),
+        ("c", "0,3.5,281.2,53"),
+        ("b", "56.7,2,40,20"),
+    ] {
+        let at: Vec<f32> = rects[id].split(',').map(|v| v.parse().unwrap()).collect();
+        let want: Vec<f32> = expected.split(',').map(|v| v.parse().unwrap()).collect();
+        assert!(
+            at.iter().zip(&want).all(|(a, b)| (a - b).abs() < 0.6),
+            "{id} at {expected}, as in Chrome: {text}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn wide_first_items_and_spaces_break_lines_like_chrome() {
     let (text, rects) = picture_rects(
         "breaks.html",
