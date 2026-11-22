@@ -4259,9 +4259,8 @@ fn create(
                     "center" => renderer::AlignItems::Center,
                     "flex-start" | "start" | "self-start" => renderer::AlignItems::FlexStart,
                     "flex-end" | "end" | "self-end" => renderer::AlignItems::FlexEnd,
-                    "baseline" | "first baseline" | "last baseline" => {
-                        renderer::AlignItems::Baseline
-                    }
+                    "baseline" | "first baseline" => renderer::AlignItems::Baseline,
+                    "last baseline" => renderer::AlignItems::LastBaseline,
                     "stretch" | "normal" => renderer::AlignItems::Stretch,
                     _ => continue,
                 };
@@ -6076,9 +6075,8 @@ fn create(
                                 renderer::AlignItems::FlexStart
                             }
                             "flex-end" | "end" | "self-end" => renderer::AlignItems::FlexEnd,
-                            "baseline" | "first baseline" | "last baseline" => {
-                                renderer::AlignItems::Baseline
-                            }
+                            "baseline" | "first baseline" => renderer::AlignItems::Baseline,
+                            "last baseline" => renderer::AlignItems::LastBaseline,
                             "stretch" | "normal" => renderer::AlignItems::Stretch,
                             _ => continue,
                         };

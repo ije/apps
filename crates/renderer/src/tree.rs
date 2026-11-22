@@ -4477,6 +4477,53 @@ impl LayoutTree<'_> {
         Some(output)
     }
 
+    /// In a column, a baseline runs along the cross axis, so like Chrome the items that align on their first or last
+    /// baselines share their line-left edge, as a group at the start or the end side of the column.
+    fn group_baselines(&mut self, index: usize, parent_width: Option<f32>, width: f32) {
+        use taffy::ResolveOrZero;
+        let calc = |value, basis| crate::style::resolve_calc(value, basis);
+        let style = self.slots[index].taffy();
+        let rtl = style.direction == taffy::Direction::Rtl;
+        let inset = style.padding.resolve_or_zero(parent_width, calc)
+            + style.border.resolve_or_zero(parent_width, calc);
+        let [left, right] = [inset.left, width - inset.right];
+        let align = self.slots[index].style.align_items;
+        for last in [false, true] {
+            let kind = if last {
+                AlignItems::LastBaseline
+            } else {
+                AlignItems::Baseline
+            };
+            let members: Vec<usize> = (self.slots[index].children.iter())
+                .map(|&child| usize::from(child))
+                .filter(|&child| {
+                    let slot = &self.slots[child];
+                    slot.taffy().position != taffy::Position::Absolute
+                        && slot.taffy().display != taffy::Display::None
+                        && slot.style.align_self.or(align) == Some(kind)
+                })
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            let wide = members.iter().fold(0f32, |wide, &child| {
+                let layout = &self.slots[child].layout;
+                wide.max(layout.size.width + layout.margin.left + layout.margin.right)
+            });
+            let x = if rtl != last { right - wide } else { left };
+            for child in members {
+                let slot = &mut self.slots[child];
+                let at = x + slot.layout.margin.left;
+                if slot.layout.location.x != at {
+                    slot.layout.location.x = at;
+                    if !self.exact {
+                        changed(self.slots, child);
+                    }
+                }
+            }
+        }
+    }
+
     /// Places a float with its margin box `size` at or below `y`, between `edges`, like CSS 2 9.5.1.
     fn place(&mut self, edges: [f32; 2], size: [f32; 2], mut y: f32, bits: u8) -> [f32; 2] {
         let right = bits & Flow::RIGHT != 0;
@@ -4607,6 +4654,14 @@ impl LayoutTree<'_> {
                     start,
                 );
             }
+        }
+        if inputs.run_mode == RunMode::PerformLayout
+            && matches!(
+                self.slots[index].taffy().flex_direction,
+                FlexDirection::Column | FlexDirection::ColumnReverse
+            )
+        {
+            self.group_baselines(index, inputs.parent_size.width, output.size.width);
         }
         if inputs.run_mode != RunMode::PerformLayout
             || self.slots[index].style.inline != Inline::Lines

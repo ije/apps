@@ -3708,6 +3708,30 @@ fn faded_inline_boxes_with_backgrounds_draw_as_groups_in_their_lines() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn baseline_items_of_columns_align_as_a_group_like_chrome() {
+    let (text, rects) = picture_rects(
+        "columns.html",
+        "<body style='margin:0;font:16px/20px Helvetica'><style>.w{display:flex;flex-direction:column;width:300px}</style>\
+         <div class=w dir=rtl style='align-items:baseline'><div id=a>first</div>\
+         <div id=b style='font-size:30px;line-height:36px'>second</div></div>\
+         <div class=w dir=rtl style='align-items:last baseline'><div id=f>first</div>\
+         <div id=g style='font-size:30px'>second</div></div>\
+         <div class=w style='align-items:baseline'><div id=d>first</div></div></body>",
+    );
+    for (id, x) in [
+        ("a", 203.26),
+        ("b", 203.26),
+        ("f", 0.),
+        ("g", 0.),
+        ("d", 0.),
+    ] {
+        let at: f32 = rects[id].split(',').next().unwrap().parse().unwrap();
+        assert!((at - x).abs() < 0.05, "{id} at x {x}, as in Chrome: {text}");
+    }
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn wide_first_items_and_spaces_break_lines_like_chrome() {
     let (text, rects) = picture_rects(
         "breaks.html",

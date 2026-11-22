@@ -51,17 +51,22 @@ impl Line {
     }
 
     pub fn nearest_index(&self, x: Pixels) -> usize {
-        let at = if self.sorted {
-            self.glyphs.partition_point(|glyph| glyph.x < x)
-        } else {
-            (self.glyphs.iter().position(|glyph| glyph.x >= x)).unwrap_or(self.glyphs.len())
-        };
-        // Past every glyph, the choice is between the rightmost glyph and the line end.
-        let before = if self.sorted || at < self.glyphs.len() {
-            at.checked_sub(1).map(|before| self.glyphs[before])
-        } else {
-            self.glyphs.iter().copied().max_by_key(|glyph| glyph.x)
-        };
+        if !self.sorted {
+            // Each glyph has a caret stop at both sides: before its text on its leading side, after it on the other.
+            let mut best = (Pixels(f32::INFINITY), 0);
+            for at in 0..self.glyphs.len() {
+                let [left, right] = self.edges(at);
+                for (edge, index) in [(self.glyphs[at].x, left), (self.right_of(at), right)] {
+                    let distance = (edge - x).abs();
+                    if distance < best.0 {
+                        best = (distance, index);
+                    }
+                }
+            }
+            return if self.glyphs.is_empty() { 0 } else { best.1 };
+        }
+        let at = self.glyphs.partition_point(|glyph| glyph.x < x);
+        let before = at.checked_sub(1).map(|before| self.glyphs[before]);
         let (before, before_x) =
             before.map_or((0, px(0.)), |glyph| (glyph.index as usize, glyph.x));
         let (after, after_x) = (self.glyphs.get(at)).map_or((self.len, self.width), |glyph| {
@@ -74,19 +79,57 @@ impl Line {
         }
     }
 
+    /// Whether the glyph at visual place `at` is in a right-to-left run: a neighbor's text goes the other way.
+    fn reversed(&self, at: usize) -> bool {
+        let index = self.glyphs[at].index;
+        self.glyphs
+            .get(at + 1)
+            .is_some_and(|next| next.index < index)
+            || at
+                .checked_sub(1)
+                .is_some_and(|before| self.glyphs[before].index > index)
+    }
+
+    fn right_of(&self, at: usize) -> Pixels {
+        self.glyphs.get(at + 1).map_or(self.width, |next| next.x)
+    }
+
+    /// The text offsets at the left and right edges of the glyph at visual place `at`.
+    fn edges(&self, at: usize) -> [usize; 2] {
+        let index = self.glyphs[at].index;
+        let end = (self.glyphs.iter())
+            .map(|glyph| glyph.index)
+            .filter(|&other| other > index)
+            .min()
+            .map_or(self.len, |end| end as usize);
+        match self.reversed(at) {
+            true => [end, index as usize],
+            false => [index as usize, end],
+        }
+    }
+
     pub fn x_at(&self, index: usize) -> Pixels {
-        let at = if self.sorted {
-            Some(
-                self.glyphs
-                    .partition_point(|glyph| (glyph.index as usize) < index),
-            )
-            .filter(|&at| at < self.glyphs.len())
-        } else {
-            self.glyphs
-                .iter()
-                .position(|glyph| glyph.index as usize >= index)
-        };
-        at.map_or(self.width, |at| self.glyphs[at].x)
+        if !self.sorted {
+            // The caret goes before the glyph that the text at `index` starts, on its leading side, or after the
+            // last glyph of the text on its trailing side.
+            let next = (0..self.glyphs.len())
+                .filter(|&at| self.glyphs[at].index as usize >= index)
+                .min_by_key(|&at| (self.glyphs[at].index, at));
+            return match next {
+                Some(at) if self.reversed(at) => self.right_of(at),
+                Some(at) => self.glyphs[at].x,
+                None => (0..self.glyphs.len())
+                    .max_by_key(|&at| (self.glyphs[at].index, at))
+                    .map_or(self.width, |at| match self.reversed(at) {
+                        true => self.glyphs[at].x,
+                        false => self.right_of(at),
+                    }),
+            };
+        }
+        let at = self
+            .glyphs
+            .partition_point(|glyph| (glyph.index as usize) < index);
+        self.glyphs.get(at).map_or(self.width, |glyph| glyph.x)
     }
 }
 
@@ -253,6 +296,25 @@ mod tests {
         };
         line.sort_check();
         line
+    }
+
+    #[test]
+    fn right_to_left_glyphs_put_carets_on_their_leading_side() {
+        // "ab" then three right-to-left letters, drawn reversed: a b 4 3 2, each 10 wide.
+        let mut line = line("abcde");
+        for (glyph, index) in line.glyphs.iter_mut().zip([0, 1, 4, 3, 2]) {
+            glyph.index = index;
+        }
+        line.sort_check();
+        assert!(!line.sorted);
+        let carets: Vec<f32> = (0..=5).map(|index| line.x_at(index).0).collect();
+        assert_eq!(carets, [0., 10., 50., 40., 30., 20.]);
+        // At 20 the right side of b and the left side of the run meet: the first stop wins.
+        let hits: Vec<usize> = [0., 10., 20., 30., 40., 50.]
+            .into_iter()
+            .map(|x| line.nearest_index(px(x)))
+            .collect();
+        assert_eq!(hits, [0, 1, 2, 4, 3, 2]);
     }
 
     #[test]

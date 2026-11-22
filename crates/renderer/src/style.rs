@@ -159,7 +159,7 @@ keywords! {
     Overscroll { Auto, Contain, None }
     FlexDirection { Row, RowReverse, Column, ColumnReverse }
     FlexWrap { NoWrap, Wrap, WrapReverse }
-    AlignItems { FlexStart, FlexEnd, Center, Baseline, Stretch }
+    AlignItems { FlexStart, FlexEnd, Center, Baseline, LastBaseline, Stretch }
     AlignContent { Start, End, FlexStart, FlexEnd, Center, Stretch, SpaceBetween, SpaceEvenly, SpaceAround }
     ObjectFit { Fill, Contain, Cover, ScaleDown, None }
     // `FirstOnly` takes the first baseline and gives none for the last. `Middle` puts it at half the border box height.
@@ -376,7 +376,7 @@ impl Style {
             AlignItems::FlexStart => t::AlignItems::FLEX_START,
             AlignItems::FlexEnd => t::AlignItems::FLEX_END,
             AlignItems::Center => t::AlignItems::CENTER,
-            AlignItems::Baseline => t::AlignItems::BASELINE,
+            AlignItems::Baseline | AlignItems::LastBaseline => t::AlignItems::BASELINE,
             AlignItems::Stretch => t::AlignItems::STRETCH,
         };
         let content = |value: AlignContent| match value {
