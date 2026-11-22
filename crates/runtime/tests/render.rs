@@ -264,6 +264,19 @@ fn pages_scroll_sideways_from_their_start() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn boxes_with_break_spaces_text_share_styles() {
+    let (text, rects) = picture_rects(
+        "code.html",
+        "<body style='margin:0;font:16px/20px Helvetica'><style>code{padding:.2em .4em;font-size:85%;\
+         white-space:break-spaces;background:#eee;border-radius:6px}</style>\
+         <p>One <code>inline code</code> and <code>width</code>.</p><ul class=w><li><code>show</code></li>\
+         <li><code>true</code></li><li><code id=c0>false</code></li></ul></body>",
+    );
+    assert!(rects.contains_key("c0"), "{text}");
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn right_to_left_and_reversed_boxes_scroll_from_their_end() {
     run_hidden(
         r#"

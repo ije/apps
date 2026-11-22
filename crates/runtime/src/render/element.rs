@@ -2251,7 +2251,7 @@ fn create(
         ))
     .then(|| {
         use std::hash::{Hash, Hasher};
-        let texted = inline_text().map(|data| data.text.is_empty());
+        let texted = inline_text().map(|data| (data.text.is_empty(), data.greedy));
         let mut hasher = rustc_hash::FxHasher::default();
         (
             Rc::as_ptr(&parsed),
@@ -6666,7 +6666,7 @@ fn create(
                 placed.push(child);
             }
         }
-        if data.greedy {
+        if data.greedy && hit.is_none() {
             el.text_style().set_text_wrap(renderer::TextWrap::Wrap);
         }
         let mut paragraph = renderer::Node::from(InlineText {
