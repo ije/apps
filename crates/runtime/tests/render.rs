@@ -277,6 +277,33 @@ fn boxes_with_break_spaces_text_share_styles() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn blocks_far_from_the_view_move_with_a_sideways_scroll() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const read = () => run(`[0, 15, 20, 39].map(i => Math.round(document.getElementById('r' + i).getBoundingClientRect().left)).join()`);
+        const got = [await read()];
+        for (const [key, value] of [['scrollLeft', 100], ['scrollLeft', 30], ['scrollTop', 300]]) {
+            await run(`document.getElementById('b')['${key}'] = ${value}`);
+            got.push(await read());
+            await win.webContents.capturePage();
+            got.push(await read());
+        }
+        const want = '9,9,9,9 -91,-91,-91,-91 -91,-91,-91,-91 -21,-21,-21,-21 -21,-21,-21,-21 -21,-21,-21,-21 -21,-21,-21,-21';
+        if (got.join(' ') !== want) fail(got.join(' '));
+        "#,
+        &[(
+            "page.html",
+            "<body style='margin:0'><div id=b style='width:150px;height:200px;overflow:auto;border:1px solid;margin:8px'>\
+             <div style='width:600px;height:20px'></div></div>\
+             <script type=module>const b = document.getElementById('b');\
+             for (let i = 0; i < 40; i++) b.append(Object.assign(document.createElement('div'), { id: 'r' + i, style: 'height:40px' }));</script></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn right_to_left_and_reversed_boxes_scroll_from_their_end() {
     run_hidden(
         r#"

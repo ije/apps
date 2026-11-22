@@ -7463,7 +7463,9 @@ fn create(
                         ];
                     }
                 }
-                plan = (!runs.is_empty()).then_some((slots, runs, [left, width], zone));
+                // The x of the content: the box moves its blocks, and so does its own scroll.
+                let x = left + f32::from(dom.mirror_offset(id).x);
+                plan = (!runs.is_empty()).then_some((slots, runs, [x, width], zone));
             }
         }
         let mut culled = Vec::new();

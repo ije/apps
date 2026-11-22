@@ -634,7 +634,12 @@ pub(super) fn spacer(
             };
             let [low, high] = zone.visible(&dom.bounds, window);
             let y = f32::from(bounds.top());
-            let x = dom.bounds.get(&parent).map(|rect| rect[0]);
+            let x = dom.bounds.get(&parent).map(|rect| {
+                rect[0]
+                    + dom.scroll.get(&parent).map_or(0., |handle| {
+                        f32::from(crate::dom::painted_offset(handle, window.scale_factor()).x)
+                    })
+            });
             let resized = x.is_none()
                 || dom
                     .cull

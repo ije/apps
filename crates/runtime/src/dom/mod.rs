@@ -905,6 +905,11 @@ impl State {
             | ((self.pixel_ratio.clamp(0., 600.) * 100.).round() as u32) << 16
     }
 
+    // The scroll offset of a box that the mirror shows.
+    pub(crate) fn mirror_offset(&self, id: usize) -> renderer::Point<renderer::Pixels> {
+        self.mirror_offsets.get(&id).copied().unwrap_or_default()
+    }
+
     // After prepaint, the mirror shows the scroll offsets now.
     pub(crate) fn prepainted(&mut self) {
         self.mirror_offsets.clear();
