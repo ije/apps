@@ -3026,6 +3026,24 @@ pub fn call(
             let page = doc.nodes[id].parent == Some(0)
                 && doc.nodes[id].tag == "html"
                 && !state.scroll.contains_key(&id);
+            // As in Chrome, a box that can't scroll keeps its offset at 0.
+            if !page && !state.scroll.contains_key(&id) {
+                let computed = styles(doc, state, viewport);
+                let style = computed.values.get(id);
+                let scrolls = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                    .into_iter()
+                    .any(|prop| {
+                        style
+                            .and_then(|style| style.get(prop))
+                            .is_some_and(|value| !matches!(value, "visible" | "clip"))
+                    });
+                let boxed = style
+                    .and_then(|style| style.get(Prop::DISPLAY))
+                    .is_some_and(|value| !matches!(value, "inline" | "contents" | "none"));
+                if doc.nodes[id].tag.starts_with('#') || !scrolls || !boxed {
+                    return Ok(json!([0., 0.]));
+                }
+            }
             let handle = state
                 .scroll
                 .entry(if page { 0 } else { id })
@@ -3576,11 +3594,13 @@ pub fn call(
                 .parent
                 .and_then(|parent| state.bounds.get(&parent))
                 .map_or(viewport[0], |rect| rect[2]);
+            // The bounds are those of the last frame, which laid out the animated padding and borders.
+            let now = state.animating.get(&id).unwrap_or(style);
             let borders = units
-                .borders(style, base)
+                .borders(now, base)
                 .map(|width| width / if shared { 2. } else { 1. });
             let padding = units
-                .edges(style, style::PADDING, base)
+                .edges(now, style::PADDING, base)
                 .map(|value| value.max(0.));
             let bars = state
                 .scroll
@@ -3625,9 +3645,8 @@ pub fn call(
                 renderer::size(renderer::px(size[0]), renderer::px(size[1])),
             );
             // The bounds are those of the last frame, so its animated transform moved them.
-            let moved = state.animating.get(&id).unwrap_or(style);
             let shift = match transformed
-                .then(|| crate::render::effects::transform(moved, units, local, None))
+                .then(|| crate::render::effects::transform(now, units, local, None))
                 .flatten()
             {
                 Some(m) if m[3] == 0. && m[7] == 0. && m[15] == 1. => {

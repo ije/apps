@@ -9,7 +9,7 @@ use std::{cell::RefCell, rc::Rc};
 fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
     let host = Rc::new(RefCell::new(Host::default()));
     host.borrow_mut().pages.insert(1, Page {
-        doc: Document::parse("<html><body><main><div id='left'></div><div id='right'></div></main></body></html>"),
+        doc: Document::parse("<html><body><main><div id='left' style='overflow:auto'></div><div id='right' style='overflow:auto'></div></main></body></html>"),
         dirty: false,
     });
     let engine = JsContext::new(
@@ -47,6 +47,7 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
         if(JSON.stringify(received)!=='[["capture","left"],["left",60,25],["capture","right"],["right",60,25]]') throw Error(JSON.stringify(received));
         received.length=0;
         const root=document.body.attachShadow({mode:'open'}), inner=document.createElement('div');
+        inner.style.overflow='auto';
         root.append(inner);
         document.addEventListener('scroll',()=>received.push('outside'),true);
         root.addEventListener('scroll',()=>received.push('shadow'),true);
@@ -4254,7 +4255,9 @@ fn throwing_resize_observer_does_not_stop_layout_callbacks() {
     host.borrow_mut().pages.insert(
         1,
         Page {
-            doc: Document::parse("<html><body><main><div id='box'></div></main></body></html>"),
+            doc: Document::parse(
+                "<html><body><main><div id='box' style='overflow:auto'></div></main></body></html>",
+            ),
             dirty: false,
         },
     );

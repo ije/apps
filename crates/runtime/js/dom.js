@@ -94,6 +94,15 @@
     if (rootElement(node)) { if (pageScroller(node)) node = document; } else if ((pending() || geometry[3]) && !observing && !call('dom.scrolled', node._id)) return 0;
     return metric(node, k);
   };
+  // As in Chrome, a scroll lays out a box that was no scroll box in the last layout, so it scrolls only if it can,
+  // and its offset stays in its range.
+  const scrollTo = (node, left, top, behavior = null) => {
+    const fresh = !rootElement(node) && !(marks?.[node._id] & 2);
+    if (fresh) layout();
+    const offset = call('dom.scroll', node._id, left, top, behavior);
+    if (fresh) layout();
+    return offset;
+  };
   // Do not cache client boxes from observer reads: they use the previous frame's styles.
   const client = node => { if (slot(node) < 0) return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; if (observing) return call('dom.client', node._id, true); const cached = node._client; if (cached?.[13] === geometry[2] && cached[14] === version) return cached; return node._client = [...call('dom.client', node._id), geometry[2], version]; };
   // Only scroll boxes have a scroll range, so other boxes take the border boxes of their children as their
@@ -1054,10 +1063,10 @@
     getClientRects() { if (slot(this) < 0) return listOf(DOMRectList, []); const parts = call('dom.fragments', this._id); return listOf(DOMRectList, parts ? parts.map(part => new DOMRect(...part)) : [this.getBoundingClientRect()]); }
     get clientWidth() { return rootElement(this) ? innerWidth : Math.round(client(this)[2]); } get clientHeight() { return rootElement(this) ? innerHeight : Math.round(client(this)[3]); }
     get clientLeft() { return Math.round(client(this)[0]); } get clientTop() { return Math.round(client(this)[1]); }
-    get scrollTop() { return scrollOf(this, 5); } set scrollTop(value) { call('dom.scroll', this._id, null, Number(value)); }
-    get scrollLeft() { return scrollOf(this, 4); } set scrollLeft(value) { call('dom.scroll', this._id, Number(value), null); }
+    get scrollTop() { return scrollOf(this, 5); } set scrollTop(value) { scrollTo(this, null, Number(value)); }
+    get scrollLeft() { return scrollOf(this, 4); } set scrollLeft(value) { scrollTo(this, Number(value), null); }
     get scrollWidth() { return pageScroller(this) ? Math.round(innerWidth + metric(document, 6)) : extent(this, 0); } get scrollHeight() { return pageScroller(this) ? Math.round(innerHeight + metric(document, 7)) : extent(this, 1); }
-    scrollTo(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); call('dom.scroll', this._id, left ?? null, top ?? null, behavior); }
+    scrollTo(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); scrollTo(this, left ?? null, top ?? null, behavior); }
     scroll(left, top) { this.scrollTo(left, top); }
     scrollBy(left, top) { let behavior = null; if (typeof left === 'object') ({ left, top, behavior = null } = left ?? {}); this.scrollTo({ left: this.scrollLeft + (left ?? 0), top: this.scrollTop + (top ?? 0), behavior }); }
     scrollIntoView(options = {}) {
@@ -4130,7 +4139,9 @@
       if (target instanceof SVGElement && !(target instanceof SVGSVGElement)) { const box = target.getBBox(); top = left = 0; borderWidth = width = box.width; borderHeight = height = box.height; } else if (!atomicTags.test(target.localName)) { if (inline) top = left = borderWidth = borderHeight = width = height = 0; }
       // An atomic inline box like `<math>` has no client box, so its content box comes from its border box.
       else if (!clientWidth && !clientHeight && (borderWidth || borderHeight)) { const s = getComputedStyle(target), side = name => parseFloat(s['padding' + name]) + parseFloat(s['border' + name + 'Width']); left = parseFloat(s.paddingLeft); top = parseFloat(s.paddingTop); width = Math.max(0, borderWidth - side('Left') - side('Right')); height = Math.max(0, borderHeight - side('Top') - side('Bottom')); }
-      const value = borderWidth + ':' + borderHeight + ':' + width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: borderWidth, blockSize: borderHeight }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) try { observer.callback(entries, observer); } catch (error) { report(error); } }
+      // Sizes are in 1/64 pixels, like Chrome's layout units, so float noise reports no change.
+      const unit = value => Math.round(value * 64) / 64; [borderWidth, borderHeight, width, height] = [borderWidth, borderHeight, width, height].map(unit);
+      const value = observer._boxes?.get(target) === 'border-box' ? borderWidth + ':' + borderHeight : width + ':' + height; observer.targets.set(key, [rect.width, rect.height, at, value]); if (value !== previous?.[3]) { entries.push({ target, contentRect: new DOMRect(left, top, width, height), borderBoxSize: [{ inlineSize: borderWidth, blockSize: borderHeight }], contentBoxSize: [{ inlineSize: width, blockSize: height }], devicePixelContentBoxSize: [{ inlineSize: width * devicePixelRatio, blockSize: height * devicePixelRatio }] }); } } } finally { observing = false; } if (entries.length) try { observer.callback(entries, observer); } catch (error) { report(error); } }
     // Resize observers measure the last frame before scroll listeners change the page, so its styles are still computed.
     // `scrollend` fires when a box has not scrolled for 100 ms, and only pages that listen for it pay for the timers.
     for (const id of call('dom.scrollEvents')) {

@@ -2519,6 +2519,10 @@ impl PageView {
                 .chain(restore_pseudos.iter().map(|(id, _)| *id))
                 .collect();
             let units = !lengths.is_empty();
+            // Animated padding and borders change content boxes that resize observers read.
+            if relayouts > 0 || units {
+                dom.bounds.restyled();
+            }
             if restored {
                 let styles = Rc::make_mut(&mut styles);
                 for (id, old) in lengths {
