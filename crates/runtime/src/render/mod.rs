@@ -330,6 +330,10 @@ impl PageState {
         let mut path = Some(id);
         while let Some(at) = path {
             texts.remove(&at);
+            // An inline box can still be a kept box of its own, like the only box of a run, so it builds again too.
+            if place.is_some() && at != node && kept.contains_key(&at) {
+                self.repaint.borrow_mut().insert(at);
+            }
             path = doc.nodes[at].parent.filter(|_| at != node);
         }
         place.map(|_| ()).ok_or(node)

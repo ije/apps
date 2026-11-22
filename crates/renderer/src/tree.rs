@@ -4293,28 +4293,10 @@ impl LayoutTree<'_> {
             total += offset + margins + height + drop;
             hypothetical += height + margins + drop;
             contents += drop;
+            // Like Taffy, an item adds its margins to the content size, also negative ones.
             contents += match available_space.height {
                 taffy::AvailableSpace::Definite(_) => (height + margins).max(sides.height),
-                _ => {
-                    let difference = (height + margins) - height;
-                    let basis =
-                        height - (padding.top + padding.bottom) - (border.top + border.bottom);
-                    let fraction = if difference > 0. {
-                        difference / grow.max(1.)
-                    } else if difference < 0. {
-                        difference / (shrink.max(1.) * basis)
-                    } else {
-                        0.
-                    };
-                    height
-                        + if fraction > 0. {
-                            grow.max(1.) * fraction
-                        } else if fraction < 0. && shrink.max(1.) * basis != 0. {
-                            shrink.max(1.) * basis * fraction
-                        } else {
-                            0.
-                        }
-                }
+                _ => height + margins,
             };
             grows |= grow > 0.;
             shrinks |= shrink > 0.;

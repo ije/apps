@@ -3545,6 +3545,55 @@ fn middle_boxes_and_preserved_inline_text_keep_lines_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn negative_empty_and_container_margins_collapse_like_chrome() {
+    let (text, rects) = picture_rects(
+        "collapse.html",
+        "<body style='margin:0;font:16px/20px Helvetica'><style>.w{width:600px}</style>\
+         <div class=w><div id=a style='overflow:hidden'><div style='height:20px;margin-bottom:20px'></div>\
+         <div style='margin:-30px 0 5px'></div></div></div>\
+         <div class=w><div id=b style='overflow:hidden'><div style='height:20px'></div>\
+         <div style='margin:10px 0;height:0'></div><div id=b2 style='margin:10px 0;min-height:1px'></div></div></div>\
+         <div class=w><div style='height:20px'></div><div id=c style='container-type:inline-size;width:400px'>\
+         <div id=c2 style='height:10px;margin-top:2cqi'></div></div></div></body>",
+    );
+    for (id, [y, height]) in [
+        ("a", [0., 10.]),
+        ("b", [0., 41.]),
+        ("b2", [30., 1.]),
+        ("c", [20., 18.]),
+        ("c2", [28., 10.]),
+    ] {
+        let at: Vec<f32> = rects[id].split(',').map(|v| v.parse().unwrap()).collect();
+        assert!(
+            at[1] == y && at[3] == height,
+            "{id} at y {y} with height {height}, as in Chrome: {text}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
+fn the_only_box_of_a_run_paints_its_new_color() {
+    run_hidden(
+        r#"
+        await load('run.html');
+        await win.webContents.capturePage();
+        const pixel = async () => [...(await win.webContents.capturePage({ x: 10, y: 20, width: 1, height: 1 })).toBitmap()].slice(0, 3).reverse().join();
+        if (await pixel() !== '0,128,0') fail('first color: ' + await pixel());
+        await run("document.getElementById('l').style.color = 'rgb(255, 0, 0)'");
+        await win.webContents.capturePage();
+        if (await pixel() !== '255,0,0') fail('the new color did not draw: ' + await pixel());
+        "#,
+        &[(
+            "run.html",
+            "<body style='margin:0;font:40px/40px Menlo'><div><div></div><span id=l style='color:rgb(0,128,0)'>\u{2588}</span></div>\
+             <script>getComputedStyle(document.getElementById('l')).color</script></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn wide_first_items_and_spaces_break_lines_like_chrome() {
     let (text, rects) = picture_rects(
         "breaks.html",

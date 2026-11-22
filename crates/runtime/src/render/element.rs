@@ -1014,8 +1014,8 @@ pub(super) type Svg = (Vec<Rc<style::Style>>, ([f32; 2], u64));
 
 type Used = Rc<rustc_hash::FxHashMap<usize, [f32; 2]>>;
 type Sets = ([f32; 2], [f32; 2], bool);
-pub(super) type Adjoined = ((u64, u32), Sets);
-pub(super) type Walked = ((u64, u32, [bool; 2]), Used);
+pub(super) type Adjoined = ((u64, u32, Option<[u32; 2]>), Sets);
+pub(super) type Walked = ((u64, u32, [bool; 2], Option<[u32; 2]>), Used);
 
 thread_local! {
     // Reserve a quarter of the stack for layout and paint, which recurse as deeply as build.
@@ -8085,15 +8085,10 @@ fn create(
                             .filter(|&other| self::block(build, other))
                             .map_or(0., |other| {
                                 let (_, [positive, negative], empty) =
-                                    adjoining(build, other, content[0]);
-                                let used = margins(
-                                    build,
-                                    other,
-                                    &styles.lengths[other],
-                                    content[0],
-                                    false,
-                                    false,
-                                );
+                                    adjoining(build, other, content[0], Some(container));
+                                let mut units = styles.lengths[other];
+                                units.container = Some(container);
+                                let used = margins(build, other, &units, content[0], false, false);
                                 // An empty box passes its top margin on too.
                                 let used = used[2] + if empty { used[0] } else { 0. };
                                 (positive + negative - used).max(0.)
@@ -9680,9 +9675,13 @@ fn margins(
         let collapses = container(build, parent);
         let open =
             [0, 2].map(|side| collapses && margin_collapses_through(build, parent, side, width));
-        // Skip animated boxes. Clear walks when fonts, viewport or container units change: the key excludes
-        // them.
-        let key = (build.info[parent].revision, width.to_bits(), open);
+        // Skip animated boxes. Clear walks when fonts or the viewport change: the key excludes them.
+        let key = (
+            build.info[parent].revision,
+            width.to_bits(),
+            open,
+            units.container.map(|size| size.map(f32::to_bits)),
+        );
         let animated = build.info[parent].flags & cull::ANIMATED != 0;
         if let Some((old, used)) = build.view.walked.borrow().get(&parent)
             && *old == key
@@ -9706,7 +9705,7 @@ fn margins(
                     }
                     continue;
                 }
-                let (top, bottom, empty) = adjoining(build, child, width);
+                let (top, bottom, empty) = adjoining(build, child, width, units.container);
                 let mut sides = [0f32; 2];
                 if leading {
                     if empty {
@@ -9737,7 +9736,7 @@ fn margins(
                     {
                         continue;
                     }
-                    let sets = adjoining(build, child, width);
+                    let sets = adjoining(build, child, width, units.container);
                     let empty = block(build, child) && sets.2;
                     let Some(sides) = used.get_mut(&child) else {
                         break;
@@ -9843,6 +9842,7 @@ fn body_overflow_moves(doc: &Document, styles: &ComputedStyles, id: usize) -> bo
         })
 }
 
+// `side` 3 is the bottom edge of a box that margins collapse through, which can also have a zero height.
 fn margin_collapses_through(build: &Build<'_>, id: usize, side: usize, width: f32) -> bool {
     let (doc, styles) = (build.doc, build.styles);
     let style = &styles.values[id];
@@ -9913,9 +9913,12 @@ fn margin_collapses_through(build: &Build<'_>, id: usize, side: usize, width: f3
         && [Prop::COLUMN_COUNT, Prop::COLUMN_WIDTH]
             .into_iter()
             .all(|key| style.get(key).is_none_or(|value| value == "auto"))
-        // So does a box with `align-content`, which makes a formatting context of its own.
+        // So does a box with `align-content` or a size container, which make a formatting context of their own.
         && style
             .get(Prop::ALIGN_CONTENT)
+            .is_none_or(|value| value == "normal")
+        && style
+            .get(Prop::CONTAINER_TYPE)
             .is_none_or(|value| value == "normal")
         && style
             .get(Prop::POSITION)
@@ -9926,7 +9929,7 @@ fn margin_collapses_through(build: &Build<'_>, id: usize, side: usize, width: f3
                 .get(kind)
                 .is_none_or(|value| matches!(value, "none" | "hidden")))
         && (side == 0
-            || style.get(Prop::HEIGHT).is_none_or(|value| value == "auto")
+            || (side == 3 || style.get(Prop::HEIGHT).is_none_or(|value| value == "auto"))
                 && style
                     .get(Prop::MIN_HEIGHT)
                     .is_none_or(|value| value == "auto" || edge(Prop::MIN_HEIGHT) == 0.))
@@ -10197,11 +10200,16 @@ fn percent_bound(
     Some(renderer::Length::Bound(index))
 }
 
-fn adjoining(build: &Build<'_>, id: usize, width: f32) -> Sets {
+// `around` is the size of the container around the box, for container units.
+fn adjoining(build: &Build<'_>, id: usize, width: f32, around: Option<[f32; 2]>) -> Sets {
     if let Some(&sets) = build.adjoins.borrow().get(&id) {
         return sets;
     }
-    let key = (build.info[id].revision, width.to_bits());
+    let key = (
+        build.info[id].revision,
+        width.to_bits(),
+        around.map(|size| size.map(f32::to_bits)),
+    );
     let animated = build.info[id].flags & cull::ANIMATED != 0;
     if !animated
         && let Some(&(old, sets)) = build.view.adjoined.borrow().get(&id)
@@ -10210,7 +10218,8 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> Sets {
         build.adjoins.borrow_mut().insert(id, sets);
         return sets;
     }
-    let (style, units) = (&build.styles.values[id], build.styles.lengths[id]);
+    let (style, mut units) = (&build.styles.values[id], build.styles.lengths[id]);
+    units.container = around.or(units.container);
     let own = |prop: Prop| {
         let value = style
             .get(prop)
@@ -10246,7 +10255,7 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> Sets {
                 }
                 break;
             }
-            let (child_top, child_bottom, empty) = adjoining(build, child, width);
+            let (child_top, child_bottom, empty) = adjoining(build, child, width, around);
             for adjoining in if order {
                 [child_bottom, child_top]
             } else {
@@ -10263,13 +10272,13 @@ fn adjoining(build: &Build<'_>, id: usize, width: f32) -> Sets {
         }
     }
     let empty = first
-        && last
+        && (last || blocks && margin_collapses_through(build, id, 3, width))
         && style
             .get(Prop::HEIGHT)
             .is_none_or(|value| value == "auto" || units.resolve(value, width) == Some(0.))
         && children.iter().all(|&child| {
             if block(build, child) {
-                adjoining(build, child, width).2
+                adjoining(build, child, width, around).2
             } else {
                 style::makes_no_line(build.doc, build.styles, child)
             }
