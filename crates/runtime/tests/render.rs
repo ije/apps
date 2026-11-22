@@ -3514,6 +3514,37 @@ fn top_aligned_spans_keep_fixed_line_heights_like_chrome() {
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn middle_boxes_and_preserved_inline_text_keep_lines_like_chrome() {
+    let (text, rects) = picture_rects(
+        "middle.html",
+        "<body style='margin:0;font:16px/24px Helvetica'><style>.w{width:300px}\
+         .k{display:inline-block;padding:4px;font:11px/10px Menlo;vertical-align:middle;border:1px solid}\
+         td{padding:0}table{border-collapse:collapse}code{font:13px Menlo;padding:3px}</style>\
+         <div class=w><p id=p0 style='margin:0'>A <kbd id=k0 class=k>K</kbd> z</p></div>\
+         <div class=w><p id=p1 style='margin:0'>A <kbd id=k1 class=k style='margin:2px 0 6px'>K</kbd> z</p></div>\
+         <div class=w><table><tr><td id=c0><code style='white-space:pre'>code</code></td></tr></table></div>\
+         <div class=w><table><tr><td id=c1><code style='white-space:break-spaces'>code</code></td></tr></table></div>\
+         <div class=w style='display:grid'><div id=g0><code style='white-space:pre-wrap'>code</code></div></div></body>",
+    );
+    for (id, [y, height]) in [
+        ("p0", [0., 24.]),
+        ("p1", [0., 28.]),
+        ("k0", [3.31, 20.]),
+        ("k1", [2., 20.]),
+        ("c0", [0., 24.]),
+        ("c1", [0., 24.]),
+        ("g0", [0., 24.]),
+    ] {
+        let at: Vec<f32> = rects[id].split(',').map(|v| v.parse().unwrap()).collect();
+        assert!(
+            (at[1] - y).abs() < 0.05 && (at[3] - height).abs() < 0.05,
+            "{id} at y {y} with height {height}, as in Chrome: {text}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn wide_first_items_and_spaces_break_lines_like_chrome() {
     let (text, rects) = picture_rects(
         "breaks.html",

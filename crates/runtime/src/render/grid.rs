@@ -1363,8 +1363,10 @@ pub(crate) fn intrinsic(
         // Margins that adjoin the top edge, those after the last box placed, and whether a box was placed.
         let (mut top, mut pending, mut placed) = ([0f32; 2], [0f32; 2], false);
         let join = |a: [f32; 2], b: [f32; 2]| [a[0].max(b[0]), a[1].min(b[1])];
-        let total = |line: [f32; 4]| {
-            line[1].max(if line[2] + line[3] > 0. {
+        // Whether the line has an inline box, so it has the strut.
+        let mut strut = false;
+        let total = |line: [f32; 4], strut: bool| {
+            line[1].max(if strut || line[2] + line[3] > 0. {
                 units.font.lh + line[2] + line[3]
             } else {
                 0.
@@ -1388,12 +1390,12 @@ pub(crate) fn intrinsic(
                         .is_none_or(|value| value.starts_with("inline")));
             if !row && !inline_level {
                 content[1] = content[1].max(run);
-                let height = total(line);
+                let height = total(line, strut);
                 if height > 0. {
                     content[2] += pending[0] + pending[1] + height;
                     (pending, placed) = ([0.; 2], true);
                 }
-                (line, run, spaced) = ([0.; 4], 0., false);
+                (line, run, spaced, strut) = ([0.; 4], 0., false, false);
                 let [min, max, _, height] =
                     intrinsic(doc, child, styles, available, None, text, measured);
                 content = [content[0].max(min), content[1].max(max), content[2]];
@@ -1488,43 +1490,61 @@ pub(crate) fn intrinsic(
                     && available
                         .is_some_and(|available| line[0] + gaps[0] + spacing + width > available)
             }) {
-                content[2] += total(line) + gaps[1];
-                (line, aligned) = ([0.; 4], [0.; 2]);
+                content[2] += total(line, strut) + gaps[1];
+                (line, aligned, strut) = ([0.; 4], [0.; 2], false);
             }
             line[0] += if line[0] > 0. { gaps[0] + spacing } else { 0. } + width;
             // Like a line box, a raised or lowered inline box grows the line by what it reaches past the strut.
             let (child_style, child_units) = (&styles.values[child], &styles.lengths[child]);
+            let boxed = !inline_level
+                || doc.nodes[child].tag.starts_with('#')
+                || child_style
+                    .get(Prop::DISPLAY)
+                    .is_some_and(|value| value != "inline");
             let raise = match child_style.get(Prop::VERTICAL_ALIGN) {
-                _ if !inline_level
-                    || doc.nodes[child].tag.starts_with('#')
-                    || child_style
-                        .get(Prop::DISPLAY)
-                        .is_some_and(|value| value != "inline") =>
-                {
-                    None
-                }
+                _ if boxed => None,
                 Some("super") => Some(units.font.em / 3. + 1. / measured.pixel_ratio),
                 Some("sub") => Some(-units.font.em / 5. - 1. / measured.pixel_ratio),
                 Some(value) => child_units.resolve(value, child_units.font.lh),
                 None => None,
             };
+            // How far the inline box of the child reaches past the strut, above and below.
+            let reach = |raise: f32| {
+                let baseline = |style, units: &style::Lengths| {
+                    f32::from(text.baseline(
+                        text.face(&style::font(style)),
+                        renderer::px(units.font.em),
+                        renderer::px(units.font.lh),
+                        measured.pixel_ratio,
+                    ))
+                };
+                let (above, root) = (baseline(child_style, child_units), baseline(style, units));
+                [
+                    above + raise - root,
+                    child_units.font.lh - above - raise - (units.font.lh - root),
+                ]
+            };
+            if !boxed {
+                strut = true;
+            }
             match raise {
                 Some(raise) => {
-                    let baseline = |style, units: &style::Lengths| {
-                        f32::from(text.baseline(
-                            text.face(&style::font(style)),
-                            renderer::px(units.font.em),
-                            renderer::px(units.font.lh),
-                            measured.pixel_ratio,
-                        ))
-                    };
-                    let (above, root) =
-                        (baseline(child_style, child_units), baseline(style, units));
-                    line[2] = line[2].max(above + raise - root);
-                    line[3] =
-                        line[3].max(child_units.font.lh - above - raise - (units.font.lh - root));
+                    let [above, below] = reach(raise);
+                    line[2] = line[2].max(above);
+                    line[3] = line[3].max(below);
                 }
                 None => {
+                    // Like a line box, a line with an inline box on the baseline keeps the strut, and the
+                    // padding, borders and margins of the inline box hang outside the line.
+                    let height = if boxed {
+                        height
+                    } else {
+                        let [above, below] = reach(0.);
+                        line[2] = line[2].max(above);
+                        line[3] = line[3].max(below);
+                        let frame = frame(child_style, child_units, available.unwrap_or(0.));
+                        height - frame[0] - frame[2]
+                    };
                     line[1] = line[1].max(height);
                     // Like layout, items aligned on their baselines can make the line taller than each item.
                     if flex
@@ -1584,8 +1604,8 @@ pub(crate) fn intrinsic(
             }
             if !flex && doc.nodes[child].tag == "br" {
                 content[1] = content[1].max(run);
-                content[2] += total(line).max(styles.lengths[child].font.lh);
-                (line, run) = ([0.; 4], 0.);
+                content[2] += total(line, strut).max(styles.lengths[child].font.lh);
+                (line, run, strut) = ([0.; 4], 0., false);
             }
         }
         content[1] = content[1].max(run);
@@ -1598,7 +1618,7 @@ pub(crate) fn intrinsic(
             }) {
             units.font.lh
         } else {
-            total(line)
+            total(line, strut)
         };
         if height > 0. {
             content[2] += pending[0] + pending[1] + height;

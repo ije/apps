@@ -5023,8 +5023,12 @@ impl LayoutTree<'_> {
         let style = slot.taffy();
         let baseline = slot.style.baseline;
         let first = output.baselines.first;
-        if baseline == Baseline::Bottom {
-            let bottom = Some(output.size.height);
+        if matches!(baseline, Baseline::Bottom | Baseline::Middle) {
+            let bottom = Some(if baseline == Baseline::Middle {
+                output.size.height / 2.
+            } else {
+                output.size.height
+            });
             return Baselines {
                 first: bottom,
                 last: bottom,

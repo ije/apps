@@ -162,8 +162,8 @@ keywords! {
     AlignItems { FlexStart, FlexEnd, Center, Baseline, Stretch }
     AlignContent { Start, End, FlexStart, FlexEnd, Center, Stretch, SpaceBetween, SpaceEvenly, SpaceAround }
     ObjectFit { Fill, Contain, Cover, ScaleDown, None }
-    // `FirstOnly` takes the first baseline and gives none for the last.
-    Baseline { Auto, Last, First, FirstOnly, Bottom, None }
+    // `FirstOnly` takes the first baseline and gives none for the last. `Middle` puts it at half the border box height.
+    Baseline { Auto, Last, First, FirstOnly, Bottom, Middle, None }
     Inline { None, Lines, Hangs }
     Cursor {
         Default, Text, VerticalText, Pointer, Crosshair, Grab, Grabbing, NotAllowed, ColResize, RowResize,

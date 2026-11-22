@@ -4651,8 +4651,9 @@ fn create(
             _ => None,
         };
         let sized = matches!(el.style().size.height, renderer::Length::Px(_));
+        // Like Chrome, a middle box puts the middle of its margin box half an x-height above the baseline.
+        let centered = align == "middle" && middle.is_none();
         el.style().align_self = match align {
-            "middle" if middle.is_none() => Some(renderer::AlignItems::Center),
             "top" => Some(renderer::AlignItems::FlexStart),
             "text-top" if !sized && display != "inline" => Some(renderer::AlignItems::FlexStart),
             "bottom" => Some(renderer::AlignItems::FlexEnd),
@@ -4697,16 +4698,21 @@ fn create(
         let parent_style = &styles.values[parent];
         let parent = below(parent_style, line);
         let edge = el.style().align_self.is_none()
+            && !centered
             && (matches!(align, "text-top" | "text-bottom")
                 || middle.is_some()
                 || swatch
                 || replaced && !field
                 || display == "inline-grid"
                     && !node.children.iter().any(|&child| in_flow(doc, info, child)));
-        if edge {
+        if centered {
+            el.style().baseline = renderer::Baseline::Middle;
+        } else if edge {
             el.style().baseline = renderer::Baseline::None;
         }
-        let lift = if !edge {
+        let lift = if centered {
+            line.ex / 2. + (margin[2] - margin[0]) / 2.
+        } else if !edge {
             0.
         } else if matches!(align, "text-top" | "text-bottom") {
             let face = text.face(&style::font(parent_style));
@@ -4767,8 +4773,9 @@ fn create(
         };
         let floor = margin[2].min(0.) + parent
             - match () {
-                _ if matches!(display, "inline-block" | "inline-flex" | "inline-grid")
-                    && !replaced =>
+                _ if centered
+                    || matches!(display, "inline-block" | "inline-flex" | "inline-grid")
+                        && !replaced =>
                 {
                     f32::INFINITY
                 }
@@ -6191,10 +6198,8 @@ fn create(
                 } else {
                     [0.; 3]
                 };
+                let centered = align == "middle" && height.is_none() && own != "inline";
                 decoration.style().align_self = match align {
-                    "middle" if height.is_none() && own != "inline" => {
-                        Some(renderer::AlignItems::Center)
-                    }
                     "top" => Some(renderer::AlignItems::FlexStart),
                     "text-top" if height.is_none() => Some(renderer::AlignItems::FlexStart),
                     "bottom" => Some(renderer::AlignItems::FlexEnd),
@@ -6202,12 +6207,16 @@ fn create(
                 };
                 let edge = decoration.style().align_self.is_none()
                     && own != "inline"
+                    && !centered
                     && (matches!(align, "text-top" | "text-bottom" | "middle") || blank);
-                if edge {
+                if centered {
+                    decoration.style().baseline = renderer::Baseline::Middle;
+                } else if edge {
                     decoration.style().baseline = renderer::Baseline::None;
                 }
                 let lift = match (align, height) {
                     _ if decoration.style().align_self.is_some() => 0.,
+                    _ if centered => line.ex / 2. + (pseudo_margin[2] - pseudo_margin[0]) / 2.,
                     ("middle", _) if own == "inline" => {
                         line.ex / 2. - (ascent - descent) / pixel_ratio / 2.
                     }
