@@ -71,6 +71,8 @@ struct Slot {
     escaped: Option<Clip<Pixels>>,
     // The size that the measure function gave in the last layout, which can overflow the box.
     measured: taffy::Size<f32>,
+    // An out-of-flow box that escapes its parent: the room its containing block gave it in the last layout.
+    room: Option<[f32; 2]>,
     // The near and far corners that `far` found, from the origin of the box. Cleared up the tree when a box changes.
     far: [Option<[Point<f32>; 2]>; 2],
     split: Option<Rc<Split>>,
@@ -183,6 +185,7 @@ impl Slot {
             reach: None,
             escaped: None,
             measured: taffy::Size::ZERO,
+            room: None,
             far: [None; 2],
             split: None,
             floats: false,
@@ -233,6 +236,7 @@ impl Slot {
         self.text = inherited.clone();
         self.layout = Layout::new();
         self.baselines = Baselines::NONE;
+        self.room = None;
         self.origin = Point::default();
         (self.bounds, self.painted, self.exact) = Default::default();
         self.far = [None; 2];
@@ -317,6 +321,8 @@ pub struct Tree {
     bounded: Vec<u32>,
     // Absolute boxes that escape their parent, which layout places again in their containing blocks.
     escaping: FxHashSet<u32>,
+    // Out-of-flow boxes that escape their parent, which took the room of their containing block.
+    roomed: FxHashSet<u32>,
     root: Option<u32>,
     measured_with: (f32, usize),
     stretch: Option<Size<Pixels>>,
@@ -387,6 +393,7 @@ impl Tree {
             self.free.clear();
             self.keys.clear();
             self.escaping.clear();
+            self.roomed.clear();
             self.orphans.clear();
             self.root = None;
             self.styles = Interned::default();
@@ -862,10 +869,12 @@ impl Tree {
             *index = moved[*index as usize];
         }
         self.root = self.root.map(|root| moved[root as usize]);
-        self.escaping = (self.escaping.iter())
-            .map(|&index| moved[index as usize])
-            .filter(|&index| index != NONE)
-            .collect();
+        for set in [&mut self.escaping, &mut self.roomed] {
+            *set = (set.iter())
+                .map(|&index| moved[index as usize])
+                .filter(|&index| index != NONE)
+                .collect();
+        }
         self.slots = slots;
         self.free.clear();
         self.layers.clear();
@@ -890,6 +899,8 @@ impl Tree {
             active: false,
             joined: false,
             hung: Vec::new(),
+            viewport: [viewport.width.0 * scale, viewport.height.0 * scale],
+            roomed: Vec::new(),
         };
         taffy::compute_root_layout(&mut tree, root, space);
         // A layout boundary that the layout of its parents didn't reach lays out alone, as its parents placed it.
@@ -901,6 +912,37 @@ impl Tree {
             {
                 tree.compute(NodeId::from(index as usize), inputs, None);
             }
+        }
+        // Escaped boxes took the room of their containing blocks from the last layout. Where this layout changed it,
+        // the boxes on their path lay out again.
+        self.roomed.extend(mem::take(&mut tree.roomed));
+        let viewport_room = tree.viewport;
+        let mut again = false;
+        self.roomed.retain(|&index| {
+            let Some(slot) = tree.slots.get(index as usize) else {
+                return false;
+            };
+            let escape = slot.style.escape & (Escape::ABSOLUTE | Escape::FIXED);
+            let (Some(old), true, true) =
+                (slot.room, slot.live, escape != 0 && slot.parent != NONE)
+            else {
+                return false;
+            };
+            let Some(new) = room(tree.slots, slot.parent, escape, viewport_room) else {
+                return false;
+            };
+            if (old[0] - new[0]).abs() > 0.5 || (old[1] - new[1]).abs() > 0.5 {
+                again = true;
+                let mut at = tree.slots[index as usize].parent;
+                while at != NONE {
+                    tree.slots[at as usize].cache.clear();
+                    at = tree.slots[at as usize].parent;
+                }
+            }
+            true
+        });
+        if again {
+            taffy::compute_root_layout(&mut tree, root, space);
         }
         #[cfg(debug_assertions)]
         {
@@ -2698,6 +2740,37 @@ fn lift(slot: &Slot) -> f32 {
     }
 }
 
+// The room from the padding box of `parent` to the far padding edges of the block that contains its out-of-flow
+// boxes of `escape`, by the places of the last layout, or `None` when `parent` contains them.
+fn room(slots: &[Slot], parent: u32, escape: u8, viewport: [f32; 2]) -> Option<[f32; 2]> {
+    if slots[parent as usize].style.contains & escape != 0 {
+        return None;
+    }
+    let mut at = [0f32; 2];
+    let mut block = parent;
+    loop {
+        let outer = &slots[block as usize];
+        if outer.style.contains & escape != 0 || outer.parent == NONE {
+            break;
+        }
+        at = [
+            at[0] + outer.layout.location.x,
+            at[1] + outer.layout.location.y,
+        ];
+        block = outer.parent;
+    }
+    let outer = &slots[block as usize];
+    let end = match outer.style.contains & escape != 0 {
+        true => [
+            outer.layout.size.width - outer.layout.border.right,
+            outer.layout.size.height - outer.layout.border.bottom,
+        ],
+        false => viewport,
+    };
+    let border = slots[parent as usize].layout.border;
+    Some([end[0] - at[0] - border.left, end[1] - at[1] - border.top])
+}
+
 // The parts of a box that spans columns, in window pixels from `origin`, its place.
 fn parts(
     slot: &Slot,
@@ -2996,6 +3069,10 @@ struct LayoutTree<'a> {
     // Line boxes that keep their line in this Taffy pass: the box, its overflow and its style with that much less
     // right margin.
     hung: Vec<(NodeId, f32, taffy::Style)>,
+    // The size of the viewport, the initial containing block.
+    viewport: [f32; 2],
+    // The boxes that took the room of their containing block in this layout.
+    roomed: Vec<u32>,
 }
 
 impl LayoutTree<'_> {
@@ -3113,6 +3190,51 @@ impl LayoutTree<'_> {
                 // Taffy reads `direction` in all layout, which handles right-to-left itself, so a right-to-left
                 // box gives it only to the pass of its absolute boxes.
                 let index = usize::from(node);
+                // Like Chrome, a box that escapes its parent takes the room of its containing block, so its auto
+                // size doesn't shrink to the parent.
+                if tree.slots[index].style.flow & Flow::RTL_BLOCK == 0
+                    && let Some(area) = output.oof_positioning_area
+                    && output.oof_candidates.as_slice().iter().any(|candidate| {
+                        let escape = tree.slots[usize::from(candidate.node)].style.escape
+                            & (Escape::ABSOLUTE | Escape::FIXED);
+                        escape != 0 && tree.slots[index].style.contains & escape == 0
+                    })
+                {
+                    let mut claims =
+                        taffy::CoreStyle::is_containing_block(tree.slots[index].taffy());
+                    (claims.absolute, claims.fixed) = (true, true);
+                    let mut rest = taffy::OofCandidates::new();
+                    for &candidate in output.oof_candidates.take().as_slice() {
+                        let child = usize::from(candidate.node);
+                        let escape =
+                            tree.slots[child].style.escape & (Escape::ABSOLUTE | Escape::FIXED);
+                        let Some(room) = (escape != 0)
+                            .then(|| room(tree.slots, index as u32, escape, tree.viewport))
+                            .flatten()
+                        else {
+                            rest.push(candidate);
+                            continue;
+                        };
+                        tree.slots[child].room = Some(room);
+                        tree.roomed.push(child as u32);
+                        let area = taffy::OofPositioningArea {
+                            size: taffy::Size {
+                                width: area.size.width.max(room[0]),
+                                height: area.size.height.max(room[1]),
+                            },
+                            ..area
+                        };
+                        taffy::compute_oof_layout_for_area(
+                            tree,
+                            node,
+                            &[candidate],
+                            area,
+                            taffy::Direction::Ltr,
+                            claims,
+                        );
+                    }
+                    output.oof_candidates = rest;
+                }
                 if tree.slots[index].style.flow & Flow::RTL_BLOCK != 0 {
                     if let Some(area) = output.oof_positioning_area
                         && !output.oof_candidates.is_empty()
