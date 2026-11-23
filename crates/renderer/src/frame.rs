@@ -113,6 +113,8 @@ pub struct RenderFrame {
     // after a scrolled content, so a scroll draws again only what changed there and what paints after it.
     pub keeps_under: bool,
     under: Option<KeptUnder>,
+    // A target that the first copies into cover whole, so its old pixels need no load.
+    pub covered: Option<Target>,
     // Draws only the items of the window layer before the split of `Under`, or only those after it.
     half: Option<([u32; 2], bool)>,
 }
@@ -361,6 +363,7 @@ impl RenderFrame {
         for cached in &mut self.cache {
             cached.used = false;
         }
+        self.covered = None;
         let under = self.record_under(scene);
         let whole = [0, 0, window[0] as i32, window[1] as i32];
         if self.damage.is_empty() {
@@ -379,6 +382,8 @@ impl RenderFrame {
                 None => self.record_layer(scene, 0, Target::Frame, true, 0),
             }
         }
+        // The regions copy into the window together, since each pass into a target loads and stores all of it.
+        let mut copies = Vec::with_capacity(self.damage.len());
         for at in 0..self.damage.len() {
             let region = self.damage[at];
             let base = self.region_base(region);
@@ -393,13 +398,9 @@ impl RenderFrame {
                 }
                 None => self.record_region(scene, base, region, None, true),
             }
-            self.commands.push(Command::Copy {
-                src: base,
-                dst: Target::Frame,
-                region,
-            });
-            self.release(base);
+            copies.push((base, region));
         }
+        self.copy_bases(&copies, Target::Frame);
         self.promoted.clear();
         for index in 0..self.content.len() {
             let layer = self.content[index];
@@ -503,12 +504,19 @@ impl RenderFrame {
             self.half = None;
             return Some((target, split));
         };
+        let mut copies = Vec::with_capacity(regions.len());
+        for region in regions {
+            let base = self.region_base(region);
+            self.record_region(scene, base, region, Some((split, false)), true);
+            copies.push((base, region));
+        }
         let target = match scene.shift {
             Some(([x, y, width, height], by)) => {
                 let kept = self.under.as_mut()?;
                 let (old, new) = (kept.ids[kept.turn], kept.ids[kept.turn ^ 1]);
                 kept.turn ^= 1;
                 let target = self.kept_layer(new, [0, 0]);
+                self.covered = Some(target);
                 let (source, moved) = (
                     self.kept_layer(old, [0, 0]),
                     self.kept_layer(old, [-by[0], -by[1]]),
@@ -545,17 +553,17 @@ impl RenderFrame {
                 self.kept_layer(id, [0, 0])
             }
         };
-        for region in regions {
-            let base = self.region_base(region);
-            self.record_region(scene, base, region, Some((split, false)), true);
-            self.commands.push(Command::Copy {
-                src: base,
-                dst: target,
-                region,
-            });
+        self.copy_bases(&copies, target);
+        Some((target, split))
+    }
+
+    fn copy_bases(&mut self, copies: &[(Target, [i32; 4])], dst: Target) {
+        for &(src, region) in copies {
+            self.commands.push(Command::Copy { src, dst, region });
+        }
+        for &(base, _) in copies {
             self.release(base);
         }
-        Some((target, split))
     }
 
     #[cfg(test)]
@@ -2125,6 +2133,43 @@ mod tests {
         );
         assert_eq!(blurs(&scene(160., 2.)), 0, "a moved layer keeps its blurs");
         assert_eq!(blurs(&scene(160., 3.)), 1, "another blur draws again");
+    }
+
+    #[test]
+    fn damage_regions_copy_into_the_window_in_one_pass() {
+        let mask = Clip::from(bounds([0., 0., 400., 300.]));
+        let mut scene = Scene::default();
+        scene.push(Instance::new(BOX, bounds([0., 0., 400., 300.]), mask));
+        scene.push_effect(
+            EffectState {
+                opacity: 0.5,
+                ..effect(mask)
+            },
+            None,
+        );
+        scene.push(Instance::new(BOX, bounds([20., 20., 300., 200.]), mask));
+        scene.pop_effect();
+        let mut frame = RenderFrame {
+            damage: vec![[0, 0, 50, 50], [200, 200, 50, 50]],
+            ..Default::default()
+        };
+        frame.record(&scene, [400, 300], 4096, true);
+        let copies = (frame.commands.iter())
+            .map(|command| {
+                matches!(
+                    command,
+                    Command::Copy {
+                        dst: super::Target::Frame,
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(copies.iter().filter(|copy| **copy).count(), 2);
+        assert!(
+            copies.ends_with(&[true, true]),
+            "the copies come last, together"
+        );
     }
 
     #[test]

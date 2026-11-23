@@ -1416,6 +1416,8 @@ impl Renderer {
         let pipelines = self.pipelines;
         // The target of the open copy pass.
         let mut copying: Option<Target> = None;
+        // Only the first pass into it skips the load.
+        let mut covered = frame.covered;
         for (at, command) in frame.commands.iter().enumerate() {
             if at == frame.shot_commands && wide.replace(false) {
                 end!();
@@ -1491,7 +1493,10 @@ impl Renderer {
                         current.1 = false;
                         // A pooled texture can hold other layers, so the rest of it is loaded.
                         let first = starts(*dst);
-                        let load = if first {
+                        let whole = covered
+                            .take_if(|whole| frame.texture(*whole) == frame.texture(*dst))
+                            .is_some();
+                        let load = if first || whole {
                             MTLLoadAction::DontCare
                         } else {
                             MTLLoadAction::Load
