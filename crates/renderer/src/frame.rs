@@ -228,7 +228,7 @@ impl<T> Pool<T> {
     }
 
     // The sizes of textures that hold no cached layer.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     pub fn spare(&self, sizes: &mut Vec<[u32; 2]>) {
         sizes.clear();
         sizes.extend(
@@ -566,7 +566,7 @@ impl RenderFrame {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(target_os = "macos", test))]
     pub(crate) fn keeps_under_now(&self) -> bool {
         self.under.is_some()
     }

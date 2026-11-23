@@ -30,7 +30,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/native
       - if: runner.os != 'Windows'
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
       - if: runner.os == 'Windows'
         run: cargo test -p apps --test build --locked
       - if: runner.os == 'Windows'

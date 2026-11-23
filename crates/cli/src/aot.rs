@@ -395,8 +395,8 @@ pub fn compile(files: &mut BBTreeMap<String, String>, runtime: &Path) -> Result<
     fs::write(directory.path().join("manifest.json"), &manifest)?;
     link_image(
         directory.path(),
-        layout[0] as usize,
-        layout[1] as usize,
+        layout[0],
+        layout[1],
         fs::metadata(&image)?.len() as usize,
         manifest.len(),
     )?;

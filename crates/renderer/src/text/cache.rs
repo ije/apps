@@ -298,6 +298,7 @@ mod tests {
         assert_eq!(first.line.width, fresh.line.width);
     }
 
+    #[cfg(target_os = "macos")]
     fn run(color: u32) -> crate::TextRun {
         crate::TextRun {
             len: 6,
