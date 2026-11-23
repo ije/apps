@@ -288,13 +288,16 @@ fn web_audio_sounds_free_their_players() {
     engine
         .eval(
             "globalThis.ended = 0; globalThis.live = new AudioContext();
-            for (let i = 0; i < 40; i++) setTimeout(() => { const tone = live.createOscillator(); tone.connect(live.destination); tone.onended = () => ended++; tone.start(); tone.stop(live.currentTime + 0.02); }, i * 5)",
+            for (let i = 0; i < 40; i++) setTimeout(() => { const tone = live.createOscillator(); tone.connect(live.destination); tone.onended = () => { globalThis.twice ||= tone.ended; tone.ended = true; ended++; }; tone.start(); tone.stop(live.currentTime + 0.02); }, i * 5)",
             "media-test",
         )
         .unwrap();
-    wait(
-        &engine,
-        "ended === 40 ? 'done' : `pending: ${ended} ended at ${live.currentTime.toFixed(1)} s`",
+    assert_eq!(
+        wait(
+            &engine,
+            "globalThis.twice ? 'twice' : ended === 40 ? 'done' : `pending: ${ended} ended at ${live.currentTime.toFixed(1)} s`",
+        ),
+        "done"
     );
     // Other tests in this binary can hold a few players at the same time.
     for _ in 0..2500 {

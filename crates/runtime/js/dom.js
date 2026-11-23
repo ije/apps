@@ -2998,7 +2998,7 @@
       if (this._start === undefined) throw new DOMException('The source has not started', 'InvalidStateError');
       this._stop = Math.max(+when, this._start); this._audio?._close(); this._audio = null;
     }
-    _ended() { const event = new Event('ended'); this.onended?.(event); this.dispatchEvent(event); }
+    _ended() { const event = new Event('ended'); this.dispatchEvent(event); }
   }
   const waveTypes = ['sine', 'square', 'sawtooth', 'triangle'];
   class PeriodicWave {
@@ -3095,7 +3095,7 @@
     state = 'running'; sampleRate = 48000; baseLatency = 0.01; outputLatency = 0.02; onstatechange = null; _start = performance.now(); _pending = [];
     constructor(options) { super(); if (options?.sampleRate) this.sampleRate = +options.sampleRate; this.destination = new AudioDestinationNode(this); this.listener = {}; }
     get currentTime() { return (performance.now() - this._start) / 1000; }
-    _set(state) { if (this.state === 'closed') return Promise.reject(new DOMException('The context is closed', 'InvalidStateError')); this.state = state; const event = new Event('statechange'); this.onstatechange?.(event); this.dispatchEvent(event); return Promise.resolve(); }
+    _set(state) { if (this.state === 'closed') return Promise.reject(new DOMException('The context is closed', 'InvalidStateError')); this.state = state; const event = new Event('statechange'); this.dispatchEvent(event); return Promise.resolve(); }
     resume() { return this.state === 'running' ? Promise.resolve() : this._set('running'); } suspend() { return this._set('suspended'); } close() { return this._set('closed'); }
     getOutputTimestamp() { return { contextTime: this.currentTime, performanceTime: performance.now() }; }
     createGain() { return new GainNode(this); } createBufferSource() { return new AudioBufferSourceNode(this); }
@@ -3173,7 +3173,7 @@
       buffer._data = this._mix(sources, ends, 0, this.length, this._channels)[0];
       this.state = 'closed';
       const event = Object.assign(new Event('complete'), { renderedBuffer: buffer });
-      setTimeout(() => { sources.forEach(source => source._ended()); this.oncomplete?.(event); this.dispatchEvent(event); });
+      setTimeout(() => { sources.forEach(source => source._ended()); this.dispatchEvent(event); });
       return Promise.resolve(buffer);
     }
   }

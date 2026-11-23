@@ -148,17 +148,18 @@ fn input_without_a_program_goes_to_the_page() {
         test.poll(),
         r#"[["data","a"],["data","\u0003"],["data","\u001b[A"],["data","\u000d"],["data","\u001b[15~"]]"#
     );
-    // Option types a character on macOS, or is an Alt key.
+    // Option types a character on macOS, or is an Alt key. Other platforms have no Option key, so Alt sends ESC and
+    // the text.
     assert!(test.key("f", 4, "\u{192}"));
     assert!(test.key("f", 4 | 16, "\u{192}"));
-    let typed = if cfg!(target_os = "macos") {
-        "\u{192}"
+    let [typed, alt] = if cfg!(target_os = "macos") {
+        ["\u{192}", "\\u001bf"]
     } else {
-        "\\u001b\u{192}"
+        ["\\u001b\u{192}"; 2]
     };
     assert_eq!(
         test.poll(),
-        format!(r#"[["data","{typed}"],["data","\u001bf"]]"#)
+        format!(r#"[["data","{typed}"],["data","{alt}"]]"#)
     );
     // Application cursor keys and a bracketed paste.
     test.feed("\x1b[?1h\x1b[?2004h");

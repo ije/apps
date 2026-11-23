@@ -51,6 +51,7 @@ impl Contexts {
         self.page.tick().unwrap();
     }
 
+    #[cfg(unix)]
     fn wait(&self, ready: &str) {
         for _ in 0..5000 {
             self.tick();
