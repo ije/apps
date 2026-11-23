@@ -852,14 +852,38 @@ impl SelectorCache {
                 .parent
                 .or_else(|| self.hosts.get(&node).copied());
         }
+        let placed = (id * KINDS + PREVIOUS) as u32;
+        let placed = self.dependencies.iter().any(|&(key, _)| key == placed);
+        let (siblings, count) = self.previous(id, placed);
         self.dependencies.iter().all(|&(read, _)| {
             let (node, kind) = (read as usize / KINDS, read as usize % KINDS);
             if node == id {
                 kind != 2
+            } else if siblings[..count].contains(&node) {
+                !matches!(kind, 2 | EDGE | INDEX | WITHIN)
             } else {
                 !(Some(node) == parent && kind == 2) && chain[..length].contains(&node)
             }
         })
+    }
+
+    // The element siblings before `id`, nearest first. Its parent must keep their places, as after a read of the
+    // `PREVIOUS` kind of `id`. A share maps the reads of these siblings, like the reads of ancestors.
+    fn previous(&self, id: usize, placed: bool) -> ([usize; 4], usize) {
+        let (mut siblings, mut count, mut at) = ([0; 4], 0, id);
+        if placed {
+            while count < siblings.len()
+                && let Some(before) = self
+                    .nodes
+                    .get(at)
+                    .and_then(|node| node.values[PREVIOUS].checked_sub(1))
+            {
+                at = before as usize;
+                siblings[count] = at;
+                count += 1;
+            }
+        }
+        (siblings, count)
     }
 
     pub(crate) fn share(
@@ -888,6 +912,29 @@ impl SelectorCache {
             }
         };
         let pairs = &pairs[..length];
+        // The siblings before `from` pair with those before `to` at the same distance.
+        let placed = (from * KINDS + PREVIOUS) as u32;
+        let mut siblings = [([0; 4], 0); 2];
+        if dependencies.iter().any(|&(key, _)| key == placed) {
+            let bit = 1 << (PREVIOUS - EDGE);
+            if let Some(parent) = doc.nodes[to].parent
+                && self
+                    .watched
+                    .get(parent)
+                    .is_none_or(|watched| watched & bit == 0)
+            {
+                self.place(doc, parent, bit, &mut Vec::new());
+            }
+            siblings = [self.previous(from, true), self.previous(to, true)];
+        }
+        // Sibling ids differ, so `PREVIOUS` compares only whether there is a sibling. The reads of the siblings
+        // compare too, and `shareable` keeps the siblings of ancestors out.
+        let differs = |this: &Self, node: usize, other: usize, kind: usize| match kind {
+            PREVIOUS => {
+                (this.nodes[node].values[kind] == 0) != (this.nodes[other].values[kind] == 0)
+            }
+            _ => this.nodes[node].values[kind] != this.nodes[other].values[kind],
+        };
         self.dependencies.clear();
         for &(read, revision) in dependencies {
             let (node, kind) = (read as usize / KINDS, read as usize % KINDS);
@@ -912,8 +959,7 @@ impl SelectorCache {
                             self.place(doc, parent, bit, &mut Vec::new());
                         }
                     }
-                    if !(kind == 1 || kind == 6 && node == from)
-                        && self.nodes[node].values[kind] != self.nodes[other].values[kind]
+                    if !(kind == 1 || kind == 6 && node == from) && differs(self, node, other, kind)
                     {
                         return false;
                     }
@@ -922,8 +968,26 @@ impl SelectorCache {
                         self.nodes[other].revisions[kind],
                     )
                 }
-                None if node == top && kind == 2 => return false,
-                None => (read, revision),
+                None => match siblings[0].0[..siblings[0].1]
+                    .iter()
+                    .position(|&sibling| sibling == node)
+                {
+                    Some(index) => {
+                        if index >= siblings[1].1 || matches!(kind, 2 | EDGE | INDEX | WITHIN) {
+                            return false;
+                        }
+                        let other = siblings[1].0[index];
+                        if kind != 1 && differs(self, node, other, kind) {
+                            return false;
+                        }
+                        (
+                            (other * KINDS + kind) as u32,
+                            self.nodes[other].revisions[kind],
+                        )
+                    }
+                    None if node == top && kind == 2 => return false,
+                    None => (read, revision),
+                },
             };
             self.dependencies.push(dependency);
         }
@@ -998,6 +1062,20 @@ impl SelectorCache {
             checked.set(self.epoch);
         }
         valid
+    }
+}
+
+// Whether a simple selector reads the place of the node among its siblings.
+fn positional(simple: &SimpleSelector) -> bool {
+    let SimpleSelector::Pseudo(name, _, parsed, _) = simple else {
+        return false;
+    };
+    match name.as_str() {
+        "first-child" | "last-child" | "only-child" | "nth-child" | "nth-last-child"
+        | "first-of-type" | "last-of-type" | "only-of-type" | "nth-of-type"
+        | "nth-last-of-type" => true,
+        "not" | "is" | "where" => parsed.iter().any(|s| s.simple.iter().any(positional)),
+        _ => false,
     }
 }
 
@@ -2102,6 +2180,499 @@ impl Selector {
             memo.dependencies.extend_from_slice(found);
             return len & MATCHED != 0;
         }
+        let check = |s: &SimpleSelector, memo: &mut SelectorCache| match s {
+            SimpleSelector::Tag(_) | SimpleSelector::Id(_) | SimpleSelector::Class(_) => true,
+            SimpleSelector::Universal => true,
+            SimpleSelector::Root => node.tag == "html",
+            SimpleSelector::Attribute(name, operator, value, flag) => node
+                .attrs
+                .iter()
+                .find(|(key, _)| *key == name || key.eq_ignore_ascii_case(name))
+                .is_some_and(|(_, actual)| {
+                    let insensitive = *flag == 1
+                        || *flag == 2 && !node.tag.bytes().any(|c| c.is_ascii_uppercase());
+                    let equal = |part: Option<&str>| {
+                        part.is_some_and(|part| {
+                            if insensitive {
+                                part.eq_ignore_ascii_case(value)
+                            } else {
+                                part == value
+                            }
+                        })
+                    };
+                    let length = value.len();
+                    match operator.as_str() {
+                        "" => true,
+                        "=" => equal(Some(actual)),
+                        "~=" => actual
+                            .split_ascii_whitespace()
+                            .any(|word| equal(Some(word))),
+                        "|=" => {
+                            equal(actual.get(..length))
+                                && actual.as_bytes().get(length).is_none_or(|&c| c == b'-')
+                        }
+                        _ if value.is_empty() => false,
+                        "^=" => equal(actual.get(..length)),
+                        "$=" => equal(
+                            actual
+                                .len()
+                                .checked_sub(length)
+                                .and_then(|start| actual.get(start..)),
+                        ),
+                        "*=" if insensitive => actual
+                            .as_bytes()
+                            .windows(length)
+                            .any(|part| part.eq_ignore_ascii_case(value.as_bytes())),
+                        "*=" => actual.contains(value.as_str()),
+                        _ => false,
+                    }
+                }),
+            SimpleSelector::Pseudo(name, argument, parsed, [a, b]) => match name.as_str() {
+                "scope" => scope.map_or(node.tag == "html", |scope| {
+                    scope == id || node.parent == Some(scope) && doc.nodes[scope].tag == "#document"
+                }),
+                "has" => {
+                    let local = memo.nodes.get(id).is_some()
+                        && parsed.iter().all(|selector| selector.local(node));
+                    if !local {
+                        return Self::has(parsed, doc, id, memo, false).0;
+                    }
+                    let known = memo.within.get(&id).and_then(|results| {
+                        results.iter().find(|result| Rc::ptr_eq(&result.0, parsed))
+                    });
+                    let (found, beside) = match known {
+                        Some(result) => (result.1, result.2),
+                        None => {
+                            let start = memo.dependencies.len();
+                            let (found, beside) = Self::has(parsed, doc, id, memo, true);
+                            memo.dependencies.truncate(start);
+                            let results = memo.within.entry(id).or_default();
+                            results.push((parsed.clone(), found, beside));
+                            match node.parent.filter(|_| beside) {
+                                Some(parent) => memo.watched[parent] |= BESIDE,
+                                None => memo.watched[id] |= BELOW,
+                            }
+                            (found, beside)
+                        }
+                    };
+                    if beside {
+                        memo.depend(id, 1);
+                    }
+                    memo.depend(id, WITHIN);
+                    found
+                }
+                "empty" => {
+                    memo.depend(id, 2);
+                    memo.depend(id, 3);
+                    for &child in &node.children {
+                        memo.depend(child, 3);
+                    }
+                    node.text.is_empty()
+                        && node.children.iter().all(|&id| {
+                            doc.nodes[id].tag == "#comment"
+                                || doc.nodes[id].tag == "#text" && doc.nodes[id].text.is_empty()
+                        })
+                }
+                "hover" | "active" | "focus" | "focus-visible" | "focus-within" => {
+                    memo.depend(id, 5);
+                    node.state
+                        & match name.as_str() {
+                            "hover" => HOVER,
+                            "active" => ACTIVE,
+                            "focus-within" => FOCUS_WITHIN,
+                            "focus-visible" => FOCUS_VISIBLE,
+                            _ => FOCUS,
+                        }
+                        != 0
+                }
+                "in-range" | "out-of-range" => {
+                    memo.depend(id, 0);
+                    memo.depend(id, 3);
+                    let value = node.current_value().unwrap_or("");
+                    let bound = |name| node.attrs.get(name).map(String::as_str);
+                    let numeric = node.input_type().eq_ignore_ascii_case("number");
+                    // Dates and times in their valid forms compare as strings.
+                    let beyond = |limit: Option<&str>, below: bool| {
+                        limit.is_some_and(|limit| {
+                            let order = match (value.parse::<f64>(), limit.parse::<f64>()) {
+                                (Ok(value), Ok(limit)) if numeric => value.partial_cmp(&limit),
+                                _ if numeric || value.is_empty() || limit.len() != value.len() => {
+                                    None
+                                }
+                                _ => Some(value.cmp(limit)),
+                            };
+                            order
+                                == Some(if below {
+                                    std::cmp::Ordering::Less
+                                } else {
+                                    std::cmp::Ordering::Greater
+                                })
+                        })
+                    };
+                    let out = !node.input_type().eq_ignore_ascii_case("range")
+                        && (beyond(bound("min"), true) || beyond(bound("max"), false));
+                    ranged(node)
+                        && !node.attrs.contains_key("readonly")
+                        && !disabled(doc, id, memo)
+                        && out == (name == "out-of-range")
+                }
+                "target" => {
+                    memo.depend(id, 5);
+                    doc.target == Some(id)
+                }
+                "link" | "any-link" | "-webkit-any-link" => {
+                    matches!(node.tag.as_str(), "a" | "area") && node.attrs.contains_key("href")
+                }
+                "defined" => {
+                    memo.depend(id, 5);
+                    node.state & super::DEFINED != 0
+                        || !node.tag.contains('-')
+                        || matches!(
+                            node.tag.as_str(),
+                            "annotation-xml"
+                                | "color-profile"
+                                | "font-face"
+                                | "font-face-src"
+                                | "font-face-uri"
+                                | "font-face-format"
+                                | "font-face-name"
+                                | "missing-glyph"
+                        )
+                }
+                "open" => {
+                    matches!(node.tag.as_str(), "details" | "dialog")
+                        && node.attrs.contains_key("open")
+                }
+                "indeterminate" => {
+                    memo.depend(id, 5);
+                    node.tag == "progress" && !node.attrs.contains_key("value")
+                        || node.tag == "input"
+                            && node.state & super::INDETERMINATE != 0
+                            && node.input_type().eq_ignore_ascii_case("checkbox")
+                }
+                "default" => {
+                    let checkable = node.tag == "input"
+                        && ["checkbox", "radio"]
+                            .iter()
+                            .any(|kind| node.input_type().eq_ignore_ascii_case(kind));
+                    if checkable || node.tag == "option" {
+                        node.attrs
+                            .contains_key(if checkable { "checked" } else { "selected" })
+                    } else if submits(node) {
+                        let mut form = Some(id);
+                        while let Some(at) = form.filter(|&at| doc.nodes[at].tag != "form") {
+                            memo.depend(at, 1);
+                            form = doc.nodes[at].parent;
+                            form.inspect(|&form| memo.depend(form, 4));
+                        }
+                        let mut pending = Vec::from_iter(form);
+                        let mut first = None;
+                        while let Some(at) = pending.pop() {
+                            if doc.nodes[at].tag.starts_with('#') {
+                                continue;
+                            }
+                            memo.depend(at, 0);
+                            if Some(at) != form && submits(&doc.nodes[at]) {
+                                first = Some(at);
+                                break;
+                            }
+                            memo.depend(at, 2);
+                            pending.extend(doc.nodes[at].children.iter().rev());
+                        }
+                        first == Some(id)
+                    } else {
+                        false
+                    }
+                }
+                "checked" => {
+                    memo.depend(id, 0);
+                    memo.depend(id, 5);
+                    match node.tag.as_str() {
+                        "input" => {
+                            node.checked()
+                                && ["checkbox", "radio"]
+                                    .iter()
+                                    .any(|kind| node.input_type().eq_ignore_ascii_case(kind))
+                        }
+                        "option" if node.state & super::DIRTY != 0 || node.checked() => {
+                            node.checked()
+                        }
+                        "option" => {
+                            let mut select = node.parent.unwrap_or_default();
+                            memo.depend(select, 1);
+                            if doc.nodes[select].tag == "optgroup" {
+                                select = doc.nodes[select].parent.unwrap_or_default();
+                            }
+                            memo.depend(select, 0);
+                            memo.depend(select, 2);
+                            let parent = &doc.nodes[select];
+                            let mut options = Vec::new();
+                            for &child in &parent.children {
+                                if doc.nodes[child].tag == "optgroup" {
+                                    memo.depend(child, 2);
+                                    options.extend(&doc.nodes[child].children);
+                                } else {
+                                    options.push(child);
+                                }
+                            }
+                            options.retain(|&option| doc.nodes[option].tag == "option");
+                            for &option in &options {
+                                memo.depend(option, 0);
+                                memo.depend(option, 5);
+                            }
+                            parent.tag == "select"
+                                && !parent.attrs.contains_key("multiple")
+                                && parent.attrs.get("size").is_none_or(|size| {
+                                    size.trim().parse::<u32>().is_ok_and(|size| size <= 1)
+                                })
+                                && options.iter().all(|&option| !doc.nodes[option].checked())
+                                && options.iter().find(|&&option| {
+                                    !doc.nodes[option].attrs.contains_key("disabled")
+                                }) == Some(&id)
+                        }
+                        _ => false,
+                    }
+                }
+                "modal" | "popover-open" | "fullscreen" | "-webkit-full-screen" => {
+                    memo.depend(id, 5);
+                    node.state
+                        & match name.as_str() {
+                            "modal" => super::MODAL,
+                            "popover-open" => super::POPOVER,
+                            _ => super::FULLSCREEN,
+                        }
+                        != 0
+                }
+                "-internal-dialog-in-top-layer" => {
+                    memo.depend(id, 5);
+                    node.tag == "dialog" && node.state & (super::MODAL | super::MODAL << 5) != 0
+                }
+                "disabled" | "enabled" => {
+                    matches!(
+                        node.tag.as_str(),
+                        "button"
+                            | "input"
+                            | "select"
+                            | "textarea"
+                            | "optgroup"
+                            | "option"
+                            | "fieldset"
+                    ) && disabled(doc, id, memo) == (name == "disabled")
+                }
+                "valid" | "invalid" => {
+                    // Match `candidate` in dom.js, which also sets the validity bit.
+                    memo.depend(id, 1);
+                    memo.depend(id, 5);
+                    let candidate = match node.tag.as_str() {
+                        "input" => !["hidden", "reset", "button"]
+                            .iter()
+                            .any(|kind| node.input_type().eq_ignore_ascii_case(kind)),
+                        "button" => submits(node),
+                        "select" | "textarea" => true,
+                        _ => false,
+                    };
+                    candidate
+                        && !node.attrs.contains_key("readonly")
+                        && node.parent.is_none_or(|parent| {
+                            memo.depend(parent, 4);
+                            !doc.nodes[parent].tag.starts_with("datalist")
+                        })
+                        && !disabled(doc, id, memo)
+                        && (node.state & super::INVALID != 0) == (name == "invalid")
+                }
+                "placeholder-shown" | "required" | "optional" => {
+                    memo.depend(id, 2);
+                    memo.depend(id, 3);
+                    memo.depend(id, 5);
+                    for &child in &node.children {
+                        memo.depend(child, 3);
+                    }
+                    let required = node.attrs.contains_key("required");
+                    let empty = if ["checkbox", "radio"]
+                        .iter()
+                        .any(|kind| node.input_type().eq_ignore_ascii_case(kind))
+                    {
+                        !node.checked()
+                    } else {
+                        node.current_value().map_or(
+                            node.text.is_empty()
+                                && node.children.iter().all(|&child| {
+                                    doc.nodes[child].tag == "#text"
+                                        && doc.nodes[child].text.is_empty()
+                                }),
+                            str::is_empty,
+                        )
+                    };
+                    matches!(node.tag.as_str(), "input" | "select" | "textarea")
+                        && match name.as_str() {
+                            "placeholder-shown" => {
+                                node.tag != "select"
+                                    && node.attrs.contains_key("placeholder")
+                                    && empty
+                            }
+                            "required" => required,
+                            _ => !required,
+                        }
+                }
+                "read-write" | "read-only" if matches!(node.tag.as_str(), "input" | "textarea") => {
+                    let writable = !node.attrs.contains_key("readonly")
+                        && !disabled(doc, id, memo)
+                        && (node.tag == "textarea"
+                            || ![
+                                "hidden", "checkbox", "radio", "file", "submit", "image", "reset",
+                                "button", "color", "range",
+                            ]
+                            .iter()
+                            .any(|other| node.input_type().eq_ignore_ascii_case(other)));
+                    writable == (name == "read-write")
+                }
+                "read-write" | "read-only" | "lang" | "dir" => {
+                    let attribute = match name.as_str() {
+                        "lang" | "dir" => name.as_str(),
+                        _ => "contenteditable",
+                    };
+                    let mut value = None;
+                    let mut current = Some(id);
+                    while value.is_none()
+                        && let Some(ancestor) = current
+                    {
+                        memo.depend(ancestor, 0);
+                        memo.depend(ancestor, 1);
+                        value =
+                            doc.nodes[ancestor].attrs.get(attribute).filter(
+                                |value| match attribute {
+                                    "lang" => true,
+                                    "dir" => ["ltr", "rtl", "auto"]
+                                        .iter()
+                                        .any(|v| value.eq_ignore_ascii_case(v)),
+                                    _ => super::editable_value(value).is_some(),
+                                },
+                            );
+                        current = doc.nodes[ancestor].parent;
+                    }
+                    match name.as_str() {
+                        "lang" => value.is_some_and(|value| {
+                            !value.is_empty()
+                                && argument.split(',').any(|range| {
+                                    let range = range.trim().trim_matches(['"', '\'']);
+                                    range == "*"
+                                        || value.as_bytes().get(..range.len()).is_some_and(
+                                            |prefix| prefix.eq_ignore_ascii_case(range.as_bytes()),
+                                        ) && value
+                                            .as_bytes()
+                                            .get(range.len())
+                                            .is_none_or(|&c| c == b'-')
+                                })
+                        }),
+                        "dir" => {
+                            let rtl = value.is_some_and(|value| value.eq_ignore_ascii_case("rtl"));
+                            let wanted = argument.trim();
+                            wanted.eq_ignore_ascii_case("rtl") && rtl
+                                || wanted.eq_ignore_ascii_case("ltr") && !rtl
+                        }
+                        _ => {
+                            (value.and_then(|value| super::editable_value(value)) == Some(true))
+                                == (name == "read-write")
+                        }
+                    }
+                }
+                "not" => !parsed
+                    .iter()
+                    .any(|s| s.matches_nested(doc, id, scope, memo)),
+                "is" | "where" => parsed
+                    .iter()
+                    .any(|s| s.matches_nested(doc, id, scope, memo)),
+                "first-child" | "last-child" | "only-child" | "nth-child" | "nth-last-child"
+                | "first-of-type" | "last-of-type" | "only-of-type" | "nth-of-type"
+                | "nth-last-of-type" => {
+                    memo.depend(id, 1);
+                    node.parent.is_some_and(|parent| {
+                        let siblings = &doc.nodes[parent].children;
+                        let (index, count) = if parsed.is_empty() {
+                            match name.as_str() {
+                                "first-child" | "last-child" | "only-child" => {
+                                    memo.placed(doc, id, EDGE)
+                                }
+                                "nth-child" => memo.placed(doc, id, INDEX),
+                                _ => memo.depend(parent, 2),
+                            }
+                            let positions = memo.positions(doc, parent);
+                            let Some(&[index, count, of_type, type_count]) = positions.0.get(&id)
+                            else {
+                                return false;
+                            };
+                            if name.ends_with("of-type") {
+                                (of_type, type_count)
+                            } else {
+                                (index, count)
+                            }
+                        } else {
+                            memo.depend(parent, 2);
+                            if !parsed
+                                .iter()
+                                .any(|s| s.matches_nested(doc, id, scope, memo))
+                            {
+                                return false;
+                            }
+                            let key = (parsed.as_ptr() as usize, parent, scope);
+                            let positions = match memo.nth.get(&key) {
+                                Some(positions) => positions.clone(),
+                                None => {
+                                    let start = memo.dependencies.len();
+                                    memo.depend(parent, 2);
+                                    let mut indices = rustc_hash::FxHashMap::default();
+                                    for &child in siblings {
+                                        if !doc.nodes[child].tag.starts_with('#')
+                                            && parsed
+                                                .iter()
+                                                .any(|s| s.matches_nested(doc, child, scope, memo))
+                                        {
+                                            indices.insert(child, indices.len());
+                                        }
+                                    }
+                                    let mut dependencies = memo.dependencies.split_off(start);
+                                    dependencies.sort_unstable();
+                                    dependencies.dedup();
+                                    let positions = Rc::new((indices, dependencies));
+                                    memo.nth.insert(key, positions.clone());
+                                    positions
+                                }
+                            };
+                            let Some(&index) = positions.0.get(&id) else {
+                                return false;
+                            };
+                            (index, positions.0.len())
+                        };
+                        match name.as_str() {
+                            "first-child" | "first-of-type" => index == 0,
+                            "last-child" | "last-of-type" => index + 1 == count,
+                            "only-child" | "only-of-type" => count == 1,
+                            _ => {
+                                let index = if name.starts_with("nth-last") {
+                                    count - 1 - index
+                                } else {
+                                    index
+                                };
+                                let (a, n) = (*a as i64, index as i64 + 1 - *b as i64);
+                                if a == 0 {
+                                    n == 0
+                                } else {
+                                    n % a == 0 && n / a >= 0
+                                }
+                            }
+                        }
+                    })
+                }
+                _ => false,
+            },
+            SimpleSelector::Element(..) | SimpleSelector::NoNamespace => false,
+            SimpleSelector::Parent(parent, _) => parent
+                .iter()
+                .any(|s| s.matches_nested(doc, id, scope, memo)),
+        };
+        // Place checks read the siblings of the node. They run after the other selectors of the chain, so a failed
+        // chain keeps them out of the dependencies, and its nodes can share their styles.
+        let late = self.previous.is_some() && self.simple.iter().any(positional);
         let result = (|| {
             let host = node
                 .tag
@@ -2140,521 +2711,11 @@ impl Selector {
                     return false;
                 }
             } else if node.tag.starts_with('#')
-                || !self.simple.iter().all(|s| match s {
-                    SimpleSelector::Tag(_) | SimpleSelector::Id(_) | SimpleSelector::Class(_) => {
-                        true
-                    }
-                    SimpleSelector::Universal => true,
-                    SimpleSelector::Root => node.tag == "html",
-                    SimpleSelector::Attribute(name, operator, value, flag) => node
-                        .attrs
-                        .iter()
-                        .find(|(key, _)| *key == name || key.eq_ignore_ascii_case(name))
-                        .is_some_and(|(_, actual)| {
-                            let insensitive = *flag == 1
-                                || *flag == 2 && !node.tag.bytes().any(|c| c.is_ascii_uppercase());
-                            let equal = |part: Option<&str>| {
-                                part.is_some_and(|part| {
-                                    if insensitive {
-                                        part.eq_ignore_ascii_case(value)
-                                    } else {
-                                        part == value
-                                    }
-                                })
-                            };
-                            let length = value.len();
-                            match operator.as_str() {
-                                "" => true,
-                                "=" => equal(Some(actual)),
-                                "~=" => actual
-                                    .split_ascii_whitespace()
-                                    .any(|word| equal(Some(word))),
-                                "|=" => {
-                                    equal(actual.get(..length))
-                                        && actual.as_bytes().get(length).is_none_or(|&c| c == b'-')
-                                }
-                                _ if value.is_empty() => false,
-                                "^=" => equal(actual.get(..length)),
-                                "$=" => equal(
-                                    actual
-                                        .len()
-                                        .checked_sub(length)
-                                        .and_then(|start| actual.get(start..)),
-                                ),
-                                "*=" if insensitive => actual
-                                    .as_bytes()
-                                    .windows(length)
-                                    .any(|part| part.eq_ignore_ascii_case(value.as_bytes())),
-                                "*=" => actual.contains(value.as_str()),
-                                _ => false,
-                            }
-                        }),
-                    SimpleSelector::Pseudo(name, argument, parsed, [a, b]) => match name.as_str() {
-                        "scope" => scope.map_or(node.tag == "html", |scope| {
-                            scope == id
-                                || node.parent == Some(scope) && doc.nodes[scope].tag == "#document"
-                        }),
-                        "has" => {
-                            let local = memo.nodes.get(id).is_some()
-                                && parsed.iter().all(|selector| selector.local(node));
-                            if !local {
-                                return Self::has(parsed, doc, id, memo, false).0;
-                            }
-                            let known = memo.within.get(&id).and_then(|results| {
-                                results.iter().find(|result| Rc::ptr_eq(&result.0, parsed))
-                            });
-                            let (found, beside) = match known {
-                                Some(result) => (result.1, result.2),
-                                None => {
-                                    let start = memo.dependencies.len();
-                                    let (found, beside) = Self::has(parsed, doc, id, memo, true);
-                                    memo.dependencies.truncate(start);
-                                    let results = memo.within.entry(id).or_default();
-                                    results.push((parsed.clone(), found, beside));
-                                    match node.parent.filter(|_| beside) {
-                                        Some(parent) => memo.watched[parent] |= BESIDE,
-                                        None => memo.watched[id] |= BELOW,
-                                    }
-                                    (found, beside)
-                                }
-                            };
-                            if beside {
-                                memo.depend(id, 1);
-                            }
-                            memo.depend(id, WITHIN);
-                            found
-                        }
-                        "empty" => {
-                            memo.depend(id, 2);
-                            memo.depend(id, 3);
-                            for &child in &node.children {
-                                memo.depend(child, 3);
-                            }
-                            node.text.is_empty()
-                                && node.children.iter().all(|&id| {
-                                    doc.nodes[id].tag == "#comment"
-                                        || doc.nodes[id].tag == "#text"
-                                            && doc.nodes[id].text.is_empty()
-                                })
-                        }
-                        "hover" | "active" | "focus" | "focus-visible" | "focus-within" => {
-                            memo.depend(id, 5);
-                            node.state
-                                & match name.as_str() {
-                                    "hover" => HOVER,
-                                    "active" => ACTIVE,
-                                    "focus-within" => FOCUS_WITHIN,
-                                    "focus-visible" => FOCUS_VISIBLE,
-                                    _ => FOCUS,
-                                }
-                                != 0
-                        }
-                        "in-range" | "out-of-range" => {
-                            memo.depend(id, 0);
-                            memo.depend(id, 3);
-                            let value = node.current_value().unwrap_or("");
-                            let bound = |name| node.attrs.get(name).map(String::as_str);
-                            let numeric = node.input_type().eq_ignore_ascii_case("number");
-                            // Dates and times in their valid forms compare as strings.
-                            let beyond = |limit: Option<&str>, below: bool| {
-                                limit.is_some_and(|limit| {
-                                    let order = match (value.parse::<f64>(), limit.parse::<f64>()) {
-                                        (Ok(value), Ok(limit)) if numeric => {
-                                            value.partial_cmp(&limit)
-                                        }
-                                        _ if numeric
-                                            || value.is_empty()
-                                            || limit.len() != value.len() =>
-                                        {
-                                            None
-                                        }
-                                        _ => Some(value.cmp(limit)),
-                                    };
-                                    order
-                                        == Some(if below {
-                                            std::cmp::Ordering::Less
-                                        } else {
-                                            std::cmp::Ordering::Greater
-                                        })
-                                })
-                            };
-                            let out = !node.input_type().eq_ignore_ascii_case("range")
-                                && (beyond(bound("min"), true) || beyond(bound("max"), false));
-                            ranged(node)
-                                && !node.attrs.contains_key("readonly")
-                                && !disabled(doc, id, memo)
-                                && out == (name == "out-of-range")
-                        }
-                        "target" => {
-                            memo.depend(id, 5);
-                            doc.target == Some(id)
-                        }
-                        "link" | "any-link" | "-webkit-any-link" => {
-                            matches!(node.tag.as_str(), "a" | "area")
-                                && node.attrs.contains_key("href")
-                        }
-                        "defined" => {
-                            memo.depend(id, 5);
-                            node.state & super::DEFINED != 0
-                                || !node.tag.contains('-')
-                                || matches!(
-                                    node.tag.as_str(),
-                                    "annotation-xml"
-                                        | "color-profile"
-                                        | "font-face"
-                                        | "font-face-src"
-                                        | "font-face-uri"
-                                        | "font-face-format"
-                                        | "font-face-name"
-                                        | "missing-glyph"
-                                )
-                        }
-                        "open" => {
-                            matches!(node.tag.as_str(), "details" | "dialog")
-                                && node.attrs.contains_key("open")
-                        }
-                        "indeterminate" => {
-                            memo.depend(id, 5);
-                            node.tag == "progress" && !node.attrs.contains_key("value")
-                                || node.tag == "input"
-                                    && node.state & super::INDETERMINATE != 0
-                                    && node.input_type().eq_ignore_ascii_case("checkbox")
-                        }
-                        "default" => {
-                            let checkable = node.tag == "input"
-                                && ["checkbox", "radio"]
-                                    .iter()
-                                    .any(|kind| node.input_type().eq_ignore_ascii_case(kind));
-                            if checkable || node.tag == "option" {
-                                node.attrs.contains_key(if checkable {
-                                    "checked"
-                                } else {
-                                    "selected"
-                                })
-                            } else if submits(node) {
-                                let mut form = Some(id);
-                                while let Some(at) = form.filter(|&at| doc.nodes[at].tag != "form")
-                                {
-                                    memo.depend(at, 1);
-                                    form = doc.nodes[at].parent;
-                                    form.inspect(|&form| memo.depend(form, 4));
-                                }
-                                let mut pending = Vec::from_iter(form);
-                                let mut first = None;
-                                while let Some(at) = pending.pop() {
-                                    if doc.nodes[at].tag.starts_with('#') {
-                                        continue;
-                                    }
-                                    memo.depend(at, 0);
-                                    if Some(at) != form && submits(&doc.nodes[at]) {
-                                        first = Some(at);
-                                        break;
-                                    }
-                                    memo.depend(at, 2);
-                                    pending.extend(doc.nodes[at].children.iter().rev());
-                                }
-                                first == Some(id)
-                            } else {
-                                false
-                            }
-                        }
-                        "checked" => {
-                            memo.depend(id, 0);
-                            memo.depend(id, 5);
-                            match node.tag.as_str() {
-                                "input" => {
-                                    node.checked()
-                                        && ["checkbox", "radio"].iter().any(|kind| {
-                                            node.input_type().eq_ignore_ascii_case(kind)
-                                        })
-                                }
-                                "option" if node.state & super::DIRTY != 0 || node.checked() => {
-                                    node.checked()
-                                }
-                                "option" => {
-                                    let mut select = node.parent.unwrap_or_default();
-                                    memo.depend(select, 1);
-                                    if doc.nodes[select].tag == "optgroup" {
-                                        select = doc.nodes[select].parent.unwrap_or_default();
-                                    }
-                                    memo.depend(select, 0);
-                                    memo.depend(select, 2);
-                                    let parent = &doc.nodes[select];
-                                    let mut options = Vec::new();
-                                    for &child in &parent.children {
-                                        if doc.nodes[child].tag == "optgroup" {
-                                            memo.depend(child, 2);
-                                            options.extend(&doc.nodes[child].children);
-                                        } else {
-                                            options.push(child);
-                                        }
-                                    }
-                                    options.retain(|&option| doc.nodes[option].tag == "option");
-                                    for &option in &options {
-                                        memo.depend(option, 0);
-                                        memo.depend(option, 5);
-                                    }
-                                    parent.tag == "select"
-                                        && !parent.attrs.contains_key("multiple")
-                                        && parent.attrs.get("size").is_none_or(|size| {
-                                            size.trim().parse::<u32>().is_ok_and(|size| size <= 1)
-                                        })
-                                        && options
-                                            .iter()
-                                            .all(|&option| !doc.nodes[option].checked())
-                                        && options.iter().find(|&&option| {
-                                            !doc.nodes[option].attrs.contains_key("disabled")
-                                        }) == Some(&id)
-                                }
-                                _ => false,
-                            }
-                        }
-                        "modal" | "popover-open" | "fullscreen" | "-webkit-full-screen" => {
-                            memo.depend(id, 5);
-                            node.state
-                                & match name.as_str() {
-                                    "modal" => super::MODAL,
-                                    "popover-open" => super::POPOVER,
-                                    _ => super::FULLSCREEN,
-                                }
-                                != 0
-                        }
-                        "-internal-dialog-in-top-layer" => {
-                            memo.depend(id, 5);
-                            node.tag == "dialog"
-                                && node.state & (super::MODAL | super::MODAL << 5) != 0
-                        }
-                        "disabled" | "enabled" => {
-                            matches!(
-                                node.tag.as_str(),
-                                "button"
-                                    | "input"
-                                    | "select"
-                                    | "textarea"
-                                    | "optgroup"
-                                    | "option"
-                                    | "fieldset"
-                            ) && disabled(doc, id, memo) == (name == "disabled")
-                        }
-                        "valid" | "invalid" => {
-                            // Match `candidate` in dom.js, which also sets the validity bit.
-                            memo.depend(id, 1);
-                            memo.depend(id, 5);
-                            let candidate = match node.tag.as_str() {
-                                "input" => !["hidden", "reset", "button"]
-                                    .iter()
-                                    .any(|kind| node.input_type().eq_ignore_ascii_case(kind)),
-                                "button" => submits(node),
-                                "select" | "textarea" => true,
-                                _ => false,
-                            };
-                            candidate
-                                && !node.attrs.contains_key("readonly")
-                                && node.parent.is_none_or(|parent| {
-                                    memo.depend(parent, 4);
-                                    !doc.nodes[parent].tag.starts_with("datalist")
-                                })
-                                && !disabled(doc, id, memo)
-                                && (node.state & super::INVALID != 0) == (name == "invalid")
-                        }
-                        "placeholder-shown" | "required" | "optional" => {
-                            memo.depend(id, 2);
-                            memo.depend(id, 3);
-                            memo.depend(id, 5);
-                            for &child in &node.children {
-                                memo.depend(child, 3);
-                            }
-                            let required = node.attrs.contains_key("required");
-                            let empty = if ["checkbox", "radio"]
-                                .iter()
-                                .any(|kind| node.input_type().eq_ignore_ascii_case(kind))
-                            {
-                                !node.checked()
-                            } else {
-                                node.current_value().map_or(
-                                    node.text.is_empty()
-                                        && node.children.iter().all(|&child| {
-                                            doc.nodes[child].tag == "#text"
-                                                && doc.nodes[child].text.is_empty()
-                                        }),
-                                    str::is_empty,
-                                )
-                            };
-                            matches!(node.tag.as_str(), "input" | "select" | "textarea")
-                                && match name.as_str() {
-                                    "placeholder-shown" => {
-                                        node.tag != "select"
-                                            && node.attrs.contains_key("placeholder")
-                                            && empty
-                                    }
-                                    "required" => required,
-                                    _ => !required,
-                                }
-                        }
-                        "read-write" | "read-only"
-                            if matches!(node.tag.as_str(), "input" | "textarea") =>
-                        {
-                            let writable = !node.attrs.contains_key("readonly")
-                                && !disabled(doc, id, memo)
-                                && (node.tag == "textarea"
-                                    || ![
-                                        "hidden", "checkbox", "radio", "file", "submit", "image",
-                                        "reset", "button", "color", "range",
-                                    ]
-                                    .iter()
-                                    .any(|other| node.input_type().eq_ignore_ascii_case(other)));
-                            writable == (name == "read-write")
-                        }
-                        "read-write" | "read-only" | "lang" | "dir" => {
-                            let attribute = match name.as_str() {
-                                "lang" | "dir" => name.as_str(),
-                                _ => "contenteditable",
-                            };
-                            let mut value = None;
-                            let mut current = Some(id);
-                            while value.is_none()
-                                && let Some(ancestor) = current
-                            {
-                                memo.depend(ancestor, 0);
-                                memo.depend(ancestor, 1);
-                                value = doc.nodes[ancestor].attrs.get(attribute).filter(|value| {
-                                    match attribute {
-                                        "lang" => true,
-                                        "dir" => ["ltr", "rtl", "auto"]
-                                            .iter()
-                                            .any(|v| value.eq_ignore_ascii_case(v)),
-                                        _ => super::editable_value(value).is_some(),
-                                    }
-                                });
-                                current = doc.nodes[ancestor].parent;
-                            }
-                            match name.as_str() {
-                                "lang" => value.is_some_and(|value| {
-                                    !value.is_empty()
-                                        && argument.split(',').any(|range| {
-                                            let range = range.trim().trim_matches(['"', '\'']);
-                                            range == "*"
-                                                || value.as_bytes().get(..range.len()).is_some_and(
-                                                    |prefix| {
-                                                        prefix
-                                                            .eq_ignore_ascii_case(range.as_bytes())
-                                                    },
-                                                ) && value
-                                                    .as_bytes()
-                                                    .get(range.len())
-                                                    .is_none_or(|&c| c == b'-')
-                                        })
-                                }),
-                                "dir" => {
-                                    let rtl = value
-                                        .is_some_and(|value| value.eq_ignore_ascii_case("rtl"));
-                                    let wanted = argument.trim();
-                                    wanted.eq_ignore_ascii_case("rtl") && rtl
-                                        || wanted.eq_ignore_ascii_case("ltr") && !rtl
-                                }
-                                _ => {
-                                    (value.and_then(|value| super::editable_value(value))
-                                        == Some(true))
-                                        == (name == "read-write")
-                                }
-                            }
-                        }
-                        "not" => !parsed
-                            .iter()
-                            .any(|s| s.matches_nested(doc, id, scope, memo)),
-                        "is" | "where" => parsed
-                            .iter()
-                            .any(|s| s.matches_nested(doc, id, scope, memo)),
-                        "first-child" | "last-child" | "only-child" | "nth-child"
-                        | "nth-last-child" | "first-of-type" | "last-of-type" | "only-of-type"
-                        | "nth-of-type" | "nth-last-of-type" => {
-                            memo.depend(id, 1);
-                            node.parent.is_some_and(|parent| {
-                                let siblings = &doc.nodes[parent].children;
-                                let (index, count) = if parsed.is_empty() {
-                                    match name.as_str() {
-                                        "first-child" | "last-child" | "only-child" => {
-                                            memo.placed(doc, id, EDGE)
-                                        }
-                                        "nth-child" => memo.placed(doc, id, INDEX),
-                                        _ => memo.depend(parent, 2),
-                                    }
-                                    let positions = memo.positions(doc, parent);
-                                    let Some(&[index, count, of_type, type_count]) =
-                                        positions.0.get(&id)
-                                    else {
-                                        return false;
-                                    };
-                                    if name.ends_with("of-type") {
-                                        (of_type, type_count)
-                                    } else {
-                                        (index, count)
-                                    }
-                                } else {
-                                    memo.depend(parent, 2);
-                                    if !parsed
-                                        .iter()
-                                        .any(|s| s.matches_nested(doc, id, scope, memo))
-                                    {
-                                        return false;
-                                    }
-                                    let key = (parsed.as_ptr() as usize, parent, scope);
-                                    let positions = match memo.nth.get(&key) {
-                                        Some(positions) => positions.clone(),
-                                        None => {
-                                            let start = memo.dependencies.len();
-                                            memo.depend(parent, 2);
-                                            let mut indices = rustc_hash::FxHashMap::default();
-                                            for &child in siblings {
-                                                if !doc.nodes[child].tag.starts_with('#')
-                                                    && parsed.iter().any(|s| {
-                                                        s.matches_nested(doc, child, scope, memo)
-                                                    })
-                                                {
-                                                    indices.insert(child, indices.len());
-                                                }
-                                            }
-                                            let mut dependencies =
-                                                memo.dependencies.split_off(start);
-                                            dependencies.sort_unstable();
-                                            dependencies.dedup();
-                                            let positions = Rc::new((indices, dependencies));
-                                            memo.nth.insert(key, positions.clone());
-                                            positions
-                                        }
-                                    };
-                                    let Some(&index) = positions.0.get(&id) else {
-                                        return false;
-                                    };
-                                    (index, positions.0.len())
-                                };
-                                match name.as_str() {
-                                    "first-child" | "first-of-type" => index == 0,
-                                    "last-child" | "last-of-type" => index + 1 == count,
-                                    "only-child" | "only-of-type" => count == 1,
-                                    _ => {
-                                        let index = if name.starts_with("nth-last") {
-                                            count - 1 - index
-                                        } else {
-                                            index
-                                        };
-                                        let (a, n) = (*a as i64, index as i64 + 1 - *b as i64);
-                                        if a == 0 {
-                                            n == 0
-                                        } else {
-                                            n % a == 0 && n / a >= 0
-                                        }
-                                    }
-                                }
-                            })
-                        }
-                        _ => false,
-                    },
-                    SimpleSelector::Element(..) | SimpleSelector::NoNamespace => false,
-                    SimpleSelector::Parent(parent, _) => parent
-                        .iter()
-                        .any(|s| s.matches_nested(doc, id, scope, memo)),
-                })
+                || !self
+                    .simple
+                    .iter()
+                    .filter(|s| !late || !positional(s))
+                    .all(|s| check(s, memo))
             {
                 return false;
             }
@@ -2665,7 +2726,7 @@ impl Selector {
             let Some(parent) = node.parent else {
                 return false;
             };
-            match combinator {
+            let chained = match combinator {
                 '>' => previous.matches_nested(doc, parent, scope, memo),
                 '+' => {
                     memo.placed(doc, id, PREVIOUS);
@@ -2734,7 +2795,14 @@ impl Selector {
                     }
                     matched
                 }
-            }
+            };
+            chained
+                && (!late
+                    || self
+                        .simple
+                        .iter()
+                        .filter(|s| positional(s))
+                        .all(|s| check(s, memo)))
         })();
         if compound {
             return result;

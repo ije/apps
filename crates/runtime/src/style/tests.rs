@@ -6101,3 +6101,48 @@ fn content_visibility_and_intrinsic_sizes_parse_like_chrome() {
         assert_eq!(get(selector, name), expected, "{selector} {name}");
     }
 }
+
+#[test]
+fn siblings_share_styles_only_after_like_siblings() {
+    let mut doc = Document::parse(
+        "<style>span{color:blue} .a + span{color:red} section > :first-of-type{width:3px}</style>\
+         <div><p class=a></p><span></span><b></b><span></span><p class=a></p><span></span></div>\
+         <section><i></i><i></i></section>",
+    );
+    let b = element(&doc, "b");
+    let mut sheets = HashMap::new();
+    let mut cache = StyleCache::default();
+    for marked in [false, true, false] {
+        doc.nodes[b]
+            .attrs
+            .set("class", if marked { "a" } else { "" });
+        let cached = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
+        let fresh = compute_styles(
+            &doc,
+            800.,
+            600.,
+            None,
+            &mut sheets,
+            &mut StyleCache::default(),
+            None,
+        );
+        assert_eq!(cached.values, fresh.values);
+        for (index, red) in [(1, true), (2, marked), (3, true)] {
+            let id = format!("span:nth-of-type({index})");
+            assert_eq!(
+                cached.values[element(&doc, &id)]
+                    .get(Prop::COLOR)
+                    .and_then(color),
+                Some((if red { 0xff0000 } else { 0x0000ff }, 255)),
+                "{id}"
+            );
+        }
+        for (id, width) in [("i:first-of-type", Some("3px")), ("i:last-of-type", None)] {
+            assert_eq!(
+                cached.values[element(&doc, id)].get(Prop::WIDTH),
+                width,
+                "{id}"
+            );
+        }
+    }
+}
