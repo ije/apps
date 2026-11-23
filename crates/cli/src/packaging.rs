@@ -325,7 +325,9 @@ pub fn package_app(
                 .to_string_lossy()
                 .replace('\\', "/");
             let metadata = entry.metadata()?;
+            // Windows hosts write DOS entries by default, which lose the executable mode.
             let options = zip::write::SimpleFileOptions::default()
+                .system(zip::System::Unix)
                 .compression_method(zip::CompressionMethod::Deflated)
                 .large_file(metadata.len() >= u32::MAX as u64);
             #[cfg(unix)]

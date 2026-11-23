@@ -353,6 +353,8 @@ fn invalid_jsc_override_does_not_use_system_engine() {
     let result = Command::new(env!("CARGO_BIN_EXE_apps"))
         .arg("run")
         .arg(entry)
+        // Any file works: `cargo test -p apps` doesn't build apps-runtime.
+        .env("APPS_RUNTIME", env!("CARGO_BIN_EXE_apps"))
         .env("APPS_JSC_LIBRARY", dir.path().join("missing-jsc"))
         .output()
         .unwrap();

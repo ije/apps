@@ -31,16 +31,22 @@ fn page(disabled: u32) -> (Rc<RefCell<Host>>, JsContext, String) {
 }
 
 // Allow CoreAudio's one-time executable-folder scan to finish. target/debug/deps can make it take seconds.
+// A value that starts with "pending" waits, and the last one shows in the panic.
 fn wait(engine: &JsContext, ready: &str) -> String {
+    let started = std::time::Instant::now();
+    let mut value = String::new();
     for _ in 0..30000 {
         engine.tick().unwrap();
-        let value = engine.eval(ready, "media-test").unwrap();
-        if value != "pending" {
+        value = engine.eval(ready, "media-test").unwrap();
+        if !value.starts_with("pending") {
             return value;
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    panic!("Media did not finish: {ready}");
+    panic!(
+        "Media did not finish after {:?}: {ready} is {value}",
+        started.elapsed()
+    );
 }
 
 const EVENTS: &str = "globalThis.events = []; for (const type of ['loadstart', 'durationchange', 'resize', 'loadedmetadata', 'loadeddata', 'canplay', 'canplaythrough', 'play', 'playing', 'pause', 'seeking', 'seeked', 'ended', 'error', 'emptied']) media.addEventListener(type, () => events.push(type));";
@@ -281,12 +287,15 @@ fn web_audio_sounds_free_their_players() {
     let (_host, engine, _base) = page(apps_runtime::bundle::disabled_features(None).unwrap());
     engine
         .eval(
-            "globalThis.ended = 0; const live = new AudioContext();
+            "globalThis.ended = 0; globalThis.live = new AudioContext();
             for (let i = 0; i < 40; i++) setTimeout(() => { const tone = live.createOscillator(); tone.connect(live.destination); tone.onended = () => ended++; tone.start(); tone.stop(live.currentTime + 0.02); }, i * 5)",
             "media-test",
         )
         .unwrap();
-    wait(&engine, "ended === 40 ? 'done' : 'pending'");
+    wait(
+        &engine,
+        "ended === 40 ? 'done' : `pending: ${ended} ended at ${live.currentTime.toFixed(1)} s`",
+    );
     // Other tests in this binary can hold a few players at the same time.
     for _ in 0..2500 {
         engine.tick().unwrap();

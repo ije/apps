@@ -373,11 +373,32 @@ impl TextSystem {
     }
 
     pub fn metrics(&self, font: FontId) -> FaceMetrics {
-        let shelf = self.0.borrow();
+        let shelf = &mut *self.0.borrow_mut();
         let face = &shelf.faces[font as usize];
         let swash = face.font.as_swash();
         let metrics = swash.metrics(&face.coords);
         let em = f32::from(metrics.units_per_em.max(1));
+        // Like FreeType in Chrome, a face without these OS/2 values (version 1, like DejaVu) measures its glyphs.
+        let mut scaler = shelf
+            .scaler
+            .builder(swash)
+            .size(1.)
+            .variations(
+                face.axes
+                    .iter()
+                    .map(|(tag, value)| (tag_from_bytes(tag), *value)),
+            )
+            .build();
+        let mut measure = |value: f32, ch| match value {
+            0. => scaler
+                .scale_outline(swash.charmap().map(ch))
+                .map_or(0., |outline| outline.bounds().max.y),
+            value => value / em,
+        };
+        let (cap_height, x_height) = (
+            measure(metrics.cap_height, 'H'),
+            measure(metrics.x_height, 'x'),
+        );
         let head = swash.table(tag_from_bytes(b"head"));
         let corner = |at| head.and_then(|head| read_i16(head, at)).unwrap_or(0.) / em;
         let [left, bottom, right, top] = [36, 38, 40, 42].map(corner);
@@ -389,8 +410,8 @@ impl TextSystem {
             ascent: metrics.ascent / em,
             descent: -metrics.descent / em,
             line_gap: metrics.leading / em,
-            cap_height: metrics.cap_height / em,
-            x_height: metrics.x_height / em,
+            cap_height,
+            x_height,
             bounds: Rect::new(point(left, bottom), size(right - left, top - bottom)),
             em_ascent: match typo {
                 Some((ascent, descent)) => ascent / (ascent - descent),

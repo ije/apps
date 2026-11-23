@@ -1866,9 +1866,13 @@ send({ready:process.argv.slice(2),type:process.type??null,fd:process.env.NODE_CH
             assert.deepStrictEqual(await talk(fork(file,['a','b'],{{execPath:'node',env}})),[1,2,'disconnect','exit 3','close']);
             const parent=spawn('node',['-e',`const c=require('child_process').fork('apps:///child.js',['a','b'],{{execPath:${{JSON.stringify(runtime)}}}}),log=[];
                 c.on('message',m=>{{log.push(m.big?m.big.length:m);if(m.ready)c.send('big');else if(m.big)c.send('bye');}});
-                for(const name of ['disconnect','exit','close'])c.on(name,code=>log.push(name+' '+code));c.on('close',()=>console.log(JSON.stringify(log)));`],{{env}});
+                let left=2;const end=()=>--left||console.log(JSON.stringify(log));
+                for(const name of ['disconnect','exit','close'])c.on(name,code=>log.push(name+' '+code));c.on('close',end);c.on('disconnect',end);`],{{env}});
             const out=[];parent.stdout.on('data',data=>out.push(data));await once(parent,'close');
-            assert.deepStrictEqual(JSON.parse(Buffer.concat(out).toString()),[{{ready:['a','b'],type:null,fd:null,connected:true}},1<<21,1,2,'disconnect undefined','exit 3','close 3']);
+            // Node orders `disconnect` and `exit` by which of the channel end and SIGCHLD it reads first.
+            const log=JSON.parse(Buffer.concat(out).toString());
+            assert.deepStrictEqual(log.slice(0,4),[{{ready:['a','b'],type:null,fd:null,connected:true}},1<<21,1,2]);
+            assert.deepStrictEqual(log.slice(4).sort(),['close 3','disconnect undefined','exit 3']);
         }}
     "#,
         runtime = serde_json::to_string(env!("CARGO_BIN_EXE_apps-runtime")).unwrap(),
