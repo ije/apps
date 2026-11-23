@@ -409,13 +409,36 @@ pub(crate) struct PaintSpan {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PaintKey {
     pub(crate) mask: Clip<Pixels>,
-    offset: Point<Pixels>,
+    pub(crate) offset: Point<Pixels>,
     opacity: f32,
     smoothing: bool,
     scale: f32,
 }
 
+impl PaintSpan {
+    // Where this span, inside the span `from`, is in `to`, a copy of `from`.
+    pub(crate) fn rebased(&self, from: &PaintSpan, to: &PaintSpan) -> Option<PaintSpan> {
+        let mut input = self.input;
+        for ((own, was), now) in input.iter_mut().zip(from.input).zip(to.input) {
+            *own = scene::rebased(*own, was, now)?;
+        }
+        Some(PaintSpan {
+            scene: self.scene.rebased(&from.scene, &to.scene)?,
+            input,
+        })
+    }
+}
+
 impl PaintKey {
+    // The key of paint that moved with its offset, in the mask `mask`.
+    pub(crate) fn moved(&self, by: Point<Pixels>, mask: Clip<Pixels>) -> Self {
+        Self {
+            mask,
+            offset: self.offset + by,
+            ..*self
+        }
+    }
+
     // Paint under both keys differs only by the place and clip of the content.
     pub(crate) fn same_paint(&self, other: &Self) -> bool {
         (self.opacity, self.smoothing, self.scale) == (other.opacity, other.smoothing, other.scale)
@@ -1158,6 +1181,9 @@ impl Window {
         }
         self.shots = shots;
         let fresh = self.platform.atlas().take_fresh();
+        // Patches of composited animations before a paint in the same frame can't place their damage, but the diff
+        // finds it.
+        self.scene.rediff_patches();
         self.scene.diff(fresh.as_deref());
         let mut frame = self.platform.draw(&self.scene, !captures.is_empty());
         self.scene.drawn();
@@ -1491,7 +1517,6 @@ impl Window {
     }
 
     // The frame starts again after this paint, which the next paint doesn't copy.
-    #[cfg_attr(debug_assertions, allow(dead_code))]
     pub(crate) fn restart_frame(&mut self) {
         self.restart = true;
         self.scene.abort();
@@ -1564,6 +1589,17 @@ impl Window {
         (self.scene.culled == mark.culled)
             .then(|| self.scene.plain(&span.scene, &self.snap_mask(mask)))
             .flatten()
+    }
+
+    // A move within a rounding error of whole device pixels, as layout far down the page gives, is made whole.
+    pub(crate) fn snap_move(&self, by: Point<Pixels>) -> Point<Pixels> {
+        by.map(|value| {
+            let device = value.0 * self.scale_factor;
+            match (device - device.round()).abs() < 1e-3 {
+                true => Pixels(device.round() / self.scale_factor),
+                false => value,
+            }
+        })
     }
 
     // Whether a plain span that drew `area` can move by `by` and draw in `mask`, as a paint there would draw.
@@ -1649,8 +1685,6 @@ impl Window {
     }
 
     // Copies a span of the last paint.
-    // Debug builds paint instead, to check the copy.
-    #[cfg_attr(debug_assertions, allow(dead_code))]
     pub(crate) fn replay(
         &mut self,
         span: &PaintSpan,

@@ -52,6 +52,11 @@ pub(super) struct Build<'a> {
     pub(super) plan: RefCell<Rc<[usize]>>,
 }
 
+thread_local! {
+    // The reads that the box being built keeps, so each query is kept once.
+    static SEEN: RefCell<rustc_hash::FxHashSet<(Query, bool)>> = RefCell::default();
+}
+
 // Log external reads through Build::log, or disable reuse of this box.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(debug_assertions, derive(Debug))]
@@ -1282,17 +1287,16 @@ pub(super) fn element(
         let below = |read: &Read| usize::from(read.reader) > depth;
         let mut log = build.reads.borrow_mut();
         let mut end = mark;
-        for at in mark..log.len() {
-            let read = log[at];
-            if usize::from(read.scope) <= depth
-                && !log[end.saturating_sub(16).max(mark)..end]
-                    .iter()
-                    .any(|old| old.query == read.query && below(old) == below(&read))
-            {
-                log[end] = read;
-                end += 1;
+        SEEN.with_borrow_mut(|seen| {
+            seen.clear();
+            for at in mark..log.len() {
+                let read = log[at];
+                if usize::from(read.scope) <= depth && seen.insert((read.query, below(&read))) {
+                    log[end] = read;
+                    end += 1;
+                }
             }
-        }
+        });
         log.truncate(end);
         let reads = storable.then(|| {
             log[mark..]

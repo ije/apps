@@ -98,6 +98,14 @@ struct Slot {
     // in `touched` of that pass.
     regions: Option<(u32, [u32; 2])>,
     touched: [u32; 2],
+    // The regions and touched boxes of the last prepaint that went through the boxes in it. Copies of the
+    // regions relocate them as a block.
+    base_regions: Option<(u32, [u32; 2])>,
+    base_touched: [u32; 2],
+    // The regions and touched boxes that the last prepaint of the box gave, which they relocate from with the
+    // copies of the regions of its parent.
+    own_regions: Option<(u32, [u32; 2])>,
+    own_touched: [u32; 2],
     // All hooks in the box allow a skip, and no box in it is listed in a stacking context outside it.
     skips: bool,
     // The prepaint pass that skipped the box.
@@ -126,6 +134,22 @@ struct Chunk {
     area: Option<Rect<f32>>,
     // A copy can move with the box when its mask moves with it, as in a scroll.
     translates: bool,
+    // The last paint of the box that went through the boxes in it. Copies relocate that span as a block, so the
+    // chunks of the boxes in it follow the copies.
+    base: Output,
+    // The last paint or copy of the box, which the chunk relocates from with the copies of its parent.
+    origin: Output,
+}
+
+// What a paint or a copy of a box drew, and where.
+#[derive(Clone, Copy)]
+struct Output {
+    pass: u32,
+    span: PaintSpan,
+    key: PaintKey,
+    at: Point<Pixels>,
+    mask: Clip<Pixels>,
+    area: Option<Rect<f32>>,
 }
 
 // Where a column set puts a box of its flow, in layout units.
@@ -199,6 +223,10 @@ impl Slot {
             chunk: None,
             regions: None,
             touched: [0; 2],
+            base_regions: None,
+            base_touched: [0; 2],
+            own_regions: None,
+            own_touched: [0; 2],
             skips: false,
             skipped: 0,
             contained: false,
@@ -258,6 +286,8 @@ impl Slot {
         self.split = None;
         self.chunk = None;
         self.regions = None;
+        self.base_regions = None;
+        self.own_regions = None;
     }
 
     fn taffy(&self) -> &taffy::Style {
@@ -371,6 +401,14 @@ pub struct Tree {
     hidden: Vec<Vec<Option<Rect<Pixels>>>>,
     // The move of the box that `keep` visits when its layout stayed and only the scroll offset moved it.
     delta: Option<Point<Pixels>>,
+    // For each box that `keep` goes through, how far scrolls moved it without a prepaint of the boxes in it.
+    lags: Vec<Point<Pixels>>,
+    // For each box that a debug paint goes through where a release paint copies, the chunks before the paint.
+    #[cfg(debug_assertions)]
+    copied: Vec<Vec<(u32, Option<Chunk>)>>,
+    // A prepaint since the last paint went through all boxes again for a check.
+    #[cfg(debug_assertions)]
+    checked: bool,
     // The boxes whose hooks skip also inside a skipped box, in this pass and the last one.
     touched: Vec<u32>,
     last_touched: (u32, Vec<u32>),
@@ -1250,8 +1288,20 @@ impl Tree {
         [(snapped / scale).map(Pixels) + offset, exact + offset]
     }
 
+    fn checked(&self) -> bool {
+        #[cfg(debug_assertions)]
+        return self.checked;
+        #[cfg(not(debug_assertions))]
+        false
+    }
+
     pub(crate) fn prepaint(&mut self, root: NodeId, window: &mut Window) {
         self.prepaints = self.prepaints.wrapping_add(1);
+        // Like the restarts of release builds, some passes go through the boxes that scrolls moved.
+        #[cfg(debug_assertions)]
+        {
+            self.unshift |= self.prepaints % 5 == 2;
+        }
         window.begin_prepaint(self.prepaints);
         mem::swap(&mut self.touched, &mut self.last_touched.1);
         self.last_touched.0 = self.prepaints.wrapping_sub(1);
@@ -1266,8 +1316,11 @@ impl Tree {
         self.copies = window.copies();
         self.prepaint_node(index_of(root), Point::default(), false, window);
         self.unshift = false;
+        // The check lays out all boxes again, so it checks every third pass, and state that a skip keeps reaches it.
+        // Hooks then hold the state of the full pass, which copies don't show, so the next paint draws all boxes.
         #[cfg(debug_assertions)]
-        if !window.redraws() {
+        if !window.redraws() && self.prepaints.is_multiple_of(3) {
+            self.checked = true;
             // The boxes inside a box that a scroll moved keep their old places.
             let mut stale = vec![false; self.slots.len()];
             // The z-index lists of a moved box, and of the boxes inside it, are old too. Paint copies such a box.
@@ -1391,6 +1444,7 @@ impl Tree {
             self.keep(index, parent, window);
             return;
         }
+        self.rebase(index, window);
         let slot = &mut self.slots[index as usize];
         // The boxes inside a box that a skip kept in the last pass are as they were, also when the box itself
         // was built again since.
@@ -1406,7 +1460,7 @@ impl Tree {
         let slot = &mut self.slots[index as usize];
         slot.placed = Some((prepaints, origin, placement));
         slot.origin = origin;
-        slot.lag = Point::default();
+        let lag = mem::take(&mut slot.lag);
         // A listed box comes before the listed boxes inside it, which paint above it at the same z-index.
         slot.listed = slot.style.z_index.is_some() && !self.stacks.is_empty();
         if let Some(order) = slot.style.z_index
@@ -1423,12 +1477,15 @@ impl Tree {
         (slot.bounds, slot.exact) = (bounds, exact);
         let (listed, transforms) = (self.stacks.last().map(Vec::len), window.transforms);
         let shifting = mem::replace(&mut self.shifting, true);
+        // The boxes inside take the moves of this box without a prepaint, as in `keep`.
+        self.lags.push(lag);
         self.visit(
             index,
             window,
             |hooks, cx, inner| hooks.prepaint(cx, inner),
             |tree, style, window| tree.prepaint_box(index, style, covered, window),
         );
+        self.lags.pop();
         self.flatten(index, transforms, shifting, window);
         self.reach(index, window.scale_factor());
         if self.slots[index as usize].escaped.is_some() {
@@ -1543,6 +1600,8 @@ impl Tree {
         slot.skips = skips;
         slot.regions = Some((self.prepaints, [regions, window.regions_len()]));
         slot.touched = [touched, self.touched.len() as u32];
+        (slot.base_regions, slot.base_touched) = (slot.regions, slot.touched);
+        (slot.own_regions, slot.own_touched) = (slot.regions, slot.touched);
         self.skips &= skips;
     }
 
@@ -1847,7 +1906,114 @@ impl Tree {
         [bounds, exact]
     }
 
+    // A box that no prepaint or paint went through since its parent last did moves with its parent: it takes the
+    // moves of its parent without a prepaint, and its regions and paint chunk relocate with the copies of the regions
+    // and the chunk of its parent.
+    fn rebase(&mut self, index: u32, window: &Window) {
+        let parent = self.slots[index as usize].parent;
+        if parent == NONE {
+            return;
+        }
+        let lag = self.lags.last().copied().unwrap_or_default();
+        let slot = &mut self.slots[index as usize];
+        if lag != Point::default() {
+            slot.lag += lag;
+            slot.painted.origin += lag;
+            slot.bounds.origin += lag;
+            slot.exact.origin += lag;
+            slot.reach = slot.reach.map(|reach| reach + lag);
+            if let Some(region) = &mut slot.region {
+                region.bounds.origin += lag;
+            }
+            if let Some((_, _, placed)) = &mut slot.placed {
+                placed.offset += lag;
+                if placed.mask.bounds.size.width.0 < crate::scene::OPEN {
+                    placed.mask.bounds.origin += lag;
+                }
+                if !placed.mask.radii.is_zero() {
+                    placed.mask.rounded.origin += lag;
+                }
+            }
+            // Boxes with hooks that skip inside moved with the box that a scroll moved, like their text.
+            if !(slot.hooks.as_ref()).is_some_and(|hooks| hooks.skips_inside()) {
+                if let Some(hooks) = slot.hooks.clone() {
+                    hooks.lag(lag);
+                }
+                if let Some(state) =
+                    (slot.state.as_ref()).and_then(|state| state.downcast_ref::<TextState>())
+                {
+                    state.layout.shift(lag);
+                }
+            }
+        }
+        let (above, slot) = (&self.slots[parent as usize], &self.slots[index as usize]);
+        let regions = match (above.regions, above.base_regions, slot.own_regions) {
+            (Some((pass, now)), Some((was, base)), Some((at, own)))
+                if slot.regions.is_some_and(|(current, _)| current != pass)
+                    && pass != was
+                    && at == was
+                    && base[0] <= own[0]
+                    && own[1] <= base[1] =>
+            {
+                let [first, last] = slot.own_touched;
+                let [start, end] = above.base_touched;
+                (first == last || start <= first && last <= end).then(|| {
+                    let touched = match first == last {
+                        true => [0; 2],
+                        false => [first, last].map(|at| at - start + above.touched[0]),
+                    };
+                    (
+                        Some((pass, own.map(|at| at - base[0] + now[0]))),
+                        touched,
+                        at,
+                    )
+                })
+            }
+            _ => None,
+        };
+        let chunk = match (above.chunk, slot.chunk) {
+            (Some(outer), Some(chunk))
+                if outer.pass == self.paints.0
+                    && chunk.pass != outer.pass
+                    && outer.base.pass != outer.pass
+                    && chunk.origin.pass == outer.base.pass =>
+            {
+                let (origin, base) = (chunk.origin, outer.base);
+                origin.span.rebased(&base.span, &outer.span).map(|span| {
+                    let by = outer.at - base.at;
+                    let mask = moved_mask(origin.mask, by, base.mask, outer.mask);
+                    let key_mask = moved_mask(origin.key.mask, by, base.mask, outer.mask);
+                    let scale = window.scale_factor();
+                    Chunk {
+                        pass: outer.pass,
+                        key: (origin.key).moved(outer.key.offset - base.key.offset, key_mask),
+                        span,
+                        at: origin.at + by,
+                        mask,
+                        area: origin.area.map(|area| area + by.scale(scale)),
+                        ..chunk
+                    }
+                })
+            }
+            _ => None,
+        };
+        // No prepaint went through the box since the one of its regions, or its chunk, as the copies of its parent show.
+        let slot = &mut self.slots[index as usize];
+        if let Some(chunk) = chunk {
+            slot.chunk = Some(chunk);
+            (slot.calm, slot.since) = (
+                self.prepaints.wrapping_sub(1),
+                chunk.prepass.wrapping_add(1),
+            );
+        }
+        if let Some((regions, touched, visit)) = regions {
+            (slot.regions, slot.touched) = (regions, touched);
+            (slot.calm, slot.since) = (self.prepaints.wrapping_sub(1), visit.wrapping_add(1));
+        }
+    }
+
     fn keep(&mut self, index: u32, parent: Point<f32>, window: &mut Window) {
+        self.rebase(index, window);
         let slot = &mut self.slots[index as usize];
         let location = slot.layout.location;
         let mut origin = point(parent.x + location.x, parent.y + location.y);
@@ -1957,6 +2123,7 @@ impl Tree {
                 }
                 slot.regions = Some((self.prepaints, [start, window.regions_len()]));
                 slot.touched = [touched, self.touched.len() as u32];
+                (slot.own_regions, slot.own_touched) = (slot.regions, slot.touched);
                 slot.skipped = self.prepaints;
                 slot.lag += by;
                 self.shifting &= slot.flat;
@@ -2000,6 +2167,7 @@ impl Tree {
                 let slot = &mut self.slots[index as usize];
                 slot.regions = Some((self.prepaints, [start, window.regions_len()]));
                 slot.touched = [touched, self.touched.len() as u32];
+                (slot.own_regions, slot.own_touched) = (slot.regions, slot.touched);
                 slot.skipped = self.prepaints;
                 self.shifting &= slot.flat;
                 if slot.escaped.is_some() {
@@ -2016,14 +2184,13 @@ impl Tree {
             }
             window.truncate_regions(start as usize);
         }
+        // The boxes inside take the moves of this box without a prepaint, so they move with it from here.
+        self.lags
+            .push(mem::take(&mut self.slots[index as usize].lag));
         let (outer, still, parent) = (
             mem::replace(&mut self.skips, true),
             mem::replace(&mut self.still, delta.is_some()),
-            // The boxes inside last moved with this box before its moves without a prepaint.
-            mem::replace(
-                &mut self.delta,
-                delta.map(|by| by + mem::take(&mut self.slots[index as usize].lag)),
-            ),
+            mem::replace(&mut self.delta, delta),
         );
         let (regions, listed) = (window.regions_len(), self.stacks.last().map(Vec::len));
         let (touched, unsettled, transforms) = (
@@ -2038,6 +2205,7 @@ impl Tree {
             |hooks, cx, inner| hooks.kept(cx, inner),
             |tree, style, window| tree.keep_box(index, style, moved, window),
         );
+        self.lags.pop();
         self.flatten(index, transforms, shifting, window);
         self.still &= window.unsettled == unsettled;
         // The volatile boxes inside can reach elsewhere.
@@ -2243,6 +2411,10 @@ impl Tree {
         self.deferred.clear();
         self.unbounded = 0;
         self.paint_node(index_of(root), false, window);
+        #[cfg(debug_assertions)]
+        {
+            self.checked = false;
+        }
     }
 
     // An out-of-flow box escapes the clips of the scroll viewports inside its containing block.
@@ -2290,32 +2462,41 @@ impl Tree {
             .chunk
             .filter(|chunk| {
                 !matches!(slot.kind, Kind::Layers(_))
+                    && !self.checked()
                     && slot.calm == self.prepaints
                     && slot.since <= chunk.prepass.wrapping_add(1)
                     && Some(chunk.pass) == self.paints.1
                     && chunk.unbounded == outside
             })
-            .and_then(|chunk| match chunk.area {
-                _ if (chunk.key, chunk.at) == (key, at) => Some((chunk, None)),
-                // Paint in a mask that moved with the box drew all of it moved, culled parts too.
-                _ if chunk.translates
-                    && chunk.key.same_paint(&key)
-                    && window.translated(chunk.mask, mask, at - chunk.at) =>
-                {
-                    Some((chunk, Some((at - chunk.at, chunk.mask, mask))))
-                }
-                // A span that drew nothing can't show that the box draws nothing in its new place.
-                Some(area)
-                    if !area.is_empty()
+            .and_then(|chunk| {
+                let by = window.snap_move(at - chunk.at);
+                match chunk.area {
+                    _ if (chunk.key, chunk.at) == (key, at) => Some((chunk, None)),
+                    // Paint in a mask that moved with the box drew all of it moved, culled parts too.
+                    _ if chunk.translates
                         && chunk.key.same_paint(&key)
-                        && window.movable(area, at - chunk.at, mask) =>
-                {
-                    Some((chunk, Some((at - chunk.at, chunk.mask, mask))))
+                        && window.translated(chunk.mask, mask, by) =>
+                    {
+                        Some((chunk, Some((by, chunk.mask, mask))))
+                    }
+                    // A span that drew nothing can't show that the box draws nothing in its new place, unless its
+                    // mask stayed: it cut nothing there.
+                    Some(area)
+                        if chunk.key.same_paint(&key)
+                            && match area.is_empty() {
+                                true => chunk.mask == mask,
+                                false => window.movable(area, by, mask),
+                            } =>
+                    {
+                        Some((chunk, Some((by, chunk.mask, mask))))
+                    }
+                    _ => None,
                 }
-                _ => None,
             });
-        #[cfg(not(debug_assertions))]
-        if let Some((chunk, moved)) = copy
+        // Debug builds paint the box to check the copy, unless the boxes inside have old places.
+        let lagged = self.slots[index as usize].lag != Point::default();
+        if (cfg!(not(debug_assertions)) || lagged)
+            && let Some((chunk, moved)) = copy
             && let Some(span) = window.replay(&chunk.span, moved)
         {
             let area = moved.map_or(chunk.area, |(by, ..)| {
@@ -2323,6 +2504,14 @@ impl Tree {
                     .area
                     .map(|area| area + by.scale(window.scale_factor()))
             });
+            let output = Output {
+                pass: self.paints.0,
+                span,
+                key,
+                at,
+                mask,
+                area,
+            };
             self.slots[index as usize].chunk = Some(Chunk {
                 pass: self.paints.0,
                 span,
@@ -2330,6 +2519,7 @@ impl Tree {
                 at,
                 mask,
                 area,
+                origin: output,
                 ..chunk
             });
             if foreign {
@@ -2338,21 +2528,33 @@ impl Tree {
             return;
         }
         // The boxes inside a box that a scroll moved without a prepaint have old places, so it can't paint.
-        #[cfg(not(debug_assertions))]
-        if self.slots[index as usize].lag != Point::default() {
+        if lagged {
             // WARNING: an ancestor that copies its regions keeps the lag, so the prepaint of the restart must go
-            // through all of them, or each pass restarts again.
-            let mut at = self.slots[index as usize].parent;
-            while at != NONE {
-                let slot = &mut self.slots[at as usize];
-                slot.regions = None;
-                at = slot.parent;
+            // through all of them, or each pass restarts again. That holds for each box with a lag: this paint
+            // copied chunks that the next one can't, so it may reach boxes that this one didn't.
+            if !self.unshift {
+                for at in 0..self.slots.len() {
+                    if !self.slots[at].live || self.slots[at].lag == Point::default() {
+                        continue;
+                    }
+                    let mut at = self.slots[at].parent;
+                    while at != NONE {
+                        let slot = &mut self.slots[at as usize];
+                        slot.regions = None;
+                        at = slot.parent;
+                    }
+                }
             }
             self.unshift = true;
             window.restart_frame();
             return;
         }
         let (mark, deferred) = (window.paint_mark(), self.deferred.len());
+        // A debug paint of a box that release builds copy keeps the chunks of the boxes in it as a copy does.
+        #[cfg(debug_assertions)]
+        if copy.is_some() {
+            self.copied.push(Vec::new());
+        }
         if slot.hooks.as_ref().is_some_and(|hooks| !hooks.cached()) {
             window.paint_volatile();
         }
@@ -2397,19 +2599,69 @@ impl Tree {
                     ))
             );
         }
+        #[cfg(debug_assertions)]
+        if copy.is_some() {
+            for (at, chunk) in self.copied.pop().unwrap_or_default().into_iter().rev() {
+                self.slots[at as usize].chunk = chunk;
+            }
+        }
         #[cfg(not(debug_assertions))]
         let _ = copy;
-        self.slots[index as usize].chunk = span.map(|span| Chunk {
-            pass: self.paints.0,
-            prepass: self.prepaints,
-            key,
-            unbounded: outside,
-            at,
-            mask,
-            area: window.plain(&span, mark, mask),
-            translates: slot_contained && window.translatable(&span),
-            span,
+        let fresh = span.map(|span| {
+            let output = Output {
+                pass: self.paints.0,
+                span,
+                key,
+                at,
+                mask,
+                area: window.plain(&span, mark, mask),
+            };
+            Chunk {
+                pass: self.paints.0,
+                prepass: self.prepaints,
+                key,
+                unbounded: outside,
+                at,
+                mask,
+                area: output.area,
+                translates: slot_contained && window.translatable(&span),
+                span,
+                base: output,
+                origin: output,
+            }
         });
+        #[cfg(debug_assertions)]
+        let fresh = match (copy, span) {
+            (Some((chunk, moved)), Some(span)) => {
+                let area = moved.map_or(chunk.area, |(by, ..)| {
+                    (chunk.area).map(|area| area + by.scale(window.scale_factor()))
+                });
+                let output = Output {
+                    pass: self.paints.0,
+                    span,
+                    key,
+                    at,
+                    mask,
+                    area,
+                };
+                Some(Chunk {
+                    pass: self.paints.0,
+                    span,
+                    key,
+                    at,
+                    mask,
+                    area,
+                    origin: output,
+                    ..chunk
+                })
+            }
+            _ => fresh,
+        };
+        #[cfg(debug_assertions)]
+        if let Some(copied) = self.copied.last_mut() {
+            copied.push((index, self.slots[index as usize].chunk));
+        }
+        self.slots[index as usize].chunk = fresh;
         if foreign {
             window.cull();
         }
@@ -5730,7 +5982,30 @@ impl LayoutGridContainer for LayoutTree<'_> {
     }
 }
 
-// Records of a paint and of a copy match, but for the rounding of a transform that turns about a moved point.
+// A mask that moved by `by`, as a moved copy moves it: the mask `old` around the copy becomes `now`.
+fn moved_mask(
+    mask: Clip<Pixels>,
+    by: Point<Pixels>,
+    old: Clip<Pixels>,
+    now: Clip<Pixels>,
+) -> Clip<Pixels> {
+    if mask == old {
+        return now;
+    }
+    let mut moved = mask;
+    if mask.bounds.size.width.0 < crate::scene::OPEN {
+        moved.bounds.origin += by;
+    }
+    if (old.rounded, old.radii) == (mask.rounded, mask.radii) {
+        (moved.rounded, moved.radii) = (now.rounded, now.radii);
+    } else if !mask.radii.is_zero() {
+        moved.rounded.origin += by;
+    }
+    moved
+}
+
+// Records of a paint and of a copy match, but for the rounding of moved places and of a transform that turns about a
+// moved point.
 #[cfg(debug_assertions)]
 fn same_records(now: &[String], last: &[String]) -> bool {
     let split = |text: &str| {
@@ -5754,7 +6029,8 @@ fn same_records(now: &[String], last: &[String]) -> bool {
                     && x.len() == y.len()
                     && x.iter()
                         .zip(&y)
-                        .all(|(x, y)| (x - y).abs() <= 1e-3 * (1. + x.abs()))
+                        // A copy moved over many frames adds up the rounding of f32 places, far below a pixel.
+                        .all(|(x, y)| (x - y).abs() <= 1e-2 + 1e-6 * x.abs())
         })
 }
 
@@ -5782,6 +6058,15 @@ mod tests {
 
     fn slot(tree: &Tree, id: usize) -> &super::Slot {
         &tree.slots[tree.index(id.into()).unwrap() as usize]
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn copies_match_their_paint_but_for_rounding() {
+        let same = |now: &str, last: &str| super::same_records(&[now.into()], &[last.into()]);
+        assert!(same("-1 [1966.2743, 2.0]", "-1 [1966.2744, 2.0]"));
+        assert!(!same("-1 [1966.27, 2.0]", "-1 [1966.52, 2.0]"));
+        assert!(!same("-1 [1966.27, 2.0]", "-1 [1966.27, 3.0]"));
     }
 
     #[test]

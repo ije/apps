@@ -47,6 +47,8 @@ pub struct Scene {
     pub(crate) culled: u32,
     // Patched regions since the last diff, which the prior entries don't know.
     patched: Damage,
+    // A frame drew patches without a diff, so the prior entries don't show the window.
+    undiffed: bool,
     salt: u64,
     // The content of scroll containers in the window layer, in paint order, and those of the last painted scene.
     scrolls: Vec<Scroll>,
@@ -226,7 +228,7 @@ pub(crate) fn within(area: Rect<f32>, clip: Rect<f32>) -> bool {
 }
 
 // Clips at least this wide are the open mask of an effect layer.
-const OPEN: f32 = 1e6;
+pub(crate) const OPEN: f32 = 1e6;
 
 // A clip of a moved span: the mask `old` around the span becomes the mask `now` there, the open mask of an
 // effect layer stays, and other clips are inside the span and move with it.
@@ -328,16 +330,28 @@ fn inside(rect: Rect<f32>, outer: Rect<f32>) -> bool {
         && rect.bottom() < outer.bottom()
 }
 
-// In a scroll, the mask around the content stays where the content moves, so a clip that is only that mask
-// counts as the place of the instance itself.
+// In a scroll, the mask around the content stays where the content moves, so the sides of a clip that are only that
+// mask count as the place of the drawing itself. A scroll draws again what they hid.
+fn uncut(clip: Rect<f32>, viewport: Rect<f32>, area: Rect<f32>) -> Rect<f32> {
+    let side = |clip: f32, viewport: f32, area: f32| if clip == viewport { area } else { clip };
+    let start = point(
+        side(clip.left(), viewport.left(), area.left()),
+        side(clip.top(), viewport.top(), area.top()),
+    );
+    let end = point(
+        side(clip.right(), viewport.right(), area.right()),
+        side(clip.bottom(), viewport.bottom(), area.bottom()),
+    );
+    Rect::between(start, end).intersect(area)
+}
+
 fn instance_hash(instance: &Instance, origin: Point<f32>, viewport: Option<&Clip<f32>>) -> u64 {
     let mut copy = *instance;
     let shift = |[x, y, width, height]: [f32; 4]| [x - origin.x, y - origin.y, width, height];
-    let masked = viewport.is_some_and(|viewport| instance.clip == viewport.bounds.to_array());
     copy.rect = shift(instance.rect);
-    copy.clip = shift(match masked {
-        true => instance.area().to_array(),
-        false => instance.reach().to_array(),
+    copy.clip = shift(match viewport {
+        Some(viewport) => uncut(rect(instance.clip), viewport.bounds, instance.area()).to_array(),
+        None => instance.reach().to_array(),
     });
     copy.round = match instance.round_radii == [0.; 8] {
         true => [0.; 4],
@@ -433,6 +447,40 @@ pub(crate) struct Span {
     cuts: [u32; 2],
 }
 
+// Where the range `own`, inside `was`, is in `now`, a copy of `was`.
+pub(crate) fn rebased(own: [u32; 2], was: [u32; 2], now: [u32; 2]) -> Option<[u32; 2]> {
+    (was[0] <= own[0] && own[1] <= was[1] && was[1] - was[0] == now[1] - now[0])
+        .then(|| own.map(|at| at - was[0] + now[0]))
+}
+
+impl Span {
+    // Where this span, inside the span `from`, is in `to`, a copy of `from`.
+    pub(crate) fn rebased(&self, from: &Span, to: &Span) -> Option<Span> {
+        let layers = rebased(self.layers, from.layers, to.layers)?;
+        let (layer, instances, nested) = match self.layer == from.layer {
+            true => (
+                to.layer,
+                rebased(self.instances, from.instances, to.instances)?,
+                rebased(self.nested, from.nested, to.nested)?,
+            ),
+            // A span in a layer that `from` made.
+            false => (
+                rebased([self.layer, self.layer + 1], from.layers, to.layers)?[0],
+                self.instances,
+                self.nested,
+            ),
+        };
+        Some(Span {
+            layer,
+            instances,
+            nested,
+            layers,
+            scrolls: rebased(self.scrolls, from.scrolls, to.scrolls)?,
+            cuts: rebased(self.cuts, from.cuts, to.cuts)?,
+        })
+    }
+}
+
 impl Nested {
     pub(crate) fn reach(&self) -> Rect<f32> {
         self.bounds.intersect(self.clip.bounds)
@@ -466,6 +514,7 @@ impl Default for Scene {
             drawn: false,
             diffed: None,
             patched: Damage::default(),
+            undiffed: false,
             culled: 0,
             salt: 0,
             scrolls: Vec::new(),
@@ -844,7 +893,14 @@ impl Scene {
                 let instance = moved.map_or(*instance, |(by, old, now)| {
                     moved_instance(instance, by, &old, &now)
                 });
-                out.push(format!("{name} {:?}", bytes(slice::from_ref(&instance))));
+                // Fields as floats, so the check can allow the rounding of moved copies.
+                let fields: Vec<f32> = bytes(slice::from_ref(&instance))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|word| f32::from_ne_bytes(*word))
+                    .collect();
+                out.push(format!("{name} {fields:?}"));
             }
             for nested in &layer.nested[start as usize..stop as usize] {
                 let nested = moved.map_or(*nested, |(by, old, now)| {
@@ -895,8 +951,6 @@ impl Scene {
     }
 
     // Copies a span of the last paint into the current layer, and returns where it is now.
-    // Debug builds paint instead, to check the copy.
-    #[cfg_attr(debug_assertions, allow(dead_code))]
     // Whether the span of `last` reads an atlas tile that was removed since that paint.
     fn reads_removed(&self, span: &Span) -> bool {
         if self.removed.is_empty() {
@@ -1036,8 +1090,6 @@ impl Scene {
     }
 
     // Copies a plain span of the last paint moved by `by` device pixels, from the mask `old` into `now`.
-    // Debug builds paint instead, to check the copy.
-    #[cfg_attr(debug_assertions, allow(dead_code))]
     pub(crate) fn replay_moved(
         &mut self,
         span: &Span,
@@ -1429,6 +1481,13 @@ impl Scene {
             layer = parent;
         }
         patched
+    }
+
+    // The next diff finds the patches since the last one by itself, when the window shows the prior entries.
+    pub(crate) fn rediff_patches(&mut self) {
+        if !self.undiffed {
+            self.patched.clear();
+        }
     }
 
     // Finds what changed since the drawn window, and the digest of each layer. `fresh` holds atlas tiles
@@ -1829,6 +1888,7 @@ impl Scene {
         }
         // A new scene without a diff leaves the prior entries behind.
         self.drawn = self.diffed != Some(false);
+        self.undiffed = self.diffed.is_none();
         if self.diffed.take() == Some(true) {
             mem::swap(&mut self.prior, &mut self.entries);
             self.prior_maps.clone_from(&self.maps);
@@ -2006,7 +2066,6 @@ impl Walk<'_> {
                 ])
             };
             let spreads = effect.blur != 0. || effect.shadow.is_some() || effect.backdrop.is_some();
-            let masked = nested.clip.bounds == scroll.viewport.bounds && !spreads;
             let mut hasher = rustc_hash::FxHasher::default();
             (
                 effect.transform.map(|matrix| {
@@ -2042,9 +2101,13 @@ impl Walk<'_> {
                     .glass
                     .as_ref()
                     .map(|glass| (glass.key, rect(glass.bounds))),
-                match masked {
-                    true => rect(nested.bounds),
-                    false => rect(nested.clip.bounds.intersect(nested.bounds)),
+                match spreads {
+                    false => rect(uncut(
+                        nested.clip.bounds,
+                        scroll.viewport.bounds,
+                        nested.bounds,
+                    )),
+                    true => rect(nested.clip.bounds.intersect(nested.bounds)),
                 },
                 (nested.clip.radii != Default::default()).then(|| {
                     match nested.clip.rounded == scroll.viewport.rounded {
@@ -2827,6 +2890,51 @@ mod tests {
             // A second patch of a layer whose place a patch changed can't use the maps of the diff.
             assert!(patched.patch(7, 0.4, None, [None; 2]));
             assert!(!patched.damage.whole);
+        }
+    }
+
+    #[test]
+    fn patches_before_a_paint_damage_only_what_the_diff_finds() {
+        let mask = Clip::from(bounds([0., 0., 800., 600.]));
+        let fill = |scene: &mut Scene, opacity: f32| {
+            scene.clear();
+            scene.push(Instance::new(BOX, bounds([0., 0., 800., 600.]), mask));
+            // A blend around the layer leaves its patches without a place in the window.
+            let blend_mode = crate::BlendMode::Multiply;
+            scene.push_effect(
+                EffectState {
+                    blend_mode,
+                    ..effect(mask)
+                },
+                None,
+            );
+            scene.push_effect(
+                EffectState {
+                    opacity,
+                    ..effect(mask)
+                },
+                Some(7),
+            );
+            scene.push(Instance::new(BOX, bounds([20., 20., 40., 40.]), mask));
+            scene.pop_effect();
+            scene.pop_effect();
+        };
+        for shown in [false, true] {
+            let mut scene = Scene::default();
+            fill(&mut scene, 0.9);
+            scene.diff(Some(&[]));
+            scene.drawn();
+            assert!(scene.patch(7, 0.5, None, [None; 2]));
+            assert!(scene.damage.whole);
+            // A frame that draws the patch alone shows what the prior entries don't.
+            if shown {
+                scene.drawn();
+            }
+            fill(&mut scene, 0.5);
+            scene.rediff_patches();
+            scene.diff(Some(&[]));
+            assert_eq!(scene.damage.whole, shown);
+            assert!(shown || !scene.damage.rects.is_empty());
         }
     }
 
