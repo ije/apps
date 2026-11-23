@@ -501,16 +501,19 @@ pub(crate) fn static_after(styles: &ComputedStyles, id: usize) -> bool {
 // paint above `child`, which the paragraph builds after its text. `child` can be inside inline boxes of the paragraph.
 fn layered_after(doc: &Document, styles: &ComputedStyles, id: usize, child: usize) -> bool {
     let mut pending: Vec<usize> = Vec::new();
-    let mut at = child;
-    while let Some(parent) = doc.nodes[at].parent {
+    // A `display: contents` box is not in the child list of its parent, but its children are, so the list can
+    // hold a lower node of the chain.
+    let (mut at, mut listed) = (child, child);
+    while at != id
+        && let Some(parent) = doc.nodes[at].parent
+    {
         let children = &doc.nodes[parent].children;
-        let index = children
+        if let Some(index) = children
             .iter()
-            .position(|&node| node == at)
-            .unwrap_or(children.len());
-        pending.extend_from_slice(&children[index + 1..]);
-        if parent == id {
-            break;
+            .position(|&node| node == at || node == listed)
+        {
+            listed = children[index];
+            pending.extend_from_slice(&children[index + 1..]);
         }
         at = parent;
     }

@@ -271,6 +271,25 @@ fn positioned_inline_boxes_contain_the_boxes_in_them_from_their_first_to_their_l
 
 #[test]
 #[ignore = "requires the macOS window server"]
+fn absolute_boxes_in_contents_boxes_keep_their_static_place_in_the_line() {
+    run_hidden(
+        r#"
+        await load('page.html');
+        const box = await run(`(r => [r.left, r.top].map(Math.round).join())(document.getElementById('i').getBoundingClientRect())`);
+        const text = await run(`Math.round((g => (g.selectNodeContents(document.getElementById('t')), g.getClientRects()[0].right))(document.createRange()))`);
+        if (box !== text + ',0') fail('the box after the text: ' + box + ' text ' + text);
+        "#,
+        &[(
+            "page.html",
+            "<head><style>body{margin:0;font:14px/18px Helvetica} b{display:contents}\
+             i{position:absolute;width:8px;height:8px}</style></head>\
+             <body><div><span id=t>aaa</span><b><i id=i></i></b>bbb</div></body>",
+        )],
+    );
+}
+
+#[test]
+#[ignore = "requires the macOS window server"]
 fn scroll_anchors_keep_the_content_in_view() {
     run_hidden(
         r#"
