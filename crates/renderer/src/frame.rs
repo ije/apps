@@ -13,6 +13,8 @@ pub(crate) const IDENTITY: [f32; 16] = [
 ];
 
 const HALF_RESOLUTION_SIGMA: f32 = 8.;
+// A layer that the target cuts draws its content in cells of this size, so it keeps its pixels while it moves.
+const CUT_STEP: f32 = 256.;
 
 #[derive(Clone, Copy, PartialEq, Default)]
 pub enum Target {
@@ -1303,7 +1305,8 @@ impl RenderFrame {
         // The region of a transformed layer is in its own space: the visible part mapped back through the
         // transform. A composited transform moves the layer without a repaint, so the region keeps a window
         // of room on each side and moves in steps of a window, and small moves keep its pixels.
-        let [reach, full] = match &effect.transform {
+        let content = content.outset(spread);
+        let [reach, around] = match &effect.transform {
             Some(transform) => {
                 let [x, y, width, height] = visible;
                 let back = crate::window::invert(&crate::window::plane_of(transform));
@@ -1343,10 +1346,18 @@ impl RenderFrame {
                 };
                 [reach; 2]
             }
-            None => [visible, full],
+            None => {
+                let at = crate::point(content.origin.x.floor(), content.origin.y.floor());
+                let snap = |low: f32, size: f32, at: f32| {
+                    let [low, high] = [low, low + size].map(|edge| (edge - at) / CUT_STEP);
+                    [low.floor(), high.ceil()].map(|edge| edge * CUT_STEP + at)
+                };
+                let [[x0, x1], [y0, y1]] =
+                    [snap(full[0], full[2], at.x), snap(full[1], full[3], at.y)];
+                [visible, [x0, y0, x1 - x0, y1 - y0]]
+            }
         };
-        let content = content.outset(spread);
-        let Some(whole_region) = self.region(content, full) else {
+        let Some(whole_region) = self.region(content, around) else {
             return;
         };
         // A layer that draws as in an earlier frame takes the pixels of then. One that draws the same in
@@ -2133,6 +2144,42 @@ mod tests {
         );
         assert_eq!(blurs(&scene(160., 2.)), 0, "a moved layer keeps its blurs");
         assert_eq!(blurs(&scene(160., 3.)), 1, "another blur draws again");
+    }
+
+    #[test]
+    fn blurred_layers_that_scroll_across_the_window_edge_keep_their_pixels() {
+        let mask = Clip::from(bounds([0., 0., 800., 600.]));
+        let scene = |y: f32| {
+            let mut scene = Scene::default();
+            scene.push(Instance::new(BOX, bounds([0., 0., 800., 600.]), mask));
+            scene.push_effect(
+                EffectState {
+                    blur: 2.,
+                    ..effect(mask)
+                },
+                None,
+            );
+            let open = Clip::from(bounds([-1e6, -1e6, 2e6, 2e6]));
+            scene.push(Instance::new(BOX, bounds([100., y, 100., 200.]), open));
+            scene.pop_effect();
+            scene.diff(Some(&[]));
+            scene
+        };
+        let mut frame = RenderFrame::default();
+        let blurs = (0..12)
+            .map(|step| {
+                frame.record(&scene(500. - 6. * step as f32), [800, 600], 16384, true);
+                let commands = frame.commands.iter();
+                commands
+                    .filter(|command| matches!(command, Command::Blur { .. }))
+                    .count()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(&blurs[..2], [1, 1], "the second frame keeps the blur");
+        assert!(
+            blurs[2..].iter().all(|blurs| *blurs == 0),
+            "a layer that moves across the edge draws the kept blur: {blurs:?}"
+        );
     }
 
     #[test]
