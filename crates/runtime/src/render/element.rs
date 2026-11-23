@@ -3316,13 +3316,18 @@ fn create(
                 .get(Prop::BACKGROUND_IMAGE)
                 .is_some_and(|value| value != "none");
         // The color fills the clip box of the bottom layer.
-        let clips = style::components(style.get(Prop::BACKGROUND_CLIP).unwrap_or(""), ',');
-        let layers = style
-            .get(Prop::BACKGROUND_IMAGE)
-            .map_or(1, |value| style::components(value, ',').len());
-        let clip = clips
-            .get((layers.max(1) - 1) % clips.len().max(1))
-            .map_or("", |clip| clip.trim());
+        let clip = style.get(Prop::BACKGROUND_CLIP).unwrap_or("");
+        let clip = if clip.contains(',') {
+            let clips = style::components(clip, ',');
+            let layers = style
+                .get(Prop::BACKGROUND_IMAGE)
+                .map_or(1, |value| style::components(value, ',').len());
+            clips
+                .get((layers.max(1) - 1) % clips.len().max(1))
+                .map_or("", |clip| clip.trim())
+        } else {
+            clip.trim()
+        };
         if blended {
         } else if text_clip {
             text_fill = Some(color);
