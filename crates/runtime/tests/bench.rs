@@ -653,3 +653,28 @@ fn list_changes() {
         )
     );
 }
+
+// STYLE_PAGE=<html file>: a cold full style pass of a large page, like the first reflow of an app.
+#[test]
+#[ignore = "release performance measurement"]
+fn page_style_pass() {
+    let Ok(path) = std::env::var("STYLE_PAGE") else {
+        return;
+    };
+    let html = std::fs::read_to_string(path).unwrap();
+    let mut rounds: Vec<f64> = (0..9)
+        .map(|_| {
+            page(
+                &html,
+                "const t = performance.now(); getComputedStyle(document.body).color; performance.now() - t",
+            )
+            .parse()
+            .unwrap()
+        })
+        .collect();
+    rounds.sort_by(f64::total_cmp);
+    println!(
+        "page_style_pass_ms median={:.2} min={:.2}",
+        rounds[4], rounds[0]
+    );
+}
