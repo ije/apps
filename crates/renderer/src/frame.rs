@@ -27,7 +27,6 @@ pub struct Layer {
     scale: f32,
     bounds: [f32; 4],
     // The texels of the texture that the layer holds. A pooled texture can be larger, or hold other tiles.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     scissor: [u32; 4],
 }
 
@@ -70,6 +69,9 @@ pub enum Command {
         backdrop: Option<Target>,
         index: u32,
     },
+    // Draws into the window stay inside this region, and clearing the window clears only it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Scissor(Option<[i32; 4]>),
 }
 
 #[derive(Default)]
@@ -112,6 +114,8 @@ pub struct RenderFrame {
     // Set by a backend that draws damage regions over the last frame: it then keeps the window below what paints
     // after a scrolled content, so a scroll draws again only what changed there and what paints after it.
     pub keeps_under: bool,
+    // Set by a backend that draws damage regions straight into the window under a scissor, with no layer for each.
+    pub scissors: bool,
     under: Option<KeptUnder>,
     // A target that the first copies into cover whole, so its old pixels need no load.
     pub covered: Option<Target>,
@@ -228,7 +232,7 @@ impl<T> Pool<T> {
     }
 
     // The sizes of textures that hold no cached layer.
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub fn spare(&self, sizes: &mut Vec<[u32; 2]>) {
         sizes.clear();
         sizes.extend(
@@ -265,7 +269,7 @@ pub fn region(bounds: Rect<f32>) -> [i32; 4] {
 
 // The window regions to draw again, or `None` for the whole window. A layer that reads the pixels
 // below it draws whole when a region reaches it, since it reads only what the frame drew again.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub fn damage_regions(
     scene: &Scene,
     window: [u32; 2],
@@ -303,12 +307,49 @@ fn regions_of(
         ];
         [x, y, right - x, bottom - y]
     };
+    let area = |[.., width, height]: [i32; 4]| i64::from(width) * i64::from(height);
     let mut regions: Vec<[i32; 4]> = Vec::new();
-    let add = |regions: &mut Vec<[i32; 4]>, mut region: [i32; 4]| {
-        while let Some(at) = regions.iter().position(|other| meets(*other, region)) {
-            region = join(regions.swap_remove(at), region);
+    let mut pending = Vec::new();
+    // Regions don't overlap. Two that meet join when that adds little, or else the new one keeps only its parts
+    // outside the other.
+    let mut add = |regions: &mut Vec<[i32; 4]>, region: [i32; 4]| {
+        pending.push(region);
+        while let Some(region) = pending.pop() {
+            let Some(at) = regions.iter().position(|other| meets(*other, region)) else {
+                regions.push(region);
+                continue;
+            };
+            let other = regions[at];
+            let joined = join(other, region);
+            if area(joined) <= area(other) + area(region) + 64 * 64 {
+                regions.swap_remove(at);
+                pending.push(joined);
+                continue;
+            }
+            let [x, y, width, height] = region;
+            let [right, bottom] = [x + width, y + height];
+            let top = y.max(other[1]);
+            let end = bottom.min(other[1] + other[3]);
+            pending.extend(
+                [
+                    [x, y, width, top - y],
+                    [x, end, width, bottom - end],
+                    [x, top, other[0] - x, end - top],
+                    [
+                        other[0] + other[2],
+                        top,
+                        right - other[0] - other[2],
+                        end - top,
+                    ],
+                ]
+                .into_iter()
+                .map(|[x, y, width, height]| {
+                    let left = x.max(region[0]);
+                    [left, y, (x + width).min(right) - left, height]
+                })
+                .filter(|part| part[2] > 0 && part[3] > 0),
+            );
         }
-        regions.push(region);
     };
     // Edges blend into the pixel next to them.
     for rect in &damage.rects {
@@ -320,23 +361,23 @@ fn regions_of(
     for &region in extra {
         add(&mut regions, region);
     }
-    let reads: Vec<[i32; 4]> = reads
+    let mut reads: Vec<[i32; 4]> = reads
         .map(|read| read.intersect(bounds))
         .filter(|read| !read.is_empty())
         .map(region)
         .collect();
-    while let Some(&read) = reads.iter().find(|read| {
-        regions.iter().any(|region| meets(*region, **read))
-            && !regions
-                .iter()
-                .any(|region| join(*region, **read) == *region)
-    }) {
-        add(&mut regions, read);
+    // A layer that reads below it draws in one region.
+    while let Some(at) =
+        (reads.iter()).position(|read| regions.iter().any(|region| meets(*region, *read)))
+    {
+        let mut read = reads.swap_remove(at);
+        while let Some(at) = regions.iter().position(|region| meets(*region, read)) {
+            read = join(regions.swap_remove(at), read);
+        }
+        regions.push(read);
     }
-    let area: i64 = (regions.iter())
-        .map(|region| i64::from(region[2]) * i64::from(region[3]))
-        .sum();
-    (area * 2 <= i64::from(window[0]) * i64::from(window[1])).then_some(regions)
+    let drawn: i64 = regions.iter().copied().map(area).sum();
+    (drawn * 2 <= i64::from(window[0]) * i64::from(window[1])).then_some(regions)
 }
 
 impl RenderFrame {
@@ -382,10 +423,26 @@ impl RenderFrame {
                 None => self.record_layer(scene, 0, Target::Frame, true, 0),
             }
         }
+        if self.scissors && !self.damage.is_empty() {
+            self.bases.push(Target::Frame);
+        }
         // The regions copy into the window together, since each pass into a target loads and stores all of it.
         let mut copies = Vec::with_capacity(self.damage.len());
         for at in 0..self.damage.len() {
             let region = self.damage[at];
+            if self.scissors {
+                self.commands.push(Command::Scissor(Some(region)));
+                match under {
+                    Some((kept, split)) => {
+                        let (src, dst) = (kept, Target::Frame);
+                        self.commands.push(Command::Copy { src, dst, region });
+                        self.record_region(scene, dst, region, Some((split, true)), false);
+                    }
+                    None => self.record_region(scene, Target::Frame, region, None, true),
+                }
+                self.commands.push(Command::Scissor(None));
+                continue;
+            }
             let base = self.region_base(region);
             match under {
                 Some((kept, split)) => {
@@ -1061,8 +1118,14 @@ impl RenderFrame {
         release: bool,
         mirror: bool,
     ) -> (Target, f32) {
+        // A pooled texture can be larger than its layer, so the blur covers only the texels that the layer holds.
         let covered = match src {
-            Target::Layer(_) => self.rect(src).map(|value| value as i32),
+            Target::Layer(index) => {
+                let layer = &self.layers[index];
+                let [x, y, width, height] = layer.scissor.map(|value| value as f32 * layer.scale);
+                let [left, top] = [layer.origin[0] as f32 + x, layer.origin[1] as f32 + y];
+                [left, top, width, height].map(|value| value as i32)
+            }
             Target::Frame => region,
         };
         if sigma < HALF_RESOLUTION_SIGMA {
@@ -1301,8 +1364,9 @@ impl RenderFrame {
         }
         let (w, h) = (self.window[0] as f32, self.window[1] as f32);
         // The region of a transformed layer is in its own space: the visible part mapped back through the
-        // transform. A composited transform moves the layer without a repaint, so the region keeps a window
-        // of room on each side and moves in steps of a window, and small moves keep its pixels.
+        // transform. A composited transform moves a kept layer without a repaint, so its region keeps a window
+        // of room on each side and moves in steps of a window, and small moves keep its pixels. A layer that
+        // changed draws only the visible part.
         let [reach, full] = match &effect.transform {
             Some(transform) => {
                 let [x, y, width, height] = visible;
@@ -1327,7 +1391,7 @@ impl RenderFrame {
                         },
                     )
                 });
-                let reach = match seen {
+                let room = match seen {
                     Some([left, top, right, bottom]) => {
                         // At most 4 windows on a side, around the middle of the visible part.
                         let span = |low: f32, high: f32, step: f32| {
@@ -1341,7 +1405,10 @@ impl RenderFrame {
                     }
                     None => [-w, -h, 3. * w, 3. * h],
                 };
-                [reach; 2]
+                let tight = seen.map(|[left, top, right, bottom]| {
+                    [left - 1., top - 1., right - left + 2., bottom - top + 2.]
+                });
+                [tight.unwrap_or(room), room]
             }
             None => [visible, full],
         };
@@ -1861,6 +1928,7 @@ mod tests {
                     Command::Blur { index, .. } => format!("blur {index}"),
                     Command::Copy { region, .. } => format!("copy {region:?}"),
                     Command::Composite { index, .. } => format!("composite {index}"),
+                    Command::Scissor(region) => format!("scissor {region:?}"),
                 })
                 .collect();
             (
@@ -2211,5 +2279,51 @@ mod tests {
             None,
             "most of the window"
         );
+    }
+
+    #[test]
+    fn damage_regions_that_meet_split_instead_of_joining() {
+        let mut damage = crate::scene::Damage::default();
+        damage.add(bounds([0., 280., 400., 20.]));
+        damage.add(bounds([10., 0., 10., 299.]));
+        damage.add(bounds([380., 0., 10., 299.]));
+        let regions = super::regions_of(&damage, std::iter::empty(), [400, 300], &[]).unwrap();
+        let area: i32 = regions.iter().map(|region| region[2] * region[3]).sum();
+        assert!(area < 400 * 30 + 2 * 12 * 300, "{regions:?}");
+        for (at, a) in regions.iter().enumerate() {
+            for b in &regions[at + 1..] {
+                let meet = a[0] < b[0] + b[2]
+                    && b[0] < a[0] + a[2]
+                    && a[1] < b[1] + b[3]
+                    && b[1] < a[1] + a[3];
+                assert!(!meet, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn scissor_regions_draw_into_the_window() {
+        let mask = Clip::from(bounds([0., 0., 400., 300.]));
+        let mut scene = Scene::default();
+        scene.push(Instance::new(BOX, bounds([0., 0., 400., 300.]), mask));
+        let mut frame = RenderFrame {
+            damage: vec![[10, 10, 50, 50]],
+            scissors: true,
+            ..Default::default()
+        };
+        frame.record(&scene, [400, 300], 16384, true);
+        assert!(matches!(
+            frame.commands[0],
+            Command::Scissor(Some([10, 10, 50, 50]))
+        ));
+        assert!(matches!(
+            frame.commands[1],
+            Command::Pass(super::Target::Frame, true)
+        ));
+        assert!(matches!(
+            frame.commands.last(),
+            Some(Command::Scissor(None))
+        ));
+        assert!(frame.layers.is_empty());
     }
 }

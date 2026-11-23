@@ -1,5 +1,5 @@
 use crate::atlas::{self, PageKind, PageList, PageStore, Tile};
-use crate::frame::{Command, Mask, Pool, RenderFrame, Target};
+use crate::frame::{self, Command, Mask, Pool, RenderFrame, Target};
 use crate::gpu::{ATTRIBUTES, Blur, Composite, Globals, Instance, Plain, bytes};
 use crate::scene::Scene;
 use crate::{Rect, Size};
@@ -48,6 +48,8 @@ struct Pipelines {
     draw: RenderPipeline,
     composite: RenderPipeline,
     blur: RenderPipeline,
+    // Clear a region of an opaque window, or of a transparent one.
+    clear: [RenderPipeline; 2],
 }
 
 // Made again after the device is lost.
@@ -297,6 +299,7 @@ impl Gpu {
         let make = |stage: &str, blend| {
             let (groups, buffers) = match stage {
                 "draw" => (&groups[..2], &steps[..]),
+                "clear" | "erase" => (&groups[..1], &[][..]),
                 _ => (&groups[..], &[][..]),
             };
             let shape = wgpu::PipelineLayoutDescriptor {
@@ -346,6 +349,7 @@ impl Gpu {
             draw,
             composite,
             blur: make("blur", None),
+            clear: [make("clear", None), make("erase", None)],
         });
         self.pipelines.borrow_mut().push((format, made.clone()));
         made
@@ -412,7 +416,7 @@ fn configure(
         true => wgpu::PresentMode::Mailbox,
         false => wgpu::PresentMode::Fifo,
     };
-    config.usage |= caps.usages & TextureUsages::COPY_SRC;
+    config.usage |= caps.usages & (TextureUsages::COPY_SRC | TextureUsages::COPY_DST);
     surface.configure(&gpu.device, &config);
     Ok(config)
 }
@@ -433,8 +437,15 @@ pub(super) struct Renderer {
     sources: (u64, FxHashMap<[Option<u32>; 2], BindGroup>),
     staging: Vec<u8>,
     frame: RenderFrame,
+    // A copy of the last frame, which a frame with damage regions starts from.
+    last: Option<Texture>,
+    // The layers of the last frame that drew the whole window.
+    whole_layers: usize,
     pub snapshots: Vec<crate::Snapshot>,
 }
+
+// Copies of the last frame that start a frame: the offset of the source, and the region of the window.
+type Prelude = Vec<([i32; 2], [i32; 4])>;
 
 // The buffers that a frame fills: the window for a capture, and each snapshot layer with its key and size.
 type Reads = (Option<Result<Buffer>>, Vec<(u64, [u32; 2], Buffer)>);
@@ -465,6 +476,8 @@ impl Renderer {
             sources: (u64::MAX, FxHashMap::default()),
             staging: Vec::new(),
             frame: RenderFrame::default(),
+            last: None,
+            whole_layers: 0,
             snapshots: Vec::new(),
         })
     }
@@ -494,6 +507,7 @@ impl Renderer {
         self.instances = None;
         self.uniforms = None;
         self.staging = Vec::new();
+        self.last = None;
     }
 
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> (Drawn, Capture) {
@@ -503,6 +517,23 @@ impl Renderer {
                 eprintln!("apps: the GPU can't recover: {error:#}");
             }
             return (Drawn::Again, failed("The GPU was lost"));
+        }
+        let window = [self.config.width, self.config.height];
+        // The window keeps a copy of each frame, so a frame draws only its damage regions over the last one.
+        let last = self
+            .last
+            .take()
+            .filter(|last| [last.width(), last.height()] == window);
+        let damage = last
+            .as_ref()
+            .and_then(|_| frame::damage_regions(scene, window, &[]));
+        // Nothing changed, so the window keeps its last frame.
+        if !capture
+            && damage.as_ref().is_some_and(Vec::is_empty)
+            && !scene.shots.iter().any(|shot| shot.read)
+        {
+            self.last = last;
+            return (Drawn::Skipped, None);
         }
         let Some(surface) = &self.surface else {
             return (Drawn::Skipped, None);
@@ -529,16 +560,68 @@ impl Renderer {
             Next::Validation => return (Drawn::Skipped, failed("The window surface is not valid")),
         };
         let size = [output.texture.width(), output.texture.height()];
-        let (read, shots) = match self.encode(scene, &output.texture, capture) {
-            Ok(reads) => reads,
-            Err(error) => {
-                eprintln!("apps: drawing failed: {error:#}");
-                // Queue writes wait for a submit, which also releases them when the frame fails.
-                self.gpu.queue.submit(None);
-                return (Drawn::Again, capture.then_some(Err(error)));
-            }
+        let (damage, last) = match size == window {
+            true => (damage.unwrap_or_default(), last),
+            false => (Vec::new(), None),
         };
+        // A scroll copies the viewport from the pixels that were `by` further. The scene damaged the edges that
+        // they don't cover.
+        let mut prelude = Prelude::new();
+        if !damage.is_empty() {
+            let whole = [0, 0, size[0] as i32, size[1] as i32];
+            match scene.shift {
+                Some(([x, y, width, height], by))
+                    if width > by[0].abs() && height > by[1].abs() =>
+                {
+                    let area = [
+                        x + (-by[0]).max(0),
+                        y + (-by[1]).max(0),
+                        width - by[0].abs(),
+                        height - by[1].abs(),
+                    ];
+                    let [x, y, width, height] = area;
+                    let [right, bottom] = [whole[2], whole[3]];
+                    for part in [
+                        [0, 0, right, y],
+                        [0, y + height, right, bottom - y - height],
+                        [0, y, x, height],
+                        [x + width, y, right - x - width, height],
+                    ] {
+                        if part[2] > 0 && part[3] > 0 {
+                            prelude.push(([0, 0], part));
+                        }
+                    }
+                    prelude.push((by, area));
+                }
+                _ => prelude.push(([0, 0], whole)),
+            }
+        }
+        // The copies to and from the last frame need a surface that allows them.
+        let keep = self
+            .config
+            .usage
+            .contains(TextureUsages::COPY_SRC | TextureUsages::COPY_DST);
+        let last = keep.then(|| {
+            last.unwrap_or_else(|| {
+                let usage = TextureUsages::COPY_SRC | TextureUsages::COPY_DST;
+                texture(&self.gpu.device, size, self.config.format, usage)
+            })
+        });
+        self.frame.damage = damage;
+        self.frame.keeps_under = keep;
+        self.frame.scissors = keep;
+        let (read, shots) =
+            match self.encode(scene, &output.texture, last.as_ref(), &prelude, capture) {
+                Ok(reads) => reads,
+                Err(error) => {
+                    eprintln!("apps: drawing failed: {error:#}");
+                    // Queue writes wait for a submit, which also releases them when the frame fails.
+                    self.gpu.queue.submit(None);
+                    return (Drawn::Again, capture.then_some(Err(error)));
+                }
+            };
         self.gpu.queue.present(output);
+        self.last = last;
         for (key, size, buffer) in shots {
             match self.read(buffer, size) {
                 Ok((size, pixels)) => (self.snapshots).push(crate::Snapshot { key, size, pixels }),
@@ -680,18 +763,37 @@ impl Renderer {
         Ok(strides.map(|stride| stride as u64))
     }
 
-    fn encode(&mut self, scene: &Scene, output: &Texture, capture: bool) -> Result<Reads> {
+    fn encode(
+        &mut self,
+        scene: &Scene,
+        output: &Texture,
+        last: Option<&Texture>,
+        prelude: &Prelude,
+        capture: bool,
+    ) -> Result<Reads> {
         // Copies read the frame, which needs a surface that allows them.
         let copies = self.config.usage.contains(TextureUsages::COPY_SRC);
         let mut frame = std::mem::take(&mut self.frame);
-        frame.record(
-            scene,
-            [output.width(), output.height()],
-            self.max_side(),
-            copies,
-        );
+        self.pool.spare(&mut frame.spare);
+        let window = [output.width(), output.height()];
+        frame.record(scene, window, self.max_side(), copies);
+        // Each damage region draws the layers that reach it again, which can cost more than the whole window.
+        let none = Prelude::new();
+        let prelude =
+            match !frame.damage.is_empty() && frame.layers.len() > 2 * self.whole_layers + 8 {
+                true => {
+                    frame.damage.clear();
+                    frame.record(scene, window, self.max_side(), copies);
+                    &none
+                }
+                false => prelude,
+            };
+        if frame.damage.is_empty() {
+            self.whole_layers = frame.layers.len();
+        }
         let strides = self.prepare(&frame);
-        let result = strides.and_then(|strides| self.commands(&frame, output, strides, capture));
+        let result = strides
+            .and_then(|strides| self.commands(&frame, output, last, prelude, strides, capture));
         self.frame = frame;
         result
     }
@@ -700,6 +802,8 @@ impl Renderer {
         &mut self,
         frame: &RenderFrame,
         output: &Texture,
+        last: Option<&Texture>,
+        prelude: &Prelude,
         strides: [u64; 3],
         capture: bool,
     ) -> Result<Reads> {
@@ -750,8 +854,13 @@ impl Renderer {
         } else {
             Color::BLACK
         };
-        let open = |encoder: &mut wgpu::CommandEncoder, target: Target, wipe: bool| {
-            let load = match (wipe, target) {
+        let mut scissor: Option<[i32; 4]> = None;
+        let open = |encoder: &mut wgpu::CommandEncoder,
+                    target: Target,
+                    wipe: bool,
+                    scissor: Option<[i32; 4]>| {
+            let scissor = scissor.filter(|_| target == Target::Frame);
+            let load = match (wipe && scissor.is_none(), target) {
                 (false, _) => wgpu::LoadOp::Load,
                 (true, Target::Frame) => wgpu::LoadOp::Clear(background),
                 (true, Target::Layer(_)) => wgpu::LoadOp::Clear(Color::TRANSPARENT),
@@ -773,9 +882,34 @@ impl Renderer {
             };
             let mut pass = encoder.begin_render_pass(&described).forget_lifetime();
             pass.set_bind_group(0, shared, &[globals_of(target)]);
+            if let Some([x, y, width, height]) = scissor {
+                pass.set_scissor_rect(x as u32, y as u32, width as u32, height as u32);
+                if wipe {
+                    pass.set_pipeline(&pipelines.clear[usize::from(self.transparent)]);
+                    pass.draw(0..4, 0..1);
+                }
+            }
             pass
         };
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let at = |[x, y, ..]: [i32; 4]| Origin3d {
+            x: x as u32,
+            y: y as u32,
+            z: 0,
+        };
+        if let Some(last) = last {
+            for &([x, y], region) in prelude {
+                let from = wgpu::TexelCopyTextureInfo {
+                    origin: at([region[0] + x, region[1] + y, 0, 0]),
+                    ..last.as_image_copy()
+                };
+                let to = wgpu::TexelCopyTextureInfo {
+                    origin: at(region),
+                    ..output.as_image_copy()
+                };
+                encoder.copy_texture_to_texture(from, to, extent(region[2], region[3]));
+            }
+        }
         let mut pass: Option<wgpu::RenderPass<'static>> = None;
         let mut current = (Target::Frame, true);
         for command in &frame.commands {
@@ -791,8 +925,12 @@ impl Renderer {
                 Command::Pass(target, wipe) => {
                     // end the old pass first. Two open passes put the encoder in an error state.
                     drop(pass.take());
-                    pass = wipe.then(|| open(&mut encoder, target, true));
+                    pass = wipe.then(|| open(&mut encoder, target, true, scissor));
                     current = (target, false);
+                }
+                Command::Scissor(region) => {
+                    pass = None;
+                    scissor = region;
                 }
                 Command::Draw {
                     ref instances,
@@ -803,7 +941,8 @@ impl Renderer {
                         continue;
                     };
                     let wipe = std::mem::take(&mut current.1);
-                    let into = pass.get_or_insert_with(|| open(&mut encoder, current.0, wipe));
+                    let into =
+                        pass.get_or_insert_with(|| open(&mut encoder, current.0, wipe, scissor));
                     let sources = self
                         .sources
                         .1
@@ -818,7 +957,7 @@ impl Renderer {
                 }
                 Command::Blur { src, dst, index } => {
                     pass = None;
-                    let mut blur = open(&mut encoder, dst, true);
+                    let mut blur = open(&mut encoder, dst, true, None);
                     blur.set_pipeline(&pipelines.blur);
                     blur.set_bind_group(1, &bind([view(src); 3]), &[]);
                     let offset = blurs + u64::from(index) * strides[2];
@@ -852,7 +991,8 @@ impl Renderer {
                     index,
                 } => {
                     let wipe = std::mem::take(&mut current.1);
-                    let into = pass.get_or_insert_with(|| open(&mut encoder, current.0, wipe));
+                    let into =
+                        pass.get_or_insert_with(|| open(&mut encoder, current.0, wipe, scissor));
                     let source = view(src);
                     let mask = match mask {
                         Some(Mask::Page(mask)) => page(true, Some(mask)),
@@ -872,6 +1012,10 @@ impl Renderer {
             }
         }
         drop(pass);
+        if let Some(last) = last {
+            let size = extent(output.width() as i32, output.height() as i32);
+            encoder.copy_texture_to_texture(output.as_image_copy(), last.as_image_copy(), size);
+        }
         // Copies the top left `size` pixels of a texture into a buffer that the CPU can read.
         let mut copy = |from: &Texture, [width, height]: [u32; 2]| {
             let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);

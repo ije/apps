@@ -235,6 +235,9 @@ pub trait Hooks: 'static {
     fn shifts(&self) -> bool {
         false
     }
+    // A box around this one moved by `by` without a prepaint of this one, with `shift`. What the hooks gave the page
+    // moved with it, so only their own record of their place moves.
+    fn lag(&self, _by: Point<Pixels>) {}
     // The near and far corners of the rectangle between `corners` in a box of `size` where paint moves it, like a
     // transform. Scroll containers count it in their scrollable overflow.
     fn reach(&self, _size: Size<Pixels>, corners: [Point<Pixels>; 2]) -> [Point<Pixels>; 2] {
@@ -325,6 +328,11 @@ impl Hooks for Chain {
 
     fn shifts(&self) -> bool {
         self.0.shifts() && self.1.shifts()
+    }
+
+    fn lag(&self, by: Point<Pixels>) {
+        self.0.lag(by);
+        self.1.lag(by);
     }
 
     fn skips_inside(&self) -> bool {
@@ -556,6 +564,7 @@ pub fn canvas<T: 'static>(
         prepared: Cell::new(None),
         within: false,
         watches: false,
+        placed: Cell::new(Rect::default()),
     })
 }
 
@@ -570,6 +579,7 @@ pub fn canvas_within<T: 'static>(
         prepared: Cell::new(None),
         within: true,
         watches: false,
+        placed: Cell::new(Rect::default()),
     })
 }
 
@@ -585,6 +595,7 @@ pub fn canvas_watching<T: 'static>(
         prepared: Cell::new(None),
         within: true,
         watches: true,
+        placed: Cell::new(Rect::default()),
     })
 }
 
@@ -594,6 +605,8 @@ struct Canvas<P, F, T> {
     prepared: Cell<Option<T>>,
     within: bool,
     watches: bool,
+    // Where the last prepaint placed it, which a shift moves.
+    placed: Cell<Rect>,
 }
 
 impl<T: 'static, P, F> Hooks for Canvas<P, F, T>
@@ -603,12 +616,18 @@ where
 {
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
         inner(cx.window);
+        self.placed.set(cx.exact);
         self.prepared
             .set(Some((self.prepaint)(cx.exact, cx.window)));
     }
 
     fn volatile(&self) -> bool {
         false
+    }
+
+    // A watching canvas prepares again when a box around it skips or shifts.
+    fn skips_inside(&self) -> bool {
+        self.watches
     }
 
     fn cached(&self) -> bool {
@@ -624,12 +643,20 @@ where
         true
     }
 
-    fn shift(&self, _: Point<Pixels>, _: Rect, _: &mut Window) -> bool {
+    // The exact bounds of a box inside the box that a scroll moved are those of its last prepaint, so a watching
+    // canvas moves its own place.
+    fn shift(&self, by: Point<Pixels>, _: Rect, window: &mut Window) -> bool {
+        if self.watches {
+            let placed = self.placed.get();
+            let moved = Rect::new(placed.origin + by, placed.size);
+            self.placed.set(moved);
+            self.prepared.set(Some((self.prepaint)(moved, window)));
+        }
         true
     }
 
     fn shifts(&self) -> bool {
-        !self.watches
+        true
     }
 
     // A kept canvas prepares its paint again, at its kept place.

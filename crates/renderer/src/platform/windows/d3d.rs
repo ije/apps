@@ -732,6 +732,7 @@ impl Renderer {
                         );
                     }
                 }
+                Command::Scissor(_) => {}
                 Command::Composite {
                     src,
                     mask,

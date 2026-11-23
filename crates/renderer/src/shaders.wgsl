@@ -882,3 +882,24 @@ fn copy_vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32
 fn copy_fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     return textureLoad(t0, vec2<i32>(position.xy) + copy.offset.xy, 0);
 }
+
+@vertex
+fn clear_vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(strip_corner(index) * 2.0 - 1.0, 0.0, 1.0);
+}
+
+// The background of an opaque window.
+@fragment
+fn clear_fragment() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}
+
+@vertex
+fn erase_vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(strip_corner(index) * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn erase_fragment() -> @location(0) vec4<f32> {
+    return vec4<f32>(0.0);
+}
