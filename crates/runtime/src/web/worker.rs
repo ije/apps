@@ -331,7 +331,7 @@ impl State {
                 let data = args[4].take();
                 // A worker gets the bundled scripts and assets of the app, not its native addons.
                 let app = crate::bundle::AppInfo {
-                    name: Some(self.app.name.clone().unwrap_or_default()),
+                    name: Some(self.app.name.as_deref().unwrap_or("apps").into()),
                     packaged: self.app.packaged,
                     features: self.app.features,
                     scripts: self.app.scripts.clone(),

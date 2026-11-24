@@ -1061,7 +1061,7 @@ impl Host {
                     matches!(role, Role::Main),
                     "process.exit() is only available in the main process and workers"
                 );
-                if let Some(before) = crate::host::BEFORE_EXIT.get() {
+                if let Some(before) = crate::host::context::BEFORE_EXIT.get() {
                     before();
                 }
                 let _ = std::io::stdout().flush();

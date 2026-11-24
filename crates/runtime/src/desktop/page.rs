@@ -1,6 +1,6 @@
 use super::{Desktop, Pages, RELOADED, View, scripted};
 use crate::host::link::ToMain;
-use crate::{dom::Document, host::JsContext, jsc::Role, render::PageView};
+use crate::{dom::Document, host::context::JsContext, jsc::Role, render::PageView};
 use anyhow::{Context as _, Result, bail, ensure};
 use renderer::{App, Rect, WindowChange, WindowOptions, point, px, size};
 use std::{
@@ -321,7 +321,7 @@ impl Desktop {
             .then(|| JsContext::new(self.api.clone(), self.host.clone(), Role::Preload(id)))
             .transpose();
         let renderer = JsContext::new(self.api.clone(), self.host.clone(), Role::Renderer(id));
-        if (preload.is_err() || renderer.is_err()) && crate::host::stopping(id) {
+        if (preload.is_err() || renderer.is_err()) && crate::host::context::stopping(id) {
             return Ok(());
         }
         let preload = preload?.map(Rc::new);
@@ -362,7 +362,7 @@ impl Desktop {
             }
         };
         // Run one page script per __appsNext call so JSC drains microtasks between scripts.
-        use crate::host::NEXT;
+        use crate::host::context::NEXT;
         for (mut source, url) in scripts
             .iter()
             .filter(|(kind, _)| *kind == "module")

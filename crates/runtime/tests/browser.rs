@@ -1,6 +1,6 @@
 #[test]
 fn browser_window_rejects_remote_urls_and_loads_local_urls() {
-    use apps_runtime::{host::JsContext, jsc::JavaScriptCore, jsc::Role};
+    use apps_runtime::{host::context::JsContext, jsc::JavaScriptCore, jsc::Role};
     let host = std::rc::Rc::new(std::cell::RefCell::new(apps_runtime::host::Host::default()));
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host.clone(), Role::Main).unwrap();
     assert!(engine.eval("new __apps.WebContentsView()", "test").is_err());
@@ -66,7 +66,7 @@ fn browser_window_rejects_remote_urls_and_loads_local_urls() {
 
 #[test]
 fn web_contents_view_matches_electron_api() {
-    let engine = apps_runtime::host::JsContext::new(
+    let engine = apps_runtime::host::context::JsContext::new(
         apps_runtime::jsc::JavaScriptCore::load().unwrap(),
         std::rc::Rc::default(),
         apps_runtime::jsc::Role::Main,

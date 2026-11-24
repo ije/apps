@@ -1,7 +1,7 @@
 #[cfg(unix)]
 #[test]
 fn native_addons_values_callbacks_and_contexts() {
-    use apps_runtime::{host::Host, host::JsContext, jsc::JavaScriptCore, jsc::Role};
+    use apps_runtime::{host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role};
     use std::{cell::RefCell, process::Command, rc::Rc};
     let dir = tempfile::tempdir().unwrap();
     let library = dir.path().join("addon.node");

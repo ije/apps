@@ -8,7 +8,7 @@ mod tests;
 
 use crate::bundle::Feature;
 use crate::host::link::{Link, PageQueue, ToMain, ToPage};
-use crate::{host::Host, host::JsContext, jsc::JavaScriptCore, jsc::Role};
+use crate::{host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role};
 use anyhow::{Context as _, Result, bail, ensure};
 use bbtree::unsync::BBTreeMap;
 use main::Main;
@@ -73,8 +73,11 @@ struct Pages(Rc<RefCell<Desktop>>);
 
 impl crate::render::Pages for Pages {
     fn renderer(&self, id: u64) -> Option<Rc<JsContext>> {
-        let desktop = self.0.try_borrow().ok()?;
-        desktop.views.get(&id)?.renderer.clone()
+        self.0.borrow().views.get(&id)?.renderer.clone()
+    }
+
+    fn try_renderer(&self, id: u64) -> Option<Rc<JsContext>> {
+        self.0.try_borrow().ok()?.views.get(&id)?.renderer.clone()
     }
 
     fn dispatch(
@@ -361,7 +364,8 @@ impl Desktop {
                         } else if command["op"] == "reload" {
                             let host = self.host.borrow();
                             for &id in self.views.keys() {
-                                if let Some(url) = host.url(id)
+                                if let Some(url) =
+                                    host.dom.get(&id).and_then(|dom| dom.base.as_ref())
                                     && url.as_str().starts_with("apps:///")
                                 {
                                     self.link.page(ToPage::Window(
@@ -448,7 +452,7 @@ impl Desktop {
                             }
                             self.host.borrow_mut().close_page(id);
                             crate::web::storage::forget(id);
-                            crate::host::page_stopped(id);
+                            crate::host::context::page_stopped(id);
                             self.ended = self.owner == Some(id);
                             if self.ended {
                                 crate::native::devtools::uninstall();
@@ -1026,7 +1030,7 @@ impl Desktop {
             renderer::native::on_should_quit(move || {
                 let quit = terminate.should_quit();
                 if quit {
-                    crate::host::stop_pages();
+                    crate::host::context::stop_pages();
                 }
                 quit
             });
@@ -1054,8 +1058,8 @@ impl Desktop {
                     std::process::exit(exit.exit_code());
                 }
             });
-            crate::host::BEFORE_EXIT.set(Some(|| {
-                crate::host::stop_pages();
+            crate::host::context::BEFORE_EXIT.set(Some(|| {
+                crate::host::context::stop_pages();
                 renderer::native::before_exit();
             }));
             #[cfg(target_os = "macos")]
@@ -1121,7 +1125,7 @@ impl Desktop {
             main.wake();
             page.wake();
         });
-        crate::host::NATIVE.set(Some(|op, args| {
+        crate::host::context::NATIVE.set(Some(|op, args| {
             renderer::native::sync(|| crate::native::native_call(op, args))
         }));
         crate::native::devtools::install(owner.unwrap_or(0));

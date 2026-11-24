@@ -94,7 +94,7 @@ pub fn run(
             .map(|directory| {
                 directory
                     .path()
-                    .join(apps_runtime::jsc::aot::aot_image_name(target.platform))
+                    .join(apps_runtime::jsc::aot::image_name(target.platform))
             })
             .as_deref(),
     )?;

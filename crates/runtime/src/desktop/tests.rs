@@ -857,7 +857,7 @@ fn dialogs_of_main_and_pages_show_a_message_box() {
     let code =
         "__apps.app.whenReady().then(() => new __apps.BrowserWindow().loadFile('index.html'));";
     let desktop = app(code, &[], dir.path().to_path_buf());
-    crate::host::NATIVE.set(Some(|op, args| {
+    crate::host::context::NATIVE.set(Some(|op, args| {
         assert_eq!(op, "dialog.message");
         let buttons = args["buttons"].as_array().map_or(0, Vec::len);
         Ok(serde_json::json!({

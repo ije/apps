@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use apps_runtime::{
     dom::Document,
-    host::JsContext,
+    host::context::JsContext,
     jsc::JavaScriptCore,
     jsc::script_source,
     jsc::{Role, Waker},

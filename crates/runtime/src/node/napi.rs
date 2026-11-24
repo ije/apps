@@ -2763,7 +2763,8 @@ mod tests {
         let api = JavaScriptCore::load().unwrap();
         let host = Rc::new(RefCell::new(Host::default()));
         let _engine =
-            crate::host::JsContext::new(api.clone(), host.clone(), crate::jsc::Role::Main).unwrap();
+            crate::host::context::JsContext::new(api.clone(), host.clone(), crate::jsc::Role::Main)
+                .unwrap();
         let root = CONTEXTS
             .with(|contexts| contexts.borrow().values().find_map(Weak::upgrade))
             .unwrap();

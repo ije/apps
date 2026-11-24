@@ -1,4 +1,4 @@
-use crate::{bundle::Bundle, host::Host, host::JsContext, jsc::JavaScriptCore, jsc::Role};
+use crate::{bundle::Bundle, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role};
 use anyhow::{Context, Result};
 use std::{cell::RefCell, rc::Rc, sync::mpsc, time::Duration};
 
@@ -34,7 +34,7 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
         "apps:node",
     )?;
     engine.eval_page(std::str::from_utf8(&source)?, "apps:node")?;
-    while engine.eval_page(crate::host::NEXT, "apps:node")? == "true" {}
+    while engine.eval_page(crate::host::context::NEXT, "apps:node")? == "true" {}
     let code = loop {
         let delay = engine.tick()?;
         if delay != 0 && !engine.addons_pending() && engine.call("__appsAlive", &[])? != "true" {

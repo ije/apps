@@ -521,7 +521,7 @@ impl renderer::View for PageView {
         let view = self.0.clone();
         cx.defer(move |cx| {
             cx.update_window(view.window, |window, cx| {
-                let renderer = view.runtime.renderer(view.id);
+                let renderer = view.runtime.try_renderer(view.id);
                 if let Some(renderer) = renderer
                     && let Err(error) = super::scripted(cx, Some(window), || {
                         renderer.eval(&format!("__appsPaint({changed:?})"), "apps:paint")

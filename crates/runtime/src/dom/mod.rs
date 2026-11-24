@@ -5294,7 +5294,7 @@ pub(crate) fn utf16_index(text: &str, index: usize) -> usize {
 mod tests {
     use super::*;
     use crate::{
-        host::JsContext,
+        host::context::JsContext,
         host::{Host, Page},
         jsc::JavaScriptCore,
         jsc::Role,

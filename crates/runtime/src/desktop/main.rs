@@ -1,6 +1,6 @@
 use crate::render::inspect::tool;
 use crate::{
-    host::JsContext,
+    host::context::JsContext,
     host::{
         Host,
         link::{Link, PageQueue, ToMain, ToPage},
@@ -315,10 +315,10 @@ impl Main {
                         Ok(window) => Parent::Ready(NativeHandle(window)),
                         Err(_) => Parent::Waiting,
                     },
-                    // The parent closed, so the attach would wait forever.
                     None if windows.contains_key(&parent) || self.link.spawning(parent) => {
                         Parent::Waiting
                     }
+                    // The parent closed, so the attach would wait forever.
                     None => Parent::Gone,
                 }
             });
@@ -518,7 +518,7 @@ impl Main {
             self.waiting
                 .borrow_mut()
                 .retain(|waiting| waiting["args"][1].as_u64() != Some(id));
-            crate::host::stop_page(id);
+            crate::host::context::stop_page(id);
             if let Ok(mut host) = self.host.try_borrow_mut()
                 && let Err(error) = host.browsers.close_window(id)
             {
@@ -724,7 +724,7 @@ impl Main {
             }
         }
         if self.link.quitting() && !self.ended.replace(true) {
-            crate::host::stop_pages();
+            crate::host::context::stop_pages();
             renderer::native::quit();
         }
         if self.api.schedule_shrink() {
@@ -875,7 +875,7 @@ mod tests {
         assert_eq!(runs(), "event");
         // Use a unique page ID: close stops it process-wide.
         main.native(json!({"op":"window","args":["close",901]}));
-        crate::host::page_stopped(901);
+        crate::host::context::page_stopped(901);
         for id in [901, 902] {
             let (answer, reply) = mpsc::sync_channel(1);
             link.main(ToMain::Open(id, json!(["open", "", "", "", ""]), answer));

@@ -1,4 +1,4 @@
-use crate::{host::Host, host::JsContext, jsc::Role};
+use crate::{host::Host, host::context::JsContext, jsc::Role};
 use anyhow::{Context, Result, bail, ensure};
 use apps_webview::Browser;
 use serde_json::{Value, json};

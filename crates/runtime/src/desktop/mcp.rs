@@ -43,12 +43,12 @@ pub(crate) fn poll(desktop: &Desktop, cx: &mut App) -> bool {
 }
 
 extern "C" fn connect(ctx: usize) -> i32 {
-    crate::host::connect_inspector(ctx).map_or(-1, i32::from)
+    crate::host::context::connect_inspector(ctx).map_or(-1, i32::from)
 }
 
 extern "C" fn inspect(ctx: usize, message: *const u8, len: usize) -> bool {
     let message = unsafe { std::slice::from_raw_parts(message, len) };
-    crate::host::inspect(ctx, &String::from_utf8_lossy(message)).is_ok()
+    crate::host::context::inspect(ctx, &String::from_utf8_lossy(message)).is_ok()
 }
 
 extern "C" fn messages(
@@ -61,7 +61,7 @@ extern "C" fn messages(
 }
 
 extern "C" fn contexts(list: *mut c_void, push: extern "C" fn(*mut c_void, usize, u32, u64)) {
-    for (ctx, role) in crate::host::contexts() {
+    for (ctx, role) in crate::host::context::contexts() {
         let (role, id) = match role {
             Role::Main => (0, 0),
             Role::Preload(id) => (1, id),
@@ -194,7 +194,7 @@ impl Desktop {
             list.push(json!({
                 "id": id,
                 "title": view.title,
-                "url": host.url(id).map(url::Url::as_str),
+                "url": host.dom.get(&id).and_then(|dom| dom.base.as_ref()).map(url::Url::as_str),
                 "state": state,
                 "preload": view.preload.is_some(),
             }));
@@ -394,7 +394,7 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
 mod tests {
     use crate::{
         host::Host,
-        host::JsContext,
+        host::context::JsContext,
         jsc::Role,
         jsc::{self, JavaScriptCore},
     };
@@ -407,16 +407,16 @@ mod tests {
             Role::Main,
         )
         .unwrap();
-        let [(ctx, Role::Main)] = crate::host::contexts()[..] else {
+        let [(ctx, Role::Main)] = crate::host::context::contexts()[..] else {
             panic!("Expected one main context");
         };
-        assert!(crate::host::connect_inspector(ctx).unwrap());
+        assert!(crate::host::context::connect_inspector(ctx).unwrap());
         for message in [
             r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"6 * 7","returnByValue":true}}"#,
             r#"{"id":2,"method":"Debugger.enable","params":{}}"#,
             r#"{"id":3,"method":"Debugger.setPauseOnDebuggerStatements","params":{"enabled":true}}"#,
         ] {
-            crate::host::inspect(ctx, message).unwrap();
+            crate::host::context::inspect(ctx, message).unwrap();
         }
         let messages: Vec<_> = jsc::inspector_messages()
             .into_iter()
@@ -434,7 +434,7 @@ mod tests {
         );
         assert_eq!(engine.eval("debugger; 'after'", "test").unwrap(), "after");
         drop(engine);
-        assert!(crate::host::contexts().is_empty());
+        assert!(crate::host::context::contexts().is_empty());
         let _ = Host::default();
     }
 }

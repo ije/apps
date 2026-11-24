@@ -372,13 +372,13 @@ pub struct State {
     platform: crate::web::platform::State,
     servers: crate::web::serve::State,
     sockets: crate::web::websocket::State,
-    assets: std::sync::Arc<HashMap<String, std::path::PathBuf>>,
+    workers: crate::web::worker::State,
     tcp: crate::web::tcp::State,
     storage: crate::web::storage::State,
-    workers: crate::web::worker::State,
     next_id: u64,
     fetches: HashMap<u64, Fetch>,
     agent: Option<Agent>,
+    assets: std::sync::Arc<HashMap<String, std::path::PathBuf>>,
 }
 
 pub(crate) fn url(input: &str, base: Option<&str>, set: Option<(&str, &str)>) -> Result<Url> {

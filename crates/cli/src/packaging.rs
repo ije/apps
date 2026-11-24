@@ -176,7 +176,7 @@ pub fn package_app(
     };
     let mut bytes = apps_runtime::bundle::write(&assets.join("app.bundle"), files, &bytecode)?;
     if let Some(aot) = aot {
-        let image_name = apps_runtime::jsc::aot::aot_image_name(target.platform);
+        let image_name = apps_runtime::jsc::aot::image_name(target.platform);
         target
             .validate_binary(aot)
             .with_context(|| format!("{image_name} does not match the build target"))?;
@@ -214,7 +214,7 @@ pub fn package_app(
     }
     // AOT code runs only in the JSC that its compiler was built with.
     let jsc = if aot.is_some() {
-        jsc.with_file_name(apps_runtime::jsc::aot::aot_engine_library(target.platform))
+        jsc.with_file_name(apps_runtime::jsc::aot::engine_library(target.platform))
     } else {
         jsc
     };

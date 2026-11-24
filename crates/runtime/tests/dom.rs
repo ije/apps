@@ -1,6 +1,6 @@
 use apps_runtime::{
     dom::Document,
-    host::JsContext,
+    host::context::JsContext,
     host::{Host, Page},
     jsc::JavaScriptCore,
     jsc::Role,

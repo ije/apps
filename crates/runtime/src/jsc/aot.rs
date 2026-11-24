@@ -10,11 +10,11 @@ use std::{
 
 pub const AOT_PREFIX: &str = "\"apps:aot:";
 
-pub fn aot_source(build: &str, name: &str) -> String {
+pub fn source(build: &str, name: &str) -> String {
     format!("{AOT_PREFIX}{build}:{name}\";throw Error(\"Missing AOT image\");")
 }
 
-pub fn aot_image_name(platform: &str) -> &'static str {
+pub fn image_name(platform: &str) -> &'static str {
     if platform == "linux" {
         "app.so"
     } else {
@@ -22,7 +22,7 @@ pub fn aot_image_name(platform: &str) -> &'static str {
     }
 }
 
-pub fn aot_engine_library(platform: &str) -> &'static str {
+pub fn engine_library(platform: &str) -> &'static str {
     if platform == "linux" {
         "libJavaScriptCoreAOT.so"
     } else {
@@ -30,7 +30,7 @@ pub fn aot_engine_library(platform: &str) -> &'static str {
     }
 }
 
-pub fn aot_compiler_library(platform: &str) -> &'static str {
+pub fn compiler_library(platform: &str) -> &'static str {
     if platform == "linux" {
         "libJavaScriptCoreCompiler.so"
     } else {
@@ -38,7 +38,7 @@ pub fn aot_compiler_library(platform: &str) -> &'static str {
     }
 }
 
-pub fn aot_front_end_library(platform: &str) -> &'static str {
+pub fn front_end_library(platform: &str) -> &'static str {
     if platform == "linux" {
         "libapps_aot.so"
     } else {
@@ -89,7 +89,7 @@ fn read(jsc: &Library, path: &Path) -> Result<Option<Image>> {
         ensure!(
             manifest.runtime == super::RUNTIME_SCRIPTS,
             "{} was built for another runtime",
-            aot_image_name(std::env::consts::OS)
+            image_name(std::env::consts::OS)
         );
         ensure!(
             manifest.scripts.values().all(|&module| module != 0),
@@ -99,7 +99,7 @@ fn read(jsc: &Library, path: &Path) -> Result<Option<Image>> {
             *jsc.get(b"JSLoadAOT\0").with_context(|| {
                 format!(
                     "{} needs the JavaScriptCore of its build",
-                    aot_image_name(std::env::consts::OS)
+                    image_name(std::env::consts::OS)
                 )
             })?;
         let mut error = [0; 1024];
@@ -148,7 +148,7 @@ impl Image {
         ensure!(
             build == self.build,
             "{} does not match app.bundle",
-            aot_image_name(std::env::consts::OS)
+            image_name(std::env::consts::OS)
         );
         self.modules
             .get(name)

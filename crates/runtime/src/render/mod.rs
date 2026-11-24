@@ -39,7 +39,9 @@ type MaskSources = Vec<(String, background::Source)>;
 
 // The app side of the page views: it runs page scripts and their events.
 pub(crate) trait Pages {
-    fn renderer(&self, id: u64) -> Option<Rc<crate::host::JsContext>>;
+    // The page context of view `id`. It expects the desktop free, where `try_renderer` skips a busy one.
+    fn renderer(&self, id: u64) -> Option<Rc<crate::host::context::JsContext>>;
+    fn try_renderer(&self, id: u64) -> Option<Rc<crate::host::context::JsContext>>;
     fn dispatch(
         &self,
         id: u64,
@@ -134,8 +136,8 @@ thread_local! {
 
 // Do not use cx or window inside f: reflow accesses them through pointers.
 pub(crate) fn scripted<R>(cx: &mut App, window: Option<&mut Window>, f: impl FnOnce() -> R) -> R {
-    crate::host::REFLOW.set(Some(reflow));
-    crate::host::CLIPBOARD.set(Some(clipboard));
+    crate::host::context::REFLOW.set(Some(reflow));
+    crate::host::context::CLIPBOARD.set(Some(clipboard));
     let previous = SCRIPTS.replace(Some((cx, window.map(|window| window as *mut Window))));
     let result = f();
     SCRIPTS.set(previous);
@@ -156,7 +158,7 @@ fn clipboard(text: Option<String>) -> Option<String> {
 }
 
 pub(crate) fn edit(
-    renderer: &crate::host::JsContext,
+    renderer: &crate::host::context::JsContext,
     app: Option<(&mut App, Option<&mut Window>)>,
     command: &str,
     text: &str,
@@ -253,7 +255,7 @@ pub(crate) fn queue_animation_frame(view: Rc<PageState>, window: &mut Window) {
 
 fn animation_frame(view: Rc<PageState>, window: &mut Window, cx: &mut App) {
     view.queued.set(false);
-    let renderer = view.runtime.renderer(view.id);
+    let renderer = view.runtime.try_renderer(view.id);
     if let Some(renderer) = renderer
         && let Err(error) = scripted(cx, Some(window), || {
             renderer.eval("__appsAnimationFrame()", "apps:frame")

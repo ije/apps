@@ -1,4 +1,4 @@
-mod context;
+pub mod context;
 pub(crate) mod link;
 mod ops;
 pub(crate) mod window;
@@ -7,11 +7,7 @@ pub(crate) mod worker;
 use crate::dom::{Document, Node};
 use crate::jsc::{JavaScriptCore, Role};
 use anyhow::{Context, Result, bail, ensure};
-pub use context::JsContext;
-pub(crate) use context::{
-    BEFORE_EXIT, CLIPBOARD, NATIVE, NEXT, REFLOW, connect_inspector, contexts, inspect,
-    page_stopped, stop_page, stop_pages, stopping,
-};
+use context::JsContext;
 use link::Target;
 use serde_json::{Value, json};
 use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
@@ -82,10 +78,6 @@ impl Host {
             Target::Window(id) if command["args"][0] == "create" => link.create_window(id, command),
             Target::Window(id) => link.page(ToPage::Window(id, command)),
         }
-    }
-
-    pub(crate) fn url(&self, id: u64) -> Option<&url::Url> {
-        self.dom.get(&id)?.base.as_ref()
     }
 
     // The nodes of each page: in its tree, allocated, and free for reuse.

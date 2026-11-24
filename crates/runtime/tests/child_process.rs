@@ -1,4 +1,4 @@
-use apps_runtime::{host::Host, host::JsContext, jsc::JavaScriptCore, jsc::Role};
+use apps_runtime::{host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role};
 use std::{
     cell::RefCell,
     rc::Rc,

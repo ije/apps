@@ -1,4 +1,7 @@
-use super::{Host, JsContext, NEXT, Page, WORKER_PAGE};
+use super::{
+    Host, Page, WORKER_PAGE,
+    context::{JsContext, NEXT},
+};
 use crate::{
     dom::Document,
     jsc::{JavaScriptCore, Role},

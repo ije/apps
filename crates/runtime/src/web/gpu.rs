@@ -235,7 +235,7 @@ impl Drop for Gpu {
 mod tests {
     use crate::{
         dom::Document,
-        host::JsContext,
+        host::context::JsContext,
         host::{Host, Page},
         jsc::JavaScriptCore,
         jsc::Role,

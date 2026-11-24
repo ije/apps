@@ -371,7 +371,7 @@ impl JavaScriptCore {
         let image = if cfg!(target_os = "macos") {
             path.with_file_name("../Resources/app.dylib")
         } else {
-            path.with_file_name(aot::aot_image_name(std::env::consts::OS))
+            path.with_file_name(aot::image_name(std::env::consts::OS))
         };
         INSPECTOR.get_or_init(|| unsafe {
             Some(Inspector {
