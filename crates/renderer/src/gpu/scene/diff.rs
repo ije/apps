@@ -435,9 +435,35 @@ impl Scene {
                 owner[(start as usize).min(end)..end].fill(at as u32);
             }
         }
+        // Entries of a scroll hash their clips before the viewport cut them, so content that moves across the edge of
+        // the viewport keeps its hash. They hash the viewports around them instead, each in the content around it.
+        self.uncut.clear();
+        for raw in &self.raw {
+            let (key, clip) = match *raw {
+                Raw::Instance(layer, at, clip) => ((layer, at, false), clip),
+                Raw::Nested(layer, at, bounds) => ((layer, at, true), bounds.to_array()),
+                Raw::Effect(..) => continue,
+            };
+            self.uncut.entry(key).or_insert(clip);
+        }
+        let mut frames: Vec<u64> = Vec::with_capacity(self.scrolls.len());
+        for scroll in &self.scrolls {
+            let (outer, shift) = match scroll.parent {
+                u32::MAX => (0, Point::default()),
+                at => (frames[at as usize], self.scrolls[at as usize].shift),
+            };
+            let place = |rect: Rect<f32>| bits((rect - shift).to_array());
+            let viewport = &scroll.viewport;
+            let mut hasher = rustc_hash::FxHasher::default();
+            (outer, place(viewport.bounds), place(viewport.rounded)).hash(&mut hasher);
+            bits(viewport.radii.to_array()).hash(&mut hasher);
+            frames.push(hasher.finish());
+        }
         let mut walk = Walk {
             layers: &self.layers,
             scrolls: &self.scrolls,
+            uncut: &self.uncut,
+            frames: &frames,
             owners,
             entries: mem::take(&mut self.entries),
             maps: mem::take(&mut self.maps),
@@ -845,6 +871,9 @@ pub(super) fn effect_bounds(layer: &SceneLayer) -> Option<Rect<f32>> {
 struct Walk<'a> {
     layers: &'a [SceneLayer],
     scrolls: &'a [Scroll],
+    uncut: &'a FxHashMap<(u32, u32, bool), [f32; 4]>,
+    // For each scroll, its viewport and the ones around it.
+    frames: &'a [u64],
     // The innermost scroll of each instance and nested layer of the window layer, or u32::MAX.
     owners: [Vec<u32>; 2],
     entries: Vec<Entry>,
@@ -867,7 +896,7 @@ impl Walk<'_> {
         let mut digest = 1;
         let mut nested = content.nested.iter().enumerate().peekable();
         for (at, instance) in content.instances.iter().enumerate() {
-            while let Some((index, inner)) = nested.next_if(|(_, inner)| inner.at as usize <= at) {
+            while let Some((index, _)) = nested.next_if(|(_, inner)| inner.at as usize <= at) {
                 let scroll = self.find(layer, index, true).or(scroll);
                 let top = if layer == 0 {
                     index as u32 | NESTED
@@ -876,7 +905,7 @@ impl Walk<'_> {
                 };
                 digest = mix(
                     digest,
-                    self.nested(layer, origin, inner, context, scroll, top),
+                    self.nested(layer, index, origin, context, scroll, top),
                 );
             }
             // A scroll viewport cut it away, so it draws nothing.
@@ -891,16 +920,20 @@ impl Walk<'_> {
             };
             digest = mix(digest, hash);
             let entry = match scroll {
-                Some(at) => {
-                    let scroll = &self.scrolls[at];
+                Some(scroll_at) => {
+                    let scroll = &self.scrolls[scroll_at];
                     let base = if layer == 0 {
                         origin - scroll.shift
                     } else {
                         origin
                     };
+                    let mut uncut = *instance;
+                    if let Some(clip) = self.uncut.get(&(layer as u32, at as u32, false)) {
+                        uncut.clip = *clip;
+                    }
                     mix(
-                        instance_hash(instance, base, Some(&scroll.viewport)),
-                        scroll.id,
+                        instance_hash(&uncut, base, Some(&scroll.viewport)),
+                        mix(scroll.id, self.frames[scroll_at]),
                     )
                 }
                 None => hash,
@@ -914,7 +947,7 @@ impl Walk<'_> {
                 top: if layer == 0 { at as u32 } else { top },
             });
         }
-        for (index, inner) in nested {
+        for (index, _) in nested {
             let scroll = self.find(layer, index, true).or(scroll);
             let top = if layer == 0 {
                 index as u32 | NESTED
@@ -923,7 +956,7 @@ impl Walk<'_> {
             };
             digest = mix(
                 digest,
-                self.nested(layer, origin, inner, context, scroll, top),
+                self.nested(layer, index, origin, context, scroll, top),
             );
         }
         self.digests[layer] = digest;
@@ -943,20 +976,24 @@ impl Walk<'_> {
     fn nested(
         &mut self,
         parent: usize,
+        index: usize,
         base: Point<f32>,
-        nested: &Nested,
         context: u64,
         scroll: Option<usize>,
         top: u32,
     ) -> u64 {
         let layers = self.layers;
+        let nested = &layers[parent].nested[index];
         let Some(effect) = &layers[nested.layer].effect else {
             return 0;
         };
         // In a scroll, the entry hashes its place in the content, with the mask around the content as its own place.
         let entry = scroll.map(|at| {
+            let frame = self.frames[at];
             let scroll = &self.scrolls[at];
             let shift = scroll.shift;
+            let clip = (self.uncut.get(&(parent as u32, index as u32, true)))
+                .map_or(nested.clip.bounds, |clip| rect(*clip));
             let base = if parent == 0 { base - shift } else { base };
             let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
             let rect = |rect: Rect<f32>| {
@@ -968,7 +1005,7 @@ impl Walk<'_> {
                 ])
             };
             let spreads = effect.blur != 0. || effect.shadow.is_some() || effect.backdrop.is_some();
-            let masked = nested.clip.bounds == scroll.viewport.bounds && !spreads;
+            let masked = clip == scroll.viewport.bounds && !spreads;
             let mut hasher = rustc_hash::FxHasher::default();
             (
                 effect.transform.map(|matrix| {
@@ -1006,7 +1043,7 @@ impl Walk<'_> {
                     .map(|glass| (glass.key, rect(glass.bounds))),
                 match masked {
                     true => rect(nested.bounds),
-                    false => rect(nested.clip.bounds.intersect(nested.bounds)),
+                    false => rect(clip.intersect(nested.bounds)),
                 },
                 (nested.clip.radii != Default::default()).then(|| {
                     match nested.clip.rounded == scroll.viewport.rounded {
@@ -1016,6 +1053,7 @@ impl Walk<'_> {
                 }),
                 bits(&nested.clip.radii.to_array()),
                 scroll.id,
+                frame,
             )
                 .hash(&mut hasher);
             if let Some(text) = effect.text_mask {

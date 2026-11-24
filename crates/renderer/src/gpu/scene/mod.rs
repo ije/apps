@@ -68,6 +68,8 @@ pub struct Scene {
     cutting: Vec<usize>,
     // The clips that `bake` cut, while the scene is baked.
     raw: Vec<Raw>,
+    // The same clips by place: (layer, instance or nested layer, nested), the first cut only.
+    uncut: FxHashMap<(u32, u32, bool), [f32; 4]>,
     baked: bool,
     owners: [Vec<u32>; 2],
     // The window region that shows a scroll container, and how far its content moved since the drawn frame, in
@@ -250,6 +252,7 @@ impl Default for Scene {
             last_cuts: Vec::new(),
             cutting: Vec::new(),
             raw: Vec::new(),
+            uncut: FxHashMap::default(),
             baked: false,
             owners: Default::default(),
             shift: None,

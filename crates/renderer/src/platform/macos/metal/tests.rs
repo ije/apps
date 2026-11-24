@@ -528,8 +528,9 @@ fn scrolled_content_copies_the_last_frame_moved() {
     use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
     let (send, receive) = std::sync::mpsc::channel();
     // Scroll offsets in device pixels, and a change: 1 and 2 recolor a row (2 one under the bar), 3 the bar. A
-    // part of a pixel can't be copied, and a change inside the content draws it.
-    let steps: [(f32, u8); 13] = [
+    // part of a pixel can't be copied, and a change inside the content draws it. The kept window turns past its
+    // viewport height both ways.
+    let steps: [(f32, u8); 15] = [
         (0., 0),
         (6., 0),
         (12., 0),
@@ -543,6 +544,8 @@ fn scrolled_content_copies_the_last_frame_moved() {
         (14., 0),
         (14., 3),
         (8., 0),
+        (48., 0),
+        (88., 0),
     ];
     let job = move || {
         let size = objc2_core_foundation::CGSize::new(200., 120.);

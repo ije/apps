@@ -96,6 +96,47 @@ fn copied_spans_keep_their_scrolls_once() {
 }
 
 #[test]
+fn content_that_scrolls_across_the_viewport_edge_draws_only_the_exposed_edge() {
+    let mut scene = Scene::default();
+    let mut frame = |pass: u32, scroll: f32, height: f32| {
+        scene.begin_paint(pass, &mut Vec::new());
+        let viewport = Clip::from(bounds([0., 0., 400., height]));
+        let interest = Clip::from(bounds([5., -200. - scroll, 390., 700.]));
+        let at = |x: f32, y: f32| Instance::new(BOX, bounds([x, y - scroll, 50., 60.]), interest);
+        scene.begin_scroll(1, viewport, point(0., scroll), true);
+        // Boxes across the top edge, inside, across the bottom edge, and in a layer across the bottom edge.
+        for y in [-20., 100., 280.] {
+            scene.push(at(10., y));
+        }
+        scene.push_effect(
+            EffectState {
+                opacity: 0.5,
+                ..effect(interest)
+            },
+            None,
+        );
+        scene.push(at(100., 270.));
+        scene.pop_effect();
+        scene.end_scroll();
+        scene.diff(Some(&[]));
+        let damage = (scene.damage.rects.iter())
+            .map(|rect| rect.to_array())
+            .collect::<Vec<_>>();
+        scene.drawn();
+        scene.clear();
+        damage
+    };
+    frame(1, 0., 300.);
+    assert_eq!(frame(2, 10., 300.), [[0., 290., 400., 10.]]);
+    assert_eq!(frame(3, 20., 300.), [[0., 290., 400., 10.]]);
+    let resized = frame(4, 20., 250.);
+    assert!(
+        resized.iter().any(|rect| rect[1] + rect[3] >= 280.),
+        "a smaller viewport draws what it cuts again: {resized:?}"
+    );
+}
+
+#[test]
 fn nested_escapes_close_their_cuts() {
     // A fixed box in an absolute box: both escape the scroll, one inside the other.
     let viewport = Clip::from(bounds([0., 0., 100., 100.]));
