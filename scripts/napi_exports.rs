@@ -16,10 +16,15 @@ pub fn link_args(source: &str, target: &str, release: bool) -> Vec<String> {
     args
 }
 
-pub fn export_symbols(source: &Path) {
-    println!("cargo:rerun-if-changed={}", source.display());
+// `folder` holds the Node-API source files.
+pub fn export_symbols(folder: &Path) {
+    println!("cargo:rerun-if-changed={}", folder.display());
+    let mut source = String::new();
+    for entry in fs::read_dir(folder).unwrap() {
+        source += &fs::read_to_string(entry.unwrap().path()).unwrap();
+    }
     for arg in link_args(
-        &fs::read_to_string(source).unwrap(),
+        &source,
         &env::var("CARGO_CFG_TARGET_OS").unwrap(),
         env::var("PROFILE").as_deref() == Ok("release"),
     ) {

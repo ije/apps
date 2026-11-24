@@ -127,7 +127,16 @@ pub fn build(root: &Path, entry: &Path, release: bool, target: BuildTarget) -> R
         cmd.args(["--target", &format!("{arch}-{os}")]);
     }
     let mut flags = crate::napi_exports::link_args(
-        include_str!("../../runtime/src/node/napi.rs"),
+        concat!(
+            include_str!("../../runtime/src/node/napi/mod.rs"),
+            include_str!("../../runtime/src/node/napi/buffers.rs"),
+            include_str!("../../runtime/src/node/napi/calls.rs"),
+            include_str!("../../runtime/src/node/napi/hooks.rs"),
+            include_str!("../../runtime/src/node/napi/objects.rs"),
+            include_str!("../../runtime/src/node/napi/scope.rs"),
+            include_str!("../../runtime/src/node/napi/values.rs"),
+            include_str!("../../runtime/src/node/napi/work.rs"),
+        ),
         target.platform,
         release,
     );
