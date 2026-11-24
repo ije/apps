@@ -552,14 +552,9 @@ impl Scene {
         }
     }
 
-    // `removed` lists the atlas tiles removed since the last paint, and returns true when all copies must stop.
-    pub(crate) fn begin_paint(
-        &mut self,
-        pass: u32,
-        removed: impl FnOnce(&mut Vec<(bool, u32, Rect<i32>)>) -> bool,
-    ) -> bool {
-        self.pass = Some(pass);
-        removed(&mut self.removed)
+    // `removed` lists the atlas tiles removed since the last paint.
+    pub(crate) fn begin_paint(&mut self, pass: u32, removed: Vec<(bool, u32, Rect<i32>)>) {
+        (self.pass, self.removed) = (Some(pass), removed);
     }
 
     /// Paint left out content, so a copy of it can't move.
