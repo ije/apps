@@ -1,5 +1,5 @@
 use crate::{Event, Rect, WindowId};
-use std::{cell::RefCell, time::Duration};
+use std::cell::RefCell;
 
 #[derive(Clone, Copy)]
 pub enum WindowEvent {
@@ -97,36 +97,6 @@ pub fn on_open_urls(mut f: impl FnMut(Vec<String>) + 'static) {
 
 pub fn on_quit(f: impl FnOnce() + 'static) {
     HANDLERS.with_borrow_mut(|handlers| handlers.quit = Some(Box::new(f)));
-}
-
-pub fn post(f: Box<dyn FnOnce() + Send>) {
-    super::native_post(f);
-}
-
-pub fn after(delay: Duration, f: impl FnOnce() + 'static) {
-    super::native_after(delay, f);
-}
-
-/// Builds the GPU device and pipelines on this thread, so the first window doesn't wait for them.
-pub fn prewarm() {
-    #[cfg(target_os = "macos")]
-    super::prewarm();
-}
-
-pub fn sync<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    super::native_sync(f)
-}
-
-pub fn before_exit() {
-    super::park_render();
-}
-
-pub fn activate(force: bool) {
-    super::Platform::activate(force);
-}
-
-pub fn quit() {
-    super::Platform::quit();
 }
 
 #[cfg(target_os = "macos")]

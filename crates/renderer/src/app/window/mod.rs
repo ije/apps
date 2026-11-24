@@ -1328,7 +1328,7 @@ impl Window {
     pub fn press_key(&mut self, key: Key, modifiers: Modifiers, app: &mut App) -> bool {
         let id = self.id;
         let blocked =
-            |event: Event| crate::native::sync(move || crate::native::key(id, &event, &|| false));
+            |event: Event| crate::sync_main(move || crate::native::key(id, &event, &|| false));
         let text = key.text.clone();
         let down = Event::KeyDown {
             key: key.clone(),

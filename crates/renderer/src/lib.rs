@@ -25,7 +25,8 @@ pub use gpu::scene::{Backdrop, BlendMode, Glass, PaintEffect, RenderImage};
 pub use input::*;
 pub use platform::{
     CARET_BLINK, Timer, WindowChange, WindowControl, WindowId, WindowOptions, WindowState,
-    control_size, native,
+    activate, before_exit, control_size, native, post_main, post_main_after, prewarm, quit,
+    sync_main,
 };
 pub use style::*;
 pub use text::{

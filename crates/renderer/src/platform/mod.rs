@@ -141,6 +141,38 @@ pub(crate) fn events() -> &'static dyn WindowEvents {
         .expect("the app sets its window events before it opens windows")
 }
 
+/// Runs `f` on the main thread, which owns the native windows.
+pub fn post_main(f: Box<dyn FnOnce() + Send>) {
+    native_post(f);
+}
+
+pub fn post_main_after(delay: Duration, f: impl FnOnce() + 'static) {
+    native_after(delay, f);
+}
+
+/// Runs `f` on the main thread and waits for its result.
+pub fn sync_main<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    native_sync(f)
+}
+
+/// Builds the GPU device and pipelines on this thread, so the first window doesn't wait for them.
+pub fn prewarm() {
+    #[cfg(target_os = "macos")]
+    macos::prewarm();
+}
+
+pub fn before_exit() {
+    park_render();
+}
+
+pub fn activate(force: bool) {
+    Platform::activate(force);
+}
+
+pub fn quit() {
+    Platform::quit();
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WindowId(pub u64);
 
