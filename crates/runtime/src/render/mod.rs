@@ -1,10 +1,8 @@
 mod background;
 mod control;
-pub(crate) mod cull;
 pub(crate) mod effects;
 mod element;
 pub mod fonts;
-pub(crate) mod grid;
 pub(crate) mod hit;
 mod hud;
 pub(crate) mod inline;
@@ -18,6 +16,7 @@ mod paint;
 mod plan;
 pub mod raster;
 pub(crate) mod scrollbar;
+mod spacer;
 pub(crate) mod terminal;
 pub(crate) mod text;
 
@@ -27,6 +26,7 @@ use crate::{host::Host, style};
 use element::{Build, element};
 pub(crate) use hud::Hud;
 pub(crate) use inspect::Inspect;
+use layout::cull;
 pub use page::PageState;
 use renderer::{App, Color, Event, Window, WindowId};
 use std::{
@@ -759,7 +759,7 @@ impl PageView {
                     pending.extend(dom.tree.shadows.get(&node));
                 }
             }
-            cull::reskip(&self.0, dom, &nodes);
+            spacer::reskip(&self.0, dom, &nodes);
         }
         let mut children: Vec<_> = styles
             .children
@@ -2700,7 +2700,7 @@ impl PageView {
                 )
                 .absolute()
             })
-            .children(autos.then(|| cull::autos(self.0.clone())))
+            .children(autos.then(|| spacer::autos(self.0.clone())))
             .children(page_bar.map(|look| scrollbar::Scrollbar {
                 id: 0,
                 handle: page_scroll.clone(),

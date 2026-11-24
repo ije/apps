@@ -1,3 +1,4 @@
+use super::measure::Measurements;
 use crate::css;
 use crate::css::properties::Prop;
 use crate::{
@@ -6,113 +7,6 @@ use crate::{
     style::{self, ComputedStyles},
 };
 use std::collections::HashMap;
-
-#[derive(Default)]
-pub(crate) struct Measurements {
-    // The last key field marks the column and row extents of a grid layout, which intrinsic sizes repeat.
-    #[allow(clippy::type_complexity)]
-    pub(crate) sizes: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>, bool), [f32; 4]>,
-    // The top and bottom margins of each measured box, as [positive, negative] after they collapse with the
-    // margins of children that they adjoin.
-    #[allow(clippy::type_complexity)]
-    pub(crate) margins: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), [[f32; 2]; 2]>,
-    // How far the first line of a text box reaches above its strut, by the keys of `sizes`.
-    #[allow(clippy::type_complexity)]
-    pub(crate) leads: rustc_hash::FxHashMap<(usize, Option<u32>, Option<u32>), f32>,
-    pub(crate) pixel_ratio: f32,
-    pub(crate) naturals: rustc_hash::FxHashMap<usize, [f32; 2]>,
-    pub(crate) texts:
-        rustc_hash::FxHashMap<usize, Option<std::rc::Rc<crate::render::inline::InlineText>>>,
-    // The text nodes in runs of more than one in flex and grid containers: `None` for a later node, which the
-    // first builds, and for the first, whether the run has text other than white space.
-    pub(crate) joined: rustc_hash::FxHashMap<usize, Option<bool>>,
-    // The containers whose runs this build noted.
-    pub(crate) noted: rustc_hash::FxHashSet<usize>,
-    // Use style-address keys only during grid layout, while styles outlive the map.
-    #[allow(clippy::type_complexity)]
-    pub(crate) edges:
-        Option<rustc_hash::FxHashMap<(*const css::properties::Style, u32), [[f32; 4]; 3]>>,
-    // The boxes with `content-visibility: auto`, true while they are near the view and show their contents.
-    pub(crate) shown: rustc_hash::FxHashMap<usize, bool>,
-    // For `contain-intrinsic-size: auto`: the last content size of a box that showed its contents, and whether it
-    // skipped them at its last build.
-    pub(crate) remembered: rustc_hash::FxHashMap<usize, (Option<[f32; 2]>, bool)>,
-    // Boxes that show their contents until the next frame, because a script reads the geometry of a node in them.
-    pub(crate) forced: rustc_hash::FxHashSet<usize>,
-    // Boxes that start or stop to skip their contents, which the next build builds again.
-    pub(crate) waking: Vec<usize>,
-}
-
-impl Measurements {
-    /// Keeps the measured sizes, margins and leads of the boxes that `keep` takes.
-    pub(crate) fn retain(&mut self, keep: impl Fn(usize) -> bool) {
-        self.sizes.retain(|&(id, ..), _| keep(id));
-        self.margins.retain(|&(id, ..), _| keep(id));
-        self.leads.retain(|&(id, ..), _| keep(id));
-    }
-
-    /// Like CSS, each run of text nodes in a flex or grid container is one anonymous item. Its first node builds it
-    /// with the text of all. `again` notes the runs of `children` also when this build noted them.
-    pub(crate) fn note_runs(
-        &mut self,
-        doc: &Document,
-        styles: &ComputedStyles,
-        container: usize,
-        children: &[usize],
-        again: bool,
-    ) {
-        if !self.noted.insert(container) && !again {
-            return;
-        }
-        let mut at = 0;
-        while at < children.len() {
-            if doc.nodes[children[at]].tag != "#text" {
-                at += 1;
-                continue;
-            }
-            let end = at
-                + children[at..]
-                    .iter()
-                    .take_while(|&&node| {
-                        matches!(doc.nodes[node].tag.as_str(), "#text" | "#comment")
-                    })
-                    .count();
-            let run: Vec<usize> = children[at..end]
-                .iter()
-                .copied()
-                .filter(|&node| doc.nodes[node].tag == "#text")
-                .collect();
-            if let [first, rest @ ..] = &run[..]
-                && !rest.is_empty()
-            {
-                let text = run
-                    .iter()
-                    .any(|&node| !doc.nodes[node].text.trim_ascii().is_empty());
-                self.joined.insert(*first, Some(text));
-                self.joined.extend(rest.iter().map(|&node| (node, None)));
-                self.texts.insert(
-                    *first,
-                    crate::render::inline::inline_text(doc, styles, *first, rest, &[], [true; 2])
-                        .map(std::rc::Rc::new),
-                );
-            } else {
-                self.joined.remove(&children[at]);
-            }
-            at = end;
-        }
-    }
-
-    /// Whether a text child of a flex or grid container makes an item: not for a later node of a run, and for
-    /// white space only with `preserve` or other text in its run.
-    pub(crate) fn text_item(&self, doc: &Document, child: usize, preserve: bool) -> bool {
-        let blank = doc.nodes[child].text.trim_ascii().is_empty();
-        match self.joined.get(&child) {
-            Some(None) => false,
-            Some(&Some(text)) => text || preserve || !blank,
-            None => preserve || !blank,
-        }
-    }
-}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Grid {
@@ -320,7 +214,7 @@ fn tracks(
     (list, names, fit.then_some((index, inner.len() * count)))
 }
 
-pub(super) fn placement(
+pub(crate) fn placement(
     start: &str,
     end: &str,
     names: &[(String, usize)],
@@ -684,7 +578,7 @@ fn size(
 // The renderer ceils each measured leaf to layout units, so sums of leaves must use the same widths.
 fn leaf_ceil(width: f32, pixel_ratio: f32) -> f32 {
     match pixel_ratio > 0. {
-        true => super::layout::size::layout_ceil(width, pixel_ratio),
+        true => super::size::layout_ceil(width, pixel_ratio),
         false => width,
     }
 }
@@ -756,7 +650,7 @@ pub(crate) fn intrinsic(
     let border_box = style
         .get(Prop::BOX_SIZING)
         .is_some_and(|v| v == "border-box");
-    let alt = super::layout::size::broken_image(node)
+    let alt = super::size::broken_image(node)
         .then(|| node.attrs.get("alt").filter(|alt| !alt.is_empty()))
         .flatten();
     let sizeless = alt.is_some()
@@ -817,9 +711,7 @@ pub(crate) fn intrinsic(
     let mut taken = [false; 2];
     let mut collapsed = None;
     let natural = (node.tag != "svg")
-        .then(|| {
-            super::layout::size::natural_size(doc, id, measured.naturals.get(&id).copied(), style)
-        })
+        .then(|| super::size::natural_size(doc, id, measured.naturals.get(&id).copied(), style))
         .flatten();
     let skipped = matches!(style.get(Prop::CONTENT_VISIBILITY), Some("hidden" | "auto"))
         && super::cull::skips(
@@ -841,7 +733,7 @@ pub(crate) fn intrinsic(
                     matches!(node.tag.as_str(), "img" | "video")
                         && style.get([Prop::WIDTH, Prop::HEIGHT][axis]).is_none()
                 })
-                .and_then(|v| super::layout::size::dimension(v, false))
+                .and_then(|v| super::size::dimension(v, false))
                 .map(|v| (v - if border_box { inner[axis] } else { 0. }).max(0.))
         });
         // Like layout, a video without a frame and with a CSS ratio has no natural size: it adds no width, and
@@ -866,7 +758,7 @@ pub(crate) fn intrinsic(
             [used[0], vertical[0]][axis].or_else(|| {
                 node.attrs
                     .get(["width", "height"][axis])
-                    .and_then(|v| super::layout::size::dimension(v, false))
+                    .and_then(|v| super::size::dimension(v, false))
             })
         });
         let ratio = node.attrs.get("viewBox").and_then(|view| {
@@ -889,8 +781,8 @@ pub(crate) fn intrinsic(
             _ => [width.unwrap_or(24.), height.unwrap_or(24.)],
         };
         content = [width, width, height];
-    } else if super::layout::size::text_field(node, style) {
-        let [width, height] = super::layout::size::field_size(
+    } else if super::size::text_field(node, style) {
+        let [width, height] = super::size::field_size(
             doc,
             id,
             style,
@@ -909,7 +801,7 @@ pub(crate) fn intrinsic(
             .and_then(|parts| parts[1].as_ref())
     {
         let [width, height] =
-            super::layout::size::file_size(style, button, units, text, measured.pixel_ratio);
+            super::size::file_size(style, button, units, text, measured.pixel_ratio);
         content = [width, width, height];
     } else if node.tag == "input"
         && let Some(kind) = Some(node.input_type()).filter(|value| {
@@ -937,7 +829,7 @@ pub(crate) fn intrinsic(
         let ceiled = leaf_ceil(width, measured.pixel_ratio);
         content = [ceiled, ceiled, units.font.lh];
         if node.native_control(style).is_some() {
-            let [padding, height] = super::layout::size::native_size(renderer::ControlKind::Button);
+            let [padding, height] = super::size::native_size(renderer::ControlKind::Button);
             let ceiled = leaf_ceil(width + padding, measured.pixel_ratio);
             content = [ceiled, ceiled, height];
         }
@@ -997,7 +889,7 @@ pub(crate) fn intrinsic(
                     .is_some_and(|v| v.contains('%'));
             runs[atom.run].inset[1] = renderer::px(if percent { used } else { max });
             // Like Chrome, a replaced box sits on the baseline, and other boxes on their last line.
-            let baseline = if super::layout::size::natural_size(
+            let baseline = if super::size::natural_size(
                 doc,
                 atom.node,
                 measured.naturals.get(&atom.node).copied(),
@@ -1087,7 +979,7 @@ pub(crate) fn intrinsic(
                 renderer::px(units.font.em),
                 renderer::px(units.font.lh),
             );
-            for (row, [above, below]) in super::layout::line::row_extents(
+            for (row, [above, below]) in super::line::row_extents(
                 &lines,
                 &runs,
                 &heights,
@@ -1440,7 +1332,7 @@ pub(crate) fn intrinsic(
                             doc,
                             styles,
                             child,
-                            super::layout::size::natural_size(
+                            super::size::natural_size(
                                 doc,
                                 child,
                                 measured.naturals.get(&child).copied(),
@@ -1587,7 +1479,7 @@ pub(crate) fn intrinsic(
                                 && [Prop::APPEARANCE, Prop::WEBKIT_APPEARANCE]
                                     .into_iter()
                                     .any(|prop| child_style.get(prop) == Some("none"))
-                            || super::layout::size::natural_size(
+                            || super::size::natural_size(
                                 doc,
                                 child,
                                 measured.naturals.get(&child).copied(),
@@ -1789,7 +1681,7 @@ pub(crate) fn intrinsic(
         .filter(|value| {
             !(value.contains("auto") && natural.is_some_and(|(_, ratio)| ratio.is_some()))
         })
-        .and_then(super::layout::size::aspect_ratio)
+        .and_then(super::size::aspect_ratio)
         .zip(available)
         .map(|(ratio, width)| {
             let height = if border_box {
@@ -1856,8 +1748,7 @@ fn first_baseline(
     };
     // Like Chrome, a replaced box sits on its bottom edge.
     if node.tag == "svg"
-        || super::layout::size::natural_size(doc, id, measured.naturals.get(&id).copied(), style)
-            .is_some()
+        || super::size::natural_size(doc, id, measured.naturals.get(&id).copied(), style).is_some()
     {
         return None;
     }
@@ -2039,8 +1930,7 @@ fn pseudo_size(
     {
         return None;
     }
-    let units =
-        super::layout::size::pseudo_lengths(&styles.lengths[id], style, pseudo, text, pixel_ratio);
+    let units = super::size::pseudo_lengths(&styles.lengths[id], style, pseudo, text, pixel_ratio);
     let [padding, margin] = [css::properties::PADDING, css::properties::MARGIN]
         .map(|edges| units.edges(pseudo, edges, base));
     let border = units.borders(pseudo, base);
@@ -2132,7 +2022,7 @@ fn pseudo_size(
 
 /// The width, height and baseline of an inline-level pseudo-element that is an atom of its element's text.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn pseudo_atom(
+pub(crate) fn pseudo_atom(
     doc: &Document,
     id: usize,
     index: usize,
@@ -2145,7 +2035,7 @@ pub(super) fn pseudo_atom(
     let [_, max, used, height] =
         pseudo_size(doc, id, index, styles, base, None, text, pixel_ratio)?;
     let pseudo = &styles.pseudos[&id][index];
-    let units = super::layout::size::pseudo_lengths(
+    let units = super::size::pseudo_lengths(
         &styles.lengths[id],
         &styles.values[id],
         pseudo,
@@ -2420,7 +2310,7 @@ pub(crate) fn layout(
         Default::default();
     let table = style::table_box(style::role(styles, id));
     let legend = (doc.nodes[id].tag == "fieldset")
-        .then(|| super::layout::size::legend(doc, styles, id))
+        .then(|| super::size::legend(doc, styles, id))
         .flatten()
         .map(|(legend, ..)| legend);
     let pseudos = styles.pseudos.get(&id).filter(|_| !table);
@@ -2433,7 +2323,7 @@ pub(crate) fn layout(
         let replaced = pseudo_item(child).is_none()
             && (doc.nodes[child].tag == "svg"
                 || doc.nodes[child].tag != "input"
-                    && super::layout::size::natural_size(
+                    && super::size::natural_size(
                         doc,
                         child,
                         measured.naturals.get(&child).copied(),

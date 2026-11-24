@@ -5,7 +5,7 @@ use super::layout::size::{
 use super::{
     ViewState,
     background::css_background,
-    cull,
+    layout::cull,
     paint::{DomBox, Turned},
     scrollbar,
     text::InlineText,
@@ -27,7 +27,7 @@ pub(super) struct Build<'a> {
     pub(super) view: &'a Rc<ViewState>,
     pub(super) ancestors: Rc<[usize]>,
     pub(super) flex_parent: bool,
-    pub(super) measured: &'a RefCell<super::grid::Measurements>,
+    pub(super) measured: &'a RefCell<super::layout::measure::Measurements>,
     pub(super) perspective: Option<(f32, String)>,
     pub(super) siblings: &'a RefCell<HashMap<usize, Rc<Siblings>>>,
     // The index of each child of a parent with a `<br>`.
@@ -149,7 +149,7 @@ pub(super) struct Patch {
     pub(super) ancestors: Rc<[usize]>,
     pub(super) containing: [f32; 2],
     pub(super) container: [f32; 2],
-    pub(super) slot: Option<([f32; 4], super::grid::Grid)>,
+    pub(super) slot: Option<([f32; 4], super::layout::grid::Grid)>,
     pub(super) flex_parent: bool,
     pub(super) columned: bool,
     pub(super) perspective: Option<(f32, String)>,
@@ -172,7 +172,7 @@ pub(super) struct Kept {
     containing: std::cell::Cell<[f32; 2]>,
     pub(super) culled: bool,
     // The cell of a grid item, so it can build in place.
-    slot: Option<([f32; 4], super::grid::Grid)>,
+    slot: Option<([f32; 4], super::layout::grid::Grid)>,
     #[cfg(debug_assertions)]
     pub(super) print: u64,
     // The print that the records around hold. It stays when the box builds in place.
@@ -1086,7 +1086,7 @@ pub(super) fn element(
     id: usize,
     containing: [f32; 2],
     container: [f32; 2],
-    slot: Option<([f32; 4], super::grid::Grid)>,
+    slot: Option<([f32; 4], super::layout::grid::Grid)>,
 ) -> Child {
     let info = build.info[id];
     let depth = build.ancestors.len();
@@ -1469,7 +1469,7 @@ fn check(
     id: usize,
     containing: [f32; 2],
     container: [f32; 2],
-    slot: Option<([f32; 4], super::grid::Grid)>,
+    slot: Option<([f32; 4], super::layout::grid::Grid)>,
     mark: usize,
     printed: usize,
 ) {
@@ -1556,7 +1556,7 @@ fn create(
     id: usize,
     containing: [f32; 2],
     container: [f32; 2],
-    slot: Option<([f32; 4], super::grid::Grid)>,
+    slot: Option<([f32; 4], super::layout::grid::Grid)>,
     pseudo: Option<usize>,
 ) -> Child {
     let reader = build;
@@ -2021,7 +2021,7 @@ fn create(
         (
             skips && !forced,
             forced,
-            skips.then(|| super::grid::intrinsic_size(style, &units, remembered)),
+            skips.then(|| super::layout::grid::intrinsic_size(style, &units, remembered)),
             // The last size is the size without the contents only if the last build skipped them.
             last.filter(|_| was),
         )
@@ -4188,7 +4188,7 @@ fn create(
                     && value == "fit-content"
                 {
                     // The grid's measure child gives the content sizes, and these bounds clamp a stretched width.
-                    let [min, max, ..] = super::grid::intrinsic(
+                    let [min, max, ..] = super::layout::grid::intrinsic(
                         doc,
                         id,
                         styles,
@@ -4213,7 +4213,7 @@ fn create(
                 } else if matches!(value, "fit-content" | "max-content" | "min-content")
                     && axis == 0
                 {
-                    let [min, max, ..] = super::grid::intrinsic(
+                    let [min, max, ..] = super::layout::grid::intrinsic(
                         doc,
                         id,
                         styles,
@@ -6744,7 +6744,7 @@ fn create(
             if atom.pseudo != 0 {
                 return pseudo();
             }
-            let [_, max, _, height] = super::grid::intrinsic(
+            let [_, max, _, height] = super::layout::grid::intrinsic(
                 doc,
                 atom.node,
                 styles,
@@ -6861,7 +6861,7 @@ fn create(
                     };
                 }
                 atom_slot(atom, child, containing[0], &|| {
-                    super::grid::pseudo_atom(
+                    super::layout::grid::pseudo_atom(
                         doc,
                         id,
                         usize::from(atom.pseudo - 1),
@@ -7191,7 +7191,7 @@ fn create(
             {
                 let extent =
                     padding[1] + padding[3] + borders[1] + borders[3] + margin[1] + margin[3];
-                let [min, max, ..] = super::grid::intrinsic(
+                let [min, max, ..] = super::layout::grid::intrinsic(
                     doc,
                     id,
                     styles,
@@ -7206,7 +7206,7 @@ fn create(
             let vertical = padding[0] + padding[2] + borders[0] + borders[2];
             let mut tracked = [None; 2];
             if shrunk {
-                let [min, max, ..] = super::grid::intrinsic(
+                let [min, max, ..] = super::layout::grid::intrinsic(
                     doc,
                     id,
                     styles,
@@ -7250,7 +7250,7 @@ fn create(
                 if matches!(style::role(styles, id), 1 | 2 | 10..=12)
                     && style.get(Prop::MIN_WIDTH).is_none()
                 {
-                    let [min, ..] = super::grid::intrinsic(
+                    let [min, ..] = super::layout::grid::intrinsic(
                         doc,
                         id,
                         styles,
@@ -7351,7 +7351,7 @@ fn create(
                 })
                 .map(|(_, _, _, grid)| grid.clone());
             Some(cached.unwrap_or_else(|| {
-                let grid = super::grid::layout(
+                let grid = super::layout::grid::layout(
                     doc,
                     id,
                     styles,
@@ -7497,7 +7497,7 @@ fn create(
             // Absolute grid items need an in-flow content-height box for flex basis and min-height: auto.
             // Previously stretched rows cannot provide it.
             if flexed {
-                let [.., height] = super::grid::intrinsic(
+                let [.., height] = super::layout::grid::intrinsic(
                     doc,
                     id,
                     styles,
@@ -7793,7 +7793,7 @@ fn create(
         if let (Some(grid), Some(zone)) = (&grid, &build.zone) {
             if let Some(dom) = view.host.borrow().page_state(view.id) {
                 for &(child, _, [x, y, width, height], _) in &grid.cells {
-                    if super::grid::pseudo_item(child).is_some() {
+                    if super::layout::grid::pseudo_item(child).is_some() {
                         continue;
                     }
                     let placed = dom
@@ -7835,7 +7835,7 @@ fn create(
                 culls.set(culls.get() + 1);
                 #[cfg(debug_assertions)]
                 culled_ids.extend(culled.iter().map(|&(child, _)| child));
-                el = el.child(cull::anchor(
+                el = el.child(super::spacer::anchor(
                     culled.clone(),
                     build.ancestors.clone(),
                     zone.clone(),
@@ -8149,7 +8149,7 @@ fn create(
                             place!(open, None);
                         }
                         place!(
-                            cull::spacer(
+                            super::spacer::spacer(
                                 run,
                                 build.ancestors.clone(),
                                 *then,
@@ -8201,7 +8201,7 @@ fn create(
                     });
                     Some((
                         bounds,
-                        super::grid::Grid {
+                        super::layout::grid::Grid {
                             columns: columns?,
                             rows: rows?,
                             gap: grid.gap,
@@ -8593,17 +8593,20 @@ fn create(
                                 };
                                 // Lines past the explicit grid are `auto`.
                                 let (line, span) =
-                                    super::grid::placement(start, end, &[], tracks.len());
+                                    super::layout::grid::placement(start, end, &[], tracks.len());
                                 let line = line.filter(|line| line + span <= tracks.len());
                                 let first = line.filter(|_| start != "auto").map(edge);
                                 let last = match (line, end) {
                                     (_, "auto") => None,
                                     (Some(line), _) => Some(edge(line + span) - gap),
-                                    (None, _) => {
-                                        super::grid::placement(end, "auto", &[], tracks.len())
-                                            .0
-                                            .map(|line| edge(line) - gap)
-                                    }
+                                    (None, _) => super::layout::grid::placement(
+                                        end,
+                                        "auto",
+                                        &[],
+                                        tracks.len(),
+                                    )
+                                    .0
+                                    .map(|line| edge(line) - gap),
                                 };
                                 if first.is_none() && last.is_none() {
                                     continue;
@@ -9098,7 +9101,7 @@ fn create(
         .filter(|_| id != 0 && !node.tag.starts_with('#') && slot.is_none());
     let mut el = match vertical {
         Some(mode) => {
-            let [_, widest, ..] = super::grid::intrinsic(
+            let [_, widest, ..] = super::layout::grid::intrinsic(
                 doc,
                 id,
                 styles,
@@ -9113,7 +9116,7 @@ fn create(
                 .map(|height| height + extra[1])
                 .unwrap_or_else(|| widest.min(units.viewport[1]))
                 .max(1.);
-            let block = super::grid::intrinsic(
+            let block = super::layout::grid::intrinsic(
                 doc,
                 id,
                 styles,

@@ -90,7 +90,7 @@ pub(crate) fn hit_test(
                 .cull
                 .info
                 .get(id)
-                .is_some_and(|info| info.flags & crate::render::cull::UNCULLABLE == 0)
+                .is_some_and(|info| info.flags & crate::render::layout::cull::UNCULLABLE == 0)
         {
             continue;
         }

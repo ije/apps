@@ -988,9 +988,9 @@ impl DomBox {
             *bottom = bottom.min(reach[0]);
             *top = top.max(reach[1]);
             if matches!(*plans, 1 | 2)
-                && flags & (super::cull::PLAIN_BLOCK | super::cull::UNCULLABLE)
-                    == super::cull::PLAIN_BLOCK
-                && (*plans == 1 || flags & super::cull::DEFINITE_SIZE == 0)
+                && flags & (super::layout::cull::PLAIN_BLOCK | super::layout::cull::UNCULLABLE)
+                    == super::layout::cull::PLAIN_BLOCK
+                && (*plans == 1 || flags & super::layout::cull::DEFINITE_SIZE == 0)
             {
                 *bottom = bottom.min(f32::from(window_bounds.bottom()));
                 *top = top.max(f32::from(window_bounds.top()));
