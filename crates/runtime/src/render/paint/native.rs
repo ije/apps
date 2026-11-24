@@ -18,32 +18,6 @@ impl Node {
             String::as_str,
         )
     }
-
-    /// The AppKit control of an input with `appearance: system`, on macOS.
-    pub(crate) fn native_control(&self, style: &css::properties::Style) -> Option<ControlKind> {
-        if style.get(Prop::APPEARANCE) != Some("system") {
-            return None;
-        }
-        self.system_control()
-    }
-
-    /// The AppKit control that `appearance: system` gives this element, on macOS.
-    pub(crate) fn system_control(&self) -> Option<ControlKind> {
-        if !cfg!(target_os = "macos") || self.tag != "input" {
-            return None;
-        }
-        Some(match self.input_type().to_ascii_lowercase().as_str() {
-            "button" | "submit" | "reset" => ControlKind::Button,
-            "checkbox" if self.attrs.contains_key("switch") => ControlKind::Switch,
-            "range" => ControlKind::Slider,
-            "number" => ControlKind::Stepper,
-            "text" | "email" | "url" | "tel" => ControlKind::Text,
-            "search" => ControlKind::Search,
-            "color" => ControlKind::Color,
-            "date" => ControlKind::Date,
-            _ => return None,
-        })
-    }
 }
 
 #[derive(Default)]

@@ -1,3 +1,5 @@
+mod fonts;
+
 use crate::css::properties::Prop;
 use crate::dom::{ABSENT, Document, Node};
 use crate::style;

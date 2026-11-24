@@ -719,7 +719,7 @@ impl PageView {
         let cached = dom.styles.computed.clone();
         let mut styles = dom.restyle(&mut doc, [width, height]);
         if cached.is_none_or(|cached| !std::rc::Rc::ptr_eq(&cached, &styles))
-            && fonts::load(&doc, dom, &state.app.assets).0
+            && dom.load_fonts(&doc, &state.app.assets).0
         {
             styles = dom.restyle(&mut doc, [width, height]);
         }

@@ -131,6 +131,35 @@ impl Node {
         self.attrs.get("type").map_or("text", String::as_str)
     }
 
+    /// The AppKit control of an input with `appearance: system`, on macOS.
+    pub(crate) fn native_control(
+        &self,
+        style: &crate::css::properties::Style,
+    ) -> Option<renderer::ControlKind> {
+        if style.get(crate::css::properties::Prop::APPEARANCE) != Some("system") {
+            return None;
+        }
+        self.system_control()
+    }
+
+    /// The AppKit control that `appearance: system` gives this element, on macOS.
+    pub(crate) fn system_control(&self) -> Option<renderer::ControlKind> {
+        if !cfg!(target_os = "macos") || self.tag != "input" {
+            return None;
+        }
+        Some(match self.input_type().to_ascii_lowercase().as_str() {
+            "button" | "submit" | "reset" => renderer::ControlKind::Button,
+            "checkbox" if self.attrs.contains_key("switch") => renderer::ControlKind::Switch,
+            "range" => renderer::ControlKind::Slider,
+            "number" => renderer::ControlKind::Stepper,
+            "text" | "email" | "url" | "tel" => renderer::ControlKind::Text,
+            "search" => renderer::ControlKind::Search,
+            "color" => renderer::ControlKind::Color,
+            "date" => renderer::ControlKind::Date,
+            _ => return None,
+        })
+    }
+
     pub(crate) fn content_editable(&self) -> Option<bool> {
         self.attrs
             .get("contenteditable")

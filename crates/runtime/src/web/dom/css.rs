@@ -979,12 +979,8 @@ pub(super) fn sheet(
 pub(super) fn font(args: &Value, state: &mut PageState) -> Result<Value> {
     let family = args[1].as_str().context("Expected font family")?;
     Ok(match args[2].as_str() {
-        Some(name) => json!(crate::render::fonts::local_font(state, family, name)),
-        None => json!(crate::render::fonts::add_font(
-            state,
-            family,
-            crate::web::bytes(&args[2])?
-        )?),
+        Some(name) => json!(state.local_font(family, name)),
+        None => json!(state.add_font(family, crate::web::bytes(&args[2])?)?),
     })
 }
 

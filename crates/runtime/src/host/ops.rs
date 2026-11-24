@@ -932,7 +932,7 @@ impl Host {
                     &mut page.doc,
                     *self.viewports.get(&id).unwrap_or(&[800., 600.]),
                 );
-                let loaded = crate::render::fonts::load(&page.doc, state, &self.app.assets);
+                let loaded = state.load_fonts(&page.doc, &self.app.assets);
                 page.dirty |= std::mem::take(&mut state.dirty);
                 return Ok(json!(loaded));
             }
