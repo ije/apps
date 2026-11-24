@@ -488,9 +488,10 @@ pub(super) fn node(
                 && !style::table_part(doc, &styles, id))
             .then(|| {
                 // The box parent, past `display: contents` boxes.
-                std::iter::successors(state.tree.flat_parent(doc, &styles, id), |&parent| {
-                    state.tree.flat_parent(doc, &styles, parent)
-                })
+                std::iter::successors(
+                    state.tree.flat_parent(doc, &styles.children, id),
+                    |&parent| state.tree.flat_parent(doc, &styles.children, parent),
+                )
                 .find(|&parent| styles.values[parent].get(Prop::DISPLAY) != Some("contents"))
             })
             .flatten()
@@ -585,8 +586,8 @@ pub(super) fn node(
                             && size.is_none()
                             && (style.get(Prop::DISPLAY) == Some("contents")
                                 || std::iter::successors(
-                                    state.tree.flat_parent(doc, &styles, id),
-                                    |&node| state.tree.flat_parent(doc, &styles, node),
+                                    state.tree.flat_parent(doc, &styles.children, id),
+                                    |&node| state.tree.flat_parent(doc, &styles.children, node),
                                 )
                                 .any(|node| {
                                     styles.values[node].get(Prop::DISPLAY) == Some("none")

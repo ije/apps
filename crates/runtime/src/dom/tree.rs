@@ -1,5 +1,4 @@
 use super::{Document, Node};
-use crate::style;
 
 #[derive(Default)]
 pub struct Tree {
@@ -215,16 +214,16 @@ impl Tree {
         len
     }
 
-    // The parent in the flat tree: the slot of a slotted node, or the host of a shadow root.
+    // The parent in the flat tree: the slot of a slotted node, or the host of a shadow root. `composed` has the
+    // children of the slots and hosts in the last style pass.
     pub(crate) fn flat_parent(
         &self,
         doc: &Document,
-        styles: &style::ComputedStyles,
+        composed: &rustc_hash::FxHashMap<usize, Vec<usize>>,
         id: usize,
     ) -> Option<usize> {
         match doc.nodes[id].parent {
-            Some(parent) if self.shadows.contains_key(&parent) => styles
-                .children
+            Some(parent) if self.shadows.contains_key(&parent) => composed
                 .iter()
                 .find_map(|(&slot, kids)| (slot != parent && kids.contains(&id)).then_some(slot)),
             Some(parent) => Some(parent),

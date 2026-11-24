@@ -260,9 +260,9 @@ impl Geometry {
     }
 
     // Sets the marks of the mirror that come from styles, once for each style pass `epoch`.
-    pub(crate) fn style_flags(
+    pub(crate) fn style_flags<'a>(
         &mut self,
-        computed: &crate::style::ComputedStyles,
+        styles: impl Iterator<Item = &'a Rc<crate::css::properties::Style>>,
         epoch: u64,
         flags: impl Fn(&crate::css::properties::Style) -> [bool; 3],
     ) {
@@ -271,7 +271,7 @@ impl Geometry {
         }
         self.layout_epoch = epoch;
         let mut known = rustc_hash::FxHashMap::default();
-        for (id, style) in computed.values.iter().enumerate() {
+        for (id, style) in styles.enumerate() {
             let bits = *known
                 .entry(Rc::as_ptr(style))
                 .or_insert_with(|| flags(style));

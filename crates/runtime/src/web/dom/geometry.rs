@@ -288,7 +288,7 @@ pub(super) fn node(
                         1
                     });
                 }
-                node = state.tree.flat_parent(doc, &computed, at);
+                node = state.tree.flat_parent(doc, &computed.children, at);
             }
             if args[1].as_bool() == Some(true) {
                 let measured = &mut state.layout.measurements;
@@ -309,7 +309,7 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut PageState, viewport: 
     let computed = state.restyle(doc, viewport);
     state
         .geometry
-        .style_flags(&computed, state.styles.epoch, |style| {
+        .style_flags(computed.values.iter(), state.styles.epoch, |style| {
             let clip = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
                 .into_iter()
                 .any(|prop| {

@@ -131,6 +131,10 @@ pub struct Node {
 }
 
 impl Node {
+    pub(crate) fn input_type(&self) -> &str {
+        self.attrs.get("type").map_or("text", String::as_str)
+    }
+
     pub(crate) fn content_editable(&self) -> Option<bool> {
         self.attrs
             .get("contenteditable")

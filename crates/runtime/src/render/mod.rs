@@ -632,7 +632,7 @@ impl PageView {
                                     terminal = Some((id, state.media.terminals.clone()));
                                 }
                                 chain.extend(state.geometry.scroll.get(&id).cloned());
-                                node = seen.as_ref().and_then(|computed| state.tree.flat_parent(&page.doc, computed, id));
+                                node = seen.as_ref().and_then(|computed| state.tree.flat_parent(&page.doc, &computed.children, id));
                             }
                             window.scroll_only(chain);
                         }
@@ -747,7 +747,7 @@ impl PageView {
             let mut nodes = rustc_hash::FxHashSet::default();
             for id in waking {
                 let path: Vec<_> = std::iter::successors(Some(id), |&node| {
-                    dom.tree.flat_parent(&doc, &styles, node)
+                    dom.tree.flat_parent(&doc, &styles.children, node)
                 })
                 .collect();
                 for node in path {
@@ -1127,7 +1127,7 @@ impl PageView {
             let mut node = Some(id).filter(|&id| id < doc.nodes.len());
             while let Some(id) = node {
                 kept.remove(&id);
-                node = dom.tree.flat_parent(&doc, &styles, id);
+                node = dom.tree.flat_parent(&doc, &styles.children, id);
             }
         }
         if self.focused.replace(dom.interaction.focus) != dom.interaction.focus
@@ -1137,7 +1137,7 @@ impl PageView {
             let mut node = Some(focus);
             while let Some(id) = node {
                 kept.remove(&id);
-                node = dom.tree.flat_parent(&doc, &styles, id);
+                node = dom.tree.flat_parent(&doc, &styles.children, id);
             }
         }
         if !same {
@@ -1900,9 +1900,9 @@ impl PageView {
             // Container units change the boxes in the resized containers, and the sizes of the boxes around them.
             let mut nodes = rustc_hash::FxHashSet::default();
             for &container in &dom.styles.cache.units {
-                let mut node = dom.tree.flat_parent(&doc, &styles, container);
+                let mut node = dom.tree.flat_parent(&doc, &styles.children, container);
                 while let Some(id) = node.filter(|&id| nodes.insert(id)) {
-                    node = dom.tree.flat_parent(&doc, &styles, id);
+                    node = dom.tree.flat_parent(&doc, &styles.children, id);
                 }
                 let mut pending = vec![container];
                 while let Some(id) = pending.pop() {
@@ -1935,14 +1935,14 @@ impl PageView {
                 while let Some(id) = node.filter(|&id| around.insert(id)) {
                     info[id].flags |= cull::GEOMETRY_CHANGED;
                     fresh.iter_mut().for_each(|fresh| fresh.push(id));
-                    node = dom.tree.flat_parent(&doc, &styles, id);
+                    node = dom.tree.flat_parent(&doc, &styles.children, id);
                 }
                 // Grid tracks leave out absolutely positioned items, so the grids above one keep their layout.
                 let mut node = Some(id);
                 while let Some(id) = node.filter(|&id| regridded.insert(id)) {
                     dom.layout.grids.remove(&id);
                     node = (info[id].flags & cull::OUT_OF_FLOW == 0)
-                        .then(|| dom.tree.flat_parent(&doc, &styles, id))
+                        .then(|| dom.tree.flat_parent(&doc, &styles.children, id))
                         .flatten();
                 }
                 stale = true;
@@ -2185,7 +2185,7 @@ impl PageView {
                 if let Some(info) = info.get_mut(id) {
                     info.flags |= cull::SHOWN;
                 }
-                node = dom.tree.flat_parent(&doc, &styles, id);
+                node = dom.tree.flat_parent(&doc, &styles.children, id);
             }
         }
         let autos = !dom.layout.autos.is_empty();

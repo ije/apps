@@ -8,10 +8,6 @@ use renderer::{ControlEvent, ControlKind, ControlSink, NativeControl, Pixels, Re
 use std::sync::{Arc, Mutex, PoisonError};
 
 impl Node {
-    pub(crate) fn input_type(&self) -> &str {
-        self.attrs.get("type").map_or("text", String::as_str)
-    }
-
     pub(crate) fn button_label(&self) -> &str {
         self.attrs.get("value").map_or(
             match self.input_type().to_ascii_lowercase().as_str() {
