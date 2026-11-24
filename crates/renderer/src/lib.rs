@@ -29,7 +29,7 @@ pub use platform::{
     control_size, native,
 };
 pub(crate) use scene::Scene;
-pub use scene::{Backdrop, BlendMode, BorderStyle, Glass, PaintEffect, RenderImage};
+pub use scene::{Backdrop, BlendMode, Glass, PaintEffect, RenderImage};
 pub use style::*;
 pub use text::{
     Decoration, DecorationStyle, Font, FontId, FontStyle, FontWeight, Glyph, GlyphId, Line,

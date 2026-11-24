@@ -1,9 +1,19 @@
 use crate::{
-    BorderStyle, Clip, Color, Edges, Pixels, Point, Radii, Rect, Size,
+    Clip, Color, Edges, Pixels, Point, Radii, Rect, Size,
     geometry::{snap_width, to_layout_unit},
     point, px, size,
     text::TextOverrides,
 };
+
+// The shader reads the style as its position in this list.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum BorderStyle {
+    #[default]
+    Solid,
+    Dashed,
+    Dotted,
+    Double,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Length {
