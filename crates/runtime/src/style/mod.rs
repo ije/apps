@@ -22,7 +22,7 @@ mod tailwind;
 mod tests;
 mod text;
 pub(crate) use chunked::Chunked;
-pub(crate) use page::{ShadowWalk, Styles};
+pub(crate) use page::{Page, ShadowWalk, Styles};
 
 pub(crate) use animation::{Animation, Motion, Scripted};
 pub(crate) use text::{

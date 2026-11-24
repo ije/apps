@@ -523,10 +523,6 @@ const MIRROR_FIXED: u8 = 32;
 const MIRROR_INERT: u8 = 64;
 // The box has a transform, or an ancestor has one that changes its size, so the bounds are not its layout box.
 const MIRROR_TRANSFORMED: u8 = 128;
-const HIDDEN: u8 = 1;
-const EDITABLE: u8 = 2;
-const INERT: u8 = 4;
-const OWN_INERT: u8 = 8;
 
 impl LayoutMirror {
     fn slot(&self, id: usize) -> *mut f32 {
@@ -536,6 +532,17 @@ impl LayoutMirror {
                 memory.0.as_ptr()
             })
             .wrapping_add(4 + id * 8)
+    }
+
+    pub(crate) fn mark_inert(&self, id: usize, inert: bool) {
+        unsafe {
+            let flags = self.flags(id);
+            *flags = (*flags & !MIRROR_INERT) | (u8::from(inert) * MIRROR_INERT);
+        }
+    }
+
+    pub(crate) fn inert(&self, id: usize) -> bool {
+        unsafe { *self.flags(id) & MIRROR_INERT != 0 }
     }
 
     fn flags(&self, id: usize) -> *mut u8 {
@@ -558,7 +565,7 @@ impl LayoutMirror {
         }
     }
 
-    fn reserve(&mut self, id: usize) {
+    pub(crate) fn reserve(&mut self, id: usize) {
         if id >= self.capacity {
             self.resize((id + 1).next_power_of_two().max(1024));
         }
@@ -1125,10 +1132,7 @@ impl State {
     // Keep inertness outside ComputedStyles.user_select: modal changes have no revision to invalidate kept
     // boxes.
     pub(crate) fn inert(&self, id: usize) -> bool {
-        self.styles
-            .select_marks
-            .get(id)
-            .is_some_and(|marks| marks & INERT != 0)
+        self.styles.inert(id)
     }
 
     // The styles of the last frame, also after a change that asks the next frame for new ones.
@@ -1195,7 +1199,7 @@ impl State {
     }
 }
 
-fn slots(
+pub(crate) fn slots(
     doc: &Document,
     roots: impl IntoIterator<Item = (usize, usize)>,
 ) -> rustc_hash::FxHashMap<usize, Vec<usize>> {
@@ -4732,412 +4736,31 @@ pub(crate) fn styles(
     state: &mut State,
     viewport: [f32; 2],
 ) -> Rc<style::ComputedStyles> {
-    let text_system = state.text_system.clone();
-    let (system, scale) = (
-        text_system.as_deref(),
-        text_system.is_some().then_some(state.pixel_ratio),
-    );
-    let theme = state.theme();
-    let reduced_motion = theme & 32 != 0;
-    let key = (viewport, scale, reduced_motion, theme);
-    let animated = std::mem::take(&mut state.styles.animated);
-    let animating = !animated.is_empty();
-    // Resize observers read content boxes, which these values change without a new border box.
-    if animated.values().any(|style| {
-        !style.vars().is_empty()
-            || style.own().any(|(prop, _)| {
-                let name = prop.name();
-                ["padding", "border", "overflow", "scrollbar"]
-                    .iter()
-                    .any(|start| name.starts_with(start))
-                    || matches!(name, "display" | "font-size" | "zoom" | "box-sizing")
-            })
-    }) {
-        state.bounds.restyled();
-    }
-    if !animating
-        && state.styles.key == key
-        && let Some(computed) = &state.styles.computed
-        && computed.values.len() == doc.nodes.len()
+    let scale = state.text_system.is_some().then_some(state.pixel_ratio);
+    let pending = match state
+        .styles
+        .begin(doc, viewport, state.theme(), scale, &mut state.bounds)
     {
-        return computed.clone();
-    }
+        Ok(kept) => return kept,
+        Err(pending) => pending,
+    };
     state.drop_removed(doc);
-    if state.styles.shadow_walk.tree != doc.nodes.tree()
-        || state.styles.shadow_walk.count != state.shadows.len()
-    {
-        let slots = slots(doc, state.shadows.iter().map(|(&host, &root)| (host, root)));
-        let assigned: rustc_hash::FxHashSet<usize> = slots.values().flatten().copied().collect();
-        let mut composed = rustc_hash::FxHashMap::default();
-        for (&host, &root) in &state.shadows {
-            composed.insert(
-                host,
-                std::iter::once(root)
-                    .chain(
-                        doc.nodes[host]
-                            .children
-                            .iter()
-                            .copied()
-                            .filter(|child| !assigned.contains(child)),
-                    )
-                    .collect(),
-            );
-        }
-        for (&slot, nodes) in &slots {
-            if !nodes.is_empty() {
-                composed.insert(
-                    slot,
-                    nodes
-                        .iter()
-                        .chain(&doc.nodes[slot].children)
-                        .copied()
-                        .collect(),
-                );
-            }
-        }
-        let old = &state.styles.shadow_walk.shadows.hosts;
-        let hosts = if old.len() == state.hosts.len()
-            && state
-                .hosts
-                .iter()
-                .all(|(root, host)| old.get(root) == Some(host))
-        {
-            old.clone()
-        } else {
-            Rc::new(
-                state
-                    .hosts
-                    .iter()
-                    .map(|(&root, &host)| (root, host))
-                    .collect(),
-            )
-        };
-        state.styles.shadow_walk = Rc::new(style::ShadowWalk {
-            tree: doc.nodes.tree(),
-            count: state.shadows.len(),
-            slots,
-            shadows: Rc::new(style::Shadows {
-                roots: state.shadows.clone(),
-                hosts,
-                composed,
-            }),
-        });
-    }
-    let shadow_walk = state.styles.shadow_walk.clone();
-    let context = style::StyleContext {
-        shadows: shadow_walk.shadows.clone(),
-        reduced_motion,
-        theme,
-        scale: scale.unwrap_or(1.),
-        aliases: state.font_aliases.clone(),
-        animated,
-        inserted: state
-            .styles
-            .inserted
-            .iter()
-            .map(|(_, sheet, user)| (sheet.clone(), *user))
-            .collect(),
-        previous: state
-            .styles
-            .computed
-            .clone()
-            .or_else(|| state.styles.previous.take()),
-        top_layer: !state.top_layer.is_empty(),
-    };
-    let mut result = style::compute_styles(
+    state.styles.update(
         doc,
-        viewport[0],
-        viewport[1],
-        system,
-        &mut state.styles.sheets,
-        &mut state.styles.cache,
-        Some(&context),
-    );
-    state.styles.cache.finish();
-    state
-        .styles
-        .sheets
-        .retain(|text, _| Rc::strong_count(text) > 1);
-    for (&host, &root) in &state.shadows {
-        result
-            .children
-            .insert(host, doc.nodes[root].children.clone());
-    }
-    for (&slot, assigned) in &shadow_walk.slots {
-        if !assigned.is_empty() {
-            result.children.insert(slot, assigned.clone());
-        }
-    }
-    let serial = state.styles.walk.serial;
-    let mut relisted = false;
-    if state
-        .styles
-        .walk
-        .update(doc, &result.children, state.styles.cache.document_walk())
-    {
-        let inert = |id: usize| doc.nodes[id].attrs.contains_key("inert");
-        let editable = |id: usize| {
-            let node = &doc.nodes[id];
-            matches!(node.tag.as_str(), "input" | "textarea")
-                || node.content_editable() == Some(true)
-        };
-        // The marks of the last pass tell which nodes the lists hold.
-        let kept = state.styles.walk.since(serial).is_some_and(|touched| {
-            touched.iter().all(|&id| {
-                let id = id as usize;
-                state
-                    .styles
-                    .select_marks
-                    .get(id)
-                    .is_none_or(|marks| marks & (EDITABLE | OWN_INERT) == 0)
-                    && !(state.styles.walk.contains(id) && (inert(id) || editable(id)))
-            })
-        });
-        if !kept || cfg!(debug_assertions) {
-            let nodes = state.styles.walk.nodes.iter();
-            let nodes = nodes.map(|&(id, _)| id as usize);
-            let lists = (
-                nodes.clone().filter(|&id| editable(id)).collect::<Vec<_>>(),
-                nodes.filter(|&id| inert(id)).collect::<Vec<_>>(),
-            );
-            relisted = (&lists.0, &lists.1) != (&state.styles.editable, &state.styles.inert);
-            assert!(!kept || !relisted, "kept editable and inert lists differ");
-            (state.styles.editable, state.styles.inert) = lists;
-        }
-    }
-    let subject = [MODAL, FULLSCREEN].into_iter().find_map(|bit| {
-        state
-            .top_layer
-            .iter()
-            .rev()
-            .copied()
-            .find(|&id| doc.nodes.get(id).is_some_and(|node| node.state & bit != 0))
-    });
-    let walk = &state.styles.walk;
-    // A node takes its marks and selection mode from its parent. Returns whether they changed.
-    let settle = |marks: &mut [u8],
-                  select: &mut style::Chunked<(style::UserSelect, usize)>,
-                  id: usize,
-                  parent: u32| {
-        let (inherited, hidden, inert) = match parent {
-            u32::MAX => ((style::UserSelect::Text, 0), false, false),
-            parent => (
-                select[parent as usize],
-                marks[parent as usize] & HIDDEN != 0,
-                Some(id) != subject
-                    && (parent == 0 && subject.is_some() || marks[parent as usize] & INERT != 0),
-            ),
-        };
-        let flags = result.flags[id];
-        let hidden = hidden || flags & style::DISPLAY_NONE != 0;
-        let inert = inert || marks[id] & OWN_INERT != 0;
-        let own = marks[id] & (EDITABLE | OWN_INERT);
-        let mode = if hidden || flags & style::INVISIBLE != 0 {
-            style::UserSelect::None
-        } else if own & EDITABLE != 0 {
-            style::UserSelect::Text
-        } else if flags & style::SELECT_NONE != 0 {
-            style::UserSelect::None
-        } else if flags & style::SELECT_ALL != 0 {
-            style::UserSelect::All
-        } else if flags & style::SELECT_TEXT != 0 {
-            style::UserSelect::Text
-        } else {
-            inherited.0
-        };
-        let new = (
-            own | (u8::from(hidden) * HIDDEN) | (u8::from(inert) * INERT),
-            (mode, if mode == inherited.0 { inherited.1 } else { id }),
-        );
-        let changed = (marks[id], select[id]) != new;
-        if changed {
-            (marks[id], select[id]) = new;
-        }
-        changed
-    };
-    let all = |marks: &mut Vec<u8>, select: &mut style::Chunked<(style::UserSelect, usize)>| {
-        marks.clear();
-        marks.resize(doc.nodes.len(), 0);
-        for &id in &state.styles.editable {
-            marks[id] = EDITABLE;
-        }
-        for &id in &state.styles.inert {
-            marks[id] |= OWN_INERT;
-        }
-        for &(id, parent) in walk.nodes.iter() {
-            settle(marks, select, id as usize, parent);
-        }
-    };
-    // The last pass gives the marks when it had the same lists, modal subject and, but for a patch, walk.
-    // Then only nodes with other style flags or another place can change, and the nodes below them.
-    let base = context.previous.as_deref().filter(|previous| {
-        state.styles.select_base.0 == std::ptr::from_ref(*previous) as usize
-            && state.styles.select_base.1 == subject
-            && !relisted
-            && state.styles.select_marks.len() <= doc.nodes.len()
-    });
-    let touched = base.and_then(|_| match state.styles.select_base.2 == walk.serial {
-        true => Some(&[][..]),
-        false => walk.since(state.styles.select_base.2),
-    });
-    let mut marks = std::mem::take(&mut state.styles.select_marks);
-    let mut select = std::mem::take(&mut result.user_select);
-    state.bounds.reserve(doc.nodes.len().saturating_sub(1));
-    // `visibility: hidden` also takes focus away, as in browsers.
-    let unfocusable = |id: usize, marks: u8| {
-        marks & (HIDDEN | INERT) != 0 || result.flags[id] & style::INVISIBLE != 0
-    };
-    let mirror = |bounds: &LayoutMirror, id: usize, marks: u8| unsafe {
-        let mirror = bounds.flags(id);
-        *mirror = (*mirror & !MIRROR_INERT) | (u8::from(unfocusable(id, marks)) * MIRROR_INERT);
-    };
-    let mut contents = None;
-    match (base, touched) {
-        (Some(previous), Some(touched)) => {
-            select.clone_from(&previous.user_select);
-            select.resize(doc.nodes.len(), (style::UserSelect::None, 0));
-            marks.resize(doc.nodes.len(), 0);
-            let mut places = Vec::new();
-            for id in result.flags.differing(&previous.flags).flatten() {
-                if previous.flags.get(id) != Some(&result.flags[id])
-                    && let Some(at) = walk.place(id)
-                {
-                    places.push(at as usize);
-                }
-            }
-            for &id in touched {
-                match walk.place(id as usize) {
-                    Some(at) => places.push(at as usize),
-                    None => {
-                        marks[id as usize] = 0;
-                        select[id as usize] = (style::UserSelect::None, 0);
-                    }
-                }
-            }
-            places.sort_unstable();
-            let mut flattened = state.styles.select_base.3;
-            let (mut next, mut scan) = (0, 0);
-            let mut places = places.into_iter();
-            loop {
-                if next >= scan {
-                    match places.find(|&at| at >= next) {
-                        Some(at) => next = at,
-                        None => break,
-                    }
-                }
-                let (id, parent) = walk.nodes[next];
-                if settle(&mut marks, &mut select, id as usize, parent) {
-                    scan = scan.max(next + walk.span(id as usize));
-                }
-                mirror(&state.bounds, id as usize, marks[id as usize]);
-                flattened |= result.flags[id as usize] & style::DISPLAY_CONTENTS != 0;
-                next += 1;
-            }
-            // A node that stops to pass its children on needs the scan below, like every pass after one.
-            contents = Some(flattened);
-            #[cfg(debug_assertions)]
-            {
-                let (mut full, mut modes) = (Vec::new(), select.clone());
-                all(&mut full, &mut modes);
-                assert!(
-                    full == marks && modes == select,
-                    "kept selection marks differ"
-                );
-            }
-        }
-        _ => {
-            select.clear();
-            select.resize(doc.nodes.len(), (style::UserSelect::None, 0));
-            all(&mut marks, &mut select);
-            for &(id, _) in walk.nodes.iter() {
-                mirror(&state.bounds, id as usize, marks[id as usize]);
-            }
-        }
-    }
-    #[cfg(debug_assertions)]
-    for &(id, _) in walk.nodes.iter() {
-        let shown = !unfocusable(id as usize, marks[id as usize]);
-        let mirrored = unsafe { *state.bounds.flags(id as usize) } & MIRROR_INERT == 0;
-        assert!(shown == mirrored, "kept inert mirror differs");
-    }
-    let mut flatten = contents.unwrap_or_else(|| {
-        let mut nodes = walk.nodes.iter();
-        nodes.any(|&(id, _)| result.flags[id as usize] & style::DISPLAY_CONTENTS != 0)
-    });
-    #[cfg(debug_assertions)]
-    {
-        let mut nodes = walk.nodes.iter();
-        let any = nodes.any(|&(id, _)| result.flags[id as usize] & style::DISPLAY_CONTENTS != 0);
-        assert!(flatten || !any, "kept display contents scan differs");
-    }
-    (state.styles.select_marks, result.user_select) = (marks, select);
-    let serial = walk.serial;
-    if flatten {
-        let contents = |child: usize| result.flags[child] & style::DISPLAY_CONTENTS != 0;
-        let mut parents = vec![false; doc.nodes.len()];
-        flatten = false;
-        for &(id, parent) in state.styles.walk.nodes.iter() {
-            if contents(id as usize) {
-                flatten = true;
-                if parent != u32::MAX {
-                    parents[parent as usize] = true;
-                }
-            }
-        }
-        for &(id, _) in state.styles.walk.nodes.iter().rev() {
-            let id = id as usize;
-            if parents[id] {
-                let children = result.children.get(&id).unwrap_or(&doc.nodes[id].children);
-                let mut flattened = Vec::new();
-                for &child in children {
-                    if contents(child) {
-                        flattened.extend(
-                            result
-                                .children
-                                .get(&child)
-                                .unwrap_or(&doc.nodes[child].children),
-                        );
-                    } else {
-                        flattened.push(child);
-                    }
-                }
-                result.children.insert(id, flattened);
-            }
-        }
-    }
-    if let Some(previous) = &context.previous {
-        for range in result.values.differing(&previous.values) {
-            for id in range {
-                let new = &result.values[id];
-                if previous.values.get(id).is_some_and(|old| {
-                    !Rc::ptr_eq(old, new) && old.differs_in(new, &ANCHORING_PROPS)
-                }) && state.styles.unanchored.len() < 4096
-                {
-                    state.styles.unanchored.push(id);
-                }
-            }
-        }
-    }
-    if animating {
-        let result = Rc::new(result);
-        state.styles.select_base = (Rc::as_ptr(&result) as usize, subject, serial, flatten);
-        return result;
-    }
-    state.styles.animating.clear();
-    state.styles.animating_pseudos.clear();
-    state.styles.epoch += 1;
-    state.bounds.restyled();
-    state.styles.key = key;
-    let result = Rc::new(result);
-    state.styles.select_base = (Rc::as_ptr(&result) as usize, subject, serial, flatten);
-    state.styles.linted = false;
-    state.styles.computed = Some(result.clone());
-    state.styles.previous = None;
-    result
+        pending,
+        style::Page {
+            shadows: &state.shadows,
+            hosts: &state.hosts,
+            top_layer: &state.top_layer,
+            font_aliases: &state.font_aliases,
+            text_system: state.text_system.as_deref(),
+            bounds: &mut state.bounds,
+        },
+    )
 }
 
 // Like Chrome, a change of these properties of the scroll anchor or a box around it keeps the scroll offset.
-const ANCHORING_PROPS: css::PropSet = css::PropSet::new(&[
+pub(crate) const ANCHORING_PROPS: css::PropSet = css::PropSet::new(&[
     Prop::POSITION,
     Prop::TOP,
     Prop::RIGHT,
