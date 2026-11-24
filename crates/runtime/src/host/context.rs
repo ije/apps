@@ -16,7 +16,6 @@ pub(super) struct Binding {
     pub(super) role: Role,
     pub(super) sqlite: RefCell<crate::node::sqlite::State>,
     pub(super) web: RefCell<crate::web::State>,
-    pub(super) workers: RefCell<super::worker::State>,
     pub(super) ffi: crate::node::ffi::State,
     pub(super) node: RefCell<crate::node::State>,
     pub(super) inspector: std::cell::Cell<Ptr>,
@@ -350,15 +349,14 @@ pub struct JsContext {
 }
 
 impl JsContext {
-    pub fn new(api: Rc<JavaScriptCore>, host: Rc<RefCell<Host>>, role: Role) -> Result<Self> {
-        Self::new_interruptible(api, host, role, None)
-    }
-
-    pub fn new_interruptible(
+    // A context whose host calls go to `router`, and whose workers run with `run_worker`.
+    pub(super) fn create(
         api: Rc<JavaScriptCore>,
         host: Rc<RefCell<Host>>,
         role: Role,
         interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        router: Callback,
+        run_worker: crate::web::worker::Run,
     ) -> Result<Self> {
         let devtools = !host.borrow().app.packaged;
         let ctx = unsafe { (api.create)(api.group, ptr::null_mut()) };
@@ -377,8 +375,8 @@ impl JsContext {
             web: RefCell::new(crate::web::State::new(
                 matches!(role, Role::Renderer(_)),
                 host.borrow().app.assets.clone(),
+                run_worker,
             )),
-            workers: RefCell::new(super::worker::State::new(&host.borrow().app)),
             ffi: Default::default(),
             node: RefCell::default(),
             inspector: std::cell::Cell::new(ptr::null_mut()),
@@ -466,7 +464,7 @@ impl JsContext {
             ],
         );
         let natives = [
-            ("__appsNative", super::ops::call as Callback),
+            ("__appsNative", router),
             ("__appsNow", now),
             ("__appsLoadAddon", crate::node::napi::load),
             ("__appsFFINative", ffi_call),
@@ -788,7 +786,6 @@ impl JsContext {
                     .web
                     .borrow_mut()
                     .configure_storage(&host.app, window);
-                binding.workers.borrow_mut().configure(&host.app);
             }
             Ok(())
         })

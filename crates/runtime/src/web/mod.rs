@@ -7,6 +7,7 @@ pub(crate) mod storage;
 pub(crate) mod tcp;
 pub mod terminal;
 pub(crate) mod websocket;
+pub(crate) mod worker;
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -374,6 +375,7 @@ pub struct State {
     assets: std::sync::Arc<HashMap<String, std::path::PathBuf>>,
     tcp: crate::web::tcp::State,
     storage: crate::web::storage::State,
+    workers: crate::web::worker::State,
     next_id: u64,
     fetches: HashMap<u64, Fetch>,
     agent: Option<Agent>,
@@ -416,9 +418,11 @@ impl State {
     pub(crate) fn new(
         renderer: bool,
         assets: std::sync::Arc<HashMap<String, std::path::PathBuf>>,
+        run_worker: crate::web::worker::Run,
     ) -> Self {
         Self {
             renderer,
+            workers: crate::web::worker::State::new(run_worker),
             assets,
             ..Self::default()
         }
@@ -427,6 +431,7 @@ impl State {
     pub fn configure_storage(&mut self, app: &crate::bundle::AppInfo, window: Option<u64>) {
         let namespace = app.name.as_deref().unwrap_or("apps");
         self.storage.configure(namespace, window);
+        self.workers.configure(app);
     }
     pub fn call(&mut self, op: &str, args: &mut Value) -> Result<Value> {
         match op {
@@ -651,6 +656,7 @@ impl State {
                 Some(("serve", op)) => self.servers.call(op, args, &mut self.sockets),
                 Some(("socket", op)) => self.sockets.call(op, args, self.renderer),
                 Some(("crypto", op)) => crate::web::crypto::call(op, args),
+                Some(("worker", op)) => self.workers.call(op, args),
                 Some(("tcp", op)) => self.tcp.call(op, args),
                 Some(("storage", op)) => self.storage.call(op, args),
                 _ => bail!("Unknown web operation: {op}"),

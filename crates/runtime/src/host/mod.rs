@@ -5,6 +5,7 @@ pub(crate) mod window;
 pub(crate) mod worker;
 
 use crate::dom::{Document, Node};
+use crate::jsc::{JavaScriptCore, Role};
 use anyhow::{Context, Result, bail, ensure};
 pub use context::JsContext;
 pub(crate) use context::{
@@ -13,7 +14,7 @@ pub(crate) use context::{
 };
 use link::Target;
 use serde_json::{Value, json};
-use std::{collections::HashMap, path::PathBuf};
+use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
 
 pub(crate) const WORKER_PAGE: u64 = 0;
 
@@ -552,5 +553,22 @@ impl Host {
         } else {
             json!(errors)
         })
+    }
+}
+
+// The contexts of the app put together: their host calls go to the router, and their workers run in contexts
+// of their own.
+impl JsContext {
+    pub fn new(api: Rc<JavaScriptCore>, host: Rc<RefCell<Host>>, role: Role) -> Result<Self> {
+        Self::new_interruptible(api, host, role, None)
+    }
+
+    pub fn new_interruptible(
+        api: Rc<JavaScriptCore>,
+        host: Rc<RefCell<Host>>,
+        role: Role,
+        interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Self> {
+        Self::create(api, host, role, interrupt, ops::call, worker::run)
     }
 }

@@ -337,7 +337,6 @@ pub(super) fn dispatch(
         role,
         sqlite,
         web,
-        workers,
         node,
         ..
     } = binding;
@@ -538,16 +537,9 @@ pub(super) fn dispatch(
             !matches!(role, Role::Renderer(_)) || op != "worker.start" || values[1] == false,
             "Page workers cannot request native APIs"
         );
-        match op.strip_prefix("worker.") {
-            Some(op) => workers
-                .try_borrow_mut()
-                .context("Web is busy")?
-                .call(op, &mut args),
-            None => web
-                .try_borrow_mut()
-                .context("Web is busy")?
-                .call(op, &mut args),
-        }
+        web.try_borrow_mut()
+            .context("Web is busy")?
+            .call(op, &mut args)
     } else if op.starts_with("sqlite.") {
         sqlite
             .try_borrow_mut()
@@ -1062,7 +1054,7 @@ impl Host {
             }
             "process.exit" => {
                 let code = args[0].as_f64().unwrap_or(0.) as i32;
-                if super::worker::exit(code) {
+                if crate::web::worker::exit(code) {
                     return Ok(Value::Null);
                 }
                 ensure!(
@@ -1182,7 +1174,7 @@ impl Host {
             "chdir" => {
                 // The cwd belongs to the whole process, and preloads and workers are threads in it.
                 ensure!(
-                    matches!(role, Role::Main) && !super::worker::in_worker(),
+                    matches!(role, Role::Main) && !crate::web::worker::in_worker(),
                     "process.chdir() is only available in the main process"
                 );
                 let mut cwd = CWD.lock().unwrap_or_else(|error| error.into_inner());
