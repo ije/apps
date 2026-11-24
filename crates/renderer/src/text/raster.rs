@@ -1,4 +1,4 @@
-use super::{FontId, Fonts, GlyphId, GlyphPixels, GlyphRaster};
+use super::{FontId, Fonts, GlyphId, GlyphRaster, Raster};
 use crate::{Color, Pixels, Point, Rect, Size};
 use anyhow::Result;
 
@@ -30,7 +30,7 @@ impl Fonts {
     }
 
     /// A glyph larger than `max` rasters at a smaller scale, and `shown` is the place it stretches back to.
-    pub(crate) fn raster(&self, raster: &GlyphRaster, max: i32) -> Result<Option<GlyphPixels>> {
+    pub(crate) fn raster(&self, raster: &GlyphRaster, max: i32) -> Result<Option<Raster<Vec<u8>>>> {
         let full = self.backend.raster_bounds(raster)?;
         let stretch = full.size.width.max(full.size.height) as f32 / max as f32;
         let (raster, bounds) = if stretch > 1. {
@@ -114,7 +114,7 @@ mod tests {
         };
         let full = text.backend.raster_bounds(&raster).unwrap();
         assert!(full.size.width > 16384);
-        let max = 2048;
+        let max = crate::text::MAX_GLYPH_SIDE;
         let (shown, size, bytes) = text.raster(&raster, max).unwrap().unwrap();
         assert!(size.width.max(size.height) <= max + 4);
         assert_eq!(bytes.len(), (size.width * size.height) as usize);

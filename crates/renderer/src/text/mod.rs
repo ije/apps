@@ -11,7 +11,7 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
-mod windows;
+pub(crate) mod windows;
 #[cfg(target_os = "linux")]
 use linux as sys;
 #[cfg(target_os = "macos")]
@@ -143,8 +143,11 @@ impl Hash for GlyphRaster {
     }
 }
 
-// The place a glyph raster shows at, its size, and its bytes.
-pub(crate) type GlyphPixels = (Rect<i32>, Size<i32>, Vec<u8>);
+// The place a raster shows at, its size, and its bytes.
+pub(crate) type Raster<B> = (Rect<i32>, Size<i32>, B);
+
+// Larger glyphs raster at a smaller scale.
+pub(crate) const MAX_GLYPH_SIDE: i32 = 2048;
 
 /// In em units. `descent` is negative.
 #[derive(Clone, Copy)]

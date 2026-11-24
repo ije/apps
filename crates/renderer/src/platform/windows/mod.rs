@@ -9,6 +9,7 @@ mod keys;
 mod window;
 
 use super::single::Task;
+use crate::text::windows::{extent, setting};
 use crate::{Cursor, Rect, WindowOptions, platform::Callbacks, point, px, size};
 use anyhow::Result;
 use rustc_hash::FxHashMap;
@@ -130,19 +131,6 @@ fn fire(id: usize) {
     if let Some(f) = TIMERS.with_borrow_mut(|timers| timers.waiting.remove(&id)) {
         f();
     }
-}
-
-fn setting<T>(action: SYSTEM_PARAMETERS_INFO_ACTION, value: &mut T) -> bool {
-    // SAFETY: callers pass the type that the action fills, and its size.
-    unsafe {
-        SystemParametersInfoW(
-            action,
-            size_of_val(value) as u32,
-            Some((value as *mut T).cast()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
-        )
-    }
-    .is_ok()
 }
 
 pub(crate) struct Platform;
@@ -348,15 +336,6 @@ fn points(rect: RECT, scale: f32) -> Rect {
         px((rect.bottom - rect.top) as f32),
     );
     Rect::new(corner, extent) / scale
-}
-
-fn extent(rect: RECT) -> [i32; 4] {
-    [
-        rect.left,
-        rect.top,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-    ]
 }
 
 // Windows that want frames. A pacing thread waits for each composition of the desktop and then invalidates

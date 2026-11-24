@@ -1,4 +1,7 @@
-use crate::{Rect, Size, text::GlyphRaster};
+use crate::{
+    Rect, Size,
+    text::{GlyphRaster, Raster},
+};
 use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
@@ -7,7 +10,6 @@ use std::{
 };
 
 const MAX_GLYPH_PIXELS: usize = 4 << 20;
-pub(crate) const MAX_GLYPH_SIDE: i32 = 2048;
 const MAX_AGE: u32 = 60;
 // Keep retired tiles until in-flight frames finish. Increase this delay if a window uses more than 3
 // drawables.
@@ -81,8 +83,6 @@ pub(crate) struct Atlas<B> {
     // Tiles removed since the last paint: (color page, page, texels).
     removed: RefCell<Vec<(bool, u32, Rect<i32>)>>,
 }
-
-pub(crate) type Raster<B> = (Rect<i32>, Size<i32>, B);
 
 pub(crate) type Build<'a> = dyn FnMut() -> Result<Option<Raster<Cow<'a, [u8]>>>> + 'a;
 

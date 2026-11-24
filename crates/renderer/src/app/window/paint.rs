@@ -620,7 +620,7 @@ impl Window {
             self.atlas
                 .get_or_insert_with(&TileKey::Glyph(params), &mut || {
                     Ok(text
-                        .raster(&params, crate::gpu::atlas::MAX_GLYPH_SIDE)?
+                        .raster(&params, crate::text::MAX_GLYPH_SIDE)?
                         .map(|(shown, size, bytes)| (shown, size, Cow::Owned(bytes))))
                 })
         else {
