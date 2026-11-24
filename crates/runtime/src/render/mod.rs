@@ -673,6 +673,14 @@ impl PageView {
             self.caret.take();
             self.mismatched.take();
             self.frames.take();
+            self.terminals.take();
+        }
+        // The drawings of ended terminal sessions go now, with their images and timers.
+        if !self.terminals.borrow().is_empty() {
+            let sessions = dom.terminals.borrow();
+            self.terminals
+                .borrow_mut()
+                .retain(|session, _| sessions.contains(*session));
         }
         {
             // Redraw once per mismatch until a pass has none, to stop alternating sizes from causing endless

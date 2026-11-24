@@ -290,7 +290,6 @@ impl Grid {
         }
         let mut terminals = self.terminals.borrow_mut();
         let mut drawings = self.view.terminals.borrow_mut();
-        drawings.retain(|session, _| terminals.contains(*session));
         // Without a session, the element is an empty box.
         let Some((session, terminal, bar)) = terminals.drawn(self.id) else {
             return;

@@ -595,6 +595,13 @@ fn terminals_draw_their_grid_and_take_input() {
         if (Math.abs(png[1] - cell * 2) > cell / 4) fail('PNG image: ' + png + ' cell ' + cell);
         await run(String.raw`t.output('\x1b_Ga=d\x1b\\')`);
         if ((await colors(0))[2] > cell / 4) fail('deleted image');
+        // A reloaded page draws its new sessions with their own theme, not with the drawings of the old ones.
+        await run("el.removeAttribute('style')");
+        await win.webContents.capturePage();
+        await load('term.html');
+        await run(String.raw`t.output('\x1b[41m    \x1b[0m')`);
+        const reloaded = await colors(0);
+        if (Math.abs(reloaded[0] - fill[0]) > cell / 4 || reloaded[1]) fail('reloaded page: ' + reloaded);
         "#,
         &[
             (

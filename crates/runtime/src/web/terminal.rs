@@ -494,7 +494,6 @@ pub(crate) struct Terminals {
     pub bars: rustc_hash::FxHashMap<usize, (renderer::ScrollRef, renderer::Pixels)>,
     /// The events for the page, and for its preload script.
     events: [Vec<Value>; 2],
-    last: u32,
     /// The revision of the document when the views were last checked.
     revision: u64,
 }
@@ -542,9 +541,11 @@ impl Terminals {
     fn create(&mut self, mut terminal: Terminal) -> u32 {
         // Only a preload script creates sessions.
         terminal.open_in(1);
-        self.last += 1;
-        self.sessions.insert(self.last, terminal);
-        self.last
+        // IDs are unique in the process, so a reloaded page never takes the drawing of an old session.
+        static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let session = LAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.sessions.insert(session, terminal);
+        session
     }
 
     // Shows a session in an element, or nothing. A session shows in one element.
