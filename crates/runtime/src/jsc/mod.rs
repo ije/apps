@@ -135,7 +135,6 @@ static SCRIPTS: std::sync::Mutex<Scripts> = std::sync::Mutex::new(Scripts {
 
 pub struct JavaScriptCore {
     aot: Option<&'static aot::Image>,
-    _library: Library,
     pub(crate) group: Ptr,
     group_release: unsafe extern "C" fn(Ptr),
     pub(crate) garbage_collect: unsafe extern "C" fn(Ptr),
@@ -364,9 +363,19 @@ unsafe fn open_library(path: &Path) -> std::result::Result<Library, libloading::
 
 impl JavaScriptCore {
     pub fn load() -> Result<Rc<Self>> {
-        let path = library_path(&std::env::current_exe()?, std::env::consts::OS)?;
-        let library = unsafe { open_library(&path) }
-            .with_context(|| format!("Cannot load Bun JavaScriptCore from {}", path.display()))?;
+        // One library for all engines, never unloaded, so tables of its functions stay valid.
+        static LIBRARY: std::sync::OnceLock<(Library, PathBuf)> = std::sync::OnceLock::new();
+        let (library, path) = match LIBRARY.get() {
+            Some(loaded) => loaded,
+            None => {
+                let path = library_path(&std::env::current_exe()?, std::env::consts::OS)?;
+                let library = unsafe { open_library(&path) }.with_context(|| {
+                    format!("Cannot load Bun JavaScriptCore from {}", path.display())
+                })?;
+                let _ = LIBRARY.set((library, path));
+                LIBRARY.get().unwrap()
+            }
+        };
         let image = if cfg!(target_os = "macos") {
             path.with_file_name("../Resources/app.dylib")
         } else {
@@ -398,7 +407,7 @@ impl JavaScriptCore {
                 // In JSC's cell cage every block the heap holds stays resident. AOT images use wide
                 // references, which need no cage.
                 std::env::set_var("JSC_markedBlockCageSizeInMB", "0");
-                let _ = aot::load(&library, &image);
+                let _ = aot::load(library, &image);
                 group = Some(group_create());
                 std::env::remove_var("JSC_alwaysUseSharedArrayBuffer");
                 std::env::remove_var("JSC_heapGrowthMaxIncrease");
@@ -406,7 +415,7 @@ impl JavaScriptCore {
                 std::env::remove_var("JSC_markedBlockCageSizeInMB");
             });
             Ok(Rc::new(Self {
-                aot: aot::load(&library, &image)?,
+                aot: aot::load(library, &image)?,
                 group: group.unwrap_or_else(|| group_create()),
                 inspectable: *library.get(b"JSGlobalContextSetInspectable\0")?,
                 extra_memory: *library.get(b"JSReportExtraMemoryCost\0")?,
@@ -490,7 +499,6 @@ impl JavaScriptCore {
                 make_utf8: *library.get(b"JSValueMakeStringUTF8\0")?,
                 make_uint8: *library.get(b"JSObjectMakeUint8ArrayUninitialized\0")?,
                 to_utf8: *library.get(b"JSStringConvertCharactersToUTF8\0")?,
-                _library: library,
             }))
         }
     }
