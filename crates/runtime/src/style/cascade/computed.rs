@@ -72,6 +72,17 @@ impl ComputedStyles {
         self.extras.remove(&id);
     }
 
+    // A fast pass starts from the styles of the last pass.
+    pub(crate) fn start_from(&mut self, previous: &ComputedStyles, count: usize) {
+        self.values.clone_from(&previous.values);
+        self.vars.clone_from(&previous.vars);
+        self.flags.clone_from(&previous.flags);
+        self.lengths.clone_from(&previous.lengths);
+        self.lengths.grow(count);
+        self.extras.clone_from(&previous.extras);
+        self.containers.clone_from(&previous.containers);
+    }
+
     pub(crate) fn extras(&self, id: usize) -> &Extras {
         self.extras.get(&id).map_or(&NO_EXTRAS, |extras| extras)
     }

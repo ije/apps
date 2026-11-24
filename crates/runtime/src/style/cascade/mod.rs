@@ -542,15 +542,7 @@ pub(crate) fn compute_styles(
     out.theme = native_theme;
     let count = doc.nodes.len();
     match previous.filter(|_| fast) {
-        Some(previous) => {
-            out.values.clone_from(&previous.values);
-            out.vars.clone_from(&previous.vars);
-            out.flags.clone_from(&previous.flags);
-            out.lengths.clone_from(&previous.lengths);
-            out.lengths.grow(count);
-            out.extras.clone_from(&previous.extras);
-            out.containers.clone_from(&previous.containers);
-        }
+        Some(previous) => out.start_from(previous, count),
         None => out.lengths.reset(count, Lengths::new(16., width, height)),
     }
     let (style, vars) = empty();
