@@ -23,9 +23,8 @@ pub fn run(mut bundle: Bundle, argv: Vec<String>) -> Result<i32> {
     let package =
         crate::bundle::Package::parse(bundle.files.get("package.json").map(String::as_str))?;
     let host = Rc::new(RefCell::new(Host {
-        app: crate::bundle::AppInfo::new(&mut bundle, &package, false)?,
         argv: Some(argv),
-        ..Host::default()
+        ..Host::new(crate::bundle::AppInfo::new(&mut bundle, &package, false)?)
     }));
     let api = JavaScriptCore::load()?;
     let engine = JsContext::new(api.clone(), host, Role::Main)?;

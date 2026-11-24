@@ -342,18 +342,20 @@ fn reflow(id: u64) {
         return;
     };
     // Reflow after composite frames even if the page is clean: boxes moved without layout. User scrolls move the
-    // mirror without one.
-    if view.page.store.try_borrow_mut().map_or(true, |mut store| {
-        let shifted = !store.pages.get(&id).is_some_and(|page| page.dirty)
-            && store
-                .page_state_mut(id)
-                .is_some_and(|dom| dom.shift_scrolls());
-        shifted
-            || !store.pages.get(&id).is_some_and(|page| page.dirty)
-                && !store
-                    .page_state(id)
-                    .is_some_and(|dom| dom.geometry.mirror.moved() || dom.layout.cull.reskipped)
-    }) {
+    // mirror without one. The build logs its lint warnings to the host, so a busy host skips it too.
+    if view.input.host.try_borrow_mut().is_err()
+        || view.page.store.try_borrow_mut().map_or(true, |mut store| {
+            let shifted = !store.pages.get(&id).is_some_and(|page| page.dirty)
+                && store
+                    .page_state_mut(id)
+                    .is_some_and(|dom| dom.shift_scrolls());
+            shifted
+                || !store.pages.get(&id).is_some_and(|page| page.dirty)
+                    && !store
+                        .page_state(id)
+                        .is_some_and(|dom| dom.geometry.mirror.moved() || dom.layout.cull.reskipped)
+        })
+    {
         return;
     }
     let run = |window: &mut Window, cx: &mut App| {
