@@ -8876,7 +8876,7 @@ fn create(
                     else {
                         return true;
                     };
-                    let Some(computed) = &state.computed else {
+                    let Some(computed) = &state.styles.computed else {
                         return true;
                     };
                     let at = [position.x, position.y].map(f32::from);

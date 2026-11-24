@@ -320,7 +320,7 @@ impl Host {
                             && current
                                 .parent
                                 .is_none_or(|parent| doc.nodes[parent].tag != "style"))
-                            && state.computed.is_some()
+                            && state.styles.computed.is_some()
                             && reaches(doc, &state.hosts, id, 0)
                         {
                             state.invalidate();
@@ -361,7 +361,7 @@ impl Host {
                             !reaches(doc, &state.hosts, parent, child),
                             "Cannot create a DOM cycle"
                         );
-                        if state.computed.is_some()
+                        if state.styles.computed.is_some()
                             && (reaches(doc, &state.hosts, parent, 0)
                                 || reaches(doc, &state.hosts, child, 0))
                         {
@@ -423,7 +423,8 @@ impl Host {
                         {
                             prune(doc, previous);
                         }
-                        if state.computed.is_some() && reaches(doc, &state.hosts, parent, 0) {
+                        if state.styles.computed.is_some() && reaches(doc, &state.hosts, parent, 0)
+                        {
                             state.invalidate();
                         }
                         doc.nodes[child].parent = None;
@@ -437,7 +438,7 @@ impl Host {
                         if doc.nodes[id].attrs.get(key).map(String::as_str) == value {
                             return Ok(false);
                         }
-                        if state.computed.is_some() && reaches(doc, &state.hosts, id, 0) {
+                        if state.styles.computed.is_some() && reaches(doc, &state.hosts, id, 0) {
                             state.invalidate();
                         }
                         // Kept walks of the tree read these attributes, so their edits must use `get_mut` and
@@ -475,7 +476,7 @@ impl Host {
                             !reaches(doc, &state.hosts, host, root),
                             "Cannot create a DOM cycle"
                         );
-                        if state.computed.is_some() && reaches(doc, &state.hosts, host, 0) {
+                        if state.styles.computed.is_some() && reaches(doc, &state.hosts, host, 0) {
                             state.invalidate();
                         }
                         state.shadows.insert(host, root);
@@ -496,7 +497,7 @@ impl Host {
                                 .or(fallback)
                                 .is_none_or(str::is_empty)
                         };
-                        if state.computed.is_some()
+                        if state.styles.computed.is_some()
                             && empty(current.value.as_ref()) != empty(value.as_ref())
                             && reaches(doc, &state.hosts, id, 0)
                         {
@@ -548,7 +549,7 @@ impl Host {
                         } else {
                             0
                         };
-                        if state.computed.is_some() && reaches(doc, &state.hosts, id, 0) {
+                        if state.styles.computed.is_some() && reaches(doc, &state.hosts, id, 0) {
                             state.invalidate();
                         }
                         if let Some(node) = doc.nodes.edit(id) {

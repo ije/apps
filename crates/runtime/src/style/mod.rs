@@ -16,11 +16,13 @@ use std::{borrow::Cow, collections::HashMap, rc::Rc};
 
 mod animation;
 mod chunked;
+mod page;
 mod tailwind;
 #[cfg(test)]
 mod tests;
 mod text;
 pub(crate) use chunked::Chunked;
+pub(crate) use page::{ShadowWalk, Styles};
 
 pub(crate) use animation::{Animation, Motion, Scripted};
 pub(crate) use text::{

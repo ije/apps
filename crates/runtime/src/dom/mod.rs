@@ -447,14 +447,6 @@ impl Walk {
     }
 }
 
-#[derive(Default)]
-struct ShadowWalk {
-    tree: u64,
-    count: usize,
-    slots: rustc_hash::FxHashMap<usize, Vec<usize>>,
-    shadows: Rc<style::Shadows>,
-}
-
 pub(crate) const CHECKED: u16 = 16;
 pub(crate) const DIRTY: u16 = 32;
 pub(crate) const MODAL: u16 = 64;
@@ -774,15 +766,6 @@ pub struct State {
     unshifted: Vec<usize>,
     only_scrolled: bool,
     shiftable: rustc_hash::FxHashMap<usize, (u64, u64, bool)>,
-    pub(crate) computed: Option<Rc<style::ComputedStyles>>,
-    previous: Option<Rc<style::ComputedStyles>>,
-    pub(crate) style_walk: Walk,
-    editable: Vec<usize>,
-    inert: Vec<usize>,
-    select_marks: Vec<u8>,
-    // The pass that made the marks: its styles, modal subject and walk, and whether it flattened children.
-    select_base: (usize, Option<usize>, u64, bool),
-    shadow_walk: Rc<ShadowWalk>,
     pub(crate) grids: rustc_hash::FxHashMap<
         usize,
         (
@@ -805,12 +788,8 @@ pub struct State {
     // A hash of the state that paint reads outside the boxes: images and the selection.
     pub(crate) paint_inputs: u64,
     pub(crate) layout_revision: u64,
-    style_epoch: u64,
     layout_epoch: u64,
-    pub(crate) sheets: HashMap<Rc<str>, Rc<css::Stylesheet>>,
-    pub(crate) inserted: Vec<(String, Rc<css::Stylesheet>, bool)>,
-    pub(crate) style_cache: style::StyleCache,
-    style_key: ([f32; 2], Option<f32>, bool, u32),
+    pub(crate) styles: style::Styles,
     pub(crate) focus: Option<usize>,
     interaction: [Vec<usize>; 3],
     pub selection: rustc_hash::FxHashMap<usize, [usize; 2]>,
@@ -826,7 +805,6 @@ pub struct State {
     pub(crate) hosts: rustc_hash::FxHashMap<usize, usize>,
     pub retired: Vec<Arc<renderer::RenderImage>>,
     pub(crate) retired_canvases: HashSet<usize>,
-    queries: rustc_hash::FxHashMap<Box<str>, Rc<[Selector]>>,
     pub(crate) recycled: Vec<(usize, Arc<renderer::RenderImage>)>,
     decoded: Arc<Mutex<Vec<(usize, u64, Decoded)>>>,
     frames: Frames,
@@ -858,16 +836,6 @@ pub struct State {
     pub(crate) text_system: Option<std::rc::Rc<renderer::TextSystem>>,
     pub(crate) window: renderer::WindowState,
     pub pixel_ratio: f32,
-    pub(crate) linted: bool,
-    pub(crate) warned: HashSet<String>,
-    pub(crate) checked: rustc_hash::FxHashSet<(u8, css::Prop, Rc<str>)>,
-    // The values in `checked` by address. Each holds its value, so no other value takes the address.
-    pub(crate) checked_values: rustc_hash::FxHashMap<(usize, u8, css::Prop), Rc<str>>,
-    pub(crate) motion: style::Motion,
-    pub(crate) animated: HashMap<usize, css::Style>,
-    pub(crate) animating: HashMap<usize, Rc<css::Style>>,
-    pub(crate) animating_pseudos: HashMap<usize, Rc<[css::Style; 2]>>,
-    pub(crate) recolored: Vec<usize>,
     pub(crate) containers: rustc_hash::FxHashMap<usize, [f32; 2]>,
     pub(crate) atoms: rustc_hash::FxHashMap<usize, [f32; 3]>,
     // The rendered `::before` and `::after` boxes that scripts can read, by their atom key: the place of the border
@@ -889,8 +857,6 @@ pub struct State {
     pub(crate) autos: rustc_hash::FxHashMap<usize, (Rc<[usize]>, Rc<[usize]>, (u64, [f32; 2]))>,
     // `contentvisibilityautostatechange` events: the box and whether it skips its contents now.
     pub(crate) skip_events: Vec<(usize, bool)>,
-    // The nodes whose style moved or sized them since the last frame, which suppress scroll anchoring.
-    pub(crate) unanchored: Vec<usize>,
 }
 
 // Where a canvas drew a drawable element, which takes the pointer there.
@@ -972,7 +938,7 @@ impl State {
 
     // How far the user scrolls since the last prepaint moved a node of the mirror. Text layouts keep their places.
     pub(crate) fn scroll_shift(&self, id: usize) -> [f32; 2] {
-        let Some(place) = self.style_walk.place(id).map(|place| place as usize) else {
+        let Some(place) = self.styles.walk.place(id).map(|place| place as usize) else {
             return [0.; 2];
         };
         self.scroll_shifts
@@ -1011,12 +977,12 @@ impl State {
             return false;
         };
         let by = [f32::from(to.x - from.x), f32::from(to.y - from.y)];
-        let walk = &self.style_walk;
-        let (Some(start), Some(computed)) = (walk.place(id), self.computed.as_ref()) else {
+        let walk = &self.styles.walk;
+        let (Some(start), Some(computed)) = (walk.place(id), self.styles.computed.as_ref()) else {
             return false;
         };
         let range = start as usize + 1..start as usize + walk.span(id);
-        let key = (self.style_epoch, walk.serial);
+        let key = (self.styles.epoch, walk.serial);
         let shiftable = match self.shiftable.get(&id) {
             Some(&(epoch, serial, shiftable)) if (epoch, serial) == key => shiftable,
             _ => {
@@ -1102,7 +1068,7 @@ impl State {
                 gone.extend(self.shadows.get(&id));
             }
         }
-        self.style_cache.forget(&gone);
+        self.styles.cache.forget(&gone);
         for id in gone {
             self.measurements.shown.remove(&id);
             self.autos.remove(&id);
@@ -1138,15 +1104,15 @@ impl State {
         free.drain(..cut);
         free.shrink_to_fit();
         self.free = free.into();
-        self.style_walk = Default::default();
-        self.select_marks = Vec::new();
+        self.styles.walk = Default::default();
+        self.styles.select_marks = Vec::new();
         self.measurements.texts = Default::default();
-        self.style_cache.trim(len);
+        self.styles.cache.trim(len);
         self.layout_nodes.truncate(len);
         self.layout_nodes.shrink_to_fit();
         self.painted.truncate(len);
         self.painted.shrink_to_fit();
-        self.motion.trim(len);
+        self.styles.motion.trim(len);
         self.cull.trim(len);
         self.bounds.shrink(len);
         if len < before {
@@ -1159,24 +1125,28 @@ impl State {
     // Keep inertness outside ComputedStyles.user_select: modal changes have no revision to invalidate kept
     // boxes.
     pub(crate) fn inert(&self, id: usize) -> bool {
-        self.select_marks
+        self.styles
+            .select_marks
             .get(id)
             .is_some_and(|marks| marks & INERT != 0)
     }
 
     // The styles of the last frame, also after a change that asks the next frame for new ones.
     pub(crate) fn last_styles(&self) -> Option<&Rc<style::ComputedStyles>> {
-        self.computed.as_ref().or(self.previous.as_ref())
+        self.styles
+            .computed
+            .as_ref()
+            .or(self.styles.previous.as_ref())
     }
 
     pub(crate) fn invalidate(&mut self) {
-        if let Some(computed) = self.computed.take() {
-            self.previous = Some(computed);
+        if let Some(computed) = self.styles.computed.take() {
+            self.styles.previous = Some(computed);
         }
     }
 
     pub(crate) fn update_containers(&mut self, doc: &Document) -> bool {
-        let changed = self.style_cache.set_containers(&self.containers, doc);
+        let changed = self.styles.cache.set_containers(&self.containers, doc);
         if changed {
             self.invalidate();
         }
@@ -1202,7 +1172,7 @@ impl State {
     pub(crate) fn place(&mut self, doc: &mut Document, id: usize, node: Node) {
         doc.nodes[id] = node;
         self.detached.push(id);
-        if let Some(cached) = &mut self.computed {
+        if let Some(cached) = &mut self.styles.computed {
             // Grow every per-node list here. Initialize detached nodes as a full style pass does.
             if let Some(computed) = Rc::get_mut(cached) {
                 let (style, vars) = style::empty();
@@ -1435,15 +1405,15 @@ pub(crate) fn load_image(
 
 fn parsed(state: &mut State, source: &Value) -> Result<Rc<[Selector]>> {
     let source = source.as_str().context("Expected selector")?;
-    if let Some(found) = state.queries.get(source) {
+    if let Some(found) = state.styles.queries.get(source) {
         return Ok(found.clone());
     }
     let parsed: Rc<[Selector]> = Selector::try_parse(source)?.into();
     // Scripts repeat a few selectors, so a full cache holds generated ones.
-    if state.queries.len() == 256 {
-        state.queries.clear();
+    if state.styles.queries.len() == 256 {
+        state.styles.queries.clear();
     }
-    state.queries.insert(source.into(), parsed.clone());
+    state.styles.queries.insert(source.into(), parsed.clone());
     Ok(parsed)
 }
 
@@ -1561,7 +1531,7 @@ pub fn call(
         return Ok(Value::Null);
     }
     if op == "dom.iterations" {
-        state.motion.iterations = true;
+        state.styles.motion.iterations = true;
         return Ok(Value::Null);
     }
     if op == "dom.cssControl" {
@@ -1571,7 +1541,7 @@ pub fn call(
         }
         let styles = styles(doc, state, viewport);
         state.dirty = true;
-        return Ok(json!(state.motion.css_control(
+        return Ok(json!(state.styles.motion.css_control(
             args[0].as_u64().unwrap_or(0) as u32,
             args[1].as_str().unwrap_or_default(),
             time,
@@ -1588,10 +1558,10 @@ pub fn call(
     if op == "dom.animation" {
         let id = args[0].as_u64().context("Expected an animation")? as u32;
         state.dirty = true;
-        let old = state.motion.unscript(id);
+        let old = state.styles.motion.unscript(id);
         if let Some((node, _)) = &old {
-            state.animating.remove(node);
-            state.animating_pseudos.remove(node);
+            state.styles.animating.remove(node);
+            state.styles.animating_pseudos.remove(node);
         }
         let spec = &args[2];
         let Some(node) = args[1]
@@ -1601,8 +1571,8 @@ pub fn call(
         else {
             return Ok(Value::Null);
         };
-        state.animating.remove(&node);
-        state.animating_pseudos.remove(&node);
+        state.styles.animating.remove(&node);
+        state.styles.animating_pseudos.remove(&node);
         let frames: Vec<(f64, &str, &str)> = spec["frames"]
             .as_array()
             .into_iter()
@@ -1643,7 +1613,7 @@ pub fn call(
                 _ => 0,
             },
         );
-        state.motion.script(
+        state.styles.motion.script(
             node,
             animation,
             spec["time"].as_f64().unwrap_or(0.) / 1000.,
@@ -1668,6 +1638,7 @@ pub fn call(
         let source = format!("@media {query} {{}}");
         let theme = state.theme();
         let sheet = state
+            .styles
             .sheets
             .entry(source.as_str().into())
             .or_insert_with(|| Rc::new(css::Stylesheet::parse(&source)));
@@ -1730,13 +1701,14 @@ pub fn call(
                 match registered {
                     _ if !name.starts_with("--") => Err("SyntaxError"),
                     _ if css::Prop::find(name)
-                        .is_some_and(|prop| state.style_cache.scripted.contains_key(&prop)) =>
+                        .is_some_and(|prop| state.styles.cache.scripted.contains_key(&prop)) =>
                     {
                         Err("InvalidModificationError")
                     }
                     Some(value) => {
                         state
-                            .style_cache
+                            .styles
+                            .cache
                             .scripted
                             .insert(css::Prop::new(name), value);
                         Ok(Value::Null)
@@ -1753,9 +1725,9 @@ pub fn call(
                     .filter_map(|id| Some(id.as_u64()? as u32))
                     .collect::<Vec<_>>();
                 if ids.is_empty() {
-                    state.style_cache.adopted.remove(&root);
+                    state.styles.cache.adopted.remove(&root);
                 } else {
-                    state.style_cache.adopted.insert(root, ids);
+                    state.styles.cache.adopted.insert(root, ids);
                 }
                 Ok(Value::Null)
             }
@@ -1770,17 +1742,18 @@ pub fn call(
                         } else {
                             sheet.cssom()
                         };
-                        state.style_cache.constructed.insert(id, Rc::new(sheet));
+                        state.styles.cache.constructed.insert(id, Rc::new(sheet));
                         Ok(tree)
                     }
                     "drop" => {
-                        state.style_cache.constructed.remove(&id);
+                        state.styles.cache.constructed.remove(&id);
                         Ok(Value::Null)
                     }
                     kind => {
                         let (path, top) = path(kind, &args[3]);
                         state
-                            .style_cache
+                            .styles
+                            .cache
                             .edit_constructed(id, top, |sheet| sheet.edit(&path, edit(kind, text)))
                     }
                 }
@@ -1897,8 +1870,8 @@ pub fn call(
                     state.hosts.remove(&root);
                 }
                 state.hosts.remove(&id);
-                state.style_cache.adopted.remove(&id);
-                state.motion.forget(id);
+                state.styles.cache.adopted.remove(&id);
+                state.styles.motion.forget(id);
                 state.anchors.remove(&id);
                 state.blocks.remove(&id);
                 state.containers.remove(&id);
@@ -1926,7 +1899,7 @@ pub fn call(
         }
         let list = json!([canvases, freed]);
         if !freed.is_empty() {
-            state.style_cache.forget(&freed);
+            state.styles.cache.forget(&freed);
             let freed: rustc_hash::FxHashSet<usize> = freed.into_iter().collect();
             state.top_layer.retain(|node| !freed.contains(node));
             for ids in &mut state.interaction {
@@ -2061,7 +2034,7 @@ pub fn call(
         };
         let focus = if op == "dom.focus" { FOCUS } else { 0 };
         let shown = args[2].as_bool() != Some(true);
-        let used = state.style_cache.states & (flag | focus) != 0;
+        let used = state.styles.cache.states & (flag | focus) != 0;
         let control = |id: &usize| {
             doc.nodes.get(*id).is_some_and(|node| {
                 matches!(
@@ -2291,10 +2264,10 @@ pub fn call(
                 }
             }
             // Without a layout, answer only when the frame would start nothing here.
-            if args[3].as_bool() == Some(true) && !state.motion.settled(&nodes, &styles) {
+            if args[3].as_bool() == Some(true) && !state.styles.motion.settled(&nodes, &styles) {
                 return Ok(Value::Null);
             }
-            Ok(json!(state.motion.css(
+            Ok(json!(state.styles.motion.css(
                 &nodes,
                 args[2].as_bool() == Some(true),
                 &styles
@@ -2303,6 +2276,7 @@ pub fn call(
         "dom.animated" => {
             let styles = styles(doc, state, viewport);
             Ok(state
+                .styles
                 .motion
                 .scripted(id, 0, &styles, args[1].as_u64().unwrap_or(0) as u32)
                 .map_or(Value::Null, |values| {
@@ -2317,7 +2291,7 @@ pub fn call(
             let styles = styles(doc, state, viewport);
             let pseudo = args[2].as_str().unwrap_or_default().trim_start_matches(':');
             if let Some(style) = styles.values.get(id) {
-                state.motion.read(id, style);
+                state.styles.motion.read(id, style);
             }
             let slot = match pseudo {
                 "" => Some(0),
@@ -2325,12 +2299,17 @@ pub fn call(
                 "after" => Some(2),
                 _ => None,
             };
-            let scripted = slot.and_then(|slot| state.motion.scripted(id, slot, &styles, u32::MAX));
+            let scripted =
+                slot.and_then(|slot| state.styles.motion.scripted(id, slot, &styles, u32::MAX));
             // The compositor can play animations between frames, so they are sampled now. As in Chrome, values that
             // move boxes stay those of the last frame, which match its layout.
-            let current = state.animating.get(&id).and_then(|last| {
+            let current = state.styles.animating.get(&id).and_then(|last| {
                 let now = std::time::Instant::now();
-                let current = state.motion.timeline(id, 0, &styles, &[now], &[]).pop()?;
+                let current = state
+                    .styles
+                    .motion
+                    .timeline(id, 0, &styles, &[now], &[])
+                    .pop()?;
                 let paints = current.iter().all(|(prop, value)| {
                     crate::render::composited(prop) || last.get(prop) == Some(&**value)
                 });
@@ -2338,17 +2317,19 @@ pub fn call(
             });
             let mut sampled = None;
             let backdrop = (pseudo == "backdrop")
-                .then(|| state.motion.backdrop(id, styles.backdrops.get(&id)?))
+                .then(|| state.styles.motion.backdrop(id, styles.backdrops.get(&id)?))
                 .flatten();
             let style = match pseudo {
                 "" => Some(current.as_ref().unwrap_or_else(|| {
                     &**state
+                        .styles
                         .animating
                         .get(&id)
                         .or_else(|| styles.authored.get(&id))
                         .unwrap_or(&styles.values[id])
                 })),
                 "before" | "after" => state
+                    .styles
                     .animating_pseudos
                     .get(&id)
                     .or_else(|| styles.pseudos.get(&id))
@@ -2569,7 +2550,7 @@ pub fn call(
                         .flatten()
                 })
                 .or_else(|| pseudo_box.map(|rect| [rect[2], rect[3]]));
-            let registry = state.style_cache.registry();
+            let registry = state.styles.cache.registry();
             let parent = start.map(|parent| &*styles.values[parent]);
             let flow = start.is_some_and(|parent| style::table_box(style::role(&styles, parent)))
                 || parent.is_none_or(|parent| {
@@ -2926,23 +2907,26 @@ pub fn call(
             if doc.nodes[id].tag == "link" && doc.nodes[id].stylesheet.is_none() {
                 return Ok(Value::Null);
             }
-            let sheet = state.style_cache.sheet(doc, id, &mut state.sheets);
+            let sheet = state.styles.cache.sheet(doc, id, &mut state.styles.sheets);
             Ok(sheet.map_or_else(|| json!([]), |sheet| sheet.cssom()))
         }
         "dom.sheet" => {
             let kind = args[1].as_str().unwrap_or_default();
             let text = args[2].as_str().unwrap_or_default();
             let (path, top) = path(kind, &args[3]);
-            let result =
-                state
-                    .style_cache
-                    .edit_sheet(doc, id, &mut state.sheets, top, |sheet, disabled| {
-                        if kind == "disabled" {
-                            *disabled = args[2].as_bool().unwrap_or(false);
-                            return Ok(Value::Null);
-                        }
-                        sheet.edit(&path, edit(kind, text))
-                    });
+            let result = state.styles.cache.edit_sheet(
+                doc,
+                id,
+                &mut state.styles.sheets,
+                top,
+                |sheet, disabled| {
+                    if kind == "disabled" {
+                        *disabled = args[2].as_bool().unwrap_or(false);
+                        return Ok(Value::Null);
+                    }
+                    sheet.edit(&path, edit(kind, text))
+                },
+            );
             state.invalidate();
             state.dirty = true;
             Ok(result.unwrap_or_else(|error| json!({ "error": error })))
@@ -3555,7 +3539,13 @@ pub fn call(
             let rect = state.bounds.get(&id).copied().unwrap_or_default();
             // Reuse the last frame's styles for resize observers to avoid a style pass per callback.
             let last = (args[1].as_bool() == Some(true))
-                .then(|| state.computed.clone().or_else(|| state.previous.clone()))
+                .then(|| {
+                    state
+                        .styles
+                        .computed
+                        .clone()
+                        .or_else(|| state.styles.previous.clone())
+                })
                 .flatten()
                 .filter(|last| id < last.values.len() && last.lengths.get(id).is_some());
             let computed = match last {
@@ -3594,7 +3584,7 @@ pub fn call(
                 .and_then(|parent| state.bounds.get(&parent))
                 .map_or(viewport[0], |rect| rect[2]);
             // The bounds are those of the last frame, which laid out the animated padding and borders.
-            let now = state.animating.get(&id).unwrap_or(style);
+            let now = state.styles.animating.get(&id).unwrap_or(style);
             let borders = units
                 .borders(now, base)
                 .map(|width| width / if shared { 2. } else { 1. });
@@ -3883,7 +3873,7 @@ pub(crate) fn use_font(state: &mut State, family: &str, name: &str, added: bool)
     state.font_loads += 1;
     style::FONT_NAMES.with(|names| *names.borrow_mut() = Default::default());
     // Invalidate only font-dependent values. A new style cache loses constructed and CSSOM-edited sheets.
-    state.style_cache.environment.metrics = None;
+    state.styles.cache.environment.metrics = None;
     state.invalidate();
     if !same {
         state
@@ -3895,10 +3885,10 @@ pub(crate) fn use_font(state: &mut State, family: &str, name: &str, added: bool)
 
 pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32; 2]) {
     let computed = styles(doc, state, viewport);
-    if state.layout_epoch == state.style_epoch {
+    if state.layout_epoch == state.styles.epoch {
         return;
     }
-    state.layout_epoch = state.style_epoch;
+    state.layout_epoch = state.styles.epoch;
     let mut known = rustc_hash::FxHashMap::default();
     for (id, style) in computed.values.iter().enumerate() {
         let bits = *known.entry(Rc::as_ptr(style)).or_insert_with(|| {
@@ -4382,6 +4372,7 @@ fn rendered_text(
             display.ends_with("flex") || display.ends_with("grid") || display == "contents" && a;
         pending.extend(
             state
+                .styles
                 .shadow_walk
                 .shadows
                 .composed
@@ -4749,7 +4740,7 @@ pub(crate) fn styles(
     let theme = state.theme();
     let reduced_motion = theme & 32 != 0;
     let key = (viewport, scale, reduced_motion, theme);
-    let animated = std::mem::take(&mut state.animated);
+    let animated = std::mem::take(&mut state.styles.animated);
     let animating = !animated.is_empty();
     // Resize observers read content boxes, which these values change without a new border box.
     if animated.values().any(|style| {
@@ -4765,14 +4756,15 @@ pub(crate) fn styles(
         state.bounds.restyled();
     }
     if !animating
-        && state.style_key == key
-        && let Some(computed) = &state.computed
+        && state.styles.key == key
+        && let Some(computed) = &state.styles.computed
         && computed.values.len() == doc.nodes.len()
     {
         return computed.clone();
     }
     state.drop_removed(doc);
-    if state.shadow_walk.tree != doc.nodes.tree() || state.shadow_walk.count != state.shadows.len()
+    if state.styles.shadow_walk.tree != doc.nodes.tree()
+        || state.styles.shadow_walk.count != state.shadows.len()
     {
         let slots = slots(doc, state.shadows.iter().map(|(&host, &root)| (host, root)));
         let assigned: rustc_hash::FxHashSet<usize> = slots.values().flatten().copied().collect();
@@ -4803,7 +4795,7 @@ pub(crate) fn styles(
                 );
             }
         }
-        let old = &state.shadow_walk.shadows.hosts;
+        let old = &state.styles.shadow_walk.shadows.hosts;
         let hosts = if old.len() == state.hosts.len()
             && state
                 .hosts
@@ -4820,7 +4812,7 @@ pub(crate) fn styles(
                     .collect(),
             )
         };
-        state.shadow_walk = Rc::new(ShadowWalk {
+        state.styles.shadow_walk = Rc::new(style::ShadowWalk {
             tree: doc.nodes.tree(),
             count: state.shadows.len(),
             slots,
@@ -4831,7 +4823,7 @@ pub(crate) fn styles(
             }),
         });
     }
-    let shadow_walk = state.shadow_walk.clone();
+    let shadow_walk = state.styles.shadow_walk.clone();
     let context = style::StyleContext {
         shadows: shadow_walk.shadows.clone(),
         reduced_motion,
@@ -4840,11 +4832,16 @@ pub(crate) fn styles(
         aliases: state.font_aliases.clone(),
         animated,
         inserted: state
+            .styles
             .inserted
             .iter()
             .map(|(_, sheet, user)| (sheet.clone(), *user))
             .collect(),
-        previous: state.computed.clone().or_else(|| state.previous.take()),
+        previous: state
+            .styles
+            .computed
+            .clone()
+            .or_else(|| state.styles.previous.take()),
         top_layer: !state.top_layer.is_empty(),
     };
     let mut result = style::compute_styles(
@@ -4852,12 +4849,15 @@ pub(crate) fn styles(
         viewport[0],
         viewport[1],
         system,
-        &mut state.sheets,
-        &mut state.style_cache,
+        &mut state.styles.sheets,
+        &mut state.styles.cache,
         Some(&context),
     );
-    state.style_cache.finish();
-    state.sheets.retain(|text, _| Rc::strong_count(text) > 1);
+    state.styles.cache.finish();
+    state
+        .styles
+        .sheets
+        .retain(|text, _| Rc::strong_count(text) > 1);
     for (&host, &root) in &state.shadows {
         result
             .children
@@ -4868,11 +4868,12 @@ pub(crate) fn styles(
             result.children.insert(slot, assigned.clone());
         }
     }
-    let serial = state.style_walk.serial;
+    let serial = state.styles.walk.serial;
     let mut relisted = false;
     if state
-        .style_walk
-        .update(doc, &result.children, state.style_cache.document_walk())
+        .styles
+        .walk
+        .update(doc, &result.children, state.styles.cache.document_walk())
     {
         let inert = |id: usize| doc.nodes[id].attrs.contains_key("inert");
         let editable = |id: usize| {
@@ -4881,26 +4882,27 @@ pub(crate) fn styles(
                 || node.content_editable() == Some(true)
         };
         // The marks of the last pass tell which nodes the lists hold.
-        let kept = state.style_walk.since(serial).is_some_and(|touched| {
+        let kept = state.styles.walk.since(serial).is_some_and(|touched| {
             touched.iter().all(|&id| {
                 let id = id as usize;
                 state
+                    .styles
                     .select_marks
                     .get(id)
                     .is_none_or(|marks| marks & (EDITABLE | OWN_INERT) == 0)
-                    && !(state.style_walk.contains(id) && (inert(id) || editable(id)))
+                    && !(state.styles.walk.contains(id) && (inert(id) || editable(id)))
             })
         });
         if !kept || cfg!(debug_assertions) {
-            let nodes = state.style_walk.nodes.iter();
+            let nodes = state.styles.walk.nodes.iter();
             let nodes = nodes.map(|&(id, _)| id as usize);
             let lists = (
                 nodes.clone().filter(|&id| editable(id)).collect::<Vec<_>>(),
                 nodes.filter(|&id| inert(id)).collect::<Vec<_>>(),
             );
-            relisted = (&lists.0, &lists.1) != (&state.editable, &state.inert);
+            relisted = (&lists.0, &lists.1) != (&state.styles.editable, &state.styles.inert);
             assert!(!kept || !relisted, "kept editable and inert lists differ");
-            (state.editable, state.inert) = lists;
+            (state.styles.editable, state.styles.inert) = lists;
         }
     }
     let subject = [MODAL, FULLSCREEN].into_iter().find_map(|bit| {
@@ -4911,7 +4913,7 @@ pub(crate) fn styles(
             .copied()
             .find(|&id| doc.nodes.get(id).is_some_and(|node| node.state & bit != 0))
     });
-    let walk = &state.style_walk;
+    let walk = &state.styles.walk;
     // A node takes its marks and selection mode from its parent. Returns whether they changed.
     let settle = |marks: &mut [u8],
                   select: &mut style::Chunked<(style::UserSelect, usize)>,
@@ -4956,10 +4958,10 @@ pub(crate) fn styles(
     let all = |marks: &mut Vec<u8>, select: &mut style::Chunked<(style::UserSelect, usize)>| {
         marks.clear();
         marks.resize(doc.nodes.len(), 0);
-        for &id in &state.editable {
+        for &id in &state.styles.editable {
             marks[id] = EDITABLE;
         }
-        for &id in &state.inert {
+        for &id in &state.styles.inert {
             marks[id] |= OWN_INERT;
         }
         for &(id, parent) in walk.nodes.iter() {
@@ -4969,16 +4971,16 @@ pub(crate) fn styles(
     // The last pass gives the marks when it had the same lists, modal subject and, but for a patch, walk.
     // Then only nodes with other style flags or another place can change, and the nodes below them.
     let base = context.previous.as_deref().filter(|previous| {
-        state.select_base.0 == std::ptr::from_ref(*previous) as usize
-            && state.select_base.1 == subject
+        state.styles.select_base.0 == std::ptr::from_ref(*previous) as usize
+            && state.styles.select_base.1 == subject
             && !relisted
-            && state.select_marks.len() <= doc.nodes.len()
+            && state.styles.select_marks.len() <= doc.nodes.len()
     });
-    let touched = base.and_then(|_| match state.select_base.2 == walk.serial {
+    let touched = base.and_then(|_| match state.styles.select_base.2 == walk.serial {
         true => Some(&[][..]),
-        false => walk.since(state.select_base.2),
+        false => walk.since(state.styles.select_base.2),
     });
-    let mut marks = std::mem::take(&mut state.select_marks);
+    let mut marks = std::mem::take(&mut state.styles.select_marks);
     let mut select = std::mem::take(&mut result.user_select);
     state.bounds.reserve(doc.nodes.len().saturating_sub(1));
     // `visibility: hidden` also takes focus away, as in browsers.
@@ -5013,7 +5015,7 @@ pub(crate) fn styles(
                 }
             }
             places.sort_unstable();
-            let mut flattened = state.select_base.3;
+            let mut flattened = state.styles.select_base.3;
             let (mut next, mut scan) = (0, 0);
             let mut places = places.into_iter();
             loop {
@@ -5068,13 +5070,13 @@ pub(crate) fn styles(
         let any = nodes.any(|&(id, _)| result.flags[id as usize] & style::DISPLAY_CONTENTS != 0);
         assert!(flatten || !any, "kept display contents scan differs");
     }
-    (state.select_marks, result.user_select) = (marks, select);
+    (state.styles.select_marks, result.user_select) = (marks, select);
     let serial = walk.serial;
     if flatten {
         let contents = |child: usize| result.flags[child] & style::DISPLAY_CONTENTS != 0;
         let mut parents = vec![false; doc.nodes.len()];
         flatten = false;
-        for &(id, parent) in state.style_walk.nodes.iter() {
+        for &(id, parent) in state.styles.walk.nodes.iter() {
             if contents(id as usize) {
                 flatten = true;
                 if parent != u32::MAX {
@@ -5082,7 +5084,7 @@ pub(crate) fn styles(
                 }
             }
         }
-        for &(id, _) in state.style_walk.nodes.iter().rev() {
+        for &(id, _) in state.styles.walk.nodes.iter().rev() {
             let id = id as usize;
             if parents[id] {
                 let children = result.children.get(&id).unwrap_or(&doc.nodes[id].children);
@@ -5109,28 +5111,28 @@ pub(crate) fn styles(
                 let new = &result.values[id];
                 if previous.values.get(id).is_some_and(|old| {
                     !Rc::ptr_eq(old, new) && old.differs_in(new, &ANCHORING_PROPS)
-                }) && state.unanchored.len() < 4096
+                }) && state.styles.unanchored.len() < 4096
                 {
-                    state.unanchored.push(id);
+                    state.styles.unanchored.push(id);
                 }
             }
         }
     }
     if animating {
         let result = Rc::new(result);
-        state.select_base = (Rc::as_ptr(&result) as usize, subject, serial, flatten);
+        state.styles.select_base = (Rc::as_ptr(&result) as usize, subject, serial, flatten);
         return result;
     }
-    state.animating.clear();
-    state.animating_pseudos.clear();
-    state.style_epoch += 1;
+    state.styles.animating.clear();
+    state.styles.animating_pseudos.clear();
+    state.styles.epoch += 1;
     state.bounds.restyled();
-    state.style_key = key;
+    state.styles.key = key;
     let result = Rc::new(result);
-    state.select_base = (Rc::as_ptr(&result) as usize, subject, serial, flatten);
-    state.linted = false;
-    state.computed = Some(result.clone());
-    state.previous = None;
+    state.styles.select_base = (Rc::as_ptr(&result) as usize, subject, serial, flatten);
+    state.styles.linted = false;
+    state.styles.computed = Some(result.clone());
+    state.styles.previous = None;
     result
 }
 
@@ -5541,7 +5543,7 @@ mod tests {
                 "test",
             )
             .unwrap();
-        let held = host.borrow().dom[&1].computed.clone().unwrap();
+        let held = host.borrow().dom[&1].styles.computed.clone().unwrap();
         engine
             .eval(
                 "for(let i=0;i<20;i++)document.createElement('b').textContent='x';getComputedStyle(editor).color",
@@ -5550,7 +5552,7 @@ mod tests {
             .unwrap();
         assert!(Rc::ptr_eq(
             &held,
-            host.borrow().dom[&1].computed.as_ref().unwrap()
+            host.borrow().dom[&1].styles.computed.as_ref().unwrap()
         ));
     }
     #[test]
@@ -5563,7 +5565,7 @@ mod tests {
                 "test",
             )
             .unwrap();
-        let cached = Rc::as_ptr(host.borrow().dom[&1].computed.as_ref().unwrap());
+        let cached = Rc::as_ptr(host.borrow().dom[&1].styles.computed.as_ref().unwrap());
         engine
             .eval(
                 "editor.setAttribute('style','color:red');editor.removeAttribute('missing')",
@@ -5572,7 +5574,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             cached,
-            Rc::as_ptr(host.borrow().dom[&1].computed.as_ref().unwrap())
+            Rc::as_ptr(host.borrow().dom[&1].styles.computed.as_ref().unwrap())
         );
         engine
             .eval(
@@ -5592,14 +5594,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             cached,
-            Rc::as_ptr(host.borrow().dom[&1].computed.as_ref().unwrap())
+            Rc::as_ptr(host.borrow().dom[&1].styles.computed.as_ref().unwrap())
         );
         engine.eval(r#"
             editor.append(fragment);
             if(getComputedStyle(editor.firstChild).color!=='rgb(0, 0, 255)')throw Error('Inserted style was stale');
             fragment.append(editor.firstChild);
         "#, "test").unwrap();
-        assert!(host.borrow().dom[&1].computed.is_none());
+        assert!(host.borrow().dom[&1].styles.computed.is_none());
         engine.eval(r#"
             const root=editor.attachShadow({mode:'open'});
             root.innerHTML='<span style="color:green">text</span>';
@@ -5614,7 +5616,13 @@ mod tests {
         let (host, engine) = engine(
             "<html><head><style id=s>p:empty{color:red}</style></head><body><p id=p>text</p><svg><text>a</text></svg></body></html>",
         );
-        let computed = || host.borrow().dom[&1].computed.as_ref().map(Rc::as_ptr);
+        let computed = || {
+            host.borrow().dom[&1]
+                .styles
+                .computed
+                .as_ref()
+                .map(Rc::as_ptr)
+        };
         let p = host.borrow().pages[&1]
             .doc
             .nodes
@@ -5676,12 +5684,23 @@ mod tests {
         engine
             .eval("p.style.fontFamily='Brand';if(getComputedStyle(p).fontFamily!=='Real Font')throw Error('Alias')", "test")
             .unwrap();
-        let first = host.borrow().dom[&1].computed.as_ref().unwrap().values[p].clone();
-        host.borrow_mut().dom.get_mut(&1).unwrap().computed = None;
+        let first = host.borrow().dom[&1]
+            .styles
+            .computed
+            .as_ref()
+            .unwrap()
+            .values[p]
+            .clone();
+        host.borrow_mut().dom.get_mut(&1).unwrap().styles.computed = None;
         engine.eval("getComputedStyle(p).color", "test").unwrap();
         assert!(Rc::ptr_eq(
             &first,
-            &host.borrow().dom[&1].computed.as_ref().unwrap().values[p]
+            &host.borrow().dom[&1]
+                .styles
+                .computed
+                .as_ref()
+                .unwrap()
+                .values[p]
         ));
     }
 
@@ -5740,7 +5759,7 @@ mod tests {
             engine.eval(read, "test").unwrap();
         }
         #[cfg(debug_assertions)]
-        assert!(host.borrow().dom[&1].style_cache.incremental >= 20);
+        assert!(host.borrow().dom[&1].styles.cache.incremental >= 20);
     }
 
     #[test]
@@ -5778,7 +5797,7 @@ mod tests {
             engine.eval(&format!("{step};{read}"), "test").unwrap();
         }
         #[cfg(debug_assertions)]
-        assert!(host.borrow().dom[&1].style_cache.incremental >= 15);
+        assert!(host.borrow().dom[&1].styles.cache.incremental >= 15);
     }
 
     #[test]
@@ -5831,12 +5850,12 @@ mod tests {
             ),
             ("sheet.deleteRule(0)", "css(leaf,'marginLeft')==='0px'"),
         ] {
-            let before = host.borrow().dom[&1].style_cache.incremental;
+            let before = host.borrow().dom[&1].styles.cache.incremental;
             let result = engine
                 .eval(&format!("{step};{read}{check}"), "test")
                 .unwrap();
             assert_eq!(result, "true", "{step}");
-            passes.push(host.borrow().dom[&1].style_cache.incremental > before);
+            passes.push(host.borrow().dom[&1].styles.cache.incremental > before);
         }
         // A rule that any node can match needs a full pass.
         assert_eq!(
@@ -5856,7 +5875,7 @@ mod tests {
             "[...document.querySelectorAll('h2')].map(h=>getComputedStyle(h).color&&h._id).join()";
         let text = |ids: String| {
             let host = host.borrow();
-            let computed = host.dom[&1].computed.as_ref().unwrap();
+            let computed = host.dom[&1].styles.computed.as_ref().unwrap();
             ids.split(',')
                 .map(|id| {
                     let pseudos = &computed.pseudos[&id.parse::<usize>().unwrap()];
@@ -5890,10 +5909,10 @@ mod tests {
             ("s.style.counterReset=''", &["1", "2", "3"]),
             ("a.className='big'", &["1", "2", "3"]),
         ] {
-            let before = host.borrow().dom[&1].style_cache.incremental;
+            let before = host.borrow().dom[&1].styles.cache.incremental;
             let result = text(engine.eval(&format!("{step};{read}"), "test").unwrap());
             assert_eq!(result, numbers(expected), "{step}");
-            passes.push(host.borrow().dom[&1].style_cache.incremental > before);
+            passes.push(host.borrow().dom[&1].styles.cache.incremental > before);
         }
         assert_eq!(passes, [true; 6]);
     }
@@ -5932,7 +5951,7 @@ mod tests {
             .unwrap();
         engine.eval(read, "test").unwrap();
         #[cfg(debug_assertions)]
-        assert!(host.borrow().dom[&1].style_cache.incremental >= 8);
+        assert!(host.borrow().dom[&1].styles.cache.incremental >= 8);
     }
 
     #[test]
@@ -5969,7 +5988,7 @@ mod tests {
             engine.eval(&format!("{step};{read}"), "test").unwrap();
         }
         #[cfg(debug_assertions)]
-        assert!(host.borrow().dom[&1].style_cache.incremental >= 12);
+        assert!(host.borrow().dom[&1].styles.cache.incremental >= 12);
     }
 
     #[test]
@@ -6043,10 +6062,10 @@ mod tests {
             "card.classList.add('on')",
         ] {
             #[cfg(debug_assertions)]
-            let before = host.borrow().dom[&1].style_cache.incremental;
+            let before = host.borrow().dom[&1].styles.cache.incremental;
             engine.eval(&format!("{step};{read}"), "test").unwrap();
             #[cfg(debug_assertions)]
-            if host.borrow().dom[&1].style_cache.incremental == before {
+            if host.borrow().dom[&1].styles.cache.incremental == before {
                 full.push(step);
             }
         }
@@ -6082,12 +6101,12 @@ mod tests {
         );
         let mut state = State::default();
         styles(&mut doc, &mut state, [800., 600.]);
-        let sheets = state.sheets.clone();
+        let sheets = state.styles.sheets.clone();
         assert_eq!(sheets.len(), 200);
-        state.computed = None;
+        state.styles.computed = None;
         styles(&mut doc, &mut state, [800., 600.]);
         for (source, sheet) in sheets {
-            assert!(Rc::ptr_eq(&sheet, &state.sheets[&source]));
+            assert!(Rc::ptr_eq(&sheet, &state.styles.sheets[&source]));
         }
         let sheet = doc
             .nodes
@@ -6096,17 +6115,17 @@ mod tests {
             .unwrap();
         let text = doc.nodes[sheet].children[0];
         doc.nodes[text].text = ".replacement{color:blue}".into();
-        state.computed = None;
+        state.styles.computed = None;
         styles(&mut doc, &mut state, [800., 600.]);
-        assert_eq!(state.sheets.len(), 200);
-        assert!(!state.sheets.contains_key(".item0{color:red}"));
+        assert_eq!(state.styles.sheets.len(), 200);
+        assert!(!state.styles.sheets.contains_key(".item0{color:red}"));
         let head = doc.nodes[sheet].parent.unwrap();
         doc.nodes[head].children.retain(|id| *id != sheet);
         doc.nodes[sheet].parent = None;
-        state.computed = None;
+        state.styles.computed = None;
         styles(&mut doc, &mut state, [800., 600.]);
-        assert_eq!(state.sheets.len(), 199);
-        assert!(!state.sheets.contains_key(".replacement{color:blue}"));
+        assert_eq!(state.styles.sheets.len(), 199);
+        assert!(!state.styles.sheets.contains_key(".replacement{color:blue}"));
     }
 
     #[test]
@@ -6120,7 +6139,8 @@ mod tests {
             let rule = format!("@property {name}{{syntax:\"*\";inherits:false;{initial}}}");
             let value = css::Stylesheet::parse(&rule).property().unwrap();
             state
-                .style_cache
+                .styles
+                .cache
                 .scripted
                 .insert(css::Prop::new(name), value);
         }

@@ -851,7 +851,7 @@ impl renderer::View for PageView {
             );
         }
         let bounds = dom.bounds.get(&id)?;
-        let style = dom.computed.as_ref()?.values.get(id)?;
+        let style = dom.styles.computed.as_ref()?.values.get(id)?;
         let face = style::font(style);
         let text = state["text"].as_str()?;
         let font_size = css::length(

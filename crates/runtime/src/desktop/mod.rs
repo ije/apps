@@ -869,10 +869,11 @@ impl Desktop {
                             let css = args[3].as_str().unwrap_or_default();
                             let sheet = Rc::new(crate::css::Stylesheet::parse(css));
                             state
+                                .styles
                                 .inserted
                                 .push((key.to_owned(), sheet, args[4] == true));
                         } else {
-                            state.inserted.retain(|(old, ..)| old != key);
+                            state.styles.inserted.retain(|(old, ..)| old != key);
                         }
                         state.invalidate();
                         page.dirty = true;
@@ -2741,7 +2742,7 @@ mod tests {
                     "test",
                 )
                 .unwrap();
-            assert!(desktop.host.borrow().dom[&1].computed.is_some());
+            assert!(desktop.host.borrow().dom[&1].styles.computed.is_some());
             desktop.command(serde_json::json!({
                 "op":"window", "args":["load",1,"<html><body style='color:purple'>New page</body></html>"]
             }));

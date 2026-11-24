@@ -58,7 +58,8 @@ pub(crate) fn load(
     }
     let loads = state.font_loads;
     let faces: Vec<_> = state
-        .style_cache
+        .styles
+        .cache
         .font_faces()
         .into_iter()
         .map(|(family, src, range)| {

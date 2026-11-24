@@ -1367,7 +1367,7 @@ impl Hooks for DomBox {
         let view = &*self.view;
         let mut host = view.host.borrow_mut();
         let dom = host.dom.entry(view.id).or_default();
-        let walk = &dom.style_walk;
+        let walk = &dom.styles.walk;
         let Some(start) = walk.place(self.id) else {
             return false;
         };
