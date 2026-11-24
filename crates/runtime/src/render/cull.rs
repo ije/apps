@@ -626,7 +626,7 @@ pub(super) fn spacer(
     path: Rc<[usize]>,
     [left, width]: [f32; 2],
     zone: Rc<Zone>,
-    view: Rc<super::PageState>,
+    view: Rc<super::ViewState>,
 ) -> Child {
     let Run {
         members,
@@ -648,22 +648,24 @@ pub(super) fn spacer(
             let Some(dom) = host.dom.get_mut(&view.id) else {
                 return;
             };
-            let [low, high] = zone.visible(&dom.bounds, window);
+            let [low, high] = zone.visible(&dom.geometry.mirror, window);
             let y = f32::from(bounds.top());
-            let x = dom.bounds.get(&parent).map(|rect| {
+            let x = dom.geometry.mirror.get(&parent).map(|rect| {
                 rect[0]
-                    + dom.scroll.get(&parent).map_or(0., |handle| {
+                    + dom.geometry.scroll.get(&parent).map_or(0., |handle| {
                         f32::from(crate::dom::painted_offset(handle, window.scale_factor()).x)
                     })
             });
             let resized = x.is_none()
                 || dom
+                    .layout
                     .cull
                     .widths
                     .get(&parent)
                     .is_none_or(|now| (now[0] - width).abs() > 0.01);
             let reflowed = watch.iter().any(|&(id, width)| {
-                dom.cull
+                dom.layout
+                    .cull
                     .placed
                     .get(id)
                     .is_none_or(|placed| (placed.1[0] - width).abs() > 0.01)
@@ -674,7 +676,7 @@ pub(super) fn spacer(
             let near = f32::from(window.viewport_size().height) / 2.;
             let shown = resized || reflowed || y < high && y + height > low;
             if shown || moved && y < high + near && y + height > low - near {
-                dom.cull.off |= resized || reflowed;
+                dom.layout.cull.off |= resized || reflowed;
                 wake(view, &path, shown, window);
             }
             let delta = [at[0] - last.get()[0], at[1] - last.get()[1]];
@@ -684,9 +686,9 @@ pub(super) fn spacer(
             {
                 shift(
                     &page.doc,
-                    &dom.shadows,
-                    &mut dom.cull.subtrees,
-                    &mut dom.bounds,
+                    &dom.tree.shadows,
+                    &mut dom.layout.cull.subtrees,
+                    &mut dom.geometry.mirror,
                     &members,
                     delta,
                 );
@@ -708,7 +710,7 @@ pub(super) fn anchor(
     items: Vec<(usize, [f32; 4])>,
     path: Rc<[usize]>,
     zone: Rc<Zone>,
-    view: Rc<super::PageState>,
+    view: Rc<super::ViewState>,
 ) -> Child {
     let first = Cell::new(None);
     renderer::canvas_watching(
@@ -720,7 +722,7 @@ pub(super) fn anchor(
             else {
                 return;
             };
-            let [low, high] = zone.visible(&dom.bounds, window);
+            let [low, high] = zone.visible(&dom.geometry.mirror, window);
             let [left, top] = [f32::from(bounds.left()), f32::from(bounds.top())];
             let moved = first.get().is_some_and(|first| first != [left, top]);
             first.set(first.get().or(Some([left, top])));
@@ -730,14 +732,14 @@ pub(super) fn anchor(
                 let [x, y] = [left + x, top + y];
                 shown |= y < high && y + height > low;
                 close |= y < high + near && y + height > low - near;
-                if let Some(&[old_x, old_y, ..]) = dom.bounds.get(&id)
+                if let Some(&[old_x, old_y, ..]) = dom.geometry.mirror.get(&id)
                     && [old_x, old_y] != [x, y]
                 {
                     shift(
                         &page.doc,
-                        &dom.shadows,
-                        &mut dom.cull.subtrees,
-                        &mut dom.bounds,
+                        &dom.tree.shadows,
+                        &mut dom.layout.cull.subtrees,
+                        &mut dom.geometry.mirror,
                         &[id],
                         [x - old_x, y - old_y],
                     );
@@ -758,7 +760,7 @@ pub(super) fn anchor(
 
 // After prepaint, shows the contents of each `content-visibility: auto` box near the view or with the focus,
 // and skips the contents of the others.
-pub(super) fn autos(view: Rc<super::PageState>) -> Child {
+pub(super) fn autos(view: Rc<super::ViewState>) -> Child {
     renderer::canvas_watching(
         move |_, window| {
             let view = &*view;
@@ -779,7 +781,12 @@ pub(super) fn autos(view: Rc<super::PageState>) -> Child {
             ];
             // As in Chrome, a box with the focus or the selection in it shows its contents.
             let mut relevant = rustc_hash::FxHashSet::default();
-            for start in dom.focus.into_iter().chain(dom.selection.keys().copied()) {
+            for start in dom
+                .interaction
+                .focus
+                .into_iter()
+                .chain(dom.interaction.selection.keys().copied())
+            {
                 let mut node = Some(start);
                 while let Some(id) = node.filter(|&id| relevant.insert(id)) {
                     node = page.doc.nodes.get(id).and_then(|node| node.parent);
@@ -787,10 +794,10 @@ pub(super) fn autos(view: Rc<super::PageState>) -> Child {
             }
             // The boxes whose state changes, in document order, so boxes come after the boxes around them.
             let mut changes = Vec::new();
-            let shown = &dom.measurements.shown;
-            let scroll = &dom.scroll;
-            dom.autos.retain(|&id, (path, clips, last)| {
-                let Some(node) = dom.layout_nodes.get(id).and_then(Option::as_ref) else {
+            let shown = &dom.layout.measurements.shown;
+            let scroll = &dom.geometry.scroll;
+            dom.layout.autos.retain(|&id, (path, clips, last)| {
+                let Some(node) = dom.layout.layout_nodes.get(id).and_then(Option::as_ref) else {
                     return false;
                 };
                 if node.flags & SKIPS == 0
@@ -800,22 +807,22 @@ pub(super) fn autos(view: Rc<super::PageState>) -> Child {
                 }
                 // A box in skipped contents keeps its state, as in Chrome.
                 let relevant = relevant.contains(&id);
-                if dom.cull.visible.get(id) != Some(&true) && !relevant {
+                if dom.layout.cull.visible.get(id) != Some(&true) && !relevant {
                     return true;
                 }
-                let area = clips.iter().filter_map(|clip| dom.bounds.get(clip)).fold(
-                    view_area,
-                    |area, rect| {
+                let area = clips
+                    .iter()
+                    .filter_map(|clip| dom.geometry.mirror.get(clip))
+                    .fold(view_area, |area, rect| {
                         [
                             area[0].max(rect[0] - x),
                             area[1].max(rect[1] - y),
                             area[2].min(rect[0] + rect[2] + x),
                             area[3].min(rect[1] + rect[3] + y),
                         ]
-                    },
-                );
+                    });
                 let near = relevant
-                    || dom.bounds.get(&id).is_some_and(|rect| {
+                    || dom.geometry.mirror.get(&id).is_some_and(|rect| {
                         rect[0] <= area[2]
                             && rect[0] + rect[2] >= area[0]
                             && rect[1] <= area[3]
@@ -841,22 +848,24 @@ pub(super) fn autos(view: Rc<super::PageState>) -> Child {
                     );
                     let view = std::hash::Hasher::finish(&view) | 1;
                     let edges = dom
-                        .bounds
+                        .geometry
+                        .mirror
                         .get(&id)
                         .map_or([f32::NAN; 2], |rect| [rect[1], rect[1] + rect[3]]);
                     let resized =
                         edges != last.1 && (edges[0] == last.1[0] || edges[1] == last.1[1]);
                     if relevant || last.0 != view || !resized || shown.get(&id).is_none() {
                         *last = (view, edges);
-                        changes.push((dom.cull.walk.place(id), id, near, path.clone()));
+                        changes.push((dom.layout.cull.walk.place(id), id, near, path.clone()));
                     }
                 }
                 true
             });
-            let removed = dom.measurements.shown.len() > dom.autos.len();
+            let removed = dom.layout.measurements.shown.len() > dom.layout.autos.len();
             if removed {
-                let autos = &dom.autos;
-                dom.measurements
+                let autos = &dom.layout.autos;
+                dom.layout
+                    .measurements
                     .shown
                     .retain(|id, _| autos.contains_key(id));
             }
@@ -864,7 +873,7 @@ pub(super) fn autos(view: Rc<super::PageState>) -> Child {
             let (mut flipped, mut seen) = (false, false);
             let [width, height] = [f32::from(size.width), f32::from(size.height)];
             for (_, id, near, path) in changes {
-                let shown = &mut dom.measurements.shown;
+                let shown = &mut dom.layout.measurements.shown;
                 // A box in a box that skips its contents now keeps its state.
                 if path[..path.len() - 1]
                     .iter()
@@ -875,16 +884,21 @@ pub(super) fn autos(view: Rc<super::PageState>) -> Child {
                 let old = shown.insert(id, near);
                 // As in Chrome, new boxes report that they skip their contents before any box reports a change.
                 if old.is_none() {
-                    let at = dom.skip_events.iter().take_while(|event| event.1).count();
-                    dom.skip_events.insert(at, (id, true));
+                    let at = dom
+                        .layout
+                        .skip_events
+                        .iter()
+                        .take_while(|event| event.1)
+                        .count();
+                    dom.layout.skip_events.insert(at, (id, true));
                 }
                 if old.is_some() || near {
-                    dom.skip_events.push((id, !near));
-                    dom.measurements.waking.push(id);
+                    dom.layout.skip_events.push((id, !near));
+                    dom.layout.measurements.waking.push(id);
                     flipped = true;
                     // A box that shows in the view needs its contents in this frame.
                     seen |= near
-                        && dom.bounds.get(&id).is_some_and(|rect| {
+                        && dom.geometry.mirror.get(&id).is_some_and(|rect| {
                             rect[0] < width
                                 && rect[0] + rect[2] > 0.
                                 && rect[1] < height
@@ -907,22 +921,22 @@ pub(super) fn autos(view: Rc<super::PageState>) -> Child {
 
 // Builds the boxes on the path again, and the visibility of all nodes, when a box starts or stops to skip its contents.
 pub(super) fn reskip(
-    view: &super::PageState,
+    view: &super::ViewState,
     dom: &mut crate::dom::State,
     nodes: &rustc_hash::FxHashSet<usize>,
 ) {
-    dom.cull.reskipped = true;
-    let measured = &mut dom.measurements;
+    dom.layout.cull.reskipped = true;
+    let measured = &mut dom.layout.measurements;
     measured.retain(|node| !nodes.contains(&node));
     let mut kept = view.kept.borrow_mut();
     for node in nodes {
         measured.texts.remove(node);
-        dom.grids.remove(node);
+        dom.layout.grids.remove(node);
         kept.remove(node);
     }
 }
 
-fn wake(view: &super::PageState, path: &[usize], shown: bool, window: &mut renderer::Window) {
+fn wake(view: &super::ViewState, path: &[usize], shown: bool, window: &mut renderer::Window) {
     let mut kept = view.kept.borrow_mut();
     for id in path {
         kept.remove(id);

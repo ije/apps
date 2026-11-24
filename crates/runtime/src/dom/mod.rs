@@ -6,10 +6,22 @@ use crate::css::selector::HOVER;
 use crate::css::selector::Selector;
 mod document;
 mod entities;
+mod geometry;
+mod interaction;
+mod mirror;
 mod selector;
+mod tree;
+mod walk;
 
+use crate::render::media::Placeholder;
 pub use document::{Document, Node, escape};
+pub(crate) use geometry::Drawn;
+pub use geometry::Geometry;
+pub use interaction::Interaction;
+pub use mirror::LayoutMirror;
 pub(crate) use selector::{Dependency, Named, SelectorCache};
+pub use tree::Tree;
+pub(crate) use walk::{ABSENT, Walk};
 
 use crate::css;
 use crate::css::properties::Prop;
@@ -24,428 +36,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Row {
-    pub shift: renderer::Pixels,
-    pub right: renderer::Pixels,
-    pub gap: renderer::Pixels,
-    pub start: usize,
-    pub drop: renderer::Pixels,
-    pub above: renderer::Pixels,
-}
-
-pub(crate) type Rows = Rc<[Row]>;
-
-pub(crate) type TextLayout = (
-    renderer::Paragraph,
-    Rc<str>,
-    std::ops::Range<usize>,
-    Rows,
-    [renderer::Pixels; 2],
-);
-
-pub(crate) type SvgBoxes = (
-    Rc<str>,
-    Vec<(String, usize)>,
-    [f32; 2],
-    Vec<(usize, [f32; 4], [f32; 4])>,
-    [f32; 4],
-    [f32; 4],
-    [f32; 4],
-);
-
-// The mask of a box, 0, or of its `::before` or `::after`, 1 and 2: its inputs and its image.
-pub(crate) type Mask = (String, Option<Arc<renderer::RenderImage>>);
-
-type Decoded = Result<Result<renderer::RenderImage, (String, [f32; 2])>>;
-
-pub(crate) struct LayoutNode {
-    pub shape: u64,
-    pub attrs: u64,
-    pub seen: u64,
-    pub style: Rc<css::properties::Style>,
-    pub pseudos: Option<Rc<[css::properties::Style; 2]>>,
-    pub units: u64,
-    pub list: u64,
-    pub kids: u64,
-    pub(crate) out: u64,
-    pub revision: u64,
-    pub geometry: u64,
-    // The last revision that changed the box itself, not only the boxes in it.
-    pub shell: u64,
-    pub flags: u32,
-    pub marks: u32,
-}
-
-// Match the JS buffer layout: 4 header floats (stale, capacity, layout count, moved), 8 floats per node,
-// MIRROR_* bytes, then a count of bounds changes.
-#[derive(Default)]
-pub struct LayoutMirror {
-    memory: Option<Arc<MirrorMemory>>,
-    capacity: usize,
-}
-
-struct MirrorMemory(std::ptr::NonNull<f32>, usize);
-
-// SAFETY: only the JS thread reads and writes the floats; other threads only drop the last owner after a GC.
-unsafe impl Send for MirrorMemory {}
-unsafe impl Sync for MirrorMemory {}
-
-impl Drop for MirrorMemory {
-    fn drop(&mut self) {
-        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.0.as_ptr(), self.1)) });
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct Walk {
-    tree: u64,
-    composed: rustc_hash::FxHashMap<usize, Vec<usize>>,
-    pub(crate) nodes: Rc<Vec<(u32, u32)>>,
-    // The position and subtree length of each node in `nodes`, by ID. An absent node has the position ABSENT.
-    index: Rc<Vec<[u32; 2]>>,
-    pub(crate) serial: u64,
-    // The serial of the walk before the last patch, the nodes that the patch touched, and the count of those
-    // that moved, joined or left. The others only changed.
-    delta: Option<(u64, Rc<Vec<u32>>, usize)>,
-    // The lists before the last patch. The next patch writes into them when no one else holds them, because
-    // new lists of this size cost page faults.
-    spare: Rc<Vec<(u32, u32)>>,
-    spare_index: Rc<Vec<[u32; 2]>>,
-}
-
-const ABSENT: u32 = u32::MAX;
-
-enum Patch<'a> {
-    Span(u32),
-    Node {
-        id: u32,
-        start: usize,
-        end: u32,
-        children: &'a [usize],
-        // The old place of each child that keeps its walk, or ABSENT.
-        places: Vec<u32>,
-        next: usize,
-    },
-}
-
-impl Walk {
-    pub(crate) fn update(
-        &mut self,
-        doc: &Document,
-        composed: &rustc_hash::FxHashMap<usize, Vec<usize>>,
-        shared: Option<&Walk>,
-    ) -> bool {
-        let tree = doc.nodes.tree();
-        if self.tree == tree && !self.nodes.is_empty() && self.composed == *composed {
-            return false;
-        }
-        if let Some(shared) = shared
-            .filter(|shared| shared.tree == tree && !shared.nodes.is_empty())
-            .filter(|shared| shared.composed == *composed)
-        {
-            self.tree = tree;
-            self.composed.clone_from(composed);
-            if Rc::ptr_eq(&self.nodes, &shared.nodes) {
-                return false;
-            }
-            self.delta = shared.delta.clone().filter(|delta| delta.0 == self.serial);
-            self.nodes = shared.nodes.clone();
-            self.index = shared.index.clone();
-            self.serial = shared.serial;
-            return true;
-        }
-        let patched = self.patch(doc, composed);
-        self.tree = tree;
-        self.composed.clone_from(composed);
-        #[cfg(debug_assertions)]
-        let kept = patched.map(|changed| (changed, self.nodes.clone(), self.index.clone()));
-        #[cfg(debug_assertions)]
-        let patched = None::<bool>;
-        if let Some(changed) = patched {
-            return changed;
-        }
-        let mut nodes = Vec::with_capacity(self.nodes.len());
-        let mut pending = vec![(0, ABSENT)];
-        while let Some((id, parent)) = pending.pop() {
-            nodes.push((id, parent));
-            pending.extend(
-                composed
-                    .get(&(id as usize))
-                    .unwrap_or(&doc.nodes[id as usize].children)
-                    .iter()
-                    .rev()
-                    .map(|&child| (child as u32, id)),
-            );
-        }
-        let mut index = vec![[ABSENT, 1]; doc.nodes.len()];
-        for (at, &(id, _)) in nodes.iter().enumerate() {
-            index[id as usize][0] = at as u32;
-        }
-        for &(id, parent) in nodes[1..].iter().rev() {
-            index[parent as usize][1] += index[id as usize][1];
-        }
-        #[cfg(debug_assertions)]
-        if let Some((changed, patched, positions)) = kept {
-            assert!(*patched == nodes, "patched walk differs");
-            assert!(
-                nodes
-                    .iter()
-                    .all(|&(id, _)| positions[id as usize] == index[id as usize])
-                    && positions.iter().filter(|slot| slot[0] != ABSENT).count() == nodes.len(),
-                "patched walk index differs"
-            );
-            return changed;
-        }
-        self.nodes = Rc::new(nodes);
-        self.index = Rc::new(index);
-        self.serial = document::stamp();
-        self.delta = None;
-        true
-    }
-
-    // The nodes that moved, joined, left or changed since the walk with this serial, with duplicates. Other
-    // nodes keep their parent and their order.
-    pub(crate) fn since(&self, serial: u64) -> Option<&[u32]> {
-        let (from, touched, _) = self.delta.as_ref()?;
-        (*from == serial).then_some(touched)
-    }
-
-    // The nodes of `since` that only changed: they have a newer revision or other children, at their old place.
-    pub(crate) fn changed_since(&self, serial: u64) -> Option<&[u32]> {
-        let (_, _, moved) = self.delta.as_ref()?;
-        Some(&self.since(serial)?[*moved..])
-    }
-
-    pub(crate) fn contains(&self, id: usize) -> bool {
-        self.place(id).is_some()
-    }
-
-    pub(crate) fn place(&self, id: usize) -> Option<u32> {
-        self.index
-            .get(id)
-            .map(|slot| slot[0])
-            .filter(|&at| at != ABSENT)
-    }
-
-    // The count of the nodes in the walk from this node to the last one below it.
-    pub(crate) fn span(&self, id: usize) -> usize {
-        self.index.get(id).map_or(1, |slot| slot[1] as usize)
-    }
-
-    pub(crate) fn parent(&self, id: usize) -> Option<u32> {
-        Some(self.nodes[self.place(id)? as usize].1)
-    }
-
-    // Copies the old walk and walks again only below nodes with a newer revision or other composed children.
-    // Returns whether the walk changed, or None when a fresh walk is needed.
-    fn patch(
-        &mut self,
-        doc: &Document,
-        composed: &rustc_hash::FxHashMap<usize, Vec<usize>>,
-    ) -> Option<bool> {
-        let old = self.nodes.clone();
-        if old.is_empty() || self.index.len() > doc.nodes.len() {
-            return None;
-        }
-        let place = |index: &[[u32; 2]], id: usize| index.get(id).map_or(ABSENT, |slot| slot[0]);
-        let mut marks: Vec<u32> = doc
-            .nodes
-            .changed_since(self.tree)
-            .chain(
-                composed
-                    .iter()
-                    .filter(|&(id, children)| self.composed.get(id) != Some(children))
-                    .map(|(&id, _)| id),
-            )
-            .chain(
-                self.composed
-                    .keys()
-                    .copied()
-                    .filter(|id| !composed.contains_key(id)),
-            )
-            .map(|id| place(&self.index, id))
-            .filter(|&at| at != ABSENT)
-            .collect();
-        marks.sort_unstable();
-        marks.dedup();
-        if marks.is_empty() {
-            return Some(false);
-        }
-        if marks.len() > old.len() / 8 {
-            return None;
-        }
-        let children = |id: u32| {
-            composed
-                .get(&(id as usize))
-                .unwrap_or(&doc.nodes[id as usize].children)
-                .as_slice()
-        };
-        let mut out = Rc::try_unwrap(std::mem::take(&mut self.spare)).unwrap_or_default();
-        out.clear();
-        out.reserve(old.len() + 64);
-        let mut index = std::mem::take(&mut self.index);
-        if Rc::get_mut(&mut index).is_none() {
-            let spare = std::mem::take(&mut self.spare_index);
-            let mut copy = Rc::try_unwrap(spare).unwrap_or_default();
-            copy.clear();
-            copy.extend_from_slice(&index);
-            self.spare_index = std::mem::replace(&mut index, Rc::new(copy));
-        }
-        let sizes = Rc::get_mut(&mut index).expect("an index of its own");
-        sizes.resize(doc.nodes.len(), [ABSENT, 1]);
-        // The parts of the new walk that are not at their place in the old one.
-        let mut moved: Vec<std::ops::Range<usize>> = Vec::new();
-        macro_rules! copy {
-            ($from:expr, $to:expr) => {
-                let (from, to) = ($from as usize, $to as usize);
-                if out.len() != from {
-                    moved.push(out.len()..out.len() + to - from);
-                }
-                out.extend_from_slice(&old[from..to]);
-            };
-        }
-        let (mut touched, mut changed) = (Vec::new(), Vec::new());
-        let mut pending = Vec::new();
-        let (mut cursor, mut mark) = (0u32, 0);
-        let mut stack = vec![Patch::Span(old.len() as u32)];
-        while let Some(top) = stack.last_mut() {
-            match top {
-                Patch::Span(end) => {
-                    while marks.get(mark).is_some_and(|&at| at < cursor) {
-                        mark += 1;
-                    }
-                    let Some(&at) = marks.get(mark).filter(|&&at| at < *end) else {
-                        copy!(cursor, *end);
-                        cursor = *end;
-                        stack.pop();
-                        continue;
-                    };
-                    mark += 1;
-                    copy!(cursor, at);
-                    let (id, parent) = old[at as usize];
-                    changed.push(id);
-                    cursor = at + 1;
-                    let (list, end) = (children(id), at + sizes[id as usize][1]);
-                    let kept = |child: &usize| {
-                        let place = place(sizes, *child);
-                        let own = place != ABSENT && old[place as usize] == (*child as u32, id);
-                        if own { place } else { ABSENT }
-                    };
-                    let mut places: Vec<u32> = list.iter().map(kept).collect();
-                    // Children keep their walk in the longest run of rising old places, so a child that
-                    // moved up doesn't make all the children after it move.
-                    if !places.iter().filter(|&&place| place != ABSENT).is_sorted() {
-                        let mut tails: Vec<usize> = Vec::new();
-                        let mut before = vec![usize::MAX; places.len()];
-                        for (child, &place) in places.iter().enumerate() {
-                            if place == ABSENT {
-                                continue;
-                            }
-                            let run = tails.partition_point(|&tail| places[tail] < place);
-                            if run > 0 {
-                                before[child] = tails[run - 1];
-                            }
-                            match tails.get_mut(run) {
-                                Some(tail) => *tail = child,
-                                None => tails.push(child),
-                            }
-                        }
-                        let mut last = tails.last().copied().unwrap_or(usize::MAX);
-                        let all = std::mem::replace(&mut places, vec![ABSENT; before.len()]);
-                        while last != usize::MAX {
-                            places[last] = all[last];
-                            last = before[last];
-                        }
-                    }
-                    stack.push(Patch::Node {
-                        id,
-                        start: out.len(),
-                        end,
-                        children: list,
-                        places,
-                        next: 0,
-                    });
-                    moved.push(out.len()..out.len() + 1);
-                    out.push((id, parent));
-                }
-                Patch::Node {
-                    id,
-                    start,
-                    end,
-                    children: list,
-                    places,
-                    next,
-                } => {
-                    let Some(&child) = list.get(*next) else {
-                        touched.extend(
-                            old[cursor as usize..*end as usize]
-                                .iter()
-                                .map(|node| node.0),
-                        );
-                        cursor = *end;
-                        let (id, start) = (*id, *start);
-                        stack.pop();
-                        let size = (out.len() - start) as u32;
-                        let grown =
-                            size.wrapping_sub(std::mem::replace(&mut sizes[id as usize][1], size));
-                        // Nodes above that are not on the stack keep their old walk. Only their length changes.
-                        let above = stack.iter().rev().find_map(|patch| match patch {
-                            Patch::Node { id, .. } => Some(*id),
-                            Patch::Span(_) => None,
-                        });
-                        let mut parent = out[start].1;
-                        while grown != 0 && parent != ABSENT && Some(parent) != above {
-                            let slot = &mut sizes[parent as usize];
-                            slot[1] = slot[1].wrapping_add(grown);
-                            parent = old[slot[0] as usize].1;
-                        }
-                        continue;
-                    };
-                    let at = places[*next];
-                    *next += 1;
-                    if at != ABSENT {
-                        touched.extend(old[cursor as usize..at as usize].iter().map(|node| node.0));
-                        cursor = at;
-                        stack.push(Patch::Span(at + sizes[child][1]));
-                        continue;
-                    }
-                    let from = out.len();
-                    pending.push((child as u32, *id));
-                    while let Some((id, parent)) = pending.pop() {
-                        out.push((id, parent));
-                        touched.push(id);
-                        pending.extend(children(id).iter().rev().map(|&child| (child as u32, id)));
-                    }
-                    moved.push(from..out.len());
-                    for &(id, _) in &out[from..] {
-                        sizes[id as usize][1] = 1;
-                    }
-                    for at in (from + 1..out.len()).rev() {
-                        let (id, parent) = out[at];
-                        sizes[parent as usize][1] += sizes[id as usize][1];
-                    }
-                }
-            }
-        }
-        for &id in &touched {
-            sizes[id as usize][0] = ABSENT;
-        }
-        for at in moved.into_iter().flatten() {
-            sizes[out[at].0 as usize][0] = at as u32;
-        }
-        self.index = index;
-        // After a patch of most of the walk, a full pass costs readers less than this list.
-        let most = touched.len() > out.len() / 2;
-        self.spare = std::mem::replace(&mut self.nodes, Rc::new(out));
-        let moved = touched.len();
-        touched.extend(changed);
-        self.delta = (!most).then(|| (self.serial, Rc::new(touched), moved));
-        self.serial = document::stamp();
-        Some(true)
-    }
-}
 
 pub(crate) const CHECKED: u16 = 16;
 pub(crate) const DIRTY: u16 = 32;
@@ -514,380 +104,36 @@ impl Node {
     }
 }
 
-const MIRROR_BOUNDS: u8 = 1;
-const MIRROR_SCROLLER: u8 = 2;
-const MIRROR_CLIP: u8 = 4;
-const MIRROR_POSITIONED: u8 = 8;
-const MIRROR_HIDDEN: u8 = 16;
-const MIRROR_FIXED: u8 = 32;
-const MIRROR_INERT: u8 = 64;
-// The box has a transform, or an ancestor has one that changes its size, so the bounds are not its layout box.
-const MIRROR_TRANSFORMED: u8 = 128;
-
-impl LayoutMirror {
-    fn slot(&self, id: usize) -> *mut f32 {
-        self.memory
-            .as_ref()
-            .map_or(std::ptr::NonNull::dangling().as_ptr(), |memory| {
-                memory.0.as_ptr()
-            })
-            .wrapping_add(4 + id * 8)
-    }
-
-    pub(crate) fn mark_inert(&self, id: usize, inert: bool) {
-        unsafe {
-            let flags = self.flags(id);
-            *flags = (*flags & !MIRROR_INERT) | (u8::from(inert) * MIRROR_INERT);
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    pub(crate) fn inert(&self, id: usize) -> bool {
-        unsafe { *self.flags(id) & MIRROR_INERT != 0 }
-    }
-
-    fn flags(&self, id: usize) -> *mut u8 {
-        self.slot(self.capacity).cast::<u8>().wrapping_add(id)
-    }
-
-    fn changes(&self) -> *mut f32 {
-        self.slot(self.capacity).wrapping_add(self.capacity / 4)
-    }
-
-    // Counts the style changes, which can change a content box without a new border box.
-    fn restyles(&self) -> *mut f32 {
-        self.changes().wrapping_add(1)
-    }
-
-    pub(crate) fn restyled(&mut self) {
-        if self.memory.is_some() {
-            // Pages compare the count only for equality, so it wraps before an f32 stops counting.
-            unsafe { *self.restyles() = (*self.restyles() + 1.) % 16_777_216. };
-        }
-    }
-
-    pub(crate) fn reserve(&mut self, id: usize) {
-        if id >= self.capacity {
-            self.resize((id + 1).next_power_of_two().max(1024));
-        }
-    }
-
-    fn shrink(&mut self, len: usize) {
-        let capacity = len.next_power_of_two().max(1024);
-        if capacity * 4 <= self.capacity {
-            self.resize(capacity);
-        }
-    }
-
-    fn resize(&mut self, capacity: usize) {
-        let words = 4 + capacity * 8 + capacity / 4 + 2;
-        let memory = std::ptr::NonNull::new(Box::into_raw(vec![0f32; words].into_boxed_slice()))
-            .expect("Layout memory")
-            .cast::<f32>();
-        unsafe {
-            *memory.as_ptr().add(1) = capacity as f32;
-            if let Some(old) = &self.memory {
-                let kept = self.capacity.min(capacity);
-                std::ptr::copy_nonoverlapping(self.slot(0), memory.as_ptr().add(4), kept * 8);
-                std::ptr::copy_nonoverlapping(
-                    self.flags(0),
-                    memory.as_ptr().add(4 + capacity * 8).cast::<u8>(),
-                    kept,
-                );
-                *memory.as_ptr().add(2) = *old.0.as_ptr().add(2);
-                *memory.as_ptr().add(words - 2) = *self.changes();
-                *memory.as_ptr().add(words - 1) = *self.restyles();
-                // Pages keep reading the old buffer until they see this flag and fetch the new one.
-                *old.0.as_ptr() = 1.;
-            }
-        }
-        self.memory = Some(Arc::new(MirrorMemory(memory, words)));
-        self.capacity = capacity;
-    }
-
-    pub(crate) fn get(&self, id: &usize) -> Option<&[f32; 4]> {
-        (*id < self.capacity && unsafe { *self.flags(*id) } & MIRROR_BOUNDS != 0)
-            .then(|| unsafe { &*self.slot(*id).cast::<[f32; 4]>() })
-    }
-
-    pub(crate) fn get_mut(&mut self, id: &usize) -> Option<&mut [f32; 4]> {
-        (*id < self.capacity && unsafe { *self.flags(*id) } & MIRROR_BOUNDS != 0)
-            .then(|| unsafe { &mut *self.slot(*id).cast::<[f32; 4]>() })
-    }
-
-    pub fn insert(&mut self, id: usize, rect: [f32; 4]) {
-        self.reserve(id);
-        unsafe {
-            let (slot, flags) = (self.slot(id).cast::<[f32; 4]>(), self.flags(id));
-            // Pages compare the count only for equality, so it wraps before an f32 stops counting.
-            if *flags & MIRROR_BOUNDS == 0 || *slot != rect {
-                let changes = self.changes();
-                *changes = (*changes + 1.) % 16_777_216.;
-            }
-            *slot = rect;
-            *flags |= MIRROR_BOUNDS;
-        }
-    }
-
-    pub(crate) fn transformed(&mut self, id: usize, on: bool) {
-        unsafe {
-            let flags = self.flags(id);
-            *flags = *flags & !MIRROR_TRANSFORMED | if on { MIRROR_TRANSFORMED } else { 0 };
-        }
-    }
-
-    pub(crate) fn remove(&mut self, id: &usize) {
-        if *id < self.capacity {
-            unsafe {
-                *self.slot(*id).cast::<[f32; 8]>() = [0.; 8];
-                *self.flags(*id) = 0;
-            }
-        }
-    }
-
-    pub(crate) fn moved(&self) -> bool {
-        self.memory
-            .as_ref()
-            .is_some_and(|memory| unsafe { *memory.0.as_ptr().add(3) } != 0.)
-    }
-
-    pub(crate) fn settle(&mut self) {
-        if let Some(memory) = &self.memory {
-            unsafe { *memory.0.as_ptr().add(3) = 0. };
-        }
-    }
-
-    pub(crate) fn set_moved(&mut self) {
-        if let Some(memory) = &self.memory {
-            unsafe { *memory.0.as_ptr().add(3) = 1. };
-        }
-    }
-
-    pub(crate) fn touch(&mut self) {
-        self.reserve(0);
-        if let Some(memory) = &self.memory {
-            // An f32 stops counting at 2^24, so the count wraps. Pages only compare it for equality.
-            unsafe {
-                let count = memory.0.as_ptr().add(2);
-                *count = (*count + 1.) % 16_777_216.;
-                *memory.0.as_ptr().add(3) = 0.;
-            }
-        }
-    }
-
-    // `nodes` must hold every node shown in either list and every node past the end of `old`.
-    pub(crate) fn hide(
-        &mut self,
-        visible: &[bool],
-        old: &[bool],
-        nodes: impl Iterator<Item = usize>,
-    ) {
-        if let Some(last) = visible.len().checked_sub(1) {
-            self.reserve(last);
-        }
-        for id in nodes {
-            let Some(&shown) = visible.get(id) else {
-                continue;
-            };
-            if old.get(id).copied().unwrap_or(true) != shown {
-                self.show(id, shown);
-            }
-        }
-    }
-
-    pub(crate) fn show(&mut self, id: usize, shown: bool) {
-        self.reserve(id);
-        unsafe {
-            let flags = self.flags(id);
-            *flags = *flags & !MIRROR_HIDDEN | if shown { 0 } else { MIRROR_HIDDEN };
-        }
-    }
-
-    fn scroll(&mut self, id: usize, values: [f32; 4]) {
-        self.reserve(id);
-        unsafe {
-            *self.slot(id).add(4).cast::<[f32; 4]>() = values;
-            *self.flags(id) |= MIRROR_SCROLLER;
-        }
-    }
-
-    // Pages take the content extent of a box without the scroller mark, so the mark must go with the handle.
-    pub(crate) fn unscroll(&mut self, id: usize) {
-        if id < self.capacity {
-            unsafe {
-                *self.slot(id).add(4).cast::<[f32; 4]>() = [0.; 4];
-                *self.flags(id) &= !MIRROR_SCROLLER;
-            }
-        }
-    }
-
-    pub(crate) fn share(&mut self) -> (*mut std::ffi::c_void, usize, *mut std::ffi::c_void) {
-        self.reserve(0);
-        let memory = self.memory.clone().expect("Layout memory");
-        (
-            memory.0.as_ptr().cast(),
-            (4 + self.capacity * 8) * 4 + self.capacity + 8,
-            Arc::into_raw(memory).cast_mut().cast(),
-        )
-    }
-
-    pub(crate) unsafe extern "C" fn release(
-        _: *mut std::ffi::c_void,
-        owner: *mut std::ffi::c_void,
-    ) {
-        drop(unsafe { Arc::from_raw(owner.cast::<MirrorMemory>()) });
-    }
-}
-
-impl Extend<(usize, [f32; 4])> for LayoutMirror {
-    fn extend<T: IntoIterator<Item = (usize, [f32; 4])>>(&mut self, items: T) {
-        for (id, rect) in items {
-            self.insert(id, rect);
-        }
-    }
-}
-
-// A move of the mirror for a scroll: by how much, and the nodes of the walk it moved.
-type ScrollShift = ([f32; 2], Rc<Vec<(u32, u32)>>, std::ops::Range<usize>);
-
 #[derive(Default)]
 pub struct State {
-    pub base: Option<url::Url>,
-    pub(crate) free: std::collections::BinaryHeap<std::cmp::Reverse<usize>>,
-    pub(crate) removed: Vec<usize>,
-    pub(crate) created: usize,
-    pub(crate) detached: Vec<usize>,
-    live: rustc_hash::FxHashSet<usize>,
-    pub bounds: LayoutMirror,
-    // The parts of boxes that columns split, which take pointer events.
-    pub(crate) fragments: rustc_hash::FxHashMap<usize, Box<[[f32; 4]]>>,
-    // The parts of spliced inline boxes in each line of text that holds them, by the key of that text.
-    pub(crate) pieces: rustc_hash::FxHashMap<usize, Vec<(usize, [f32; 4])>>,
-    pub(crate) text_layouts: rustc_hash::FxHashMap<usize, TextLayout>,
-    pub scroll: rustc_hash::FxHashMap<usize, renderer::ScrollRef>,
-    scroll_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
-    // The scroll offsets that the mirror shows, as of the last prepaint, the moves of the mirror for user scrolls
-    // since then, and whether the boxes in each scroll move as a whole, by style epoch and walk.
-    mirror_offsets: rustc_hash::FxHashMap<usize, renderer::Point<renderer::Pixels>>,
-    scroll_shifts: Vec<ScrollShift>,
-    // Scrolls that moved since the mirror did, and whether they alone left it stale.
-    unshifted: Vec<usize>,
-    only_scrolled: bool,
-    shiftable: rustc_hash::FxHashMap<usize, (u64, u64, bool)>,
-    pub(crate) grids: rustc_hash::FxHashMap<
-        usize,
-        (
-            f32,
-            Option<f32>,
-            Option<crate::render::grid::Grid>,
-            crate::render::grid::Grid,
-        ),
-    >,
-    pub(crate) flexed_grids: rustc_hash::FxHashMap<usize, [Option<(f32, f32)>; 2]>,
-    pub(crate) grid_widest: rustc_hash::FxHashMap<usize, f32>,
-    // The used columns and rows of the last layout of each grid, for `getComputedStyle()`.
-    pub(crate) tracks: rustc_hash::FxHashMap<usize, [Box<[f32]>; 2]>,
-    // The grid area of each grid item at its last build, for `getComputedStyle()`.
-    pub(crate) areas: rustc_hash::FxHashMap<usize, [f32; 2]>,
-    pub(crate) baselines: crate::render::grid::Baselines,
-    pub(crate) layout_nodes: Vec<Option<LayoutNode>>,
-    pub(crate) measurements: crate::render::grid::Measurements,
-    pub painted: Vec<u64>,
-    // A hash of the state that paint reads outside the boxes: images and the selection.
-    pub(crate) paint_inputs: u64,
-    pub(crate) layout_revision: u64,
-    layout_epoch: u64,
+    pub tree: Tree,
+    pub geometry: Geometry,
+    pub interaction: Interaction,
     pub(crate) styles: style::Styles,
-    pub(crate) focus: Option<usize>,
-    interaction: [Vec<usize>; 3],
-    pub selection: rustc_hash::FxHashMap<usize, [usize; 2]>,
-    pub selection_caret: Option<usize>,
+    pub layout: crate::render::layout::Layout,
+    pub rasters: crate::render::layout::Rasters,
+    pub media: crate::render::media::Media,
+    pub fonts: crate::render::fonts::Fonts,
+    pub base: Option<url::Url>,
     pub(crate) dirty: bool,
     pub frame_requested: bool,
     pub(crate) wheel: bool,
-    pub canvases: rustc_hash::FxHashMap<usize, crate::render::canvas::Canvas>,
-    pub(crate) terminals: Rc<std::cell::RefCell<crate::web::terminal::Terminals>>,
-    pub(crate) sources: std::cell::RefCell<rustc_hash::FxHashMap<usize, CanvasSource>>,
-    pub images: rustc_hash::FxHashMap<usize, Arc<renderer::RenderImage>>,
-    pub shadows: rustc_hash::FxHashMap<usize, usize>,
-    pub(crate) hosts: rustc_hash::FxHashMap<usize, usize>,
-    pub retired: Vec<Arc<renderer::RenderImage>>,
-    pub(crate) retired_canvases: HashSet<usize>,
-    pub(crate) recycled: Vec<(usize, Arc<renderer::RenderImage>)>,
-    decoded: Arc<Mutex<Vec<(usize, u64, Decoded)>>>,
-    frames: Frames,
-    pub(crate) placeholders: rustc_hash::FxHashMap<usize, Placeholder>,
-    decoding: rustc_hash::FxHashMap<usize, u64>,
-    pub(crate) reserved: rustc_hash::FxHashSet<usize>,
-    pub(crate) svg_sources: rustc_hash::FxHashMap<usize, Rc<str>>,
-    pub(crate) svg_boxes: rustc_hash::FxHashMap<usize, SvgBoxes>,
-    pub(crate) svg_trees: rustc_hash::FxHashMap<usize, usvg::Tree>,
-    pub(crate) svg_images: rustc_hash::FxHashMap<usize, (Rc<str>, [f32; 2])>,
-    pub(crate) masks: rustc_hash::FxHashMap<(usize, u8), Mask>,
-    pub(crate) svgs: rustc_hash::FxHashMap<usize, (Rc<str>, Arc<renderer::RenderImage>)>,
-    pub(crate) svg_cache: HashMap<
-        Rc<str>,
-        (
-            crate::render::canvas::SvgGeometry,
-            Vec<Arc<renderer::RenderImage>>,
-        ),
-    >,
-    pub(crate) backgrounds: HashMap<(usize, usize), (String, Arc<renderer::RenderImage>)>,
-    pub(crate) bitmaps: HashMap<String, Arc<renderer::RenderImage>>,
-    // The decoded source of each background layer, kept while the layer keeps its raster, so `retire` keeps it.
-    pub(crate) layer_sources: HashMap<(usize, usize), Arc<renderer::RenderImage>>,
-    pub(crate) gradients: Vec<(String, Arc<renderer::RenderImage>)>,
-    pub(crate) font_aliases: HashMap<String, String>,
-    pub(crate) fonts: HashMap<String, Option<String>>,
-    pub(crate) font_loads: u32,
-    pub(crate) font_text: (u64, Vec<u64>),
-    pub(crate) text_system: Option<std::rc::Rc<renderer::TextSystem>>,
     pub(crate) window: renderer::WindowState,
     pub pixel_ratio: f32,
-    pub(crate) containers: rustc_hash::FxHashMap<usize, [f32; 2]>,
-    pub(crate) atoms: rustc_hash::FxHashMap<usize, [f32; 3]>,
-    // The rendered `::before` and `::after` boxes that scripts can read, by their atom key: the place of the border
-    // box from the border box of the element in layout, its size, then the padding plus border of each side.
-    pub pseudo_boxes: rustc_hash::FxHashMap<usize, [f32; 8]>,
-    pub(crate) container_pass: bool,
-    pub(crate) anchors: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
-    pub(crate) blocks: rustc_hash::FxHashMap<usize, renderer::Rect<renderer::Pixels>>,
-    pub(crate) cull: crate::render::cull::Cull,
-    pub top_layer: Vec<usize>,
-    // The last drawing of each drawable element of a canvas, with its device pixels per CSS pixel.
-    pub(crate) snapshots: rustc_hash::FxHashMap<usize, (Rc<tiny_skia::Pixmap>, f32)>,
-    pub(crate) drawn: rustc_hash::FxHashMap<usize, Drawn>,
-    drawn_order: u32,
     pub(crate) paint_requested: bool,
-    // The `content-visibility: auto` boxes, each with the boxes on its path, the boxes that clip it, and the view
-    // and its top and bottom at its last change.
-    #[allow(clippy::type_complexity)]
-    pub(crate) autos: rustc_hash::FxHashMap<usize, (Rc<[usize]>, Rc<[usize]>, (u64, [f32; 2]))>,
-    // `contentvisibilityautostatechange` events: the box and whether it skips its contents now.
-    pub(crate) skip_events: Vec<(usize, bool)>,
-}
-
-// Where a canvas drew a drawable element, which takes the pointer there.
-pub(crate) struct Drawn {
-    // From the border box of the element to the content box of the canvas, in CSS pixels.
-    pub(crate) matrix: [f32; 16],
-    // The part of the content box of the canvas that shows the element.
-    pub(crate) clip: Option<[f32; 4]>,
-    // Elements drawn later take the pointer first.
-    pub(crate) order: u32,
 }
 
 impl State {
     // Only the first replaced image can be on the GPU. Drop later images at once to bound memory in unrendered
     // windows.
     fn retire(&mut self, id: usize, old: Option<Arc<renderer::RenderImage>>) {
-        if self.retired.is_empty() {
-            self.retired_canvases.clear();
+        if self.media.retired.is_empty() {
+            self.media.retired_canvases.clear();
         }
         if let Some(old) = old
-            && self.retired_canvases.insert(id)
+            && self.media.retired_canvases.insert(id)
         {
-            self.retired.push(old);
+            self.media.retired.push(old);
         }
     }
 
@@ -898,23 +144,31 @@ impl State {
 
     // The scroll offset of a box that the mirror shows.
     pub(crate) fn mirror_offset(&self, id: usize) -> renderer::Point<renderer::Pixels> {
-        self.mirror_offsets.get(&id).copied().unwrap_or_default()
+        self.geometry
+            .mirror_offsets
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
     }
 
     // After prepaint, the mirror shows the scroll offsets now.
     pub(crate) fn prepainted(&mut self) {
-        self.mirror_offsets.clear();
-        for (&id, handle) in &self.scroll {
-            self.mirror_offsets
+        self.geometry.mirror_offsets.clear();
+        for (&id, handle) in &self.geometry.scroll {
+            self.geometry
+                .mirror_offsets
                 .insert(id, painted_offset(handle, self.pixel_ratio));
         }
     }
 
     // Prepaint moves the mirror from where it put it, so the moves for user scrolls go back first.
     pub(crate) fn unshift(&mut self) {
-        self.unshifted.clear();
-        self.only_scrolled = false;
-        for (by, nodes, range) in std::mem::take(&mut self.scroll_shifts).into_iter().rev() {
+        self.geometry.unshifted.clear();
+        self.geometry.only_scrolled = false;
+        for (by, nodes, range) in std::mem::take(&mut self.geometry.scroll_shifts)
+            .into_iter()
+            .rev()
+        {
             self.shift_mirror(&nodes[range], [-by[0], -by[1]]);
         }
     }
@@ -922,20 +176,20 @@ impl State {
     fn shift_mirror(&mut self, nodes: &[(u32, u32)], [x, y]: [f32; 2]) {
         for &(id, _) in nodes {
             let id = id as usize;
-            if let Some(rect) = self.bounds.get_mut(&id)
+            if let Some(rect) = self.geometry.mirror.get_mut(&id)
                 && *rect != [0.; 4]
             {
                 (rect[0], rect[1]) = (rect[0] + x, rect[1] + y);
             }
-            if !self.fragments.is_empty()
-                && let Some(parts) = self.fragments.get_mut(&id)
+            if !self.geometry.fragments.is_empty()
+                && let Some(parts) = self.geometry.fragments.get_mut(&id)
             {
                 parts
                     .iter_mut()
                     .for_each(|part| (part[0], part[1]) = (part[0] + x, part[1] + y));
             }
-            if !self.pieces.is_empty()
-                && let Some(pieces) = self.pieces.get_mut(&id)
+            if !self.geometry.pieces.is_empty()
+                && let Some(pieces) = self.geometry.pieces.get_mut(&id)
             {
                 pieces
                     .iter_mut()
@@ -949,7 +203,8 @@ impl State {
         let Some(place) = self.styles.walk.place(id).map(|place| place as usize) else {
             return [0.; 2];
         };
-        self.scroll_shifts
+        self.geometry
+            .scroll_shifts
             .iter()
             .filter(|(_, nodes, range)| {
                 range.contains(&place) && nodes.get(place).is_some_and(|node| node.0 as usize == id)
@@ -960,20 +215,21 @@ impl State {
     // Moves the mirror for the user scrolls since the last prepaint, when a script reads geometry. True when the
     // mirror is then current without a layout.
     pub(crate) fn shift_scrolls(&mut self) -> bool {
-        let unshifted = std::mem::take(&mut self.unshifted);
-        if !std::mem::take(&mut self.only_scrolled) {
+        let unshifted = std::mem::take(&mut self.geometry.unshifted);
+        if !std::mem::take(&mut self.geometry.only_scrolled) {
             return false;
         }
         let mut shifted = true;
         for id in unshifted {
             let to = self
+                .geometry
                 .scroll
                 .get(&id)
                 .map(|handle| painted_offset(handle, self.pixel_ratio));
             shifted &= to.is_some_and(|to| self.shift_scrolled(id, to));
         }
         if shifted {
-            self.bounds.settle();
+            self.geometry.mirror.settle();
         }
         shifted
     }
@@ -981,7 +237,7 @@ impl State {
     // Moves the mirror of the boxes in a scroll that the user moved, so geometry reads before the next prepaint
     // see the new offset. False when its boxes don't move as a whole, like fixed, sticky or transformed boxes.
     fn shift_scrolled(&mut self, id: usize, to: renderer::Point<renderer::Pixels>) -> bool {
-        let Some(&from) = self.mirror_offsets.get(&id).filter(|_| id != 0) else {
+        let Some(&from) = self.geometry.mirror_offsets.get(&id).filter(|_| id != 0) else {
             return false;
         };
         let by = [f32::from(to.x - from.x), f32::from(to.y - from.y)];
@@ -991,7 +247,7 @@ impl State {
         };
         let range = start as usize + 1..start as usize + walk.span(id);
         let key = (self.styles.epoch, walk.serial);
-        let shiftable = match self.shiftable.get(&id) {
+        let shiftable = match self.geometry.shiftable.get(&id) {
             Some(&(epoch, serial, shiftable)) if (epoch, serial) == key => shiftable,
             _ => {
                 // A transform, zoom or perspective on the scroll, around it or in it doesn't move boxes by the offset.
@@ -1012,7 +268,7 @@ impl State {
                     })
                 };
                 let contains = crate::render::effects::establishes(&computed.values[id]).absolute;
-                let shiftable = self.top_layer.is_empty()
+                let shiftable = self.interaction.top_layer.is_empty()
                     && std::iter::successors(Some(id as u32), |&node| {
                         walk.parent(node as usize)
                             .filter(|&parent| parent != ABSENT)
@@ -1029,7 +285,9 @@ impl State {
                             && (contains || position != "absolute")
                             && flat(node as usize)
                     });
-                self.shiftable.insert(id, (key.0, key.1, shiftable));
+                self.geometry
+                    .shiftable
+                    .insert(id, (key.0, key.1, shiftable));
                 shiftable
             }
         };
@@ -1038,15 +296,15 @@ impl State {
         }
         let nodes = walk.nodes.clone();
         self.shift_mirror(&nodes[range.clone()], by);
-        self.scroll_shifts.push((by, nodes, range));
-        self.mirror_offsets.insert(id, to);
+        self.geometry.scroll_shifts.push((by, nodes, range));
+        self.geometry.mirror_offsets.insert(id, to);
         true
     }
 
     pub(crate) fn sync_scroll(&mut self) {
-        for (&id, handle) in &self.scroll {
+        for (&id, handle) in &self.geometry.scroll {
             let (offset, max) = (scroll_offset(handle, handle.offset()), handle.overflow());
-            self.bounds.scroll(
+            self.geometry.mirror.scroll(
                 id,
                 [
                     -f32::from(offset.x),
@@ -1061,9 +319,9 @@ impl State {
     // Free removed nodes' data now: row churn can outpace GC and retain more than the live document.
     fn drop_removed(&mut self, doc: &Document) {
         let mut gone = Vec::new();
-        for root in std::mem::take(&mut self.removed) {
+        for root in std::mem::take(&mut self.tree.removed) {
             if doc.nodes.get(root).is_none_or(|node| node.parent.is_some())
-                || self.hosts.contains_key(&root)
+                || self.tree.hosts.contains_key(&root)
             {
                 continue;
             }
@@ -1073,22 +331,23 @@ impl State {
                 let id = gone[next];
                 next += 1;
                 gone.extend(&doc.nodes[id].children);
-                gone.extend(self.shadows.get(&id));
+                gone.extend(self.tree.shadows.get(&id));
             }
         }
         self.styles.cache.forget(&gone);
         for id in gone {
-            self.measurements.shown.remove(&id);
-            self.autos.remove(&id);
-            self.measurements.remembered.remove(&id);
-            self.measurements.texts.remove(&id);
-            if !self.pseudo_boxes.is_empty() {
+            self.layout.measurements.shown.remove(&id);
+            self.layout.autos.remove(&id);
+            self.layout.measurements.remembered.remove(&id);
+            self.layout.measurements.texts.remove(&id);
+            if !self.layout.pseudo_boxes.is_empty() {
                 for pseudo in 1..3 {
-                    self.pseudo_boxes
+                    self.layout
+                        .pseudo_boxes
                         .remove(&crate::render::inline::atom_key(id, pseudo));
                 }
             }
-            if let Some(node) = self.layout_nodes.get_mut(id) {
+            if let Some(node) = self.layout.layout_nodes.get_mut(id) {
                 *node = None;
             }
         }
@@ -1097,7 +356,7 @@ impl State {
     pub(crate) fn trim(&mut self, doc: &mut Document) -> bool {
         self.drop_removed(doc);
         let before = doc.nodes.len();
-        let mut free = std::mem::take(&mut self.free).into_sorted_vec();
+        let mut free = std::mem::take(&mut self.tree.free).into_sorted_vec();
         let mut len = before;
         let cut = free
             .iter()
@@ -1111,18 +370,18 @@ impl State {
             .count();
         free.drain(..cut);
         free.shrink_to_fit();
-        self.free = free.into();
+        self.tree.free = free.into();
         self.styles.walk = Default::default();
         self.styles.select_marks = Vec::new();
-        self.measurements.texts = Default::default();
+        self.layout.measurements.texts = Default::default();
         self.styles.cache.trim(len);
-        self.layout_nodes.truncate(len);
-        self.layout_nodes.shrink_to_fit();
-        self.painted.truncate(len);
-        self.painted.shrink_to_fit();
+        self.layout.layout_nodes.truncate(len);
+        self.layout.layout_nodes.shrink_to_fit();
+        self.layout.painted.truncate(len);
+        self.layout.painted.shrink_to_fit();
         self.styles.motion.trim(len);
-        self.cull.trim(len);
-        self.bounds.shrink(len);
+        self.layout.cull.trim(len);
+        self.geometry.mirror.shrink(len);
         if len < before {
             doc.nodes.truncate(len);
             self.invalidate();
@@ -1151,7 +410,10 @@ impl State {
     }
 
     pub(crate) fn update_containers(&mut self, doc: &Document) -> bool {
-        let changed = self.styles.cache.set_containers(&self.containers, doc);
+        let changed = self
+            .styles
+            .cache
+            .set_containers(&self.layout.containers, doc);
         if changed {
             self.invalidate();
         }
@@ -1165,7 +427,7 @@ impl State {
     }
 
     fn slot(&mut self, doc: &mut Document) -> usize {
-        self.free.pop().map_or_else(
+        self.tree.free.pop().map_or_else(
             || {
                 doc.nodes.push(Node::default());
                 doc.nodes.len() - 1
@@ -1176,7 +438,7 @@ impl State {
 
     pub(crate) fn place(&mut self, doc: &mut Document, id: usize, node: Node) {
         doc.nodes[id] = node;
-        self.detached.push(id);
+        self.tree.detached.push(id);
         if let Some(cached) = &mut self.styles.computed {
             // Grow every per-node list here. Initialize detached nodes as a full style pass does.
             if let Some(computed) = Rc::get_mut(cached) {
@@ -1222,25 +484,6 @@ pub(crate) fn slots(
     slots
 }
 
-#[derive(Clone)]
-pub(crate) struct Placeholder {
-    frames: Frames,
-    node: usize,
-    wake: crate::jsc::Waker,
-}
-
-type Frames = Arc<Mutex<HashMap<usize, Arc<renderer::RenderImage>>>>;
-
-impl Placeholder {
-    pub(crate) fn show(&self, image: Arc<renderer::RenderImage>) {
-        self.frames
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(self.node, image);
-        self.wake.wake();
-    }
-}
-
 static PLACEHOLDERS: LazyLock<Mutex<HashMap<u64, Placeholder>>> = LazyLock::new(Default::default);
 
 fn new_canvas(node: &Node) -> Result<crate::render::canvas::Canvas> {
@@ -1255,13 +498,6 @@ fn new_canvas(node: &Node) -> Result<crate::render::canvas::Canvas> {
     Ok(canvas)
 }
 
-// Retain SVG sources used as pointer keys to prevent address reuse.
-pub(crate) type CanvasSource = (
-    (u64, usize, [u32; 2]),
-    Option<Rc<str>>,
-    Rc<tiny_skia::Pixmap>,
-);
-
 // Added to the node of a drawable element, this draws its snapshot and not the image of the node.
 const SNAPSHOT: usize = 1 << 32;
 
@@ -1271,11 +507,11 @@ fn source_pixels(
     size: Option<[u32; 2]>,
 ) -> Option<crate::render::canvas::Source<'_>> {
     use crate::render::canvas::{self, Source};
-    if let Some(canvas) = state.canvases.get(&id) {
+    if let Some(canvas) = state.media.canvases.get(&id) {
         return Some(Source::Pixels(&canvas.pixels));
     }
-    let image = state.images.get(&id);
-    let svg = state.svg_images.get(&id).filter(|_| image.is_none());
+    let image = state.media.images.get(&id);
+    let svg = state.media.svg_images.get(&id).filter(|_| image.is_none());
     let size = svg.map_or([0; 2], |(_, natural)| {
         size.unwrap_or(natural.map(|side| side.ceil() as u32))
     });
@@ -1284,7 +520,7 @@ fn source_pixels(
         svg.map_or(0, |(source, _)| Rc::as_ptr(source) as *const u8 as usize),
         size,
     );
-    let mut cache = state.sources.try_borrow_mut().ok()?;
+    let mut cache = state.media.sources.try_borrow_mut().ok()?;
     let fresh = match cache.get(&id) {
         Some((old, _, pixels)) if *old == key => return Some(Source::Shared(pixels.clone())),
         Some(_) => {
@@ -1322,35 +558,36 @@ pub(crate) fn show_frame(
     id: usize,
     image: Option<Arc<renderer::RenderImage>>,
 ) -> Option<Arc<renderer::RenderImage>> {
-    if state.recycled.is_empty() {
-        state.retired_canvases.clear();
+    if state.media.recycled.is_empty() {
+        state.media.retired_canvases.clear();
     }
     // A poster that decodes later must not replace the frame.
-    state.decoding.remove(&id);
+    state.media.decoding.remove(&id);
     let size = image.as_ref().map(|image| image.size());
     match size {
         Some(size) => state
+            .layout
             .measurements
             .naturals
             .insert(id, [size.width as u32 as f32, size.height as u32 as f32]),
-        None => state.measurements.naturals.remove(&id),
+        None => state.layout.measurements.naturals.remove(&id),
     };
     let old = match image {
-        Some(image) => state.images.insert(id, image),
-        None => state.images.remove(&id),
+        Some(image) => state.media.images.insert(id, image),
+        None => state.media.images.remove(&id),
     };
     if old.as_ref().map(|old| old.size()) != size
-        && let Some(node) = state.layout_nodes.get_mut(id)
+        && let Some(node) = state.layout.layout_nodes.get_mut(id)
     {
         *node = None;
-        state.cull.seen = None;
+        state.layout.cull.seen = None;
     }
     state.dirty = true;
     // Only the first replaced frame can be on the GPU. Recycle later frames immediately to bound memory in
     // unrendered windows.
     match old {
-        Some(old) if state.retired_canvases.insert(id) => {
-            state.recycled.push((id, old));
+        Some(old) if state.media.retired_canvases.insert(id) => {
+            state.media.recycled.push((id, old));
             None
         }
         old => old,
@@ -1364,8 +601,8 @@ pub(crate) fn load_image(
 ) -> Value {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let request = NEXT.fetch_add(1, Ordering::Relaxed);
-    state.decoding.insert(id, request);
-    let (decoded, wake) = (state.decoded.clone(), crate::jsc::Waker::current());
+    state.media.decoding.insert(id, request);
+    let (decoded, wake) = (state.media.decoded.clone(), crate::jsc::Waker::current());
     crate::render::image::decode_later(Box::new(move || {
         let result = read().and_then(|bytes| {
             ensure!(bytes.len() <= 64 * 1024 * 1024, "Image is too large");
@@ -1419,13 +656,13 @@ pub fn call(
 ) -> Result<Value> {
     if op == "dom.scrollEvents" {
         let mut changed = Vec::new();
-        for (&id, handle) in &state.scroll {
+        for (&id, handle) in &state.geometry.scroll {
             let offset = scroll_offset(handle, handle.offset());
             // `set_offset` stops a smooth scroll, so it only runs when the range clamps the offset.
             if offset != handle.offset() {
                 handle.set_offset(offset);
             }
-            let previous = state.scroll_offsets.entry(id).or_default();
+            let previous = state.geometry.scroll_offsets.entry(id).or_default();
             if *previous != offset {
                 *previous = offset;
                 changed.push(id);
@@ -1434,24 +671,25 @@ pub fn call(
         changed.sort_unstable();
         // Prepaint moves the mirror for a scroll, so a geometry read before it moves the mirror, or lays out again.
         if !changed.is_empty() {
-            state.only_scrolled = (state.only_scrolled || !state.bounds.moved())
+            state.geometry.only_scrolled = (state.geometry.only_scrolled
+                || !state.geometry.mirror.moved())
                 && changed
                     .iter()
-                    .all(|id| state.mirror_offsets.contains_key(id));
+                    .all(|id| state.geometry.mirror_offsets.contains_key(id));
             for &id in &changed {
-                if !state.unshifted.contains(&id) {
-                    state.unshifted.push(id);
+                if !state.geometry.unshifted.contains(&id) {
+                    state.geometry.unshifted.push(id);
                 }
             }
-            state.bounds.set_moved();
+            state.geometry.mirror.set_moved();
         }
         state.sync_scroll();
         let mut changed = json!(changed);
-        if !state.skip_events.is_empty()
+        if !state.layout.skip_events.is_empty()
             && let Some(list) = changed.as_array_mut()
         {
             list.push(json!(
-                std::mem::take(&mut state.skip_events)
+                std::mem::take(&mut state.layout.skip_events)
                     .into_iter()
                     .flat_map(|(id, skipped)| [id, usize::from(skipped)])
                     .collect::<Vec<_>>()
@@ -1460,21 +698,26 @@ pub fn call(
         return Ok(changed);
     }
     if op == "dom.decoded" {
-        let decoded =
-            std::mem::take(&mut *state.decoded.lock().unwrap_or_else(PoisonError::into_inner));
+        let decoded = std::mem::take(
+            &mut *state
+                .media
+                .decoded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         let mut results = Vec::with_capacity(decoded.len());
         for (id, request, result) in decoded {
-            if state.decoding.get(&id) != Some(&request) {
+            if state.media.decoding.get(&id) != Some(&request) {
                 results.push(json!([request, null]));
                 continue;
             }
-            state.decoding.remove(&id);
+            state.media.decoding.remove(&id);
             state.dirty |= result.is_ok();
             if result.is_ok()
-                && let Some(node) = state.layout_nodes.get_mut(id)
+                && let Some(node) = state.layout.layout_nodes.get_mut(id)
             {
                 *node = None;
-                state.cull.seen = None;
+                state.layout.cull.seen = None;
             }
             results.push(json!([
                 request,
@@ -1482,19 +725,21 @@ pub fn call(
                     Ok(Ok(image)) => {
                         let size = image.size();
                         state
+                            .layout
                             .measurements
                             .naturals
                             .insert(id, [size.width as u32 as f32, size.height as u32 as f32]);
-                        state.svg_images.remove(&id);
+                        state.media.svg_images.remove(&id);
                         state
+                            .media
                             .retired
-                            .extend(state.images.insert(id, Arc::new(image)));
+                            .extend(state.media.images.insert(id, Arc::new(image)));
                         json!([size.width as u32, size.height as u32])
                     }
                     Ok(Err((text, size))) => {
-                        state.measurements.naturals.insert(id, size);
-                        state.retired.extend(state.images.remove(&id));
-                        state.svg_images.insert(id, (text.into(), size));
+                        state.layout.measurements.naturals.insert(id, size);
+                        state.media.retired.extend(state.media.images.remove(&id));
+                        state.media.svg_images.insert(id, (text.into(), size));
                         json!(size)
                     }
                     Err(error) => json!(error.to_string()),
@@ -1504,16 +749,21 @@ pub fn call(
         return Ok(json!(results));
     }
     if op == "dom.frames" {
-        let frames =
-            std::mem::take(&mut *state.frames.lock().unwrap_or_else(PoisonError::into_inner));
+        let frames = std::mem::take(
+            &mut *state
+                .media
+                .frames
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
         let mut results = Vec::with_capacity(frames.len());
-        if state.retired.is_empty() {
-            state.retired_canvases.clear();
+        if state.media.retired.is_empty() {
+            state.media.retired_canvases.clear();
         }
         for (node, image) in frames {
             let size = image.size();
             results.push(json!([node, size.width as u32, size.height as u32]));
-            let old = state.images.insert(node, image);
+            let old = state.media.images.insert(node, image);
             state.retire(node, old);
             state.dirty = true;
         }
@@ -1619,7 +869,7 @@ pub fn call(
     // A request only needs a tick: the page draws when the callbacks change it.
     if op == "dom.requestFrame" {
         state.frame_requested = true;
-        return Ok(json!(state.text_system.is_some()));
+        return Ok(json!(state.fonts.system.is_some()));
     }
     if op == "dom.requestPaint" {
         state.paint_requested = true;
@@ -1760,33 +1010,33 @@ pub fn call(
     }
     if op == "dom.release" {
         let wrapped = args[1].as_array().context("Expected live nodes")?;
-        state.created += wrapped.len();
+        state.tree.created += wrapped.len();
         for value in wrapped {
             if let Some(id) = value.as_u64().map(|id| id as usize)
                 && doc.nodes.get(id).is_some_and(|node| !node.tag.is_empty())
             {
-                state.live.insert(id);
+                state.tree.live.insert(id);
             }
         }
         for value in args[0].as_array().context("Expected dead nodes")? {
             if let Some(id) = value.as_u64() {
-                state.live.remove(&(id as usize));
+                state.tree.live.remove(&(id as usize));
             }
         }
         state.drop_removed(doc);
-        let mut roots = std::mem::take(&mut state.detached);
+        let mut roots = std::mem::take(&mut state.tree.detached);
         roots.sort_unstable();
         roots.dedup();
         let mut freed = Vec::new();
         let mut canvases = Vec::new();
-        let retired = state.retired.len();
+        let retired = state.media.retired.len();
         for root in roots {
             if root == 0
                 || doc
                     .nodes
                     .get(root)
                     .is_none_or(|node| node.parent.is_some() || node.tag.is_empty())
-                || state.hosts.contains_key(&root)
+                || state.tree.hosts.contains_key(&root)
             {
                 continue;
             }
@@ -1794,18 +1044,18 @@ pub fn call(
             let mut subtree = Vec::new();
             let mut live = false;
             while let Some(id) = pending.pop() {
-                if state.live.contains(&id) {
+                if state.tree.live.contains(&id) {
                     live = true;
                     break;
                 }
                 subtree.push(id);
                 pending.extend(&doc.nodes[id].children);
-                if let Some(root) = state.shadows.get(&id) {
+                if let Some(root) = state.tree.shadows.get(&id) {
                     pending.push(*root);
                 }
             }
             if live {
-                state.detached.push(root);
+                state.tree.detached.push(root);
                 continue;
             }
             for id in subtree {
@@ -1816,81 +1066,88 @@ pub fn call(
                     canvases.push(id);
                 }
                 doc.nodes[id] = Node::default();
-                state.bounds.remove(&id);
-                state.fragments.remove(&id);
-                state.pieces.remove(&id);
-                state.cull.widths.remove(&id);
-                state.text_layouts.remove(&id);
-                state.scroll.remove(&id);
-                state.scroll_offsets.remove(&id);
-                state.cull.offsets.remove(&id);
-                state.grids.remove(&id);
-                state.baselines.remove(&id);
-                if let Some(node) = state.layout_nodes.get_mut(id) {
+                state.geometry.mirror.remove(&id);
+                state.geometry.fragments.remove(&id);
+                state.geometry.pieces.remove(&id);
+                state.layout.cull.widths.remove(&id);
+                state.layout.text_layouts.remove(&id);
+                state.geometry.scroll.remove(&id);
+                state.geometry.scroll_offsets.remove(&id);
+                state.layout.cull.offsets.remove(&id);
+                state.layout.grids.remove(&id);
+                state.layout.baselines.remove(&id);
+                if let Some(node) = state.layout.layout_nodes.get_mut(id) {
                     *node = None;
                 }
-                state.measurements.texts.remove(&id);
-                state.retired.extend(state.images.remove(&id));
-                state.retired.extend(
+                state.layout.measurements.texts.remove(&id);
+                state.media.retired.extend(state.media.images.remove(&id));
+                state.media.retired.extend(
                     state
+                        .media
                         .canvases
                         .remove(&id)
                         .filter(|canvas| canvas.present)
                         .map(|canvas| canvas.image),
                 );
-                state.placeholders.remove(&id);
-                state.snapshots.remove(&id);
-                state.drawn.remove(&id);
-                state.retired.extend(
+                state.media.placeholders.remove(&id);
+                state.media.snapshots.remove(&id);
+                state.geometry.drawn.remove(&id);
+                state.media.retired.extend(
                     state
+                        .rasters
                         .svgs
                         .remove(&id)
                         .map(|(_, image)| image)
                         .filter(|image| Arc::strong_count(image) == 1),
                 );
                 for slot in 0..3 {
-                    state
-                        .retired
-                        .extend(state.masks.remove(&(id, slot)).and_then(|(_, image)| image));
+                    state.media.retired.extend(
+                        state
+                            .rasters
+                            .masks
+                            .remove(&(id, slot))
+                            .and_then(|(_, image)| image),
+                    );
                 }
-                state.svg_sources.remove(&id);
-                state.svg_boxes.remove(&id);
-                state.cull.spills.remove(&id);
-                state.svg_trees.remove(&id);
-                state.svg_images.remove(&id);
-                state.measurements.naturals.remove(&id);
-                state.sources.get_mut().remove(&id);
-                state.decoding.remove(&id);
-                if let Some(root) = state.shadows.remove(&id) {
-                    state.hosts.remove(&root);
+                state.media.svg_sources.remove(&id);
+                state.rasters.svg_boxes.remove(&id);
+                state.layout.cull.spills.remove(&id);
+                state.rasters.svg_trees.remove(&id);
+                state.media.svg_images.remove(&id);
+                state.layout.measurements.naturals.remove(&id);
+                state.media.sources.get_mut().remove(&id);
+                state.media.decoding.remove(&id);
+                if let Some(root) = state.tree.shadows.remove(&id) {
+                    state.tree.hosts.remove(&root);
                 }
-                state.hosts.remove(&id);
+                state.tree.hosts.remove(&id);
                 state.styles.cache.adopted.remove(&id);
                 state.styles.motion.forget(id);
-                state.anchors.remove(&id);
-                state.blocks.remove(&id);
-                state.containers.remove(&id);
-                state.flexed_grids.remove(&id);
-                state.grid_widest.remove(&id);
-                if state.focus == Some(id) {
-                    state.focus = None;
+                state.layout.anchors.remove(&id);
+                state.layout.blocks.remove(&id);
+                state.layout.containers.remove(&id);
+                state.layout.flexed_grids.remove(&id);
+                state.layout.grid_widest.remove(&id);
+                if state.interaction.focus == Some(id) {
+                    state.interaction.focus = None;
                 }
                 if doc.target == Some(id) {
                     doc.target = None;
                 }
-                state.selection.remove(&id);
+                state.interaction.selection.remove(&id);
                 for pseudo in 0..3 {
                     state
+                        .layout
                         .atoms
                         .remove(&crate::render::inline::atom_key(id, pseudo));
                 }
-                if state.selection_caret == Some(id) {
-                    state.selection_caret = None;
+                if state.interaction.selection_caret == Some(id) {
+                    state.interaction.selection_caret = None;
                 }
-                if let Some(order) = state.painted.get_mut(id) {
+                if let Some(order) = state.layout.painted.get_mut(id) {
                     *order = 0;
                 }
-                state.free.push(std::cmp::Reverse(id));
+                state.tree.free.push(std::cmp::Reverse(id));
                 freed.push(id);
             }
         }
@@ -1898,22 +1155,26 @@ pub fn call(
         if !freed.is_empty() {
             state.styles.cache.forget(&freed);
             let freed: rustc_hash::FxHashSet<usize> = freed.into_iter().collect();
-            state.top_layer.retain(|node| !freed.contains(node));
-            for ids in &mut state.interaction {
+            state
+                .interaction
+                .top_layer
+                .retain(|node| !freed.contains(node));
+            for ids in &mut state.interaction.states {
                 ids.retain(|node| !freed.contains(node));
             }
             state
+                .layout
                 .measurements
                 .sizes
                 .retain(|(node, ..), _| !freed.contains(node));
-            state.backgrounds.retain(|(node, _), (_, image)| {
+            state.rasters.backgrounds.retain(|(node, _), (_, image)| {
                 let keep = !freed.contains(node);
                 if !keep {
-                    state.retired.push(image.clone());
+                    state.media.retired.push(image.clone());
                 }
                 keep
             });
-            state.dirty |= state.retired.len() > retired;
+            state.dirty |= state.media.retired.len() > retired;
         }
         return Ok(list);
     }
@@ -2040,16 +1301,21 @@ pub fn call(
                 )
             })
         };
-        let repaint =
-            focus == 0 && (ids.iter().any(control) || state.interaction[index].iter().any(control));
+        let repaint = focus == 0
+            && (ids.iter().any(control) || state.interaction.states[index].iter().any(control));
         if op == "dom.focus" {
-            for &id in state.focus.iter().chain(&state.interaction[0]) {
+            for &id in state
+                .interaction
+                .focus
+                .iter()
+                .chain(&state.interaction.states[0])
+            {
                 if let Some(node) = doc.nodes.edit(id) {
                     node.state &= !(FOCUS | FOCUS_VISIBLE);
                 }
             }
-            state.focus = ids.first().copied();
-            if let Some(focus) = state.focus.filter(|_| shown) {
+            state.interaction.focus = ids.first().copied();
+            if let Some(focus) = state.interaction.focus.filter(|_| shown) {
                 if let Some(node) = doc.nodes.edit(focus) {
                     node.state |= if args[1].as_bool() == Some(false) {
                         FOCUS
@@ -2066,7 +1332,7 @@ pub fn call(
                     }
                     ids.iter()
                         .copied()
-                        .find(|host| state.shadows.get(host) == Some(&at))
+                        .find(|host| state.tree.shadows.get(host) == Some(&at))
                 } {
                     if let Some(node) = doc.nodes.edit(host) {
                         node.state |= FOCUS;
@@ -2075,7 +1341,7 @@ pub fn call(
                 }
             }
         }
-        for &id in &state.interaction[index] {
+        for &id in &state.interaction.states[index] {
             if let Some(node) = doc.nodes.edit(id) {
                 node.state &= !flag;
             }
@@ -2085,7 +1351,7 @@ pub fn call(
                 node.state |= flag;
             }
         }
-        state.interaction[index] = ids;
+        state.interaction.states[index] = ids;
         if used {
             state.invalidate();
         }
@@ -2109,7 +1375,7 @@ pub fn call(
         let ids: Vec<_> = (0..args[0].as_u64().context("Expected count")?.min(4096))
             .map(|_| state.allocate(doc, Node::default()))
             .collect();
-        state.reserved.extend(&ids);
+        state.tree.reserved.extend(&ids);
         return Ok(json!(ids));
     }
     let id = args[0].as_u64().context("Expected node id")? as usize;
@@ -2123,7 +1389,7 @@ pub fn call(
                 while let Some(parent) = doc.nodes[top].parent {
                     top = parent;
                 }
-                if let Some(&host) = state.hosts.get(&top)
+                if let Some(&host) = state.tree.hosts.get(&top)
                     && roots.insert(top)
                 {
                     slotted.extend(slots(doc, [(host, top)]));
@@ -2223,8 +1489,8 @@ pub fn call(
             };
             for child in std::mem::take(&mut doc.nodes[id].children) {
                 doc.nodes[child].parent = None;
-                state.detached.push(child);
-                state.removed.push(child);
+                state.tree.detached.push(child);
+                state.tree.removed.push(child);
             }
             doc.nodes[id].text.clear();
             let mut ids = Vec::with_capacity(parsed.nodes.len());
@@ -2237,7 +1503,7 @@ pub fn call(
                 .iter()
                 .map(|&child| ids[child])
                 .collect();
-            let detached = state.detached.len();
+            let detached = state.tree.detached.len();
             for (index, mut node) in parsed.nodes.into_iter().enumerate().skip(1) {
                 node.parent = node.parent.map(|parent| ids[parent]);
                 for child in &mut node.children {
@@ -2245,7 +1511,7 @@ pub fn call(
                 }
                 state.place(doc, ids[index], node);
             }
-            state.detached.truncate(detached);
+            state.tree.detached.truncate(detached);
             state.dirty = true;
             Ok(tree(doc, id, false))
         }
@@ -2257,7 +1523,7 @@ pub fn call(
                 nodes.push(node);
                 if args[1].as_bool() == Some(true) {
                     pending.extend(doc.nodes[node].children.iter().rev());
-                    pending.extend(state.shadows.get(&node));
+                    pending.extend(state.tree.shadows.get(&node));
                 }
             }
             // Without a layout, answer only when the frame would start nothing here.
@@ -2394,14 +1660,14 @@ pub fn call(
             let mut units = styles.lengths[id];
             // Container units: the width of the nearest container, the height of the nearest size container.
             let mut sizes = [None, None];
-            let queried =
-                !state.containers.is_empty() && style.own().any(|(_, value)| value.contains("cq"));
+            let queried = !state.layout.containers.is_empty()
+                && style.own().any(|(_, value)| value.contains("cq"));
             for node in std::iter::successors(doc.nodes[id].parent, |&node| doc.nodes[node].parent)
                 .take_while(|_| queried)
             {
                 let kind = styles.values[node].get(Prop::CONTAINER_TYPE);
                 if let (Some(kind @ ("size" | "inline-size")), Some(size)) =
-                    (kind, state.containers.get(&node))
+                    (kind, state.layout.containers.get(&node))
                 {
                     sizes[0] = sizes[0].or(Some(size[0]));
                     if kind == "size" {
@@ -2414,8 +1680,7 @@ pub fn call(
                 units.container = Some([0, 1].map(|axis| sizes[axis].unwrap_or(viewport[axis])));
             }
             let shown = |node: usize| {
-                state.bounds.get(&node).is_some()
-                    && unsafe { *state.bounds.flags(node) } & MIRROR_HIDDEN == 0
+                state.geometry.mirror.get(&node).is_some() && state.geometry.mirror.shown(node)
             };
             // Padding, plus borders when `borders`, of each side, with percentages of `base`.
             let edges = |style: &css::properties::Style,
@@ -2463,11 +1728,11 @@ pub fn call(
                     _ => start,
                 }
                 .and_then(|node| {
-                    let rect = *state.bounds.get(&node)?;
+                    let rect = *state.geometry.mirror.get(&node)?;
                     let (style, units) = (&styles.values[node], &styles.lengths[node]);
                     let outer = edges(style, units, rect[2], true);
                     let inner =
-                        state.cull.widths.get(&node).copied().unwrap_or([
+                        state.layout.cull.widths.get(&node).copied().unwrap_or([
                             rect[2] - outer[1] - outer[3],
                             rect[3] - outer[0] - outer[2],
                         ]);
@@ -2496,8 +1761,8 @@ pub fn call(
                 .find(|&parent| styles.values[parent].get(Prop::DISPLAY) != Some("contents"))
             })
             .flatten()
-            .filter(|parent| state.tracks.contains_key(parent))
-            .and_then(|_| state.areas.get(&id).copied());
+            .filter(|parent| state.layout.tracks.contains_key(parent))
+            .and_then(|_| state.layout.areas.get(&id).copied());
             let block = area.map_or(block, |[width, height]| [block[0], block[1], width, height]);
             let container = || [block[2], block[3]];
             let inline = !doc.nodes[id].tag.starts_with('#')
@@ -2532,12 +1797,12 @@ pub fn call(
             .then(|| {
                 let key =
                     crate::render::inline::atom_key(id, if pseudo == "after" { 2 } else { 1 });
-                state.pseudo_boxes.get(&key).copied()
+                state.layout.pseudo_boxes.get(&key).copied()
             })
             .flatten();
             let size = (pseudo.is_empty() && !inline && shown(id))
                 .then(|| {
-                    let inner = state.cull.widths.get(&id)?;
+                    let inner = state.layout.cull.widths.get(&id)?;
                     let sides = edges(style, &units, block[2], true);
                     Some([
                         inner[0] + sides[1] + sides[3],
@@ -2547,7 +1812,13 @@ pub fn call(
                 .flatten()
                 .or_else(|| {
                     (pseudo.is_empty() && !inline && shown(id))
-                        .then(|| state.bounds.get(&id).map(|rect| [rect[2], rect[3]]))
+                        .then(|| {
+                            state
+                                .geometry
+                                .mirror
+                                .get(&id)
+                                .map(|rect| [rect[2], rect[3]])
+                        })
                         .flatten()
                 })
                 .or_else(|| pseudo_box.map(|rect| [rect[2], rect[3]]));
@@ -2611,7 +1882,7 @@ pub fn call(
                             view_box.get(2 + axis).copied()
                         });
                         let viewport = viewport.or_else(|| {
-                            svg.and_then(|svg| state.bounds.get(&svg))
+                            svg.and_then(|svg| state.geometry.mirror.get(&svg))
                                 .map(|rect| rect[2 + axis])
                         });
                         match viewport.and_then(|base| units.resolve(given, base)) {
@@ -2646,14 +1917,14 @@ pub fn call(
                         let corner = if generated {
                             // The layout place of the pseudo-element is from the border box of its element.
                             let (Some([x, y, ..]), Some(&[left, top, ..])) =
-                                (pseudo_box, state.bounds.get(&id))
+                                (pseudo_box, state.geometry.mirror.get(&id))
                             else {
                                 return value;
                             };
                             [left + x, top + y]
                         } else {
                             let (Some(&[x, y, width, height]), Some(size)) =
-                                (state.bounds.get(&id), size)
+                                (state.geometry.mirror.get(&id), size)
                             else {
                                 return value;
                             };
@@ -2810,7 +2081,7 @@ pub fn call(
                                 .get(Prop::DISPLAY)
                                 .is_some_and(|display| display.ends_with("grid")) =>
                     {
-                        let Some(tracks) = state.tracks.get(&id) else {
+                        let Some(tracks) = state.layout.tracks.get(&id) else {
                             return value;
                         };
                         let used = &tracks[usize::from(name == "grid-template-rows")];
@@ -2952,13 +2223,13 @@ pub fn call(
             Ok(result.unwrap_or_else(|error| json!({ "error": error })))
         }
         "dom.selection" => {
-            state.selection.clear();
-            state.selection_caret = None;
+            state.interaction.selection.clear();
+            state.interaction.selection_caret = None;
             if let Some(ranges) = args[1].as_array() {
                 for range in ranges {
                     let node = range[0].as_u64().context("Expected selection node")? as usize;
                     ensure!(node < doc.nodes.len(), "Invalid selection node");
-                    state.selection.insert(
+                    state.interaction.selection.insert(
                         node,
                         [
                             range[1].as_u64().unwrap_or(0) as usize,
@@ -2966,11 +2237,11 @@ pub fn call(
                         ],
                     );
                     if args[2].as_bool() == Some(true) {
-                        state.selection_caret = Some(node);
+                        state.interaction.selection_caret = Some(node);
                     }
                 }
             } else if id != 0 {
-                state.selection.insert(
+                state.interaction.selection.insert(
                     id,
                     [
                         args[1].as_u64().unwrap_or(0) as usize,
@@ -2978,7 +2249,7 @@ pub fn call(
                     ],
                 );
                 if args[1] == args[2] {
-                    state.selection_caret = Some(id);
+                    state.interaction.selection_caret = Some(id);
                 }
             }
             state.dirty = true;
@@ -3021,16 +2292,18 @@ pub fn call(
             )))
         }
         // The renderer doesn't snap, so a box with no scroll offset, and none to come, is at 0 after any layout.
-        "dom.scrolled" => Ok(json!(state.scroll.get(&id).is_some_and(|handle| {
-            handle.offset() != renderer::Point::default()
-                || handle.target() != renderer::Point::default()
-        }))),
+        "dom.scrolled" => Ok(json!(state.geometry.scroll.get(&id).is_some_and(
+            |handle| {
+                handle.offset() != renderer::Point::default()
+                    || handle.target() != renderer::Point::default()
+            }
+        ))),
         "dom.scroll" => {
             let page = doc.nodes[id].parent == Some(0)
                 && doc.nodes[id].tag == "html"
-                && !state.scroll.contains_key(&id);
+                && !state.geometry.scroll.contains_key(&id);
             // As in Chrome, a box that can't scroll keeps its offset at 0.
-            if !page && !state.scroll.contains_key(&id) {
+            if !page && !state.geometry.scroll.contains_key(&id) {
                 let computed = styles(doc, state, viewport);
                 let style = computed.values.get(id);
                 let scrolls = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
@@ -3048,6 +2321,7 @@ pub fn call(
                 }
             }
             let handle = state
+                .geometry
                 .scroll
                 .entry(if page { 0 } else { id })
                 .or_default()
@@ -3102,11 +2376,11 @@ pub fn call(
                         crate::jsc::payload::slice(value).context("Expected image data")?
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let mut canvas = match state.canvases.remove(&id) {
+                let mut canvas = match state.media.canvases.remove(&id) {
                     Some(canvas) => canvas,
                     None => {
                         let canvas = new_canvas(&doc.nodes[id])?;
-                        state.created += canvas.pixels.data().len() >> 16;
+                        state.tree.created += canvas.pixels.data().len() >> 16;
                         canvas
                     }
                 };
@@ -3115,28 +2389,30 @@ pub fn call(
                     args[2].as_str().unwrap_or(""),
                     &data,
                     &|(source, size)| match source.checked_sub(SNAPSHOT) {
-                        Some(element) => state.snapshots.get(&element).map(|(pixels, _)| {
+                        Some(element) => state.media.snapshots.get(&element).map(|(pixels, _)| {
                             crate::render::canvas::Source::Shared(pixels.clone())
                         }),
                         None => source_pixels(state, source, Some(size)),
                     },
                     state
-                        .text_system
+                        .fonts
+                        .system
                         .as_deref()
-                        .map(|system| (system, &state.font_aliases)),
+                        .map(|system| (system, &state.fonts.aliases)),
                 );
-                state.canvases.insert(id, canvas);
+                state.media.canvases.insert(id, canvas);
                 state.retire(id, result?);
             } else {
-                state.retired.extend(
+                state.media.retired.extend(
                     state
+                        .media
                         .canvases
                         .remove(&id)
                         .filter(|canvas| canvas.present)
                         .map(|canvas| canvas.image),
                 );
-                state.retired.extend(state.images.remove(&id));
-                state.sources.get_mut().remove(&id);
+                state.media.retired.extend(state.media.images.remove(&id));
+                state.media.sources.get_mut().remove(&id);
             }
             // Offscreen drawing changes nothing on the page, so it must not cost page frames.
             state.dirty |= doc.nodes[id].tag == "canvas";
@@ -3215,7 +2491,7 @@ pub fn call(
         "dom.canvasTake" => {
             let to = args[1].as_u64().context("Expected node id")? as usize;
             ensure!(to < doc.nodes.len(), "Invalid node id");
-            let mut taken = match state.canvases.get_mut(&id) {
+            let mut taken = match state.media.canvases.get_mut(&id) {
                 Some(canvas) => {
                     let mut taken = crate::render::canvas::Canvas::new(
                         canvas.pixels.width(),
@@ -3236,9 +2512,9 @@ pub fn call(
             if taken.present {
                 taken.image = crate::render::canvas::render_image(&taken.pixels, Vec::new());
             }
-            state.created += taken.pixels.data().len() >> 16;
+            state.tree.created += taken.pixels.data().len() >> 16;
             state.dirty |= taken.present;
-            let old = state.canvases.insert(to, taken);
+            let old = state.media.canvases.insert(to, taken);
             state.retire(to, old.filter(|old| old.present).map(|old| old.image));
             Ok(Value::Null)
         }
@@ -3250,21 +2526,21 @@ pub fn call(
                     .context("Invalid canvas size")?,
             )
             .context("Invalid canvas pixels")?;
-            state.created += canvas.pixels.data().len() >> 16;
-            state.canvases.insert(id, canvas);
+            state.tree.created += canvas.pixels.data().len() >> 16;
+            state.media.canvases.insert(id, canvas);
             Ok(Value::Null)
         }
         // The size of the last drawing of a drawable element in CSS pixels. With a node, that canvas gets a copy.
         "dom.snapshot" => {
-            let Some((pixels, scale)) = state.snapshots.get(&id).cloned() else {
+            let Some((pixels, scale)) = state.media.snapshots.get(&id).cloned() else {
                 return Ok(Value::Null);
             };
             if let Some(to) = args[1].as_u64() {
                 let mut canvas =
                     crate::render::canvas::Canvas::new(pixels.width(), pixels.height())?;
                 canvas.pixels = (*pixels).clone();
-                state.created += canvas.pixels.data().len() >> 16;
-                state.canvases.insert(to as usize, canvas);
+                state.tree.created += canvas.pixels.data().len() >> 16;
+                state.media.canvases.insert(to as usize, canvas);
             }
             Ok(json!([
                 pixels.width() as f32 / scale,
@@ -3281,17 +2557,19 @@ pub fn call(
                 list.collect::<Option<Vec<f32>>>()
             };
             match args[1].as_str() {
-                Some("get") => Ok(json!(state.drawn.get(&id).map(|drawn| drawn.matrix))),
+                Some("get") => Ok(json!(
+                    state.geometry.drawn.get(&id).map(|drawn| drawn.matrix)
+                )),
                 Some("clear") => {
-                    state.dirty |= state.drawn.remove(&id).is_some();
+                    state.dirty |= state.geometry.drawn.remove(&id).is_some();
                     Ok(Value::Null)
                 }
                 _ => {
                     let matrix = floats(&args[2]).and_then(|list| <[f32; 16]>::try_from(list).ok());
                     let clip = floats(&args[3]).and_then(|list| <[f32; 4]>::try_from(list).ok());
-                    let old = state.drawn.remove(&id);
+                    let old = state.geometry.drawn.remove(&id);
                     if !(args[4] == true && old.is_some()) {
-                        state.drawn_order += 1;
+                        state.geometry.drawn_order += 1;
                     }
                     let new = Drawn {
                         matrix: matrix
@@ -3300,12 +2578,12 @@ pub fn call(
                         clip: clip.or(old.as_ref().and_then(|old| old.clip)),
                         order: match &old {
                             Some(old) if args[4] == true => old.order,
-                            _ => state.drawn_order,
+                            _ => state.geometry.drawn_order,
                         },
                     };
                     // The boxes take the pointer at their new place after the next frame.
                     state.dirty |= old.is_none_or(|old| old.matrix != new.matrix);
-                    state.drawn.insert(id, new);
+                    state.geometry.drawn.insert(id, new);
                     Ok(Value::Null)
                 }
             }
@@ -3314,10 +2592,11 @@ pub fn call(
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let token = NEXT.fetch_add(1, Ordering::Relaxed);
             let placeholder = state
+                .media
                 .placeholders
                 .remove(&id)
                 .unwrap_or_else(|| Placeholder {
-                    frames: state.frames.clone(),
+                    frames: state.media.frames.clone(),
                     node: id,
                     wake: crate::jsc::Waker::current(),
                 });
@@ -3334,7 +2613,7 @@ pub fn call(
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&token)
                 .context("The canvas was already transferred")?;
-            state.placeholders.insert(id, placeholder);
+            state.media.placeholders.insert(id, placeholder);
             Ok(Value::Null)
         }
         "dom.image" => {
@@ -3376,7 +2655,8 @@ pub fn call(
         "dom.fontCheck" => {
             let family = args[1].as_str().context("Expected font family")?;
             let family = state
-                .font_aliases
+                .fonts
+                .aliases
                 .get(family)
                 .map(String::as_str)
                 .unwrap_or(family);
@@ -3434,8 +2714,14 @@ pub fn call(
             })
         }
         "dom.svgBox" => {
-            let boxes = std::iter::successors(Some(id), |&node| doc.nodes[node].parent)
-                .find_map(|node| state.svg_boxes.get(&node).map(|boxes| (node, boxes)));
+            let boxes =
+                std::iter::successors(Some(id), |&node| doc.nodes[node].parent).find_map(|node| {
+                    state
+                        .rasters
+                        .svg_boxes
+                        .get(&node)
+                        .map(|boxes| (node, boxes))
+                });
             Ok(json!(
                 boxes
                     .and_then(|(root, (_, _, _, boxes, content, ..))| if root == id {
@@ -3450,6 +2736,7 @@ pub fn call(
             ))
         }
         "dom.fragments" => Ok(state
+            .geometry
             .fragments
             .get(&id)
             .map_or(Value::Null, |parts| json!(parts))),
@@ -3469,7 +2756,7 @@ pub fn call(
             };
             let start = shown(args[1].as_u64().unwrap_or(0) as usize);
             let end = args[2].as_u64().map_or(start, |end| shown(end as usize));
-            if let Some((layout, text, range, rows, font)) = state.text_layouts.get(&id) {
+            if let Some((layout, text, range, rows, font)) = state.layout.text_layouts.get(&id) {
                 let content = &text[range.clone()];
                 let source = doc.nodes[id].text.as_str();
                 let [dx, dy] = state.scroll_shift(id);
@@ -3498,10 +2785,10 @@ pub fn call(
             }
             // Text that this frame did not lay out, like the text of a block far from the view, lays out with its
             // block on the next reflow: `null` asks the script for one, as `dom.skipped` does.
-            let forced = &mut state.measurements.forced;
+            let forced = &mut state.layout.measurements.forced;
             if doc.nodes[id].parent.is_some() && forced.insert(id) {
-                state.measurements.waking.push(id);
-                state.cull.reskipped = true;
+                state.layout.measurements.waking.push(id);
+                state.layout.cull.reskipped = true;
                 return Ok(Value::Null);
             }
             Ok(if op == "dom.textRect" {
@@ -3512,12 +2799,13 @@ pub fn call(
         }
         "dom.measureText" => {
             let system = state
-                .text_system
+                .fonts
+                .system
                 .as_ref()
                 .context("Text measurement requires a displayed window")?;
             let (line, [ascent, descent, em_ascent, em_descent]) = crate::render::canvas::line(
                 system,
-                &state.font_aliases,
+                &state.fonts.aliases,
                 args[2].as_str().unwrap_or("10px sans-serif"),
                 args[1].as_str().context("Expected text")?,
                 [
@@ -3539,7 +2827,7 @@ pub fn call(
             ]))
         }
         "dom.canvasQuery" => {
-            let Some(canvas) = state.canvases.get(&id) else {
+            let Some(canvas) = state.media.canvases.get(&id) else {
                 return Ok(json!(if args[1].is_number() {
                     json!(false)
                 } else {
@@ -3558,7 +2846,7 @@ pub fn call(
             })
         }
         "dom.client" => {
-            let rect = state.bounds.get(&id).copied().unwrap_or_default();
+            let rect = state.geometry.mirror.get(&id).copied().unwrap_or_default();
             // Reuse the last frame's styles for resize observers to avoid a style pass per callback.
             let last = (args[1].as_bool() == Some(true))
                 .then(|| {
@@ -3603,7 +2891,7 @@ pub fn call(
                     });
             let base = doc.nodes[id]
                 .parent
-                .and_then(|parent| state.bounds.get(&parent))
+                .and_then(|parent| state.geometry.mirror.get(&parent))
                 .map_or(viewport[0], |rect| rect[2]);
             // The bounds are those of the last frame, which laid out the animated padding and borders.
             let now = state.styles.animating.get(&id).unwrap_or(style);
@@ -3614,6 +2902,7 @@ pub fn call(
                 .edges(now, css::properties::PADDING, base)
                 .map(|value| value.max(0.));
             let bars = state
+                .geometry
                 .scroll
                 .get(&id)
                 .and_then(|handle| {
@@ -3641,16 +2930,19 @@ pub fn call(
             };
             // Like offsetWidth, client sizes ignore transforms, so a transformed box takes its layout size,
             // and the shift from its bounds to its own untransformed corner.
-            let transformed = unsafe { *state.bounds.flags(id) } & MIRROR_TRANSFORMED != 0;
-            let size = state.cull.widths.get(&id).filter(|_| transformed).map_or(
-                [rect[2], rect[3]],
-                |inner| {
+            let transformed = state.geometry.mirror.is_transformed(id);
+            let size = state
+                .layout
+                .cull
+                .widths
+                .get(&id)
+                .filter(|_| transformed)
+                .map_or([rect[2], rect[3]], |inner| {
                     [
                         inner[0] + padding[1] + padding[3] + borders[1] + borders[3],
                         inner[1] + padding[0] + padding[2] + borders[0] + borders[2],
                     ]
-                },
-            );
+                });
             let local = renderer::Rect::new(
                 renderer::point(renderer::px(0.), renderer::px(0.)),
                 renderer::size(renderer::px(size[0]), renderer::px(size[1])),
@@ -3713,7 +3005,7 @@ pub fn call(
             let computed = styles(doc, state, viewport);
             let (mut kind, mut roots) = (0, Vec::new());
             // An `auto` box that shows its contents from the next frame on still skips them.
-            let hidden = state.cull.visible.get(id) == Some(&false);
+            let hidden = state.layout.cull.visible.get(id) == Some(&false);
             let mut node = Some(id);
             while let Some(at) = node {
                 let style = &computed.values[at];
@@ -3724,7 +3016,7 @@ pub fn call(
                     && (crate::render::skipping(doc, state, &computed, at, false)
                         || hidden
                             && style.get(Prop::CONTENT_VISIBILITY) == Some("auto")
-                            && state.measurements.shown.contains_key(&at))
+                            && state.layout.measurements.shown.contains_key(&at))
                 {
                     roots.push(at);
                     kind = kind.max(if style.get(Prop::CONTENT_VISIBILITY) == Some("hidden") {
@@ -3736,11 +3028,11 @@ pub fn call(
                 node = flat_parent(doc, state, &computed, at);
             }
             if args[1].as_bool() == Some(true) {
-                let measured = &mut state.measurements;
+                let measured = &mut state.layout.measurements;
                 for root in roots {
                     if measured.forced.insert(root) {
                         measured.waking.push(root);
-                        state.cull.reskipped = true;
+                        state.layout.cull.reskipped = true;
                     }
                 }
             }
@@ -3808,7 +3100,8 @@ pub(crate) fn painted_offset(
 pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Result<String> {
     const LIMIT: usize = 32 * 1024 * 1024;
     let system = state
-        .text_system
+        .fonts
+        .system
         .as_ref()
         .context("Font loading requires a displayed window")?;
     ensure!(bytes.len() <= LIMIT, "Font exceeds 32 MB limit");
@@ -3874,10 +3167,10 @@ pub(crate) fn add_font(state: &mut State, family: &str, bytes: Vec<u8>) -> Resul
 }
 
 pub(crate) fn local_font(state: &mut State, family: &str, name: &str) -> bool {
-    let Some(system) = state.text_system.clone() else {
+    let Some(system) = state.fonts.system.clone() else {
         return false;
     };
-    style::font_names(&system, &state.font_aliases);
+    style::font_names(&system, &state.fonts.aliases);
     let Some(found) =
         style::FONT_NAMES.with(|names| names.borrow().0.get(&name.to_ascii_lowercase()).cloned())
     else {
@@ -3889,17 +3182,18 @@ pub(crate) fn local_font(state: &mut State, family: &str, name: &str) -> bool {
 
 pub(crate) fn use_font(state: &mut State, family: &str, name: &str, added: bool) {
     let same = name.eq_ignore_ascii_case(family);
-    if !added && (same || state.font_aliases.contains_key(family)) {
+    if !added && (same || state.fonts.aliases.contains_key(family)) {
         return;
     }
-    state.font_loads += 1;
+    state.fonts.loads += 1;
     style::FONT_NAMES.with(|names| *names.borrow_mut() = Default::default());
     // Invalidate only font-dependent values. A new style cache loses constructed and CSSOM-edited sheets.
     state.styles.cache.environment.metrics = None;
     state.invalidate();
     if !same {
         state
-            .font_aliases
+            .fonts
+            .aliases
             .insert(family.to_owned(), name.to_owned());
     }
     state.dirty = true;
@@ -3907,10 +3201,10 @@ pub(crate) fn use_font(state: &mut State, family: &str, name: &str, added: bool)
 
 pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32; 2]) {
     let computed = styles(doc, state, viewport);
-    if state.layout_epoch == state.styles.epoch {
+    if state.geometry.layout_epoch == state.styles.epoch {
         return;
     }
-    state.layout_epoch = state.styles.epoch;
+    state.geometry.layout_epoch = state.styles.epoch;
     let mut known = rustc_hash::FxHashMap::default();
     for (id, style) in computed.values.iter().enumerate() {
         let bits = *known.entry(Rc::as_ptr(style)).or_insert_with(|| {
@@ -3923,21 +3217,9 @@ pub(crate) fn layout_flags(doc: &mut Document, state: &mut State, viewport: [f32
                 });
             let position = style.get(Prop::POSITION).unwrap_or("static");
             let positioned = crate::render::effects::establishes(style).absolute;
-            (if clip { MIRROR_CLIP } else { 0 })
-                | if positioned { MIRROR_POSITIONED } else { 0 }
-                | if position == "fixed" { MIRROR_FIXED } else { 0 }
+            [clip, positioned, position == "fixed"]
         });
-        state.bounds.reserve(id);
-        unsafe {
-            let flags = state.bounds.flags(id);
-            *flags = (*flags
-                & (MIRROR_BOUNDS
-                    | MIRROR_SCROLLER
-                    | MIRROR_HIDDEN
-                    | MIRROR_INERT
-                    | MIRROR_TRANSFORMED))
-                | bits;
-        }
+        state.geometry.mirror.style_flags(id, bits);
     }
 }
 
@@ -3948,12 +3230,12 @@ pub(crate) fn flat_parent(
     id: usize,
 ) -> Option<usize> {
     match doc.nodes[id].parent {
-        Some(parent) if state.shadows.contains_key(&parent) => styles
+        Some(parent) if state.tree.shadows.contains_key(&parent) => styles
             .children
             .iter()
             .find_map(|(&slot, kids)| (slot != parent && kids.contains(&id)).then_some(slot)),
         Some(parent) => Some(parent),
-        None => state.hosts.get(&id).copied(),
+        None => state.tree.hosts.get(&id).copied(),
     }
 }
 
@@ -4443,9 +3725,10 @@ pub(crate) fn hit_test(
     let up = |id: usize| {
         doc.nodes[id]
             .parent
-            .or_else(|| state.hosts.get(&id).copied())
+            .or_else(|| state.tree.hosts.get(&id).copied())
     };
     let top: Vec<usize> = state
+        .interaction
         .top_layer
         .iter()
         .copied()
@@ -4487,6 +3770,7 @@ pub(crate) fn hit_test(
         // The last frame marked each subtree with an out-of-flow box uncullable.
         if !inside(clip)
             && state
+                .layout
                 .cull
                 .info
                 .get(id)
@@ -4507,13 +3791,13 @@ pub(crate) fn hit_test(
         }
         path.truncate(depth);
         if drawn != 0 {
-            drawn = match state.drawn.get(&id) {
+            drawn = match state.geometry.drawn.get(&id) {
                 Some(place) => {
                     // The clip is in the content box of the canvas.
                     let canvas =
                         (path.iter().rev()).find(|(id, ..)| doc.nodes[*id].tag == "canvas");
                     if let (Some([x, y, width, height]), Some(&(canvas, ..))) = (place.clip, canvas)
-                        && let Some(&[left, top, wide, _]) = state.bounds.get(&canvas)
+                        && let Some(&[left, top, wide, _]) = state.geometry.mirror.get(&canvas)
                     {
                         let (style, units) = (&computed.values[canvas], &computed.lengths[canvas]);
                         let (border, padding) = (
@@ -4559,7 +3843,7 @@ pub(crate) fn hit_test(
         }
         let canvas = style::drawable_canvas(node, style);
         if inside(clip)
-            && let Some(&[left, top, width, height]) = state.bounds.get(&id)
+            && let Some(&[left, top, width, height]) = state.geometry.mirror.get(&id)
         {
             let size = renderer::size(renderer::px(width), renderer::px(height));
             let rect =
@@ -4590,10 +3874,10 @@ pub(crate) fn hit_test(
                     && y < top + height
             };
             if (caret || !node.tag.starts_with('#'))
-                && match state.fragments.is_empty() {
+                && match state.geometry.fragments.is_empty() {
                     true => within([left, top, width, height]),
                     false => state
-                        .fragments
+                        .geometry.fragments
                         .get(&id)
                         .map_or(within([left, top, width, height]), |parts| {
                             parts.iter().copied().any(within)
@@ -4644,13 +3928,20 @@ pub(crate) fn hit_test(
     hits.sort_by_cached_key(|&id| {
         let painted = |id: usize| {
             std::iter::successors(Some(id), |&id| up(id))
-                .find_map(|id| state.painted.get(id).copied().filter(|&order| order > 0))
+                .find_map(|id| {
+                    state
+                        .layout
+                        .painted
+                        .get(id)
+                        .copied()
+                        .filter(|&order| order > 0)
+                })
                 .unwrap_or(0)
         };
         // Elements that a canvas drew are above the canvas, the last one drawn first.
         let drawn = std::iter::successors(Some(id), |&id| doc.nodes[id].parent)
-            .filter(|_| !state.drawn.is_empty())
-            .find_map(|at| Some((at, state.drawn.get(&at)?.order)));
+            .filter(|_| !state.geometry.drawn.is_empty())
+            .find_map(|at| Some((at, state.geometry.drawn.get(&at)?.order)));
         std::cmp::Reverse(match drawn {
             Some((element, order)) => {
                 let canvas =
@@ -4708,8 +3999,9 @@ pub(crate) fn hit_test(
             })
             .map(|(id, key)| {
                 // A text box that spans the point's height can hold more lines: measure each.
-                let lines = (state.text_layouts.get(&id)).filter(|_| key[0] == 0.).map(
-                    |(layout, text, range, rows, font)| {
+                let lines = (state.layout.text_layouts.get(&id))
+                    .filter(|_| key[0] == 0.)
+                    .map(|(layout, text, range, rows, font)| {
                         crate::render::text::text_rects(
                             layout,
                             text,
@@ -4717,8 +4009,7 @@ pub(crate) fn hit_test(
                             [range.start, range.end],
                             *font,
                         )
-                    },
-                );
+                    });
                 (
                     id,
                     lines
@@ -4752,11 +4043,14 @@ pub(crate) fn styles(
     state: &mut State,
     viewport: [f32; 2],
 ) -> Rc<style::ComputedStyles> {
-    let scale = state.text_system.is_some().then_some(state.pixel_ratio);
-    let pending = match state
-        .styles
-        .begin(doc, viewport, state.theme(), scale, &mut state.bounds)
-    {
+    let scale = state.fonts.system.is_some().then_some(state.pixel_ratio);
+    let pending = match state.styles.begin(
+        doc,
+        viewport,
+        state.theme(),
+        scale,
+        &mut state.geometry.mirror,
+    ) {
         Ok(kept) => return kept,
         Err(pending) => pending,
     };
@@ -4765,12 +4059,12 @@ pub(crate) fn styles(
         doc,
         pending,
         style::Page {
-            shadows: &state.shadows,
-            hosts: &state.hosts,
-            top_layer: &state.top_layer,
-            font_aliases: &state.font_aliases,
-            text_system: state.text_system.as_deref(),
-            bounds: &mut state.bounds,
+            shadows: &state.tree.shadows,
+            hosts: &state.tree.hosts,
+            top_layer: &state.interaction.top_layer,
+            font_aliases: &state.fonts.aliases,
+            text_system: state.fonts.system.as_deref(),
+            bounds: &mut state.geometry.mirror,
         },
     )
 }
@@ -5085,9 +4379,9 @@ mod tests {
     #[test]
     fn kept_containers_keep_their_sizes_between_frames() {
         let mut state = super::State::default();
-        state.containers.insert(1, [150., 20.]);
+        state.layout.containers.insert(1, [150., 20.]);
         state.update_containers(&Document::default());
-        assert_eq!(state.containers.get(&1), Some(&[150., 20.]));
+        assert_eq!(state.layout.containers.get(&1), Some(&[150., 20.]));
     }
 
     #[test]
@@ -5114,18 +4408,6 @@ mod tests {
     }
 
     #[test]
-    fn layout_count_wraps_before_f32_stops_counting() {
-        let mut mirror = LayoutMirror::default();
-        mirror.touch();
-        let count =
-            |mirror: &LayoutMirror| unsafe { mirror.memory.as_ref().unwrap().0.as_ptr().add(2) };
-        assert_eq!(unsafe { *count(&mirror) }, 1.);
-        unsafe { *count(&mirror) = 16_777_215. };
-        mirror.touch();
-        assert_eq!(unsafe { *count(&mirror) }, 0.);
-    }
-
-    #[test]
     fn font_faces_load_woff_and_list_css_faces() {
         let fixtures = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fonts"));
         let (host, engine) = engine(
@@ -5137,7 +4419,7 @@ mod tests {
         {
             let mut host = host.borrow_mut();
             let state = host.dom.entry(1).or_default();
-            state.text_system = Some(Rc::new(renderer::TextSystem::new()));
+            state.fonts.system = Some(Rc::new(renderer::TextSystem::new()));
             state.base = url::Url::parse("apps:///index.html").ok();
         }
         let bytes = std::fs::read(fixtures.join("test-cff.woff2")).unwrap();
@@ -5319,7 +4601,8 @@ mod tests {
             .dom
             .get_mut(&1)
             .unwrap()
-            .font_aliases
+            .fonts
+            .aliases
             .insert("Brand".into(), "Real Font".into());
         engine
             .eval("p.style.fontFamily='Brand';if(getComputedStyle(p).fontFamily!=='Real Font')throw Error('Alias')", "test")
@@ -5833,10 +5116,10 @@ mod tests {
         styles(&mut doc, &mut state, viewport);
         doc.nodes[on].children.retain(|&id| id != p);
         doc.nodes[p].parent = None;
-        state.removed.push(p);
+        state.tree.removed.push(p);
         state.invalidate();
         styles(&mut doc, &mut state, viewport);
-        assert!(state.removed.is_empty());
+        assert!(state.tree.removed.is_empty());
         doc.nodes[on].children.push(p);
         doc.nodes[p].parent = Some(on);
         state.invalidate();
@@ -5897,19 +5180,19 @@ mod tests {
         styles(&mut doc, &mut state, viewport);
         for id in [ids[3], ids[1], ids[2]] {
             doc.nodes[id] = Node::default();
-            state.free.push(std::cmp::Reverse(id));
+            state.tree.free.push(std::cmp::Reverse(id));
         }
         assert!(state.trim(&mut doc));
         assert_eq!(doc.nodes.len(), ids[1]);
-        assert_eq!(state.free.len(), 0);
+        assert_eq!(state.tree.free.len(), 0);
         assert!(!state.trim(&mut doc));
         styles(&mut doc, &mut state, viewport);
         assert_eq!(state.allocate(&mut doc, node()), ids[1]);
         assert_eq!(state.allocate(&mut doc, node()), ids[1] + 1);
         doc.nodes[ids[1]] = Node::default();
-        state.free.push(std::cmp::Reverse(ids[1]));
+        state.tree.free.push(std::cmp::Reverse(ids[1]));
         doc.nodes[ids[0]] = Node::default();
-        state.free.push(std::cmp::Reverse(ids[0]));
+        state.tree.free.push(std::cmp::Reverse(ids[0]));
         assert_eq!(state.allocate(&mut doc, node()), ids[0]);
     }
 
@@ -5930,7 +5213,7 @@ mod tests {
         assert_eq!(shared.values[p].get(Prop::COLOR), None);
         for id in [p, div] {
             doc.nodes[id] = Node::default();
-            state.free.push(std::cmp::Reverse(id));
+            state.tree.free.push(std::cmp::Reverse(id));
         }
         let node = Node {
             tag: "p".into(),
@@ -5963,8 +5246,8 @@ mod tests {
             let ids: Vec<usize> = (0..20_000)
                 .map(|_| state.allocate(doc, Node::default()))
                 .collect();
-            state.bounds.insert(a, rect);
-            state.bounds.insert(ids[ids.len() - 1], rect);
+            state.geometry.mirror.insert(a, rect);
+            state.geometry.mirror.insert(ids[ids.len() - 1], rect);
             ids
         };
         let ids = grow([0., 0., 10., 10.]);
@@ -5985,13 +5268,13 @@ mod tests {
                 host.dom.get_mut(&1).unwrap(),
             );
             for &id in &ids {
-                state.free.push(std::cmp::Reverse(id));
+                state.tree.free.push(std::cmp::Reverse(id));
             }
             assert!(state.trim(doc));
-            assert_eq!(state.bounds.capacity, 1024);
-            assert_eq!(state.bounds.get(&a), Some(&[0., 0., 10., 10.]));
-            state.bounds.insert(a, [0., 0., 30., 10.]);
-            state.bounds.touch();
+            assert_eq!(state.geometry.mirror.capacity, 1024);
+            assert_eq!(state.geometry.mirror.get(&a), Some(&[0., 0., 10., 10.]));
+            state.geometry.mirror.insert(a, [0., 0., 30., 10.]);
+            state.geometry.mirror.touch();
         }
         assert_eq!(engine.eval("a.offsetWidth", "test").unwrap(), "30");
         grow([0., 0., 40., 10.]);

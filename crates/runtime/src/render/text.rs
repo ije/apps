@@ -30,7 +30,7 @@ pub(super) fn paint_text(
     runs: &[renderer::TextRun],
     offset: usize,
     highlights: &[TextHighlight],
-    rows: &[crate::dom::Row],
+    rows: &[crate::render::layout::Row],
     text: &str,
     ink: Option<renderer::Color>,
     strut: renderer::FontId,
@@ -393,7 +393,7 @@ pub(super) fn row_extents<'a>(
 pub(crate) fn text_position(
     layout: &renderer::Paragraph,
     text: &str,
-    rows: &[crate::dom::Row],
+    rows: &[crate::render::layout::Row],
     index: usize,
 ) -> Option<Point<Pixels>> {
     let mut position = layout.point_at(index)?;
@@ -409,7 +409,7 @@ pub(crate) fn text_position(
 fn text_start(
     layout: &renderer::Paragraph,
     text: &str,
-    rows: &[crate::dom::Row],
+    rows: &[crate::render::layout::Row],
     index: usize,
     end: usize,
 ) -> Option<Point<Pixels>> {
@@ -433,7 +433,7 @@ fn text_start(
 pub(crate) fn text_rects(
     layout: &renderer::Paragraph,
     text: &str,
-    rows: &[crate::dom::Row],
+    rows: &[crate::render::layout::Row],
     [start, end]: [usize; 2],
     font: [Pixels; 2],
 ) -> Vec<[f32; 4]> {
@@ -485,7 +485,7 @@ pub(crate) fn text_rects(
 fn inline_box(
     layout: &renderer::Paragraph,
     text: &str,
-    rows: &[crate::dom::Row],
+    rows: &[crate::render::layout::Row],
     range: &std::ops::Range<usize>,
     style: Option<(&css::properties::Style, css::value::units::Lengths)>,
     base: Pixels,
@@ -507,7 +507,7 @@ fn inline_box(
 pub(crate) fn text_index(
     layout: &renderer::Paragraph,
     text: &str,
-    rows: &[crate::dom::Row],
+    rows: &[crate::render::layout::Row],
     mut position: Point<Pixels>,
     nearest: bool,
 ) -> Result<usize, usize> {
@@ -521,7 +521,7 @@ pub(crate) fn text_index(
     let row = if split {
         // Rows in columns: the nearest row box to the point.
         let left = layout.bounds().left();
-        let distance = |(index, row): (usize, &crate::dom::Row)| {
+        let distance = |(index, row): (usize, &crate::render::layout::Row)| {
             let y = top + line_height * index as f32 + row.drop;
             let dx = (left + row.shift - position.x)
                 .max(position.x - left - row.right)
@@ -605,7 +605,7 @@ pub(super) struct InlineText {
     pub(super) data: Rc<crate::render::inline::InlineText>,
     /// Rows can grow around runs or fallback glyphs, see `crate::render::inline::InlineText::mixed`.
     pub(super) mixed: bool,
-    pub(super) view: Rc<super::PageState>,
+    pub(super) view: Rc<super::ViewState>,
     pub(super) atoms: Rc<[AtomSlot]>,
     pub(super) justify: Option<bool>,
     /// Right-to-left text: indents and rows that overflow start at the right.
@@ -617,8 +617,8 @@ pub(super) struct InlineText {
 #[derive(Default)]
 pub(super) struct Prepainted {
     hitboxes: Vec<(renderer::Region, renderer::Cursor)>,
-    rows: crate::dom::Rows,
-    layouts: Vec<(usize, crate::dom::TextLayout)>,
+    rows: crate::render::layout::Rows,
+    layouts: Vec<(usize, crate::render::layout::TextLayout)>,
     rects: Vec<(usize, [f32; 4])>,
     origin: Point<Pixels>,
     // Where the text that prepaint shaped is placed. The renderer moves only the text of its own nodes.
@@ -637,7 +637,7 @@ pub(super) struct AtomBox {
     pub(super) slots: Rc<[AtomSlot]>,
     pub(super) index: usize,
     pub(super) node: usize,
-    pub(super) view: Rc<super::PageState>,
+    pub(super) view: Rc<super::ViewState>,
     // The width that the atom leaves free in a box as wide as the block, see `AtomRest`.
     pub(super) rest: Option<Rc<std::cell::Cell<Pixels>>>,
 }
@@ -687,6 +687,7 @@ impl renderer::Hooks for AtomBox {
                 .dom
                 .entry(view.id)
                 .or_default()
+                .layout
                 .atoms
                 .insert(self.node, size);
             cx.window.redraw();
@@ -888,16 +889,20 @@ fn place(
     rect: [f32; 4],
 ) {
     if !data.cuts.contains(&id) {
-        dom.bounds.insert(id, rect);
+        dom.geometry.mirror.insert(id, rect);
         return;
     }
-    dom.pieces.entry(id).or_default().push((data.key, rect));
+    dom.geometry
+        .pieces
+        .entry(id)
+        .or_default()
+        .push((data.key, rect));
 }
 
 // Drops the parts that the text gave its spliced boxes before it gives them again.
 fn unplace(dom: &mut crate::dom::State, data: &crate::render::inline::InlineText) {
     for cut in &data.cuts {
-        if let Some(pieces) = dom.pieces.get_mut(cut) {
+        if let Some(pieces) = dom.geometry.pieces.get_mut(cut) {
             pieces.retain(|(key, _)| *key != data.key);
         }
     }
@@ -907,7 +912,7 @@ impl InlineText {
     fn cursors<'a>(
         &'a self,
         layout: &'a renderer::Paragraph,
-        rows: &'a crate::dom::Rows,
+        rows: &'a crate::render::layout::Rows,
         bounds: Rect<Pixels>,
     ) -> impl Iterator<Item = (Rect<Pixels>, renderer::Cursor)> + 'a {
         self.data
@@ -970,7 +975,7 @@ impl renderer::Hooks for InlineText {
         let mut host = view.host.borrow_mut();
         let dom = host.dom.entry(view.id).or_default();
         for (id, entry) in self.prepainted.borrow().layouts.iter() {
-            dom.text_layouts.insert(*id, entry.clone());
+            dom.layout.text_layouts.insert(*id, entry.clone());
         }
         true
     }
@@ -1032,7 +1037,7 @@ impl renderer::Hooks for InlineText {
                 let (up, inner) = std::iter::successors(page.doc.nodes.get(node)?.parent, |&up| {
                     page.doc.nodes[up].parent
                 })
-                .find_map(|up| Some((up, dom.cull.widths.get(&up)?)))?;
+                .find_map(|up| Some((up, dom.layout.cull.widths.get(&up)?)))?;
                 // The text of a flex or grid container is an anonymous item that fits its content.
                 let display = dom
                     .last_styles()?
@@ -1129,7 +1134,7 @@ impl renderer::Hooks for InlineText {
                         (first + shift, px(0.))
                     };
                     let [above, below] = extents.get(rows.len()).copied().unwrap_or_default();
-                    rows.push(crate::dom::Row {
+                    rows.push(crate::render::layout::Row {
                         shift,
                         right: shift + end - left + gap * gaps,
                         gap,
@@ -1183,7 +1188,7 @@ impl renderer::Hooks for InlineText {
                 row.drop += by.y;
             }
         }
-        let rows: crate::dom::Rows = rows.into();
+        let rows: crate::render::layout::Rows = rows.into();
         let base = window.text_system().baseline(
             strut,
             style.font_size,
@@ -1269,7 +1274,7 @@ impl renderer::Hooks for InlineText {
                     let borders = boxed.map_or([0.; 4], |inline| inline.borders);
                     let start = point(a.x + px(borders[3]), a.y + top + px(borders[0]));
                     let end = point(b.x - px(borders[1]), b.y + top + height - px(borders[2]));
-                    dom.blocks.insert(
+                    dom.layout.blocks.insert(
                         *id,
                         Rect::new(
                             start + shift,
@@ -1383,9 +1388,9 @@ impl renderer::Hooks for InlineText {
                     {
                         rect = union;
                     }
-                    dom.fragments.insert(*id, parts);
-                } else if !dom.fragments.is_empty() && !self.data.cuts.contains(id) {
-                    dom.fragments.remove(id);
+                    dom.geometry.fragments.insert(*id, parts);
+                } else if !dom.geometry.fragments.is_empty() && !self.data.cuts.contains(id) {
+                    dom.geometry.fragments.remove(id);
                 }
                 // Like Chrome, a part that starts with a line break also has an empty part on the line before.
                 if self.data.cuts.contains(id) && self.data.text[range.clone()].starts_with('\n') {
@@ -1404,7 +1409,7 @@ impl renderer::Hooks for InlineText {
                     rows.clone(),
                     font,
                 );
-                dom.text_layouts.insert(*id, entry.clone());
+                dom.layout.text_layouts.insert(*id, entry.clone());
                 layouts.push((*id, entry));
             }
         }
@@ -1478,14 +1483,14 @@ impl renderer::Hooks for InlineText {
                 rect[0] += x;
                 rect[1] += y;
                 place(dom, &self.data, *id, *rect);
-                for part in dom.fragments.get_mut(id).into_iter().flatten() {
+                for part in dom.geometry.fragments.get_mut(id).into_iter().flatten() {
                     part[0] += x;
                     part[1] += y;
                 }
             }
         }
         for (id, entry) in layouts.iter() {
-            dom.text_layouts.insert(*id, entry.clone());
+            dom.layout.text_layouts.insert(*id, entry.clone());
         }
     }
 
@@ -1806,7 +1811,7 @@ impl renderer::Hooks for InlineText {
                     }
                 }
                 for (id, range) in &self.data.ranges {
-                    let Some([start, end]) = dom.selection.get(id) else {
+                    let Some([start, end]) = dom.interaction.selection.get(id) else {
                         continue;
                     };
                     // A selection changes without a new box, so this text draws again in each frame.
@@ -1814,7 +1819,7 @@ impl renderer::Hooks for InlineText {
                     if styles.user_select[*id].0 == style::UserSelect::None || dom.inert(*id) {
                         continue;
                     }
-                    let caret = dom.selection_caret == Some(*id);
+                    let caret = dom.interaction.selection_caret == Some(*id);
                     let text = &self.data.text[range.clone()];
                     let source = host
                         .pages

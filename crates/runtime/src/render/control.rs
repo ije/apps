@@ -110,7 +110,7 @@ pub(super) struct Look {
     pub value: f32,
 }
 
-pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> Child {
+pub(super) fn layer(id: usize, look: Look, view: Rc<super::ViewState>) -> Child {
     let drawn = std::cell::Cell::new([0u32; 3]);
     renderer::canvas(
         |_, _| (),
@@ -121,7 +121,7 @@ pub(super) fn layer(id: usize, look: Look, view: Rc<super::PageState>) -> Child 
             }
             let scale = window.scale_factor();
             let mut host = view.host.borrow_mut();
-            let backgrounds = &mut host.dom.entry(view.id).or_default().backgrounds;
+            let backgrounds = &mut host.dom.entry(view.id).or_default().rasters.backgrounds;
             let key = (id, usize::MAX - look.control as usize);
             let seen = [width, height, scale].map(f32::to_bits);
             if drawn.replace(seen) != seen || !backgrounds.contains_key(&key) {

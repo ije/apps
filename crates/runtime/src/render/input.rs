@@ -1,5 +1,5 @@
 use super::inspect::{Tool, tool};
-use super::{PageState, PageView};
+use super::{PageView, ViewState};
 use crate::css;
 use crate::css::properties::Prop;
 use crate::style;
@@ -16,7 +16,7 @@ pub(super) type Caret = (Option<[usize; 2]>, usize);
 pub(super) type Blink = ([usize; 3], Instant, Option<(u32, renderer::Timer)>);
 
 pub(super) fn paint_caret(
-    view: &PageState,
+    view: &ViewState,
     key: [usize; 3],
     bounds: Rect<Pixels>,
     color: renderer::Color,
@@ -49,11 +49,16 @@ pub(super) fn paint_caret(
 }
 
 // The rows of `aligned_rows` with the lines, width and alignment they are for.
-type KeptRows = (Rc<[renderer::TextLine]>, u32, u8, crate::dom::Rows);
+type KeptRows = (
+    Rc<[renderer::TextLine]>,
+    u32,
+    u8,
+    crate::render::layout::Rows,
+);
 
 pub(super) struct FieldText {
     pub(super) id: usize,
-    pub(super) view: Rc<PageState>,
+    pub(super) view: Rc<ViewState>,
     pub(super) text: Rc<str>,
     pub(super) password: Option<String>,
     pub(super) run: renderer::TextRun,
@@ -97,7 +102,7 @@ fn aligned_rows(
     layout: &renderer::Paragraph,
     align: renderer::TextAlign,
     rtl: bool,
-) -> crate::dom::Rows {
+) -> crate::render::layout::Rows {
     if align == renderer::TextAlign::Left {
         return Rc::default();
     }
@@ -128,7 +133,7 @@ fn aligned_rows(
                 renderer::TextAlign::Center => free / 2.,
                 _ => free,
             };
-            rows.push(crate::dom::Row {
+            rows.push(crate::render::layout::Row {
                 shift,
                 right: shift + end - left,
                 gap: px(0.),
@@ -177,16 +182,17 @@ impl renderer::Hooks for FieldText {
         let mut host = view.host.borrow_mut();
         let dom = host.dom.entry(view.id).or_default();
         let selected = dom
+            .interaction
             .selection
             .get(&self.id)
-            .filter(|_| dom.focus == Some(self.id))
+            .filter(|_| dom.interaction.focus == Some(self.id))
             .map(|&selected| match &self.password {
                 _ if self.placeholder => [0; 2],
                 Some(value) => selected.map(|offset| crate::dom::bullets(value, offset)),
                 None => selected,
             });
         if !self.placeholder {
-            dom.text_layouts.insert(
+            dom.layout.text_layouts.insert(
                 self.id,
                 (
                     layout.clone(),
@@ -328,7 +334,7 @@ impl renderer::Hooks for FieldText {
     }
 }
 
-impl PageState {
+impl ViewState {
     fn evaluate(&self, script: &str) -> Result<String> {
         let renderer = self
             .runtime
@@ -477,17 +483,17 @@ impl renderer::View for PageView {
         // The paint order of boxes, which hit tests sort by.
         if let Ok(mut host) = self.host.try_borrow_mut() {
             let dom = host.dom.entry(self.id).or_default();
-            dom.painted.fill(0);
+            dom.layout.painted.fill(0);
             let page = self.id;
             for (order, &mark) in window.marks().iter().enumerate() {
                 let id = (mark & u64::from(u32::MAX)) as usize;
                 if mark >> 32 != page {
                     continue;
                 }
-                if dom.painted.len() <= id {
-                    dom.painted.resize(id + 1, 0);
+                if dom.layout.painted.len() <= id {
+                    dom.layout.painted.resize(id + 1, 0);
                 }
-                dom.painted[id] = order as u64 + 1;
+                dom.layout.painted[id] = order as u64 + 1;
             }
         }
         if snapshots.is_empty() && !self.paint.take() {
@@ -504,14 +510,15 @@ impl renderer::View for PageView {
                     (page.doc.nodes.get(*id))
                         .is_some_and(|node| node.attrs.contains_key("drawable"))
                 };
-                dom.snapshots.retain(|id, _| drawable(id));
-                dom.drawn.retain(|id, _| drawable(id));
+                dom.media.snapshots.retain(|id, _| drawable(id));
+                dom.geometry.drawn.retain(|id, _| drawable(id));
             }
             for renderer::Snapshot { key, size, pixels } in snapshots {
                 if let Some(pixels) = tiny_skia::IntSize::from_wh(size[0], size[1])
                     .and_then(|size| tiny_skia::Pixmap::from_vec(pixels, size))
                 {
-                    dom.snapshots
+                    dom.media
+                        .snapshots
                         .insert(key as usize, (Rc::new(pixels), window.scale_factor()));
                     changed.push(key);
                 }
@@ -754,9 +761,9 @@ impl renderer::View for PageView {
             .map(|node| node as usize)
             .filter(|node| {
                 state["end"].as_u64() == Some(range.start as u64)
-                    && dom.text_layouts.contains_key(node)
+                    && dom.layout.text_layouts.contains_key(node)
             });
-        let (node, range) = if dom.text_layouts.contains_key(&id) {
+        let (node, range) = if dom.layout.text_layouts.contains_key(&id) {
             (id, range)
         } else if let Some(node) = caret {
             let at = state["offset"].as_u64()? as usize;
@@ -779,7 +786,7 @@ impl renderer::View for PageView {
             }
             found.unwrap_or((id, range))
         };
-        if let Some((layout, text, span, rows, _)) = dom.text_layouts.get(&node) {
+        if let Some((layout, text, span, rows, _)) = dom.layout.text_layouts.get(&node) {
             let content = &text[span.clone()];
             let [start, end] = [range.start, range.end].map(|index| {
                 let index = password.map_or(index, |value| crate::dom::bullets(value, index));
@@ -797,11 +804,12 @@ impl renderer::View for PageView {
         }
         // A terminal composes text at its cursor.
         let caret = dom
+            .media
             .terminals
             .borrow()
             .session(id)
             .and_then(|session| Some(self.terminals.borrow().get(&session)?.caret));
-        let bounds = caret.as_ref().or_else(|| dom.bounds.get(&id))?;
+        let bounds = caret.as_ref().or_else(|| dom.geometry.mirror.get(&id))?;
         Some(Rect::new(
             point(px(bounds[0]), px(bounds[1])),
             size(px(bounds[2]), px(bounds[3])),
@@ -818,7 +826,7 @@ impl renderer::View for PageView {
         let id = state["id"].as_u64()? as usize;
         let host = self.host.borrow();
         let dom = host.dom.get(&self.id)?;
-        if let Some((layout, text, span, rows, _)) = dom.text_layouts.get(&id) {
+        if let Some((layout, text, span, rows, _)) = dom.layout.text_layouts.get(&id) {
             let [dx, dy] = dom.scroll_shift(id);
             let point = point - renderer::point(px(dx), px(dy));
             let index = super::text::text_index(layout, text, rows, point, false)
@@ -830,7 +838,7 @@ impl renderer::View for PageView {
                     .map_or(index, |value| crate::dom::unbullet(value, index)),
             );
         }
-        let bounds = dom.bounds.get(&id)?;
+        let bounds = dom.geometry.mirror.get(&id)?;
         let style = dom.styles.computed.as_ref()?.values.get(id)?;
         let face = style::font(style);
         let text = state["text"].as_str()?;

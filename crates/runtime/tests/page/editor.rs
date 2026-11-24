@@ -124,7 +124,7 @@ fn page_text_selection_respects_user_select() {
         editor.focus();selected.selectAllChildren(editor);
         assert(selected.toString()==='editable','Editable content remains selectable under none');
     "#, "page-selection").unwrap();
-    assert_eq!(host.borrow().dom[&1].selection_caret, None);
+    assert_eq!(host.borrow().dom[&1].interaction.selection_caret, None);
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn selection_paint_ranges_and_native_text_offsets() {
     )
     .unwrap();
     engine.eval("const editor=document.querySelector('div');editor.focus();const a=editor.firstChild.firstChild,b=editor.children[1].firstChild,c=editor.lastChild.firstChild;getSelection().setBaseAndExtent(c,1,a,1)", "test").unwrap();
-    let ranges = host.borrow().dom[&1].selection.clone();
+    let ranges = host.borrow().dom[&1].interaction.selection.clone();
     for (name, expected) in [("a", [1, 3]), ("b", [0, 2]), ("c", [0, 1])] {
         let id: usize = engine
             .eval(&format!("{name}._id"), "test")
@@ -165,7 +165,7 @@ fn selection_paint_ranges_and_native_text_offsets() {
     engine
         .eval("getSelection().removeAllRanges()", "test")
         .unwrap();
-    assert!(host.borrow().dom[&1].selection.is_empty());
+    assert!(host.borrow().dom[&1].interaction.selection.is_empty());
     engine
         .eval("getSelection().collapse(c,1);__appsInput('x')", "test")
         .unwrap();
@@ -194,36 +194,42 @@ fn empty_selection_fragments_are_not_carets() {
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(host.borrow().dom[&1].selection[&empty], [0, 0]);
-    assert_eq!(host.borrow().dom[&1].selection_caret, None);
+    assert_eq!(host.borrow().dom[&1].interaction.selection[&empty], [0, 0]);
+    assert_eq!(host.borrow().dom[&1].interaction.selection_caret, None);
     engine
         .eval(
             "getSelection().collapse(editor.children[1].firstChild,0)",
             "test",
         )
         .unwrap();
-    assert_eq!(host.borrow().dom[&1].selection_caret, Some(empty));
+    assert_eq!(
+        host.borrow().dom[&1].interaction.selection_caret,
+        Some(empty)
+    );
     engine
         .eval(
             "getSelection().collapse(document.querySelector('pre').firstChild,4)",
             "test",
         )
         .unwrap();
-    assert_eq!(host.borrow().dom[&1].selection_caret, None);
+    assert_eq!(host.borrow().dom[&1].interaction.selection_caret, None);
     engine
         .eval("getSelection().removeAllRanges()", "test")
         .unwrap();
-    assert_eq!(host.borrow().dom[&1].selection_caret, None);
+    assert_eq!(host.borrow().dom[&1].interaction.selection_caret, None);
     engine
         .eval(
             "const input=document.querySelector('textarea');input.focus();input.select()",
             "test",
         )
         .unwrap();
-    assert_eq!(host.borrow().dom[&1].selection_caret, None);
+    assert_eq!(host.borrow().dom[&1].interaction.selection_caret, None);
     engine.eval("input.setSelectionRange(2,2)", "test").unwrap();
     let input: usize = engine.eval("input._id", "test").unwrap().parse().unwrap();
-    assert_eq!(host.borrow().dom[&1].selection_caret, Some(input));
+    assert_eq!(
+        host.borrow().dom[&1].interaction.selection_caret,
+        Some(input)
+    );
 }
 
 #[test]
@@ -289,7 +295,7 @@ fn caret_hit_testing_uses_the_nearest_visible_text() {
             "span" => [0., top, 100., 20.],
             _ => [0., 0., 100., 100.],
         };
-        state.bounds.insert(id, rect);
+        state.geometry.mirror.insert(id, rect);
     }
     for (point, expected) in [
         ([10, 10], Some("first")),

@@ -103,7 +103,7 @@ pub(super) fn sync(
 }
 
 pub(super) fn paint(
-    view: &super::PageState,
+    view: &super::ViewState,
     id: usize,
     bounds: Rect<Pixels>,
     style: &css::properties::Style,
@@ -153,7 +153,7 @@ pub(super) fn paint(
     window.native_control(control, sink);
 }
 
-pub(crate) fn events(view: &super::PageState) -> Vec<(usize, ControlEvent)> {
+pub(crate) fn events(view: &super::ViewState) -> Vec<(usize, ControlEvent)> {
     let mut controls = view.controls.borrow_mut();
     let events = std::mem::take(
         &mut *controls

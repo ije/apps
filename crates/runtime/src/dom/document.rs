@@ -100,7 +100,7 @@ pub struct Document {
 
 static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-pub(super) fn stamp() -> u64 {
+pub(crate) fn stamp() -> u64 {
     REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 

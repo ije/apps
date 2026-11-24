@@ -38,7 +38,7 @@ fn web_images_decode_in_the_dom() {
         )
         .unwrap();
         assert_eq!(decoded(&mut doc, &mut state), json!(size));
-        assert!(state.images.contains_key(&1));
+        assert!(state.media.images.contains_key(&1));
     }
     for (bytes, color) in [
         (
@@ -162,7 +162,7 @@ fn svg_and_bundled_images_load_through_the_host() {
         )
         .unwrap();
         assert_eq!(decoded(&mut doc, &mut state), json!([30., 12.]));
-        assert!(!state.images.contains_key(&1));
+        assert!(!state.media.images.contains_key(&1));
     }
     dom::call(
         "dom.image",
@@ -204,9 +204,9 @@ fn svg_and_bundled_images_load_through_the_host() {
         }
     };
     assert!(load(&mut host, "assets/sample.png").unwrap().is_u64());
-    assert!(!host.pages[&1].dirty && !host.dom[&1].images.contains_key(&1));
+    assert!(!host.pages[&1].dirty && !host.dom[&1].media.images.contains_key(&1));
     assert_eq!(decoded(&mut host), json!([4, 3]));
-    assert!(host.pages[&1].dirty && host.dom[&1].images.contains_key(&1));
+    assert!(host.pages[&1].dirty && host.dom[&1].media.images.contains_key(&1));
     assert!(load(&mut host, "apps:///assets/missing.png").is_err());
     assert!(load(&mut host, png.to_str().unwrap()).is_err());
     assert!(load(&mut host, url::Url::from_file_path(&png).unwrap().as_str()).is_err());

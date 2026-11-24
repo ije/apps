@@ -26,7 +26,7 @@ use std::{
 
 pub(crate) struct View {
     handle: Option<WindowId>,
-    data: Weak<crate::render::PageState>,
+    data: Weak<crate::render::ViewState>,
     title: Option<String>,
     preload: Option<Rc<JsContext>>,
     renderer: Option<Rc<JsContext>>,

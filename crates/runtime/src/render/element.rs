@@ -1,5 +1,5 @@
 use super::{
-    PageState,
+    ViewState,
     background::css_background,
     cull,
     paint::{DomBox, Turned},
@@ -20,7 +20,7 @@ pub(super) struct Build<'a> {
     pub(super) styles: &'a ComputedStyles,
     pub(super) text: &'a renderer::TextSystem,
     pub(super) pixel_ratio: f32,
-    pub(super) view: &'a Rc<PageState>,
+    pub(super) view: &'a Rc<ViewState>,
     pub(super) ancestors: Rc<[usize]>,
     pub(super) flex_parent: bool,
     pub(super) measured: &'a RefCell<super::grid::Measurements>,
@@ -512,7 +512,7 @@ fn baselines(doc: &Document, dom: Option<&crate::dom::State>, grid: usize) -> u6
     use std::hash::{Hash, Hasher};
     let mut hasher = rustc_hash::FxHasher::default();
     for child in &doc.nodes[grid].children {
-        dom.and_then(|dom| dom.baselines.get(child))
+        dom.and_then(|dom| dom.layout.baselines.get(child))
             .map(|baselines| baselines.map(|value| value.map(f32::to_bits)))
             .hash(&mut hasher);
     }
@@ -552,7 +552,7 @@ impl<'a> Build<'a> {
     }
 
     fn block_size(&self, dom: Option<&crate::dom::State>, block: usize) -> Option<[f32; 2]> {
-        dom.and_then(|dom| dom.blocks.get(&block))
+        dom.and_then(|dom| dom.layout.blocks.get(&block))
             .map(|bounds| [f32::from(bounds.size.width), f32::from(bounds.size.height)])
             .or_else(|| self.blocks.borrow().get(&block).copied())
     }
@@ -605,7 +605,7 @@ impl<'a> Build<'a> {
             )),
             Query::Backdrop(node) => hashed(backdrop(doc, styles, node as usize)),
             Query::Scroller(escape) => {
-                let Some(handles) = dom.map(|dom| &dom.scroll) else {
+                let Some(handles) = dom.map(|dom| &dom.geometry.scroll) else {
                     return Replay::Changed;
                 };
                 let ancestors = self.ancestors.iter().rev().copied();
@@ -635,10 +635,10 @@ impl<'a> Build<'a> {
                     .map(|size| size.map(f32::to_bits)),
             ),
             Query::Scroll(node) => hashed(scrolled(
-                dom.and_then(|dom| dom.scroll.get(&(node as usize))),
+                dom.and_then(|dom| dom.geometry.scroll.get(&(node as usize))),
             )),
             Query::Width(node) => hashed(
-                dom.and_then(|dom| dom.cull.widths.get(&(node as usize)))
+                dom.and_then(|dom| dom.layout.cull.widths.get(&(node as usize)))
                     .map(|size| size.map(f32::to_bits)),
             ),
             Query::Track(node, axis) => {
@@ -646,7 +646,7 @@ impl<'a> Build<'a> {
                 // off.
                 let used = f32::from_bits(read.value as u32);
                 return match dom
-                    .and_then(|dom| dom.cull.widths.get(&(node as usize)))
+                    .and_then(|dom| dom.layout.cull.widths.get(&(node as usize)))
                     .map(|size| size[usize::from(axis)])
                 {
                     // A node keeps its size, so a read that finds none was made without one too.
@@ -658,15 +658,15 @@ impl<'a> Build<'a> {
             }
             Query::Baselines(grid) => baselines(doc, dom, grid as usize),
             Query::Atom(node) => hashed(
-                dom.and_then(|dom| dom.atoms.get(&(node as usize)))
+                dom.and_then(|dom| dom.layout.atoms.get(&(node as usize)))
                     .map(|size| size.map(f32::to_bits)),
             ),
             Query::Image(node) => {
                 let node = node as usize;
                 let dom = dom.filter(|_| !broken_image(&doc.nodes[node]));
                 pictured(
-                    dom.and_then(|dom| dom.images.get(&node)),
-                    dom.and_then(|dom| dom.svg_images.get(&node)),
+                    dom.and_then(|dom| dom.media.images.get(&node)),
+                    dom.and_then(|dom| dom.media.svg_images.get(&node)),
                 )
             }
             Query::Look(node) => hashed(doc.nodes[node as usize].state & LOOK),
@@ -705,7 +705,7 @@ fn inset_axes(style: &css::properties::Style) -> u8 {
 }
 
 // An empty box at the static place of an absolute box, which puts its place in `anchors` for the box to follow.
-fn static_mark(view: &Rc<super::PageState>, key: usize) -> renderer::Node {
+fn static_mark(view: &Rc<super::ViewState>, key: usize) -> renderer::Node {
     let view = view.clone();
     renderer::canvas_watching(
         move |bounds, _| {
@@ -713,6 +713,7 @@ fn static_mark(view: &Rc<super::PageState>, key: usize) -> renderer::Node {
             host.dom
                 .entry(view.id)
                 .or_default()
+                .layout
                 .anchors
                 .insert(key, bounds);
         },
@@ -1662,8 +1663,8 @@ fn create(
                 }
                 let host = view.host.borrow();
                 let dom = host.dom.get(&view.id)?;
-                let rect = *dom.bounds.get(&id)?;
-                let moved = dom.cull.scrolled.get(&id).copied().unwrap_or(0.);
+                let rect = *dom.geometry.mirror.get(&id)?;
+                let moved = dom.layout.cull.scrolled.get(&id).copied().unwrap_or(0.);
                 Some(Rc::new(cull::Zone {
                     top: zone.top.max(rect[1]) + moved,
                     bottom: zone.bottom.min(rect[1] + rect[3]) + moved,
@@ -1964,7 +1965,8 @@ fn create(
                     .dom
                     .entry(view.id)
                     .or_default()
-                    .bounds
+                    .geometry
+                    .mirror
                     .insert(
                         id,
                         [
@@ -1979,7 +1981,7 @@ fn create(
                 let caret = painter.host.try_borrow().is_ok_and(|host| {
                     host.dom
                         .get(&painter.id)
-                        .is_some_and(|dom| dom.selection_caret == Some(id))
+                        .is_some_and(|dom| dom.interaction.selection_caret == Some(id))
                 });
                 if caret {
                     window.paint_volatile();
@@ -2009,7 +2011,7 @@ fn create(
             .borrow()
             .dom
             .get(&view.id)
-            .and_then(|dom| dom.cull.widths.get(&id).copied());
+            .and_then(|dom| dom.layout.cull.widths.get(&id).copied());
         let mut measured = measured.borrow_mut();
         let skips = cull::skips(info[id].flags, style, id, &measured, false);
         let forced = skips && measured.forced.contains(&id);
@@ -2540,7 +2542,15 @@ fn create(
             // The bar of the scrollback.
             grid_bar = Some(scrollbar::Scrollbar {
                 id,
-                handle: (state.terminals.borrow_mut().bars.entry(id).or_default().0).clone(),
+                handle: (state
+                    .media
+                    .terminals
+                    .borrow_mut()
+                    .bars
+                    .entry(id)
+                    .or_default()
+                    .0)
+                    .clone(),
                 look: scrollbar::Look::new(style, None, &units, Some(look.background())),
                 axes: [false, true],
                 reserved: [0.; 2],
@@ -2554,7 +2564,7 @@ fn create(
                     .hooks(super::terminal::Grid {
                         id,
                         view: view.clone(),
-                        terminals: state.terminals.clone(),
+                        terminals: state.media.terminals.clone(),
                         look: Rc::new(look),
                         edges: insets(styles, id, true, containing[0]),
                     })
@@ -2572,8 +2582,8 @@ fn create(
             .filter(|_| !broken)
             .map_or((None, None), |state| {
                 (
-                    state.images.get(&id).cloned(),
-                    state.svg_images.get(&id).cloned(),
+                    state.media.images.get(&id).cloned(),
+                    state.media.svg_images.get(&id).cloned(),
                 )
             });
         reader.log(
@@ -2860,7 +2870,7 @@ fn create(
             .borrow()
             .dom
             .get(&view.id)
-            .is_some_and(|state| state.svg_sources.contains_key(&id));
+            .is_some_and(|state| state.media.svg_sources.contains_key(&id));
         if !kept {
             let mut header = format!(
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{inner_width}\" height=\"{inner_height}\""
@@ -2943,13 +2953,17 @@ fn create(
             let mut host = view.host.borrow_mut();
             let state = host.dom.entry(view.id).or_default();
             // Discard the raster on source changes: paint checks only inline SVG dimensions.
-            if state.svgs.get(&id).is_some_and(|(old, _)| *old != source)
-                && let Some((_, image)) = state.svgs.remove(&id)
+            if state
+                .rasters
+                .svgs
+                .get(&id)
+                .is_some_and(|(old, _)| *old != source)
+                && let Some((_, image)) = state.rasters.svgs.remove(&id)
                 && Arc::strong_count(&image) == 1
             {
-                state.retired.push(image);
+                state.media.retired.push(image);
             }
-            state.svg_boxes.insert(
+            state.rasters.svg_boxes.insert(
                 id,
                 (
                     "".into(),
@@ -2961,7 +2975,7 @@ fn create(
                     [0.; 4],
                 ),
             );
-            state.svg_sources.insert(id, source);
+            state.media.svg_sources.insert(id, source);
         }
         el = el.w(px(width)).h(px(height));
         // As in Chrome, an `<svg>` with `overflow: visible` paints outside its box.
@@ -3212,6 +3226,7 @@ fn create(
             .dom
             .entry(view.id)
             .or_default()
+            .geometry
             .scroll
             .entry(id)
             .or_default()
@@ -3437,7 +3452,7 @@ fn create(
         // Make the handle before the read, or the read logs none and its replay finds the handle.
         let mut host = view.host.borrow_mut();
         let dom = host.dom.entry(view.id).or_default();
-        let handle = dom.scroll.entry(id).or_default();
+        let handle = dom.geometry.scroll.entry(id).or_default();
         reader.log(Query::Scroll(id as u32), 0, hashed(scrolled(Some(handle))));
         look.space(look.shown(scrolls, handle.extent()))
     });
@@ -5424,7 +5439,7 @@ fn create(
     let overscroll = overscroll(style);
     let handle = {
         let mut host = view.host.borrow_mut();
-        let scroll = &mut host.dom.entry(view.id).or_default().scroll;
+        let scroll = &mut host.dom.entry(view.id).or_default().geometry.scroll;
         if scrolls.contains(&true)
             || !page
                 && overflow.contains(&renderer::Overflow::Hidden)
@@ -5795,14 +5810,14 @@ fn create(
         .then(|| {
             let mut host = view.host.borrow_mut();
             let dom = host.dom.entry(view.id).or_default();
-            let last = dom.cull.widths.get(&id).copied();
+            let last = dom.layout.cull.widths.get(&id).copied();
             reader.log(
                 Query::Width(id as u32),
                 0,
                 hashed(last.map(|size| size.map(f32::to_bits))),
             );
             let size = last.unwrap_or_else(content_box);
-            dom.containers.insert(id, size);
+            dom.layout.containers.insert(id, size);
             // Block-axis units of an inline-size container use the next size container, or the viewport.
             if kind == Some("inline-size") {
                 [size[0], container[1]]
@@ -6731,7 +6746,7 @@ fn create(
             .borrow()
             .dom
             .get(&view.id)
-            .and_then(|dom| dom.atoms.get(&atom.key()).copied());
+            .and_then(|dom| dom.layout.atoms.get(&atom.key()).copied());
         reader.log(
             Query::Atom(atom.key() as u32),
             0,
@@ -7218,8 +7233,8 @@ fn create(
                 let last = {
                     let mut host = view.host.borrow_mut();
                     let dom = host.dom.entry(view.id).or_default();
-                    let same = dom.grid_widest.insert(id, max) == Some(max);
-                    same.then(|| dom.cull.widths.get(&id).map(|size| size[0].max(0.)))
+                    let same = dom.layout.grid_widest.insert(id, max) == Some(max);
+                    same.then(|| dom.layout.cull.widths.get(&id).map(|size| size[0].max(0.)))
                         .flatten()
                 };
                 // Laid-out bounds are in layout units, so a fitting grid may look narrower.
@@ -7238,7 +7253,7 @@ fn create(
                     .borrow()
                     .dom
                     .get(&view.id)
-                    .and_then(|dom| dom.cull.widths.get(&id))
+                    .and_then(|dom| dom.layout.cull.widths.get(&id))
                 {
                     content[0] = last[0].max(0.);
                 }
@@ -7293,25 +7308,28 @@ fn create(
                     let height = height.min(limit(Prop::MAX_HEIGHT).unwrap_or(f32::INFINITY));
                     (height.max(limit(Prop::MIN_HEIGHT).unwrap_or(0.)) - extra[1]).max(0.)
                 });
-            let height =
-                if slot.is_some() || !auto_height {
-                    Some(content[1])
-                } else if ratio.is_some() {
-                    definite = ratio.unwrap_or_default();
-                    ratio
-                } else if let Some(insets) = stretched {
-                    definite = (containing[1] - insets - margin[0] - margin[2] - vertical).max(0.);
-                    Some(definite)
-                } else if flexed {
-                    let height =
-                        view.host.borrow().dom.get(&view.id).and_then(|state| {
-                            state.cull.widths.get(&id).map(|size| size[1].max(0.))
-                        });
-                    tracked[1] = Some((height.unwrap_or(f32::NAN), vertical));
-                    height
-                } else {
-                    None
-                };
+            let height = if slot.is_some() || !auto_height {
+                Some(content[1])
+            } else if ratio.is_some() {
+                definite = ratio.unwrap_or_default();
+                ratio
+            } else if let Some(insets) = stretched {
+                definite = (containing[1] - insets - margin[0] - margin[2] - vertical).max(0.);
+                Some(definite)
+            } else if flexed {
+                let height = view.host.borrow().dom.get(&view.id).and_then(|state| {
+                    state
+                        .layout
+                        .cull
+                        .widths
+                        .get(&id)
+                        .map(|size| size[1].max(0.))
+                });
+                tracked[1] = Some((height.unwrap_or(f32::NAN), vertical));
+                height
+            } else {
+                None
+            };
             let mut host = view.host.borrow_mut();
             let dom = host.dom.entry(view.id).or_default();
             for (axis, track) in tracked.iter().enumerate() {
@@ -7329,9 +7347,9 @@ fn create(
                 baselines(doc, Some(&*dom), id),
             );
             if tracked.iter().any(Option::is_some) {
-                dom.flexed_grids.insert(id, tracked);
+                dom.layout.flexed_grids.insert(id, tracked);
             } else {
-                dom.flexed_grids.remove(&id);
+                dom.layout.flexed_grids.remove(&id);
             }
             drop(host);
             let cached = view
@@ -7339,7 +7357,7 @@ fn create(
                 .borrow()
                 .dom
                 .get(&view.id)
-                .and_then(|state| state.grids.get(&id))
+                .and_then(|state| state.layout.grids.get(&id))
                 .filter(|(width, cached, inherited, _)| {
                     *width == content[0]
                         && *cached == height
@@ -7358,7 +7376,7 @@ fn create(
                         .borrow()
                         .dom
                         .get(&view.id)
-                        .map(|dom| &dom.baselines),
+                        .map(|dom| &dom.layout.baselines),
                     text,
                     &mut measured.borrow_mut(),
                 );
@@ -7367,6 +7385,7 @@ fn create(
                     .dom
                     .entry(view.id)
                     .or_default()
+                    .layout
                     .grids
                     .insert(
                         id,
@@ -7384,7 +7403,7 @@ fn create(
         };
         if let Some(grid) = &grid {
             let mut host = view.host.borrow_mut();
-            let tracks = &mut host.dom.entry(view.id).or_default().tracks;
+            let tracks = &mut host.dom.entry(view.id).or_default().layout.tracks;
             if tracks
                 .get(&id)
                 .is_none_or(|[columns, rows]| **columns != *grid.columns || **rows != *grid.rows)
@@ -7679,8 +7698,8 @@ fn create(
         if let Some(zone) = stack {
             let host = view.host.borrow();
             if let Some(dom) = host.dom.get(&view.id)
-                && let Some(&[left, ..]) = dom.bounds.get(&id)
-                && let Some(&[width, _]) = dom.cull.widths.get(&id)
+                && let Some(&[left, ..]) = dom.geometry.mirror.get(&id)
+                && let Some(&[width, _]) = dom.layout.cull.widths.get(&id)
             {
                 let gap = if flexbox {
                     style
@@ -7698,8 +7717,8 @@ fn create(
                             shown(index) && info[children[index]].flags & cull::OUT_OF_FLOW == 0
                         },
                         |child| {
-                            let placed = *dom.cull.placed.get(child)?;
-                            let bounds = dom.bounds.get(&child)?;
+                            let placed = *dom.layout.cull.placed.get(child)?;
+                            let bounds = dom.geometry.mirror.get(&child)?;
                             let [top, _, bottom, left] = placed.2;
                             let member = cull::member(
                                 info[child],
@@ -7728,8 +7747,13 @@ fn create(
                         |child| {
                             cull::member(
                                 info[child],
-                                dom.cull.placed.get(child).copied().unwrap_or_default(),
-                                dom.bounds.get(&child),
+                                dom.layout
+                                    .cull
+                                    .placed
+                                    .get(child)
+                                    .copied()
+                                    .unwrap_or_default(),
+                                dom.geometry.mirror.get(&child),
                                 &zone,
                                 units.viewport[1],
                                 flexbox,
@@ -7746,8 +7770,13 @@ fn create(
                     for (index, &child) in children.iter().enumerate() {
                         match slots[index] {
                             0 => {
-                                let placed =
-                                    dom.cull.placed.get(child).copied().unwrap_or_default();
+                                let placed = dom
+                                    .layout
+                                    .cull
+                                    .placed
+                                    .get(child)
+                                    .copied()
+                                    .unwrap_or_default();
                                 if placed.0 != info[child].revision {
                                     watch.push((child, placed.1[0]));
                                 }
@@ -7789,14 +7818,20 @@ fn create(
                     if super::grid::pseudo_item(child).is_some() {
                         continue;
                     }
-                    let placed = dom.cull.placed.get(child).copied().unwrap_or_default();
+                    let placed = dom
+                        .layout
+                        .cull
+                        .placed
+                        .get(child)
+                        .copied()
+                        .unwrap_or_default();
                     let [top, right, bottom, left] = placed.2;
                     // Compare unsnapped cell sizes: layout snaps them later.
                     if placed.1 == [width, height]
                         && cull::member(
                             info[child],
                             placed,
-                            dom.bounds.get(&child),
+                            dom.geometry.mirror.get(&child),
                             zone,
                             units.viewport[1],
                             false,
@@ -8210,6 +8245,7 @@ fn create(
                     host.dom
                         .entry(view.id)
                         .or_default()
+                        .layout
                         .areas
                         .insert(child, own);
                 }
@@ -8412,6 +8448,7 @@ fn create(
                                 .dom
                                 .entry(view.id)
                                 .or_default()
+                                .layout
                                 .anchors
                                 .insert(child, bounds);
                         },
@@ -8848,10 +8885,11 @@ fn create(
             .collect();
         if let Some(dom) = view.host.borrow_mut().dom.get_mut(&view.id) {
             let last = dom
+                .layout
                 .autos
                 .get(&id)
                 .map_or((0, [f32::NAN; 2]), |entry| entry.2);
-            dom.autos.insert(id, (chain.clone(), clips, last));
+            dom.layout.autos.insert(id, (chain.clone(), clips, last));
         }
     }
     after.extend(
@@ -8991,7 +9029,7 @@ fn create(
     let sticky = (position == "sticky")
         .then(|| {
             let host = view.host.borrow();
-            let scrolls = &host.dom.get(&view.id)?.scroll;
+            let scrolls = &host.dom.get(&view.id)?.geometry.scroll;
             let parent = scroller(doc, styles, ancestors.iter().rev().copied(), scrolls, 0);
             let border = insets(styles, parent, false, containing[0]);
             reader.log(
@@ -10854,7 +10892,7 @@ fn fieldset_border(
     widths: [f32; 4],
     colors: [renderer::Color; 4],
     kinds: [&str; 4],
-    view: Rc<super::PageState>,
+    view: Rc<super::ViewState>,
 ) -> Child {
     let kinds = kinds.map(str::to_owned);
     renderer::canvas(
@@ -10867,7 +10905,7 @@ fn fieldset_border(
                 .borrow()
                 .dom
                 .get(&view.id)
-                .and_then(|dom| dom.bounds.get(&legend).copied())
+                .and_then(|dom| dom.geometry.mirror.get(&legend).copied())
                 .map(|[x, _, width, _]| [px(x), px(x + width)]);
             let top = bounds.top() + px(middle - widths[0] / 2.);
             let [left, right, bottom] = [bounds.left(), bounds.right(), bounds.bottom()];
@@ -11096,7 +11134,7 @@ fn svg_layer(
     id: usize,
     inline: bool,
     spill: bool,
-    view: Rc<super::PageState>,
+    view: Rc<super::ViewState>,
     padding: [f32; 4],
 ) -> Child {
     let geometry = view.clone();
@@ -11108,14 +11146,15 @@ fn svg_layer(
             }
             let mut host = geometry.host.borrow_mut();
             let state = host.dom.entry(geometry.id).or_default();
-            if let Some(source) = state.svg_sources.get(&id)
-                && let Some(entry) = state.svg_boxes.get_mut(&id)
+            if let Some(source) = state.media.svg_sources.get(&id)
+                && let Some(entry) = state.rasters.svg_boxes.get_mut(&id)
             {
                 if entry.0 != *source {
                     // Drop stale svg_trees entries here: repeated draws can skip paint and leave old sources
                     // cached.
-                    state.svg_trees.remove(&id);
-                    let (size, content, boxes, painted) = match state.svg_cache.get(source) {
+                    state.rasters.svg_trees.remove(&id);
+                    let (size, content, boxes, painted) = match state.rasters.svg_cache.get(source)
+                    {
                         Some((geometry, _)) => geometry.clone(),
                         None => {
                             let tree = super::canvas::svg_tree(source, false).ok();
@@ -11124,11 +11163,14 @@ fn svg_layer(
                                 .map(super::canvas::svg_boxes)
                                 .unwrap_or_default();
                             if let Some(tree) = tree {
-                                state.svg_trees.insert(id, tree);
+                                state.rasters.svg_trees.insert(id, tree);
                                 // Bound the cache here: this is the only place that adds sources.
-                                if state.svg_cache.len() >= 256 {
-                                    for image in
-                                        state.svg_cache.drain().flat_map(|(_, entry)| entry.1)
+                                if state.rasters.svg_cache.len() >= 256 {
+                                    for image in state
+                                        .rasters
+                                        .svg_cache
+                                        .drain()
+                                        .flat_map(|(_, entry)| entry.1)
                                     {
                                         if Arc::strong_count(&image) == 1 {
                                             window.release_image(image);
@@ -11136,6 +11178,7 @@ fn svg_layer(
                                     }
                                 }
                                 state
+                                    .rasters
                                     .svg_cache
                                     .insert(source.clone(), (geometry.clone(), Vec::new()));
                             }
@@ -11167,13 +11210,13 @@ fn svg_layer(
                     .max((y + h) * scale_y - height);
                 // Like the cull margin of a box shadow.
                 let far = spill && reach >= f32::from(window.viewport_size().height);
-                if far != state.cull.spills.contains(&id) {
+                if far != state.layout.cull.spills.contains(&id) {
                     match far {
-                        true => state.cull.spills.insert(id),
-                        false => state.cull.spills.remove(&id),
+                        true => state.layout.cull.spills.insert(id),
+                        false => state.layout.cull.spills.remove(&id),
                     };
-                    state.cull.swapped.push(id);
-                    state.cull.respilled.push(id);
+                    state.layout.cull.swapped.push(id);
+                    state.layout.cull.respilled.push(id);
                     window.redraw();
                 }
                 for &(node, [x, y, w, h], _) in &entry.3 {
@@ -11184,7 +11227,7 @@ fn svg_layer(
                         ),
                         size(px(w * scale_x), px(h * scale_y)),
                     ));
-                    state.bounds.insert(
+                    state.geometry.mirror.insert(
                         node,
                         [
                             rect.origin.x.into(),
@@ -11209,7 +11252,7 @@ fn svg_layer(
             // the content mask, in steps, so it keeps the device scale.
             let mask = window.content_mask().bounds;
             let mut cut = false;
-            let area = match state.svg_boxes.get(&id).filter(|_| spill) {
+            let area = match state.rasters.svg_boxes.get(&id).filter(|_| spill) {
                 Some((_, _, [sw, sh], _, _, [x, y, w, h], _)) => {
                     let [kx, ky] = [width / sw.max(f32::EPSILON), height / sh.max(f32::EPSILON)];
                     let mut edges = [
@@ -11251,25 +11294,31 @@ fn svg_layer(
             let raster =
                 [area[2], area[3]].map(|extent| (extent * scale).ceil().clamp(1., 4096.) as u32);
             let source = if inline {
-                state.svg_sources.get(&id).cloned()
+                state.media.svg_sources.get(&id).cloned()
             } else {
-                state.svg_images.get(&id).map(|(source, _)| source.clone())
+                state
+                    .media
+                    .svg_images
+                    .get(&id)
+                    .map(|(source, _)| source.clone())
             };
             let Some(source) = source else { return };
-            if state.svgs.get(&id).is_none_or(|(old, image)| {
+            if state.rasters.svgs.get(&id).is_none_or(|(old, image)| {
                 !inline && *old != source
                     || (image.size().width as u32) != raster[0]
                     || (image.size().height as u32) != raster[1]
             }) || moved
                 && state
+                    .rasters
                     .svg_boxes
                     .get(&id)
                     .is_some_and(|entry| entry.6 != area)
             {
-                if let Some(entry) = state.svg_boxes.get_mut(&id) {
+                if let Some(entry) = state.rasters.svg_boxes.get_mut(&id) {
                     entry.6 = area;
                 }
                 let shared = state
+                    .rasters
                     .svg_cache
                     .get(&source)
                     .filter(|_| inline && !moved)
@@ -11279,7 +11328,10 @@ fn svg_layer(
                         })
                     })
                     .cloned();
-                let image = match (&shared, state.svg_trees.remove(&id).filter(|_| inline)) {
+                let image = match (
+                    &shared,
+                    state.rasters.svg_trees.remove(&id).filter(|_| inline),
+                ) {
                     (Some(image), _) => Ok(image.clone()),
                     (_, Some(tree)) if !moved => {
                         super::canvas::render_svg(&tree, raster[0], raster[1], None)
@@ -11307,7 +11359,7 @@ fn svg_layer(
                             && raster[0] <= 96
                             && raster[1] <= 96
                             && !moved
-                            && let Some((_, images)) = state.svg_cache.get_mut(&source)
+                            && let Some((_, images)) = state.rasters.svg_cache.get_mut(&source)
                         {
                             // Keep the rasters of the last few sizes, so a resized icon doesn't grow the list.
                             if images.len() >= 4 {
@@ -11318,7 +11370,7 @@ fn svg_layer(
                             }
                             images.push(image.clone());
                         }
-                        if let Some((_, old)) = state.svgs.insert(id, (source, image))
+                        if let Some((_, old)) = state.rasters.svgs.insert(id, (source, image))
                             && Arc::strong_count(&old) == 1
                         {
                             window.release_image(old);
@@ -11327,7 +11379,7 @@ fn svg_layer(
                     Err(error) => eprintln!("apps: SVG: {error}"),
                 }
             }
-            let image = state.svgs.get(&id).map(|(_, image)| image.clone());
+            let image = state.rasters.svgs.get(&id).map(|(_, image)| image.clone());
             drop(host);
             if let Some(image) = image {
                 let target = Rect::new(

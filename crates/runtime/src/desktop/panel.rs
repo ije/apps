@@ -158,7 +158,7 @@ impl DevTools {
         command: &Value,
         engine: &JsContext,
         host: &Rc<RefCell<Host>>,
-        page: Option<&crate::render::PageState>,
+        page: Option<&crate::render::ViewState>,
     ) -> Result<()> {
         let params = &command["params"];
         let result = match command["method"].as_str() {
@@ -213,7 +213,7 @@ impl DevTools {
     }
 
     // Tells the panel which node is selected and if the picker and the HUD are on.
-    pub(crate) fn inspected(&self, page: &crate::render::PageState) -> Result<()> {
+    pub(crate) fn inspected(&self, page: &crate::render::ViewState) -> Result<()> {
         let (inspect, hud) = (page.inspect.get(), page.hud.borrow().is_some());
         self.events(&[
             json!({"type":"inspect","pick":inspect.pick,"selected":inspect.selected,"hud":hud}),

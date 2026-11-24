@@ -192,7 +192,7 @@ fn shadow_cycles_child_access_release_and_retired_images() {
             }
         }
     }
-    assert_eq!(host.borrow().dom[&1].retired.len(), 3);
+    assert_eq!(host.borrow().dom[&1].media.retired.len(), 3);
 }
 
 #[test]
@@ -492,9 +492,12 @@ fn bitmaps_and_canvases_move_between_threads() {
     let node = |name: &str| -> usize { engine.eval(name, "test").unwrap().parse().unwrap() };
     let host = host.borrow();
     let dom = &host.dom[&1];
-    assert_eq!(dom.images[&node("placeholder")].size().width as u32, 16);
+    assert_eq!(
+        dom.media.images[&node("placeholder")].size().width as u32,
+        16
+    );
     assert!(host.pages[&1].dirty);
-    let local = &dom.canvases[&node("local")];
+    let local = &dom.media.canvases[&node("local")];
     assert_eq!(local.image.bytes()[..4], [255, 0, 255, 255]);
 }
 
@@ -509,15 +512,18 @@ fn bitmaps_free_their_pixels() {
     );
     assert_eq!(result, "ok");
     let id: usize = engine.eval("closedId", "test").unwrap().parse().unwrap();
-    assert!(!host.borrow().dom[&1].canvases.contains_key(&id));
+    assert!(!host.borrow().dom[&1].media.canvases.contains_key(&id));
     host.borrow_mut().pages.get_mut(&1).unwrap().dirty = false;
     engine.eval("globalThis.kept = new OffscreenCanvas(1, 1); kept.getContext('2d').fillRect(0, 0, 1, 1); kept._context._flush();", "test").unwrap();
     let kept: usize = engine.eval("kept._id", "test").unwrap().parse().unwrap();
     {
         let host = host.borrow();
         assert!(!host.pages[&1].dirty);
-        assert!(!host.dom[&1].canvases[&kept].present);
-        assert_eq!(host.dom[&1].canvases[&kept].pixels.pixels()[0].alpha(), 255);
+        assert!(!host.dom[&1].media.canvases[&kept].present);
+        assert_eq!(
+            host.dom[&1].media.canvases[&kept].pixels.pixels()[0].alpha(),
+            255
+        );
     }
     engine
         .eval(
@@ -533,7 +539,7 @@ fn bitmaps_free_their_pixels() {
         engine.eval("drop()", "test").unwrap();
         made += 1;
         engine.tick().unwrap();
-        most = most.max(host.borrow().dom[&1].canvases.len());
+        most = most.max(host.borrow().dom[&1].media.canvases.len());
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(
@@ -611,8 +617,8 @@ fn images_decode_on_workers_and_load_after_a_wake() {
     let id: usize = engine.eval("image._id", "test").unwrap().parse().unwrap();
     {
         let host = host.borrow();
-        assert!(host.pages[&1].dirty && host.dom[&1].images.contains_key(&id));
-        assert!(host.dom[&1].retired.is_empty());
+        assert!(host.pages[&1].dirty && host.dom[&1].media.images.contains_key(&id));
+        assert!(host.dom[&1].media.retired.is_empty());
     }
     engine.eval(r#"
         const svg = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="30" height="12"></svg>');
@@ -628,6 +634,6 @@ fn images_decode_on_workers_and_load_after_a_wake() {
         .unwrap();
     assert_eq!(settle(1), r#"["error"]"#);
     let host = host.borrow();
-    assert_eq!(host.dom[&1].retired.len(), 1);
-    assert!(host.dom[&1].images.contains_key(&id));
+    assert_eq!(host.dom[&1].media.retired.len(), 1);
+    assert!(host.dom[&1].media.images.contains_key(&id));
 }

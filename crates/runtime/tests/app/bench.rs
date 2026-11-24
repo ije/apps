@@ -542,7 +542,12 @@ fn layout_reads() {
         let bounds: Vec<_> = (0..host.pages[&1].doc.nodes.len())
             .map(|id| (id, [0., (id * 7 % 3000) as f32, 300., 20.]))
             .collect();
-        host.dom.entry(1).or_default().bounds.extend(bounds);
+        host.dom
+            .entry(1)
+            .or_default()
+            .geometry
+            .mirror
+            .extend(bounds);
     }
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval("globalThis.targets = [...document.querySelectorAll('.t')]; globalThis.p = targets[0]; if (targets.length !== 2000) throw Error('targets');", "bench").unwrap();

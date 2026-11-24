@@ -38,7 +38,8 @@ fn inner_text_client_box_urls_dialog_and_details() {
         host.dom
             .entry(1)
             .or_default()
-            .bounds
+            .geometry
+            .mirror
             .insert(id, [0., 0., 116., 40.]);
         id
     };
@@ -118,7 +119,7 @@ fn popovers_follow_the_auto_stack_light_dismiss_and_invokers() {
         .parse()
         .unwrap();
     engine.eval("document.body.offsetWidth", "test").unwrap();
-    assert_eq!(host.borrow().dom[&1].top_layer, [id]);
+    assert_eq!(host.borrow().dom[&1].interaction.top_layer, [id]);
     for _ in 0..10 {
         engine.tick().unwrap();
     }
@@ -178,9 +179,9 @@ fn dialogs_close_on_requests_and_light_dismiss_by_closedby() {
     {
         let mut host = host.borrow_mut();
         let dom = host.dom.entry(1).or_default();
-        assert_eq!(dom.top_layer, [ids[0]]);
-        dom.bounds.insert(ids[0], [40., 40., 20., 20.]);
-        dom.bounds.insert(ids[1], [0., 0., 100., 100.]);
+        assert_eq!(dom.interaction.top_layer, [ids[0]]);
+        dom.geometry.mirror.insert(ids[0], [40., 40., 20., 20.]);
+        dom.geometry.mirror.insert(ids[1], [0., 0., 100., 100.]);
     }
     engine
         .eval(
@@ -194,7 +195,7 @@ fn dialogs_close_on_requests_and_light_dismiss_by_closedby() {
             "test",
         )
         .unwrap();
-    assert!(host.borrow().dom[&1].top_layer.is_empty());
+    assert!(host.borrow().dom[&1].interaction.top_layer.is_empty());
 }
 
 #[test]
@@ -220,7 +221,7 @@ fn fullscreen_elements_enter_the_top_layer_and_exit_on_escape() {
         .unwrap();
     {
         let host = host.borrow();
-        assert_eq!(host.dom[&1].top_layer.first(), Some(&id));
+        assert_eq!(host.dom[&1].interaction.top_layer.first(), Some(&id));
         assert!(host.commands.iter().any(|command| {
             command["args"][0] == "htmlFullscreen" && command["args"][2] == true
         }));
@@ -303,7 +304,8 @@ fn inert_nodes_and_modal_dialogs_take_no_hits_focus_or_selection() {
         .dom
         .entry(1)
         .or_default()
-        .bounds
+        .geometry
+        .mirror
         .extend(rects);
     let fails = engine
         .eval(

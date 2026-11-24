@@ -33,7 +33,7 @@ fn window_scroll_moves_the_page() {
         document.documentElement.style.scrollBehavior = '';
         scrollTo(0, 50);
     "#, "test").unwrap();
-    host.borrow().dom[&1].scroll[&0]
+    host.borrow().dom[&1].geometry.scroll[&0]
         .set_offset(renderer::point(renderer::px(0.), renderer::px(-120.)));
     engine
         .eval(
@@ -75,7 +75,12 @@ fn hit_testing_follows_paint_order_clipping_and_shadow_trees() {
                 (id, bounds)
             })
             .collect();
-        host.dom.entry(1).or_default().bounds.extend(bounds);
+        host.dom
+            .entry(1)
+            .or_default()
+            .geometry
+            .mirror
+            .extend(bounds);
     }
     engine.eval(r#"
         const front=document.getElementById('front'),back=document.getElementById('back');
@@ -131,14 +136,14 @@ fn hit_testing_takes_the_box_painted_last() {
             [0., 0., 100., 100.],
             [0., 0., 100., 20.],
         ]) {
-            dom.bounds.insert(id, bounds);
+            dom.geometry.mirror.insert(id, bounds);
         }
-        dom.painted = vec![0; ids.iter().max().unwrap() + 1];
+        dom.layout.painted = vec![0; ids.iter().max().unwrap() + 1];
         for (order, id) in [ids[0], ids[3], ids[4], ids[1], ids[2]]
             .into_iter()
             .enumerate()
         {
-            dom.painted[id] = order as u64 + 1;
+            dom.layout.painted[id] = order as u64 + 1;
         }
     }
     engine.eval(r#"
@@ -179,7 +184,7 @@ fn scrolling_snaps_to_device_pixels_and_respects_scroll_margins() {
             ids.iter()
                 .zip([[0., 0., 200., 50.], [300., 0., 2., 20.], [40., 0., 2., 20.]])
         {
-            dom.bounds.insert(id, bounds);
+            dom.geometry.mirror.insert(id, bounds);
         }
     }
     engine.eval(r#"
@@ -257,7 +262,7 @@ fn mirror_follows_random_mutations_and_releases() {
         for round in 0..4 {
             let rust = {
                 let host = host.borrow();
-                let (doc, shadows) = (&host.pages[&1].doc, &host.dom[&1].shadows);
+                let (doc, shadows) = (&host.pages[&1].doc, &host.dom[&1].tree.shadows);
                 let (mut out, mut pending) = (String::new(), vec![Ok(0)]);
                 while let Some(item) = pending.pop() {
                     let id = match item {
@@ -327,7 +332,7 @@ fn layout_mirror_feeds_observers_offsets_and_scrolling() {
                 .iter()
                 .position(|node| node.attrs.get("id").map(String::as_str) == Some(name))
                 .unwrap();
-            state.bounds.insert(id, *rect);
+            state.geometry.mirror.insert(id, *rect);
         }
     };
     place(&[

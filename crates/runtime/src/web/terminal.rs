@@ -642,13 +642,13 @@ impl crate::host::Host {
         );
         let page = self.pages.get_mut(&id).context("Window is closed")?;
         let state = self.dom.entry(id).or_default();
-        let terminals = state.terminals.clone();
+        let terminals = state.media.terminals.clone();
         let mut terminals = terminals.borrow_mut();
         let terminals = &mut *terminals;
         let world = usize::from(preload);
         if op == "poll" {
             let (changed, events) = terminals.poll(page.doc.nodes.latest(), world, |node| {
-                crate::host::reaches(&page.doc, &state.hosts, node, 0)
+                crate::host::reaches(&page.doc, &state.tree.hosts, node, 0)
             })?;
             page.dirty |= changed;
             return Ok(json!(events));

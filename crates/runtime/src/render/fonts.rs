@@ -53,10 +53,10 @@ pub(crate) fn load(
     state: &mut State,
     assets: &HashMap<String, PathBuf>,
 ) -> (bool, Vec<Face>) {
-    if state.text_system.is_none() {
+    if state.fonts.system.is_none() {
         return (false, Vec::new());
     }
-    let loads = state.font_loads;
+    let loads = state.fonts.loads;
     let faces: Vec<_> = state
         .styles
         .cache
@@ -74,17 +74,17 @@ pub(crate) fn load(
             let pending = sources
                 .iter()
                 .filter(|(kind, _)| *kind == "url")
-                .map(|(_, url)| state.fonts.get(url))
+                .map(|(_, url)| state.fonts.files.get(url))
                 .find(|tried| tried.is_none_or(Option::is_some));
             range.as_ref().filter(|_| pending == Some(None))
         })
         .collect();
     let revision = doc.nodes.latest();
-    let scanned = ranges.iter().any(Option::is_some) && state.font_text.0 != revision;
+    let scanned = ranges.iter().any(Option::is_some) && state.fonts.text.0 != revision;
     if ranges.iter().all(Option::is_none) {
-        state.font_text = Default::default();
+        state.fonts.text = Default::default();
     } else if scanned {
-        let (last, chars) = &mut state.font_text;
+        let (last, chars) = &mut state.fonts.text;
         if chars.is_empty() {
             (*last, *chars) = (0, vec![0; 0x110000 / 64]);
         }
@@ -98,7 +98,7 @@ pub(crate) fn load(
         }
         *last = revision;
     }
-    let chars = &state.font_text.1;
+    let chars = &state.fonts.text.1;
     let mut order: Vec<_> = ranges
         .into_iter()
         .enumerate()
@@ -151,7 +151,7 @@ pub(crate) fn load(
                     }
                     continue;
                 }
-                let name = match state.fonts.get(value).cloned() {
+                let name = match state.fonts.files.get(value).cloned() {
                     Some(name) => {
                         if let Some(name) = &name {
                             crate::dom::use_font(state, family, name, false);
@@ -183,7 +183,7 @@ pub(crate) fn load(
                             eprintln!("apps: @font-face {family}: {error}");
                         }
                         let name = result.ok();
-                        state.fonts.insert(value.clone(), name.clone());
+                        state.fonts.files.insert(value.clone(), name.clone());
                         name
                     }
                 };
@@ -199,7 +199,7 @@ pub(crate) fn load(
         .zip(statuses)
         .map(|((family, _, src, range), status)| (family, src, range, status))
         .collect();
-    (state.font_loads != loads, faces)
+    (state.fonts.loads != loads, faces)
 }
 
 #[cfg(test)]
@@ -254,7 +254,7 @@ mod tests {
             </style><p>AB →</p>"#,
         );
         let mut state = State::default();
-        state.text_system = Some(system.clone());
+        state.fonts.system = Some(system.clone());
         state.pixel_ratio = 1.;
         state.base = url::Url::parse("apps:///index.html").ok();
         let load = |doc: &mut Document, state: &mut State| {
@@ -277,12 +277,12 @@ mod tests {
                 "Ranked loaded"
             ]
         );
-        assert_eq!(state.fonts["missing.woff2"], None);
-        assert!(!state.fonts.contains_key("cyrillic.woff2"));
+        assert_eq!(state.fonts.files["missing.woff2"], None);
+        assert!(!state.fonts.files.contains_key("cyrillic.woff2"));
         // Added faces go under their CSS family, so no alias is needed.
-        assert!(!state.font_aliases.contains_key("Ranked"));
+        assert!(!state.fonts.aliases.contains_key("Ranked"));
         let width = |state: &State, font: &str, text: &str| {
-            crate::render::canvas::line(&system, &state.font_aliases, font, text, [0.; 2])
+            crate::render::canvas::line(&system, &state.fonts.aliases, font, text, [0.; 2])
                 .0
                 .width
         };
@@ -292,7 +292,7 @@ mod tests {
                 renderer::px(15.)
             );
         }
-        crate::style::font_names(&system, &state.font_aliases);
+        crate::style::font_names(&system, &state.fonts.aliases);
         let font = crate::style::font(&crate::css::properties::Style::from_iter([(
             crate::css::properties::Prop::FONT_FAMILY,
             "Missing, Brand, sans-serif".into(),
@@ -300,7 +300,7 @@ mod tests {
         // The later installed families stay for the glyphs that the first lacks.
         assert!(font.family.starts_with("Brand\n"), "{}", font.family);
         assert!(!load(&mut doc, &mut state).0);
-        assert_eq!(state.font_text.1.len(), 0x110000 / 64);
+        assert_eq!(state.fonts.text.1.len(), 0x110000 / 64);
         let text = doc
             .nodes
             .iter()
@@ -316,7 +316,7 @@ mod tests {
         let (added, faces) = load(&mut doc, &mut state);
         assert!(added && faces[3].3 == "loaded");
         load(&mut doc, &mut state);
-        assert!(state.font_text.1.is_empty());
+        assert!(state.fonts.text.1.is_empty());
     }
 
     #[test]
@@ -332,7 +332,7 @@ mod tests {
             @font-face { font-family: Brand; src: url(test-medium.woff2) }</style><p>AB</p>",
         );
         let mut state = State::default();
-        state.text_system = Some(system.clone());
+        state.fonts.system = Some(system.clone());
         state.pixel_ratio = 1.;
         state.base = url::Url::parse("apps:///index.html").ok();
         crate::dom::styles(&mut doc, &mut state, [800., 600.]);
@@ -340,7 +340,7 @@ mod tests {
         for (weight, width) in [(400, 15.), (500, 7.5), (600, 7.5)] {
             let font = format!("{weight} 10px Brand");
             assert_eq!(
-                crate::render::canvas::line(&system, &state.font_aliases, &font, "AB", [0.; 2])
+                crate::render::canvas::line(&system, &state.fonts.aliases, &font, "AB", [0.; 2])
                     .0
                     .width,
                 renderer::px(width),
@@ -348,4 +348,13 @@ mod tests {
             );
         }
     }
+}
+
+#[derive(Default)]
+pub struct Fonts {
+    pub(crate) aliases: HashMap<String, String>,
+    pub(crate) files: HashMap<String, Option<String>>,
+    pub(crate) loads: u32,
+    pub(crate) text: (u64, Vec<u64>),
+    pub(crate) system: Option<std::rc::Rc<renderer::TextSystem>>,
 }

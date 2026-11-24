@@ -1,4 +1,4 @@
-use super::PageState;
+use super::ViewState;
 use renderer::{Border, Color, Edges, Rect, TextRun, Window, point, px, size};
 
 // What the developer tools show on the page: the picker, and the boxes of two nodes.
@@ -12,7 +12,7 @@ pub(crate) struct Inspect {
 
 const BLUE: u32 = 0x0d99ffff;
 
-pub(super) fn paint(view: &PageState, window: &mut Window) {
+pub(super) fn paint(view: &ViewState, window: &mut Window) {
     let inspect = view.inspect.get();
     let Ok(host) = view.host.try_borrow() else {
         return;
@@ -33,7 +33,7 @@ pub(super) fn paint(view: &PageState, window: &mut Window) {
             continue;
         };
         let (Some(&[x, y, w, h]), Some(element)) =
-            (state.bounds.get(&node), page.doc.nodes.get(node))
+            (state.geometry.mirror.get(&node), page.doc.nodes.get(node))
         else {
             continue;
         };

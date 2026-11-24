@@ -35,7 +35,7 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
         if(received.length) throw Error('Unchanged scroll dispatched an event');
     "#, "test").unwrap();
     let id: usize = engine.eval("left._id", "test").unwrap().parse().unwrap();
-    host.borrow().dom[&1].scroll[&id]
+    host.borrow().dom[&1].geometry.scroll[&id]
         .set_offset(renderer::point(renderer::px(-60.), renderer::px(-25.)));
     engine.eval(r#"
         __appsLayout(); __appsLayout();
@@ -205,7 +205,8 @@ fn editing_fragments_observers_and_layout() {
         .dom
         .entry(1)
         .or_default()
-        .bounds
+        .geometry
+        .mirror
         .insert(id, [20., 30., 200., 80.]);
     engine.eval("__appsLayout(); __appsLayout(); if (observed.join() !== '194,200' || input.getBoundingClientRect().x !== 20 || input.clientHeight !== 78 || input.offsetHeight !== 80 || input.clientLeft !== 1) throw Error('Layout observation ' + observed.join());", "test").unwrap();
 }
@@ -281,7 +282,8 @@ fn shadow_slots_render_light_dom_and_receive_pointer_events() {
             .dom
             .entry(1)
             .or_default()
-            .bounds
+            .geometry
+            .mirror
             .insert(id, [0., 0., 100., 40.]);
     }
     engine.eval(r#"
@@ -394,7 +396,8 @@ fn pointer_hover_tracks_boundary_events_and_interaction_states() {
             .dom
             .entry(1)
             .or_default()
-            .bounds
+            .geometry
+            .mirror
             .insert(id, bounds);
     }
     engine.eval(r#"
@@ -694,7 +697,8 @@ fn range_inputs_sanitize_slide_and_step() {
         .dom
         .entry(1)
         .or_default()
-        .bounds
+        .geometry
+        .mirror
         .insert(id, [0., 0., 116., 16.]);
     engine.eval(r#"
         const r = document.getElementById('r'), seen = [];

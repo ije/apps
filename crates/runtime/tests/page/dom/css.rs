@@ -456,7 +456,7 @@ fn offset_parent_follows_cssom_view() {
                 .iter()
                 .position(|node| node.attrs.get("id").map(String::as_str) == Some(name))
                 .unwrap();
-            state.bounds.insert(id, rect);
+            state.geometry.mirror.insert(id, rect);
         }
     }
     engine.eval(r#"
@@ -611,7 +611,8 @@ fn computed_styles_resolve_lengths_colors_initial_values_and_pseudo_elements() {
         let state = host.dom.entry(1).or_default();
         let ids: Vec<usize> = (0..64).collect();
         state
-            .bounds
+            .geometry
+            .mirror
             .extend(ids.into_iter().map(|id| (id, [0., 0., 200., 100.])));
     }
     engine.eval(r#"
@@ -1016,7 +1017,7 @@ fn computed_styles_report_used_values_like_chrome() {
     {
         let mut host = host.borrow_mut();
         let state = host.dom.entry(1).or_default();
-        state.bounds.extend(ids.into_iter().zip([
+        state.geometry.mirror.extend(ids.into_iter().zip([
             [8., 8., 214., 114.],
             [31., 14., 117.6, 15.5],
             [20., 25., 200., 0.],
@@ -1028,7 +1029,7 @@ fn computed_styles_report_used_values_like_chrome() {
         ]));
         // The boxes that layout gave the pseudo-elements, by node | pseudo << 30: the place from the border box of
         // the element, the size, then the padding plus border of each side.
-        state.pseudo_boxes.extend([
+        state.layout.pseudo_boxes.extend([
             (ids[0] | 1 << 30, [17., 7., 20., 4., 0., 0., 0., 0.]),
             (ids[0] | 2 << 30, [7., 11., 40., 0., 0., 0., 0., 0.]),
             (ids[3] | 1 << 30, [0., 0., 100., 0., 0., 0., 0., 10.]),

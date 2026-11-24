@@ -212,7 +212,7 @@ pub(super) unsafe extern "C" fn call(
             if !values.get(1).is_some_and(|&value| api.to_bool(ctx, value)) {
                 return Ok(api.make_null(ctx));
             }
-            let (pointer, size, owner) = state.bounds.share();
+            let (pointer, size, owner) = state.geometry.mirror.share();
             return Ok(api.external_buffer(
                 ctx,
                 pointer,
@@ -635,7 +635,7 @@ fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
         .host
         .try_borrow_mut()
         .ok()
-        .and_then(|mut host| Some(std::mem::take(&mut host.dom.get_mut(&id)?.created)));
+        .and_then(|mut host| Some(std::mem::take(&mut host.dom.get_mut(&id)?.tree.created)));
     if let Some(created) = created.filter(|&created| created > 0) {
         // Count only wrapped nodes: JSC resets this cost only after a full GC.
         binding.api.add_memory(ctx, created * 65536);
@@ -707,7 +707,7 @@ impl Host {
             && let Ok([node]) = serde_json::from_slice::<[usize; 1]>(args)
             && let Some(state) = self.dom.get_mut(&id)
         {
-            state.images.remove(&node);
+            state.media.images.remove(&node);
         }
         if matches!(op, "submit" | "writeTexture" | "resetCanvas") {
             page.dirty = true;
@@ -846,9 +846,9 @@ impl Host {
             let state = self.dom.entry(id).or_default();
             if id == WORKER_PAGE
                 && matches!(op, "dom.canvas" | "dom.measureText")
-                && state.text_system.is_none()
+                && state.fonts.system.is_none()
             {
-                state.text_system = Some(std::rc::Rc::new(renderer::TextSystem::new()));
+                state.fonts.system = Some(std::rc::Rc::new(renderer::TextSystem::new()));
             }
             // Workers use timer-based animation frames even when their canvas creates a text system.
             if id == WORKER_PAGE && op == "dom.requestFrame" {
@@ -856,36 +856,39 @@ impl Host {
             }
             if op == "dom.canvasCommit" {
                 let node = args[0].as_u64().context("Expected node id")? as usize;
-                let image = if let Some(canvas) = state.canvases.get(&node) {
-                    state
-                        .placeholders
-                        .contains_key(&node)
-                        .then(|| crate::render::canvas::render_image(&canvas.pixels, Vec::new()))
-                } else if let Some(gpu) = self.graphics.get_mut(&id) {
-                    let start = std::time::Instant::now();
-                    loop {
-                        match gpu.image(node)? {
-                            Some(image)
-                                if state
-                                    .images
-                                    .get(&node)
-                                    .is_none_or(|old| !std::sync::Arc::ptr_eq(old, &image)) =>
-                            {
-                                state.images.insert(node, image.clone());
-                                break Some(image);
+                let image =
+                    if let Some(canvas) = state.media.canvases.get(&node) {
+                        state.media.placeholders.contains_key(&node).then(|| {
+                            crate::render::canvas::render_image(&canvas.pixels, Vec::new())
+                        })
+                    } else if let Some(gpu) = self.graphics.get_mut(&id) {
+                        let start = std::time::Instant::now();
+                        loop {
+                            match gpu.image(node)? {
+                                Some(image)
+                                    if state
+                                        .media
+                                        .images
+                                        .get(&node)
+                                        .is_none_or(|old| !std::sync::Arc::ptr_eq(old, &image)) =>
+                                {
+                                    state.media.images.insert(node, image.clone());
+                                    break Some(image);
+                                }
+                                _ if args[1] != true
+                                    || start.elapsed() >= std::time::Duration::from_millis(100) =>
+                                {
+                                    break None;
+                                }
+                                _ => std::thread::sleep(std::time::Duration::from_millis(1)),
                             }
-                            _ if args[1] != true
-                                || start.elapsed() >= std::time::Duration::from_millis(100) =>
-                            {
-                                break None;
-                            }
-                            _ => std::thread::sleep(std::time::Duration::from_millis(1)),
                         }
-                    }
-                } else {
-                    None
-                };
-                if let (Some(image), Some(placeholder)) = (image, state.placeholders.get(&node)) {
+                    } else {
+                        None
+                    };
+                if let (Some(image), Some(placeholder)) =
+                    (image, state.media.placeholders.get(&node))
+                {
                     placeholder.show(image);
                 }
                 return Ok(Value::Null);
@@ -960,7 +963,7 @@ impl Host {
                 || op == "dom.html"
                     && args[0]
                         .as_u64()
-                        .is_some_and(|id| reaches(&page.doc, &state.hosts, id as usize, 0))
+                        .is_some_and(|id| reaches(&page.doc, &state.tree.hosts, id as usize, 0))
             {
                 state.invalidate();
             }
@@ -974,7 +977,7 @@ impl Host {
             page.dirty |= std::mem::take(&mut state.dirty);
             // Clear retired worker images here: workers have no renderer to release them.
             if id == WORKER_PAGE {
-                state.retired.clear();
+                state.media.retired.clear();
             }
             if op == "dom.release"
                 && let Ok(ids) = &result
@@ -987,7 +990,7 @@ impl Host {
                         media.close(node);
                     }
                     if let (Some(state), Some(node)) = (self.dom.get(&id), node.as_u64()) {
-                        state.terminals.borrow_mut().release(node as usize);
+                        state.media.terminals.borrow_mut().release(node as usize);
                     }
                 }
             }

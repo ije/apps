@@ -1,6 +1,6 @@
 //! Draws the grid of a `<terminal>` element.
 
-use super::PageState;
+use super::ViewState;
 use crate::css;
 use crate::css::properties::Prop;
 use crate::style;
@@ -268,7 +268,7 @@ fn row(
 
 pub(super) struct Grid {
     pub(super) id: usize,
-    pub(super) view: Rc<PageState>,
+    pub(super) view: Rc<ViewState>,
     pub(super) terminals: Rc<RefCell<Terminals>>,
     pub(super) look: Rc<Look>,
     /// The padding and the border of the element, from the top clockwise. The bar is at the edge of the padding.

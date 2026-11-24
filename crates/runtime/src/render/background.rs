@@ -40,7 +40,7 @@ fn redraw_when_decoded(
 // The decoded bitmap of a file and, for SVG, its tree and whether its view box keeps its ratio. `None` while the file
 // decodes, and the window redraws when it is done.
 pub(super) fn load(
-    view: &super::PageState,
+    view: &super::ViewState,
     bitmaps: &mut Bitmaps,
     id: usize,
     file: &str,
@@ -177,7 +177,7 @@ pub(super) fn css_background(
     radius: renderer::Radii<renderer::Length>,
     // `under` is a border that the layers keep out of, while their corners follow its inner edge.
     [borders, padding, under]: [[f32; 4]; 3],
-    view: Rc<super::PageState>,
+    view: Rc<super::ViewState>,
     base: Option<&url::Url>,
     assets: &HashMap<String, std::path::PathBuf>,
     // Layers of the canvas tile over the whole viewport, from the box of the root element.
@@ -311,7 +311,7 @@ pub(super) fn css_background(
                         let mut host = view.host.borrow_mut();
                         let dom = host.dom.entry(view.id).or_default();
                         let (backgrounds, bitmaps, sources) =
-                            (&mut dom.backgrounds, &mut dom.bitmaps, &mut dom.layer_sources);
+                            (&mut dom.rasters.backgrounds, &mut dom.rasters.bitmaps, &mut dom.rasters.layer_sources);
                         let scale = window.scale_factor();
                         let key = (id, slot * 64 + index);
                         let words: Vec<&str> = repeat.split_whitespace().collect();
@@ -774,7 +774,7 @@ pub(super) fn css_background(
             let fits = |image: &renderer::RenderImage| {
                 [image.size().width, image.size().height].map(|side| side as u32) == [rw, rh]
             };
-            let entry = dom.backgrounds.get(&key);
+            let entry = dom.rasters.backgrounds.get(&key);
             if entry.is_none_or(|(old, image)| old != &inputs || !fits(image)) {
                 let texts = explicit.then(|| {
                     (
@@ -791,11 +791,12 @@ pub(super) fn css_background(
                 let cached = new
                     .then(|| {
                         let at = dom
+                            .rasters
                             .gradients
                             .iter()
                             .rposition(|(old, image)| old == &inputs && fits(image))?;
-                        let cached = dom.gradients.remove(at);
-                        dom.gradients.push(cached.clone());
+                        let cached = dom.rasters.gradients.remove(at);
+                        dom.rasters.gradients.push(cached.clone());
                         Some(cached.1)
                     })
                     .flatten();
@@ -820,14 +821,18 @@ pub(super) fn css_background(
                     }?;
                     const LIMIT: u32 = 8 << 20;
                     if new && rw * rh * 4 <= LIMIT / 4 {
-                        dom.gradients.push((inputs.clone(), image.clone()));
+                        dom.rasters.gradients.push((inputs.clone(), image.clone()));
                         let bytes = |image: &renderer::RenderImage| {
                             image.size().width as u32 * (image.size().height as u32) * 4
                         };
-                        let mut total: u32 =
-                            dom.gradients.iter().map(|(_, image)| bytes(image)).sum();
+                        let mut total: u32 = dom
+                            .rasters
+                            .gradients
+                            .iter()
+                            .map(|(_, image)| bytes(image))
+                            .sum();
                         while total > LIMIT {
-                            let (_, old) = dom.gradients.remove(0);
+                            let (_, old) = dom.rasters.gradients.remove(0);
                             total -= bytes(&old);
                             if Arc::strong_count(&old) == 1 {
                                 window.release_image(old);
@@ -837,8 +842,8 @@ pub(super) fn css_background(
                     Some(image)
                 });
                 let old = match image {
-                    Some(image) => dom.backgrounds.insert(key, (inputs, image)),
-                    None => dom.backgrounds.remove(&key),
+                    Some(image) => dom.rasters.backgrounds.insert(key, (inputs, image)),
+                    None => dom.rasters.backgrounds.remove(&key),
                 };
                 if let Some((_, old)) = old
                     && let Ok(mut old) = Arc::try_unwrap(old)
@@ -848,7 +853,7 @@ pub(super) fn css_background(
                     window.release_image(Arc::new(old));
                 }
             }
-            if let Some((_, image)) = dom.backgrounds.get(&key)
+            if let Some((_, image)) = dom.rasters.backgrounds.get(&key)
                 && let Some([x, y]) = tiled
             {
                 // Tiles snap to device pixels, so their edges never sample other atlas tiles.
@@ -886,7 +891,7 @@ pub(super) fn css_background(
                     }
                     top += px(ch);
                 }
-            } else if let Some((_, image)) = dom.backgrounds.get(&key) {
+            } else if let Some((_, image)) = dom.rasters.backgrounds.get(&key) {
                 let (origin, size) = (bounds.origin, bounds.size);
                 let target = match axis {
                     Some(1) => renderer::Rect::new(
@@ -951,7 +956,7 @@ pub(super) fn border_image(
     id: usize,
     slot: usize,
     borders: [f32; 4],
-    view: &Rc<super::PageState>,
+    view: &Rc<super::ViewState>,
 ) -> Option<renderer::Node> {
     let source = style
         .get(Prop::BORDER_IMAGE_SOURCE)
@@ -1052,7 +1057,7 @@ pub(super) fn border_image(
             let key = (id, BORDER_IMAGE + slot);
             let mut held = held.borrow_mut();
             if gradient.is_none() && held.is_none() {
-                *held = load(view, &mut dom.bitmaps, id, &file, &path, window);
+                *held = load(view, &mut dom.rasters.bitmaps, id, &file, &path, window);
             }
             // A gradient has the size of the border image area.
             let Some([nw, nh]) = (match &*held {
@@ -1184,6 +1189,7 @@ pub(super) fn border_image(
             };
             inputs.push_str(&scale.to_bits().to_string());
             if dom
+                .rasters
                 .backgrounds
                 .get(&key)
                 .is_none_or(|(old, _)| *old != inputs)
@@ -1278,8 +1284,8 @@ pub(super) fn border_image(
                     })(),
                 };
                 let old = match image {
-                    Some(image) => dom.backgrounds.insert(key, (inputs, image)),
-                    None => dom.backgrounds.remove(&key),
+                    Some(image) => dom.rasters.backgrounds.insert(key, (inputs, image)),
+                    None => dom.rasters.backgrounds.remove(&key),
                 };
                 if let Some((_, old)) = old
                     && Arc::strong_count(&old) == 1
@@ -1287,7 +1293,7 @@ pub(super) fn border_image(
                     window.release_image(old);
                 }
             }
-            let Some((_, image)) = dom.backgrounds.get(&key) else {
+            let Some((_, image)) = dom.rasters.backgrounds.get(&key) else {
                 return;
             };
             let image = image.clone();

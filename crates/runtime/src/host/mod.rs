@@ -96,7 +96,7 @@ impl Host {
                         attached += 1;
                         pending.extend(&page.doc.nodes[node].children);
                     }
-                    let free = self.dom.get(id).map_or(0, |state| state.free.len());
+                    let free = self.dom.get(id).map_or(0, |state| state.tree.free.len());
                     (
                         format!("window {id}"),
                         json!({"attached": attached, "allocated": page.doc.nodes.len(), "free": free}),
@@ -228,7 +228,7 @@ impl Host {
                                 && tag.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
                             "Invalid tag"
                         );
-                        ensure!(state.reserved.remove(&id), "Invalid node");
+                        ensure!(state.tree.reserved.remove(&id), "Invalid node");
                         state.place(
                             doc,
                             id,
@@ -259,7 +259,7 @@ impl Host {
                                 .parent
                                 .is_none_or(|parent| doc.nodes[parent].tag != "style"))
                             && state.styles.computed.is_some()
-                            && reaches(doc, &state.hosts, id, 0)
+                            && reaches(doc, &state.tree.hosts, id, 0)
                         {
                             state.invalidate();
                         }
@@ -274,8 +274,8 @@ impl Host {
                         doc.nodes[id].stylesheet = None;
                         for child in std::mem::take(&mut doc.nodes[id].children) {
                             doc.nodes[child].parent = None;
-                            state.detached.push(child);
-                            state.removed.push(child);
+                            state.tree.detached.push(child);
+                            state.tree.removed.push(child);
                         }
                         true
                     }
@@ -296,12 +296,12 @@ impl Host {
                             "Reference is not a child"
                         );
                         ensure!(
-                            !reaches(doc, &state.hosts, parent, child),
+                            !reaches(doc, &state.tree.hosts, parent, child),
                             "Cannot create a DOM cycle"
                         );
                         if state.styles.computed.is_some()
-                            && (reaches(doc, &state.hosts, parent, 0)
-                                || reaches(doc, &state.hosts, child, 0))
+                            && (reaches(doc, &state.tree.hosts, parent, 0)
+                                || reaches(doc, &state.tree.hosts, child, 0))
                         {
                             state.invalidate();
                         }
@@ -361,13 +361,14 @@ impl Host {
                         {
                             prune(doc, previous);
                         }
-                        if state.styles.computed.is_some() && reaches(doc, &state.hosts, parent, 0)
+                        if state.styles.computed.is_some()
+                            && reaches(doc, &state.tree.hosts, parent, 0)
                         {
                             state.invalidate();
                         }
                         doc.nodes[child].parent = None;
-                        state.detached.push(child);
-                        state.removed.push(child);
+                        state.tree.detached.push(child);
+                        state.tree.removed.push(child);
                         true
                     }
                     4 | 5 => {
@@ -376,7 +377,8 @@ impl Host {
                         if doc.nodes[id].attrs.get(key).map(String::as_str) == value {
                             return Ok(false);
                         }
-                        if state.styles.computed.is_some() && reaches(doc, &state.hosts, id, 0) {
+                        if state.styles.computed.is_some() && reaches(doc, &state.tree.hosts, id, 0)
+                        {
                             state.invalidate();
                         }
                         // Kept walks of the tree read these attributes, so their edits must use `get_mut` and
@@ -407,18 +409,21 @@ impl Host {
                             "Invalid shadow root"
                         );
                         ensure!(
-                            !state.shadows.contains_key(&host) && !state.hosts.contains_key(&root),
+                            !state.tree.shadows.contains_key(&host)
+                                && !state.tree.hosts.contains_key(&root),
                             "Shadow root already exists"
                         );
                         ensure!(
-                            !reaches(doc, &state.hosts, host, root),
+                            !reaches(doc, &state.tree.hosts, host, root),
                             "Cannot create a DOM cycle"
                         );
-                        if state.styles.computed.is_some() && reaches(doc, &state.hosts, host, 0) {
+                        if state.styles.computed.is_some()
+                            && reaches(doc, &state.tree.hosts, host, 0)
+                        {
                             state.invalidate();
                         }
-                        state.shadows.insert(host, root);
-                        state.hosts.insert(root, host);
+                        state.tree.shadows.insert(host, root);
+                        state.tree.hosts.insert(root, host);
                         true
                     }
                     7 => {
@@ -437,7 +442,7 @@ impl Host {
                         };
                         if state.styles.computed.is_some()
                             && empty(current.value.as_ref()) != empty(value.as_ref())
-                            && reaches(doc, &state.hosts, id, 0)
+                            && reaches(doc, &state.tree.hosts, id, 0)
                         {
                             state.invalidate();
                         }
@@ -480,14 +485,15 @@ impl Host {
                             return Ok(false);
                         }
                         let leaving = if bits & TOP_LAYER == 0
-                            && state.text_system.is_some()
-                            && state.top_layer.contains(&id)
+                            && state.fonts.system.is_some()
+                            && state.interaction.top_layer.contains(&id)
                         {
                             old & LEAVING | (old & TOP_LAYER) << 5
                         } else {
                             0
                         };
-                        if state.styles.computed.is_some() && reaches(doc, &state.hosts, id, 0) {
+                        if state.styles.computed.is_some() && reaches(doc, &state.tree.hosts, id, 0)
+                        {
                             state.invalidate();
                         }
                         if let Some(node) = doc.nodes.edit(id) {
@@ -498,10 +504,10 @@ impl Host {
                     9 => {
                         let id = node(doc, a)?;
                         if b != 0 || doc.nodes[id].state & crate::dom::LEAVING == 0 {
-                            state.top_layer.retain(|&other| other != id);
+                            state.interaction.top_layer.retain(|&other| other != id);
                         }
                         if b != 0 {
-                            state.top_layer.push(id);
+                            state.interaction.top_layer.push(id);
                         }
                         true
                     }
@@ -509,7 +515,7 @@ impl Host {
                     10 => {
                         let (id, from) =
                             (usize::try_from(a).context("Invalid node")?, node(doc, b)?);
-                        ensure!(state.reserved.remove(&id), "Invalid node");
+                        ensure!(state.tree.reserved.remove(&id), "Invalid node");
                         let from = &doc.nodes[from];
                         let text = match &from.stylesheet {
                             Some(sheet) if from.tag == "#text" => sheet.source(),

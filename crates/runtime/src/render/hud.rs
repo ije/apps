@@ -1,4 +1,4 @@
-use super::PageState;
+use super::ViewState;
 use anyhow::Result;
 use renderer::{Rect, TextAlign, TextRun, Timer, Window, point, px, size};
 use std::{
@@ -47,7 +47,7 @@ pub(crate) struct Hud {
 }
 
 impl Hud {
-    pub(crate) fn toggle(view: &Rc<PageState>, window: &mut Window) {
+    pub(crate) fn toggle(view: &Rc<ViewState>, window: &mut Window) {
         if view.hud.take().is_none() {
             static LIBRARY: OnceLock<Result<Library, String>> = OnceLock::new();
             match LIBRARY.get_or_init(|| load().map_err(|error| format!("{error:#}"))) {
@@ -105,7 +105,7 @@ fn load() -> Result<Library> {
     }
 }
 
-fn tick(view: Weak<PageState>, window: &Window) -> Timer {
+fn tick(view: Weak<ViewState>, window: &Window) -> Timer {
     window.timer(Duration::from_millis(500), move |window, _| {
         let Some(data) = view.upgrade() else {
             return;
