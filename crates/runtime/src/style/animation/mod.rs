@@ -722,10 +722,7 @@ impl Motion {
             }
         }
         let mut gone = std::mem::take(&mut self.backdrop);
-        for (id, new) in styles
-            .all_extras()
-            .filter_map(|(id, extras)| Some((id, extras.backdrop.as_ref()?)))
-        {
+        for (id, new) in styles.backdrops() {
             let (old, running) = match gone.remove(&id) {
                 Some((old, running)) => (Some(old), running),
                 None => (styles.extras(id).backdrop_start.clone(), Vec::new()),
@@ -789,10 +786,7 @@ impl Motion {
         animated.reserve(self.styled.len());
         let mut pseudo: FxHashMap<(usize, u8), Style> = FxHashMap::default();
         let mut wakes: Vec<Wake> = Vec::new();
-        for (id, effects) in styles
-            .all_extras()
-            .filter_map(|(id, extras)| Some((id, extras.animations.as_ref()?)))
-        {
+        for (id, effects) in styles.animations() {
             if painted.get(id) != Some(&true) {
                 continue;
             }

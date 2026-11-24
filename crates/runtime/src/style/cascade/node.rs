@@ -5,7 +5,8 @@ use crate::css::value::units::{FontUnits, Lengths};
 use crate::dom::Document;
 use crate::style::cascade::computed::{
     AGENT_DISPLAY, CAPTION, CELL, COUNTED, ComputedStyles, DISPLAY_CONTENTS, DISPLAY_NONE, Extras,
-    INVISIBLE, NO_EXTRAS, SELECT_ALL, SELECT_NONE, SELECT_TEXT, TABLE_DISPLAYS, empty, table_box,
+    INVISIBLE, NO_EXTRAS, SELECT_ALL, SELECT_NONE, SELECT_TEXT, TABLE_DISPLAYS, empty, rare,
+    table_box,
 };
 use crate::style::cascade::container::{ContainerQuery, query_containers};
 use crate::style::cascade::counters::{list_item, listed};
@@ -182,23 +183,23 @@ impl NodePass<'_> {
                 if shadows.roots.contains_key(&id) {
                     let list = exported_parts(
                         std::mem::take(&mut hosted),
-                        extras.get(&id).and_then(|extras| extras.parts.as_ref()),
+                        extras.get(id).and_then(|extras| extras.parts.as_ref()),
                         extras
-                            .get(&walk.trees[walk.tree[id] as usize].1)
+                            .get(walk.trees[walk.tree[id] as usize].1)
                             .and_then(|extras| extras.exported.as_ref()),
                         doc.nodes[id].attrs.get("exportparts"),
                         last.and_then(|last| last.extras(id).exported.as_ref()),
                     );
-                    let had = extras.get(&id).is_some_and(|extras| extras.exported.is_some());
+                    let had = extras.get(id).is_some_and(|extras| extras.exported.is_some());
                     if list.is_some() || had {
-                        Rc::make_mut(extras.entry(id).or_default()).exported = list;
+                        extras.edit(id, |extras| extras.exported = list);
                     }
                 }
                 if let Some(previous) = previous.filter(|_| fast) {
                     let font = previous.lengths.get(id).map(|old| old.font);
                     let pointer = |list: Option<&Shadowed>| list.map(Rc::as_ptr);
                     let old = previous.extras(id);
-                    let new = extras.get(&id).map_or(&NO_EXTRAS, |extras| extras);
+                    let new = extras.get(id).unwrap_or(&NO_EXTRAS);
                     changed[id] = stamp | u64::from(u8::from(
                         !(previous
                             .authored
@@ -324,7 +325,7 @@ impl NodePass<'_> {
                 if stored {
                     matches.clean(id);
                 }
-                extras.remove(&id);
+                extras.remove(id);
             }
             let up = (up != u32::MAX).then_some(up as usize);
             // A patched walk without shadow trees leaves `tree` as it was.
@@ -342,13 +343,13 @@ impl NodePass<'_> {
                 containers.set(id, containers[host].clone(), |a, b| {
                     address(Some(a)) == address(Some(b))
                 });
-                let selection = extras.get(&host).and_then(|host| host.selection.clone());
+                let selection = extras.get(host).and_then(|host| host.selection.clone());
                 if selection.is_some() {
                     let kept = Extras {
                         selection,
                         ..Extras::default()
                     };
-                    extras.insert(id, Rc::new(kept));
+                    extras.put(id, Rc::new(kept));
                 }
                 settle!(@changed id, up);
                 continue;
@@ -503,12 +504,12 @@ impl NodePass<'_> {
                     shadow.push(rule);
                 }
             }
-            let selection = up.and_then(|up| extras.get(&up)?.selection.as_ref());
+            let selection = up.and_then(|up| extras.get(up)?.selection.as_ref());
             let assigned = up
                 .filter(|&up| node.parent != Some(up))
-                .and_then(|up| extras.get(&up)?.slotted.as_ref());
+                .and_then(|up| extras.get(up)?.slotted.as_ref());
             let names = (tree != 0).then(|| node.attrs.get("part")).flatten();
-            let named = names.and_then(|_| extras.get(&walk.trees[tree].1)?.exported.as_ref());
+            let named = names.and_then(|_| extras.get(walk.trees[tree].1)?.exported.as_ref());
             if assigned.is_some() || named.is_some() {
                 matches.begin();
                 for passed in assigned.into_iter().flat_map(|list| list.iter()).chain(
@@ -564,7 +565,7 @@ impl NodePass<'_> {
                 style_flags.set(id, *flags, u16::eq);
                 lengths.set(id, *units);
                 if let Some(kept) = kept {
-                    extras.insert(id, kept.clone());
+                    extras.put(id, kept.clone());
                 }
                 settle!(id, up, seen);
                 continue;
@@ -1107,7 +1108,7 @@ impl NodePass<'_> {
                     root = cached.lengths.font;
                 }
                 if let Some(values) = &cached.extras {
-                    extras.insert(id, values.clone());
+                    extras.put(id, values.clone());
                 }
                 if let Some(text) = text {
                     let outputs = (
@@ -1769,17 +1770,6 @@ impl NodePass<'_> {
                 }
                 _ => Rc::new(style),
             };
-            let rare = extra.generated.is_some()
-                || extra.text.is_some()
-                || extra.backdrop.is_some()
-                || extra.backdrop_start.is_some()
-                || extra.scrollbars.is_some()
-                || extra.selection.is_some()
-                || extra.animations.is_some()
-                || extra.important.is_some()
-                || extra.starting.is_some()
-                || extra.slotted.is_some()
-                || extra.parts.is_some();
             let cached = Rc::new(CachedStyle {
                 used: std::cell::Cell::new(style_cache.pass),
                 inline: written.map(Into::into),
@@ -1790,12 +1780,12 @@ impl NodePass<'_> {
                 missing: missing.into_boxed_slice(),
                 flags: style_flags[id],
                 lengths: units,
-                extras: rare.then(|| Rc::new(extra)),
+                extras: rare(&extra).then(|| Rc::new(extra)),
                 viewport,
                 keyword,
             });
             if let Some(values) = &cached.extras {
-                extras.insert(id, values.clone());
+                extras.put(id, values.clone());
             }
             if animated.is_none() {
                 if let Some(node) = scoped.nodes[id].as_mut() {

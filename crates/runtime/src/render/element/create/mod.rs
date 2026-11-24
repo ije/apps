@@ -277,7 +277,7 @@ pub(super) fn create(
                 node.tag.as_str(),
                 "img" | "input" | "textarea" | "select" | "progress" | "meter" | "terminal"
             )
-            || extras.generated.as_ref().is_some_and(|pseudos| {
+            || styles.generated(id).is_some_and(|pseudos| {
                 pseudos.iter().any(|pseudo| {
                     pseudo
                         .get(Prop::CONTENT)
@@ -1664,7 +1664,7 @@ pub(super) fn create(
                 size
             }
         });
-    if let Some(pseudos) = extras.generated.as_ref().filter(|_| !skipped) {
+    if let Some(pseudos) = styles.generated(id).filter(|_| !skipped) {
         el = match pseudo_elements(&cx, &fr, el, &mut carry, pseudos, own) {
             ControlFlow::Continue(el) => el,
             ControlFlow::Break(done) => return done,

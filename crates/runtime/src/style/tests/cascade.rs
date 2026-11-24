@@ -549,11 +549,7 @@ fn top_layer_boxes_get_ua_rules_and_backdrops() {
     let closed = compute_styles(&doc, 800., 600., None, &mut sheets, &mut cache, None);
     assert_eq!(&closed.values[p]["display"], "none");
     assert!(!closed.values[f].contains(Prop::WIDTH));
-    assert!(
-        closed
-            .all_extras()
-            .all(|(_, extras)| extras.backdrop.is_none())
-    );
+    assert!(closed.backdrops().next().is_none());
     doc.nodes[d].state = crate::dom::MODAL;
     doc.nodes[p].state = crate::dom::POPOVER;
     doc.nodes[f].state = crate::dom::FULLSCREEN;
