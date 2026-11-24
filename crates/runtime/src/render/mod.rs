@@ -23,8 +23,8 @@ pub(crate) use hud::Hud;
 pub(crate) use inspect::Inspect;
 use layout::cull;
 pub use page::PageState;
-use paint::{background, field, native, scrollbar, spacer, terminal, text};
-use renderer::{App, Color, Event, Window, WindowId};
+use paint::{background, field, native, terminal, text};
+use renderer::{App, Window, WindowId};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -58,7 +58,7 @@ pub(crate) struct ViewState {
     pub(crate) runtime: Rc<dyn Pages>,
     pub(crate) host: Rc<RefCell<Host>>,
     images: RefCell<HashMap<usize, Arc<renderer::RenderImage>>>,
-    pub(crate) frames: RefCell<HashMap<usize, Frame>>,
+    pub(crate) frames: RefCell<HashMap<usize, frame::iframes::Frame>>,
     controls: RefCell<native::Controls>,
     ids: RefCell<(u64, Rc<effects::Ids>)>,
     svgs: RefCell<HashMap<usize, element::svg::Svg>>,
@@ -112,14 +112,6 @@ pub(crate) struct ViewState {
     drawing: Cell<renderer::Point<renderer::Pixels>>,
     // The page asked for a `paint` event after the frame.
     paint: Cell<bool>,
-}
-
-pub(crate) struct Frame {
-    pub(crate) browser: apps_webview::Browser,
-    loaded: String,
-    pub(crate) bounds: [f64; 4],
-    revision: u64,
-    shown: bool,
 }
 
 type Clips = Vec<(usize, [bool; 2])>;
@@ -655,9 +647,6 @@ impl PageView {
         let taken = !pseudos.is_empty() || !animated.is_empty() || !lengths.is_empty();
         let (mut restore, restore_pseudos, paint) =
             frame::motion::swap(dom, &mut styles, animated, pseudos, &mut lengths);
-        let painting = |paint: &[(usize, Rc<css::properties::Style>)], id: usize| {
-            paint.binary_search_by_key(&id, |(id, _)| *id).ok()
-        };
         let relaid = !restore.is_empty() || !lengths.is_empty();
         let frame = [width, height, window.scale_factor(), dom.fonts.loads as f32];
         let near = dom.layout.cull.enabled.then(|| {
@@ -681,125 +670,16 @@ impl PageView {
         };
         frame::visibility::forget(&fcx, dom, &styles, flips, flipped, window);
         native::sync(&self.controls, &doc, &styles.values);
-        let iframes = &dom.layout.cull.iframes;
-        let frame_nodes = || iframes.iter().copied().filter(|&id| visible[id]);
-        let mut frames = self.frames.borrow_mut();
-        frames.retain(|id, _| frame_nodes().any(|node| node == *id));
-        for node in frame_nodes() {
-            let (attrs, revision) = (&doc.nodes[node].attrs, doc.nodes.revision(node));
-            let frame = match frames.entry(node) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    match apps_webview::Browser::new(
-                        window,
-                        &serde_json::json!({"javascript":attrs.get("sandbox").is_none_or(|s|s.split_whitespace().any(|s|s=="allow-scripts")),"inspectable":inspectable}),
-                    ) {
-                        Ok(browser) => entry.insert(Frame {
-                            browser,
-                            loaded: String::new(),
-                            bounds: [f64::NAN; 4],
-                            revision: 0,
-                            shown: true,
-                        }),
-                        Err(error) => {
-                            eprintln!("apps: iframe: {error}");
-                            continue;
-                        }
-                    }
-                }
-            };
-            let mut shown = styles.values[node]
-                .get(Prop::VISIBILITY)
-                .is_none_or(|value| value == "visible");
-            let mut current = Some(node);
-            while let Some(id) = current
-                && shown
-            {
-                let style = painting(&paint, id).map_or(&styles.values[id], |at| &paint[at].1);
-                shown = effects::opacity(style) > 0.;
-                current = doc.nodes[id].parent;
-            }
-            if frame.shown != shown {
-                frame.shown = shown;
-                let _ = frame.browser.command("visible", &serde_json::json!(shown));
-            }
-            if frame.revision == revision {
-                continue;
-            }
-            frame.revision = revision;
-            let html = attrs.get("srcdoc");
-            let url = attrs.get("src").map_or("about:blank", String::as_str);
-            let source = html.map_or(url, String::as_str);
-            if source != frame.loaded {
-                let result = match html {
-                    Some(html) => frame.browser.load_html(html, "about:blank"),
-                    None => frame.browser.load_url(url),
-                };
-                if let Err(error) = result {
-                    eprintln!("apps: iframe: {error}");
-                }
-                frame.loaded = source.to_owned();
-            }
-        }
-        drop(frames);
-        let html = doc.nodes[0]
-            .children
-            .iter()
-            .copied()
-            .find(|&id| doc.nodes[id].tag == "html");
-        let body = html.and_then(|html| {
-            doc.nodes[html]
-                .children
-                .iter()
-                .copied()
-                .find(|&id| doc.nodes[id].tag == "body")
-        });
-        let canvas = |id: usize| {
-            styles.values[id]
-                .get(Prop::BACKGROUND_COLOR)
-                .and_then(css::value::color::color)
-                .filter(|color| color.1 > 0)
-        };
-        let dark = html
-            .and_then(|id| styles.values[id].get(Prop::COLOR_SCHEME))
-            .is_some_and(|scheme| {
-                scheme.contains("dark")
-                    && (!scheme.contains("light") || crate::native::theme_state() & 1 != 0)
-            });
-        let source = background::canvas_source(&doc, &styles);
-        // The html and body boxes read each other's background, which their kept builds don't track.
-        let layers = source.map(|id| {
-            let style = &styles.values[id];
-            element::kept::hashed((
-                id,
-                [
-                    Prop::BACKGROUND_IMAGE,
-                    Prop::BACKGROUND_COLOR,
-                    Prop::BACKGROUND_SIZE,
-                    Prop::BACKGROUND_POSITION,
-                    Prop::BACKGROUND_REPEAT,
-                    Prop::BACKGROUND_ORIGIN,
-                    Prop::BACKGROUND_ATTACHMENT,
-                    Prop::BACKGROUND_BLEND_MODE,
-                ]
-                .map(|prop| style.get(prop)),
-                style.get(Prop::FONT_SIZE),
-            ))
-        });
-        if self.canvas_layers.replace(layers) != layers {
-            let mut kept = self.kept.borrow_mut();
-            for id in [0].into_iter().chain(html).chain(body) {
-                kept.remove(&id);
-            }
-        }
-        let background = source
-            .and_then(canvas)
-            .or_else(|| match state.backgrounds.get(&self.id).copied() {
-                Some(color) if color.1 == 0 => Some(color),
-                _ if dark => Some((0x121212, 255)),
-                color => color,
-            })
-            .unwrap_or((0xffffff, 255));
+        frame::iframes::sync(
+            &fcx,
+            &dom.layout.cull.iframes,
+            &styles,
+            &paint,
+            window,
+            inspectable,
+        );
+        let (html, body, background) =
+            frame::page::canvas(&fcx, &styles, state.backgrounds.get(&self.id).copied());
         // Never set a transparent window's native color: it prevents later transparency.
         #[cfg(target_os = "macos")]
         if background.1 == 255
@@ -900,53 +780,7 @@ impl PageView {
         } else {
             Vec::new()
         };
-        let page_scroll = dom.geometry.scroll.entry(0).or_default().clone();
-        let source = html
-            .filter(|&id| {
-                [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
-                    .into_iter()
-                    .any(|name| {
-                        styles.values[id]
-                            .get(name)
-                            .is_some_and(|value| value != "visible")
-                    })
-            })
-            .or(body);
-        let [overflow_x, overflow] = [Prop::OVERFLOW_X, Prop::OVERFLOW_Y].map(|prop| {
-            source
-                .and_then(|id| styles.values[id].get(prop))
-                .unwrap_or("visible")
-        });
-        let [page_scrolls_x, page_scrolls] =
-            [overflow_x, overflow].map(|value| !matches!(value, "hidden" | "clip"));
-        // Like Chrome, the viewport takes the direction of the root element, so an RTL page scrolls from its right.
-        let page_rtl =
-            html.is_some_and(|html| styles.values[html].get(Prop::DIRECTION) == Some("rtl"));
-        let page_overscroll = html.map_or_else(Default::default, |html| {
-            element::margin::overscroll(&styles.values[html])
-        });
-        let page_bar = html
-            .filter(|_| page_scrolls || page_scrolls_x)
-            .and_then(|html| {
-                let parts = body
-                    .and_then(|body| styles.scrollbars.get(&body))
-                    .filter(|parts| parts[0].is_some())
-                    .or_else(|| styles.scrollbars.get(&html));
-                let mut look = scrollbar::Look::new(
-                    &styles.values[html],
-                    parts.map(|parts| &**parts),
-                    &styles.lengths[html],
-                    (background.1 >= 128).then_some(background.0),
-                )?;
-                look.forced = [
-                    overflow_x == "scroll" || look.forced[0],
-                    overflow == "scroll" || look.forced[1],
-                ];
-                Some(look)
-            });
-        let page_space = page_bar.as_ref().map_or([0.; 2], |look| {
-            look.space(look.shown([page_scrolls_x, page_scrolls], page_scroll.extent()))
-        });
+        let viewport = frame::page::viewport(dom, &styles, html, body, background);
         if !dom.layout.container_pass {
             let mut moved = 0.;
             dom.layout.cull.scrolled.clear();
@@ -1092,8 +926,8 @@ impl PageView {
         let root = element(
             &build,
             0,
-            [width - page_space[1], height - page_space[0]],
-            [width - page_space[1], height - page_space[0]],
+            [width - viewport.space[1], height - viewport.space[0]],
+            [width - viewport.space[1], height - viewport.space[0]],
             None,
         );
         build.zone = None;
@@ -1183,7 +1017,7 @@ impl PageView {
             #[cfg(debug_assertions)]
             zone,
             #[cfg(debug_assertions)]
-            [width - page_space[1], height - page_space[0]],
+            [width - viewport.space[1], height - viewport.space[0]],
         );
         drop(build);
         let mut reads = reads.into_inner();
@@ -1276,116 +1110,17 @@ impl PageView {
                 window.restart();
             }
         }
-        let id = self.id;
         if !window.redrawing() && !self.reflowing.get() && !repass {
             queue_layout(self.0.clone(), window);
         }
-        let page = renderer::node().id(("apps-page", 0)).size_full();
-        let mut page = if page_scrolls {
-            page.overflow_y_scroll()
-        } else {
-            page.overflow_y_hidden()
-        };
-        page.style().overflow.x = match page_scrolls_x {
-            true => renderer::Overflow::Scroll,
-            false => renderer::Overflow::Hidden,
-        };
-        if page_rtl {
-            page.style().flow |= renderer::Flow::RTL_BLOCK;
-        }
-        page.style().overscroll = page_overscroll;
-        let page = page
-            .pr(renderer::px(page_space[1]))
-            .pb(renderer::px(page_space[0]))
-            .restrict_scroll_to_axis()
-            .track_scroll(&page_scroll)
-            .bg(Color::hex((background.0 << 8) | background.1 as u32))
-            .on_pointer({
-                let view = self.0.clone();
-                move |event, window, _| {
-                    if let Event::PointerMove { held, .. } = event
-                        && view.moving.take()
-                        && *held == Some(renderer::Button::Left)
-                    {
-                        window.control().start_window_move();
-                    }
-                }
-            })
-            .child(pointer_events)
-            .child(root)
-            .child({
-                // Refresh the layout mirror after prepaint: scroll ranges change after the initial
-                // sync_scroll.
-                let data = self.0.clone();
-                renderer::canvas(
-                    move |_, _| {
-                        if let Ok(mut host) = data.host.try_borrow_mut()
-                            && let Some(dom) = host.page_state_mut(data.id)
-                        {
-                            dom.geometry.sync_scroll();
-                            dom.geometry.prepainted(dom.pixel_ratio);
-                        }
-                    },
-                    |_, _, _| (),
-                )
-                .absolute()
-            })
-            .children(autos.then(|| spacer::autos(self.0.clone())))
-            .children(page_bar.map(|look| scrollbar::Scrollbar {
-                id: 0,
-                handle: page_scroll.clone(),
-                look: Some(look),
-                axes: [page_scrolls_x, page_scrolls],
-                reserved: page_space,
-                borders: [0.; 4],
-                origin: [0.; 2],
-                quiet: false,
-            }))
-            .children(crate::native::devtools::profiling().then(|| {
-                renderer::canvas(
-                    |_, _| (),
-                    move |_, _, window| {
-                        window.paint_volatile();
-                        crate::native::devtools::frame(id, started)
-                    },
-                )
-                .absolute()
-            }))
-            .children({
-                let inspect = self.inspect.get();
-                (inspect.hover.is_some() || inspect.selected.is_some()).then(|| {
-                    let data = self.0.clone();
-                    renderer::canvas(
-                        |_, _| (),
-                        move |_, _, window| {
-                            window.paint_volatile();
-                            inspect::paint(&data, window)
-                        },
-                    )
-                    .absolute()
-                })
-            })
-            .children(self.hud.borrow().is_some().then(|| {
-                let data = self.0.clone();
-                renderer::canvas(
-                    |_, _| (),
-                    move |_, _, window| {
-                        window.paint_volatile();
-                        if let Some(hud) = &*data.hud.borrow() {
-                            hud.paint(window);
-                        }
-                    },
-                )
-                .absolute()
-            }));
-        if overlay.is_empty() {
-            page.into()
-        } else {
-            renderer::node()
-                .size_full()
-                .child(page)
-                .children(overlay)
-                .into()
-        }
+        frame::page::node(
+            &self.0,
+            viewport,
+            pointer_events,
+            root,
+            overlay,
+            autos,
+            started,
+        )
     }
 }
