@@ -366,7 +366,6 @@ impl Drop for Fetch {
     }
 }
 
-#[derive(Default)]
 pub struct State {
     pub(crate) renderer: bool,
     platform: crate::web::platform::State,
@@ -422,9 +421,16 @@ impl State {
     ) -> Self {
         Self {
             renderer,
+            platform: Default::default(),
+            servers: Default::default(),
+            sockets: Default::default(),
             workers: crate::web::worker::State::new(run_worker),
+            tcp: Default::default(),
+            storage: Default::default(),
+            next_id: 0,
+            fetches: HashMap::new(),
+            agent: None,
             assets,
-            ..Self::default()
         }
     }
 

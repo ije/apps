@@ -100,7 +100,7 @@ impl crate::render::Pages for Pages {
 }
 
 thread_local! {
-    // Skip destruction: this needs HOSTS, which exits first.
+    // Skip destruction: this needs the context table of jsc, which exits first.
     static PAGE_SIDE: std::mem::ManuallyDrop<RefCell<Option<Rc<RefCell<Desktop>>>>> = const { std::mem::ManuallyDrop::new(RefCell::new(None)) };
 }
 
