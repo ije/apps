@@ -13,7 +13,6 @@ pub(crate) mod paint;
 pub mod raster;
 mod view;
 
-use crate::css;
 use crate::css::properties::Prop;
 use crate::{host::Host, style};
 use element::{Build, element};
@@ -931,83 +930,7 @@ impl PageView {
             None,
         );
         build.zone = None;
-        let mut overlay: Vec<renderer::Child> = Vec::new();
-        for &id in &top_layer {
-            if let Some(backdrop) = backdrops
-                .iter()
-                .find_map(|(node, style)| (*node == id).then_some(style))
-                .or_else(|| styles.backdrops.get(&id))
-                .filter(|style| style.get(Prop::DISPLAY) != Some("none"))
-            {
-                let units = styles.lengths[id];
-                let mut el = renderer::node().absolute().top_0().left_0().size_full();
-                if backdrop
-                    .get(Prop::VISIBILITY)
-                    .is_none_or(|value| value == "visible")
-                {
-                    if let Some(color) = backdrop
-                        .get(Prop::BACKGROUND_COLOR)
-                        .and_then(css::value::color::paint)
-                    {
-                        el = el.bg(color);
-                    }
-                    if backdrop.get(Prop::OPACITY).is_some() {
-                        el = el.opacity(effects::opacity(backdrop));
-                    }
-                    if backdrop
-                        .get(Prop::BACKGROUND_IMAGE)
-                        .is_some_and(|value| value != "none")
-                    {
-                        let host = self.host.borrow();
-                        el = el.children(background::css_background(
-                            backdrop,
-                            units,
-                            id,
-                            3,
-                            Default::default(),
-                            [[0.; 4]; 3],
-                            self.0.clone(),
-                            host.page_state(self.id)
-                                .and_then(|state| state.base.as_ref()),
-                            &host.app.assets,
-                            false,
-                        ));
-                    }
-                }
-                overlay.push(
-                    match [Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER]
-                        .into_iter()
-                        .find_map(|prop| backdrop.get(prop))
-                        .and_then(|value| effects::filter::backdrop(value, &units))
-                    {
-                        Some((blur, color_matrix)) => el.hooks(paint::Effected {
-                            effect: renderer::PaintEffect {
-                                backdrop: Some(renderer::Backdrop {
-                                    bounds: renderer::Rect::default(),
-                                    corner_radii: Default::default(),
-                                    blur,
-                                    color_matrix,
-                                }),
-                                ..Default::default()
-                            },
-                            backdrop: Some(Default::default()),
-                        }),
-                        None => el,
-                    }
-                    .into(),
-                );
-            }
-            overlay.push(
-                renderer::node()
-                    .absolute()
-                    .size_full()
-                    .stacking()
-                    .child(renderer::layers(true))
-                    .child(element(&build, id, [width, height], [width, height], None))
-                    .child(renderer::layers(false))
-                    .into(),
-            );
-        }
+        let overlay = frame::page::overlay(&build, &backdrops, [width, height]);
         if !same {
             frame::patch::patch(&build, window);
         }
@@ -1046,36 +969,15 @@ impl PageView {
             dom.layout.cull.fresh = fresh;
             dom.layout.cull.visible = visible;
             dom.layout.measurements = measured.into_inner();
-            dom.styles.animating.clear();
-            dom.styles.animating_pseudos.clear();
-            let restored =
-                !restore.is_empty() || !restore_pseudos.is_empty() || !lengths.is_empty();
-            // Animated values go back to the cascade values here, and the next frame visits their nodes again.
-            // Animated units are not in the values, so a frame after them visits all nodes.
-            dom.layout.cull.swapped = (restore[..relayouts].iter().map(|(id, _)| *id))
-                .chain(restore_pseudos.iter().map(|(id, _)| *id))
-                .collect();
             let units = !lengths.is_empty();
-            // Animated padding and borders change content boxes that resize observers read.
-            if relayouts > 0 || units {
-                dom.geometry.mirror.restyled();
-            }
-            if restored {
-                let styles = Rc::make_mut(&mut styles);
-                for (id, old) in lengths {
-                    styles.lengths.set(id, old);
-                }
-                for (id, style) in restore {
-                    dom.styles
-                        .animating
-                        .insert(id, std::mem::replace(&mut styles.values[id], style));
-                }
-                for (id, pair) in restore_pseudos {
-                    if let Some(animated) = styles.pseudos.insert(id, pair) {
-                        dom.styles.animating_pseudos.insert(id, animated);
-                    }
-                }
-            }
+            frame::motion::restore(
+                dom,
+                &mut styles,
+                restore,
+                restore_pseudos,
+                lengths,
+                relayouts,
+            );
             dom.layout.cull.seen = (!units).then(|| (seen.0, seen.1, styles.clone()));
             if taken {
                 dom.styles.computed = Some(styles);

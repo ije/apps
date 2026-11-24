@@ -1,9 +1,10 @@
+use super::super::element::{self, Build, element};
 use super::Cx;
 use crate::css;
-use crate::css::properties::Prop;
-use crate::render::element;
+use crate::css::properties::{Prop, Style};
 use crate::render::paint::{background, scrollbar, spacer};
 use crate::render::{PageState, ViewState, inspect};
+use crate::render::{effects, paint};
 use crate::style::ComputedStyles;
 use renderer::Event;
 use std::rc::Rc;
@@ -274,4 +275,90 @@ pub(crate) fn node(
             .children(overlay)
             .into()
     }
+}
+
+// The boxes of the top layer, each above its backdrop.
+pub(crate) fn overlay(
+    build: &Build,
+    backdrops: &[(usize, Rc<Style>)],
+    size: [f32; 2],
+) -> Vec<renderer::Child> {
+    let mut overlay: Vec<renderer::Child> = Vec::new();
+    for &id in build.top_layer {
+        if let Some(backdrop) = backdrops
+            .iter()
+            .find_map(|(node, style)| (*node == id).then_some(style))
+            .or_else(|| build.styles.backdrops.get(&id))
+            .filter(|style| style.get(Prop::DISPLAY) != Some("none"))
+        {
+            let units = build.styles.lengths[id];
+            let mut el = renderer::node().absolute().top_0().left_0().size_full();
+            if backdrop
+                .get(Prop::VISIBILITY)
+                .is_none_or(|value| value == "visible")
+            {
+                if let Some(color) = backdrop
+                    .get(Prop::BACKGROUND_COLOR)
+                    .and_then(css::value::color::paint)
+                {
+                    el = el.bg(color);
+                }
+                if backdrop.get(Prop::OPACITY).is_some() {
+                    el = el.opacity(effects::opacity(backdrop));
+                }
+                if backdrop
+                    .get(Prop::BACKGROUND_IMAGE)
+                    .is_some_and(|value| value != "none")
+                {
+                    let host = build.view.host.borrow();
+                    el = el.children(background::css_background(
+                        backdrop,
+                        units,
+                        id,
+                        3,
+                        Default::default(),
+                        [[0.; 4]; 3],
+                        build.view.clone(),
+                        host.page_state(build.view.id)
+                            .and_then(|state| state.base.as_ref()),
+                        &host.app.assets,
+                        false,
+                    ));
+                }
+            }
+            overlay.push(
+                match [Prop::BACKDROP_FILTER, Prop::WEBKIT_BACKDROP_FILTER]
+                    .into_iter()
+                    .find_map(|prop| backdrop.get(prop))
+                    .and_then(|value| effects::filter::backdrop(value, &units))
+                {
+                    Some((blur, color_matrix)) => el.hooks(paint::Effected {
+                        effect: renderer::PaintEffect {
+                            backdrop: Some(renderer::Backdrop {
+                                bounds: renderer::Rect::default(),
+                                corner_radii: Default::default(),
+                                blur,
+                                color_matrix,
+                            }),
+                            ..Default::default()
+                        },
+                        backdrop: Some(Default::default()),
+                    }),
+                    None => el,
+                }
+                .into(),
+            );
+        }
+        overlay.push(
+            renderer::node()
+                .absolute()
+                .size_full()
+                .stacking()
+                .child(renderer::layers(true))
+                .child(element(build, id, size, size, None))
+                .child(renderer::layers(false))
+                .into(),
+        );
+    }
+    overlay
 }

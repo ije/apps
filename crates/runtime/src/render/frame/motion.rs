@@ -615,6 +615,46 @@ pub(crate) fn swap(
     (restore, restore_pseudos, paint)
 }
 
+// After the frame, `styles` gets its cascade values back, and `dom.styles` keeps the animated ones.
+pub(crate) fn restore(
+    dom: &mut PageState,
+    styles: &mut Rc<ComputedStyles>,
+    restore: Vec<(usize, Rc<css::properties::Style>)>,
+    restore_pseudos: Vec<(usize, Rc<[css::properties::Style; 2]>)>,
+    lengths: Vec<(usize, Lengths)>,
+    relayouts: usize,
+) {
+    dom.styles.animating.clear();
+    dom.styles.animating_pseudos.clear();
+    let restored = !restore.is_empty() || !restore_pseudos.is_empty() || !lengths.is_empty();
+    // Animated values go back to the cascade values here, and the next frame visits their nodes again.
+    // Animated units are not in the values, so a frame after them visits all nodes.
+    dom.layout.cull.swapped = (restore[..relayouts].iter().map(|(id, _)| *id))
+        .chain(restore_pseudos.iter().map(|(id, _)| *id))
+        .collect();
+    let units = !lengths.is_empty();
+    // Animated padding and borders change content boxes that resize observers read.
+    if relayouts > 0 || units {
+        dom.geometry.mirror.restyled();
+    }
+    if restored {
+        let styles = Rc::make_mut(styles);
+        for (id, old) in lengths {
+            styles.lengths.set(id, old);
+        }
+        for (id, style) in restore {
+            dom.styles
+                .animating
+                .insert(id, std::mem::replace(&mut styles.values[id], style));
+        }
+        for (id, pair) in restore_pseudos {
+            if let Some(animated) = styles.pseudos.insert(id, pair) {
+                dom.styles.animating_pseudos.insert(id, animated);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::visibility::drop_hidden_images;
