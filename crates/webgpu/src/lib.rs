@@ -160,7 +160,7 @@ pub unsafe extern "C" fn apps_webgpu_presented(gpu: *const c_void) -> bool {
 /// `gpu` comes from `apps_webgpu_new`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn apps_webgpu_allocated(gpu: *mut c_void) -> u64 {
-    unsafe { &mut *gpu.cast::<Gpu>() }.take_allocated()
+    std::mem::take(&mut unsafe { &mut *gpu.cast::<Gpu>() }.allocated)
 }
 
 const FEATURES: &[(&str, Features)] = &[
@@ -1489,10 +1489,6 @@ impl Gpu {
             name => bail!("Unsupported render command: {name}"),
         }
         Ok(())
-    }
-
-    fn take_allocated(&mut self) -> u64 {
-        std::mem::take(&mut self.allocated)
     }
 
     fn presented(&self) -> bool {

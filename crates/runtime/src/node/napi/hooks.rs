@@ -4,31 +4,19 @@ use super::{
 };
 use crate::jsc::Ptr;
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     rc::{Rc, Weak},
 };
 
 type Cleanup = unsafe extern "C" fn(Ptr);
 type AsyncCleanupHook = unsafe extern "C" fn(Ptr, Ptr);
 
-// The addon state that lives as long as the environment: cleanup hooks and instance data.
+// The hooks that run when the environment closes.
+#[derive(Default)]
 pub(super) struct Hooks {
     cleanup: RefCell<Vec<(Cleanup, Ptr)>>,
     // Addresses of `AsyncCleanup` handles.
     async_cleanup: Rc<RefCell<Vec<usize>>>,
-    instance: Cell<Ptr>,
-    instance_finalizer: Cell<Option<Finalizer>>,
-}
-
-impl Default for Hooks {
-    fn default() -> Self {
-        Self {
-            cleanup: RefCell::default(),
-            async_cleanup: Rc::default(),
-            instance: Cell::new(std::ptr::null_mut()),
-            instance_finalizer: Cell::new(None),
-        }
-    }
 }
 
 impl Hooks {
@@ -85,19 +73,6 @@ impl Hooks {
         self.async_cleanup.borrow_mut().push(cleanup as usize);
         cleanup
     }
-
-    fn set_instance(&self, data: Ptr, finalizer: Option<Finalizer>) {
-        self.instance.set(data);
-        self.instance_finalizer.set(finalizer);
-    }
-
-    fn instance(&self) -> Ptr {
-        self.instance.get()
-    }
-
-    pub(super) fn take_instance_finalizer(&self) -> Option<Finalizer> {
-        self.instance_finalizer.take()
-    }
 }
 
 pub(super) struct AsyncCleanup {
@@ -127,12 +102,14 @@ impl AsyncCleanup {
 
 impl State {
     api!(napi_set_instance_data(env, data: Ptr, callback: Option<Finalize>, hint: Ptr) {
-        env.hooks.set_instance(data, callback.map(|callback| Finalizer { callback, data, hint }));
+        env.instance.set(data);
+        env.instance_finalizer
+            .set(callback.map(|callback| Finalizer { callback, data, hint }));
         Ok(())
     });
     api!(napi_get_instance_data(env, result: *mut Ptr) {
         check(!result.is_null(), 1)?;
-        *result = env.hooks.instance();
+        *result = env.instance.get();
         Ok(())
     });
     api!(napi_add_env_cleanup_hook(env, callback: Option<Cleanup>, data: Ptr) {

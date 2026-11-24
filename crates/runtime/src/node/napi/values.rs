@@ -2,42 +2,42 @@ use super::{State, Status, chars, check};
 use crate::jsc::Ptr;
 use std::{ffi::c_char, ptr};
 
-unsafe fn copy_units<T>(
-    env: &State,
-    value: Ptr,
-    buffer: *mut T,
-    size: usize,
-    result: *mut usize,
-    convert: fn(u16) -> T,
-) -> Status {
-    check(!buffer.is_null() || !result.is_null(), 1)?;
-    check(env.kind(value)? == 4, 3)?;
-    unsafe {
-        let string = (env.api.to_string)(env.ctx, value, ptr::null_mut());
-        let length = (env.api.string_length)(string);
-        let units = (env.api.string_chars)(string);
-        let count = length.min(size.saturating_sub(1));
-        if !buffer.is_null() && size > 0 {
-            for index in 0..count {
-                buffer.add(index).write(convert(*units.add(index)));
-            }
-            buffer.add(count).write(convert(0));
-        }
-        (env.api.string_release)(string);
-        if !result.is_null() {
-            *result = if buffer.is_null() {
-                length
-            } else if size == 0 {
-                0
-            } else {
-                count
-            };
-        }
-    }
-    Ok(())
-}
-
 impl State {
+    unsafe fn copy_units<T>(
+        &self,
+        value: Ptr,
+        buffer: *mut T,
+        size: usize,
+        result: *mut usize,
+        convert: fn(u16) -> T,
+    ) -> Status {
+        check(!buffer.is_null() || !result.is_null(), 1)?;
+        check(self.kind(value)? == 4, 3)?;
+        unsafe {
+            let string = (self.api.to_string)(self.ctx, value, ptr::null_mut());
+            let length = (self.api.string_length)(string);
+            let units = (self.api.string_chars)(string);
+            let count = length.min(size.saturating_sub(1));
+            if !buffer.is_null() && size > 0 {
+                for index in 0..count {
+                    buffer.add(index).write(convert(*units.add(index)));
+                }
+                buffer.add(count).write(convert(0));
+            }
+            (self.api.string_release)(string);
+            if !result.is_null() {
+                *result = if buffer.is_null() {
+                    length
+                } else if size == 0 {
+                    0
+                } else {
+                    count
+                };
+            }
+        }
+        Ok(())
+    }
+
     api!(napi_get_undefined(env, result: *mut Ptr) {
         env.value(result, env.undefined())
     });
@@ -182,7 +182,7 @@ impl State {
         size: usize,
         result: *mut usize,
     ) {
-        copy_units(env, value, buffer, size, result, |unit| unit as c_char)
+        env.copy_units(value, buffer, size, result, |unit| unit as c_char)
     });
     api!(napi_create_string_utf16(
         env,
@@ -210,7 +210,7 @@ impl State {
         size: usize,
         result: *mut usize,
     ) {
-        copy_units(env, value, buffer, size, result, |unit| unit)
+        env.copy_units(value, buffer, size, result, |unit| unit)
     });
     api!(napi_is_array(env, value: Ptr, result: *mut bool) {
         check(!result.is_null(), 1)?;

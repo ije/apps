@@ -78,6 +78,8 @@ pub(crate) struct State {
     objects: Objects,
     hooks: Hooks,
     tasks: Tasks,
+    instance: Cell<Ptr>,
+    instance_finalizer: Cell<Option<Finalizer>>,
     pending: Cell<Ptr>,
     error: Cell<ErrorInfo>,
     external: Cell<i64>,
@@ -148,6 +150,8 @@ impl State {
             objects: Objects::default(),
             hooks: Hooks::default(),
             tasks: Tasks::default(),
+            instance: Cell::new(ptr::null_mut()),
+            instance_finalizer: Cell::new(None),
             pending: Cell::new(ptr::null_mut()),
             error: Cell::new(ErrorInfo {
                 message: ptr::null(),
@@ -158,6 +162,24 @@ impl State {
             external: Cell::new(0),
         });
         Ok(state)
+    }
+
+    // Runs the register function of an addon, and returns its exports.
+    fn register(&self, register: Register, path: &std::path::Path) -> Result<Ptr> {
+        let depth = self.handles.push(false);
+        let exports = self
+            .js("object", &[])
+            .map_err(|_| anyhow::anyhow!("Cannot create addon exports"))?;
+        let result = unsafe { register(self.env(), exports) };
+        let result = if result.is_null() { exports } else { result };
+        let exception = self.take_exception();
+        let error = (!exception.is_null()).then(|| self.api.text(self.ctx, exception));
+        self.hold(result);
+        self.handles.unwind(&self.api, self.ctx, depth);
+        if let Some(error) = error {
+            anyhow::bail!("Cannot initialize {}: {error}", path.display());
+        }
+        Ok(result)
     }
 
     fn env(&self) -> Env {
@@ -486,7 +508,7 @@ impl State {
                 }
             }
         }
-        if let Some(finalizer) = self.hooks.take_instance_finalizer() {
+        if let Some(finalizer) = self.instance_finalizer.take() {
             unsafe { finalizer.run(self.env()) };
         }
         self.objects.drop_references(&self.api, self.ctx);
@@ -695,22 +717,7 @@ impl Root {
         self.environments.borrow_mut().push(environment.clone());
         // Like Node.js, never unload an addon. Its threads and static destructors may still run.
         std::mem::forget(library);
-        let depth = environment.handles.push(false);
-        let exports = environment
-            .js("object", &[])
-            .map_err(|_| anyhow::anyhow!("Cannot create addon exports"))?;
-        let result = unsafe { register(environment.env(), exports) };
-        let result = if result.is_null() { exports } else { result };
-        let exception = environment.take_exception();
-        let error =
-            (!exception.is_null()).then(|| environment.api.text(environment.ctx, exception));
-        environment.hold(result);
-        environment
-            .handles
-            .unwind(&environment.api, environment.ctx, depth);
-        if let Some(error) = error {
-            anyhow::bail!("Cannot initialize {}: {error}", path.display());
-        }
+        let result = environment.register(register, &path)?;
         self.modules.borrow_mut().insert(path, result);
         Ok(result)
     }
