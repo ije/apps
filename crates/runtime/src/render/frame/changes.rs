@@ -488,7 +488,7 @@ pub(super) fn animate(
     }
     placed.extend(cx.view.animated.borrow().iter());
     let mut recolored = std::mem::take(&mut dom.styles.recolored);
-    // The values that move boxes. `cx.view.animated` builds the boxes of painted values in place next frame.
+    // The values that move boxes. `ViewState::animated` builds the boxes of painted values in place next frame.
     let relayouts = restore.len();
     if !paint.is_empty() {
         let values = &mut Rc::make_mut(styles).values;

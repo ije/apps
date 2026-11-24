@@ -303,7 +303,7 @@ impl PageView {
             inspectable,
         );
         let (html, body, background) =
-            page::canvas(&fcx, &styles, state.backgrounds.get(&self.id).copied());
+            page::canvas(&fcx, &styles, || state.backgrounds.get(&self.id).copied());
         // Never set a transparent window's native color: it prevents later transparency.
         #[cfg(target_os = "macos")]
         if background.1 == 255

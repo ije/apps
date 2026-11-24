@@ -14,7 +14,7 @@ use std::rc::Rc;
 pub(super) fn canvas(
     cx: &Cx,
     styles: &ComputedStyles,
-    set: Option<(u32, u8)>,
+    set: impl FnOnce() -> Option<(u32, u8)>,
 ) -> (Option<usize>, Option<usize>, (u32, u8)) {
     let html = cx.doc.nodes[0]
         .children
@@ -68,7 +68,7 @@ pub(super) fn canvas(
     }
     let background = source
         .and_then(canvas)
-        .or(match set {
+        .or_else(|| match set() {
             Some(color) if color.1 == 0 => Some(color),
             _ if dark => Some((0x121212, 255)),
             color => color,
