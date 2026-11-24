@@ -54,7 +54,7 @@ pub(crate) struct ViewState {
     mask_sources: RefCell<rustc_hash::FxHashMap<(usize, u8), MaskSources>>,
     moving: Cell<bool>,
     // A script forced this layout.
-    pub(crate) reflowing: Cell<bool>,
+    reflowing: Cell<bool>,
     parked: RefCell<Vec<(usize, Clips)>>,
     flat: RefCell<rustc_hash::FxHashSet<usize>>,
     promote: Cell<Option<(std::time::Instant, bool)>>,
@@ -63,7 +63,7 @@ pub(crate) struct ViewState {
     reaching: RefCell<Vec<([f32; 2], u8)>>,
     caret: RefCell<Option<text::Blink>>,
     /// The drawing of each terminal session, kept from frame to frame.
-    pub(crate) terminals: RefCell<rustc_hash::FxHashMap<u32, terminal::Drawn>>,
+    terminals: RefCell<rustc_hash::FxHashMap<u32, terminal::Drawn>>,
     pub(crate) hud: RefCell<Option<hud::Hud>>,
     pub(crate) inspect: Cell<inspect::Inspect>,
     kept: RefCell<rustc_hash::FxHashMap<usize, element::kept::Kept>>,
@@ -226,6 +226,26 @@ impl ViewState {
 }
 
 impl ViewState {
+    // Lays out the page for a script that reads geometry.
+    pub(crate) fn reflow(
+        self: &Rc<Self>,
+        window: &mut Window,
+        cx: &mut App,
+        pointer_events: impl Fn() -> renderer::Node,
+    ) {
+        self.reflowing.set(true);
+        window.layout(cx, |tree, window, cx| {
+            self.render_page(tree, window, cx, pointer_events())
+        });
+        self.reflowing.set(false);
+    }
+
+    // The cursor box of the terminal in element `id`, where it composes text.
+    pub(crate) fn terminal_caret(&self, dom: &PageState, id: usize) -> Option<[f32; 4]> {
+        let session = dom.media.terminals.borrow().session(id)?;
+        Some(self.terminals.borrow().get(&session)?.caret)
+    }
+
     pub(crate) fn new(id: u64, runtime: Rc<dyn Pages>, store: Rc<RefCell<Store>>) -> Rc<Self> {
         Rc::new(ViewState {
             id,

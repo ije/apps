@@ -169,7 +169,8 @@ pub(super) unsafe extern "C" fn call(
             );
             return Ok(api.realm(values[1]));
         }
-        // A forced layout builds the page, which borrows the host, so it runs before any borrow.
+        // A forced layout builds the page, which borrows the store (and the host to log lint warnings), so it runs
+        // before any borrow.
         if let Role::Renderer(id) = role
             && op == "dom.reflow"
         {
@@ -632,7 +633,7 @@ pub(super) fn dispatch(
 
 // Account for native DOM memory so removed wrappers trigger GC before row churn exhausts memory.
 fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
-    let created = binding.host.try_borrow_mut().ok().and_then(|host| {
+    let created = binding.host.try_borrow().ok().and_then(|host| {
         Some(
             host.store
                 .try_borrow_mut()

@@ -268,7 +268,9 @@ impl Pages for Input {
     }
 
     fn lint(&self, warnings: Vec<String>) {
-        let mut host = self.host.borrow_mut();
+        let Ok(mut host) = self.host.try_borrow_mut() else {
+            return;
+        };
         for text in warnings {
             host.log(serde_json::json!({"method":"Runtime.consoleAPICalled","params":{"type":"error","text":text,"context":crate::jsc::Role::Renderer(self.id)}}));
         }
@@ -359,12 +361,7 @@ fn reflow(id: u64) {
         return;
     }
     let run = |window: &mut Window, cx: &mut App| {
-        view.page.reflowing.set(true);
-        window.layout(cx, |tree, window, cx| {
-            view.page
-                .render_page(tree, window, cx, events(view.clone()))
-        });
-        view.page.reflowing.set(false);
+        view.page.reflow(window, cx, || events(view.clone()));
         window.refresh();
     };
     // SAFETY: the pointers come from `scripted`, whose caller does not touch them until the script returns.
@@ -461,10 +458,10 @@ impl renderer::View for PageView {
     fn window_changed(&mut self, window: &mut Window, cx: &mut App) {
         let input = &self.input;
         input.origin.set(None);
-        if let Ok(mut host) = input.host.try_borrow_mut() {
-            if let Ok(mut store) = input.store.try_borrow_mut()
-                && let Some(state) = store.page_state_mut(input.id)
-            {
+        if let (Ok(mut host), Ok(mut store)) =
+            (input.host.try_borrow_mut(), input.store.try_borrow_mut())
+        {
+            if let Some(state) = store.page_state_mut(input.id) {
                 state.window = window.window_state();
             }
             if !host.window_changes.contains(&input.id) {
@@ -724,12 +721,7 @@ impl renderer::View for PageView {
             ));
         }
         // A terminal composes text at its cursor.
-        let caret = dom
-            .media
-            .terminals
-            .borrow()
-            .session(id)
-            .and_then(|session| Some(self.page.terminals.borrow().get(&session)?.caret));
+        let caret = self.page.terminal_caret(dom, id);
         let bounds = caret.as_ref().or_else(|| dom.geometry.mirror.get(&id))?;
         Some(Rect::new(
             point(px(bounds[0]), px(bounds[1])),
