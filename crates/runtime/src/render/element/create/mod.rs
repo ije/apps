@@ -959,7 +959,6 @@ pub(super) fn create(
     {
         el = el.ml_auto();
     }
-    let _ink = parsed.ink.unwrap_or(Color::BLACK);
     let mut borders = parsed
         .borders
         .unwrap_or_else(|| units.borders(style, containing[0]));
@@ -1211,7 +1210,6 @@ pub(super) fn create(
             el = el.min_h(px(height + chrome[1]));
         }
     }
-    let _flexbox = cx.flexbox;
     let basis = || {
         [Prop::WIDTH, Prop::HEIGHT].map(|prop| {
             let base = containing[usize::from(prop == Prop::HEIGHT)];

@@ -14,6 +14,8 @@ use renderer::{Child, px, relative};
 use std::rc::Rc;
 
 /// Places the children of a block, flex or grid box.
+// Inlined into create, so the stack check below runs in the frame of create, as one level of boxes.
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn children(
     cx: &Cx<'_>,
@@ -89,7 +91,7 @@ pub(super) fn children(
     } else {
         flat.to_vec()
     };
-    // Each level of boxes is one large native frame, so levels past the stack budget are not drawn.
+    // Each level of boxes takes the frames of create and its stages, so levels past the stack budget are not drawn.
     let marker = 0u8;
     if (&raw const marker as usize) < STACK_LIMIT.with(|limit| *limit) {
         children.clear();
