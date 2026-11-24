@@ -1,7 +1,7 @@
 use crate::css::{Lengths, Prop, Registry, Style, Vars};
-use crate::style::animation::Animation;
 use crate::style::cascade::{Container, Passed};
 use crate::style::chunked::Chunked;
+use crate::style::keyframes::Animation;
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
 pub(crate) const DISPLAY_NONE: u16 = 1;

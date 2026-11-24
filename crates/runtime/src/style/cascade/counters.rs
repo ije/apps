@@ -1,9 +1,10 @@
 use crate::css::{Prop, Style, components, counter_text};
 use crate::dom::Document;
 use crate::style::cascade::TreeWalk;
-use crate::style::computed::{ComputedStyles, DISPLAY_NONE};
+use crate::style::cascade::computed::{ComputedStyles, DISPLAY_NONE};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
+
 pub(crate) fn list_item(style: &Style) -> bool {
     style.get(Prop::DISPLAY) == Some("list-item")
 }

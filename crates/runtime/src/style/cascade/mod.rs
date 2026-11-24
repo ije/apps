@@ -3,7 +3,11 @@ use crate::css::{
     number,
 };
 use crate::dom::{Document, SelectorCache};
-use crate::style::animation::Animation;
+use crate::style::cascade::computed::{
+    AGENT_DISPLAY, CAPTION, CELL, COUNTED, ComputedStyles, DISPLAY_CONTENTS, DISPLAY_NONE, FOOTER,
+    HEADER, INVISIBLE, ROW, SELECT_ALL, SELECT_NONE, SELECT_TEXT, Shadowed, TABLE_DISPLAYS, empty,
+    table_box,
+};
 use crate::style::cascade::container::{ContainerQuery, QueryCache, query_containers};
 use crate::style::cascade::memo::{
     CachedNode, CachedStyle, Inheritable, Inputs, Share, StyleKey, StyleRef,
@@ -17,15 +21,12 @@ use crate::style::cascade::scope::{
 use crate::style::cascade::shadow::{ELEMENT, PART, SLOTTED, STARTING, ShadowRule, exported_parts};
 use crate::style::cascade::sheets::{Cssom, Derived, Sheet};
 use crate::style::cascade::table::CollapsedTable;
-use crate::style::cascade::used::{blockify, border_spacing, pixels};
-use crate::style::cascade::vars::{references, var};
-use crate::style::computed::{HEADER, INVISIBLE};
+use crate::style::font;
 use crate::style::fonts::font_names;
+use crate::style::keyframes::Animation;
 use crate::style::ua::{presentation, svg_transform};
-use crate::style::{
-    AGENT_DISPLAY, CAPTION, CELL, COUNTED, ComputedStyles, DISPLAY_CONTENTS, DISPLAY_NONE, FOOTER,
-    ROW, SELECT_ALL, SELECT_NONE, SELECT_TEXT, Shadowed, TABLE_DISPLAYS, empty, font, table_box,
-};
+use crate::style::used::{blockify, border_spacing, drawable_canvas, pixels, resolve_keywords};
+use crate::style::vars::{references, resolve_style, var};
 use bbtree::unsync::BBTreeMap;
 use counters::{list_item, listed, number_lists};
 use rustc_hash::FxHashMap;
@@ -33,6 +34,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
 use table::anonymous_tables;
+
+pub(crate) mod computed;
 mod container;
 mod counters;
 mod memo;
@@ -41,13 +44,9 @@ pub(super) mod scope;
 mod shadow;
 mod sheets;
 mod table;
-mod used;
-mod vars;
 
 pub(crate) use container::Container;
 pub(crate) use shadow::Passed;
-pub(crate) use used::{dark, drawable_canvas, resolve_keywords};
-pub(crate) use vars::resolve_style;
 
 #[derive(Default)]
 pub(crate) struct StyleCache {

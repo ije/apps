@@ -1,5 +1,5 @@
 use crate::css::{Declared, SelectorList};
-use crate::style::Shadowed;
+use crate::style::cascade::computed::Shadowed;
 use crate::style::cascade::container::ContainerQuery;
 use crate::style::cascade::rank::Layer;
 use std::rc::Rc;

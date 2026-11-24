@@ -1,8 +1,10 @@
 use super::*;
 use crate::css::{Easing, time};
 use crate::dom::Document;
-use crate::style::animation::effect::{after, tracks};
-use crate::style::animation::interpolate::{Lerp, add, interpolate, lerp, transitions};
+use crate::style::animation::timing::{Events, after};
+use crate::style::cascade::computed::ComputedStyles;
+use crate::style::keyframes::interpolate::{Lerp, add, interpolate, lerp, transitions};
+use crate::style::keyframes::{Animation, tracks};
 use std::time::Duration;
 
 fn easing(value: &str, progress: f64) -> f64 {

@@ -1,6 +1,7 @@
-use super::{ComputedStyles, Motion, Shadows, StyleCache};
+use super::{Motion, Shadows, StyleCache};
 use crate::css::{Prop, Selector, Style, Stylesheet};
 use crate::dom::{Document, LayoutMirror, Walk};
+use crate::style::cascade::computed::ComputedStyles;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     collections::{HashMap, HashSet},

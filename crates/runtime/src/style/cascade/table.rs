@@ -1,14 +1,15 @@
 use crate::css::{BORDERS, Prop, Style};
 use crate::dom::Document;
 use crate::style::cascade::TreeWalk;
-use crate::style::cascade::memo::StyleRef;
-use crate::style::cascade::used::border_spacing;
-use crate::style::computed::{
+use crate::style::cascade::computed::{
     CAPTION, CELL, ComputedStyles, DISPLAY_CONTENTS, DISPLAY_NONE, HEADER, ROW,
 };
+use crate::style::cascade::memo::StyleRef;
+use crate::style::used::border_spacing;
 use crate::style::{Chunked, Shadows, StyleCache};
 use rustc_hash::FxHashMap;
 use std::rc::Rc;
+
 pub(crate) type CellKey = (StyleRef, [(u32, Option<[Option<Rc<str>>; 2]>); 4]);
 
 #[derive(PartialEq)]

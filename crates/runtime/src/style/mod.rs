@@ -9,19 +9,19 @@ use std::collections::HashMap;
 mod animation;
 mod cascade;
 mod chunked;
-mod computed;
 mod fonts;
+mod keyframes;
 mod page;
 pub(crate) mod tailwind;
 #[cfg(test)]
 mod tests;
 mod text;
 mod ua;
-pub(crate) use cascade::{
-    Shadows, StyleCache, StyleContext, compute_styles, dark, drawable_canvas,
-};
+mod used;
+mod vars;
+pub(crate) use cascade::computed::*;
+pub(crate) use cascade::{Shadows, StyleCache, StyleContext, compute_styles};
 pub(crate) use chunked::Chunked;
-pub(crate) use computed::*;
 pub(crate) use fonts::{FONT_NAMES, font_lists, font_names};
 pub(crate) use page::{Page, ShadowWalk, Styles};
 pub(crate) use ua::{SVG, presentation};
@@ -32,6 +32,7 @@ pub(crate) use text::{
     restyle, selection_colors, spacing, starts_word, styled_run, text_run, text_transform,
     word_break,
 };
+pub(crate) use used::{dark, drawable_canvas};
 
 pub fn styles(doc: &Document, width: f32, height: f32) -> Vec<BBTreeMap<String, String>> {
     let out = compute_styles(

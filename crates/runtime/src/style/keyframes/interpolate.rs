@@ -3,8 +3,8 @@ use crate::css::{
 };
 use std::borrow::Cow;
 use std::rc::Rc;
-pub(super) fn add(property: &str, under: &str, value: &str, accumulate: bool) -> Option<String> {
-    pub(super) fn number(text: &str) -> Option<(f64, &str)> {
+pub(crate) fn add(property: &str, under: &str, value: &str, accumulate: bool) -> Option<String> {
+    pub(crate) fn number(text: &str) -> Option<(f64, &str)> {
         let bytes = text.as_bytes();
         // An `e` is an exponent only before a digit or sign, so `2em` keeps its unit.
         let end = (0..bytes.len())
@@ -103,7 +103,7 @@ pub(super) fn add(property: &str, under: &str, value: &str, accumulate: bool) ->
     Some(parts?.join(" "))
 }
 
-pub(super) fn keeps_box_in_place<'a>(
+pub(crate) fn keeps_box_in_place<'a>(
     prop: Prop,
     mut values: impl Iterator<Item = &'a str>,
 ) -> bool {
@@ -118,7 +118,7 @@ pub(super) fn keeps_box_in_place<'a>(
     }
 }
 
-pub(super) fn animatable(prop: Prop, registry: &Registry) -> bool {
+pub(crate) fn animatable(prop: Prop, registry: &Registry) -> bool {
     let key = prop.name();
     if prop.is_custom() {
         return registry.get(&prop).is_some_and(|(syntax, ..)| {
@@ -142,7 +142,7 @@ pub(super) fn animatable(prop: Prop, registry: &Registry) -> bool {
         && key != "will-change"
 }
 
-pub(super) fn computed<'a>(
+pub(crate) fn computed<'a>(
     style: &'a Style,
     prop: Prop,
     registry: &'a Registry,
@@ -183,7 +183,7 @@ pub(super) fn computed<'a>(
     })
 }
 
-pub(super) fn transitions(style: &Style) -> Vec<(String, f64, f64, Easing, bool)> {
+pub(crate) fn transitions(style: &Style) -> Vec<(String, f64, f64, Easing, bool)> {
     const DEFAULT: [&str; 5] = ["all", "0s", "0s", "ease", "normal"];
     let shorthand: Vec<[&str; 5]> = style
         .get(Prop::TRANSITION)
@@ -240,7 +240,7 @@ pub(super) fn transitions(style: &Style) -> Vec<(String, f64, f64, Easing, bool)
         .collect()
 }
 
-pub(super) fn lerp(property: &str, from: &str, to: &str) -> Option<Rc<Lerp>> {
+pub(crate) fn lerp(property: &str, from: &str, to: &str) -> Option<Rc<Lerp>> {
     if matches!(property, "opacity" | "scale") && (from.contains('%') || to.contains('%')) {
         let number = |value: &str| {
             value
@@ -284,7 +284,7 @@ pub(super) fn lerp(property: &str, from: &str, to: &str) -> Option<Rc<Lerp>> {
     })
 }
 
-pub(super) fn interpolate(lerp: Option<&Lerp>, from: &str, to: &str, t: f64) -> Option<Rc<str>> {
+pub(crate) fn interpolate(lerp: Option<&Lerp>, from: &str, to: &str, t: f64) -> Option<Rc<str>> {
     if from == to || t == 0. {
         return Some(from.into());
     }
@@ -302,10 +302,10 @@ pub(super) fn interpolate(lerp: Option<&Lerp>, from: &str, to: &str, t: f64) -> 
     })
 }
 
-pub(super) type Lerps = [rustc_hash::FxHashMap<u64, (String, String, String, Option<Rc<Lerp>>)>; 2];
+pub(crate) type Lerps = [rustc_hash::FxHashMap<u64, (String, String, String, Option<Rc<Lerp>>)>; 2];
 
 #[derive(Debug)]
-pub(super) enum Lerp {
+pub(crate) enum Lerp {
     Same(String),
     Between(String, String, String),
     List(Vec<Lerp>, &'static str),
@@ -317,18 +317,18 @@ pub(super) enum Lerp {
     Matrix(Box<[[f64; 13]; 2]>, bool),
 }
 
-pub(super) const IDENTITY: [f64; 16] = [
+pub(crate) const IDENTITY: [f64; 16] = [
     1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
 ];
 
-pub(super) fn multiply(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
+pub(crate) fn multiply(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
     std::array::from_fn(|index| {
         let (column, row) = (index / 4, index % 4);
         (0..4).map(|k| a[k * 4 + row] * b[column * 4 + k]).sum()
     })
 }
 
-pub(super) fn rotation([x, y, z, w]: [f64; 4]) -> [f64; 16] {
+pub(crate) fn rotation([x, y, z, w]: [f64; 4]) -> [f64; 16] {
     let mut m = IDENTITY;
     m[0] = 1. - 2. * (y * y + z * z);
     m[1] = 2. * (x * y + z * w);
@@ -342,7 +342,7 @@ pub(super) fn rotation([x, y, z, w]: [f64; 4]) -> [f64; 16] {
     m
 }
 
-pub(super) fn decompose(list: &str) -> Option<([f64; 13], bool)> {
+pub(crate) fn decompose(list: &str) -> Option<([f64; 13], bool)> {
     // Relative units and percentages give NaN with these units, so `math` rejects them.
     let units = Lengths {
         font: crate::css::FontUnits::new(f32::NAN),
@@ -474,7 +474,7 @@ pub(super) fn decompose(list: &str) -> Option<([f64; 13], bool)> {
 }
 
 impl Lerp {
-    pub(super) fn new(property: &str, from: &str, to: &str) -> Option<Self> {
+    pub(crate) fn new(property: &str, from: &str, to: &str) -> Option<Self> {
         if from == to {
             return Some(Self::Same(from.to_owned()));
         }
@@ -857,7 +857,7 @@ impl Lerp {
         }
     }
 
-    pub(super) fn write(&self, t: f64, out: &mut String) {
+    pub(crate) fn write(&self, t: f64, out: &mut String) {
         use std::fmt::Write;
         let round = |value: f64, integer: bool, out: &mut String| {
             if integer {
@@ -993,7 +993,7 @@ impl Lerp {
         }
     }
 }
-pub(super) const PAINT: &[Prop] = &[
+pub(crate) const PAINT: &[Prop] = &[
     Prop::COLOR,
     Prop::OPACITY,
     Prop::TRANSFORM,

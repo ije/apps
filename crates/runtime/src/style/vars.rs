@@ -2,7 +2,7 @@ use crate::css::{
     LOGICAL, Prop, Registry, Style, Vars, computed, expand, fold, serialize_color, syntax_matches,
     system_color,
 };
-use crate::style::cascade::used::dark;
+use crate::style::used::dark;
 use std::rc::Rc;
 pub(crate) fn var(vars: &Vars, prop: Prop) -> Option<&Rc<str>> {
     vars.binary_search_by_key(&prop, |entry| entry.0)

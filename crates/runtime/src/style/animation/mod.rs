@@ -1,18 +1,18 @@
-use super::ComputedStyles;
 use crate::css::{Prop, Style};
 use crate::dom::Document;
-use crate::style::animation::effect::{
-    Animated, Clock, DIRECTIONS, Events, FILLS, Phase, Playback, TRANSITIONS, Transition, Wake,
-    advance, after, cancel, drop_important, retarget, show,
+use crate::style::animation::timing::{
+    Clock, Events, Phase, Playback, Transition, Wake, advance, after, cancel, drop_important,
+    retarget, show,
 };
-use crate::style::animation::interpolate::PAINT;
+use crate::style::cascade::computed::ComputedStyles;
+use crate::style::keyframes::interpolate::PAINT;
+use crate::style::keyframes::{Animated, Animation, DIRECTIONS, FILLS, TRANSITIONS};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{borrow::Cow, collections::HashMap, rc::Rc, time::Instant};
 
-mod effect;
-mod interpolate;
+mod timing;
 
-pub(crate) use effect::{Animation, Scripted};
+pub(crate) use timing::Scripted;
 
 #[derive(Default)]
 pub(crate) struct Motion {

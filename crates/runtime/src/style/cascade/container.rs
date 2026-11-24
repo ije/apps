@@ -1,5 +1,5 @@
 use crate::css::{Lengths, MediaQuery, Prop, Style, Vars};
-use crate::style::cascade::vars::var;
+use crate::style::vars::var;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::rc::Rc;

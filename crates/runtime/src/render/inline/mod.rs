@@ -1,8 +1,9 @@
 use crate::css::{BORDERS, Lengths, MARGIN, PADDING, Prop, Style, color, components, paint, rgba};
 use crate::dom::Document;
+use crate::style::ComputedStyles;
 use crate::style::{
-    ComputedStyles, LineHeight, case, case_ignorable, cursor, font, line_height, pseudo_content,
-    push_full, restyle, starts_word, styled_run, text_run, text_transform,
+    LineHeight, case, case_ignorable, cursor, font, line_height, pseudo_content, push_full,
+    restyle, starts_word, styled_run, text_run, text_transform,
 };
 use std::rc::Rc;
 #[derive(Clone)]
