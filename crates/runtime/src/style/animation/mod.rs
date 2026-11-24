@@ -9,10 +9,9 @@ use crate::style::keyframes::interpolate::PAINT;
 use crate::style::keyframes::{Animated, Animation, DIRECTIONS, FILLS, TRANSITIONS};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{borrow::Cow, collections::HashMap, rc::Rc, time::Instant};
+use timing::Scripted;
 
-mod timing;
-
-pub(crate) use timing::Scripted;
+pub(crate) mod timing;
 
 #[derive(Default)]
 pub(crate) struct Motion {

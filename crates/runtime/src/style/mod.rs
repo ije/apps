@@ -7,7 +7,7 @@ use crate::dom::Document;
 use bbtree::unsync::BBTreeMap;
 use std::collections::HashMap;
 
-mod animation;
+pub(crate) mod animation;
 mod cascade;
 mod chunked;
 mod fonts;
@@ -27,7 +27,7 @@ pub(crate) use fonts::{FONT_NAMES, font_lists, font_names};
 pub(crate) use page::{Page, ShadowWalk, Styles};
 pub(crate) use ua::{SVG, presentation};
 
-pub(crate) use animation::{Frame, Motion, Scripted};
+pub(crate) use animation::{Frame, Motion};
 pub(crate) use text::{
     LineHeight, case, case_ignorable, cursor, font, line_height, pseudo_content, push_full,
     restyle, selection_colors, spacing, starts_word, styled_run, text_run, text_transform,

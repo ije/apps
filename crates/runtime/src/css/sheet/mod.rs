@@ -112,7 +112,7 @@ pub(crate) fn declare(source: &str) -> Vec<[String; 3]> {
 }
 
 impl Rule {
-    pub(crate) fn bind_parent(&mut self, parent: Option<&SelectorList>) -> anyhow::Result<()> {
+    fn bind_parent(&mut self, parent: Option<&SelectorList>) -> anyhow::Result<()> {
         match self {
             Self::Style(selectors, children) => {
                 for selector in Rc::make_mut(selectors) {

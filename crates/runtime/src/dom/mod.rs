@@ -1580,7 +1580,7 @@ pub fn call(
             .collect();
         let number = |index: usize| spec["timing"][index].as_f64().unwrap_or(0.);
         let iterations = number(3);
-        let animation = style::Scripted::new(
+        let animation = style::animation::timing::Scripted::new(
             id,
             &frames,
             [

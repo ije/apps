@@ -6,7 +6,7 @@ use crate::css::{
 use std::borrow::Cow;
 use std::rc::Rc;
 pub(crate) fn add(property: &str, under: &str, value: &str, accumulate: bool) -> Option<String> {
-    pub(crate) fn number(text: &str) -> Option<(f64, &str)> {
+    fn number(text: &str) -> Option<(f64, &str)> {
         let bytes = text.as_bytes();
         // An `e` is an exponent only before a digit or sign, so `2em` keeps its unit.
         let end = (0..bytes.len())
@@ -323,14 +323,14 @@ pub(crate) const IDENTITY: [f64; 16] = [
     1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
 ];
 
-pub(crate) fn multiply(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
+fn multiply(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
     std::array::from_fn(|index| {
         let (column, row) = (index / 4, index % 4);
         (0..4).map(|k| a[k * 4 + row] * b[column * 4 + k]).sum()
     })
 }
 
-pub(crate) fn rotation([x, y, z, w]: [f64; 4]) -> [f64; 16] {
+fn rotation([x, y, z, w]: [f64; 4]) -> [f64; 16] {
     let mut m = IDENTITY;
     m[0] = 1. - 2. * (y * y + z * z);
     m[1] = 2. * (x * y + z * w);
@@ -344,7 +344,7 @@ pub(crate) fn rotation([x, y, z, w]: [f64; 4]) -> [f64; 16] {
     m
 }
 
-pub(crate) fn decompose(list: &str) -> Option<([f64; 13], bool)> {
+fn decompose(list: &str) -> Option<([f64; 13], bool)> {
     // Relative units and percentages give NaN with these units, so `math` rejects them.
     let units = Lengths {
         font: crate::css::value::units::FontUnits::new(f32::NAN),
