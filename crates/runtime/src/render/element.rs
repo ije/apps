@@ -4,11 +4,8 @@ use super::layout::size::{
 };
 use super::{
     ViewState,
-    background::css_background,
     layout::cull,
-    paint::{DomBox, Turned},
-    scrollbar,
-    text::InlineText,
+    paint::{DomBox, Turned, background::css_background, scrollbar, text::InlineText},
 };
 use crate::css;
 use crate::css::properties::Prop;
@@ -1981,7 +1978,7 @@ fn create(
                 });
                 if caret {
                     window.paint_volatile();
-                    super::text::paint_caret(
+                    super::paint::text::paint_caret(
                         &painter,
                         [id, 0, 0],
                         Rect::new(bounds.origin, size(px(1.), px(line_height))),
@@ -2532,7 +2529,7 @@ fn create(
             .page_state(view.id)
             .filter(|_| host.app.features.has(crate::bundle::Feature::Terminal))
         {
-            let look = super::terminal::look(style, styles.selections.get(&id), &units);
+            let look = super::paint::terminal::look(style, styles.selections.get(&id), &units);
             // The bar of the scrollback.
             grid_bar = Some(scrollbar::Scrollbar {
                 id,
@@ -2555,7 +2552,7 @@ fn create(
             content_layers.push(
                 renderer::node()
                     .size_full()
-                    .hooks(super::terminal::Grid {
+                    .hooks(super::paint::terminal::Grid {
                         id,
                         view: view.clone(),
                         terminals: state.media.terminals.clone(),
@@ -3006,7 +3003,7 @@ fn create(
     let input = (node.tag == "input").then(|| node.input_type());
     let appkit = node.native_control(style);
     if appkit.is_some() {
-        super::native::register(&view.controls, id);
+        super::paint::native::register(&view.controls, id);
     }
     let check = input.is_some_and(|kind| {
         kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
@@ -3221,7 +3218,7 @@ fn create(
             .entry(id)
             .or_default()
             .clone();
-        let field = super::input::FieldText {
+        let field = super::paint::field::FieldText {
             selected: Default::default(),
             id,
             view: view.clone(),
@@ -3319,7 +3316,7 @@ fn create(
     let mut text_fill = None;
     // The root element paints the background of the canvas, also when it comes from the body.
     let source = matches!(node.tag.as_str(), "html" | "body")
-        .then(|| super::background::canvas_source(doc, styles))
+        .then(|| super::paint::background::canvas_source(doc, styles))
         .flatten();
     let propagated = node.tag == "body" && source == Some(id);
     let canvas = source.filter(|_| node.tag == "html" && node.parent == Some(0));
@@ -3658,7 +3655,7 @@ fn create(
             }
         })
         .flatten();
-    let native = super::control::kind(&node.tag, input, list.is_some(), style).map(
+    let native = super::paint::control::kind(&node.tag, input, list.is_some(), style).map(
         |(control, boxed, plain)| {
             let number = |name: &str| {
                 node.attrs
@@ -3667,17 +3664,17 @@ fn create(
                     .filter(|value| value.is_finite())
             };
             let [min, max] = match control {
-                super::control::Control::Range => {
+                super::paint::control::Control::Range => {
                     [number("min").unwrap_or(0.), number("max").unwrap_or(100.)]
                 }
-                super::control::Control::Meter => {
+                super::paint::control::Control::Meter => {
                     [number("min").unwrap_or(0.), number("max").unwrap_or(1.)]
                 }
                 _ => [0., number("max").filter(|&max| max > 0.).unwrap_or(1.)],
             };
             let max = max.max(min);
             let value = match control {
-                super::control::Control::Range => {
+                super::paint::control::Control::Range => {
                     let value = node
                         .current_value()
                         .and_then(|value| value.trim().parse::<f32>().ok())
@@ -3699,15 +3696,17 @@ fn create(
                         }
                     }
                 }
-                _ => number("value").unwrap_or(if control == super::control::Control::Progress {
-                    -1.
-                } else {
-                    0.
-                }),
+                _ => number("value").unwrap_or(
+                    if control == super::paint::control::Control::Progress {
+                        -1.
+                    } else {
+                        0.
+                    },
+                ),
             };
             let mut dark = dark();
             let accent = match control {
-                super::control::Control::Meter => {
+                super::paint::control::Control::Meter => {
                     let low = number("low").unwrap_or(min).clamp(min, max);
                     let high = number("high").unwrap_or(max).clamp(low, max);
                     let region = |value: f32| u8::from(value >= low) + u8::from(value > high);
@@ -3730,7 +3729,7 @@ fn create(
                         colors[2]
                     }
                 }
-                super::control::Control::Color => node
+                super::paint::control::Control::Color => node
                     .current_value()
                     .and_then(css::value::color::color)
                     .map_or(0, |(color, _)| color),
@@ -3740,14 +3739,19 @@ fn create(
                     .and_then(css::value::color::color)
                 {
                     Some((color, _)) => {
-                        dark = super::control::accent_dark(control, node.checked(), color, dark);
+                        dark = super::paint::control::accent_dark(
+                            control,
+                            node.checked(),
+                            color,
+                            dark,
+                        );
                         color
                     }
                     None if dark => 0x99c8ff,
                     None => 0x0075ff,
                 },
             };
-            super::control::Look {
+            super::paint::control::Look {
                 control,
                 boxed,
                 plain,
@@ -3761,9 +3765,10 @@ fn create(
                     .get(Prop::COLOR)
                     .and_then(css::value::color::color)
                     .map_or(0, |(color, _)| color),
-                value: if value < min || max <= min && control != super::control::Control::Progress
+                value: if value < min
+                    || max <= min && control != super::paint::control::Control::Progress
                 {
-                    if control == super::control::Control::Progress {
+                    if control == super::paint::control::Control::Progress {
                         -1.
                     } else {
                         0.
@@ -3794,7 +3799,7 @@ fn create(
     }
     if let Some(look) = &native {
         if look.boxed {
-            let (edge, fill) = super::control::box_colors(look);
+            let (edge, fill) = super::paint::control::box_colors(look);
             for side in 0..4 {
                 padding[side] += (borders[side] - 1.).max(0.);
                 borders[side] = borders[side].min(1.);
@@ -3824,7 +3829,7 @@ fn create(
                 + borders[0]
                 + borders[2]));
         }
-        if look.control == super::control::Control::Menu {
+        if look.control == super::paint::control::Control::Menu {
             padding[1] += 16.;
             padding[3] += 4.;
             if style.get(Prop::WIDTH).is_none_or(|value| value == "auto") {
@@ -3919,7 +3924,7 @@ fn create(
     }
     let border_image = hit
         .is_none()
-        .then(|| super::background::border_image(style, units, id, 0, borders, view))
+        .then(|| super::paint::background::border_image(style, units, id, 0, borders, view))
         .flatten();
     if border_image.is_some() {
         border_colors = [renderer::Color::TRANSPARENT; 4];
@@ -4029,7 +4034,7 @@ fn create(
                 el = el.min_w(px(min));
             }
         } else if percent {
-            el = el.child(super::input::natural_width(px(width)));
+            el = el.child(super::paint::field::natural_width(px(width)));
         }
         if auto[1] && (node.tag != "textarea" || style.get(Prop::FIELD_SIZING) != Some("content")) {
             el = el.min_h(px(height + chrome[1]));
@@ -4765,7 +4770,7 @@ fn create(
         let field = editable && node.tag == "input";
         let swatch = native
             .as_ref()
-            .is_some_and(|look| look.control == super::control::Control::Color);
+            .is_some_and(|look| look.control == super::paint::control::Control::Color);
         let parent_style = &styles.values[parent];
         let parent = below(parent_style, line);
         let edge = el.style().align_self.is_none()
@@ -4811,7 +4816,7 @@ fn create(
         } else if native.as_ref().is_some_and(|look| {
             // Like Chrome, a range sits on the bottom of its border box, a progress bar without its native look
             // on the bottom of its margin box.
-            !look.plain || look.control == super::control::Control::Range
+            !look.plain || look.control == super::paint::control::Control::Range
         }) {
             0.
         } else {
@@ -5290,22 +5295,22 @@ fn create(
     }
     let resizer = (node.tag == "textarea"
         && style.get(Prop::RESIZE).is_none_or(|value| value != "none"))
-    .then_some(super::control::Look {
-        control: super::control::Control::Resizer,
+    .then_some(super::paint::control::Look {
+        control: super::paint::control::Control::Resizer,
         ..Default::default()
     });
     if let Some(look) = native
         .filter(|look| {
             !matches!(
                 look.control,
-                super::control::Control::Button | super::control::Control::Field
+                super::paint::control::Control::Button | super::paint::control::Control::Field
             )
         })
         .or(resizer)
     {
         el = el.child(if look.plain {
             let parts = styles.scrollbars.get(&id);
-            let range = look.control == super::control::Control::Range;
+            let range = look.control == super::paint::control::Control::Range;
             let ink = css::value::color::rgba(
                 style
                     .get(Prop::COLOR)
@@ -5422,7 +5427,7 @@ fn create(
             .size_full()
             .into()
         } else {
-            super::control::layer(id, look, view.clone())
+            super::paint::control::layer(id, look, view.clone())
         });
     }
     let overscroll = overscroll(style);
@@ -5587,8 +5592,8 @@ fn create(
             let space = text
                 .advance(face, px(size), ' ')
                 .map_or(size / 4., f32::from);
-            let look = super::control::Look {
-                control: super::control::Control::Disclosure,
+            let look = super::paint::control::Look {
+                control: super::paint::control::Control::Disclosure,
                 checked: kind == "disclosure-open",
                 ink: marker_style
                     .unwrap_or(style)
@@ -5602,7 +5607,7 @@ fn create(
                 .left_0()
                 .top(px((leading + ascent - side) / pixel_ratio))
                 .size(px(side / pixel_ratio))
-                .child(super::control::layer(id, look, view.clone()));
+                .child(super::paint::control::layer(id, look, view.clone()));
             let above = (leading + ascent) / pixel_ratio;
             let marker = renderer::node()
                 .flex_shrink_0()
@@ -6017,7 +6022,7 @@ fn create(
                     .and_then(css::value::color::paint)
                     .unwrap_or(ink)
             });
-            let border_image = super::background::border_image(
+            let border_image = super::paint::background::border_image(
                 pseudo,
                 pseudo_units,
                 id,
@@ -6756,7 +6761,7 @@ fn create(
             let line = styles.lengths[atom.node].font.lh;
             [max, height.max(line), line * 0.8]
         });
-        super::text::AtomSlot {
+        super::paint::text::AtomSlot {
             size,
             align: align_of(child),
             at: std::cell::Cell::new(point(px(0.), px(0.))),
@@ -6766,7 +6771,7 @@ fn create(
     let atom_box = |index: usize,
                     atom: &crate::render::inline::Atom,
                     child: Child,
-                    slots: &Rc<[super::text::AtomSlot]>,
+                    slots: &Rc<[super::paint::text::AtomSlot]>,
                     padding: [f32; 4]| {
         let mut wrapper = renderer::node()
             .absolute()
@@ -6793,7 +6798,7 @@ fn create(
             None => wrapper.max_w(renderer::Length::Calc(1., px(-padding[1] - padding[3]))),
         };
         wrapper = wrapper
-            .hooks(super::text::AtomBox {
+            .hooks(super::paint::text::AtomBox {
                 slots: slots.clone(),
                 index,
                 node: atom.key(),
@@ -6806,7 +6811,7 @@ fn create(
                 renderer::node()
                     .flex_1()
                     .min_w(px(0.))
-                    .hooks(super::text::AtomRest(rest)),
+                    .hooks(super::paint::text::AtomRest(rest)),
             );
         }
         wrapper
@@ -6847,14 +6852,14 @@ fn create(
                     .into(),
             })
             .collect();
-        let atom_slots: Rc<[super::text::AtomSlot]> = data
+        let atom_slots: Rc<[super::paint::text::AtomSlot]> = data
             .atoms
             .iter()
             .zip(&mut atom_elements)
             .map(|(atom, child)| {
                 if marker(atom) {
                     // At the top of its line, as Chrome places the box.
-                    return super::text::AtomSlot {
+                    return super::paint::text::AtomSlot {
                         size: [0.; 3],
                         align: Some(renderer::AlignItems::FlexStart),
                         at: Default::default(),
@@ -7835,7 +7840,7 @@ fn create(
                 culls.set(culls.get() + 1);
                 #[cfg(debug_assertions)]
                 culled_ids.extend(culled.iter().map(|&(child, _)| child));
-                el = el.child(super::spacer::anchor(
+                el = el.child(super::paint::spacer::anchor(
                     culled.clone(),
                     build.ancestors.clone(),
                     zone.clone(),
@@ -8008,7 +8013,7 @@ fn create(
                                 .into(),
                         })
                         .collect();
-                    let atom_slots: Rc<[super::text::AtomSlot]> = data
+                    let atom_slots: Rc<[super::paint::text::AtomSlot]> = data
                         .atoms
                         .iter()
                         .zip(&mut atom_elements)
@@ -8149,7 +8154,7 @@ fn create(
                             place!(open, None);
                         }
                         place!(
-                            super::spacer::spacer(
+                            super::paint::spacer::spacer(
                                 run,
                                 build.ancestors.clone(),
                                 *then,

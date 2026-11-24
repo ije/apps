@@ -54,7 +54,7 @@ pub(crate) struct Controls {
     sink: Option<ControlSink>,
 }
 
-pub(super) fn register(controls: &std::cell::RefCell<Controls>, id: usize) {
+pub(crate) fn register(controls: &std::cell::RefCell<Controls>, id: usize) {
     let mut controls = controls.borrow_mut();
     let controls = &mut *controls;
     if !controls.shown.contains_key(&id) {
@@ -73,7 +73,7 @@ pub(super) fn register(controls: &std::cell::RefCell<Controls>, id: usize) {
     }
 }
 
-pub(super) fn sync(
+pub(crate) fn sync(
     controls: &std::cell::RefCell<Controls>,
     doc: &Document,
     styles: &style::Chunked<std::rc::Rc<css::properties::Style>>,
@@ -89,8 +89,8 @@ pub(super) fn sync(
     }
 }
 
-pub(super) fn paint(
-    view: &super::ViewState,
+pub(crate) fn paint(
+    view: &super::super::ViewState,
     id: usize,
     bounds: Rect<Pixels>,
     style: &css::properties::Style,
@@ -140,7 +140,7 @@ pub(super) fn paint(
     window.native_control(control, sink);
 }
 
-pub(crate) fn events(view: &super::ViewState) -> Vec<(usize, ControlEvent)> {
+pub(crate) fn events(view: &super::super::ViewState) -> Vec<(usize, ControlEvent)> {
     let mut controls = view.controls.borrow_mut();
     let events = std::mem::take(
         &mut *controls

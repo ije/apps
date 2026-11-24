@@ -1,10 +1,19 @@
-use super::background;
+pub(crate) mod background;
+pub(crate) mod control;
+pub(crate) mod field;
+pub(crate) mod mask;
+pub(crate) mod native;
+pub(crate) mod scrollbar;
+pub(crate) mod spacer;
+pub(crate) mod terminal;
+pub(crate) mod text;
+
 use crate::css;
 use crate::css::properties::Prop;
 use renderer::{Child, Hooks, NodeCx, Pixels, Point, Rect, Size, Window, point, px};
-use std::{cell::Cell, collections::HashMap, rc::Rc};
+use std::{cell::Cell, rc::Rc};
 
-pub(super) struct Turned {
+pub(crate) struct Turned {
     clockwise: bool,
     block: f32,
     inline: f32,
@@ -12,7 +21,7 @@ pub(super) struct Turned {
 }
 
 impl Turned {
-    pub(super) fn node(child: Child, clockwise: bool, block: f32, inline: f32) -> renderer::Node {
+    pub(crate) fn node(child: Child, clockwise: bool, block: f32, inline: f32) -> renderer::Node {
         let mut style = renderer::Style {
             position: renderer::Position::Absolute,
             ..Default::default()
@@ -80,11 +89,11 @@ impl Hooks for Turned {
     }
 }
 
-pub(super) struct Transformed {
-    pub(super) style: Rc<css::properties::Style>,
-    pub(super) units: css::value::units::Lengths,
-    pub(super) matrix: Cell<Option<crate::css::value::transform::Matrix>>,
-    pub(super) local: super::effects::transform::Local,
+pub(crate) struct Transformed {
+    pub(crate) style: Rc<css::properties::Style>,
+    pub(crate) units: css::value::units::Lengths,
+    pub(crate) matrix: Cell<Option<crate::css::value::transform::Matrix>>,
+    pub(crate) local: super::effects::transform::Local,
 }
 
 impl Hooks for Transformed {
@@ -141,9 +150,9 @@ impl Hooks for Transformed {
     }
 }
 
-pub(super) struct Effected {
-    pub(super) effect: renderer::PaintEffect,
-    pub(super) backdrop: Option<renderer::Radii<renderer::Length>>,
+pub(crate) struct Effected {
+    pub(crate) effect: renderer::PaintEffect,
+    pub(crate) backdrop: Option<renderer::Radii<renderer::Length>>,
 }
 
 impl Hooks for Effected {
@@ -185,11 +194,11 @@ impl Hooks for Effected {
 }
 
 // The mask layers of a pseudo-element.
-pub(super) struct Masked {
-    pub(super) view: Rc<super::ViewState>,
-    pub(super) key: (usize, u8),
-    pub(super) style: Rc<css::properties::Style>,
-    pub(super) units: css::value::units::Lengths,
+pub(crate) struct Masked {
+    pub(crate) view: Rc<super::ViewState>,
+    pub(crate) key: (usize, u8),
+    pub(crate) style: Rc<css::properties::Style>,
+    pub(crate) units: css::value::units::Lengths,
 }
 
 impl Hooks for Masked {
@@ -226,7 +235,7 @@ impl Hooks for Masked {
         let mask = {
             let mut host = self.view.host.borrow_mut();
             let (_, state, app) = host.page_parts(self.view.id);
-            mask(
+            mask::mask(
                 &self.view,
                 state,
                 &app.assets,
@@ -248,7 +257,7 @@ impl Hooks for Masked {
 
 // The children of a canvas with drawable content. The window doesn't show them, and they take no pointer
 // until the page draws them.
-pub(super) struct Undrawn(pub(super) Rc<super::ViewState>);
+pub(crate) struct Undrawn(pub(crate) Rc<super::ViewState>);
 
 impl Hooks for Undrawn {
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
@@ -265,21 +274,21 @@ impl Hooks for Undrawn {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum Source {
+pub(crate) enum Source {
     Element,
     Presented,
     Drawn,
 }
 
-pub(super) struct Picture {
-    pub(super) id: usize,
-    pub(super) view: Rc<super::ViewState>,
-    pub(super) source: Source,
-    pub(super) fit: renderer::ObjectFit,
-    pub(super) cropped: Option<renderer::Radii<Pixels>>,
+pub(crate) struct Picture {
+    pub(crate) id: usize,
+    pub(crate) view: Rc<super::ViewState>,
+    pub(crate) source: Source,
+    pub(crate) fit: renderer::ObjectFit,
+    pub(crate) cropped: Option<renderer::Radii<Pixels>>,
     /// `object-position` when it isn't centered.
-    pub(super) position: Option<(Rc<str>, css::value::units::Lengths)>,
-    pub(super) pixelated: bool,
+    pub(crate) position: Option<(Rc<str>, css::value::units::Lengths)>,
+    pub(crate) pixelated: bool,
 }
 
 impl Hooks for Picture {
@@ -362,14 +371,14 @@ impl Hooks for Picture {
     }
 }
 
-pub(super) struct Sticky {
-    pub(super) scroll: renderer::ScrollRef,
-    pub(super) border: [f32; 4],
-    pub(super) block: Option<(usize, [f32; 4])>,
+pub(crate) struct Sticky {
+    pub(crate) scroll: renderer::ScrollRef,
+    pub(crate) border: [f32; 4],
+    pub(crate) block: Option<(usize, [f32; 4])>,
 }
 
 // The layout place of an element's border box, which its `::before` and `::after` boxes measure from.
-pub(super) struct ElementOrigin(pub(super) Rc<Cell<Point<Pixels>>>);
+pub(crate) struct ElementOrigin(pub(crate) Rc<Cell<Point<Pixels>>>);
 
 impl Hooks for ElementOrigin {
     fn prepaint(&self, cx: &mut NodeCx<'_>, inner: &mut dyn FnMut(&mut Window)) {
@@ -405,10 +414,10 @@ impl Hooks for ElementOrigin {
 
 /// A block pseudo-element of a spliced inline box, which gives the box a part. The box of an ancestor that a
 /// scroll moves moves the part with the box's other pieces.
-pub(super) struct PseudoPart {
-    pub(super) view: Rc<super::ViewState>,
-    pub(super) node: usize,
-    pub(super) key: usize,
+pub(crate) struct PseudoPart {
+    pub(crate) view: Rc<super::ViewState>,
+    pub(crate) node: usize,
+    pub(crate) key: usize,
 }
 
 impl PseudoPart {
@@ -468,15 +477,15 @@ impl Hooks for PseudoPart {
 // Keeps the box of a `::before` or `::after` for `getComputedStyle()`: its layout place from the border box of
 // its element without the scroll of the element, its size, and its padding plus border. Moves of the element
 // don't change them, so only prepaint writes them.
-pub(super) struct PseudoBox {
-    pub(super) view: Rc<super::ViewState>,
-    pub(super) element: usize,
-    pub(super) origin: Rc<Cell<Point<Pixels>>>,
+pub(crate) struct PseudoBox {
+    pub(crate) view: Rc<super::ViewState>,
+    pub(crate) element: usize,
+    pub(crate) origin: Rc<Cell<Point<Pixels>>>,
     // The move of a `PseudoBlock` around it.
-    pub(super) shift: Option<Rc<Cell<Point<Pixels>>>>,
+    pub(crate) shift: Option<Rc<Cell<Point<Pixels>>>>,
     // The element is a part of the text of its block, so its place is in the layout mirror, not in `origin`.
-    pub(super) mirrored: bool,
-    pub(super) key: usize,
+    pub(crate) mirrored: bool,
+    pub(crate) key: usize,
 }
 
 impl Hooks for PseudoBox {
@@ -535,17 +544,17 @@ impl Hooks for PseudoBox {
 }
 
 // The insets of an out-of-flow box whose containing block is an ancestor of its layout parent.
-pub(super) struct Contained {
+pub(crate) struct Contained {
     // Tells mismatches of this box from those of others.
-    pub(super) key: usize,
-    pub(super) container: usize,
-    pub(super) viewport: [f32; 2],
+    pub(crate) key: usize,
+    pub(crate) container: usize,
+    pub(crate) viewport: [f32; 2],
     // The containing block size that the build used, when it came from another box.
-    pub(super) sized: Option<[f32; 2]>,
-    pub(super) inset: [Option<f32>; 4],
-    pub(super) margin: [f32; 4],
+    pub(crate) sized: Option<[f32; 2]>,
+    pub(crate) inset: [Option<f32>; 4],
+    pub(crate) margin: [f32; 4],
     // The containing block is right-to-left, so `right` wins over `left`.
-    pub(super) rtl: bool,
+    pub(crate) rtl: bool,
 }
 
 impl Contained {
@@ -620,13 +629,13 @@ impl Contained {
 
 // Moves an absolute or fixed `::before` or `::after` into its containing block, when that is not its element, and
 // to its static place in the last line on the axes without insets.
-pub(super) struct PseudoBlock {
-    pub(super) view: Rc<super::ViewState>,
-    pub(super) place: Option<Contained>,
+pub(crate) struct PseudoBlock {
+    pub(crate) view: Rc<super::ViewState>,
+    pub(crate) place: Option<Contained>,
     // The axes without insets, the key of the placeholder in `anchors`, the left, top and right margins, and
     // whether the containing block is right-to-left.
-    pub(super) anchor: Option<([bool; 2], usize, [f32; 3], bool)>,
-    pub(super) offset: Rc<Cell<Point<Pixels>>>,
+    pub(crate) anchor: Option<([bool; 2], usize, [f32; 3], bool)>,
+    pub(crate) offset: Rc<Cell<Point<Pixels>>>,
 }
 
 impl Hooks for PseudoBlock {
@@ -675,46 +684,46 @@ impl Hooks for PseudoBlock {
     }
 }
 
-pub(super) struct DomBox {
-    pub(super) anchor: Option<([bool; 2], bool, [f32; 2])>,
-    pub(super) id: usize,
-    pub(super) plans: u8,
-    pub(super) ids: Rc<super::effects::Ids>,
-    pub(super) view: Rc<super::ViewState>,
-    pub(super) sticky: Option<Box<Sticky>>,
-    pub(super) fixed: bool,
-    pub(super) block: Option<[f32; 4]>,
-    pub(super) container: Option<usize>,
+pub(crate) struct DomBox {
+    pub(crate) anchor: Option<([bool; 2], bool, [f32; 2])>,
+    pub(crate) id: usize,
+    pub(crate) plans: u8,
+    pub(crate) ids: Rc<super::effects::Ids>,
+    pub(crate) view: Rc<super::ViewState>,
+    pub(crate) sticky: Option<Box<Sticky>>,
+    pub(crate) fixed: bool,
+    pub(crate) block: Option<[f32; 4]>,
+    pub(crate) container: Option<usize>,
     // The containing block is right-to-left, so `right` wins over `left`.
-    pub(super) rtl: bool,
-    pub(super) sized: Option<[f32; 2]>,
-    pub(super) inset: [Option<f32>; 4],
-    pub(super) style: Rc<css::properties::Style>,
-    pub(super) effects: Option<f32>,
-    pub(super) composited: bool,
-    pub(super) transformed: bool,
-    pub(super) perspective: Option<Box<((f32, String), usize)>>,
-    pub(super) units: css::value::units::Lengths,
-    pub(super) revision: u64,
-    pub(super) sides: [f32; 2],
-    pub(super) margin: [f32; 4],
-    pub(super) cell: Option<usize>,
-    pub(super) grid: Option<(usize, bool)>,
-    pub(super) parts: Option<Rc<Parts>>,
-    pub(super) shared: Option<[f32; 4]>,
-    pub(super) leading: Option<[f32; 3]>,
-    pub(super) boxless: bool,
-    pub(super) text: Option<([u32; 2], [f32; 2])>,
-    pub(super) placed: Cell<(Rect<Pixels>, Option<crate::css::value::transform::Matrix>)>,
+    pub(crate) rtl: bool,
+    pub(crate) sized: Option<[f32; 2]>,
+    pub(crate) inset: [Option<f32>; 4],
+    pub(crate) style: Rc<css::properties::Style>,
+    pub(crate) effects: Option<f32>,
+    pub(crate) composited: bool,
+    pub(crate) transformed: bool,
+    pub(crate) perspective: Option<Box<((f32, String), usize)>>,
+    pub(crate) units: css::value::units::Lengths,
+    pub(crate) revision: u64,
+    pub(crate) sides: [f32; 2],
+    pub(crate) margin: [f32; 4],
+    pub(crate) cell: Option<usize>,
+    pub(crate) grid: Option<(usize, bool)>,
+    pub(crate) parts: Option<Rc<Parts>>,
+    pub(crate) shared: Option<[f32; 4]>,
+    pub(crate) leading: Option<[f32; 3]>,
+    pub(crate) boxless: bool,
+    pub(crate) text: Option<([u32; 2], [f32; 2])>,
+    pub(crate) placed: Cell<(Rect<Pixels>, Option<crate::css::value::transform::Matrix>)>,
     // The window bounds and cull flags of the last prepaint, which a skip gives to `merge`.
-    pub(super) reached_at: Cell<(Rect<Pixels>, u32)>,
-    pub(super) offset: Cell<Point<Pixels>>,
-    pub(super) frame: bool,
-    pub(super) text_clip: bool,
+    pub(crate) reached_at: Cell<(Rect<Pixels>, u32)>,
+    pub(crate) offset: Cell<Point<Pixels>>,
+    pub(crate) frame: bool,
+    pub(crate) text_clip: bool,
     // A drawable element of a canvas, which paints into a snapshot for `drawElementImage()`.
-    pub(super) drawn: bool,
+    pub(crate) drawn: bool,
     // The transform at the origin for a size, which a moved box places again.
-    pub(super) local: super::effects::transform::Local,
+    pub(crate) local: super::effects::transform::Local,
 }
 
 // With its counts, a box's `Rc` must stay within the small blocks of the runtime's allocator.
@@ -722,7 +731,7 @@ const _: () = assert!(size_of::<DomBox>() + 16 <= 512);
 
 /// Boxes whose bounds join the bounds of others after a prepaint.
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) enum Parts {
+pub(crate) enum Parts {
     /// The rows and row groups of a table, with their cells or rows.
     Rows(Vec<(usize, bool, Vec<usize>)>),
     /// The spliced inline boxes of a block, with their parts, and the left and right sides of its content box,
@@ -735,7 +744,7 @@ pub(super) enum Parts {
 
 /// A part of a spliced inline box.
 #[cfg_attr(debug_assertions, derive(Debug))]
-pub(super) enum Piece {
+pub(crate) enum Piece {
     /// The part in a line of text, by the key of the text.
     Text(usize),
     /// A run of blocks, from the first to the last, and the bottom margin of the last. A block pseudo-element is
@@ -1541,7 +1550,7 @@ impl Hooks for DomBox {
 impl DomBox {
     fn draw(&self, window: &mut Window, inner: &mut dyn FnMut(&mut Window)) {
         let (bounds, matrix) = self.placed.get();
-        super::native::paint(&self.view, self.id, bounds, &self.style, window);
+        self::native::paint(&self.view, self.id, bounds, &self.style, window);
         window.mark(self.view.id << 32 | self.id as u64);
         let inner = &mut |window: &mut Window| match self.text_clip {
             true => window.with_text_clip(|window| inner(window)),
@@ -1608,7 +1617,7 @@ impl DomBox {
             Some(Clip::Shape(shape)) => shapes = Some(shape),
             None => {}
         }
-        let mask = mask(
+        let mask = mask::mask(
             view,
             state,
             &app.assets,
@@ -1719,134 +1728,6 @@ impl DomBox {
     }
 }
 
-/// The mask image of a box or a pseudo-element `key` from its mask layers and its clip path shapes.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn mask(
-    view: &super::ViewState,
-    dom: &mut crate::render::PageState,
-    assets: &HashMap<String, std::path::PathBuf>,
-    key: (usize, u8),
-    style: &css::properties::Style,
-    units: css::value::units::Lengths,
-    shapes: Option<&str>,
-    bounds: Rect<Pixels>,
-    window: &mut Window,
-) -> Option<(std::sync::Arc<renderer::RenderImage>, Rect<Pixels>)> {
-    let size = [f32::from(bounds.size.width), f32::from(bounds.size.height)];
-    let base = dom.base.clone();
-    let images = [Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]
-        .into_iter()
-        .find_map(|prop| style.get(prop))
-        .filter(|value| !value.is_empty() && *value != "none");
-    (shapes.is_some() || images.is_some()).then(|| {
-        let mut inputs = String::new();
-        for part in [
-            Prop::MASK_IMAGE,
-            Prop::WEBKIT_MASK_IMAGE,
-            Prop::MASK_SIZE,
-            Prop::WEBKIT_MASK_SIZE,
-            Prop::MASK_POSITION,
-            Prop::WEBKIT_MASK_POSITION,
-            Prop::MASK_REPEAT,
-            Prop::WEBKIT_MASK_REPEAT,
-            Prop::MASK_COMPOSITE,
-        ]
-        .map(|prop| style.get(prop).unwrap_or(""))
-        .into_iter()
-        .chain(shapes)
-        {
-            inputs.push_str(part);
-            inputs.push('\0');
-        }
-        super::effects::gradient::push_bits(&mut inputs, size, &units);
-        let [width, height] = size;
-        let scale = window.scale_factor();
-        let raster = [width, height].map(|extent| (extent * scale).ceil().clamp(1., 4096.) as u32);
-        let masks = &mut dom.rasters.masks;
-        if masks.get(&key).is_none_or(|(old, image)| {
-            *old != inputs
-                || image.as_ref().is_some_and(|image| {
-                    (image.size().width as u32) != raster[0]
-                        || (image.size().height as u32) != raster[1]
-                })
-        }) {
-            let image = if shapes.is_none()
-                && let Some(bytes) = super::effects::gradient::axis_mask(style, &units, size, raster)
-            {
-                bytes.map(|bytes| {
-                    std::sync::Arc::new(renderer::RenderImage::new(raster[0], raster[1], bytes))
-                })
-            } else {
-                let mut files = Vec::new();
-                let layers = mask_svg(style, units, size, base.as_ref(), assets, &mut files);
-                // Hold the decoded files: `retire` drops the bitmaps that nothing holds.
-                let mut sources = view.mask_sources.borrow_mut();
-                let held = sources.entry(key).or_default();
-                held.retain(|(file, _)| files.iter().any(|path| path.to_string_lossy() == *file));
-                let mut kinds = Vec::with_capacity(files.len());
-                let mut decoded = Vec::new();
-                for path in &files {
-                    let file = path.to_string_lossy();
-                    let source = match held.iter().position(|(held, _)| *held == file) {
-                        Some(index) => Some(&held[index].1),
-                        None => background::load(view, &mut dom.rasters.bitmaps, key.0, &file, path, window)
-                            .map(|source| &held.push_mut((file.into_owned(), source)).1),
-                    };
-                    // A file that still decodes is a transparent layer until the window redraws.
-                    kinds.push(source.map(|(bitmap, tree)| match tree {
-                        Some((tree, _)) => usvg::ImageKind::SVG(tree.clone()),
-                        None => {
-                            let stub = super::raster::resvg::stub(bitmap);
-                            decoded.push((stub.clone(), bitmap.clone()));
-                            usvg::ImageKind::PNG(stub)
-                        }
-                    }));
-                }
-                if kinds.iter().any(Option::is_none) {
-                    inputs.push_str("\0decoding");
-                }
-                let source = match (shapes, layers) {
-                    (Some(shape), Some(layers)) => format!(
-                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\"><defs><clipPath id=\"apps-clip\">{shape}</clipPath></defs><g clip-path=\"url(#apps-clip)\">{layers}</g></svg>"
-                    ),
-                    (Some(shape), None) => format!(
-                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{shape}</svg>"
-                    ),
-                    (None, Some(layers)) => format!(
-                        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">{layers}</svg>"
-                    ),
-                    (None, None) => return None,
-                };
-                let mut options = super::raster::svg::svg_options(false, false);
-                options.image_href_resolver.resolve_string = Box::new(move |href, _| {
-                    kinds.get(href.strip_prefix("apps-mask:")?.parse::<usize>().ok()?)?.clone()
-                });
-                match usvg::Tree::from_str(&source, &options)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|tree| {
-                        super::raster::resvg::decoded(decoded, || {
-                            super::raster::svg::render_svg(&tree, raster[0], raster[1], None)
-                        })
-                    }) {
-                    Ok(image) => Some(image),
-                    // Keep the failure too, or every paint builds and reports the same mask again.
-                    Err(error) => {
-                        eprintln!("apps: mask: {error}");
-                        None
-                    }
-                }
-            };
-            if let Some((_, Some(old))) = masks.insert(key, (inputs, image)) {
-                window.release_image(old);
-            }
-        }
-        masks
-            .get(&key)
-            .and_then(|(_, image)| image.clone().map(|image| (image, bounds)))
-    })
-    .flatten()
-}
-
 fn nest_effects(
     layers: &mut Vec<renderer::PaintEffect>,
     window: &mut Window,
@@ -1856,147 +1737,4 @@ fn nest_effects(
         Some(effect) => window.with_effect(effect, |window| nest_effects(layers, window, paint)),
         None => paint(window),
     }
-}
-
-pub(super) fn mask_svg<'a>(
-    style: &'a css::properties::Style,
-    units: css::value::units::Lengths,
-    [width, height]: [f32; 2],
-    base: Option<&url::Url>,
-    assets: &HashMap<String, std::path::PathBuf>,
-    // The files of the `url()` layers, which the SVG names as `apps-mask:<index>`.
-    files: &mut Vec<std::path::PathBuf>,
-) -> Option<String> {
-    let get =
-        |[prop, webkit]: [Prop; 2]| style.get(prop).or_else(|| style.get(webkit)).unwrap_or("");
-    let images = get([Prop::MASK_IMAGE, Prop::WEBKIT_MASK_IMAGE]);
-    if images.is_empty() || images == "none" {
-        return None;
-    }
-    let list = |props| css::value::tokens::components(get(props), ',');
-    let (sizes, positions, repeats) = (
-        list([Prop::MASK_SIZE, Prop::WEBKIT_MASK_SIZE]),
-        list([Prop::MASK_POSITION, Prop::WEBKIT_MASK_POSITION]),
-        list([Prop::MASK_REPEAT, Prop::WEBKIT_MASK_REPEAT]),
-    );
-    let pick = |values: &[&'a str], index: usize| {
-        values
-            .get(index % values.len().max(1))
-            .copied()
-            .unwrap_or("")
-    };
-    let composites =
-        css::value::tokens::components(style.get(Prop::MASK_COMPOSITE).unwrap_or(""), ',');
-    // Layers go from the bottom up, and each one joins the layers below it by its `mask-composite`.
-    let (mut defs, mut below) = (String::new(), None::<String>);
-    let area = format!(
-        "maskUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"{width}\" height=\"{height}\""
-    );
-    for (index, image) in css::value::tokens::components(images, ',')
-        .into_iter()
-        .enumerate()
-        .rev()
-    {
-        let image = image.trim();
-        let [size, position, repeat] = [
-            (pick(&sizes, index), "auto"),
-            (pick(&positions, index), "0% 0%"),
-            (pick(&repeats, index), "repeat"),
-        ]
-        .map(|(value, initial)| if value.is_empty() { initial } else { value });
-        let layer = if let Some(source) =
-            image.strip_prefix("url(").and_then(|v| v.strip_suffix(')'))
-        {
-            let Some(path) = super::raster::image::url_file(source, base, assets) else {
-                continue;
-            };
-            let aspect = match size {
-                "cover" => "xMidYMid slice",
-                "contain" => "xMidYMid meet",
-                _ => "none",
-            };
-            let ([[tw, th], at], steps) = super::effects::gradient::tile_repeat(
-                size, position, repeat, &units, width, height, None,
-            );
-            files.push(path);
-            super::effects::gradient::tiled(
-                steps,
-                [tw, th],
-                at,
-                [width, height],
-                &format!(
-                    "<image href=\"apps-mask:{}\" width=\"{tw}\" height=\"{th}\" preserveAspectRatio=\"{aspect}\"/>",
-                    files.len() - 1
-                ),
-            )
-        } else {
-            let Some((kind, body)) = image
-                .split_once('(')
-                .filter(|(kind, _)| kind.ends_with("-gradient"))
-                .and_then(|(kind, body)| Some((kind, body.strip_suffix(')')?)))
-            else {
-                continue;
-            };
-            let Some((svg, _)) = super::effects::gradient::gradient_svg(
-                kind,
-                body,
-                size,
-                position,
-                repeat,
-                units,
-                width,
-                height,
-                [0., 0., width, height],
-            ) else {
-                continue;
-            };
-            let (Some(start), Some(end)) = (svg.find('>'), svg.rfind("</svg>")) else {
-                continue;
-            };
-            svg[start + 1..end].to_owned()
-        };
-        // Each layer is its own SVG document, so its `id`s must not collide.
-        let layer = layer
-            .replace("id=\"", &format!("id=\"m{index}"))
-            .replace("url(#", &format!("url(#m{index}"));
-        let Some(under) = below.take() else {
-            below = Some(layer);
-            continue;
-        };
-        // `source-*` and `xor` are the `-webkit-mask-composite` names.
-        let joined = match pick(&composites, index).trim() {
-            "intersect" | "source-in" => {
-                defs.push_str(&format!(
-                    "<mask id=\"apps-in{index}\" mask-type=\"alpha\" {area}>{under}</mask>"
-                ));
-                format!("<g mask=\"url(#apps-in{index})\">{layer}</g>")
-            }
-            op @ ("subtract" | "source-out" | "exclude" | "xor") => {
-                // An inverted alpha mask: white, with the shape drawn black over it.
-                let out = |id: &str, shape: &str| {
-                    format!(
-                        "<mask id=\"{id}\" {area}><rect width=\"{width}\" height=\"{height}\" fill=\"#fff\"/><g filter=\"url(#apps-black)\">{shape}</g></mask>"
-                    )
-                };
-                defs.push_str(&out(&format!("apps-out{index}"), &under));
-                let mut joined = format!("<g mask=\"url(#apps-out{index})\">{layer}</g>");
-                if matches!(op, "exclude" | "xor") {
-                    defs.push_str(&out(&format!("apps-back{index}"), &layer));
-                    joined.push_str(&format!("<g mask=\"url(#apps-back{index})\">{under}</g>"));
-                }
-                joined
-            }
-            _ => under + &layer,
-        };
-        below = Some(joined);
-    }
-    let content = below?;
-    if defs.contains("apps-black") {
-        defs.push_str(&format!("<filter id=\"apps-black\" filterUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"{width}\" height=\"{height}\"><feColorMatrix values=\"0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0\"/></filter>"));
-    }
-    Some(if defs.is_empty() {
-        content
-    } else {
-        format!("<defs>{defs}</defs>{content}")
-    })
 }

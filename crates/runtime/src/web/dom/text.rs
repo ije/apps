@@ -714,13 +714,13 @@ pub(super) fn text_rect(
                 renderer::px(args[1].as_f64().unwrap_or(0.) as f32 - dx),
                 renderer::px(args[2].as_f64().unwrap_or(0.) as f32 - dy),
             );
-            let index = crate::render::text::text_index(layout, text, rows, position, true)
+            let index = crate::render::paint::text::text_index(layout, text, rows, position, true)
                 .unwrap_or_else(|index| index)
                 .clamp(range.start, range.end);
             let offset = crate::dom::text::source_offset(source, content, index - range.start);
             return Ok(json!(real(offset)));
         }
-        let mut rects = crate::render::text::text_rects(
+        let mut rects = crate::render::paint::text::text_rects(
             layout,
             text,
             rows,

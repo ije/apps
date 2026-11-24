@@ -821,7 +821,7 @@ impl Desktop {
                     }
                     // Process native control events before the next frame acknowledges them, or stale page
                     // values can undo edits.
-                    let controls = crate::render::native::events(&data);
+                    let controls = crate::render::paint::native::events(&data);
                     for (node, event) in &controls {
                         let value = serde_json::to_string(&event.value).unwrap_or_default();
                         if let Some(renderer) = &view.renderer

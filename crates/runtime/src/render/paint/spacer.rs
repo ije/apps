@@ -1,16 +1,16 @@
 // Boxes that stand in for content that a frame doesn't build: spacers for runs of culled boxes, anchors of culled
 // absolute boxes, and the watcher of `content-visibility: auto` boxes.
-use super::layout::cull::{Run, SKIPS, Zone, shift};
+use super::super::layout::cull::{Run, SKIPS, Zone, shift};
 use crate::css::properties::Prop;
 use renderer::{Child, px};
 use std::{cell::Cell, rc::Rc};
 
-pub(super) fn spacer(
+pub(crate) fn spacer(
     run: Run,
     path: Rc<[usize]>,
     [left, width]: [f32; 2],
     zone: Rc<Zone>,
-    view: Rc<super::ViewState>,
+    view: Rc<super::super::ViewState>,
 ) -> Child {
     let Run {
         members,
@@ -91,11 +91,11 @@ pub(super) fn spacer(
     spacer.into()
 }
 
-pub(super) fn anchor(
+pub(crate) fn anchor(
     items: Vec<(usize, [f32; 4])>,
     path: Rc<[usize]>,
     zone: Rc<Zone>,
-    view: Rc<super::ViewState>,
+    view: Rc<super::super::ViewState>,
 ) -> Child {
     let first = Cell::new(None);
     renderer::canvas_watching(
@@ -145,7 +145,7 @@ pub(super) fn anchor(
 
 // After prepaint, shows the contents of each `content-visibility: auto` box near the view or with the focus,
 // and skips the contents of the others.
-pub(super) fn autos(view: Rc<super::ViewState>) -> Child {
+pub(crate) fn autos(view: Rc<super::super::ViewState>) -> Child {
     renderer::canvas_watching(
         move |_, window| {
             let view = &*view;
@@ -305,8 +305,8 @@ pub(super) fn autos(view: Rc<super::ViewState>) -> Child {
 }
 
 // Builds the boxes on the path again, and the visibility of all nodes, when a box starts or stops to skip its contents.
-pub(super) fn reskip(
-    view: &super::ViewState,
+pub(crate) fn reskip(
+    view: &super::super::ViewState,
     dom: &mut crate::render::PageState,
     nodes: &rustc_hash::FxHashSet<usize>,
 ) {
@@ -321,7 +321,12 @@ pub(super) fn reskip(
     }
 }
 
-fn wake(view: &super::ViewState, path: &[usize], shown: bool, window: &mut renderer::Window) {
+fn wake(
+    view: &super::super::ViewState,
+    path: &[usize],
+    shown: bool,
+    window: &mut renderer::Window,
+) {
     let mut kept = view.kept.borrow_mut();
     for id in path {
         kept.remove(id);

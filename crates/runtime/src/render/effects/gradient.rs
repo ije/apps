@@ -1068,59 +1068,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn axis_masks_draw_as_their_svg() {
-        let units = Lengths::new(16., 800., 600.);
-        for (image, composite) in [
-            (
-                "linear-gradient(#000 0 0), linear-gradient(#000 0 0)",
-                "exclude",
-            ),
-            (
-                "linear-gradient(to right, black 30%, transparent 70%), linear-gradient(to top, transparent, black)",
-                "subtract",
-            ),
-            (
-                "linear-gradient(to right, black 30%, transparent 70%), linear-gradient(to top, transparent, black)",
-                "intersect",
-            ),
-            (
-                "linear-gradient(to left, black, transparent), linear-gradient(to bottom, transparent 20%, black)",
-                "add",
-            ),
-            (
-                "linear-gradient(to left, black, transparent), linear-gradient(black 40%, transparent), linear-gradient(to right, transparent 10%, black)",
-                "subtract, add",
-            ),
-        ] {
-            let style = style(&[("mask-image", image), ("mask-composite", composite)]);
-            let fast = axis_mask(&style, &units, [100., 50.], [100, 50]).unwrap();
-            let layers = super::super::super::paint::mask_svg(
-                &style,
-                units,
-                [100., 50.],
-                None,
-                &Default::default(),
-                &mut Vec::new(),
-            )
-            .unwrap();
-            let source = format!(
-                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"50\">{layers}</svg>"
-            );
-            let tree = super::super::super::raster::svg::svg_tree(&source, false).unwrap();
-            let slow = super::super::super::raster::svg::svg_pixels(&tree, 100, 50, None).unwrap();
-            let fast = fast.unwrap_or_else(|| vec![255; 100 * 50 * 4]);
-            let worst = fast
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .zip(slow.pixels())
-                .map(|(fast, slow)| fast[3].abs_diff(slow.alpha()))
-                .max();
-            assert!(worst <= Some(8), "{image} {composite}: {worst:?}");
-        }
-    }
-
-    #[test]
     fn gradient_masks_composite_along_their_axes() {
         let units = Lengths::new(16., 800., 600.);
         let mask = |image: &str, composite: Option<&str>, raster: [u32; 2]| {

@@ -1,6 +1,6 @@
 //! Draws the grid of a `<terminal>` element.
 
-use super::ViewState;
+use super::super::ViewState;
 use crate::css;
 use crate::css::properties::Prop;
 use crate::style;
@@ -53,7 +53,7 @@ const PALETTE: [Prop; 16] = [
     Prop::TERMINAL_BRIGHT_WHITE,
 ];
 
-pub(super) fn look(
+pub(crate) fn look(
     style: &css::properties::Style,
     selection: Option<&Rc<css::properties::Style>>,
     units: &css::value::units::Lengths,
@@ -266,17 +266,17 @@ fn row(
     row
 }
 
-pub(super) struct Grid {
-    pub(super) id: usize,
-    pub(super) view: Rc<ViewState>,
-    pub(super) terminals: Rc<RefCell<Terminals>>,
-    pub(super) look: Rc<Look>,
+pub(crate) struct Grid {
+    pub(crate) id: usize,
+    pub(crate) view: Rc<ViewState>,
+    pub(crate) terminals: Rc<RefCell<Terminals>>,
+    pub(crate) look: Rc<Look>,
     /// The padding and the border of the element, from the top clockwise. The bar is at the edge of the padding.
-    pub(super) edges: [f32; 4],
+    pub(crate) edges: [f32; 4],
 }
 
 impl Look {
-    pub(super) fn background(&self) -> u32 {
+    pub(crate) fn background(&self) -> u32 {
         self.colors[1] & 0xffffff
     }
 }

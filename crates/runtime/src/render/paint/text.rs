@@ -1,4 +1,4 @@
-use super::ViewState;
+use super::super::ViewState;
 use crate::css;
 use crate::css::properties::Prop;
 use crate::style;
@@ -10,9 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(super) type Blink = ([usize; 3], Instant, Option<(u32, renderer::Timer)>);
+pub(crate) type Blink = ([usize; 3], Instant, Option<(u32, renderer::Timer)>);
 
-pub(super) fn paint_caret(
+pub(crate) fn paint_caret(
     view: &ViewState,
     key: [usize; 3],
     bounds: Rect<Pixels>,
@@ -45,12 +45,12 @@ pub(super) fn paint_caret(
     }
 }
 
-pub(super) struct TextHighlight {
-    pub(super) range: Range<usize>,
-    pub(super) color: Option<renderer::Color>,
-    pub(super) background: renderer::Color,
+pub(crate) struct TextHighlight {
+    pub(crate) range: Range<usize>,
+    pub(crate) color: Option<renderer::Color>,
+    pub(crate) background: renderer::Color,
     /// Like Chrome, a `::selection` style draws the text without its stroke.
-    pub(super) stroke: bool,
+    pub(crate) stroke: bool,
 }
 
 // A background or border of an inline box in a group of the text: the group, rect, corners, fill and border.
@@ -63,7 +63,7 @@ type Grouped = (
 );
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn paint_text(
+pub(crate) fn paint_text(
     text_line: &renderer::TextLine,
     origin: Point<Pixels>,
     line_height: Pixels,
@@ -326,7 +326,7 @@ pub(super) fn paint_text(
     }
 }
 
-pub(super) fn spaces(text: &str) -> f32 {
+pub(crate) fn spaces(text: &str) -> f32 {
     text.bytes().filter(|byte| *byte == b' ').count() as f32
 }
 
@@ -541,21 +541,21 @@ fn first_line(
     )
 }
 
-pub(super) struct InlineText {
-    pub(super) data: Rc<crate::render::inline::InlineText>,
+pub(crate) struct InlineText {
+    pub(crate) data: Rc<crate::render::inline::InlineText>,
     /// Rows can grow around runs or fallback glyphs, see `crate::render::inline::InlineText::mixed`.
-    pub(super) mixed: bool,
-    pub(super) view: Rc<super::ViewState>,
-    pub(super) atoms: Rc<[AtomSlot]>,
-    pub(super) justify: Option<bool>,
+    pub(crate) mixed: bool,
+    pub(crate) view: Rc<super::super::ViewState>,
+    pub(crate) atoms: Rc<[AtomSlot]>,
+    pub(crate) justify: Option<bool>,
     /// Right-to-left text: indents and rows that overflow start at the right.
-    pub(super) rtl: bool,
-    pub(super) shaped: std::cell::RefCell<Option<(renderer::Paragraph, Vec<renderer::TextRun>)>>,
-    pub(super) prepainted: std::cell::RefCell<Prepainted>,
+    pub(crate) rtl: bool,
+    pub(crate) shaped: std::cell::RefCell<Option<(renderer::Paragraph, Vec<renderer::TextRun>)>>,
+    pub(crate) prepainted: std::cell::RefCell<Prepainted>,
 }
 
 #[derive(Default)]
-pub(super) struct Prepainted {
+pub(crate) struct Prepainted {
     hitboxes: Vec<(renderer::Region, renderer::Cursor)>,
     rows: crate::render::layout::Rows,
     layouts: Vec<(usize, crate::render::layout::TextLayout)>,
@@ -567,24 +567,24 @@ pub(super) struct Prepainted {
     split: bool,
 }
 
-pub(super) struct AtomSlot {
-    pub(super) size: [f32; 3],
-    pub(super) align: Option<AlignItems>,
-    pub(super) at: std::cell::Cell<Point<Pixels>>,
+pub(crate) struct AtomSlot {
+    pub(crate) size: [f32; 3],
+    pub(crate) align: Option<AlignItems>,
+    pub(crate) at: std::cell::Cell<Point<Pixels>>,
 }
 
-pub(super) struct AtomBox {
-    pub(super) slots: Rc<[AtomSlot]>,
-    pub(super) index: usize,
-    pub(super) node: usize,
-    pub(super) view: Rc<super::ViewState>,
+pub(crate) struct AtomBox {
+    pub(crate) slots: Rc<[AtomSlot]>,
+    pub(crate) index: usize,
+    pub(crate) node: usize,
+    pub(crate) view: Rc<super::super::ViewState>,
     // The width that the atom leaves free in a box as wide as the block, see `AtomRest`.
-    pub(super) rest: Option<Rc<std::cell::Cell<Pixels>>>,
+    pub(crate) rest: Option<Rc<std::cell::Cell<Pixels>>>,
 }
 
 // Fills the box of an atom with percent sizes. That box is as wide as the block, so the percentages
 // resolve against the block, and the atom is as wide as the box without this filler.
-pub(super) struct AtomRest(pub(super) Rc<std::cell::Cell<Pixels>>);
+pub(crate) struct AtomRest(pub(crate) Rc<std::cell::Cell<Pixels>>);
 
 impl renderer::Hooks for AtomRest {
     fn cached(&self) -> bool {
@@ -784,7 +784,7 @@ impl From<InlineText> for renderer::Node {
                     }
                     let strut = (system.face(&style.font()), font_size, line_height);
                     let scale = window.scale_factor();
-                    let extents = super::layout::line::row_extents(
+                    let extents = super::super::layout::line::row_extents(
                         lines.iter(),
                         &runs,
                         &data.line_heights,
@@ -994,7 +994,7 @@ impl renderer::Hooks for InlineText {
             .unwrap_or(bounds.size.width);
         let indent = style.text_indent + px(style.text_indent_percent * f32::from(base));
         let strut = window.text_system().face(&style.font());
-        let extents = super::layout::line::row_extents(
+        let extents = super::super::layout::line::row_extents(
             layout.lines().iter(),
             runs,
             &self.data.line_heights,
@@ -1210,7 +1210,7 @@ impl renderer::Hooks for InlineText {
                 // A positioned inline box contains the out-of-flow boxes in it: the padding box from the start of its
                 // first part to the end of its last, as in Chrome.
                 if let Some(styles) = computed.as_deref()
-                    && super::effects::establishes(&styles.values[*id]).absolute
+                    && super::super::effects::establishes(&styles.values[*id]).absolute
                 {
                     let borders = boxed.map_or([0.; 4], |inline| inline.borders);
                     let start = point(a.x + px(borders[3]), a.y + top + px(borders[0]));
@@ -1744,7 +1744,7 @@ impl renderer::Hooks for InlineText {
                                 renderer::Border {
                                     widths: renderer::Edges::all(px(line)),
                                     color,
-                                    style: super::effects::border_style(kind),
+                                    style: super::super::effects::border_style(kind),
                                     sides: 0,
                                 },
                             ));

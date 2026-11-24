@@ -100,7 +100,7 @@ pub(crate) struct Look {
     thin: bool,
     colors: Option<[Color; 2]>,
     custom: Option<([f32; 2], [Option<Part>; 5])>,
-    pub(super) forced: [bool; 2],
+    pub(crate) forced: [bool; 2],
 }
 
 impl Look {
@@ -218,7 +218,7 @@ impl Pointer {
 }
 
 #[derive(Default)]
-pub(super) struct State {
+pub(crate) struct State {
     offset: Option<Point<Pixels>>,
     active: Option<Instant>,
     pointer: Pointer,
@@ -227,16 +227,16 @@ pub(super) struct State {
 
 impl State {
     /// Shows the bars of a quiet `Scrollbar`.
-    pub(super) fn show(&mut self) {
+    pub(crate) fn show(&mut self) {
         self.active = Some(Instant::now());
     }
 
-    pub(super) fn visible(&self) -> bool {
+    pub(crate) fn visible(&self) -> bool {
         self.pointer != Pointer::Away || self.active.is_some_and(|at| at.elapsed() < HOLD + FADE)
     }
 }
 
-pub(super) struct Bar {
+pub(crate) struct Bar {
     hitbox: Region,
     zone: Rect<Pixels>,
     track: [f32; 2],
@@ -250,16 +250,16 @@ fn along(position: Point<Pixels>, axis: usize) -> f32 {
     f32::from(if axis == 0 { position.x } else { position.y })
 }
 
-pub(super) struct Scrollbar {
-    pub(super) id: usize,
-    pub(super) handle: ScrollRef,
-    pub(super) look: Option<Look>,
-    pub(super) axes: [bool; 2],
-    pub(super) reserved: [f32; 2],
-    pub(super) borders: [f32; 4],
-    pub(super) origin: [f32; 2],
+pub(crate) struct Scrollbar {
+    pub(crate) id: usize,
+    pub(crate) handle: ScrollRef,
+    pub(crate) look: Option<Look>,
+    pub(crate) axes: [bool; 2],
+    pub(crate) reserved: [f32; 2],
+    pub(crate) borders: [f32; 4],
+    pub(crate) origin: [f32; 2],
     /// A new offset does not show the bars. A terminal scrolls with its output, and shows them itself.
-    pub(super) quiet: bool,
+    pub(crate) quiet: bool,
 }
 
 type Prepainted = Option<(Rc<RefCell<State>>, Rc<[Option<Bar>; 2]>)>;

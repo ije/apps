@@ -1,24 +1,17 @@
-mod background;
-mod control;
 pub(crate) mod effects;
 mod element;
 pub mod fonts;
 pub(crate) mod hit;
 mod hud;
 pub(crate) mod inline;
-mod input;
 pub(crate) mod inspect;
 pub mod layout;
 pub mod media;
-pub(crate) mod native;
 mod page;
-mod paint;
+pub(crate) mod paint;
 mod plan;
 pub mod raster;
-pub(crate) mod scrollbar;
-mod spacer;
-pub(crate) mod terminal;
-pub(crate) mod text;
+mod view;
 
 use crate::css;
 use crate::css::properties::Prop;
@@ -28,6 +21,7 @@ pub(crate) use hud::Hud;
 pub(crate) use inspect::Inspect;
 use layout::cull;
 pub use page::PageState;
+use paint::{background, field, native, scrollbar, spacer, terminal, text};
 use renderer::{App, Color, Event, Window, WindowId};
 use std::{
     cell::{Cell, RefCell},
@@ -68,7 +62,7 @@ pub(crate) struct ViewState {
     controls: RefCell<native::Controls>,
     ids: RefCell<(u64, Rc<effects::Ids>)>,
     svgs: RefCell<HashMap<usize, element::Svg>>,
-    fields: RefCell<HashMap<usize, input::Caret>>,
+    fields: RefCell<HashMap<usize, field::Caret>>,
     decoding: RefCell<HashMap<String, (usize, background::Decoding)>>,
     // The decoded files of each mask, so a new mask size doesn't decode them again.
     mask_sources: RefCell<rustc_hash::FxHashMap<(usize, u8), MaskSources>>,

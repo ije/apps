@@ -318,7 +318,7 @@ pub(crate) fn hit_test(
                 let lines = (state.layout.text_layouts.get(&id))
                     .filter(|_| key[0] == 0.)
                     .map(|(layout, text, range, rows, font)| {
-                        crate::render::text::text_rects(
+                        crate::render::paint::text::text_rects(
                             layout,
                             text,
                             rows,

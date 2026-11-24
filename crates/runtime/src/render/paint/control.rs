@@ -4,7 +4,7 @@ use renderer::Child;
 use std::{fmt::Write, rc::Rc};
 
 #[derive(Clone, Copy, PartialEq, Default)]
-pub(super) enum Control {
+pub(crate) enum Control {
     Button,
     #[default]
     Field,
@@ -21,7 +21,7 @@ pub(super) enum Control {
 
 /// The control, whether it draws its native box, and whether it has `appearance: none` and draws its parts
 /// from pseudo-element styles, as ranges and progress bars do.
-pub(super) fn kind(
+pub(crate) fn kind(
     tag: &str,
     input: Option<&str>,
     list: bool,
@@ -96,7 +96,7 @@ pub(super) fn kind(
 }
 
 #[derive(Default)]
-pub(super) struct Look {
+pub(crate) struct Look {
     pub control: Control,
     pub boxed: bool,
     pub plain: bool,
@@ -110,7 +110,7 @@ pub(super) struct Look {
     pub value: f32,
 }
 
-pub(super) fn layer(id: usize, look: Look, view: Rc<super::ViewState>) -> Child {
+pub(crate) fn layer(id: usize, look: Look, view: Rc<super::super::ViewState>) -> Child {
     let drawn = std::cell::Cell::new([0u32; 3]);
     renderer::canvas(
         |_, _| (),
@@ -128,14 +128,14 @@ pub(super) fn layer(id: usize, look: Look, view: Rc<super::ViewState>) -> Child 
                 let Some(source) = svg(&look, width, height) else {
                     return;
                 };
-                let limit = super::raster::RASTER_MAX as f32;
+                let limit = super::super::raster::RASTER_MAX as f32;
                 let [rw, rh] =
                     [width, height].map(|side| (side * scale).ceil().clamp(1., limit) as u32);
                 if backgrounds.get(&key).is_none_or(|(old, image)| {
                     old != &source
                         || [image.size().width, image.size().height].map(|side| side as u32)
                             != [rw, rh]
-                }) && let Ok(image) = super::raster::svg::svg(&source, rw, rh)
+                }) && let Ok(image) = super::super::raster::svg::svg(&source, rw, rh)
                     && let Some((_, old)) = backgrounds.insert(key, (source, image))
                     && std::sync::Arc::strong_count(&old) == 1
                 {
@@ -399,7 +399,7 @@ fn svg(look: &Look, w: f32, h: f32) -> Option<String> {
 
 /// Like Chrome, a checked box, a range or a progress bar flips its color scheme when its `accent-color` is hard
 /// to see on it.
-pub(super) fn accent_dark(control: Control, checked: bool, accent: u32, dark: bool) -> bool {
+pub(crate) fn accent_dark(control: Control, checked: bool, accent: u32, dark: bool) -> bool {
     let light = match control {
         Control::Range | Control::Progress => 0xefefef,
         Control::Check | Control::Radio if checked => 0xffffff,
@@ -443,7 +443,7 @@ fn lighten(color: u32, by: f32) -> u32 {
     r << 16 | g << 8 | b
 }
 
-pub(super) fn box_colors(look: &Look) -> (Option<u32>, Option<u32>) {
+pub(crate) fn box_colors(look: &Look) -> (Option<u32>, Option<u32>) {
     if look.disabled {
         return (None, None);
     }
