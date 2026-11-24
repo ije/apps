@@ -7,7 +7,7 @@ use crate::dom::{Document, SelectorCache};
 use crate::style::StyleCache;
 use crate::style::cascade::TreeWalk;
 use crate::style::cascade::container::{ContainerQuery, style_query};
-use crate::style::cascade::memo::{CachedNode, CachedStyle};
+use crate::style::cascade::memo::{CachedNode, CachedStyle, Share};
 use crate::style::cascade::rank::{AGENT, AUTHOR, DELETED, Layer, UNLAYERED, USER};
 use crate::style::cascade::shadow::{PART, SLOTTED};
 use crate::style::ua::{FULLSCREEN_SHEET, GLASS_SHEET, UA_SHEET};
@@ -259,6 +259,8 @@ impl StyleScope {
     }
 }
 
+// The rules that match a node, by order, with the specificity of the best selector of each.
+pub(crate) type Matched = Rc<[(usize, [usize; 3])]>;
 pub(crate) type RuleLists = rustc_hash::FxHashSet<Rc<[(usize, [usize; 3])]>>;
 
 pub(crate) fn intern(
@@ -1115,5 +1117,190 @@ impl StyleCache {
             self.matches.mark(id, false);
         }
         true
+    }
+}
+
+impl StyleScope {
+    // The rules and pseudo-element rules that match a node: the last match while what it read holds, the match of
+    // a like sibling, or a match of the candidates that the keys of the node find in the buckets.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn match_node(
+        &mut self,
+        doc: &Document,
+        id: usize,
+        matches: &mut SelectorCache,
+        group: Option<(usize, [u32; 7])>,
+        shares: &mut FxHashMap<(usize, [u32; 7]), Share>,
+        candidates: &mut Vec<usize>,
+        (unique, generation): (&mut Vec<(u32, u32)>, &mut u32),
+        no_pseudos: &Rc<[usize]>,
+    ) -> (Matched, Rc<[usize]>) {
+        let node = &doc.nodes[id];
+        if let Some(cached) = self.nodes[id].as_ref()
+            && matches.valid_since(&cached.dependencies, &cached.checked)
+        {
+            (cached.rules.clone(), cached.pseudos.clone())
+        } else if node.tag.starts_with('#') {
+            let none = intern(&mut self.lists, &[]);
+            self.nodes[id] = Some(MatchedRules {
+                checked: std::cell::Cell::new(matches.epoch),
+                cached: None,
+                dependencies: Box::default(),
+                rules: none.clone(),
+                pseudos: no_pseudos.clone(),
+            });
+            (none, no_pseudos.clone())
+        } else if let Some(share) = group.and_then(|group| shares.get(&group))
+            && share
+                .style
+                .is_none_or(|style| style == matches.signature(id)[6])
+            && matches.share(doc, share.from, id, &share.dependencies)
+        {
+            matches.register(id);
+            self.nodes[id] = Some(MatchedRules {
+                checked: std::cell::Cell::new(matches.epoch),
+                cached: None,
+                dependencies: matches.dependencies.as_slice().into(),
+                rules: share.rules.clone(),
+                pseudos: share.pseudos.clone(),
+            });
+            (share.rules.clone(), share.pseudos.clone())
+        } else {
+            matches.dependencies.clear();
+            // Candidates come from the node's classes, so its matches always read them.
+            matches.depend(id, 0);
+            matches.depend(id, 7);
+            candidates.clear();
+            candidates.extend(&self.universal);
+            let classes = node.attrs.get("class").into_iter();
+            // Keys are lowercase. Only SVG names have uppercase letters, so HTML names need no copy.
+            let lower = crate::css::selector::lowercase;
+            for (kind, name) in std::iter::once((2, lower(&node.tag)))
+                .chain(node.attrs.get("id").map(|id| (0, id.as_str().into())))
+                .chain(
+                    classes.flat_map(|c| c.split_ascii_whitespace().map(|class| (1, class.into()))),
+                )
+                .chain(node.attrs.keys().map(|name| (3, lower(name))))
+            {
+                if let Some(list) = self.buckets[kind].get(&*name) {
+                    candidates.extend(list);
+                }
+            }
+            if !self.buckets[4].is_empty() {
+                let mut pair = String::new();
+                for (name, value) in node.attrs.iter() {
+                    pair.clear();
+                    pair.push_str(&lower(name));
+                    pair.push('=');
+                    pair.push_str(value);
+                    if let Some(list) = self.buckets[4].get(pair.as_str()) {
+                        candidates.extend(list);
+                    }
+                }
+            }
+            let fresh = self.nodes[id].is_none();
+            let ancestors = matches.ancestors(doc, id);
+            let mut read = 0u16;
+            let mut test = |selector: &Selector, matches: &mut SelectorCache| {
+                if let Some(ancestry) = selector.ancestry()
+                    && ancestry
+                        .0
+                        .iter()
+                        .zip(&ancestors)
+                        .any(|(need, have)| need & !have != 0)
+                {
+                    matches.reject(doc, id, ancestry, ancestry.2 & !read);
+                    read |= ancestry.2;
+                    return false;
+                }
+                selector.always()
+                    || !selector.host_only()
+                        && if fresh {
+                            selector.matches_fresh(doc, id, matches)
+                        } else {
+                            selector.matches_cached(doc, id, None, matches)
+                        }
+            };
+            let (mut matched, mut matched_pseudos) = (Vec::new(), Vec::new());
+            for &entry in candidates.iter() {
+                if entry >= PSEUDO {
+                    let index = entry & !PSEUDO;
+                    if test(&self.pseudos[index].1, matches) {
+                        matched_pseudos.push(index);
+                    }
+                    continue;
+                }
+                let (order, index) = (entry >> SELECTOR, entry & ((1 << SELECTOR) - 1));
+                let selector = &self.rules[order].0[index];
+                if test(selector, matches) {
+                    matched.push((order, selector.specificity));
+                }
+            }
+            matched.sort_unstable();
+            matched.dedup_by(|later, earlier| {
+                earlier.0 == later.0 && {
+                    earlier.1 = earlier.1.max(later.1);
+                    true
+                }
+            });
+            matched_pseudos.sort_unstable();
+            matched_pseudos.dedup();
+            // Cells take `cellpadding` from their table.
+            if matches!(node.tag.as_str(), "td" | "th") {
+                let mut at = node.parent;
+                for _ in 0..3 {
+                    let Some(parent) = at else { break };
+                    matches.depend(parent, 0);
+                    matches.depend(parent, 1);
+                    at = doc.nodes[parent].parent;
+                }
+            }
+            let style = matches.reads(id, 6);
+            matches.depend(id, 6);
+            // Each candidate selector reads the node again, so most entries repeat: drop them before sorting.
+            *generation = generation.wrapping_add(1);
+            if *generation == 0 {
+                unique.fill((0, 0));
+                *generation = 1;
+            }
+            matches.dependencies.retain(|&(key, revision)| {
+                let key = key as usize;
+                if key >= unique.len() {
+                    unique.resize(key + 1, (0, 0));
+                }
+                let seen = std::mem::replace(&mut unique[key], (*generation, revision));
+                seen != (*generation, revision)
+            });
+            matches.dependencies.sort_unstable();
+            matches.register(id);
+            let shared = intern(&mut self.lists, &matched);
+            let matched_pseudos = if matched_pseudos.is_empty() {
+                no_pseudos.clone()
+            } else {
+                Rc::from(matched_pseudos)
+            };
+            if let Some(group) = group
+                && matches.shareable(doc, id)
+            {
+                shares.insert(
+                    group,
+                    Share {
+                        from: id,
+                        rules: shared.clone(),
+                        pseudos: matched_pseudos.clone(),
+                        dependencies: matches.dependencies.as_slice().into(),
+                        style: style.then(|| matches.signature(id)[6]),
+                    },
+                );
+            }
+            self.nodes[id] = Some(MatchedRules {
+                checked: std::cell::Cell::new(matches.epoch),
+                cached: None,
+                dependencies: matches.dependencies.as_slice().into(),
+                rules: shared.clone(),
+                pseudos: matched_pseudos.clone(),
+            });
+            (shared, matched_pseudos)
+        }
     }
 }

@@ -1,11 +1,10 @@
 // One style pass over the nodes of a walk: matching, cascade, used values, pseudo-elements and the store.
 use crate::css::properties::{Prop, Registry, Style, Vars};
-use crate::css::selector::Selector;
 use crate::css::sheet::Declarations;
 use crate::css::value::color::color;
 use crate::css::value::tokens::number;
 use crate::css::value::units::{FontUnits, Lengths};
-use crate::dom::{Document, SelectorCache};
+use crate::dom::Document;
 use crate::style::cascade::computed::{
     AGENT_DISPLAY, CAPTION, CELL, COUNTED, ComputedStyles, DISPLAY_CONTENTS, DISPLAY_NONE, FOOTER,
     HEADER, INVISIBLE, ROW, SELECT_ALL, SELECT_NONE, SELECT_TEXT, TABLE_DISPLAYS, empty, table_box,
@@ -693,7 +692,7 @@ impl NodePass<'_> {
                 continue;
             }
             let scoped = &mut style_cache.scopes[scopes[tree]];
-            let (rules, keys, scope) = (&scoped.rules, &scoped.keys, scoped.id);
+            let scope = scoped.id;
             let mut key = None;
             let mut passed = None;
             let mut written = None;
@@ -795,172 +794,16 @@ impl NodePass<'_> {
                             .map(|id| id.map(|id| matches.signature(id)).unwrap_or_default());
                         (scope, [own[0], own[3], own[5], own[7], up[0], up[5], up[8]])
                     });
-                    let (matched, matched_pseudos) = if let Some(cached) = scoped.nodes[id].as_ref()
-                        && matches.valid_since(&cached.dependencies, &cached.checked)
-                    {
-                        (cached.rules.clone(), cached.pseudos.clone())
-                    } else if node.tag.starts_with('#') {
-                        let none = intern(&mut scoped.lists, &[]);
-                        scoped.nodes[id] = Some(MatchedRules {
-                            checked: std::cell::Cell::new(matches.epoch),
-                            cached: None,
-                            dependencies: Box::default(),
-                            rules: none.clone(),
-                            pseudos: no_pseudos.clone(),
-                        });
-                        (none, no_pseudos.clone())
-                    } else if let Some(share) = group.and_then(|group| shares.get(&group))
-                        && share
-                            .style
-                            .is_none_or(|style| style == matches.signature(id)[6])
-                        && matches.share(doc, share.from, id, &share.dependencies)
-                    {
-                        matches.register(id);
-                        scoped.nodes[id] = Some(MatchedRules {
-                            checked: std::cell::Cell::new(matches.epoch),
-                            cached: None,
-                            dependencies: matches.dependencies.as_slice().into(),
-                            rules: share.rules.clone(),
-                            pseudos: share.pseudos.clone(),
-                        });
-                        (share.rules.clone(), share.pseudos.clone())
-                    } else {
-                        matches.dependencies.clear();
-                        // Candidates come from the node's classes, so its matches always read them.
-                        matches.depend(id, 0);
-                        matches.depend(id, 7);
-                        candidates.clear();
-                        candidates.extend(&scoped.universal);
-                        let classes = node.attrs.get("class").into_iter();
-                        // Keys are lowercase. Only SVG names have uppercase letters, so HTML names need no copy.
-                        let lower = crate::css::selector::lowercase;
-                        for (kind, name) in std::iter::once((2, lower(&node.tag)))
-                            .chain(node.attrs.get("id").map(|id| (0, id.as_str().into())))
-                            .chain(classes.flat_map(|c| {
-                                c.split_ascii_whitespace().map(|class| (1, class.into()))
-                            }))
-                            .chain(node.attrs.keys().map(|name| (3, lower(name))))
-                        {
-                            if let Some(list) = scoped.buckets[kind].get(&*name) {
-                                candidates.extend(list);
-                            }
-                        }
-                        if !scoped.buckets[4].is_empty() {
-                            let mut pair = String::new();
-                            for (name, value) in node.attrs.iter() {
-                                pair.clear();
-                                pair.push_str(&lower(name));
-                                pair.push('=');
-                                pair.push_str(value);
-                                if let Some(list) = scoped.buckets[4].get(pair.as_str()) {
-                                    candidates.extend(list);
-                                }
-                            }
-                        }
-                        let fresh = scoped.nodes[id].is_none();
-                        let ancestors = matches.ancestors(doc, id);
-                        let mut read = 0u16;
-                        let mut test = |selector: &Selector, matches: &mut SelectorCache| {
-                            if let Some(ancestry) = selector.ancestry()
-                                && ancestry
-                                    .0
-                                    .iter()
-                                    .zip(&ancestors)
-                                    .any(|(need, have)| need & !have != 0)
-                            {
-                                matches.reject(doc, id, ancestry, ancestry.2 & !read);
-                                read |= ancestry.2;
-                                return false;
-                            }
-                            selector.always()
-                                || !selector.host_only()
-                                    && if fresh {
-                                        selector.matches_fresh(doc, id, matches)
-                                    } else {
-                                        selector.matches_cached(doc, id, None, matches)
-                                    }
-                        };
-                        let (mut matched, mut matched_pseudos) = (Vec::new(), Vec::new());
-                        for &entry in candidates.iter() {
-                            if entry >= PSEUDO {
-                                let index = entry & !PSEUDO;
-                                if test(&scoped.pseudos[index].1, matches) {
-                                    matched_pseudos.push(index);
-                                }
-                                continue;
-                            }
-                            let (order, index) = (entry >> SELECTOR, entry & ((1 << SELECTOR) - 1));
-                            let selector = &rules[order].0[index];
-                            if test(selector, matches) {
-                                matched.push((order, selector.specificity));
-                            }
-                        }
-                        matched.sort_unstable();
-                        matched.dedup_by(|later, earlier| {
-                            earlier.0 == later.0 && {
-                                earlier.1 = earlier.1.max(later.1);
-                                true
-                            }
-                        });
-                        matched_pseudos.sort_unstable();
-                        matched_pseudos.dedup();
-                        // Cells take `cellpadding` from their table.
-                        if matches!(node.tag.as_str(), "td" | "th") {
-                            let mut at = node.parent;
-                            for _ in 0..3 {
-                                let Some(parent) = at else { break };
-                                matches.depend(parent, 0);
-                                matches.depend(parent, 1);
-                                at = doc.nodes[parent].parent;
-                            }
-                        }
-                        let style = matches.reads(id, 6);
-                        matches.depend(id, 6);
-                        // Each candidate selector reads the node again, so most entries repeat: drop them before sorting.
-                        generation = generation.wrapping_add(1);
-                        if generation == 0 {
-                            unique.fill((0, 0));
-                            generation = 1;
-                        }
-                        matches.dependencies.retain(|&(key, revision)| {
-                            let key = key as usize;
-                            if key >= unique.len() {
-                                unique.resize(key + 1, (0, 0));
-                            }
-                            let seen = std::mem::replace(&mut unique[key], (generation, revision));
-                            seen != (generation, revision)
-                        });
-                        matches.dependencies.sort_unstable();
-                        matches.register(id);
-                        let shared = intern(&mut scoped.lists, &matched);
-                        let matched_pseudos = if matched_pseudos.is_empty() {
-                            no_pseudos.clone()
-                        } else {
-                            Rc::from(matched_pseudos)
-                        };
-                        if let Some(group) = group
-                            && matches.shareable(doc, id)
-                        {
-                            shares.insert(
-                                group,
-                                Share {
-                                    from: id,
-                                    rules: shared.clone(),
-                                    pseudos: matched_pseudos.clone(),
-                                    dependencies: matches.dependencies.as_slice().into(),
-                                    style: style.then(|| matches.signature(id)[6]),
-                                },
-                            );
-                        }
-                        scoped.nodes[id] = Some(MatchedRules {
-                            checked: std::cell::Cell::new(matches.epoch),
-                            cached: None,
-                            dependencies: matches.dependencies.as_slice().into(),
-                            rules: shared.clone(),
-                            pseudos: matched_pseudos.clone(),
-                        });
-                        (shared, matched_pseudos)
-                    };
+                    let (matched, matched_pseudos) = scoped.match_node(
+                        doc,
+                        id,
+                        matches,
+                        group,
+                        &mut shares,
+                        &mut candidates,
+                        (&mut unique, &mut generation),
+                        &no_pseudos,
+                    );
                     let mut applies = |order: usize, passed: bool| {
                         if scoped.medias[order]
                             .as_ref()
@@ -1449,10 +1292,15 @@ impl NodePass<'_> {
             }
             let mut cascade: BBTreeMap<Prop, (CascadeRank, Rc<str>)> = BBTreeMap::new();
             for &(order, specificity) in key.rules.0.iter() {
-                let (_, declarations, layer) = &rules[order];
+                let (_, declarations, layer) = &scoped.rules[order];
                 for &(prop, ref value, important, position) in declarations.iter() {
-                    let rank =
-                        CascadeRank::rule(*layer, important, specificity, keys[order], position);
+                    let rank = CascadeRank::rule(
+                        *layer,
+                        important,
+                        specificity,
+                        scoped.keys[order],
+                        position,
+                    );
                     put(&mut cascade, prop, rank, value.clone());
                 }
             }
@@ -1576,7 +1424,7 @@ impl NodePass<'_> {
                 let (revert, (origin, layer)) = (&**value == "revert", rank.source());
                 let mut best: Option<(CascadeRank, &Rc<str>)> = None;
                 for &(order, specificity) in key.rules.0.iter() {
-                    let (_, declarations, rule_layer) = &rules[order];
+                    let (_, declarations, rule_layer) = &scoped.rules[order];
                     let from = rule_layer.origin.min(HINT);
                     if from > origin
                         || from == origin && (revert || !rank.inline && rule_layer.rank == layer)
@@ -1592,7 +1440,7 @@ impl NodePass<'_> {
                             *rule_layer,
                             *important,
                             specificity,
-                            keys[order],
+                            scoped.keys[order],
                             *position,
                         );
                         if !matches!(&**candidate, "revert" | "revert-layer")
@@ -2085,7 +1933,7 @@ impl NodePass<'_> {
             }
             for &index in again.as_deref().unwrap_or(&key.pseudos) {
                 let (pseudo, selector, order, _) = &scoped.pseudos[index];
-                let (_, declarations, layer) = &rules[*order];
+                let (_, declarations, layer) = &scoped.rules[*order];
                 if matches!(*pseudo, SLOTTED | PART) {
                     if let Some((name, compound, target)) = scoped.arguments.get(&index) {
                         groups[usize::from(*pseudo == PART)].push(Passed {
@@ -2099,7 +1947,7 @@ impl NodePass<'_> {
                                 context: if *pseudo == PART { 1 } else { -1 },
                                 layer: *layer,
                                 specificity: selector.specificity,
-                                order: keys[*order],
+                                order: scoped.keys[*order],
                                 declarations: declarations.clone(),
                                 query: None,
                             },
@@ -2112,7 +1960,7 @@ impl NodePass<'_> {
                         *layer,
                         important,
                         selector.specificity,
-                        keys[*order],
+                        scoped.keys[*order],
                         position,
                     );
                     put(&mut pseudo_cascade[*pseudo], prop, rank, value);
