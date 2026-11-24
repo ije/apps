@@ -45,6 +45,10 @@ impl Context {
         })
     }
 
+    pub(crate) fn api(&self) -> &Rc<JavaScriptCore> {
+        &self.api
+    }
+
     pub(crate) fn ptr(&self) -> Ptr {
         self.ctx
     }
