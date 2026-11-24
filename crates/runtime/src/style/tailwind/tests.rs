@@ -40,7 +40,7 @@ fn generated(author: &str, classes: &[&str]) -> Vec<String> {
         .iter()
         .map(|class| {
             config
-                .compile(class, &super::escape(class))
+                .compile(class, &super::value::escape(class))
                 .map(|compiled| super::css(&compiled.rules))
                 .unwrap_or_default()
         })
@@ -461,7 +461,12 @@ fn utilities_and_variants_sort_like_tailwind() {
     ] {
         let sorts: Vec<_> = chain
             .split(' ')
-            .map(|class| config.compile(class, &super::escape(class)).unwrap().sort)
+            .map(|class| {
+                config
+                    .compile(class, &super::value::escape(class))
+                    .unwrap()
+                    .sort
+            })
             .collect();
         assert!(sorts.is_sorted_by(|a, b| a < b), "{chain}");
     }
