@@ -281,6 +281,7 @@ impl Features {
 // What the runtime knows about the app from its package.
 #[derive(Clone, Default)]
 pub struct AppInfo {
+    // The product name, which `app.getName()` returns.
     pub name: Option<String>,
     pub version: Option<String>,
     pub path: std::path::PathBuf,
@@ -303,7 +304,7 @@ impl AppInfo {
             .context("Invalid assets.json")?
             .unwrap_or_default();
         let mut app = Self {
-            name: Some(package.name.clone()),
+            name: Some(package.product_name.clone()),
             version: Some(package.version.clone()),
             path: if bundle.root.as_os_str().is_empty() {
                 std::env::current_dir().unwrap_or_default()
