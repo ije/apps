@@ -142,6 +142,9 @@ impl Layout {
 
     // A node is freed and its ID can come back for another node.
     pub(crate) fn forget(&mut self, id: usize) {
+        self.tracks.remove(&id);
+        self.areas.remove(&id);
+        self.autos.remove(&id);
         self.cull.widths.remove(&id);
         self.text_layouts.remove(&id);
         self.cull.offsets.remove(&id);
