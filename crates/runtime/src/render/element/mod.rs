@@ -5,6 +5,7 @@ pub(crate) mod columns;
 pub(crate) mod controls;
 pub(crate) mod create;
 pub(crate) mod cx;
+pub(crate) mod finish;
 pub(crate) mod kept;
 pub(crate) mod margin;
 pub(crate) mod marker;

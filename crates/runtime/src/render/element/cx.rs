@@ -38,6 +38,17 @@ pub(super) struct Cx<'a> {
     pub(super) flexbox: bool,
     pub(super) editable: bool,
     pub(super) stacking: bool,
+    pub(super) composited: bool,
+    pub(super) drawable: bool,
+    pub(super) layered: bool,
+    /// The length of the read log when the build of the box started.
+    pub(super) mark: usize,
+    pub(super) order: Option<i32>,
+    pub(super) positioned: bool,
+    pub(super) parent_box: Option<usize>,
+    pub(super) positioner: Option<usize>,
+    /// The key of the boxes that can share the style of this one.
+    pub(super) share: Option<u64>,
     pub(super) parent: Option<usize>,
     pub(super) block_size: Option<[f32; 2]>,
     pub(super) opacity: f32,
