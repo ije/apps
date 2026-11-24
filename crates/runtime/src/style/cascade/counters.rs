@@ -3,8 +3,7 @@ use crate::css::{
 };
 use crate::dom::Document;
 use crate::style::cascade::TreeWalk;
-use crate::style::cascade::computed::{ComputedStyles, DISPLAY_NONE, Extras};
-use rustc_hash::FxHashMap;
+use crate::style::cascade::computed::{ComputedStyles, DISPLAY_NONE, ExtrasMap};
 use std::rc::Rc;
 
 pub(crate) fn list_item(style: &Style) -> bool {
@@ -159,29 +158,28 @@ pub(crate) fn number_lists(
         };
         // A node that got no new style in a fast pass still holds the text, so its declared value is in
         // `counting`. A new style drops that entry.
-        let number = |extras: &mut FxHashMap<usize, Rc<Extras>>,
-                      counters: &[(String, i64, usize)],
-                      id: usize,
-                      side: usize| {
-            let kept = &extras[&id];
-            let own = &kept.generated.as_ref().unwrap()[side];
-            let declared = kept.counting[side].clone();
-            let declared = declared.or_else(|| own.value(Prop::CONTENT).cloned());
-            if let Some(text) = declared
-                .as_deref()
-                .and_then(|value| content(counters, value))
-            {
-                let numbered = own.get(Prop::CONTENT) != Some(&text);
-                if numbered || kept.counting[side] != declared {
-                    let kept = Rc::make_mut(extras.get_mut(&id).unwrap());
-                    kept.counting[side] = declared;
-                    if numbered {
-                        Rc::make_mut(kept.generated.as_mut().unwrap())[side]
-                            .insert(Prop::CONTENT, text);
+        let number =
+            |extras: &mut ExtrasMap, counters: &[(String, i64, usize)], id: usize, side: usize| {
+                let kept = extras.get(id).unwrap();
+                let own = &kept.generated.as_ref().unwrap()[side];
+                let declared = kept.counting[side].clone();
+                let declared = declared.or_else(|| own.value(Prop::CONTENT).cloned());
+                if let Some(text) = declared
+                    .as_deref()
+                    .and_then(|value| content(counters, value))
+                {
+                    let numbered = own.get(Prop::CONTENT) != Some(&text);
+                    if numbered || kept.counting[side] != declared {
+                        extras.edit(id, |kept| {
+                            kept.counting[side] = declared;
+                            if numbered {
+                                Rc::make_mut(kept.generated.as_mut().unwrap())[side]
+                                    .insert(Prop::CONTENT, text);
+                            }
+                        });
                     }
                 }
-            }
-        };
+            };
         for &(root, _) in walk.trees.iter() {
             counters.clear();
             let mut pending = vec![(root, false)];
@@ -189,7 +187,7 @@ pub(crate) fn number_lists(
                 let node = &doc.nodes[id];
                 let parent = node.parent.unwrap_or(usize::MAX);
                 if exit {
-                    if let Some(own) = extras.get(&id).and_then(|kept| kept.generated.clone()) {
+                    if let Some(own) = extras.get(id).and_then(|kept| kept.generated.clone()) {
                         apply(&mut counters, &own[1], id, None);
                         number(extras, &counters, id, 1);
                     }
@@ -253,7 +251,7 @@ pub(crate) fn number_lists(
                         list_items.insert(id, counter.1);
                     }
                 }
-                if let Some(own) = extras.get(&id).and_then(|kept| kept.generated.clone()) {
+                if let Some(own) = extras.get(id).and_then(|kept| kept.generated.clone()) {
                     apply(&mut counters, &own[0], id, None);
                     number(extras, &counters, id, 0);
                 }

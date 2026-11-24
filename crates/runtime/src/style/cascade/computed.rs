@@ -6,7 +6,7 @@ use crate::style::cascade::Container;
 use crate::style::cascade::shadow::Shadowed;
 use crate::style::chunked::Chunked;
 use crate::style::keyframes::Animation;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::rc::Rc;
 pub(crate) const DISPLAY_NONE: u16 = 1;
 pub(crate) const DISPLAY_CONTENTS: u16 = 2;
@@ -69,7 +69,7 @@ impl ComputedStyles {
         self.flags[id] = 0;
         self.lengths.unset(id);
         self.containers[id] = None;
-        self.extras.remove(&id);
+        self.extras.remove(id);
     }
 
     // A fast pass starts from the styles of the last pass.
@@ -84,15 +84,30 @@ impl ComputedStyles {
     }
 
     pub(crate) fn extras(&self, id: usize) -> &Extras {
-        self.extras.get(&id).map_or(&NO_EXTRAS, |extras| extras)
+        self.extras.get(id).unwrap_or(&NO_EXTRAS)
     }
 
-    pub(crate) fn all_extras(&self) -> impl Iterator<Item = (usize, &Extras)> {
-        self.extras.iter().map(|(&id, extras)| (id, &**extras))
+    pub(crate) fn animations(&self) -> impl Iterator<Item = (usize, &Rc<[Animation]>)> {
+        let ExtrasMap { map, animated, .. } = &self.extras;
+        animated
+            .iter()
+            .map(|&id| (id, map[&id].animations.as_ref().unwrap()))
     }
 
-    // The styles of `::before` and `::after`.
+    pub(crate) fn backdrops(&self) -> impl Iterator<Item = (usize, &Rc<Style>)> {
+        let ExtrasMap { map, layered, .. } = &self.extras;
+        layered
+            .iter()
+            .map(|&id| (id, map[&id].backdrop.as_ref().unwrap()))
+    }
+
+    // The styles of `::before` and `::after`, with the values of an animation frame while it draws.
     pub(crate) fn generated(&self, id: usize) -> Option<&Rc<[Style; 2]>> {
+        if !self.frame_pseudos.is_empty()
+            && let Some(pair) = self.frame_pseudos.get(&id)
+        {
+            return Some(pair);
+        }
         self.extras(id).generated.as_ref()
     }
 
@@ -107,16 +122,19 @@ impl ComputedStyles {
         for (id, style) in values {
             std::mem::swap(&mut self.values[*id], style);
         }
-        generated.retain_mut(|(id, pair)| {
-            let Some(extras) = self
-                .extras
-                .get_mut(id)
-                .filter(|kept| kept.generated.is_some())
-            else {
-                return false;
-            };
-            std::mem::swap(Rc::make_mut(extras).generated.as_mut().unwrap(), pair);
-            true
+        let frame = &mut self.frame_pseudos;
+        generated.retain_mut(|(id, pair)| match frame.remove(id) {
+            Some(animated) => {
+                *pair = animated;
+                true
+            }
+            None => match self.extras.get(*id).and_then(|kept| kept.generated.clone()) {
+                Some(base) => {
+                    frame.insert(*id, std::mem::replace(pair, base));
+                    true
+                }
+                None => false,
+            },
         });
         for (id, new) in lengths {
             let old = *self.lengths.get(*id).unwrap_or(new);
@@ -232,7 +250,9 @@ pub(crate) struct ComputedStyles {
     pub vars: Chunked<Vars>,
     pub flags: Chunked<u16>,
     pub lengths: NodeLengths,
-    pub(crate) extras: FxHashMap<usize, Rc<Extras>>,
+    pub(crate) extras: ExtrasMap,
+    // The `::before` and `::after` pairs of an animation frame, from `swap_frame()` until it is called again.
+    frame_pseudos: FxHashMap<usize, Rc<[Style; 2]>>,
     pub user_select: Chunked<(UserSelect, usize)>,
     pub children: FxHashMap<usize, Vec<usize>>,
     pub list_items: FxHashMap<usize, i64>,
@@ -269,6 +289,77 @@ pub(crate) struct Extras {
     // The declared `content` of `::before` and `::after` where it has a counter. Their styles hold the text of
     // the last pass.
     pub(crate) counting: [Option<Rc<str>>; 2],
+}
+
+// The extras of the nodes that have any, with the ids of the nodes that have animations and backdrops, which
+// animation frames visit.
+#[derive(Clone, Default)]
+pub(crate) struct ExtrasMap {
+    map: FxHashMap<usize, Rc<Extras>>,
+    animated: FxHashSet<usize>,
+    layered: FxHashSet<usize>,
+}
+
+impl ExtrasMap {
+    pub(crate) fn get(&self, id: usize) -> Option<&Extras> {
+        self.map.get(&id).map(|extras| &**extras)
+    }
+
+    pub(crate) fn put(&mut self, id: usize, extras: Rc<Extras>) {
+        self.index(id, &extras);
+        self.map.insert(id, extras);
+    }
+
+    pub(crate) fn remove(&mut self, id: usize) {
+        if let Some(old) = self.map.remove(&id) {
+            if old.animations.is_some() {
+                self.animated.remove(&id);
+            }
+            if old.backdrop.is_some() {
+                self.layered.remove(&id);
+            }
+        }
+    }
+
+    // Changes the extras of a node, and drops them when nothing is left.
+    pub(crate) fn edit(&mut self, id: usize, edit: impl FnOnce(&mut Extras)) {
+        let extras = self.map.entry(id).or_default();
+        edit(Rc::make_mut(extras));
+        let extras = extras.clone();
+        match rare(&extras) {
+            true => self.index(id, &extras),
+            false => self.remove(id),
+        }
+    }
+
+    fn index(&mut self, id: usize, extras: &Extras) {
+        for (set, has) in [
+            (&mut self.animated, extras.animations.is_some()),
+            (&mut self.layered, extras.backdrop.is_some()),
+        ] {
+            match has {
+                true => set.insert(id),
+                false => set.remove(&id),
+            };
+        }
+    }
+}
+
+// Whether the extras hold anything.
+pub(crate) fn rare(extras: &Extras) -> bool {
+    extras.generated.is_some()
+        || extras.text.is_some()
+        || extras.backdrop.is_some()
+        || extras.backdrop_start.is_some()
+        || extras.scrollbars.is_some()
+        || extras.selection.is_some()
+        || extras.animations.is_some()
+        || extras.important.is_some()
+        || extras.starting.is_some()
+        || extras.slotted.is_some()
+        || extras.parts.is_some()
+        || extras.exported.is_some()
+        || extras.counting.iter().any(Option::is_some)
 }
 
 pub(crate) const NO_EXTRAS: Extras = Extras {

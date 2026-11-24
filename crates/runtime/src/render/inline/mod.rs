@@ -1148,9 +1148,10 @@ pub(crate) fn inline_text(
                         && part.is_none()
                         && node.tag != "#text"
                         && display.is_none_or(|value| value == "inline")
-                        && (styles.extras(child).generated.is_some()
-                            || styles.extras(child).animations.is_some()
-                            || splits(style, parent)))
+                        && ({
+                            let extras = styles.extras(child);
+                            extras.generated.is_some() || extras.animations.is_some()
+                        } || splits(style, parent)))
                 && style
                     .get(Prop::POSITION)
                     .is_none_or(|value| !matches!(value, "absolute" | "fixed"))
