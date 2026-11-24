@@ -249,7 +249,7 @@ impl Desktop {
                 return Ok(());
             }
         };
-        renderer::text::warm(crate::style::font_lists(&doc));
+        renderer::warm(crate::style::font_lists(&doc));
         // Only bundled pages can run Node preloads. Never enable them for user files or HTML
         // strings.
         let trusted = location.starts_with("apps:///")

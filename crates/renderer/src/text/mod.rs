@@ -6,15 +6,28 @@ mod paragraph;
 mod raster;
 mod style;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "windows")]
+pub(crate) mod windows;
+#[cfg(target_os = "linux")]
+use linux as sys;
+#[cfg(target_os = "macos")]
+use macos as sys;
+#[cfg(target_os = "windows")]
+use windows as sys;
+
 pub use breaks::{Banded, Wrapping};
 pub use cache::Span;
-pub use draw::Decoration;
+pub use draw::TextCanvas;
+
 pub use line::*;
 pub use paragraph::*;
-pub use raster::*;
 pub use style::*;
 
-use crate::{Pixels, Rect, platform, px};
+use crate::{Pixels, Rect, Size, px};
 use anyhow::Result;
 use cache::Cache;
 use rustc_hash::FxHashMap;
@@ -101,6 +114,41 @@ impl Hash for Font {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlyphRaster {
+    pub font: FontId,
+    pub glyph: GlyphId,
+    pub size: Pixels,
+    pub scale: f32,
+    pub subpixel: u8,
+    pub emoji: bool,
+    pub dilation: u8,
+    /// The width of a line along the outline, in CSS pixels, for `-webkit-text-stroke` and `strokeText()`. 0 fills.
+    pub stroke: f32,
+}
+
+impl Eq for GlyphRaster {}
+
+impl Hash for GlyphRaster {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let bits = [self.size.0, self.scale, self.stroke].map(f32::to_bits);
+        (
+            self.font,
+            self.glyph,
+            bits,
+            [self.subpixel, self.dilation],
+            self.emoji,
+        )
+            .hash(state);
+    }
+}
+
+// The place a raster shows at, its size, and its bytes.
+pub(crate) type Raster<B> = (Rect<i32>, Size<i32>, B);
+
+// Larger glyphs raster at a smaller scale.
+pub(crate) const MAX_GLYPH_SIDE: i32 = 2048;
+
 /// In em units. `descent` is negative.
 #[derive(Clone, Copy)]
 pub struct FaceMetrics {
@@ -128,7 +176,7 @@ type Coverage = (u128, FxHashMap<char, bool>);
 #[derive(Default)]
 pub struct Fonts {
     // Backends are called from one thread at a time.
-    platform: platform::TextSystem,
+    backend: sys::TextSystem,
     resolved: RefCell<FxHashMap<Font, Option<FontId>>>,
     // Hashing a whole `Font` costs more than a shaping cache lookup, so recent fonts match by pointer first.
     recent: RefCell<Vec<(Font, FontId)>>,
@@ -139,8 +187,25 @@ pub struct Fonts {
 }
 
 impl Fonts {
+    pub(crate) fn generation(&self) -> usize {
+        self.generation.get()
+    }
+
+    /// Adds a face to `family` and returns the family name that finds it.
+    pub fn add_font(&self, bytes: Vec<u8>, family: &str) -> Result<String> {
+        let name = self.backend.add_font(bytes, family)?;
+        self.resolved.borrow_mut().clear();
+        self.recent.borrow_mut().clear();
+        self.generation.set(self.generation.get() + 1);
+        Ok(name)
+    }
+
+    pub(crate) fn shape(&self, text: &str, font_size: Pixels, spans: &[Span]) -> Line {
+        self.backend.shape(text, font_size, spans)
+    }
+
     pub fn families(&self) -> Vec<String> {
-        let mut names = self.platform.families();
+        let mut names = self.backend.families();
         names.sort_unstable();
         names.dedup();
         names
@@ -171,7 +236,7 @@ impl Fonts {
         let find = |wanted: &Font| {
             let known = self.resolved.borrow().get(wanted).copied();
             known.unwrap_or_else(|| {
-                let id = self.platform.font(wanted);
+                let id = self.backend.font(wanted);
                 self.resolved.borrow_mut().insert(wanted.clone(), id);
                 id
             })
@@ -196,7 +261,7 @@ impl Fonts {
         if let Some(Some(metrics)) = self.metrics.borrow().get(at) {
             return *metrics;
         }
-        let metrics = self.platform.metrics(font);
+        let metrics = self.backend.metrics(font);
         let mut all = self.metrics.borrow_mut();
         if all.len() <= at {
             all.resize(at + 1, None);
@@ -216,7 +281,7 @@ impl Fonts {
             .or_insert((u128::MAX, FxHashMap::default()))
             .1
             .entry(ch)
-            .or_insert_with(|| self.platform.glyph(font, ch).is_some())
+            .or_insert_with(|| self.backend.glyph(font, ch).is_some())
     }
 
     /// A bit for each ASCII char that `font` has a glyph for.
@@ -227,7 +292,7 @@ impl Fonts {
             .or_insert((u128::MAX, FxHashMap::default()));
         if *ascii == u128::MAX {
             *ascii = (0..127u8).fold(0, |bits, byte| {
-                bits | u128::from(self.platform.glyph(font, char::from(byte)).is_some()) << byte
+                bits | u128::from(self.backend.glyph(font, char::from(byte)).is_some()) << byte
             });
         }
         *ascii
@@ -238,8 +303,8 @@ impl Fonts {
     }
 
     pub fn advance(&self, font: FontId, size: Pixels, ch: char) -> Option<Pixels> {
-        let glyph = self.platform.glyph(font, ch)?;
-        Some(px(self.platform.advance(font, glyph) * size.0))
+        let glyph = self.backend.glyph(font, ch)?;
+        Some(px(self.backend.advance(font, glyph) * size.0))
     }
 
     /// Rounded, as browsers build line boxes.
@@ -263,7 +328,7 @@ impl Fonts {
 
     /// `[left, right, top, bottom]`, y up.
     pub fn glyph_bounds(&self, font: FontId, glyph: GlyphId, size: Pixels) -> Option<[f32; 4]> {
-        self.platform
+        self.backend
             .ink(font, glyph, size.0)
             .filter(|[left, right, top, bottom]| right > left && top > bottom)
     }
@@ -321,7 +386,7 @@ pub(crate) fn best(
 
 pub fn warm(lists: Vec<Vec<String>>) {
     if !lists.is_empty() {
-        platform::TextSystem::warm(lists);
+        sys::TextSystem::warm(lists);
     }
 }
 
@@ -332,7 +397,7 @@ pub struct TextSystem {
     generation: Cell<usize>,
     spans: Cell<Vec<Span>>,
     /// The floats beside the text box that layout measures now, `[top, bottom, left, right]` in its content box.
-    pub floats: RefCell<Option<Rc<[[f32; 4]]>>>,
+    floats: RefCell<Option<Rc<[[f32; 4]]>>>,
 }
 
 impl std::ops::Deref for TextSystem {
@@ -349,7 +414,7 @@ impl TextSystem {
 
     pub(crate) fn for_window(&self) -> Self {
         Self {
-            generation: Cell::new(self.fonts.generation.get()),
+            generation: Cell::new(self.fonts.generation()),
             fonts: self.fonts.clone(),
             cache: Cache::default(),
             spans: Cell::default(),
@@ -357,25 +422,29 @@ impl TextSystem {
         }
     }
 
-    pub(crate) fn generation(&self) -> usize {
-        self.fonts.generation.get()
-    }
-
-    /// Adds a face to `family` and returns the family name that finds it.
-    pub fn add_font(&self, bytes: Vec<u8>, family: &str) -> Result<String> {
-        let name = self.platform.add_font(bytes, family)?;
-        self.resolved.borrow_mut().clear();
-        self.recent.borrow_mut().clear();
-        self.fonts.generation.set(self.fonts.generation.get() + 1);
-        Ok(name)
-    }
-
     fn cache(&self) -> &Cache {
-        let now = self.fonts.generation.get();
+        let now = self.fonts.generation();
         if self.generation.replace(now) != now {
             self.cache.clear();
         }
         &self.cache
+    }
+
+    /// Text that `f` measures or lays out runs beside `floats`, `[top, bottom, left, right]` in its content box.
+    pub fn beside<R>(&self, floats: Option<Rc<[[f32; 4]]>>, f: impl FnOnce() -> R) -> R {
+        *self.floats.borrow_mut() = floats;
+        let result = f();
+        *self.floats.borrow_mut() = None;
+        result
+    }
+
+    pub(crate) fn has_floats(&self) -> bool {
+        self.floats.borrow().is_some()
+    }
+
+    /// The floats of `beside`.
+    pub fn floats(&self) -> Option<Rc<[[f32; 4]]>> {
+        self.floats.borrow().clone()
     }
 
     pub(crate) fn end_frame(&self) {

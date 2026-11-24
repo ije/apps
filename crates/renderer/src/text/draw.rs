@@ -1,15 +1,34 @@
-use super::{DecorationStyle, FontId, Line, Look, TextAlign, TextLine};
-use crate::{Color, Pixels, Point, Rect, Scalar, Size, Window, point, px};
+use super::{
+    Decoration, DecorationStyle, FontId, GlyphId, Line, Look, TextAlign, TextLine, TextSystem,
+};
+use crate::{Clip, Color, Pixels, Point, Rect, Scalar, Size, point, px};
 
-/// Strikethroughs have no offset.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Decoration {
-    pub thickness: Pixels,
-    /// The text color when `None`.
-    pub color: Option<Color>,
-    pub style: DecorationStyle,
-    /// From the baseline, instead of the default place under it.
-    pub offset: Option<Pixels>,
+/// What text paints into.
+pub trait TextCanvas {
+    fn text_system(&self) -> &TextSystem;
+    fn content_mask(&self) -> Clip<Pixels>;
+    /// Paint left out content, so a copy of it can't move.
+    fn cull(&mut self);
+    fn draw_rect(&mut self, bounds: Rect<Pixels>, color: Color);
+    fn draw_line(
+        &mut self,
+        origin: Point<Pixels>,
+        width: Pixels,
+        thickness: Pixels,
+        color: Color,
+        style: DecorationStyle,
+    );
+    #[allow(clippy::too_many_arguments)]
+    fn draw_glyph(
+        &mut self,
+        origin: Point<Pixels>,
+        font: FontId,
+        glyph: GlyphId,
+        size: Pixels,
+        color: Color,
+        emoji: bool,
+        stroke: Pixels,
+    );
 }
 
 struct Rows<'a> {
@@ -77,11 +96,11 @@ struct Ink {
 }
 
 impl Ink {
-    fn update(&mut self, glyph: &super::Glyph, window: &Window) {
+    fn update(&mut self, glyph: &super::Glyph, text: &TextSystem) {
         let key = (glyph.font, glyph.size);
         if self.key != Some(key) {
             self.key = Some(key);
-            let bounds = window.text_system().glyph_box(key.0, key.1);
+            let bounds = text.glyph_box(key.0, key.1);
             (self.size, self.lift) = (bounds.size, point(bounds.left(), -bounds.bottom()));
         }
     }
@@ -99,37 +118,37 @@ impl TextLine {
     }
 
     /// How far the ink of a glyph reaches above or below its row.
-    pub(crate) fn reach(&self, line_height: Pixels, window: &Window) -> Pixels {
+    pub(crate) fn reach(&self, line_height: Pixels, text: &TextSystem) -> Pixels {
         let line = &*self.line;
         let baseline = (line_height - line.ascent - line.descent) / 2. + line.ascent;
         let mut ink = Ink::default();
         line.glyphs.iter().fold(px(0.), |reach, glyph| {
-            ink.update(glyph, window);
+            ink.update(glyph, text);
             let top = baseline + glyph.y + ink.lift.y;
             reach.max(-top).max(top + ink.size.height - line_height)
         })
     }
 
-    pub fn paint(
+    pub fn paint<C: TextCanvas>(
         &self,
         origin: Point<Pixels>,
         line_height: Pixels,
         align: TextAlign,
         width: Option<Pixels>,
-        window: &mut Window,
+        canvas: &mut C,
     ) {
-        self.paint_rows(origin, line_height, align, width, 0..self.rows(), window);
+        self.paint_rows(origin, line_height, align, width, 0..self.rows(), canvas);
     }
 
     /// Glyphs draw only in `visible` rows.
-    pub(crate) fn paint_rows(
+    pub(crate) fn paint_rows<C: TextCanvas>(
         &self,
         origin: Point<Pixels>,
         line_height: Pixels,
         align: TextAlign,
         width: Option<Pixels>,
         visible: std::ops::Range<usize>,
-        window: &mut Window,
+        canvas: &mut C,
     ) {
         let rows = self.placed(origin, align, width);
         let line = &*self.line;
@@ -140,7 +159,7 @@ impl TextLine {
         let shown = row_glyph(visible.start)..row_glyph(visible.end);
         if shown.len() < line.glyphs.len() {
             // A copy of this paint can't move: it lacks the glyphs of the other rows.
-            window.cull();
+            canvas.cull();
         }
         let decorated = self
             .looks
@@ -155,13 +174,12 @@ impl TextLine {
             if !glyphs && !decorated {
                 continue;
             }
-            let draw =
-                |window: &mut Window, start: Point<Pixels>, width: Pixels, style: &Decoration| {
-                    if !glyphs {
-                        let color = style.color.unwrap_or_default();
-                        window.draw_line(start, width, style.thickness, color, style.style);
-                    }
-                };
+            let draw = |canvas: &mut C, start: Point<Pixels>, width: Pixels, style: &Decoration| {
+                if !glyphs {
+                    let color = style.color.unwrap_or_default();
+                    canvas.draw_line(start, width, style.thickness, color, style.style);
+                }
+            };
             let mut cursor = Cursor {
                 looks: self.looks.iter(),
                 end: 0,
@@ -180,7 +198,7 @@ impl TextLine {
             let mut first_x = origin.x;
             for (at, glyph) in line.glyphs[from..to].iter().enumerate() {
                 let at = at + from;
-                ink.update(glyph, window);
+                ink.update(glyph, canvas.text_system());
                 let half = ink.size.width.half();
                 pen.x += glyph.x - last_x;
                 if at == 0 {
@@ -191,7 +209,7 @@ impl TextLine {
                         if pen.x == start.x {
                             start.x -= half;
                         }
-                        draw(window, *start, pen.x - start.x, style);
+                        draw(canvas, *start, pen.x - start.x, style);
                         *start = point(origin.x, start.y + line_height);
                     }
                     if glyph.index as usize >= cursor.end {
@@ -236,14 +254,14 @@ impl TextLine {
                     if start.x == pen.x {
                         start.x -= half;
                     }
-                    draw(window, start, pen.x - start.x, &style);
+                    draw(canvas, start, pen.x - start.x, &style);
                 }
                 let at = pen + point(px(0.), baseline) + point(px(0.), glyph.y);
                 if !glyphs {
                 } else if Rect::new(at + ink.lift, ink.size)
-                    .intersects(window.content_mask().bounds)
+                    .intersects(canvas.content_mask().bounds)
                 {
-                    window.draw_glyph(
+                    canvas.draw_glyph(
                         at,
                         glyph.font,
                         glyph.id,
@@ -254,7 +272,7 @@ impl TextLine {
                     );
                 } else {
                     // A copy of this paint can't move: it lacks the glyph.
-                    window.cull();
+                    canvas.cull();
                 }
             }
             let half = ink.size.width.half();
@@ -266,27 +284,27 @@ impl TextLine {
                 if end == start.x {
                     start.x -= half;
                 }
-                draw(window, start, end - start.x, &style);
+                draw(canvas, start, end - start.x, &style);
             }
         }
     }
 
     /// Paints under `paint`, so call it first.
-    pub fn paint_background(
+    pub fn paint_background<C: TextCanvas>(
         &self,
         origin: Point<Pixels>,
         line_height: Pixels,
         align: TextAlign,
         width: Option<Pixels>,
-        window: &mut Window,
+        canvas: &mut C,
     ) {
         if self.looks.iter().all(|look| look.background.is_none()) {
             return;
         }
         let rows = self.placed(origin, align, width);
         let line = &*self.line;
-        let quad = |window: &mut Window, origin: Point<Pixels>, width: Pixels, color: Color| {
-            window.draw_rect(Rect::new(origin, Size::new(width, line_height)), color)
+        let quad = |canvas: &mut C, origin: Point<Pixels>, width: Pixels, color: Color| {
+            canvas.draw_rect(Rect::new(origin, Size::new(width, line_height)), color)
         };
         let mut cursor = Cursor {
             looks: self.looks.iter(),
@@ -298,7 +316,7 @@ impl TextLine {
         let (mut row, mut last_x) = (0, px(0.));
         let mut pen = point(rows.left(px(0.), 0), origin.y);
         for (at, glyph) in line.glyphs.iter().enumerate() {
-            ink.update(glyph, window);
+            ink.update(glyph, canvas.text_system());
             let half = ink.size.width.half();
             pen.x += glyph.x - last_x;
             if rows.breaks.get(row) == Some(&(at as u32)) {
@@ -306,7 +324,7 @@ impl TextLine {
                     if pen.x == start.x {
                         start.x -= half;
                     }
-                    quad(window, *start, pen.x - start.x, *color);
+                    quad(canvas, *start, pen.x - start.x, *color);
                     if (glyph.index as usize) < cursor.end {
                         *start = point(origin.x, start.y + line_height);
                     } else {
@@ -336,7 +354,7 @@ impl TextLine {
                 if start.x == pen.x {
                     start.x -= half;
                 }
-                quad(window, start, width, color);
+                quad(canvas, start, width, color);
             }
         }
         let mut end = origin.x + line.width;
@@ -347,7 +365,7 @@ impl TextLine {
             if end == start.x {
                 start.x -= ink.size.width.half();
             }
-            quad(window, start, end - start.x, color);
+            quad(canvas, start, end - start.x, color);
         }
     }
 }

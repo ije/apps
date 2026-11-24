@@ -1,7 +1,7 @@
-use crate::atlas::{self, PageKind, PageList, PageStore, Tile};
-use crate::frame::{Command, Mask, Pool, RenderFrame, Target};
+use crate::gpu::atlas::{self, PageKind, PageList, PageStore, Tile};
+use crate::gpu::frame::{Command, Mask, Pool, RenderFrame, Target};
+use crate::gpu::scene::Scene;
 use crate::gpu::{ATTRIBUTES, Blur, Composite, Globals, Instance, Plain, bytes};
-use crate::scene::Scene;
 use crate::{Rect, Size};
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use raw_window_handle::{DisplayHandle, HandleError, HasDisplayHandle};
@@ -243,7 +243,7 @@ impl Gpu {
             TextureFormat::Rgba8Unorm,
             TextureUsages::TEXTURE_BINDING,
         );
-        let source = wgpu::ShaderSource::Wgsl(include_str!("../../shaders.wgsl").into());
+        let source = wgpu::ShaderSource::Wgsl(include_str!("../../gpu/shaders.wgsl").into());
         let linear = wgpu::FilterMode::Linear;
         Self {
             module: device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -490,7 +490,7 @@ impl Renderer {
 
     // The atlas stays, since the last frame still reads it.
     pub fn release(&mut self) {
-        self.pool.clear(&mut self.frame);
+        self.frame.clear_pool(&mut self.pool);
         self.instances = None;
         self.uniforms = None;
         self.staging = Vec::new();
@@ -592,7 +592,7 @@ impl Renderer {
             | TextureUsages::COPY_SRC
             | TextureUsages::COPY_DST;
         let format = self.config.format;
-        self.pool.fill(frame, |size| {
+        frame.fill_pool(&mut self.pool, |size| {
             let made = texture(&gpu.device, size, format, usage);
             let view = made.create_view(&Default::default());
             Ok((made, view))
@@ -721,10 +721,11 @@ impl Renderer {
         let frame_view = output.create_view(&Default::default());
         let pool = &self.pool;
         let view = |target: Target| {
-            pool.get(frame, target)
+            frame
+                .pooled(pool, target)
                 .map_or(&frame_view, |(_, view)| view)
         };
-        let raw = |target: Target| pool.get(frame, target).map_or(output, |(made, _)| made);
+        let raw = |target: Target| frame.pooled(pool, target).map_or(output, |(made, _)| made);
         let bind = |views: [&TextureView; 3]| {
             let entries: [_; 3] = std::array::from_fn(|at| {
                 let resource = BindingResource::TextureView(views[at]);
@@ -900,7 +901,7 @@ impl Renderer {
         let shots = (frame.shots.iter())
             .filter_map(|&(key, target, region)| {
                 let size = [region[2] as u32, region[3] as u32];
-                let (layer, _) = pool.get(frame, target)?;
+                let (layer, _) = frame.pooled(pool, target)?;
                 Some((key, size, copy(layer, size)))
             })
             .collect();

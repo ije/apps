@@ -6,11 +6,11 @@
 
 mod d3d;
 mod keys;
-mod text;
 mod window;
 
 use super::single::Task;
-use crate::{Cursor, Rect, WindowOptions, app::Callbacks, point, px, size};
+use crate::text::windows::{extent, setting};
+use crate::{Cursor, Rect, WindowOptions, platform::Callbacks, point, px, size};
 use anyhow::Result;
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering::*};
@@ -22,7 +22,7 @@ use windows::Win32::System::{DataExchange::*, Memory::*, Ole::*, Threading::GetC
 use windows::Win32::UI::{HiDpi::*, WindowsAndMessaging::*};
 use windows::{Win32::System::LibraryLoader::GetModuleHandleW, core::w};
 
-pub(crate) use text::TextSystem;
+pub(crate) use d3d::Atlas;
 pub(crate) use window::Window;
 pub use window::WindowControl;
 
@@ -133,19 +133,6 @@ fn fire(id: usize) {
     }
 }
 
-fn setting<T>(action: SYSTEM_PARAMETERS_INFO_ACTION, value: &mut T) -> bool {
-    // SAFETY: callers pass the type that the action fills, and its size.
-    unsafe {
-        SystemParametersInfoW(
-            action,
-            size_of_val(value) as u32,
-            Some((value as *mut T).cast()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
-        )
-    }
-    .is_ok()
-}
-
 pub(crate) struct Platform;
 
 impl Platform {
@@ -212,7 +199,7 @@ impl Platform {
         crate::native::quit_handler();
     }
 
-    pub fn quit(&self) {
+    pub fn quit() {
         // The quit handlers need the app, which is in use while this runs.
         run_after(Duration::ZERO, || {
             if crate::native::should_quit() {
@@ -224,7 +211,7 @@ impl Platform {
         });
     }
 
-    pub fn activate(&self, _: bool) {}
+    pub fn activate(_: bool) {}
 
     pub fn read_clipboard(&self) -> Option<String> {
         // SAFETY: the clipboard handle stays locked while its text is copied, and the copy stops at the
@@ -349,15 +336,6 @@ fn points(rect: RECT, scale: f32) -> Rect {
         px((rect.bottom - rect.top) as f32),
     );
     Rect::new(corner, extent) / scale
-}
-
-fn extent(rect: RECT) -> [i32; 4] {
-    [
-        rect.left,
-        rect.top,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-    ]
 }
 
 // Windows that want frames. A pacing thread waits for each composition of the desktop and then invalidates

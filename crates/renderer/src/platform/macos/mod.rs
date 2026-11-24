@@ -5,15 +5,13 @@ mod controls;
 mod events;
 mod glass;
 mod metal;
-mod nsview;
 mod nswindow;
-mod open_type;
-mod text;
+mod screen;
 mod threads;
 mod vsync;
 mod window;
 
-use crate::{Cursor, Rect, WindowOptions, app::Callbacks};
+use crate::{Cursor, Rect, WindowOptions, platform::Callbacks};
 use anyhow::Result;
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
@@ -30,10 +28,9 @@ use std::{
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
-pub(crate) use controls::control_size;
+pub use controls::control_size;
 pub(crate) use glass::available as supports_glass;
-pub(crate) use metal::prewarm;
-pub(crate) use text::TextSystem;
+pub(crate) use metal::{Atlas, Present, prewarm};
 pub(crate) use threads::{
     AppThread, app_thread, ask, end_thread, native_after, native_post, native_sync, park_render,
     post, run_after, spawn_render,
@@ -85,7 +82,7 @@ define_class!(
         fn launched(&self, _: &AnyObject) {
             // Only after the run loop started: an unbundled app set up earlier can get a menu bar that takes no clicks.
             NSApp(self.mtm()).setActivationPolicy(NSApplicationActivationPolicy::Regular);
-            window::measure_screens();
+            screen::measure_screens();
             let launch = self.ivars().take();
             if let Some(launch) = launch {
                 launch();
@@ -138,14 +135,14 @@ impl Platform {
         autoreleasepool(|_| NSApp(mtm).run());
     }
 
-    pub fn quit(&self) {
+    pub fn quit() {
         // After the current event: terminating closes windows, and their callbacks need the app.
         native_post(Box::new(|| {
             threads::post_local(|| NSApp(MainThreadMarker::new().unwrap()).terminate(None))
         }));
     }
 
-    pub fn activate(&self, ignoring_other_apps: bool) {
+    pub fn activate(ignoring_other_apps: bool) {
         native_post(Box::new(move || {
             #[allow(deprecated)]
             NSApp(MainThreadMarker::new().unwrap()).activateIgnoringOtherApps(ignoring_other_apps);
@@ -171,15 +168,15 @@ impl Platform {
     }
 
     pub fn set_cursor(&self, cursor: Cursor) {
-        native_post(Box::new(move || nsview::set_cursor(cursor)));
+        native_post(Box::new(move || nswindow::set_cursor(cursor)));
     }
 
     // The cached screen saves a wait for main, which is busy while the app launches.
     pub fn primary_display_bounds(&self) -> Option<Rect> {
-        window::work_area().or_else(|| {
+        screen::work_area().or_else(|| {
             native_sync(|| {
                 let primary = NSScreen::screens(MainThreadMarker::new().unwrap()).firstObject()?;
-                Some(window::flip(
+                Some(screen::flip(
                     primary.visibleFrame(),
                     primary.frame().size.height,
                 ))

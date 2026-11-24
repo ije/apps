@@ -2,7 +2,7 @@ use super::super::native_sync;
 use super::d3d::{Atlas, Renderer};
 use super::{MAIN, keys, monitor_info, monitor_scale, native_post, on_main, points};
 use super::{current_cursor, extent, run_after, setting, want_frames};
-use crate::app::Callbacks;
+use crate::platform::{Callbacks, events};
 use crate::{Button, Cursor, Event, Pixels, Point, Rect, Scene, Size, Timer, WheelPhase};
 use crate::{WindowChange, WindowOptions, WindowState, point, px};
 use anyhow::{Context as _, Result};
@@ -239,22 +239,28 @@ impl Window {
         });
     }
 
-    pub fn take_snapshots(&self) -> Vec<crate::Snapshot> {
-        match self.shared.drawing.try_borrow_mut() {
-            Ok(mut renderer) => std::mem::take(&mut renderer.snapshots),
-            Err(_) => Vec::new(),
-        }
-    }
-
-    pub fn draw(&self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
+    // Draws `scene`, and returns the capture and the snapshot layers that it read. The window keeps its own size.
+    #[allow(clippy::type_complexity)]
+    pub fn draw(
+        &self,
+        scene: &Scene,
+        _: Option<(Size<Pixels>, f32)>,
+        capture: bool,
+    ) -> (Option<Result<([u32; 2], Vec<u8>)>>, Vec<crate::Snapshot>) {
         self.shared.quiet.take();
         match self.shared.drawing.try_borrow_mut() {
-            Ok(mut renderer) => renderer.draw(scene, capture),
-            Err(_) => capture.then(|| Err(anyhow::anyhow!("The window is busy"))),
+            Ok(mut renderer) => {
+                let frame = renderer.draw(scene, capture);
+                (frame, std::mem::take(&mut renderer.snapshots))
+            }
+            Err(_) => (
+                capture.then(|| Err(anyhow::anyhow!("The window is busy"))),
+                Vec::new(),
+            ),
         }
     }
 
-    pub fn release(&self) {
+    pub fn release(&self, _: &Scene) {
         if let Ok(mut renderer) = self.shared.drawing.try_borrow_mut() {
             renderer.release();
         }
@@ -407,8 +413,9 @@ pub(super) fn key_down(message: &MSG) -> bool {
         return false;
     };
     let callbacks = shared.callbacks;
-    let taken = crate::native::key(callbacks.id, &event, &|| callbacks.composition().is_some())
-        || callbacks.input(event);
+    let taken = crate::native::key(callbacks.id, &event, &|| {
+        events().composition(callbacks).is_some()
+    }) || events().input(callbacks, event);
     // The input method takes its keys in TranslateMessage, so those always go on.
     taken && message.wParam.0 as u16 != VK_PROCESSKEY.0
 }
@@ -679,7 +686,7 @@ impl Shared {
                 | WindowChange::Edited(_) => {}
             }
         }
-        self.callbacks.changed();
+        events().changed(self.callbacks);
     }
 
     fn zoom(&self) {
@@ -718,7 +725,7 @@ impl Shared {
         // SAFETY: a plain window call. The frame change below applies the style.
         unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, style) };
         reposition(hwnd, extent(rect), SWP_FRAMECHANGED);
-        self.callbacks.changed();
+        events().changed(self.callbacks);
     }
 
     fn activate(&self) {
@@ -757,15 +764,16 @@ impl Shared {
 
     // False when the app was busy and drew nothing.
     fn frame(&self) -> bool {
-        let Some(more) = self.callbacks.frame() else {
+        let Some(more) = events().frame(self.callbacks) else {
             return false;
         };
         if !more {
             self.wants_frames.set(false);
             want_frames(self.hwnd, false);
             let callbacks = self.callbacks;
-            self.quiet
-                .set(Some(crate::app::timer(QUIET, move |_| callbacks.release())));
+            self.quiet.set(Some(crate::platform::timer(QUIET, move || {
+                events().release(callbacks)
+            })));
         }
         true
     }
@@ -800,9 +808,9 @@ impl Shared {
 
     fn place_ime(&self) {
         let callbacks = self.callbacks;
-        let Some(caret) = callbacks
-            .selection()
-            .and_then(|selection| callbacks.rect_of(selection.range))
+        let Some(caret) = events()
+            .selection(callbacks)
+            .and_then(|selection| events().rect_of(callbacks, selection.range))
         else {
             return;
         };
@@ -839,7 +847,7 @@ impl Shared {
 
     // The input method works only while the page has an editable focus.
     fn sync_ime(&self) {
-        let enabled = self.callbacks.accepts_text_input();
+        let enabled = events().accepts_text_input(self.callbacks);
         if enabled == self.ime.replace(enabled) {
             return;
         }
@@ -871,7 +879,7 @@ impl Shared {
         if flags & GCS_RESULTSTR.0 != 0
             && let Some(text) = keys::composition_text(context, GCS_RESULTSTR)
         {
-            callbacks.insert(None, &String::from_utf16_lossy(&text));
+            events().insert(callbacks, None, &String::from_utf16_lossy(&text));
         }
         // A message without flags cancels the composition.
         let composing = match flags {
@@ -885,9 +893,9 @@ impl Shared {
                     let at = keys::caret(context, text.len());
                     at..at
                 });
-                callbacks.compose(None, &String::from_utf16_lossy(&text), selected);
+                events().compose(callbacks, None, &String::from_utf16_lossy(&text), selected);
             }
-            Some(_) => callbacks.clear_composition(),
+            Some(_) => events().clear_composition(callbacks),
             None => {}
         }
         // SAFETY: releases the context taken above.
@@ -912,7 +920,7 @@ impl Shared {
         if text.chars().any(char::is_control) {
             return;
         }
-        self.callbacks.insert(None, &text);
+        events().insert(self.callbacks, None, &text);
     }
 
     fn wheel(&self, msg: u32, wparam: WPARAM, lparam: LPARAM) {
@@ -928,17 +936,20 @@ impl Shared {
         let notches = f32::from((wparam.0 >> 16) as i16) / WHEEL_DELTA as f32;
         // A tilt to the right scrolls right, which is the opposite sign of a wheel turn.
         let lines = notches * per_notch as f32 * if msg == WM_MOUSEHWHEEL { -1. } else { 1. };
-        self.callbacks.input(Event::Wheel {
-            at: self.points(self.screen_point(lparam)),
-            delta: if sideways {
-                point(lines, 0.)
-            } else {
-                point(0., lines)
+        events().input(
+            self.callbacks,
+            Event::Wheel {
+                at: self.points(self.screen_point(lparam)),
+                delta: if sideways {
+                    point(lines, 0.)
+                } else {
+                    point(0., lines)
+                },
+                lines: true,
+                phase: WheelPhase::None,
+                modifiers,
             },
-            lines: true,
-            phase: WheelPhase::None,
-            modifiers,
-        });
+        );
     }
 
     fn files(&self, drop: HDROP) {
@@ -960,8 +971,8 @@ impl Shared {
             DragFinish(drop);
         }
         let at = self.points(at);
-        self.callbacks.input(Event::FileEnter { at, paths });
-        self.callbacks.input(Event::FileDrop { at });
+        events().input(self.callbacks, Event::FileEnter { at, paths });
+        events().input(self.callbacks, Event::FileDrop { at });
     }
 
     // `None` leaves the message to the default handling.
@@ -994,14 +1005,14 @@ impl Shared {
                         // Alt-tab can leave Alt held for us, since its release went to another window.
                         let now = (keys::held(), keys::caps_lock());
                         self.seen.set(Some(now));
-                        callbacks.input(Event::ModifiersChanged { modifiers: now.0 });
+                        events().input(callbacks, Event::ModifiersChanged { modifiers: now.0 });
                     }
-                    callbacks.changed();
+                    events().changed(callbacks);
                     None
                 }
                 WM_MOVE => {
                     if !self.sizing_loop.get() {
-                        callbacks.changed();
+                        events().changed(callbacks);
                     }
                     Some(0)
                 }
@@ -1012,7 +1023,7 @@ impl Shared {
                 WM_EXITSIZEMOVE => {
                     self.sizing_loop.set(false);
                     self.resizing.set(false);
-                    callbacks.changed();
+                    events().changed(callbacks);
                     None
                 }
                 WM_SIZING => {
@@ -1020,7 +1031,7 @@ impl Shared {
                     None
                 }
                 WM_SIZE if wparam.0 == SIZE_MINIMIZED as usize => {
-                    callbacks.changed();
+                    events().changed(callbacks);
                     Some(0)
                 }
                 WM_SIZE => {
@@ -1030,7 +1041,8 @@ impl Shared {
                     {
                         eprintln!("apps: resizing the swap chain: {error:#}");
                     }
-                    callbacks.resized(
+                    events().resized(
+                        callbacks,
                         crate::size(px(pixels[0] as f32), px(pixels[1] as f32)) / scale,
                         scale,
                     );
@@ -1048,7 +1060,7 @@ impl Shared {
                         want_frames(hwnd, true);
                     }
                     if shown || flags.contains(SWP_HIDEWINDOW) {
-                        callbacks.changed();
+                        events().changed(callbacks);
                     }
                     None
                 }
@@ -1093,7 +1105,7 @@ impl Shared {
                         rect = info.rcWork;
                     }
                     reposition(hwnd, extent(rect), SET_WINDOW_POS_FLAGS::default());
-                    callbacks.resized(self.client().size, scale);
+                    events().resized(callbacks, self.client().size, scale);
                     Some(0)
                 }
                 WM_NCHITTEST => {
@@ -1101,8 +1113,9 @@ impl Shared {
                         return None;
                     }
                     let at = self.screen_point(lparam);
-                    let drag = (self.movable.get() && callbacks.in_drag_area(self.points(at)))
-                        .then_some(HTCAPTION as isize);
+                    let drag = (self.movable.get()
+                        && events().in_drag_area(callbacks, self.points(at)))
+                    .then_some(HTCAPTION as isize);
                     if !self.chromeless {
                         return drag;
                     }
@@ -1133,7 +1146,7 @@ impl Shared {
                 // Main decides about closing and closes the window itself.
                 WM_CLOSE => {
                     if self.closable.get() {
-                        callbacks.should_close();
+                        events().should_close(callbacks);
                     }
                     Some(0)
                 }
@@ -1161,53 +1174,68 @@ impl Shared {
                     .find_map(|(flag, button)| flags.contains(flag).then_some(button));
                     let at = self.points(word(lparam.0));
                     self.pointer.set(at);
-                    callbacks.input(Event::PointerMove {
-                        at,
-                        held,
-                        modifiers: keys::held(),
-                    });
+                    events().input(
+                        callbacks,
+                        Event::PointerMove {
+                            at,
+                            held,
+                            modifiers: keys::held(),
+                        },
+                    );
                     Some(0)
                 }
                 WM_NCMOUSEMOVE => {
                     self.track(TME_LEAVE | TME_NONCLIENT);
                     let at = self.points(self.screen_point(lparam));
                     self.pointer.set(at);
-                    let taken = callbacks.input(Event::PointerMove {
-                        at,
-                        held: None,
-                        modifiers: keys::held(),
-                    });
+                    let taken = events().input(
+                        callbacks,
+                        Event::PointerMove {
+                            at,
+                            held: None,
+                            modifiers: keys::held(),
+                        },
+                    );
                     taken.then_some(0)
                 }
                 WM_MOUSELEAVE | WM_NCMOUSELEAVE => {
                     self.tracking.set(false);
-                    callbacks.input(Event::PointerLeave {
-                        at: self.pointer.get(),
-                    });
+                    events().input(
+                        callbacks,
+                        Event::PointerLeave {
+                            at: self.pointer.get(),
+                        },
+                    );
                     Some(0)
                 }
                 WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
                     let button = button()?;
                     SetCapture(hwnd);
                     let at = word(lparam.0);
-                    callbacks.input(Event::PointerDown {
-                        at: self.points(at),
-                        button,
-                        modifiers: keys::held(),
-                        clicks: self.press(button, at),
-                    });
+                    events().input(
+                        callbacks,
+                        Event::PointerDown {
+                            at: self.points(at),
+                            button,
+                            modifiers: keys::held(),
+                            clicks: self.press(button, at),
+                        },
+                    );
                     // X buttons report that they were handled.
                     Some(isize::from(msg == WM_XBUTTONDOWN))
                 }
                 WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => {
                     let button = button()?;
                     let _ = ReleaseCapture();
-                    callbacks.input(Event::PointerUp {
-                        at: self.points(word(lparam.0)),
-                        button,
-                        modifiers: keys::held(),
-                        clicks: self.press.get().3,
-                    });
+                    events().input(
+                        callbacks,
+                        Event::PointerUp {
+                            at: self.points(word(lparam.0)),
+                            button,
+                            modifiers: keys::held(),
+                            clicks: self.press.get().3,
+                        },
+                    );
                     Some(isize::from(msg == WM_XBUTTONUP))
                 }
                 // The caption moves the window, as the drag areas of the page ask.
@@ -1220,12 +1248,15 @@ impl Shared {
                 WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK | WM_NCRBUTTONDOWN | WM_NCMBUTTONDOWN => {
                     let button = button()?;
                     let at = self.screen_point(lparam);
-                    let taken = callbacks.input(Event::PointerDown {
-                        at: self.points(at),
-                        button,
-                        modifiers: keys::held(),
-                        clicks: self.press(button, at),
-                    });
+                    let taken = events().input(
+                        callbacks,
+                        Event::PointerDown {
+                            at: self.points(at),
+                            button,
+                            modifiers: keys::held(),
+                            clicks: self.press(button, at),
+                        },
+                    );
                     let hit = wparam.0 as u32;
                     if taken {
                         return Some(0);
@@ -1239,12 +1270,15 @@ impl Shared {
                 }
                 WM_NCLBUTTONUP | WM_NCRBUTTONUP | WM_NCMBUTTONUP => {
                     let button = button()?;
-                    let taken = callbacks.input(Event::PointerUp {
-                        at: self.points(self.screen_point(lparam)),
-                        button,
-                        modifiers: keys::held(),
-                        clicks: 1,
-                    });
+                    let taken = events().input(
+                        callbacks,
+                        Event::PointerUp {
+                            at: self.points(self.screen_point(lparam)),
+                            button,
+                            modifiers: keys::held(),
+                            clicks: 1,
+                        },
+                    );
                     if taken {
                         return Some(0);
                     }
@@ -1271,10 +1305,10 @@ impl Shared {
                 WM_KEYUP | WM_SYSKEYUP => {
                     if let Some(event) = keys::key(&self.seen, wparam, lparam, false)
                         && !crate::native::key(callbacks.id, &event, &|| {
-                            callbacks.composition().is_some()
+                            events().composition(callbacks).is_some()
                         })
                     {
-                        callbacks.input(event);
+                        events().input(callbacks, event);
                     }
                     // Taking the release also keeps Alt from opening the window menu.
                     Some(0)
@@ -1289,7 +1323,7 @@ impl Shared {
                 }
                 WM_IME_COMPOSITION => self.composition(lparam.0 as u32),
                 WM_IME_ENDCOMPOSITION => {
-                    callbacks.clear_composition();
+                    events().clear_composition(callbacks);
                     None
                 }
                 WM_SETCURSOR if lparam.0 as u32 & 0xFFFF == HTCLIENT => {
@@ -1300,7 +1334,7 @@ impl Shared {
                     let area = PCWSTR(lparam.0 as *const u16);
                     if !area.is_null() && area.as_wide() == w!("ImmersiveColorSet").as_wide() {
                         follow_theme(hwnd);
-                        callbacks.appearance_changed();
+                        events().appearance_changed(callbacks);
                     }
                     None
                 }

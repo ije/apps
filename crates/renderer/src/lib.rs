@@ -1,38 +1,39 @@
 mod app;
-mod atlas;
 mod color;
 mod control;
-mod frame;
 mod geometry;
 mod gpu;
 mod input;
-mod node;
 mod platform;
-mod scene;
 mod style;
-pub mod text;
-mod tree;
-mod window;
+mod text;
 
-pub use app::{App, THREAD_PER_APP, Timer, native, run, spawn};
+pub use app::window::node::{
+    Child, Hooks, Node, NodeCx, NodeKey, canvas, canvas_watching, canvas_within, layers, node,
+    shared, text,
+};
+pub use app::window::scroll::ScrollRef;
+pub use app::window::tree::Tree;
+pub use app::window::*;
+pub use app::{App, THREAD_PER_APP, run, spawn};
 pub use color::*;
 pub use control::*;
 pub use geometry::*;
+pub use gpu::Snapshot;
+pub(crate) use gpu::scene::Scene;
+pub use gpu::scene::{Backdrop, BlendMode, Glass, PaintEffect, RenderImage};
 pub use input::*;
-pub use node::{
-    AvailableSpace, Child, Hooks, Node, NodeCx, NodeKey, ScrollRef, canvas, canvas_watching,
-    canvas_within, layers, node, shared, text,
+pub use platform::{
+    CARET_BLINK, Timer, WindowChange, WindowControl, WindowId, WindowOptions, WindowState,
+    activate, before_exit, control_size, native, post_main, post_main_after, prewarm, quit,
+    sync_main,
 };
-pub(crate) use scene::Scene;
-pub use scene::{Backdrop, BlendMode, BorderStyle, Glass, PaintEffect, RenderImage};
 pub use style::*;
 pub use text::{
     Decoration, DecorationStyle, Font, FontId, FontStyle, FontWeight, Glyph, GlyphId, Line,
     Paragraph, SUBPIXEL_STEPS, SharedString, TextAlign, TextLine, TextOverrides, TextRun,
-    TextStyle, TextSystem, TextWrap, WhiteSpace, WordBreak, Wrapping, widest_piece,
+    TextStyle, TextSystem, TextWrap, WhiteSpace, WordBreak, Wrapping, warm, widest_piece,
 };
-pub use tree::Tree;
-pub use window::*;
 
 pub fn supports_glass() -> bool {
     #[cfg(target_os = "macos")]

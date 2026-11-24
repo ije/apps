@@ -2,7 +2,9 @@ use super::Client;
 use crate::platform::linux::gpu::{Atlas, Capture, Drawn, Renderer};
 use crate::platform::linux::{Action, Display as _, Native, run_after};
 use crate::{
-    Pixels, Rect, Scene, Size, WindowOptions, WindowState, app::Callbacks, point, px, size,
+    Pixels, Rect, Scene, Size, WindowOptions, WindowState,
+    platform::{Callbacks, events},
+    point, px, size,
 };
 use anyhow::Result;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle, XcbDisplayHandle, XcbWindowHandle};
@@ -274,7 +276,7 @@ impl Toplevel {
         } else if self.wants.get() {
             self.start();
         }
-        self.calls.changed();
+        events().changed(self.calls);
     }
 
     pub fn set_mapped(&self, mapped: bool) {
@@ -290,13 +292,13 @@ impl Toplevel {
 
     pub fn expose(&self) {
         if self.mapped.get() {
-            self.calls.appearance_changed();
+            events().appearance_changed(self.calls);
         }
     }
 
     pub fn focus(&self, active: bool) {
         self.shape.borrow_mut().active = active;
-        self.calls.changed();
+        events().changed(self.calls);
     }
 
     pub fn sync_request(&self, value: sync::Int64) {
@@ -324,8 +326,8 @@ impl Toplevel {
             resized
         };
         match resized {
-            true => self.calls.resized(extent, scale),
-            false => self.calls.changed(),
+            true => events().resized(self.calls, extent, scale),
+            false => events().changed(self.calls),
         }
     }
 
@@ -355,7 +357,7 @@ impl Toplevel {
                 }
             }
         }
-        self.calls.changed();
+        events().changed(self.calls);
     }
 }
 
@@ -367,7 +369,7 @@ fn tick(window: Weak<Toplevel>, round: u64, at: Instant) {
         if strong.round.get() != round {
             return;
         }
-        let more = strong.calls.frame();
+        let more = events().frame(strong.calls);
         if strong.round.get() != round {
             return;
         }
@@ -440,7 +442,7 @@ impl Native for Toplevel {
             let _ = client.xcb.flush();
         }
         if drawn == Drawn::Again {
-            self.calls.appearance_changed();
+            events().appearance_changed(self.calls);
         }
         capture
     }

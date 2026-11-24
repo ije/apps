@@ -1,13 +1,16 @@
-use crate::{Rect, Scene, Size, text::GlyphRaster};
+use crate::{
+    Rect, Size,
+    text::{GlyphRaster, Raster},
+};
 use anyhow::{Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
+    mem,
 };
 
 const MAX_GLYPH_PIXELS: usize = 4 << 20;
-pub(crate) const MAX_GLYPH_SIDE: i32 = 2048;
 const MAX_AGE: u32 = 60;
 // Keep retired tiles until in-flight frames finish. Increase this delay if a window uses more than 3
 // drawables.
@@ -82,8 +85,6 @@ pub(crate) struct Atlas<B> {
     removed: RefCell<Vec<(bool, u32, Rect<i32>)>>,
 }
 
-pub(crate) type Raster<B> = (Rect<i32>, Size<i32>, B);
-
 pub(crate) type Build<'a> = dyn FnMut() -> Result<Option<Raster<Cow<'a, [u8]>>>> + 'a;
 
 fn pixels(tile: &Tile) -> usize {
@@ -110,21 +111,18 @@ impl<B: PageStore> Atlas<B> {
         self.evicted.get()
     }
 
-    pub fn take_evicted(&self) -> bool {
-        self.evicted.replace(false)
-    }
-
     // The tiles removed since the last call. Canvases and videos remove one each frame, so only the copies
-    // that read them paint again. Many removals stop all copies.
-    pub(crate) fn take_removed(&self, into: &mut Vec<(bool, u32, Rect<i32>)>) {
+    // that read them paint again. Many removals stop all copies. Returns true when tiles that copies read were
+    // freed.
+    // `into` gets the list, and the atlas keeps the cleared buffer of `into` for later removals.
+    pub(crate) fn take_removed(&self, into: &mut Vec<(bool, u32, Rect<i32>)>) -> bool {
         into.clear();
-        let mut removed = self.removed.borrow_mut();
-        if removed.len() > 64 {
+        mem::swap(into, &mut self.removed.borrow_mut());
+        if into.len() > 64 {
             self.evicted.set(true);
-        } else {
-            into.extend_from_slice(&removed);
+            into.clear();
         }
-        removed.clear();
+        self.evicted.replace(false)
     }
 
     // Instances that read new pixels in the place of old ones look the same, so they must draw again.
@@ -210,8 +208,8 @@ impl<B: PageStore> Atlas<B> {
         }
     }
 
-    // `scene` is the scene of this frame, which the next paint copies spans from.
-    pub fn finish_frame(&self, scene: &Scene) {
+    // `read` holds the tiles that the scene of this frame reads, which the next paint copies spans from.
+    pub fn finish_frame(&self, read: impl IntoIterator<Item = (bool, u32, Rect<f32>)>) {
         let frame = self.frame.replace(self.frame.get().wrapping_add(1));
         let mut retired = self.retired.borrow_mut();
         if !retired.is_empty() {
@@ -255,7 +253,7 @@ impl<B: PageStore> Atlas<B> {
             .filter_map(|(_, entry)| entry.tile.map(place))
             .collect();
         if !unread.is_empty() {
-            for (color, page, texels) in scene.texels() {
+            for (color, page, texels) in read {
                 unread.remove(&(color, page, texels.origin.map(|value| value as i32)));
             }
         }
@@ -292,7 +290,7 @@ impl<B: PageStore> Atlas<B> {
 
     // The tiles of the last frame and of `scene`, whose spans the next paint can copy, must stay.
     #[cfg(target_os = "macos")]
-    pub fn release_images(&self, scene: &Scene) {
+    pub fn release_images(&self, read: impl IntoIterator<Item = (bool, u32, Rect<f32>)>) {
         let frame = self.frame.get();
         let mut tiles = self.tiles.borrow_mut();
         let old = |key: &TileKey, entry: &Entry| {
@@ -304,7 +302,7 @@ impl<B: PageStore> Atlas<B> {
             .filter_map(|(_, entry)| entry.tile)
             .map(|tile| (tile.page, tile.rect))
             .collect();
-        for (color, page, texels) in scene.texels() {
+        for (color, page, texels) in read {
             if unread.is_empty() {
                 break;
             }
@@ -371,11 +369,7 @@ impl<T> PageList<T> {
         let Some((packer, _)) = self.pages.get_mut(index).and_then(Option::as_mut) else {
             return false;
         };
-        packer
-            .allocator
-            .deallocate(etagere::AllocId::deserialize(id));
-        packer.live = packer.live.saturating_sub(1);
-        if packer.live != 0 {
+        if !packer.free(id) {
             return false;
         }
         if let Some(old) = self.spare.replace(index)
@@ -458,6 +452,13 @@ impl Packer {
         }
     }
 
+    // True when the page holds no tile after this.
+    fn free(&mut self, id: u32) -> bool {
+        self.allocator.deallocate(etagere::AllocId::deserialize(id));
+        self.live = self.live.saturating_sub(1);
+        self.live == 0
+    }
+
     fn allocate(&mut self, size: Size<i32>) -> Option<(crate::Rect<i32>, u32)> {
         // Keep small tiles off large pages so an icon cannot retain a large texture.
         if page_size(size) != self.size {
@@ -478,6 +479,7 @@ impl Packer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Scene;
     use crate::gpu::{GLYPH, IMAGE, Instance};
 
     #[derive(Default)]
@@ -539,9 +541,9 @@ mod tests {
             assert_eq!(*page, Size::new(width, height));
         }
         atlas.remove(&TileKey::Image(1));
-        atlas.finish_frame(&Scene::default());
-        atlas.finish_frame(&Scene::default());
-        atlas.finish_frame(&Scene::default());
+        atlas.finish_frame([]);
+        atlas.finish_frame([]);
+        atlas.finish_frame([]);
         let backend = atlas.pages.borrow();
         assert!(backend.list.is_empty(big.page as usize));
     }
@@ -558,10 +560,10 @@ mod tests {
         };
         insert(1);
         insert(2);
-        atlas.finish_frame(&Scene::default());
+        atlas.finish_frame([]);
         let shown = insert(2);
-        atlas.finish_frame(&Scene::default());
-        atlas.release_images(&Scene::default());
+        atlas.finish_frame([]);
+        atlas.release_images([]);
         atlas.free_retired(|| {});
         let freed = &atlas.pages.borrow().freed;
         assert_eq!(freed.len(), 1);
@@ -582,7 +584,7 @@ mod tests {
                 .unwrap()
                 .0;
             inserted.push(tile);
-            atlas.finish_frame(&Scene::default());
+            atlas.finish_frame([]);
             let backend = atlas.pages.borrow();
             assert!(backend.freed.len() as u64 <= frame.saturating_sub(IN_FLIGHT as u64));
             let key = |tile: &Tile| (tile.page, tile.id, tile.rect);
@@ -639,7 +641,7 @@ mod tests {
         let (shown, gone) = (insert(&glyph(1)), insert(&glyph(2)));
         let (photo, hidden) = (insert(&TileKey::Image(1)), insert(&TileKey::Image(2)));
         let mut scene = Scene::default();
-        scene.begin_paint(0);
+        scene.begin_paint(0, &mut Vec::new());
         let mark = scene.mark();
         scene.push(sprite(GLYPH, shown));
         let mut cropped = sprite(IMAGE, photo);
@@ -649,14 +651,14 @@ mod tests {
         let mut span = scene.span(mark).unwrap();
         scene.push(sprite(GLYPH, gone));
         scene.push(sprite(IMAGE, hidden));
-        atlas.finish_frame(&scene);
+        atlas.finish_frame(scene.texels());
         let mut retired_at = None;
         for pass in 1..=MAX_AGE * 2 {
             scene.clear();
-            scene.begin_paint(pass);
+            scene.begin_paint(pass, &mut Vec::new());
             span = scene.replay(&span).unwrap();
             atlas.glyph_pixels.set(MAX_GLYPH_PIXELS + 1);
-            atlas.finish_frame(&scene);
+            atlas.finish_frame(scene.texels());
             let freed = (atlas.pages.borrow().freed.iter()).any(|tile| tile.id == gone.id);
             if atlas.tiles.borrow().get(&glyph(2)).is_none() {
                 let at = *retired_at.get_or_insert(pass);
@@ -669,27 +671,28 @@ mod tests {
         }
         assert!(retired_at.is_some());
         assert!(atlas.tiles.borrow().get(&glyph(1)).is_some());
-        assert!(!atlas.take_evicted(), "copies never read the swept glyph");
+        assert!(!atlas.evicted(), "copies never read the swept glyph");
         #[cfg(target_os = "macos")]
         {
-            atlas.release_images(&scene);
+            atlas.release_images(scene.texels());
             atlas.free_retired(|| {});
             let tiles = atlas.tiles.borrow();
             assert!(tiles.get(&TileKey::Image(1)).is_some());
             assert!(tiles.get(&TileKey::Image(2)).is_none());
-            assert!(!atlas.take_evicted());
+            assert!(!atlas.evicted());
         }
         // A removed tile stops only the copies that read it.
         scene.clear();
-        scene.begin_paint(MAX_AGE * 2 + 1);
+        scene.begin_paint(MAX_AGE * 2 + 1, &mut Vec::new());
         let photo_span = scene.replay(&span).unwrap();
         let mark = scene.mark();
         scene.push(sprite(GLYPH, shown));
         let glyph_span = scene.span(mark).unwrap();
         scene.clear();
         atlas.remove(&TileKey::Image(1));
-        atlas.take_removed(&mut scene.removed);
-        assert!(!atlas.take_evicted());
+        let mut removed = Vec::new();
+        assert!(!atlas.take_removed(&mut removed));
+        scene.begin_paint(MAX_AGE * 2 + 2, &mut removed);
         assert!(
             scene.replay(&glyph_span).is_some(),
             "the glyph copy reads no removed tile"
@@ -712,12 +715,12 @@ mod tests {
         let old = insert(1);
         atlas.remove(&TileKey::Image(1));
         for _ in 0..=IN_FLIGHT {
-            atlas.finish_frame(&scene);
+            atlas.finish_frame(scene.texels());
         }
         assert_eq!(insert(2).rect, old.rect);
         assert_eq!(atlas.take_fresh().unwrap().len(), 1);
         for _ in 0..MAX_AGE {
-            atlas.finish_frame(&scene);
+            atlas.finish_frame(scene.texels());
         }
         assert!(atlas.freed.borrow().is_empty());
     }
@@ -729,7 +732,7 @@ mod tests {
         let mut sweeps = Vec::new();
         for _ in 0..46 {
             let before = atlas.swept.get();
-            atlas.finish_frame(&Scene::default());
+            atlas.finish_frame([]);
             if atlas.swept.get() != before {
                 sweeps.push(atlas.swept.get());
             }
@@ -752,7 +755,7 @@ mod tests {
                 Err(anyhow::anyhow!("no pixels"))
             });
             assert!(tile.is_none());
-            atlas.finish_frame(&Scene::default());
+            atlas.finish_frame([]);
         }
         assert_eq!(builds.get(), 2);
         assert_eq!(atlas.pages.borrow().made, 0);

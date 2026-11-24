@@ -1,9 +1,12 @@
+mod layers;
+mod textures;
+
 use crate::{
     Color, Rect, Size,
-    atlas::{self, PageKind, PageList, PageStore, Tile},
-    frame::{self, Command, Mask, Pool, RenderFrame, Target},
+    gpu::atlas::{self, PageKind, PageList, PageStore, Tile},
+    gpu::frame::{Command, Mask, Pool, RenderFrame, Target},
+    gpu::scene::Scene,
     gpu::{ATTRIBUTES, Globals, Instance, bytes},
-    scene::Scene,
 };
 use anyhow::{Context as _, Result, ensure};
 use block2::RcBlock;
@@ -36,6 +39,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
+use textures::{new_texture, page_texture, upload};
 
 const FORMAT: MTLPixelFormat = MTLPixelFormat::BGRA8Unorm;
 const MAX_TEXTURE_SIZE: u32 = 16384;
@@ -154,6 +158,8 @@ pub(crate) struct Renderer {
     blank: Texture,
     pool: Pool<Texture>,
     frame: RenderFrame,
+    // A buffer for `Scene::native_glass`.
+    glass_taken: Vec<usize>,
     promoted: Vec<Promoted>,
     glass: Vec<NativeGlass>,
     glass_update: bool,
@@ -163,7 +169,7 @@ pub(crate) struct Renderer {
     restacked: bool,
     committed: u64,
     completed: Arc<AtomicU64>,
-    pub snapshots: Vec<crate::Snapshot>,
+    snapshots: Vec<crate::Snapshot>,
     // Copies of the snapshot layers of the last frame that read them, for the next one with the same sizes.
     shot_copies: Vec<Texture>,
     // The drawable of the last frame, which a frame with a damage region copies.
@@ -419,6 +425,7 @@ impl Renderer {
             blank,
             pool: Pool::default(),
             frame: RenderFrame::default(),
+            glass_taken: Vec::new(),
             promoted: Vec::new(),
             glass: Vec::new(),
             glass_update: false,
@@ -436,188 +443,6 @@ impl Renderer {
             regions: Vec::new(),
             frames: 0,
         })
-    }
-
-    pub fn promote(
-        &mut self,
-        key: u64,
-        index: usize,
-        region: [i32; 4],
-        [step, repeat, since]: [f64; 3],
-        opacities: &[f32],
-        transforms: &[[f64; 16]],
-    ) {
-        CATransaction::setDisableActions(true);
-        let scale = self.layer.contentsScale();
-        let [x, y, w, h] = region.map(|value| value as f64 / scale);
-        if let Some(at) = self
-            .promoted
-            .iter()
-            .position(|promoted| promoted.key == key && promoted.index != index)
-        {
-            self.promoted.remove(at).sublayer.removeFromSuperlayer();
-        }
-        let at = match self
-            .promoted
-            .iter()
-            .position(|promoted| promoted.key == key)
-        {
-            Some(at) => at,
-            None => {
-                let sublayer = metal_layer(&self.device, false, self.wide);
-                sublayer.setPresentsWithTransaction(true);
-                sublayer.setContentsScale(scale);
-                sublayer.setDrawableSize(CGSize::new(region[2] as f64, region[3] as f64));
-                sublayer.setAnchorPoint(objc2_core_foundation::CGPoint::new(0., 0.));
-                sublayer.setBounds(objc2_core_foundation::CGRect::new(
-                    objc2_core_foundation::CGPoint::new(0., 0.),
-                    CGSize::new(w, h),
-                ));
-                sublayer.setPosition(objc2_core_foundation::CGPoint::new(x, y));
-                // Keep promoted layers below the caret: promotion does not account for it.
-                self.overlay.insertSublayer_atIndex(&sublayer, 0);
-                self.promoted.push(Promoted {
-                    key,
-                    index,
-                    sublayer,
-                    drawn: false,
-                });
-                self.restacked = true;
-                self.promoted.len() - 1
-            }
-        };
-        let sublayer = &self.promoted[at].sublayer;
-        let count = opacities.len().max(1);
-        let times: Vec<_> = (0..count)
-            .map(|k| NSNumber::new_f64(k as f64 / (count - 1).max(1) as f64))
-            .collect();
-        let times = NSArray::from_retained_slice(&times);
-        let begin = CACurrentMediaTime() - since;
-        let play = |path: &NSString, values: &NSArray| {
-            let animation = CAKeyframeAnimation::animationWithKeyPath(Some(path));
-            // SAFETY: the values are what the key path animates: numbers or transform values.
-            unsafe { animation.setValues(Some(values)) };
-            animation.setKeyTimes(Some(&times));
-            animation.setDuration(step * (count - 1) as f64);
-            animation.setRepeatCount(repeat as f32);
-            animation.setBeginTime(begin);
-            // SAFETY: a constant of Core Animation.
-            animation.setFillMode(unsafe { kCAFillModeBoth });
-            animation.setRemovedOnCompletion(false);
-            sublayer.addAnimation_forKey(&animation, Some(path));
-        };
-        let numbers: Vec<_> = opacities
-            .iter()
-            .map(|&value| NSNumber::new_f32(value))
-            .collect();
-        let numbers = NSArray::from_retained_slice(&numbers);
-        // SAFETY: an array of numbers is an array of objects.
-        play(ns_string!("opacity"), unsafe {
-            &*Retained::as_ptr(&numbers).cast::<NSArray>()
-        });
-        sublayer.setOpacity(opacities.last().copied().unwrap_or(1.));
-        if !transforms.is_empty() {
-            let mul = |a: &[f64; 16], b: &[f64; 16]| -> [f64; 16] {
-                std::array::from_fn(|i| (0..4).map(|k| a[k * 4 + i % 4] * b[i / 4 * 4 + k]).sum())
-            };
-            let shift = |dx: f64, dy: f64| {
-                let mut m = [0.; 16];
-                [m[0], m[5], m[10], m[15], m[12], m[13]] = [1., 1., 1., 1., dx, dy];
-                m
-            };
-            let (place, anchor) = (shift(x, y), shift(-x, -y));
-            let values: Vec<_> = transforms
-                .iter()
-                .map(|matrix| {
-                    let m = mul(&anchor, &mul(matrix, &place));
-                    // SAFETY: a `CATransform3D` is 16 `CGFloat`s, which are `f64`, column by column.
-                    let t = unsafe { mem::transmute::<[f64; 16], CATransform3D>(m) };
-                    // SAFETY: a plain struct value.
-                    unsafe { NSValue::valueWithCATransform3D(t) }
-                })
-                .collect();
-            if let Some(last) = values.last() {
-                // SAFETY: the value holds a transform.
-                sublayer.setTransform(unsafe { last.CATransform3DValue() });
-            }
-            let values = NSArray::from_retained_slice(&values);
-            // SAFETY: an array of values is an array of objects.
-            play(ns_string!("transform"), unsafe {
-                &*Retained::as_ptr(&values).cast::<NSArray>()
-            });
-        }
-    }
-
-    pub fn demote(&mut self) {
-        if self.promoted.is_empty() {
-            return;
-        }
-        CATransaction::setDisableActions(true);
-        for promoted in self.promoted.drain(..) {
-            promoted.sublayer.removeFromSuperlayer();
-        }
-        self.restacked = true;
-    }
-
-    pub fn set_caret(&mut self, caret: Option<(Rect<f32>, Color, std::time::Instant)>) {
-        if self
-            .caret
-            .as_ref()
-            .map(|(_, bounds, color, since)| (*bounds, *color, *since))
-            == caret
-        {
-            return;
-        }
-        CATransaction::setDisableActions(true);
-        self.restacked = true;
-        if let Some((layer, ..)) = self.caret.take() {
-            layer.removeFromSuperlayer();
-        }
-        let Some((bounds, color, since)) = caret else {
-            return;
-        };
-        let scale = self.layer.contentsScale();
-        let (x, y, w, h) = (
-            f64::from(bounds.origin.x) / scale,
-            f64::from(bounds.origin.y) / scale,
-            f64::from(bounds.size.width) / scale,
-            f64::from(bounds.size.height) / scale,
-        );
-        let layer = CALayer::new();
-        layer.setAnchorPoint(objc2_core_foundation::CGPoint::new(0., 0.));
-        layer.setBounds(objc2_core_foundation::CGRect::new(
-            objc2_core_foundation::CGPoint::new(0., 0.),
-            CGSize::new(w, h),
-        ));
-        layer.setPosition(objc2_core_foundation::CGPoint::new(x, y));
-        let srgb = objc2_core_graphics::CGColor::new_srgb(
-            f64::from(color.r),
-            f64::from(color.g),
-            f64::from(color.b),
-            f64::from(color.a),
-        );
-        layer.setBackgroundColor(Some(&srgb));
-        let blink = crate::CARET_BLINK.as_secs_f64();
-        let animation = CAKeyframeAnimation::animationWithKeyPath(Some(ns_string!("opacity")));
-        let values = NSArray::from_retained_slice(&[NSNumber::new_f32(1.), NSNumber::new_f32(0.)]);
-        // SAFETY: an array of numbers is an array of objects, which is what this key path animates.
-        unsafe { animation.setValues(Some(&*Retained::as_ptr(&values).cast::<NSArray>())) };
-        animation.setKeyTimes(Some(&NSArray::from_retained_slice(&[
-            NSNumber::new_f64(0.),
-            NSNumber::new_f64(0.5),
-            NSNumber::new_f64(1.),
-        ])));
-        // SAFETY: constants of Core Animation.
-        animation.setCalculationMode(unsafe { kCAAnimationDiscrete });
-        animation.setDuration(blink * 2.);
-        animation.setRepeatCount(f32::INFINITY);
-        animation.setBeginTime(CACurrentMediaTime() - since.elapsed().as_secs_f64());
-        // SAFETY: constants of Core Animation.
-        animation.setFillMode(unsafe { kCAFillModeBoth });
-        animation.setRemovedOnCompletion(false);
-        layer.addAnimation_forKey(&animation, Some(ns_string!("opacity")));
-        self.overlay.addSublayer(&layer);
-        self.caret = Some((layer, bounds, color, since));
     }
 
     pub fn atlas(&self) -> &Rc<Atlas> {
@@ -648,45 +473,12 @@ impl Renderer {
         congested
     }
 
-    pub fn take_present(&mut self) -> Option<Present> {
-        self.present.take()
+    pub fn take_snapshots(&mut self) -> Vec<crate::Snapshot> {
+        mem::take(&mut self.snapshots)
     }
 
-    // Present glass and the frame in one main-thread Core Animation transaction, including AppKit's resize
-    // transaction.
-    pub fn take_glass_update(
-        &mut self,
-        apply: impl FnOnce(Vec<super::glass::GlassSurface>) + Send + 'static,
-    ) -> Option<Present> {
-        if !mem::take(&mut self.glass_update) {
-            return None;
-        }
-        self.glass_stale = false;
-        let surfaces = super::Sendable::new(
-            self.glass
-                .iter()
-                .map(|glass| glass.surface.clone())
-                .collect::<Vec<_>>(),
-        );
-        let frame = self.present.take().and_then(|mut present| present.0.take());
-        let update = Present::new(move || {
-            let run = move || {
-                apply(surfaces.take());
-                if let Some(frame) = frame {
-                    frame.take()();
-                }
-            };
-            if MainThreadMarker::new().is_some() {
-                run();
-            } else {
-                super::native_post(Box::new(run));
-            }
-        });
-        if self.in_transaction {
-            self.present = Some(update);
-            return None;
-        }
-        Some(update)
+    pub fn take_present(&mut self) -> Option<Present> {
+        self.present.take()
     }
 
     pub fn discard(&mut self, present: Present) {
@@ -714,7 +506,7 @@ impl Renderer {
     }
 
     pub fn release(&mut self, scene: &crate::Scene) {
-        self.atlas.release_images(scene);
+        self.atlas.release_images(scene.texels());
         self.shot_copies.clear();
         // An empty command buffer waits for earlier frames on the same queue.
         self.atlas.free_retired(|| {
@@ -726,7 +518,7 @@ impl Renderer {
         for list in &mut self.atlas.pages.borrow_mut().pages {
             list.trim();
         }
-        self.pool.clear(&mut self.frame);
+        self.frame.clear_pool(&mut self.pool);
         self.last = None;
         self.drawables.clear();
         BUFFERS.with(|buffers| buffers.borrow_mut().reset(MIN_INSTANCE_BUFFER));
@@ -753,7 +545,7 @@ impl Renderer {
             // Kept pixels are in the old color space.
             self.last = None;
             self.drawables.clear();
-            self.pool.clear(&mut self.frame);
+            self.frame.clear_pool(&mut self.pool);
             let space = Some(color_space(wide));
             for promoted in &self.promoted {
                 promoted.sublayer.setColorspace(space);
@@ -767,40 +559,8 @@ impl Renderer {
         let mut glass: Vec<NativeGlass> = Vec::new();
         if super::glass::available() {
             // Later glass draws above earlier glass, so it is checked first.
-            for nested in scene.layers[0].nested.iter().rev() {
-                let index = nested.layer;
-                let layer = &scene.layers[index];
-                let Some(effect) = &layer.effect else {
-                    continue;
-                };
-                let (Some(config), Some(bounds)) = (&effect.glass, layer.bounds) else {
-                    continue;
-                };
-                let mask = &effect.content_mask;
-                if effect.transform.is_some()
-                    || effect.opacity != 1.
-                    || effect.color_matrix.is_some()
-                    || effect.blur != 0.
-                    || effect.shadow.is_some()
-                    || effect.blend_mode != crate::BlendMode::Normal
-                    || effect.clip.is_some()
-                    || effect.mask.is_some()
-                    || effect.backdrop.is_some()
-                    || bounds != config.bounds
-                    || bounds.intersect(mask.bounds) != bounds
-                    || mask.radii != Default::default()
-                    || scene.paints_over(index, bounds, |layer| {
-                        glass.iter().any(|native| native.index == layer)
-                    })
-                    || bounds.size.width > 4096.
-                    || bounds.size.height > 4096.
-                {
-                    continue;
-                }
-                let region = crate::frame::region(bounds);
-                if region[2] <= 0 || region[3] <= 0 {
-                    continue;
-                }
+            scene.native_glass(&mut self.glass_taken, |index, bounds, config| {
+                let region = crate::geometry::region(bounds);
                 let sublayer = match self
                     .glass
                     .iter()
@@ -831,7 +591,7 @@ impl Renderer {
                         interactive: config.interactive,
                     },
                 });
-            }
+            });
         }
         glass.reverse();
         self.glass = glass;
@@ -850,15 +610,11 @@ impl Renderer {
                 && self.glass.is_empty()
                 && [last.width() as u32, last.height() as u32] == window
         });
-        let damage = (last.as_ref()).and_then(|_| frame::damage_regions(scene, window, &[]));
+        let damage = (last.as_ref()).and_then(|_| scene.damage_regions(window, &[]));
         // Nothing changed, so the window keeps its last frame.
         if damage.as_ref().is_some_and(Vec::is_empty)
             && self.promoted.iter().all(|promoted| promoted.drawn)
-            && (self.promoted.iter().map(|promoted| promoted.index)).eq(self
-                .frame
-                .skip
-                .iter()
-                .copied())
+            && (self.frame).skips(self.promoted.iter().map(|promoted| promoted.index))
             && !scene.shots.iter().any(|shot| shot.read)
         {
             self.last = last;
@@ -908,7 +664,7 @@ impl Renderer {
                 .collect::<Option<Vec<_>>>()
         {
             let extra: Vec<_> = extra.into_iter().flatten().copied().collect();
-            if let Some(regions) = frame::damage_regions(scene, window, &extra) {
+            if let Some(regions) = scene.damage_regions(window, &extra) {
                 (damage, last) = (regions, None);
             }
         }
@@ -939,7 +695,7 @@ impl Renderer {
             .retain(|(texture, frame)| !ptr::eq(&**texture, &*frame_texture) && frames - frame < 4);
         self.drawables.push((frame_texture.clone(), frames));
         self.regions.retain(|(frame, _)| frames - frame < 4);
-        let regions = (!self.frame.damage.is_empty() && shift.is_none()).then_some(own);
+        let regions = (self.frame.damaged() && shift.is_none()).then_some(own);
         self.regions.push((frames, regions));
         let (commands, sublayers) = match rendered {
             Ok(commands) => commands,
@@ -956,7 +712,7 @@ impl Renderer {
         let shots: Vec<_> = (self.frame.shots.iter())
             .filter_map(|&(key, target, region)| {
                 let size = [region[2] as u32, region[3] as u32];
-                let layer = self.pool.get(&self.frame, target)?;
+                let layer = self.frame.pooled(&self.pool, target)?;
                 // A blit encoder keeps much memory in the Apple GPU driver, so there a draw copies the layer
                 // into a texture that the CPU can read.
                 let read = if self.atlas.pages.borrow().shared {
@@ -1114,33 +870,22 @@ impl Renderer {
         drawable: &ProtocolObject<dyn MTLTexture>,
         window: [u32; 2],
         damage: Vec<[i32; 4]>,
-        last: Option<(&ProtocolObject<dyn MTLTexture>, Option<crate::scene::Shift>)>,
+        last: Option<(
+            &ProtocolObject<dyn MTLTexture>,
+            Option<crate::gpu::scene::Shift>,
+        )>,
         srgb: Option<&ProtocolObject<dyn MTLTexture>>,
     ) -> Result<Rendered> {
         let mut frame = mem::take(&mut self.frame);
-        let skipped = mem::take(&mut frame.skip);
-        frame.content.clear();
-        for promoted in &self.promoted {
-            frame.skip.push(promoted.index);
-            if !promoted.drawn {
-                frame.content.push(promoted.index);
-            }
-        }
-        for glass in &self.glass {
-            frame.skip.push(glass.index);
-            frame.content.push(glass.index);
-        }
-        // A layer that left or joined Core Animation draws otherwise in the whole window.
-        frame.damage = match frame.skip == skipped {
-            true => damage,
-            false => Vec::new(),
-        };
-        frame.fresh = srgb.is_some();
-        frame.keeps_under = true;
-        self.pool.spare(&mut frame.spare);
+        // Core Animation draws the promoted layers and the glass, and the frame draws their content when they need it.
+        let native = (self.promoted.iter())
+            .map(|promoted| (promoted.index, !promoted.drawn))
+            .chain(self.glass.iter().map(|glass| (glass.index, true)));
+        frame.prepare(native, damage, srgb.is_some(), true);
+        frame.take_spare(&self.pool);
         frame.record(scene, window, MAX_TEXTURE_SIZE, true);
         let device = &self.device;
-        self.pool.fill(&frame, |size| {
+        frame.fill_pool(&mut self.pool, |size| {
             new_texture(
                 device,
                 size.map(|side| side as usize),
@@ -1164,7 +909,7 @@ impl Renderer {
         // damaged the edges that they don't cover.
         let mut prelude: Vec<Prelude> = Vec::new();
         let mut kept = None;
-        if !frame.damage.is_empty()
+        if frame.damaged()
             && let Some((last, shift)) = last
         {
             let whole = [0, 0, window[0] as i32, window[1] as i32];
@@ -1236,7 +981,7 @@ impl Renderer {
         let mut sublayers = Vec::new();
         if result.is_ok() {
             for &(index, target, region) in &frame.promoted {
-                let Some(source) = self.pool.get(&frame, target) else {
+                let Some(source) = frame.pooled(&self.pool, target) else {
                     continue;
                 };
                 let promoted = self.promoted.iter_mut().find(|p| p.index == index);
@@ -1305,11 +1050,8 @@ impl Renderer {
         // Copies that start the frame, drawn when its first pass begins: (source, offset, area).
         prelude: &[Prelude],
     ) -> Result<()> {
-        let texture = |target: Target| {
-            self.pool
-                .get(frame, target)
-                .map_or(drawable, |texture| texture)
-        };
+        let texture =
+            |target: Target| (frame.pooled(&self.pool, target)).map_or(drawable, |texture| texture);
         let pages = self.atlas.pages.borrow();
         let page = |kind, index: Option<u32>| {
             index
@@ -1611,52 +1353,6 @@ fn metal_layer(
     surface
 }
 
-// Sides must be within 1..=16384.
-fn new_texture(
-    device: &ProtocolObject<dyn MTLDevice>,
-    [width, height]: [usize; 2],
-    format: MTLPixelFormat,
-    usage: MTLTextureUsage,
-    storage: MTLStorageMode,
-) -> Result<Texture> {
-    let spec = MTLTextureDescriptor::new();
-    // SAFETY: callers keep both sides within the limits of a 2D texture.
-    unsafe {
-        spec.setWidth(width);
-        spec.setHeight(height);
-    }
-    spec.setPixelFormat(format);
-    spec.setUsage(usage);
-    spec.setStorageMode(storage);
-    device
-        .newTextureWithDescriptor(&spec)
-        .with_context(|| format!("no {width}x{height} texture"))
-}
-
-fn upload(texture: &ProtocolObject<dyn MTLTexture>, rect: Rect<i32>, bytes: &[u8], row: usize) {
-    let at = |value: i32| value as usize;
-    // SAFETY: callers pass bytes that cover the rectangle, which lies within the CPU-accessible texture.
-    unsafe {
-        texture.replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-            MTLRegion {
-                origin: MTLOrigin {
-                    x: at(rect.origin.x),
-                    y: at(rect.origin.y),
-                    z: 0,
-                },
-                size: MTLSize {
-                    width: at(rect.size.width),
-                    height: at(rect.size.height),
-                    depth: 1,
-                },
-            },
-            0,
-            NonNull::from(bytes).cast(),
-            row,
-        );
-    }
-}
-
 pub(crate) struct Pages {
     device: Device,
     shared: bool,
@@ -1673,27 +1369,6 @@ impl Pages {
 }
 
 // Mask pages keep coverage in red, which all backends sample alike.
-fn page_texture(
-    device: &ProtocolObject<dyn MTLDevice>,
-    shared: bool,
-    kind: PageKind,
-    size: Size<i32>,
-) -> Result<Texture> {
-    new_texture(
-        device,
-        [size.width as usize, size.height as usize],
-        match kind {
-            PageKind::Mask => MTLPixelFormat::R8Unorm,
-            PageKind::Color => FORMAT,
-        },
-        MTLTextureUsage::ShaderRead,
-        if shared {
-            MTLStorageMode::Shared
-        } else {
-            MTLStorageMode::Managed
-        },
-    )
-}
 
 impl PageStore for Pages {
     fn insert(
@@ -1719,701 +1394,4 @@ impl PageStore for Pages {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::{Color, Rect, point, size};
-    use objc2::rc::Retained;
-    use objc2_quartz_core::{CALayer, CAMediaTiming};
-
-    #[test]
-    fn page_sublayers_stay_in_the_overlay_below_the_caret() {
-        let mut renderer = super::Renderer::new(false).unwrap();
-        let sublayers = |layer: &CALayer| -> Vec<*const CALayer> {
-            // SAFETY: a plain layer property.
-            unsafe { layer.sublayers() }.map_or_else(Vec::new, |list| {
-                list.iter().map(|layer| Retained::as_ptr(&layer)).collect()
-            })
-        };
-        let turn = [
-            0., 1., 0., 0., -1., 0., 0., 0., 0., 0., 1., 0., 65., -15., 0., 1.,
-        ];
-        let since = objc2_quartz_core::CACurrentMediaTime();
-        renderer.promote(
-            1,
-            3,
-            [20, 10, 40, 30],
-            [0.5, f64::INFINITY, 0.25],
-            &[1., 0.5],
-            &[turn, turn],
-        );
-        let caret = Rect {
-            origin: point(4., 6.),
-            size: size(2., 16.),
-        };
-        let black = Color {
-            r: 0.,
-            g: 0.,
-            b: 0.,
-            a: 1.,
-        };
-        renderer.set_caret(Some((caret, black, std::time::Instant::now())));
-        renderer.promote(
-            2,
-            4,
-            [100, 10, 40, 30],
-            [1. / 120., 1., 0.],
-            &[1., 0.5],
-            &[],
-        );
-        let caret = Retained::as_ptr(&renderer.caret.as_ref().unwrap().0);
-        let promoted: Vec<_> = renderer
-            .promoted
-            .iter()
-            .map(|promoted| Retained::as_ptr(&promoted.sublayer).cast::<CALayer>())
-            .collect();
-        assert!(
-            sublayers(&renderer.layer).is_empty(),
-            "AppKit owns the frame layer's sublayers"
-        );
-        assert_eq!(
-            sublayers(&renderer.overlay),
-            [promoted[1], promoted[0], caret]
-        );
-        let first = &renderer.promoted[0].sublayer;
-        assert_eq!((first.position().x, first.position().y), (20., 10.));
-        let turned = first.transform();
-        assert_eq!(
-            [
-                turned.m11, turned.m12, turned.m21, turned.m22, turned.m41, turned.m42
-            ],
-            [0., 1., -1., 0., 35., -5.],
-            "a turn about the center of the sublayer, from its top left corner"
-        );
-        // SAFETY: a plain layer property.
-        let looped =
-            unsafe { first.animationForKey(objc2_foundation::ns_string!("transform")) }.unwrap();
-        assert_eq!(
-            (looped.repeatCount(), looped.duration()),
-            (f32::INFINITY, 0.5)
-        );
-        assert!(
-            (since - 0.25 - looped.beginTime()).abs() < 0.05,
-            "it starts at the first sample"
-        );
-        assert!(renderer.overlay.masksToBounds());
-        let position = renderer.caret.as_ref().unwrap().0.position();
-        assert_eq!((position.x, position.y), (4., 6.));
-        renderer.demote();
-        assert_eq!(sublayers(&renderer.overlay), [caret]);
-        renderer.set_caret(None);
-        assert!(sublayers(&renderer.overlay).is_empty());
-    }
-
-    #[test]
-    fn opacity_patches_redraw_only_their_region_like_a_full_frame() {
-        use crate::{
-            Clip,
-            gpu::{BOX, Instance, rect},
-            scene::{EffectState, Scene, effect},
-        };
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
-        let (send, receive) = std::sync::mpsc::channel();
-        let job = move || {
-            let mut renderer = super::Renderer::new(false).unwrap();
-            renderer.set_drawable_size(objc2_core_foundation::CGSize::new(200., 120.));
-            let mask = Clip::from(rect([0., 0., 200., 120.]));
-            let quad = |bounds: [f32; 4], color: [f32; 4]| {
-                let mut instance = Instance::new(BOX, rect(bounds), mask);
-                instance.color = color;
-                instance
-            };
-            let mut scene = Scene::default();
-            scene.push(quad([0., 0., 200., 120.], [0.9, 0.9, 0.85, 1.]));
-            scene.push(quad([150., 10., 40., 40.], [0.2, 0.4, 0.8, 1.]));
-            let state = EffectState {
-                opacity: 0.8,
-                ..effect(mask)
-            };
-            scene.push_effect(state, Some(7));
-            scene.push(quad([20., 20., 30., 30.], [0.9, 0.1, 0.1, 1.]));
-            scene.pop_effect();
-            scene.push(quad([40., 30., 50., 10.], [0.1, 0.1, 0.1, 0.7]));
-            renderer.draw(&scene, false);
-            scene.drawn();
-            for opacity in [0.3, 0.55] {
-                scene.patch(7, opacity, None, [None; 2]);
-                renderer.draw(&scene, false);
-                scene.drawn();
-                let (damage, drawn) = (
-                    renderer.frame.damage.clone(),
-                    renderer.frame.instances.len(),
-                );
-                let last = renderer.last.clone().unwrap();
-                let commands = renderer.queue.commandBuffer().unwrap();
-                let buffer = renderer.read_back(&commands, &last, [200, 120]).unwrap();
-                commands.commit();
-                commands.waitUntilCompleted();
-                // SAFETY: the GPU finished writing the shared buffer.
-                let mut pixels = unsafe {
-                    std::slice::from_raw_parts(
-                        buffer.contents().as_ptr().cast::<u8>(),
-                        buffer.length(),
-                    )
-                }
-                .to_vec();
-                for pixel in pixels.as_chunks_mut::<4>().0 {
-                    pixel.swap(0, 2);
-                }
-                let (_, full) = renderer.draw(&scene, true).unwrap().unwrap();
-                send.send((damage, drawn, pixels == full)).unwrap();
-            }
-            super::super::threads::end_thread();
-        };
-        super::super::threads::spawn_render(job, || {});
-        for _ in 0..2 {
-            let (damage, drawn, same) = receive.recv().unwrap();
-            assert_eq!(damage, [[19, 19, 32, 32]]);
-            assert!(drawn < 4, "the far box is not drawn again");
-            assert!(same, "the region matches a full frame");
-        }
-    }
-
-    #[test]
-    fn rebuilt_scenes_redraw_only_what_changed_like_a_full_frame() {
-        use crate::{
-            Clip,
-            atlas::TileKey,
-            gpu::{BOX, IMAGE, Instance, rect},
-            scene::{BackdropState, EffectState, Scene, effect},
-        };
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
-        #[derive(Clone, Copy)]
-        struct Step {
-            name: &'static str,
-            box_color: f32,
-            box_at: [f32; 2],
-            inner: f32,
-            opacity: f32,
-            image: usize,
-            turned: f32,
-            shift: f32,
-            corner: f32,
-        }
-        let first = Step {
-            name: "first",
-            box_color: 0.8,
-            box_at: [150., 10.],
-            inner: 0.1,
-            opacity: 0.8,
-            image: 0,
-            turned: 0.2,
-            shift: 0.,
-            corner: 0.2,
-        };
-        let steps = [
-            first,
-            Step {
-                name: "same",
-                ..first
-            },
-            Step {
-                name: "box color",
-                box_color: 0.3,
-                ..first
-            },
-            Step {
-                name: "moved box",
-                box_color: 0.3,
-                box_at: [120., 14.],
-                ..first
-            },
-            Step {
-                name: "layer content",
-                box_color: 0.3,
-                box_at: [120., 14.],
-                inner: 0.6,
-                ..first
-            },
-            Step {
-                name: "layer opacity",
-                box_color: 0.3,
-                box_at: [120., 14.],
-                inner: 0.6,
-                opacity: 0.5,
-                ..first
-            },
-            Step {
-                name: "image",
-                box_color: 0.3,
-                box_at: [120., 14.],
-                inner: 0.6,
-                opacity: 0.5,
-                image: 1,
-                ..first
-            },
-            Step {
-                name: "turned layer content",
-                box_color: 0.3,
-                box_at: [120., 14.],
-                inner: 0.6,
-                opacity: 0.5,
-                image: 1,
-                turned: 0.9,
-                ..first
-            },
-            Step {
-                name: "below a backdrop",
-                box_color: 0.3,
-                box_at: [100., 50.],
-                inner: 0.6,
-                opacity: 0.5,
-                image: 1,
-                turned: 0.9,
-                ..first
-            },
-            Step {
-                name: "moved layer",
-                box_color: 0.3,
-                box_at: [100., 50.],
-                inner: 0.6,
-                opacity: 0.5,
-                image: 1,
-                turned: 0.9,
-                shift: 3.,
-                ..first
-            },
-            Step {
-                name: "part of a shadowed layer",
-                box_color: 0.3,
-                box_at: [100., 50.],
-                inner: 0.6,
-                opacity: 0.5,
-                image: 1,
-                turned: 0.9,
-                shift: 3.,
-                corner: 0.7,
-            },
-        ];
-        let (send, receive) = std::sync::mpsc::channel();
-        let job = move || {
-            let mut renderer = super::Renderer::new(false).unwrap();
-            renderer.set_drawable_size(objc2_core_foundation::CGSize::new(200., 120.));
-            let mask = Clip::from(rect([0., 0., 200., 120.]));
-            let quad = |bounds: [f32; 4], color: [f32; 4]| {
-                let mut instance = Instance::new(BOX, rect(bounds), mask);
-                instance.color = color;
-                instance
-            };
-            let tiles = [[230, 40, 40, 255], [40, 200, 90, 255]].map(|pixel: [u8; 4]| {
-                let side = crate::size(4, 4);
-                (renderer.atlas())
-                    .get_or_insert_with(&TileKey::Image(u64::from(pixel[0])), &mut || {
-                        let bytes = pixel.repeat(16).into();
-                        Ok(Some((Rect::new(Default::default(), side), side, bytes)))
-                    })
-                    .unwrap()
-                    .0
-            });
-            let build = |scene: &mut Scene, step: Step| {
-                scene.push(quad([0., 0., 200., 120.], [0.9, 0.9, 0.85, 1.]));
-                let [x, y] = step.box_at;
-                scene.push(quad([x, y, 40., 40.], [0.2, 0.4, step.box_color, 1.]));
-                let state = EffectState {
-                    opacity: step.opacity,
-                    ..effect(mask)
-                };
-                scene.push_effect(state, Some(7));
-                let shift = step.shift;
-                let inner = [0.9, step.inner, 0.1, 1.];
-                scene.push(quad([20. + shift, 20. + shift, 30., 30.], inner));
-                scene.push(quad(
-                    [24. + shift, 60. + shift, 20., 10.],
-                    [0.1, 0.5, 0.5, 1.],
-                ));
-                scene.pop_effect();
-                let state = EffectState {
-                    shadow: Some((
-                        crate::point(2., 2.),
-                        2.,
-                        crate::Color {
-                            r: 0.,
-                            g: 0.,
-                            b: 0.,
-                            a: 0.5,
-                        },
-                    )),
-                    ..effect(mask)
-                };
-                scene.push_effect(state, Some(8));
-                scene.push(quad([150., 80., 45., 36.], [0.8, 0.8, 0.8, 1.]));
-                scene.push(quad([186., 106., 6., 6.], [step.corner, 0.3, 0.3, 1.]));
-                scene.pop_effect();
-                // A blend mode reads only the pixel below, so a change below it doesn't draw all of it.
-                let state = EffectState {
-                    blend_mode: crate::BlendMode::Multiply,
-                    ..effect(mask)
-                };
-                scene.push_effect(state, None);
-                scene.push(quad([140., 70., 60., 50.], [0.9, 0.6, 0.9, 0.5]));
-                scene.pop_effect();
-                scene.push(quad([40., 30., 50., 10.], [0.1, 0.1, 0.1, 0.7]));
-                let tile = tiles[step.image];
-                let mut image = Instance::new(IMAGE, rect([60., 84., 16., 16.]), mask);
-                image.aux = tile.rect.map(|value| value as f32).to_array();
-                (image.info[2], image.info[3]) = (1., tile.page as f32);
-                scene.push(image);
-                let (sin, cos) = 0.3f32.sin_cos();
-                let mut turn = crate::frame::IDENTITY;
-                [turn[0], turn[1], turn[4], turn[5], turn[12], turn[13]] =
-                    [cos, sin, -sin, cos, 10., -20.];
-                let state = EffectState {
-                    transform: Some(turn),
-                    ..effect(mask)
-                };
-                scene.push_effect(state, None);
-                scene.push(quad([150., 60., 20., 20.], [step.turned, 0.2, 0.6, 1.]));
-                scene.pop_effect();
-                let state = EffectState {
-                    backdrop: Some(BackdropState {
-                        bounds: rect([96., 64., 50., 40.]),
-                        corner_radii: Default::default(),
-                        blur: 3.,
-                        color_matrix: None,
-                    }),
-                    ..effect(mask)
-                };
-                scene.push_effect(state, None);
-                scene.push(quad([96., 64., 50., 40.], [1., 1., 1., 0.3]));
-                scene.pop_effect();
-            };
-            let read = |renderer: &super::Renderer| {
-                let last = renderer.last.clone().unwrap();
-                let commands = renderer.queue.commandBuffer().unwrap();
-                let buffer = renderer.read_back(&commands, &last, [200, 120]).unwrap();
-                commands.commit();
-                commands.waitUntilCompleted();
-                // SAFETY: the GPU finished writing the shared buffer.
-                let mut pixels = unsafe {
-                    std::slice::from_raw_parts(
-                        buffer.contents().as_ptr().cast::<u8>(),
-                        buffer.length(),
-                    )
-                }
-                .to_vec();
-                for pixel in pixels.as_chunks_mut::<4>().0 {
-                    pixel.swap(0, 2);
-                }
-                pixels
-            };
-            let mut scene = Scene::default();
-            for step in steps {
-                scene.clear();
-                build(&mut scene, step);
-                scene.diff(Some(&[]));
-                let committed = renderer.committed;
-                renderer.draw(&scene, false);
-                scene.drawn();
-                if step.name == "part of a shadowed layer" {
-                    let frame = &renderer.frame;
-                    // The shadow blurs the region of the layer.
-                    let blurred = (frame.blurs.iter())
-                        .map(|blur| blur.region[2] * blur.region[3])
-                        .fold(0., f32::max);
-                    assert!(
-                        blurred > 0. && blurred < 40. * 30.,
-                        "the layer draws whole: {blurred}"
-                    );
-                }
-                let drawn = (renderer.committed != committed).then(|| {
-                    let frame = &renderer.frame;
-                    (frame.damage.clone(), frame.instances.len())
-                });
-                let pixels = read(&renderer);
-                let (_, full) = renderer.draw(&scene, true).unwrap().unwrap();
-                send.send((step.name, drawn, pixels == full)).unwrap();
-                // The next rebuild draws again where a patch drew, though its scene draws as before.
-                if step.name == "layer opacity" {
-                    scene.patch(7, 0.25, None, [None; 2]);
-                    renderer.draw(&scene, false);
-                    scene.drawn();
-                    let drawn = Some((renderer.frame.damage.clone(), 0));
-                    let pixels = read(&renderer);
-                    let (_, full) = renderer.draw(&scene, true).unwrap().unwrap();
-                    send.send(("patched", drawn, pixels == full)).unwrap();
-                }
-            }
-            super::super::threads::end_thread();
-        };
-        super::super::threads::spawn_render(job, || {});
-        for _ in 0..=steps.len() {
-            let (name, drawn, same) = receive.recv().unwrap();
-            assert!(same, "{name}: the frame matches a full frame");
-            let expect: Option<(&[[i32; 4]], usize)> = match name {
-                "first" => Some((&[], 11)),
-                "same" => None,
-                "box color" => Some((&[[149, 9, 42, 42]], 2)),
-                "moved box" => Some((&[[119, 9, 72, 46]], 2)),
-                // The layer draws its boxes again, the window its background and the bar over it.
-                "layer content" => Some((&[[19, 19, 32, 32]], 4)),
-                // The layer keeps its pixels.
-                "layer opacity" => Some((&[[19, 19, 32, 52]], 2)),
-                "patched" => Some((&[[19, 19, 32, 52]], 0)),
-                // The patched layer draws again, and joins the image in one region.
-                "image" => Some((&[[19, 19, 58, 82]], 3)),
-                // The layer turns into the backdrop, which reads all of its region again.
-                "turned layer content" => Some((&[[96, 64, 60, 44]], 2)),
-                "below a backdrop" => Some((&[[96, 13, 65, 91]], 2)),
-                // The layer moves with its pixels.
-                "moved layer" => Some((&[[19, 19, 35, 55]], 2)),
-                // The layer draws only the part that reaches the region.
-                "part of a shadowed layer" => Some((&[[181, 101, 19, 19]], 3)),
-                _ => unreachable!(),
-            };
-            assert_eq!(
-                drawn.as_ref().map(|(damage, drawn)| (&damage[..], *drawn)),
-                expect,
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
-    fn returned_drawables_draw_what_changed_since_their_frame() {
-        use crate::{
-            Clip,
-            gpu::{BOX, Instance, rect},
-            scene::Scene,
-        };
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
-        let (send, receive) = std::sync::mpsc::channel();
-        let job = move || {
-            let size = objc2_core_foundation::CGSize::new(200., 120.);
-            let [mut renderer, mut reference] = [(), ()].map(|_| {
-                let mut renderer = super::Renderer::new(false).unwrap();
-                renderer.set_drawable_size(size);
-                renderer
-            });
-            let mask = Clip::from(rect([0., 0., 200., 120.]));
-            let quad = |bounds: [f32; 4], color: [f32; 4]| {
-                let mut instance = Instance::new(BOX, rect(bounds), mask);
-                instance.color = color;
-                instance
-            };
-            let mut scene = Scene::default();
-            let (mut uncopied, mut widest) = (0, 0);
-            for frame in 0..12 {
-                scene.clear();
-                scene.push(quad([0., 0., 200., 120.], [0.9, 0.9, 0.85, 1.]));
-                let x = 10. + 12. * frame as f32;
-                scene.push(quad([x, 10., 10., 10.], [0.2, 0.4, 0.8, 1.]));
-                let shade = (frame / 3) as f32 / 4.;
-                scene.push(quad([150., 80., 20., 20.], [shade, 0.5, 0.2, 1.]));
-                scene.diff(Some(&[]));
-                renderer.draw(&scene, false);
-                scene.drawn();
-                let damaged = !renderer.frame.damage.is_empty();
-                // A drawable from frames ago draws the steps of the box since then.
-                // One frame moves the box 12px, so its own region is 24px wide. A drawable comes back after 3
-                // frames at most, so a region never holds more than 3 moves.
-                uncopied += u32::from(renderer.frame.damage.iter().any(|region| region[2] > 24));
-                widest = (renderer.frame.damage.iter())
-                    .fold(widest, |widest, region| widest.max(region[2]));
-                let last = renderer.last.clone().unwrap();
-                let commands = renderer.queue.commandBuffer().unwrap();
-                let buffer = renderer.read_back(&commands, &last, [200, 120]).unwrap();
-                commands.commit();
-                commands.waitUntilCompleted();
-                // SAFETY: the GPU finished writing the shared buffer.
-                let mut pixels = unsafe {
-                    std::slice::from_raw_parts(
-                        buffer.contents().as_ptr().cast::<u8>(),
-                        buffer.length(),
-                    )
-                }
-                .to_vec();
-                for pixel in pixels.as_chunks_mut::<4>().0 {
-                    pixel.swap(0, 2);
-                }
-                let (_, full) = reference.draw(&scene, true).unwrap().unwrap();
-                send.send((frame, damaged, pixels == full)).unwrap();
-            }
-            send.send((u32::MAX, uncopied > 4 && widest <= 36, true))
-                .unwrap();
-            super::super::threads::end_thread();
-        };
-        super::super::threads::spawn_render(job, || {});
-        for _ in 0..=12 {
-            let (frame, damaged, same) = receive.recv().unwrap();
-            assert!(same, "frame {frame} matches a full frame");
-            assert!(damaged || frame == 0, "frame {frame} draws its damage");
-        }
-    }
-
-    #[test]
-    fn scrolled_content_copies_the_last_frame_moved() {
-        use crate::{
-            Clip,
-            gpu::{BOX, Instance, rect},
-            point,
-            scene::{EffectState, Scene, effect},
-        };
-        use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandQueue};
-        let (send, receive) = std::sync::mpsc::channel();
-        // Scroll offsets in device pixels, and a change: 1 and 2 recolor a row (2 one under the bar), 3 the bar. A
-        // part of a pixel can't be copied, and a change inside the content draws it.
-        let steps: [(f32, u8); 13] = [
-            (0., 0),
-            (6., 0),
-            (12., 0),
-            (30., 0),
-            (30.5, 0),
-            (40., 0),
-            (52., 1),
-            (46., 0),
-            (20., 0),
-            (20., 2),
-            (14., 0),
-            (14., 3),
-            (8., 0),
-        ];
-        let job = move || {
-            let size = objc2_core_foundation::CGSize::new(200., 120.);
-            let [mut renderer, mut reference] = [(), ()].map(|_| {
-                let mut renderer = super::Renderer::new(false).unwrap();
-                renderer.set_drawable_size(size);
-                renderer
-            });
-            let window = Clip::from(rect([0., 0., 200., 120.]));
-            let viewport = Clip::from(rect([10., 10., 180., 100.]));
-            let quad = |bounds: [f32; 4], clip: Clip<f32>, color: [f32; 4]| {
-                let mut instance = Instance::new(BOX, rect(bounds), clip);
-                instance.color = color;
-                instance
-            };
-            let read = |renderer: &super::Renderer| {
-                let last = renderer.last.clone().unwrap();
-                let commands = renderer.queue.commandBuffer().unwrap();
-                let buffer = renderer.read_back(&commands, &last, [200, 120]).unwrap();
-                commands.commit();
-                commands.waitUntilCompleted();
-                // SAFETY: the GPU finished writing the shared buffer.
-                let mut pixels = unsafe {
-                    std::slice::from_raw_parts(
-                        buffer.contents().as_ptr().cast::<u8>(),
-                        buffer.length(),
-                    )
-                }
-                .to_vec();
-                for pixel in pixels.as_chunks_mut::<4>().0 {
-                    pixel.swap(0, 2);
-                }
-                pixels
-            };
-            let mut scene = Scene::default();
-            for (offset, changed) in steps {
-                scene.clear();
-                scene.push(quad([0., 0., 200., 120.], window, [0.9, 0.9, 0.85, 1.]));
-                scene.begin_scroll(7, viewport, point(0., offset), false);
-                for row in 0..12 {
-                    let y = 14. + 22. * row as f32 - offset;
-                    let shade = row as f32 / 12.;
-                    let color = match (changed, row) {
-                        (1, 4) | (2, 1) => [0.9, 0.1, 0.1, 1.],
-                        _ => [shade, 0.4, 1. - shade, 1.],
-                    };
-                    // A composited opacity animation, which patch frames draw without a new diff.
-                    if row == 3 {
-                        let state = EffectState {
-                            opacity: 0.8,
-                            ..effect(viewport)
-                        };
-                        scene.push_effect(state, Some(9));
-                    }
-                    scene.push(quad([20., y, 120., 16.], viewport, color));
-                    if row == 3 {
-                        scene.pop_effect();
-                    }
-                    scene.push(quad(
-                        [150., y + 4., 30., 8.],
-                        viewport,
-                        [0.2, 0.2, 0.2, 0.5],
-                    ));
-                }
-                // A bar that stays over the top of the viewport, painted inside it as a fixed box is.
-                let bar = match changed {
-                    3 => [0.6, 0.2, 0.5, 0.7],
-                    _ => [0.1, 0.5, 0.3, 0.8],
-                };
-                scene.pause_cuts(0);
-                scene.push(quad([0., 0., 200., 24.], window, bar));
-                scene.resume_cuts();
-                // Content after the bar, as a scroll bar is.
-                scene.push(quad(
-                    [184., 60. - offset, 6., 40.],
-                    viewport,
-                    [0.3, 0.3, 0.3, 0.6],
-                ));
-                scene.end_scroll();
-                scene.diff(Some(&[]));
-                let shifted = scene.shift;
-                renderer.draw(&scene, false);
-                scene.drawn();
-                let kept = renderer.frame.keeps_under_now();
-                let area: i32 = renderer
-                    .frame
-                    .damage
-                    .iter()
-                    .map(|region| region[2] * region[3])
-                    .sum();
-                let pixels = read(&renderer);
-                let (_, full) = reference.draw(&scene, true).unwrap().unwrap();
-                // A patch frame after the scroll must not copy the scroll again.
-                assert!(scene.patch(9, 0.4, None, [None; 2]));
-                renderer.draw(&scene, false);
-                scene.drawn();
-                let patched = read(&renderer);
-                let (_, patched_full) = reference.draw(&scene, true).unwrap().unwrap();
-                send.send((
-                    offset,
-                    shifted,
-                    area,
-                    pixels == full,
-                    kept,
-                    patched == patched_full,
-                ))
-                .unwrap();
-            }
-            super::super::threads::end_thread();
-        };
-        super::super::threads::spawn_render(job, || {});
-        let mut last = 0.;
-        for (at, (offset, changed)) in steps.into_iter().enumerate() {
-            let (got, shifted, area, same, kept, patched) = receive.recv().unwrap();
-            assert_eq!(got, offset);
-            assert!(
-                same,
-                "offset {offset}, change {changed}: the frame matches a full frame"
-            );
-            assert!(
-                patched,
-                "offset {offset}, change {changed}: the patch frame matches a full frame"
-            );
-            // The first scroll keeps the window below the bar, and later frames keep it up to date.
-            assert_eq!(kept, at > 0, "offset {offset}, change {changed}");
-            let by = offset - last;
-            let copies = by != 0. && by.fract() == 0. && last.fract() == 0.;
-            assert_eq!(
-                shifted.map(|(_, by)| by),
-                copies.then_some([0, by as i32]),
-                "offset {offset}"
-            );
-            if copies && changed == 0 {
-                // The edge, and the bar where it is and where the copy put it.
-                assert!(
-                    area <= 200 * (24 + 2) * 2 + 182 * (by.abs() as i32 + 2),
-                    "offset {offset}: {area}"
-                );
-            }
-            last = offset;
-        }
-    }
-}
+mod tests;

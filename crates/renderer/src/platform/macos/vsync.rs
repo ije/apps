@@ -5,7 +5,7 @@
 #![allow(deprecated)]
 
 use super::{lock, threads::post};
-use crate::app::Callbacks;
+use crate::platform::{Callbacks, events};
 use block2::RcBlock;
 use objc2_core_foundation::CFRetained;
 use objc2_core_video::{CVDisplayLink, CVTimeStamp, kCVReturnSuccess};
@@ -145,34 +145,19 @@ impl Pulse {
             self.callbacks.thread,
             Box::new(move || {
                 pulse.waiting.store(false, atomic::Ordering::Release);
-                let callbacks = pulse.callbacks;
-                // A tick without a frame takes one frame out of a queue that is too long.
-                let free = callbacks.with(move |window, _| {
-                    let free = !window.platform.renderer.take_congested();
-                    window.frame_at = free.then_some(at);
-                    free
-                });
-                if free == Some(true) {
-                    step(callbacks);
-                }
+                events().tick(pulse.callbacks, Some(at));
             }),
         );
-    }
-}
-
-pub(crate) fn step(callbacks: Callbacks) {
-    if callbacks.frame() == Some(false) {
-        callbacks.with(|window, _| window.platform.rest());
     }
 }
 
 pub(crate) struct Pacer {
     pulse: Arc<Pulse>,
     on: Option<&'static Screen>,
-    pub wants: bool,
-    pub visible: bool,
-    pub display: Option<u32>,
-    pub closed: bool,
+    wants: bool,
+    visible: bool,
+    display: Option<u32>,
+    closed: bool,
 }
 
 impl Pacer {
@@ -190,7 +175,28 @@ impl Pacer {
         }))
     }
 
-    pub fn sync(&mut self) {
+    // Whether the window wants display ticks.
+    pub fn want(&mut self, on: bool) {
+        self.wants = on;
+        self.sync();
+    }
+
+    // Where the window is: shown on a screen, and the display that it is on.
+    pub fn place(&mut self, visible: bool, display: Option<u32>) {
+        (self.visible, self.display) = (visible, display);
+        self.sync();
+    }
+
+    pub fn display(&self) -> Option<u32> {
+        self.display
+    }
+
+    pub fn close(&mut self) {
+        self.closed = true;
+        self.sync();
+    }
+
+    fn sync(&mut self) {
         let target = self
             .display
             .filter(|_| self.wants && self.visible && !self.closed);

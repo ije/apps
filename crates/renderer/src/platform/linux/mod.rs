@@ -3,23 +3,24 @@
 
 mod gpu;
 mod input;
-mod text;
 mod wayland;
 mod x11;
 
 use super::single::Task;
 use crate::{Cursor, Pixels, Point, Rect, Scene, Size, WindowChange, WindowOptions};
-use crate::{WindowState, app::Callbacks};
+use crate::{
+    WindowState,
+    platform::{Callbacks, events},
+};
 use anyhow::Result;
-use gpu::{Atlas, Capture};
+pub(crate) use gpu::Atlas;
+use gpu::Capture;
 use raw_window_handle::RawWindowHandle;
 use rustc_hash::FxHashMap;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::{cell::Cell, cell::RefCell, collections::BTreeMap, collections::VecDeque};
 use std::{rc::Rc, rc::Weak, time::Duration, time::Instant};
-
-pub(crate) use text::TextSystem;
 
 // A window that stops drawing releases its spare GPU resources after this.
 const QUIET: Duration = Duration::from_secs(1);
@@ -268,7 +269,7 @@ impl Platform {
         crate::native::quit_handler();
     }
 
-    pub fn quit(&self) {
+    pub fn quit() {
         // Main decides, and it can't run while the app calls this.
         soon(|| {
             if crate::native::should_quit() {
@@ -277,7 +278,7 @@ impl Platform {
         });
     }
 
-    pub fn activate(&self, _: bool) {}
+    pub fn activate(_: bool) {}
 
     pub fn read_clipboard(&self) -> Option<String> {
         self.display.read_clipboard()
@@ -360,27 +361,32 @@ impl Window {
     pub fn force_frame(&self) {
         let calls = self.calls;
         soon(move || {
-            calls.frame();
+            events().frame(calls);
         });
     }
 
-    pub fn take_snapshots(&self) -> Vec<crate::Snapshot> {
-        self.native.take_snapshots()
-    }
-
-    pub fn draw(&self, scene: &Scene, capture: bool) -> Capture {
+    // Draws `scene`, and returns the capture and the snapshot layers that it read. The window keeps its own size.
+    pub fn draw(
+        &self,
+        scene: &Scene,
+        _: Option<(Size<Pixels>, f32)>,
+        capture: bool,
+    ) -> (Capture, Vec<crate::Snapshot>) {
         if self.quiet.replace(Some(true)).is_none() {
             self.wait();
         }
-        self.native.draw(scene, capture)
+        (
+            self.native.draw(scene, capture),
+            self.native.take_snapshots(),
+        )
     }
 
     fn wait(&self) {
         let calls = self.calls;
-        crate::app::timer(QUIET, move |_| calls.release()).detach();
+        crate::platform::timer(QUIET, move || events().release(calls)).detach();
     }
 
-    pub fn release(&self) {
+    pub fn release(&self, _: &Scene) {
         // Frames came since the timer started, so the quiet second starts again.
         if self.quiet.replace(Some(false)) == Some(true) {
             return self.wait();

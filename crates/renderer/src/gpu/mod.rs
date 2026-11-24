@@ -1,3 +1,7 @@
+pub(crate) mod atlas;
+pub(crate) mod frame;
+pub(crate) mod scene;
+
 use crate::{Clip, Rect, point, size};
 use std::{mem, slice};
 
@@ -167,6 +171,13 @@ pub fn bytes<T: Plain>(items: &[T]) -> &[u8] {
     let (start, length) = (items.as_ptr().cast::<u8>(), mem::size_of_val(items));
     // SAFETY: plain data can be read as bytes.
     unsafe { slice::from_raw_parts(start, length) }
+}
+
+/// The pixels of a layer of `Window::with_snapshot`, as premultiplied RGBA.
+pub struct Snapshot {
+    pub key: u64,
+    pub size: [u32; 2],
+    pub pixels: Vec<u8>,
 }
 
 #[cfg(test)]

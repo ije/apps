@@ -3,7 +3,10 @@ mod window;
 use super::input::{self, Clicks, Composer, Ime, NOTCH_LINES};
 use super::{Display, Native as _, Opened, run_after, soon, watch};
 use crate::{Button, Cursor, Event, Key, Modifiers, Pixels, Point, Rect, WindowOptions};
-use crate::{app::Callbacks, point, px, size};
+use crate::{
+    platform::{Callbacks, events},
+    point, px, size,
+};
 use anyhow::{Context as _, Result};
 use rustc_hash::FxHashMap;
 use std::io::{ErrorKind, Read as _, Write as _};
@@ -275,7 +278,7 @@ pub(super) struct Client {
 fn later(calls: Option<Callbacks>, event: Event) {
     if let Some(calls) = calls {
         soon(move || {
-            calls.input(event);
+            events().input(calls, event);
         });
     }
 }
@@ -445,7 +448,7 @@ impl Client {
         let Some(ime) = ime else {
             return;
         };
-        if calls.is_some_and(|calls| !calls.accepts_text_input()) {
+        if calls.is_some_and(|calls| !events().accepts_text_input(calls)) {
             return;
         }
         ime.enable();
@@ -581,7 +584,7 @@ impl Client {
             let calls = live.window(Some(&window)).map(|target| target.calls);
             drop(live);
             if let Some(calls) = calls {
-                calls.input(Event::FileEnter { at, paths });
+                events().input(calls, Event::FileEnter { at, paths });
             }
             false
         });
@@ -1043,12 +1046,15 @@ impl Client {
                     } else if let Some(text) = pending {
                         Ime::Commit(text).apply(calls);
                     }
-                    calls.input(Event::PointerDown {
-                        at,
-                        button,
-                        modifiers,
-                        clicks,
-                    });
+                    events().input(
+                        calls,
+                        Event::PointerDown {
+                            at,
+                            button,
+                            modifiers,
+                            clicks,
+                        },
+                    );
                 });
             }
             Ptr::AxisSource {

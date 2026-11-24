@@ -1,4 +1,3 @@
-use super::extent;
 use crate::text::{FaceMetrics, Features, GlyphRaster, SUBPIXEL_STEPS, Span};
 use crate::{Color, Font, FontId, Glyph, GlyphId, Line, Pixels, Rect, Size, point, px, size};
 use anyhow::{Context as _, Result, bail, ensure};
@@ -9,7 +8,10 @@ use windows::Win32::Globalization::GetUserDefaultLocaleName;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Gdi::LOGFONTW;
 use windows::Win32::System::SystemServices::LOCALE_NAME_MAX_LENGTH;
-use windows::Win32::UI::WindowsAndMessaging::SPI_GETICONTITLELOGFONT;
+use windows::Win32::UI::WindowsAndMessaging::{
+    SPI_GETICONTITLELOGFONT, SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SystemParametersInfoW,
+};
 use windows::core::{BOOL, HSTRING, IUnknown, Interface, Ref, implement};
 
 type Done = windows::core::Result<()>;
@@ -163,7 +165,7 @@ impl Library {
         locale.truncate(written.max(1) as usize - 1);
         // The user interface font is the one of icon titles.
         let mut icons = LOGFONTW::default();
-        let ui_family = super::setting(SPI_GETICONTITLELOGFONT, &mut icons)
+        let ui_family = setting(SPI_GETICONTITLELOGFONT, &mut icons)
             .then(|| {
                 let name = icons.lfFaceName.split(|&unit| unit == 0).next()?;
                 Some(String::from_utf16_lossy(name))
@@ -972,4 +974,26 @@ impl TextSystem {
 
     // DirectWrite shares its font cache across the process, so there is nothing to load ahead.
     pub fn warm(_: Vec<Vec<String>>) {}
+}
+
+pub(crate) fn setting<T>(action: SYSTEM_PARAMETERS_INFO_ACTION, value: &mut T) -> bool {
+    // SAFETY: callers pass the type that the action fills, and its size.
+    unsafe {
+        SystemParametersInfoW(
+            action,
+            size_of_val(value) as u32,
+            Some((value as *mut T).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+        )
+    }
+    .is_ok()
+}
+
+pub(crate) fn extent(rect: RECT) -> [i32; 4] {
+    [
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+    ]
 }

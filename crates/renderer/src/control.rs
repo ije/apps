@@ -40,7 +40,3 @@ pub struct ControlEvent {
 
 /// Called on the main thread.
 pub type ControlSink = std::sync::Arc<dyn Fn(ControlEvent) + Send + Sync>;
-
-pub fn control_size(kind: ControlKind) -> [f32; 2] {
-    crate::platform::control_size(kind)
-}

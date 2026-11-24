@@ -1,12 +1,11 @@
 use crate::{
     App, Backdrop, BorderStyle, BoxShadow, Child, Clip, Color, Cursor, Edges, Event, Key,
     Modifiers, NodeKey, PaintEffect, Pixels, Point, Radii, Rect, RenderImage, ScrollRef, Size,
-    Tree, Utf16Selection, WheelPhase,
-    atlas::TileKey,
-    geometry::{snap, snap_width},
-    platform, point, px,
-    scene::{self, BackdropState, EffectState, Scene},
-    size,
+    Snapshot, Tree, Utf16Selection, WheelPhase, WindowChange, WindowControl, WindowId, WindowState,
+    geometry::{Plane, compose, invert, plane_of, project, snap, snap_width},
+    gpu::atlas::TileKey,
+    gpu::scene::{self, BackdropState, EffectState, Scene},
+    platform, point, px, size,
     text::{DecorationStyle, FontId, GlyphId, GlyphRaster, SUBPIXEL_STEPS, TextSystem},
 };
 use anyhow::Result;
@@ -23,12 +22,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[path = "paint.rs"]
+pub(crate) mod node;
 mod paint;
+mod retain;
+pub(crate) mod scroll;
+pub(crate) mod tree;
 pub use paint::*;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct WindowId(pub u64);
 
 /// Text input calls use UTF-16 offsets.
 pub trait View: 'static {
@@ -68,97 +67,11 @@ pub trait View: 'static {
     fn index_at(&mut self, at: Point<Pixels>, window: &mut Window, app: &mut App) -> Option<usize>;
 }
 
-#[derive(Clone, Debug)]
-pub struct WindowOptions {
-    pub bounds: Rect,
-    // `bounds` includes the title bar and frame.
-    pub outer_size: bool,
-    pub title: String,
-    pub titlebar_hidden: bool,
-    pub buttons_at: Option<Point<Pixels>>,
-    pub frameless: bool,
-    pub transparent: bool,
-    pub show: bool,
-    pub resizable: bool,
-    pub minimizable: bool,
-    pub movable: bool,
-}
-
-impl Default for WindowOptions {
-    fn default() -> Self {
-        Self {
-            bounds: crate::rect(px(0.), px(0.), px(800.), px(600.)),
-            outer_size: true,
-            title: String::new(),
-            titlebar_hidden: false,
-            buttons_at: None,
-            frameless: false,
-            transparent: false,
-            show: true,
-            resizable: true,
-            minimizable: true,
-            movable: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct WindowState {
-    pub frame: Rect,
-    pub content: Rect,
-    pub minimized: bool,
-    pub maximized: bool,
-    pub fullscreen: bool,
-    pub visible: bool,
-    pub resizing: bool,
-    pub display: Rect,
-    pub work_area: Rect,
-}
-
-pub use crate::platform::WindowControl;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum WindowChange {
-    Frame(Rect),
-    Center,
-    Show(bool),
-    Hide,
-    Blur,
-    Restore,
-    SizeLimits(Size<Pixels>, Size<Pixels>),
-    /// An `NSWindowLevel`, where 0 is normal.
-    AlwaysOnTop(isize),
-    Resizable(bool),
-    Minimizable(bool),
-    Maximizable(bool),
-    Closable(bool),
-    Movable(bool),
-    Background(Color),
-    Opacity(f32),
-    Shadow(bool),
-    IgnoreMouse(bool, bool),
-    AllWorkspaces(bool, bool),
-    ContentProtection(bool),
-    Focusable(bool),
-    AspectRatio(f32, Size<Pixels>),
-    Parent(Option<raw_window_handle::RawWindowHandle>, bool),
-    Vibrancy(Option<isize>, isize),
-    Edited(bool),
-    CancelComposition,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub enum Scope {
     Clip(Option<Clip<Pixels>>),
     Offset(Point<Pixels>),
     Opacity(Option<f32>),
-}
-
-/// The pixels of a layer of `Window::with_snapshot`, as premultiplied RGBA.
-pub struct Snapshot {
-    pub key: u64,
-    pub size: [u32; 2],
-    pub pixels: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -183,42 +96,6 @@ impl Region {
     pub fn under_pointer(&self, window: &Window) -> bool {
         window.under.contains(&self.key)
     }
-}
-
-// Column-major 3x3 matrices of the z = 0 plane of a CSS transform.
-pub(crate) type Plane = [f32; 9];
-
-pub(crate) fn plane_of(m: &[f32; 16]) -> Plane {
-    [m[0], m[1], m[3], m[4], m[5], m[7], m[12], m[13], m[15]]
-}
-
-fn compose(outer: &Plane, inner: &Plane) -> Plane {
-    let mut out = [0.; 9];
-    for (index, out) in out.iter_mut().enumerate() {
-        let (v, row) = (&inner[index - index % 3..], index % 3);
-        *out = outer[row] * v[0] + outer[3 + row] * v[1] + outer[6 + row] * v[2];
-    }
-    out
-}
-
-pub(crate) fn invert(m: &Plane) -> Option<Plane> {
-    let cross = |a: &[f32], b: &[f32]| {
-        [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ]
-    };
-    let (c0, c1, c2) = (&m[0..3], &m[3..6], &m[6..9]);
-    let rows = [cross(c1, c2), cross(c2, c0), cross(c0, c1)];
-    let det = c0[0] * rows[0][0] + c0[1] * rows[0][1] + c0[2] * rows[0][2];
-    (det.abs() > 1e-9).then(|| std::array::from_fn(|i| rows[i % 3][i / 3] / det))
-}
-
-fn project(m: &Plane, at: Point<Pixels>) -> Option<Point<Pixels>> {
-    let (x, y) = (at.x.0, at.y.0);
-    let [u, v, w] = [0, 1, 2].map(|row| m[row] * x + m[3 + row] * y + m[6 + row]);
-    (w.abs() > 1e-6).then(|| point(px(u / w), px(v / w)))
 }
 
 // CSS-pixel matrices become device-pixel matrices at this scale.
@@ -389,13 +266,19 @@ struct Input {
     prepass: Option<u32>,
 }
 
+// The counts of `unsettle` calls and of hit transforms at a place in prepaint.
+#[derive(Clone, Copy)]
+pub(crate) struct PrepaintMark {
+    unsettled: u32,
+    transforms: u32,
+}
+
 // Where a paint span starts: in the scene and in the paint records of the input.
 #[derive(Clone, Copy)]
 pub(crate) struct PaintMark {
     scene: scene::Mark,
     input: [u32; 4],
     volatile: u32,
-    culled: u32,
 }
 
 // The output of a paint span, which a later paint can copy while it paints under the same `PaintKey`.
@@ -480,13 +363,11 @@ impl Input {
 
 #[derive(Default)]
 pub(crate) struct ScrollGesture {
-    pub(crate) latch: Option<ScrollRef>,
-    pub(crate) spent: bool,
-    pub(crate) speed: Point<f32>,
-    pub(crate) edge: Option<(ScrollRef, Point<Pixels>)>,
+    pub(super) latch: Option<ScrollRef>,
+    pub(super) spent: bool,
+    pub(super) speed: Point<f32>,
+    pub(super) edge: Option<(ScrollRef, Point<Pixels>)>,
 }
-
-pub const CARET_BLINK: Duration = Duration::from_millis(500);
 
 #[cfg(target_os = "macos")]
 struct Caret {
@@ -545,15 +426,20 @@ impl Track {
 
 pub struct Window {
     id: WindowId,
-    pub(crate) platform: platform::Window,
-    pub(crate) view: Option<Box<dyn View>>,
+    // The glyph and image tiles that paint takes, which the GPU backend of the window holds. Declared before
+    // `platform`, so the backend drops the last handle, with its GPU device.
+    atlas: Rc<platform::Atlas>,
+    // A buffer that the atlas and the scene trade the removed atlas tiles in.
+    removed: Vec<(bool, u32, Rect<i32>)>,
+    platform: platform::Window,
+    pub(super) view: Option<Box<dyn View>>,
     text_system: Rc<TextSystem>,
     scale_factor: f32,
     viewport_size: Size<Pixels>,
-    pub(crate) zoom: f32,
+    zoom: f32,
     native: (Size<Pixels>, f32),
     tree: Option<Tree>,
-    pub(crate) scene: Scene,
+    scene: Scene,
     // `pending` is being built; `live` is on screen and takes the input.
     pending: Input,
     live: Input,
@@ -564,20 +450,20 @@ pub struct Window {
     volatile: u32,
     // The next paint draws all boxes again.
     repaint: bool,
-    pub(crate) unsettled: u32,
+    unsettled: u32,
     // The count of hit transforms that prepaint made.
-    pub(crate) transforms: u32,
+    transforms: u32,
     generation: usize,
     under: Vec<u64>,
     hovered: usize,
     next_region: u64,
     content_masks: Vec<(Clip<Pixels>, Clip<f32>)>,
     // The clips of `with_group_clip` in the space of the content masks.
-    pub(crate) group_clips: Vec<Clip<Pixels>>,
+    group_clips: Vec<Clip<Pixels>>,
     // The viewports of the scrolls whose content paints in a larger interest area, or `None` for other scrolls.
     viewports: Vec<Option<Rect<Pixels>>>,
     offsets: Vec<Point<Pixels>>,
-    pub(crate) font_smoothing: bool,
+    font_smoothing: bool,
     hit_transform: Option<Rc<HitTransform>>,
     // The transforms and the clip of each `with_hit_base` around the current box.
     hit_bases: Vec<(Option<Rc<HitTransform>>, Rect)>,
@@ -585,21 +471,21 @@ pub struct Window {
     shots: FxHashMap<u64, (u64, [i32; 2])>,
     opacity: f32,
     // The mask layer and effect depth of `with_text_clip`.
-    pub(crate) text_clip: Option<(usize, usize)>,
+    text_clip: Option<(usize, usize)>,
     states: FxHashMap<(NodeKey, TypeId), Box<dyn Any>>,
     next_states: FxHashMap<(NodeKey, TypeId), Box<dyn Any>>,
     frame_callbacks: Vec<FrameCallback>,
     // A patch frame waits for the end of the frame, where a full draw can take its place.
-    pub(crate) patch: bool,
-    pub(crate) captures: Vec<CaptureCallback>,
-    pub(crate) ime_key: Option<(Event, bool)>,
+    patch: bool,
+    captures: Vec<CaptureCallback>,
+    ime_key: Option<(Event, bool)>,
     #[cfg(target_os = "macos")]
     caret: Option<Caret>,
     #[cfg(target_os = "macos")]
     caret_covered: bool,
     #[cfg(target_os = "macos")]
     controls: (Vec<crate::NativeControl>, Option<crate::ControlSink>),
-    pub(crate) dirty: bool,
+    dirty: bool,
     drawing: bool,
     // `again`: the page asked for another pass while one was built. `settling`: this is that extra pass.
     again: bool,
@@ -610,19 +496,19 @@ pub struct Window {
     patches: Vec<crate::Node>,
     // The boxes whose style moved or sized them since the last layout, which keeps the offset for scroll anchors in
     // or below them.
-    pub(crate) unanchored: rustc_hash::FxHashSet<u64>,
-    pub(crate) pointer: Point<Pixels>,
-    pub(crate) closed: bool,
+    unanchored: rustc_hash::FxHashSet<u64>,
+    pointer: Point<Pixels>,
+    pub(super) closed: bool,
     cursor: Option<Cursor>,
     drawn_at: Instant,
     frames_drawn: u64,
     tracks: Vec<Track>,
-    pub(crate) rails: ([f32; 2], Instant),
+    rails: ([f32; 2], Instant),
     // The time of a frame that a display tick started, and when its device sent the event in dispatch.
-    pub(crate) frame_at: Option<Instant>,
-    pub(crate) event_at: Option<Instant>,
-    pub(crate) scroll_chain: Option<Vec<ScrollRef>>,
-    pub(crate) gesture: ScrollGesture,
+    frame_at: Option<Instant>,
+    event_at: Option<Instant>,
+    scroll_chain: Option<Vec<ScrollRef>>,
+    gesture: ScrollGesture,
 }
 
 impl Window {
@@ -632,11 +518,14 @@ impl Window {
         text_system: Rc<TextSystem>,
     ) -> Self {
         let (scale_factor, viewport_size) = (platform.scale_factor(), platform.content_size());
+        let atlas = platform.atlas().clone();
         Self {
             id,
             platform,
             view: None,
             text_system,
+            atlas,
+            removed: Vec::new(),
             scale_factor,
             viewport_size,
             zoom: 1.,
@@ -762,7 +651,7 @@ impl Window {
     /// the scroll anchors in it.
     pub fn suppress_anchoring(&mut self, id: impl Into<crate::NodeKey>) {
         self.unanchored
-            .insert(crate::tree::identity(Some(id.into()), 0));
+            .insert(crate::app::window::tree::identity(Some(id.into()), 0));
     }
 
     // The node needs its key, or the patch is ignored.
@@ -807,7 +696,7 @@ impl Window {
 
     pub fn demote(&mut self) {
         #[cfg(target_os = "macos")]
-        self.platform.renderer.demote();
+        self.platform.demote();
         self.tracks.clear();
     }
 
@@ -848,12 +737,12 @@ impl Window {
             Some(transforms) => transforms
                 .iter()
                 .map(|matrix| {
-                    crate::scene::transform_bounds(&device_matrix(*matrix, scale), content)
+                    crate::geometry::transform_bounds(&device_matrix(*matrix, scale), content)
                 })
                 .reduce(|all, bounds| all.union(bounds)),
             None => Some(content),
         };
-        let region = crate::frame::region(content);
+        let region = crate::geometry::region(content);
         // Promoted layers bypass window clips. Keep them inside the clip with no overlapping content above.
         let window = Rect::new(Point::default(), self.viewport_size.scale(scale));
         let reach = reach.map(|reach| reach.intersect(window));
@@ -889,7 +778,7 @@ impl Window {
                 })
                 .collect();
             let begin = start.elapsed().as_secs_f64();
-            self.platform.renderer.promote(
+            self.platform.promote(
                 key,
                 index,
                 region,
@@ -930,7 +819,11 @@ impl Window {
     pub(crate) fn draw_patch(&mut self) {
         if mem::take(&mut self.patch) {
             // The atlas and text caches keep their frame, so the tiles this scene reads stay.
-            let _ = self.platform.draw(&self.scene, false);
+            let (_, snapshots) = self.platform.draw(&self.scene, None, false);
+            debug_assert!(
+                snapshots.is_empty(),
+                "a patch frame reads no snapshot layers"
+            );
             self.scene.drawn();
         }
     }
@@ -993,8 +886,92 @@ impl Window {
         self.refresh();
     }
 
-    pub(crate) fn take_frame_callbacks(&mut self) -> Vec<FrameCallback> {
-        mem::take(&mut self.frame_callbacks)
+    // The frame of a display tick or a forced frame.
+    pub(crate) fn frame(&mut self, app: &mut App) {
+        for callback in mem::take(&mut self.frame_callbacks) {
+            callback(self, app);
+        }
+        if self.dirty || !self.captures.is_empty() {
+            // The diff damage holds the regions of a patch that was not drawn.
+            self.patch = false;
+            self.draw(app);
+        }
+        self.draw_patch();
+        self.frame_at = None;
+    }
+
+    // A native event, in zoomed pixels. `drop_held` forgets a key that waits for the input method.
+    pub(crate) fn dispatch_native(
+        &mut self,
+        mut event: Event,
+        app: &mut App,
+        drop_held: bool,
+    ) -> bool {
+        if drop_held {
+            self.ime_key = None;
+        }
+        if self.zoom != 1. {
+            event.unzoom(self.zoom);
+        }
+        self.dispatch_event(event, app)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn dispatch_at(&mut self, event: Event, sent: Instant, app: &mut App) {
+        self.event_at = Some(sent);
+        self.dispatch_native(event, app, false);
+        self.event_at = None;
+    }
+
+    // A key that the input method may take. The text it types or composes says what the key was.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn hold_key(&mut self, key: Event, composing: bool) {
+        self.ime_key = Some((key, composing));
+    }
+
+    // `ime` is set when the key typed more than one character or composes, and then the page ignores it.
+    pub(crate) fn send_ime_key(&mut self, app: &mut App, typed: bool) -> bool {
+        let Some((mut key, composing)) = self.ime_key.take() else {
+            return false;
+        };
+        let ime = typed || composing;
+        if let Event::KeyDown { ime: held, .. } = &mut key {
+            *held = ime;
+        }
+        self.dispatch_native(key, app, false) && !ime
+    }
+
+    // Gives back the GPU memory that the window does not need while it is idle.
+    pub(crate) fn release_gpu(&mut self) {
+        self.platform.release(&self.scene);
+    }
+
+    // A display tick at `at`, or a forced frame with `None`. A tick while the GPU queue is full draws no frame,
+    // which takes one frame out of the queue. A window that wants no more frames rests.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn tick(&mut self, at: Option<Instant>, app: &mut App) {
+        if let Some(at) = at {
+            if !self.platform.tick() {
+                return;
+            }
+            self.frame_at = Some(at);
+        }
+        self.frame(app);
+        if !self.wants_frame() {
+            self.platform.rest();
+        }
+    }
+
+    // A frame of a live resize, which presents inside the transaction of AppKit when `visible`. Returns its present.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn present_live(
+        &mut self,
+        visible: bool,
+        app: &mut App,
+    ) -> Option<platform::Present> {
+        self.platform.begin_live(visible);
+        self.tick(None, app);
+        self.platform.end_live()
     }
 
     pub(crate) fn wants_frame(&self) -> bool {
@@ -1085,7 +1062,12 @@ impl Window {
                 });
                 self.view = Some(view);
                 if let Some(root) = root {
-                    tree.layout(root, self.viewport_size, self);
+                    tree.layout(
+                        root,
+                        self.viewport_size,
+                        mem::take(&mut self.unanchored),
+                        self,
+                    );
                     tree.prepaint(root, self);
                     self.hovered = self.pending.probe(self.pointer, &mut self.under);
                     let restarting = self.restart && self.restarts < 4;
@@ -1131,7 +1113,7 @@ impl Window {
                 self.refresh();
             }
             self.caret_covered = covered;
-            self.platform.renderer.set_caret(
+            self.platform.set_caret(
                 caret
                     .filter(|caret| caret.overlay && !covered)
                     .map(|caret| (caret.bounds, caret.color, caret.since)),
@@ -1141,38 +1123,18 @@ impl Window {
                 .set_controls(controls, self.controls.1.clone());
         }
         let captures = mem::take(&mut self.captures);
-        #[cfg(target_os = "macos")]
-        self.platform
-            .set_drawable_size(self.native.0, self.native.1);
-        // A snapshot layer is read only when it draws otherwise than in the last frame.
-        let mut shots = FxHashMap::default();
-        for at in 0..self.scene.shots.len() {
-            let (key, layer) = (self.scene.shots[at].key, self.scene.shots[at].layer);
-            let [x, y, width, height] = self.scene.shots[at].region;
-            let mut hasher = rustc_hash::FxHasher::default();
-            let region = crate::rect(x as f32, y as f32, width as f32, height as f32);
-            self.scene.digest(layer, region, &mut hasher);
-            let now = (std::hash::Hasher::finish(&hasher), [width, height]);
-            self.scene.shots[at].read = self.shots.get(&key) != Some(&now);
-            shots.insert(key, now);
-        }
-        self.shots = shots;
-        let fresh = self.platform.atlas().take_fresh();
+        self.scene.read_shots(&mut self.shots);
+        let fresh = self.atlas.take_fresh();
         self.scene.diff(fresh.as_deref());
-        let mut frame = self.platform.draw(&self.scene, !captures.is_empty());
+        let (mut frame, snapshots) =
+            (self.platform).draw(&self.scene, Some(self.native), !captures.is_empty());
         self.scene.drawn();
-        let snapshots = self.platform.take_snapshots();
-        // A layer that the backend could not read is read with the next frame.
-        for shot in &mut self.scene.shots {
-            if mem::take(&mut shot.read) && !snapshots.iter().any(|read| read.key == shot.key) {
-                self.shots.remove(&shot.key);
-            }
-        }
+        self.scene.keep_unread(&snapshots, &mut self.shots);
         if let Some(tree) = &mut self.tree {
             tree.bury();
         }
         self.text_system.end_frame();
-        self.platform.atlas().finish_frame(&self.scene);
+        self.atlas.finish_frame(self.scene.texels());
         let last = captures.len().wrapping_sub(1);
         for (index, capture) in captures.into_iter().enumerate() {
             let result = match &mut frame {
@@ -1220,7 +1182,12 @@ impl Window {
             self.clear_pending();
             let mut tree = self.tree.take().unwrap_or_default();
             if let Some(root) = self.build(&mut tree, app, &mut render) {
-                tree.layout(root, self.viewport_size, self);
+                tree.layout(
+                    root,
+                    self.viewport_size,
+                    mem::take(&mut self.unanchored),
+                    self,
+                );
                 tree.prepaint(root, self);
             }
             self.tree = Some(tree);
@@ -1386,7 +1353,7 @@ impl Window {
     pub fn press_key(&mut self, key: Key, modifiers: Modifiers, app: &mut App) -> bool {
         let id = self.id;
         let blocked =
-            |event: Event| crate::native::sync(move || crate::native::key(id, &event, &|| false));
+            |event: Event| crate::sync_main(move || crate::native::key(id, &event, &|| false));
         let text = key.text.clone();
         let down = Event::KeyDown {
             key: key.clone(),
@@ -1487,7 +1454,7 @@ impl Window {
 
     /// Paint left out or placed content by the content mask, so a copy can't move with its box.
     pub fn cull(&mut self) {
-        self.scene.culled += 1;
+        self.scene.cull();
     }
 
     // The frame starts again after this paint, which the next paint doesn't copy.
@@ -1507,285 +1474,12 @@ impl Window {
         self.repaint = true;
     }
 
-    // Whether the next paint can copy spans of the last one.
-    pub(crate) fn copies(&self) -> bool {
-        !self.repaint
-            && !self.platform.atlas().evicted()
-            && self.text_system.generation() == self.generation
-            && self.live.pass.is_some()
-            && self.scene.last_pass == self.live.pass
-    }
-
-    // Returns the pass, and the pass whose spans can be copied.
-    pub(crate) fn begin_paint(&mut self) -> (u32, Option<u32>) {
-        self.paints = self.paints.wrapping_add(1);
-        let generation = self.text_system.generation();
-        let atlas = self.platform.atlas();
-        atlas.take_removed(&mut self.scene.removed);
-        let evicted = atlas.take_evicted();
-        let fresh = mem::take(&mut self.repaint) || evicted || generation != self.generation;
-        self.generation = generation;
-        self.scene.begin_paint(self.paints);
-        self.pending.pass = Some(self.paints);
-        let last = self
-            .live
-            .pass
-            .filter(|_| !fresh && self.scene.last_pass == self.live.pass);
-        (self.paints, last)
-    }
-
-    pub(crate) fn paint_key(&self) -> PaintKey {
-        PaintKey {
-            mask: self.content_mask(),
-            offset: self.offset(),
-            opacity: self.opacity,
-            smoothing: self.font_smoothing,
-            scale: self.scale_factor,
-        }
-    }
-
-    pub(crate) fn paint_mark(&self) -> PaintMark {
-        PaintMark {
-            scene: self.scene.mark(),
-            input: self.pending.lens(),
-            volatile: self.volatile,
-            culled: self.scene.culled,
-        }
-    }
-
-    // The area in device pixels that a span drew in `mask`, when the span can move with its box: its paint cut
-    // nothing and drew nothing outside the mask or in layers.
-    pub(crate) fn plain(
-        &self,
-        span: &PaintSpan,
-        mark: PaintMark,
-        mask: Clip<Pixels>,
-    ) -> Option<Rect<f32>> {
-        (self.scene.culled == mark.culled)
-            .then(|| self.scene.plain(&span.scene, &self.snap_mask(mask)))
-            .flatten()
-    }
-
-    // Whether a plain span that drew `area` can move by `by` and draw in `mask`, as a paint there would draw.
-    pub(crate) fn movable(&self, area: Rect<f32>, by: Point<Pixels>, mask: Clip<Pixels>) -> bool {
-        let by = by.scale(self.scale_factor);
-        let whole = |value: f32| value == value.round();
-        whole(by.x) && whole(by.y) && scene::within(area + by, self.snap_mask(mask).bounds)
-    }
-
-    // Whether `now` is the mask `old` moved by whole device pixels.
-    pub(crate) fn translated(
-        &self,
-        old: Clip<Pixels>,
-        now: Clip<Pixels>,
-        by: Point<Pixels>,
-    ) -> bool {
-        let by = by.scale(self.scale_factor);
-        let [old, now] = [old, now].map(|mask| self.snap_mask(mask));
-        let near =
-            |a: Point<f32>, b: Point<f32>| (a.x - b.x).abs() < 1e-3 && (a.y - b.y).abs() < 1e-3;
-        let whole = |value: f32| value == value.round();
-        whole(by.x)
-            && whole(by.y)
-            && near(old.bounds.origin + by, now.bounds.origin)
-            && near(old.bounds.bottom_right() + by, now.bounds.bottom_right())
-            && (old.rounded.size == Size::default() && now.rounded.size == Size::default()
-                || near(old.rounded.origin + by, now.rounded.origin)
-                    && near(old.rounded.bottom_right() + by, now.rounded.bottom_right()))
-            && old.radii == now.radii
-    }
-
-    // Whether a copy of a span can move with its box: its layers don't read pixels below or a mask layer, or
-    // turn in perspective.
-    pub(crate) fn translatable(&self, span: &PaintSpan) -> bool {
-        self.scene.translatable(&span.scene)
-    }
-
-    // What a span drew. `last` reads a span of the last paint.
-    #[cfg(debug_assertions)]
-    pub(crate) fn span_records(
-        &self,
-        span: &PaintSpan,
-        last: bool,
-        moved: Option<(Point<Pixels>, Clip<Pixels>, Clip<Pixels>)>,
-    ) -> Vec<String> {
-        let moved = moved.map(|(by, old, now)| {
-            (
-                by.scale(self.scale_factor),
-                self.snap_mask(old),
-                self.snap_mask(now),
-            )
-        });
-        let mut out = self.scene.records(&span.scene, last, moved);
-        let input = if last { &self.live } else { &self.pending };
-        let range = |[start, end]: [u32; 2]| start as usize..end as usize;
-        let [listeners, cursors, drags, marks] = span.input.map(range);
-        let phases: Vec<_> = input.listeners[listeners]
-            .iter()
-            .map(|(phase, _)| *phase)
-            .collect();
-        out.push(format!("listeners {phases:?}"));
-        // The prepaint check of debug builds gives regions new keys.
-        let kinds: Vec<_> = input.cursors[cursors]
-            .iter()
-            .map(|(_, cursor)| *cursor)
-            .collect();
-        out.push(format!("cursors {kinds:?}"));
-        out.push(format!("drag areas {}", input.drag_areas[drags].len()));
-        out.push(format!("marks {:?}", &input.marks[marks]));
-        out
-    }
-
-    // `None` when paint read state outside the tree, or wrote where a copy can't follow.
-    pub(crate) fn paint_span(&self, mark: PaintMark) -> Option<PaintSpan> {
-        if self.volatile != mark.volatile || self.text_clip.is_some() {
-            return None;
-        }
-        let ends = self.pending.lens();
-        Some(PaintSpan {
-            scene: self.scene.span(mark.scene)?,
-            input: std::array::from_fn(|at| [mark.input[at], ends[at]]),
-        })
-    }
-
-    // Copies a span of the last paint.
-    // Debug builds paint instead, to check the copy.
-    #[cfg_attr(debug_assertions, allow(dead_code))]
-    pub(crate) fn replay(
-        &mut self,
-        span: &PaintSpan,
-        moved: Option<(Point<Pixels>, Clip<Pixels>, Clip<Pixels>)>,
-    ) -> Option<PaintSpan> {
-        let ([listeners, cursors, drags, marks], live) = (span.input, &self.live);
-        let range = |[start, end]: [u32; 2]| start as usize..end as usize;
-        if self.text_clip.is_some()
-            || live
-                .lens()
-                .iter()
-                .zip(&span.input)
-                .any(|(len, [_, end])| end > len)
-        {
-            return None;
-        }
-        let start = self.pending.lens();
-        let scene = match moved {
-            Some((by, old, now)) => {
-                let (old, now) = (self.snap_mask(old), self.snap_mask(now));
-                (self.scene).replay_moved(&span.scene, by.scale(self.scale_factor), &old, &now)?
-            }
-            None => self.scene.replay(&span.scene)?,
-        };
-        let pending = &mut self.pending;
-        Rc::make_mut(&mut pending.listeners).extend_from_slice(&live.listeners[range(listeners)]);
-        pending
-            .cursors
-            .extend_from_slice(&live.cursors[range(cursors)]);
-        pending
-            .drag_areas
-            .extend_from_slice(&live.drag_areas[range(drags)]);
-        pending.marks.extend_from_slice(&live.marks[range(marks)]);
-        let ends = pending.lens();
-        Some(PaintSpan {
-            scene,
-            input: std::array::from_fn(|at| [start[at], ends[at]]),
-        })
-    }
-
-    // Kept subtrees reuse their regions only while this is unchanged.
-    pub(crate) fn placement(&self) -> Placement {
-        let transform = (self.hit_transform.as_ref()).map_or(0, |transform| transform.id);
-        Placement {
-            offset: self.offset(),
-            mask: self.content_mask(),
-            visible: self.visible_mask().bounds,
-            depth: self.depth() as u32,
-            transform,
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    pub(crate) fn region_places(&self) -> Vec<(Rect, Clip<Pixels>, Hit, bool)> {
-        let place = |placed: &Placed| {
-            let region = placed.region;
-            (
-                region.bounds,
-                Clip {
-                    bounds: placed.clip.bounds.intersect(placed.view),
-                    ..placed.clip
-                },
-                region.hit,
-                placed.transform.is_some(),
-            )
-        };
-        self.pending.regions.iter().map(place).collect()
-    }
-
-    #[cfg(debug_assertions)]
-    pub(crate) fn redraws(&self) -> bool {
-        self.again
-    }
-
-    pub(crate) fn truncate_regions(&mut self, len: usize) {
-        self.pending.regions.truncate(len);
-    }
-
     fn clear_pending(&mut self) {
         if self.pending.prepass.is_some() {
             mem::swap(&mut self.spare.1, &mut self.pending.regions);
             self.spare.0 = self.pending.prepass;
         }
         self.pending.clear();
-    }
-
-    pub(crate) fn begin_prepaint(&mut self, pass: u32) {
-        self.pending.prepass = Some(pass);
-    }
-
-    pub(crate) fn regions_len(&self) -> u32 {
-        self.pending.regions.len() as u32
-    }
-
-    // Copies regions of the prepaint pass `pass` moved by a scroll offset `by`, and returns where they start.
-    pub(crate) fn shift_regions(
-        &mut self,
-        pass: u32,
-        range: [u32; 2],
-        by: Point<Pixels>,
-    ) -> Option<u32> {
-        let at = self.copy_regions(pass, range)?;
-        // The viewports of scrolls around the box can move with an outer scroll, so its regions see them anew.
-        let viewports = self.viewport_bounds();
-        let mut moved = Vec::new();
-        for placed in &mut self.pending.regions[at as usize..] {
-            placed.region.bounds.origin += by;
-            // The open mask inside a transform stays.
-            if placed.clip.bounds.size.width.0 < OPEN {
-                placed.clip.bounds.origin += by;
-            }
-            if placed.transform.is_none() {
-                placed.view = placed.clip.bounds.intersect(viewports);
-            }
-            if placed.clip.rounded.size != Size::default() {
-                placed.clip.rounded.origin += by;
-            }
-            if let Some(transform) = &placed.transform {
-                placed.transform = Some(transform.shifted(by, &mut moved));
-            }
-        }
-        Some(at)
-    }
-
-    // Copies regions of the prepaint pass `pass`, and returns where they start.
-    pub(crate) fn copy_regions(&mut self, pass: u32, [start, end]: [u32; 2]) -> Option<u32> {
-        let source = match (self.live.prepass, self.spare.0) {
-            (Some(live), _) if live == pass => &self.live.regions,
-            (_, Some(spare)) if spare == pass => &self.spare.1,
-            _ => return None,
-        };
-        let copied = source.get(start as usize..end as usize)?;
-        let at = self.pending.regions.len() as u32;
-        self.pending.regions.extend_from_slice(copied);
-        Some(at)
     }
 
     /// Drops the state that `keyed` keeps, as for a new document whose nodes reuse the old keys.
@@ -1866,14 +1560,18 @@ impl Window {
     }
 
     // Stops the cuts of the scroll viewports inside the first `depth` until `resume_cuts`.
-    pub(crate) fn pause_cuts(&mut self, depth: usize) -> Vec<Option<Rect<Pixels>>> {
+    // An out-of-flow box paints in `f` outside the cuts and viewports of the scrolls inside the first `depth`.
+    pub(crate) fn with_cuts_paused<R>(
+        &mut self,
+        depth: usize,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
         self.scene.pause_cuts(depth);
-        self.hide_viewports(depth)
-    }
-
-    pub(crate) fn resume_cuts(&mut self, paused: Vec<Option<Rect<Pixels>>>) {
+        let paused = self.hide_viewports(depth);
+        let result = f(self);
         self.show_viewports(paused);
         self.scene.resume_cuts();
+        result
     }
 
     // Takes the scroll viewports inside the first `depth` out of the clips until `show_viewports`.

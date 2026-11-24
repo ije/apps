@@ -329,7 +329,7 @@ fn create(kind: ControlKind) -> Retained<AnyObject> {
     }
 }
 
-pub(crate) fn control_size(kind: ControlKind) -> [f32; 2] {
+pub fn control_size(kind: ControlKind) -> [f32; 2] {
     static SIZES: OnceLock<[[f32; 2]; 8]> = OnceLock::new();
     SIZES.get_or_init(|| native_sync(measure))[kind as usize]
 }

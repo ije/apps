@@ -11,6 +11,48 @@ pub struct Border {
     pub sides: u8,
 }
 
+impl crate::text::TextCanvas for Window {
+    fn text_system(&self) -> &TextSystem {
+        &self.text_system
+    }
+
+    fn content_mask(&self) -> Clip<Pixels> {
+        Window::content_mask(self)
+    }
+
+    fn cull(&mut self) {
+        Window::cull(self);
+    }
+
+    fn draw_rect(&mut self, bounds: Rect<Pixels>, color: Color) {
+        Window::draw_rect(self, bounds, color);
+    }
+
+    fn draw_line(
+        &mut self,
+        origin: Point<Pixels>,
+        width: Pixels,
+        thickness: Pixels,
+        color: Color,
+        style: DecorationStyle,
+    ) {
+        Window::draw_line(self, origin, width, thickness, color, style);
+    }
+
+    fn draw_glyph(
+        &mut self,
+        origin: Point<Pixels>,
+        font: FontId,
+        glyph: GlyphId,
+        size: Pixels,
+        color: Color,
+        emoji: bool,
+        stroke: Pixels,
+    ) {
+        Window::draw_glyph(self, origin, font, glyph, size, color, emoji, stroke);
+    }
+}
+
 impl Window {
     pub(super) fn snap_bounds(&self, bounds: Rect<Pixels>) -> Rect<f32> {
         let scale = self.scale_factor;
@@ -50,8 +92,23 @@ impl Window {
         self.content_mask().radii == Default::default()
     }
 
-    // `origin` is a point of the box in the window, so the area moves with the box when an outer scroll moves it.
-    pub(crate) fn begin_interest(&mut self, origin: Point<Pixels>, offset: Point<Pixels>) -> bool {
+    // Runs `f` in the interest area of a scroll at `at`: a point of the box in the window, so the area moves with
+    // the box when an outer scroll moves it, and the scroll offset.
+    pub(crate) fn with_interest<R>(
+        &mut self,
+        at: Option<(Point<Pixels>, Point<Pixels>)>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some((origin, offset)) = at else {
+            return f(self);
+        };
+        self.begin_interest(origin, offset);
+        let result = f(self);
+        self.end_interest();
+        result
+    }
+
+    fn begin_interest(&mut self, origin: Point<Pixels>, offset: Point<Pixels>) -> bool {
         let mask = self.content_mask();
         let open = self.opens_interest();
         self.viewports.push(open.then_some(mask.bounds));
@@ -70,14 +127,21 @@ impl Window {
         open
     }
 
-    pub(crate) fn end_interest(&mut self) {
+    fn end_interest(&mut self) {
         if self.viewports.pop().flatten().is_some() {
             self.pop_content_mask();
         }
     }
 
-    // The content of a scroll container, which `offset` moved, paints between these two calls.
-    pub(crate) fn begin_scroll(&mut self, id: u64, origin: Point<Pixels>, offset: Point<Pixels>) {
+    // The content of a scroll container paints in `f`: its id, a point of its box, and the offset that moved it.
+    pub(crate) fn with_scroll<R>(
+        &mut self,
+        scroll: Option<(u64, Point<Pixels>, Point<Pixels>)>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let Some((id, origin, offset)) = scroll else {
+            return f(self);
+        };
         let viewport = self.snap_mask(self.content_mask());
         let scale = self.scale_factor;
         let open = self.begin_interest(origin, offset);
@@ -87,11 +151,10 @@ impl Window {
             Point::new(-offset.x.0 * scale, -offset.y.0 * scale),
             open,
         );
-    }
-
-    pub(crate) fn end_scroll(&mut self) {
+        let result = f(self);
         self.end_interest();
         self.scene.end_scroll();
+        result
     }
 
     pub(super) fn snap_mask(&self, mask: Clip<Pixels>) -> Clip<f32> {
@@ -186,7 +249,7 @@ impl Window {
             let part = clip.bounds.intersect(band);
             // A band that the mask cut draws differently in another mask, so a copy of it can't move.
             if part != band {
-                self.scene.culled += 1;
+                self.scene.cull();
             }
             if !part.is_empty() {
                 instance.clip = part.to_array();
@@ -232,7 +295,7 @@ impl Window {
         ] {
             let part = clip.bounds.intersect(strip);
             if part != strip {
-                self.scene.culled += 1;
+                self.scene.cull();
             }
             if !part.is_empty() {
                 instance.clip = part.to_array();
@@ -381,7 +444,7 @@ impl Window {
                     color_matrix,
                 },
             ),
-            glass: effect.glass.map(|glass| crate::scene::GlassState {
+            glass: effect.glass.map(|glass| crate::gpu::scene::GlassState {
                 key: glass.key,
                 bounds: glass.bounds.scale(scale),
                 corner_radius: glass.corner_radius.0 * scale,
@@ -486,7 +549,7 @@ impl Window {
             let full = crate::gpu::rect(line.rect);
             let shown = full.intersect(clip.bounds);
             if shown != full {
-                self.scene.culled += 1;
+                self.scene.cull();
             }
             if shown.is_empty() {
                 continue;
@@ -554,11 +617,10 @@ impl Window {
         };
         let text = &self.text_system;
         let Some((tile, shown)) =
-            self.platform
-                .atlas()
+            self.atlas
                 .get_or_insert_with(&TileKey::Glyph(params), &mut || {
                     Ok(text
-                        .raster(&params, crate::atlas::MAX_GLYPH_SIDE)?
+                        .raster(&params, crate::text::MAX_GLYPH_SIDE)?
                         .map(|(shown, size, bytes)| (shown, size, Cow::Owned(bytes))))
                 })
         else {
@@ -584,7 +646,7 @@ impl Window {
         kind: u32,
         rect: Rect<f32>,
         clip: Clip<f32>,
-        tile: crate::atlas::Tile,
+        tile: crate::gpu::atlas::Tile,
     ) -> Instance {
         let mut instance = Instance::new(kind, rect, clip);
         instance.aux = tile.rect.map(|value| value as f32).to_array();
@@ -593,9 +655,8 @@ impl Window {
         instance
     }
 
-    fn image_tile(&self, image: &RenderImage) -> Option<crate::atlas::Tile> {
-        self.platform
-            .atlas()
+    fn image_tile(&self, image: &RenderImage) -> Option<crate::gpu::atlas::Tile> {
+        self.atlas
             .get_or_insert_with(&TileKey::Image(image.id), &mut || {
                 let size = image.size();
                 Ok(Some((
@@ -665,6 +726,6 @@ impl Window {
     }
 
     pub fn release_image(&mut self, image: Arc<RenderImage>) {
-        self.platform.atlas().remove(&TileKey::Image(image.id));
+        self.atlas.remove(&TileKey::Image(image.id));
     }
 }

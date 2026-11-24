@@ -487,7 +487,7 @@ impl Main {
     fn native(&self, command: Value) {
         let args = &command["args"];
         if command["op"] == "focus" {
-            renderer::native::activate(args[0] == true);
+            renderer::activate(args[0] == true);
             return;
         }
         let action = args[0].as_str().unwrap_or_default();
@@ -712,7 +712,7 @@ impl Main {
                 }) {
                     self.wake.set(Some(at));
                     let main = Rc::downgrade(self);
-                    renderer::native::after(Duration::from_millis(delay), move || {
+                    renderer::post_main_after(Duration::from_millis(delay), move || {
                         if let Some(main) = main.upgrade() {
                             main.drive();
                         }
@@ -727,7 +727,7 @@ impl Main {
         }
         if self.link.quitting() && !self.ended.replace(true) {
             crate::host::context::stop_pages();
-            renderer::native::quit();
+            renderer::quit();
         }
         if self.api.shrink_pending() && !self.quiet.replace(true) {
             self.shrink_when_quiet();
@@ -792,7 +792,7 @@ impl Main {
 
     fn shrink_when_quiet(self: &Rc<Self>) {
         let main = Rc::downgrade(self);
-        renderer::native::after(Duration::from_secs(1), move || {
+        renderer::post_main_after(Duration::from_secs(1), move || {
             if let Some(main) = main.upgrade() {
                 if main.api.shrink_due() {
                     main.quiet.set(false);

@@ -7,8 +7,8 @@ use objc2::{msg_send, runtime::AnyObject};
 use objc2_app_kit::{
     self as kit, NSEvent, NSEventModifierFlags as Flags, NSEventPhase as Phase, NSEventType as Kind,
 };
-use objc2_foundation::NSRect;
-use std::ffi::c_void;
+use objc2_foundation::{NSAttributedString, NSNotFound, NSRange, NSRect, NSString};
+use std::{ffi::c_void, ops::Range};
 
 // Modifier bits of UCKeyTranslate: the Carbon modifier mask shifted right by 8.
 const UC_COMMAND: u32 = 1;
@@ -326,5 +326,76 @@ impl Drop for Layout {
         unsafe {
             let () = msg_send![self.source, release];
         }
+    }
+}
+
+pub(super) const NOT_FOUND: usize = NSNotFound as usize;
+
+pub(super) fn span(range: NSRange) -> Option<Range<usize>> {
+    (range.location != NOT_FOUND).then(|| range.location..range.location + range.length)
+}
+
+pub(super) fn ns_range(range: Option<Range<usize>>) -> NSRange {
+    range.map_or(NSRange::new(NOT_FOUND, 0), NSRange::from)
+}
+
+// Input methods send plain or attributed strings.
+pub(super) fn plain(text: &AnyObject) -> String {
+    match text.downcast_ref::<NSAttributedString>() {
+        Some(text) => text.string().to_string(),
+        None => text
+            .downcast_ref::<NSString>()
+            .map(NSString::to_string)
+            .unwrap_or_default(),
+    }
+}
+
+// A merge keeps the order of events: only moves with the same buttons and modifiers, and wheel deltas of
+// one gesture, combine.
+pub(super) fn merge(waiting: &mut Event, next: &Event) -> bool {
+    if let (
+        Event::PointerMove {
+            held, modifiers, ..
+        },
+        Event::PointerMove {
+            held: next_held,
+            modifiers: next_modifiers,
+            ..
+        },
+    ) = (&*waiting, next)
+    {
+        if held != next_held || modifiers != next_modifiers {
+            return false;
+        }
+        *waiting = next.clone();
+        return true;
+    }
+    match (waiting, next) {
+        (
+            Event::Wheel {
+                at,
+                delta,
+                lines,
+                phase,
+                modifiers,
+            },
+            Event::Wheel {
+                at: next_at,
+                delta: next_delta,
+                lines: next_lines,
+                phase: next_phase,
+                modifiers: next_modifiers,
+            },
+        ) => {
+            let same_gesture = *phase == *next_phase
+                || (*phase == WheelPhase::Began && *next_phase == WheelPhase::Changed);
+            if modifiers != next_modifiers || lines != next_lines || !same_gesture {
+                return false;
+            }
+            *at = *next_at;
+            *delta += *next_delta;
+            true
+        }
+        _ => false,
     }
 }

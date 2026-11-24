@@ -233,12 +233,12 @@ impl Desktop {
             let _ = std::thread::Builder::new()
                 .name("apps-warm".into())
                 .spawn(|| {
-                    use renderer::text::{Font, TextRun, TextSystem};
+                    use renderer::{Font, TextRun, TextSystem};
                     #[link(name = "CoreGraphics", kind = "framework")]
                     unsafe extern "C" {
                         fn CGMainDisplayID() -> u32;
                     }
-                    renderer::native::prewarm();
+                    renderer::prewarm();
                     unsafe { CGMainDisplayID() };
                     let text = TextSystem::new();
                     let run = TextRun {
@@ -985,7 +985,7 @@ impl Desktop {
         } = self;
         drop((api, host));
         let main = main.context("Missing the main side")?;
-        apps_webview::on_main_thread(|task| renderer::native::sync(task), renderer::native::post);
+        apps_webview::on_main_thread(|task| renderer::sync_main(task), renderer::post_main);
         if let Some(port) = mcp {
             mcp::start(port, link.clone())?;
         }
@@ -1002,7 +1002,7 @@ impl Desktop {
             link.set_wake_main(move || {
                 if !pending.swap(true, Ordering::AcqRel) {
                     let pending = pending.clone();
-                    renderer::native::post(Box::new(move || {
+                    renderer::post_main(Box::new(move || {
                         pending.store(false, Ordering::Release);
                         main::drive_main();
                     }));
@@ -1062,7 +1062,7 @@ impl Desktop {
             });
             crate::host::context::BEFORE_EXIT.set(Some(|| {
                 crate::host::context::stop_pages();
-                renderer::native::before_exit();
+                renderer::before_exit();
             }));
             #[cfg(target_os = "macos")]
             crate::native::observe();
@@ -1094,7 +1094,7 @@ impl Desktop {
                 )),
                 None => link.call("__appsInitMenu", Vec::new(), "apps:menu"),
             }
-            renderer::native::activate(true);
+            renderer::activate(true);
             std::mem::forget(main);
         });
         Ok(exit.exit_code())
@@ -1128,7 +1128,7 @@ impl Desktop {
             page.wake();
         });
         crate::host::context::NATIVE.set(Some(|op, args| {
-            renderer::native::sync(|| crate::native::native_call(op, args))
+            renderer::sync_main(|| crate::native::native_call(op, args))
         }));
         crate::native::devtools::install(owner.unwrap_or(0));
         let runtime = Rc::new(RefCell::new(Self {

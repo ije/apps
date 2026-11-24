@@ -1,9 +1,9 @@
 use crate::{
     Color, Rect, Size,
-    atlas::{self, PageKind, PageList, PageStore, Tile},
-    frame::{Command, Mask, Pool, RenderFrame, Target},
+    gpu::atlas::{self, PageKind, PageList, PageStore, Tile},
+    gpu::frame::{Command, Mask, Pool, RenderFrame, Target},
+    gpu::scene::Scene,
     gpu::{ATTRIBUTES, Blur, Composite, Globals, Instance, Plain, bytes},
-    scene::Scene,
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use std::{borrow::Cow, cell::RefCell, mem, rc::Rc, slice, time::Duration};
@@ -537,7 +537,7 @@ impl Renderer {
 
     // Layers go; the swap chain keeps the last frame on screen.
     pub fn release(&mut self) {
-        self.pool.clear(&mut self.frame);
+        self.frame.clear_pool(&mut self.pool);
     }
 
     pub fn draw(&mut self, scene: &Scene, capture: bool) -> Option<Result<([u32; 2], Vec<u8>)>> {
@@ -550,11 +550,7 @@ impl Renderer {
                     // The next frame makes a new device. Every window must draw again on it.
                     self.surface = None;
                     super::run_after(Duration::from_millis(100), || {
-                        crate::app::update(|app| {
-                            for id in app.window_ids() {
-                                app.refresh_window(id);
-                            }
-                        })
+                        crate::platform::events().device_lost()
                     });
                 }
                 capture.then_some(Err(error))
@@ -567,7 +563,7 @@ impl Renderer {
         if !Rc::ptr_eq(&gpu, &self.gpu) || self.surface.is_none() {
             // The old composition target must go before the window takes a new one.
             self.surface = None;
-            self.pool.clear(&mut self.frame);
+            self.frame.clear_pool(&mut self.pool);
             self.gpu = gpu;
             self.surface = Some(Surface::new(&self.gpu, self.hwnd, self.size, self.opaque)?);
         }
@@ -577,7 +573,7 @@ impl Renderer {
         if encoded.is_ok() {
             for &(key, target, region) in &frame.shots {
                 let size = [region[2] as u32, region[3] as u32];
-                let Some(layer) = self.pool.get(&frame, target) else {
+                let Some(layer) = frame.pooled(&self.pool, target) else {
                     continue;
                 };
                 match read_back(&self.gpu, &layer.pixels, size) {
@@ -601,7 +597,7 @@ impl Renderer {
 
     fn encode(&mut self, frame: &RenderFrame) -> Result<()> {
         let gpu = &*self.gpu;
-        self.pool.fill(frame, |size| {
+        frame.fill_pool(&mut self.pool, |size| {
             let bind = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
             Image::new(&gpu.device, texture(&gpu.device, size, FORMAT, bind)?, bind)
         })?;
@@ -612,7 +608,7 @@ impl Renderer {
             .as_ref()
             .and_then(|surface| surface.back.as_ref())
             .context("no back buffer")?;
-        let image = |target: Target| self.pool.get(frame, target).unwrap_or(back);
+        let image = |target: Target| frame.pooled(&self.pool, target).unwrap_or(back);
         let source = |target: Target| image(target).read.clone();
         let pages = gpu.atlas.pages.borrow();
         let page = |kind, index: Option<u32>| index.and_then(|index| pages.view(kind, index));

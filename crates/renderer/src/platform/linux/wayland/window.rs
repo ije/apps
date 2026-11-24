@@ -1,7 +1,11 @@
 use super::{Client, Hub, route};
 use crate::platform::linux::gpu::{Atlas, Capture, Drawn, Renderer};
 use crate::platform::linux::{Action, Display as _, Native, run_after, soon};
-use crate::{Pixels, Rect, Scene, Size, WindowOptions, WindowState, app::Callbacks, point, px};
+use crate::{
+    Pixels, Rect, Scene, Size, WindowOptions, WindowState,
+    platform::{Callbacks, events},
+    point, px,
+};
 use anyhow::Result;
 use raw_window_handle::{RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle};
 use std::time::{Duration, Instant};
@@ -215,7 +219,7 @@ impl Surface {
     pub fn focus(&self, active: bool) {
         self.shape.borrow_mut().active = active;
         let calls = self.calls;
-        soon(move || calls.changed());
+        soon(move || events().changed(calls));
     }
 
     fn kick(&self) {
@@ -254,7 +258,7 @@ impl Surface {
             }
         }
         pace.started.set(Some(now));
-        if self.calls.frame() == Some(false) {
+        if events().frame(self.calls) == Some(false) {
             pace.wants.set(false);
             return;
         }
@@ -309,7 +313,7 @@ impl Surface {
         }
         if changed {
             let calls = self.calls;
-            soon(move || calls.resized(extent, scale));
+            soon(move || events().resized(calls, extent, scale));
         }
     }
 
@@ -341,9 +345,9 @@ impl Surface {
         let calls = self.calls;
         soon(move || {
             if !first {
-                calls.appearance_changed();
+                events().appearance_changed(calls);
             }
-            calls.changed();
+            events().changed(calls);
         });
         if first {
             self.kick();
@@ -437,7 +441,7 @@ impl Native for Surface {
             _ => pace.waiting.set(false),
         }
         if drawn == Drawn::Again {
-            self.calls.appearance_changed();
+            events().appearance_changed(self.calls);
         }
         capture
     }
@@ -602,7 +606,7 @@ impl Client {
             xdg_toplevel::Event::Close => {
                 let calls = window.calls;
                 soon(move || {
-                    calls.should_close();
+                    events().should_close(calls);
                 });
             }
             _ => {}
@@ -621,7 +625,7 @@ impl Client {
             && let Some(window) = self.window_of(surface)
         {
             let calls = window.calls;
-            soon(move || calls.appearance_changed());
+            soon(move || events().appearance_changed(calls));
         }
     }
 

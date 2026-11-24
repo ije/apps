@@ -1,4 +1,4 @@
-use super::{Decoration, Features, Font, FontWeight};
+use super::{Features, Font, FontWeight};
 use crate::{Color, Pixels, px};
 use std::rc::Rc;
 
@@ -41,6 +41,17 @@ pub struct TextRun {
     pub tab_size: f32,
     /// `-webkit-text-stroke`: the width and color of a line centered on the glyph outlines.
     pub stroke: Option<(Pixels, Color)>,
+}
+
+/// Strikethroughs have no offset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Decoration {
+    pub thickness: Pixels,
+    /// The text color when `None`.
+    pub color: Option<Color>,
+    pub style: DecorationStyle,
+    /// From the baseline, instead of the default place under it.
+    pub offset: Option<Pixels>,
 }
 
 /// Declares `TextStyle` and its overrides from one list, so the two cannot drift.

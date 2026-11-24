@@ -1,9 +1,9 @@
 use super::{
-    RunCursor, SharedString, TextAlign, TextLine, TextRun, TextStyle, TextWrap, WhiteSpace,
-    WordBreak, Wrapping,
+    RunCursor, SharedString, TextAlign, TextCanvas, TextLine, TextRun, TextStyle, TextSystem,
+    TextWrap, WhiteSpace, WordBreak, Wrapping,
     breaks::{Banded, breaks_beside},
 };
-use crate::{AvailableSpace, Pixels, Point, Rect, Size, Window, px};
+use crate::{AvailableSpace, Pixels, Point, Rect, Size, px};
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
@@ -123,17 +123,19 @@ impl TextState {
         &self,
         known: Size<Option<Pixels>>,
         available: Size<AvailableSpace>,
-        window: &mut Window,
+        system: &TextSystem,
+        scale: f32,
     ) -> (Size<Pixels>, Option<[Pixels; 2]>) {
-        let floats = window.text_system().floats.borrow().clone();
-        self.measure_beside(known, available, window, floats)
+        let floats = system.floats();
+        self.measure_beside(known, available, system, scale, floats)
     }
 
     fn measure_beside(
         &self,
         known: Size<Option<Pixels>>,
         available: Size<AvailableSpace>,
-        window: &mut Window,
+        system: &TextSystem,
+        scale: f32,
         floats: Option<Rc<[[f32; 4]]>>,
     ) -> (Size<Pixels>, Option<[Pixels; 2]>) {
         let Self {
@@ -145,9 +147,7 @@ impl TextState {
         let (runs, style) = (self.runs.borrow(), self.style.borrow());
         let (runs, style) = (&*runs, &*style);
         // Like Chrome's layout units, which count device pixels, a line is at most 2^25 device pixels tall.
-        let line_height = style
-            .line_height
-            .min(px(33_554_431. / window.scale_factor().max(1.)));
+        let line_height = style.line_height.min(px(33_554_431. / scale.max(1.)));
         let definite = |space: AvailableSpace| match space {
             AvailableSpace::Definite(width) => Some(width),
             _ => None,
@@ -183,7 +183,6 @@ impl TextState {
             return (inner.size, Some(inner.baselines));
         }
         let min_content = probe == Some(0);
-        let system = window.text_system().clone();
         // Like CSS, `BreakWord` does not break inside words for the min-content size.
         let word_break = match style.word_break {
             WordBreak::BreakWord if min_content => WordBreak::Normal,
@@ -296,7 +295,7 @@ impl TextState {
             let (text, runs, truncated) = match truncate {
                 Some((affix, width)) => {
                     let (text, runs, truncated) =
-                        truncate_text(&system, style, text, runs, &affix, width - lean, wrap_width);
+                        truncate_text(system, style, text, runs, &affix, width - lean, wrap_width);
                     (text, Cow::Owned(runs), truncated)
                 }
                 None => (text.clone(), Cow::Borrowed(runs), false),
@@ -371,7 +370,7 @@ impl TextState {
             system.face(&style.font()),
             style.font_size,
             line_height,
-            window.scale_factor(),
+            scale,
         );
         let baselines = [top + baseline, baseline + size.height - line_height];
         if let Some(probe) = probe {
@@ -427,7 +426,7 @@ impl TextState {
     }
 
     /// taffy can answer the final width from its cache across frames, while the text was last shaped for another width.
-    pub(crate) fn fit(&self, width: Pixels, window: &mut Window) {
+    pub(crate) fn fit(&self, width: Pixels, system: &TextSystem, scale: f32) {
         let style = self.style.borrow();
         let wraps = style.white_space == WhiteSpace::Normal || style.text_overflow.is_some();
         drop(style);
@@ -445,7 +444,8 @@ impl TextState {
             self.measure_beside(
                 Size::new(Some(width), None),
                 Size::new(AvailableSpace::Definite(width), AvailableSpace::MinContent),
-                window,
+                system,
+                scale,
                 floats,
             );
         }
@@ -464,7 +464,7 @@ impl Paragraph {
         Some(width)
     }
 
-    pub fn paint(&self, align: TextAlign, window: &mut Window) {
+    pub fn paint(&self, align: TextAlign, canvas: &mut impl TextCanvas) {
         let inner = self.0.borrow();
         let Some(inner) = inner.as_ref() else {
             return;
@@ -477,12 +477,12 @@ impl Paragraph {
         let line_height = inner.line_height;
         let reach = inner.reach.get().unwrap_or_else(|| {
             let reach = (inner.lines.iter())
-                .map(|line| line.reach(line_height, window))
+                .map(|line| line.reach(line_height, canvas.text_system()))
                 .fold(px(0.), Pixels::max);
             inner.reach.set(Some(reach));
             reach
         });
-        let mask = window.content_mask().bounds;
+        let mask = canvas.content_mask().bounds;
         let (top, bottom) = (mask.top() - reach, mask.bottom() + reach);
         for line in inner.lines.iter() {
             let height = line.extent(line_height).height;
@@ -492,11 +492,11 @@ impl Paragraph {
             if first >= last {
                 if !line.line.glyphs.is_empty() {
                     // A copy of this paint can't move: it lacks the line.
-                    window.cull();
+                    canvas.cull();
                 }
             } else {
-                line.paint_background(origin, line_height, align, width, window);
-                line.paint_rows(origin, line_height, align, width, first..last, window);
+                line.paint_background(origin, line_height, align, width, canvas);
+                line.paint_rows(origin, line_height, align, width, first..last, canvas);
             }
             origin.y += height;
         }
@@ -573,13 +573,15 @@ impl Paragraph {
         style: &TextStyle,
         width: Pixels,
         bounds: Rect<Pixels>,
-        window: &mut Window,
+        system: &TextSystem,
+        scale: f32,
     ) -> Self {
-        let state = TextState::new(text, Some(runs), style, window.scale_factor());
+        let state = TextState::new(text, Some(runs), style, scale);
         state.measure(
             Size::default(),
             Size::new(AvailableSpace::Definite(width), AvailableSpace::MinContent),
-            window,
+            system,
+            scale,
         );
         state.layout.place(bounds);
         state.layout
