@@ -353,6 +353,34 @@ impl Caret {
         }
     }
 
+    // Whether the walk passed the point, so the text after it counts.
+    fn after_point(&self) -> bool {
+        self.found >= 0 || self.waiting
+    }
+
+    // Collapsible white space: one space at the first such character, if text follows.
+    fn collapse(&mut self, node: i64, offset: i64) {
+        self.space.get_or_insert((node, offset));
+    }
+
+    // Editable content that the walk skips, before the text or after it.
+    fn skip_editable(&mut self) {
+        self.hidden = [self.text.is_empty() || self.hidden[0], true];
+    }
+
+    // The JSON of `caret_text`, with whether the text reaches the start and the end of the root.
+    fn finish(mut self, [start, end]: [bool; 2]) -> Value {
+        self.reach_all();
+        json!([
+            String::from_utf16_lossy(&self.text),
+            self.runs,
+            self.found,
+            start,
+            end,
+            self.hidden
+        ])
+    }
+
     // A block edge drops a pending space, and the points after that space stay before the line break.
     fn block_edge(&mut self) {
         if !self.edge {
@@ -455,7 +483,7 @@ fn caret_text(
                     Some((at, offset)) if at == node => {
                         (offset.saturating_sub(budget), offset.saturating_add(budget))
                     }
-                    _ if caret.found >= 0 || caret.waiting => (0, budget),
+                    _ if caret.after_point() => (0, budget),
                     _ => (length.saturating_sub(budget), usize::MAX),
                 };
                 (lo, hi, length)
@@ -481,7 +509,7 @@ fn caret_text(
                     && !(white_space == "pre-line" && character == '\n')
                     && matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c');
                 if collapses && !hidden {
-                    caret.space.get_or_insert((node as i64, offset as i64));
+                    caret.collapse(node as i64, offset as i64);
                 } else if !hidden {
                     caret.emit(units, node as i64, offset as i64);
                 }
@@ -495,7 +523,7 @@ fn caret_text(
         let display = display(computed, node, style.get(Prop::DISPLAY).unwrap_or("inline"));
         let host = current.content_editable();
         if node != root && !editable && host == Some(true) {
-            caret.hidden = [caret.text.is_empty() || caret.hidden[0], true];
+            caret.skip_editable();
         }
         if node != root && (display == "none" || !editable && host == Some(true)) {
             continue;
@@ -554,15 +582,7 @@ fn caret_text(
             }
         }
     }
-    caret.reach_all();
-    json!([
-        String::from_utf16_lossy(&caret.text),
-        caret.runs,
-        caret.found,
-        start,
-        end,
-        caret.hidden
-    ])
+    caret.finish([start, end])
 }
 
 // The innerText algorithm of HTML in one pass over the flat tree. With `range`, only the selected parts of
