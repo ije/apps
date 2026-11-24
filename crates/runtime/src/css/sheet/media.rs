@@ -1,16 +1,4 @@
-use super::{Lengths, MediaQuery, Rule, Stylesheet};
-pub(crate) fn supports_condition(condition: &str) -> bool {
-    let evaluate = |source: String| match Stylesheet::parse(&source).0.as_slice() {
-        [rule] => match **rule {
-            Rule::Supports(_, supported, _) => Some(supported),
-            _ => None,
-        },
-        _ => None,
-    };
-    evaluate(format!("@supports {condition}{{}}"))
-        .or_else(|| evaluate(format!("@supports ({condition}){{}}")))
-        .unwrap_or(false)
-}
+use crate::css::{Lengths, MediaQuery};
 
 impl MediaQuery {
     pub(crate) fn list(

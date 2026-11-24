@@ -1,9 +1,8 @@
-use super::Lengths;
-use super::{
+use crate::css::{
     Declaration, Declarations, MediaQuery, Prop, Rule, Stylesheet, components, computed, supports,
     syntax_matches,
 };
-use crate::css::{Selector, SelectorList};
+use crate::css::{Lengths, Selector, SelectorList};
 use cssparser::{
     AtRuleParser, CowRcStr, DeclarationParser, Delimiter, ParseError, Parser, ParserState,
     QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, StyleSheetParser, Token,
@@ -806,7 +805,7 @@ fn condition(
                     Some(_) => false,
                     None => text.split_once(':').is_some_and(|(name, value)| {
                         let value = value.trim();
-                        super::supports(
+                        crate::css::supports(
                             &name.trim().to_ascii_lowercase(),
                             value
                                 .strip_suffix("!important")
@@ -1115,9 +1114,22 @@ impl<'i> QualifiedRuleParser<'i> for Keyframes {
     }
 }
 
+pub(crate) fn supports_condition(condition: &str) -> bool {
+    let evaluate = |source: String| match Stylesheet::parse(&source).0.as_slice() {
+        [rule] => match **rule {
+            Rule::Supports(_, supported, _) => Some(supported),
+            _ => None,
+        },
+        _ => None,
+    };
+    evaluate(format!("@supports {condition}{{}}"))
+        .or_else(|| evaluate(format!("@supports ({condition}){{}}")))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::css::*;
     use crate::css::{FontUnits, Lengths};
 
     #[test]

@@ -1,4 +1,4 @@
-use super::{
+use crate::css::{
     BORDER_IMAGE, BORDER_IMAGE_INITIAL, Easing, Kind, Lengths, Prop, color, components,
     corner_shape, number,
 };
@@ -68,7 +68,7 @@ pub(crate) fn supports(name: &str, value: &str) -> Option<bool> {
             Some(3) => format!("100% / / {value}"),
             _ => value.to_owned(),
         };
-        return Some(super::border_image(&text).is_some_and(|parts| {
+        return Some(crate::css::border_image(&text).is_some_and(|parts| {
             index.is_none()
                 || (0..5).all(|other| {
                     Some(other) == index

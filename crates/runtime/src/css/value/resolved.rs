@@ -1,10 +1,10 @@
-use super::grammar::grammar;
-use super::specified::math_sum;
-use super::{
+use crate::css::value::grammar::grammar;
+use crate::css::value::specified::math_sum;
+use crate::css::{
     BORDER_IMAGE, BORDERS, INITIAL, Kind, Lengths, PADDING, Prop, Registry, SHORTHANDS, Style,
-    area_cells, color, components, corner_shape, expand, number, specified, write_printed,
+    area_cells, components, corner_shape, expand, number, specified, write_printed,
 };
-use crate::css::LOGICAL;
+use crate::css::{LOGICAL, serialize_color, shortest};
 use std::borrow::Cow;
 pub(crate) fn resolved(
     style: &Style,
@@ -529,7 +529,7 @@ pub(crate) fn resolved(
         } else {
             value
         };
-        match color::serialize(value) {
+        match serialize_color(value) {
             Some(text) => text,
             None => value.to_owned(),
         }
@@ -545,7 +545,7 @@ pub(crate) fn resolved(
             Some(k) if k.is_infinite() => {
                 format!("superellipse({}infinity)", if k < 0. { "-" } else { "" })
             }
-            Some(k) => format!("superellipse({})", super::number(k)),
+            Some(k) => format!("superellipse({})", crate::css::number(k)),
             None => value,
         },
         "border-top-width" if none(Prop::BORDER_TOP_STYLE) => "0px".into(),
@@ -1302,17 +1302,4 @@ pub(crate) fn physical_name<'a>(style: &Style, name: &'a str) -> Cow<'a, str> {
         return Cow::Owned(physical_name(style, physical).into_owned());
     }
     Cow::Borrowed(name)
-}
-
-pub(crate) fn shortest(sides: [&str; 4]) -> String {
-    let count = if sides[3] != sides[1] {
-        4
-    } else if sides[2] != sides[0] {
-        3
-    } else if sides[1] != sides[0] {
-        2
-    } else {
-        1
-    };
-    sides[..count].join(" ")
 }

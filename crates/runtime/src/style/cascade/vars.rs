@@ -1,6 +1,5 @@
-use crate::css::{
-    LOGICAL, Prop, Registry, Style, Vars, color, computed, expand, fold, syntax_matches,
-};
+use crate::css::{LOGICAL, Prop, Registry, Style, Vars, computed, expand, fold, syntax_matches};
+use crate::css::{serialize_color, system_color};
 use crate::style::cascade::used::dark;
 use std::rc::Rc;
 pub(crate) fn var(vars: &Vars, prop: Prop) -> Option<&Rc<str>> {
@@ -397,7 +396,7 @@ pub(crate) fn resolve_style(
                 .as_bytes()
                 .first()
                 .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'-')
-            && let Some(system) = color::system(value, dark)
+            && let Some(system) = system_color(value, dark)
         {
             *value = system.into();
         }
@@ -406,14 +405,14 @@ pub(crate) fn resolve_style(
     if !style.contains(Prop::COLOR) && parent.is_some_and(|parent| !parent.contains(Prop::COLOR)) {
         style.insert(
             Prop::COLOR,
-            color::system("canvastext", dark).unwrap_or_default(),
+            system_color("canvastext", dark).unwrap_or_default(),
         );
     }
     let convert = |value: &str, current: &str| {
         if !value.starts_with("color-mix(") && !value.contains("(from ") {
             return None;
         }
-        color::serialize(&value.to_ascii_lowercase().replace("currentcolor", current))
+        serialize_color(&value.to_ascii_lowercase().replace("currentcolor", current))
     };
     let inherited = parent
         .and_then(|parent| parent.get(Prop::COLOR))

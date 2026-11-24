@@ -891,6 +891,43 @@ impl std::ops::Index<&str> for Style {
     }
 }
 
+// A style holds longhands only: the cascade expands every shorthand.
+pub(crate) const PADDING: [Prop; 4] = [
+    Prop::PADDING_TOP,
+    Prop::PADDING_RIGHT,
+    Prop::PADDING_BOTTOM,
+    Prop::PADDING_LEFT,
+];
+pub(crate) const MARGIN: [Prop; 4] = [
+    Prop::MARGIN_TOP,
+    Prop::MARGIN_RIGHT,
+    Prop::MARGIN_BOTTOM,
+    Prop::MARGIN_LEFT,
+];
+
+pub(crate) const BORDERS: [[Prop; 3]; 4] = [
+    [
+        Prop::BORDER_TOP_WIDTH,
+        Prop::BORDER_TOP_STYLE,
+        Prop::BORDER_TOP_COLOR,
+    ],
+    [
+        Prop::BORDER_RIGHT_WIDTH,
+        Prop::BORDER_RIGHT_STYLE,
+        Prop::BORDER_RIGHT_COLOR,
+    ],
+    [
+        Prop::BORDER_BOTTOM_WIDTH,
+        Prop::BORDER_BOTTOM_STYLE,
+        Prop::BORDER_BOTTOM_COLOR,
+    ],
+    [
+        Prop::BORDER_LEFT_WIDTH,
+        Prop::BORDER_LEFT_STYLE,
+        Prop::BORDER_LEFT_COLOR,
+    ],
+];
+
 #[test]
 fn names_are_sorted() {
     assert!(NAMES.is_sorted());

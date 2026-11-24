@@ -1,4 +1,4 @@
-use super::{BORDERS, Prop, Style};
+use crate::css::{BORDERS, Prop, Style};
 impl Lengths {
     pub fn edges(&self, style: &Style, sides: [Prop; 4], base: f32) -> [f32; 4] {
         sides.map(|side| {

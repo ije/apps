@@ -1,4 +1,4 @@
-use super::{Lengths, components};
+use crate::css::{Lengths, components};
 use std::rc::Rc;
 
 pub(crate) fn timing_function(part: &str) -> bool {

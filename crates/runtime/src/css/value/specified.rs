@@ -1,5 +1,5 @@
-use super::grammar::grammar;
-use super::{Kind, Lengths, color, components, number, shortest, write_number, write_printed};
+use crate::css::value::grammar::grammar;
+use crate::css::{Kind, Lengths, components, number, serialize_color, write_number, write_printed};
 use std::borrow::Cow;
 
 // Chrome's text for a declared value: lowercase keywords, units and functions, short numbers, `0px` for
@@ -512,7 +512,7 @@ fn canonical(value: &str, length: bool, named: bool, out: &mut String) {
                         out.push_str("\")");
                     }
                     "rgb" | "rgba" | "hsl" | "hsla" | "hwb" | "lab" | "lch" | "oklab" | "oklch" => {
-                        match color::serialize(part) {
+                        match serialize_color(part) {
                             Some(color) => out.push_str(&color),
                             None => out.push_str(&lower),
                         }
@@ -634,7 +634,7 @@ fn canonical(value: &str, length: bool, named: bool, out: &mut String) {
                     }
                 }
             } else if first == b'#' && !named {
-                out.push_str(&color::serialize(part).unwrap_or(lower));
+                out.push_str(&serialize_color(part).unwrap_or(lower));
             } else if part.len() > 1 && part.contains('/') && !part.contains(['(', '"', '\'']) {
                 for (index, side) in part.split('/').enumerate() {
                     if index > 0 {
@@ -682,4 +682,16 @@ fn canonical(value: &str, length: bool, named: bool, out: &mut String) {
             }
         }
     }
+}
+pub(crate) fn shortest(sides: [&str; 4]) -> String {
+    let count = if sides[3] != sides[1] {
+        4
+    } else if sides[2] != sides[0] {
+        3
+    } else if sides[1] != sides[0] {
+        2
+    } else {
+        1
+    };
+    sides[..count].join(" ")
 }

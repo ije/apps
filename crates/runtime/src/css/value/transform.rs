@@ -1,4 +1,4 @@
-use super::{Kind, Lengths, Prop, Style, components};
+use crate::css::{Kind, Lengths, Prop, Style, components};
 use renderer::{Pixels, Rect};
 
 pub(crate) type Matrix = [f32; 16];

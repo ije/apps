@@ -1,4 +1,4 @@
-use crate::css::color::color;
+use crate::css::color;
 use crate::css::{Easing, Lengths, Prop, Registry, Style, components, time, timing_function};
 use crate::style::animation::effect::PAINT;
 use std::borrow::Cow;
@@ -757,25 +757,23 @@ impl Lerp {
         }
         if let (Some(a), Some(b)) = (color(from), color(to)) {
             // As in browsers, colors interpolate in sRGB only when both are legacy sRGB colors.
-            return Some(
-                match (crate::css::color::oklab(from), crate::css::color::oklab(to)) {
-                    (Some((false, mut a)), Some((_, mut b)))
-                    | (Some((_, mut a)), Some((false, mut b))) => {
-                        for (a, b) in a.iter_mut().zip(&mut b) {
-                            if a.is_nan() {
-                                *a = *b;
-                            } else if b.is_nan() {
-                                *b = *a;
-                            }
+            return Some(match (crate::css::oklab(from), crate::css::oklab(to)) {
+                (Some((false, mut a)), Some((_, mut b)))
+                | (Some((_, mut a)), Some((false, mut b))) => {
+                    for (a, b) in a.iter_mut().zip(&mut b) {
+                        if a.is_nan() {
+                            *a = *b;
+                        } else if b.is_nan() {
+                            *b = *a;
                         }
-                        Self::Oklab(
-                            a.map(|v| if v.is_nan() { 0. } else { v }),
-                            b.map(|v| if v.is_nan() { 0. } else { v }),
-                        )
                     }
-                    _ => Self::Color(a, b),
-                },
-            );
+                    Self::Oklab(
+                        a.map(|v| if v.is_nan() { 0. } else { v }),
+                        b.map(|v| if v.is_nan() { 0. } else { v }),
+                    )
+                }
+                _ => Self::Color(a, b),
+            });
         }
         for separator in [',', ' '] {
             let (a, b) = (components(from, separator), components(to, separator));
