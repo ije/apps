@@ -249,6 +249,128 @@ impl Drop for DevTools {
     }
 }
 
+impl super::Desktop {
+    // The developer tools of window `id`, its FPS HUD, and the picker.
+    pub(super) fn tools(
+        &mut self,
+        action: &str,
+        id: u64,
+        args: &Value,
+        mut cx: Option<&mut renderer::App>,
+    ) -> Result<()> {
+        match action {
+            "devtools" => {
+                if self.host.borrow().app.packaged {
+                    return Ok(());
+                }
+                let cx = cx
+                    .as_deref_mut()
+                    .context("Developer Tools require a native window")?;
+                let view = self.views.get(&id);
+                // The console or the picker opens the tools, and keeps open tools.
+                let show = args[2].as_str();
+                let fresh = !self.devtools.contains_key(&id);
+                let open = fresh || show.is_some();
+                if fresh {
+                    let title = format!("Window {id}");
+                    let tools = view
+                        .and_then(|view| view.handle)
+                        .and_then(|handle| {
+                            cx.update_window(handle, |window, _| {
+                                DevTools::new(&title, Role::Renderer(id), Some(window))
+                            })
+                        })
+                        .unwrap_or_else(|| DevTools::new(&title, Role::Renderer(id), None))?;
+                    self.devtools.insert(id, tools);
+                } else if !open {
+                    self.devtools.remove(&id);
+                    if let Some(engine) = view.and_then(|view| view.renderer.as_deref()) {
+                        release(engine)?;
+                    }
+                }
+                if let Some(data) = view.and_then(|view| view.data.upgrade()) {
+                    let mut inspect = data.inspect.get();
+                    if fresh || !open {
+                        inspect = crate::render::Inspect {
+                            open,
+                            ..Default::default()
+                        };
+                    }
+                    if show == Some("pick") {
+                        inspect.pick = true;
+                    }
+                    data.inspect.set(inspect);
+                    if let Some(tools) = self.devtools.get(&id) {
+                        tools.inspected(&data)?;
+                        if show == Some("console") {
+                            tools.events(&[serde_json::json!({"type":"show","tab":show})])?;
+                        }
+                    }
+                }
+                if let Some(handle) = view.and_then(|view| view.handle) {
+                    cx.refresh_window(handle);
+                }
+            }
+            // The FPS HUD of the window. Open developer tools show if it is on.
+            "hud" => {
+                if self.host.borrow().app.packaged {
+                    return Ok(());
+                }
+                let (Some(view), Some(cx)) = (self.views.get(&id), cx.as_deref_mut()) else {
+                    return Ok(());
+                };
+                let (Some(data), Some(handle)) = (view.data.upgrade(), view.handle) else {
+                    return Ok(());
+                };
+                cx.update_window(handle, |window, _| {
+                    crate::render::Hud::toggle(&data, window)
+                });
+                if let Some(tools) = self.devtools.get(&id) {
+                    tools.inspected(&data)?;
+                }
+            }
+            // The picker of the developer tools: the pointer moved to a place on the page, or
+            // pressed there. Without a place it turns the picker on or off.
+            "inspect" => {
+                let (Some(tools), Some(view)) = (self.devtools.get(&id), self.views.get(&id))
+                else {
+                    return Ok(());
+                };
+                let (Some(data), Some(engine), Some(cx)) =
+                    (view.data.upgrade(), &view.renderer, cx)
+                else {
+                    return Ok(());
+                };
+                let mut inspect = data.inspect.get();
+                if args[2].is_number() {
+                    let at = serde_json::json!({"x":args[2],"y":args[3]});
+                    let node = crate::render::scripted(cx, None, || agent(engine, "pick", &at))?
+                        .as_u64()
+                        .map(|node| node as usize);
+                    if args[4] == true {
+                        inspect.selected = node;
+                    } else if inspect.hover == node {
+                        return Ok(());
+                    }
+                    inspect.hover = node;
+                } else {
+                    inspect.pick = args[2].as_bool().unwrap_or(!inspect.pick);
+                    inspect.hover = None;
+                }
+                data.inspect.set(inspect);
+                if !args[2].is_number() || args[4] == true {
+                    tools.inspected(&data)?;
+                }
+                if let Some(handle) = view.handle {
+                    cx.refresh_window(handle);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 // Calls the script that inspects a context from inside it. A new context gets the script on its first call.
 pub(crate) fn agent(engine: &JsContext, method: &str, params: &Value) -> Result<Value> {
     if engine.eval_page("typeof this.__appsAgent", "apps:devtools")? != "function" {
