@@ -83,6 +83,59 @@ impl Host {
         }
     }
 
+    pub(crate) fn url(&self, id: u64) -> Option<&url::Url> {
+        self.dom.get(&id)?.base.as_ref()
+    }
+
+    // The nodes of each page: in its tree, allocated, and free for reuse.
+    pub(crate) fn memory(&self) -> Value {
+        Value::Object(
+            self.pages
+                .iter()
+                .map(|(id, page)| {
+                    let (mut attached, mut pending) = (0, vec![0]);
+                    while let Some(node) = pending.pop() {
+                        attached += 1;
+                        pending.extend(&page.doc.nodes[node].children);
+                    }
+                    let free = self.dom.get(id).map_or(0, |state| state.free.len());
+                    (
+                        format!("window {id}"),
+                        json!({"attached": attached, "allocated": page.doc.nodes.len(), "free": free}),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    // Puts a new page in window `id`, without the resources of the old one.
+    pub(crate) fn load_page(&mut self, id: u64, doc: Document) {
+        self.forget_page(id);
+        self.pages.insert(id, Page { doc, dirty: true });
+    }
+
+    pub(crate) fn close_page(&mut self, id: u64) {
+        self.forget_page(id);
+        self.pages.remove(&id);
+        self.viewports.remove(&id);
+        self.backgrounds.remove(&id);
+    }
+
+    fn forget_page(&mut self, id: u64) {
+        self.graphics.remove(&id);
+        self.media.remove(&id);
+        self.dom.remove(&id);
+        self.bridge.remove(&id);
+        self.dropped.remove(&id);
+    }
+
+    pub(crate) fn set_background(&mut self, id: u64, color: (u32, u8)) {
+        self.backgrounds.insert(id, color);
+        if let Some(page) = self.pages.get_mut(&id) {
+            page.dirty = true;
+        }
+    }
+
     pub(crate) fn log(&mut self, entry: Value) {
         if self.logs.len() == 500 {
             self.logs.pop_front();

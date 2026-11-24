@@ -146,10 +146,10 @@ extern "C" fn call(
     let app = unsafe { app.cast::<(&Desktop, &mut App)>().as_mut() };
     let result = match (op, app) {
         (b"cpu", _) => crate::node::system::call("process.cpu", &Value::Null).map(Some),
-        (b"windows", Some((desktop, cx))) => windows(desktop, cx).map(Some),
+        (b"windows", Some((desktop, cx))) => Ok(Some(desktop.windows(cx))),
         (b"screenshot", Some((desktop, cx))) => screenshot(&args, desktop, cx, &reply),
         (b"input", Some((desktop, cx))) => input(&args, desktop, cx, &reply),
-        (b"memory", Some((desktop, _))) => memory(&args, desktop).map(Some),
+        (b"memory", Some((desktop, _))) => desktop.memory(args["gc"] == true).map(Some),
         _ => Err(anyhow!("Unknown devtools operation")),
     };
     match result {
@@ -159,45 +159,69 @@ extern "C" fn call(
     }
 }
 
-fn page(args: &Value, desktop: &Desktop) -> Result<(u64, WindowId)> {
-    let window = match args["window"].as_u64() {
-        Some(id) => id,
-        None => desktop
+impl Desktop {
+    // The window `id`, or the first one, and its native handle.
+    fn window(&self, id: Option<u64>) -> Result<(u64, WindowId)> {
+        let window = match id {
+            Some(id) => id,
+            None => self
+                .views
+                .keys()
+                .copied()
+                .min()
+                .context("The app has no windows")?,
+        };
+        let handle = self
             .views
-            .keys()
-            .copied()
-            .min()
-            .context("The app has no windows")?,
-    };
-    let handle = desktop
-        .views
-        .get(&window)
-        .and_then(|view| view.handle)
-        .context("No such window")?;
-    Ok((window, handle))
-}
-
-fn windows(desktop: &Desktop, cx: &mut App) -> Result<Value> {
-    let host = desktop.host.borrow();
-    let mut ids: Vec<_> = desktop.views.keys().copied().collect();
-    ids.sort_unstable();
-    let mut list = Vec::new();
-    for id in ids {
-        let view = &desktop.views[&id];
-        let state = view.handle.and_then(|handle| {
-            cx.update_window(handle, |window, _| {
-                state_json(&window.window_state(), window.is_active())
-            })
-        });
-        list.push(json!({
-            "id": id,
-            "title": view.title,
-            "url": host.dom.get(&id).and_then(|dom| dom.base.as_ref()).map(url::Url::as_str),
-            "state": state,
-            "preload": view.preload.is_some(),
-        }));
+            .get(&window)
+            .and_then(|view| view.handle)
+            .context("No such window")?;
+        Ok((window, handle))
     }
-    Ok(json!(list))
+
+    fn windows(&self, cx: &mut App) -> Value {
+        let host = self.host.borrow();
+        let mut ids: Vec<_> = self.views.keys().copied().collect();
+        ids.sort_unstable();
+        let mut list = Vec::new();
+        for id in ids {
+            let view = &self.views[&id];
+            let state = view.handle.and_then(|handle| {
+                cx.update_window(handle, |window, _| {
+                    state_json(&window.window_state(), window.is_active())
+                })
+            });
+            list.push(json!({
+                "id": id,
+                "title": view.title,
+                "url": host.url(id).map(url::Url::as_str),
+                "state": state,
+                "preload": view.preload.is_some(),
+            }));
+        }
+        json!(list)
+    }
+
+    fn memory(&self, gc: bool) -> Result<Value> {
+        let engine = self
+            .views
+            .iter()
+            .filter_map(|(&id, view)| view.renderer.as_deref().map(|engine| (id, engine)))
+            .min_by_key(|(id, _)| *id)
+            .map(|(_, engine)| engine);
+        if gc && let Some(engine) = engine {
+            engine.collect_garbage();
+        }
+        let heap = engine
+            .map(|engine| engine.heap())
+            .transpose()?
+            .unwrap_or(Value::Null);
+        Ok(json!({
+            "rss": crate::node::system::call("process.memory", &Value::Null)?,
+            "heap": heap,
+            "domNodes": self.host.borrow().memory(),
+        }))
+    }
 }
 
 fn screenshot(
@@ -206,7 +230,7 @@ fn screenshot(
     cx: &mut App,
     reply: &Reply,
 ) -> Result<Option<Value>> {
-    let (window, handle) = page(args, desktop)?;
+    let (window, handle) = desktop.window(args["window"].as_u64())?;
     let (crop, css, reply) = (
         args["crop"].clone(),
         args["device_pixels"] != true,
@@ -229,7 +253,7 @@ fn screenshot(
 }
 
 fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result<Option<Value>> {
-    let (window, handle) = page(args, desktop)?;
+    let (window, handle) = desktop.window(args["window"].as_u64())?;
     let action = args["action"].as_str().context("Expected an action")?;
     let at = point(
         px(args["x"].as_f64().unwrap_or(0.) as f32),
@@ -364,39 +388,6 @@ fn input(args: &Value, desktop: &Desktop, cx: &mut App, reply: &Reply) -> Result
         reply.send(result.map(|_| sent.into()).context("The window closed"));
     });
     Ok(None)
-}
-
-fn memory(args: &Value, desktop: &Desktop) -> Result<Value> {
-    let engine = desktop
-        .views
-        .iter()
-        .filter_map(|(&id, view)| view.renderer.as_deref().map(|engine| (id, engine)))
-        .min_by_key(|(id, _)| *id)
-        .map(|(_, engine)| engine);
-    if args["gc"] == true
-        && let Some(engine) = engine
-    {
-        engine.collect_garbage();
-    }
-    let heap = engine
-        .map(|engine| engine.heap())
-        .transpose()?
-        .unwrap_or(Value::Null);
-    let host = desktop.host.borrow();
-    let report = json!({
-        "rss": crate::node::system::call("process.memory", &Value::Null)?,
-        "heap": heap,
-        "domNodes": host.pages.iter().map(|(id, page)| {
-            let (mut attached, mut pending) = (0, vec![0]);
-            while let Some(node) = pending.pop() {
-                attached += 1;
-                pending.extend(&page.doc.nodes[node].children);
-            }
-            let free = host.dom.get(id).map_or(0, |state| state.free.len());
-            (format!("window {id}"), json!({"attached": attached, "allocated": page.doc.nodes.len(), "free": free}))
-        }).collect::<serde_json::Map<_, _>>(),
-    });
-    Ok(report)
 }
 
 #[cfg(test)]

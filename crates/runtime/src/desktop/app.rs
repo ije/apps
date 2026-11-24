@@ -129,7 +129,7 @@ pub fn run(setup: impl FnOnce(&App) -> Result<()>) -> Result<()> {
             .context("Start this app with apps run or apps build")?;
         (bundle, None)
     };
-    let desktop = bootstrap(bundle, setup)?;
+    let desktop = Desktop::rust(bundle, setup)?;
     if let Some(input) = input {
         desktop.reload_from(input);
     }
@@ -148,22 +148,25 @@ pub fn run(setup: impl FnOnce(&App) -> Result<()>) -> Result<()> {
     Ok(())
 }
 
-fn bootstrap(bundle: Bundle, setup: impl FnOnce(&App) -> Result<()>) -> Result<Desktop> {
-    let pages = bundle
-        .pages
-        .keys()
-        .chain(bundle.files.keys().filter(|name| name.ends_with(".html")))
-        .cloned()
-        .collect();
-    let desktop = Desktop::create(bundle, true)?;
-    let main = desktop.main.as_ref().context("Missing the main side")?;
-    setup(&App(Rc::new(State {
-        main: Rc::downgrade(main),
-        link: desktop.link.clone(),
-        pages,
-        next_id: Cell::new(1),
-    })))?;
-    Ok(desktop)
+impl Desktop {
+    // A desktop with a Rust main, after `setup` ran.
+    fn rust(bundle: Bundle, setup: impl FnOnce(&App) -> Result<()>) -> Result<Self> {
+        let pages = bundle
+            .pages
+            .keys()
+            .chain(bundle.files.keys().filter(|name| name.ends_with(".html")))
+            .cloned()
+            .collect();
+        let desktop = Self::create(bundle, true)?;
+        let main = desktop.main.as_ref().context("Missing the main side")?;
+        setup(&App(Rc::new(State {
+            main: Rc::downgrade(main),
+            link: desktop.link.clone(),
+            pages,
+            next_id: Cell::new(1),
+        })))?;
+        Ok(desktop)
+    }
 }
 
 #[cfg(test)]
@@ -185,7 +188,7 @@ mod tests {
         bundle.files.insert("index.html".into(), page.into());
         let thread = std::thread::current().id();
         let mut handle = None;
-        let mut desktop = bootstrap(bundle, |app| {
+        let mut desktop = Desktop::rust(bundle, |app| {
             app.handle("double", move |id, args| {
                 ensure!(id == 1 && thread != std::thread::current().id());
                 Ok((args[0].as_i64().unwrap() * 2).into())

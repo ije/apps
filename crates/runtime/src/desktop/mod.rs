@@ -6,12 +6,7 @@ pub(crate) mod panel;
 use crate::bundle::Feature;
 use crate::host::link::{Link, PageQueue, ToMain, ToPage};
 use crate::{
-    dom::Document,
-    host::JsContext,
-    host::{Host, Page},
-    jsc::JavaScriptCore,
-    jsc::Role,
-    render::PageView,
+    dom::Document, host::Host, host::JsContext, jsc::JavaScriptCore, jsc::Role, render::PageView,
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use bbtree::unsync::BBTreeMap;
@@ -30,11 +25,11 @@ use std::{
 };
 
 pub(crate) struct View {
-    pub(crate) handle: Option<WindowId>,
-    pub(crate) data: Weak<crate::render::PageState>,
-    pub(crate) title: Option<String>,
-    pub(crate) preload: Option<Rc<JsContext>>,
-    pub(crate) renderer: Option<Rc<JsContext>>,
+    handle: Option<WindowId>,
+    data: Weak<crate::render::PageState>,
+    title: Option<String>,
+    preload: Option<Rc<JsContext>>,
+    renderer: Option<Rc<JsContext>>,
     fullscreen: Option<[bool; 2]>,
     focused: bool,
 }
@@ -51,10 +46,10 @@ impl View {
 pub struct Desktop {
     api: Rc<JavaScriptCore>,
     host: Rc<RefCell<Host>>,
-    pub(crate) main: Option<Rc<Main>>,
-    pub(crate) link: Link,
+    main: Option<Rc<Main>>,
+    link: Link,
     queue: Arc<PageQueue>,
-    pub(crate) views: HashMap<u64, View>,
+    views: HashMap<u64, View>,
     devtools: HashMap<u64, panel::DevTools>,
     main_logs: Vec<serde_json::Value>,
     files: Arc<HashMap<String, String>>,
@@ -366,8 +361,7 @@ impl Desktop {
                         } else if command["op"] == "reload" {
                             let host = self.host.borrow();
                             for &id in self.views.keys() {
-                                if let Some(url) =
-                                    host.dom.get(&id).and_then(|dom| dom.base.as_ref())
+                                if let Some(url) = host.url(id)
                                     && url.as_str().starts_with("apps:///")
                                 {
                                     self.link.page(ToPage::Window(
@@ -418,7 +412,7 @@ impl Desktop {
                             } else {
                                 (0xffffff, 255)
                             });
-                        self.host.borrow_mut().backgrounds.insert(id, background);
+                        self.host.borrow_mut().set_background(id, background);
                         let mut data = Weak::new();
                         let handle = if let Some(cx) = cx.as_deref_mut() {
                             let runtime = runtime.unwrap().clone();
@@ -676,11 +670,7 @@ impl Desktop {
                                 source
                             })
                             .collect::<Vec<_>>();
-                        {
-                            let mut host = self.host.borrow_mut();
-                            reset(&mut host, id);
-                            host.pages.insert(id, Page { doc, dirty: true });
-                        }
+                        self.host.borrow_mut().load_page(id, doc);
                         let view = self.views.get_mut(&id).context("Window is closed")?;
                         view.focused = true;
                         if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
@@ -971,12 +961,7 @@ impl Desktop {
                             if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
                                 cx.update_window(handle, |window, _| window.close());
                             }
-                            let mut host = self.host.borrow_mut();
-                            reset(&mut host, id);
-                            host.pages.remove(&id);
-                            host.viewports.remove(&id);
-                            host.backgrounds.remove(&id);
-                            drop(host);
+                            self.host.borrow_mut().close_page(id);
                             crate::web::storage::forget(id);
                             crate::host::page_stopped(id);
                             self.ended = self.owner == Some(id);
@@ -1072,12 +1057,7 @@ impl Desktop {
                             .as_str()
                             .and_then(crate::style::color)
                             .unwrap_or((0xffffff, 255));
-                        let mut host = self.host.borrow_mut();
-                        host.backgrounds.insert(id, color);
-                        if let Some(page) = host.pages.get_mut(&id) {
-                            page.dirty = true;
-                        }
-                        drop(host);
+                        self.host.borrow_mut().set_background(id, color);
                         if let (Some(handle), Some(cx)) =
                             (self.views[&id].handle, cx.as_deref_mut())
                         {
@@ -1740,14 +1720,6 @@ fn scripted<R>(cx: Option<&mut App>, f: impl FnOnce() -> R) -> R {
         Some(cx) => crate::render::scripted(cx, None, f),
         None => f(),
     }
-}
-
-fn reset(host: &mut Host, id: u64) {
-    host.graphics.remove(&id);
-    host.media.remove(&id);
-    host.dom.remove(&id);
-    host.bridge.remove(&id);
-    host.dropped.remove(&id);
 }
 
 fn shrink_when_quiet(runtime: Rc<RefCell<Desktop>>, cx: &mut App) {
