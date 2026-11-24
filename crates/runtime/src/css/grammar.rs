@@ -1,13 +1,7 @@
-use super::BORDER_IMAGE;
-use super::BORDER_IMAGE_INITIAL;
-use super::Easing;
-use super::Kind;
-use super::Lengths;
-use super::Prop;
-use super::color;
-use super::components;
-use super::corner_shape;
-use super::number;
+use super::{
+    BORDER_IMAGE, BORDER_IMAGE_INITIAL, Easing, Kind, Lengths, Prop, color, components,
+    corner_shape, number,
+};
 pub(super) fn grammar(name: &str) -> Option<&'static str> {
     match name {
         "-webkit-text-decoration" => Some("*"),

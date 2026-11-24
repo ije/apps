@@ -1,7 +1,4 @@
-use super::Lengths;
-use super::MediaQuery;
-use super::Rule;
-use super::Stylesheet;
+use super::{Lengths, MediaQuery, Rule, Stylesheet};
 pub(crate) fn supports_condition(condition: &str) -> bool {
     let evaluate = |source: String| match Stylesheet::parse(&source).0.as_slice() {
         [rule] => match **rule {

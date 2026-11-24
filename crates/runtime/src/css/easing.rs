@@ -1,5 +1,4 @@
-use super::Lengths;
-use super::components;
+use super::{Lengths, components};
 use std::rc::Rc;
 
 pub(crate) fn timing_function(part: &str) -> bool {

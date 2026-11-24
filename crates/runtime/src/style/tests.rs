@@ -1,16 +1,12 @@
 use super::*;
-use crate::css::Edit;
-use crate::css::Filter;
-use crate::css::MARGIN;
-use crate::css::PADDING;
-use crate::css::clip_path;
-use crate::css::declarations;
-use crate::css::declare;
-use crate::css::length;
-use crate::css::resolved;
-use crate::css::specified;
-use crate::css::supports;
-use crate::css::supports_condition;
+use crate::css::{
+    Edit, Filter, MARGIN, MediaQuery, PADDING, Registry, clip_path, counter_text, declarations,
+    declare, length, resolved, specified, supports, supports_condition, syntax_matches,
+};
+use crate::style::cascade::rank::CascadeRank;
+use crate::style::cascade::scope::{DELETED, PSEUDO, SELECTOR};
+use rustc_hash::FxHashMap;
+use std::rc::Rc;
 
 #[test]
 fn glass_variants_follow_native_support_and_cached_states() {

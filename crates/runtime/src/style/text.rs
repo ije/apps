@@ -1,10 +1,5 @@
 use super::{ComputedStyles, FONT_NAMES, Lengths, Style, color, components};
-use crate::css::BORDERS;
-use crate::css::MARGIN;
-use crate::css::PADDING;
-use crate::css::Prop;
-use crate::css::paint;
-use crate::css::rgba;
+use crate::css::{BORDERS, MARGIN, PADDING, Prop, paint, rgba};
 use crate::dom::Document;
 use std::rc::Rc;
 

@@ -1,13 +1,6 @@
 // The last field is the position of the declaration in its block, which breaks ties between properties.
-use super::BORDER_IMAGE;
-use super::BORDER_IMAGE_INITIAL;
-use super::Prop;
-use super::Style;
-use super::expand;
-use super::fold;
-use super::supports;
-use crate::css::Selector;
-use crate::css::SelectorList;
+use super::{BORDER_IMAGE, BORDER_IMAGE_INITIAL, Prop, Style, expand, fold, supports};
+use crate::css::{Selector, SelectorList};
 use std::rc::Rc;
 pub(crate) type Declared = (Prop, Rc<str>, bool, u16);
 

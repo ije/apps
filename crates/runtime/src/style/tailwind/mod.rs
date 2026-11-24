@@ -5255,3 +5255,23 @@ fn names<'a>(text: &'a str, prefix: &'a str) -> impl Iterator<Item = &'a str> {
 
 #[cfg(test)]
 mod tests;
+
+// Compiles Tailwind for a page that a system web view shows, like the developer tools: `css`, and the
+// classes among the words of `text`.
+pub(crate) fn page_css(css: &str, text: &str) -> String {
+    let stop = |c: char| c.is_whitespace() || "\"'`<>=;,&".contains(c);
+    let words: Vec<_> = text.split(stop).filter(|word| !word.is_empty()).collect();
+    let doc = Document::parse(&format!("<p class=\"{}\">", words.join(" ")));
+    let order: Vec<_> = (0..doc.nodes.len() as u32).map(|id| (id, 0)).collect();
+    let mut sheets = vec![Rc::new(Stylesheet::parse(css))];
+    Compiler::default().update(&mut sheets, &doc, &order);
+    // A web view does not know the rules that only configure Tailwind.
+    let plain = |rule: &&Rc<Rule>| {
+        !matches!(
+            ***rule,
+            Rule::Tailwind(_) | Rule::Theme(..) | Rule::Variant(..) | Rule::Utility(..)
+        )
+    };
+    let rules = sheets.iter().flat_map(|sheet| &sheet.0).filter(plain);
+    rules.map(|rule| rule.source()).collect()
+}

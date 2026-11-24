@@ -1,12 +1,5 @@
-use super::Kind;
-use super::Lengths;
-use super::color;
-use super::components;
 use super::grammar::grammar;
-use super::number;
-use super::shortest;
-use super::write_number;
-use super::write_printed;
+use super::{Kind, Lengths, color, components, number, shortest, write_number, write_printed};
 use std::borrow::Cow;
 
 // Chrome's text for a declared value: lowercase keywords, units and functions, short numbers, `0px` for

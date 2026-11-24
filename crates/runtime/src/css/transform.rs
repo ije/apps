@@ -1,5 +1,4 @@
-use super::Prop;
-use super::{Kind, Lengths, Style, components};
+use super::{Kind, Lengths, Prop, Style, components};
 use renderer::{Pixels, Rect};
 
 pub(crate) type Matrix = [f32; 16];

@@ -1,11 +1,9 @@
-use super::{
-    ComputedStyles, Declarations, Prop, Registry, Style, color, components, expand,
-    resolve_keywords, resolve_style,
+use super::ComputedStyles;
+use super::cascade::{resolve_keywords, resolve_style};
+use crate::css::{
+    Declarations, Easing, Lengths, Prop, Registry, Style, color, components, expand, time,
+    timing_function,
 };
-use crate::css::Easing;
-use crate::css::Lengths;
-use crate::css::time;
-use crate::css::timing_function;
 use crate::dom::Document;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{borrow::Cow, collections::HashMap, rc::Rc, time::Instant};

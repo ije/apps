@@ -1,23 +1,9 @@
-use super::BORDER_IMAGE;
-use super::BORDERS;
-use super::INITIAL;
-use super::Kind;
-use super::Lengths;
-use super::PADDING;
-use super::Prop;
-use super::Registry;
-use super::SHORTHANDS;
-use super::Style;
-use super::area_cells;
-use super::color;
-use super::components;
-use super::corner_shape;
-use super::expand;
 use super::grammar::grammar;
-use super::number;
-use super::specified;
 use super::specified::math_sum;
-use super::write_printed;
+use super::{
+    BORDER_IMAGE, BORDERS, INITIAL, Kind, Lengths, PADDING, Prop, Registry, SHORTHANDS, Style,
+    area_cells, color, components, corner_shape, expand, number, specified, write_printed,
+};
 use crate::css::LOGICAL;
 use std::borrow::Cow;
 pub(crate) fn resolved(

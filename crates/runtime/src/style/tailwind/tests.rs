@@ -1695,7 +1695,7 @@ fn incremental_inserts_match_a_fresh_compile() {
 
 #[test]
 fn standalone_pages_get_their_theme_base_and_classes() {
-    let css = super::super::tailwind(
+    let css = super::page_css(
         "@import 'tailwindcss';@theme{--color-box:#1d1d20}.caret{rotate:90deg}",
         "<p class=\"flex bg-box\">const flex = `hover:text-red-500 px-[3px]`</p>",
     );
