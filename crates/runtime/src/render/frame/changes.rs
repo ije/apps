@@ -13,7 +13,7 @@ use std::sync::Arc;
 // The boxes whose style, children or content changed since the last frame. It gives the flags of each visited
 // node, the nodes with a new layout, the nodes that changed when the tree and the focus didn't, and whether a box
 // built in place that others read without a record, like a row for its cells.
-pub(crate) fn detect(
+pub(super) fn detect(
     cx: &Cx,
     dom: &mut PageState,
     styles: &ComputedStyles,
@@ -399,7 +399,7 @@ pub(crate) fn detect(
 
 // Animated boxes take their flags and build in place where they can, and painted values go into `styles` until
 // the end of the frame. It gives the number of restored values that move boxes.
-pub(crate) fn animate(
+pub(super) fn animate(
     cx: &Cx,
     dom: &mut PageState,
     styles: &mut Rc<ComputedStyles>,
@@ -535,7 +535,7 @@ pub(crate) fn animate(
 }
 
 // Measurements of boxes that a new frame size, a container query pass or a new layout changed go.
-pub(crate) fn remeasure(
+pub(super) fn remeasure(
     cx: &Cx,
     dom: &mut PageState,
     styles: &ComputedStyles,
@@ -614,7 +614,7 @@ pub(crate) fn remeasure(
 }
 
 // Images that load or decode later, and the selection, change paint without a new box.
-pub(crate) fn repaint(state: &mut PageState, window: &mut renderer::Window) {
+pub(super) fn repaint(state: &mut PageState, window: &mut renderer::Window) {
     let hash = |value: &dyn Fn(&mut rustc_hash::FxHasher)| {
         let mut hasher = rustc_hash::FxHasher::default();
         value(&mut hasher);

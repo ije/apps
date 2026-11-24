@@ -11,10 +11,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Whether an animated pair of pseudo-element styles differs from its base pair only in opacity.
-pub(crate) fn fades_only(
-    base: &[css::properties::Style; 2],
-    pair: &[css::properties::Style; 2],
-) -> bool {
+fn fades_only(base: &[css::properties::Style; 2], pair: &[css::properties::Style; 2]) -> bool {
     let rest = |(prop, _): &(Prop, &Rc<str>)| *prop != Prop::OPACITY;
     base.iter()
         .zip(pair.iter())
@@ -22,7 +19,7 @@ pub(crate) fn fades_only(
 }
 
 /// Whether two styles differ only in what patches change: opacity, transforms and filters that are one `blur()`.
-pub(crate) fn composites(a: &css::properties::Style, b: &css::properties::Style) -> bool {
+fn composites(a: &css::properties::Style, b: &css::properties::Style) -> bool {
     let rest = |(prop, _): &(Prop, &Rc<str>)| {
         *prop != Prop::OPACITY
             && !TRANSFORM_PROPS.contains(prop)
@@ -44,7 +41,7 @@ pub(crate) fn composites(a: &css::properties::Style, b: &css::properties::Style)
             })
 }
 
-pub(crate) fn animate(
+pub(super) fn animate(
     view: &Rc<ViewState>,
     dom: &mut crate::render::PageState,
     next: Option<std::time::Instant>,
@@ -93,7 +90,7 @@ pub(crate) fn animate(
 }
 
 // Animation handlers can hide or remove a popup, so run them before its final frame is painted.
-pub(crate) fn animation_events(
+pub(super) fn animation_events(
     view: &Rc<ViewState>,
     events: Vec<(usize, &'static str, String, f64)>,
     cx: &mut App,
@@ -118,7 +115,7 @@ pub(crate) fn animation_events(
     view.runtime.drive(cx);
 }
 
-pub(crate) fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
+fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
     if window.will_draw() {
         return;
     }
@@ -465,7 +462,7 @@ pub(crate) fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) 
 
 // Animated custom properties need a style pass. Its values replace `animated`, and the units of nodes whose
 // font size animates, like `em` lengths, are swapped in for this frame.
-pub(crate) fn restyle(
+pub(super) fn restyle(
     doc: &mut Document,
     dom: &mut PageState,
     styles: &ComputedStyles,
@@ -509,7 +506,7 @@ pub(crate) fn restyle(
 
 // The animated boxes that draw in composited layers, and whether they turn, and the pseudo-elements that
 // animate only their opacity.
-pub(crate) fn layers(
+pub(super) fn layers(
     view: &ViewState,
     doc: &Document,
     styles: &ComputedStyles,
@@ -564,7 +561,7 @@ pub(crate) fn layers(
     (composited, pseudo_layers)
 }
 
-pub(crate) type Swapped = (
+pub(super) type Swapped = (
     Vec<(usize, Rc<css::properties::Style>)>,
     Vec<(usize, Rc<[css::properties::Style; 2]>)>,
     Vec<(usize, Rc<css::properties::Style>)>,
@@ -572,7 +569,7 @@ pub(crate) type Swapped = (
 
 // Animated values replace the cascade ones for this frame. Values that change layout, pseudo-elements and units
 // go into `styles`, and the restore lists keep their cascade values. The others are listed for paint, by node.
-pub(crate) fn swap(
+pub(super) fn swap(
     dom: &mut PageState,
     styles: &mut Rc<ComputedStyles>,
     animated: Vec<(usize, Rc<css::properties::Style>, bool)>,
@@ -616,7 +613,7 @@ pub(crate) fn swap(
 }
 
 // After the frame, `styles` gets its cascade values back, and `dom.styles` keeps the animated ones.
-pub(crate) fn restore(
+pub(super) fn restore(
     dom: &mut PageState,
     styles: &mut Rc<ComputedStyles>,
     restore: Vec<(usize, Rc<css::properties::Style>)>,

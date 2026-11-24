@@ -1,20 +1,12 @@
+use super::super::Frame;
 use super::Cx;
 use crate::css::properties::{Prop, Style};
 use crate::render::effects;
 use crate::style::ComputedStyles;
 use std::rc::Rc;
 
-// The system web view of an `<iframe>`.
-pub(crate) struct Frame {
-    pub(crate) browser: apps_webview::Browser,
-    loaded: String,
-    pub(crate) bounds: [f64; 4],
-    revision: u64,
-    shown: bool,
-}
-
 // Each shown `<iframe>` has a system web view, which loads its source and hides with its opacity.
-pub(crate) fn sync(
+pub(super) fn sync(
     cx: &Cx,
     iframes: &[usize],
     styles: &ComputedStyles,

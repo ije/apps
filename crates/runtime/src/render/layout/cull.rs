@@ -77,6 +77,23 @@ pub(crate) fn skips(
         }
 }
 
+// The box skips its contents, so they are not rendered. Its flags of the last layout hold while its style is the
+// same. Without `forced`, also the boxes that show their contents only for the geometry that a script reads.
+pub(crate) fn skipping(
+    doc: &Document,
+    layout: &super::Layout,
+    styles: &crate::style::ComputedStyles,
+    id: usize,
+    forced: bool,
+) -> bool {
+    let style = &styles.values[id];
+    let flags = match layout.layout_nodes.get(id).and_then(Option::as_ref) {
+        Some(old) if Rc::ptr_eq(&old.style, style) => old.flags,
+        _ => u32::from(skippable(&doc.nodes[id].tag, style)) * SKIPS,
+    };
+    skips(flags, style, id, &layout.measurements, forced)
+}
+
 pub(crate) fn reads_height(style: &css::properties::Style) -> bool {
     [
         Prop::HEIGHT,

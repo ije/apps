@@ -7,7 +7,7 @@ use std::{cell::Cell, rc::Rc};
 
 // Fields whose value changed, and positioned boxes whose parents stayed, build again on their own.
 #[inline(never)]
-pub(crate) fn patch(build: &Build, window: &mut Window) {
+pub(super) fn patch(build: &Build, window: &mut Window) {
     let view = build.view;
     let changed: Vec<usize> = view
         .patches
@@ -162,7 +162,7 @@ pub(crate) fn patch(build: &Build, window: &mut Window) {
 }
 
 // Boxes that only paint otherwise build again in place.
-pub(crate) fn place(
+pub(super) fn place(
     build: &Build,
     window: &mut Window,
     #[cfg(debug_assertions)] zone: Option<Rc<cull::Zone>>,

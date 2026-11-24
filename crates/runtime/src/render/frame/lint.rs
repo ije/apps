@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 // Warnings for the CSS of changed nodes that the page can't draw as written.
 #[inline(never)]
-pub(crate) fn lint(
+pub(super) fn lint(
     doc: &Document,
     dom: &mut PageState,
     styles: &ComputedStyles,

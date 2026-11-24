@@ -4,7 +4,7 @@ use renderer::Event;
 use std::rc::Rc;
 
 // Presses go to the page in the bubble phase, after drag areas and scrollbars could stop them.
-pub(crate) fn events(data: Rc<ViewState>) -> renderer::Node {
+pub(super) fn events(data: Rc<ViewState>) -> renderer::Node {
     renderer::canvas(|_, _| (), move |_, _, window| {
         window.paint_volatile();
         let parked = data.parked.take();

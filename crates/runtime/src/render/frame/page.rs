@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 // The `html` and `body` nodes, and the color of the page canvas: the background of the root, the color that the
 // app set for the window, or the color of the color scheme.
-pub(crate) fn canvas(
+pub(super) fn canvas(
     cx: &Cx,
     styles: &ComputedStyles,
     set: Option<(u32, u8)>,
@@ -78,20 +78,20 @@ pub(crate) fn canvas(
 }
 
 // The scroll of the page viewport, which takes the overflow of the root or of the body.
-pub(crate) struct Viewport {
-    pub(crate) scroll: renderer::ScrollRef,
+pub(super) struct Viewport {
+    pub(super) scroll: renderer::ScrollRef,
     // Whether the page scrolls on the x and y axes.
-    pub(crate) scrolls: [bool; 2],
-    pub(crate) rtl: bool,
-    pub(crate) overscroll: renderer::Point<renderer::Overscroll>,
-    pub(crate) bar: Option<scrollbar::Look>,
+    pub(super) scrolls: [bool; 2],
+    pub(super) rtl: bool,
+    pub(super) overscroll: renderer::Point<renderer::Overscroll>,
+    pub(super) bar: Option<scrollbar::Look>,
     // The room of the scroll bars at the bottom and at the right.
-    pub(crate) space: [f32; 2],
+    pub(super) space: [f32; 2],
     // The color of the page canvas.
-    pub(crate) background: (u32, u8),
+    pub(super) background: (u32, u8),
 }
 
-pub(crate) fn viewport(
+pub(super) fn viewport(
     dom: &mut PageState,
     styles: &ComputedStyles,
     html: Option<usize>,
@@ -156,7 +156,7 @@ pub(crate) fn viewport(
 }
 
 // The box of the page: the viewport scroll with the page, its scroll bars and the boxes that paint above it.
-pub(crate) fn node(
+pub(super) fn node(
     view: &Rc<ViewState>,
     viewport: Viewport,
     pointer_events: renderer::Node,
@@ -278,7 +278,7 @@ pub(crate) fn node(
 }
 
 // The boxes of the top layer, each above its backdrop.
-pub(crate) fn overlay(
+pub(super) fn overlay(
     build: &Build,
     backdrops: &[(usize, Rc<Style>)],
     size: [f32; 2],

@@ -9,7 +9,7 @@ use crate::style;
 use crate::style::ComputedStyles;
 use std::{rc::Rc, sync::Arc};
 
-pub(crate) fn in_view(
+pub(super) fn in_view(
     bounds: &crate::dom::LayoutMirror,
     [width, height]: [f32; 2],
     id: usize,
@@ -28,7 +28,7 @@ pub(crate) fn in_view(
         && clips.all(|(clip, axes)| bounds.get(&clip).is_none_or(|&rect| overlaps(rect, axes)))
 }
 
-pub(crate) fn clips<'a>(
+pub(super) fn clips<'a>(
     doc: &'a crate::dom::Document,
     styles: &'a style::ComputedStyles,
     id: usize,
@@ -60,7 +60,7 @@ pub(crate) fn clips<'a>(
 }
 
 // Returns whether the walk changed by a patch that kept the lists of cells, canvases and iframes.
-pub(crate) fn walk(
+pub(super) fn walk(
     doc: &crate::dom::Document,
     dom: &mut crate::render::PageState,
     styles: &style::ComputedStyles,
@@ -138,24 +138,7 @@ pub(crate) fn walk(
     patched
 }
 
-// The box skips its contents, so they are not rendered.
-// Without `forced`, also the boxes that show their contents only for the geometry that a script reads.
-pub(crate) fn skipping(
-    doc: &crate::dom::Document,
-    dom: &crate::render::PageState,
-    styles: &style::ComputedStyles,
-    id: usize,
-    forced: bool,
-) -> bool {
-    let style = &styles.values[id];
-    let flags = match dom.layout.layout_nodes.get(id).and_then(Option::as_ref) {
-        Some(old) if Rc::ptr_eq(&old.style, style) => old.flags,
-        _ => u32::from(cull::skippable(&doc.nodes[id].tag, style)) * cull::SKIPS,
-    };
-    cull::skips(flags, style, id, &dom.layout.measurements, forced)
-}
-
-pub(crate) fn visibility(
+fn visibility(
     doc: &crate::dom::Document,
     dom: &crate::render::PageState,
     styles: &style::ComputedStyles,
@@ -164,7 +147,8 @@ pub(crate) fn visibility(
     for &(node, parent) in dom.layout.cull.walk.order().iter() {
         let node = node as usize;
         if parent != u32::MAX
-            && (!visible[parent as usize] || skipping(doc, dom, styles, parent as usize, true))
+            && (!visible[parent as usize]
+                || cull::skipping(doc, &dom.layout, styles, parent as usize, true))
         {
             continue;
         }
@@ -190,7 +174,7 @@ pub(crate) fn visibility(
     visible
 }
 
-pub(crate) fn drop_hidden_images(
+pub(super) fn drop_hidden_images(
     dom: &mut crate::render::PageState,
     visible: &[bool],
     styles: &style::ComputedStyles,
@@ -284,7 +268,7 @@ pub(crate) fn drop_hidden_images(
 }
 
 // Boxes forced to show their contents for a script skip them again in the next frame.
-pub(crate) fn wake(
+pub(super) fn wake(
     view: &Rc<ViewState>,
     doc: &Document,
     dom: &mut PageState,
@@ -324,7 +308,7 @@ pub(crate) fn wake(
 
 // The nodes that show, the list of the last frame when all nodes were visited again, and the nodes that a
 // patched walk showed or hid.
-pub(crate) fn update(
+pub(super) fn update(
     doc: &Document,
     dom: &mut PageState,
     styles: &ComputedStyles,
@@ -396,7 +380,8 @@ pub(crate) fn update(
             let (id, parent) = (id as usize, walk.order()[at as usize].1);
             let style = &styles.values[id];
             let shown = (parent == u32::MAX
-                || visible[parent as usize] && !skipping(doc, dom, styles, parent as usize, true))
+                || visible[parent as usize]
+                    && !cull::skipping(doc, &dom.layout, styles, parent as usize, true))
                 && !match dom.layout.layout_nodes.get(id).and_then(Option::as_ref) {
                     Some(old) if Rc::ptr_eq(&old.style, style) => old.flags & cull::HIDDEN != 0,
                     _ => none(style),
@@ -428,7 +413,7 @@ pub(crate) fn update(
 
 // Clear node-ID caches for hidden or removed nodes here, and freed nodes in dom.release. New nodes
 // can reuse their IDs.
-pub(crate) fn forget(
+pub(super) fn forget(
     cx: &Cx,
     dom: &mut PageState,
     styles: &ComputedStyles,
