@@ -21,6 +21,7 @@ use table::anonymous_tables;
 pub(crate) mod computed;
 mod container;
 mod counters;
+mod declared;
 mod memo;
 mod moves;
 mod node;
