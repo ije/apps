@@ -1,6 +1,14 @@
-use super::*;
+use super::{Builder, Realm};
+use anyhow::{Context, Result, bail, ensure};
+use serde_json::{Value, json};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
-pub(super) type Paths = (
+type Paths = (
     Option<(PathBuf, serde_json::Map<String, Value>)>,
     Option<PathBuf>,
 );
@@ -205,7 +213,7 @@ impl Builder {
                         format!("export default {};", json!(url))
                     }
                     "raw" => {
-                        self.shared.watch(path.clone());
+                        self.shared.files.borrow_mut().insert(path.clone());
                         format!("export default {};", json!(fs::read_to_string(&path)?))
                     }
                     _ => format!(
@@ -230,7 +238,7 @@ impl Builder {
         let cached = self.shared.resolution(&resolution);
         if let Some((target, root, manifest)) = cached {
             self.package_roots.extend(root);
-            self.shared.watch_all(manifest);
+            self.shared.files.borrow_mut().extend(manifest);
             return Ok((target, None));
         }
         if specifier.starts_with('.') || Path::new(specifier).is_absolute() {

@@ -1,7 +1,16 @@
-use super::resolve::{exported, remote};
-use super::*;
+use super::{
+    Shared,
+    resolve::{exported, remote},
+};
+use anyhow::{Context, Result, ensure};
+use serde_json::Value;
+use std::{
+    fmt::Write,
+    fs,
+    path::{Path, PathBuf},
+};
 
-pub(super) fn css_package(directory: &Path, name: &str) -> Result<PathBuf> {
+fn css_package(directory: &Path, name: &str) -> Result<PathBuf> {
     let count = if name.starts_with('@') { 2 } else { 1 };
     let package = name.split('/').take(count).collect::<Vec<_>>().join("/");
     let subpath = name[package.len()..].trim_start_matches('/');
@@ -57,7 +66,7 @@ pub(super) fn css(
     let source = match inline {
         Some(source) => source,
         None => {
-            shared.watch(path.to_owned());
+            shared.files.borrow_mut().insert(path.to_owned());
             ensure!(
                 path.extension()
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("css")),

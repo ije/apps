@@ -170,7 +170,7 @@ fn glass_classes_work_with_nested_css_and_no_glass_import() {
             ),
         )
         .unwrap();
-        let source = html(&path, &Rc::default()).unwrap();
+        let source = Rc::<Shared>::default().html(&path).unwrap();
         assert_eq!(
             linked_css(&source).contains("@import \"tailwindcss\";"),
             tailwind
@@ -227,7 +227,7 @@ fn tailwind_import_survives_nested_css_without_a_package() {
         files: Rc::clone(&files),
         ..Shared::default()
     });
-    let source = html(&path, &shared).unwrap();
+    let source = shared.html(&path).unwrap();
     assert!(linked_css(&source).contains("@import \"tailwindcss\";"));
     assert!(!source.contains(".h-4"));
     assert_eq!(files.borrow().len(), 2);
@@ -257,7 +257,7 @@ fn tailwind_parts_keep_their_imports() {
         "<link rel='stylesheet' href='./style.css'><ul class='flex'></ul>",
     )
     .unwrap();
-    let source = html(&path, &Rc::default()).unwrap();
+    let source = Rc::<Shared>::default().html(&path).unwrap();
     let css = linked_css(&source);
     assert!(css.contains("@import \"tailwindcss/theme.css\";"));
     assert!(css.contains("@import \"tailwindcss/utilities\";"));

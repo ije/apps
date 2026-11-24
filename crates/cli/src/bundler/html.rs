@@ -1,10 +1,24 @@
-use super::*;
 use super::{
+    Entry, Realm, Shared,
     css::{css, urls},
     resolve::remote,
 };
+use anyhow::{Context, Result};
+use apps_runtime::dom::Document;
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
-pub(super) fn html(path: &Path, shared: &Rc<Shared>) -> Result<String> {
+// A page, with the groups of scripts that the caller bundles: the realm, the script node that loads the
+// chunk, and the entries.
+pub(super) struct Page {
+    doc: Document,
+    groups: Vec<(Realm, usize, Vec<Entry>)>,
+}
+
+pub(super) fn html(path: &Path, shared: &Shared) -> Result<Page> {
     let mut doc = Document::parse(&fs::read_to_string(path)?);
     let parent = path.parent().context("Missing HTML directory")?;
     let http = shared.enabled("httpImport");
@@ -116,7 +130,7 @@ pub(super) fn html(path: &Path, shared: &Rc<Shared>) -> Result<String> {
                 (file, None) => {
                     let source = fs::read_to_string(&file)
                         .with_context(|| format!("Cannot read {}", file.display()))?;
-                    shared.watch(file);
+                    shared.files.borrow_mut().insert(file);
                     source
                 }
             };
@@ -153,6 +167,7 @@ pub(super) fn html(path: &Path, shared: &Rc<Shared>) -> Result<String> {
         doc.nodes[parent].children.insert(0, index);
         scripts[1].insert(0, (index, (PathBuf::from("apps:preload"), Some(preload))));
     }
+    let mut groups = Vec::new();
     for (realm, list) in [Realm::Renderer, Realm::Preload].into_iter().zip(scripts) {
         let Some(&(mut first, _)) = list.first() else {
             continue;
@@ -189,23 +204,39 @@ pub(super) fn html(path: &Path, shared: &Rc<Shared>) -> Result<String> {
                 _ => (path, inline),
             })
             .collect();
-        let code = script_source(
-            &BBTreeMap::from([("app.js".into(), bundle(entries, realm, shared.clone())?)]),
-            true,
-        );
-        let chunk = shared.script(code);
-        doc.nodes[first]
-            .attrs
-            .insert("src".into(), format!("apps:///script-{chunk}.js"));
+        groups.push((realm, first, entries));
     }
-    // The runtime parses this text again, and the parser drops one newline at the start of these elements.
-    let starts: Vec<usize> = (0..doc.nodes.len())
-        .filter(|&id| matches!(doc.nodes[id].tag.as_str(), "pre" | "textarea" | "listing"))
-        .filter_map(|id| doc.nodes[id].children.first().copied())
-        .filter(|&child| doc.nodes[child].tag == "#text" && doc.nodes[child].text.starts_with('\n'))
-        .collect();
-    for child in starts {
-        doc.nodes[child].text.insert(0, '\n');
+    Ok(Page { doc, groups })
+}
+
+impl Page {
+    // Serializes the page, with the script chunk that `bundle` gives each group.
+    pub(super) fn finish(
+        mut self,
+        mut bundle: impl FnMut(Vec<Entry>, Realm) -> Result<usize>,
+    ) -> Result<String> {
+        for (realm, first, entries) in std::mem::take(&mut self.groups) {
+            let chunk = bundle(entries, realm)?;
+            self.doc.nodes[first]
+                .attrs
+                .insert("src".into(), format!("apps:///script-{chunk}.js"));
+        }
+        // The runtime parses this text again, and the parser drops one newline at the start of these elements.
+        let starts: Vec<usize> = (0..self.doc.nodes.len())
+            .filter(|&id| {
+                matches!(
+                    self.doc.nodes[id].tag.as_str(),
+                    "pre" | "textarea" | "listing"
+                )
+            })
+            .filter_map(|id| self.doc.nodes[id].children.first().copied())
+            .filter(|&child| {
+                self.doc.nodes[child].tag == "#text" && self.doc.nodes[child].text.starts_with('\n')
+            })
+            .collect();
+        for child in starts {
+            self.doc.nodes[child].text.insert(0, '\n');
+        }
+        Ok(self.doc.serialize(0))
     }
-    Ok(doc.serialize(0))
 }
