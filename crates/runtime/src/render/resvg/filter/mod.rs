@@ -228,7 +228,7 @@ impl Image {
             return Ok(self);
         }
         let mut pixmap = new_pixmap(width, height)?;
-        super::render::copy_pixmap(&mut pixmap, self.as_ref(), 0, 0);
+        super::pixmap::copy_pixmap(&mut pixmap, self.as_ref(), 0, 0);
         Ok(Image {
             image: Rc::new(pixmap),
             ..self
@@ -248,17 +248,21 @@ impl Image {
     }
 }
 
-pub fn apply(
+// `feImage` draws its nodes with `render`, the tree walk of the parent module.
+pub(super) type Render = fn(&usvg::Group, IntRect, tiny_skia::Transform, &mut tiny_skia::PixmapMut);
+
+pub(super) fn apply(
     filter: &usvg::filter::Filter,
     ts: tiny_skia::Transform,
     source: &mut tiny_skia::Pixmap,
+    render: Render,
 ) {
     let (width, height) = (source.width(), source.height());
     let Some(empty) = tiny_skia::Pixmap::new(1, 1) else {
         return;
     };
     let graphic = Rc::new(std::mem::replace(source, empty));
-    let result = apply_inner(filter, ts, graphic).and_then(|image| {
+    let result = apply_inner(filter, ts, graphic, render).and_then(|image| {
         Ok(image
             .into_color_space(usvg::filter::ColorInterpolation::SRGB)
             .fit(width, height)?
@@ -282,6 +286,7 @@ fn apply_inner(
     filter: &usvg::filter::Filter,
     ts: usvg::Transform,
     source: Rc<tiny_skia::Pixmap>,
+    render: Render,
 ) -> Result<Image, Error> {
     let source = &source;
     let region = filter
@@ -337,7 +342,7 @@ fn apply_inner(
                 let input = get_input(fe.input(), region, source, &results)?;
                 apply_tile(input, region)
             }
-            usvg::filter::Kind::Image(fe) => apply_image(fe, region, subregion, ts),
+            usvg::filter::Kind::Image(fe) => apply_image(fe, region, subregion, ts, render),
             usvg::filter::Kind::ComponentTransfer(fe) => {
                 let input = get_input(fe.input(), region, source, &results)?;
                 apply_component_transfer(fe, cs, input)
@@ -514,8 +519,8 @@ fn apply_drop_shadow(
         *p = table[p.alpha() as usize];
     }
 
-    super::render::copy_pixmap(&mut pixmap, &shadow_pixmap, dx as i32, dy as i32);
-    super::render::draw_over(&mut pixmap.as_mut(), input.as_ref().as_ref(), 0, 0, 1.0);
+    super::pixmap::copy_pixmap(&mut pixmap, &shadow_pixmap, dx as i32, dy as i32);
+    super::pixmap::draw_over(&mut pixmap.as_mut(), input.as_ref().as_ref(), 0, 0, 1.0);
 
     Ok(Image::from_image(pixmap, cs))
 }
@@ -562,7 +567,7 @@ fn apply_offset(
     }
 
     let mut pixmap = new_pixmap(input.width(), input.height())?;
-    super::render::copy_pixmap(&mut pixmap, input.as_ref(), dx as i32, dy as i32);
+    super::pixmap::copy_pixmap(&mut pixmap, input.as_ref(), dx as i32, dy as i32);
 
     Ok(Image::from_image(pixmap, input.color_space))
 }
@@ -581,7 +586,7 @@ fn apply_blend(
     draw(
         &mut pixmap,
         input1.as_ref(),
-        super::render::convert_blend_mode(fe.mode()),
+        super::pixmap::convert_blend_mode(fe.mode()),
     );
 
     Ok(Image::from_image(pixmap, cs))
@@ -640,7 +645,7 @@ fn draw(
     blend_mode: tiny_skia::BlendMode,
 ) {
     if blend_mode == tiny_skia::BlendMode::SourceOver {
-        super::render::draw_over(&mut pixmap.as_mut(), input.as_ref(), 0, 0, 1.0);
+        super::pixmap::draw_over(&mut pixmap.as_mut(), input.as_ref(), 0, 0, 1.0);
     } else {
         pixmap.draw_pixmap(
             0,
@@ -730,6 +735,7 @@ fn apply_image(
     region: IntRect,
     subregion: IntRect,
     ts: usvg::Transform,
+    render: Render,
 ) -> Result<Image, Error> {
     let mut pixmap = new_pixmap(region.width(), region.height())?;
 
@@ -744,7 +750,7 @@ fn apply_image(
     );
 
     let max_bbox = tiny_skia::IntRect::from_xywh(0, 0, region.width(), region.height()).unwrap();
-    super::render::render_nodes(fe.root(), max_bbox, transform, &mut pixmap.as_mut());
+    render(fe.root(), max_bbox, transform, &mut pixmap.as_mut());
 
     Ok(Image::from_image(
         pixmap,
