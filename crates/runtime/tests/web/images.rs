@@ -176,7 +176,9 @@ fn svg_and_bundled_images_load_through_the_host() {
     let png = directory.path().join("sample.png");
     std::fs::write(&png, include_bytes!("../images/sample.png")).unwrap();
     let mut host = Host::default();
-    std::sync::Arc::make_mut(&mut host.app.assets).insert("assets/sample.png".into(), png.clone());
+    host.update_app(|app| {
+        std::sync::Arc::make_mut(&mut app.assets).insert("assets/sample.png".into(), png.clone())
+    });
     host.store.borrow_mut().pages.insert(
         1,
         Page {

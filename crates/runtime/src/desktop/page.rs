@@ -176,7 +176,9 @@ impl Desktop {
             .clone()
         {
             self.files = files;
-            self.host.borrow_mut().app.scripts = scripts;
+            self.host
+                .borrow_mut()
+                .update_app(|app| app.scripts = scripts);
         }
         let value = args[2].as_str().context("Expected HTML text or path")?;
         let page = args[3] == "page";

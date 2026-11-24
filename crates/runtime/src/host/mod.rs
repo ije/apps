@@ -18,7 +18,7 @@ pub(crate) const WORKER_PAGE: u64 = 0;
 #[derive(Default)]
 pub struct Host {
     pub(crate) link: Option<link::Link>,
-    pub app: crate::bundle::AppInfo,
+    pub app: Rc<crate::bundle::AppInfo>,
     pub paths: HashMap<String, PathBuf>,
     pub relaunch: Option<Vec<String>>,
     pub argv: Option<Vec<String>>,
@@ -34,10 +34,22 @@ pub struct Host {
 }
 
 impl Host {
-    pub(crate) fn new(app: crate::bundle::AppInfo) -> Self {
-        let host = Self::default();
-        host.store.borrow_mut().set_app(&app);
-        Self { app, ..host }
+    pub fn new(app: crate::bundle::AppInfo) -> Self {
+        let host = Self {
+            app: Rc::new(app),
+            ..Self::default()
+        };
+        host.store.borrow_mut().app = host.app.clone();
+        host
+    }
+
+    // The host and its views share one app, so it changes only through here.
+    pub fn update_app<R>(&mut self, f: impl FnOnce(&mut crate::bundle::AppInfo) -> R) -> R {
+        let mut store = self.store.borrow_mut();
+        store.app = Rc::default();
+        let result = f(Rc::make_mut(&mut self.app));
+        store.app = self.app.clone();
+        result
     }
 
     pub(crate) fn command(&mut self, target: Target, command: Value) {

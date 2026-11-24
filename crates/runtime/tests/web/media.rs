@@ -10,9 +10,8 @@ fn page(features: apps_runtime::bundle::Features) -> (Rc<RefCell<Host>>, JsConte
     let base = url::Url::from_directory_path(&folder).unwrap();
     {
         let mut host = host.borrow_mut();
-        host.app.features = features;
+        host.update_app(|app| app.features = features);
         let mut store = host.store.borrow_mut();
-        store.set_app(&host.app);
         store.pages.insert(
             1,
             Page {

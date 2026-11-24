@@ -546,7 +546,7 @@ impl JsContext {
         {
             let binding = binding(self.engine.ptr()).context("The JavaScript context is closed")?;
             let mut host = binding.host.borrow_mut();
-            host.app.install(files)?;
+            host.update_app(|app| app.install(files))?;
             if !host.app.scripts.is_empty() {
                 let window = match binding.role {
                     Role::Renderer(id) | Role::Preload(id) => Some(id),
@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn bundled_chunks_keep_nul_bytes_and_non_ascii_text() {
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().app.scripts = std::sync::Arc::new(std::collections::HashMap::from([
+        let scripts = std::sync::Arc::new(std::collections::HashMap::from([
             (
                 "script-1.js".to_owned(),
                 bytes::Bytes::from_static(
@@ -682,6 +682,7 @@ mod tests {
                 bytes::Bytes::from("globalThis.b = '\u{4f60}\u{597d}';"),
             ),
         ]));
+        host.borrow_mut().update_app(|app| app.scripts = scripts);
         let main = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Main).unwrap();
         let script = "__appsChunk('script-1.js'); __appsChunk('script-2.js'); \
             [a, f.toString(), b.length, b.charCodeAt(0)].join('|')";
@@ -809,7 +810,8 @@ mod tests {
     #[test]
     fn pages_cannot_turn_strings_into_code() {
         let host = page_host(1, "<body></body>");
-        host.borrow_mut().app.features = crate::bundle::Features::NONE;
+        host.borrow_mut()
+            .update_app(|app| app.features = crate::bundle::Features::NONE);
         let page =
             JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
         for code in [

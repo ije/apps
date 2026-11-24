@@ -95,7 +95,7 @@ impl ViewState {
             let runtime = self.runtime.clone();
             cx.defer(move |cx| runtime.drive(cx));
         }
-        let inspectable = !store.packaged;
+        let inspectable = !store.app.packaged;
         let state = &mut *store;
         let Some(page) = state.pages.get_mut(&self.id) else {
             return renderer::node().size_full().into();
@@ -157,7 +157,7 @@ impl ViewState {
         let cached = dom.styles.computed.clone();
         let mut styles = dom.restyle(&mut doc, [width, height]);
         if cached.is_none_or(|cached| !std::rc::Rc::ptr_eq(&cached, &styles))
-            && dom.load_fonts(&doc, &state.assets).0
+            && dom.load_fonts(&doc, &state.app.assets).0
         {
             styles = dom.restyle(&mut doc, [width, height]);
         }

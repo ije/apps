@@ -974,7 +974,7 @@ pub(crate) fn border_image(
             let base = store
                 .page_state(view.id)
                 .and_then(|state| state.base.clone());
-            let path = super::super::raster::image::url_file(url, base.as_ref(), &store.assets)
+            let path = super::super::raster::image::url_file(url, base.as_ref(), &store.app.assets)
                 .filter(|path| {
                     path.to_str().is_some_and(|path| {
                         path.starts_with(super::super::raster::image::DATA_PREFIX)

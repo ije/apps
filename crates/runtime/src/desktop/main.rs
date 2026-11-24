@@ -968,7 +968,7 @@ mod tests {
             assert!(!main.before_input(5, &down(tool), &|| false));
         }
         assert_eq!(keys(), "");
-        host.borrow_mut().app.packaged = true;
+        host.borrow_mut().update_app(|app| app.packaged = true);
         main.before_input(5, &down(key("f12", Modifiers::NONE)), &|| false);
         assert!(keys().contains(r#""code":"f12""#));
         main.driving.set(true);

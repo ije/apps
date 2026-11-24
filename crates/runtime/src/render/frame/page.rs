@@ -322,7 +322,7 @@ pub(super) fn overlay(
                         store
                             .page_state(build.view.id)
                             .and_then(|state| state.base.as_ref()),
-                        &store.assets,
+                        &store.app.assets,
                         false,
                     ));
                 }

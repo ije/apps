@@ -899,7 +899,7 @@ fn package_features_reach_the_runtime() {
     }
     let gpu = |features| {
         let mut host = apps_runtime::host::Host::default();
-        host.app.features = features;
+        host.update_app(|app| app.features = features);
         let host = Rc::new(RefCell::new(host));
         host.borrow().store.borrow_mut().pages.insert(
             1,

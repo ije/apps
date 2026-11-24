@@ -1419,7 +1419,7 @@ pub(super) fn create(
             [borders, padding, [0.; 4]],
             view.clone(),
             base.as_ref(),
-            &view.store.borrow().assets,
+            &view.store.borrow().app.assets,
             canvas.is_some(),
         ));
     }

@@ -430,7 +430,7 @@ mod tests {
     #[test]
     fn packaged_apps_disable_developer_tools() {
         let mut host = Host::default();
-        host.app.packaged = true;
+        host.update_app(|app| app.packaged = true);
         let host = Rc::new(RefCell::new(host));
         let engine =
             JsContext::new(JavaScriptCore::load().unwrap(), host.clone(), Role::Main).unwrap();

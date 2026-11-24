@@ -519,7 +519,7 @@ pub(super) fn pseudo_elements(
                 [[0.; 4], pseudo_padding, pseudo_borders],
                 view.clone(),
                 base.as_ref(),
-                &view.store.borrow().assets,
+                &view.store.borrow().app.assets,
                 false,
             ));
         }

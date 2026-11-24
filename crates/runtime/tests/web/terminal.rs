@@ -14,11 +14,11 @@ fn contexts(features: &str) -> Contexts {
     let host = Rc::new(RefCell::new(Host::default()));
     {
         let mut host = host.borrow_mut();
-        host.app.features =
+        let features =
             apps_runtime::bundle::Package::parse(Some(&format!(r#"{{"features":{features}}}"#)))
                 .unwrap()
                 .features;
-        host.store.borrow_mut().set_app(&host.app);
+        host.update_app(|app| app.features = features);
         host.store.borrow_mut().pages.insert(
             1,
             Page {

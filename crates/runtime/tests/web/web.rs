@@ -299,7 +299,7 @@ fn runtime_imports_follow_features() {
     let api = JavaScriptCore::load().unwrap();
     let run = |features: apps_runtime::bundle::Features, role: Role, code: &str| {
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().app.features = features;
+        host.borrow_mut().update_app(|app| app.features = features);
         host.borrow().store.borrow_mut().pages.insert(
             1,
             Page {

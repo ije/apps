@@ -37,8 +37,10 @@ fn font_faces_load_woff_and_list_css_faces() {
         r#"<style>@font-face{font-family:Css;src:url(test.woff) format("woff")}
                 @font-face{font-family:Later;src:url(later.woff);unicode-range:U+0400-04FF}</style><p>AB</p>"#,
     );
-    std::sync::Arc::make_mut(&mut host.borrow_mut().app.assets)
-        .insert("test.woff".into(), fixtures.join("test.woff"));
+    host.borrow_mut().update_app(|app| {
+        std::sync::Arc::make_mut(&mut app.assets)
+            .insert("test.woff".into(), fixtures.join("test.woff"))
+    });
     {
         let host = host.borrow().store.clone();
         let mut host = host.borrow_mut();

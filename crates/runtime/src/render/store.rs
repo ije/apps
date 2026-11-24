@@ -20,21 +20,13 @@ pub struct Store {
     pub backgrounds: HashMap<u64, (u32, u8)>,
     pub graphics: HashMap<u64, crate::web::gpu::Gpu>,
     pub media: HashMap<u64, crate::web::media::Media>,
-    // Copies of the app values that views read.
-    pub packaged: bool,
-    pub features: crate::bundle::Features,
-    pub assets: Assets,
+    // The same app as the host's.
+    pub app: std::rc::Rc<crate::bundle::AppInfo>,
     // The state that views of a closed page still write to until they go. Nothing reads it back.
     pub(crate) closed: PageState,
 }
 
 impl Store {
-    pub fn set_app(&mut self, app: &crate::bundle::AppInfo) {
-        self.packaged = app.packaged;
-        self.features = app.features;
-        self.assets = app.assets.clone();
-    }
-
     pub fn page_state(&self, id: u64) -> Option<&PageState> {
         self.pages.get(&id).map(|page| &page.state)
     }
@@ -54,8 +46,8 @@ impl Store {
     // The document of the page in window `id`, when it is open, its state, and the app assets.
     pub(crate) fn page_parts(&mut self, id: u64) -> (Option<&Document>, &mut PageState, &Assets) {
         match self.pages.get_mut(&id) {
-            Some(page) => (Some(&page.doc), &mut page.state, &self.assets),
-            None => (None, &mut self.closed, &self.assets),
+            Some(page) => (Some(&page.doc), &mut page.state, &self.app.assets),
+            None => (None, &mut self.closed, &self.app.assets),
         }
     }
 }

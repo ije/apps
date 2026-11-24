@@ -715,8 +715,10 @@ fn renderer_cannot_forge_native_worker_requests() {
 #[test]
 fn page_workers_from_strings_need_js_execute() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().app.features =
-        apps_runtime::bundle::Features::default().without(apps_runtime::bundle::Feature::JsExecute);
+    host.borrow_mut().update_app(|app| {
+        app.features = apps_runtime::bundle::Features::default()
+            .without(apps_runtime::bundle::Feature::JsExecute)
+    });
     host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {

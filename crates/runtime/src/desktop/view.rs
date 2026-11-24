@@ -482,8 +482,9 @@ impl renderer::View for PageView {
             } => {
                 let key = named.name.as_str();
                 let pick = (key == "escape" && self.page.inspect.get().pick).then_some(Tool::Pick);
-                let tool = pick
-                    .or_else(|| tool(key, *modifiers).filter(|_| !input.store.borrow().packaged));
+                let tool = pick.or_else(|| {
+                    tool(key, *modifiers).filter(|_| !input.store.borrow().app.packaged)
+                });
                 let open = self.page.inspect.get().open;
                 let args = match tool {
                     Some(Tool::Hud) => serde_json::json!(["hud", id]),

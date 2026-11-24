@@ -62,7 +62,7 @@ pub(super) fn replaced(
     if node.tag == "terminal" {
         let store = view.store.borrow();
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !store.features.has(crate::bundle::Feature::Terminal)
+        if !store.app.features.has(crate::bundle::Feature::Terminal)
             && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             eprintln!(
@@ -71,7 +71,7 @@ pub(super) fn replaced(
         }
         if let Some(state) = store
             .page_state(view.id)
-            .filter(|_| store.features.has(crate::bundle::Feature::Terminal))
+            .filter(|_| store.app.features.has(crate::bundle::Feature::Terminal))
         {
             let look =
                 crate::render::paint::terminal::look(style, styles.selections.get(&id), &units);
