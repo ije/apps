@@ -167,9 +167,10 @@ impl State {
     // Runs the register function of an addon, and returns its exports.
     fn register(&self, register: Register, path: &std::path::Path) -> Result<Ptr> {
         let depth = self.handles.push(false);
-        let exports = self
-            .js("object", &[])
-            .map_err(|_| anyhow::anyhow!("Cannot create addon exports"))?;
+        let Ok(exports) = self.js("object", &[]) else {
+            self.handles.unwind(&self.api, self.ctx, depth);
+            anyhow::bail!("Cannot create addon exports");
+        };
         let result = unsafe { register(self.env(), exports) };
         let result = if result.is_null() { exports } else { result };
         let exception = self.take_exception();
