@@ -1871,18 +1871,6 @@ impl Window {
         self.viewports.len()
     }
 
-    // The content mask cut by the scroll viewports inside the first `depth`.
-    pub(crate) fn visible_below(&self, depth: usize) -> Clip<Pixels> {
-        let mut mask = self.content_mask();
-        for viewport in self.viewports[depth.min(self.viewports.len())..]
-            .iter()
-            .flatten()
-        {
-            mask.bounds = mask.bounds.intersect(*viewport);
-        }
-        mask
-    }
-
     // `mask` cut by the scroll viewports from `from` to `to`.
     pub(crate) fn cut_between(
         &self,
