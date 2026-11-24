@@ -194,7 +194,7 @@ pub(super) fn svg_box(
                         })
                 })
     }) && view
-        .host
+        .store
         .borrow()
         .page_state(view.id)
         .is_some_and(|state| state.media.svg_sources.contains_key(&id));
@@ -277,8 +277,8 @@ pub(super) fn svg_box(
         replaced.push_str(&source[end..]);
         let source: Rc<str> = replaced.into();
         view.svgs.borrow_mut().insert(id, (painted, key));
-        let mut host = view.host.borrow_mut();
-        let state = host.state(view.id);
+        let mut store = view.store.borrow_mut();
+        let state = store.state(view.id);
         // Discard the raster on source changes: paint checks only inline SVG dimensions.
         if state
             .rasters

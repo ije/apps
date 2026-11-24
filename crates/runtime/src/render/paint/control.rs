@@ -120,8 +120,8 @@ pub(crate) fn layer(id: usize, look: Look, view: Rc<super::super::ViewState>) ->
                 return;
             }
             let scale = window.scale_factor();
-            let mut host = view.host.borrow_mut();
-            let backgrounds = &mut host.state(view.id).rasters.backgrounds;
+            let mut store = view.store.borrow_mut();
+            let backgrounds = &mut store.state(view.id).rasters.backgrounds;
             let key = (id, usize::MAX - look.control as usize);
             let seen = [width, height, scale].map(f32::to_bits);
             if drawn.replace(seen) != seen || !backgrounds.contains_key(&key) {

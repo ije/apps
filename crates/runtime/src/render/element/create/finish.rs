@@ -95,9 +95,9 @@ pub(super) fn finish(
                     return;
                 };
                 // Use the nearest drag-region box under the pointer so no-drag children keep their clicks.
-                let dragged = view.host.try_borrow().is_ok_and(|host| {
-                    let viewport = *host.viewports.get(&view.id).unwrap_or(&[800., 600.]);
-                    let Some(page) = host.pages.get(&view.id) else {
+                let dragged = view.store.try_borrow().is_ok_and(|store| {
+                    let viewport = *store.viewports.get(&view.id).unwrap_or(&[800., 600.]);
+                    let Some(page) = store.pages.get(&view.id) else {
                         return true;
                     };
                     let state = &page.state;
@@ -182,8 +182,8 @@ pub(super) fn finish(
     el = el.children(bars);
     let sticky = (position == "sticky")
         .then(|| {
-            let host = view.host.borrow();
-            let scrolls = &host.page_state(view.id)?.geometry.scroll;
+            let store = view.store.borrow();
+            let scrolls = &store.page_state(view.id)?.geometry.scroll;
             let parent = scroller(doc, styles, ancestors.iter().rev().copied(), scrolls, 0);
             let border = insets(styles, parent, false, containing[0]);
             reader.log(

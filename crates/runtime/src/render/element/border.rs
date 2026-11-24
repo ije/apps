@@ -17,7 +17,7 @@ pub(super) fn fieldset_border(
             // The legend can move without a new box here.
             window.paint_volatile();
             let gap = view
-                .host
+                .store
                 .borrow()
                 .page_state(view.id)
                 .and_then(|dom| dom.geometry.mirror.get(&legend).copied())

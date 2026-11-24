@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn utility_classes_follow_dom_changes() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><head><style>@import 'tailwindcss';</style></head><body><div id='dot' class='h-4 w-4 flex'></div></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -15,6 +15,7 @@ fn utility_classes_follow_dom_changes() {
     .unwrap();
     engine.eval("const dot = document.getElementById('dot'); dot.setAttribute('class', 'h-' + 8 + ' w-' + 8 + ' bg-[#123456]');", "test").unwrap();
     {
+        let host = host.borrow().store.clone();
         let host = host.borrow();
         let doc = &host.pages[&1].doc;
         let id = doc
@@ -32,6 +33,7 @@ fn utility_classes_follow_dom_changes() {
     engine
         .eval("dot.removeAttribute('class');", "test")
         .unwrap();
+    let host = host.borrow().store.clone();
     let host = host.borrow();
     let doc = &host.pages[&1].doc;
     let id = doc
@@ -45,7 +47,7 @@ fn utility_classes_follow_dom_changes() {
 #[test]
 fn media_queries_follow_viewport_changes() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><head><style>@media (min-width:40em) { #target { color:red; } }</style></head><body><div id='target'></div></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -68,7 +70,11 @@ fn media_queries_follow_viewport_changes() {
         __appsLayout();
         if (changes.length) throw Error('Initial media event');
     "#, "test").unwrap();
-    host.borrow_mut().viewports.insert(1, [400., 600.]);
+    host.borrow()
+        .store
+        .borrow_mut()
+        .viewports
+        .insert(1, [400., 600.]);
     engine.eval(r#"
         if (query.matches) throw Error('Media query did not resize');
         __appsLayout(); __appsLayout();
@@ -77,14 +83,18 @@ fn media_queries_follow_viewport_changes() {
         query.removeListener(listener);
         query.onchange = null;
     "#, "test").unwrap();
-    host.borrow_mut().viewports.insert(1, [1000., 600.]);
+    host.borrow()
+        .store
+        .borrow_mut()
+        .viewports
+        .insert(1, [1000., 600.]);
     engine.eval("__appsLayout(); if (!query.matches || changes.length !== 2) throw Error('Media listener removal');", "test").unwrap();
 }
 
 #[test]
 fn custom_elements_shadow_styles_and_lifecycle() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page { doc: Document::parse("<html><body><div id='outside'>outside</div><test-existing></test-existing></body></html>"), dirty: false, ..Default::default() });
+    host.borrow().store.borrow_mut().pages.insert(1, Page { doc: Document::parse("<html><body><div id='outside'>outside</div><test-existing></test-existing></body></html>"), dirty: false, ..Default::default() });
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     engine.eval(r#"
       const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
@@ -118,7 +128,7 @@ fn custom_elements_shadow_styles_and_lifecycle() {
 #[test]
 fn computed_styles_follow_random_tree_changes() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><head><style>body{color:rgb(1, 1, 1)} p + p{color:rgb(6, 6, 6)} .a{color:rgb(2, 2, 2)} li:first-child{color:rgb(4, 4, 4)} li:nth-child(3n){color:rgb(5, 5, 5)} div:empty{color:rgb(7, 7, 7)} [inert] span{color:rgb(8, 8, 8)} td:last-child{color:rgb(9, 9, 9)} .a > .b{color:rgb(3, 3, 3)} .flat{display:contents} span ~ p{background-color:rgb(1, 0, 0)} div:has(+ div){background-color:rgb(2, 0, 0)} li:last-child{background-color:rgb(3, 0, 0)} li:only-child{background-color:rgb(4, 0, 0)} li:nth-last-child(2){background-color:rgb(5, 0, 0)} li:has(> .a){background-color:rgb(6, 0, 0)} td:has(~ .a){background-color:rgb(7, 0, 0)} ul:has(.b) p{background-color:rgb(8, 0, 0)} body:has(.flat) td{background-color:rgb(9, 0, 0)}</style></head><body><ul id='list'></ul><table><tbody id='rows'></tbody></table><div id='box' class='a'></div></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -176,7 +186,7 @@ fn computed_styles_follow_random_tree_changes() {
 #[test]
 fn rules_added_later_follow_names_that_nodes_already_had() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html class='dark'><head><style>p{color:rgb(1, 1, 1)}</style></head><body><div data-on='1'><p class='x'>a</p></div></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -200,7 +210,7 @@ fn rules_added_later_follow_names_that_nodes_already_had() {
 #[test]
 fn script_animations_leave_important_declarations() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><style>#d{opacity:0.5 !important}</style><body><div id=d></div><div id=e style='color:red !important'></div></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -217,7 +227,7 @@ fn script_animations_leave_important_declarations() {
 #[test]
 fn computed_styles_follow_mutations_and_resize() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><style>.item {color:red} @media (min-width:900px) {.item {color:blue}}</style><body><div class='item'></div></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -228,7 +238,11 @@ fn computed_styles_follow_mutations_and_resize() {
     )
     .unwrap();
     engine.eval("const item=document.querySelector('.item');for(let i=0;i<3;i++)if(getComputedStyle(item).color!=='rgb(255, 0, 0)')throw Error('Initial style');", "test").unwrap();
-    host.borrow_mut().viewports.insert(1, [1000., 600.]);
+    host.borrow()
+        .store
+        .borrow_mut()
+        .viewports
+        .insert(1, [1000., 600.]);
     engine.eval(r#"
         if(getComputedStyle(item).color!=='rgb(0, 0, 255)')throw Error('Viewport change');
         document.querySelector('style').textContent='.item {color:green}';
@@ -250,7 +264,7 @@ fn computed_styles_follow_mutations_and_resize() {
 #[test]
 fn form_pseudo_classes_follow_script_state() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><form><input id=em type=email value=nope><input id=req required><input id=num type=number min=5 value=2><input id=plain><fieldset id=fs disabled><input id=in1 required></fieldset><select id=sel required><option value=''>-</option><option>a</option></select><input type=radio name=r id=r1 required><input type=radio name=r id=r2><input type=checkbox id=cb><textarea id=ta required></textarea></form><x-el id=x></x-el></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -441,6 +455,7 @@ fn offset_parent_follows_cssom_view() {
         "",
     );
     {
+        let host = host.borrow().store.clone();
         let mut host = host.borrow_mut();
         let host = &mut *host;
         let page = host.pages.get_mut(&1).unwrap();
@@ -607,6 +622,7 @@ fn computed_styles_resolve_lengths_colors_initial_values_and_pseudo_elements() {
         "<html><head><style>:root{font-size:16px} #a{padding:calc(0.25rem * 2) 1em;margin:5%;color:#ff000080;border:2px solid;animation:fade 2s ease-in 1s infinite;line-height:1.5;opacity:50%;box-sizing:border-box;width:100px;height:40px} #a::before{content:'x';font-weight:700} #h{display:none}</style></head><body><div id=a>a</div><span id=s>s</span><div id=h></div></body></html>",
     );
     {
+        let host = host.borrow().store.clone();
         let mut host = host.borrow_mut();
         let state = host.state(1);
         let ids: Vec<usize> = (0..64).collect();
@@ -797,7 +813,7 @@ fn slotted_and_part_rules_cross_the_shadow_boundary() {
 #[test]
 fn web_animations_sample_commit_finish_and_replace() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><div id='a'></div><div id='b' style='opacity:0.5'></div></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -854,7 +870,7 @@ fn web_animations_sample_commit_finish_and_replace() {
 #[test]
 fn bundled_link_sheets_are_not_text() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: apps_runtime::bundle::page(
@@ -1015,6 +1031,7 @@ fn computed_styles_report_used_values_like_chrome() {
     };
     let ids = ["w", "a", "r", "m", "p", "o", "v", "q"].map(id);
     {
+        let host = host.borrow().store.clone();
         let mut host = host.borrow_mut();
         let state = host.state(1);
         state.geometry.mirror.extend(ids.into_iter().zip([
@@ -1102,7 +1119,7 @@ fn border_images_parse_and_serialize_like_chrome() {
 #[test]
 fn text_stroke_values_like_chrome() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><head><style>body{font-size:16px}#a{-webkit-text-stroke:2px red}#b{-webkit-text-stroke:thin;color:blue}#c{-webkit-text-stroke:green 3px}#d{-webkit-text-stroke:-1px red}#e{-webkit-text-stroke-width:0.1em;font-size:20px}</style></head><body><div id=a><span id=a2>x</span></div><div id=b></div><div id=c></div><div id=d></div><div id=e></div></body></html>"),
         dirty: false, ..Default::default()
     });

@@ -60,18 +60,18 @@ pub(super) fn replaced(
         content_layers.push(presented.into());
     }
     if node.tag == "terminal" {
-        let host = view.host.borrow();
+        let store = view.store.borrow();
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !host.app.features.has(crate::bundle::Feature::Terminal)
+        if !store.features.has(crate::bundle::Feature::Terminal)
             && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
             eprintln!(
                 "apps: The terminal feature is disabled. Add \"terminal\" to \"features\" in package.json"
             );
         }
-        if let Some(state) = host
+        if let Some(state) = store
             .page_state(view.id)
-            .filter(|_| host.app.features.has(crate::bundle::Feature::Terminal))
+            .filter(|_| store.features.has(crate::bundle::Feature::Terminal))
         {
             let look =
                 crate::render::paint::terminal::look(style, styles.selections.get(&id), &units);
@@ -110,7 +110,7 @@ pub(super) fn replaced(
     }
     if node.tag == "img" || node.tag == "video" {
         let (image, vector) = view
-            .host
+            .store
             .borrow()
             .page_state(view.id)
             .filter(|_| !broken)

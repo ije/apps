@@ -11,6 +11,7 @@ pub mod media;
 mod page;
 pub(crate) mod paint;
 pub mod raster;
+mod store;
 mod view;
 
 use crate::css::properties::Prop;
@@ -27,6 +28,7 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+pub use store::{Page, Store};
 
 type MaskSources = Vec<(String, background::Source)>;
 
@@ -52,6 +54,7 @@ pub(crate) struct ViewState {
     queued: Cell<bool>,
     pub(crate) runtime: Rc<dyn Pages>,
     pub(crate) host: Rc<RefCell<Host>>,
+    pub(crate) store: Rc<RefCell<Store>>,
     images: RefCell<HashMap<usize, Arc<renderer::RenderImage>>>,
     pub(crate) frames: RefCell<HashMap<usize, Frame>>,
     controls: RefCell<native::Controls>,
@@ -194,14 +197,14 @@ fn reflow(id: u64) {
     };
     // Reflow after composite frames even if the page is clean: boxes moved without layout. User scrolls move the
     // mirror without one.
-    if view.host.try_borrow_mut().map_or(true, |mut host| {
-        let shifted = !host.pages.get(&id).is_some_and(|page| page.dirty)
-            && host
+    if view.store.try_borrow_mut().map_or(true, |mut store| {
+        let shifted = !store.pages.get(&id).is_some_and(|page| page.dirty)
+            && store
                 .page_state_mut(id)
                 .is_some_and(|dom| dom.shift_scrolls());
         shifted
-            || !host.pages.get(&id).is_some_and(|page| page.dirty)
-                && !host
+            || !store.pages.get(&id).is_some_and(|page| page.dirty)
+                && !store
                     .page_state(id)
                     .is_some_and(|dom| dom.geometry.mirror.moved() || dom.layout.cull.reskipped)
     }) {
@@ -262,9 +265,9 @@ fn animation_frame(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
         eprintln!("apps: {error}");
     }
     // A frame whose callbacks changed nothing draws nothing.
-    if view.host.try_borrow().map_or(true, |host| {
-        host.pages.get(&view.id).is_some_and(|page| page.dirty)
-            || host
+    if view.store.try_borrow().map_or(true, |store| {
+        store.pages.get(&view.id).is_some_and(|page| page.dirty)
+            || store
                 .graphics
                 .get(&view.id)
                 .is_some_and(|gpu| gpu.presented())
@@ -272,11 +275,12 @@ fn animation_frame(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
         window.refresh();
     }
     if view
-        .host
+        .store
         .try_borrow_mut()
         .ok()
-        .and_then(|mut host| {
-            host.page_state_mut(view.id)
+        .and_then(|mut store| {
+            store
+                .page_state_mut(view.id)
                 .map(|dom| std::mem::take(&mut dom.frame_requested))
         })
         .unwrap_or(false)
@@ -384,11 +388,13 @@ impl PageView {
         host: Rc<RefCell<Host>>,
         window: WindowId,
     ) -> Self {
+        let store = host.borrow().store.clone();
         let view = Rc::new(ViewState {
             id,
             queued: Cell::new(false),
             runtime,
             host,
+            store,
             images: RefCell::default(),
             frames: RefCell::default(),
             controls: RefCell::default(),

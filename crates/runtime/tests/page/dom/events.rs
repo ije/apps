@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><main><div id='left' style='overflow:auto'></div><div id='right' style='overflow:auto'></div></main></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -35,7 +35,7 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
         if(received.length) throw Error('Unchanged scroll dispatched an event');
     "#, "test").unwrap();
     let id: usize = engine.eval("left._id", "test").unwrap().parse().unwrap();
-    host.borrow().pages[&1].state.geometry.scroll[&id]
+    host.borrow().store.borrow().pages[&1].state.geometry.scroll[&id]
         .set_offset(renderer::point(renderer::px(-60.), renderer::px(-25.)));
     engine.eval(r#"
         __appsLayout(); __appsLayout();
@@ -54,7 +54,7 @@ fn scroll_events_coalesce_and_synchronize_native_and_script_scrolling() {
 #[test]
 fn mutations_preserve_tree_and_event_order() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<html><body><main id='root'><p>old</p></main></body></html>"),
@@ -117,7 +117,8 @@ fn mutations_preserve_tree_and_event_order() {
         parent.appendChild(button);
         root.appendChild(parent);
     "#, "test").unwrap();
-    assert!(host.borrow().pages[&1].dirty);
+    assert!(host.borrow().store.borrow().pages[&1].dirty);
+    let host = host.borrow().store.clone();
     let host = host.borrow();
     let doc = &host.pages[&1].doc;
     let styles = apps_runtime::style::styles(doc, 800., 600.);
@@ -133,7 +134,7 @@ fn mutations_preserve_tree_and_event_order() {
 #[test]
 fn editing_fragments_observers_and_layout() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<html><body><main id='root'></main></body></html>"),
@@ -203,7 +204,9 @@ fn editing_fragments_observers_and_layout() {
         globalThis.editorId = input._id;
     "#, "test").unwrap();
     let id: usize = engine.eval("editorId", "test").unwrap().parse().unwrap();
-    host.borrow_mut()
+    host.borrow()
+        .store
+        .borrow_mut()
         .state(1)
         .geometry
         .mirror
@@ -214,7 +217,7 @@ fn editing_fragments_observers_and_layout() {
 #[test]
 fn inner_html_of_a_form_drops_nested_forms() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<form id=f><div id=d></div></form>"),
@@ -239,7 +242,7 @@ fn inner_html_of_a_form_drops_nested_forms() {
 #[test]
 fn shadow_slots_render_light_dom_and_receive_pointer_events() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><head><style>button { color:#123456; }</style></head><body><test-slots><button id='edit'>Edit</button><span slot='missing'>hidden</span><em>text</em></test-slots></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -279,7 +282,9 @@ fn shadow_slots_render_light_dom_and_receive_pointer_events() {
     let ids: Vec<usize> =
         serde_json::from_str(&engine.eval("JSON.stringify(ids)", "test").unwrap()).unwrap();
     for id in ids {
-        host.borrow_mut()
+        host.borrow()
+            .store
+            .borrow_mut()
             .state(1)
             .geometry
             .mirror
@@ -303,7 +308,7 @@ fn shadow_slots_render_light_dom_and_receive_pointer_events() {
 #[test]
 fn native_events_focus_the_editing_host_and_cross_shadow_roots() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<html><body><test-editor></test-editor></body></html>"),
@@ -342,7 +347,7 @@ fn native_events_focus_the_editing_host_and_cross_shadow_roots() {
 #[test]
 fn aria_properties_reflect_and_select_focuses_fields() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><button id='toggle'></button><input id='field' value='text'></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -363,7 +368,7 @@ fn aria_properties_reflect_and_select_focuses_fields() {
 #[test]
 fn pointer_hover_tracks_boundary_events_and_interaction_states() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><head><style>#outer:hover{color:red} #inner:hover{color:blue} #outer:focus-within{background-color:green} #inner:active{font-weight:700} #inner:focus{border-top:3px solid}</style></head><body><div id='outer'><div id='inner' tabindex='0'></div></div><div id='other'></div><test-card></test-card></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -392,7 +397,9 @@ fn pointer_hover_tracks_boundary_events_and_interaction_states() {
         [0., 200., 100., 100.],
         [0., 200., 50., 50.],
     ]) {
-        host.borrow_mut()
+        host.borrow()
+            .store
+            .borrow_mut()
             .state(1)
             .geometry
             .mirror
@@ -571,6 +578,7 @@ fn select_options_follow_selection_and_keyboard() {
         globalThis.selectId = s.options[3]._id;
         "#,
     );
+    let host = host.borrow().store.clone();
     let host = host.borrow();
     let doc = &host.pages[&1].doc;
     let option = doc
@@ -691,7 +699,9 @@ fn range_inputs_sanitize_slide_and_step() {
         .unwrap()
         .parse()
         .unwrap();
-    host.borrow_mut()
+    host.borrow()
+        .store
+        .borrow_mut()
         .state(1)
         .geometry
         .mirror
@@ -1175,7 +1185,7 @@ fn indexes_follow_ids_labels_forms_and_bases() {
 #[test]
 fn select_popup_picks_options() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<select id='s'><option>One<optgroup label='G'><option disabled>Two<option>Three</optgroup><hr><option hidden>Four<option>Five</select>"),
         dirty: false, ..Default::default()
     });
@@ -1206,7 +1216,7 @@ fn select_popup_picks_options() {
 #[test]
 fn tab_order_includes_custom_elements_with_their_own_tab_index() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><button id='a'></button><x-pad id='pad' contenteditable='true'></x-pad><button id='b'></button></body></html>"),
         dirty: false, ..Default::default()
     });

@@ -10,8 +10,8 @@ pub(super) fn events(data: Rc<ViewState>) -> renderer::Node {
         let parked = data.parked.take();
         let size = window.viewport_size();
         if !parked.is_empty()
-            && data.host.try_borrow().is_ok_and(|host| {
-                host.page_state(data.id).is_some_and(|dom| {
+            && data.store.try_borrow().is_ok_and(|store| {
+                store.page_state(data.id).is_some_and(|dom| {
                     parked.iter().any(|(id, clips)| {
                         in_view(&dom.geometry.mirror, [f32::from(size.width), f32::from(size.height)], *id, clips.iter().copied())
                     })
@@ -102,9 +102,9 @@ pub(super) fn events(data: Rc<ViewState>) -> renderer::Node {
             }
             queue_layout(view.clone(), window);
             let (mut target, mut wheel, mut terminal) = (None, false, None);
-            if let Ok(host) = view.host.try_borrow() {
-                let viewport = *host.viewports.get(&view.id).unwrap_or(&[800., 600.]);
-                if let Some(page) = host.pages.get(&view.id) {
+            if let Ok(store) = view.store.try_borrow() {
+                let viewport = *store.viewports.get(&view.id).unwrap_or(&[800., 600.]);
+                if let Some(page) = store.pages.get(&view.id) {
                     let state = &page.state;
                     let seen = state.layout.cull.seen.as_ref().map(|seen| seen.2.clone()).or_else(|| state.styles.computed.clone());
                     target = seen.as_ref().and_then(|computed| {

@@ -171,10 +171,10 @@ fn native_addons_values_callbacks_and_contexts() {
             .unwrap(),
         r#"{"ran":4,"late":0}"#
     );
-    let mut host = Host::default();
-    host.pages.insert(
+    let host = Host::default();
+    host.store.borrow_mut().pages.insert(
         1,
-        apps_runtime::host::Page {
+        apps_runtime::render::Page {
             doc: apps_runtime::dom::Document::parse("<body></body>"),
             dirty: false,
             ..Default::default()

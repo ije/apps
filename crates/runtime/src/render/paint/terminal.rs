@@ -304,8 +304,9 @@ impl Grid {
         }
         let scrolled = drawn.scroll;
         // The focus is read here, because it doesn't build the element again.
-        let focused = self.view.host.try_borrow().is_ok_and(|host| {
-            host.pages
+        let focused = self.view.store.try_borrow().is_ok_and(|store| {
+            store
+                .pages
                 .get(&self.view.id)
                 .and_then(|page| page.doc.nodes.get(self.id))
                 .is_some_and(|node| node.state & crate::css::selector::FOCUS != 0)

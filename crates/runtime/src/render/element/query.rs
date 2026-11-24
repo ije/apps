@@ -339,8 +339,8 @@ pub(super) fn static_mark(view: &Rc<super::super::ViewState>, key: usize) -> ren
     let view = view.clone();
     renderer::canvas_watching(
         move |bounds, _| {
-            let mut host = view.host.borrow_mut();
-            host.state(view.id).layout.anchors.insert(key, bounds);
+            let mut store = view.store.borrow_mut();
+            store.state(view.id).layout.anchors.insert(key, bounds);
         },
         |_, _, _| {},
     )

@@ -122,10 +122,10 @@ fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
     let started = std::time::Instant::now();
     let size = window.viewport_size();
     let viewport = [f32::from(size.width), f32::from(size.height)];
-    let Ok(mut host) = view.host.try_borrow_mut() else {
+    let Ok(mut store) = view.store.try_borrow_mut() else {
         return window.refresh();
     };
-    let state = &mut *host;
+    let state = &mut *store;
     let Some(page) = state.pages.get_mut(&view.id) else {
         return window.refresh();
     };
@@ -440,7 +440,7 @@ fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
         _ => next.filter(|_| patched),
     };
     animate(&view, dom, next, now, true, window, cx);
-    drop(host);
+    drop(store);
     if patched && !promoted && crate::native::devtools::profiling() {
         crate::native::devtools::frame(view.id, started);
     }
@@ -451,9 +451,9 @@ fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
     if !events.is_empty() {
         animation_events(&view, events, cx);
         if view
-            .host
+            .store
             .try_borrow()
-            .is_ok_and(|host| host.pages.get(&view.id).is_some_and(|page| page.dirty))
+            .is_ok_and(|store| store.pages.get(&view.id).is_some_and(|page| page.dirty))
         {
             window.refresh();
         }

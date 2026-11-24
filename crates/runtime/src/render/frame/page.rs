@@ -207,8 +207,8 @@ pub(super) fn node(
             let data = view.clone();
             renderer::canvas(
                 move |_, _| {
-                    if let Ok(mut host) = data.host.try_borrow_mut()
-                        && let Some(dom) = host.page_state_mut(data.id)
+                    if let Ok(mut store) = data.store.try_borrow_mut()
+                        && let Some(dom) = store.page_state_mut(data.id)
                     {
                         dom.geometry.sync_scroll();
                         dom.geometry.prepainted(dom.pixel_ratio);
@@ -310,7 +310,7 @@ pub(super) fn overlay(
                     .get(Prop::BACKGROUND_IMAGE)
                     .is_some_and(|value| value != "none")
                 {
-                    let host = build.view.host.borrow();
+                    let store = build.view.store.borrow();
                     el = el.children(background::css_background(
                         backdrop,
                         units,
@@ -319,9 +319,10 @@ pub(super) fn overlay(
                         Default::default(),
                         [[0.; 4]; 3],
                         build.view.clone(),
-                        host.page_state(build.view.id)
+                        store
+                            .page_state(build.view.id)
                             .and_then(|state| state.base.as_ref()),
-                        &host.app.assets,
+                        &store.assets,
                         false,
                     ));
                 }

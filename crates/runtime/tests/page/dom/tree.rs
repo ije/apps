@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn svg_presentation_attributes_links_and_attribute_nodes() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><head><style>.c{fill:blue}</style></head><body><svg><g style='fill:red;stroke:blue'><path id=a fill=none /><path id=b stroke-width=5 /><path id=c class=c fill=green /></g><g fill=green><path id=d /></g></svg><p id=p fill=red></p></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -31,7 +31,7 @@ fn svg_presentation_attributes_links_and_attribute_nodes() {
 #[test]
 fn core_dom_interfaces_follow_the_standard() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><div id='a' z='1' b='2' class='x y'>t<!--c-->u</div><template id='t'><p>hi</p></template></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -138,7 +138,7 @@ fn dom_matrix_math_keeps_nan_infinity_negative_zero_and_2d() {
 #[test]
 fn sibling_walks_follow_mutations() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<body><ul></ul><ol><li>a</li><li>b</li></ol></body>"),
@@ -236,6 +236,7 @@ fn created_svg_keeps_qualified_name_case() {
         check('serialization', () => s.innerHTML === '<linearGradient id="grad"></linearGradient><feGaussianBlur></feGaussianBlur>');
         "#,
     );
+    let host = host.borrow().store.clone();
     let host = host.borrow();
     let tags: Vec<_> = host.pages[&1]
         .doc
@@ -524,6 +525,7 @@ fn busy_hosts_keep_page_writes() {
             .unwrap();
     }
     engine.tick().unwrap();
+    let host = host.borrow().store.clone();
     let host = host.borrow();
     let doc = &host.pages[&1].doc;
     let body = doc
@@ -713,7 +715,7 @@ fn table_parts_without_a_table_keep_their_displays_like_chrome() {
 #[test]
 fn same_text_writes_large_fragments_and_id_queries() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<body><p id=label>a</p><div id=empty></div></body>"),
@@ -729,10 +731,16 @@ fn same_text_writes_large_fragments_and_id_queries() {
     .unwrap();
     let dirty = |source: &str| {
         engine.tick().unwrap();
-        host.borrow_mut().pages.get_mut(&1).unwrap().dirty = false;
+        host.borrow()
+            .store
+            .borrow_mut()
+            .pages
+            .get_mut(&1)
+            .unwrap()
+            .dirty = false;
         engine.eval(source, "test").unwrap();
         engine.tick().unwrap();
-        host.borrow().pages[&1].dirty
+        host.borrow().store.borrow().pages[&1].dirty
     };
     assert!(!dirty(
         "const label = document.getElementById('label'), text = label.firstChild; label.textContent = 'a'; text.data = 'a'; text.replaceData(0, 1, 'a'); document.getElementById('empty').textContent = ''; document.getElementById('empty').replaceChildren(); if (label.firstChild !== text) throw Error('kept text')"

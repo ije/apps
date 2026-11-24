@@ -1,9 +1,6 @@
 use apps_runtime::{
-    dom::Document,
-    host::context::JsContext,
-    host::{Host, Page},
-    jsc::JavaScriptCore,
-    jsc::Role,
+    dom::Document, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role,
+    render::Page,
 };
 use std::{
     cell::RefCell,
@@ -13,7 +10,7 @@ use std::{
 
 fn page() -> (JsContext, Rc<RefCell<Host>>) {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<body></body>"),
@@ -141,9 +138,9 @@ fn weak_sweeps_free_detached_nodes_and_preserve_live_subtrees() {
         engine.eval("__appsDomSweep(true)", "test").unwrap();
     }
     assert!(
-        host.borrow().pages[&1].doc.nodes.len() < 20000,
+        host.borrow().store.borrow().pages[&1].doc.nodes.len() < 20000,
         "{} nodes",
-        host.borrow().pages[&1].doc.nodes.len()
+        host.borrow().store.borrow().pages[&1].doc.nodes.len()
     );
     assert_eq!(engine.eval("live.dispatchEvent(new Event('test'));[live.parentNode===kept,live.textContent,kept.value].join(':')", "test").unwrap(), "true:saved:42");
 }

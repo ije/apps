@@ -139,8 +139,8 @@ impl renderer::View for PageView {
 
     fn drawn(&mut self, snapshots: Vec<renderer::Snapshot>, window: &mut Window, cx: &mut App) {
         // The paint order of boxes, which hit tests sort by.
-        if let Ok(mut host) = self.host.try_borrow_mut() {
-            let dom = host.state(self.id);
+        if let Ok(mut store) = self.store.try_borrow_mut() {
+            let dom = store.state(self.id);
             dom.layout.painted.fill(0);
             let page = self.id;
             for (order, &mark) in window.marks().iter().enumerate() {
@@ -159,9 +159,8 @@ impl renderer::View for PageView {
         }
         let mut changed = Vec::with_capacity(snapshots.len());
         {
-            let mut host = self.host.borrow_mut();
-            let host = &mut *host;
-            let (doc, dom, _) = host.page_parts(self.id);
+            let mut store = self.store.borrow_mut();
+            let (doc, dom, _) = store.page_parts(self.id);
             // An element that is no longer drawable gives its pixels back.
             if let Some(doc) = doc.filter(|_| !snapshots.is_empty()) {
                 let drawable = |id: &usize| {
@@ -203,7 +202,9 @@ impl renderer::View for PageView {
     fn window_changed(&mut self, window: &mut Window, cx: &mut App) {
         self.origin.set(None);
         if let Ok(mut host) = self.host.try_borrow_mut() {
-            if let Some(state) = host.page_state_mut(self.id) {
+            if let Ok(mut store) = self.store.try_borrow_mut()
+                && let Some(state) = store.page_state_mut(self.id)
+            {
                 state.window = window.window_state();
             }
             if !host.window_changes.contains(&self.id) {
@@ -225,7 +226,7 @@ impl renderer::View for PageView {
                 let key = named.name.as_str();
                 let pick = (key == "escape" && self.inspect.get().pick).then_some(Tool::Pick);
                 let tool = pick
-                    .or_else(|| tool(key, *modifiers).filter(|_| !self.host.borrow().app.packaged));
+                    .or_else(|| tool(key, *modifiers).filter(|_| !self.store.borrow().packaged));
                 let open = self.inspect.get().open;
                 let args = match tool {
                     Some(Tool::Hud) => serde_json::json!(["hud", id]),
@@ -410,9 +411,9 @@ impl renderer::View for PageView {
         // The IME asks right after an edit, before the next frame lays out the new text, so reflow first.
         super::scripted(cx, Some(window), || super::reflow(self.id));
         let id = state["id"].as_u64()? as usize;
-        let host = self.host.borrow();
-        let dom = host.page_state(self.id)?;
-        let password = super::paint::field::password(&host, self.id, id, &state);
+        let store = self.store.borrow();
+        let dom = store.page_state(self.id)?;
+        let password = super::paint::field::password(&store, self.id, id, &state);
         let caret = state["node"]
             .as_u64()
             .map(|node| node as usize)
@@ -426,7 +427,7 @@ impl renderer::View for PageView {
             let at = state["offset"].as_u64()? as usize;
             (node, at..at + range.len())
         } else {
-            let nodes = &host.pages.get(&self.id)?.doc.nodes;
+            let nodes = &store.pages.get(&self.id)?.doc.nodes;
             let (mut offset, mut pending, mut found) = (0, vec![id], None);
             while let Some(node) = pending.pop() {
                 let current = nodes.get(node)?;
@@ -481,8 +482,8 @@ impl renderer::View for PageView {
     ) -> Option<usize> {
         let state = self.editing()?;
         let id = state["id"].as_u64()? as usize;
-        let host = self.host.borrow();
-        let dom = host.page_state(self.id)?;
+        let store = self.store.borrow();
+        let dom = store.page_state(self.id)?;
         if let Some((layout, text, span, rows, _)) = dom.layout.text_layouts.get(&id) {
             let [dx, dy] = dom.geometry.scroll_shift(&dom.styles.walk, id);
             let point = point - renderer::point(px(dx), px(dy));
@@ -491,7 +492,7 @@ impl renderer::View for PageView {
                 .clamp(span.start, span.end);
             let index = text[span.start..index].encode_utf16().count();
             return Some(
-                super::paint::field::password(&host, self.id, id, &state)
+                super::paint::field::password(&store, self.id, id, &state)
                     .map_or(index, |value| crate::dom::text::unbullet(value, index)),
             );
         }

@@ -425,7 +425,7 @@ fn dispatch(command: &Value, engine: &JsContext, host: &Rc<RefCell<Host>>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{dom::Document, host::Page, jsc::JavaScriptCore};
+    use crate::{dom::Document, jsc::JavaScriptCore, render::Page};
 
     #[test]
     fn packaged_apps_disable_developer_tools() {
@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn evaluation_updates_live_document_and_reports_errors() {
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
+        host.borrow().store.borrow_mut().pages.insert(
             1,
             Page {
                 doc: Document::parse("<body><p id='value'>before</p></body>"),
@@ -486,7 +486,7 @@ mod tests {
             dispatch(&command, &engine, &host).unwrap(),
             json!({"value":{"type":"string","text":"changed"}})
         );
-        assert!(host.borrow().pages[&1].dirty);
+        assert!(host.borrow().store.borrow().pages[&1].dirty);
         let call = |method: &str, params: Value| {
             dispatch(&json!({"method":method,"params":params}), &engine, &host).unwrap()
         };
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     fn page_tools_read_the_tree_and_the_panel_has_its_styles() {
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
+        host.borrow().store.borrow_mut().pages.insert(
             1,
             Page {
                 doc: Document::parse("<head><title>t</title></head><body><p id='value' class='a b'>before</p> <script></script></body>"),

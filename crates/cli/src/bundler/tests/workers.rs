@@ -92,11 +92,12 @@ fn import_meta_url_in_modules_and_templates() {
         ] {
             let files = compile(&entry, realm, None, Rc::default(), production, None).unwrap();
             let host = Rc::new(RefCell::new(apps_runtime::host::Host::default()));
-            host.borrow_mut().pages.insert(
+            host.borrow().store.borrow_mut().pages.insert(
                 1,
-                apps_runtime::host::Page {
+                apps_runtime::render::Page {
                     doc: Document::parse("<body></body>"),
                     dirty: false,
+                    ..Default::default()
                 },
             );
             let engine = apps_runtime::host::context::JsContext::new(
@@ -475,10 +476,7 @@ if (threads.isMainThread) {
 
 #[test]
 fn page_workers_and_chunks_load_from_bundled_scripts() {
-    use apps_runtime::{
-        host::{Host, Page},
-        jsc::Role,
-    };
+    use apps_runtime::{host::Host, jsc::Role, render::Page};
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("worker.ts"),
@@ -509,11 +507,12 @@ fn page_workers_and_chunks_load_from_bundled_scripts() {
         .unwrap();
         assert!(!files["app.js"].contains("data:"));
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
+        host.borrow().store.borrow_mut().pages.insert(
             1,
             Page {
                 doc: Document::parse("<html><body></body></html>"),
                 dirty: false,
+                ..Default::default()
             },
         );
         let engine = apps_runtime::host::context::JsContext::new(
@@ -558,11 +557,12 @@ fn import_meta_filename_and_dirname_follow_node() {
         ] {
             let files = compile(&entry, realm, None, Rc::default(), production, None).unwrap();
             let host = Rc::new(RefCell::new(apps_runtime::host::Host::default()));
-            host.borrow_mut().pages.insert(
+            host.borrow().store.borrow_mut().pages.insert(
                 1,
-                apps_runtime::host::Page {
+                apps_runtime::render::Page {
                     doc: Document::parse("<body></body>"),
                     dirty: false,
+                    ..Default::default()
                 },
             );
             let engine = apps_runtime::host::context::JsContext::new(

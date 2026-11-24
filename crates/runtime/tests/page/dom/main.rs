@@ -1,8 +1,9 @@
 use apps_runtime::{
     dom::Document,
+    host::Host,
     host::context::JsContext,
-    host::{Host, Page},
     jsc::{JavaScriptCore, Role},
+    render::Page,
 };
 use std::{cell::RefCell, rc::Rc};
 
@@ -12,7 +13,7 @@ fn offscreen_page(source: &str) -> (Rc<RefCell<Host>>, JsContext, String) {
         let _ = wake.send(());
     });
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<body><canvas id=shown width=8 height=8></canvas></body>"),
@@ -58,7 +59,7 @@ fn offscreen_page(source: &str) -> (Rc<RefCell<Host>>, JsContext, String) {
 
 fn checked_page(html: &str, script: &str) -> (Rc<RefCell<Host>>, JsContext) {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse(html),
@@ -86,7 +87,7 @@ fn checked_page(html: &str, script: &str) -> (Rc<RefCell<Host>>, JsContext) {
 
 fn css_page(html: &str) -> (Rc<RefCell<Host>>, JsContext) {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse(html),

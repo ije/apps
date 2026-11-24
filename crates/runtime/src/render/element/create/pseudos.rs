@@ -315,7 +315,7 @@ pub(super) fn pseudo_elements(
                     false,
                 ),
                 Some(block) => {
-                    let size = reader.block_size(view.host.borrow().page_state(view.id), block);
+                    let size = reader.block_size(view.store.borrow().page_state(view.id), block);
                     reader.log(
                         Query::Block(block as u32),
                         0,
@@ -505,7 +505,7 @@ pub(super) fn pseudo_elements(
             .is_some_and(|value| value != "none")
         {
             let base = view
-                .host
+                .store
                 .borrow()
                 .page_state(view.id)
                 .and_then(|state| state.base.clone());
@@ -519,7 +519,7 @@ pub(super) fn pseudo_elements(
                 [[0.; 4], pseudo_padding, pseudo_borders],
                 view.clone(),
                 base.as_ref(),
-                &view.host.borrow().app.assets,
+                &view.store.borrow().assets,
                 false,
             ));
         }

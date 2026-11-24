@@ -260,8 +260,8 @@ pub(super) fn svg_layer(
             if !inline || width <= 0. || height <= 0. {
                 return;
             }
-            let mut host = geometry.host.borrow_mut();
-            let state = host.state(geometry.id);
+            let mut store = geometry.store.borrow_mut();
+            let state = store.state(geometry.id);
             if let Some(source) = state.media.svg_sources.get(&id)
                 && let Some(entry) = state.rasters.svg_boxes.get_mut(&id)
             {
@@ -362,8 +362,8 @@ pub(super) fn svg_layer(
             }
             let scale = window.scale_factor();
             let view = &*view;
-            let mut host = view.host.borrow_mut();
-            let state = host.state(view.id);
+            let mut store = view.store.borrow_mut();
+            let state = store.state(view.id);
             // The painted area in the box, in CSS pixels on device pixel edges. A long spill paints only near
             // the content mask, in steps, so it keeps the device scale.
             let mask = window.content_mask().bounds;
@@ -496,7 +496,7 @@ pub(super) fn svg_layer(
                 }
             }
             let image = state.rasters.svgs.get(&id).map(|(_, image)| image.clone());
-            drop(host);
+            drop(store);
             if let Some(image) = image {
                 let target = Rect::new(
                     point(bounds.left() + px(area[0]), bounds.top() + px(area[1])),

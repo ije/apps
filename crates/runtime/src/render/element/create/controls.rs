@@ -232,7 +232,7 @@ pub(super) fn controls(
             el = el.child(sizer);
         }
         let handle = view
-            .host
+            .store
             .borrow_mut()
             .state(view.id)
             .geometry

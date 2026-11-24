@@ -114,8 +114,7 @@ impl Template {
     fn host(&self, link: &Link) -> Host {
         Host {
             link: Some(link.clone()),
-            app: self.app.clone(),
-            ..Host::default()
+            ..Host::new(self.app.clone())
         }
     }
 }
@@ -421,9 +420,9 @@ impl Desktop {
                         }
                     }
                     "insertCSS" | "removeInsertedCSS" => {
-                        let mut host = self.host.borrow_mut();
-                        let host = &mut *host;
-                        let Some(page) = host.pages.get_mut(&id) else {
+                        let host = self.host.borrow();
+                        let mut store = host.store.borrow_mut();
+                        let Some(page) = store.pages.get_mut(&id) else {
                             continue;
                         };
                         let state = &mut page.state;
@@ -591,9 +590,7 @@ impl Desktop {
 
     fn titles(&mut self, mut cx: Option<&mut App>) -> Result<()> {
         for (&id, view) in &mut self.views {
-            let Some(title) = self
-                .host
-                .borrow()
+            let Some(title) = (self.host.borrow().store.borrow())
                 .pages
                 .get(&id)
                 .filter(|page| page.dirty)
@@ -628,9 +625,10 @@ impl Desktop {
             if app.quit {
                 return Ok(None);
             }
-            let resized = std::mem::take(&mut app.host.borrow_mut().resized);
+            let store = app.host.borrow().store.clone();
+            let resized = std::mem::take(&mut store.borrow_mut().resized);
             for id in resized {
-                let Some([width, height]) = app.host.borrow().viewports.get(&id).copied() else {
+                let Some([width, height]) = store.borrow().viewports.get(&id).copied() else {
                     continue;
                 };
                 let zoom = app
@@ -844,7 +842,10 @@ impl Desktop {
             }
             app.titles(Some(cx))?;
             let host = app.host.borrow();
-            if app.queue.pending() || !host.resized.is_empty() || !host.window_changes.is_empty() {
+            if app.queue.pending()
+                || !host.store.borrow().resized.is_empty()
+                || !host.window_changes.is_empty()
+            {
                 delay = delay.min(0);
             }
             drop(host);
@@ -860,11 +861,11 @@ impl Desktop {
             }
             for (&id, view) in &app.views {
                 let (dirty, frame) = {
-                    let host = app.host.borrow();
+                    let store = store.borrow();
                     (
-                        host.pages.get(&id).is_some_and(|p| p.dirty)
-                            || host.graphics.get(&id).is_some_and(|gpu| gpu.presented()),
-                        host.page_state(id).is_some_and(|dom| dom.frame_requested),
+                        store.pages.get(&id).is_some_and(|p| p.dirty)
+                            || store.graphics.get(&id).is_some_and(|gpu| gpu.presented()),
+                        store.page_state(id).is_some_and(|dom| dom.frame_requested),
                     )
                 };
                 if frame
@@ -874,7 +875,7 @@ impl Desktop {
                             crate::render::queue_animation_frame(data, window)
                         })
                         .is_some()
-                    && let Some(dom) = app.host.borrow_mut().page_state_mut(id)
+                    && let Some(dom) = store.borrow_mut().page_state_mut(id)
                 {
                     dom.frame_requested = false;
                 }
@@ -1202,8 +1203,8 @@ fn shrink_when_quiet(runtime: Rc<RefCell<Desktop>>, cx: &mut App) {
                     let _ = page.eval("__appsDomSweep?.(true)", "apps:trim");
                 }
             }
-            let host = &mut *app.host.borrow_mut();
-            for page in host.pages.values_mut() {
+            let host = app.host.borrow();
+            for page in host.store.borrow_mut().pages.values_mut() {
                 if page.state.trim(&mut page.doc) {
                     page.dirty = true;
                 }

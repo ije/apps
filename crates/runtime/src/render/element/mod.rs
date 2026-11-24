@@ -369,8 +369,8 @@ pub(crate) fn element(
         let inside = false;
         let held = (record.call == call || inside) && {
             let fresh = record.epoch.get() == build.epoch;
-            let host = build.view.host.borrow();
-            let dom = host.page_state(build.view.id);
+            let store = build.view.store.borrow();
+            let dom = store.page_state(build.view.id);
             record.reads.iter().all(|read| {
                 fresh && !read.query.host()
                     || match build.replay(id, containing, container, cell, dom, read) {
@@ -389,8 +389,8 @@ pub(crate) fn element(
             "box {id} <{}> builds again inside a kept box: {}",
             build.doc.nodes[id].tag,
             if record.call == call {
-                let host = build.view.host.borrow();
-                let dom = host.page_state(build.view.id);
+                let store = build.view.store.borrow();
+                let dom = store.page_state(build.view.id);
                 format!(
                     "{:?} changed",
                     record

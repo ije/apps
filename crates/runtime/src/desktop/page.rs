@@ -33,7 +33,9 @@ impl Desktop {
         };
         let width = limit(number("width", 800.), 0);
         let height = limit(number("height", 600.), 1);
-        self.host.borrow_mut().viewports.insert(id, [width, height]);
+        (self.host.borrow().store.borrow_mut())
+            .viewports
+            .insert(id, [width, height]);
         let transparent = options["transparent"] == true;
         let vibrancy = options["vibrancy"]
             .as_i64()
@@ -136,8 +138,7 @@ impl Desktop {
                     window.control().toggle_fullscreen();
                 }
                 let size = window.viewport_size();
-                self.host
-                    .borrow_mut()
+                (self.host.borrow().store.borrow_mut())
                     .viewports
                     .insert(id, [f32::from(size.width), f32::from(size.height)]);
             });
@@ -300,15 +301,14 @@ impl Desktop {
             let mut host = self.host.borrow_mut();
             host.load_page(id, doc);
             // Preload scripts see the page URL, like page scripts.
-            host.state(id).base = url::Url::parse(&location).ok();
+            host.store.borrow_mut().state(id).base = url::Url::parse(&location).ok();
         }
         let view = self.views.get_mut(&id).context("Window is closed")?;
         view.focused = true;
         if let (Some(handle), Some(cx)) = (view.handle, cx.as_deref_mut()) {
             cx.update_window(handle, |window, _| {
-                let mut host = self.host.borrow_mut();
-                let state = host.state(id);
-                state.attach_window(window);
+                let host = self.host.borrow();
+                host.store.borrow_mut().state(id).attach_window(window);
                 // Like Playwright, pages count as focused while the devtools MCP server runs, so tests in hidden windows get focus events.
                 view.focused = window.is_active() || crate::native::devtools::enabled();
             });

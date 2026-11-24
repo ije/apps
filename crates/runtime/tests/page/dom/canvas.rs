@@ -41,7 +41,7 @@ fn visibility_observers_option_lists_and_canvas_current_color_follow_chrome() {
 #[test]
 fn canvas_pixels_survive_partial_updates_and_clipping() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<html><body></body></html>"),
@@ -81,7 +81,7 @@ fn canvas_pixels_survive_partial_updates_and_clipping() {
 #[test]
 fn hostile_selectors_canvas_data_and_traversal() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(1, Page {
+    host.borrow().store.borrow_mut().pages.insert(1, Page {
         doc: Document::parse("<html><body><ul id='list'><li id='a'>1</li><li id=\"it's\">2</li><li id='c'>3</li></ul><svg><g><circle></circle></g><foreignObject><div id='html'></div></foreignObject></svg></body></html>"),
         dirty: false, ..Default::default()
     });
@@ -109,7 +109,7 @@ fn hostile_selectors_canvas_data_and_traversal() {
 #[test]
 fn shadow_cycles_child_access_release_and_retired_images() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<html><body><div id='box'></div></body></html>"),
@@ -148,14 +148,20 @@ fn shadow_cycles_child_access_release_and_retired_images() {
         document.getElementById('box').textContent = '';
     "#, "test").unwrap();
     let [p, canvas] = ["p", "canvas"].map(|tag| {
-        host.borrow().pages[&1]
+        host.borrow().store.borrow().pages[&1]
             .doc
             .nodes
             .iter()
             .position(|node| node.tag == tag && node.parent.is_none())
             .unwrap()
     });
-    host.borrow_mut().pages.get_mut(&1).unwrap().dirty = false;
+    host.borrow()
+        .store
+        .borrow_mut()
+        .pages
+        .get_mut(&1)
+        .unwrap()
+        .dirty = false;
     let freed = host
         .borrow_mut()
         .call(
@@ -165,8 +171,12 @@ fn shadow_cycles_child_access_release_and_retired_images() {
         )
         .unwrap();
     assert_eq!(freed[0], serde_json::json!([canvas]));
-    assert!(host.borrow().pages[&1].doc.nodes[p].tag.is_empty());
-    assert!(!host.borrow().pages[&1].dirty);
+    assert!(
+        host.borrow().store.borrow().pages[&1].doc.nodes[p]
+            .tag
+            .is_empty()
+    );
+    assert!(!host.borrow().store.borrow().pages[&1].dirty);
     let image: usize = engine.eval("image._id", "test").unwrap().parse().unwrap();
     {
         use base64::Engine as _;
@@ -194,7 +204,14 @@ fn shadow_cycles_child_access_release_and_retired_images() {
             }
         }
     }
-    assert_eq!(host.borrow().pages[&1].state.media.retired.len(), 3);
+    assert_eq!(
+        host.borrow().store.borrow().pages[&1]
+            .state
+            .media
+            .retired
+            .len(),
+        3
+    );
 }
 
 #[test]
@@ -492,6 +509,7 @@ fn bitmaps_and_canvases_move_between_threads() {
     );
     assert_eq!(result, "ok");
     let node = |name: &str| -> usize { engine.eval(name, "test").unwrap().parse().unwrap() };
+    let host = host.borrow().store.clone();
     let host = host.borrow();
     let dom = &host.pages[&1].state;
     assert_eq!(
@@ -515,16 +533,23 @@ fn bitmaps_free_their_pixels() {
     assert_eq!(result, "ok");
     let id: usize = engine.eval("closedId", "test").unwrap().parse().unwrap();
     assert!(
-        !host.borrow().pages[&1]
+        !host.borrow().store.borrow().pages[&1]
             .state
             .media
             .canvases
             .contains_key(&id)
     );
-    host.borrow_mut().pages.get_mut(&1).unwrap().dirty = false;
+    host.borrow()
+        .store
+        .borrow_mut()
+        .pages
+        .get_mut(&1)
+        .unwrap()
+        .dirty = false;
     engine.eval("globalThis.kept = new OffscreenCanvas(1, 1); kept.getContext('2d').fillRect(0, 0, 1, 1); kept._context._flush();", "test").unwrap();
     let kept: usize = engine.eval("kept._id", "test").unwrap().parse().unwrap();
     {
+        let host = host.borrow().store.clone();
         let host = host.borrow();
         assert!(!host.pages[&1].dirty);
         assert!(!host.pages[&1].state.media.canvases[&kept].present);
@@ -547,7 +572,13 @@ fn bitmaps_free_their_pixels() {
         engine.eval("drop()", "test").unwrap();
         made += 1;
         engine.tick().unwrap();
-        most = most.max(host.borrow().pages[&1].state.media.canvases.len());
+        most = most.max(
+            host.borrow().store.borrow().pages[&1]
+                .state
+                .media
+                .canvases
+                .len(),
+        );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(
@@ -572,7 +603,7 @@ fn images_decode_on_workers_and_load_after_a_wake() {
         .save(directory.path().join("wide.png"))
         .unwrap();
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<body></body>"),
@@ -581,7 +612,14 @@ fn images_decode_on_workers_and_load_after_a_wake() {
         },
     );
     let base = url::Url::from_directory_path(directory.path()).unwrap();
-    host.borrow_mut().pages.get_mut(&1).unwrap().state.base = Some(base.clone());
+    host.borrow()
+        .store
+        .borrow_mut()
+        .pages
+        .get_mut(&1)
+        .unwrap()
+        .state
+        .base = Some(base.clone());
     let engine = JsContext::new(
         JavaScriptCore::load().unwrap(),
         host.clone(),
@@ -618,13 +656,20 @@ fn images_decode_on_workers_and_load_after_a_wake() {
         image.decode().then(() => events.push('decoded:' + image.naturalHeight));
         if (image.complete || wide.complete || image.naturalWidth || events.length) throw Error('Image loaded synchronously');
     "#, serde_json::json!(base.as_str())), "test").unwrap();
-    host.borrow_mut().pages.get_mut(&1).unwrap().dirty = false;
+    host.borrow()
+        .store
+        .borrow_mut()
+        .pages
+        .get_mut(&1)
+        .unwrap()
+        .dirty = false;
     assert_eq!(
         settle(3),
         r#"["decoded:3","load:4:true","wide:error:true:0"]"#
     );
     let id: usize = engine.eval("image._id", "test").unwrap().parse().unwrap();
     {
+        let host = host.borrow().store.clone();
         let host = host.borrow();
         assert!(host.pages[&1].dirty && host.pages[&1].state.media.images.contains_key(&id));
         assert!(host.pages[&1].state.media.retired.is_empty());
@@ -642,6 +687,7 @@ fn images_decode_on_workers_and_load_after_a_wake() {
         .eval("image.src = base + 'missing.png'", "test")
         .unwrap();
     assert_eq!(settle(1), r#"["error"]"#);
+    let host = host.borrow().store.clone();
     let host = host.borrow();
     assert_eq!(host.pages[&1].state.media.retired.len(), 1);
     assert!(host.pages[&1].state.media.images.contains_key(&id));

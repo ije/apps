@@ -27,9 +27,9 @@ pub(crate) fn spacer(
     let mut spacer = renderer::canvas_watching(
         move |bounds, window| {
             let view = &*view;
-            let mut host = view.host.borrow_mut();
-            let host = &mut *host;
-            let Some(page) = host.pages.get_mut(&view.id) else {
+            let mut store = view.store.borrow_mut();
+            let store = &mut *store;
+            let Some(page) = store.pages.get_mut(&view.id) else {
                 return;
             };
             let dom = &mut page.state;
@@ -101,9 +101,9 @@ pub(crate) fn anchor(
     renderer::canvas_watching(
         move |bounds, window| {
             let view = &*view;
-            let mut host = view.host.borrow_mut();
-            let host = &mut *host;
-            let Some(page) = host.pages.get_mut(&view.id) else {
+            let mut store = view.store.borrow_mut();
+            let store = &mut *store;
+            let Some(page) = store.pages.get_mut(&view.id) else {
                 return;
             };
             let dom = &mut page.state;
@@ -149,9 +149,9 @@ pub(crate) fn autos(view: Rc<super::super::ViewState>) -> Child {
     renderer::canvas_watching(
         move |_, window| {
             let view = &*view;
-            let mut guard = view.host.borrow_mut();
-            let host = &mut *guard;
-            let Some(page) = host.pages.get_mut(&view.id) else {
+            let mut guard = view.store.borrow_mut();
+            let store = &mut *guard;
+            let Some(page) = store.pages.get_mut(&view.id) else {
                 return;
             };
             let dom = &mut page.state;

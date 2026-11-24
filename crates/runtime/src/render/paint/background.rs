@@ -310,8 +310,8 @@ pub(crate) fn css_background(
                             return;
                         }
                         let view = &*view;
-                        let mut host = view.host.borrow_mut();
-                        let dom = host.state(view.id);
+                        let mut store = view.store.borrow_mut();
+                        let dom = store.state(view.id);
                         let (backgrounds, bitmaps, sources) =
                             (&mut dom.rasters.backgrounds, &mut dom.rasters.bitmaps, &mut dom.rasters.layer_sources);
                         let scale = window.scale_factor();
@@ -772,8 +772,8 @@ pub(crate) fn css_background(
                 inputs.push('\0');
             }
             let view = &*view;
-            let mut host = view.host.borrow_mut();
-            let dom = host.state(view.id);
+            let mut store = view.store.borrow_mut();
+            let dom = store.state(view.id);
             let key = (id, slot * 64 + index);
             let fits = |image: &renderer::RenderImage| {
                 [image.size().width, image.size().height].map(|side| side as u32) == [rw, rh]
@@ -970,11 +970,11 @@ pub(crate) fn border_image(
         .and_then(|v| v.strip_suffix(')'))
     {
         Some(url) => {
-            let host = view.host.borrow();
-            let base = host
+            let store = view.store.borrow();
+            let base = store
                 .page_state(view.id)
                 .and_then(|state| state.base.clone());
-            let path = super::super::raster::image::url_file(url, base.as_ref(), &host.app.assets)
+            let path = super::super::raster::image::url_file(url, base.as_ref(), &store.assets)
                 .filter(|path| {
                     path.to_str().is_some_and(|path| {
                         path.starts_with(super::super::raster::image::DATA_PREFIX)
@@ -1058,8 +1058,8 @@ pub(crate) fn border_image(
             }
             let scale = window.scale_factor();
             let view = &*view;
-            let mut host = view.host.borrow_mut();
-            let dom = host.state(view.id);
+            let mut store = view.store.borrow_mut();
+            let dom = store.state(view.id);
             let key = (id, BORDER_IMAGE + slot);
             let mut held = held.borrow_mut();
             if gradient.is_none() && held.is_none() {
@@ -1304,7 +1304,7 @@ pub(crate) fn border_image(
                 return;
             };
             let image = image.clone();
-            drop((held, host));
+            drop((held, store));
             let atlas = gradient.is_none();
             for (index, part) in parts.iter().enumerate() {
                 let Some(part) = part else {

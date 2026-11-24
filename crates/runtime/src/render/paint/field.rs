@@ -135,8 +135,8 @@ impl renderer::Hooks for FieldText {
         };
         let window = &mut *cx.window;
         let view = &*self.view;
-        let mut host = view.host.borrow_mut();
-        let dom = host.state(view.id);
+        let mut store = view.store.borrow_mut();
+        let dom = store.state(view.id);
         let selected = dom
             .interaction
             .selection
@@ -159,7 +159,7 @@ impl renderer::Hooks for FieldText {
                 ),
             );
         }
-        drop(host);
+        drop(store);
         let state = (selected, self.text.len());
         if view.fields.borrow_mut().insert(self.id, state) != Some(state) {
             let (shown, old) = (self.handle.bounds(), self.handle.offset());
@@ -291,12 +291,13 @@ impl renderer::Hooks for FieldText {
 }
 
 pub(crate) fn password<'a>(
-    host: &crate::host::Host,
+    store: &super::super::Store,
     view: u64,
     id: usize,
     state: &'a serde_json::Value,
 ) -> Option<&'a str> {
-    host.pages
+    store
+        .pages
         .get(&view)?
         .doc
         .nodes

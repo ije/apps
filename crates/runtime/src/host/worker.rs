@@ -1,5 +1,5 @@
 use super::{
-    Host, Page, WORKER_PAGE,
+    Host, WORKER_PAGE,
     context::{JsContext, NEXT},
 };
 use crate::{
@@ -17,16 +17,13 @@ use std::{
 
 // Runs the script of a worker in a new JavaScript context, on the worker thread.
 pub(crate) fn run(mut job: Job) -> Result<()> {
-    let host = Rc::new(RefCell::new(Host {
-        app: std::mem::take(&mut job.app),
-        ..Host::default()
-    }));
+    let host = Rc::new(RefCell::new(Host::new(std::mem::take(&mut job.app))));
     let role = if job.native {
         Role::Main
     } else {
-        host.borrow_mut().pages.insert(
+        host.borrow().store.borrow_mut().pages.insert(
             WORKER_PAGE,
-            Page {
+            crate::render::Page {
                 doc: Document::parse("<html><body></body></html>"),
                 dirty: false,
                 ..Default::default()

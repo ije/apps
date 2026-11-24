@@ -14,10 +14,10 @@ const BLUE: u32 = 0x0d99ffff;
 
 pub(super) fn paint(view: &ViewState, window: &mut Window) {
     let inspect = view.inspect.get();
-    let Ok(host) = view.host.try_borrow() else {
+    let Ok(store) = view.store.try_borrow() else {
         return;
     };
-    let Some(page) = host.pages.get(&view.id) else {
+    let Some(page) = store.pages.get(&view.id) else {
         return;
     };
     let state = &page.state;

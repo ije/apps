@@ -1,9 +1,6 @@
 use apps_runtime::{
-    dom::Document,
-    host::context::JsContext,
-    host::{Host, Page},
-    jsc::JavaScriptCore,
-    jsc::Role,
+    dom::Document, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role,
+    render::Page,
 };
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -21,7 +18,8 @@ fn contexts(features: &str) -> Contexts {
             apps_runtime::bundle::Package::parse(Some(&format!(r#"{{"features":{features}}}"#)))
                 .unwrap()
                 .features;
-        host.pages.insert(
+        host.store.borrow_mut().set_app(&host.app);
+        host.store.borrow_mut().pages.insert(
             1,
             Page {
                 doc: Document::parse("<html><body><terminal id=parsed></terminal></body></html>"),

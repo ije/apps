@@ -640,7 +640,8 @@ impl crate::host::Host {
             },
             "terminal.{op} is unavailable in this context"
         );
-        let page = self.pages.get_mut(&id).context("Window is closed")?;
+        let mut store = self.store.try_borrow_mut().context("Host is busy")?;
+        let page = store.pages.get_mut(&id).context("Window is closed")?;
         let state = &mut page.state;
         let terminals = state.media.terminals.clone();
         let mut terminals = terminals.borrow_mut();

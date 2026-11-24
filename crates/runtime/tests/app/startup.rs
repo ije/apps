@@ -146,9 +146,9 @@ fn engine_launch() {
     let host: std::rc::Rc<std::cell::RefCell<apps_runtime::host::Host>> = std::rc::Rc::default();
     let mut times = Vec::new();
     for id in 1..=9 {
-        host.borrow_mut().pages.insert(
+        host.borrow().store.borrow_mut().pages.insert(
             id,
-            apps_runtime::host::Page {
+            apps_runtime::render::Page {
                 doc: apps_runtime::dom::Document::parse("<body></body>"),
                 dirty: false,
                 ..Default::default()

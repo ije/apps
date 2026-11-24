@@ -438,7 +438,10 @@ fn window_state_events_and_close_follow_electron() {
         r#"[{"x":0,"y":0,"width":400,"height":300},"Start",["page-title-updated"]]"#
     );
     assert_eq!(desktop.views[&1].title.as_deref(), Some("Page"));
-    assert_eq!(desktop.host.borrow().backgrounds[&1], (0x112233, 0x80));
+    assert_eq!(
+        desktop.host.borrow().store.borrow().backgrounds[&1],
+        (0x112233, 0x80)
+    );
     let state = |frame: [i32; 4], extra: &str| {
         let [x, y, width, height] = frame;
         format!(
@@ -553,7 +556,7 @@ fn window_extras_follow_electron() {
         "[1,false,false,[2,3],true,true,false,null,null]"
     );
     if cfg!(target_os = "macos") {
-        assert_eq!(desktop.host.borrow().backgrounds[&1], (0, 0));
+        assert_eq!(desktop.host.borrow().store.borrow().backgrounds[&1], (0, 0));
     }
     for (script, error) in [
         (
@@ -711,7 +714,7 @@ fn window_titles_follow_the_document() {
             )
             .unwrap();
         assert!(
-            desktop.host.borrow().pages[&1]
+            desktop.host.borrow().store.borrow().pages[&1]
                 .state
                 .styles
                 .computed

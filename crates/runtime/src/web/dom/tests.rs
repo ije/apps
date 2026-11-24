@@ -2,12 +2,7 @@ use super::*;
 use crate::css;
 use crate::css::properties::Prop;
 use crate::dom::Node;
-use crate::{
-    host::context::JsContext,
-    host::{Host, Page},
-    jsc::JavaScriptCore,
-    jsc::Role,
-};
+use crate::{host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role, render::Page};
 use std::{cell::RefCell, rc::Rc};
 
 fn engine(html: &str) -> (Rc<RefCell<Host>>, JsContext) {
@@ -17,7 +12,7 @@ fn engine(html: &str) -> (Rc<RefCell<Host>>, JsContext) {
         dirty: false,
         ..Default::default()
     };
-    host.borrow_mut().pages.insert(1, page);
+    host.borrow().store.borrow_mut().pages.insert(1, page);
     let engine = JsContext::new(
         JavaScriptCore::load().unwrap(),
         host.clone(),
@@ -45,6 +40,7 @@ fn font_faces_load_woff_and_list_css_faces() {
     std::sync::Arc::make_mut(&mut host.borrow_mut().app.assets)
         .insert("test.woff".into(), fixtures.join("test.woff"));
     {
+        let host = host.borrow().store.clone();
         let mut host = host.borrow_mut();
         let state = host.state(1);
         state.fonts.system = Some(Rc::new(renderer::TextSystem::new()));
@@ -93,7 +89,7 @@ fn detached_nodes_keep_styles_that_a_frame_holds() {
             "test",
         )
         .unwrap();
-    let held = host.borrow().pages[&1]
+    let held = host.borrow().store.borrow().pages[&1]
         .state
         .styles
         .computed
@@ -107,7 +103,7 @@ fn detached_nodes_keep_styles_that_a_frame_holds() {
         .unwrap();
     assert!(Rc::ptr_eq(
         &held,
-        host.borrow().pages[&1]
+        host.borrow().store.borrow().pages[&1]
             .state
             .styles
             .computed
@@ -126,7 +122,7 @@ fn detached_editor_overlays_preserve_connected_styles() {
         )
         .unwrap();
     let cached = Rc::as_ptr(
-        host.borrow().pages[&1]
+        host.borrow().store.borrow().pages[&1]
             .state
             .styles
             .computed
@@ -142,7 +138,7 @@ fn detached_editor_overlays_preserve_connected_styles() {
     assert_eq!(
         cached,
         Rc::as_ptr(
-            host.borrow().pages[&1]
+            host.borrow().store.borrow().pages[&1]
                 .state
                 .styles
                 .computed
@@ -169,7 +165,7 @@ fn detached_editor_overlays_preserve_connected_styles() {
     assert_eq!(
         cached,
         Rc::as_ptr(
-            host.borrow().pages[&1]
+            host.borrow().store.borrow().pages[&1]
                 .state
                 .styles
                 .computed
@@ -182,7 +178,13 @@ fn detached_editor_overlays_preserve_connected_styles() {
         if(getComputedStyle(editor.firstChild).color!=='rgb(0, 0, 255)')throw Error('Inserted style was stale');
         fragment.append(editor.firstChild);
     "#, "test").unwrap();
-    assert!(host.borrow().pages[&1].state.styles.computed.is_none());
+    assert!(
+        host.borrow().store.borrow().pages[&1]
+            .state
+            .styles
+            .computed
+            .is_none()
+    );
     engine.eval(r#"
         const root=editor.attachShadow({mode:'open'});
         root.innerHTML='<span style="color:green">text</span>';
@@ -198,20 +200,20 @@ fn invalidation_skips_text_edits_and_unused_states() {
         "<html><head><style id=s>p:empty{color:red}</style></head><body><p id=p>text</p><svg><text>a</text></svg></body></html>",
     );
     let computed = || {
-        host.borrow().pages[&1]
+        host.borrow().store.borrow().pages[&1]
             .state
             .styles
             .computed
             .as_ref()
             .map(Rc::as_ptr)
     };
-    let p = host.borrow().pages[&1]
+    let p = host.borrow().store.borrow().pages[&1]
         .doc
         .nodes
         .iter()
         .position(|node| node.tag == "p")
         .unwrap();
-    let revision = || host.borrow().pages[&1].doc.nodes.latest();
+    let revision = || host.borrow().store.borrow().pages[&1].doc.nodes.latest();
     let hover = |ids: &[usize]| {
         host.borrow_mut()
             .call(Role::Renderer(1), "dom.hover", json!([ids]))
@@ -257,7 +259,9 @@ fn invalidation_skips_text_edits_and_unused_states() {
             "test",
         )
         .unwrap();
-    host.borrow_mut()
+    host.borrow()
+        .store
+        .borrow_mut()
         .page_state_mut(1)
         .unwrap()
         .fonts
@@ -266,7 +270,7 @@ fn invalidation_skips_text_edits_and_unused_states() {
     engine
         .eval("p.style.fontFamily='Brand';if(getComputedStyle(p).fontFamily!=='Real Font')throw Error('Alias')", "test")
         .unwrap();
-    let first = host.borrow().pages[&1]
+    let first = host.borrow().store.borrow().pages[&1]
         .state
         .styles
         .computed
@@ -274,11 +278,17 @@ fn invalidation_skips_text_edits_and_unused_states() {
         .unwrap()
         .values[p]
         .clone();
-    host.borrow_mut().page_state_mut(1).unwrap().styles.computed = None;
+    host.borrow()
+        .store
+        .borrow_mut()
+        .page_state_mut(1)
+        .unwrap()
+        .styles
+        .computed = None;
     engine.eval("getComputedStyle(p).color", "test").unwrap();
     assert!(Rc::ptr_eq(
         &first,
-        &host.borrow().pages[&1]
+        &host.borrow().store.borrow().pages[&1]
             .state
             .styles
             .computed
@@ -300,7 +310,7 @@ fn incremental_styles_match_full_passes() {
                 <p id=p>t</p><div id=sized class=em><b class=rem>r</b><b class=em>e</b></div>
                 <div id=vars class=vars><span class=vars>v</span></div><div id=hover class='h s'>h</div>
                 <div id=k>k</div></div></body></html>");
-    let hover = host.borrow().pages[&1]
+    let hover = host.borrow().store.borrow().pages[&1]
         .doc
         .nodes
         .iter()
@@ -343,7 +353,14 @@ fn incremental_styles_match_full_passes() {
         engine.eval(read, "test").unwrap();
     }
     #[cfg(debug_assertions)]
-    assert!(host.borrow().pages[&1].state.styles.cache.incremental >= 20);
+    assert!(
+        host.borrow().store.borrow().pages[&1]
+            .state
+            .styles
+            .cache
+            .incremental
+            >= 20
+    );
 }
 
 #[test]
@@ -381,7 +398,14 @@ fn incremental_styles_follow_class_changes() {
         engine.eval(&format!("{step};{read}"), "test").unwrap();
     }
     #[cfg(debug_assertions)]
-    assert!(host.borrow().pages[&1].state.styles.cache.incremental >= 15);
+    assert!(
+        host.borrow().store.borrow().pages[&1]
+            .state
+            .styles
+            .cache
+            .incremental
+            >= 15
+    );
 }
 
 #[test]
@@ -434,12 +458,23 @@ fn incremental_styles_follow_added_rules_and_places() {
         ),
         ("sheet.deleteRule(0)", "css(leaf,'marginLeft')==='0px'"),
     ] {
-        let before = host.borrow().pages[&1].state.styles.cache.incremental;
+        let before = host.borrow().store.borrow().pages[&1]
+            .state
+            .styles
+            .cache
+            .incremental;
         let result = engine
             .eval(&format!("{step};{read}{check}"), "test")
             .unwrap();
         assert_eq!(result, "true", "{step}");
-        passes.push(host.borrow().pages[&1].state.styles.cache.incremental > before);
+        passes.push(
+            host.borrow().store.borrow().pages[&1]
+                .state
+                .styles
+                .cache
+                .incremental
+                > before,
+        );
     }
     // A rule that any node can match needs a full pass.
     assert_eq!(
@@ -458,6 +493,7 @@ fn incremental_styles_renumber_counters() {
     let read =
         "[...document.querySelectorAll('h2')].map(h=>getComputedStyle(h).color&&h._id).join()";
     let text = |ids: String| {
+        let host = host.borrow().store.clone();
         let host = host.borrow();
         let computed = host.pages[&1].state.styles.computed.as_ref().unwrap();
         ids.split(',')
@@ -493,10 +529,21 @@ fn incremental_styles_renumber_counters() {
         ("s.style.counterReset=''", &["1", "2", "3"]),
         ("a.className='big'", &["1", "2", "3"]),
     ] {
-        let before = host.borrow().pages[&1].state.styles.cache.incremental;
+        let before = host.borrow().store.borrow().pages[&1]
+            .state
+            .styles
+            .cache
+            .incremental;
         let result = text(engine.eval(&format!("{step};{read}"), "test").unwrap());
         assert_eq!(result, numbers(expected), "{step}");
-        passes.push(host.borrow().pages[&1].state.styles.cache.incremental > before);
+        passes.push(
+            host.borrow().store.borrow().pages[&1]
+                .state
+                .styles
+                .cache
+                .incremental
+                > before,
+        );
     }
     assert_eq!(passes, [true; 6]);
 }
@@ -531,7 +578,7 @@ fn cousins_that_share_matches_restyle_with_their_own_ancestors() {
     ] {
         engine.eval(&format!("{step};{read}"), "test").unwrap();
     }
-    let g3 = host.borrow().pages[&1]
+    let g3 = host.borrow().store.borrow().pages[&1]
         .doc
         .nodes
         .iter()
@@ -542,7 +589,14 @@ fn cousins_that_share_matches_restyle_with_their_own_ancestors() {
         .unwrap();
     engine.eval(read, "test").unwrap();
     #[cfg(debug_assertions)]
-    assert!(host.borrow().pages[&1].state.styles.cache.incremental >= 8);
+    assert!(
+        host.borrow().store.borrow().pages[&1]
+            .state
+            .styles
+            .cache
+            .incremental
+            >= 8
+    );
 }
 
 #[test]
@@ -584,7 +638,14 @@ fn incremental_styles_adjust_collapsed_tables_again() {
         engine.eval(&format!("{step};{read}"), "test").unwrap();
     }
     #[cfg(debug_assertions)]
-    assert!(host.borrow().pages[&1].state.styles.cache.incremental >= 12);
+    assert!(
+        host.borrow().store.borrow().pages[&1]
+            .state
+            .styles
+            .cache
+            .incremental
+            >= 12
+    );
 }
 
 #[test]
@@ -596,7 +657,7 @@ fn incremental_styles_match_full_passes_in_shadow_trees() {
                 </style></head><body><x-card id=card class=c><span id=a class=on>a<s id=s></s></span>
                 <b id=b slot=side>b</b><i id=i>i</i></x-card><x-card id=other></x-card>
                 <x-card id=third></x-card><div id=late class=late><p id=lp>late</p></div></body></html>");
-    let card = host.borrow().pages[&1]
+    let card = host.borrow().store.borrow().pages[&1]
         .doc
         .nodes
         .iter()
@@ -658,10 +719,20 @@ fn incremental_styles_match_full_passes_in_shadow_trees() {
         "card.classList.add('on')",
     ] {
         #[cfg(debug_assertions)]
-        let before = host.borrow().pages[&1].state.styles.cache.incremental;
+        let before = host.borrow().store.borrow().pages[&1]
+            .state
+            .styles
+            .cache
+            .incremental;
         engine.eval(&format!("{step};{read}"), "test").unwrap();
         #[cfg(debug_assertions)]
-        if host.borrow().pages[&1].state.styles.cache.incremental == before {
+        if host.borrow().store.borrow().pages[&1]
+            .state
+            .styles
+            .cache
+            .incremental
+            == before
+        {
             full.push(step);
         }
     }
@@ -902,13 +973,14 @@ fn reused_ids_drop_the_old_style_while_the_styles_are_shared() {
 #[test]
 fn trim_shrinks_the_layout_mirror_under_a_page_that_holds_it() {
     let (host, engine) = engine("<html><body><p id='a'></p></body></html>");
-    let a = host.borrow().pages[&1]
+    let a = host.borrow().store.borrow().pages[&1]
         .doc
         .nodes
         .iter()
         .position(|node| node.tag == "p")
         .unwrap();
     let grow = |rect| {
+        let host = host.borrow().store.clone();
         let mut host = host.borrow_mut();
         let host = &mut *host;
         let page = host.pages.get_mut(&1).unwrap();
@@ -931,6 +1003,7 @@ fn trim_shrinks_the_layout_mirror_under_a_page_that_holds_it() {
         "10"
     );
     {
+        let host = host.borrow().store.clone();
         let mut host = host.borrow_mut();
         let host = &mut *host;
         let page = host.pages.get_mut(&1).unwrap();

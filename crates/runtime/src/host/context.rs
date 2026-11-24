@@ -605,9 +605,9 @@ mod tests {
 
     fn page_host(id: u64, html: &str) -> Rc<RefCell<Host>> {
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
+        host.borrow().store.borrow_mut().pages.insert(
             id,
-            crate::host::Page {
+            crate::render::Page {
                 doc: crate::dom::Document::parse(html),
                 dirty: false,
                 ..Default::default()
@@ -785,7 +785,7 @@ mod tests {
             "test",
         )
         .unwrap();
-        assert!(host.borrow().pages[&1].dirty);
+        assert!(host.borrow().store.borrow().pages[&1].dirty);
         assert_eq!(
             page.eval("document.querySelector('#value').textContent", "test")
                 .unwrap(),
@@ -1029,6 +1029,7 @@ mod tests {
             page.eval("customElements.define('x-row', class extends HTMLElement {});const list = document.getElementById('list');for (let i = 0; i < 50; i++) { list.innerHTML = '<div><span>a</span><span>b</span></div>'.repeat(20); list.insertAdjacentHTML('beforeend', '<p><b>c</b></p>'.repeat(20)); __appsDomSweep(); }const kept = list.firstChild, observer = new MutationObserver(() => {});observer.observe(list, { childList: true });list.innerHTML = '<i>x</i>';const records = observer.takeRecords();__appsDomSweep();[kept.textContent, kept.isConnected, records.length, records[0].removedNodes.length, records[0].removedNodes[0] === kept, list.textContent].join()", "test").unwrap(),
             "ab,false,1,40,true,x"
         );
+        let host = host.borrow().store.clone();
         let host = host.borrow();
         let used = host.pages[&1].doc.nodes.len() - host.pages[&1].state.tree.free_count();
         assert!(used < 400, "{used}");
@@ -1048,6 +1049,7 @@ mod tests {
             .parse()
             .unwrap();
         let layout = || {
+            let host = host.borrow().store.clone();
             let mut host = host.borrow_mut();
             let bounds = &mut host.state(1).geometry.mirror;
             bounds.insert(id, [0., 0., 110., 10.]);

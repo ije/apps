@@ -27,6 +27,7 @@ fn inner_text_client_box_urls_dialog_and_details() {
         "#,
     );
     let id = {
+        let host = host.borrow().store.clone();
         let mut host = host.borrow_mut();
         let host = &mut *host;
         let doc = &host.pages[&1].doc;
@@ -117,7 +118,13 @@ fn popovers_follow_the_auto_stack_light_dismiss_and_invokers() {
         .parse()
         .unwrap();
     engine.eval("document.body.offsetWidth", "test").unwrap();
-    assert_eq!(host.borrow().pages[&1].state.interaction.top_layer, [id]);
+    assert_eq!(
+        host.borrow().store.borrow().pages[&1]
+            .state
+            .interaction
+            .top_layer,
+        [id]
+    );
     for _ in 0..10 {
         engine.tick().unwrap();
     }
@@ -175,6 +182,7 @@ fn dialogs_close_on_requests_and_light_dismiss_by_closedby() {
         })
         .collect();
     {
+        let host = host.borrow().store.clone();
         let mut host = host.borrow_mut();
         let dom = host.state(1);
         assert_eq!(dom.interaction.top_layer, [ids[0]]);
@@ -194,7 +202,7 @@ fn dialogs_close_on_requests_and_light_dismiss_by_closedby() {
         )
         .unwrap();
     assert!(
-        host.borrow().pages[&1]
+        host.borrow().store.borrow().pages[&1]
             .state
             .interaction
             .top_layer
@@ -226,7 +234,11 @@ fn fullscreen_elements_enter_the_top_layer_and_exit_on_escape() {
     {
         let host = host.borrow();
         assert_eq!(
-            host.pages[&1].state.interaction.top_layer.first(),
+            host.store.borrow().pages[&1]
+                .state
+                .interaction
+                .top_layer
+                .first(),
             Some(&id)
         );
         assert!(host.commands.iter().any(|command| {
@@ -307,7 +319,13 @@ fn inert_nodes_and_modal_dialogs_take_no_hits_focus_or_selection() {
         ("fb", [0., 120., 50., 20.]),
     ]
     .map(|(name, rect)| (id(name), rect));
-    host.borrow_mut().state(1).geometry.mirror.extend(rects);
+    host.borrow()
+        .store
+        .borrow_mut()
+        .state(1)
+        .geometry
+        .mirror
+        .extend(rects);
     let fails = engine
         .eval(
             r#"(() => {

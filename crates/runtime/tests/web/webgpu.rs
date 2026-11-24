@@ -1,9 +1,6 @@
 use apps_runtime::{
-    dom::Document,
-    host::context::JsContext,
-    host::{Host, Page},
-    jsc::JavaScriptCore,
-    jsc::Role,
+    dom::Document, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role,
+    render::Page,
 };
 use std::{
     cell::RefCell,
@@ -15,7 +12,7 @@ use std::{
 #[test]
 fn canvas_identity_and_webgl_errors() {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<html><body><canvas id='parsed'></canvas></body></html>"),
@@ -56,7 +53,7 @@ fn canvas_identity_and_webgl_errors() {
 
 fn page(html: &str) -> (Rc<RefCell<Host>>, JsContext) {
     let host = Rc::new(RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse(html),
@@ -88,6 +85,8 @@ fn wait(engine: &JsContext, ready: &str) -> String {
 fn present(host: &RefCell<Host>, node: usize) -> Arc<renderer::RenderImage> {
     for _ in 0..5000 {
         if let Some(image) = host
+            .borrow()
+            .store
             .borrow_mut()
             .graphics
             .get_mut(&1)
@@ -211,7 +210,9 @@ fn renders_pixels_and_runs_compute() {
         .parse()
         .unwrap();
     assert!(
-        host.borrow_mut()
+        host.borrow()
+            .store
+            .borrow_mut()
             .graphics
             .get_mut(&1)
             .unwrap()
@@ -219,7 +220,7 @@ fn renders_pixels_and_runs_compute() {
             .unwrap()
             .is_none()
     );
-    let node = host.borrow().pages[&1]
+    let node = host.borrow().store.borrow().pages[&1]
         .doc
         .nodes
         .iter()
@@ -306,7 +307,7 @@ fn static_canvas_stops_presenting_when_idle() {
         globalThis.gpuTestResult = 'ok';
     })().catch(error => { globalThis.gpuTestResult = String(error); });"#, "gpu-test").unwrap();
     assert_eq!(wait(&engine, "globalThis.gpuTestResult ?? 'pending'"), "ok");
-    let node = host.borrow().pages[&1]
+    let node = host.borrow().store.borrow().pages[&1]
         .doc
         .nodes
         .iter()
@@ -314,11 +315,18 @@ fn static_canvas_stops_presenting_when_idle() {
         .unwrap();
     let image = present(&host, node);
     assert_eq!(&image.bytes()[..4], &[0, 255, 0, 255]);
-    host.borrow_mut().pages.get_mut(&1).unwrap().dirty = false;
+    host.borrow()
+        .store
+        .borrow_mut()
+        .pages
+        .get_mut(&1)
+        .unwrap()
+        .dirty = false;
     std::thread::sleep(Duration::from_millis(20));
     for _ in 0..3 {
         assert_eq!(engine.tick().unwrap(), -1);
-        let mut state = host.borrow_mut();
+        let host = host.borrow();
+        let mut state = host.store.borrow_mut();
         let gpu = state.graphics.get_mut(&1).unwrap();
         assert!(!gpu.presented());
         assert_eq!(gpu.image(node).unwrap().unwrap().id, image.id);

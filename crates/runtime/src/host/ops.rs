@@ -200,11 +200,12 @@ pub(super) unsafe extern "C" fn call(
         if let Role::Renderer(id) = role
             && op == "dom.layout"
         {
-            let mut host = binding.host.try_borrow_mut().context("Host is busy")?;
-            let host = &mut *host;
-            let page = host.pages.get_mut(&id).context("Window is closed")?;
+            let host = binding.host.try_borrow().context("Host is busy")?;
+            let mut store = host.store.try_borrow_mut().context("Host is busy")?;
+            let store = &mut *store;
+            let page = store.pages.get_mut(&id).context("Window is closed")?;
             let state = &mut page.state;
-            let viewport = *host.viewports.get(&id).unwrap_or(&[800., 600.]);
+            let viewport = *store.viewports.get(&id).unwrap_or(&[800., 600.]);
             if values.get(2).is_some_and(|&value| api.to_bool(ctx, value)) {
                 crate::web::dom::geometry::layout_flags(&mut page.doc, state, viewport);
             }
@@ -631,11 +632,16 @@ pub(super) fn dispatch(
 
 // Account for native DOM memory so removed wrappers trigger GC before row churn exhausts memory.
 fn report_nodes(binding: &Binding, ctx: Ptr, id: u64) {
-    let created = binding
-        .host
-        .try_borrow_mut()
-        .ok()
-        .and_then(|mut host| Some(host.page_state_mut(id)?.tree.take_created()));
+    let created = binding.host.try_borrow_mut().ok().and_then(|host| {
+        Some(
+            host.store
+                .try_borrow_mut()
+                .ok()?
+                .page_state_mut(id)?
+                .tree
+                .take_created(),
+        )
+    });
     if let Some(created) = created.filter(|&created| created > 0) {
         // Count only wrapped nodes: JSC resets this cost only after a full GC.
         binding.api.add_memory(ctx, created * 65536);
@@ -646,8 +652,12 @@ fn gpu(binding: &Binding, ctx: Ptr, id: u64, op: &str, args: &[u8]) -> Result<se
     let mut host = binding.host.try_borrow_mut().context("Host is busy")?;
     let result = host.gpu(id, op, args);
     // JSC cannot see GPU memory, so wrappers that own it would wait for an unrelated GC.
-    if let Some(gpu) = host.graphics.get_mut(&id)
-        && let bytes = gpu.take_allocated()
+    let bytes = host
+        .store
+        .try_borrow_mut()
+        .ok()
+        .and_then(|mut store| Some(store.graphics.get_mut(&id)?.take_allocated()));
+    if let Some(bytes) = bytes
         && bytes > 0
     {
         drop(host);
@@ -701,8 +711,10 @@ impl Host {
             self.app.features.has(crate::bundle::Feature::WebGpu),
             "The webgpu feature is disabled"
         );
-        let page = self.pages.get_mut(&id).context("Window is closed")?;
-        let result = self.graphics.entry(id).or_default().call(op, args)?;
+        let mut store = self.store.try_borrow_mut().context("Host is busy")?;
+        let store = &mut *store;
+        let page = store.pages.get_mut(&id).context("Window is closed")?;
+        let result = store.graphics.entry(id).or_default().call(op, args)?;
         if op == "resetCanvas"
             && let Ok([node]) = serde_json::from_slice::<[usize; 1]>(args)
         {
@@ -716,9 +728,11 @@ impl Host {
 
     pub fn media(&mut self, id: u64, op: &str, args: &Value) -> Result<Value> {
         let features = self.app.features;
-        let page = self.pages.get_mut(&id).context("Window is closed")?;
+        let mut store = self.store.try_borrow_mut().context("Host is busy")?;
+        let store = &mut *store;
+        let page = store.pages.get_mut(&id).context("Window is closed")?;
         let state = &mut page.state;
-        let media = self.media.entry(id).or_default();
+        let media = store.media.entry(id).or_default();
         if op == "poll" {
             let events: Value = serde_json::from_slice(&media.poll())?;
             for event in events.as_array().into_iter().flatten() {
@@ -794,7 +808,10 @@ impl Host {
                 "Host operation is unavailable in page scripts: {op}"
             );
             if op == "dom.navigate" {
-                ensure!(self.pages.contains_key(&id), "Window is closed");
+                ensure!(
+                    self.store.borrow().pages.contains_key(&id),
+                    "Window is closed"
+                );
                 let url = args[0].as_str().context("Expected navigation URL")?;
                 ensure!(
                     url.starts_with("apps:///") || url.starts_with("file:///"),
@@ -807,7 +824,10 @@ impl Host {
                 return Ok(Value::Null);
             }
             if op == "dom.fullscreen" {
-                ensure!(self.pages.contains_key(&id), "Window is closed");
+                ensure!(
+                    self.store.borrow().pages.contains_key(&id),
+                    "Window is closed"
+                );
                 self.command(
                     Target::Window(id),
                     json!({"op":"window", "args":["htmlFullscreen",id,args[0] == true]}),
@@ -825,9 +845,12 @@ impl Host {
                 );
                 return Ok(Value::Null);
             }
-            let page = self.pages.get_mut(&id).context("Window is closed")?;
+            let store = self.store.clone();
+            let mut store = store.try_borrow_mut().context("Host is busy")?;
+            let store = &mut *store;
+            let page = store.pages.get_mut(&id).context("Window is closed")?;
             if op == "dom.viewport" {
-                let viewport = self.viewports.get(&id).unwrap_or(&[800., 600.]);
+                let viewport = store.viewports.get(&id).unwrap_or(&[800., 600.]);
                 return Ok(json!([
                     viewport[0].round(),
                     viewport[1].round(),
@@ -857,7 +880,7 @@ impl Host {
                         state.media.placeholders.contains_key(&node).then(|| {
                             crate::render::raster::render_image(&canvas.pixels, Vec::new())
                         })
-                    } else if let Some(gpu) = self.graphics.get_mut(&id) {
+                    } else if let Some(gpu) = store.graphics.get_mut(&id) {
                         let start = std::time::Instant::now();
                         loop {
                             match gpu.image(node)? {
@@ -895,7 +918,7 @@ impl Host {
                     state.window.work_area,
                     state.window.frame,
                 );
-                let viewport = self.viewports.get(&id).unwrap_or(&[800., 600.]);
+                let viewport = store.viewports.get(&id).unwrap_or(&[800., 600.]);
                 return Ok(if f32::from(display.size.width) > 0. {
                     json!(
                         [
@@ -930,7 +953,7 @@ impl Host {
             if op == "dom.fonts" {
                 state.restyle(
                     &mut page.doc,
-                    *self.viewports.get(&id).unwrap_or(&[800., 600.]),
+                    *store.viewports.get(&id).unwrap_or(&[800., 600.]),
                 );
                 let loaded = state.load_fonts(&page.doc, &self.app.assets);
                 page.dirty |= std::mem::take(&mut state.dirty);
@@ -967,7 +990,7 @@ impl Host {
                 args,
                 &mut page.doc,
                 state,
-                *self.viewports.get(&id).unwrap_or(&[800., 600.]),
+                *store.viewports.get(&id).unwrap_or(&[800., 600.]),
             );
             page.dirty |= std::mem::take(&mut state.dirty);
             // Clear retired worker images here: workers have no renderer to release them.
@@ -978,13 +1001,13 @@ impl Host {
                 && let Ok(ids) = &result
             {
                 for node in ids[0].as_array().into_iter().flatten() {
-                    if let Some(gpu) = self.graphics.get_mut(&id) {
+                    if let Some(gpu) = store.graphics.get_mut(&id) {
                         let _ = gpu.call("resetCanvas", format!("[{node}]").as_bytes());
                     }
-                    if let (Some(media), Some(node)) = (self.media.get_mut(&id), node.as_u64()) {
+                    if let (Some(media), Some(node)) = (store.media.get_mut(&id), node.as_u64()) {
                         media.close(node);
                     }
-                    if let (Some(state), Some(node)) = (self.page_state(id), node.as_u64()) {
+                    if let (Some(state), Some(node)) = (store.page_state(id), node.as_u64()) {
                         state.media.terminals.borrow_mut().release(node as usize);
                     }
                 }

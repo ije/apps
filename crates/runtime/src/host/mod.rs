@@ -6,6 +6,7 @@ pub(crate) mod worker;
 
 use crate::dom::Document;
 use crate::jsc::{JavaScriptCore, Role};
+use crate::render::{Page, Store};
 use anyhow::{Context, Result};
 use context::JsContext;
 use link::Target;
@@ -15,13 +16,6 @@ use std::{cell::RefCell, collections::HashMap, path::PathBuf, rc::Rc};
 pub(crate) const WORKER_PAGE: u64 = 0;
 
 #[derive(Default)]
-pub struct Page {
-    pub doc: Document,
-    pub state: crate::render::PageState,
-    pub dirty: bool,
-}
-
-#[derive(Default)]
 pub struct Host {
     pub(crate) link: Option<link::Link>,
     pub app: crate::bundle::AppInfo,
@@ -29,24 +23,23 @@ pub struct Host {
     pub relaunch: Option<Vec<String>>,
     pub argv: Option<Vec<String>>,
     pub commands: Vec<Value>,
-    pub pages: rustc_hash::FxHashMap<u64, Page>,
+    pub store: Rc<RefCell<Store>>,
     pub bridge: HashMap<u64, HashMap<String, crate::jsc::payload::Payload>>,
     pub dropped: HashMap<u64, Vec<String>>,
     pub browsers: crate::native::browser::State,
     pub logs: std::collections::VecDeque<Value>,
-    pub graphics: HashMap<u64, crate::web::gpu::Gpu>,
-    pub media: HashMap<u64, crate::web::media::Media>,
-    pub viewports: HashMap<u64, [f32; 2]>,
-    pub resized: Vec<u64>,
     pub window_changes: Vec<u64>,
-    pub backgrounds: HashMap<u64, (u32, u8)>,
     pub theme: u32,
     pub theme_changed: bool,
-    // The state that views of a closed page still write to until they go. Nothing reads it back.
-    pub(crate) closed: crate::render::PageState,
 }
 
 impl Host {
+    pub(crate) fn new(app: crate::bundle::AppInfo) -> Self {
+        let host = Self::default();
+        host.store.borrow_mut().set_app(&app);
+        Self { app, ..host }
+    }
+
     pub(crate) fn command(&mut self, target: Target, command: Value) {
         use link::{ToMain, ToPage};
         let Some(link) = &self.link else {
@@ -60,46 +53,17 @@ impl Host {
         }
     }
 
-    pub fn page_state(&self, id: u64) -> Option<&crate::render::PageState> {
-        self.pages.get(&id).map(|page| &page.state)
-    }
-
-    pub fn page_state_mut(&mut self, id: u64) -> Option<&mut crate::render::PageState> {
-        self.pages.get_mut(&id).map(|page| &mut page.state)
-    }
-
-    // The state of the page in window `id`.
-    pub fn state(&mut self, id: u64) -> &mut crate::render::PageState {
-        match self.pages.get_mut(&id) {
-            Some(page) => &mut page.state,
-            None => &mut self.closed,
-        }
-    }
-
-    // The document of the page in window `id`, when it is open, its state, and the app.
-    pub(crate) fn page_parts(
-        &mut self,
-        id: u64,
-    ) -> (
-        Option<&Document>,
-        &mut crate::render::PageState,
-        &crate::bundle::AppInfo,
-    ) {
-        match self.pages.get_mut(&id) {
-            Some(page) => (Some(&page.doc), &mut page.state, &self.app),
-            None => (None, &mut self.closed, &self.app),
-        }
-    }
-
     // The URL of the page in window `id`.
-    pub(crate) fn page_url(&self, id: u64) -> Option<&url::Url> {
-        self.page_state(id)?.base.as_ref()
+    pub(crate) fn page_url(&self, id: u64) -> Option<url::Url> {
+        self.store.borrow().page_state(id)?.base.clone()
     }
 
     // The nodes of each page: in its tree, allocated, and free for reuse.
     pub(crate) fn memory(&self) -> Value {
         Value::Object(
-            self.pages
+            self.store
+                .borrow()
+                .pages
                 .iter()
                 .map(|(id, page)| {
                     let (mut attached, mut pending) = (0, vec![0]);
@@ -120,7 +84,7 @@ impl Host {
     // Puts a new page in window `id`, without the resources of the old one.
     pub(crate) fn load_page(&mut self, id: u64, doc: Document) {
         self.forget_page(id);
-        self.pages.insert(
+        self.store.borrow_mut().pages.insert(
             id,
             Page {
                 doc,
@@ -132,22 +96,26 @@ impl Host {
 
     pub(crate) fn close_page(&mut self, id: u64) {
         self.forget_page(id);
-        self.pages.remove(&id);
-        self.closed = Default::default();
-        self.viewports.remove(&id);
-        self.backgrounds.remove(&id);
+        let mut store = self.store.borrow_mut();
+        store.pages.remove(&id);
+        store.closed = Default::default();
+        store.viewports.remove(&id);
+        store.backgrounds.remove(&id);
     }
 
     fn forget_page(&mut self, id: u64) {
-        self.graphics.remove(&id);
-        self.media.remove(&id);
+        let mut store = self.store.borrow_mut();
+        store.graphics.remove(&id);
+        store.media.remove(&id);
+        drop(store);
         self.bridge.remove(&id);
         self.dropped.remove(&id);
     }
 
     pub(crate) fn set_background(&mut self, id: u64, color: (u32, u8)) {
-        self.backgrounds.insert(id, color);
-        if let Some(page) = self.pages.get_mut(&id) {
+        let mut store = self.store.borrow_mut();
+        store.backgrounds.insert(id, color);
+        if let Some(page) = store.pages.get_mut(&id) {
             page.dirty = true;
         }
     }
@@ -166,7 +134,7 @@ impl Host {
         }
         self.theme = theme;
         self.theme_changed = true;
-        for page in self.pages.values_mut() {
+        for page in self.store.borrow_mut().pages.values_mut() {
             page.dirty = true;
             page.state.styles.invalidate();
         }
@@ -174,7 +142,8 @@ impl Host {
 
     // Only dom.batch and dom.html can change page trees: dom.js mirrors them for reads.
     pub(crate) fn batch(&mut self, id: u64, codes: &[u8], text: &str) -> Result<Value> {
-        let page = self.pages.get_mut(&id).context("Window is closed")?;
+        let mut store = self.store.try_borrow_mut().context("Host is busy")?;
+        let page = store.pages.get_mut(&id).context("Window is closed")?;
         let (changed, errors) = page.state.batch(&mut page.doc, codes, text);
         page.dirty |= changed;
         Ok(if errors.is_empty() {

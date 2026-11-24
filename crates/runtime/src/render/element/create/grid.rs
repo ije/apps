@@ -154,8 +154,8 @@ pub(super) fn grid_container(
                 [min, max].map(|value| (value - horizontal - margin[1] - margin[3]).max(0.));
             widest = Some([min, max]);
             let last = {
-                let mut host = view.host.borrow_mut();
-                let dom = host.state(view.id);
+                let mut store = view.store.borrow_mut();
+                let dom = store.state(view.id);
                 let same = dom.layout.grid_widest.insert(id, max) == Some(max);
                 same.then(|| dom.layout.cull.widths.get(&id).map(|size| size[0].max(0.)))
                     .flatten()
@@ -172,7 +172,7 @@ pub(super) fn grid_container(
         }
         if fills {
             if let Some(last) = view
-                .host
+                .store
                 .borrow()
                 .page_state(view.id)
                 .and_then(|dom| dom.layout.cull.widths.get(&id))
@@ -239,7 +239,7 @@ pub(super) fn grid_container(
             definite = (containing[1] - insets - margin[0] - margin[2] - vertical).max(0.);
             Some(definite)
         } else if flexed {
-            let height = view.host.borrow().page_state(view.id).and_then(|state| {
+            let height = view.store.borrow().page_state(view.id).and_then(|state| {
                 state
                     .layout
                     .cull
@@ -252,8 +252,8 @@ pub(super) fn grid_container(
         } else {
             None
         };
-        let mut host = view.host.borrow_mut();
-        let dom = host.state(view.id);
+        let mut store = view.store.borrow_mut();
+        let dom = store.state(view.id);
         for (axis, track) in tracked.iter().enumerate() {
             if let Some((used, _)) = track {
                 reader.log(
@@ -273,9 +273,9 @@ pub(super) fn grid_container(
         } else {
             dom.layout.flexed_grids.remove(&id);
         }
-        drop(host);
+        drop(store);
         let cached = view
-            .host
+            .store
             .borrow()
             .page_state(view.id)
             .and_then(|state| state.layout.grids.get(&id))
@@ -293,14 +293,14 @@ pub(super) fn grid_container(
                 Some(content[0]),
                 height,
                 slot.as_ref().map(|(_, grid)| grid),
-                view.host
+                view.store
                     .borrow()
                     .page_state(view.id)
                     .map(|dom| &dom.layout.baselines),
                 text,
                 &mut measured.borrow_mut(),
             );
-            view.host.borrow_mut().state(view.id).layout.grids.insert(
+            view.store.borrow_mut().state(view.id).layout.grids.insert(
                 id,
                 (
                     content[0],
@@ -315,8 +315,8 @@ pub(super) fn grid_container(
         None
     };
     if let Some(grid) = &grid {
-        let mut host = view.host.borrow_mut();
-        let tracks = &mut host.state(view.id).layout.tracks;
+        let mut store = view.store.borrow_mut();
+        let tracks = &mut store.state(view.id).layout.tracks;
         if tracks
             .get(&id)
             .is_none_or(|[columns, rows]| **columns != *grid.columns || **rows != *grid.rows)
@@ -326,7 +326,7 @@ pub(super) fn grid_container(
                 [grid.columns.as_slice().into(), grid.rows.as_slice().into()],
             );
         }
-        drop(host);
+        drop(store);
         el = el.flex().flex_col();
         for (index, item) in items.iter_mut().enumerate() {
             let key = !(id * 2 + index);

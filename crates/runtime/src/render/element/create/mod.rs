@@ -154,8 +154,8 @@ pub(super) fn create(
                 {
                     return Some(zone.clone());
                 }
-                let host = view.host.borrow();
-                let dom = host.page_state(view.id)?;
+                let store = view.store.borrow();
+                let dom = store.page_state(view.id)?;
                 let rect = *dom.geometry.mirror.get(&id)?;
                 let moved = dom.layout.cull.scrolled.get(&id).copied().unwrap_or(0.);
                 Some(Rc::new(cull::Zone {
@@ -226,7 +226,7 @@ pub(super) fn create(
                 }
                 // Prefer the last layout to the estimate: missed min/max constraints can cause endless
                 // redraws.
-                let size = reader.block_size(view.host.borrow().page_state(view.id), block);
+                let size = reader.block_size(view.store.borrow().page_state(view.id), block);
                 reader.log(
                     Query::Block(block as u32),
                     0,
@@ -325,7 +325,7 @@ pub(super) fn create(
         let mut br = renderer::canvas(
             move |bounds, _| {
                 let view = &*view;
-                view.host
+                view.store
                     .borrow_mut()
                     .state(view.id)
                     .geometry
@@ -341,8 +341,9 @@ pub(super) fn create(
                     );
             },
             move |bounds, _, window| {
-                let caret = painter.host.try_borrow().is_ok_and(|host| {
-                    host.page_state(painter.id)
+                let caret = painter.store.try_borrow().is_ok_and(|store| {
+                    store
+                        .page_state(painter.id)
                         .is_some_and(|dom| dom.interaction.selection_caret == Some(id))
                 });
                 if caret {
@@ -369,7 +370,7 @@ pub(super) fn create(
     // the geometry of the contents, it builds them but keeps the size it had without them.
     let (skipped, forced, intrinsic, last) = if info[id].flags & cull::SKIPS != 0 {
         let last = view
-            .host
+            .store
             .borrow()
             .page_state(view.id)
             .and_then(|dom| dom.layout.cull.widths.get(&id).copied());
@@ -624,8 +625,8 @@ pub(super) fn create(
     cx.share = share;
     cx.hit = share.and_then(|key| {
         let shared = view.shared.borrow();
-        let host = view.host.borrow();
-        let dom = host.page_state(view.id);
+        let store = view.store.borrow();
+        let dom = store.page_state(view.id);
         let here = |read: &Read| Read {
             query: read.query.moved(u32::MAX, id as u32).unwrap_or(read.query),
             ..*read
@@ -862,8 +863,8 @@ pub(super) fn create(
     };
     let reserved = look.as_ref().map_or([0.; 2], |look| {
         // Make the handle before the read, or the read logs none and its replay finds the handle.
-        let mut host = view.host.borrow_mut();
-        let dom = host.state(view.id);
+        let mut store = view.store.borrow_mut();
+        let dom = store.state(view.id);
         let handle = dom.geometry.scroll.entry(id).or_default();
         reader.log(Query::Scroll(id as u32), 0, hashed(scrolled(Some(handle))));
         look.space(look.shown(scrolls, handle.extent()))
@@ -1403,7 +1404,7 @@ pub(super) fn create(
             .is_some_and(|value| value != "none")
     {
         let base = view
-            .host
+            .store
             .borrow()
             .page_state(view.id)
             .and_then(|state| state.base.clone());
@@ -1420,7 +1421,7 @@ pub(super) fn create(
             [borders, padding, [0.; 4]],
             view.clone(),
             base.as_ref(),
-            &view.host.borrow().app.assets,
+            &view.store.borrow().assets,
             canvas.is_some(),
         ));
     }
@@ -1596,8 +1597,8 @@ pub(super) fn create(
     }
     let overscroll = overscroll(style);
     let handle = {
-        let mut host = view.host.borrow_mut();
-        let scroll = &mut host.state(view.id).geometry.scroll;
+        let mut store = view.store.borrow_mut();
+        let scroll = &mut store.state(view.id).geometry.scroll;
         if scrolls.contains(&true)
             || !page
                 && overflow.contains(&renderer::Overflow::Hidden)
@@ -1647,8 +1648,8 @@ pub(super) fn create(
     let own = kind
         .is_some_and(|v| matches!(v, "inline-size" | "size"))
         .then(|| {
-            let mut host = view.host.borrow_mut();
-            let dom = host.state(view.id);
+            let mut store = view.store.borrow_mut();
+            let dom = store.state(view.id);
             let last = dom.layout.cull.widths.get(&id).copied();
             reader.log(
                 Query::Width(id as u32),
@@ -1836,7 +1837,7 @@ pub(super) fn create(
                         })
             })
             .collect();
-        if let Some(dom) = view.host.borrow_mut().page_state_mut(view.id) {
+        if let Some(dom) = view.store.borrow_mut().page_state_mut(view.id) {
             let last = dom
                 .layout
                 .autos

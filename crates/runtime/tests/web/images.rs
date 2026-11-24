@@ -142,10 +142,7 @@ fn avif_rejects_corrupt_data_and_respects_limits() {
 
 #[test]
 fn svg_and_bundled_images_load_through_the_host() {
-    use apps_runtime::{
-        host::{Host, Page},
-        jsc::Role,
-    };
+    use apps_runtime::{host::Host, jsc::Role, render::Page};
     use std::io::Write;
     let mut doc = Document::parse("<body><img></body>");
     let mut state = apps_runtime::render::PageState::default();
@@ -180,7 +177,7 @@ fn svg_and_bundled_images_load_through_the_host() {
     std::fs::write(&png, include_bytes!("../images/sample.png")).unwrap();
     let mut host = Host::default();
     std::sync::Arc::make_mut(&mut host.app.assets).insert("assets/sample.png".into(), png.clone());
-    host.pages.insert(
+    host.store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<body><img></body>"),
@@ -188,7 +185,7 @@ fn svg_and_bundled_images_load_through_the_host() {
             ..Default::default()
         },
     );
-    host.state(1).base = Some(url::Url::parse("apps:///page-0.html").unwrap());
+    host.store.borrow_mut().state(1).base = Some(url::Url::parse("apps:///page-0.html").unwrap());
     let load = |host: &mut Host, source: &str| {
         host.call(Role::Renderer(1), "dom.imageURL", json!([1, source]))
     };
@@ -206,13 +203,27 @@ fn svg_and_bundled_images_load_through_the_host() {
         }
     };
     assert!(load(&mut host, "assets/sample.png").unwrap().is_u64());
-    assert!(!host.pages[&1].dirty && !host.pages[&1].state.media.images.contains_key(&1));
+    assert!(
+        !host.store.borrow().pages[&1].dirty
+            && !host.store.borrow().pages[&1]
+                .state
+                .media
+                .images
+                .contains_key(&1)
+    );
     assert_eq!(decoded(&mut host), json!([4, 3]));
-    assert!(host.pages[&1].dirty && host.pages[&1].state.media.images.contains_key(&1));
+    assert!(
+        host.store.borrow().pages[&1].dirty
+            && host.store.borrow().pages[&1]
+                .state
+                .media
+                .images
+                .contains_key(&1)
+    );
     assert!(load(&mut host, "apps:///assets/missing.png").is_err());
     assert!(load(&mut host, png.to_str().unwrap()).is_err());
     assert!(load(&mut host, url::Url::from_file_path(&png).unwrap().as_str()).is_err());
-    host.page_state_mut(1).unwrap().base =
+    host.store.borrow_mut().page_state_mut(1).unwrap().base =
         Some(url::Url::from_directory_path(directory.path()).unwrap());
     load(&mut host, "sample.png").unwrap();
     assert_eq!(decoded(&mut host), json!([4, 3]));

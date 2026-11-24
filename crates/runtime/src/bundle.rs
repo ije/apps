@@ -709,11 +709,7 @@ pub(crate) mod map {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        host::{Host, Page},
-        jsc::Role,
-        style,
-    };
+    use crate::{host::Host, jsc::Role, render::Page, style};
     use serde_json::json;
 
     fn metadata(source: Option<&str>) -> Result<(String, String, String, String)> {
@@ -985,7 +981,7 @@ mod tests {
             }
         }
         let mut host = Host::default();
-        host.pages.insert(
+        host.store.borrow_mut().pages.insert(
             1,
             Page {
                 doc,
@@ -1015,7 +1011,7 @@ mod tests {
                 .collect();
             assert!(host.batch(1, &codes, text).unwrap().is_null());
             assert_eq!(
-                style::styles(&host.pages[&1].doc, 800., 600.)[card]["height"],
+                style::styles(&host.store.borrow().pages[&1].doc, 800., 600.)[card]["height"],
                 height
             );
         }

@@ -591,7 +591,7 @@ impl Cx<'_> {
         } = *self.build;
         let reader = self.reader;
         let last = view
-            .host
+            .store
             .borrow()
             .page_state(view.id)
             .and_then(|dom| dom.layout.atoms.get(&atom.key()).copied());

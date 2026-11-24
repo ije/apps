@@ -241,11 +241,12 @@ fn declarative_handlers_are_main_only() {
         ] {
             let files = compile(&entry, realm, None, Rc::default(), production, None).unwrap();
             let host = Rc::new(RefCell::new(apps_runtime::host::Host::default()));
-            host.borrow_mut().pages.insert(
+            host.borrow().store.borrow_mut().pages.insert(
                 1,
-                apps_runtime::host::Page {
+                apps_runtime::render::Page {
                     doc: Document::parse("<body></body>"),
                     dirty: false,
+                    ..Default::default()
                 },
             );
             let engine = apps_runtime::host::context::JsContext::new(
@@ -516,15 +517,17 @@ fn package_preload_dynamic_imports_follow_watch_changes() {
 fn react_counter() {
     for production in [false, true] {
         use apps_runtime::{
-            host::{Host, Page, context::JsContext},
+            host::{Host, context::JsContext},
             jsc::{JavaScriptCore, Role},
+            render::Page,
         };
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
+        host.borrow().store.borrow_mut().pages.insert(
             1,
             Page {
                 doc: Document::parse("<html><body><div id='root'></div></body></html>"),
                 dirty: false,
+                ..Default::default()
             },
         );
         let engine = JsContext::new(
@@ -578,7 +581,7 @@ fn react_counter() {
             );
         }
         assert_eq!(engine.eval("typeof process", "test").unwrap(), "undefined");
-        assert!(host.borrow().pages[&1].dirty);
+        assert!(host.borrow().store.borrow().pages[&1].dirty);
     }
 }
 
@@ -587,8 +590,9 @@ fn react_counter() {
 fn three_webgpu_renders_a_cube() {
     for production in [false, true] {
         use apps_runtime::{
-            host::{Host, Page, context::JsContext},
+            host::{Host, context::JsContext},
             jsc::{JavaScriptCore, Role},
+            render::Page,
         };
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/three")
@@ -604,14 +608,19 @@ fn three_webgpu_renders_a_cube() {
         )
         .unwrap();
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
+        host.borrow().store.borrow_mut().pages.insert(
             1,
             Page {
                 doc: Document::parse("<html><body></body></html>"),
                 dirty: false,
+                ..Default::default()
             },
         );
-        host.borrow_mut().viewports.insert(1, [96., 96.]);
+        host.borrow()
+            .store
+            .borrow_mut()
+            .viewports
+            .insert(1, [96., 96.]);
         let engine = JsContext::new(
             JavaScriptCore::load().unwrap(),
             host.clone(),
@@ -641,7 +650,7 @@ fn three_webgpu_renders_a_cube() {
                 .unwrap(),
             "true"
         );
-        let node = host.borrow().pages[&1]
+        let node = host.borrow().store.borrow().pages[&1]
             .doc
             .nodes
             .iter()
@@ -651,6 +660,8 @@ fn three_webgpu_renders_a_cube() {
             for _ in 0..5000 {
                 engine.tick().unwrap();
                 let image = host
+                    .borrow()
+                    .store
                     .borrow_mut()
                     .graphics
                     .get_mut(&1)
@@ -890,11 +901,12 @@ fn package_features_reach_the_runtime() {
         let mut host = apps_runtime::host::Host::default();
         host.app.features = features;
         let host = Rc::new(RefCell::new(host));
-        host.borrow_mut().pages.insert(
+        host.borrow().store.borrow_mut().pages.insert(
             1,
-            apps_runtime::host::Page {
+            apps_runtime::render::Page {
                 doc: Document::parse("<html><body><canvas></canvas></body></html>"),
                 dirty: false,
+                ..Default::default()
             },
         );
         let engine = apps_runtime::host::context::JsContext::new(

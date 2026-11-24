@@ -1,9 +1,6 @@
 use apps_runtime::{
-    dom::Document,
-    host::context::JsContext,
-    host::{Host, Page},
-    jsc::JavaScriptCore,
-    jsc::Role,
+    dom::Document, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role,
+    render::Page,
 };
 use std::time::{Duration, Instant};
 
@@ -86,7 +83,7 @@ fn descendant_selector() {
 
 fn page(html: &str, script: &str) -> String {
     let host = std::rc::Rc::new(std::cell::RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse(html),
@@ -169,7 +166,7 @@ fn child_access() {
 #[ignore = "release performance measurement"]
 fn release_sweep() {
     let host = std::rc::Rc::new(std::cell::RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse(&format!(
@@ -234,9 +231,9 @@ fn shadow_restyle_and_hover() {
 #[ignore = "release performance measurement"]
 fn host_calls() {
     let host: std::rc::Rc<std::cell::RefCell<apps_runtime::host::Host>> = Default::default();
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
-        apps_runtime::host::Page {
+        apps_runtime::render::Page {
             doc: Document::parse("<body><p id=a class='x y'>hi</p></body>"),
             dirty: false,
             ..Default::default()
@@ -261,7 +258,7 @@ fn host_calls() {
 #[ignore = "release performance measurement"]
 fn dom_updates() {
     let host: std::rc::Rc<std::cell::RefCell<Host>> = Default::default();
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<body><main></main><section></section></body>"),
@@ -358,7 +355,7 @@ fn image_decode() {
     .save(&path)
     .unwrap();
     let host = std::rc::Rc::new(std::cell::RefCell::new(Host::default()));
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<body></body>"),
@@ -366,8 +363,14 @@ fn image_decode() {
             ..Default::default()
         },
     );
-    host.borrow_mut().pages.get_mut(&1).unwrap().state.base =
-        Some(url::Url::from_directory_path(directory.path()).unwrap());
+    host.borrow()
+        .store
+        .borrow_mut()
+        .pages
+        .get_mut(&1)
+        .unwrap()
+        .state
+        .base = Some(url::Url::from_directory_path(directory.path()).unwrap());
     let engine = JsContext::new(JavaScriptCore::load().unwrap(), host, Role::Renderer(1)).unwrap();
     let source = url::Url::from_file_path(&path).unwrap();
     let mut rounds = Vec::new();
@@ -393,7 +396,7 @@ fn image_decode() {
 #[ignore = "release performance measurement; requires a native GPU adapter"]
 fn webgpu_present() {
     let host: std::rc::Rc<std::cell::RefCell<Host>> = Default::default();
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse("<canvas id=c width=1920 height=1080></canvas>"),
@@ -415,7 +418,7 @@ fn webgpu_present() {
     while engine.eval("typeof frame", "bench").unwrap() != "function" {
         engine.tick().unwrap();
     }
-    let node = host.borrow().pages[&1]
+    let node = host.borrow().store.borrow().pages[&1]
         .doc
         .nodes
         .iter()
@@ -433,6 +436,8 @@ fn webgpu_present() {
             loop {
                 let call = Instant::now();
                 let image = host
+                    .borrow()
+                    .store
                     .borrow_mut()
                     .graphics
                     .get_mut(&1)
@@ -536,7 +541,7 @@ fn layout_reads() {
         .repeat(sections)
     );
     let host: std::rc::Rc<std::cell::RefCell<Host>> = Default::default();
-    host.borrow_mut().pages.insert(
+    host.borrow().store.borrow_mut().pages.insert(
         1,
         Page {
             doc: Document::parse(&html),
@@ -545,6 +550,7 @@ fn layout_reads() {
         },
     );
     {
+        let host = host.borrow().store.clone();
         let mut host = host.borrow_mut();
         let bounds: Vec<_> = (0..host.pages[&1].doc.nodes.len())
             .map(|id| (id, [0., (id * 7 % 3000) as f32, 300., 20.]))

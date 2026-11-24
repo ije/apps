@@ -76,8 +76,8 @@ pub(crate) fn paint(
     };
     // Native controls are placed again in each frame.
     window.paint_volatile();
-    let host = view.host.borrow();
-    let Some(node) = host
+    let store = view.store.borrow();
+    let Some(node) = store
         .pages
         .get(&view.id)
         .and_then(|page| page.doc.nodes.get(id))

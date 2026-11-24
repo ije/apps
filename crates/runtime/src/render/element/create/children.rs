@@ -230,8 +230,8 @@ pub(super) fn children(
     let mut culled_ids = Vec::new();
     let mut plan = None;
     if let Some(zone) = stack {
-        let host = view.host.borrow();
-        if let Some(dom) = host.page_state(view.id)
+        let store = view.store.borrow();
+        if let Some(dom) = store.page_state(view.id)
             && let Some(&[left, ..]) = dom.geometry.mirror.get(&id)
             && let Some(&[width, _]) = dom.layout.cull.widths.get(&id)
         {
@@ -345,7 +345,7 @@ pub(super) fn children(
     }
     let mut culled = Vec::new();
     if let (Some(grid), Some(zone)) = (&grid, &build.zone) {
-        if let Some(dom) = view.host.borrow().page_state(view.id) {
+        if let Some(dom) = view.store.borrow().page_state(view.id) {
             for &(child, _, [x, y, width, height], _) in &grid.cells {
                 if crate::render::layout::grid::intrinsic::pseudo_item(child).is_some() {
                     continue;
@@ -776,8 +776,8 @@ pub(super) fn children(
             // The containing block of a grid item is its grid area. Table parts take it from their table.
             let own = area.filter(|_| !style::table_part(doc, styles, child));
             if let Some(own) = own {
-                let mut host = view.host.borrow_mut();
-                host.state(view.id).layout.areas.insert(child, own);
+                let mut store = view.store.borrow_mut();
+                store.state(view.id).layout.areas.insert(child, own);
             }
             let bounds = placement.as_ref().map(|(bounds, _)| *bounds);
             // A kept text field builds again from its patch, which must hold its new place.
@@ -971,7 +971,7 @@ pub(super) fn children(
                     move |mut bounds, _| {
                         bounds.origin.y += px(pending);
                         let view = &*entity;
-                        view.host
+                        view.store
                             .borrow_mut()
                             .state(view.id)
                             .layout

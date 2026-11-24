@@ -74,8 +74,8 @@ impl PageView {
     ) -> renderer::Child {
         let started = std::time::Instant::now();
         {
-            let mut host = self.host.borrow_mut();
-            let state = host.state(self.id);
+            let mut store = self.store.borrow_mut();
+            let state = store.state(self.id);
             state.attach_window(window);
             state.geometry.unshift();
             state.geometry.sync_scroll();
@@ -83,20 +83,20 @@ impl PageView {
             changes::repaint(state, window);
         }
         let pointer_events = pointer::events(self.0.clone());
-        let mut host = self.host.borrow_mut();
+        let mut store = self.store.borrow_mut();
         let size = window.viewport_size();
         let width = f32::from(size.width);
         let height = f32::from(size.height);
-        let resized = host.viewports.insert(self.id, [width, height]) != Some([width, height]);
+        let resized = store.viewports.insert(self.id, [width, height]) != Some([width, height]);
         // The desktop is borrowed while it opens a window, so resize events go through a deferred
         // `Desktop::drive`.
-        if resized && !host.resized.contains(&self.id) {
-            host.resized.push(self.id);
+        if resized && !store.resized.contains(&self.id) {
+            store.resized.push(self.id);
             let runtime = self.runtime.clone();
             cx.defer(move |cx| runtime.drive(cx));
         }
-        let inspectable = !host.app.packaged;
-        let state = &mut *host;
+        let inspectable = !store.packaged;
+        let state = &mut *store;
         let Some(page) = state.pages.get_mut(&self.id) else {
             return renderer::node().size_full().into();
         };
@@ -157,7 +157,7 @@ impl PageView {
         let cached = dom.styles.computed.clone();
         let mut styles = dom.restyle(&mut doc, [width, height]);
         if cached.is_none_or(|cached| !std::rc::Rc::ptr_eq(&cached, &styles))
-            && dom.load_fonts(&doc, &state.app.assets).0
+            && dom.load_fonts(&doc, &state.assets).0
         {
             styles = dom.restyle(&mut doc, [width, height]);
         }
@@ -473,10 +473,13 @@ impl PageView {
         let autos = !dom.layout.autos.is_empty();
         let measured = RefCell::new(std::mem::take(&mut dom.layout.measurements));
         let walk = dom.styles.walk.snapshot();
-        for text in warnings {
-            host.log(serde_json::json!({"method":"Runtime.consoleAPICalled","params":{"type":"error","text":text,"context":crate::jsc::Role::Renderer(self.id)}}));
+        drop(store);
+        if !warnings.is_empty() {
+            let mut host = self.host.borrow_mut();
+            for text in warnings {
+                host.log(serde_json::json!({"method":"Runtime.consoleAPICalled","params":{"type":"error","text":text,"context":crate::jsc::Role::Renderer(self.id)}}));
+            }
         }
-        drop(host);
         let text_system = window.text_system().clone();
         let ids = {
             let mut ids = self.ids.borrow_mut();
@@ -575,8 +578,8 @@ impl PageView {
             doc.nodes.compose_children(node, children);
         }
         let repass = {
-            let mut host = self.host.borrow_mut();
-            let dom = host.state(self.id);
+            let mut store = self.store.borrow_mut();
+            let dom = store.state(self.id);
             for id in dom.styles.unanchored.drain(..) {
                 window.suppress_anchoring(id);
             }
@@ -620,7 +623,7 @@ impl PageView {
             let changed = dom.update_containers(&doc);
             let repass = changed && !dom.layout.container_pass;
             dom.layout.container_pass = repass;
-            if let Some(page) = host.pages.get_mut(&self.id) {
+            if let Some(page) = store.pages.get_mut(&self.id) {
                 page.doc = doc;
             }
             repass

@@ -234,17 +234,14 @@ impl Drop for Gpu {
 #[cfg(test)]
 mod tests {
     use crate::{
-        dom::Document,
-        host::context::JsContext,
-        host::{Host, Page},
-        jsc::JavaScriptCore,
-        jsc::Role,
+        dom::Document, host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role,
+        render::Page,
     };
     use std::{cell::RefCell, rc::Rc};
 
     fn page() -> (Rc<RefCell<Host>>, JsContext) {
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
+        host.borrow().store.borrow_mut().pages.insert(
             1,
             Page {
                 doc: Document::parse("<body></body>"),
@@ -262,7 +259,9 @@ mod tests {
     }
 
     fn stats(host: &Rc<RefCell<Host>>, key: &str) -> u64 {
-        host.borrow_mut()
+        host.borrow()
+            .store
+            .borrow_mut()
             .graphics
             .get_mut(&1)
             .unwrap()

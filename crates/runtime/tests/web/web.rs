@@ -1,8 +1,5 @@
 use apps_runtime::{
-    host::context::JsContext,
-    host::{Host, Page},
-    jsc::JavaScriptCore,
-    jsc::Role,
+    host::Host, host::context::JsContext, jsc::JavaScriptCore, jsc::Role, render::Page,
 };
 use std::{
     cell::RefCell,
@@ -15,7 +12,7 @@ fn web_apis_in_every_context() {
     let api = JavaScriptCore::load().unwrap();
     for role in [Role::Main, Role::Preload(1), Role::Renderer(1)] {
         let host = Rc::new(RefCell::new(Host::default()));
-        host.borrow_mut().pages.insert(
+        host.borrow().store.borrow_mut().pages.insert(
             1,
             Page {
                 doc: apps_runtime::dom::Document::parse("<html><body></body></html>"),
@@ -303,7 +300,7 @@ fn runtime_imports_follow_features() {
     let run = |features: apps_runtime::bundle::Features, role: Role, code: &str| {
         let host = Rc::new(RefCell::new(Host::default()));
         host.borrow_mut().app.features = features;
-        host.borrow_mut().pages.insert(
+        host.borrow().store.borrow_mut().pages.insert(
             1,
             Page {
                 doc: apps_runtime::dom::Document::parse("<html><body></body></html>"),
