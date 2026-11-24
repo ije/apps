@@ -1,11 +1,15 @@
 use super::super::layout::cull;
-use super::super::paint::background;
+use super::super::paint::{background, spacer};
+use super::super::{PageState, ViewState, layout};
+use super::Cx;
 use crate::css;
 use crate::css::properties::Prop;
+use crate::dom::Document;
 use crate::style;
+use crate::style::ComputedStyles;
 use std::{rc::Rc, sync::Arc};
 
-pub(crate) fn in_view(
+pub(super) fn in_view(
     bounds: &crate::dom::LayoutMirror,
     [width, height]: [f32; 2],
     id: usize,
@@ -24,7 +28,7 @@ pub(crate) fn in_view(
         && clips.all(|(clip, axes)| bounds.get(&clip).is_none_or(|&rect| overlaps(rect, axes)))
 }
 
-pub(crate) fn clips<'a>(
+pub(super) fn clips<'a>(
     doc: &'a crate::dom::Document,
     styles: &'a style::ComputedStyles,
     id: usize,
@@ -56,7 +60,7 @@ pub(crate) fn clips<'a>(
 }
 
 // Returns whether the walk changed by a patch that kept the lists of cells, canvases and iframes.
-pub(crate) fn walk(
+pub(super) fn walk(
     doc: &crate::dom::Document,
     dom: &mut crate::render::PageState,
     styles: &style::ComputedStyles,
@@ -134,24 +138,7 @@ pub(crate) fn walk(
     patched
 }
 
-// The box skips its contents, so they are not rendered.
-// Without `forced`, also the boxes that show their contents only for the geometry that a script reads.
-pub(crate) fn skipping(
-    doc: &crate::dom::Document,
-    dom: &crate::render::PageState,
-    styles: &style::ComputedStyles,
-    id: usize,
-    forced: bool,
-) -> bool {
-    let style = &styles.values[id];
-    let flags = match dom.layout.layout_nodes.get(id).and_then(Option::as_ref) {
-        Some(old) if Rc::ptr_eq(&old.style, style) => old.flags,
-        _ => u32::from(cull::skippable(&doc.nodes[id].tag, style)) * cull::SKIPS,
-    };
-    cull::skips(flags, style, id, &dom.layout.measurements, forced)
-}
-
-pub(crate) fn visibility(
+fn visibility(
     doc: &crate::dom::Document,
     dom: &crate::render::PageState,
     styles: &style::ComputedStyles,
@@ -160,7 +147,8 @@ pub(crate) fn visibility(
     for &(node, parent) in dom.layout.cull.walk.order().iter() {
         let node = node as usize;
         if parent != u32::MAX
-            && (!visible[parent as usize] || skipping(doc, dom, styles, parent as usize, true))
+            && (!visible[parent as usize]
+                || cull::skipping(doc, &dom.layout, styles, parent as usize, true))
         {
             continue;
         }
@@ -186,7 +174,7 @@ pub(crate) fn visibility(
     visible
 }
 
-pub(crate) fn drop_hidden_images(
+pub(super) fn drop_hidden_images(
     dom: &mut crate::render::PageState,
     visible: &[bool],
     styles: &style::ComputedStyles,
@@ -277,6 +265,263 @@ pub(crate) fn drop_hidden_images(
             false
         }
     });
+}
+
+// Boxes forced to show their contents for a script skip them again in the next frame.
+pub(super) fn wake(
+    view: &Rc<ViewState>,
+    doc: &Document,
+    dom: &mut PageState,
+    styles: &ComputedStyles,
+) {
+    let mut waking = std::mem::take(&mut dom.layout.measurements.waking);
+    if !view.reflowing.get() {
+        waking.extend(dom.layout.measurements.forced.drain());
+    }
+    if !waking.is_empty() {
+        let mut nodes = rustc_hash::FxHashSet::default();
+        for id in waking {
+            let path: Vec<_> = std::iter::successors(Some(id), |&node| {
+                dom.tree.flat_parent(doc, &styles.children, node)
+            })
+            .collect();
+            for node in path {
+                if let Some(info) = dom.layout.cull.info.get_mut(node) {
+                    info.flags &= !cull::SHOWN;
+                }
+                nodes.insert(node);
+            }
+            // The boxes inside kept records of the other state, like the boxes of nested `auto` boxes.
+            let mut pending = doc
+                .nodes
+                .get(id)
+                .map_or_else(Vec::new, |node| node.children.clone());
+            while let Some(node) = pending.pop() {
+                nodes.insert(node);
+                pending.extend(&doc.nodes[node].children);
+                pending.extend(dom.tree.shadows.get(&node));
+            }
+        }
+        spacer::reskip(view, dom, &nodes);
+    }
+}
+
+// The nodes that show, the list of the last frame when all nodes were visited again, and the nodes that a
+// patched walk showed or hid.
+pub(super) fn update(
+    doc: &Document,
+    dom: &mut PageState,
+    styles: &ComputedStyles,
+    last: Option<&(u64, Option<usize>, Rc<ComputedStyles>)>,
+    same: bool,
+    walked: &Rc<Vec<(u32, u32)>>,
+    serial: u64,
+) -> (Vec<bool>, Option<Vec<bool>>, Vec<usize>) {
+    let mut visible = std::mem::take(&mut dom.layout.cull.visible);
+    let mut previous = None;
+    let patched = !same && walk(doc, dom, styles);
+    let none = |style: &Rc<css::properties::Style>| style.get(Prop::DISPLAY) == Some("none");
+    let skips = |id: usize, style: &Rc<css::properties::Style>| {
+        let value = style.get(Prop::CONTENT_VISIBILITY);
+        let tag = doc.nodes.get(id).map_or("", |node| node.tag.as_str());
+        (
+            cull::skippable(tag, style),
+            value == Some("hidden"),
+            value == Some("auto"),
+        )
+    };
+    let rewalked = !dom.layout.cull.walk.holds(walked);
+    // A patched walk changes the visibility of the nodes it touched only. Table cells also show their rows,
+    // so their lists must be the same.
+    let touched = dom.layout.cull.walk.since(serial).filter(|_| patched);
+    // A `content-visibility: auto` box that shows or skips its contents shows or hides all nodes in it.
+    let steady = !std::mem::take(&mut dom.layout.cull.reskipped)
+        && (same
+            || dom.layout.cull.cascaded
+                && (!rewalked || touched.is_some())
+                && last.as_ref().is_some_and(|(.., computed)| {
+                    styles
+                        .values
+                        .differing(&computed.values)
+                        .flatten()
+                        .all(|id| {
+                            computed.values.get(id).is_none_or(|old| {
+                                styles.values.get(id).is_some_and(|new| {
+                                    none(old) == none(new) && skips(id, old) == skips(id, new)
+                                })
+                            })
+                        })
+                }));
+    // The nodes that a patched walk showed or hid.
+    let mut flips = Vec::new();
+    if steady {
+        let start = visible.len();
+        if start < doc.nodes.len() {
+            visible.resize(doc.nodes.len(), false);
+            dom.geometry
+                .mirror
+                .hide(&visible, &[], start..visible.len());
+        }
+        let walk = &dom.layout.cull.walk;
+        let mut placed: Vec<(u32, u32)> = Vec::new();
+        for &id in touched.into_iter().flatten() {
+            match walk.place(id as usize) {
+                Some(at) => placed.push((at, id)),
+                None if visible[id as usize] => {
+                    visible[id as usize] = false;
+                    flips.push(id as usize);
+                }
+                None => {}
+            }
+        }
+        placed.sort_unstable();
+        placed.dedup();
+        for (at, id) in placed {
+            let (id, parent) = (id as usize, walk.order()[at as usize].1);
+            let style = &styles.values[id];
+            let shown = (parent == u32::MAX
+                || visible[parent as usize]
+                    && !cull::skipping(doc, &dom.layout, styles, parent as usize, true))
+                && !match dom.layout.layout_nodes.get(id).and_then(Option::as_ref) {
+                    Some(old) if Rc::ptr_eq(&old.style, style) => old.flags & cull::HIDDEN != 0,
+                    _ => none(style),
+                };
+            if visible[id] != shown {
+                visible[id] = shown;
+                flips.push(id);
+            }
+        }
+        for &id in &flips {
+            dom.geometry.mirror.show(id, visible[id]);
+        }
+    } else {
+        previous = Some(std::mem::replace(
+            &mut visible,
+            visibility(doc, dom, styles),
+        ));
+        dom.layout.cull.cascaded = true;
+    }
+    #[cfg(debug_assertions)]
+    if steady && !same {
+        assert!(
+            visible == visibility(doc, dom, styles),
+            "kept visibility differs"
+        );
+    }
+    (visible, previous, flips)
+}
+
+// Clear node-ID caches for hidden or removed nodes here, and freed nodes in dom.release. New nodes
+// can reuse their IDs.
+pub(super) fn forget(
+    cx: &Cx,
+    dom: &mut PageState,
+    styles: &ComputedStyles,
+    flips: Vec<usize>,
+    flipped: bool,
+    window: &mut renderer::Window,
+) {
+    drop_hidden_images(dom, cx.visible, styles, |image| window.release_image(image));
+    cx.view
+        .mask_sources
+        .borrow_mut()
+        .retain(|key, _| dom.rasters.masks.contains_key(key));
+    for id in flips.into_iter().filter(|&id| !cx.shown(id)) {
+        cx.view.svgs.borrow_mut().remove(&id);
+        cx.view.kept.borrow_mut().remove(&id);
+        cx.view.patches.borrow_mut().remove(&id);
+        cx.view.outs.borrow_mut().remove(&id);
+        cx.view.walked.borrow_mut().remove(&id);
+        cx.view.adjoined.borrow_mut().remove(&id);
+        cx.view.fields.borrow_mut().remove(&id);
+        cx.view
+            .decoding
+            .borrow_mut()
+            .retain(|_, (node, _)| *node != id);
+        dom.layout.containers.remove(&id);
+        dom.layout.flexed_grids.remove(&id);
+        dom.layout.grid_widest.remove(&id);
+        dom.layout.tracks.remove(&id);
+        dom.layout.areas.remove(&id);
+        dom.layout.anchors.remove(&id);
+        dom.layout
+            .anchors
+            .remove(&crate::render::inline::atom_key(id, 2));
+    }
+    if flipped {
+        cx.view.svgs.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view.kept.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view.patches.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view.outs.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view.walked.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view.adjoined.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view.fields.borrow_mut().retain(|&id, _| cx.shown(id));
+        cx.view
+            .decoding
+            .borrow_mut()
+            .retain(|_, (id, _)| cx.shown(*id));
+        dom.layout.containers.retain(|&id, _| cx.shown(id));
+        dom.layout.flexed_grids.retain(|&id, _| cx.shown(id));
+        dom.layout.grid_widest.retain(|&id, _| cx.shown(id));
+        dom.layout.tracks.retain(|&id, _| cx.shown(id));
+        dom.layout.areas.retain(|&id, _| cx.shown(id));
+        // Pseudo-elements keep their anchors by `atom_key`.
+        dom.layout
+            .anchors
+            .retain(|&id, _| cx.shown(id & ((1 << 30) - 1)));
+    }
+    {
+        let mut reach = cx.view.reach.borrow_mut();
+        if reach.len() > cx.doc.nodes.len() {
+            reach.truncate(cx.doc.nodes.len());
+            reach.shrink_to_fit();
+        }
+    }
+    // The boxes around an `<svg>` whose spill changed build again, so spacers follow its flags.
+    for id in std::mem::take(&mut dom.layout.cull.respilled) {
+        let mut kept = cx.view.kept.borrow_mut();
+        let mut node = Some(id).filter(|&id| id < cx.doc.nodes.len());
+        while let Some(id) = node {
+            kept.remove(&id);
+            node = dom.tree.flat_parent(cx.doc, &styles.children, id);
+        }
+    }
+    if cx.view.focused.replace(dom.interaction.focus) != dom.interaction.focus
+        && let Some(focus) = dom.interaction.focus.filter(|&id| id < cx.doc.nodes.len())
+    {
+        let mut kept = cx.view.kept.borrow_mut();
+        let mut node = Some(focus);
+        while let Some(id) = node {
+            kept.remove(&id);
+            node = dom.tree.flat_parent(cx.doc, &styles.children, id);
+        }
+    }
+    if !cx.same {
+        let unscrolled: Vec<usize> = dom
+            .geometry
+            .scroll
+            .keys()
+            .copied()
+            .filter(|&id| {
+                cx.shown(id)
+                    && id != 0
+                    && !matches!(cx.doc.nodes[id].tag.as_str(), "html" | "body")
+                    && !layout::size::text_field(&cx.doc.nodes[id], &styles.values[id])
+                    && [Prop::OVERFLOW_X, Prop::OVERFLOW_Y]
+                        .into_iter()
+                        .all(|prop| {
+                            styles.values[id]
+                                .get(prop)
+                                .is_none_or(|value| matches!(value, "visible" | "clip"))
+                        })
+            })
+            .collect();
+        // Pages read offsets from the layout mirror, which only handles write.
+        for id in unscrolled {
+            dom.geometry.scroll.remove(&id);
+            dom.geometry.mirror.unscroll(id);
+        }
+    }
 }
 
 #[cfg(test)]

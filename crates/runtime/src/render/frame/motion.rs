@@ -1,16 +1,17 @@
 use super::super::effects::{BLURS, COMPOSITED_PROPS, TRANSFORM_PROPS, filter, pseudo_key};
-use super::super::{CompositedTransform, ViewState, effects};
+use super::super::{CompositedTransform, PageState, ViewState, effects};
 use super::visibility::{clips, in_view};
 use crate::css;
 use crate::css::properties::Prop;
+use crate::css::value::units::Lengths;
+use crate::dom::Document;
+use crate::style::ComputedStyles;
 use renderer::{App, Window};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Whether an animated pair of pseudo-element styles differs from its base pair only in opacity.
-pub(crate) fn fades_only(
-    base: &[css::properties::Style; 2],
-    pair: &[css::properties::Style; 2],
-) -> bool {
+fn fades_only(base: &[css::properties::Style; 2], pair: &[css::properties::Style; 2]) -> bool {
     let rest = |(prop, _): &(Prop, &Rc<str>)| *prop != Prop::OPACITY;
     base.iter()
         .zip(pair.iter())
@@ -18,7 +19,7 @@ pub(crate) fn fades_only(
 }
 
 /// Whether two styles differ only in what patches change: opacity, transforms and filters that are one `blur()`.
-pub(crate) fn composites(a: &css::properties::Style, b: &css::properties::Style) -> bool {
+fn composites(a: &css::properties::Style, b: &css::properties::Style) -> bool {
     let rest = |(prop, _): &(Prop, &Rc<str>)| {
         *prop != Prop::OPACITY
             && !TRANSFORM_PROPS.contains(prop)
@@ -40,7 +41,7 @@ pub(crate) fn composites(a: &css::properties::Style, b: &css::properties::Style)
             })
 }
 
-pub(crate) fn animate(
+pub(super) fn animate(
     view: &Rc<ViewState>,
     dom: &mut crate::render::PageState,
     next: Option<std::time::Instant>,
@@ -89,7 +90,7 @@ pub(crate) fn animate(
 }
 
 // Animation handlers can hide or remove a popup, so run them before its final frame is painted.
-pub(crate) fn animation_events(
+pub(super) fn animation_events(
     view: &Rc<ViewState>,
     events: Vec<(usize, &'static str, String, f64)>,
     cx: &mut App,
@@ -114,7 +115,7 @@ pub(crate) fn animation_events(
     view.runtime.drive(cx);
 }
 
-pub(crate) fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
+fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) {
     if window.will_draw() {
         return;
     }
@@ -455,6 +456,198 @@ pub(crate) fn composite(view: Rc<ViewState>, window: &mut Window, cx: &mut App) 
             .is_ok_and(|host| host.pages.get(&view.id).is_some_and(|page| page.dirty))
         {
             window.refresh();
+        }
+    }
+}
+
+// Animated custom properties need a style pass. Its values replace `animated`, and the units of nodes whose
+// font size animates, like `em` lengths, are swapped in for this frame.
+pub(super) fn restyle(
+    doc: &mut Document,
+    dom: &mut PageState,
+    styles: &ComputedStyles,
+    children: &mut [(usize, Vec<usize>)],
+    viewport: [f32; 2],
+    custom: HashMap<usize, css::properties::Style>,
+    animated: &mut Vec<(usize, Rc<css::properties::Style>, bool)>,
+) -> Vec<(usize, Lengths)> {
+    let mut lengths = Vec::new();
+    if !custom.is_empty() {
+        dom.styles.animated = custom;
+        // Styles match the light tree, so the composed children step aside for this pass.
+        for (node, light) in children.iter_mut().rev() {
+            *light = doc.nodes.compose_children(*node, std::mem::take(light));
+        }
+        let restyled = dom.restyle(doc, viewport);
+        for (node, composed) in children.iter_mut() {
+            *composed = doc.nodes.compose_children(*node, std::mem::take(composed));
+        }
+        lengths = (0..restyled.values.len().min(styles.values.len()))
+            .filter_map(|id| {
+                let new = *restyled.lengths.get(id)?;
+                (styles.lengths.get(id) != Some(&new)).then_some((id, new))
+            })
+            .collect();
+        *animated = restyled
+            .values
+            .differing(&styles.values)
+            .flatten()
+            .filter(|&id| {
+                styles
+                    .values
+                    .get(id)
+                    .is_some_and(|old| !Rc::ptr_eq(&restyled.values[id], old))
+            })
+            .map(|id| (id, restyled.values[id].clone(), true))
+            .collect();
+    }
+    lengths
+}
+
+// The animated boxes that draw in composited layers, and whether they turn, and the pseudo-elements that
+// animate only their opacity.
+pub(super) fn layers(
+    view: &ViewState,
+    doc: &Document,
+    styles: &ComputedStyles,
+    animated: &[(usize, Rc<css::properties::Style>, bool)],
+    pseudos: &[(usize, Rc<[css::properties::Style; 2]>)],
+) -> (Vec<(usize, bool)>, Vec<usize>) {
+    let mut flat = view.flat.borrow_mut();
+    *flat = animated
+        .iter()
+        .map(|(id, ..)| *id)
+        .filter(|id| flat.contains(id))
+        .collect();
+    let composited: Vec<(usize, bool)> = animated
+        .iter()
+        .filter(|(id, style, layout)| {
+            !layout
+                && !flat.contains(id)
+                // A canvas draws its content from snapshots, which only full frames make.
+                && (styles.values[*id].get(Prop::CANVAS_CONTENT) != Some("drawable")
+                    || doc.nodes[*id].tag == "canvas")
+                && composites(style, &styles.values[*id])
+                // A spliced box has no layer: its parts draw its opacity.
+                && !crate::render::inline::spliced(doc, styles, *id)
+                // A step that draws like the base style builds in place, like other paint changes.
+                && !style.iter().eq(styles.values[*id].iter())
+                && filter(style, 1).is_none_or(|value| {
+                    value == "none" || effects::filter::lone_blur(Some(value)).is_some()
+                })
+                && style.get(Prop::BACKFACE_VISIBILITY) != Some("hidden")
+        })
+        .map(|(id, style, _)| {
+            let base = &styles.values[*id];
+            let turns = TRANSFORM_PROPS.iter().any(|&prop| {
+                style.get(prop).is_some_and(|value| value != "none")
+                    || style.get(prop) != base.get(prop)
+            });
+            (*id, turns)
+        })
+        .collect();
+    drop(flat);
+    // Pseudo-elements that animate only their opacity keep keyed layers, which frames patch.
+    let pseudo_layers: Vec<usize> = pseudos
+        .iter()
+        .filter(|(id, pair)| {
+            styles
+                .pseudos
+                .get(id)
+                .is_some_and(|base| fades_only(base, pair))
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    (composited, pseudo_layers)
+}
+
+pub(super) type Swapped = (
+    Vec<(usize, Rc<css::properties::Style>)>,
+    Vec<(usize, Rc<[css::properties::Style; 2]>)>,
+    Vec<(usize, Rc<css::properties::Style>)>,
+);
+
+// Animated values replace the cascade ones for this frame. Values that change layout, pseudo-elements and units
+// go into `styles`, and the restore lists keep their cascade values. The others are listed for paint, by node.
+pub(super) fn swap(
+    dom: &mut PageState,
+    styles: &mut Rc<ComputedStyles>,
+    animated: Vec<(usize, Rc<css::properties::Style>, bool)>,
+    pseudos: Vec<(usize, Rc<[css::properties::Style; 2]>)>,
+    lengths: &mut [(usize, Lengths)],
+) -> Swapped {
+    // Restore cascade values and pseudos after the frame: animations replace them temporarily.
+    let mut restore = Vec::new();
+    let mut restore_pseudos = Vec::new();
+    if !pseudos.is_empty() {
+        dom.styles.computed = None;
+        let map = &mut Rc::make_mut(styles).pseudos;
+        for (id, pair) in pseudos {
+            if let Some(old) = map.insert(id, pair) {
+                restore_pseudos.push((id, old));
+            }
+        }
+    }
+    let mut paint = Vec::new();
+    if !animated.is_empty() {
+        dom.styles.computed = None;
+        let values = &mut Rc::make_mut(styles).values;
+        for (id, style, layout) in animated {
+            if layout {
+                restore.push((id, std::mem::replace(&mut values[id], style)));
+            } else {
+                paint.push((id, style));
+            }
+        }
+        paint.sort_unstable_by_key(|(id, _)| *id);
+    }
+    if !lengths.is_empty() {
+        dom.styles.computed = None;
+        let units = &mut Rc::make_mut(styles).lengths;
+        for (id, new) in lengths.iter_mut() {
+            let old = *units.get(*id).unwrap_or(new);
+            units.set(*id, std::mem::replace(new, old));
+        }
+    }
+    (restore, restore_pseudos, paint)
+}
+
+// After the frame, `styles` gets its cascade values back, and `dom.styles` keeps the animated ones.
+pub(super) fn restore(
+    dom: &mut PageState,
+    styles: &mut Rc<ComputedStyles>,
+    restore: Vec<(usize, Rc<css::properties::Style>)>,
+    restore_pseudos: Vec<(usize, Rc<[css::properties::Style; 2]>)>,
+    lengths: Vec<(usize, Lengths)>,
+    relayouts: usize,
+) {
+    dom.styles.animating.clear();
+    dom.styles.animating_pseudos.clear();
+    let restored = !restore.is_empty() || !restore_pseudos.is_empty() || !lengths.is_empty();
+    // Animated values go back to the cascade values here, and the next frame visits their nodes again.
+    // Animated units are not in the values, so a frame after them visits all nodes.
+    dom.layout.cull.swapped = (restore[..relayouts].iter().map(|(id, _)| *id))
+        .chain(restore_pseudos.iter().map(|(id, _)| *id))
+        .collect();
+    let units = !lengths.is_empty();
+    // Animated padding and borders change content boxes that resize observers read.
+    if relayouts > 0 || units {
+        dom.geometry.mirror.restyled();
+    }
+    if restored {
+        let styles = Rc::make_mut(styles);
+        for (id, old) in lengths {
+            styles.lengths.set(id, old);
+        }
+        for (id, style) in restore {
+            dom.styles
+                .animating
+                .insert(id, std::mem::replace(&mut styles.values[id], style));
+        }
+        for (id, pair) in restore_pseudos {
+            if let Some(animated) = styles.pseudos.insert(id, pair) {
+                dom.styles.animating_pseudos.insert(id, animated);
+            }
         }
     }
 }
