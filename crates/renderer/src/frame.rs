@@ -165,17 +165,20 @@ impl<T> Default for Pool<T> {
 }
 
 impl<T> Pool<T> {
-    pub fn fill(
+    // `sizes` and `kept` are the textures of a frame and the cached layers they keep. `alive` says whether a cached
+    // layer still draws.
+    fn fill(
         &mut self,
-        frame: &RenderFrame,
+        sizes: &[[u32; 2]],
+        kept: &[u64],
+        alive: impl Fn(u64) -> bool,
+        window: [u32; 2],
+        damaged: bool,
         mut make: impl FnMut([u32; 2]) -> anyhow::Result<T>,
     ) -> anyhow::Result<()> {
         // The textures of dropped layers go back to the others.
         for (.., idle, id) in &mut self.textures {
-            if *id != 0
-                && !frame.cache.iter().any(|cached| cached.id == *id)
-                && !(frame.under.as_ref()).is_some_and(|under| under.ids.contains(id))
-            {
+            if *id != 0 && !alive(*id) {
                 (*idle, *id) = (0, 0);
             }
         }
@@ -187,7 +190,7 @@ impl<T> Pool<T> {
             .iter()
             .map(|(_, size, ..)| pixels(*size))
             .sum();
-        let age = match frame.damage.is_empty() || pooled > 2 * pixels(frame.window) {
+        let age = match !damaged || pooled > 2 * pixels(window) {
             true => DAMAGED_FRAMES,
             false => 1,
         };
@@ -199,7 +202,7 @@ impl<T> Pool<T> {
         self.textures
             .retain(|(.., idle, _)| *idle <= SPARE_FRAMES * DAMAGED_FRAMES);
         self.slots.clear();
-        for (&size, &id) in frame.textures.iter().zip(&frame.kept) {
+        for (&size, &id) in sizes.iter().zip(kept) {
             let found = match id {
                 0 => None,
                 _ => self.textures.iter().position(|texture| texture.3 == id),
@@ -228,7 +231,7 @@ impl<T> Pool<T> {
 
     // The sizes of textures that hold no cached layer.
     #[cfg(target_os = "macos")]
-    pub fn spare(&self, sizes: &mut Vec<[u32; 2]>) {
+    fn spare(&self, sizes: &mut Vec<[u32; 2]>) {
         sizes.clear();
         sizes.extend(
             (self.textures.iter())
@@ -237,23 +240,58 @@ impl<T> Pool<T> {
         );
     }
 
-    pub fn get(&self, frame: &RenderFrame, target: Target) -> Option<&T> {
-        let Target::Layer(index) = target else {
-            return None;
-        };
-        Some(&self.textures[self.slots[frame.layers[index].texture]].0)
+    fn get(&self, texture: usize) -> &T {
+        &self.textures[self.slots[texture]].0
     }
 
-    // The frame forgets the cached layers too, since their pixels go.
-    pub fn clear(&mut self, frame: &mut RenderFrame) {
+    fn clear(&mut self) {
         self.textures.clear();
         self.slots.clear();
-        frame.cache.clear();
-        frame.under = None;
     }
 }
 
 impl RenderFrame {
+    // Gives the textures of this frame backend textures from `pool`, made with `make` when the pool has none.
+    pub(crate) fn fill_pool<T>(
+        &self,
+        pool: &mut Pool<T>,
+        make: impl FnMut([u32; 2]) -> anyhow::Result<T>,
+    ) -> anyhow::Result<()> {
+        let alive = |id| {
+            self.cache.iter().any(|cached| cached.id == id)
+                || (self.under.as_ref()).is_some_and(|under| under.ids.contains(&id))
+        };
+        let damaged = !self.damage.is_empty();
+        pool.fill(
+            &self.textures,
+            &self.kept,
+            alive,
+            self.window,
+            damaged,
+            make,
+        )
+    }
+
+    pub(crate) fn pooled<'a, T>(&self, pool: &'a Pool<T>, target: Target) -> Option<&'a T> {
+        let Target::Layer(index) = target else {
+            return None;
+        };
+        Some(pool.get(self.layers[index].texture))
+    }
+
+    // The frame forgets the cached layers too, since their pixels go.
+    pub(crate) fn clear_pool<T>(&mut self, pool: &mut Pool<T>) {
+        pool.clear();
+        self.cache.clear();
+        self.under = None;
+    }
+
+    // New layers take the sizes of the spare textures of `pool` first.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn take_spare<T>(&mut self, pool: &Pool<T>) {
+        pool.spare(&mut self.spare);
+    }
+
     pub fn record(&mut self, scene: &Scene, window: [u32; 2], max_texture: u32, copy: bool) {
         self.instances.clear();
         self.composites.clear();
@@ -1875,26 +1913,27 @@ mod tests {
         let used = record([800, 600], [100., 100., 24., 24.], 1.);
         let (idle, mut pool, mut made) = (RenderFrame::default(), super::Pool::default(), 0);
         let mut fill = |pool: &mut super::Pool<usize>, frame: &RenderFrame| {
-            pool.fill(frame, |_| {
-                made += 1;
-                Ok(made)
-            })
-            .unwrap();
+            frame
+                .fill_pool(pool, |_| {
+                    made += 1;
+                    Ok(made)
+                })
+                .unwrap();
         };
         fill(&mut pool, &used);
         let target = super::Target::Layer(0);
-        assert_eq!(pool.get(&used, target), Some(&1));
-        assert_eq!(pool.get(&used, super::Target::Frame), None);
+        assert_eq!(used.pooled(&pool, target), Some(&1));
+        assert_eq!(used.pooled(&pool, super::Target::Frame), None);
         for _ in 0..2 {
             fill(&mut pool, &idle);
         }
         fill(&mut pool, &used);
-        assert_eq!(pool.get(&used, target), Some(&1));
+        assert_eq!(used.pooled(&pool, target), Some(&1));
         for _ in 0..3 {
             fill(&mut pool, &idle);
         }
         fill(&mut pool, &used);
-        assert_eq!(pool.get(&used, target), Some(&2));
+        assert_eq!(used.pooled(&pool, target), Some(&2));
     }
 
     #[test]
@@ -1978,18 +2017,21 @@ mod tests {
         let (mut frame, mut pool, mut made) = (RenderFrame::default(), super::Pool::default(), 0);
         let mut draw = |frame: &mut RenderFrame, scene: &Scene| {
             frame.record(scene, [400, 300], 16384, true);
-            pool.fill(frame, |_| {
-                made += 1;
-                Ok(made)
-            })
-            .unwrap();
+            frame
+                .fill_pool(&mut pool, |_| {
+                    made += 1;
+                    Ok(made)
+                })
+                .unwrap();
             let target = frame.commands.iter().find_map(|command| match command {
                 Command::Composite { src, .. } => Some(*src),
                 _ => None,
             });
             (
                 frame.instances.len(),
-                target.and_then(|target| pool.get(frame, target)).copied(),
+                target
+                    .and_then(|target| frame.pooled(&pool, target))
+                    .copied(),
             )
         };
         let (drawn, _) = draw(&mut frame, &scene(1., 0.5));

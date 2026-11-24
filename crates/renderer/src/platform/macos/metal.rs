@@ -726,7 +726,7 @@ impl Renderer {
         for list in &mut self.atlas.pages.borrow_mut().pages {
             list.trim();
         }
-        self.pool.clear(&mut self.frame);
+        self.frame.clear_pool(&mut self.pool);
         self.last = None;
         self.drawables.clear();
         BUFFERS.with(|buffers| buffers.borrow_mut().reset(MIN_INSTANCE_BUFFER));
@@ -753,7 +753,7 @@ impl Renderer {
             // Kept pixels are in the old color space.
             self.last = None;
             self.drawables.clear();
-            self.pool.clear(&mut self.frame);
+            self.frame.clear_pool(&mut self.pool);
             let space = Some(color_space(wide));
             for promoted in &self.promoted {
                 promoted.sublayer.setColorspace(space);
@@ -924,7 +924,7 @@ impl Renderer {
         let shots: Vec<_> = (self.frame.shots.iter())
             .filter_map(|&(key, target, region)| {
                 let size = [region[2] as u32, region[3] as u32];
-                let layer = self.pool.get(&self.frame, target)?;
+                let layer = self.frame.pooled(&self.pool, target)?;
                 // A blit encoder keeps much memory in the Apple GPU driver, so there a draw copies the layer
                 // into a texture that the CPU can read.
                 let read = if self.atlas.pages.borrow().shared {
@@ -1105,10 +1105,10 @@ impl Renderer {
         };
         frame.fresh = srgb.is_some();
         frame.keeps_under = true;
-        self.pool.spare(&mut frame.spare);
+        frame.take_spare(&self.pool);
         frame.record(scene, window, MAX_TEXTURE_SIZE, true);
         let device = &self.device;
-        self.pool.fill(&frame, |size| {
+        frame.fill_pool(&mut self.pool, |size| {
             new_texture(
                 device,
                 size.map(|side| side as usize),
@@ -1204,7 +1204,7 @@ impl Renderer {
         let mut sublayers = Vec::new();
         if result.is_ok() {
             for &(index, target, region) in &frame.promoted {
-                let Some(source) = self.pool.get(&frame, target) else {
+                let Some(source) = frame.pooled(&self.pool, target) else {
                     continue;
                 };
                 let promoted = self.promoted.iter_mut().find(|p| p.index == index);
@@ -1273,11 +1273,8 @@ impl Renderer {
         // Copies that start the frame, drawn when its first pass begins: (source, offset, area).
         prelude: &[Prelude],
     ) -> Result<()> {
-        let texture = |target: Target| {
-            self.pool
-                .get(frame, target)
-                .map_or(drawable, |texture| texture)
-        };
+        let texture =
+            |target: Target| (frame.pooled(&self.pool, target)).map_or(drawable, |texture| texture);
         let pages = self.atlas.pages.borrow();
         let page = |kind, index: Option<u32>| {
             index
