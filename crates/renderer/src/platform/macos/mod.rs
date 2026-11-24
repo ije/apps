@@ -5,8 +5,8 @@ mod controls;
 mod events;
 mod glass;
 mod metal;
-mod nsview;
 mod nswindow;
+mod screen;
 mod threads;
 mod vsync;
 mod window;
@@ -82,7 +82,7 @@ define_class!(
         fn launched(&self, _: &AnyObject) {
             // Only after the run loop started: an unbundled app set up earlier can get a menu bar that takes no clicks.
             NSApp(self.mtm()).setActivationPolicy(NSApplicationActivationPolicy::Regular);
-            window::measure_screens();
+            screen::measure_screens();
             let launch = self.ivars().take();
             if let Some(launch) = launch {
                 launch();
@@ -168,15 +168,15 @@ impl Platform {
     }
 
     pub fn set_cursor(&self, cursor: Cursor) {
-        native_post(Box::new(move || nsview::set_cursor(cursor)));
+        native_post(Box::new(move || nswindow::set_cursor(cursor)));
     }
 
     // The cached screen saves a wait for main, which is busy while the app launches.
     pub fn primary_display_bounds(&self) -> Option<Rect> {
-        window::work_area().or_else(|| {
+        screen::work_area().or_else(|| {
             native_sync(|| {
                 let primary = NSScreen::screens(MainThreadMarker::new().unwrap()).firstObject()?;
-                Some(window::flip(
+                Some(screen::flip(
                     primary.visibleFrame(),
                     primary.frame().size.height,
                 ))
