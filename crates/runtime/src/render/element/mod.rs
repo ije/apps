@@ -1,11 +1,15 @@
 pub(crate) mod border;
+pub(crate) mod children;
 pub(crate) mod columns;
 pub(crate) mod create;
+pub(crate) mod cx;
 pub(crate) mod kept;
 pub(crate) mod margin;
 #[cfg(debug_assertions)]
 pub(crate) mod oracle;
+pub(crate) mod paragraph;
 pub(crate) mod plan;
+pub(crate) mod pseudos;
 pub(crate) mod query;
 pub(crate) mod svg;
 
